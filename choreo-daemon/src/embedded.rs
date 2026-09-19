@@ -77,6 +77,11 @@ pub struct EmbeddedDaemon {
     /// the SAME counter the Unix and TCP accept paths use, so the cap applies
     /// uniformly across all three transports.
     conn_count: Arc<AtomicUsize>,
+    /// The shared redb database handle, cloned from the core so `connect()`
+    /// hands each connection thread its own clone — on-demand image reads run
+    /// on the connection thread, never on the command loop (same as the
+    /// socket transports; see [`DaemonCore::db`]).
+    db: Arc<redb::Database>,
     /// Ferry for connection-thread `JoinHandles` (same pattern as the TCP
     /// accept thread in `lifecycle.rs`): the accept path here is `connect()`
     /// itself, spawning on the CALLER's thread, so handles are sent over the
@@ -127,6 +132,7 @@ pub fn spawn_embedded(state: DaemonState, _opts: EmbeddedOptions) -> io::Result<
     let daemon_tx = core.daemon_tx.clone();
     let conn_count = Arc::clone(&core.conn_count);
     let global_lag = Arc::clone(&core.global_lag);
+    let db = Arc::clone(&core.db);
     // JoinHandle ferry: connect() sends each connection thread's handle here;
     // shutdown() drains and bounded-joins them (same pattern as the TCP
     // accept thread's `tcp_client_tx`/`tcp_client_rx` in lifecycle.rs).
@@ -139,6 +145,7 @@ pub fn spawn_embedded(state: DaemonState, _opts: EmbeddedOptions) -> io::Result<
         daemon_tx: Some(daemon_tx),
         global_lag,
         conn_count,
+        db,
         handle_tx,
         handle_rx: Some(handle_rx),
         shut_down: false,
@@ -203,6 +210,9 @@ impl EmbeddedDaemon {
         // values — `&self` is not Send, so anything read off `self` inside
         // the spawned thread would fail to compile.
         let global_lag = Arc::clone(&self.global_lag);
+        // Same reason for the DB handle: the connection thread owns its own
+        // clone, so on-demand image reads never touch `self`.
+        let db = Arc::clone(&self.db);
         info!(client_id, "embedded client connecting");
         crate::metrics::record_connection_accepted();
         let handle = thread::spawn(move || {
@@ -217,6 +227,7 @@ impl EmbeddedDaemon {
                 writer,
                 writer_rx,
                 global_lag,
+                db,
             };
             crate::server::connection::embedded_client_thread(args);
         });

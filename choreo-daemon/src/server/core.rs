@@ -69,6 +69,15 @@ pub(crate) struct DaemonCore {
     /// exist before either adapter is spawned. See ARCHITECTURE.md
     /// (exception #3) for the lock-free rationale.
     pub conn_count: Arc<AtomicUsize>,
+    /// The shared redb database handle. The transport adapters hand this
+    /// `Arc` to each connection thread so on-demand image reads (`GetImage`)
+    /// resolve on the connection's own thread — they never serialize on the
+    /// command loop. redb's `Database` handle is explicitly designed for
+    /// concurrent readers (each connection opens its own read transaction),
+    /// so sharing one `Arc` across every connection thread is safe and needs
+    /// no per-connection handle. Cloned from [`DaemonState::db`] BEFORE
+    /// `state` moves into the command-loop thread (`start_daemon_core`).
+    pub db: Arc<redb::Database>,
     /// `JoinHandle` of the command-loop thread; the shutdown drain joins it
     /// after sending `Shutdown` and dropping `daemon_tx`.
     pub cmd_handle: thread::JoinHandle<()>,
@@ -224,6 +233,11 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: CoreOptions) -> Daemon
     // session threads increment on enqueue (see DaemonCore::global_lag).
     let global_lag = Arc::clone(&state.global_lag);
 
+    // Clone the shared DB handle for the transport adapters BEFORE `state`
+    // moves into the command-loop thread: each connection thread reads the
+    // `session_attachments` store directly (see DaemonCore::db).
+    let db = Arc::clone(&state.db);
+
     // Daemon-wide live-connection counter backing MAX_CONCURRENT_CONNECTIONS.
     // Both accept paths take a slot per accepted connection, so the cap is
     // enforced across the Unix main thread and the TCP accept thread. Created
@@ -337,6 +351,7 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: CoreOptions) -> Daemon
         shutdown,
         global_lag,
         conn_count,
+        db,
         cmd_handle,
     }
 }

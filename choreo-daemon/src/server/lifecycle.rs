@@ -303,6 +303,10 @@ pub fn run_server(
     let shutdown = Arc::clone(&core.shutdown);
     let global_lag = Arc::clone(&core.global_lag);
     let conn_count = Arc::clone(&core.conn_count);
+    // The shared DB handle, cloned per connection below so each connection
+    // thread reads on-demand images from its own redb handle instead of
+    // round-tripping through the command loop (see DaemonCore::db).
+    let db = Arc::clone(&core.db);
 
     // Signal handler thread: sets the shutdown flag and connects to our own
     // socket to unblock the blocking accept() call on the main thread.
@@ -443,6 +447,10 @@ pub fn run_server(
         // thread keeps the original for the Unix accept path, and each
         // connection thread gets its own clone from here.
         let global_lag_tcp = Arc::clone(&global_lag);
+        // Same pattern for the DB handle: the main thread keeps its `db`
+        // clone for the Unix accept path, the TCP accept thread takes its own
+        // and hands a clone to each connection it spawns.
+        let db_tcp = Arc::clone(&db);
         tcp_accept_handle = Some(thread::spawn(move || {
             loop {
                 if tcp_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
@@ -482,6 +490,9 @@ pub fn run_server(
                         let sk_bytes = *transport_sk.as_bytes();
                         let acl = Arc::clone(&acl);
                         let global_lag = Arc::clone(&global_lag_tcp);
+                        // Each TCP connection thread reads images from its own
+                        // clone of the shared DB handle.
+                        let db = Arc::clone(&db_tcp);
                         // Register the writer channel BEFORE the handshake (see
                         // register_client_writer): the main thread joins this
                         // accept thread before sending the shutdown broadcast,
@@ -505,7 +516,7 @@ pub fn run_server(
                             if let Err(e) =
                                 crate::server::connection::tcp_handshake_and_client_thread(
                                     tcp, sk_bytes, &acl, tx, client_id, writer_tx, writer_rx,
-                                    global_lag,
+                                    global_lag, db,
                                 )
                             {
                                 error!(error = %e, "TCP client error");
@@ -566,6 +577,9 @@ pub fn run_server(
                 // TCP path above for why the slot drop precedes the send).
                 let auto_exit_tx = if auto_exit { Some(tx.clone()) } else { None };
                 let global_lag = Arc::clone(&global_lag);
+                // Each Unix connection thread reads images from its own clone
+                // of the shared DB handle.
+                let db = Arc::clone(&db);
                 // Register the writer channel with the daemon BEFORE spawning
                 // the connection thread — see register_client_writer for why
                 // this closes the "connection accepted concurrently with
@@ -580,7 +594,7 @@ pub fn run_server(
                         // thread exits, even on panic.
                         let conn_slot = slot;
                         let result = crate::server::connection::client_thread(
-                            stream, tx, client_id, writer_tx, writer_rx, global_lag,
+                            stream, tx, client_id, writer_tx, writer_rx, global_lag, db,
                         );
                         if let Err(e) = result {
                             error!(error = %e, "client error");

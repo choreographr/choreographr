@@ -520,62 +520,6 @@ fn handle_get_session_missing() {
 }
 
 #[test]
-fn handle_get_display_image_reads_persisted_bytes() {
-    // The command-loop handler is the daemon-side half of on-demand image
-    // fetch: it reads the attachment bytes from the DB (written at
-    // persist-at-emit time) and replies over the channel. Missing slot →
-    // None, present slot → the exact bytes.
-    let (mut state, _rx) = make_daemon_state();
-
-    // Nothing persisted yet → not found.
-    {
-        let (reply, rx) = mpsc::channel();
-        state.handle_command(DaemonCommand::GetDisplayImage {
-            session_id: 1,
-            turn_id: 0,
-            image_index: 0,
-            reply,
-        });
-        assert_eq!(rx.recv().unwrap(), None);
-    }
-
-    let turn = choreo_proto::Turn {
-        created_at: choreo_proto::TimestampMs::now(),
-        undone: false,
-        error: None,
-        user_text: None,
-        assistant_text: None,
-        assistant_reasoning: None,
-        tool_calls: vec![],
-        token_usage: None,
-        tool_results: vec![],
-        displayed_images: vec![choreo_proto::DisplayedImageRecord {
-            metadata: choreo_proto::ImageMetadata {
-                mime_type: "image/png".into(),
-                width: 1,
-                height: 1,
-                byte_len: 5,
-                alt: None,
-            },
-            data: b"hello".to_vec(),
-            tool_call_id: None,
-        }],
-        reasoning_artifact: None,
-        reasoning_producer: None,
-    };
-    crate::db::write_turn(&state.db, 1, 0, &turn).unwrap();
-
-    let (reply, rx) = mpsc::channel();
-    state.handle_command(DaemonCommand::GetDisplayImage {
-        session_id: 1,
-        turn_id: 0,
-        image_index: 0,
-        reply,
-    });
-    assert_eq!(rx.recv().unwrap(), Some(b"hello".to_vec()));
-}
-
-#[test]
 fn handle_update_metadata() {
     let (mut state, _rx) = make_daemon_state();
     state.session_metadata.insert(

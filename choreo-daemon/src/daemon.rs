@@ -191,16 +191,6 @@ pub enum DaemonCommand {
         session_id: u64,
         reply: std::sync::mpsc::Sender<Option<SessionSummary>>,
     },
-    /// Read one displayed image's raw bytes from the durable attachment store.
-    /// Handled on the command loop (which owns the DB handle) so any
-    /// connection thread can serve an on-demand image fetch without holding a
-    /// DB reference itself; the reply is the raw bytes or `None` (not found).
-    GetDisplayImage {
-        session_id: u64,
-        turn_id: u32,
-        image_index: u32,
-        reply: std::sync::mpsc::Sender<Option<Vec<u8>>>,
-    },
     UpdateMetadata {
         session_id: u64,
         metadata: SessionMetadata,
@@ -596,14 +586,6 @@ impl DaemonState {
             DaemonCommand::ListSessions { reply } => self.handle_list_sessions(&reply),
             DaemonCommand::GetSession { session_id, reply } => {
                 self.handle_get_session(session_id, &reply);
-            }
-            DaemonCommand::GetDisplayImage {
-                session_id,
-                turn_id,
-                image_index,
-                reply,
-            } => {
-                self.handle_get_display_image(session_id, turn_id, image_index, &reply);
             }
             DaemonCommand::UpdateMetadata {
                 session_id,
@@ -1408,38 +1390,6 @@ impl DaemonState {
             .get(&session_id)
             .map(|meta| meta.to_summary(session_id));
         let _ = reply.send(summary);
-    }
-
-    /// Serve one displayed image's raw bytes from the durable attachment store.
-    ///
-    /// Persist-at-emit (see `emit_image`) writes each displayed image's bytes
-    /// to `session_attachments` the instant the tool produces it, so the DB is
-    /// the single source of truth for image bytes and this read is always
-    /// current — including mid-request, before the turn's final write. A read
-    /// failure is answered as `None` (the client treats it as "not found" and
-    /// does not retry), so a transient redb hiccup can never leak a raw error
-    /// into the image-fetch protocol.
-    fn handle_get_display_image(
-        &mut self,
-        session_id: u64,
-        turn_id: u32,
-        image_index: u32,
-        reply: &std::sync::mpsc::Sender<Option<Vec<u8>>>,
-    ) {
-        let data = match db::read_display_image(&self.db, session_id, turn_id, image_index) {
-            Ok(data) => data,
-            Err(e) => {
-                warn!(
-                    session_id,
-                    turn_id,
-                    image_index,
-                    error = %e,
-                    "failed to read display image attachment"
-                );
-                None
-            }
-        };
-        let _ = reply.send(data);
     }
 
     /// Update the in-memory metadata for a session.

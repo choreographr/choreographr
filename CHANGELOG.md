@@ -159,6 +159,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attachments) is still written atomically at finalize; the redundant
   full-record clone in `emit_image` is gone (the record is moved into the turn).
 
+- **On-demand image reads no longer serialize on the daemon command loop
+  (`choreo-daemon`).** The `GetImage` fetch was serviced by the command loop:
+  each connection sent a `DaemonCommand::GetDisplayImage` and blocked on a reply
+  channel, so every connection's image reads queued behind the loop's single
+  serialization point. Each connection now carries its own
+  `Arc<redb::Database>` (cloned from a new `DaemonCore::db`, threaded through the
+  Unix, TCP, and embedded transports into `ClientConn`) and
+  `handle_client_get_image` reads the `session_attachments` store directly on the
+  connection thread via `db::read_display_image` — no command-loop round-trip and
+  no reply channel. redb's `Database` is built for concurrent readers, so one
+  shared handle serves every connection; the trust boundary (only the attached
+  session's images are served, everything else answers `None`) and the
+  error-to-`None` mapping are unchanged. The now-unused
+  `DaemonCommand::GetDisplayImage` variant, its `handle_command` arm, and the
+  `handle_get_display_image` handler are removed.
+
 ### Removed
 
 - **The `/models` alias is gone — use `/model`.**

@@ -262,6 +262,11 @@ fn send_to_writer(ctx: &ClientCtx, msg: &DaemonMessage) {
 struct ClientCtx<'a> {
     /// This connection's delivery sink (see `send_to_writer`).
     writer: &'a crate::broadcast::SubscriberSink,
+    /// This connection's own redb handle, shared with every other connection
+    /// (redb's `Database` is built for concurrent readers). Used to serve
+    /// on-demand image reads DIRECTLY on the connection thread instead of
+    /// serializing them on the command loop.
+    db: &'a redb::Database,
     /// Daemon-wide lag counter, shared by every connection; replies must
     /// increment it so the writer thread's per-dequeue decrement stays
     /// balanced (see `send_to_writer`).
@@ -670,6 +675,10 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
 /// message read and teardown lives here.
 pub(crate) struct ClientConn {
     daemon_tx: mpsc::Sender<DaemonCommand>,
+    /// This connection's own handle to the shared redb database (see
+    /// [`ClientCtx::db`]): on-demand image reads run here, on the connection
+    /// thread, never as a command-loop round-trip.
+    db: Arc<redb::Database>,
     /// This connection's delivery sink (see `send_to_writer`).
     writer: crate::broadcast::SubscriberSink,
     /// Daemon-wide lag counter, shared by every connection; kept so replies
@@ -693,8 +702,14 @@ impl ClientConn {
     /// transport-specific writer buffer. Spawning here keeps the socket
     /// threads to just: set write timeout, clone the stream into a writer
     /// buffer, call this, then read/dispatch/finish.
+    // Eight inputs (the daemon command sender, the DB handle, the sink, the
+    // writer buffer, the writer receiver, the lag counter, the client id, and
+    // the trust-domain flag) — bundling them into a struct would only move the
+    // same fields one call site deeper, so the lint is explicitly allowed.
+    #[expect(clippy::too_many_arguments)]
     fn new<W: ConnectionWriter + Send + 'static>(
         daemon_tx: mpsc::Sender<DaemonCommand>,
+        db: Arc<redb::Database>,
         writer: crate::broadcast::SubscriberSink,
         writer_buf: W,
         writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
@@ -710,6 +725,7 @@ impl ClientConn {
             std::thread::spawn(move || writer_thread(writer_buf, &writer_rx, &bytes, &global));
         Self {
             daemon_tx,
+            db,
             writer,
             global_lag,
             client_id,
@@ -728,6 +744,7 @@ impl ClientConn {
     pub(crate) fn dispatch(&mut self, msg: ClientMessage) -> io::Result<()> {
         let mut ctx = ClientCtx {
             writer: &self.writer,
+            db: &self.db,
             global_lag: &self.global_lag,
             daemon_tx: &self.daemon_tx,
             attached_session_id: &mut self.attached_session_id,
@@ -758,6 +775,7 @@ pub(crate) fn client_thread(
     writer: crate::broadcast::SubscriberSink,
     writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
     global_lag: Arc<AtomicUsize>,
+    db: Arc<redb::Database>,
 ) -> io::Result<()> {
     // Bound the writer's blocking socket writes so a wedged client (receive
     // window permanently zero) cannot stall it forever — this is what makes
@@ -768,7 +786,7 @@ pub(crate) fn client_thread(
     let writer_buf = BufWriter::new(stream);
 
     let mut conn = ClientConn::new(
-        daemon_tx, writer, writer_buf, writer_rx, global_lag, client_id, true,
+        daemon_tx, db, writer, writer_buf, writer_rx, global_lag, client_id, true,
     );
 
     // The writer channel was registered with the daemon by the acceptor
@@ -840,6 +858,7 @@ pub(crate) fn tcp_handshake_and_client_thread(
     writer: crate::broadcast::SubscriberSink,
     writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
     global_lag: Arc<AtomicUsize>,
+    db: Arc<redb::Database>,
 ) -> io::Result<()> {
     // The preamble read runs BEFORE any authentication, so it is bounded by
     // the transport's absolute-deadline machinery (same as the handshake
@@ -894,7 +913,9 @@ pub(crate) fn tcp_handshake_and_client_thread(
         }
     };
 
-    tcp_client_thread(noise, daemon_tx, client_id, writer, writer_rx, global_lag)
+    tcp_client_thread(
+        noise, daemon_tx, client_id, writer, writer_rx, global_lag, db,
+    )
 }
 
 pub(crate) fn tcp_client_thread(
@@ -904,6 +925,7 @@ pub(crate) fn tcp_client_thread(
     writer: crate::broadcast::SubscriberSink,
     writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
     global_lag: Arc<AtomicUsize>,
+    db: Arc<redb::Database>,
 ) -> io::Result<()> {
     // Writer thread: blocks on writer_rx, sends via NoiseStream encryption.
     // Bound the underlying socket's blocking writes (see WRITER_WRITE_TIMEOUT)
@@ -915,7 +937,7 @@ pub(crate) fn tcp_client_thread(
     let writer_buf = noise.try_clone()?;
 
     let mut conn = ClientConn::new(
-        daemon_tx, writer, writer_buf, writer_rx, global_lag, client_id, false,
+        daemon_tx, db, writer, writer_buf, writer_rx, global_lag, client_id, false,
     );
 
     // The writer channel was registered with the daemon by the acceptor
@@ -970,6 +992,9 @@ pub(crate) struct EmbeddedConnArgs {
     pub writer: crate::broadcast::SubscriberSink,
     pub writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
     pub global_lag: Arc<AtomicUsize>,
+    /// This connection's own handle to the shared redb database (on-demand
+    /// image reads run on the connection thread; see [`ClientCtx::db`]).
+    pub db: Arc<redb::Database>,
 }
 
 /// The embedded (in-process) connection thread — the third transport, next
@@ -998,10 +1023,12 @@ pub(crate) fn embedded_client_thread(args: EmbeddedConnArgs) {
         writer,
         writer_rx,
         global_lag,
+        db,
     } = args;
 
     let mut conn = ClientConn::new(
         daemon_tx,
+        db,
         writer,
         ChannelConnectionWriter::new(out_tx),
         writer_rx,
@@ -1301,28 +1328,31 @@ fn handle_list_models_sync(ctx: &mut ClientCtx, attached_session_id: Option<u64>
 /// Only images of the session THIS connection is attached to are served — the
 /// same trust boundary every other session-scoped command enforces. A request
 /// for any other (or no) session is answered `None` rather than reading an
-/// arbitrary session's attachments. The daemon command loop owns the DB and
-/// performs the actual `get`, so this connection needs no DB handle; the reply
-/// channel is drained inline, exactly like the other session-scoped replies.
+/// arbitrary session's attachments.
+///
+/// The connection now owns a redb handle (see [`ClientCtx::db`]), so the read
+/// runs RIGHT HERE on the connection thread via [`crate::db::read_display_image`]
+/// — a single O(log n) `get` against the attachment table, with no
+/// command-loop round-trip and no reply channel to drain. Each connection
+/// opens its own read transaction, so concurrent connections never serialize.
 fn handle_client_get_image(session_id: u64, turn_id: u32, image_index: u32, ctx: &ClientCtx) {
     let data = if *ctx.attached_session_id == Some(session_id) {
-        let (reply, rx) = mpsc::channel();
-        if ctx
-            .daemon_tx
-            .send(DaemonCommand::GetDisplayImage {
-                session_id,
-                turn_id,
-                image_index,
-                reply,
-            })
-            .is_ok()
-        {
-            // `None` covers both "not found" and a dropped reply channel; the
-            // client treats it identically (mark the image failed, don't
-            // retry), so the two collapse here intentionally.
-            rx.recv().ok().flatten()
-        } else {
-            None
+        // `None` covers both "not found" and a redb read error; the client
+        // treats them identically (mark the image failed, don't retry), so the
+        // two collapse here intentionally — a transient redb hiccup must never
+        // leak a raw error into the image-fetch protocol.
+        match crate::db::read_display_image(ctx.db, session_id, turn_id, image_index) {
+            Ok(data) => data,
+            Err(e) => {
+                warn!(
+                    session_id,
+                    turn_id,
+                    image_index,
+                    error = %e,
+                    "failed to read display image attachment"
+                );
+                None
+            }
         }
     } else {
         None
@@ -1508,6 +1538,20 @@ fn handle_remove_credential_sync(ctx: &mut ClientCtx, service: String) {
 mod tests {
     use super::*;
     use crate::broadcast::test_sink;
+    use std::sync::LazyLock;
+
+    /// Shared in-memory database for the `ClientCtx` literals in this module.
+    /// Every literal now carries a `db: &'a redb::Database` field (required by
+    /// the struct whether or not the handler under test reads through it), and
+    /// a `redb::Database` is `Send + Sync`, so one lazily-initialized static —
+    /// backed by `InMemoryBackend`, which needs no filesystem path — serves
+    /// them all. Tests that DO exercise the store (the `GetImage` serve path)
+    /// write into this same handle with unique session/turn ids.
+    static TEST_DB: LazyLock<redb::Database> = LazyLock::new(|| {
+        redb::Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .expect("create the in-memory test database")
+    });
 
     /// A `ConnectionWriter` test double that forwards every written message
     /// to a channel and records shutdown calls on another. Message-passing
@@ -1826,6 +1870,7 @@ mod tests {
         let mut none_tx = None;
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
@@ -1862,6 +1907,7 @@ mod tests {
         let mut none_tx = None;
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
@@ -1900,6 +1946,7 @@ mod tests {
         let mut none_tx = None;
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
@@ -1945,6 +1992,7 @@ mod tests {
         let mut none_tx = None;
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
@@ -1970,6 +2018,7 @@ mod tests {
         let mut none_tx = None;
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
@@ -1996,6 +2045,7 @@ mod tests {
         let mut none_tx = None;
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
@@ -2024,6 +2074,7 @@ mod tests {
         let mut none_tx = None;
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
@@ -2056,6 +2107,7 @@ mod tests {
         let mut none_tx = None;
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
@@ -2094,6 +2146,7 @@ mod tests {
         let mut none_tx = None;
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
@@ -2122,6 +2175,7 @@ mod tests {
         let mut none_tx = None;
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
@@ -2144,15 +2198,18 @@ mod tests {
 
     #[test]
     fn handle_client_get_image_serves_attached_session() {
-        // A client attached to session 5 requests image 1 of turn 2; the daemon
-        // reads the bytes and the connection routes them back as Image.
-        let (daemon_tx, daemon_rx) = mpsc::channel();
+        // A client attached to session 5 requests image 1 of turn 2; the
+        // connection thread reads the bytes straight from its own DB handle
+        // (`ctx.db`) and routes them back as Image — no command-loop hop. The
+        // bytes are written the way persist-at-emit does, via `write_turn`.
+        let (daemon_tx, _daemon_rx) = mpsc::channel();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
         let mut attached = Some(5u64);
         let mut none_tx = None;
         let ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut attached,
@@ -2160,18 +2217,25 @@ mod tests {
             client_id: 0,
             is_unix: true,
         };
-        std::thread::spawn(move || {
-            if let Ok(DaemonCommand::GetDisplayImage {
-                session_id,
-                turn_id,
-                image_index,
-                reply,
-            }) = daemon_rx.recv()
-            {
-                assert_eq!((session_id, turn_id, image_index), (5, 2, 1));
-                let _ = reply.send(Some(vec![1, 2, 3]));
-            }
-        });
+        // Persist a turn whose displayed-image index 1 is [1, 2, 3] (slot d1).
+        // Unique session/turn ids keep this write isolated from any other test
+        // that shares the static TEST_DB.
+        let turn = choreo_proto::Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![displayed_image(b""), displayed_image(&[1, 2, 3])],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        crate::db::write_turn(&TEST_DB, 5, 2, &turn).unwrap();
+
         handle_client_get_image(5, 2, 1, &ctx);
         let msg = writer_rx.recv().unwrap();
         match msg {
@@ -2188,10 +2252,26 @@ mod tests {
         }
     }
 
+    /// Build a `DisplayedImageRecord` carrying `data`, for the `GetImage` test.
+    fn displayed_image(data: &[u8]) -> choreo_proto::DisplayedImageRecord {
+        choreo_proto::DisplayedImageRecord {
+            metadata: choreo_proto::ImageMetadata {
+                mime_type: "image/png".into(),
+                width: 1,
+                height: 1,
+                byte_len: data.len() as u64,
+                alt: None,
+            },
+            data: data.to_vec(),
+            tool_call_id: None,
+        }
+    }
+
     #[test]
     fn handle_client_get_image_refuses_unattached_session() {
-        // The client is NOT attached to the requested session: the daemon must
-        // not be consulted (no command sent) and the reply is a not-found None.
+        // The client is NOT attached to the requested session: the DB must not
+        // be consulted for the request (no command is sent to the daemon) and
+        // the reply is a not-found None.
         let (daemon_tx, daemon_rx) = mpsc::channel();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
@@ -2199,6 +2279,7 @@ mod tests {
         let mut none_tx = None;
         let ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut attached,
@@ -2232,6 +2313,7 @@ mod tests {
         let mut none_tx = None;
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
@@ -2263,6 +2345,7 @@ mod tests {
         let mut none_tx = None;
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
@@ -2296,6 +2379,7 @@ mod tests {
         let mut attached_tx = Some(old_tx);
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut attached_id,
@@ -2331,6 +2415,7 @@ mod tests {
         let mut attached_tx = Some(old_tx);
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut attached_id,
@@ -2361,6 +2446,7 @@ mod tests {
         let mut none_tx = None;
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
@@ -2387,6 +2473,7 @@ mod tests {
         let mut none_tx = None;
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
@@ -2427,6 +2514,7 @@ mod tests {
         let mut none_tx = None;
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
@@ -2449,6 +2537,7 @@ mod tests {
         let mut attached_tx: Option<mpsc::Sender<SessionCommand>> = None;
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut attached_id,
@@ -2478,6 +2567,7 @@ mod tests {
         let mut attached_tx = Some(session_tx);
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut attached_id,
@@ -2503,6 +2593,7 @@ mod tests {
         let mut none_tx = None;
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
@@ -2529,6 +2620,7 @@ mod tests {
         let mut attached_tx = Some(session_tx);
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut attached_id,
@@ -2554,6 +2646,7 @@ mod tests {
         let mut none_tx = None;
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
@@ -2579,6 +2672,7 @@ mod tests {
         let mut attached_tx = Some(session_tx);
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut attached_id,
@@ -2612,6 +2706,7 @@ mod tests {
         let mut none_tx = None;
         let mut ctx = ClientCtx {
             writer: &sink,
+            db: &TEST_DB,
             global_lag: &global_lag,
             daemon_tx: &daemon_tx,
             attached_session_id: &mut none_id,
