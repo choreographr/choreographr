@@ -72,6 +72,7 @@ rpmbuild -bb \
     --define "_tmppath $TOPDIR/tmp" \
     --define "__os_install_post %{nil}" \
     --define "pkg_arch $PKG_ARCH" \
+    --define "pkg_version $VERSION" \
     "$REPO_ROOT/packaging/rpm/choreographr.spec"
 
 mkdir -p "$REPO_ROOT/dist"

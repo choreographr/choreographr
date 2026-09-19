@@ -12,7 +12,7 @@
 # regenerate packaging/aur/.SRCINFO with: makepkg --printsrcinfo > .SRCINFO
 
 pkgname=choreographr-bin
-pkgver=0.2.0
+pkgver=0.2.1
 pkgrel=1
 pkgdesc="Agentic coding assistant — daemon, TUI, and bridges"
 # Both Linux arches ship; the source array below is arch-dependent, so the
@@ -26,13 +26,13 @@ depends=()
 # The Linux release tarballs are the fully static musl builds (see
 # scripts/release.sh): one artifact per arch serves general Linux AND the AUR
 # -bin package.
-source_x86_64=("https://github.com/choreographr/choreographr/releases/download/v0.2.0/choreographr-0.2.0-x86_64-unknown-linux-musl.tar.gz")
-source_aarch64=("https://github.com/choreographr/choreographr/releases/download/v0.2.0/choreographr-0.2.0-aarch64-unknown-linux-musl.tar.gz")
+source_x86_64=("https://github.com/choreographr/choreographr/releases/download/v0.2.1/choreographr-0.2.1-x86_64-unknown-linux-musl.tar.gz")
+source_aarch64=("https://github.com/choreographr/choreographr/releases/download/v0.2.1/choreographr-0.2.1-aarch64-unknown-linux-musl.tar.gz")
 # The digests of the exact release tarballs, from the release's SHA256SUMS
 # (choreographr-<V>-<arch>-unknown-linux-musl.tar.gz). Update with pkgver.
 # NOTE: the aarch64 digest is a placeholder (all-zero) until the arm64 tarball
 # ships in a release; fill it from that release's SHA256SUMS alongside pkgver.
-sha256sums_x86_64=('58efee8c92187cb3686a5a30f0014aac29b6bd9094cfc7ac0a0f420b02053f6c')
+sha256sums_x86_64=('0d0c96e0cdf9e24063ebf3743ea520ee9e673657e90e6d0f4b191b0bf4a55e93')
 sha256sums_aarch64=('0000000000000000000000000000000000000000000000000000000000000000')
 
 package() {

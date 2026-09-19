@@ -97,9 +97,9 @@ bump checklist. The manual steps that must stay in lockstep:
   manual fallback: bump `version`, both `url` lines, and both `sha256` values
   (recompute each digest with `shasum -a 256 <downloaded>.tar.gz`) in
   `homebrew/choreographr.rb`, then push to the tap repo.
-- **AUR** — bump `pkgver` in `aur/PKGBUILD`, reset `pkgrel` to 1, update the
-  `source` URL and `sha256sums`, then regenerate `aur/.SRCINFO`:
-  `makepkg --printsrcinfo > .SRCINFO`.
+- **AUR** — bump `pkgver` in `aur/PKGBUILD`, reset `pkgrel` to 1, update
+  `source_<arch>` URLs and `sha256sums_<arch>` (both arches), then regenerate
+  `aur/.SRCINFO`: `makepkg --printsrcinfo > .SRCINFO`.
 - **crates.io** — `cargo release publish` for the publish-set members in
   dependency order. Prometheus metrics and the blockchain tools are
   feature-gated and **off by default** on crates.io; the native PDF tools are
@@ -116,8 +116,10 @@ bump checklist. The manual steps that must stay in lockstep:
   arch's own host. `scripts/build-deb.sh`/`build-rpm.sh` detect the host arch
   (`uname -m`) and tag accordingly: the `.deb` control field uses Debian's
   spelling (`amd64`/`arm64`) while the filename uses the tarball spelling
-  (`x86_64`/`aarch64`), and the RPM spec's `BuildArch` comes from the
-  `pkg_arch` macro the build script passes. In CI each arch is built on its own
+  (`x86_64`/`aarch64`), and the RPM spec's `Version`/`BuildArch` come from the
+  `pkg_version`/`pkg_arch` macros the build script passes (the version read
+  from `Cargo.toml`, so the shipped package can't carry a stale version). In CI
+  each arch is built on its own
   runner — `linux-x86_64` on `ubuntu-latest`, `linux-arm64` on the native
   `ubuntu-24.04-arm` runner (whose smoke tests execute the arm64 binaries on
   real arm64 hardware, no qemu).

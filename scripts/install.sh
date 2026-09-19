@@ -24,7 +24,7 @@
 
 set -eu
 
-VERSION="0.1.0" # embedded release version — bump with every release
+VERSION="0.2.1" # embedded release version — bump with every release
 # Overridable for testing/mirrors (e.g. a local HTTP server serving the same
 # layout). Default points at the canonical download root for this version.
 : "${CHOREOGRAPHR_BASE_URL:=https://choreographr.com/download/${VERSION}/}"

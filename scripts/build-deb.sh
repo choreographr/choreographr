@@ -71,7 +71,7 @@ Depends:
 Section: utils
 Priority: optional
 Description: Agentic coding assistant — daemon, TUI, and bridges
- Prebuilt 0.1.0 binaries for the Choreographr daemon and its clients, plus the
+ Prebuilt $VERSION binaries for the Choreographr daemon and its clients, plus the
  systemd user unit. The unit is installed but never auto-enabled; start the
  daemon with: systemctl --user enable --now choreographr
 EOF

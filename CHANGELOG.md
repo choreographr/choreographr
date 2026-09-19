@@ -301,6 +301,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Stale hardcoded versions across the packaging surface are now
+  manifest-derived or brought current.** The RPM spec carried `Version: 0.1.0`
+  and was never propagated from the manifest, so every shipped `.rpm`
+  claimed version 0.1.0 regardless of the release; `scripts/build-rpm.sh`
+  now passes `--define pkg_version=<X.Y.Z>` (read from `Cargo.toml`) and the
+  spec's `Version:` and `%description` use it. The desktop `.deb`'s control
+  `Description:` ("Prebuilt 0.1.0 binaries") is likewise now built from
+  `$VERSION`. Three standalone pins that had silently drifted were brought
+  current: `scripts/install.sh` (the published curl installer was pinned to
+  0.1.0 through the whole 0.2.x line), `packaging/aur/PKGBUILD` +
+  `.SRCINFO` (0.2.0 → 0.2.1, with the real 0.2.1 musl digest), and the iOS
+  app's `CFBundleShortVersionString` (0.1.0), now sourced from a single
+  `MARKETING_VERSION` in `ios/project.yml` instead of a literal in
+  `ios/Info.plist`.
+
 - **The IM bridge now attaches to a session created after it started
   (`choreo-im`).** The bridge's on-demand image fetch (and live turns) require
   an attach, but it only acted on the startup `ListSessions` reply: a bridge

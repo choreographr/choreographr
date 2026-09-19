@@ -44,6 +44,11 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.choreographr.gui
         PRODUCT_NAME: choreo-gui
+        # App marketing version, expanded by Xcode into Info.plist's
+        # CFBundleShortVersionString ($(MARKETING_VERSION)) so the version
+        # lives in exactly one place. choreo-gui is a stub that does not ship
+        # yet, but bump this alongside the release so it does not silently rot.
+        MARKETING_VERSION: "0.2.1"
         # Rust staticlib stage root — per-SDK via $(PLATFORM_NAME): Xcode
         # expands it to `iphonesimulator`/`iphoneos` at build time, and the
         # two SDKs have INCOMPATIBLE object formats (ld64 refuses to link a
