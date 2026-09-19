@@ -70,6 +70,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Routine dependency refresh: `Cargo.lock` re-resolved to current upstream
+  releases (`cargo update`), no manifest-requirement or source changes. Notable
+  bumps: `ammonia` 4.1.4 → 4.2.0 (dragging `cssparser` 0.37 → 0.38,
+  `html5ever` 0.39 → 0.40, `markup5ever` 0.39 → 0.40, `string_cache`
+  0.9 → 0.11, `web_atoms` 0.2.6 → 0.3.0, and a `phf` 0.13 → 0.14
+  consolidation), `pdf-inspector` 1.20 → 1.21, `ratatui-image` 11.0.8 → 11.1.0,
+  `rustix` 1.1.4 → 1.1.5, and `syn` 3.0.5 → 3.0.6, plus `alloy-chains`,
+  `alloy-eip7928`, `cc`, `cfg-if`, `const-hex`, `find-msvc-tools`,
+  `finl_unicode`, `redox_users`, `thin-vec`, `unicode-ident`, and
+  `ureq-proto`.
+
 - **Retried the IM bridge's session attach and trimmed the daemon's
   image-stripping copy (`choreo-im`, `choreo-daemon`).** Two follow-ups to the
   on-demand image work. (1) The `choreo-im` bridge only attached to a session
