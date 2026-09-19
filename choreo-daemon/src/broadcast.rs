@@ -51,6 +51,13 @@
 //! guarantee. That is why the invariant is "every increment is matched by a
 //! decrement except the bounded exit-window straggler", not a claim of
 //! exactness.
+//!
+//! One carve-out from the per-client budget: a solicited `Image` reply (see
+//! [`counts_toward_client_lag`]) is EXCLUDED from the per-client counter — it is
+//! request-driven and can be multi-megabyte, so counting it could evict a
+//! client merely for fetching its own images. It still counts in the
+//! daemon-wide total (which bounds memory), and the writer thread mirrors the
+//! split on dequeue, so the counters stay balanced.
 
 use choreo_proto::DaemonMessage;
 use crossbeam_channel::Sender;
@@ -116,13 +123,25 @@ impl SubscriberSink {
         global: &AtomicUsize,
     ) -> Option<(usize, usize)> {
         let size = msg.approx_wire_size();
+        // A solicited `Image` reply is excluded from the PER-CLIENT eviction
+        // budget (see [`counts_toward_client_lag`]); it is still counted in the
+        // daemon-wide budget. The writer thread mirrors this exact split on
+        // dequeue, keyed on the same variant predicate, so the counters stay
+        // balanced.
+        let counts_client = counts_toward_client_lag(msg);
         let new_total = global.fetch_add(size, Ordering::Relaxed) + size;
-        let new_client = self.bytes_in_flight.fetch_add(size, Ordering::Relaxed) + size;
+        let new_client = if counts_client {
+            self.bytes_in_flight.fetch_add(size, Ordering::Relaxed) + size
+        } else {
+            self.bytes_in_flight.load(Ordering::Relaxed)
+        };
         if self.tx.send(msg.clone()).is_ok() {
             Some((new_client, new_total))
         } else {
             // Receiver gone — restore both counters (see the doc comment).
-            self.bytes_in_flight.fetch_sub(size, Ordering::Relaxed);
+            if counts_client {
+                self.bytes_in_flight.fetch_sub(size, Ordering::Relaxed);
+            }
             global.fetch_sub(size, Ordering::Relaxed);
             None
         }
@@ -246,6 +265,30 @@ pub enum EnqueueOutcome {
     /// still enqueued; the caller must trigger eviction of the largest
     /// lagging client.
     GlobalOverBudget,
+}
+
+/// Whether a message enqueued onto a connection's writer channel counts
+/// toward the PER-CLIENT lag (eviction) budget.
+///
+/// Broadcast/streaming messages and ordinary replies count: a client whose
+/// backlog of UNSOLICITED traffic grows past the cap is genuinely lagging and
+/// is the one eviction sheds. The one exception is a large, SOLICITED `Image`
+/// reply (the answer to `ClientMessage::GetImage`): the client asked for
+/// exactly those bytes, so their size is not evidence that it cannot keep up —
+/// a single image can approach `MAX_FRAME_SIZE` (64 MiB, equal to the default
+/// per-client cap), so counting it could evict a client merely for scrolling
+/// images into view. Such replies are still counted in the daemon-wide budget
+/// (which bounds total memory) and are still delivered losslessly; only the
+/// per-client eviction threshold ignores them.
+///
+/// The writer thread applies the IDENTICAL predicate on dequeue (see
+/// `writer_thread`), so the per-client counter stays balanced. Both ends key on
+/// the message VARIANT, so they agree by construction — a new large solicited
+/// reply variant that should also be exempt must be added here (and the
+/// writer's mirror follows automatically).
+#[must_use]
+pub(crate) fn counts_toward_client_lag(msg: &DaemonMessage) -> bool {
+    !matches!(msg, DaemonMessage::Image { .. })
 }
 
 /// Lag thresholds. Default = 64 MiB per client, 512 MiB daemon-wide.
@@ -533,5 +576,44 @@ mod tests {
         };
         let outcome = sink.enqueue(&status_msg(1), &limits, &global);
         assert!(matches!(outcome, EnqueueOutcome::ClientOverLag));
+    }
+
+    /// A large SOLICITED `Image` reply must not count toward the per-client
+    /// eviction budget (it would otherwise evict a client merely for fetching
+    /// its own images), while still counting in the daemon-wide budget; a
+    /// broadcast still does count toward the per-client cap.
+    #[test]
+    fn image_reply_is_excluded_from_per_client_lag_but_a_broadcast_is_not() {
+        let (tx, _rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+        let sink = SubscriberSink::new(tx);
+        let global = AtomicUsize::new(0);
+        // Tiny per-client cap so a broadcast crosses it immediately; the global
+        // budget is infinite so only the per-client threshold is in play.
+        let limits = LagLimits {
+            per_client_cap: 16,
+            global_budget: usize::MAX,
+        };
+
+        // A multi-KiB Image reply: the per-client counter must stay at zero...
+        let image = DaemonMessage::Image {
+            session_id: 1,
+            turn_id: 1,
+            image_index: 0,
+            data: Some(vec![0u8; 4096]),
+        };
+        assert!(sink.send_accounted(&image, &global).is_some());
+        assert_eq!(
+            sink.bytes_in_flight.load(Ordering::Relaxed),
+            0,
+            "an Image reply must not count toward the per-client budget"
+        );
+        // ...but it DOES count in the daemon-wide total (memory bound).
+        assert!(global.load(Ordering::Relaxed) >= 4096);
+
+        // A broadcast still counts toward the per-client cap and crosses it.
+        assert!(matches!(
+            sink.enqueue(&status_msg(1), &limits, &global),
+            EnqueueOutcome::ClientOverLag
+        ));
     }
 }

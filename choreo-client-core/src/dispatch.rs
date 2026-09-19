@@ -129,7 +129,7 @@ pub trait TurnEventHandler {
 ///   value position there, so every arm below reads a single `session_id`)
 ///   and then handles the inner event; the flat variants never appear in its
 ///   match.
-/// - The 24 flat connection/reply/global variants — replies to the client's
+/// - The 29 flat connection/reply/global variants — replies to the client's
 ///   own requests (`Sessions`, `Models`, `Pong`, keystore/account replies,
 ///   catalog/refresh replies, on-demand `Image`, …), handled by
 ///   `dispatch_flat_message`.

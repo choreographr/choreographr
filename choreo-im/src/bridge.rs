@@ -137,13 +137,22 @@ impl DaemonBridge {
 
             let result = choreo_client_core::run_daemon_reader(&mut reader, |msg| {
                 debug!(?msg, "received daemon message");
-                // The startup `ListSessions` reply: pick a session and attach,
-                // mirroring how the GUI/TUI choose one. Sent once — later
-                // summary refreshes must not re-trigger an attach.
-                if let DaemonMessage::Sessions { sessions } = &msg
-                    && !attached
-                    && let Some(session_id) = session_to_attach(sessions)
-                {
+                // Attach handshake. The daemon only serves `GetImage` for — and
+                // only delivers session-scoped events (`TurnAppended`, …) to
+                // subscribers of — the session a connection is ATTACHED to, so
+                // the bridge must attach before its image path can work. Two
+                // triggers, both gated by the one-shot latch so a later summary
+                // refresh cannot re-attach:
+                //   1. the startup `ListSessions` reply (an existing session), and
+                //   2. a later `SessionCreated` push — the bridge may start
+                //      before ANY session exists, in which case it attaches to
+                //      the first top-level session created afterwards. The
+                //      daemon pushes `SessionCreated` to summary subscribers,
+                //      which the bridge becomes at startup (the
+                //      `SubscribeSessionsSummary` below) precisely so this
+                //      retry path exists instead of the bridge staying
+                //      unattached forever.
+                if !attached && let Some(session_id) = attach_target(&msg) {
                     attached = true;
                     info!(session_id, "bridge attaching to session");
                     let _ = reader_client_tx.send(ClientMessage::AttachSession { session_id });
@@ -189,14 +198,18 @@ impl DaemonBridge {
             }
         });
 
-        // Kick off the session-selection handshake: ask for the session list;
-        // the reader thread's `Sessions` arm picks one and attaches. Without
-        // this the bridge receives no live turns and its on-demand image
-        // fetch would be refused (daemon serves `GetImage` per attached
-        // session only). Best-effort: `client_tx` outlives the writer thread
-        // as long as the bridge is alive, so the send can only fail if the
-        // writer already exited (daemon gone), in which case no attach would
-        // help anyway.
+        // Kick off the session-selection handshake: subscribe to session
+        // lifecycle pushes (so a session created AFTER startup still triggers
+        // an attach) and ask for the current session list; the reader thread's
+        // `attach_target` picks one and attaches. Without this the bridge
+        // receives no live turns and its on-demand image fetch would be
+        // refused (the daemon serves `GetImage` per attached session only).
+        // Best-effort: `client_tx` outlives the writer thread as long as the
+        // bridge is alive, so a send can only fail if the writer already
+        // exited (daemon gone), in which case no attach would help anyway.
+        if let Err(e) = client_tx.send(ClientMessage::SubscribeSessionsSummary) {
+            warn!("failed to subscribe to session summaries at bridge startup: {e}");
+        }
         if let Err(e) = client_tx.send(ClientMessage::ListSessions) {
             warn!("failed to request session list at bridge startup: {e}");
         }
@@ -245,6 +258,29 @@ fn collect_turn_images(
         }
     }
     (events, requests)
+}
+
+/// Pick the session the bridge should attach to from a single daemon message,
+/// or `None` if the message carries nothing attachable.
+///
+/// Two sources: the `ListSessions` reply (delegated to [`session_to_attach`])
+/// and a `SessionCreated` push for a TOP-LEVEL session
+/// (`parent_session_id.is_none()`). The latter is the retry path for a bridge
+/// that started before any session existed — sub-sessions are never a root
+/// attach target. Pure so the policy is unit-tested without a live socket.
+fn attach_target(msg: &DaemonMessage) -> Option<u64> {
+    match msg {
+        DaemonMessage::Sessions { sessions } => session_to_attach(sessions),
+        DaemonMessage::Session {
+            session_id: Some(session_id),
+            event:
+                SessionEvent::SessionCreated {
+                    parent_session_id: None,
+                    ..
+                },
+        } => Some(*session_id),
+        _ => None,
+    }
 }
 
 /// Choose which session the bridge attaches to from a `ListSessions` reply.
@@ -508,6 +544,46 @@ mod tests {
             session_to_attach(&[]).map(|session_id| ClientMessage::AttachSession { session_id }),
             None
         );
+    }
+
+    /// A `SessionCreated` envelope for `id` (only the fields `attach_target`
+    /// consults matter; the rest are filler).
+    fn session_created(id: u64, parent_session_id: Option<u64>) -> DaemonMessage {
+        DaemonMessage::Session {
+            session_id: Some(id),
+            event: SessionEvent::SessionCreated {
+                title: None,
+                parent_session_id,
+                working_dir: None,
+                account_name: None,
+                selected_model: None,
+                reasoning_effort: None,
+            },
+        }
+    }
+
+    #[test]
+    fn attach_target_from_list_reply_and_top_level_creation() {
+        // A `ListSessions` reply is delegated to `session_to_attach`.
+        let sessions = vec![summary(5, Some(9)), summary(7, None)];
+        assert_eq!(
+            attach_target(&DaemonMessage::Sessions { sessions }),
+            Some(7)
+        );
+        // An empty list has nothing to attach to.
+        assert_eq!(
+            attach_target(&DaemonMessage::Sessions { sessions: vec![] }),
+            None
+        );
+
+        // A later TOP-LEVEL `SessionCreated` is the retry path (the bridge
+        // started before any session existed): attachable by its own id.
+        assert_eq!(attach_target(&session_created(11, None)), Some(11));
+        // A sub-session creation is never a root attach target.
+        assert_eq!(attach_target(&session_created(11, Some(7))), None);
+
+        // Unrelated messages carry nothing attachable.
+        assert_eq!(attach_target(&DaemonMessage::Pong), None);
     }
 
     #[test]

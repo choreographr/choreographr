@@ -151,6 +151,20 @@ impl App {
                 img.protocols.clear();
                 img.failed_sizes.clear();
                 img.pending_job = None;
+                // Defensive: an image advertised with `byte_len > 0` but
+                // delivered empty would otherwise re-queue the fetch on EVERY
+                // frame (`data` stays empty, `byte_len > 0`, `fetching` just
+                // cleared, `fetch_failed` false) — an unbounded fetch loop.
+                // Treat an empty payload for a non-empty image as terminal-
+                // but-recoverable, exactly like a `None`: latch `fetch_failed`
+                // so the render path stops, and let a later re-advertisement
+                // of the turn (finalize re-broadcast) clear it via
+                // `sync_turn_images`. The daemon never writes a zero-byte
+                // slot, so this is a guard against a malformed/unexpected
+                // reply, not an expected path.
+                if img.data.is_empty() && img.metadata.byte_len > 0 {
+                    img.fetch_failed = true;
+                }
             }
             // Not found (deleted/evicted/stale index): stop re-requesting so a
             // missing image cannot spin a fetch every frame.
@@ -337,6 +351,59 @@ mod tests {
         // A failed image is never re-queued by a later render pass.
         app.request_image_fetch(1, 2, 1);
         assert_eq!(app.pending_image_fetch.len(), 0);
+    }
+
+    #[test]
+    fn handle_image_reply_empty_for_nonempty_image_latches_failure() {
+        // A malformed reply — `Some(vec![])` for an image advertised with
+        // `byte_len > 0` — must NOT spin the fetch loop: the empty payload is
+        // latched as a (recoverable) failure so the render path stops, exactly
+        // like a `None` reply. `sync_turn_images` still clears the latch on a
+        // later re-advertisement, so recovery is preserved.
+        let mut app = test_app();
+        let meta = choreo_proto::ImageMetadata {
+            mime_type: "image/png".to_string(),
+            width: 4,
+            height: 4,
+            byte_len: 8,
+            alt: None,
+        };
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![choreo_proto::DisplayedImageRecord {
+                metadata: meta,
+                data: Vec::new(),
+                tool_call_id: None,
+            }],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        app.sync_turn_images(4, 1, &turn);
+
+        // The daemon returns an empty payload despite `byte_len > 0`.
+        app.handle_image_reply(4, 1, 0, Some(Vec::new()));
+        let img = &app.rendered_images[&4][&1][&0];
+        assert!(img.fetch_failed);
+        assert!(img.data.is_empty());
+        assert!(!img.fetching);
+
+        // No re-request on the next render pass (the loop is broken).
+        app.request_image_fetch(4, 1, 0);
+        assert_eq!(app.pending_image_fetch.len(), 0);
+
+        // A later re-advertisement clears the latch (recovery still works).
+        app.sync_turn_images(4, 1, &turn);
+        assert!(!app.rendered_images[&4][&1][&0].fetch_failed);
+        app.request_image_fetch(4, 1, 0);
+        assert_eq!(app.pending_image_fetch, vec![(4, 1, 0)]);
     }
 
     #[test]

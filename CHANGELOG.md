@@ -70,6 +70,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Retried the IM bridge's session attach and trimmed the daemon's
+  image-stripping copy (`choreo-im`, `choreo-daemon`).** Two follow-ups to the
+  on-demand image work. (1) The `choreo-im` bridge only attached to a session
+  from its single startup `ListSessions` reply, so a bridge started before any
+  session existed never attached — and therefore never received live turns or
+  served `GetImage` — for its whole life. It now also subscribes to session
+  summaries (`SubscribeSessionsSummary`) and attaches to the first top-level
+  `SessionCreated` it sees while unattached (`attach_target`), the retry path.
+  (2) `turn_for_client` no longer `Turn::clone()`s and then clears the image
+  bytes; it reconstructs the client turn field-by-field with metadata-only
+  `displayed_images`/`tool_results`, so an N-image turn's server-side copy is
+  O(N) instead of O(N²) (the wire was already O(N)). `ClientConn::new`'s eight
+  positional arguments are bundled into a `ClientConnSetup` struct (dropping
+  the `too_many_arguments` suppression), and the stale “24/25 flat variants”
+  counts in `dispatch.rs`/`ARCHITECTURE.md` are corrected to the actual 29.
+
 - **Displayed-image state/handlers extracted into `choreo-tui/src/state/images.rs`.**
   The image-related `App` methods (`sync_turn_images`, `apply_image_result`,
   `request_image_fetch`, `flush_image_fetches`, `handle_image_reply`,
@@ -200,6 +216,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The `/models` alias is gone — use `/model`.**
 
 ### Fixed
+
+- **The IM bridge now attaches to a session created after it started
+  (`choreo-im`).** The bridge's on-demand image fetch (and live turns) require
+  an attach, but it only acted on the startup `ListSessions` reply: a bridge
+  that started before any session existed stayed unattached forever. It now
+  subscribes to session summaries and attaches to the first top-level
+  `SessionCreated` it sees while unattached (see `attach_target`), so a session
+  created later is picked up.
+
+- **A multi-megabyte `GetImage` reply can no longer evict the client that
+  requested it (`choreo-daemon`).** Replies were counted against the per-client
+  lag/eviction budget, and an image reply can approach `MAX_FRAME_SIZE` (64 MiB
+  — the whole per-client cap), so a client could be disconnected for merely
+  scrolling images into view. `counts_toward_client_lag` now EXCLUDES a
+  solicited `Image` reply from the per-client counter (it still counts in the
+  daemon-wide memory budget); the writer thread mirrors the split on dequeue, so
+  the counters stay balanced.
+
+- **A malformed empty `Image` reply can no longer spin an unbounded fetch loop
+  (`choreo-tui`).** `handle_image_reply` stored a `Some(vec![])` payload and
+  cleared the in-flight flag without latching failure, so an image advertised
+  with `byte_len > 0` but delivered empty stayed “unfetched” and re-queued a
+  `GetImage` every frame. It now treats an empty payload for a non-empty image
+  as a recoverable failure, exactly like a `None` reply. (The daemon never
+  writes a zero-byte slot, so this guards a malformed/unexpected reply.)
 
 - **A transient displayed-image fetch failure no longer hides the image for the
   rest of the session (`choreo-tui`).** Image bytes are persisted at emit time,

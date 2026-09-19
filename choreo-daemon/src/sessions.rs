@@ -1073,22 +1073,58 @@ impl SessionState {
 /// and the DB keeps the full payload for the request builder and the image
 /// store.
 pub(crate) fn turn_for_client(turn: &Turn) -> Turn {
-    let mut clone = turn.clone();
-    clone.reasoning_artifact = None;
-    clone.reasoning_producer = None;
-    // Vision image bytes are daemon/model-only: the request builder consumes
-    // them from the authoritative daemon-side turn, and the client never
-    // renders them, so drop the raw bytes here.
-    for record in &mut clone.tool_results {
-        record.image = None;
+    // Reconstruct the client turn FIELD BY FIELD instead of `turn.clone()`:
+    // a deep clone would COPY every image payload (display + vision bytes, up
+    // to megabytes) into the clone only for the lines below to throw it away.
+    // This is the hot path — `session_state_message` runs it over every turn
+    // of a session on open, and `broadcast_turn_appended` runs it after every
+    // streamed tool result / image emit — so the redundant payload copy would
+    // make an N-image turn O(N²) in server-side memory traffic (the wire is
+    // already O(N) after stripping). Building the stripped records directly
+    // never allocates the image buffers at all. (A new `Turn` field forces a
+    // compile error here, which is deliberate: it must be triaged into the
+    // client view rather than silently deep-cloned.)
+    Turn {
+        created_at: turn.created_at,
+        undone: turn.undone,
+        error: turn.error.clone(),
+        user_text: turn.user_text.clone(),
+        assistant_text: turn.assistant_text.clone(),
+        assistant_reasoning: turn.assistant_reasoning.clone(),
+        tool_calls: turn.tool_calls.clone(),
+        token_usage: turn.token_usage,
+        // Vision image bytes are daemon/model-only: the request builder
+        // consumes them from the authoritative daemon-side turn, and the
+        // client never renders them, so no `image` rides the client view.
+        tool_results: turn
+            .tool_results
+            .iter()
+            .map(|r| ToolResultRecord {
+                call_id: r.call_id.clone(),
+                name: r.name.clone(),
+                content: r.content.clone(),
+                is_error: r.is_error,
+                invocation_description: r.invocation_description.clone(),
+                image: None,
+            })
+            .collect(),
+        // Displayed-image bytes are fetched on demand
+        // (ClientMessage::GetImage); the metadata (with `byte_len`) stays so
+        // the client can size the placeholder and knows whether there is
+        // anything to fetch.
+        displayed_images: turn
+            .displayed_images
+            .iter()
+            .map(|img| DisplayedImageRecord {
+                metadata: img.metadata.clone(),
+                data: Vec::new(),
+                tool_call_id: img.tool_call_id.clone(),
+            })
+            .collect(),
+        // Opaque reasoning round-trip payloads are daemon-only.
+        reasoning_artifact: None,
+        reasoning_producer: None,
     }
-    // Displayed-image bytes are fetched on demand (ClientMessage::GetImage);
-    // the metadata (with `byte_len`) stays so the client can size the
-    // placeholder and knows whether there is anything to fetch.
-    for image in &mut clone.displayed_images {
-        image.data.clear();
-    }
-    clone
 }
 
 fn broadcast(

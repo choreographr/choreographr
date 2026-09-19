@@ -157,16 +157,27 @@ fn writer_thread<W: ConnectionWriter>(
 ) {
     for msg in rx {
         let size = msg.approx_wire_size();
+        // Mirror the producer's per-client accounting split: a solicited
+        // `Image` reply never incremented `bytes` (see
+        // `broadcast::counts_toward_client_lag`), so it must not decrement it
+        // here either — only the daemon-wide counter tracks those bytes. The
+        // predicate is keyed on the message variant exactly like the producer's
+        // increment, so the per-client counter stays balanced.
+        let counts_client = crate::broadcast::counts_toward_client_lag(&msg);
         if let Err(e) = writer.send_message(&msg) {
             warn!("writer thread error: {e}");
             // The failing message still left the queue — account it so the
             // backlog reflects what is actually still queued, then stop.
-            bytes.fetch_sub(size, Ordering::Relaxed);
+            if counts_client {
+                bytes.fetch_sub(size, Ordering::Relaxed);
+            }
             global.fetch_sub(size, Ordering::Relaxed);
             writer.shutdown();
             break;
         }
-        bytes.fetch_sub(size, Ordering::Relaxed);
+        if counts_client {
+            bytes.fetch_sub(size, Ordering::Relaxed);
+        }
         global.fetch_sub(size, Ordering::Relaxed);
         if matches!(msg, DaemonMessage::ShuttingDown | DaemonMessage::Evicted) {
             writer.shutdown();
@@ -199,7 +210,11 @@ fn writer_thread<W: ConnectionWriter>(
     // guarantee, but it is never an unbounded stream.
     for msg in rx.try_iter() {
         let size = msg.approx_wire_size();
-        bytes.fetch_sub(size, Ordering::Relaxed);
+        // Same split as the dequeue path: only the daemon-wide counter tracks an
+        // `Image` reply (the per-client counter never saw it).
+        if crate::broadcast::counts_toward_client_lag(&msg) {
+            bytes.fetch_sub(size, Ordering::Relaxed);
+        }
         global.fetch_sub(size, Ordering::Relaxed);
     }
 }
@@ -242,16 +257,22 @@ pub(crate) fn register_client_writer(
 /// Send a reply to a client's writer channel.
 ///
 /// Replies ride the same unbounded channel as broadcasts, so they MUST keep
-/// the lag counters consistent: `send_accounted` increments both before the
-/// send (the writer thread decrements them on every dequeue) and self-
-/// corrects both if the receiver is gone. The lag limits are NOT enforced
-/// here: a reply is a request/response contract that must never be dropped
-/// (lossless for replies was already true — a blocking send never dropped,
-/// it just blocked; with an unbounded channel it can no longer block
-/// either), and replies are small and infrequent next to broadcast streams,
-/// so they cannot meaningfully inflate a lagging client's backlog. A dropped
-/// reply on a dead receiver is fine: the connection is being torn down
+/// the lag counters consistent: `send_accounted` increments the daemon-wide
+/// counter (and the per-client counter, EXCEPT for a solicited `Image` reply —
+/// see [`crate::broadcast::counts_toward_client_lag`]) before the send, and the
+/// writer thread decrements the same counters on every dequeue; both self-
+/// correct if the receiver is gone. The lag limits are NOT enforced here: a
+/// reply is a request/response contract that must never be dropped (lossless
+/// for replies was already true — a blocking send never dropped, it just
+/// blocked; with an unbounded channel it can no longer block either). A
+/// dropped reply on a dead receiver is fine: the connection is being torn down
 /// anyway.
+///
+/// Most replies are small and infrequent next to broadcast streams, but a
+/// `GetImage` reply can be multi-megabyte — which is exactly why the PER-CLIENT
+/// eviction budget excludes it (the client solicited those bytes; counting
+/// them could evict it for simply scrolling images into view). The daemon-wide
+/// budget still bounds total memory across all replies.
 fn send_to_writer(ctx: &ClientCtx, msg: &DaemonMessage) {
     ctx.writer.send_accounted(msg, ctx.global_lag);
 }
@@ -697,26 +718,47 @@ pub(crate) struct ClientConn {
     writer_handle: std::thread::JoinHandle<()>,
 }
 
+/// The inputs a freshly-accepted connection hands to [`ClientConn::new`],
+/// bundled so the constructor takes ONE value instead of eight positional
+/// arguments (the transport-specific writer buffer is the only generic field).
+/// The three transport call sites (Unix, TCP/Noise, embedded) stay readable and
+/// the `too_many_arguments` lint never has to be suppressed.
+struct ClientConnSetup<W> {
+    daemon_tx: mpsc::Sender<DaemonCommand>,
+    /// This connection's own handle to the shared redb database (see
+    /// [`ClientCtx::db`]).
+    db: Arc<redb::Database>,
+    /// This connection's delivery sink (see `send_to_writer`).
+    writer: crate::broadcast::SubscriberSink,
+    /// Transport-specific writer buffer the spawned writer thread sends through.
+    writer_buf: W,
+    /// The receiver end of this connection's writer channel.
+    writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
+    /// Daemon-wide lag counter, shared by every connection.
+    global_lag: Arc<AtomicUsize>,
+    client_id: u64,
+    /// Whether this connection arrived over the local Unix socket (vs the
+    /// TCP/Noise listener). Trust-boundary input for local-only commands (see
+    /// [`ClientCtx::is_unix`]).
+    is_unix: bool,
+}
+
 impl ClientConn {
     /// Build a connection and spawn its writer thread over the given
     /// transport-specific writer buffer. Spawning here keeps the socket
     /// threads to just: set write timeout, clone the stream into a writer
     /// buffer, call this, then read/dispatch/finish.
-    // Eight inputs (the daemon command sender, the DB handle, the sink, the
-    // writer buffer, the writer receiver, the lag counter, the client id, and
-    // the trust-domain flag) — bundling them into a struct would only move the
-    // same fields one call site deeper, so the lint is explicitly allowed.
-    #[expect(clippy::too_many_arguments)]
-    fn new<W: ConnectionWriter + Send + 'static>(
-        daemon_tx: mpsc::Sender<DaemonCommand>,
-        db: Arc<redb::Database>,
-        writer: crate::broadcast::SubscriberSink,
-        writer_buf: W,
-        writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
-        global_lag: Arc<AtomicUsize>,
-        client_id: u64,
-        is_unix: bool,
-    ) -> Self {
+    fn new<W: ConnectionWriter + Send + 'static>(setup: ClientConnSetup<W>) -> Self {
+        let ClientConnSetup {
+            daemon_tx,
+            db,
+            writer,
+            writer_buf,
+            writer_rx,
+            global_lag,
+            client_id,
+            is_unix,
+        } = setup;
         // The writer thread decrements the SAME per-client byte counter the
         // daemon's sinks increment on enqueue, plus the daemon-wide counter.
         let bytes = Arc::clone(&writer.bytes_in_flight);
@@ -785,9 +827,16 @@ pub(crate) fn client_thread(
     let reader = BufReader::new(stream.try_clone()?);
     let writer_buf = BufWriter::new(stream);
 
-    let mut conn = ClientConn::new(
-        daemon_tx, db, writer, writer_buf, writer_rx, global_lag, client_id, true,
-    );
+    let mut conn = ClientConn::new(ClientConnSetup {
+        daemon_tx,
+        db,
+        writer,
+        writer_buf,
+        writer_rx,
+        global_lag,
+        client_id,
+        is_unix: true,
+    });
 
     // The writer channel was registered with the daemon by the acceptor
     // (register_client_writer) before this thread was spawned, so the shutdown
@@ -936,9 +985,16 @@ pub(crate) fn tcp_client_thread(
         .set_write_timeout(Some(WRITER_WRITE_TIMEOUT))?;
     let writer_buf = noise.try_clone()?;
 
-    let mut conn = ClientConn::new(
-        daemon_tx, db, writer, writer_buf, writer_rx, global_lag, client_id, false,
-    );
+    let mut conn = ClientConn::new(ClientConnSetup {
+        daemon_tx,
+        db,
+        writer,
+        writer_buf,
+        writer_rx,
+        global_lag,
+        client_id,
+        is_unix: false,
+    });
 
     // The writer channel was registered with the daemon by the acceptor
     // (register_client_writer) before this thread was spawned, so the shutdown
@@ -1026,16 +1082,16 @@ pub(crate) fn embedded_client_thread(args: EmbeddedConnArgs) {
         db,
     } = args;
 
-    let mut conn = ClientConn::new(
+    let mut conn = ClientConn::new(ClientConnSetup {
         daemon_tx,
         db,
         writer,
-        ChannelConnectionWriter::new(out_tx),
+        writer_buf: ChannelConnectionWriter::new(out_tx),
         writer_rx,
         global_lag,
         client_id,
-        true,
-    );
+        is_unix: true,
+    });
 
     // The writer channel was registered with the daemon by `connect()`
     // (register_client_writer) BEFORE this thread was spawned, so the
