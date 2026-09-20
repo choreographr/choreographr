@@ -55,7 +55,7 @@ built nowhere.
 - **`workflow_dispatch`** — identical builds **and the same release-job checks**
   (the supply-chain gate and the git-cliff release-notes generation), but
   **no release is created** (only the final `gh release create` step is
-  tag-gated); artifacts attach to the workflow run (default 90-day retention).
+  push-gated); artifacts attach to the workflow run (default 90-day retention).
   This is how the *whole* pipeline — builds **and** the release job — is tested
   without spamming tags.
 
@@ -80,7 +80,7 @@ against the official Termux aarch64 rootfs (skopeo fetches the image layers;
 no docker), closing the "never executed before release" gap.
 
 The `release` job runs on every tag push **and** on `workflow_dispatch` (only
-the final `gh release create` step is tag-gated, so a dispatch runs every other
+the final `gh release create` step is push-gated, so a dispatch runs every other
 check). It downloads the four shipping platforms' build artifacts
 (`linux-x86_64`, `linux-arm64`, `macos-arm64`, `android-termux` — deliberately
 not the not-yet-shipped `windows-msvc`), generates one combined `SHA256SUMS`

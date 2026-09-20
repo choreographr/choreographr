@@ -11,7 +11,7 @@
 #     (supply chain, generated release notes), then create the GitHub release
 #     with the combined SHA256SUMS.
 #   * workflow_dispatch → identical builds AND the release job's checks, but NO
-#     release is created (only the final `gh release create` step is tag-gated);
+#     release is created (only the final `gh release create` step is push-gated);
 #     the artifacts attach to the workflow run instead. This exists so the first
 #     real tag is never the first test of the pipeline — platform/NDK quirks AND
 #     the release job's guards are iterated out on demand.
@@ -775,7 +775,7 @@ jobs:
     timeout-minutes: 10
     # Runs on BOTH tag pushes and workflow_dispatch so the dry run exercises this
     # job's checks (supply chain, generated notes) — not only the builds. Only
-    # the final `gh release create` step is tag-gated, so a dispatch proves the
+    # the final `gh release create` step is push-gated, so a dispatch proves the
     # whole job without publishing (its artifacts stay attached to the run,
     # default 90-day retention). This is what makes `just pre-release`'s dispatch
     # a real end-to-end rehearsal: the v0.2.2 failure (a release-job guard with no
@@ -784,6 +784,13 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          # git-cliff (release-notes.sh) walks history and TAGS to pick the
+          # release's commit range; the default shallow checkout (depth 1, no
+          # tags) starves it and silently yields a heading-only body (the
+          # `[ -s ]` guard below would pass on the heading alone). Full history
+          # + tags are required here; build jobs keep the fast default depth.
+          fetch-depth: 0
 
       # Enumerate the SHIPPING platforms explicitly — do NOT use `pattern: "*"`,
       # which downloads EVERY artifact in the run and races the not-yet-shippable
@@ -842,16 +849,21 @@ jobs:
         # fallback would ship a release with no notes.
         run: |
           ./scripts/release-notes.sh > /tmp/release-notes.md
-          if [ ! -s /tmp/release-notes.md ]; then
-              echo "error: scripts/release-notes.sh produced no notes — check cliff.toml and the tag's commit messages" >&2
+          # Require at least one bullet, not merely a non-empty file: with no
+          # commits in range git-cliff still writes the `## [X.Y.Z]` heading, so
+          # `[ -s ]` alone would let a silently-empty release body ship.
+          if ! grep -q '^- ' /tmp/release-notes.md; then
+              echo "error: scripts/release-notes.sh produced no bullets — check cliff.toml, the tag, and that the checkout has full history + tags" >&2
               exit 1
           fi
           cat /tmp/release-notes.md
 
       - name: Create the GitHub release
-        # Tag pushes only: a workflow_dispatch rehearsal runs every step above
-        # (so the dry run exercises this job) but must not publish.
-        if: startsWith(github.ref, 'refs/tags/v')
+        # Publish only on a real tag PUSH. Keying on the event (not github.ref)
+        # is deliberate: a dispatch run against a tag ref
+        # (`gh workflow run release.yml --ref vX.Y.Z`) must not publish, and the
+        # only push trigger is already restricted to `v*` tags.
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
