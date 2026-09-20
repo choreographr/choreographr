@@ -18,6 +18,9 @@ use ratatui::widgets::StatefulWidget;
 ///
 /// User-text markers (green indicator dots on the track) are rendered
 /// from pre-computed virtual-slot positions passed via [`with_markers`].
+/// Markers are drawn on the track *beneath* the thumb, so a marker that
+/// lands under the thumb is hidden rather than obscuring it — the thumb is
+/// the position indicator and must stay visible at all times.
 #[derive(Debug, Clone)]
 pub(crate) struct SmoothScrollbar {
     thumb_fg: Option<Color>,
@@ -99,6 +102,20 @@ impl SmoothScrollbarState {
     }
 }
 
+/// The layer occupying one half-cell of the scrollbar track.
+///
+/// Precedence is thumb → marker → empty: the thumb is painted on top so a
+/// user-text marker can never obscure the position indicator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Half {
+    /// The scrollbar thumb (the movable position indicator).
+    Thumb,
+    /// A user-text marker dot.
+    Marker,
+    /// Empty track (the shaded background only).
+    Empty,
+}
+
 impl StatefulWidget for SmoothScrollbar {
     type State = SmoothScrollbarState;
 
@@ -142,8 +159,8 @@ impl StatefulWidget for SmoothScrollbar {
             track_style = track_style.bg(bg);
         }
 
-        // Marker style: marker_fg on the filled half, track_bg on the
-        // unfilled half so the un-filled portion inherits the track.
+        // Marker colors are re-used below for the half-cells a marker
+        // fills when it is not shadowed by the thumb.
         let marker_fg = self.marker_fg;
         let track_bg = self.track_bg;
 
@@ -161,51 +178,45 @@ impl StatefulWidget for SmoothScrollbar {
             let y = area.y + i as u16;
             let x = area.x;
 
-            let marker_top = self.markers.contains(&top_slot);
-            let marker_bot = self.markers.contains(&bot_slot);
+            // Resolve each half-cell to the topmost layer occupying it:
+            // the thumb wins over a marker, which wins over the empty track.
+            // This is what keeps the thumb visible when a marker lands on
+            // the same cell.
+            let top_half = if top_in_thumb {
+                Half::Thumb
+            } else if self.markers.contains(&top_slot) {
+                Half::Marker
+            } else {
+                Half::Empty
+            };
+            let bot_half = if bot_in_thumb {
+                Half::Thumb
+            } else if self.markers.contains(&bot_slot) {
+                Half::Marker
+            } else {
+                Half::Empty
+            };
 
-            match (marker_top, marker_bot) {
-                // Both halves are markers.
-                (true, true) => {
-                    let s = style_from_opts(marker_fg, track_bg);
-                    buf.set_string(x, y, "█", s);
-                }
-                // Only the top half is a marker.
-                (true, false) => {
-                    if bot_in_thumb {
-                        let s = style_from_opts(marker_fg, self.thumb_fg);
-                        buf.set_string(x, y, "▀", s);
-                    } else {
-                        let s = style_from_opts(marker_fg, track_bg);
-                        buf.set_string(x, y, "▀", s);
-                    }
-                }
-                // Only the bottom half is a marker.
-                (false, true) => {
-                    if top_in_thumb {
-                        let s = style_from_opts(marker_fg, self.thumb_fg);
-                        buf.set_string(x, y, "▄", s);
-                    } else {
-                        let s = style_from_opts(marker_fg, track_bg);
-                        buf.set_string(x, y, "▄", s);
-                    }
-                }
-                // No marker — original thumb/track logic.
-                (false, false) => match (top_in_thumb, bot_in_thumb) {
-                    (true, true) => {
-                        buf.set_string(x, y, "█", full_style);
-                    }
-                    (true, false) => {
-                        buf.set_string(x, y, "▀", half_style);
-                    }
-                    (false, true) => {
-                        buf.set_string(x, y, "▄", half_style);
-                    }
-                    (false, false) => {
-                        buf.set_string(x, y, " ", track_style);
-                    }
-                },
-            }
+            // A half-block glyph paints its upper half in the cell's
+            // foreground and its lower half in the background, which lets two
+            // different half-cell fills (e.g. thumb over marker) share one
+            // cell while still showing the thumb on top.
+            let (symbol, style) = match (top_half, bot_half) {
+                (Half::Empty, Half::Empty) => (" ", track_style),
+                (Half::Thumb, Half::Thumb) => ("█", full_style),
+                (Half::Marker, Half::Marker) => ("█", style_from_opts(marker_fg, track_bg)),
+                // Only the upper half is filled.
+                (Half::Thumb, Half::Empty) => ("▀", half_style),
+                (Half::Marker, Half::Empty) => ("▀", style_from_opts(marker_fg, track_bg)),
+                // Only the lower half is filled.
+                (Half::Empty, Half::Thumb) => ("▄", half_style),
+                (Half::Empty, Half::Marker) => ("▄", style_from_opts(marker_fg, track_bg)),
+                // Mixed fills: the thumb occupies one half and a marker the
+                // other, so both the thumb (fg) and marker (bg) stay visible.
+                (Half::Thumb, Half::Marker) => ("▀", style_from_opts(self.thumb_fg, marker_fg)),
+                (Half::Marker, Half::Thumb) => ("▄", style_from_opts(self.thumb_fg, marker_fg)),
+            };
+            buf.set_string(x, y, symbol, style);
         }
     }
 }
@@ -396,15 +407,14 @@ mod tests {
     }
 
     #[test]
-    fn marker_visible_when_covered_by_thumb() {
-        // Same layout — marker at line 0 falls in virtual slot 0
-        // which is inside the thumb range [0,3).
-        //   Row 0: top_slot=0 (marker + top thumb), bot_slot=1 (thumb only)
-        //     → marker_top=true → "▀" fg=green bg=thumb (marker over thumb)
-        //   Row 1: top_slot=2 (thumb only), bot_slot=3 (track)
-        //     → "▀" half_style (original thumb behavior)
+    fn thumb_renders_over_marker_when_overlapping() {
+        // Same layout — marker at line 0 falls in virtual slot 0, which is
+        // inside the thumb range [0,3).  The thumb is drawn on top, so the
+        // marker is hidden there and the rows render as a plain thumb.
+        //   Row 0: both slots (0,1) in the thumb → "█"
+        //   Row 1: slot 2 in thumb, slot 3 on track → "▀"
         let symbols = render_to_symbols_with_markers(5, 10, 3, 0, &[0]);
-        assert_eq!(symbols[0], "▀", "row 0 marker top half over thumb");
+        assert_eq!(symbols[0], "█", "row 0 fully thumb (marker hidden beneath)");
         assert_eq!(symbols[1], "▀", "row 1 thumb upper half");
     }
 
@@ -461,24 +471,29 @@ mod tests {
     }
 
     #[test]
-    fn marker_mixed_with_thumb_has_green_fg_and_thumb_bg() {
+    fn thumb_on_top_marker_on_other_half() {
+        // viewport=1 → the thumb is a single half-cell (slot [0,1)); a marker
+        // at slot 1 shares the row.  The thumb occupies the upper half (the
+        // cell's foreground) and the marker the lower half (its background),
+        // so the thumb stays visible above the marker.
         let mut buf = Buffer::empty(Rect::new(0, 0, 1, 5));
         let scrollbar = SmoothScrollbar::new()
             .thumb_fg(Color::Gray)
             .track_bg(Color::DarkGray)
             .marker_fg(Color::Green)
-            .with_markers(&[0]);
-        // Position=0, content=10, viewport=3 → thumb covers rows 0-1.
-        // Marker at line 0 → virtual slot 0 → row 0 top half, which is
-        // also inside the thumb range → mixed marker+thumb rendering.
+            .with_markers(&[1]);
         let mut state = SmoothScrollbarState::new(10)
             .position(0)
-            .viewport_content_length(3);
+            .viewport_content_length(1);
         scrollbar.render(buf.area, &mut buf, &mut state);
-        // Row 0: top marker (slot 0) + bottom thumb (slot 1).
+        // Row 0: top slot 0 in thumb, bottom slot 1 is the marker.
         let cell = buf.cell((0, 0)).unwrap();
-        assert_eq!(cell.symbol(), "▀", "marker top half over thumb");
-        assert_eq!(cell.fg, Color::Green, "marker half should be green");
-        assert_eq!(cell.bg, Color::Gray, "thumb half should use thumb fg as bg");
+        assert_eq!(cell.symbol(), "▀", "thumb upper half over marker");
+        assert_eq!(cell.fg, Color::Gray, "upper half should be the thumb color");
+        assert_eq!(
+            cell.bg,
+            Color::Green,
+            "lower half should be the marker color"
+        );
     }
 }
