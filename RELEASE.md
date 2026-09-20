@@ -52,9 +52,12 @@ built nowhere.
   pushed tag matches the manifest version, generates the release body from the
   commit messages (git-cliff), and creates the release with all artifacts and
   one combined `SHA256SUMS`.
-- **`workflow_dispatch`** — identical builds, but **no release is created**;
-  artifacts attach to the workflow run (default 90-day retention). This is
-  how the pipeline itself is tested without spamming tags.
+- **`workflow_dispatch`** — identical builds **and the same release-job checks**
+  (the supply-chain gate and the git-cliff release-notes generation), but
+  **no release is created** (only the final `gh release create` step is
+  tag-gated); artifacts attach to the workflow run (default 90-day retention).
+  This is how the *whole* pipeline — builds **and** the release job — is tested
+  without spamming tags.
 
 | Job | Runner | Artifacts |
 |---|---|---|
@@ -76,15 +79,17 @@ binaries under qemu-user
 against the official Termux aarch64 rootfs (skopeo fetches the image layers;
 no docker), closing the "never executed before release" gap.
 
-The `release` job (tag pushes only) downloads the four shipping platforms'
-build artifacts (`linux-x86_64`, `linux-arm64`, `macos-arm64`, `android-termux`
-— deliberately
-not the not-yet-shipped `windows-msvc`),
-generates one combined `SHA256SUMS` over everything, guards that the pushed
-tag matches the manifest version, generates the release body from the commit
-messages with git-cliff (`scripts/release-notes.sh` / `cliff.toml` — the commit
-subjects become the Keep a Changelog bullets and the bodies their paragraphs;
-an empty result fails the job), and creates the release with
+The `release` job runs on every tag push **and** on `workflow_dispatch` (only
+the final `gh release create` step is tag-gated, so a dispatch runs every other
+check). It downloads the four shipping platforms' build artifacts
+(`linux-x86_64`, `linux-arm64`, `macos-arm64`, `android-termux` — deliberately
+not the not-yet-shipped `windows-msvc`), generates one combined `SHA256SUMS`
+over everything, installs `cargo-deny` + `git-cliff`, runs the supply-chain
+guard, then on a tag guards that the pushed tag matches the manifest version,
+generates the release body from the commit messages with git-cliff
+(`scripts/release-notes.sh` / `cliff.toml` — the commit subjects become the Keep
+a Changelog bullets and the bodies their paragraphs; an empty result fails the
+job), and creates the release with
 `gh release create vX.Y.Z dist/* --notes-file /tmp/release-notes.md`. The
 release **title** is read from `choreo-shared/release-name.txt` — the same file
 compiled into the binaries, so the title and `--version` cannot drift (an empty
@@ -145,10 +150,11 @@ behind `origin/master`), `fmt --check`, clippy with warnings denied, the full
 unit + integration suite, the supply-chain guard, and the crates.io credential
 check. **As its final step it pushes `master` and kicks the
 release workflow** (`gh workflow run release.yml`) — a `workflow_dispatch` dry
-run that builds every platform exactly like a tag does but creates **no** GitHub
-release, so the pipeline is proven on GitHub before you ever tag (watch it with
-`gh run watch`). That push is why `master` must be clean and up to date before
-you start.
+run that builds every platform AND runs the release job's checks (the
+supply-chain gate and the git-cliff release-notes generation) exactly like a tag
+does, but creates **no** GitHub release, so the *whole* pipeline is proven on
+GitHub before you ever tag (watch it with `gh run watch`). That push is why
+`master` must be clean and up to date before you start.
 
 The individual steps remain available as `just preflight`,
 `just check-release-state`, `just check-crates-io-token`,
