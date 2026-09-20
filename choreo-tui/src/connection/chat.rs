@@ -132,7 +132,17 @@ pub(super) fn handle_chat_event(
                         .last_terminal_size
                         .map_or(78, |(w, _)| input_inner_width(w));
                     if app.input.is_on_first_visual_line(inner) {
-                        app.navigate_history_up();
+                        // Recall requires an empty draft: history is reachable
+                        // only from an empty prompt, or while already browsing.
+                        // With a non-empty draft, Up on the first visual line
+                        // moves the cursor to the start of the line instead —
+                        // the mirror of Down-on-last-line's move-to-end.
+                        if app.history_index.is_some() || app.input.text.is_empty() {
+                            app.navigate_history_up();
+                        } else {
+                            app.input.cursor_home_line();
+                            app.ensure_input_cursor_visible();
+                        }
                     } else {
                         app.input.cursor_up(inner);
                         app.ensure_input_cursor_visible();
@@ -161,6 +171,9 @@ pub(super) fn handle_chat_event(
                     }
                 }
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    // Inserting a newline mutates the buffer: detach a recalled
+                    // history entry into the draft first.
+                    app.detach_history_on_edit();
                     app.input.insert_char_at_cursor('\n');
                     app.ensure_input_cursor_visible();
                 }
@@ -201,16 +214,21 @@ pub(super) fn handle_chat_event(
                     let command = parse_input_line(&line, &mut app.next_request_id);
                     run_command(command, true, app, client_tx)?;
                 }
-                KeyCode::Backspace
-                | KeyCode::Delete
-                | KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Home
-                | KeyCode::End => {
+                // Backspace/Delete mutate the buffer, so a recalled history
+                // entry detaches into the draft eagerly on the first one.
+                KeyCode::Backspace | KeyCode::Delete => {
+                    app.detach_history_on_edit();
+                    handle_input_key(*key, &mut app.input);
+                    app.ensure_input_cursor_visible();
+                }
+                // Left/Right/Home/End are pure cursor moves — they must NOT
+                // detach a recalled entry.
+                KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End => {
                     handle_input_key(*key, &mut app.input);
                     app.ensure_input_cursor_visible();
                 }
                 KeyCode::Char(_) => {
+                    app.detach_history_on_edit();
                     handle_input_key(*key, &mut app.input);
                     app.ensure_input_cursor_visible();
                 }
@@ -500,10 +518,25 @@ fn handle_chat_ctrl_key(key: KeyEvent, app: &mut App) {
         KeyCode::Char('c') => {
             tracing::debug!("Ctrl+C ignored on chat page");
         }
-        // Ctrl+Left, Ctrl+Right, Ctrl+Backspace, Ctrl+Delete, Ctrl+Home,
-        // Ctrl+End, etc. are text-editing shortcuts that should still work
-        // in the input box.
+        // Ctrl+Backspace clears the whole draft — but while browsing history
+        // it is INERT: it must not clear the recalled entry or detach it.  The
+        // user leaves browsing with Down (or by editing the entry), never by
+        // wiping it.
+        KeyCode::Backspace
+            if key.modifiers.contains(KeyModifiers::CONTROL) && app.history_index.is_some() =>
+        {
+            tracing::debug!("[choreo-tui] Ctrl+Backspace ignored while browsing history");
+        }
+        // Ctrl+Left/Right, Ctrl+Backspace, Ctrl+Delete, Ctrl+Home/End, Ctrl+W,
+        // Ctrl+U etc. are text-editing shortcuts that should still work in the
+        // input box.  Of these, Ctrl+W, Ctrl+U and Ctrl+Delete mutate the
+        // buffer, so a recalled history entry must detach into the draft
+        // eagerly on the first one; the pure cursor moves (Ctrl+Left/Right/
+        // Home/End) must not.
         _ => {
+            if matches!(key.code, KeyCode::Char('w' | 'u') | KeyCode::Delete) {
+                app.detach_history_on_edit();
+            }
             handle_input_key(key, &mut app.input);
             app.ensure_input_cursor_visible();
         }

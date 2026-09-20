@@ -794,7 +794,7 @@ mod unsent_draft_tests {
     }
 
     #[test]
-    fn switching_while_in_history_navigation_stashes_real_draft() {
+    fn switching_while_browsing_history_does_not_stash_recalled_entry() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = test_app();
         app.attached_session_id = Some(1);
@@ -815,36 +815,28 @@ mod unsent_draft_tests {
             reasoning_producer: None,
         };
         app.display_for(1).view.insert_or_replace(0, turn);
-        // The user typed a fresh draft and pressed Up: the buffer now shows
-        // the history entry, with the real draft stashed for the round trip.
-        // The cursor sits mid-text (not at the end) to pin the position
-        // fidelity of the stash/restore.
-        app.input.text = "my draft".to_string();
-        app.input.cursor = 5;
+        // Recall requires an empty draft: the user starts from an empty prompt
+        // and presses Up, so the buffer now shows the history entry.
         app.navigate_history_up();
         assert_eq!(app.input.text, "past prompt");
-        assert_eq!(app.saved_draft, "my draft");
-        assert_eq!(app.saved_draft_cursor, 5, "cursor stashed on Up");
+        assert_eq!(app.history_index, Some(0));
 
-        // Switching sessions must stash the *real* draft, not the history
-        // entry the buffer happens to be showing.
+        // Switching sessions mid-browse must NOT stash the recalled entry as
+        // session 1's draft — recall began from an empty draft, and exiting
+        // browsing returns to it.
         app.attach_to_session(2, &tx).expect("attach to session 2");
-        assert_eq!(app.display_for(1).draft, "my draft");
         assert_eq!(
-            app.display_for(1).draft_cursor,
-            5,
-            "mid-text cursor survives the switch"
+            app.display_for(1).draft,
+            "",
+            "the recalled entry must not become the draft"
         );
-        assert!(app.saved_draft.is_empty(), "history stash must be consumed");
         assert_eq!(app.history_index, None);
         assert!(app.input.is_empty(), "session 2 starts with no draft");
 
-        // Returning to session 1 restores the user's own draft, cursor
-        // position included.
+        // Returning to session 1 starts from the empty draft again.
         app.attach_to_session(1, &tx)
             .expect("attach back to session 1");
-        assert_eq!(app.input.text, "my draft");
-        assert_eq!(app.input.cursor, 5, "mid-text cursor restored");
+        assert!(app.input.is_empty());
         assert_eq!(app.history_index, None);
     }
 
@@ -986,7 +978,6 @@ mod unsent_draft_tests {
         assert_eq!(app.input.cursor, 4);
     }
 
-    #[allow(clippy::assert_is_empty)] // deliberate empty-check; clippy's rewrite is worse
     #[test]
     fn editing_history_entry_becomes_the_draft_on_switch() {
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -1009,25 +1000,31 @@ mod unsent_draft_tests {
             reasoning_producer: None,
         };
         app.display_for(1).view.insert_or_replace(0, turn);
-        app.input.text = "my draft".to_string();
-        app.input.cursor = 3;
+        // Recall requires an empty draft, so the user starts from an empty
+        // prompt and presses Up.
         app.navigate_history_up();
         assert_eq!(app.input.text, "past prompt");
+        assert_eq!(app.history_index, Some(0));
 
-        // The user types over the history entry instead of exiting it.
-        app.input.insert_char_at_cursor('X');
+        // The user types over the recalled history entry: the first edit
+        // detaches it into the draft (browsing ends, the edit stays in the
+        // buffer).
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("edit recalled entry");
         assert_eq!(app.input.text, "past promptX");
+        assert_eq!(app.history_index, None);
 
-        // Switching sessions must keep the edited buffer — the user's real
-        // draft — rather than restoring the pre-Up stash and discarding the
-        // edits.
+        // Switching sessions keeps the edited buffer as session 1's draft.
         app.attach_to_session(2, &tx).expect("attach to session 2");
         assert_eq!(
             app.display_for(1).draft,
             "past promptX",
             "edits on top of a history entry become the session draft"
         );
-        assert!(app.saved_draft.is_empty());
         assert_eq!(app.history_index, None);
 
         // Round-trip restores the edited text.

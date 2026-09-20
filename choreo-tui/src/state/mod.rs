@@ -294,12 +294,15 @@ pub(crate) struct SessionDisplayState {
     pub(crate) token_usage: Option<TokenUsage>,
     pub(crate) context_window: Option<u32>,
     pub(crate) last_prompt_tokens: Option<u32>,
-    /// Unsent prompt draft: the text (and cursor position) the user had
-    /// typed but not yet submitted when they last left this session.  The
-    /// input bar is a single shared buffer, so each session stashes its own
-    /// draft here and it is restored on the next visit — an unsubmitted
-    /// prompt must never leak into a different session.  Cleared on submit
-    /// and dropped when the session (and its display) is deleted.
+    /// The sole per-session prompt draft: the text (and cursor position) the
+    /// user had typed but not yet submitted.  The input bar is a single
+    /// shared buffer, so each session stashes its own draft here — captured
+    /// on session switch and restored on the next visit — so an unsubmitted
+    /// prompt never leaks into a different session.  History recall only
+    /// begins from an empty draft, and editing a recalled entry turns it into
+    /// the draft (see `App::detach_history_on_edit`); there is no separate
+    /// global stash.  Cleared on submit and dropped when the session (and its
+    /// display) is deleted.
     pub(crate) draft: String,
     pub(crate) draft_cursor: usize,
 }
@@ -420,20 +423,13 @@ pub(crate) struct App {
     pub(crate) text_selection: Option<TextSelection>,
     pub(crate) last_terminal_size: Option<(u16, u16)>,
     pub(crate) terminal_resized: bool,
+    /// The index of the past prompt currently recalled into the input bar
+    /// while browsing history (`Up`/`Down`), or `None` when not browsing.
+    /// There is no separate stash of the user's draft: recall is only
+    /// reachable from an empty draft, so exiting browsing simply returns to
+    /// that empty draft (see `exit_history_browsing`).  Reset to `None` on
+    /// session switch.
     pub(crate) history_index: Option<usize>,
-    /// The user's real draft while they are stepping through history: captured
-    /// on the first Up press, restored by `restore_history_draft`.  Kept as a
-    /// separate stash because the input bar holds a history entry while
-    /// `history_index` is `Some`.  The cursor position is stashed alongside so
-    /// exiting history navigation (or switching sessions mid-navigation)
-    /// restores the exact editing position, not the end of the text.
-    pub(crate) saved_draft: String,
-    pub(crate) saved_draft_cursor: usize,
-    /// The text of the history entry currently shown in the input bar, so
-    /// `restore_history_draft` can tell whether the user edited the entry on
-    /// top of it: a buffer that no longer matches the loaded entry *is* the
-    /// user's real draft and must be kept, not discarded.
-    pub(crate) history_entry_text: Option<String>,
     pub(crate) fullscreen_image_target: Option<(u64, u32, usize)>,
     pub(crate) status: Option<String>,
     /// Whether the current `status` came from a connection-task
@@ -605,9 +601,6 @@ impl App {
             scrollbar_dragging: false,
             text_selection: None,
             history_index: None,
-            saved_draft: String::new(),
-            saved_draft_cursor: 0,
-            history_entry_text: None,
             fullscreen_image_target: None,
             status: None,
             status_is_transient: false,
@@ -1070,15 +1063,19 @@ impl App {
     }
 
     pub(crate) fn navigate_history_up(&mut self) {
+        // Recall requires an empty draft: with a non-empty prompt (and not
+        // already browsing) history is unreachable, so this is a no-op.  The
+        // caller (`connection/chat.rs`) handles the "move to line start"
+        // behavior for a non-empty first-line Up.
+        if self.history_index.is_none() && !self.input.text.is_empty() {
+            return;
+        }
         let texts = self.user_texts();
         if texts.is_empty() {
             return;
         }
         if self.history_index.is_none() {
-            // First Up press: stash the user's real draft (text *and* cursor)
-            // before loading the newest history entry into the buffer.
-            self.saved_draft = self.input.text.clone();
-            self.saved_draft_cursor = self.input.cursor;
+            // First Up press, from the empty draft: load the newest entry.
             self.load_history_entry(0, &texts);
             return;
         }
@@ -1112,13 +1109,13 @@ impl App {
             if texts.is_empty() {
                 // The conversation changed out from under us (e.g. the user
                 // switched sessions mid-navigation) and no history remains to
-                // walk back through — fall straight to the saved draft.
-                self.restore_history_draft();
+                // walk back through — exit browsing to the empty draft.
+                self.exit_history_browsing();
                 return;
             }
             if idx == 0 {
                 // Already at the newest entry: Down exits back to the draft.
-                self.restore_history_draft();
+                self.exit_history_browsing();
                 return;
             }
             // history_index was recorded against the turn list as it existed
@@ -1138,58 +1135,51 @@ impl App {
         }
     }
 
-    /// Load the history entry at `idx` into the input: stash the index, set
+    /// Load the history entry at `idx` into the input: record the index, set
     /// the text, move the cursor to the end, and keep it visible.  Shared by
     /// all the "step through history" paths so they can't drift apart.  The
-    /// loaded text is recorded too, so `restore_history_draft` can detect when
-    /// the user has edited the entry on top of it.
+    /// recalled text is never stashed: recall is only reachable from an empty
+    /// draft, and editing it detaches it into the per-session draft (see
+    /// `detach_history_on_edit`).
     fn load_history_entry(&mut self, idx: usize, texts: &[String]) {
         self.history_index = Some(idx);
         // Callers always pass a valid history index, but a stale one must not
         // panic the render path — fall back to an empty entry (no text).
         let entry = texts.get(idx).cloned().unwrap_or_default();
-        self.history_entry_text = Some(entry.clone());
         self.input.text = entry;
         self.input.generation += 1;
         self.input.cursor = self.input.text.len();
         self.ensure_input_cursor_visible();
     }
 
-    /// Drop history navigation and put the user's saved draft back in the
-    /// input, clearing the stash.  Shared by all the "exit to draft" paths.
-    ///
-    /// The cursor stashed on the first Up press is restored too, so exiting
-    /// mid-editing lands back exactly where the user was typing.  If the
-    /// buffer was edited after the history entry loaded, those edits are the
-    /// user's real draft — keep the buffer as-is instead of silently
-    /// discarding them in favour of the pre-Up stash.
-    fn restore_history_draft(&mut self) {
-        self.history_index = None;
-        if let Some(entry) = self.history_entry_text.take()
-            && self.input.text != entry
-        {
-            // The buffer diverged from the loaded history entry: the user
-            // typed over it, so the buffer holds what they actually want.
-            tracing::debug!("[choreo-tui] history entry edited; keeping buffer as the draft");
-            self.saved_draft.clear();
-            self.saved_draft_cursor = 0;
+    /// Leave history browsing, returning the input to the empty draft that
+    /// recall began from.  Recall is only reachable from an empty prompt (see
+    /// `navigate_history_up`), so there is no stash to restore — the draft was
+    /// empty when browsing began.  Shared by all the "exit browsing" paths
+    /// (`navigate_history_down` and `persist_input_draft`).
+    fn exit_history_browsing(&mut self) {
+        if self.history_index.is_none() {
             return;
         }
-        // Move the draft out of its stash rather than cloning it: the stash
-        // is consumed here and the input buffer takes ownership of the bytes.
-        let cursor = self.saved_draft_cursor;
-        self.input.text = std::mem::take(&mut self.saved_draft);
-        self.saved_draft_cursor = 0;
-        self.input.generation += 1;
-        self.input.cursor = cursor;
+        self.history_index = None;
+        self.input.clear();
         self.ensure_input_cursor_visible();
+    }
+
+    /// Detach the currently recalled history entry the moment the user edits
+    /// it: end browsing, keeping the edit in the buffer as the session's
+    /// draft.  Called eagerly, *before* any buffer-mutating keystroke, so the
+    /// first edit makes the recalled text the draft instead of being discarded
+    /// when browsing later ends.
+    pub(crate) fn detach_history_on_edit(&mut self) {
+        if self.history_index.is_some() {
+            self.history_index = None;
+            tracing::debug!("[choreo-tui] history entry edited; detaching it into the draft");
+        }
     }
 
     pub(crate) fn commit_to_history(&mut self) {
         self.history_index = None;
-        self.history_entry_text = None;
-        self.saved_draft.clear();
-        self.saved_draft_cursor = 0;
     }
 
     /// Clear the draft stashed for the currently attached session, mirroring
@@ -1654,17 +1644,17 @@ impl App {
     ///
     /// Callers invoke this *before* rebinding `attached_session_id` so it
     /// still names the session the input bar's current contents belong to.
-    /// History navigation interacts with the draft: if the user was stepping
-    /// through past prompts (Up), the buffer holds a history entry rather
-    /// than their real draft — first drop back to the draft
-    /// (`restore_history_draft`) so the stash captures what they actually
-    /// typed instead of a history entry.  With nothing attached (the startup
-    /// auto-attach), there is no outgoing session to stash into; text already
-    /// in the bar is kept rather than clobbered, and only a target with an
-    /// empty bar gets its draft loaded.
+    /// History browsing interacts with the draft: if the user is mid-browse
+    /// (Up), the buffer holds a recalled history entry rather than a real
+    /// draft — first exit browsing (`exit_history_browsing`) so the recalled
+    /// entry is not stashed as the outgoing session's draft (recall began
+    /// from an empty draft, so exiting restores that empty buffer).  With
+    /// nothing attached (the startup auto-attach), there is no outgoing
+    /// session to stash into; text already in the bar is kept rather than
+    /// clobbered, and only a target with an empty bar gets its draft loaded.
     pub(crate) fn persist_input_draft(&mut self, target_session_id: u64) {
         if self.history_index.is_some() {
-            self.restore_history_draft();
+            self.exit_history_browsing();
         }
         // Destructure `self` so the input buffer and the per-session display
         // map can be borrowed mutably at the same time (disjoint fields via

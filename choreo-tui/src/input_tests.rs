@@ -650,9 +650,7 @@ fn navigate_history_up_down_with_multi_line() {
 fn navigate_history_up_adjusts_scroll_offset_for_long_entry() {
     let mut app = test_app();
     app.last_terminal_size = Some((80, 24));
-    // Short text currently in input
-    app.input.text = "x".to_string();
-    app.input.cursor = 1;
+    // Recall requires an empty draft, so the input starts empty (its default).
 
     // Insert a long multi-line history entry (20 visual lines at 80-wide terminal)
     // Vec-then-concat instead of format!.collect::<String>() (clippy::format_collect)
@@ -689,59 +687,6 @@ fn navigate_history_up_adjusts_scroll_offset_for_long_entry() {
     let visible_height = app.input_bar_content_lines(80) as usize;
     let cursor_row = cursor_row as usize;
     // Cursor should be within the visible window
-    assert!(
-        cursor_row >= app.input.scroll_offset,
-        "cursor_row {cursor_row} should be >= scroll_offset {}",
-        app.input.scroll_offset
-    );
-    assert!(
-        cursor_row < app.input.scroll_offset + visible_height,
-        "cursor_row {cursor_row} should be < scroll_offset {} + visible_height {visible_height}",
-        app.input.scroll_offset
-    );
-}
-
-#[test]
-fn navigate_history_down_adjusts_scroll_offset_for_long_draft() {
-    let mut app = test_app();
-    app.last_terminal_size = Some((80, 24));
-    // A long multi-line draft saved in history state
-    let long_draft: String = (0..20)
-        .map(|i| format!("line {i}\n"))
-        .collect::<Vec<_>>()
-        .concat();
-    app.saved_draft = long_draft.clone();
-    app.input.text = "x".to_string();
-    app.input.cursor = 1;
-    // Simulate being at the first history entry (so Down restores draft)
-    app.history_index = Some(0);
-    let id = app.next_request_id;
-    app.display_for(0).view.insert_or_replace(
-        id,
-        choreo_proto::Turn {
-            created_at: choreo_proto::TimestampMs::now(),
-            undone: false,
-            error: None,
-            user_text: Some("history entry".into()),
-            assistant_text: None,
-            assistant_reasoning: None,
-            tool_calls: vec![],
-            token_usage: None,
-            tool_results: vec![],
-            displayed_images: vec![],
-            reasoning_artifact: None,
-            reasoning_producer: None,
-        },
-    );
-    app.next_request_id += 1;
-
-    app.navigate_history_down();
-    // After restoring the long draft, scroll_offset should ensure cursor is visible.
-    let inner = input_inner_width(80);
-    let visual_lines = compute_visual_lines(&app.input.text, inner);
-    let (cursor_row, _) = find_cursor_pos(&app.input.text, app.input.cursor, &visual_lines);
-    let visible_height = app.input_bar_content_lines(80) as usize;
-    let cursor_row = cursor_row as usize;
     assert!(
         cursor_row >= app.input.scroll_offset,
         "cursor_row {cursor_row} should be >= scroll_offset {}",
@@ -1223,15 +1168,30 @@ fn navigate_history_up_loads_most_recent() {
     add_user_text(&mut app, "cmd-2");
     add_user_text(&mut app, "cmd-1");
     add_user_text(&mut app, "cmd-0");
-    app.input.text = "typing".to_string();
-    app.input.cursor = 6;
+    // Recall requires an empty draft, so the input starts empty (its default).
 
     app.navigate_history_up();
 
     assert_eq!(app.history_index, Some(0));
     assert_eq!(app.input.text, "cmd-0");
     assert_eq!(app.input.cursor, 5);
-    assert_eq!(app.saved_draft, "typing");
+}
+
+#[test]
+fn navigate_history_up_with_nonempty_draft_is_a_noop() {
+    // Gate: `Up` with a non-empty draft must NOT recall history.  The move to
+    // the start of the line is handled by the caller (`connection/chat.rs`),
+    // so at the state level this is a plain no-op.
+    let mut app = test_app();
+    add_user_text(&mut app, "cmd");
+    app.input.text = "typing".to_string();
+    app.input.cursor = 6;
+
+    app.navigate_history_up();
+
+    assert!(app.history_index.is_none());
+    assert_eq!(app.input.text, "typing");
+    assert_eq!(app.input.cursor, 6);
 }
 
 #[test]
@@ -1275,20 +1235,21 @@ fn navigate_history_up_empty_history_does_nothing() {
     assert!(app.history_index.is_none());
 }
 
-#[allow(clippy::assert_is_empty)] // plain is_empty asserts read best here
 #[test]
-fn navigate_history_down_restores_draft() {
+fn navigate_history_down_exits_browsing_to_empty_draft() {
     let mut app = test_app();
     add_user_text(&mut app, "cmd");
+    // Browsing started from an empty draft; Down past the newest entry ends
+    // browsing and returns to that empty draft (there is no stash).
     app.history_index = Some(0);
-    app.saved_draft = "draft".to_string();
     app.input.text = "cmd".to_string();
+    app.input.cursor = 3;
 
     app.navigate_history_down();
 
     assert!(app.history_index.is_none());
-    assert_eq!(app.input.text, "draft");
-    assert!(app.saved_draft.is_empty());
+    assert_eq!(app.input.text, "");
+    assert_eq!(app.input.cursor, 0);
 }
 
 #[test]
@@ -1312,7 +1273,6 @@ fn navigate_history_down_moves_to_newer() {
     assert!(app.history_index.is_none());
 }
 
-#[allow(clippy::assert_is_empty)] // plain is_empty asserts read best here
 #[test]
 fn navigate_history_down_survives_shrunk_history() {
     let mut app = test_app();
@@ -1322,7 +1282,6 @@ fn navigate_history_down_survives_shrunk_history() {
     // Simulate having browsed back to the oldest entry...
     app.history_index = Some(2);
     app.input.text = "oldest".to_string();
-    app.saved_draft = "draft".to_string();
 
     // ...then the conversation changes underneath us: the turn list is reset
     // so only a single user text remains (e.g. a session switch mid-nav).
@@ -1355,29 +1314,24 @@ fn navigate_history_down_survives_shrunk_history() {
     assert_eq!(app.history_index, Some(0));
     assert_eq!(app.input.text, "recent");
 
-    // And the next Down still exits back to the saved draft.
+    // And the next Down exits browsing back to the empty draft.
     app.navigate_history_down();
     assert!(app.history_index.is_none());
-    assert_eq!(app.input.text, "draft");
-    assert!(app.saved_draft.is_empty());
+    assert_eq!(app.input.text, "");
 }
 
-#[allow(clippy::assert_is_empty)] // plain is_empty asserts read best here
 #[test]
-fn navigate_history_down_empty_history_restores_draft() {
+fn navigate_history_down_empty_history_exits_to_empty() {
     let mut app = test_app();
     app.history_index = Some(3);
-    app.saved_draft = "draft".to_string();
     app.input.text = "stale".to_string();
 
-    // No turns at all: Down must fall back to the draft, not panic.
+    // No turns at all: Down must fall back to the empty draft, not panic.
     app.navigate_history_down();
     assert!(app.history_index.is_none());
-    assert_eq!(app.input.text, "draft");
-    assert!(app.saved_draft.is_empty());
+    assert_eq!(app.input.text, "");
 }
 
-#[allow(clippy::assert_is_empty)] // plain is_empty asserts read best here
 #[test]
 fn navigate_history_up_survives_shrunk_history() {
     let mut app = test_app();
@@ -1387,7 +1341,6 @@ fn navigate_history_up_survives_shrunk_history() {
     // Browsed all the way to the oldest entry...
     app.history_index = Some(2);
     app.input.text = "oldest".to_string();
-    app.saved_draft = "draft".to_string();
 
     // ...then the turn list shrinks to a single entry underneath us (e.g. a
     // session switch mid-nav).
@@ -1426,28 +1379,23 @@ fn navigate_history_up_survives_shrunk_history() {
     assert_eq!(app.history_index, Some(0));
     assert_eq!(app.input.text, "recent");
 
-    // Down still walks back to the saved draft.
+    // Down still exits browsing back to the empty draft.
     app.navigate_history_down();
     assert!(app.history_index.is_none());
-    assert_eq!(app.input.text, "draft");
-    assert!(app.saved_draft.is_empty());
+    assert_eq!(app.input.text, "");
 }
 
-#[allow(clippy::assert_is_empty)] // plain is_empty asserts read best here
 #[test]
 fn history_nav_resets_after_commit() {
     let mut app = test_app();
     add_user_text(&mut app, "old");
     app.history_index = Some(0);
-    app.saved_draft = "draft".to_string();
 
     app.commit_to_history();
 
     assert!(app.history_index.is_none());
-    assert!(app.saved_draft.is_empty());
 }
 
-#[allow(clippy::assert_is_empty)] // plain is_empty asserts read best here
 #[test]
 fn terminal_event_up_down_navigates_history() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1465,7 +1413,6 @@ fn terminal_event_up_down_navigates_history() {
     )
     .expect("handle up");
     assert_eq!(app.input.text, "recent");
-    assert!(app.saved_draft.is_empty());
 
     // Press Up again — loads older
     handle_terminal_event(
@@ -1485,7 +1432,7 @@ fn terminal_event_up_down_navigates_history() {
     .expect("handle down");
     assert_eq!(app.input.text, "recent");
 
-    // Press Down — past newest, restores draft (empty)
+    // Press Down — past newest, exits browsing to the empty draft
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
         &mut app,
@@ -1493,7 +1440,6 @@ fn terminal_event_up_down_navigates_history() {
     )
     .expect("handle down");
     assert_eq!(app.input.text, "");
-    assert!(app.saved_draft.is_empty());
 }
 
 #[test]
@@ -1559,14 +1505,36 @@ fn terminal_event_down_on_single_line_draft_goes_to_end() {
 }
 
 #[test]
-fn terminal_event_down_still_navigates_history_after_up() {
+fn terminal_event_up_on_nonempty_draft_moves_to_line_start() {
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = test_app();
     add_user_text(&mut app, "older");
     add_user_text(&mut app, "recent");
     // The user is editing a multi-line draft when they press Up.
     app.input.text = "line one\ndraft".to_string();
-    app.input.cursor = 0;
+    app.input.cursor = 5; // mid-way through the first visual line
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle up");
+    // Recall requires an empty draft: with a non-empty draft, Up on the first
+    // visual line moves the cursor to the start of the line instead, leaving
+    // the draft (and history) untouched.
+    assert!(app.history_index.is_none());
+    assert_eq!(app.input.text, "line one\ndraft");
+    assert_eq!(app.input.cursor, 0);
+}
+
+#[test]
+fn terminal_event_down_still_navigates_history_after_up() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    add_user_text(&mut app, "older");
+    add_user_text(&mut app, "recent");
+    // Recall requires an empty draft, so browsing starts from an empty prompt.
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
@@ -1583,28 +1551,83 @@ fn terminal_event_down_still_navigates_history_after_up() {
         &tx,
     )
     .expect("handle down");
-    // Down exits history back to the saved draft with its stashed cursor.
+    // Down exits browsing back to the empty draft.
     assert!(app.history_index.is_none());
-    assert_eq!(app.input.text, "line one\ndraft");
+    assert_eq!(app.input.text, "");
     assert_eq!(app.input.cursor, 0);
 
-    // Subsequent Down is back in draft mode: moves into the last line first…
+    // Subsequent Down is back in draft mode on an empty buffer: nothing below
+    // it, so it is a no-op at end-of-line.
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
         &mut app,
         &tx,
     )
     .expect("handle down");
-    assert_eq!(app.input.cursor, 9);
+    assert_eq!(app.input.text, "");
+}
 
-    // …and the next Down, on the last visual line, terminates at the end.
+#[test]
+fn terminal_event_editing_recalled_entry_detaches_it_into_draft() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    add_user_text(&mut app, "recent prompt");
+
+    // Recall from the empty draft, then add a character.
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
         &mut app,
         &tx,
     )
-    .expect("handle down");
-    assert_eq!(app.input.cursor, app.input.text.len());
+    .expect("handle up");
+    assert!(app.history_index.is_some());
+    assert_eq!(app.input.text, "recent prompt");
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle char");
+
+    // The first edit detaches the recalled entry: browsing ends and the
+    // edit stays in the buffer as the draft.
+    assert!(app.history_index.is_none());
+    assert_eq!(app.input.text, "recent prompt!");
+
+    // A subsequent session switch stores that edit as the source session's
+    // draft (the recalled entry is not stashed — only the user's edit is).
+    app.attached_session_id = Some(0);
+    app.persist_input_draft(1);
+    assert_eq!(app.display_for(0).draft, "recent prompt!");
+}
+
+#[test]
+fn terminal_event_ctrl_backspace_inert_while_browsing() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    add_user_text(&mut app, "recent prompt");
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle up");
+    assert!(app.history_index.is_some());
+    assert_eq!(app.input.text, "recent prompt");
+
+    // Ctrl+Backspace is inert while browsing: it neither clears the recalled
+    // entry nor detaches it.
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+backspace");
+
+    assert!(app.history_index.is_some());
+    assert_eq!(app.input.text, "recent prompt");
 }
 
 #[test]
