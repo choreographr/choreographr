@@ -106,6 +106,18 @@ pub struct SessionRecord {
     /// must never be replayed into a service that does not recognize it.
     #[serde(default)]
     pub last_response_id_producer: Option<ReasoningProducer>,
+    /// Whether this session is pinned. Daemon-owned: the session thread
+    /// writes the full record on every mutation, but it has no knowledge of
+    /// these flags, so [`write_session`] preserves whatever the daemon last
+    /// set (see the preserve logic there). `#[serde(default)]` keeps old
+    /// records decoding as `false`.
+    #[serde(default)]
+    pub pinned: bool,
+    /// When this session was archived (Unix-epoch-milliseconds), or `None`.
+    /// Daemon-owned, same preserve-across-full-record-writes contract as
+    /// `pinned`. `#[serde(default)]` keeps old records decoding as `None`.
+    #[serde(default)]
+    pub archived_at: Option<i64>,
 }
 
 /// Resolve the database file path: the `CHOREOGRAPHR_DB_PATH` override when
@@ -599,8 +611,6 @@ pub fn write_session(
     session_id: u64,
     record: &SessionRecord,
 ) -> io::Result<()> {
-    let payload = rmp_serde::to_vec_named(record)
-        .map_err(|e| db_err(format!("codec encode session: {e}")))?;
     let write_txn = db
         .begin_write()
         .map_err(|e| db_err(format!("redb write txn: {e}")))?;
@@ -608,6 +618,36 @@ pub fn write_session(
         let mut table = write_txn
             .open_table(SESSIONS)
             .map_err(|e| db_err(format!("redb open sessions: {e}")))?;
+        // Preserve the daemon-owned flags. The session thread writes the FULL
+        // record on every mutation, but the incoming `record` is built from
+        // `SessionConfig`, which does NOT carry `pinned`/`archived_at` (the
+        // daemon is their sole authority — see `update_session_flags`). Read
+        // the row we are about to overwrite and copy its two flag fields onto
+        // a mutable clone of the incoming record, so a full-record write can
+        // never clobber what the daemon last set. An absent row (first write)
+        // or an undecodable one means there is nothing to preserve — use the
+        // incoming values as-is.
+        let mut record = record.clone();
+        if let Some(guard) = table
+            .get(session_id)
+            .map_err(|e| db_err(format!("redb get session: {e}")))?
+        {
+            match rmp_serde::from_slice::<SessionRecord>(guard.value()) {
+                Ok(existing) => {
+                    record.pinned = existing.pinned;
+                    record.archived_at = existing.archived_at;
+                }
+                Err(e) => {
+                    warn!(
+                        session_id,
+                        error = %e,
+                        "undecodable existing session record; keeping incoming flags"
+                    );
+                }
+            }
+        }
+        let payload = rmp_serde::to_vec_named(&record)
+            .map_err(|e| db_err(format!("codec encode session: {e}")))?;
         table
             .insert(session_id, payload.as_slice())
             .map_err(|e| db_err(format!("redb insert session: {e}")))?;
@@ -616,6 +656,73 @@ pub fn write_session(
         .commit()
         .map_err(|e| db_err(format!("redb commit session: {e}")))?;
     debug!("write_session: id={} ok", session_id);
+    Ok(())
+}
+
+/// Read-modify-write ONLY the daemon-owned `pinned` and `archived_at` fields
+/// of a session record, inside a single write transaction. This is how the
+/// daemon mutates its flags without touching (or racing) the rest of the
+/// record the session thread owns.
+///
+/// If the row is absent (the session does not exist, or has already been
+/// deleted), this is a successful no-op: there is nothing to flag, and the
+/// caller's index update is the only effect. Undecodable rows are treated the
+/// same way (logged and left untouched), matching `read_session`'s
+/// tolerant-read policy.
+///
+/// # Errors
+///
+/// Returns Err if the write transaction, table open, row lookup, decode of
+/// the CURRENT record, encode, insert, or commit fails.
+pub fn update_session_flags(
+    db: &redb::Database,
+    session_id: u64,
+    pinned: bool,
+    archived_at: Option<i64>,
+) -> io::Result<()> {
+    debug!("update_session_flags: id={session_id} pinned={pinned}");
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+    {
+        let mut table = write_txn
+            .open_table(SESSIONS)
+            .map_err(|e| db_err(format!("redb open sessions: {e}")))?;
+        // Read the current row and decode it, so the OTHER fields survive the
+        // flag update untouched. An absent row is a no-op (a deleted session
+        // has no record to flag).
+        let Some(guard) = table
+            .get(session_id)
+            .map_err(|e| db_err(format!("redb get session: {e}")))?
+        else {
+            debug!(session_id, "update_session_flags: no record, nothing to do");
+            return Ok(());
+        };
+        let mut record = match rmp_serde::from_slice::<SessionRecord>(guard.value()) {
+            Ok(record) => record,
+            Err(e) => {
+                warn!(
+                    session_id,
+                    error = %e,
+                    "update_session_flags: undecodable record, leaving it untouched"
+                );
+                return Ok(());
+            }
+        };
+        drop(guard);
+        // Mutate ONLY the two daemon-owned fields, then re-encode the whole
+        // record so every other field is preserved byte-for-byte.
+        record.pinned = pinned;
+        record.archived_at = archived_at;
+        let payload = rmp_serde::to_vec_named(&record)
+            .map_err(|e| db_err(format!("codec encode session: {e}")))?;
+        table
+            .insert(session_id, payload.as_slice())
+            .map_err(|e| db_err(format!("redb insert session: {e}")))?;
+    }
+    write_txn
+        .commit()
+        .map_err(|e| db_err(format!("redb commit session: {e}")))?;
     Ok(())
 }
 
@@ -1859,6 +1966,8 @@ mod tests {
             account_name: None,
             last_response_id: None,
             last_response_id_producer: None,
+            pinned: false,
+            archived_at: None,
         };
         write_session(&db, id, &record).unwrap();
 
@@ -2293,6 +2402,8 @@ mod tests {
                 provider_slug: "openai".into(),
                 model: "gpt-5.4".into(),
             }),
+            pinned: false,
+            archived_at: None,
         };
         write_session(&db, id, &record).unwrap();
 
@@ -2306,6 +2417,111 @@ mod tests {
             "response id provenance must survive the write/read cycle",
         );
         assert_eq!(read.title.as_deref(), Some("t"));
+    }
+
+    /// Build a minimal valid session record for the flag tests.
+    fn flag_record() -> SessionRecord {
+        SessionRecord {
+            title: Some("flags".into()),
+            selected_model: None,
+            reasoning_effort: None,
+            parent_session_id: None,
+            working_dir: None,
+            turn_count: 3,
+            created_at: 1000,
+            last_modified: 2000,
+            active_tool_groups: vec!["core".into()],
+            context_config: ContextConfig::default(),
+            account_name: Some("acct".into()),
+            last_response_id: None,
+            last_response_id_producer: None,
+            pinned: false,
+            archived_at: None,
+        }
+    }
+
+    #[test]
+    fn write_session_preserves_daemon_flags() {
+        // The session thread writes the FULL record (with pinned=false,
+        // archived_at=None — it never knows the daemon's flags); a full-record
+        // write must NOT clobber flags the daemon set via update_session_flags.
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        write_session(&db, 1, &flag_record()).unwrap();
+
+        update_session_flags(&db, 1, true, Some(4242)).unwrap();
+        // Confirm the daemon's update landed.
+        let after_update = read_session(&db, 1).unwrap().unwrap();
+        assert!(after_update.pinned);
+        assert_eq!(after_update.archived_at, Some(4242));
+
+        // Now the session thread writes a full record that tries to reset the
+        // flags (the default `flag_record` has pinned=false/archived_at=None).
+        let mut reset_attempt = flag_record();
+        reset_attempt.turn_count = 9; // a genuine field change must persist
+        reset_attempt.pinned = false;
+        reset_attempt.archived_at = None;
+        write_session(&db, 1, &reset_attempt).unwrap();
+
+        let after_write = read_session(&db, 1).unwrap().unwrap();
+        assert!(
+            after_write.pinned,
+            "a full-record write must preserve the daemon-set pinned flag"
+        );
+        assert_eq!(
+            after_write.archived_at,
+            Some(4242),
+            "a full-record write must preserve the daemon-set archived_at"
+        );
+        assert_eq!(
+            after_write.turn_count, 9,
+            "the write's own fields must still take effect"
+        );
+    }
+
+    #[test]
+    fn update_session_flags_round_trips_and_preserves_other_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let record = flag_record();
+        write_session(&db, 7, &record).unwrap();
+
+        update_session_flags(&db, 7, true, Some(999)).unwrap();
+        let read = read_session(&db, 7).unwrap().unwrap();
+        assert!(read.pinned);
+        assert_eq!(read.archived_at, Some(999));
+        // Every other field is untouched.
+        assert_eq!(read.title, record.title);
+        assert_eq!(read.turn_count, record.turn_count);
+        assert_eq!(read.created_at, record.created_at);
+        assert_eq!(read.last_modified, record.last_modified);
+        assert_eq!(read.active_tool_groups, record.active_tool_groups);
+        assert_eq!(read.account_name, record.account_name);
+
+        // Clearing works too (unpin + unarchive).
+        update_session_flags(&db, 7, false, None).unwrap();
+        let cleared = read_session(&db, 7).unwrap().unwrap();
+        assert!(!cleared.pinned);
+        assert_eq!(cleared.archived_at, None);
+    }
+
+    #[test]
+    fn update_session_flags_missing_id_is_ok() {
+        // A missing row (deleted session, or a race) is a harmless no-op, not
+        // an error — the caller's index update still runs and other rows are
+        // untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        // Create the SESSIONS table with a real row, so the reads below can
+        // open it (a fresh DB has no table until the first committed write).
+        write_session(&db, 1, &flag_record()).unwrap();
+
+        update_session_flags(&db, 123, true, Some(1)).unwrap();
+        assert!(read_session(&db, 123).unwrap().is_none());
+        // The unrelated existing row is untouched by the no-op update.
+        let one = read_session(&db, 1).unwrap().unwrap();
+        assert!(!one.pinned);
+        assert_eq!(one.archived_at, None);
     }
 
     #[test]
@@ -2389,6 +2605,8 @@ mod tests {
             account_name: None,
             last_response_id: None,
             last_response_id_producer: None,
+            pinned: false,
+            archived_at: None,
         };
 
         write_session(&db, 5, &record).unwrap();
@@ -2427,6 +2645,8 @@ mod tests {
             account_name: None,
             last_response_id: None,
             last_response_id_producer: None,
+            pinned: false,
+            archived_at: None,
         };
         write_session(&db, 6, &record).unwrap();
         mark_session_deleted(&db, 6).unwrap();

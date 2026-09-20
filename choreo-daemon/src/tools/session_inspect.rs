@@ -607,6 +607,8 @@ mod tests {
             reasoning_effort: None,
             last_response_id: None,
             last_response_id_producer: None,
+            pinned: false,
+            archived_at: None,
         };
         write_session(&db, target, &record).unwrap();
         for (tid, t) in turns {

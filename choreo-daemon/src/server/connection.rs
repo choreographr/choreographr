@@ -593,6 +593,35 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             info!("client {}: DeleteSession id={}", ctx.client_id, session_id);
             handle_delete_session_sync(ctx, session_id);
         }
+        ClientMessage::SetSessionPinned { session_id, pinned } => {
+            info!(
+                "client {}: SetSessionPinned id={} pinned={}",
+                ctx.client_id, session_id, pinned
+            );
+            handle_set_session_flags_sync(
+                ctx,
+                session_id,
+                Some(pinned),
+                None,
+                "set_session_pinned",
+            );
+        }
+        ClientMessage::SetSessionArchived {
+            session_id,
+            archived,
+        } => {
+            info!(
+                "client {}: SetSessionArchived id={} archived={}",
+                ctx.client_id, session_id, archived
+            );
+            handle_set_session_flags_sync(
+                ctx,
+                session_id,
+                None,
+                Some(archived),
+                "set_session_archived",
+            );
+        }
         ClientMessage::GetCredential { service } => {
             handle_get_credential_sync(ctx, service);
         }
@@ -1518,6 +1547,47 @@ fn handle_delete_session_sync(ctx: &mut ClientCtx, session_id: u64) {
             );
         }
         Err(_) => warn!("daemon disconnected while handling delete session"),
+    }
+}
+
+/// Handle a `SetSessionPinned`/`SetSessionArchived` client message. On success
+/// NOTHING is sent to the client — the daemon's `SessionFlagsChanged` broadcast
+/// is the success signal (every subscriber, the requester included, receives
+/// it). On failure the error is a TARGETED reply to THIS connection only, so
+/// just the requester learns the operation failed (`operation` names which of
+/// the two messages it was). Follows the same shape as
+/// [`handle_delete_session_sync`].
+fn handle_set_session_flags_sync(
+    ctx: &mut ClientCtx,
+    session_id: u64,
+    pinned: Option<bool>,
+    archived: Option<bool>,
+    operation: &str,
+) {
+    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::SetSessionFlags {
+        session_id,
+        pinned,
+        archived,
+        reply,
+    });
+    match result {
+        Ok(Ok(())) => {
+            // Success: no targeted reply — the daemon broadcasts
+            // SessionFlagsChanged to every subscriber (this client included).
+        }
+        Ok(Err(e)) => {
+            send_to_writer(
+                ctx,
+                &DaemonMessage::Session {
+                    session_id: Some(session_id),
+                    event: SessionEvent::SessionFailed {
+                        operation: operation.into(),
+                        error: e.to_string(),
+                    },
+                },
+            );
+        }
+        Err(_) => warn!("daemon disconnected while handling {operation}"),
     }
 }
 

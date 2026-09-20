@@ -154,7 +154,7 @@ fn reasoning_capability_size(cap: &ReasoningCapability) -> usize {
 
 /// Byte length of a session-scoped [`SessionEvent`]'s serialized payload.
 ///
-/// Mirrors the pre-split `DaemonMessage::approx_wire_size` arms for the 29
+/// Mirrors the pre-split `DaemonMessage::approx_wire_size` arms for the 31
 /// session-scoped variants, minus the `session_id` field that now lives on
 /// the [`DaemonMessage::Session`] envelope (the envelope's own 2-field
 /// overhead is added by the `Session` arm). Same accounting style: per-field
@@ -189,6 +189,9 @@ fn session_event_size(event: &SessionEvent) -> usize {
                 + option_str_len(reasoning_effort.as_ref())
         }
         SessionEvent::SessionAttached | SessionEvent::SessionDeleted => OVERHEAD,
+        // Fixed small payload (a bool + an optional i64): the generous fixed
+        // OVERHEAD covers both field keys and their scalar/nil values.
+        SessionEvent::SessionFlagsChanged { .. } => OVERHEAD,
         SessionEvent::SessionState {
             title,
             selected_model,
@@ -331,10 +334,11 @@ impl DaemonMessage {
                     + sessions
                         .iter()
                         .map(|s| {
-                            // 15-field SessionSummary: named-mode keys + tags
-                            // + status string (the variable-size status
-                            // payload is not otherwise counted).
-                            named_field_overhead(15)
+                            // 17-field SessionSummary (`pinned` + `archived_at`
+                            // added): named-mode keys + tags + status string (the
+                            // variable-size status payload is not otherwise
+                            // counted).
+                            named_field_overhead(17)
                                 + option_str_len(s.title.as_ref())
                                 + option_str_len(s.selected_model.as_ref())
                                 + option_str_len(s.reasoning_effort.as_ref())

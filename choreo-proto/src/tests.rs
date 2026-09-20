@@ -131,11 +131,11 @@ fn decode_tolerates_array_encoded_struct() {
     // Named mode writes structs as maps with field-name keys, but decode also
     // accepts the array (field-order) form — that is the compatibility
     // contract that keeps a future switch to compact mode backwards-readable.
-    // Hand-build `[7, [10, 20, 30]]`: version 7, then a `TokenUsage` struct
+    // Hand-build `[8, [10, 20, 30]]`: version 8, then a `TokenUsage` struct
     // serialized WITHOUT field names as a 3-element array.
     let blob = [
         0x92, // array of 2: (version, message)
-        0x07, // PROTOCOL_VERSION = 7
+        0x08, // PROTOCOL_VERSION = 8
         0x93, // array of 3: TokenUsage { input_tokens, output_tokens, total_tokens }
         0x0a, // input_tokens = 10
         0x14, // output_tokens = 20
@@ -510,6 +510,8 @@ fn session_summary_none_optionals_round_trip() {
         token_usage: None,
         context_window: None,
         last_prompt_tokens: None,
+        pinned: false,
+        archived_at: None,
     };
     let frame = encode_frame(&summary).expect("encode");
     let decoded: SessionSummary = decode_frame(&frame[4..]).expect("decode");
@@ -540,6 +542,8 @@ fn session_summary_some_token_usage_round_trip() {
         token_usage: Some(usage),
         context_window: None,
         last_prompt_tokens: None,
+        pinned: false,
+        archived_at: None,
     };
     let frame = encode_frame(&summary).expect("encode");
     let decoded: SessionSummary = decode_frame(&frame[4..]).expect("decode");
@@ -588,6 +592,8 @@ fn sessions_with_none_optionals_round_trip() {
         token_usage: None,
         context_window: None,
         last_prompt_tokens: None,
+        pinned: false,
+        archived_at: None,
     };
     let msg = DaemonMessage::Sessions {
         sessions: vec![summary.clone(), summary],

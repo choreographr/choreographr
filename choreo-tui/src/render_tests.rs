@@ -406,6 +406,8 @@ fn render_session_list_shows_ids_parents_and_titles() {
             token_usage: None,
             context_window: None,
             last_prompt_tokens: None,
+            pinned: false,
+            archived_at: None,
         },
         SessionSummary {
             session_id: 9002,
@@ -423,6 +425,8 @@ fn render_session_list_shows_ids_parents_and_titles() {
             token_usage: None,
             context_window: None,
             last_prompt_tokens: None,
+            pinned: false,
+            archived_at: None,
         },
     ]);
 
@@ -501,6 +505,8 @@ fn session_list_selected_row_highlight_is_solid_across_width() {
             token_usage: None,
             context_window: None,
             last_prompt_tokens: None,
+            pinned: false,
+            archived_at: None,
         })
         .collect();
     app.session_mgr.set_sessions(sessions);
@@ -598,6 +604,8 @@ fn session_list_scrolls_to_keep_selection_visible() {
             token_usage: None,
             context_window: None,
             last_prompt_tokens: None,
+            pinned: false,
+            archived_at: None,
         })
         .collect();
     app.session_mgr.set_sessions(sessions);
@@ -662,6 +670,8 @@ fn session_list_scrolls_down_then_up_directionally() {
             token_usage: None,
             context_window: None,
             last_prompt_tokens: None,
+            pinned: false,
+            archived_at: None,
         })
         .collect();
     app.session_mgr.set_sessions(sessions);

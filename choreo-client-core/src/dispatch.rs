@@ -119,6 +119,17 @@ pub trait TurnEventHandler {
     ) {
         let _ = (session_id, turn_id, image_index, data);
     }
+    /// A session's `pinned`/`archived_at` flags changed (the daemon's
+    /// `SessionFlagsChanged` broadcast, delivered with the origin session).
+    /// The default is a no-op so frontends that do not surface pin/archive
+    /// need no code; a frontend that shows them updates its view here.
+    fn handle_session_flags_changed(
+        &mut self,
+        _session_id: u64,
+        _pinned: bool,
+        _archived_at: Option<i64>,
+    ) {
+    }
 }
 
 /// Dispatch a [`DaemonMessage`] to the [`TurnEventHandler`], splitting the
@@ -563,6 +574,10 @@ fn dispatch_session_event(
         }
         SessionEvent::SessionDeleted => {}
         SessionEvent::SessionDeleteFailed { .. } => {}
+        SessionEvent::SessionFlagsChanged {
+            pinned,
+            archived_at,
+        } => handler.handle_session_flags_changed(*session_id, *pinned, *archived_at),
         SessionEvent::SessionAccountSet { account, .. } => {
             handler.handle_status_text(format!("[daemon] session account set: {account}"));
         }

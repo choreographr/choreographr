@@ -315,6 +315,14 @@ pub struct SessionMetadata {
     pub accumulated_usage: TokenUsage,
     pub context_window: Option<u32>,
     pub last_prompt_tokens: Option<u32>,
+    /// Whether this session is pinned. The DAEMON is the sole authority for
+    /// this flag (the session thread's `SessionConfig` does not carry it —
+    /// `handle_update_metadata` preserves the daemon's value across the
+    /// session thread's snapshots).
+    pub pinned: bool,
+    /// When this session was archived (Unix-epoch-milliseconds), or `None`.
+    /// Daemon-owned, same authority/preserve contract as `pinned`.
+    pub archived_at: Option<i64>,
 }
 
 /// Convert a persisted record into metadata. New sessions loaded from the
@@ -342,6 +350,11 @@ impl From<SessionRecord> for SessionMetadata {
         };
         let mut meta = SessionMetadata::from(&config);
         meta.turn_count = record.turn_count;
+        // The flags live on the record (daemon-owned), not on `SessionConfig`,
+        // so restore them from the persisted record rather than the defaulted
+        // `false`/`None` that `From<&SessionConfig>` produced.
+        meta.pinned = record.pinned;
+        meta.archived_at = record.archived_at;
         meta
     }
 }
@@ -365,6 +378,10 @@ impl From<SessionMetadata> for SessionRecord {
             // state→record conversion below overrides this from the config.
             last_response_id: None,
             last_response_id_producer: None,
+            // Carry the daemon-owned flags so a record built from metadata
+            // keeps whatever the daemon last set.
+            pinned: meta.pinned,
+            archived_at: meta.archived_at,
         }
     }
 }
@@ -407,6 +424,8 @@ impl SessionMetadata {
             token_usage: Some(self.accumulated_usage),
             context_window: self.context_window,
             last_prompt_tokens: self.last_prompt_tokens,
+            pinned: self.pinned,
+            archived_at: self.archived_at,
         }
     }
 }
@@ -510,6 +529,11 @@ impl From<&SessionConfig> for SessionMetadata {
             accumulated_usage: config.accumulated_usage,
             context_window: config.context_window,
             last_prompt_tokens: config.last_prompt_tokens,
+            // SessionConfig does NOT carry the daemon-owned flags (the daemon
+            // is their authority — see `handle_update_metadata`'s preserve and
+            // `From<SessionRecord>`); default them here.
+            pinned: false,
+            archived_at: None,
         }
     }
 }
@@ -1977,6 +2001,12 @@ fn handle_get_summary(
         token_usage: Some(state.config.accumulated_usage),
         context_window: state.config.context_window,
         last_prompt_tokens: state.config.last_prompt_tokens,
+        // The session thread's `SessionConfig` does not carry the
+        // daemon-owned flags; this summary is only used by tests (the daemon's
+        // own `GetSession`/`ListSessions` reply from `SessionMetadata`), so the
+        // defaults are fine here.
+        pinned: false,
+        archived_at: None,
     });
     false
 }

@@ -64,5 +64,7 @@ pub fn make_session(id: u64, title: &str, model: &str, count: u32) -> choreo_pro
         token_usage: None,
         context_window: None,
         last_prompt_tokens: None,
+        pinned: false,
+        archived_at: None,
     }
 }

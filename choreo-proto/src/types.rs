@@ -494,6 +494,17 @@ pub struct SessionSummary {
     /// context size being sent to the model), if available.
     #[serde(default)]
     pub last_prompt_tokens: Option<u32>,
+    /// Whether this session is pinned (pinned sessions float to the top of
+    /// the sessions list). A daemon-owned per-session flag;
+    /// `#[serde(default)]` keeps older payloads deserializing as `false`.
+    #[serde(default)]
+    pub pinned: bool,
+    /// When this session was archived, as Unix-epoch-milliseconds (the same
+    /// time family as `created_at`/`last_modified`), or `None` when it is
+    /// not archived. A daemon-owned per-session flag; `#[serde(default)]`
+    /// keeps older payloads deserializing as `None`.
+    #[serde(default)]
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -583,6 +594,24 @@ pub enum ClientMessage {
     },
     DeleteSession {
         session_id: u64,
+    },
+    /// Set (or clear) the session's `pinned` flag. The daemon is the
+    /// authority: it updates its metadata index, persists the flag via a
+    /// read-modify-write that touches ONLY the two flag columns, and
+    /// broadcasts [`SessionEvent::SessionFlagsChanged`]. There is NO targeted
+    /// success reply — the broadcast is the success signal — but a failure
+    /// is reported to the requesting connection only.
+    SetSessionPinned {
+        session_id: u64,
+        pinned: bool,
+    },
+    /// Set (or clear) the session's `archived` state. Archiving stamps the
+    /// current time into the summary's `archived_at`; unarchiving clears it.
+    /// Same daemon-authoritative update/broadcast contract as
+    /// [`ClientMessage::SetSessionPinned`].
+    SetSessionArchived {
+        session_id: u64,
+        archived: bool,
     },
     AddAccount {
         name: String,
@@ -676,7 +705,7 @@ pub struct CatalogProvider {
 
 /// Session-scoped events produced by the daemon for a specific session.
 ///
-/// These 29 events used to be `DaemonMessage` variants that each carried
+/// These 31 events used to be `DaemonMessage` variants that each carried
 /// their own `session_id` field. They now live inside
 /// [`DaemonMessage::Session`], whose envelope supplies the origin session
 /// for every session-scoped event: `session_id: Some(id)`, present on the
@@ -841,6 +870,18 @@ pub enum SessionEvent {
     SessionDeleteFailed {
         error: String,
     },
+    /// The session's `pinned`/`archived_at` flags changed. This is a
+    /// daemon-GENERATED BROADCAST (it rides `DaemonState::broadcast()`, the
+    /// lifecycle fan-out that reaches both activity and summary subscribers),
+    /// NOT a targeted reply: the daemon command loop owns the flags, updates
+    /// its metadata index, persists them, and emits this once for every client
+    /// — the requesting client included — in place of a per-request
+    /// acknowledgement. It carries the full post-change flag state so a
+    /// subscriber can update its view directly.
+    SessionFlagsChanged {
+        pinned: bool,
+        archived_at: Option<i64>,
+    },
     TurnsUndone {
         turn_ids: Vec<u32>,
     },
@@ -919,7 +960,7 @@ pub enum KeystoreState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DaemonMessage {
     /// Single home for all session-scoped events. The envelope supplies the
-    /// origin `session_id` that used to ride on each of the 29 moved
+    /// origin `session_id` that used to ride on each of the 31 moved
     /// variants, so every inner [`SessionEvent`] has an origin session **by
     /// construction** when `session_id` is `Some(id)` (present on the wire
     /// as `Some(id)`). Connection-level replies with no origin session (e.g.
@@ -1464,6 +1505,8 @@ mod tests {
                 }),
                 context_window: Some(128_000),
                 last_prompt_tokens: Some(100),
+                pinned: id.is_multiple_of(2),
+                archived_at: id.is_multiple_of(3).then_some(1_700_000_000_000),
             }
         }
 
@@ -1515,6 +1558,16 @@ mod tests {
                 DaemonMessage::Session {
                     session_id: Some(1),
                     event: SessionEvent::SessionAttached,
+                },
+            ),
+            (
+                "SessionFlagsChanged",
+                DaemonMessage::Session {
+                    session_id: Some(1),
+                    event: SessionEvent::SessionFlagsChanged {
+                        pinned: true,
+                        archived_at: Some(1_700_000_000_000),
+                    },
                 },
             ),
             (

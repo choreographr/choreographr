@@ -94,6 +94,8 @@ fn open_db_creates_migrates_and_round_trips() {
         account_name: None,
         last_response_id: None,
         last_response_id_producer: None,
+        pinned: false,
+        archived_at: None,
     };
     db::write_session(&db, 7, &record).unwrap();
     let read = db::read_session(&db, 7).unwrap().unwrap();

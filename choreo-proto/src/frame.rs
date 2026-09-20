@@ -34,7 +34,11 @@ use std::io::Cursor;
 /// `SessionEvent::SessionCreated` is now notification-only and must never move
 /// a client's view. Fixes a client hijacking its own view when ANOTHER client
 /// created a session.
-pub const PROTOCOL_VERSION: u8 = 7;
+/// 8 = per-session `pinned`/`archived` flags: the new
+/// `ClientMessage::SetSessionPinned`/`SetSessionArchived` requests and the
+/// broadcast `SessionEvent::SessionFlagsChanged`, plus the
+/// `SessionSummary::pinned`/`archived_at` fields they surface.
+pub const PROTOCOL_VERSION: u8 = 8;
 /// Max serialised *payload* size, enforced identically on encode (before the
 /// 4-byte length prefix is added — [`encode_inner`]) and on decode
 /// (`read_payload`, which checks the length prefix before reading the body).

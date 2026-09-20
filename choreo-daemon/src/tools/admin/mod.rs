@@ -47,6 +47,8 @@ pub(crate) mod tests {
                             token_usage: Some(TokenUsage::default()),
                             context_window: None,
                             last_prompt_tokens: None,
+                            pinned: false,
+                            archived_at: None,
                         }));
                     }
                     DaemonCommand::GetSession {

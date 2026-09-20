@@ -492,6 +492,18 @@ pub enum DaemonCommand {
         session_id: u64,
         title: String,
     },
+    /// Set the daemon-owned `pinned`/`archived` flags of a session. `Some`
+    /// requests a change to that field; `None` leaves it untouched — so the
+    /// two client messages (`SetSessionPinned`/`SetSessionArchived`) share
+    /// this one command. Replies `Ok(())` on success, `Err` (targeted to the
+    /// requesting connection) on failure; the SUCCESS signal to other clients
+    /// is the broadcast `SessionFlagsChanged`.
+    SetSessionFlags {
+        session_id: u64,
+        pinned: Option<bool>,
+        archived: Option<bool>,
+        reply: std::sync::mpsc::Sender<io::Result<()>>,
+    },
     /// Set the session working directory, forwarded to the session's main
     /// loop for in-memory update, broadcast, and persistence.  The session
     /// replies once the change has been applied; the daemon replies with an
@@ -751,6 +763,12 @@ impl DaemonState {
             DaemonCommand::SetSessionTitle { session_id, title } => {
                 self.handle_set_session_title(session_id, title);
             }
+            DaemonCommand::SetSessionFlags {
+                session_id,
+                pinned,
+                archived,
+                reply,
+            } => self.handle_set_session_flags(session_id, pinned, archived, &reply),
             DaemonCommand::SetWorkingDir {
                 session_id,
                 path,
@@ -1226,6 +1244,9 @@ impl DaemonState {
             account_name: account_name.clone(),
             last_response_id: None,
             last_response_id_producer: None,
+            // New sessions start unpinned and unarchived.
+            pinned: false,
+            archived_at: None,
         };
 
         if let Err(e) = db::write_session(&self.db, sid, &record) {
@@ -1247,6 +1268,10 @@ impl DaemonState {
             accumulated_usage: TokenUsage::default(),
             context_window,
             last_prompt_tokens: None,
+            // A brand-new session starts unpinned and unarchived; these are
+            // daemon-owned and afterwards preserved across UpdateMetadata.
+            pinned: false,
+            archived_at: None,
         };
         let session_tx = self.spawn_session(sid, record, metadata);
 
@@ -1385,8 +1410,12 @@ impl DaemonState {
         // Newest first; the session_id tiebreak keeps equal timestamps
         // deterministic (no ordering jitter between refreshes).
         summaries.sort_by(|a, b| {
-            b.last_modified
-                .cmp(&a.last_modified)
+            // Pinned sessions float to the top; then newest-first; then a
+            // session_id tiebreak keeps equal timestamps deterministic (no
+            // ordering jitter between refreshes).
+            b.pinned
+                .cmp(&a.pinned)
+                .then_with(|| b.last_modified.cmp(&a.last_modified))
                 .then_with(|| b.session_id.cmp(&a.session_id))
         });
         let _ = reply.send(summaries);
@@ -1403,6 +1432,74 @@ impl DaemonState {
             .get(&session_id)
             .map(|meta| meta.to_summary(session_id));
         let _ = reply.send(summary);
+    }
+
+    /// Set the daemon-owned `pinned`/`archived` flags of a session. The daemon
+    /// is the authority: it updates its in-memory index, persists ONLY the two
+    /// flag fields (a read-modify-write that cannot clobber the rest of the
+    /// record the session thread owns), and broadcasts
+    /// `SessionFlagsChanged` to every subscriber. There is no targeted SUCCESS
+    /// reply (the broadcast is the signal); a failure is reported to the
+    /// requesting connection only.
+    fn handle_set_session_flags(
+        &mut self,
+        session_id: u64,
+        pinned: Option<bool>,
+        archived: Option<bool>,
+        reply: &std::sync::mpsc::Sender<io::Result<()>>,
+    ) {
+        debug!(session_id, ?pinned, ?archived, "SetSessionFlags");
+        // A deleted session must not be resurrected by a flag update — the
+        // same guard every other index mutation uses.
+        if self.deleted_sessions.contains(&session_id) {
+            let _ = reply.send(Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "session not found",
+            )));
+            return;
+        }
+        // Resolve the post-change state from the daemon's index, applying only
+        // the fields the request asked to change. Read the two values out into
+        // locals so the `get_mut` borrow ends before the DB call and the
+        // broadcast below (both need `&self`/`&mut self`).
+        let Some(meta) = self.session_metadata.get_mut(&session_id) else {
+            let _ = reply.send(Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "session not found",
+            )));
+            return;
+        };
+        if let Some(v) = pinned {
+            meta.pinned = v;
+        }
+        if let Some(v) = archived {
+            // Archiving stamps the current time; unarchiving clears it.
+            meta.archived_at = if v {
+                Some(TimestampMs::now().as_millis())
+            } else {
+                None
+            };
+        }
+        let pinned = meta.pinned;
+        let archived_at = meta.archived_at;
+        // Persist ONLY the two flag fields via the read-modify-write helper, so
+        // a concurrent full-record write from the session thread can neither
+        // clobber these flags nor have its own fields clobbered here.
+        if let Err(e) = db::update_session_flags(&self.db, session_id, pinned, archived_at) {
+            warn!(session_id, error = %e, "failed to persist session flags");
+            let _ = reply.send(Err(e));
+            return;
+        }
+        // Broadcast the new flag state. This is the success signal for EVERY
+        // subscriber (including the requester); there is no targeted reply.
+        self.broadcast(&DaemonMessage::Session {
+            session_id: Some(session_id),
+            event: SessionEvent::SessionFlagsChanged {
+                pinned,
+                archived_at,
+            },
+        });
+        let _ = reply.send(Ok(()));
     }
 
     /// Update the in-memory metadata for a session.
@@ -1436,6 +1533,13 @@ impl DaemonState {
             if existing.status == SessionStatus::Sleeping {
                 metadata.status = SessionStatus::Sleeping;
             }
+
+            // The daemon OWNS the pinned/archived flags: the session thread's
+            // snapshot (`SessionMetadata::from(&SessionState)`) never carries
+            // them, so preserve the daemon's current values rather than letting
+            // a straggler snapshot reset them to the defaults.
+            metadata.pinned = existing.pinned;
+            metadata.archived_at = existing.archived_at;
         }
         // Detect a real account CHANGE before the metadata is moved into the
         // index: switching (or attaching) an account on a live session is the

@@ -430,6 +430,8 @@ fn handle_list_sessions_with_metadata() {
             accumulated_usage: TokenUsage::default(),
             context_window: None,
             last_prompt_tokens: None,
+            pinned: false,
+            archived_at: None,
         },
     );
     let (reply, rx) = mpsc::channel();
@@ -463,6 +465,8 @@ fn handle_list_sessions_orders_by_last_modified_desc() {
                 accumulated_usage: TokenUsage::default(),
                 context_window: None,
                 last_prompt_tokens: None,
+                pinned: false,
+                archived_at: None,
             },
         );
     }
@@ -498,6 +502,8 @@ fn handle_list_sessions_tiebreaks_by_session_id_desc() {
                 accumulated_usage: TokenUsage::default(),
                 context_window: None,
                 last_prompt_tokens: None,
+                pinned: false,
+                archived_at: None,
             },
         );
     }
@@ -520,6 +526,190 @@ fn handle_get_session_missing() {
     assert!(result.is_none());
 }
 
+/// A minimal metadata entry for the flag tests (all fields not relevant to the
+/// flag ordering/preserve behaviour are filler).
+fn flag_metadata(pinned: bool, archived_at: Option<i64>, last_modified: i64) -> SessionMetadata {
+    SessionMetadata {
+        title: Some("flags".into()),
+        selected_model: None,
+        reasoning_effort: None,
+        parent_session_id: None,
+        working_dir: None,
+        created_at: 1000,
+        last_modified,
+        turn_count: 0,
+        status: SessionStatus::Inactive,
+        active_tool_groups: vec![],
+        account_name: None,
+        accumulated_usage: TokenUsage::default(),
+        context_window: None,
+        last_prompt_tokens: None,
+        pinned,
+        archived_at,
+    }
+}
+
+/// A minimal persisted record for the flag tests.
+fn flag_record() -> crate::db::SessionRecord {
+    crate::db::SessionRecord {
+        title: Some("flags".into()),
+        selected_model: None,
+        reasoning_effort: None,
+        parent_session_id: None,
+        working_dir: None,
+        turn_count: 0,
+        created_at: 1000,
+        last_modified: 1000,
+        active_tool_groups: vec![],
+        context_config: choreo_proto::ContextConfig::default(),
+        account_name: None,
+        last_response_id: None,
+        last_response_id_producer: None,
+        pinned: false,
+        archived_at: None,
+    }
+}
+
+#[test]
+fn handle_set_session_flags_applies_persists_and_broadcasts() {
+    let (mut state, _rx) = make_daemon_state();
+    state
+        .session_metadata
+        .insert(1, flag_metadata(false, None, 1000));
+    // Persist a row so `update_session_flags` has something to modify.
+    db::write_session(&state.db, 1, &flag_record()).unwrap();
+
+    // A summary subscriber observes the broadcast (the success signal).
+    let (tx, rx) = test_sink();
+    state.handle_command(DaemonCommand::RegisterSummarySubscriber {
+        client_id: 1,
+        writer: tx,
+    });
+    let _ = rx.try_iter().count(); // drain any subscribe-time pushes
+
+    // Pin + archive.
+    let (reply, reply_rx) = mpsc::channel();
+    state.handle_command(DaemonCommand::SetSessionFlags {
+        session_id: 1,
+        pinned: Some(true),
+        archived: Some(true),
+        reply,
+    });
+    assert!(reply_rx.recv().unwrap().is_ok(), "flags set must succeed");
+
+    // The in-memory index is updated.
+    let meta = state.session_metadata.get(&1).unwrap();
+    assert!(meta.pinned);
+    assert!(meta.archived_at.is_some(), "archiving stamps a timestamp");
+    let stamped = meta.archived_at;
+
+    // And the DB row reflects ONLY the flags (via read_session).
+    let persisted = db::read_session(&state.db, 1).unwrap().unwrap();
+    assert!(persisted.pinned);
+    assert_eq!(persisted.archived_at, stamped);
+
+    // The broadcast carried the post-change flag state.
+    let broadcast = rx.try_iter().find_map(|m| match m {
+        DaemonMessage::Session {
+            session_id: Some(1),
+            event:
+                SessionEvent::SessionFlagsChanged {
+                    pinned,
+                    archived_at,
+                },
+        } => Some((pinned, archived_at)),
+        _ => None,
+    });
+    assert_eq!(
+        broadcast,
+        Some((true, stamped)),
+        "SessionFlagsChanged must be broadcast with the new flags"
+    );
+
+    // Unpin + unarchive clears the timestamp.
+    let (reply2, reply_rx2) = mpsc::channel();
+    state.handle_command(DaemonCommand::SetSessionFlags {
+        session_id: 1,
+        pinned: Some(false),
+        archived: Some(false),
+        reply: reply2,
+    });
+    assert!(reply_rx2.recv().unwrap().is_ok());
+    let meta = state.session_metadata.get(&1).unwrap();
+    assert!(!meta.pinned);
+    assert_eq!(meta.archived_at, None);
+    let persisted = db::read_session(&state.db, 1).unwrap().unwrap();
+    assert!(!persisted.pinned);
+    assert_eq!(persisted.archived_at, None);
+}
+
+#[test]
+fn handle_set_session_flags_missing_session_errors() {
+    let (mut state, _rx) = make_daemon_state();
+    let (reply, reply_rx) = mpsc::channel();
+    state.handle_command(DaemonCommand::SetSessionFlags {
+        session_id: 99,
+        pinned: Some(true),
+        archived: None,
+        reply,
+    });
+    let err = reply_rx
+        .recv()
+        .unwrap()
+        .expect_err("unknown session must fail");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+fn handle_update_metadata_preserves_daemon_flags() {
+    let (mut state, _rx) = make_daemon_state();
+    // The daemon has set flags on this session.
+    state
+        .session_metadata
+        .insert(1, flag_metadata(true, Some(4242), 1000));
+
+    // A session-thread snapshot arrives with the defaulted flags (it has no
+    // knowledge of them) — the preserve rule must keep the daemon's values.
+    state.handle_command(DaemonCommand::UpdateMetadata {
+        session_id: 1,
+        metadata: flag_metadata(false, None, 2000),
+    });
+
+    let stored = state.session_metadata.get(&1).unwrap();
+    assert!(
+        stored.pinned,
+        "pinned must survive an UpdateMetadata snapshot"
+    );
+    assert_eq!(
+        stored.archived_at,
+        Some(4242),
+        "archived_at must survive an UpdateMetadata snapshot"
+    );
+    // The snapshot's own fields still apply (monotonic last_modified).
+    assert_eq!(stored.last_modified, 2000);
+}
+
+#[test]
+fn handle_list_sessions_orders_pinned_first() {
+    let (mut state, _rx) = make_daemon_state();
+    // Session 1 is newer but unpinned; session 2 is older but pinned.
+    state
+        .session_metadata
+        .insert(1, flag_metadata(false, None, 9000));
+    state
+        .session_metadata
+        .insert(2, flag_metadata(true, None, 1000));
+    let (reply, rx) = mpsc::channel();
+    state.handle_command(DaemonCommand::ListSessions { reply });
+    let sessions: Vec<SessionSummary> = rx.recv().unwrap();
+    let ids: Vec<u64> = sessions.iter().map(|s| s.session_id).collect();
+    assert_eq!(
+        ids,
+        vec![2, 1],
+        "pinned session must float above newer unpinned"
+    );
+}
+
 #[test]
 fn handle_update_metadata() {
     let (mut state, _rx) = make_daemon_state();
@@ -540,6 +730,8 @@ fn handle_update_metadata() {
             accumulated_usage: TokenUsage::default(),
             context_window: None,
             last_prompt_tokens: None,
+            pinned: false,
+            archived_at: None,
         },
     );
     let new_meta = SessionMetadata {
@@ -557,6 +749,8 @@ fn handle_update_metadata() {
         accumulated_usage: TokenUsage::default(),
         context_window: None,
         last_prompt_tokens: None,
+        pinned: false,
+        archived_at: None,
     };
     state.handle_command(DaemonCommand::UpdateMetadata {
         session_id: 1,
@@ -592,6 +786,8 @@ fn handle_update_metadata_preserves_sleeping_status_after_exit() {
             accumulated_usage: TokenUsage::default(),
             context_window: None,
             last_prompt_tokens: None,
+            pinned: false,
+            archived_at: None,
         },
     );
     // Straggler snapshot from the (now dead) session thread — e.g. a
@@ -611,6 +807,8 @@ fn handle_update_metadata_preserves_sleeping_status_after_exit() {
         accumulated_usage: TokenUsage::default(),
         context_window: None,
         last_prompt_tokens: None,
+        pinned: false,
+        archived_at: None,
     };
     state.handle_command(DaemonCommand::UpdateMetadata {
         session_id: 1,
@@ -681,6 +879,8 @@ fn handle_broadcast_session_status() {
             accumulated_usage: TokenUsage::default(),
             context_window: None,
             last_prompt_tokens: None,
+            pinned: false,
+            archived_at: None,
         },
     );
     let (tx, rx) = test_sink();
@@ -743,6 +943,8 @@ fn handle_broadcast_session_status_dedups_against_session_and_activity_subscribe
             accumulated_usage: TokenUsage::default(),
             context_window: None,
             last_prompt_tokens: None,
+            pinned: false,
+            archived_at: None,
         },
     );
 
@@ -882,6 +1084,8 @@ fn handle_attach_session_rejects_deleted_session() {
         account_name: None,
         last_response_id: None,
         last_response_id_producer: None,
+        pinned: false,
+        archived_at: None,
     };
     db::write_session(&state.db, 1, &record).unwrap();
     // The deleted marker is set (the session thread has not yet exited,
@@ -928,6 +1132,8 @@ fn session_exited_finalizes_pending_delete() {
         account_name: None,
         last_response_id: None,
         last_response_id_producer: None,
+        pinned: false,
+        archived_at: None,
     };
     db::write_session(&state.db, 7, &record).unwrap();
     db::mark_session_deleted(&state.db, 7).unwrap();
@@ -981,6 +1187,8 @@ fn delete_finished_session_guards_against_straggler_resurrection() {
         account_name: None,
         last_response_id: None,
         last_response_id_producer: None,
+        pinned: false,
+        archived_at: None,
     };
     db::write_session(&state.db, 12, &record).unwrap();
     // A stale tombstone from an earlier interrupted delete of the same id.
@@ -1024,6 +1232,8 @@ fn delete_finished_session_guards_against_straggler_resurrection() {
             accumulated_usage: TokenUsage::default(),
             context_window: None,
             last_prompt_tokens: None,
+            pinned: false,
+            archived_at: None,
         },
     });
     assert!(
@@ -1071,6 +1281,8 @@ fn delete_session_clears_stale_tombstone_when_no_live_thread() {
         account_name: None,
         last_response_id: None,
         last_response_id_producer: None,
+        pinned: false,
+        archived_at: None,
     };
     db::write_session(&state.db, 3, &record).unwrap();
     db::mark_session_deleted(&state.db, 3).unwrap();
@@ -1115,6 +1327,8 @@ fn delete_session_defers_when_thread_alive() {
         account_name: None,
         last_response_id: None,
         last_response_id_producer: None,
+        pinned: false,
+        archived_at: None,
     };
     db::write_session(&state.db, 4, &record).unwrap();
     // A blocking stand-in session thread: not finished, so the delete
@@ -1165,6 +1379,8 @@ fn delete_session_keeps_tombstone_while_a_delete_is_pending() {
         account_name: None,
         last_response_id: None,
         last_response_id_producer: None,
+        pinned: false,
+        archived_at: None,
     };
     db::write_session(&state.db, 5, &record).unwrap();
     // First delete defers: live thread → marker set, tombstone written,
@@ -1234,6 +1450,8 @@ fn session_exited_does_not_delete_non_deleted_session() {
         account_name: None,
         last_response_id: None,
         last_response_id_producer: None,
+        pinned: false,
+        archived_at: None,
     };
     db::write_session(&state.db, 8, &record).unwrap();
 
@@ -1397,6 +1615,8 @@ fn handle_validate_model_rejects_when_no_provider() {
             accumulated_usage: TokenUsage::default(),
             context_window: None,
             last_prompt_tokens: None,
+            pinned: false,
+            archived_at: None,
         },
     );
     let (reply, rx) = mpsc::channel();
@@ -1435,6 +1655,8 @@ fn handle_validate_model_rejects_unknown_model() {
             accumulated_usage: TokenUsage::default(),
             context_window: None,
             last_prompt_tokens: None,
+            pinned: false,
+            archived_at: None,
         },
     );
     seed_credentialed_account(&mut state, "test-account", "openai");
@@ -1478,6 +1700,8 @@ fn handle_validate_model_allows_known_model() {
             accumulated_usage: TokenUsage::default(),
             context_window: None,
             last_prompt_tokens: None,
+            pinned: false,
+            archived_at: None,
         },
     );
     seed_credentialed_account(&mut state, "test-account", "openai");
@@ -1527,6 +1751,8 @@ fn handle_set_session_title_forwards_to_session() {
             accumulated_usage: TokenUsage::default(),
             context_window: None,
             last_prompt_tokens: None,
+            pinned: false,
+            archived_at: None,
         },
     );
 
@@ -1936,6 +2162,8 @@ fn insert_active_session_with_account(
             accumulated_usage: TokenUsage::default(),
             context_window: None,
             last_prompt_tokens: None,
+            pinned: false,
+            archived_at: None,
         },
     );
     insert_active_session(state, session_id)
@@ -3292,6 +3520,8 @@ fn update_metadata_account_change_spawns_background_prefetch() {
             accumulated_usage: TokenUsage::default(),
             context_window: None,
             last_prompt_tokens: None,
+            pinned: false,
+            archived_at: None,
         },
     );
 
@@ -3387,6 +3617,8 @@ fn state_with_session_account(account: &str) -> (DaemonState, mpsc::Receiver<Dae
             accumulated_usage: TokenUsage::default(),
             context_window: None,
             last_prompt_tokens: None,
+            pinned: false,
+            archived_at: None,
         },
     );
     (state, rx)

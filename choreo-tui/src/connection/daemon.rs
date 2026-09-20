@@ -738,6 +738,17 @@ pub(crate) fn handle_daemon_message(
                 record_confirmed_unlock_key(app);
             }
         },
+        DaemonMessage::Session {
+            event: SessionEvent::SessionFlagsChanged { .. },
+            ..
+        } => {
+            // Per-session `pinned`/`archived_at` flag change. The backend
+            // broadcasts this so every subscriber can refresh its view; the
+            // TUI's pin/archive UX arrives in a LATER change, so this is
+            // deliberately a no-op for now (and must NOT fall through to the
+            // generic dispatch, which has nothing to render for it).
+            return Ok(());
+        }
         _ => {}
     }
 
