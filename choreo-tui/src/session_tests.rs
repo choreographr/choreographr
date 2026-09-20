@@ -1399,12 +1399,13 @@ fn session_created_for_user_session_attaches_on_chat_page() {
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
 
-    // A user-created session (parent_session_id = None) keeps the old
+    // The direct reply to THIS client's CreateSession
+    // (`SessionCreatedForRequester`, parent_session_id = None) keeps the old
     // behavior: switch the view and attach.
     handle_daemon_message(
         DaemonMessage::Session {
             session_id: Some(99),
-            event: SessionEvent::SessionCreated {
+            event: SessionEvent::SessionCreatedForRequester {
                 parent_session_id: None,
                 title: None,
                 working_dir: None,
@@ -1416,7 +1417,7 @@ fn session_created_for_user_session_attaches_on_chat_page() {
         &mut app,
         &tx,
     )
-    .expect("handle SessionCreated");
+    .expect("handle SessionCreatedForRequester");
 
     assert_eq!(app.attached_session_id, Some(99));
     assert_eq!(app.active_session_id, Some(99));
@@ -1435,6 +1436,98 @@ fn session_created_for_user_session_attaches_on_chat_page() {
     assert!(
         msgs.iter()
             .any(|m| matches!(m, ClientMessage::ListSessions))
+    );
+}
+
+// ── A BROADCAST SessionCreated must never hijack the view ──
+
+#[test]
+fn session_created_broadcast_does_not_attach_on_chat_page() {
+    // The phone scenario: ANOTHER client created the session, so this client
+    // only sees the broadcast `SessionCreated` (parent_session_id = None).
+    // It must not move the view.
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+
+    handle_daemon_message(
+        DaemonMessage::Session {
+            session_id: Some(99),
+            event: SessionEvent::SessionCreated {
+                parent_session_id: None,
+                title: None,
+                working_dir: None,
+                account_name: Some("acct".to_string()),
+                selected_model: Some("gpt-new".to_string()),
+                reasoning_effort: None,
+            },
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle SessionCreated broadcast");
+
+    assert_eq!(
+        app.attached_session_id,
+        Some(42),
+        "another client's creation must not change the attached session"
+    );
+    assert_eq!(app.active_session_id, Some(42));
+    let msgs: Vec<ClientMessage> = rx.try_iter().collect();
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| matches!(m, ClientMessage::AttachSession { .. })),
+        "a broadcast create must not auto-attach"
+    );
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| matches!(m, ClientMessage::ListSessions)),
+        "on the Chat page a broadcast create must not refresh the list — \
+         the Sessions reply would rewrite the status line"
+    );
+}
+
+#[test]
+fn session_created_broadcast_on_session_manager_refreshes_list_only() {
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    app.page = Page::SessionManager;
+
+    handle_daemon_message(
+        DaemonMessage::Session {
+            session_id: Some(99),
+            event: SessionEvent::SessionCreated {
+                parent_session_id: None,
+                title: None,
+                working_dir: None,
+                account_name: None,
+                selected_model: None,
+                reasoning_effort: None,
+            },
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle SessionCreated broadcast");
+
+    assert_eq!(app.attached_session_id, Some(42));
+    assert_eq!(app.active_session_id, Some(42));
+    let msgs: Vec<ClientMessage> = rx.try_iter().collect();
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| matches!(m, ClientMessage::AttachSession { .. })),
+        "a broadcast create must not auto-attach"
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, ClientMessage::ListSessions)),
+        "on the Session Manager page the list must refresh so the new session is visible"
     );
 }
 

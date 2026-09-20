@@ -698,6 +698,32 @@ pub enum SessionEvent {
         selected_model: Option<String>,
         reasoning_effort: Option<String>,
     },
+    /// Direct reply to the creating connection's [`ClientMessage::CreateSession`].
+    ///
+    /// Unlike [`SessionEvent::SessionCreated`] — which is BROADCAST to every
+    /// subscriber as a notification — this variant is sent ONLY to the client
+    /// that sent the `CreateSession`, and it is the one session-lifecycle
+    /// message that carries requester-relative intent: a frontend MAY move its
+    /// own view (attach to the session the local user just created). Every
+    /// OTHER client learns of the new session through the broadcast
+    /// `SessionCreated`, which is notification-only and must NEVER move an
+    /// existing client's attachment.
+    ///
+    /// The two are separate variants rather than one flagged variant because
+    /// they have different audiences (requester vs. everyone) and different
+    /// handling (attach vs. list-update). Overloading one variant for both is
+    /// exactly what let another client's creation hijack this client's view
+    /// (the daemon allocated the id, so a reply was required, and the reply was
+    /// indistinguishable from the broadcast). A sub-session still arrives as a
+    /// broadcast `SessionCreated` with a non-null `parent_session_id`.
+    SessionCreatedForRequester {
+        title: Option<String>,
+        parent_session_id: Option<u64>,
+        working_dir: Option<String>,
+        account_name: Option<String>,
+        selected_model: Option<String>,
+        reasoning_effort: Option<String>,
+    },
     SessionAttached,
     SessionState {
         title: Option<String>,
@@ -1457,6 +1483,20 @@ mod tests {
                     event: SessionEvent::SessionCreated {
                         title: Some("t".into()),
                         parent_session_id: Some(2),
+                        working_dir: Some("/tmp".into()),
+                        account_name: Some("default".into()),
+                        selected_model: Some("gpt-5.6".into()),
+                        reasoning_effort: Some("high".into()),
+                    },
+                },
+            ),
+            (
+                "SessionCreatedForRequester",
+                DaemonMessage::Session {
+                    session_id: Some(1),
+                    event: SessionEvent::SessionCreatedForRequester {
+                        title: Some("t".into()),
+                        parent_session_id: None,
                         working_dir: Some("/tmp".into()),
                         account_name: Some("default".into()),
                         selected_model: Some("gpt-5.6".into()),

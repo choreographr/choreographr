@@ -159,14 +159,14 @@ fn sigint_exits_after_create_session_connect_and_disconnect() {
                 reasoning_effort: None,
             })
             .expect("send create session");
-        // Wait for the SessionCreated broadcast (it follows the direct
-        // reply), so the session thread is up before the client goes away.
+        // Wait for the create reply (it follows the direct-reply path), so
+        // the session thread is up before the client goes away.
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut created = false;
         while Instant::now() < deadline {
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(DaemonMessage::Session {
-                    event: SessionEvent::SessionCreated { .. },
+                    event: SessionEvent::SessionCreatedForRequester { .. },
                     ..
                 }) => {
                     created = true;

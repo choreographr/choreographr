@@ -1349,6 +1349,41 @@ impl App {
         Ok(())
     }
 
+    /// Handle the BROADCAST notification that a session was created — by any
+    /// client, this one included (a create arrives both as the direct
+    /// `SessionCreatedForRequester` reply and as the `SessionCreated`
+    /// notification).
+    ///
+    /// Unlike [`App::handle_session_created`] — the direct reply to THIS
+    /// client's create, which auto-attaches — a notification must NEVER change
+    /// the attached session. This is the fix for the phone-view-follows-laptop
+    /// bug: before the split, a broadcast create was indistinguishable from
+    /// the reply and every client attached to it.
+    ///
+    /// The only action is to keep the session list current *when the user is
+    /// looking at it*: on the Session Manager page an unsolicited `ListSessions`
+    /// renders a fresh list; on the Chat page it would rewrite the status line
+    /// for an event the user did not initiate, so it is skipped — matching the
+    /// sub-session-on-the-Chat-page rule in `handle_session_created`.
+    pub(crate) fn note_session_created(
+        &mut self,
+        session_id: u64,
+        parent_session_id: Option<u64>,
+        client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    ) {
+        tracing::debug!(
+            session_id,
+            parent_session_id,
+            "session created elsewhere — refreshing list only, not attaching",
+        );
+        if self.page == Page::SessionManager {
+            // Best-effort refresh: a broken channel means the whole connection
+            // is tearing down, and the reply renders into the session list
+            // (never the status line), so there is nothing to propagate.
+            let _ = client_tx.send(ClientMessage::ListSessions);
+        }
+    }
+
     pub(crate) fn handle_session_attached(&mut self, session_id: u64) {
         self.active_session_id = Some(session_id);
         self.attached_session_id = Some(session_id);

@@ -41,8 +41,8 @@ fn open_state(dir: &tempfile::TempDir) -> DaemonState {
 }
 
 /// Create a session and wait for the connection-level reply (the
-/// `SessionCreated` event comes back to the CREATING client directly, via
-/// the same single-writer channel broadcasts ride on).
+/// `SessionCreatedForRequester` event comes back to the CREATING client
+/// directly, via the same single-writer channel broadcasts ride on).
 fn create_session(link: &choreo_daemon::EmbeddedLink) -> u64 {
     link.client_tx
         .send(ClientMessage::CreateSession {
@@ -57,10 +57,13 @@ fn create_session(link: &choreo_daemon::EmbeddedLink) -> u64 {
         .unwrap();
     loop {
         // Session-status broadcasts and other traffic are expected here;
-        // keep waiting for the connection-level creation reply.
+        // keep waiting for the connection-level creation reply. The reply to
+        // OUR CreateSession is `SessionCreatedForRequester`; the broadcast
+        // `SessionCreated` (if this link is subscribed) is also acceptable.
         if let DaemonMessage::Session {
             session_id: Some(sid),
-            event: SessionEvent::SessionCreated { .. },
+            event:
+                SessionEvent::SessionCreatedForRequester { .. } | SessionEvent::SessionCreated { .. },
         } = link.daemon_rx.recv().unwrap()
         {
             return sid;

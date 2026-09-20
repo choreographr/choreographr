@@ -493,9 +493,9 @@ fn evicts_client_that_stops_reading() {
     let session_id = match read_message::<_, DaemonMessage>(&mut stream) {
         DaemonMessage::Session {
             session_id: Some(session_id),
-            event: SessionEvent::SessionCreated { .. },
+            event: SessionEvent::SessionCreatedForRequester { .. },
         } => session_id,
-        other => panic!("expected SessionCreated, got {other:?}"),
+        other => panic!("expected SessionCreatedForRequester, got {other:?}"),
     };
 
     write_message(&mut stream, &ClientMessage::AttachSession { session_id });

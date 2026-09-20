@@ -415,7 +415,7 @@ fn dispatch_session_event(
     };
 
     match event {
-        SessionEvent::SessionCreated {
+        SessionEvent::SessionCreatedForRequester {
             title,
             working_dir,
             account_name,
@@ -423,6 +423,10 @@ fn dispatch_session_event(
             reasoning_effort,
             ..
         } => {
+            // Direct reply to THIS client's CreateSession. This is the only
+            // create-driven event allowed to move the view: `handle_session_
+            // created` carries requester-relative intent (attach to the
+            // session the local user just asked for).
             handler.handle_session_created(
                 *session_id,
                 title.clone(),
@@ -431,6 +435,13 @@ fn dispatch_session_event(
                 selected_model.clone(),
                 reasoning_effort.clone(),
             );
+        }
+        SessionEvent::SessionCreated { .. } => {
+            // Broadcast notification that a session now exists (created by
+            // ANY client). Deliberately a no-op: routing it to
+            // `handle_session_created` would attach every client to another
+            // client's creation. Keeping the session list fresh is each
+            // frontend's own concern (it refreshes via `ListSessions`).
         }
         SessionEvent::SessionAttached => {
             handler.handle_session_attached(*session_id);

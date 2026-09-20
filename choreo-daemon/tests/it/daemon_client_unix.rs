@@ -187,9 +187,9 @@ fn unix_list_sessions_round_trip() {
     match client.recv() {
         DaemonMessage::Session {
             session_id: Some(session_id),
-            event: SessionEvent::SessionCreated { .. },
+            event: SessionEvent::SessionCreatedForRequester { .. },
         } => assert_eq!(session_id, 1),
-        other => panic!("expected SessionCreated, got {other:?}"),
+        other => panic!("expected SessionCreatedForRequester, got {other:?}"),
     }
 
     // The new session is now visible to ListSessions — exactly one entry,
@@ -218,9 +218,9 @@ fn unix_create_session_then_attach() {
     match client.recv() {
         DaemonMessage::Session {
             session_id: Some(session_id),
-            event: SessionEvent::SessionCreated { .. },
+            event: SessionEvent::SessionCreatedForRequester { .. },
         } => assert_eq!(session_id, 1),
-        other => panic!("expected SessionCreated, got {other:?}"),
+        other => panic!("expected SessionCreatedForRequester, got {other:?}"),
     }
 
     // Attach to the session we just created. The daemon deliberately sends
@@ -287,9 +287,9 @@ fn unix_two_clients_isolated_and_shared_state() {
     match client_a.recv() {
         DaemonMessage::Session {
             session_id: Some(session_id),
-            event: SessionEvent::SessionCreated { .. },
+            event: SessionEvent::SessionCreatedForRequester { .. },
         } => assert_eq!(session_id, 1),
-        other => panic!("expected SessionCreated, got {other:?}"),
+        other => panic!("expected SessionCreatedForRequester, got {other:?}"),
     }
 
     // ...and B sees it: daemon state is shared across connections even

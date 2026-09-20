@@ -819,9 +819,12 @@ fn handle_sync_message(
 
         DaemonMessage::Session {
             session_id: Some(session_id),
-            event: SessionEvent::SessionCreated { .. },
+            event: SessionEvent::SessionCreatedForRequester { .. },
             ..
         } => {
+            // The create reply now arrives as its own variant (distinct from
+            // the notification-only `SessionCreated` broadcast); it is what
+            // completes ACP's outstanding `NewSession` request.
             if let Some(entry) = pending.take_sync(&PendingKind::CreateSession) {
                 let acp_id = sessions.create(*session_id);
                 send_to_daemon(

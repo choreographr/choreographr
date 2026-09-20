@@ -28,7 +28,13 @@ use std::io::Cursor;
 /// carry only `ImageMetadata`. Clients fetch an image's bytes on demand via
 /// the new `ClientMessage::GetImage` ⇄ `DaemonMessage::Image` pair, so opening
 /// a long session no longer transfers its entire image history.
-pub const PROTOCOL_VERSION: u8 = 6;
+/// 7 = the create-session reply is split from the create-session broadcast:
+/// `SessionEvent::SessionCreatedForRequester` is the direct reply to the
+/// creating connection (frontends may attach to it), while
+/// `SessionEvent::SessionCreated` is now notification-only and must never move
+/// a client's view. Fixes a client hijacking its own view when ANOTHER client
+/// created a session.
+pub const PROTOCOL_VERSION: u8 = 7;
 /// Max serialised *payload* size, enforced identically on encode (before the
 /// 4-byte length prefix is added — [`encode_inner`]) and on decode
 /// (`read_payload`, which checks the length prefix before reading the body).

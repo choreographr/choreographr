@@ -1265,6 +1265,11 @@ impl DaemonState {
 
         let _ = reply.send(Ok((sid, session_tx)));
         crate::metrics::record_session_created();
+        // BROADCAST notification only: every subscriber learns a session now
+        // exists, but this must NOT move any client's view. The direct reply
+        // that lets the CREATING client attach is `SessionCreatedForRequester`,
+        // built and sent in the connection thread (`handle_client_create_session`)
+        // — see the split documented on `SessionEvent`.
         let created_msg = DaemonMessage::Session {
             session_id: Some(sid),
             event: SessionEvent::SessionCreated {

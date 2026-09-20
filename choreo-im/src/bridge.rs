@@ -432,6 +432,7 @@ fn daemon_to_bridge_events(
         DaemonMessage::Session {
             event:
                 SessionEvent::SessionCreated { .. }
+                | SessionEvent::SessionCreatedForRequester { .. }
                 | SessionEvent::SessionAttached
                 | SessionEvent::SessionState { .. }
                 | SessionEvent::SessionStatusChanged { .. }

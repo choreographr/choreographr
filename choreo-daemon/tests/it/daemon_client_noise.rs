@@ -229,9 +229,9 @@ fn noise_list_sessions_round_trip() {
     match client.recv() {
         DaemonMessage::Session {
             session_id: Some(session_id),
-            event: SessionEvent::SessionCreated { .. },
+            event: SessionEvent::SessionCreatedForRequester { .. },
         } => assert_eq!(session_id, 1),
-        other => panic!("expected SessionCreated, got {other:?}"),
+        other => panic!("expected SessionCreatedForRequester, got {other:?}"),
     }
 
     // The new session is visible to ListSessions — exactly one entry,
@@ -305,9 +305,9 @@ fn noise_and_unix_share_daemon_state() {
     match noise_client.recv() {
         DaemonMessage::Session {
             session_id: Some(session_id),
-            event: SessionEvent::SessionCreated { .. },
+            event: SessionEvent::SessionCreatedForRequester { .. },
         } => assert_eq!(session_id, 1),
-        other => panic!("expected SessionCreated, got {other:?}"),
+        other => panic!("expected SessionCreatedForRequester, got {other:?}"),
     }
 
     // ...and the Unix client sees it: both listeners serve the same
@@ -386,18 +386,19 @@ fn noise_subscribe_receives_session_broadcasts() {
     }
 
     // B creates a session. An unsubscribed client must receive only the
-    // DIRECT SessionCreated reply — not the duplicate SessionCreated and
-    // SessionStatusChanged broadcasts that the old auto-registration pushed
-    // onto every TCP client's writer channel. (Under auto-registration this
-    // single recv could have returned either broadcast first, which is why
-    // the old tests drained; the exact-one-message assert below is the pin.)
+    // DIRECT `SessionCreatedForRequester` reply — not the duplicate
+    // SessionCreated and SessionStatusChanged broadcasts that the old
+    // auto-registration pushed onto every TCP client's writer channel.
+    // (Under auto-registration this single recv could have returned either
+    // broadcast first, which is why the old tests drained; the
+    // exact-one-message assert below is the pin.)
     client_b.send(create_session());
     match client_b.recv() {
         DaemonMessage::Session {
             session_id: Some(session_id),
-            event: SessionEvent::SessionCreated { .. },
+            event: SessionEvent::SessionCreatedForRequester { .. },
         } => assert_eq!(session_id, 1),
-        other => panic!("expected SessionCreated, got {other:?}"),
+        other => panic!("expected SessionCreatedForRequester, got {other:?}"),
     }
 
     // A, subscribed, sees B's creation as two summary broadcasts: a
@@ -435,17 +436,25 @@ fn noise_subscribe_receives_session_broadcasts() {
         "subscribed client must receive the SessionStatusChanged broadcast"
     );
 
-    // A creates a session too. A receives three messages for it — the
-    // direct SessionCreated reply plus its own broadcast SessionCreated and
-    // SessionStatusChanged — in racy order, so count rather than sequence
-    // them. B (unsubscribed) must stay quiet: a Ping's Pong has to be B's
-    // very next message, which it could not be if any broadcast about A's
-    // session had leaked onto B's writer channel.
+    // A creates a session too. A receives three messages for it — the direct
+    // `SessionCreatedForRequester` reply plus its own broadcast
+    // `SessionCreated` and `SessionStatusChanged` — in racy order, so count
+    // rather than sequence them. B (unsubscribed) must stay quiet: a Ping's
+    // Pong has to be B's very next message, which it could not be if any
+    // broadcast about A's session had leaked onto B's writer channel.
     client_a.send(create_session());
+    let mut requester_2 = 0;
     let mut created_2 = 0;
     let mut status_2 = 0;
     for _ in 0..3 {
         match client_a.recv() {
+            DaemonMessage::Session {
+                session_id: Some(session_id),
+                event: SessionEvent::SessionCreatedForRequester { .. },
+            } => {
+                assert_eq!(session_id, 2);
+                requester_2 += 1;
+            }
             DaemonMessage::Session {
                 session_id: Some(session_id),
                 event: SessionEvent::SessionCreated { .. },
@@ -463,7 +472,8 @@ fn noise_subscribe_receives_session_broadcasts() {
             other => panic!("expected session 2 traffic, got {other:?}"),
         }
     }
-    assert_eq!(created_2, 2, "direct reply + broadcast SessionCreated");
+    assert_eq!(requester_2, 1, "direct SessionCreatedForRequester reply");
+    assert_eq!(created_2, 1, "broadcast SessionCreated");
     assert_eq!(status_2, 1, "broadcast SessionStatusChanged");
 
     client_b.send(ClientMessage::Ping);
@@ -667,11 +677,11 @@ fn noise_large_message_daemon_to_client() {
         match client.recv() {
             DaemonMessage::Session {
                 session_id: Some(session_id),
-                event: SessionEvent::SessionCreated { .. },
+                event: SessionEvent::SessionCreatedForRequester { .. },
             } => {
                 assert_eq!(session_id, (i + 1) as u64);
             }
-            other => panic!("expected SessionCreated, got {other:?}"),
+            other => panic!("expected SessionCreatedForRequester, got {other:?}"),
         }
     }
 

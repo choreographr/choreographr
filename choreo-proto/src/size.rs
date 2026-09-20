@@ -172,6 +172,14 @@ fn session_event_size(event: &SessionEvent) -> usize {
             selected_model,
             reasoning_effort,
             ..
+        }
+        | SessionEvent::SessionCreatedForRequester {
+            title,
+            working_dir,
+            account_name,
+            selected_model,
+            reasoning_effort,
+            ..
         } => {
             named_field_overhead(6)
                 + option_str_len(title.as_ref())

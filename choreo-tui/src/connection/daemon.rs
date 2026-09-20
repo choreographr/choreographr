@@ -24,7 +24,7 @@ pub(crate) fn handle_daemon_message(
         DaemonMessage::Session {
             session_id: Some(session_id),
             event:
-                SessionEvent::SessionCreated {
+                SessionEvent::SessionCreatedForRequester {
                     parent_session_id,
                     account_name,
                     selected_model,
@@ -33,15 +33,12 @@ pub(crate) fn handle_daemon_message(
                 },
             ..
         } => {
-            // Already known — nothing to do, and skip the generic dispatch too.
-            if app
-                .session_mgr
-                .sessions
-                .iter()
-                .any(|s| s.session_id == *session_id)
-            {
-                return Ok(());
-            }
+            // Direct reply to THIS client's `CreateSession` — the only
+            // create-driven event that moves the view (attach to the session
+            // the local user just made). NOT gated by an "already known"
+            // check: the notification broadcast (below) may have added the
+            // session to the list first — their arrival order is not
+            // guaranteed — and that must not suppress the attach.
             app.handle_session_created(
                 *session_id,
                 *parent_session_id,
@@ -53,6 +50,25 @@ pub(crate) fn handle_daemon_message(
             // Early return so we don't fall through to dispatch_daemon_message,
             // which would push text to the chat history (duplicate / invisible
             // on the Session Manager page).
+            return Ok(());
+        }
+        DaemonMessage::Session {
+            session_id: Some(session_id),
+            event:
+                SessionEvent::SessionCreated {
+                    parent_session_id, ..
+                },
+            ..
+        } => {
+            // Broadcast notification that SOME connection created a session
+            // (possibly ours, via the broadcast half of the create). It must
+            // never move the view — only the direct ForRequester reply above
+            // does that — so this only keeps the session list current when the
+            // user is looking at it. This is the fix for a session created by
+            // another client (e.g. the phone's view following the laptop).
+            app.note_session_created(*session_id, *parent_session_id, client_tx);
+            // Early return: the generic dispatch would push text to the chat
+            // history for a session the user never opened.
             return Ok(());
         }
         DaemonMessage::Session {

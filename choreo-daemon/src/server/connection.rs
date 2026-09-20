@@ -1191,11 +1191,16 @@ fn handle_client_create_session(
             // the user presses Enter on a session.
             // This keeps the old session alive when
             // creating from the session manager page.
+            // The reply to THIS connection's CreateSession is
+            // `SessionCreatedForRequester` — the frontend may attach to it.
+            // The daemon separately broadcasts `SessionCreated` to every
+            // subscriber (see `DaemonState::handle_create_session`), where it
+            // is notification-only and must not move a client's view.
             send_to_writer(
                 ctx,
                 &DaemonMessage::Session {
                     session_id: Some(sid),
-                    event: SessionEvent::SessionCreated {
+                    event: SessionEvent::SessionCreatedForRequester {
                         title,
                         parent_session_id,
                         working_dir: cwd_str,

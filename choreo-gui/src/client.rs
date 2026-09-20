@@ -206,13 +206,14 @@ fn handle_session_message(
     match message {
         DaemonMessage::Session {
             session_id: Some(session_id),
-            event: SessionEvent::SessionCreated { .. } | SessionEvent::SessionAttached,
+            event: SessionEvent::SessionCreatedForRequester { .. } | SessionEvent::SessionAttached,
         } => {
-            // The envelope's `session_id` is now `Option<u64>`; these two
-            // events are always session-scoped (the daemon never emits them
-            // with `None`), so binding `Some(session_id)` gives us the origin
-            // session id directly. Record the new attached session id, but
-            // let dispatch emit the informational text message.
+            // Attach ONLY to the direct reply to this connection's own
+            // CreateSession (`SessionCreatedForRequester`) or an AttachSession
+            // ack — never to the broadcast `SessionCreated` notification, which
+            // would make the GUI follow a session another client created.
+            // Record the new attached session id, but let dispatch emit the
+            // informational text message.
             state.attached_session_id = Some(*session_id);
             false
         }
