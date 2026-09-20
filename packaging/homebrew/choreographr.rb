@@ -19,19 +19,19 @@
 class Choreographr < Formula
   desc "Agentic coding assistant — daemon, TUI, and bridges"
   homepage "https://choreographr.com"
-  version "0.2.1"
+  version "0.2.2"
 
   # Both macOS targets ship: aarch64 (native) and x86_64 (cross-built with
   # target-cpu=x86-64-v3 on the arm64 CI host — see scripts/release.sh). brew
   # selects the branch at install time via Hardware::CPU, matching the
   # installer's own Homebrew prefix (/opt/homebrew vs /usr/local).
   if Hardware::CPU.arm?
-    url "https://github.com/choreographr/choreographr/releases/download/v0.2.1/choreographr-0.2.1-aarch64-apple-darwin.tar.gz"
-    sha256 "efe730748688c5c7e665bb7f56b155c0b60fe19c784e2d64ef11d455cb77f7f2"
+    url "https://github.com/choreographr/choreographr/releases/download/v0.2.2/choreographr-0.2.2-aarch64-apple-darwin.tar.gz"
+    sha256 "949736b7c137110c0ebe0b8a44e31c58257825c686f82600328e773fc4361485"
   else
     # x86_64-apple-darwin: cross-built by release.sh on the arm64 CI host.
-    url "https://github.com/choreographr/choreographr/releases/download/v0.2.1/choreographr-0.2.1-x86_64-apple-darwin.tar.gz"
-    sha256 "9c3506fb1ff3cc83dda0c7430dde92fb9b5fb580ea21d1596a27bf51b1c6fe29"
+    url "https://github.com/choreographr/choreographr/releases/download/v0.2.2/choreographr-0.2.2-x86_64-apple-darwin.tar.gz"
+    sha256 "b934fb2c859c06c44cf2c6f555f7e61f9abf8ad4de1bca781c70357f9f68ba0f"
   end
 
   def install
