@@ -38,6 +38,7 @@ mod input;
 mod layout;
 mod pages;
 mod providers;
+mod session_manager;
 
 // Compatibility layer: every item moved into the sibling modules is
 // re-exported here so `crate::state::X` references (in this crate and in
@@ -47,6 +48,7 @@ pub(crate) use input::*;
 pub(crate) use layout::*;
 pub(crate) use pages::*;
 pub(crate) use providers::*;
+pub(crate) use session_manager::*;
 
 pub(crate) const STATUS_BAR_HEIGHT: u16 = 1;
 pub(crate) const MIN_INPUT_CONTENT_LINES: u16 = 1;
