@@ -2765,7 +2765,7 @@ dependencies = [
 
 [[package]]
 name = "choreo-acp"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "choreo-proto",
@@ -2782,7 +2782,7 @@ dependencies = [
 
 [[package]]
 name = "choreo-ai-protocols"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2812,7 +2812,7 @@ dependencies = [
 
 [[package]]
 name = "choreo-blockchain"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "alloy",
  "choreo-sanitize",
@@ -2829,7 +2829,7 @@ dependencies = [
 
 [[package]]
 name = "choreo-client-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64 0.23.1",
  "choreo-keystore",
@@ -2850,7 +2850,7 @@ dependencies = [
 
 [[package]]
 name = "choreo-content"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bs58",
  "choreo-keystore",
@@ -2877,7 +2877,7 @@ dependencies = [
 
 [[package]]
 name = "choreo-daemon"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2950,7 +2950,7 @@ dependencies = [
 
 [[package]]
 name = "choreo-gui"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "android-activity",
  "base64 0.23.1",
@@ -2978,7 +2978,7 @@ dependencies = [
 
 [[package]]
 name = "choreo-im"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ammonia",
  "anyhow",
@@ -3001,7 +3001,7 @@ dependencies = [
 
 [[package]]
 name = "choreo-image"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "heif-oxide",
  "image",
@@ -3010,7 +3010,7 @@ dependencies = [
 
 [[package]]
 name = "choreo-keystore"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aes-gcm 0.11.1",
  "base64 0.23.1",
@@ -3034,7 +3034,7 @@ dependencies = [
 
 [[package]]
 name = "choreo-markdown"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ammonia",
  "pulldown-cmark",
@@ -3043,7 +3043,7 @@ dependencies = [
 
 [[package]]
 name = "choreo-mcp"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "libc",
  "serde",
@@ -3054,7 +3054,7 @@ dependencies = [
 
 [[package]]
 name = "choreo-power-events"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "core-foundation 0.10.1",
  "core-foundation-sys",
@@ -3068,7 +3068,7 @@ dependencies = [
 
 [[package]]
 name = "choreo-proto"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "rmp-serde",
  "serde",
@@ -3080,14 +3080,14 @@ dependencies = [
 
 [[package]]
 name = "choreo-sanitize"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "unicode-general-category",
 ]
 
 [[package]]
 name = "choreo-shared"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "tempfile",
@@ -3097,7 +3097,7 @@ dependencies = [
 
 [[package]]
 name = "choreo-sockreg"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "crossbeam-channel",
  "nix 0.31.3",
@@ -3108,7 +3108,7 @@ dependencies = [
 
 [[package]]
 name = "choreo-transport"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64 0.23.1",
  "choreo-proto",
@@ -3125,7 +3125,7 @@ dependencies = [
 
 [[package]]
 name = "choreo-tui"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ansi-to-tui",
  "anstyle-progress",
@@ -3169,7 +3169,7 @@ dependencies = [
 
 [[package]]
 name = "choreographr"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "choreo-daemon",
