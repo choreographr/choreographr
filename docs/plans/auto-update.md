@@ -48,6 +48,7 @@ thread alongside `catalog.rs`, a new `ClientMessage`/`DaemonMessage` pair);
 17. [Out of scope / future work](#17-out-of-scope--future-work)
 18. [Verification / definition of done](#18-verification--definition-of-done)
 19. [References](#19-references)
+20. [Prior art: how peer agents update](#20-prior-art-how-peer-agents-update)
 
 ---
 
@@ -130,6 +131,16 @@ Relevant existing machinery this design reuses:
 - **The "installed, never auto-enabled" service policy** (`packaging/README.md`)
   is the cultural precedent for `[updates] apply = false` by default.
 
+> **How the peers do it.** A survey of the other agents in `~/agents` (zero,
+> jcode, fx, codex, opencode, buzz, deepseek-harness, maka-agent, headlong) is
+> in [§20](#20-prior-art-how-peer-agents-update). The short version: CLIs
+> self-update from GitHub Releases / a CDN with **SHA-256 over HTTPS** (no
+> signature); desktop apps (Tauri/Electron) use **signed feeds**; every
+> self-updater with real reach **detects the install method** and delegates
+> Homebrew. This plan borrows the detection/delegation and the stage-then-
+> reload model, and — consistent with `install.sh` already exceeding the CLI
+> norm — keeps the signature (which matches the desktop norm).
+
 ---
 
 ## 3. Design principles
@@ -172,6 +183,14 @@ compromise of the download host (the very threat the pin defends against)
 becomes a code-execution path. Therefore the manifest must be **signed**, and
 the verification key **compiled into the binary** — the pin moves from "this
 exact version" to "anything this offline key signed."
+
+> **Note on precedent (§20).** This is stricter than the CLI norm: zero,
+> jcode, and fx all trust a SHA-256 fetched over HTTPS with no signature.
+> Only the desktop apps sign (Tauri's minisign feed; Electron's OS
+> code-signing). Since Choreographr's `install.sh` already exceeds the CLI
+> norm (it *pins*), the signature is the consistent choice — but a
+> checksum-over-HTTPS manifest would match zero/jcode/fx and is a legitimate
+> fallback if the signing key/rotation burden is unwanted ([D8](#15-decisions-to-confirm)).
 
 ### Manifest format
 
@@ -261,6 +280,15 @@ Two refinements:
   heuristics so the daemon never forks a package manager implicitly.
 
 A `--channel <name>` override exists for the rare wrong guess and for tests.
+
+This matches the consensus in the peer survey ([§20](#20-prior-art-how-peer-agents-update)):
+zero (`DetectInstallMethod`: Homebrew keg = `Cellar/<formula>/<version>` with an
+`INSTALL_RECEIPT.json`; npm via a marker file), codex (`InstallContext` →
+`InstallMethod`), and opencode (`Installation.method()`) all classify the
+install method — and **all three delegate Homebrew to `brew upgrade`** rather
+than overwriting the keg. `zero` resolves symlinks first (Homebrew links
+`<prefix>/bin` to the keg) so the check and the apply agree on what a
+"Homebrew install" is.
 
 ---
 
@@ -352,6 +380,16 @@ until the channel ships.
   one operation and tell the user to relaunch the TUI; it must not mutate the
   sibling while the TUI holds it open (Unix rename handles this: the *new*
   TUI start picks up the new binary, the *old* one keeps running until exit).
+- **Run the swap out-of-process / after the client exits (precedent, [§20](#20-prior-art-how-peer-agents-update)).**
+  codex performs the upgrade *after* the TUI exits (it prints the command and
+  runs it once the terminal is restored); fx downloads and stages in the
+  background, then waits for the user to press `ctrl+g` and refuses to reload
+  while work is in flight (a streaming response, queued prompts, an open
+  modal, an unsent draft); Electron apps ask for a separate confirmation and
+  check for active tasks before `quitAndInstall`. All three avoid replacing a
+  binary that is mid-use. Choreographr's `RestartRequired` state is the same
+  idea — and for the TUI autostart case, staging then letting the *next* TUI
+  launch pick up the new binary sidesteps self-replacement entirely.
 
 ---
 
@@ -428,6 +466,18 @@ Clone the catalog maintenance thread's proven shape
   re-trigger immediately.
 - **25 h** (not 24) so check times **drift +1 h/day**, spreading load across
   the server's daily cycle — same reasoning as `REFRESH_ATTEMPT_INTERVAL`.
+- **Throttle the check and persist the throttle** — peers do exactly this
+  ([§20](#20-prior-art-how-peer-agents-update)): jcode detects GitHub's 60/h
+  unauthenticated limit and persists a **backoff window** every process on the
+  machine reads; codex caches the last check for 20 h in a version file and
+  persists a `dismissed_version`; fx checks 30 min after a 10 s first delay;
+  maka-agent checks 10 s after launch, then every 4 h, plus a 15 min-throttled
+  focus check. Our DB-anchored cooldown is the same pattern.
+- **Prefer a self-hosted manifest to the GitHub API.** jcode's rate-limit
+  handling exists because `api.github.com` shares a 60 req/h per-IP bucket with
+  everything else on the machine/NAT. A static, signed `latest.json` on
+  `choreographr.com` has no such limit (and no GitHub JSON-shape coupling) —
+  reinforcing [D7](#15-decisions-to-confirm).
 - **`/refresh-models`-style manual bypass**: `/update --check` (or the CLI)
   bypasses the cooldown but still records the attempt.
 - The check itself is a blocking `ureq` GET on this thread (the daemon is
@@ -480,6 +530,14 @@ package channels are notify-only.
   the `O_NOFOLLOW` + ownership/mode checks the daemon already applies to
   `--log-file` (`cli.rs::open_log_file`): create the update dir `0700`, refuse
   to follow symlinks at predictable paths, and verify regular-file ownership.
+- **A lower-privileged user who can write in the install dir** → this is the
+  exact threat `zero`'s promotion path defends against: it binds the final
+  `rename` to an *open descriptor* on the staging file and its directory
+  (not the staging pathname) so a race cannot substitute an attacker's file
+  after verification; it also refuses to reuse an unverifiable leftover it
+  did not create (`ErrTargetPossiblyTampered`). We can adopt the simpler
+  descriptor-bound `rename` and the "never delete a file you did not create"
+  rule even without the full machinery.
 - **Resource exhaustion** → enforce the manifest `size` cap on the download,
   extract with the same "explicit member list" policy, and clean up partial
   state on every failure.
@@ -573,9 +631,11 @@ must run serially.
 
 **Recommended / proposed:**
 
-- **D1 — Trust anchor:** minisign-signed manifest, key compiled in; **not**
-  SHA256SUMS-over-TLS alone. *(Recommend: yes — the install.sh note demands
-  it.)*
+- **D1 — Trust anchor:** minisign-signed manifest, key compiled in. *(Recommend:
+  yes — matches the desktop norm and `install.sh`'s existing pin; but note that
+  zero/jcode/fx ship checksum-over-HTTPS with **no** signature and it is the
+  accepted CLI baseline — see [§4](#4-trust-model-a-signed-manifest) and
+  [§20](#20-prior-art-how-peer-agents-update).)*
 - **D2 — Check default:** background check **on by default** (mirrors the
   models.dev refresh), apply **off** by default. *(Recommend: yes.)*
 - **D3 — Self-update scope:** only installer/tarball/Termux dirs; everything
@@ -598,6 +658,13 @@ must run serially.
 - **D8 — Signer:** offline conductor key vs. CI secret? *(Recommend:
   offline.)*
 - **D9 — Auto-restart:** ever? *(Recommend: v2, explicit-consent only.)*
+- **D10 — Apply timing:** swap out-of-process / on the next launch, never
+  in-place over a running binary (codex after-exit; fx stage-then-`ctrl+g`)?
+  *(Recommend: yes.)*
+- **D11 — Installer reuse:** should `install.sh` gain a `--latest`/`--update`
+  mode and act as the apply path for the curl channel (as codex/opencode do),
+  rather than a second in-binary downloader? *(Recommend: yes — one
+  downloader/verifier, shared.)*
 
 ---
 
@@ -673,3 +740,96 @@ must run serially.
 - `packaging/README.md` — the "installed, never auto-enabled" policy.
 - `.github/workflows/release.yml`, `RELEASE.md` — where manifest generation and
   signing slot in.
+
+---
+
+## 20. Prior art: how peer agents update
+
+Surveyed `~/agents` on 2026-09-20. Four families, one clear pattern.
+
+**A. Native self-update from GitHub Releases / a CDN, SHA-256 over HTTPS (CLIs).**
+
+- **zero** (Go, `internal/update/*`) — GitHub `releases/latest`; per-asset
+  `*.sha256`; semver; `DetectInstallMethod` (Homebrew keg = `Cellar/<f>/<v>`
+  carrying an `INSTALL_RECEIPT.json`; npm via a `.zero-binary-version` marker /
+  `package.json` shape; else standalone); **Homebrew → refusal + `brew upgrade`**;
+  npm → `npm install -g …@latest`; standalone → download + verify + extract +
+  **descriptor-bound atomic promote** (the rename is bound to an open dir/file
+  handle, not a pathname, to defeat a writable-install-dir race) with a
+  distinct `ErrTargetPossiblyTampered`, Windows delete-on-close, optional
+  helper-binary refresh, `zero upgrade`/`--check`, and a `data:` endpoint for
+  deterministic tests.
+- **jcode** (Rust, `jcode-update-core` + `jcode-app-core/update*`) — GitHub
+  `releases/latest` + `SHA256SUMS`; platform asset naming; atomic install;
+  **GitHub 60/h rate-limit detection + a persisted backoff** shared across
+  processes; a **dev-build guard** (compare the compiled git hash to the
+  release tag via local `git merge-base --is-ancestor`, else the GitHub compare
+  API; keep the dev build unless provably behind); a background-vs-foreground
+  time estimate; plus a "main source" path (`git pull` + `cargo build`).
+- **fx** (Zig, `core/upgrade/*`) — background thread (10 s first delay, 30 min
+  interval, interruptible sleep, bounded join on stop); CDN
+  `fx-<ver>-<platform>.tar.gz` + `.sha256`; verify → extract → atomic copy over
+  self; then **waits for the user to press `ctrl+g` to reload** and refuses to
+  reload while work is in flight (streaming, queued prompts, open modal, unsent
+  draft); dev-build guard by path (`/zig-out/bin/`); stable/dev channels.
+
+**B. Delegate to the package manager (detect method, no self-write) (CLIs).**
+
+- **codex** (Rust) — `InstallContext` → `InstallMethod`
+  (npm/bun/viteplus/pnpm/brew/standalone/other) → `UpdateAction`; a startup
+  check throttled to 20 h and cached in a version file; latest version fetched
+  from the **method-specific** source (brew cask API; npm registry + GitHub;
+  GitHub releases for standalone); a dismissable banner with a persisted
+  `dismissed_version`; the actual upgrade runs the package-manager command
+  **after the TUI exits** (standalone re-runs the install script).
+- **opencode** (TS) — `Installation` service detects method
+  (curl/npm/yarn/pnpm/bun/brew/scoop/choco), fetches latest per source,
+  `opencode upgrade [target]` runs the method command (pipes the install script
+  for the curl method).
+
+**C. Desktop app frameworks with signed feeds.**
+
+- **buzz** (Tauri) — `tauri-plugin-updater`, public key + endpoint embedded at
+  build (`BUZZ_UPDATER_PUBLIC_KEY`/`_ENDPOINT` via `build.rs`); Tauri's
+  **minisign-signed `latest.json`**.
+- **deepseek-harness** (Electron) — `electron-updater`; signed installers
+  (Authenticode / notarization); Sha512 + blockmap; fixed feed URL;
+  `autoDownload=false`; manual download + install with an explicit restart
+  confirmation and an evidence/journal workflow.
+- **maka-agent** (Electron) — `electron-updater`; `autoDownload=true`; 10 s
+  first check, 4 h interval, 15 min throttled focus check; an **attestation
+  verifier** for the downloaded artifact; a prepared install with rollback and
+  an active-task guard; `quitAndInstall`.
+
+**D. Server-side `git pull` self-update (supervised restart).**
+
+- **headlong** (Python web) — opt-in (`HEADLONG_WEB_SELF_UPDATE=1`);
+  `POST /api/update` → `git pull` → rebuild static → SIGTERM; systemd
+  `Restart=always` returns on the new code.
+
+**E. No self-updater:** hermes-agent, turnstone, openwork (Helm/K8s rollout),
+  t3code, OpenMinis (app store), rtk (Homebrew / install.sh), pi (install
+  locks), langgraph.
+
+### Cross-cutting lessons
+
+1. **Integrity is usually just SHA-256 over HTTPS in CLIs; signatures only in
+   desktop frameworks.** zero/jcode/fx use checksums with no signature; only
+   Tauri (minisign) and Electron (OS code-signing) sign. Our signed-manifest
+   idea is *ahead* of the CLI norm and *matches* the desktop norm.
+2. **Install-method detection is non-negotiable** — every self-updater that
+   touches a real machine has it, and Homebrew is universally delegate/refuse.
+3. **Never self-write where a package manager owns the file.**
+4. **Stage, then let the user reload** (fx `ctrl+g`; Electron confirmation;
+   codex after-exit).
+5. **Run the updater out-of-process / after the client exits** to dodge
+   self-replacement races.
+6. **Throttle the check and persist the state** (jcode backoff; codex 20 h;
+   fx 30 min; maka 4 h + focus).
+7. **Guard dev builds** — never overwrite one (jcode ancestry; fx path).
+8. **GitHub's unauthenticated 60/h limit is real** (jcode) — argue for a
+   self-hosted manifest.
+9. **Windows replacement is the hard part** — zero carries ~45 KB of
+   Windows-specific stage/replace code (delete-on-close, reboot replacement).
+10. **Quiet failures + dismissable banners** (codex persisted dismissal; maka
+    holds back transient check errors; deepseek quiet auto-check).
