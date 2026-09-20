@@ -2016,3 +2016,47 @@ fn handle_sessions_empty_creates_default_session_without_working_dir() {
         }
     );
 }
+
+#[test]
+fn handle_sessions_auto_attach_skips_archived_sessions() {
+    // An archived session is hidden from the live list, so it must not be
+    // auto-attached on the Chat page either. The archived session here is the
+    // most recent (and pinned), so it sorts FIRST — yet the auto-attach must
+    // still pick the live session.
+    let mut app = App::new();
+    app.image_job_tx = None;
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let mut archived = make_session(5, "archived", "m", 0);
+    archived.archived_at = Some(1_705_314_000_500);
+    archived.pinned = true;
+    archived.last_modified = 2_000_000_000_000; // newest → sorts first
+    let live = make_session(3, "live", "m", 0);
+
+    app.handle_sessions(&[archived, live], &tx)
+        .expect("handle_sessions should succeed");
+
+    let msg = rx.recv().expect("auto-attach message");
+    assert_eq!(msg, ClientMessage::AttachSession { session_id: 3 });
+    assert_eq!(app.attached_session_id, Some(3));
+}
+
+#[test]
+fn handle_sessions_only_archived_creates_default_instead_of_attaching() {
+    // Every session is archived: there is no live session to open, so the
+    // bootstrap creates a fresh default rather than silently attaching to the
+    // archived one.
+    let mut app = App::new();
+    app.image_job_tx = None;
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let mut archived = make_session(5, "archived", "m", 0);
+    archived.archived_at = Some(1_705_314_000_500);
+
+    app.handle_sessions(&[archived], &tx)
+        .expect("handle_sessions should succeed");
+
+    let msg = rx.recv().expect("CreateSession message");
+    assert!(matches!(msg, ClientMessage::CreateSession { .. }));
+    assert_eq!(app.attached_session_id, None);
+}

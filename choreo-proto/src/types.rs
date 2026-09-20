@@ -507,6 +507,27 @@ pub struct SessionSummary {
     pub archived_at: Option<i64>,
 }
 
+impl SessionSummary {
+    /// The session-LIST ordering, shared by BOTH the daemon (`ListSessions`)
+    /// and every client that renders the list (the TUI's session manager).
+    /// Pinned sessions sort first, then newest `last_modified`, then highest
+    /// `session_id` as a deterministic tiebreak (so equal timestamps never
+    /// jitter between refreshes).
+    ///
+    /// Centralising the comparator here is deliberate: the daemon and the
+    /// clients both order the same rows, and two hand-kept copies of this key
+    /// would silently drift (a client re-sort that disagrees with the daemon's
+    /// order), so there is exactly one definition of "list order".
+    #[must_use]
+    pub fn cmp_for_list(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .pinned
+            .cmp(&self.pinned)
+            .then_with(|| other.last_modified.cmp(&self.last_modified))
+            .then_with(|| other.session_id.cmp(&self.session_id))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ClientMessage {

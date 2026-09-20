@@ -1066,6 +1066,29 @@ impl SessionManagerState {
         self.all = sessions;
         self.rebuild_view();
         if let Some(id) = preferred {
+            // The preferred session may live in the OTHER partition: opening
+            // the manager while attached to an ARCHIVED session defaults to
+            // the live list, where the target is absent. Switch to the view
+            // that actually holds it so the highlight lands on the session the
+            // user was viewing instead of falling onto an unrelated first row.
+            // (No switch when the id is not in the list at all — the row-0
+            // fallback below still applies then.)
+            let target_archived = self
+                .all
+                .iter()
+                .find(|s| s.session_id == id)
+                .map(|s| s.archived_at.is_some());
+            if let Some(want_archived) = target_archived {
+                let showing_archived = matches!(self.view, SessionManagerView::Archived);
+                if want_archived != showing_archived {
+                    self.view = if want_archived {
+                        SessionManagerView::Archived
+                    } else {
+                        SessionManagerView::List
+                    };
+                    self.rebuild_view();
+                }
+            }
             self.selection = if self.sessions.is_empty() {
                 None
             } else {
@@ -1092,15 +1115,11 @@ impl SessionManagerState {
     /// Every list mutation routes through here so `all`, `sessions`, and
     /// `selection` can never drift apart.
     fn rebuild_view(&mut self) {
-        // Pinned first, then newest, then highest id.  The daemon already
-        // sends id-desc tiebreaks, but applying the full key here keeps the
-        // order deterministic regardless of arrival order.
-        self.all.sort_by(|a, b| {
-            b.pinned
-                .cmp(&a.pinned)
-                .then_with(|| b.last_modified.cmp(&a.last_modified))
-                .then_with(|| b.session_id.cmp(&a.session_id))
-        });
+        // One definition of list order, shared with the daemon
+        // (`SessionSummary::cmp_for_list`): pinned first, then newest, then
+        // highest id. Applying it here keeps the client's order identical to
+        // the daemon's regardless of arrival order.
+        self.all.sort_by(SessionSummary::cmp_for_list);
         // Remember which session was highlighted (and at which row) before
         // the partition, so the cursor can follow it across the rebuild.
         let selected_id = self
@@ -1184,6 +1203,15 @@ impl SessionManagerState {
             return;
         }
         self.rebuild_view();
+        // Keep the detail view's own copy in sync while the user is looking at
+        // it, so a flag change made elsewhere is reflected without leaving the
+        // page (the detail view renders `detail_data`, not `sessions`).
+        if let Some(detail) = self.detail_data.as_mut()
+            && detail.session_id == session_id
+        {
+            detail.pinned = pinned;
+            detail.archived_at = archived_at;
+        }
     }
 
     /// Highlight `session_id` in the list immediately when it is already

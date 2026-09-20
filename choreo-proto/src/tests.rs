@@ -519,6 +519,53 @@ fn session_summary_none_optionals_round_trip() {
 }
 
 #[test]
+fn session_summary_cmp_for_list_orders_pinned_then_recency_then_id() {
+    let mk = |id: u64, pinned: bool, last_modified: i64| SessionSummary {
+        session_id: id,
+        title: None,
+        selected_model: None,
+        reasoning_effort: None,
+        parent_session_id: None,
+        working_dir: None,
+        created_at: 0,
+        last_modified,
+        turn_count: 0,
+        status: SessionStatus::Inactive,
+        active_tool_groups: vec![],
+        account_name: None,
+        token_usage: None,
+        context_window: None,
+        last_prompt_tokens: None,
+        pinned,
+        archived_at: None,
+    };
+
+    // Pinned rows float above unpinned ones regardless of recency.
+    let pinned_old = mk(1, true, 100);
+    let unpinned_new = mk(2, false, 999);
+    assert_eq!(
+        pinned_old.cmp_for_list(&unpinned_new),
+        std::cmp::Ordering::Less
+    );
+
+    // Same pin state: the newer `last_modified` comes first.
+    let newer = mk(1, false, 200);
+    let older = mk(2, false, 100);
+    assert_eq!(newer.cmp_for_list(&older), std::cmp::Ordering::Less);
+
+    // Equal pin AND timestamp: the higher id wins, so the order is
+    // deterministic (no jitter between refreshes).
+    let higher = mk(9, false, 100);
+    let lower = mk(3, false, 100);
+    assert_eq!(higher.cmp_for_list(&lower), std::cmp::Ordering::Less);
+
+    // The comparator is a drop-in for `sort_by`.
+    let mut rows = [unpinned_new, pinned_old.clone()];
+    rows.sort_by(SessionSummary::cmp_for_list);
+    assert_eq!(rows[0].session_id, pinned_old.session_id);
+}
+
+#[test]
 fn session_summary_some_token_usage_round_trip() {
     let usage = TokenUsage {
         input_tokens: 10,

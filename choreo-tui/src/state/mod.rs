@@ -1296,18 +1296,12 @@ impl App {
         }
 
         if self.page == Page::SessionManager {
-            // Best-effort refresh for both kinds of session: a broken channel
-            // here means the whole connection is tearing down, and the reply
-            // renders into the session list (never the status line), so there
-            // is nothing actionable to propagate.
-            if let Some(parent_id) = parent_session_id {
-                tracing::debug!(
-                    session_id,
-                    parent_session_id = parent_id,
-                    "refreshing session list so the sub-session is visible on the Session Manager page",
-                );
-            }
-            let _ = client_tx.send(ClientMessage::ListSessions);
+            // No explicit ListSessions here: the daemon's `SessionCreated`
+            // BROADCAST — handled by `note_session_created` just below —
+            // already triggers exactly one list refresh on this page, and the
+            // TUI subscribes to all activity so it always receives it.
+            // Refreshing from this direct reply as well would send a redundant
+            // `ListSessions` for every create (two round-trips per create).
             return Ok(());
         }
 
@@ -1836,16 +1830,29 @@ impl App {
                 }
             }
             if self.attached_session_id.is_none() {
+                // Auto-attach to a LIVE session only. Archived sessions are
+                // deliberately hidden from the sessions list's live view, so
+                // they must not hijack the Chat page either — a restart with a
+                // pinned/archived session would otherwise silently open it.
+                // Filtered into a local slice FIRST so the existing top-level
+                // preference (and the sub-session fallback) keep their exact
+                // semantics over the non-archived subset.
+                //
                 // Prefer the most recently modified *top-level* session.
                 // Agent-spawned sub-sessions (parent_session_id = Some) are
                 // transient tool artifacts whose last_modified is bumped as
                 // they stream, so they'd otherwise top the list and silently
                 // hijack the view to a session the user never opened — e.g.
                 // its streaming token count would appear on the chat page.
-                let target = sessions
+                let live: Vec<&SessionSummary> = sessions
                     .iter()
+                    .filter(|s| s.archived_at.is_none())
+                    .collect();
+                let target = live
+                    .iter()
+                    .copied()
                     .find(|s| s.parent_session_id.is_none())
-                    .or_else(|| sessions.first());
+                    .or_else(|| live.first().copied());
                 if let Some(first) = target {
                     // Set attachment state immediately (mirroring the session
                     // manager Enter handler) so a second Sessions reply in the
@@ -3421,6 +3428,21 @@ mod tests {
         assert_eq!(mgr.selection, Some(0));
     }
 
+    #[test]
+    fn select_session_switches_to_archived_view_when_target_is_archived() {
+        // Opening the manager while attached to an ARCHIVED session must land
+        // the highlight on it — it lives in the archived partition — instead
+        // of falling onto an unrelated first row of the default live list.
+        let mut mgr = SessionManagerState::new();
+        let mut archived = make_session(2, "archived");
+        archived.archived_at = Some(1_705_314_000_500);
+        mgr.select_session(2);
+        mgr.set_sessions(vec![make_session(1, "live"), archived]);
+        assert_eq!(mgr.view, SessionManagerView::Archived);
+        assert_eq!(mgr.selection, Some(0));
+        assert_eq!(mgr.sessions[mgr.selection.unwrap()].session_id, 2);
+    }
+
     // ── pinned/archived view model ──
 
     #[test]
@@ -3524,6 +3546,23 @@ mod tests {
     }
 
     #[test]
+    fn apply_session_flags_updates_open_detail_view() {
+        // The detail view renders its own `detail_data` snapshot, not
+        // `sessions`, so a flag change must update it too or the Detail page
+        // shows stale Pinned/Archived values.
+        let mut mgr = SessionManagerState::new();
+        mgr.set_sessions(vec![make_session(1, "a")]);
+        mgr.enter_detail();
+        assert_eq!(mgr.view, SessionManagerView::Detail);
+        assert!(!mgr.detail_data.as_ref().unwrap().pinned);
+
+        mgr.apply_session_flags(1, true, Some(1_705_314_000_500));
+        let detail = mgr.detail_data.as_ref().unwrap();
+        assert!(detail.pinned);
+        assert_eq!(detail.archived_at, Some(1_705_314_000_500));
+    }
+
+    #[test]
     fn archiving_highlighted_session_moves_selection_to_neighbour() {
         let mut mgr = SessionManagerState::new();
         mgr.set_sessions(vec![
@@ -3560,8 +3599,9 @@ mod tests {
         let mut app = test_app();
         app.session_mgr
             .set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
-        // Both sessions share a timestamp, so the stable sort keeps input
-        // order; move the cursor onto session 2 (index 1).
+        // The fixture timestamps decrease with id, so the list order is
+        // ascending by id (session 1 first); move the cursor onto session 2
+        // (index 1).
         app.session_mgr.select_down();
         assert_eq!(app.session_mgr.selection, Some(1));
 

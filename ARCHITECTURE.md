@@ -1713,19 +1713,34 @@ async tool calls. See `connection/chat.rs` and `state::App::new_turn_rejection`.
 **Session-manager list views (`SessionManagerState`).**  The page keeps the
 FULL list in `all` and the rendered rows in `sessions`; a private
 `rebuild_view` re-derives `sessions` from `all` on every mutation — sorting by
-`(pinned desc, last_modified desc, session_id desc)`, keeping only the rows the
+the SHARED `SessionSummary::cmp_for_list` (pinned desc, `last_modified` desc,
+`session_id` desc) that the daemon's `ListSessions` also uses, so the two
+orders cannot drift — keeping only the rows the
 current `view` shows (`List` → `archived_at.is_none()`, `Archived` →
 `archived_at.is_some()`, `Detail` treated as `List`), and re-pointing the
 selection at the same session by id (clamping to the old row index — a
-neighbour — when it left the view).  `Tab` is the only view-switch key
+neighbour — when it left the view).  When the one-shot `pending_select` (set by
+`select_session` when the manager opens on the attached session) names a
+session that lives in the OTHER partition — an ARCHIVED attached session, with
+the live list as the default view — `set_sessions` switches to that view so the
+highlight lands on the session the user was viewing, not a first row of the
+live list.  `Tab` is the only view-switch key
 (`toggle_view`, List ↔ Archived; Ctrl+A is the global accounts shortcut).
 `p` and `a` send `SetSessionPinned`/`SetSessionArchived` but NEVER mutate local
-state: the daemon is the authority and its `SessionFlagsChanged` broadcast —
-applied via `App::handle_session_flags_changed` → `rebuild_view` — is the
+state: the daemon is the authority — it persists the flag change BEFORE
+touching its in-memory index and broadcasting, so a failed persist can never
+leave the daemon's list ahead of disk — and its `SessionFlagsChanged` broadcast
+(rides the activity bus, so the TUI receives it on any page) —
+applied via `App::handle_session_flags_changed` → `SessionManagerState::apply_session_flags`
+(`rebuild_view` plus an in-place update of an open `detail_data`) — is the
 success signal (there is no targeted reply; a failure arrives as a targeted
 `SessionFailed` and is shown on the page).  Full-list lookups (status changes,
 the attached summary, `attach_to_session`) read `all`, never the filtered
-`sessions`, so an archived attached session still updates correctly.
+`sessions`, so an archived attached session still updates correctly.  A newly
+created session only refreshes the manager list via the broadcast
+`SessionCreated` (`note_session_created`) — the direct
+`SessionCreatedForRequester` reply deliberately does NOT also send a
+`ListSessions`, so a create costs one list refresh, not two.
 
 ### `choreo-gui` — Desktop/Android client (iOS: embedded-daemon host)
 
@@ -3417,6 +3432,9 @@ counts survive the attach instead of regressing.
   `last_modified` is bumped each time one of their requests completes and
   would otherwise hijack the view) and sets attachment state immediately so a
   second `Sessions` reply cannot re-fire the attach to a different session.
+  Archived sessions are excluded first: they are hidden from the live list, so
+  they must not be auto-opened either — when EVERY session is archived the
+  bootstrap creates a fresh default session instead of attaching to one.
 - The auto-attach rule keys on the EVENT, not on `parent_session_id`:
   `SessionCreatedForRequester` — the direct reply to THIS client's
   `CreateSession` (parent `None`) — is the ONLY create event that may attach

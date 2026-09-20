@@ -1398,8 +1398,10 @@ impl DaemonState {
         }
     }
 
-    /// Return a list of all active session summaries, most recently
-    /// modified first.
+    /// Return a list of all active session summaries in the shared list
+    /// order (pinned first, then newest, then id-desc —
+    /// [`SessionSummary::cmp_for_list`]). This is the same ordering every
+    /// client re-applies when it renders the list, so the two cannot drift.
     fn handle_list_sessions(&mut self, reply: &std::sync::mpsc::Sender<Vec<SessionSummary>>) {
         let mut summaries: Vec<SessionSummary> = self
             .session_metadata
@@ -1407,17 +1409,10 @@ impl DaemonState {
             .map(|(id, meta)| meta.to_summary(*id))
             .collect();
 
-        // Newest first; the session_id tiebreak keeps equal timestamps
-        // deterministic (no ordering jitter between refreshes).
-        summaries.sort_by(|a, b| {
-            // Pinned sessions float to the top; then newest-first; then a
-            // session_id tiebreak keeps equal timestamps deterministic (no
-            // ordering jitter between refreshes).
-            b.pinned
-                .cmp(&a.pinned)
-                .then_with(|| b.last_modified.cmp(&a.last_modified))
-                .then_with(|| b.session_id.cmp(&a.session_id))
-        });
+        // One definition of list order (`cmp_for_list`), used here and by the
+        // clients, so equal timestamps stay deterministic and pinned rows
+        // float to the top identically everywhere.
+        summaries.sort_by(SessionSummary::cmp_for_list);
         let _ = reply.send(summaries);
     }
 
@@ -1458,30 +1453,26 @@ impl DaemonState {
             )));
             return;
         }
-        // Resolve the post-change state from the daemon's index, applying only
-        // the fields the request asked to change. Read the two values out into
-        // locals so the `get_mut` borrow ends before the DB call and the
-        // broadcast below (both need `&self`/`&mut self`).
-        let Some(meta) = self.session_metadata.get_mut(&session_id) else {
+        // Resolve the POST-change flag state WITHOUT mutating the index yet.
+        // Persisting first — and only touching the in-memory index once the DB
+        // write has succeeded — keeps memory, the DB, and every client in
+        // agreement: a persist failure must NOT leave the daemon reporting a
+        // flag that no client was ever told about (and that a restart would
+        // lose). A `None` field leaves the existing value untouched; archiving
+        // stamps the current time, unarchiving clears it.
+        let Some(existing) = self.session_metadata.get(&session_id) else {
             let _ = reply.send(Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "session not found",
             )));
             return;
         };
-        if let Some(v) = pinned {
-            meta.pinned = v;
-        }
-        if let Some(v) = archived {
-            // Archiving stamps the current time; unarchiving clears it.
-            meta.archived_at = if v {
-                Some(TimestampMs::now().as_millis())
-            } else {
-                None
-            };
-        }
-        let pinned = meta.pinned;
-        let archived_at = meta.archived_at;
+        let pinned = pinned.unwrap_or(existing.pinned);
+        let archived_at = match archived {
+            Some(true) => Some(TimestampMs::now().as_millis()),
+            Some(false) => None,
+            None => existing.archived_at,
+        };
         // Persist ONLY the two flag fields via the read-modify-write helper, so
         // a concurrent full-record write from the session thread can neither
         // clobber these flags nor have its own fields clobbered here.
@@ -1490,8 +1481,13 @@ impl DaemonState {
             let _ = reply.send(Err(e));
             return;
         }
-        // Broadcast the new flag state. This is the success signal for EVERY
-        // subscriber (including the requester); there is no targeted reply.
+        // The DB write succeeded — now (and only now) apply the change to the
+        // in-memory index and broadcast it as the success signal for EVERY
+        // subscriber (including the requester; there is no targeted reply).
+        if let Some(meta) = self.session_metadata.get_mut(&session_id) {
+            meta.pinned = pinned;
+            meta.archived_at = archived_at;
+        }
         self.broadcast(&DaemonMessage::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionFlagsChanged {
