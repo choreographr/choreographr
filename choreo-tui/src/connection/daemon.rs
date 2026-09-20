@@ -130,8 +130,16 @@ pub(crate) fn handle_daemon_message(
         } => {
             app.error = Some(format!("[daemon] {operation} failed: {error}"));
             // If we're on the Session Manager page, also show the error
-            // right on that page so the user has immediate feedback.
-            if app.page == Page::SessionManager && operation == "create_session" {
+            // right on that page so the user has immediate feedback — for the
+            // create flow and for the pin/archive flow (both of which are
+            // driven from that page and otherwise only flash the transient
+            // status line).
+            if app.page == Page::SessionManager
+                && matches!(
+                    operation.as_str(),
+                    "create_session" | "set_session_pinned" | "set_session_archived"
+                )
+            {
                 app.session_mgr.set_error(error.clone());
             }
         }
@@ -739,14 +747,31 @@ pub(crate) fn handle_daemon_message(
             }
         },
         DaemonMessage::Session {
-            event: SessionEvent::SessionFlagsChanged { .. },
+            session_id,
+            event:
+                SessionEvent::SessionFlagsChanged {
+                    pinned,
+                    archived_at,
+                },
             ..
         } => {
-            // Per-session `pinned`/`archived_at` flag change. The backend
-            // broadcasts this so every subscriber can refresh its view; the
-            // TUI's pin/archive UX arrives in a LATER change, so this is
-            // deliberately a no-op for now (and must NOT fall through to the
-            // generic dispatch, which has nothing to render for it).
+            // Per-session `pinned`/`archived_at` flag change. The daemon
+            // broadcasts the post-change state to every client — the
+            // requesting client included — as the SUCCESS SIGNAL for a
+            // `SetSessionPinned`/`SetSessionArchived` (there is no targeted
+            // reply; a failure arrives as `SessionFailed`). Applying it here,
+            // rather than optimistically on the keypress, is what keeps the
+            // TUI's list in agreement with the daemon.
+            match session_id {
+                Some(session_id) => {
+                    app.handle_session_flags_changed(*session_id, *pinned, *archived_at);
+                }
+                None => {
+                    tracing::debug!("SessionFlagsChanged without an origin session id; ignoring");
+                }
+            }
+            // Must NOT fall through to the generic dispatch, which has nothing
+            // to render for this event.
             return Ok(());
         }
         _ => {}

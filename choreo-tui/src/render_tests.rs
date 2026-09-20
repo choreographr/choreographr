@@ -582,9 +582,9 @@ fn session_list_scrolls_to_keep_selection_visible() {
     // 21 content rows, one of which is the table header, so 20 session
     // rows fit.  With the selection on row 25 the window must start at
     // 6 — the top six rows scroll off and the highlighted row stays
-    // pinned to the last visible row.  All timestamps are equal so the
-    // stable sort in `set_sessions` keeps the ids in input order
-    // (index i = session id i+1).
+    // pinned to the last visible row.  `last_modified` decreases with the
+    // id, so the (pinned, last_modified desc, session_id desc) sort keeps
+    // the ids in ascending order (index i = session id i+1).
     let mut app = test_app();
     app.page = crate::state::Page::SessionManager;
     let sessions: Vec<SessionSummary> = (1..=30)
@@ -596,7 +596,7 @@ fn session_list_scrolls_to_keep_selection_visible() {
             parent_session_id: None,
             working_dir: None,
             created_at: 1_705_314_000_000,
-            last_modified: 1_705_314_000_000,
+            last_modified: 1_705_314_000_000 + (30 - i).cast_signed(),
             turn_count: i as u32,
             status: SessionStatus::Inactive,
             active_tool_groups: vec![],
@@ -662,7 +662,9 @@ fn session_list_scrolls_down_then_up_directionally() {
             parent_session_id: None,
             working_dir: None,
             created_at: 1_705_314_000_000,
-            last_modified: 1_705_314_000_000,
+            // Decreasing with id keeps the sort in ascending-id order
+            // (index i = session id i+1).
+            last_modified: 1_705_314_000_000 + (30 - i).cast_signed(),
             turn_count: i as u32,
             status: SessionStatus::Inactive,
             active_tool_groups: vec![],
@@ -748,6 +750,106 @@ fn session_list_scrolls_down_then_up_directionally() {
     assert!(
         !content.contains("session 30 "),
         "bottom row scrolled off after window shift"
+    );
+}
+
+// ── Archived view + pin marker ──────────────────────────────────────
+
+#[test]
+fn session_list_archived_view_renders_only_archived() {
+    use crate::test_util::{make_session, test_app};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = test_app();
+    app.page = crate::state::Page::SessionManager;
+    let mut archived = make_session(2, "old-session", "gpt-4", 1);
+    archived.archived_at = Some(1_705_314_000_500);
+    app.session_mgr
+        .set_sessions(vec![make_session(1, "live-session", "gpt-4", 1), archived]);
+    // Tab into the archived view.
+    app.session_mgr.toggle_view();
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("render archived view");
+    let content: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(Cell::symbol)
+        .collect();
+
+    assert!(content.contains("Archived"), "archived block title drawn");
+    assert!(
+        content.contains("old-session"),
+        "the archived session is shown"
+    );
+    assert!(
+        !content.contains("live-session"),
+        "live sessions are hidden in the archived view"
+    );
+}
+
+#[test]
+fn session_list_archived_view_empty_state_message() {
+    use crate::test_util::{make_session, test_app};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = test_app();
+    app.page = crate::state::Page::SessionManager;
+    app.session_mgr
+        .set_sessions(vec![make_session(1, "live", "gpt-4", 1)]);
+    app.session_mgr.toggle_view();
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("render empty archived view");
+    let content: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(Cell::symbol)
+        .collect();
+    assert!(content.contains("No archived sessions."));
+}
+
+#[test]
+fn session_list_shows_pin_marker() {
+    use crate::test_util::{make_session, test_app};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = test_app();
+    app.page = crate::state::Page::SessionManager;
+    let mut pinned = make_session(1, "pinned-session", "gpt-4", 1);
+    pinned.pinned = true;
+    app.session_mgr
+        .set_sessions(vec![pinned, make_session(2, "plain", "gpt-4", 1)]);
+    // Make the pinned top row both selected and attached so its marker column
+    // renders the unique "sel + attached + pin" glyph sequence.
+    app.session_mgr.selection = Some(0);
+    app.attached_session_id = Some(1);
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("render pinned list");
+    let content: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(Cell::symbol)
+        .collect();
+    assert!(
+        content.contains(">*P"),
+        "the pinned, selected, attached row draws the P pin marker"
     );
 }
 

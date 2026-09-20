@@ -1399,7 +1399,7 @@ impl App {
             status,
         ) = self
             .session_mgr
-            .sessions
+            .all
             .iter()
             .find(|s| s.session_id == session_id)
             .map_or((None, None, None, None, None, None, None, None), |s| {
@@ -1468,7 +1468,7 @@ impl App {
 
     pub(crate) fn attached_session_mut(&mut self) -> Option<&mut SessionSummary> {
         self.session_mgr
-            .sessions
+            .all
             .iter_mut()
             .find(|s| Some(s.session_id) == self.attached_session_id)
     }
@@ -1569,7 +1569,7 @@ impl App {
     ) {
         if let Some(session) = self
             .session_mgr
-            .sessions
+            .all
             .iter_mut()
             .find(|s| s.session_id == session_id)
         {
@@ -1622,7 +1622,7 @@ impl App {
         // parent is only known from the session summary list.
         let summary = self
             .session_mgr
-            .sessions
+            .all
             .iter()
             .find(|s| s.session_id == session_id)?;
         let parent_id = summary.parent_session_id?;
@@ -1636,7 +1636,7 @@ impl App {
             // id and strand the user on a session the daemon rejects.
             && self
                 .session_mgr
-                .sessions
+                .all
                 .iter()
                 .any(|s| s.session_id == parent_id)
         {
@@ -1762,7 +1762,7 @@ impl App {
         // SessionAttached reply re-applies the same (possibly newer) value.
         self.attached_status = self
             .session_mgr
-            .sessions
+            .all
             .iter()
             .find(|s| s.session_id == session_id)
             .map(|s| s.status.clone());
@@ -1788,7 +1788,7 @@ impl App {
         // the session list renderer does.
         let title = |id: u64| {
             self.session_mgr
-                .sessions
+                .all
                 .iter()
                 .find(|s| s.session_id == id)
                 .and_then(|s| s.title.clone())
@@ -1934,6 +1934,21 @@ impl App {
 
     pub(crate) fn handle_session_delete_failed(&mut self, session_id: u64, error: &str) {
         self.status = Some(format!("failed to delete session {session_id}: {error}"));
+    }
+
+    /// A per-session `pinned`/`archived_at` flag change was broadcast by the
+    /// daemon — the success signal for a `SetSessionPinned`/`SetSessionArchived`
+    /// request.  There is no targeted success reply, so the TUI deliberately
+    /// does NOT mutate its own list on the keypress; this handler is what
+    /// applies the change (a failure instead arrives as `SessionEvent::SessionFailed`).
+    pub(crate) fn handle_session_flags_changed(
+        &mut self,
+        session_id: u64,
+        pinned: bool,
+        archived_at: Option<i64>,
+    ) {
+        self.session_mgr
+            .apply_session_flags(session_id, pinned, archived_at);
     }
 
     pub(crate) fn display_token_usage(&self) -> Option<TokenUsage> {
@@ -3221,7 +3236,11 @@ mod tests {
             parent_session_id: None,
             working_dir: None,
             created_at: 1000,
-            last_modified: 1000,
+            // Decreasing with id so the session manager's sort keeps the
+            // fixtures in ascending-id order (the order these tests assume);
+            // the value stays small so an explicit `handle_session_status_changed`
+            // timestamp still overrides it in the monotonicity test.
+            last_modified: 1000 - id.cast_signed(),
             turn_count: 0,
             status: SessionStatus::Inactive,
             active_tool_groups: vec!["core".into()],
@@ -3251,6 +3270,8 @@ mod tests {
             accumulated_usage: None,
             context_window: None,
             last_prompt_tokens: None,
+            pinned: false,
+            archived_at: None,
         }
     }
 
@@ -3309,13 +3330,17 @@ mod tests {
     }
 
     #[test]
-    fn set_sessions_stable_for_equal_timestamps() {
-        // Equal last_modified values must keep the incoming order (the daemon
-        // already applies its id-desc tiebreak before sending).
+    fn set_sessions_equal_timestamps_break_ties_by_id_desc() {
+        // Equal last_modified values are tiebroken by session_id DESCENDING
+        // (matching the daemon's own ordering), independent of input order.
         let mut mgr = SessionManagerState::new();
-        mgr.set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
+        let mut a = make_session(1, "a");
+        let mut b = make_session(2, "b");
+        a.last_modified = 5000;
+        b.last_modified = 5000;
+        mgr.set_sessions(vec![a, b]);
         let ids: Vec<u64> = mgr.sessions.iter().map(|s| s.session_id).collect();
-        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(ids, vec![2, 1]);
     }
 
     #[test]
@@ -3326,7 +3351,11 @@ mod tests {
         mgr.set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
         mgr.select_down();
         assert_eq!(mgr.selection, Some(1));
-        mgr.set_sessions(vec![make_session(2, "b"), make_session(1, "a")]);
+        // Session 2 jumps to the top (newer last_modified); the cursor follows
+        // it by id even though its index changed.
+        let mut refreshed = make_session(2, "b");
+        refreshed.last_modified = 9999;
+        mgr.set_sessions(vec![refreshed, make_session(1, "a")]);
         assert_eq!(mgr.selection, Some(0), "session 2 moved to index 0");
         assert_eq!(mgr.sessions[mgr.selection.unwrap()].session_id, 2);
     }
@@ -3392,6 +3421,140 @@ mod tests {
         assert_eq!(mgr.selection, Some(0));
     }
 
+    // ── pinned/archived view model ──
+
+    #[test]
+    fn toggle_view_partitions_list_and_archived() {
+        let mut mgr = SessionManagerState::new();
+        let mut archived = make_session(2, "archived");
+        archived.archived_at = Some(1_705_314_000_500);
+        mgr.set_sessions(vec![make_session(1, "live"), archived]);
+        // Default view is the live list: only non-archived sessions.
+        assert_eq!(mgr.view, SessionManagerView::List);
+        assert_eq!(
+            mgr.sessions
+                .iter()
+                .map(|s| s.session_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        // Tab switches to the archived list.
+        mgr.toggle_view();
+        assert_eq!(mgr.view, SessionManagerView::Archived);
+        assert_eq!(
+            mgr.sessions
+                .iter()
+                .map(|s| s.session_id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(mgr.selection, Some(0));
+        assert_eq!(mgr.scroll, 0);
+        // Tab back returns to the live list.
+        mgr.toggle_view();
+        assert_eq!(mgr.view, SessionManagerView::List);
+        assert_eq!(
+            mgr.sessions
+                .iter()
+                .map(|s| s.session_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    #[allow(clippy::assert_is_empty)] // clearer than assert_eq! against []
+    fn toggle_view_empty_clears_selection() {
+        let mut mgr = SessionManagerState::new();
+        mgr.set_sessions(vec![make_session(1, "live")]);
+        mgr.toggle_view();
+        assert_eq!(mgr.view, SessionManagerView::Archived);
+        assert!(mgr.sessions.is_empty());
+        assert_eq!(mgr.selection, None);
+    }
+
+    #[test]
+    fn pinned_sorts_first_in_both_views() {
+        let mut mgr = SessionManagerState::new();
+        // Fixtures sort ascending by id; pin the LAST row so it must float to
+        // the top of the live view.
+        let mut pinned = make_session(3, "pinned");
+        pinned.pinned = true;
+        mgr.set_sessions(vec![make_session(1, "a"), make_session(2, "b"), pinned]);
+        assert_eq!(
+            mgr.sessions
+                .iter()
+                .map(|s| s.session_id)
+                .collect::<Vec<_>>(),
+            vec![3, 1, 2]
+        );
+        // In the archived view, pinning still wins over recency.
+        let mut archived_pinned = make_session(5, "archived-pinned");
+        archived_pinned.pinned = true;
+        archived_pinned.archived_at = Some(1_705_314_000_500);
+        let mut archived = make_session(4, "archived");
+        archived.archived_at = Some(1_705_314_000_600);
+        mgr.set_sessions(vec![archived, archived_pinned]);
+        mgr.toggle_view();
+        assert_eq!(
+            mgr.sessions
+                .iter()
+                .map(|s| s.session_id)
+                .collect::<Vec<_>>(),
+            vec![5, 4]
+        );
+    }
+
+    #[test]
+    fn apply_session_flags_repartitions_and_preserves_selection() {
+        let mut mgr = SessionManagerState::new();
+        mgr.set_sessions(vec![
+            make_session(1, "a"),
+            make_session(2, "b"),
+            make_session(3, "c"),
+        ]);
+        mgr.selection = Some(1);
+        assert_eq!(mgr.sessions[1].session_id, 2);
+        // Pin session 2: it stays in the live view and floats to the top, and
+        // the cursor follows it by id.
+        mgr.apply_session_flags(2, true, None);
+        assert_eq!(mgr.sessions[0].session_id, 2);
+        assert!(mgr.sessions[0].pinned);
+        assert_eq!(mgr.selection, Some(0));
+    }
+
+    #[test]
+    fn archiving_highlighted_session_moves_selection_to_neighbour() {
+        let mut mgr = SessionManagerState::new();
+        mgr.set_sessions(vec![
+            make_session(1, "a"),
+            make_session(2, "b"),
+            make_session(3, "c"),
+        ]);
+        mgr.selection = Some(1); // session 2
+        // Archive the highlighted session: it leaves the live view, so the
+        // cursor clamps to the neighbour now occupying its row (session 3).
+        mgr.apply_session_flags(2, false, Some(1_705_314_000_500));
+        assert_eq!(
+            mgr.sessions
+                .iter()
+                .map(|s| s.session_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(mgr.selection, Some(1));
+        assert_eq!(mgr.sessions[1].session_id, 3);
+        // The archived session appears in the archived view.
+        mgr.toggle_view();
+        assert_eq!(
+            mgr.sessions
+                .iter()
+                .map(|s| s.session_id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+    }
+
     #[test]
     fn status_change_reorders_only_when_timestamp_advances() {
         let mut app = test_app();
@@ -3448,7 +3611,7 @@ mod tests {
     #[test]
     fn remove_session_removes_from_list() {
         let mut mgr = SessionManagerState::new();
-        mgr.sessions = vec![make_session(1, "a"), make_session(2, "b")];
+        mgr.set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
         mgr.selection = Some(0);
         mgr.remove_session(1);
         assert_eq!(mgr.sessions.len(), 1);
@@ -3458,7 +3621,7 @@ mod tests {
     #[test]
     fn remove_session_nonexistent_is_noop() {
         let mut mgr = SessionManagerState::new();
-        mgr.sessions = vec![make_session(1, "a")];
+        mgr.set_sessions(vec![make_session(1, "a")]);
         mgr.selection = Some(0);
         mgr.remove_session(999);
         assert_eq!(mgr.sessions.len(), 1);
@@ -3469,7 +3632,7 @@ mod tests {
     #[allow(clippy::assert_is_empty)] // clearer than assert_eq! against []
     fn remove_session_last_item_clears_selection() {
         let mut mgr = SessionManagerState::new();
-        mgr.sessions = vec![make_session(1, "a")];
+        mgr.set_sessions(vec![make_session(1, "a")]);
         mgr.selection = Some(0);
         mgr.remove_session(1);
         assert!(mgr.sessions.is_empty());
@@ -3479,7 +3642,7 @@ mod tests {
     #[test]
     fn remove_session_clamps_selection_to_new_len() {
         let mut mgr = SessionManagerState::new();
-        mgr.sessions = vec![make_session(1, "a"), make_session(2, "b")];
+        mgr.set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
         mgr.selection = Some(1);
         mgr.remove_session(2);
         assert_eq!(mgr.sessions.len(), 1);
@@ -3489,7 +3652,7 @@ mod tests {
     #[test]
     fn remove_session_clears_detail_view_for_deleted_session() {
         let mut mgr = SessionManagerState::new();
-        mgr.sessions = vec![make_session(1, "a"), make_session(2, "b")];
+        mgr.set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
         mgr.view = SessionManagerView::Detail;
         mgr.detail_data = Some(make_detail_data(1));
         mgr.remove_session(1);
@@ -3500,7 +3663,7 @@ mod tests {
     #[test]
     fn remove_session_clears_confirmation_for_deleted_session() {
         let mut mgr = SessionManagerState::new();
-        mgr.sessions = vec![make_session(1, "a")];
+        mgr.set_sessions(vec![make_session(1, "a")]);
         mgr.confirm_delete = Some((1, "a".into()));
         mgr.remove_session(1);
         assert!(mgr.confirm_delete.is_none());

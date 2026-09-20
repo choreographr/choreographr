@@ -161,7 +161,12 @@ pub(crate) enum Page {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SessionManagerView {
+    /// The live session list — every session that is NOT archived.
     List,
+    /// The archived session list (Tab-toggled from `List`).  Archiving a
+    /// session moves it out of `List` and into `Archived`; unarchiving moves
+    /// it back.
+    Archived,
     Detail,
 }
 
@@ -751,9 +756,24 @@ pub(crate) struct SessionDetailData {
     pub(crate) accumulated_usage: Option<TokenUsage>,
     pub(crate) context_window: Option<u32>,
     pub(crate) last_prompt_tokens: Option<u32>,
+    /// Whether the session is pinned (shown first in every list view).
+    pub(crate) pinned: bool,
+    /// When the session was archived (Unix-epoch-ms), or `None` when it is
+    /// live.
+    pub(crate) archived_at: Option<i64>,
 }
 
 pub(crate) struct SessionManagerState {
+    /// The FULL session list exactly as last delivered by the daemon, sorted
+    /// by `(pinned desc, last_modified desc, session_id desc)`.  `sessions`
+    /// (the rendered view) is derived from this by [`Self::rebuild_view`] —
+    /// the `List` view keeps the non-archived rows, the `Archived` view the
+    /// archived ones — so every list mutation must go through `all` and then
+    /// rebuild, or the two would drift apart.
+    pub(crate) all: Vec<SessionSummary>,
+    /// The rows currently rendered for `view` — a filter of `all`.  Navigation,
+    /// windowing, rendering and selection all read this, so it always matches
+    /// what is on screen.
     pub(crate) sessions: Vec<SessionSummary>,
     pub(crate) view: SessionManagerView,
     pub(crate) selection: Option<usize>,
@@ -1023,6 +1043,7 @@ impl ModelSelectorState {
 impl SessionManagerState {
     pub(crate) fn new() -> Self {
         Self {
+            all: Vec::new(),
             sessions: Vec::new(),
             view: SessionManagerView::List,
             selection: None,
@@ -1037,29 +1058,132 @@ impl SessionManagerState {
 
     pub(crate) fn set_sessions(&mut self, sessions: Vec<SessionSummary>) {
         self.error = None;
-        // A pending highlight from `select_session` (set when navigating to
-        // the session manager) takes priority over the current selection so
-        // the fresh list lands on the session the user was just viewing;
-        // otherwise keep following the session currently selected.
-        let preferred = self.pending_select.or_else(|| {
-            self.selection
-                .and_then(|i| self.sessions.get(i))
-                .map(|s| s.session_id)
+        // `select_session`'s one-shot preference takes priority over whatever
+        // the user had highlighted, so the fresh list lands on the session
+        // they were just viewing.  `rebuild_view` below preserves the current
+        // selection by id otherwise.
+        let preferred = self.pending_select.take();
+        self.all = sessions;
+        self.rebuild_view();
+        if let Some(id) = preferred {
+            self.selection = if self.sessions.is_empty() {
+                None
+            } else {
+                Some(
+                    self.sessions
+                        .iter()
+                        .position(|s| s.session_id == id)
+                        .unwrap_or(0),
+                )
+            };
+            // Re-anchor the scroll window so the highlighted row is visible
+            // right away rather than waiting for the next navigation step.
+            self.reanchor_scroll();
+        }
+    }
+
+    /// Re-derive the rendered view (`sessions`) from the full list (`all`):
+    /// sort `all` by `(pinned desc, last_modified desc, session_id desc)`,
+    /// keep only the rows the current `view` shows, and re-point the selection
+    /// at the same session by id — clamping to the old row index otherwise, so
+    /// archiving the highlighted session lands the cursor on a neighbour
+    /// rather than jumping to the top, and an emptied view clears it.
+    ///
+    /// Every list mutation routes through here so `all`, `sessions`, and
+    /// `selection` can never drift apart.
+    fn rebuild_view(&mut self) {
+        // Pinned first, then newest, then highest id.  The daemon already
+        // sends id-desc tiebreaks, but applying the full key here keeps the
+        // order deterministic regardless of arrival order.
+        self.all.sort_by(|a, b| {
+            b.pinned
+                .cmp(&a.pinned)
+                .then_with(|| b.last_modified.cmp(&a.last_modified))
+                .then_with(|| b.session_id.cmp(&a.session_id))
         });
-        self.sessions = sessions;
-        self.sort_by_last_modified();
+        // Remember which session was highlighted (and at which row) before
+        // the partition, so the cursor can follow it across the rebuild.
+        let selected_id = self
+            .selection
+            .and_then(|i| self.sessions.get(i))
+            .map(|s| s.session_id);
+        let selected_index = self.selection;
+        // `Detail` never hosts a list; treat it as `List` so the underlying
+        // `sessions` matches what `leave_detail` returns to.
+        let show_archived = matches!(self.view, SessionManagerView::Archived);
+        self.sessions = self
+            .all
+            .iter()
+            .filter(|s| s.archived_at.is_some() == show_archived)
+            .cloned()
+            .collect();
         self.selection = if self.sessions.is_empty() {
             None
         } else {
-            preferred
+            let idx = selected_id
                 .and_then(|id| self.sessions.iter().position(|s| s.session_id == id))
-                .unwrap_or(0)
-                .into()
+                // The highlighted session left this view (e.g. it was just
+                // archived): clamp the old row index into the new bounds so
+                // the cursor lands on a neighbour.
+                .unwrap_or_else(|| selected_index.unwrap_or(0).min(self.sessions.len() - 1));
+            Some(idx)
         };
-        // The preference is one-shot: consume it once it has been applied to
-        // a fresh list, so later refreshes fall back to preserving whatever
-        // the user has navigated to since.
-        self.pending_select = None;
+    }
+
+    /// Re-order after a live status change and keep the cursor on the same
+    /// session, which may have moved to a new index.
+    pub(crate) fn resort_after_status_change(&mut self) {
+        self.rebuild_view();
+    }
+
+    /// Switch between the live (`List`) and archived (`Archived`) views (Tab).
+    /// The new view's first row becomes the selection (or `None` when it is
+    /// empty) and the window scrolls back to the top.
+    pub(crate) fn toggle_view(&mut self) {
+        self.view = match self.view {
+            SessionManagerView::Archived => SessionManagerView::List,
+            // `Detail` never hosts the Tab key, but treat it as `List` so the
+            // toggle stays total.
+            SessionManagerView::List | SessionManagerView::Detail => SessionManagerView::Archived,
+        };
+        // Re-partition against the (unchanged) full list; the old selection
+        // index is meaningless in the other view, so reset to the first row.
+        self.rebuild_view();
+        self.selection = if self.sessions.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
+        self.scroll = 0;
+    }
+
+    /// Apply a `pinned`/`archived_at` change broadcast by the daemon — the
+    /// success signal for a `SetSessionPinned`/`SetSessionArchived` request
+    /// (there is no targeted reply; failures arrive as `SessionFailed`).
+    /// Updates the session in the FULL list and re-partitions, so archiving a
+    /// session leaves the `List` view immediately; the cursor follows the
+    /// session by id when it survives the move, or clamps to a neighbour when
+    /// it does not.
+    pub(crate) fn apply_session_flags(
+        &mut self,
+        session_id: u64,
+        pinned: bool,
+        archived_at: Option<i64>,
+    ) {
+        if let Some(session) = self.all.iter_mut().find(|s| s.session_id == session_id) {
+            session.pinned = pinned;
+            session.archived_at = archived_at;
+        } else {
+            // A flags change for a session not in the list (e.g. one we never
+            // learned about): nothing to re-partition, but log so a future
+            // mismatch is diagnosable.
+            tracing::debug!(
+                session_id,
+                "SessionFlagsChanged for an unknown session; ignoring",
+            );
+            return;
+        }
+        self.rebuild_view();
     }
 
     /// Highlight `session_id` in the list immediately when it is already
@@ -1079,29 +1203,6 @@ impl SessionManagerState {
             // right away rather than waiting for the next navigation step.
             self.reanchor_scroll();
         }
-    }
-
-    /// Order sessions newest-first by `last_modified`.  Uses a STABLE sort:
-    /// equal timestamps keep whatever order the daemon sent (which is already
-    /// id-desc tiebroken in `handle_list_sessions`), so the TUI doesn't need
-    /// to re-implement that tiebreak here.
-    fn sort_by_last_modified(&mut self) {
-        // `sort_by_key` is stable (see the doc comment above); Reverse gives
-        // newest-first without a custom comparator.
-        self.sessions
-            .sort_by_key(|s| std::cmp::Reverse(s.last_modified));
-    }
-
-    /// Re-order after a live status change and keep the cursor on the same
-    /// session, which may have moved to a new index.
-    pub(crate) fn resort_after_status_change(&mut self) {
-        let selected_id = self
-            .selection
-            .and_then(|i| self.sessions.get(i))
-            .map(|s| s.session_id);
-        self.sort_by_last_modified();
-        self.selection =
-            selected_id.and_then(|id| self.sessions.iter().position(|s| s.session_id == id));
     }
 
     pub(crate) fn select_up(&mut self) {
@@ -1236,6 +1337,8 @@ impl SessionManagerState {
                 accumulated_usage: s.token_usage,
                 context_window: s.context_window,
                 last_prompt_tokens: s.last_prompt_tokens,
+                pinned: s.pinned,
+                archived_at: s.archived_at,
             }
         });
         if self.detail_data.is_some() {
@@ -1249,26 +1352,21 @@ impl SessionManagerState {
     }
 
     pub(crate) fn remove_session(&mut self, id: u64) {
-        let old_len = self.sessions.len();
-        self.sessions.retain(|s| s.session_id != id);
-        let removed = old_len - self.sessions.len();
-        if removed == 0 {
+        let old_len = self.all.len();
+        self.all.retain(|s| s.session_id != id);
+        if self.all.len() == old_len {
             return;
         }
-        if let Some(sel) = self.selection
-            && sel >= self.sessions.len()
-        {
-            self.selection = if self.sessions.is_empty() {
-                None
-            } else {
-                Some(self.sessions.len().saturating_sub(1))
-            };
-        }
+        // Re-partition from the updated full list; the selection follows the
+        // same session by id, or clamps into the new bounds.
+        self.rebuild_view();
         if self
             .detail_data
             .as_ref()
             .is_some_and(|d| d.session_id == id)
         {
+            // Leaving Detail returns to List, whose partition `rebuild_view`
+            // already produced (`Detail` is treated as `List` there).
             self.view = SessionManagerView::List;
             self.detail_data = None;
         }

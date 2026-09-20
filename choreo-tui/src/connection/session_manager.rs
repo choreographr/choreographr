@@ -9,7 +9,9 @@ pub(super) fn handle_session_manager_event(
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     match app.session_mgr.view {
-        SessionManagerView::List => handle_session_list_event(event, app, client_tx),
+        SessionManagerView::List | SessionManagerView::Archived => {
+            handle_session_list_event(event, app, client_tx)
+        }
         SessionManagerView::Detail => handle_session_detail_event(event, app, client_tx),
     }
 }
@@ -85,6 +87,43 @@ fn handle_session_list_key(
             }
         }
         KeyCode::Char('i') => app.session_mgr.enter_detail(),
+        KeyCode::Tab => {
+            // The ONLY view-switch key: toggles the live list and the archived
+            // list (Ctrl+A is the global accounts shortcut and must not be
+            // reused here).
+            app.session_mgr.toggle_view();
+        }
+        KeyCode::Char('p') => {
+            // Toggle the highlighted session's pin.  Local state is NOT
+            // mutated on the keypress — the daemon's `SessionFlagsChanged`
+            // broadcast applies the change (and rolls back nothing on failure,
+            // since nothing was applied optimistically).
+            if let Some(sel) = app.session_mgr.selection
+                && let Some(session) = app.session_mgr.sessions.get(sel)
+            {
+                let session_id = session.session_id;
+                let pinned = !session.pinned;
+                client_tx
+                    .send(ClientMessage::SetSessionPinned { session_id, pinned })
+                    .map_err(broken_pipe)?;
+            }
+        }
+        KeyCode::Char('a') => {
+            // Archive on the live list, unarchive on the archived list.  As
+            // with `p`, the request only ASKS; the broadcast applies it.
+            if let Some(sel) = app.session_mgr.selection
+                && let Some(session) = app.session_mgr.sessions.get(sel)
+            {
+                let session_id = session.session_id;
+                let archived = matches!(app.session_mgr.view, SessionManagerView::List);
+                client_tx
+                    .send(ClientMessage::SetSessionArchived {
+                        session_id,
+                        archived,
+                    })
+                    .map_err(broken_pipe)?;
+            }
+        }
         KeyCode::Char('n') => {
             tracing::info!("[choreo-tui] pressing n on session list -> CreateSession");
             client_tx

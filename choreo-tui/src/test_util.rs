@@ -56,7 +56,10 @@ pub fn make_session(id: u64, title: &str, model: &str, count: u32) -> choreo_pro
         parent_session_id: None,
         working_dir: None,
         created_at: 1_705_314_000_000,
-        last_modified: 1_705_314_000_000,
+        // Decreasing with id so the session manager's
+        // `(pinned, last_modified desc, session_id desc)` sort lands the
+        // fixtures in ascending-id order — the order these tests assume.
+        last_modified: 1_705_314_000_000 - id.cast_signed(),
         turn_count: count,
         status: choreo_proto::SessionStatus::Inactive,
         active_tool_groups: Vec::new(),

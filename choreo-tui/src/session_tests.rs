@@ -345,6 +345,108 @@ mod session_manager_key_tests {
     }
 
     #[test]
+    fn session_manager_tab_toggles_archived_view() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = make_sm_app();
+        assert_eq!(app.session_mgr.view, SessionManagerView::List);
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("handle tab");
+        assert_eq!(app.session_mgr.view, SessionManagerView::Archived);
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("handle tab");
+        assert_eq!(app.session_mgr.view, SessionManagerView::List);
+    }
+
+    #[test]
+    fn session_manager_p_sends_toggled_pin() {
+        let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
+        let mut app = make_sm_app();
+        // The highlighted session (1) starts un-pinned.
+        assert_eq!(app.session_mgr.sessions[0].session_id, 1);
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("handle p");
+        assert_eq!(
+            rx.recv().expect("sent message"),
+            ClientMessage::SetSessionPinned {
+                session_id: 1,
+                pinned: true,
+            }
+        );
+
+        // After the daemon's broadcast applies the pin, `p` sends the inverse.
+        app.session_mgr.apply_session_flags(1, true, None);
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("handle p");
+        assert_eq!(
+            rx.recv().expect("sent message"),
+            ClientMessage::SetSessionPinned {
+                session_id: 1,
+                pinned: false,
+            }
+        );
+    }
+
+    #[test]
+    fn session_manager_a_archives_on_list_and_unarchives_on_archived() {
+        let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
+        let mut app = make_sm_app();
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("handle a");
+        assert_eq!(
+            rx.recv().expect("sent message"),
+            ClientMessage::SetSessionArchived {
+                session_id: 1,
+                archived: true,
+            }
+        );
+
+        // After the broadcast archives session 1, the archived view holds it
+        // and `a` must send the unarchive request.
+        app.session_mgr
+            .apply_session_flags(1, false, Some(1_705_314_000_500));
+        app.session_mgr.toggle_view();
+        assert_eq!(app.session_mgr.view, SessionManagerView::Archived);
+        assert_eq!(app.session_mgr.sessions[0].session_id, 1);
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("handle a");
+        assert_eq!(
+            rx.recv().expect("sent message"),
+            ClientMessage::SetSessionArchived {
+                session_id: 1,
+                archived: false,
+            }
+        );
+    }
+
+    #[test]
     fn session_manager_detail_b_returns_to_list() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = make_sm_app();
@@ -1791,7 +1893,7 @@ fn session_attached_does_not_regress_accumulated_live_state() {
     app.session_mgr
         .set_sessions(vec![make_session(42, "a", "gpt-stale", 0)]);
     {
-        let s = app.session_mgr.sessions.first_mut().unwrap();
+        let s = app.session_mgr.all.first_mut().unwrap();
         s.token_usage = Some(TokenUsage {
             input_tokens: 1,
             output_tokens: 2,

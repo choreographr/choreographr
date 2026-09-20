@@ -21,7 +21,9 @@ use super::{
 // Dispatched from the top-level `render()` in render/mod.rs.
 pub(super) fn render_session_manager(frame: &mut Frame<'_>, app: &mut App) {
     match app.session_mgr.view {
-        SessionManagerView::List => render_session_list_view(frame, app),
+        SessionManagerView::List | SessionManagerView::Archived => {
+            render_session_list_view(frame, app);
+        }
         SessionManagerView::Detail => render_session_detail_view(frame, app),
     }
 }
@@ -40,8 +42,16 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
         chunks.get(1).copied().unwrap_or_default(),
     );
 
+    // The archived view shares every layout rule with the live list; only the
+    // block title, the empty-state message, the pin marker and the status
+    // hint differ.
+    let archived_view = matches!(app.session_mgr.view, SessionManagerView::Archived);
     let block = Block::default()
-        .title(" Session Manager ")
+        .title(if archived_view {
+            " Session Manager — Archived "
+        } else {
+            " Session Manager "
+        })
         .borders(Borders::ALL);
     let inner = block.inner(list_area);
     frame.render_widget(block, list_area);
@@ -81,8 +91,12 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     if total_items == 0 {
-        let msg = Paragraph::new("No sessions. Press 'n' to create one.");
-        frame.render_widget(msg, list_inner);
+        let msg = if archived_view {
+            "No archived sessions."
+        } else {
+            "No sessions. Press 'n' to create one."
+        };
+        frame.render_widget(Paragraph::new(msg), list_inner);
     } else {
         // ── Column layout ────────────────────────────────────────────────
         // The title column is LAST so it absorbs the remaining width via
@@ -91,7 +105,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
         // fixed-width numeric columns; long ids truncate with an ellipsis.
         let session_w = 8u16;
         let parent_w = 8u16;
-        let marker_w = 2u16; // ">" selection + "*" attached markers
+        let marker_w = 3u16; // ">" selection + "*" attached + "P" pin markers
         let status_w = 14u16;
         let model_w = 16u16;
         let turns_w = 5u16;
@@ -137,6 +151,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
 
             let sel = if is_selected { ">" } else { " " };
             let att = if is_attached { "*" } else { " " };
+            let pin = if session.pinned { "P" } else { " " };
             // Child sessions show their parent's id; top-level sessions get a
             // dash so the column stays readable at a glance.
             let parent = session
@@ -161,7 +176,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
             let status_cell_style = row_style.fg(status_color);
             rows.push(
                 Row::new(vec![
-                    Cell::from(format!("{sel}{att}")),
+                    Cell::from(format!("{sel}{att}{pin}")),
                     Cell::from(truncate_str(
                         &session.session_id.to_string(),
                         session_w as usize,
@@ -215,8 +230,18 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
     let status = if let Some((_id, title)) = &app.session_mgr.confirm_delete {
         Paragraph::new(Line::from(format!(" Delete \"{title}\"? (y/N)  ")))
     } else {
+        let archive_hint = if archived_view {
+            "unarchive"
+        } else {
+            "archive"
+        };
+        let tab_hint = if archived_view {
+            "live list"
+        } else {
+            "archived list"
+        };
         Paragraph::new(Line::from(format!(
-            " <j/k nav>  <Enter switch>  <i details>  <n new>  <d delete>  <Esc back>  —  {total_items} sessions"
+            " <j/k nav>  <Enter switch>  <i details>  <n new>  <d delete>  <p pin>  <a {archive_hint}>  <Tab {tab_hint}>  <Esc back>  —  {total_items} sessions"
         )))
     };
     frame.render_widget(status, status_area);
@@ -269,6 +294,16 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
             Line::from(format!(
                 "Last Modified: {}",
                 format_timestamp(detail.last_modified)
+            )),
+            Line::from(format!(
+                "Pinned:        {}",
+                if detail.pinned { "yes" } else { "no" }
+            )),
+            Line::from(format!(
+                "Archived:      {}",
+                detail
+                    .archived_at
+                    .map_or_else(|| "-".to_string(), format_timestamp)
             )),
             Line::from(format!("Turn Count:    {}", detail.turn_count)),
             Line::from(format!(

@@ -1177,3 +1177,107 @@ fn ctrl_r_with_empty_capability_shows_message() {
         Some("model does not support reasoning")
     );
 }
+
+// ── per-session pin/archive flags (SessionFlagsChanged) ──
+
+#[test]
+fn session_flags_changed_updates_list_and_archived_split() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    app.session_mgr.set_sessions(vec![
+        make_session(1, "a", "m", 0),
+        make_session(2, "b", "m", 0),
+    ]);
+    // The live view holds both sessions.
+    assert_eq!(app.session_mgr.sessions.len(), 2);
+
+    // The daemon broadcasts a pin for session 1.
+    handle_daemon_message(
+        DaemonMessage::Session {
+            session_id: Some(1),
+            event: SessionEvent::SessionFlagsChanged {
+                pinned: true,
+                archived_at: None,
+            },
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle SessionFlagsChanged");
+    // Pinned first, flag applied.
+    assert_eq!(app.session_mgr.sessions[0].session_id, 1);
+    assert!(app.session_mgr.sessions[0].pinned);
+
+    // The daemon broadcasts an archive for session 2.
+    handle_daemon_message(
+        DaemonMessage::Session {
+            session_id: Some(2),
+            event: SessionEvent::SessionFlagsChanged {
+                pinned: false,
+                archived_at: Some(1_705_314_000_500),
+            },
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle SessionFlagsChanged");
+    // Session 2 left the live list…
+    assert_eq!(
+        app.session_mgr
+            .sessions
+            .iter()
+            .map(|s| s.session_id)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    // …and appears in the archived list.
+    app.session_mgr.toggle_view();
+    assert_eq!(
+        app.session_mgr
+            .sessions
+            .iter()
+            .map(|s| s.session_id)
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+}
+
+#[test]
+fn session_failed_for_pin_and_archive_sets_page_error() {
+    let mut app = test_app();
+    app.page = Page::SessionManager;
+    let (tx, _rx) = std::sync::mpsc::channel();
+    assert!(app.session_mgr.error.is_none());
+
+    handle_daemon_message(
+        DaemonMessage::Session {
+            session_id: Some(1),
+            event: SessionEvent::SessionFailed {
+                operation: "set_session_pinned".into(),
+                error: "boom".into(),
+            },
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle SessionFailed");
+    assert_eq!(app.session_mgr.error.as_deref(), Some("boom"));
+    // The generic dispatch overwrites `app.error` with the raw daemon error
+    // text after this arm; the page-local error is the useful signal here.
+    assert_eq!(app.error.as_deref(), Some("boom"));
+
+    app.session_mgr.error = None;
+    handle_daemon_message(
+        DaemonMessage::Session {
+            session_id: Some(1),
+            event: SessionEvent::SessionFailed {
+                operation: "set_session_archived".into(),
+                error: "nope".into(),
+            },
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle SessionFailed");
+    assert_eq!(app.session_mgr.error.as_deref(), Some("nope"));
+}
