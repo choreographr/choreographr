@@ -745,6 +745,55 @@ fn reset_for_session_switch_preserves_accumulated_streaming_state() {
 }
 
 #[test]
+fn reset_for_session_switch_preserves_scroll_position() {
+    let mut app = test_app();
+    // A short viewport so a handful of turns makes the history scrollable.
+    app.history_viewport = HistoryViewport {
+        width: 80,
+        height: 5,
+    };
+    app.active_session_id = Some(1);
+    app.attached_session_id = Some(1);
+    // Session 1 accumulates a conversation long enough to scroll.
+    {
+        let display = app.display_for(1);
+        for id in 0..6u32 {
+            display
+                .view
+                .insert_or_replace(id, streamed_turn("question", "an answer that wraps"));
+        }
+    }
+    app.compute_total_height_and_markers();
+    // The user scrolls up to re-read earlier turns…
+    app.scroll_up(2);
+    let saved = app.effective_scroll();
+    assert!(saved > 0, "session 1 should be scrolled up");
+
+    // …switches to a session they have never opened: it opens at the bottom.
+    app.reset_for_session_switch(2);
+    app.compute_total_height_and_markers();
+    assert_eq!(
+        app.effective_scroll(),
+        0,
+        "a session visited for the first time opens at the bottom"
+    );
+
+    // …and returns to session 1: the reading position is remembered.
+    app.reset_for_session_switch(1);
+    // The daemon's attach snapshot lands after the switch and marks the display
+    // content-dirty.  The height cache was just cleared, so the rebuild must
+    // treat this as a baseline (not anchor the offset against a phantom old
+    // height) and leave the preserved offset intact.
+    app.active_display().unwrap().mark_content_changed();
+    app.compute_total_height_and_markers();
+    assert_eq!(
+        app.effective_scroll(),
+        saved,
+        "session 1's scroll position must be remembered across the switch"
+    );
+}
+
+#[test]
 fn handle_session_state_keeps_accumulated_live_turn_over_snapshot_placeholder() {
     let mut app = test_app();
     app.attached_session_id = Some(7);

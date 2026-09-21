@@ -939,6 +939,10 @@ impl App {
         }
     }
 
+    /// Enter `session_id`: rebind the active session and reset only the
+    /// transient *render* state that the next layout pass will rebuild.  The
+    /// per-session reading position (`history_scroll`) and prompt draft are
+    /// preserved so a session the user returns to looks the way they left it.
     pub(crate) fn reset_for_session_switch(&mut self, session_id: u64) {
         self.active_session_id = Some(session_id);
         // A command line belongs to the session the user was editing; it must
@@ -968,10 +972,14 @@ impl App {
         //
         // Only transient *render* state is reset here — it is rebuilt on the
         // next layout pass because `markers_dirty` forces a full rebuild from
-        // the preserved `view.turns`.
+        // the preserved `view.turns`.  The scroll position (`history_scroll`)
+        // is deliberately NOT reset: it lives in the per-session display and
+        // is the user's reading position, so re-entering a session restores
+        // where they left off instead of snapping to the bottom.  A session
+        // visited for the first time starts at scroll 0 (the bottom) because
+        // `or_default()` builds a fresh display behind `display_for`.
         display.render_cache.clear();
         display.visible_turn_ids.clear();
-        display.history_scroll = HistoryScrollState::new();
         display.markers.clear();
         display.height_prefix.clear();
         display.turn_heights.clear();
