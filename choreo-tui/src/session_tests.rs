@@ -798,6 +798,144 @@ fn reset_for_session_switch_preserves_scroll_position() {
     );
 }
 
+/// The content line at the top of the history viewport, from the raw scroll
+/// state (the thing that must stay fixed when the user returns).
+fn top_content_line(app: &App) -> usize {
+    app.total_history_height()
+        .saturating_sub(app.effective_scroll())
+        .saturating_sub(app.history_viewport.height as usize)
+}
+
+#[test]
+fn session_switch_preserves_content_across_viewport_height_change() {
+    let mut app = test_app();
+    app.history_viewport = HistoryViewport {
+        width: 80,
+        height: 8,
+    };
+    app.active_session_id = Some(1);
+    app.attached_session_id = Some(1);
+    {
+        let display = app.display_for(1);
+        for id in 0..8u32 {
+            display
+                .view
+                .insert_or_replace(id, streamed_turn("question", "an answer that wraps"));
+        }
+    }
+    app.compute_total_height_and_markers();
+    app.scroll_up(3);
+    let anchored = top_content_line(&app);
+    assert!(
+        app.effective_scroll() > 0,
+        "session 1 should be scrolled up"
+    );
+
+    // Leave and return with a SHORTER history viewport — exactly what happens
+    // when the help/status bands reflow the layout on attach.  A raw
+    // from-bottom offset would slide the content; the anchor must not.
+    app.reset_for_session_switch(2);
+    app.clamp_scroll_state();
+    app.compute_total_height_and_markers();
+    app.reset_for_session_switch(1);
+    app.history_viewport.height = 6;
+    app.clamp_scroll_state();
+    app.compute_total_height_and_markers();
+
+    assert_eq!(
+        top_content_line(&app),
+        anchored,
+        "the same content must stay at the top of the viewport"
+    );
+}
+
+#[test]
+fn session_switch_keeps_anchored_content_when_background_content_grows() {
+    let mut app = test_app();
+    app.history_viewport = HistoryViewport {
+        width: 80,
+        height: 8,
+    };
+    app.active_session_id = Some(1);
+    app.attached_session_id = Some(1);
+    {
+        let display = app.display_for(1);
+        for id in 0..8u32 {
+            display
+                .view
+                .insert_or_replace(id, streamed_turn("question", "an answer that wraps"));
+        }
+    }
+    app.compute_total_height_and_markers();
+    app.scroll_up(3);
+    let anchored = top_content_line(&app);
+
+    // Leave; while away the session keeps streaming (a new turn lands via the
+    // all-activity subscription).
+    app.reset_for_session_switch(2);
+    app.clamp_scroll_state();
+    app.compute_total_height_and_markers();
+    {
+        let display = app.display_for(1);
+        display
+            .view
+            .insert_or_replace(8, streamed_turn("follow-up", "another answer"));
+        display.mark_content_changed();
+    }
+
+    // Return: the anchored content is still at the top (growth is below it).
+    app.reset_for_session_switch(1);
+    app.clamp_scroll_state();
+    app.compute_total_height_and_markers();
+    assert_eq!(
+        top_content_line(&app),
+        anchored,
+        "background growth must not shift the anchored content"
+    );
+}
+
+#[test]
+fn session_switch_at_bottom_follows_new_background_content() {
+    let mut app = test_app();
+    app.history_viewport = HistoryViewport {
+        width: 80,
+        height: 8,
+    };
+    app.active_session_id = Some(1);
+    app.attached_session_id = Some(1);
+    {
+        let display = app.display_for(1);
+        for id in 0..8u32 {
+            display
+                .view
+                .insert_or_replace(id, streamed_turn("question", "an answer that wraps"));
+        }
+    }
+    app.compute_total_height_and_markers();
+    // No scroll: the user left the session pinned to the bottom.
+    assert_eq!(app.effective_scroll(), 0);
+
+    app.reset_for_session_switch(2);
+    app.clamp_scroll_state();
+    app.compute_total_height_and_markers();
+    {
+        let display = app.display_for(1);
+        display
+            .view
+            .insert_or_replace(8, streamed_turn("follow-up", "another answer"));
+        display.mark_content_changed();
+    }
+
+    app.reset_for_session_switch(1);
+    app.clamp_scroll_state();
+    app.compute_total_height_and_markers();
+    assert_eq!(
+        app.effective_scroll(),
+        0,
+        "a bottom-pinned session must follow new content on return"
+    );
+}
+
 #[test]
 fn handle_session_state_keeps_accumulated_live_turn_over_snapshot_placeholder() {
     let mut app = test_app();

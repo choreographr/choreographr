@@ -3265,18 +3265,23 @@ User presses Enter on a session in the session manager
   → reset_for_session_switch(session_id)
       • preserves live state: view.turns, view.request_to_turn, active
         request set, live token estimates, reasoning overrides
-      • preserves the per-session reading position (history_scroll): a session
-        the user returns to reopens where they left off, not at the bottom
+      • preserves the per-session reading position as an ABSOLUTE anchor: on
+        the way out it captures the content line at the top of the viewport
+        (`ScrollRestore { top_line, at_bottom }`), and on the target's first
+        rebuild the anchor is converted back to a from-bottom offset against
+        the fresh total.  The raw offset is only a distance from the bottom,
+        so it would slide the content when the viewport height differs on
+        return (the help/status bands reflow on attach) or when the session
+        streamed in the background — the anchor is immune to both.  A session
+        left pinned to the bottom (`at_bottom`) follows new content instead.
       • resets only transient render state (markers, height caches), which is
-        rebuilt on the next layout pass (markers_dirty) — the cleared height
-        cache also makes that first rebuild a scroll BASELINE (max_scroll 0 ⇒
-        at_bottom), so the preserved offset is used verbatim rather than being
-        "anchored" against a phantom old height
+        rebuilt on the next layout pass (markers_dirty); the anchor is applied
+        at the end of that rebuild
       • the UI loop's pre-render `clamp_scroll_state` is guarded on
         `markers_dirty` (skip while a rebuild is pending), so it cannot clamp
-        the preserved offset against the cleared (max_scroll 0) height cache
-        before the draw-time rebuild runs; render still clamps for the frame,
-        and the next frame's clamp settles any real overflow
+        against the cleared (max_scroll 0) height cache before the draw-time
+        rebuild runs; render still clamps for the frame, and the next frame's
+        clamp settles any real overflow
   → AttachSession sent to daemon
   → daemon responds with SessionState { turns, … }
   → handle_session_state MERGES the snapshot with the accumulated turns:

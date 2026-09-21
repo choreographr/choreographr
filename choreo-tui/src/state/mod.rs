@@ -257,6 +257,10 @@ pub(crate) struct SessionDisplayState {
     pub(crate) streaming_dirty: bool,
     pub(crate) content_dirty: bool,
     pub(crate) history_scroll: HistoryScrollState,
+    /// Reading position captured when this session was last left, applied once
+    /// on the next visit (see [`ScrollRestore`]).  `None` while the session is
+    /// active or has never been left.
+    pub(crate) scroll_restore: Option<ScrollRestore>,
     pub(crate) turn_layouts: Vec<TurnLayout>,
     /// Per-turn explicit reasoning visibility (`turn_id` → expanded) set by
     /// clicking the reasoning header.  Absent entries fall back to
@@ -322,6 +326,7 @@ impl Default for SessionDisplayState {
             streaming_dirty: false,
             content_dirty: false,
             history_scroll: HistoryScrollState::new(),
+            scroll_restore: None,
             turn_layouts: Vec::new(),
             reasoning_override: HashMap::new(),
             tool_collapse_override: HashMap::new(),
@@ -470,6 +475,26 @@ pub(crate) struct HistoryViewport {
 pub(crate) struct HistoryScrollState {
     pub(crate) scroll: usize,
     pub(crate) scroll_compensation: usize,
+}
+
+/// The reading position captured when a session is left, so the next visit can
+/// restore the same *content* even though the raw scroll offset (a distance
+/// from the bottom) is only meaningful for the viewport height it was taken at:
+/// the help/status bands reflow the history viewport on attach, and background
+/// sessions keep streaming, so both the viewport height and the total content
+/// height can differ by the time the user returns.
+#[derive(Clone, Copy)]
+pub(crate) struct ScrollRestore {
+    /// Absolute content line (from the top of the history) drawn at the top of
+    /// the viewport when the session was left.  Content appended below it — or
+    /// a taller/shorter viewport — does not shift it, so restoring to this line
+    /// re-shows exactly what the user was looking at.
+    pub(crate) top_line: usize,
+    /// Whether the viewport was pinned to the bottom (scroll 0) when the session
+    /// was left.  A bottom-pinned session follows new content on return instead
+    /// of staying anchored to what it was showing, matching the in-session
+    /// behavior when content arrives while the user sits at the bottom.
+    pub(crate) at_bottom: bool,
 }
 
 pub(crate) enum UiEvent {
@@ -944,6 +969,17 @@ impl App {
     /// per-session reading position (`history_scroll`) and prompt draft are
     /// preserved so a session the user returns to looks the way they left it.
     pub(crate) fn reset_for_session_switch(&mut self, session_id: u64) {
+        // Capture the outgoing session's reading position before rebinding the
+        // active session: the history viewport height reflows when the help /
+        // status bands change on attach (and background sessions keep
+        // streaming), so a raw from-bottom offset cannot be restored verbatim.
+        // The captured anchor is applied once on the target's first rebuild.
+        if let Some(prev) = self.active_session_id {
+            let vp = self.history_viewport;
+            if let Some(prev_display) = self.session_displays.get_mut(&prev) {
+                prev_display.capture_scroll_restore(&vp);
+            }
+        }
         self.active_session_id = Some(session_id);
         // A command line belongs to the session the user was editing; it must
         // never become the newly-attached session's draft.  Exiting command
@@ -972,11 +1008,12 @@ impl App {
         //
         // Only transient *render* state is reset here — it is rebuilt on the
         // next layout pass because `markers_dirty` forces a full rebuild from
-        // the preserved `view.turns`.  The scroll position (`history_scroll`)
-        // is deliberately NOT reset: it lives in the per-session display and
-        // is the user's reading position, so re-entering a session restores
-        // where they left off instead of snapping to the bottom.  A session
-        // visited for the first time starts at scroll 0 (the bottom) because
+        // the preserved `view.turns`.  The reading position is NOT reset: the
+        // outgoing session's absolute anchor was captured above, and the
+        // target's own `scroll_restore` (set when it was last left) is applied
+        // on the rebuild below, so a session reopens showing the content the
+        // user left it on rather than snapping to the bottom.  A session never
+        // visited has no anchor and opens at scroll 0 (the bottom) because
         // `or_default()` builds a fresh display behind `display_for`.
         display.render_cache.clear();
         display.visible_turn_ids.clear();
@@ -2108,6 +2145,12 @@ impl SessionDisplayState {
                 }
             }
 
+            // A session switch captured an absolute reading position on the
+            // session we left; restore it now that the height model is fresh
+            // (wins over the preserve adjustment above, which cannot be both
+            // pending and meaningful on the same rebuild).
+            self.apply_scroll_restore(viewport);
+
             self.content_dirty = false;
             self.streaming_dirty = false;
         }
@@ -2385,6 +2428,48 @@ impl SessionDisplayState {
             return;
         }
         self.history_scroll.clamp(self.max_scroll_offset(viewport));
+    }
+
+    /// Capture the current reading position so the next visit can restore the
+    /// same content regardless of the viewport height then (see
+    /// [`ScrollRestore`]).  Called on the outgoing session just before the
+    /// active session is rebound.
+    pub(crate) fn capture_scroll_restore(&mut self, viewport: &HistoryViewport) {
+        let total = self.total_history_height();
+        let eff = self.effective_scroll(viewport);
+        let vh = viewport.height as usize;
+        self.scroll_restore = Some(ScrollRestore {
+            // The top content line of the bottom-anchored window; saturates to
+            // 0 for content shorter than the viewport (where `eff` is 0 too).
+            top_line: total.saturating_sub(eff.saturating_add(vh)),
+            at_bottom: eff == 0,
+        });
+    }
+
+    /// Re-establish a captured reading position against the freshly rebuilt
+    /// height model.  Consumes the anchor, so it applies exactly once per
+    /// restore (the first rebuild after the session switch).
+    fn apply_scroll_restore(&mut self, viewport: &HistoryViewport) {
+        let Some(restore) = self.scroll_restore.take() else {
+            return;
+        };
+        if restore.at_bottom {
+            // Was pinned to the bottom: follow any content that arrived while
+            // the session was in the background, exactly as an in-session
+            // content change does when the user is at the bottom.
+            self.history_scroll.scroll = 0;
+            self.history_scroll.scroll_compensation = 0;
+            return;
+        }
+        let vh = viewport.height as usize;
+        let total = self.total_history_height();
+        // Convert the absolute top line back to a from-bottom offset against the
+        // (possibly changed) total height, so the same content sits at the top
+        // of the viewport again.  Clamp to the valid range; a top line past the
+        // end (content shrank while away) falls back to the bottom.
+        let scroll = total.saturating_sub(restore.top_line.saturating_add(vh));
+        self.history_scroll.scroll = scroll.min(self.max_scroll_offset(viewport));
+        self.history_scroll.scroll_compensation = 0;
     }
 
     pub(crate) fn effective_scroll(&self, viewport: &HistoryViewport) -> usize {
