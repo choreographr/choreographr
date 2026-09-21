@@ -49,10 +49,30 @@ use std::time::Duration;
 
 use crate::common;
 
-/// Bounded receive timeout for daemon replies: short enough that a wedged
-/// daemon fails the test loudly, long enough that a loaded CI box doesn't
-/// flake.
+/// Bounded receive timeout for the ORDINARY (small) daemon replies: short
+/// enough that a wedged daemon fails the test loudly, long enough that a
+/// loaded CI box doesn't flake.
 const TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Receive timeout for the LARGE-message round trips (the `>64 KiB` tests,
+/// which fragment across many Noise wire frames).
+///
+/// A large round trip legitimately does ~two orders of magnitude more work
+/// than a Ping/Pong: every ~64 KiB wire fragment is separately AES-GCM
+/// encrypted on the sender and decrypted on the receiver under the shared
+/// `TransportState` lock, and the `AddCredential` path additionally
+/// test-decrypts the 1 MiB blob and persists it to redb. Under
+/// `cargo test-all`, nextest runs one test process per core AND several other
+/// integration tests run at the same time, so the daemon+client threads
+/// INSIDE this test's process are heavily oversubscribed. Measured under 4×
+/// concurrent full-suite load (16 cores), the 1 MiB `AddCredential` round trip
+/// took ~6.4 s end to end (client transmit ~2.7 s, daemon reassembly ~1.7 s,
+/// keystore verify+decrypt ~1.8 s) — the daemon completes CORRECTLY, just
+/// slowly. The small-message [`TIMEOUT`] above is a latency assumption that
+/// does not hold for this path, so using it here races normal load rather than
+/// detecting a real fault. This larger bound keeps the test honest (a truly
+/// wedged daemon still fails loudly, ~30 s later) without flaking on load.
+const LARGE_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A connected Noise client driven through the real
 /// `run_daemon_tcp_connection`.
@@ -117,8 +137,15 @@ impl NoiseClient {
     }
 
     fn recv(&self) -> DaemonMessage {
+        self.recv_within(TIMEOUT)
+    }
+
+    /// Like [`Self::recv`] but with an explicit bound. Used by the large-message
+    /// tests, whose replies take materially longer to arrive under load (see
+    /// [`LARGE_MESSAGE_TIMEOUT`]).
+    fn recv_within(&self, timeout: Duration) -> DaemonMessage {
         self.rx
-            .recv_timeout(TIMEOUT)
+            .recv_timeout(timeout)
             .unwrap_or_else(|e| panic!("timed out waiting for daemon message: {e:?}"))
     }
 
@@ -624,14 +651,14 @@ fn noise_large_message_through_daemon() {
         encrypted_payload: blob,
         unlock_key: unlock_key.to_vec(),
     });
-    match client.recv() {
+    match client.recv_within(LARGE_MESSAGE_TIMEOUT) {
         // A successful AddCredential now implicitly unlocks the keystore, so
         // the daemon emits `Unlocked` before `CredentialAdded` (mirroring a
         // successful `Unlock`).
         DaemonMessage::Unlocked => {}
         other => panic!("expected Unlocked, got {other:?}"),
     }
-    match client.recv() {
+    match client.recv_within(LARGE_MESSAGE_TIMEOUT) {
         DaemonMessage::CredentialAdded { service } => assert_eq!(service, "big-blob"),
         other => panic!("expected CredentialAdded, got {other:?}"),
     }
@@ -687,9 +714,10 @@ fn noise_large_message_daemon_to_client() {
 
     // This client never subscribed to the session summary, so the next
     // message is exactly the Sessions reply — and it must be intact after
-    // reassembly.
+    // reassembly. Bound by [`LARGE_MESSAGE_TIMEOUT`]: the aggregated reply is
+    // itself a multi-fragment (>64 KiB) reassembly.
     client.send(ClientMessage::ListSessions);
-    match client.recv() {
+    match client.recv_within(LARGE_MESSAGE_TIMEOUT) {
         DaemonMessage::Sessions { sessions } => {
             assert_eq!(sessions.len(), SESSIONS);
             for s in &sessions {
