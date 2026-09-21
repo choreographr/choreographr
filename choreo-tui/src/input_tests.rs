@@ -1631,6 +1631,95 @@ fn terminal_event_ctrl_backspace_inert_while_browsing() {
 }
 
 #[test]
+fn terminal_event_alt_char_while_browsing_does_not_detach() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    add_user_text(&mut app, "recent prompt");
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle up");
+    assert!(app.history_index.is_some());
+
+    // An Alt+letter chord is not an edit (`InputBuffer::handle_key` ignores it),
+    // so it must not detach the recalled entry — only real buffer mutations do.
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle alt+x");
+
+    assert!(
+        app.history_index.is_some(),
+        "a non-edit key must not detach"
+    );
+    assert_eq!(app.input.text, "recent prompt");
+}
+
+#[test]
+fn terminal_event_noop_ctrl_u_while_browsing_does_not_detach() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    add_user_text(&mut app, "recent prompt");
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle up");
+    // Move the cursor to the start of the line, where Ctrl+U deletes nothing.
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle home");
+    assert_eq!(app.input.cursor, 0);
+    assert!(app.history_index.is_some());
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+u");
+
+    // Ctrl+U at the line start edits nothing, so browsing stays intact (the
+    // buffer's `generation` is not bumped).
+    assert!(app.history_index.is_some(), "a no-op edit must not detach");
+    assert_eq!(app.input.text, "recent prompt");
+}
+
+#[test]
+fn terminal_event_empty_paste_while_browsing_does_not_detach() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    add_user_text(&mut app, "recent prompt");
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle up");
+    assert!(app.history_index.is_some());
+
+    // An empty paste mutates nothing, so it must leave browsing intact.
+    handle_terminal_event(Event::Paste(String::new()), &mut app, &tx).expect("handle empty paste");
+
+    assert!(
+        app.history_index.is_some(),
+        "an empty paste must not detach"
+    );
+    assert_eq!(app.input.text, "recent prompt");
+}
+
+#[test]
 fn terminal_event_down_on_last_draft_line_wrapped_multibyte() {
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = test_app();

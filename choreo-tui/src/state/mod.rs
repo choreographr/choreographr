@@ -26,11 +26,13 @@ use crate::markdown_render::{
     reasoning_expanded_default, render_turn_lines, tool_result_default_collapsed,
 };
 
-// The input-editing key types are only referenced from the test module
-// (`use super::*` feeds the unit tests); production key handling lives in
-// `input.rs`, so gate the import to the test build to keep clippy clean.
+// `KeyEvent` is used by production code (`App::edit_input`); the other
+// input-editing key types are referenced only from the test module
+// (`use super::*` feeds the unit tests), so gate those to the test build to
+// keep clippy clean.
+use crossterm::event::KeyEvent;
 #[cfg(test)]
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyModifiers};
 
 mod command_palette;
 mod images;
@@ -947,6 +949,13 @@ impl App {
         // screen coordinates; it must not linger and highlight the next
         // session's history.
         self.text_selection = None;
+        // A history-recalled entry belongs to the session being left; end
+        // browsing so the new session can never show, or stash, the previous
+        // session's recalled prompt.  `persist_input_draft` — which runs before
+        // this on every real switch — already exits browsing, so this is the
+        // defensive backstop that makes the field's "reset on session switch"
+        // contract hold even if a future caller skips the input hand-off.
+        self.history_index = None;
         let display = self.display_for(session_id);
         // Keep the session's live state: `view.turns` and `view.request_to_turn`
         // (accumulated via the all-activity subscription while the user was
@@ -1176,6 +1185,32 @@ impl App {
             self.history_index = None;
             tracing::debug!("[choreo-tui] history entry edited; detaching it into the draft");
         }
+    }
+
+    /// Feed a key to the shared input buffer and, if it actually changed the
+    /// buffer's text, detach a recalled history entry into the draft.
+    ///
+    /// This is the single place that answers *"did this key edit the draft?"*
+    /// so the connection-layer key handler never has to re-enumerate the
+    /// mutating chords — that hand-maintained list lived next to the routing
+    /// code and silently drifted from `InputBuffer::handle_key`, so a newly
+    /// mutating chord would fail to detach a recalled entry.  A pure cursor
+    /// move (`Left`/`Right`/`Home`/`End`, Ctrl+arrows) or an ignored key (an
+    /// `Alt`+letter chord, a NUL) leaves browsing intact, while any real edit —
+    /// typing, Backspace/Delete, Ctrl+W/Ctrl+U/Ctrl+Delete — ends browsing and
+    /// keeps the edit in the buffer as the session's draft.
+    ///
+    /// The buffer's `generation` counter is bumped by every text mutation and
+    /// by nothing else (cursor moves and no-op deletes leave it untouched), so
+    /// a change in it is the precise "the text was edited" signal — no need to
+    /// classify keys by hand.
+    pub(crate) fn edit_input(&mut self, key: KeyEvent) {
+        let before = self.input.generation;
+        self.input.handle_key(key);
+        if self.input.generation != before {
+            self.detach_history_on_edit();
+        }
+        self.ensure_input_cursor_visible();
     }
 
     pub(crate) fn commit_to_history(&mut self) {
@@ -4125,6 +4160,20 @@ mod tests {
         assert!(
             app.text_selection.is_none(),
             "session switch must clear the in-progress selection"
+        );
+    }
+
+    #[test]
+    fn reset_for_session_switch_ends_history_browsing() {
+        // A history-recalled entry belongs to the session being left; switch
+        // must end browsing so the field's "reset on session switch" contract
+        // holds even when the input hand-off is skipped.
+        let mut app = test_app();
+        app.history_index = Some(0);
+        app.reset_for_session_switch(1);
+        assert!(
+            app.history_index.is_none(),
+            "session switch must end history browsing"
         );
     }
 

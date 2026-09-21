@@ -1,7 +1,5 @@
 use crate::render::{mouse_in_history_box, mouse_in_scrollbar_column};
-use crate::state::{
-    App, INPUT_PAD, InputBuffer, PAGE_SCROLL_LINES, find_turn_at_row, input_inner_width,
-};
+use crate::state::{App, INPUT_PAD, PAGE_SCROLL_LINES, find_turn_at_row, input_inner_width};
 use crate::{clipboard, parse_input_line, selection};
 use choreo_client_core::{ClientError, broken_pipe};
 use choreo_proto::ClientMessage;
@@ -214,23 +212,22 @@ pub(super) fn handle_chat_event(
                     let command = parse_input_line(&line, &mut app.next_request_id);
                     run_command(command, true, app, client_tx)?;
                 }
-                // Backspace/Delete mutate the buffer, so a recalled history
-                // entry detaches into the draft eagerly on the first one.
-                KeyCode::Backspace | KeyCode::Delete => {
-                    app.detach_history_on_edit();
-                    handle_input_key(*key, &mut app.input);
-                    app.ensure_input_cursor_visible();
-                }
-                // Left/Right/Home/End are pure cursor moves — they must NOT
-                // detach a recalled entry.
-                KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End => {
-                    handle_input_key(*key, &mut app.input);
-                    app.ensure_input_cursor_visible();
-                }
-                KeyCode::Char(_) => {
-                    app.detach_history_on_edit();
-                    handle_input_key(*key, &mut app.input);
-                    app.ensure_input_cursor_visible();
+                // Every text-editing and cursor key goes through
+                // `edit_input`, which detaches a recalled history entry into
+                // the draft iff the key actually edited the buffer.  A pure
+                // cursor move (Left/Right/Home/End) therefore leaves browsing
+                // intact, while typing, Backspace/Delete, or a mutating Ctrl
+                // chord ends browsing and keeps the edit as the draft.  There
+                // is no hand-kept list of "which keys edit" to drift from
+                // `InputBuffer::handle_key`.
+                KeyCode::Backspace
+                | KeyCode::Delete
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Char(_) => {
+                    app.edit_input(*key);
                 }
                 KeyCode::PageUp => {
                     app.scroll_up(PAGE_SCROLL_LINES);
@@ -529,21 +526,10 @@ fn handle_chat_ctrl_key(key: KeyEvent, app: &mut App) {
         }
         // Ctrl+Left/Right, Ctrl+Backspace, Ctrl+Delete, Ctrl+Home/End, Ctrl+W,
         // Ctrl+U etc. are text-editing shortcuts that should still work in the
-        // input box.  Of these, Ctrl+W, Ctrl+U and Ctrl+Delete mutate the
-        // buffer, so a recalled history entry must detach into the draft
-        // eagerly on the first one; the pure cursor moves (Ctrl+Left/Right/
-        // Home/End) must not.
-        _ => {
-            if matches!(key.code, KeyCode::Char('w' | 'u') | KeyCode::Delete) {
-                app.detach_history_on_edit();
-            }
-            handle_input_key(key, &mut app.input);
-            app.ensure_input_cursor_visible();
-        }
+        // input box.  All of them go through `edit_input`, which detaches a
+        // recalled history entry into the draft iff the chord actually edited
+        // the buffer — the pure cursor moves (Ctrl+Left/Right/Home/End) leave
+        // browsing intact, while Ctrl+W/Ctrl+U/Ctrl+Delete detach it.
+        _ => app.edit_input(key),
     }
-}
-
-fn handle_input_key(key: crossterm::event::KeyEvent, input: &mut InputBuffer) {
-    // All editing logic moved into InputBuffer::handle_key.
-    input.handle_key(key);
 }

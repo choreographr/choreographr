@@ -248,9 +248,12 @@ impl App {
     /// Enter command mode from an EMPTY prompt.  The `/` trigger that flipped
     /// the mode is never stored: the composer buffer is cleared so it holds
     /// only the command line (no leading slash), and the palette resets to the
-    /// top row.
+    /// top row.  Ending any history browsing too, since the recalled entry
+    /// lived in the very buffer being cleared — the command line is not a
+    /// prompt and must not inherit a recalled entry's browsing state.
     pub(crate) fn enter_command_mode(&mut self) {
         self.input.clear();
+        self.history_index = None;
         self.command_mode = true;
         self.command_palette.reset();
     }
@@ -393,6 +396,19 @@ mod tests {
         assert!(
             app.input.text.is_empty(),
             "the `/` trigger is never stored in the buffer"
+        );
+    }
+
+    #[test]
+    fn enter_command_mode_ends_history_browsing() {
+        // Entering command mode clears the shared buffer, so a recalled history
+        // entry (and its browsing state) must not survive into the command line.
+        let mut app = test_app();
+        app.history_index = Some(0);
+        app.enter_command_mode();
+        assert!(
+            app.history_index.is_none(),
+            "command mode must end history browsing"
         );
     }
 

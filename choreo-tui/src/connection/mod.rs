@@ -1050,10 +1050,13 @@ fn handle_paste_event(data: &str, app: &mut App) {
                 return;
             }
             tracing::debug!("[choreo-tui] pasting into chat input buffer");
-            // Pasting mutates the buffer, so a recalled history entry detaches
-            // into the draft eagerly.
-            app.detach_history_on_edit();
-            app.input.insert_str_at_cursor(data);
+            // A non-empty paste mutates the buffer, so a recalled history entry
+            // detaches into the draft eagerly; an empty paste edits nothing and
+            // must leave browsing (and the recalled entry) intact.
+            if !data.is_empty() {
+                app.detach_history_on_edit();
+                app.input.insert_str_at_cursor(data);
+            }
             app.ensure_input_cursor_visible();
         }
         Page::AIProviders => {

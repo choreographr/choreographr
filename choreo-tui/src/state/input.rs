@@ -38,6 +38,12 @@ impl InputBuffer {
     }
 
     pub(crate) fn clear(&mut self) {
+        // No-op when the buffer is already empty: skipping the `generation`
+        // bump keeps that counter a faithful "the text changed" signal (see
+        // `App::edit_input`) instead of firing on an empty clear.
+        if self.text.is_empty() && self.cursor == 0 && self.scroll_offset == 0 {
+            return;
+        }
         self.text.clear();
         self.cursor = 0;
         self.scroll_offset = 0;
@@ -179,6 +185,13 @@ impl InputBuffer {
     }
 
     pub(crate) fn delete_to_start(&mut self) {
+        // A cursor already at the line start has nothing to delete: return
+        // without bumping `generation`, so a no-op Ctrl+U is not mistaken for
+        // an edit (it would otherwise spuriously detach a recalled history
+        // entry — see `App::edit_input`).
+        if self.cursor == 0 {
+            return;
+        }
         self.text.drain(..self.cursor);
         self.cursor = 0;
         self.generation += 1;
