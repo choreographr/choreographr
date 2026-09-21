@@ -770,7 +770,11 @@ fn reset_for_session_switch_preserves_scroll_position() {
     assert!(saved > 0, "session 1 should be scrolled up");
 
     // …switches to a session they have never opened: it opens at the bottom.
+    // Mirror the UI loop's pre-render order: it clamps scroll *before* the
+    // draw-time height rebuild, which must not clobber the preserved offset
+    // (the cleared height cache makes `max_scroll_offset` read 0 there).
     app.reset_for_session_switch(2);
+    app.clamp_scroll_state();
     app.compute_total_height_and_markers();
     assert_eq!(
         app.effective_scroll(),
@@ -785,6 +789,7 @@ fn reset_for_session_switch_preserves_scroll_position() {
     // treat this as a baseline (not anchor the offset against a phantom old
     // height) and leave the preserved offset intact.
     app.active_display().unwrap().mark_content_changed();
+    app.clamp_scroll_state();
     app.compute_total_height_and_markers();
     assert_eq!(
         app.effective_scroll(),

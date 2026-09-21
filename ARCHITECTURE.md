@@ -3272,6 +3272,11 @@ User presses Enter on a session in the session manager
         cache also makes that first rebuild a scroll BASELINE (max_scroll 0 ⇒
         at_bottom), so the preserved offset is used verbatim rather than being
         "anchored" against a phantom old height
+      • the UI loop's pre-render `clamp_scroll_state` is guarded on
+        `markers_dirty` (skip while a rebuild is pending), so it cannot clamp
+        the preserved offset against the cleared (max_scroll 0) height cache
+        before the draw-time rebuild runs; render still clamps for the frame,
+        and the next frame's clamp settles any real overflow
   → AttachSession sent to daemon
   → daemon responds with SessionState { turns, … }
   → handle_session_state MERGES the snapshot with the accumulated turns:

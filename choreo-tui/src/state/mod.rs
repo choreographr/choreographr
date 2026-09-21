@@ -2370,6 +2370,20 @@ impl SessionDisplayState {
     }
 
     pub(crate) fn clamp_scroll_state(&mut self, viewport: &HistoryViewport) {
+        // Never clamp against a height model that is about to be rebuilt.
+        // `markers_dirty` means the per-turn heights (and thus
+        // `max_scroll_offset`) no longer reflect the content — a session
+        // switch just cleared the height cache, or a resize re-wrapped every
+        // line.  `max_scroll_offset` would read 0 there, so clamping would
+        // collapse a legitimately preserved scroll offset to the bottom
+        // *before* the rebuild in `compute_total_height_and_markers` runs
+        // (the pre-render clamp in the UI loop runs ahead of the draw-time
+        // rebuild).  Rendering clamps `effective_scroll` against the freshly
+        // rebuilt height for the one frame this skips, and the next frame's
+        // clamp settles any genuine overflow, so skipping here is safe.
+        if self.markers_dirty {
+            return;
+        }
         self.history_scroll.clamp(self.max_scroll_offset(viewport));
     }
 
