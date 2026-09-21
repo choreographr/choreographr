@@ -2,9 +2,10 @@
 
 **Status:** proposed — *awaiting a decision on the refresh-persistence question
 in §6 (D4)*. The login mechanics are verified against the upstream `openai/codex`
-source; the one genuinely open design question is whether the daemon may retain
-the keystore unlock key for the unlocked session so it can persist rotated
-refresh tokens. Everything else is a build-out of verified wire facts.
+source and cross-checked against this project's local agent-harness corpus in
+`~/agents` (§16); the one genuinely open design question is whether the daemon
+may retain the keystore unlock key for the unlocked session so it can persist
+rotated refresh tokens. Everything else is a build-out of verified wire facts.
 **Date:** 2026-09-21
 **Target:** first-class OAuth credentials for inference providers, starting with
 the ChatGPT/Codex subscription (`openai-codex` / new `chatgpt` slug, Responses
@@ -14,7 +15,8 @@ API at `https://chatgpt.com/backend-api/codex`), behind the existing keystore an
 `choreo-client-core` (PKCE + loopback/device-code login, JWT claims),
 `choreo-ai-protocols` (credential-derived bearer + extra headers, OAuth provider
 table), `choreo-daemon` (`accounts/mod.rs`, `daemon.rs`, `providers/mod.rs`,
-`sessions.rs` refresh-on-401), `choreo-proto` (one `InferenceError`/broadcast),
+`sessions.rs` per-account single-flight refresh), `choreo-proto` (one
+`InferenceError`/broadcast),
 `choreo-tui` + `choreo-cli` (`/login` UX and device-code fallback), and docs
 (`ARCHITECTURE.md`, `README.md`).
 
@@ -29,8 +31,11 @@ table), `choreo-daemon` (`accounts/mod.rs`, `daemon.rs`, `providers/mod.rs`,
 > (PKCE loopback or device-code) runs in the *frontend*, because the loopback
 > redirect must be on the browser's machine and the daemon is often remote —
 > then the tokens ride the **existing encrypted `AddCredential` path unchanged**.
-> Refresh runs in the *daemon* (it must work unattended), with one open question:
-> the daemon currently drops the 32-byte unlock key after unlock, so it cannot
+> Refresh runs in the *daemon* (it must work unattended) and must be
+> **single-flight per account**, because every mature harness in `~/agents` treats
+> the refresh token as **single-use/rotating** (§16) — two concurrent requests
+> spending the same refresh token both fail. There is one open question: the
+> daemon currently drops the 32-byte unlock key after unlock, so it cannot
 > re-encrypt and persist a rotated refresh token (see §6 D4).
 
 ---
@@ -52,6 +57,7 @@ table), `choreo-daemon` (`accounts/mod.rs`, `daemon.rs`, `providers/mod.rs`,
 13. [Out of scope / future work](#13-out-of-scope--future-work)
 14. [Verification / definition of done](#14-verification--definition-of-done)
 15. [References](#15-references)
+16. [Prior art — how other harnesses do it](#16-prior-art--how-other-harnesses-do-it)
 
 ---
 
@@ -147,10 +153,23 @@ of writing. Two grants are used; both end with
 
 ### 3.2 Device code (headless / SSH / remote)
 
-- `POST {issuer}/deviceauth/usercode` → returns `user_code` + `device_auth_id`.
-- User opens `{issuer}/codex/device` and enters the code.
-- Poll `POST {issuer}/deviceauth/token` with `{ device_auth_id, user_code }`.
-- Final exchange uses `redirect_uri = {issuer}/deviceauth/callback`.
+Two generations of endpoint paths exist across harnesses; **verify at build
+time** and keep both in the OAuth table:
+
+- `openai/codex` (`device_code_auth.rs`): `POST {issuer}/deviceauth/usercode`,
+  poll `{issuer}/deviceauth/token`, verification URL `{issuer}/codex/device`,
+  exchange with `redirect_uri = {issuer}/deviceauth/callback`.
+- pi (`packages/ai/src/auth/oauth/openai-codex.ts`): `POST
+  {issuer}/api/accounts/deviceauth/usercode` and `…/api/accounts/deviceauth/token`
+  (JSON bodies), and the poll returns **`{ authorization_code, code_verifier }`**
+  — not tokens — which is then exchanged through the normal token endpoint with
+  `redirect_uri = {issuer}/deviceauth/callback`.
+
+Either way the flow is: request a user code → the user opens the verification URL
+and enters the code → poll until authorized → **exchange the resulting
+authorization code for tokens**. Device-code **is** a supported ChatGPT path
+(pi and hermes both implement it; hermes even defaults to it), so zero's preset
+comment to the contrary is stale.
 
 ### 3.3 Using the token
 
@@ -167,6 +186,11 @@ From `token_data.rs`, `model-provider/src/auth.rs`,
   (the latter under the `https://api.openai.com/profile` claim; the rest under
   `https://api.openai.com/auth`). `account_id` is parsed from
   `https://api.openai.com/auth.chatgpt_account_id`.
+- **Where `account_id` is read from:** upstream codex and jcode parse the
+  **id_token**; pi parses the **access_token** JWT (`getAccountId(token.access)`,
+  same claim path). Both are observed in the wild — the adapter should try the
+  access token first and fall back to the id_token (and vice versa), since the
+  claim is identical.
 
 > **Unverified / confirm-against-a-live-token.** I did **not** verify (a) whether
 > the provider **rotates** the refresh token on refresh, nor (b) the exact
@@ -196,8 +220,9 @@ session thread: InferenceProvider::from_account_config(config, auth, registry)
 chatgpt.com/backend-api/codex/responses
   │  on 401 / expiry:
   ▼
-refresh (blocking ureq, JSON) → update in-memory credential → drop cached
-client → rebuild → retry once        ← D4: persistence is the open question
+refresh (blocking ureq; JSON for refresh) — single-flight per account →
+update in-memory credential → drop cached client → rebuild → retry once
+                        ← D4: persistence (rotating token) is the open question
 ```
 
 Two boundaries are deliberately unchanged: the **encrypted `AddCredential`
@@ -236,6 +261,11 @@ OAuth {
 
 - The variant participates in the existing `#[zeroize(drop)]` derive and the
   redacting `Display`/`Debug` (all fields `***`).
+- **The `id_token` must survive a refresh.** A refresh response commonly returns a
+  new access token *without* a new id_token; overwriting the field with `None`
+  would drop the `chatgpt_account_id` claim the request headers need. The refresh
+  parser must replace the id_token only when the response actually carries one
+  (zero, `oauth/flow.go::PostToken`, does exactly this).
 - `ServiceCredential` is serialized with **postcard**; appending a variant is
   forward-compatible for new blobs (old daemons cannot read new blobs, which is
   fine — same binary), and new daemons continue to read old blobs.
@@ -261,11 +291,17 @@ its own zeroize/redact treatment.
 
 **D3 — Token→header abstraction lives in two layers, with minimal provider-churn.**
 
+Every harness models request auth as a value derived *from the credential*, not a
+frozen string — pi's `ModelAuth { apiKey?, headers?, baseUrl? }` (per-credential
+`baseUrl` for GitHub Copilot), opencode's `auth.json` union, jcode's `AuthRoute`.
+Mirror that:
+
 - *`choreo-ai-protocols`*: let the OpenAI clients accept a credential-derived
-  bearer token **plus per-account extra headers**. There is already a proven
-  per-request header-injection mechanism — `shared::opencode_gateway_headers`,
-  applied on both the OpenAI and Anthropic paths — so this is a generalization of
-  an existing seam, not new plumbing.
+  `ProviderAuth` — a bearer token **plus per-account extra headers** (and later a
+  per-credential `base_url`, e.g. Copilot). There is already a proven per-request
+  header-injection mechanism — `shared::opencode_gateway_headers`, applied on both
+  the OpenAI and Anthropic paths — so this is a generalization of an existing
+  seam, not new plumbing.
 - *`choreo-daemon` session layer*: the session already rebuilds its provider
   lazily (`SessionState::resolve_provider`) and already invalidates cached clients
   on credential change (`drop_session_clients`). So **refresh lives at the agent
@@ -273,16 +309,41 @@ its own zeroize/redact treatment.
   `ureq`, exactly like provider calls), update the in-memory credential, drop the
   cached client, and retry once. The provider crates stay synchronous and free of
   daemon concerns (no async, no token-source trait).
+- **Refresh is single-flight per account** (see D4): the guard must be per
+  *account*, not per session thread — one account can back many sessions, and a
+  rotating refresh token spent twice is a hard failure.
 
-**D4 — Where refresh runs, and the persistence wrinkle (the open question).**
+**D4 — Where refresh runs, single-flight, and the persistence wrinkle.**
+
 Daemon-side refresh is required for unattended operation (the client may not be
-connected when a token expires). The catch found in the code: **the daemon does
-not retain the 32-byte unlock key after unlock.** `handle_unlock` /
-`unlock_tail` decrypt all credential blobs into memory and then drop the key;
-no `DaemonState` field holds it (`choreo-daemon/src/daemon/keystore.rs`,
-`daemon.rs`). Consequently the daemon can refresh and update its **in-memory**
-credential, but it **cannot re-encrypt and persist** a rotated refresh token back
-to the DB blob. Options:
+connected when a token expires). Three requirements fall out of the cross-harness
+review (§16):
+
+1. **Single-flight per account.** Refresh tokens are rotated and **single-use**:
+   zero serializes refreshes per key and re-loads the token *inside* the lock,
+   reusing a peer's rotation rather than spending the token twice; pi does the same
+   inside `CredentialStore.modify`; hermes refreshes under the `auth.json` lock
+   after re-reading the row. Since one account can back many sessions on different
+   threads, the daemon needs a **per-account refresh guard** — a natural fit for
+   the channel-based model (a refresh coordinator the session threads ask for a
+   token) or a small single-purpose lock documented under the AGENTS.md
+   exceptions.
+2. **Refresh on a schedule, not only on failure.** Refresh before each request
+   when within a **buffer** of expiry (goose 30 s, zero/hermes 60 s, pi 5 min);
+   force-refresh once on a 401 (`zero.Handle401`); and optionally run a
+   **proactive best-effort scheduler** (zero `RefreshScheduler`) so a long-idle
+   daemon refreshes before the token lapses.
+3. **Failure taxonomy.** Terminal (`invalid_grant` / `invalid_token` /
+   `refresh_token_reused`) → the credential is dead, quarantine it and surface
+   "re-login required" once (do not hot-loop). Transient (network / 429 / 5xx) →
+   back off and retry.
+
+The persistence wrinkle: **the daemon does not retain the 32-byte unlock key
+after unlock.** `handle_unlock` / `unlock_tail` decrypt all credential blobs into
+memory and then drop the key; no `DaemonState` field holds it
+(`choreo-daemon/src/daemon/keystore.rs`, `daemon.rs`). Consequently the daemon
+can refresh and update its **in-memory** credential, but it **cannot re-encrypt
+and persist** a rotated refresh token back to the DB blob. Options:
 
 | Option | Behavior | Cost |
 |---|---|---|
@@ -291,9 +352,15 @@ to the DB blob. Options:
 | **3. Client re-push on rotation** | Daemon emits a "credential refreshed, please re-store" event; an attached client persists. | Fails whenever no client is attached (the headless-server case). |
 
 **Recommendation:** ship **Option 1** as v1 with explicit "re-login required"
-surfacing when refresh fails, and treat Option 2 as a follow-up gated on
-confirming whether ChatGPT rotates refresh tokens. This is the single decision to
-settle before coding the refresh path.
+surfacing when refresh fails, and treat Option 2 as a follow-up. Note that the
+cross-harness evidence (§16) says OAuth refresh tokens **do** rotate and are
+single-use, so Option 1 is only correct while the daemon process lives: after a
+`/lock` or restart the *original* refresh token is re-read and may already be
+spent. Two consequences: (a) the per-account single-flight guard is mandatory
+regardless of which D4 option ships; (b) if reuse-after-restart proves broken in
+practice, Option 2 (retain the key, documented + opt-in) becomes the path to a
+durable store. This is the single decision to settle before coding the refresh
+path.
 
 **D5 — Auth-kind in the catalog.** Add an `auth` attribute to the provider
 entry (`api_key` vs `oauth`, plus an OAuth-profile reference) so the daemon knows
@@ -306,12 +373,24 @@ and refresh encodings, header mapping) live in a small **data-driven table** so
 GitHub Copilot, Qwen, Kimi-code, and Radius can be added without OpenAI-specific
 code (Copilot's device-code→copilot-token exchange is a different shape).
 
+**Shipping a third-party client id is a deliberate opt-in.** The ChatGPT flow's
+`client_id` is OpenAI's public Codex CLI identity, not ours; zero bakes in such
+presets but keeps them **off** unless `ZERO_OAUTH_ALLOW_PRESETS` is set, precisely
+because a preset is someone else's OAuth client identity. Mirror that: the
+`chatgpt` entry exists in the table but the shipped client id is used only after
+an explicit user opt-in (or an override), so the default credential path carries
+no borrowed client identity.
+
 **D6 — Device-code is a first-class fallback**, selected explicitly
 (`--device`) or automatically when no browser/display is available.
 
-**D7 — Distinct error surfacing.** Add an `InferenceError` variant for
-expired/revoked auth (mapped from 401s and failed refreshes) plus a broadcast, so
-the UI shows "re-login required" rather than a generic provider error.
+**D7 — Distinct error surfacing, split terminal vs transient.** Add an
+`InferenceError` variant for dead auth (mapped from a **terminal** refresh failure
+— `invalid_grant` / `invalid_token` / `refresh_token_reused` — not from a generic
+401) plus a broadcast, so the UI shows "re-login required" rather than a generic
+provider error and the daemon stops replaying a doomed exchange. Transient
+failures (network / 429 / 5xx) stay on the normal retry path. This mirrors hermes'
+`relogin_required` classification and goose's clear-on-refresh-failure.
 
 ## 7. Cross-crate change inventory
 
@@ -320,7 +399,7 @@ the UI shows "re-login required" rather than a generic provider error.
 | `choreo-keystore` | `ServiceCredential::OAuth { … }` variant (§5) with zeroize + redacted Display; empty/expiry helpers. |
 | `choreo-client-core` | PKCE S256 + `state` generation; loopback callback server (std threads / `tiny_http`, no async); device-code client; JWT claim parsing (`chatgpt_account_id`, `plan_type`, `email`); build the OAuth credential and reuse `build_add_credential_from_credential`. |
 | `choreo-ai-protocols` | Accept credential-derived bearer + extra headers in the OpenAI clients (generalize `shared::opencode_gateway_headers`); OAuth provider parameter table; (ChatGPT has no `/models` — plan the curated model-list path). |
-| `choreo-daemon` | `api_key_for` → an auth accessor returning the OAuth credential; `ProviderAuth` wiring in `providers/mod.rs`; `ResolveAccountCmd` reply carries OAuth auth; 401→refresh→rebuild→retry in the session agent loop; `oauth` catalog auth-kind; D4 persistence decision. |
+| `choreo-daemon` | `api_key_for` → an auth accessor returning the OAuth credential; `ProviderAuth` wiring in `providers/mod.rs`; `ResolveAccountCmd` reply carries OAuth auth; **per-account single-flight refresh guard** + 401→refresh→rebuild→retry in the session agent loop; optional proactive refresh scheduler; `oauth` catalog auth-kind; D4 persistence decision. |
 | `choreo-proto` | One `InferenceError` variant + one `DaemonMessage` (re-login-required). `AddCredential` itself is unchanged (opaque bytes). |
 | `choreo-tui` / `choreo-cli` | `/login <provider>` (alias `/add-oauth`), provider-picker entry, device-code fallback, re-login prompts; a CLI login subcommand. |
 | docs | `ARCHITECTURE.md` (drop the now-supported slugs from the deferred note; document the credential/auth/refresh flow), `README.md` (feature-matrix OAuth row, command list). |
@@ -336,6 +415,11 @@ new-account wizard):
   code, then sends `AddCredential` — the identical tail to `/add-key`.
 - **`--device`** (or automatic when no browser) — device-code prompt: print the
   verification URL + user code, poll, then `AddCredential`.
+- **`--no-browser` / `--print-auth-url`** — for SSH/remote: print the authorize
+  URL and accept a pasted callback URL or `code`. (jcode ships
+  `--print-auth-url`/`--callback-url`/`--complete` with persisted `pending-login`
+  state; pi races a `manual_code` prompt against the loopback server; goose times
+  the callback wait out with the URL in the message.)
 - **Re-login prompt** — when the daemon broadcasts "auth expired / re-login
   required", the frontend offers to re-run `/login` for that account.
 
@@ -347,6 +431,18 @@ new-account wizard):
   `redact_error_url` pattern from Codex is the model).
 - **Zeroize** access/refresh/id tokens; redacted `Display`/`Debug` on the new
   variant (mirrors the existing `ServiceCredential` treatment).
+- **Endpoint rule, applied to configured *and* discovered endpoints (fail
+  closed):** a credential-bearing endpoint must be `https`, with loopback `http`
+  exempt — zero's `ValidateEndpointURL`. Discovery metadata must never downgrade
+  the login to cleartext or an attacker host.
+- **Refuse redirects on credential-bearing POSTs** (token exchange/refresh,
+  device authorization/poll) so a 307/308 cannot replay a code, verifier, refresh
+  token, or client secret to an unvalidated origin (zero `withoutRedirects`).
+- **Reserved auth params are not overridable** by provider extra-params
+  (`response_type` / `client_id` / `redirect_uri` / `state` / `code_challenge*`),
+  and PKCE `plain` is refused (zero `isReservedAuthParam`, `ErrPKCEDowngrade`).
+- **Cap and redact error bodies** (1 MiB; `error`/`error_description` only) so
+  token material in an unexpected payload never lands in a log.
 - The **refresh-persistence** decision (D4) is a security-model decision and must
   be documented in `ARCHITECTURE.md` whichever way it goes.
 - The token transport needs **no** new code: tokens ride the same X25519-encrypted
@@ -381,9 +477,11 @@ time-based waits; integration tests in a crate-level `tests/it/` target, marked
 3. **Interactive login (PKCE).** `choreo-client-core` PKCE + loopback server +
    token exchange + JWT claims; wire `/login openai` in the TUI and CLI; mock-
    server integration test.
-4. **Refresh.** Session agent-loop 401→refresh→rebuild→retry; D4 Option 1
-   (in-memory) with "re-login required" surfacing; integration test with a stub
-   token source.
+4. **Refresh.** Per-account single-flight guard; refresh when within a buffer of
+   expiry and force-refresh once on 401; rebuild the session client and retry;
+   D4 Option 1 (in-memory) with the terminal/transient "re-login required"
+   surfacing; integration test with a stub token source (including a concurrent
+   double-refresh that must spend the token once).
 5. **Device-code fallback.** `/login openai --device`; mock-server test.
 6. **Catalog polish + docs.** `chatgpt` slug, model list, `ARCHITECTURE.md` /
    `README.md`.
@@ -394,7 +492,7 @@ time-based waits; integration tests in a crate-level `tests/it/` target, marked
 
 | Risk | Mitigation |
 |---|---|
-| Refresh-token **rotation** invalidates the persisted blob after restart (D4). | Confirm against a live token **before** coding refresh; if it rotates, escalate to D4 Option 2 (retain the key, documented + opt-in). |
+| Refresh-token **rotation** is real and the token is single-use (§16), so (a) two concurrent refreshes can invalidate each other and (b) the persisted blob may hold a spent token after restart (D4). | Single-flight the refresh **per account** regardless of which D4 option ships; confirm reuse-after-restart against a live token before coding refresh; if it breaks, escalate to D4 Option 2 (retain the key, documented + opt-in). |
 | The ChatGPT backend is unofficial/undocumented and may change headers or paths. | Confine wire specifics to the OAuth provider table + one adapter; add a clear error when the endpoint rejects a request; document the source of truth as the Codex CLI. |
 | Client id / scope / port are OpenAI's allow-listed values and may change. | Keep them in the data-driven table (overridable), with tests pinning current values. |
 | No `/models` endpoint on the ChatGPT backend. | Curated list from the catalog (`openai-codex` already carries one); document the divergence. |
@@ -444,4 +542,34 @@ time-based waits; integration tests in a crate-level `tests/it/` target, marked
   `choreo-ai-protocols/src/shared.rs` (`opencode_gateway_headers` — the
   per-request header seam), `choreo-ai-protocols/catalog/models-overlay.toml`
   (`openai-codex`), `ARCHITECTURE.md` (~line 1366, deferred providers).
-```
+- Cross-harness prior art (§16), verified in `~/agents` — `zero/internal/oauth/`
+  (`manager.go`, `flow.go`, `scheduler.go`, `presets.go`, `oauth.go`),
+  `pi/packages/ai/src/auth/` (`types.ts`, `resolve.ts`, `oauth/openai-codex.ts`,
+  `oauth/device-code.ts`, `oauth/meta.ts`), `goose/crates/goose/src/oauth/mod.rs`,
+  `opencode/packages/opencode/src/auth/index.ts`, `jcode/OAUTH.md`,
+  `hermes-agent/docs/…/model-provider-plugin.md` and `credential-pools.md`.
+
+## 16. Prior art — how other harnesses do it
+
+The `~/agents` tree is this project's own checkout of ~24 agent harnesses (with
+`ARCHITECTURE_COMPARISON.md` and `MULTI_ACCOUNT_PROVIDER_ANALYSIS.md`). Every
+harness that supports provider OAuth converges on the same shape, which this plan
+mirrors.
+
+| Harness | Shape | Notable |
+|---|---|---|
+| **pi** (`packages/ai/src/auth/`) | `ProviderAuth { apiKey?, oauth? }`; `OAuthAuth { login, refresh, toAuth }`; `OAuthCredential { access, refresh, expires, accountId? }`; `ModelAuth { apiKey, headers, baseUrl }` | Cleanest abstraction; **double-checked-lock refresh inside `CredentialStore.modify`**; races a manual-code prompt against the loopback server; per-provider OAuth modules (`openai-codex.ts`, `anthropic.ts`, `github-copilot.ts`, `kimi-coding.ts`, `meta.ts`, `radius.ts`, `xai.ts`, `openrouter.ts`); device-code poller with RFC 8628 `authorization_pending`/`slow_down`. |
+| **zero** (`internal/oauth/`) | Go engine: `Manager.GetFresh` / `Handle401` / `refreshAndSave`, `Store`, provider presets, `RefreshScheduler` | **Single-flight refresh per key** (mutex + re-load under lock); proactive scheduler with jitter (best-effort; on-demand is the safety net); presets **off** unless `ZERO_OAUTH_ALLOW_PRESETS`; hardening (`ValidateEndpointURL`, `withoutRedirects`, reserved params, `ErrPKCEDowngrade`); id-token-preserving `PostToken`. |
+| **hermes-agent** (Python) | Credential **pool** (`credential-pools.md`), `auth_type` per profile, `refresh_credential` hook | **Cross-process refresh under an `auth.json` lock, re-reading the row first**; terminal (`invalid_grant`/`refresh_token_reused`) → **DEAD + re-login**, transient → bench+retry; 6 OAuth providers; `codex_login_flow: device_code\|browser`. |
+| **jcode** (Rust) | Per-provider login (`login --provider …`), `auth_mode.rs::AuthRoute`, `auth.json` + per-provider token files | Dual-auth providers (`claude`/`anthropic-api`, `openai`/`openai-api`); **consent-gated import** from Codex/Claude/OpenCode/pi/Hermes/OpenClaw; `--no-browser`/`--print-auth-url`/`--callback-url` with `pending-login` state; applies the Claude-Code OAuth request contract (identity line, tool-name remap) and the ChatGPT `originator`/`chatgpt-account-id` headers. |
+| **goose** (Rust) | `oauth/mod.rs` (axum loopback + `oauth2`/`rmcp`), `GooseCredentialStore` | Rust reference for the loopback server + callback page + timeout; `REFRESH_BUFFER_SECS=30`; re-reads stored creds before refresh; clears bad creds and falls back to browser re-auth. *(Its flow is MCP-server OAuth, not provider login, but the mechanics transfer.)* |
+| **opencode** (TS) | `auth.json` union `Oauth{refresh,access,expires,accountId?,enterpriseUrl?} \| Api{key} \| WellKnown` | Origin of the `auth.json` shape other tools import; one credential per provider id; `0o600` file. |
+| **codex** (Rust) | `codex-rs/login/` | The authoritative ChatGPT flow (`server.rs`, `oauth/client.rs` per-endpoint encoding, `device_code_auth.rs`, `token_data.rs` claims) — the source §3 is verified against. |
+
+**Convergent conclusions folded into this plan:** (1) request auth is a value
+derived from the credential, not a static key (D3); (2) refresh tokens rotate and
+are single-use, so refresh must be single-flight per account (D4); (3) refresh on
+a buffer + on 401 + optionally on a timer (D4); (4) a shipped third-party client
+id is an opt-in (D5); (5) terminal vs transient auth failure drives the UI (D7);
+(6) headless login (device-code + paste-the-URL) is first-class (§8); (7) zero's
+endpoint/redirect/PKCE hardening is adopted wholesale (§9).
