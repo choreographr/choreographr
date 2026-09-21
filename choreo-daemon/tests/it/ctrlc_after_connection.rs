@@ -13,6 +13,16 @@
 //! hard deadline instead of joining it, so a wedged shutdown fails the test
 //! loudly instead of hanging the suite forever.
 //!
+//! These tests rely on an ordering guarantee in `run_server` (server/lifecycle.rs):
+//! the SIGINT/SIGTERM handler is registered **synchronously** on the `run_server`
+//! thread *before* the Unix socket is bound (and before the TCP listener is made
+//! connectable) — so once the harness's readiness gate passes (socket file
+//! exists AND a TCP connect succeeds), the handler is already installed. That is
+//! what makes delivering SIGINT with no startup `sleep` safe: a SIGINT cannot
+//! land in an uninstalled-handler window and kill the test process with the
+//! kernel's default action. See the registration site in `run_server` for the
+//! full rationale.
+//!
 //! Belongs to the `#[ignore = "integration"]` integration suite (real sockets, real signal
 //! delivery, real threads).
 
@@ -73,6 +83,12 @@ fn sigint_and_wait(daemon: &mut common::SpawnedDaemon) -> bool {
 
 /// CONTROL: a fresh daemon with zero connections must exit promptly on
 /// SIGINT (the bug report confirms this works in the field).
+///
+/// This is the regression test for the startup-ordering race: it is the only
+/// test here that signals with NO `sleep` after readiness, so it is the one
+/// that would expose a handler installed later than the readiness the harness
+/// observes. It is safe only because `run_server` registers the handler before
+/// binding the socket (see the file-level note).
 #[test]
 #[ignore = "integration"]
 fn sigint_exits_fresh_daemon_with_no_connections() {

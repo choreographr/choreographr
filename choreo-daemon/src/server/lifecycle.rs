@@ -261,6 +261,74 @@ pub fn run_server(
     // unchanged.
     auto_exit: bool,
 ) -> io::Result<()> {
+    // ── Signal-handler registration ────────────────────────────────────────
+    // Register the SIGINT/SIGTERM handler SYNCHRONOUSLY here, on the
+    // `run_server` thread, BEFORE the socket is bound — hence before any
+    // readiness a caller can observe (the socket file appearing, a TCP
+    // connect succeeding). `Signals::new` installs the self-pipe handler as
+    // a side effect of returning, and the pipe buffers any signal that
+    // arrives before the consumer thread starts draining it — so the
+    // guarantee is: once the socket exists at all, SIGINT is caught rather
+    // than taking the kernel's default action and killing the process.
+    //
+    // This ordering is load-bearing. The previous shape spawned a thread
+    // whose FIRST action was `Signals::new`, which runs only once the
+    // scheduler reaches that thread: the accept loop (and the readiness a
+    // client observes) could come up first, so a SIGINT landing in that
+    // window hit an uninstalled handler and terminated the process by the
+    // default action. Registering on the `run_server` thread before the bind
+    // closes that window entirely.
+    //
+    // Failure to register is log-and-continue, not a startup error: the
+    // daemon still serves, it just cannot be Ctrl+C'd (matching the old
+    // behavior). The registered iterator is moved into its consumer thread
+    // below; when registration fails the local is `None` and no thread is
+    // spawned. An early `bind` failure returns with the local dropping,
+    // which unregisters the handler (`signal_hook` unregisters on drop) —
+    // i.e. a failed startup leaves no handler behind, as before.
+    #[cfg(unix)]
+    let signals: Option<signal_hook::iterator::Signals> =
+        match signal_hook::iterator::Signals::new([SIGINT, SIGTERM]) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                error!("failed to register signal handlers: {e}");
+                None
+            }
+        };
+    // Windows: `low_level::register` installs the CRT console handler (the
+    // same primitive `flag::register` is built on) synchronously and returns
+    // once it is live; the channel receivers are moved into the consumer
+    // thread below, which just blocks in `recv()`. Registering here — rather
+    // than inside the spawned thread — closes the same startup race as the
+    // Unix path above.
+    #[cfg(windows)]
+    let windows_signal_rx: Option<mpsc::Receiver<()>> = {
+        use signal_hook::consts::{SIGINT, SIGTERM};
+        let (sig_tx, sig_rx) = mpsc::channel::<()>();
+        let int_tx = sig_tx.clone();
+        let term_tx = sig_tx;
+        // SAFETY: on Windows the registered action runs on the CRT's
+        // console-handler thread, where an mpsc send is safe (no POSIX
+        // async-signal restrictions apply); the senders are moved into the
+        // registrations and outlive them.
+        match unsafe {
+            signal_hook::low_level::register(SIGINT, move || {
+                let _ = int_tx.send(());
+            })
+        }
+        .and_then(|_| unsafe {
+            signal_hook::low_level::register(SIGTERM, move || {
+                let _ = term_tx.send(());
+            })
+        }) {
+            Ok(()) => Some(sig_rx),
+            Err(e) => {
+                error!("failed to register signal handlers: {e}");
+                None
+            }
+        }
+    };
+
     // Probe-then-remove, with the socket path carried in every error: a
     // bind/removal failure otherwise surfaces as a context-free "Permission
     // denied (os error 13)" (the Termux /tmp failure mode) with no hint WHICH
@@ -312,22 +380,18 @@ pub fn run_server(
     // without disturbing this binding). See DaemonCore::writer_write_timeout.
     let writer_write_timeout = core.writer_write_timeout;
 
-    // Signal handler thread: sets the shutdown flag and connects to our own
-    // socket to unblock the blocking accept() call on the main thread.
+    // Signal-consumer thread: drains the handler ALREADY REGISTERED above,
+    // setting the shutdown flag and connecting to our own socket to unblock
+    // the blocking accept() call on the main thread.
     //
-    // Unix: blocking iterator over the self-pipe (unchanged behavior).
+    // Unix: blocking iterator over the self-pipe. Registration happened
+    // synchronously on this thread before the socket was bound; if it failed
+    // (`None`) no consumer is spawned and the daemon runs without a handler.
     #[cfg(unix)]
-    {
+    if let Some(mut signals) = signals {
         let sig_shutdown = Arc::clone(&shutdown);
         let sig_path = socket_path.to_string();
         thread::spawn(move || {
-            let mut signals = match signal_hook::iterator::Signals::new([SIGINT, SIGTERM]) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("failed to register signal handlers: {e}");
-                    return;
-                }
-            };
             for _ in signals.forever() {
                 sig_shutdown.store(true, Ordering::SeqCst);
                 // Wake the accept loop by connecting to our own socket.
@@ -338,43 +402,17 @@ pub fn run_server(
         });
     }
 
-    // Windows: no sigwait and no iterator module — `low_level::register`
-    // installs the CRT console handler (the same primitive `flag::register`
-    // is built on), forwarding each signal as a channel message; the thread
-    // then blocks in `recv()` with zero CPU instead of polling a flag, then
-    // wakes the accept loop the same way as Unix (a connect to our own socket
-    // unblocks accept()).
+    // Windows: the CRT console handler (installed synchronously above)
+    // forwards each signal as a channel message; this thread blocks in
+    // `recv()` with zero CPU instead of polling a flag, then wakes the accept
+    // loop the same way as Unix (a connect to our own socket unblocks
+    // accept()). The senders are held by the registrations, so recv never
+    // returns Err and the loop runs until the process exits.
     #[cfg(windows)]
-    {
+    if let Some(sig_rx) = windows_signal_rx {
         let sig_shutdown = Arc::clone(&shutdown);
         let sig_path = socket_path.to_string();
         thread::spawn(move || {
-            use signal_hook::consts::{SIGINT, SIGTERM};
-            let (sig_tx, sig_rx) = mpsc::channel::<()>();
-            let int_tx = sig_tx.clone();
-            let term_tx = sig_tx;
-            // SAFETY: on Windows the registered action runs on the CRT's
-            // console-handler thread, where an mpsc send is safe (no POSIX
-            // async-signal restrictions apply); the senders are moved into
-            // the registrations and outlive them.
-            if let Err(e) = unsafe {
-                signal_hook::low_level::register(SIGINT, move || {
-                    let _ = int_tx.send(());
-                })
-            }
-            .and_then(|_| unsafe {
-                signal_hook::low_level::register(SIGTERM, move || {
-                    let _ = term_tx.send(());
-                })
-            }) {
-                error!("failed to register signal handlers: {e}");
-                return;
-            }
-            // Block until a signal arrives (channel recv — no polling), then
-            // wake the accept loop: the pending connection causes the next
-            // blocking accept() to return immediately so the shutdown flag is
-            // checked. The senders are held by the registrations, so recv
-            // never returns Err and the loop runs until the process exits.
             while sig_rx.recv().is_ok() {
                 sig_shutdown.store(true, Ordering::SeqCst);
                 let _ = choreo_proto::connect_unix(&sig_path);
