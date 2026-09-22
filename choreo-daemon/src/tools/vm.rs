@@ -525,7 +525,13 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
         dec_double_result(&resp).is_ok()
     }
 
-    /// read_file(path: &str) -> file content as String.
+    /// read_file(path: &str) -> line-numbered file content as String.
+    ///
+    /// NOTE: since the read tools were merged, this returns the same
+    /// line-numbered, header-prefixed text the model sees — a `path:` /
+    /// `lines: a-b of N` header followed by `N | content` lines — not raw
+    /// bytes. Strip the header and the `N | ` gutter if the guest needs the
+    /// bare file text.
     pub fn read_file(path: &str) -> String {
         let mut args = Vec::new();
         enc_str(path, &mut args);
@@ -1436,7 +1442,7 @@ impl Tool for RunRiscV {
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "Rust source code for `fn main()`. CRITICAL: Do NOT include #![no_std], #![no_main], #[panic_handler], _start, or the `choreo` module — these are auto-generated. Do NOT use raw ecall with Linux syscall number 64 (write) — it is not supported. Use the provided wrappers (they handle postcard encoding automatically — no need to call choreo::tool_call or choreo::call directly):\n- choreo::write(b\"...\"), choreo::exit(code)\n- choreo::read_file(path: &str) -> String\n- choreo::write_file(path: &str, content: &str, overwrite: bool)\n- choreo::db_get(key: &str) -> Vec<u8>, choreo::db_set(key: &str, value: &[u8]), choreo::db_delete(key: &str) -> bool\n- choreo::sh(command: &str, shell: Shell, workdir: Option<&str>, timeout_ms: Option<u64>) -> String\n- choreo::exec(command: &str, args: &[&str], workdir: Option<&str>, timeout_ms: Option<u64>) -> String\n- choreo::grep(pattern: &str, regex: bool, include: Option<&str>, path: Option<&str>, max_results: Option<u32>) -> String — pass regex: true for regular expression patterns, regex: false for literal substring matching. include is a file glob filter (e.g. Some(\"*.rs\")). path scopes the search directory.\n- choreo::find(pattern: &str, glob: bool, path: Option<&str>, max_results: Option<u32>) -> String — glob: true = glob mode; false = auto-detect.\n- choreo::http_request(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&str>, timeout_secs: Option<u64>) -> String\nExample: `fn main() { let content = choreo::read_file(\"Cargo.toml\"); choreo::write(content.as_bytes()); }`. Alloc types are pre-imported: Vec, String, Box, format!, .to_string(). The guest is a single-hart RISC-V VM with the A (atomic) extension disabled — do not use `core::sync::atomic` read-modify-write operations (they fail at compile time)."
+                    "description": "Rust source code for `fn main()`. CRITICAL: Do NOT include #![no_std], #![no_main], #[panic_handler], _start, or the `choreo` module — these are auto-generated. Do NOT use raw ecall with Linux syscall number 64 (write) — it is not supported. Use the provided wrappers (they handle postcard encoding automatically — no need to call choreo::tool_call or choreo::call directly):\n- choreo::write(b\"...\"), choreo::exit(code)\n- choreo::read_file(path: &str) -> String (line-numbered: a `path:`/`lines:` header then `N | content` lines — strip the header and gutter for raw text)\n- choreo::write_file(path: &str, content: &str, overwrite: bool)\n- choreo::db_get(key: &str) -> Vec<u8>, choreo::db_set(key: &str, value: &[u8]), choreo::db_delete(key: &str) -> bool\n- choreo::sh(command: &str, shell: Shell, workdir: Option<&str>, timeout_ms: Option<u64>) -> String\n- choreo::exec(command: &str, args: &[&str], workdir: Option<&str>, timeout_ms: Option<u64>) -> String\n- choreo::grep(pattern: &str, regex: bool, include: Option<&str>, path: Option<&str>, max_results: Option<u32>) -> String — pass regex: true for regular expression patterns, regex: false for literal substring matching. include is a file glob filter (e.g. Some(\"*.rs\")). path scopes the search directory.\n- choreo::find(pattern: &str, glob: bool, path: Option<&str>, max_results: Option<u32>) -> String — glob: true = glob mode; false = auto-detect.\n- choreo::http_request(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&str>, timeout_secs: Option<u64>) -> String\nExample: `fn main() { let content = choreo::read_file(\"Cargo.toml\"); choreo::write(content.as_bytes()); }`. Alloc types are pre-imported: Vec, String, Box, format!, .to_string(). The guest is a single-hart RISC-V VM with the A (atomic) extension disabled — do not use `core::sync::atomic` read-modify-write operations (they fail at compile time)."
                 },
                 "program": {
                     "type": "string",

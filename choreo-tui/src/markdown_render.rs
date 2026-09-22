@@ -741,7 +741,6 @@ pub(crate) struct RenderedTurnLines {
 /// one triangle-click away.
 const QUIET_TOOLS: &[&str] = &[
     "read_file",
-    "read_file_range",
     "http_request",
     "grep",
     "retrieve_webpage",

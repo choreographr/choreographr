@@ -1358,7 +1358,7 @@ fn render_turn_lines_tool_calls() {
 
 #[test]
 fn render_turn_lines_quiet_tool_collapsed_by_default_hides_content() {
-    // Quiet tools (read_file, read_file_range, http_request) default to
+    // Quiet tools (read_file, http_request) default to
     // collapsed: the header row (triangle + invocation description) is
     // shown, but the label row and verbatim content are hidden behind
     // the triangle until the user expands the result.
@@ -1526,7 +1526,6 @@ fn tool_result_default_collapsed_quiet_and_error_rules() {
         image: None,
     };
     assert!(tool_result_default_collapsed(&mk("read_file", false)));
-    assert!(tool_result_default_collapsed(&mk("read_file_range", false)));
     assert!(tool_result_default_collapsed(&mk("http_request", false)));
     assert!(tool_result_default_collapsed(&mk("grep", false)));
     assert!(tool_result_default_collapsed(&mk(

@@ -25,6 +25,7 @@ fn edit_args(path: &Path, old: &str, new: &str) -> EditFileArgs {
             old_text: old.into(),
             new_text: new.into(),
             replace_all: None,
+            near_line: None,
         }],
         expected_sha256: None,
         dry_run: None,

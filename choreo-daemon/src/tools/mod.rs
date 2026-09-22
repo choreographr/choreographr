@@ -211,7 +211,6 @@ pub(crate) mod pdf;
 pub(crate) mod powershell;
 pub(crate) mod random;
 pub(crate) mod read_file;
-pub(crate) mod read_file_range;
 pub(crate) mod read_image;
 pub(crate) mod retrieve_webpage;
 pub(crate) mod series;
@@ -756,7 +755,6 @@ impl ToolRegistry {
             protected_groups: HashSet::from(["core".to_string()]),
         };
         reg.register(read_file::ReadFile);
-        reg.register(read_file_range::ReadFileRange);
         reg.register(fs::ListFiles);
         reg.register(fs::DeleteFiles);
         reg.register(fs::LineCount);
@@ -1258,6 +1256,21 @@ pub(crate) fn resolve_path(
     } else {
         p.to_path_buf()
     }
+}
+
+/// Display label for a resolved path: the path relative to `root` when it
+/// lives inside it, else the path as written. Shared by the file-read/search
+/// tools so a path printed by one (`read_file`'s header, `grep`'s
+/// `path:line:content`) is accepted verbatim by another (`edit_file`,
+/// `line_count`) — the caller passes its session `working_dir` as `root`.
+pub(crate) fn display_path_label(path: &std::path::Path, root: Option<&std::path::Path>) -> String {
+    if let Some(root) = root
+        && let Ok(rel) = path.strip_prefix(root)
+        && !rel.as_os_str().is_empty()
+    {
+        return rel.to_string_lossy().into_owned();
+    }
+    path.to_string_lossy().into_owned()
 }
 
 pub(crate) fn sha256_hex(content: &str) -> String {

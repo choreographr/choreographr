@@ -29,7 +29,7 @@ pub(crate) fn open_text_reader(path: &std::path::Path) -> Result<BufReader<File>
     if let Some(pos) = head.iter().position(|&b| b == 0) {
         return Err(ToolExecError(format!(
             "'{}' appears to be a binary file (NUL byte at offset {pos}); \
-             read_file/read_file_range are for UTF-8 text files",
+             read_file is for UTF-8 text files",
             path.display()
         )));
     }
@@ -157,11 +157,11 @@ pub(crate) struct StreamedLine {
 
 /// Streaming, memory-bounded line iterator shared by the file-read tools.
 ///
-/// Wraps the [`read_line_capped`] / [`drain_rest_of_line`] helpers so
-/// `read_file` and `read_file_range` don't each re-implement the loop:
-/// memory stays bounded at one capped line regardless of file size, over-cap
-/// lines are drained (counted, never buffered) so byte totals stay exact,
-/// and EOF is signalled by `None`.
+/// Wraps the [`read_line_capped`] / [`drain_rest_of_line`] helpers so the
+/// file-read tools (`read_file`, `line_count`) don't each re-implement the
+/// loop: memory stays bounded at one capped line regardless of file size,
+/// over-cap lines are drained (counted, never buffered) so byte totals stay
+/// exact, and EOF is signalled by `None`.
 pub(crate) struct TextStream<R: BufRead> {
     reader: R,
     line_buf: Vec<u8>,
@@ -295,13 +295,12 @@ impl OutputBudget {
 
 /// Validate and render one streamed line for tool output.
 ///
-/// Shared by `read_file` and `read_file_range`: rejects NUL bytes and
-/// invalid UTF-8 in lines that are actually returned (reporting the byte
-/// offset into the file), normalizes line endings to `str::lines()`
-/// semantics (strip one `\n`, then one `\r`), and appends a
-/// `...[line truncated]` marker when the display cap cut the line short.
-/// With `numbered`, the line is prefixed with its 1-based file line number
-/// (`read_file_range` rendering).
+/// Used by `read_file`: rejects NUL bytes and invalid UTF-8 in lines that are
+/// actually returned (reporting the byte offset into the file), normalizes
+/// line endings to `str::lines()` semantics (strip one `\n`, then one `\r`),
+/// and appends a `...[line truncated]` marker when the display cap cut the
+/// line short. With `numbered`, the line is prefixed with its 1-based file
+/// line number and a ` | ` gutter.
 pub(crate) fn render_streamed_line(
     line: &StreamedLine,
     path: &std::path::Path,

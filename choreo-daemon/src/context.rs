@@ -503,7 +503,7 @@ pub fn subdirectory_hints(
 fn extract_tool_path(tool_name: &str, arguments_json: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(arguments_json).ok()?;
     match tool_name {
-        "read_file" | "read_file_range" | "write_file" | "edit_file" => v
+        "read_file" | "write_file" | "edit_file" => v
             .get("path")?
             .as_str()
             .map(std::string::ToString::to_string),

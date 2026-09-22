@@ -931,10 +931,10 @@ fn path_label(path: &Path, resolved: &Path, single_file: bool) -> String {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default()
     } else {
-        path.strip_prefix(resolved)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .into_owned()
+        // Delegate to the shared label helper so `grep`'s multi-file paths and
+        // the file-read tools' paths use one rule (relative to the search root
+        // / working dir).
+        crate::tools::display_path_label(path, Some(resolved))
     }
 }
 
