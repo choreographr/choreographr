@@ -1528,6 +1528,15 @@ fn tool_result_default_collapsed_quiet_and_error_rules() {
     assert!(tool_result_default_collapsed(&mk("read_file", false)));
     assert!(tool_result_default_collapsed(&mk("read_file_range", false)));
     assert!(tool_result_default_collapsed(&mk("http_request", false)));
+    assert!(tool_result_default_collapsed(&mk("grep", false)));
+    assert!(tool_result_default_collapsed(&mk(
+        "retrieve_webpage",
+        false
+    )));
+    assert!(tool_result_default_collapsed(&mk(
+        "spawn_subsession",
+        false
+    )));
     assert!(!tool_result_default_collapsed(&mk("sh", false)));
     assert!(!tool_result_default_collapsed(&mk("read_file", true)));
     assert!(!tool_result_default_collapsed(&mk("http_request", true)));

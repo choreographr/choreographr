@@ -733,12 +733,20 @@ pub(crate) struct RenderedTurnLines {
     pub tool_result_header_idxs: Vec<usize>,
 }
 
-/// Tools whose result content is only meaningful to the LLM (verbatim file
-/// contents, raw HTTP responses) and would spam the user's session history
+/// Tools whose result content is typically bulky and only meaningful to the
+/// LLM (verbatim file contents, raw HTTP responses, search matches, rendered
+/// web pages, sub-session reports) and would spam the user's session history
 /// if rendered in full by default.  Their invocation description (e.g.
 /// "Reading file `main.rs`.") is the primary UI summary; the full body is
 /// one triangle-click away.
-const QUIET_TOOLS: &[&str] = &["read_file", "read_file_range", "http_request"];
+const QUIET_TOOLS: &[&str] = &[
+    "read_file",
+    "read_file_range",
+    "http_request",
+    "grep",
+    "retrieve_webpage",
+    "spawn_subsession",
+];
 
 /// Whether a tool result should default to collapsed in the TUI.
 ///
