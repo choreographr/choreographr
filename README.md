@@ -737,9 +737,10 @@ to the prompt without cancelling anything. (You can also just type a
 - `/model` — open the model selector picker
 - `/model <name>` — set the session's model directly
 - `/refresh-models [--force]` — re-fetch the models.dev catalog (conditional GET against the cached etag; 304 → "models up to date"); `--force` bypasses the etag so the server must return a fresh catalog. Also re-reads the user overlay. The daemon fetches on a background thread and replies with provider/model counts; a burst of `/refresh-models` requests is coalesced into a single fetch (each requester's status reflects its own `--force` flag, and a 304 reply is ordered after any queued overlay reload so the counts are current).
+- `/new [title]` — create a new session and switch this client to it (the top-level shortcut for `/session new`)
 - `/session` — open the interactive session manager
 - `/session list` — list all sessions
-- `/session new [title]` — create a new session
+- `/session new [title]` — create a new session and switch this client to it
 - `/session switch <id>` — switch to a different session
 - `/session info <id>` — show info for a specific session
 - `/cancel <request-id>` — cancel a running request
@@ -755,7 +756,7 @@ to the prompt without cancelling anything. (You can also just type a
 - `/account remove <name>` — remove an AI provider account
 - `/account <name>` — set the session's AI provider account
 - `Ctrl+A` — open the AI provider accounts page (list accounts; `Enter` sets the highlighted account on the active session and returns to chat, `r` removes, `c` opens the API-key modal, `n` starts the new-account wizard; a click on an account row does the same as selecting it and pressing `Enter`, and the mouse wheel scrolls the highlight)
-- `Ctrl+S` — open the session manager page (list sessions; `j`/`k` or the mouse wheel navigate, `Enter` attaches to the highlighted session and returns to chat, `i` opens details, `n` creates a new session, `d` deletes, `p` pins/unpins the highlighted session, `a` archives it, `Tab` toggles between the live session list and the archived list (`a` unarchives on the archived list); a click on a session row does the same as selecting it and pressing `Enter`, and `Esc` returns to chat). Pinned sessions sort to the top of both lists; archiving a session moves it out of the live list and into the archived list. The pin/archive keys only *ask* the daemon — the change is applied when the daemon broadcasts the new flag state, and a failure is shown on the page
+- `Ctrl+S` — open the session manager page (list sessions; `j`/`k` or the mouse wheel navigate, `Enter` attaches to the highlighted session and returns to chat, `i` opens details, `n` creates a new session and switches this client to it, `d` deletes, `p` pins/unpins the highlighted session, `a` archives it, `Tab` toggles between the live session list and the archived list (`a` unarchives on the archived list); a click on a session row does the same as selecting it and pressing `Enter`, and `Esc` returns to chat). Pinned sessions sort to the top of both lists; archiving a session moves it out of the live list and into the archived list. The pin/archive keys only *ask* the daemon — the change is applied when the daemon broadcasts the new flag state, and a failure is shown on the page
 - New-account wizard (`n` on the accounts page) — centered modal windows: a **searchable provider picker** (type to filter by provider name, `↑`/`↓`/`PgUp`/`PgDn` or the mouse wheel navigate, `Enter` or a click on a row picks — the list is alphabetical), then a separate **slug modal** (enter the account's unique name, e.g. `/account <slug>`); `Enter` creates the account and jumps straight to the **API-key modal**
 - `/reasoning` — cycle the reasoning effort for the attached session's model
 - `/reasoning list` — list the available reasoning effort slugs

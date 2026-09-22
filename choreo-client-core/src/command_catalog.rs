@@ -103,6 +103,12 @@ static COMMAND_CATALOG: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
             group: CommandGroup::Session,
         },
         CommandSpec {
+            name: "new",
+            summary: "Create and switch to a new session",
+            arg_hint: Some("[title]"),
+            group: CommandGroup::Session,
+        },
+        CommandSpec {
             name: "ping",
             summary: "Ping the daemon",
             arg_hint: None,

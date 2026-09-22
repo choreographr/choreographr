@@ -1733,6 +1733,55 @@ fn session_created_for_user_session_attaches_on_chat_page() {
     );
 }
 
+#[test]
+fn session_created_for_user_session_on_session_manager_navigates() {
+    // Pressing `n` (or `/new`, or `/session new`) on the Session Manager
+    // creates a session; the requester reply must navigate the creator to it
+    // (attach + switch to the Chat page), not leave them stranded on the list.
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    app.page = Page::SessionManager;
+
+    handle_daemon_message(
+        DaemonMessage::Session {
+            session_id: Some(99),
+            event: SessionEvent::SessionCreatedForRequester {
+                parent_session_id: None,
+                title: None,
+                working_dir: None,
+                account_name: Some("acct".to_string()),
+                selected_model: Some("gpt-new".to_string()),
+                reasoning_effort: Some("off".to_string()),
+            },
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle SessionCreatedForRequester");
+
+    assert_eq!(
+        app.page,
+        Page::Chat,
+        "the creator must land on the session it just made"
+    );
+    assert_eq!(app.attached_session_id, Some(99));
+    assert_eq!(app.active_session_id, Some(99));
+    assert_eq!(app.display_for(99).account_name.as_deref(), Some("acct"));
+    let msgs: Vec<ClientMessage> = rx.try_iter().collect();
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, ClientMessage::AttachSession { session_id } if *session_id == 99)),
+        "the creator must attach to the new session"
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, ClientMessage::UnsubscribeSessionsSummary)),
+        "leaving the Session Manager must drop its summary subscription"
+    );
+}
+
 // ── A BROADCAST SessionCreated must never hijack the view ──
 
 #[test]

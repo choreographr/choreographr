@@ -98,6 +98,49 @@ fn validate_pubkey_b64(b64: &str) -> Result<(), String> {
 
 // ── Sub-parsers for grouped shell commands ──────────────────────
 
+/// Build the `CreateSession` message shared by `/new` and `/session new`.
+///
+/// Always a top-level session (`parent_session_id: None` — sub-sessions are
+/// only ever spawned by the daemon's `spawn_subsession` tool) with an optional
+/// title. Every other field is left `None` so the client fills in the attached
+/// session's defaults and the daemon applies its own, keeping `/new` and
+/// `/session new` byte-for-byte identical on the wire.
+fn create_session(title: Option<String>) -> Command {
+    Command::Send(ClientMessage::CreateSession {
+        title,
+        parent_session_id: None,
+        working_dir: None,
+        context_config: None,
+        account_name: None,
+        selected_model: None,
+        reasoning_effort: None,
+    })
+}
+
+/// The optional title from the text following `new` — an all-whitespace
+/// remainder (or nothing) means "no title".
+fn parse_new_title(rest: &str) -> Option<String> {
+    let title = rest.trim();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title.to_string())
+    }
+}
+
+/// `/new [title]` — the top-level shortcut for `/session new`. A plain alias
+/// in behavior, but a first-class catalog command in its own right (so it is
+/// discoverable in the command palette).
+fn parse_new_command(rest: &str) -> Option<Command> {
+    if rest == "new" {
+        return Some(create_session(None));
+    }
+    if let Some(title) = rest.strip_prefix("new ") {
+        return Some(create_session(parse_new_title(title)));
+    }
+    None
+}
+
 fn parse_session_subcommand(rest: &str) -> Option<Command> {
     if let Some(sub) = rest.strip_prefix("session ") {
         let sub = sub.trim();
@@ -114,32 +157,10 @@ fn parse_session_subcommand(rest: &str) -> Option<Command> {
             });
         }
         if let Some(title) = sub.strip_prefix("new ") {
-            let title = title.trim();
-            let title = if title.is_empty() {
-                None
-            } else {
-                Some(title.to_string())
-            };
-            return Some(Command::Send(ClientMessage::CreateSession {
-                title,
-                parent_session_id: None,
-                working_dir: None,
-                context_config: None,
-                account_name: None,
-                selected_model: None,
-                reasoning_effort: None,
-            }));
+            return Some(create_session(parse_new_title(title)));
         }
         if sub == "new" {
-            return Some(Command::Send(ClientMessage::CreateSession {
-                title: None,
-                parent_session_id: None,
-                working_dir: None,
-                context_config: None,
-                account_name: None,
-                selected_model: None,
-                reasoning_effort: None,
-            }));
+            return Some(create_session(None));
         }
         if sub == "list" {
             return Some(Command::Send(ClientMessage::ListSessions));
@@ -248,6 +269,9 @@ fn parse_command(rest: &str) -> Command {
     // Try grouped sub-command parsers before falling through to the flat commands.
     // Session, account, and model commands each have their own mini grammar and
     // were extracted from this function to keep each parser focused.
+    if let Some(cmd) = parse_new_command(rest) {
+        return cmd;
+    }
     if let Some(cmd) = parse_session_subcommand(rest) {
         return cmd;
     }

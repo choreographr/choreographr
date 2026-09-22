@@ -1738,10 +1738,12 @@ success signal (there is no targeted reply; a failure arrives as a targeted
 `SessionFailed` and is shown on the page).  Full-list lookups (status changes,
 the attached summary, `attach_to_session`) read `all`, never the filtered
 `sessions`, so an archived attached session still updates correctly.  A newly
-created session only refreshes the manager list via the broadcast
-`SessionCreated` (`note_session_created`) — the direct
-`SessionCreatedForRequester` reply deliberately does NOT also send a
-`ListSessions`, so a create costs one list refresh, not two.
+created session refreshes the manager list via the broadcast
+`SessionCreated` (`note_session_created`) while the user is still on that page;
+the requester's own `SessionCreatedForRequester` reply instead navigates the
+creator to the new session (`App::handle_session_created` →
+`attach_to_session`, which leaves the Session Manager for the Chat page), so a
+create from `n` on this page lands the creator on the session it just made.
 
 ### `choreo-gui` — Desktop/Android client (iOS: embedded-daemon host)
 
@@ -3453,8 +3455,12 @@ counts survive the attach instead of regressing.
   bootstrap creates a fresh default session instead of attaching to one.
 - The auto-attach rule keys on the EVENT, not on `parent_session_id`:
   `SessionCreatedForRequester` — the direct reply to THIS client's
-  `CreateSession` (parent `None`) — is the ONLY create event that may attach
-  (`reset_for_session_switch` + `AttachSession`).
+  `CreateSession` (parent `None`) — is the ONLY create event that may attach.
+  It navigates the creator to the new session from ANY page — including the
+  Session Manager, where `n` (or `/new`, or `/session new`) creates — via the
+  shared `App::attach_to_session` (`UnsubscribeSessionsSummary` + `AttachSession`,
+  then the Chat page); a `ListSessions` is sent first so the summary is present
+  when `SessionAttached` fills any remaining display gaps.
 - Every broadcast `SessionCreated` is notification-only (`App::note_session_created`):
   the new session is never attached, whether it is a top-level session created
   by ANOTHER client (the phone-view-follows-laptop bug this split fixes) or an

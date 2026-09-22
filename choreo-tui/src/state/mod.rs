@@ -1182,63 +1182,53 @@ impl App {
         client_tx: &std::sync::mpsc::Sender<ClientMessage>,
     ) -> Result<(), ClientError> {
         // Agent-spawned sub-sessions (parent_session_id = Some) are transient
-        // tool artifacts, not sessions the user opened.  Auto-attaching to one
+        // tool artifacts, not sessions the user opened.  Navigating to one
         // would hijack the Chat view away from the session the user is reading
         // and destroy its scroll position, so treat it like background noise.
         if let Some(parent_id) = parent_session_id {
             tracing::info!(
                 session_id,
                 parent_session_id = parent_id,
-                "sub-session created — not auto-attaching",
+                "sub-session created — not navigating",
             );
-        }
-
-        if self.page == Page::SessionManager {
-            // No explicit ListSessions here: the daemon's `SessionCreated`
-            // BROADCAST — handled by `note_session_created` just below —
-            // already triggers exactly one list refresh on this page, and the
-            // TUI subscribes to all activity so it always receives it.
-            // Refreshing from this direct reply as well would send a redundant
-            // `ListSessions` for every create (two round-trips per create).
             return Ok(());
         }
 
-        // Sub-session created from the Chat page: an unsolicited ListSessions
-        // would make the daemon reply with `Sessions`, whose handler writes
-        // the global status line and reflows the viewed viewport — the very
-        // symptom this path exists to prevent.  Never auto-attach either.
-        if parent_session_id.is_some() {
-            return Ok(());
-        }
-
-        // User-created session from the Chat page: send ListSessions before
-        // AttachSession so the session summary list is populated before
-        // SessionAttached triggers handle_session_attached.  Unlike the
-        // Session Manager refresh above, this send is propagated: the attach
-        // below depends on the summary reply arriving in order.
-        client_tx
-            .send(ClientMessage::ListSessions)
-            .map_err(broken_pipe)?;
-        // The input bar may hold an unsent prompt belonging to the session
-        // the user was viewing before the new session was created — hand it
-        // over via `persist_input_draft` so the prompt can't leak into a
-        // session it was never meant for.
-        self.persist_input_draft(session_id);
-        self.reset_for_session_switch(session_id);
-        self.attached_session_id = Some(session_id);
-        // Set display fields immediately so they're available when
-        // SessionAttached arrives — check the session summary first,
-        // then fall back to the creation parameters.
+        // Direct reply to THIS client's create (`SessionCreatedForRequester`):
+        // navigate the requester to the session it just made — attach and
+        // switch to the Chat page.  This is the requester-side half of the
+        // requester-vs-broadcast split; every OTHER client sees only the
+        // `SessionCreated` broadcast (`note_session_created`) and refreshes its
+        // list without moving.  All three create entry points funnel here —
+        // `/new`, `/session new`, and `n` on the Session Manager — so the client
+        // that asked for the session always lands on it (previously the Session
+        // Manager branch returned early, leaving the creator on the list).
+        //
+        // Prime the display fields from the creation params BEFORE attaching:
+        // the session summary (from the `ListSessions` below) may not have
+        // arrived yet, and the status bar should read correctly the instant the
+        // attach lands.  `attach_to_session` -> `reset_for_session_switch`
+        // preserves these (it clears only transient render state).
         {
             let display = self.display_for(session_id);
             display.account_name = account_name;
             display.selected_model = selected_model;
             display.reasoning_effort = reasoning_effort;
         }
+        // Send ListSessions before AttachSession so the summary list is
+        // populated when the `SessionAttached` reply fills any remaining
+        // display gaps (working_dir, status, tokens, …).  Unlike the broadcast
+        // refresh in `note_session_created`, this send is propagated: the
+        // attach below depends on the summary reply arriving in order.
         client_tx
-            .send(ClientMessage::AttachSession { session_id })
+            .send(ClientMessage::ListSessions)
             .map_err(broken_pipe)?;
-        Ok(())
+        // Shared attach sequence (also used by the Session Manager's Enter):
+        // it sends UnsubscribeSessionsSummary + AttachSession, hands the input
+        // bar over, rebinds the active session, and switches to the Chat page.
+        // A broken pipe leaves the view on the previous session instead of
+        // stranding the user on an un-attached one.
+        self.attach_to_session(session_id, client_tx)
     }
 
     /// Handle the BROADCAST notification that a session was created — by any

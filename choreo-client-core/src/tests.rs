@@ -204,6 +204,58 @@ fn session_switch() {
 }
 
 #[test]
+fn new_without_title() {
+    // Bare `/new` is the top-level shortcut for `/session new`.
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/new", &mut next),
+        Command::Send(ClientMessage::CreateSession {
+            title: None,
+            parent_session_id: None,
+            working_dir: None,
+            context_config: None,
+            account_name: None,
+            selected_model: None,
+            reasoning_effort: None,
+        })
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn new_with_title() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/new my title", &mut next),
+        Command::Send(ClientMessage::CreateSession {
+            title: Some("my title".to_string()),
+            parent_session_id: None,
+            working_dir: None,
+            context_config: None,
+            account_name: None,
+            selected_model: None,
+            reasoning_effort: None,
+        })
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn new_and_session_new_agree() {
+    // `/new [title]` and `/session new [title]` must produce the same command
+    // so the two entry points can never drift apart.
+    for (bare, grouped) in [("/new", "/session new"), ("/new t", "/session new t")] {
+        let mut nb = 3;
+        let mut ng = 3;
+        assert_eq!(
+            parse_input_line(bare, &mut nb),
+            parse_input_line(grouped, &mut ng),
+            "`{bare}` and `{grouped}` must parse identically"
+        );
+    }
+}
+
+#[test]
 fn session_switch_rejects_invalid_id() {
     let mut next = 3;
     assert_eq!(
@@ -710,6 +762,7 @@ fn parses_quit() {
 /// be detected.
 const PARSER_COMMAND_NAMES: &[&str] = &[
     "session",
+    "new",
     "model",
     "reasoning",
     "continue",
