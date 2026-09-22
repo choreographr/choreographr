@@ -1,18 +1,21 @@
-//! The inline command palette (Chat page) plus the **command-entry mode** it
-//! drives, the logical shortcut table (one shortcut per command), and the
-//! chord / `KeyEvent` resolution that rebinds `Ctrl+M` to `Ctrl+O` on legacy
-//! terminals.
+//! The inline command palette (Chat page), the logical shortcut table (one
+//! shortcut per command), and the chord / `KeyEvent` resolution that rebinds
+//! `Ctrl+M` to `Ctrl+O` on legacy terminals.
 //!
-//! Pressing `/` on an EMPTY prompt enters command mode — the `/` is a pure
-//! trigger and never enters the buffer.  While in command mode the shared
-//! composer buffer (`App::input`) holds the command line WITHOUT its leading
-//! slash (`model`, `model gpt-4o`), the palette floats above the input box
-//! listing the matching commands, `Enter` RUNS the highlighted command (no
-//! preceding `Tab` required — see `command_palette_enter_line`), `Esc` returns
-//! to the prompt, `Tab` completes the highlighted name into the buffer, and
-//! `↑`/`↓` move the palette highlight.  Command mode is only ever entered from
-//! an empty prompt and exiting clears the buffer, so there is never a prompt
-//! to preserve and no second buffer is needed.
+//! There is **no separate "command mode" flag**: a line is a COMMAND LINE iff
+//! the shared composer buffer (`App::input`) starts with `/`, and the palette
+//! is shown exactly when it is (and no higher-priority overlay — the model
+//! selector — is open).  The `/` therefore lives IN the buffer, verbatim as
+//! the user typed it and exactly as `parse_input_line` expects (it strips one
+//! leading `/` and parses the remainder as a command).  The palette thus
+//! appears the moment a `/` starts the line and disappears when the user
+//! deletes it — there is no latched flag that can fall out of sync with the
+//! buffer (the historical bug where a second `/` produced `//acl`).
+//!
+//! While the palette is shown the buffer holds the command line WITH its
+//! leading slash (`/model`, `/model gpt-4o`), `Enter` RUNS the line (see
+//! `command_palette_enter_line`), `Esc` discards it, `Tab` completes the
+//! highlighted name into the buffer, and `↑`/`↓` move the palette highlight.
 
 use crate::state::App;
 use choreo_client_core::{CommandMatch, command_catalog, match_commands};
@@ -205,9 +208,8 @@ impl CommandPaletteState {
         }
     }
 
-    /// Reset the highlight and scroll window to the top.  Called whenever
-    /// command mode is entered or exited, so a fresh palette always starts on
-    /// the first row.
+    /// Reset the highlight and scroll window to the top.  Called when a command
+    /// line is discarded, so the next command line starts on the first row.
     fn reset(&mut self) {
         self.focused = 0;
         self.scroll = 0;
@@ -215,58 +217,57 @@ impl CommandPaletteState {
 }
 
 impl App {
-    /// Whether command mode is active and the palette should be shown: command
-    /// mode is on and no higher-priority overlay (the model selector) is open.
-    /// This must stay TRUE with zero matches, so a "no matches" palette still
-    /// shows and `Enter` still submits the typed command line.
-    pub(crate) fn command_palette_active(&self) -> bool {
-        self.command_mode && !self.model_selector.is_open()
+    /// The current command line's text AFTER its leading `/`, or `None` when
+    /// the buffer is not a command line.
+    ///
+    /// Command-line-ness is derived here — there is NO `command_mode` flag — so
+    /// the palette tracks the buffer exactly: typing the leading `/` shows it,
+    /// deleting the `/` hides it, and a paste of a `/…` line shows it for free.
+    fn command_line(&self) -> Option<&str> {
+        self.input.text.strip_prefix('/')
     }
 
     /// The first whitespace-delimited token of the command line
-    /// (`"model gpt-4o"` → `"model"`, `""`/`"  model"` → `""`).  The whole
-    /// command line is one token here because the buffer never carries the
-    /// leading slash; leading whitespace yields an empty token, matching the
-    /// whole catalog.
+    /// (`"/model gpt-4o"` → `"model"`, `"/"`/`"/  model"` → `""`).  The leading
+    /// slash is stripped first, so the token is a bare command name (or empty) —
+    /// exactly what `match_commands` matches against.  Only the first token
+    /// filters the palette (an argument tail such as `gpt-4o` is ignored).  A
+    /// non-command buffer yields `""` (the whole catalog); callers that need the
+    /// active/inactive distinction use [`Self::command_palette_active`].
     fn command_query(&self) -> &str {
-        self.input
-            .text
+        self.command_line()
+            .unwrap_or("")
             .split(char::is_whitespace)
             .next()
             .unwrap_or("")
     }
 
+    /// Whether a command line is active and the palette should be shown: the
+    /// buffer starts with `/` and no higher-priority overlay (the model
+    /// selector) is open.  This stays TRUE with zero matches, so a "no matches"
+    /// palette still shows and `Enter` still submits the typed command line.
+    pub(crate) fn command_palette_active(&self) -> bool {
+        self.command_line().is_some() && !self.model_selector.is_open()
+    }
+
     /// The commands matching the current command line's first token (empty when
-    /// command mode is off).  An empty query returns the whole catalog.
+    /// the buffer is not a command line).  An empty query returns the whole
+    /// catalog.
     pub(crate) fn command_palette_matches(&self) -> Vec<CommandMatch> {
-        if !self.command_mode {
+        if self.command_line().is_none() {
             return Vec::new();
         }
         match_commands(self.command_query())
     }
 
-    /// Enter command mode from an EMPTY prompt.  The `/` trigger that flipped
-    /// the mode is never stored: the composer buffer is cleared so it holds
-    /// only the command line (no leading slash), and the palette resets to the
-    /// top row.  Ending any history browsing too, since the recalled entry
-    /// lived in the very buffer being cleared — the command line is not a
-    /// prompt and must not inherit a recalled entry's browsing state.
-    pub(crate) fn enter_command_mode(&mut self) {
-        self.input.clear();
-        self.history_index = None;
-        self.command_mode = true;
-        self.command_palette.reset();
-    }
-
-    /// Leave command mode, discarding the command line and resetting the
-    /// palette.  Guarded: outside command mode this is a no-op, so the many
-    /// call sites that fire on page changes / session switches (which run with
-    /// a real prompt draft in the buffer) never clobber that draft.
-    pub(crate) fn exit_command_mode(&mut self) {
-        if !self.command_mode {
+    /// Discard the command line, if the buffer holds one: clear the buffer and
+    /// reset the palette.  Guarded — a no-op on a non-command buffer — so the
+    /// many call sites that fire on page changes / session switches (which run
+    /// with a real prompt draft in the buffer) never clobber that draft.
+    pub(crate) fn discard_command_line(&mut self) {
+        if self.command_line().is_none() {
             return;
         }
-        self.command_mode = false;
         self.input.clear();
         self.command_palette.reset();
     }
@@ -288,9 +289,9 @@ impl App {
         self.command_palette.focused = (current + delta).rem_euclid(len as isize) as usize;
     }
 
-    /// Complete the highlighted match into the command line: `"<name> "` (NO
-    /// leading slash — the buffer holds the bare command line) with the cursor
-    /// at the end (never submits).  A no-op when there is nothing to complete.
+    /// Complete the highlighted match into the command line, keeping the
+    /// leading `/`: `"/mo"` → `"/model "` with the cursor at the end (never
+    /// submits).  A no-op when there is nothing to complete.
     pub(crate) fn command_palette_complete(&mut self) {
         let matches = self.command_palette_matches();
         // Prefer the highlighted row; fall back to the first match when the
@@ -301,7 +302,7 @@ impl App {
         else {
             return;
         };
-        self.input.text = format!("{} ", found.spec.name);
+        self.input.text = format!("/{} ", found.spec.name);
         // Place the cursor at the end of the completed line via the buffer's
         // own accessor.  `InputBuffer::cursor` is a BYTE offset (every edit
         // advances it by `len_utf8`, and the buffer slices on it), so the end
@@ -313,27 +314,31 @@ impl App {
         self.ensure_input_cursor_visible();
     }
 
-    /// Resolve the command line to RUN when the user presses Enter in command
-    /// mode — the bridge from "the highlighted palette row" to an executable
-    /// line, so Enter alone runs the selected command without a preceding
-    /// `Tab`.
+    /// Resolve the command line to RUN when the user presses Enter — the bridge
+    /// from "the highlighted palette row" to an executable line, so Enter alone
+    /// runs the selected command without a preceding `Tab`.
     ///
-    /// The typed line's FIRST whitespace-delimited token is what filters the
-    /// palette.  When that token already names a command EXACTLY the line is
-    /// returned verbatim — a fully-typed command must never be rewritten, and
-    /// its argument tail (`model gpt-4o`, `session new foo`) has to survive.
-    /// Otherwise the line is empty or a still-partial name: complete the first
-    /// token to the highlighted match and keep any argument tail
-    /// (`"mo gpt-4o"` → `"model gpt-4o"`), which is exactly what running the
+    /// The typed line's FIRST whitespace-delimited token (after the leading `/`)
+    /// is what filters the palette.  When that token already names a command
+    /// EXACTLY the line is returned verbatim — a fully-typed command must never
+    /// be rewritten, and its argument tail (`/model gpt-4o`, `/session new foo`)
+    /// has to survive.  Otherwise the token is empty or a still-partial name:
+    /// complete it to the highlighted match and keep any argument tail
+    /// (`/mo gpt-4o` → `/model gpt-4o`), which is exactly what running the
     /// selected row means.  With no highlighted match (a typo'd command) the
-    /// line is returned verbatim so the normal "unknown command" feedback
-    /// still fires.
+    /// line is returned verbatim so the normal "unknown command" feedback still
+    /// fires.  A non-command buffer is returned verbatim (its caller runs it as
+    /// a prompt).
     pub(crate) fn command_palette_enter_line(&self) -> String {
         let line = &self.input.text;
+        // Only a `/`-leading line is a command; anything else runs untouched.
+        let Some(rest) = line.strip_prefix('/') else {
+            return line.clone();
+        };
         // Split off the leading token the same way `command_query` does (first
-        // whitespace-delimited token) so the exact-match test and the palette
-        // filter always agree on what the query is.
-        let first = line.split(char::is_whitespace).next().unwrap_or("");
+        // whitespace-delimited token of the post-slash remainder) so the
+        // exact-match test and the palette filter always agree on the query.
+        let first = rest.split(char::is_whitespace).next().unwrap_or("");
         // A fully-typed command runs untouched — its arguments belong to the
         // user, not to a palette completion.
         if command_catalog()
@@ -344,8 +349,8 @@ impl App {
         }
         // Empty or still-partial token: adopt the highlighted row.  Prefer the
         // focused match; fall back to the first match when the focus is stale.
-        // Keep whatever followed the token (`"mo gpt-4o"` → `"model gpt-4o"`)
-        // so a completed prefix does not drop an already-typed argument.
+        // Keep whatever followed the token (`/mo gpt-4o` → `/model gpt-4o`) so a
+        // completed prefix does not drop an already-typed argument.
         let matches = self.command_palette_matches();
         let Some(found) = matches
             .get(self.command_palette.focused)
@@ -355,11 +360,11 @@ impl App {
             // parser reports the unknown command.
             return line.clone();
         };
-        // `first` is a whitespace-split prefix of `line`, so `first.len()` is a
+        // `first` is a whitespace-split prefix of `rest`, so `first.len()` is a
         // valid char boundary at or before the end; `get` keeps the slice
-        // total (clippy's `string_slice` denies a bare `&line[..]`).
-        let rest = line.get(first.len()..).unwrap_or("");
-        format!("{}{}", found.spec.name, rest)
+        // total (clippy's `string_slice` denies a bare `&rest[..]`).
+        let tail = rest.get(first.len()..).unwrap_or("");
+        format!("/{}{}", found.spec.name, tail)
     }
 
     /// The highlighted row index, clamped against the current match count — the
@@ -386,36 +391,54 @@ mod tests {
     use crate::test_util::test_app;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+    /// Set the composer to a command line (leading slash included) the way
+    /// typing it would — the buffer holds the `/`, so a command line is just a
+    /// buffer that starts with one.
+    fn set_command(app: &mut App, line: &str) {
+        app.input.text = line.to_string();
+        app.input.cursor = line.len();
+    }
+
     #[test]
-    fn enter_command_mode_clears_buffer_and_activates() {
+    fn a_slash_leading_buffer_is_a_command_line_and_activates() {
         let mut app = test_app();
-        assert!(!app.command_palette_active(), "inactive before entering");
-        app.enter_command_mode();
-        assert!(app.command_mode);
+        assert!(!app.command_palette_active(), "inactive on an empty buffer");
+        set_command(&mut app, "/");
         assert!(app.command_palette_active());
-        assert!(
-            app.input.text.is_empty(),
-            "the `/` trigger is never stored in the buffer"
+        assert_eq!(app.command_line(), Some(""));
+        assert_eq!(
+            app.command_palette_matches().len(),
+            choreo_client_core::command_catalog().len(),
+            "an empty command line shows the whole catalog"
         );
     }
 
     #[test]
-    fn enter_command_mode_ends_history_browsing() {
-        // Entering command mode clears the shared buffer, so a recalled history
-        // entry (and its browsing state) must not survive into the command line.
+    fn a_non_slash_buffer_is_not_a_command_line() {
         let mut app = test_app();
-        app.history_index = Some(0);
-        app.enter_command_mode();
-        assert!(
-            app.history_index.is_none(),
-            "command mode must end history browsing"
-        );
+        app.input.text = "model".to_string();
+        assert!(!app.command_palette_active());
+        assert_eq!(app.command_line(), None);
+        assert!(app.command_palette_matches().is_empty());
+    }
+
+    #[test]
+    fn discard_command_line_clears_a_command_but_spares_a_prompt_draft() {
+        let mut app = test_app();
+        set_command(&mut app, "/model");
+        app.discard_command_line();
+        assert!(app.input.text.is_empty(), "the command line is discarded");
+
+        // Outside a command line, discarding must NOT clobber a real draft.
+        app.input.text = "hello".to_string();
+        app.discard_command_line();
+        assert_eq!(app.input.text, "hello", "a real prompt draft is preserved");
     }
 
     #[test]
     fn active_is_false_while_model_selector_open() {
         let mut app = test_app();
-        app.enter_command_mode();
+        set_command(&mut app, "/");
         assert!(app.command_palette_active());
         app.model_selector.open();
         assert!(
@@ -425,27 +448,16 @@ mod tests {
     }
 
     #[test]
-    fn active_is_false_outside_command_mode() {
-        let mut app = test_app();
-        app.input.text = "model".to_string();
-        assert!(
-            !app.command_palette_active(),
-            "no command mode means no palette"
-        );
-        assert!(app.command_palette_matches().is_empty());
-    }
-
-    #[test]
     fn matches_use_first_token_only() {
         let mut app = test_app();
-        app.enter_command_mode();
+        set_command(&mut app, "/");
         // Empty command line → whole catalog.
         assert_eq!(
             app.command_palette_matches().len(),
             choreo_client_core::command_catalog().len()
         );
 
-        app.input.text = "mo".to_string();
+        set_command(&mut app, "/mo");
         let names: Vec<&str> = app
             .command_palette_matches()
             .iter()
@@ -454,7 +466,7 @@ mod tests {
         assert_eq!(names, vec!["model"]);
 
         // An argument after a space still filters by the FIRST token.
-        app.input.text = "model gpt-4o".to_string();
+        set_command(&mut app, "/model gpt-4o");
         let names: Vec<&str> = app
             .command_palette_matches()
             .iter()
@@ -466,7 +478,7 @@ mod tests {
     #[test]
     fn move_wraps_at_both_ends() {
         let mut app = test_app();
-        app.enter_command_mode(); // empty line → whole catalog
+        set_command(&mut app, "/"); // empty query → whole catalog
         let len = app.command_palette_matches().len();
         assert!(len > 1, "catalog must have several commands");
         assert_eq!(app.command_palette_focused(), 0);
@@ -488,40 +500,36 @@ mod tests {
     #[test]
     fn move_is_noop_when_empty() {
         let mut app = test_app();
-        app.enter_command_mode();
-        app.input.text = "zzz-no-such-command".to_string();
+        set_command(&mut app, "/zzz-no-such-command");
         assert!(app.command_palette_matches().is_empty());
         app.command_palette_move(1);
         assert_eq!(app.command_palette_focused(), 0);
     }
 
     #[test]
-    fn complete_inserts_name_without_slash_and_puts_cursor_at_end() {
+    fn complete_keeps_the_slash_and_puts_cursor_at_end() {
         let mut app = test_app();
-        app.enter_command_mode();
-        app.input.text = "mo".to_string();
-        app.input.cursor = 2;
+        set_command(&mut app, "/mo");
         app.command_palette_complete();
-        assert_eq!(app.input.text, "model ");
-        assert_eq!(app.input.cursor, "model ".len());
+        assert_eq!(app.input.text, "/model ");
+        assert_eq!(app.input.cursor, "/model ".len());
     }
 
     #[test]
     fn complete_is_noop_when_nothing_matches() {
         let mut app = test_app();
-        app.enter_command_mode();
-        app.input.text = "zzz-no-such-command".to_string();
+        set_command(&mut app, "/zzz-no-such-command");
         app.command_palette_complete();
-        assert_eq!(app.input.text, "zzz-no-such-command");
+        assert_eq!(app.input.text, "/zzz-no-such-command");
     }
 
     #[test]
-    fn enter_line_uses_the_highlighted_command_on_an_empty_line() {
+    fn enter_line_uses_the_highlighted_command_on_a_bare_slash() {
         let mut app = test_app();
-        app.enter_command_mode(); // empty line → whole catalog, focus on row 0
+        set_command(&mut app, "/"); // whole catalog, focus on row 0
         assert_eq!(
             app.command_palette_enter_line(),
-            choreo_client_core::command_catalog()[0].name,
+            format!("/{}", choreo_client_core::command_catalog()[0].name),
             "Enter runs the highlighted row without a preceding Tab"
         );
 
@@ -529,34 +537,31 @@ mod tests {
         app.command_palette_move(1);
         assert_eq!(
             app.command_palette_enter_line(),
-            choreo_client_core::command_catalog()[1].name
+            format!("/{}", choreo_client_core::command_catalog()[1].name)
         );
     }
 
     #[test]
     fn enter_line_completes_a_partial_first_token() {
         let mut app = test_app();
-        app.enter_command_mode();
-        app.input.text = "mo".to_string();
-        assert_eq!(app.command_palette_enter_line(), "model");
+        set_command(&mut app, "/mo");
+        assert_eq!(app.command_palette_enter_line(), "/model");
     }
 
     #[test]
     fn enter_line_keeps_the_argument_tail_of_a_partial_token() {
         let mut app = test_app();
-        app.enter_command_mode();
-        app.input.text = "mo gpt-4o".to_string();
-        assert_eq!(app.command_palette_enter_line(), "model gpt-4o");
+        set_command(&mut app, "/mo gpt-4o");
+        assert_eq!(app.command_palette_enter_line(), "/model gpt-4o");
     }
 
     #[test]
     fn enter_line_keeps_a_fully_typed_command_verbatim() {
         let mut app = test_app();
-        app.enter_command_mode();
-        app.input.text = "model gpt-4o".to_string();
+        set_command(&mut app, "/model gpt-4o");
         assert_eq!(
             app.command_palette_enter_line(),
-            "model gpt-4o",
+            "/model gpt-4o",
             "an exact command name runs untouched, arguments and all"
         );
     }
@@ -564,28 +569,23 @@ mod tests {
     #[test]
     fn enter_line_returns_verbatim_when_nothing_matches() {
         let mut app = test_app();
-        app.enter_command_mode();
-        app.input.text = "zzz-no-such-command".to_string();
+        set_command(&mut app, "/zzz-no-such-command");
         assert_eq!(
             app.command_palette_enter_line(),
-            "zzz-no-such-command",
+            "/zzz-no-such-command",
             "no highlighted row → the parser still reports the unknown command"
         );
     }
 
     #[test]
-    fn exit_command_mode_clears_buffer_and_is_a_noop_outside_mode() {
+    fn enter_line_returns_a_non_command_line_verbatim() {
         let mut app = test_app();
-        app.enter_command_mode();
-        app.input.text = "model".to_string();
-        app.exit_command_mode();
-        assert!(!app.command_mode);
-        assert!(app.input.text.is_empty(), "the command line is discarded");
-
-        // Outside command mode, exiting must NOT clobber a real prompt draft.
         app.input.text = "hello".to_string();
-        app.exit_command_mode();
-        assert_eq!(app.input.text, "hello", "a real prompt draft is preserved");
+        assert_eq!(
+            app.command_palette_enter_line(),
+            "hello",
+            "a plain prompt line is returned untouched"
+        );
     }
 
     #[test]

@@ -408,14 +408,9 @@ pub(crate) struct App {
     pub(crate) model_selector: ModelSelectorState,
     /// Transient selection state for the inline command palette (Chat page).
     /// The palette's highlight and scroll window; its visible/hidden condition
-    /// is the `command_mode` flag (see `command_palette_active`).
+    /// is whether the input buffer starts with `/` (see `command_palette_active`)
+    /// — there is no separate mode flag to keep in sync with the buffer.
     pub(crate) command_palette: CommandPaletteState,
-    /// Whether the Chat composer is in **command-entry mode**: the prompt was
-    /// opened by a `/` trigger on an empty prompt, so `input` holds a bare
-    /// command line (no leading slash) and the palette is shown.  Enter RUNS
-    /// the command, Esc returns to the prompt.  Only ever entered from an empty
-    /// prompt and cleared on exit, so no second buffer is needed.
-    pub(crate) command_mode: bool,
     /// The live provider list for the new-account wizard's provider picker
     /// (S4). Initialized from the static `PROVIDER_OPTIONS` default and
     /// replaced wholesale whenever the daemon broadcasts `CatalogUpdated`, so
@@ -608,7 +603,6 @@ impl App {
             ai_providers: AIProvidersState::new(),
             model_selector: ModelSelectorState::new(),
             command_palette: CommandPaletteState::new(),
-            command_mode: false,
             // Start from the static default; the daemon's CatalogUpdated
             // broadcast replaces it with the live list.  The picker must be
             // alphabetical, so sort the default here too (see `sort_providers`
@@ -982,9 +976,9 @@ impl App {
         }
         self.active_session_id = Some(session_id);
         // A command line belongs to the session the user was editing; it must
-        // never become the newly-attached session's draft.  Exiting command
-        // mode clears the buffer before any draft hand-off happens elsewhere.
-        self.exit_command_mode();
+        // never become the newly-attached session's draft.  Discarding it clears
+        // the buffer before any draft hand-off happens elsewhere.
+        self.discard_command_line();
         // A selection is keyed to the previous session's rendered content in
         // screen coordinates; it must not linger and highlight the next
         // session's history.
@@ -1155,10 +1149,10 @@ impl App {
     pub(crate) fn set_page(&mut self, page: Page) {
         self.page = page;
         // A command line is scoped to the Chat page: a page change (e.g.
-        // Ctrl+S opening the session manager) must never leave command-entry
-        // mode active underneath.  Guarded so a real prompt draft survives a
-        // page change (see `exit_command_mode`).
-        self.exit_command_mode();
+        // Ctrl+S opening the session manager) must never leave one in the
+        // buffer underneath.  Guarded so a real prompt draft survives a page
+        // change (see `discard_command_line`).
+        self.discard_command_line();
         // A selection is stored in screen coordinates keyed to the Chat
         // page's rendered history; leaving the page (or re-entering via an
         // attach flow, which changes the underlying session) invalidates
@@ -1553,11 +1547,10 @@ impl App {
         client_tx
             .send(ClientMessage::AttachSession { session_id })
             .map_err(broken_pipe)?;
-        // Drop command-entry mode BEFORE the input hand-off below: a command
-        // line is not a prompt, so it must be discarded (not stashed as the
-        // outgoing session's draft) and the target session's draft loaded in
-        // its place.
-        self.exit_command_mode();
+        // Discard a command line BEFORE the input hand-off below: it is not a
+        // prompt, so it must be dropped (not stashed as the outgoing session's
+        // draft) and the target session's draft loaded in its place.
+        self.discard_command_line();
         // Hand the input bar over to the target session (stash the outgoing
         // session's input, load the target's draft) before `attached_session_id`
         // is rebound below — it still names the session the input bar's

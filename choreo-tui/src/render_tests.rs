@@ -936,14 +936,14 @@ fn render_chat_content(app: &mut crate::state::App, w: u16, h: u16) -> String {
 }
 
 #[test]
-fn command_palette_lists_commands_when_in_command_mode() {
+fn command_palette_lists_commands_for_a_command_line() {
     use crate::test_util::test_app;
 
     let mut app = test_app();
-    app.enter_command_mode();
+    app.input.text = "/".to_string();
     assert!(
         app.command_palette_active(),
-        "command mode shows the palette"
+        "a `/`-leading line shows the palette"
     );
 
     let content = render_chat_content(&mut app, 80, 24);
@@ -964,8 +964,7 @@ fn command_palette_narrows_to_model_for_prefix_query() {
     use crate::test_util::test_app;
 
     let mut app = test_app();
-    app.enter_command_mode();
-    app.input.text = "mo".to_string();
+    app.input.text = "/mo".to_string();
 
     let content = render_chat_content(&mut app, 80, 24);
     assert!(content.contains("/model"), "the matched command is drawn");
@@ -976,7 +975,7 @@ fn command_palette_narrows_to_model_for_prefix_query() {
 }
 
 #[test]
-fn command_palette_draws_nothing_outside_command_mode() {
+fn command_palette_draws_nothing_for_a_plain_prompt() {
     use crate::test_util::test_app;
 
     let mut app = test_app();

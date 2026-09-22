@@ -1475,18 +1475,14 @@ fn press(app: &mut App, tx: &std::sync::mpsc::Sender<ClientMessage>, code: KeyCo
 }
 
 #[test]
-fn typing_slash_on_empty_prompt_enters_command_mode() {
+fn typing_slash_on_empty_prompt_starts_a_command_line() {
     let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
     assert!(!app.command_palette_active(), "inactive before typing");
 
     press(&mut app, &tx, KeyCode::Char('/'));
 
-    assert!(app.command_mode, "`/` enters command mode");
-    assert!(
-        app.input.text.is_empty(),
-        "the `/` trigger is never stored in the buffer"
-    );
+    assert_eq!(app.input.text, "/", "the `/` is stored in the buffer");
     assert!(app.command_palette_active());
     assert_eq!(
         app.command_palette_matches().len(),
@@ -1503,7 +1499,7 @@ fn typing_further_narrows_palette_to_model() {
     for c in ['m', 'o'] {
         press(&mut app, &tx, KeyCode::Char(c));
     }
-    assert_eq!(app.input.text, "mo", "the command line carries no slash");
+    assert_eq!(app.input.text, "/mo", "the command line keeps its slash");
     let names: Vec<&str> = app
         .command_palette_matches()
         .iter()
@@ -1524,10 +1520,7 @@ fn palette_up_down_move_the_highlight() {
     press(&mut app, &tx, KeyCode::Up);
     assert_eq!(app.command_palette_focused(), 0);
     // The move keys must not have edited the input.
-    assert!(
-        app.input.text.is_empty(),
-        "navigation must not edit the buffer"
-    );
+    assert_eq!(app.input.text, "/", "navigation must not edit the buffer");
 }
 
 #[test]
@@ -1541,14 +1534,20 @@ fn palette_tab_completes_name_without_submitting() {
 
     press(&mut app, &tx, KeyCode::Tab);
 
-    assert_eq!(app.input.text, "model ", "Tab completes the name, no slash");
-    assert_eq!(app.input.cursor, "model ".len());
-    assert!(app.command_mode, "Tab stays in command mode");
+    assert_eq!(
+        app.input.text, "/model ",
+        "Tab completes the name, keeping the slash"
+    );
+    assert_eq!(app.input.cursor, "/model ".len());
+    assert!(
+        app.command_palette_active(),
+        "Tab keeps the command line active"
+    );
     assert!(rx.try_recv().is_err(), "Tab must never submit");
 }
 
 #[test]
-fn palette_enter_runs_the_command_and_exits_mode() {
+fn palette_enter_runs_the_command_and_clears_the_line() {
     let mut app = test_app();
     let (tx, rx) = std::sync::mpsc::channel();
     press(&mut app, &tx, KeyCode::Char('/'));
@@ -1564,10 +1563,13 @@ fn palette_enter_runs_the_command_and_exits_mode() {
         "Enter runs `/model`, opening the model selector"
     );
     assert_eq!(rx.recv().expect("ListModels"), ClientMessage::ListModels);
-    assert!(!app.command_mode, "running a command exits command mode");
+    assert!(
+        !app.command_palette_active(),
+        "running a command clears the line"
+    );
     assert!(
         app.input.is_empty(),
-        "the command line is discarded on exit"
+        "the command line is discarded after running"
     );
 }
 
@@ -1595,10 +1597,13 @@ fn palette_shift_enter_runs_the_command_without_a_newline() {
         "Shift+Enter runs the command like Enter"
     );
     assert_eq!(rx.recv().expect("ListModels"), ClientMessage::ListModels);
-    assert!(!app.command_mode, "running the command exits command mode");
+    assert!(
+        !app.command_palette_active(),
+        "running the command clears the line"
+    );
     assert!(
         app.input.text.is_empty(),
-        "no stray newline survives command-mode completion"
+        "no stray newline survives command-line completion"
     );
 }
 
@@ -1644,7 +1649,10 @@ fn palette_enter_on_empty_line_runs_the_highlighted_command() {
         rx.recv().expect("SubscribeSessionsSummary"),
         ClientMessage::SubscribeSessionsSummary
     );
-    assert!(!app.command_mode, "running a command exits command mode");
+    assert!(
+        !app.command_palette_active(),
+        "running a command clears the line"
+    );
     assert!(app.input.is_empty());
 }
 
@@ -1667,7 +1675,10 @@ fn palette_enter_on_a_partial_token_runs_the_highlighted_command() {
         "Enter ran the highlighted `/model`"
     );
     assert_eq!(rx.recv().expect("ListModels"), ClientMessage::ListModels);
-    assert!(!app.command_mode, "running a command exits command mode");
+    assert!(
+        !app.command_palette_active(),
+        "running a command clears the line"
+    );
 }
 
 #[test]
@@ -1692,11 +1703,11 @@ fn palette_enter_runs_the_row_the_arrows_selected() {
         "Enter ran the arrow-selected `/model`"
     );
     assert_eq!(rx.recv().expect("ListModels"), ClientMessage::ListModels);
-    assert!(!app.command_mode);
+    assert!(!app.command_palette_active());
 }
 
 #[test]
-fn command_mode_enter_runs_an_unknown_command() {
+fn palette_enter_runs_an_unknown_command() {
     // `command_palette_active()` must stay TRUE with zero matches, so an
     // unmatched line still submits (and the daemon/parser reports it).
     let mut app = test_app();
@@ -1714,7 +1725,10 @@ fn command_mode_enter_runs_an_unknown_command() {
     press(&mut app, &tx, KeyCode::Enter);
 
     assert!(rx.try_recv().is_err(), "an unknown command sends nothing");
-    assert!(!app.command_mode, "Enter always exits command mode");
+    assert!(
+        !app.command_palette_active(),
+        "Enter always clears the command line"
+    );
     assert!(app.input.is_empty());
     assert!(
         app.status
@@ -1726,7 +1740,7 @@ fn command_mode_enter_runs_an_unknown_command() {
 }
 
 #[test]
-fn palette_esc_exits_command_mode_without_cancelling() {
+fn palette_esc_discards_the_command_line_without_cancelling() {
     let mut app = test_app();
     // A live session means the normal Esc would send Cancel.
     app.attached_session_id = Some(42);
@@ -1736,7 +1750,10 @@ fn palette_esc_exits_command_mode_without_cancelling() {
 
     press(&mut app, &tx, KeyCode::Esc);
 
-    assert!(!app.command_mode, "Esc exits command mode");
+    assert!(
+        !app.command_palette_active(),
+        "Esc discards the command line"
+    );
     assert!(app.input.text.is_empty(), "Esc returns to an empty prompt");
     assert!(
         rx.try_recv().is_err(),
@@ -1753,14 +1770,61 @@ fn slash_with_existing_text_inserts_literally() {
 
     press(&mut app, &tx, KeyCode::Char('/'));
 
-    assert!(!app.command_mode, "a non-empty prompt keeps `/` literal");
+    assert!(
+        !app.command_palette_active(),
+        "a non-empty prompt keeps `/` literal"
+    );
     assert_eq!(app.input.text, "hi/");
 }
 
 #[test]
-fn literal_slash_command_submits_via_normal_prompt_path() {
-    // A `/model` line set directly (e.g. pasted) and submitted via the normal
-    // prompt path — without ever entering command mode — still parses and runs.
+fn deleting_the_slash_hides_the_palette() {
+    // The palette is derived from the buffer — a `/` starts a command line —
+    // so deleting that one character returns to a plain prompt.
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    press(&mut app, &tx, KeyCode::Char('/'));
+    assert!(app.command_palette_active());
+
+    press(&mut app, &tx, KeyCode::Backspace);
+
+    assert!(app.input.text.is_empty(), "the slash is deleted");
+    assert!(
+        !app.command_palette_active(),
+        "deleting the leading `/` hides the palette"
+    );
+}
+
+#[test]
+fn a_double_slash_is_run_verbatim_never_silently_prepended() {
+    // Regression for the reported bug: the buffer holds the `/` the user
+    // typed, so a stray second slash shows `//acl` — and `//acl` is exactly
+    // what runs (rejected as unknown), never a hidden extra `/` turning a
+    // typed `/acl` into `//acl`.
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    press(&mut app, &tx, KeyCode::Char('/'));
+    press(&mut app, &tx, KeyCode::Char('/'));
+    for c in "acl".chars() {
+        press(&mut app, &tx, KeyCode::Char(c));
+    }
+    assert_eq!(app.input.text, "//acl", "both slashes are visible");
+
+    press(&mut app, &tx, KeyCode::Enter);
+
+    assert!(rx.try_recv().is_err(), "an unknown command sends nothing");
+    assert!(app.input.is_empty());
+    assert_eq!(
+        app.status.as_deref(),
+        Some("unknown command: //acl"),
+        "the run reflects exactly what the user saw"
+    );
+}
+
+#[test]
+fn literal_slash_command_line_runs() {
+    // A `/model` line set directly (e.g. pasted) is a command line (the buffer
+    // starts with `/`) and runs when submitted.
     let mut app = test_app();
     let (tx, rx) = std::sync::mpsc::channel();
     app.input.text = "/model".to_string();
@@ -1770,21 +1834,24 @@ fn literal_slash_command_submits_via_normal_prompt_path() {
 
     assert!(app.model_selector.is_open(), "`/model` opens the selector");
     assert_eq!(rx.recv().expect("ListModels"), ClientMessage::ListModels);
-    assert!(!app.command_mode);
+    assert!(!app.command_palette_active());
 }
 
 #[test]
-fn attaching_a_session_exits_command_mode_without_a_draft() {
+fn attaching_a_session_discards_a_command_line_without_a_draft() {
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = test_app();
     app.attached_session_id = Some(1);
     app.display_for(1);
-    app.enter_command_mode();
-    app.input.text = "model".to_string();
+    app.input.text = "/model".to_string();
+    app.input.cursor = "/model".len();
 
     app.attach_to_session(2, &tx).expect("attach to session 2");
 
-    assert!(!app.command_mode, "switching sessions exits command mode");
+    assert!(
+        !app.command_palette_active(),
+        "switching sessions discards the command line"
+    );
     assert!(
         app.input.is_empty(),
         "the command line must not become a session draft"

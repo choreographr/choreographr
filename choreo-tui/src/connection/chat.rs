@@ -29,9 +29,9 @@ pub(super) fn handle_chat_event(
             if key.code != KeyCode::Char('h') || !key.modifiers.contains(KeyModifiers::CONTROL) {
                 app.show_ctrl_help = false;
             }
-            // A plain (unmodified) keypress predicate, used by the
-            // command-mode arms below so Ctrl/Alt chords still fall through to
-            // the shortcut handler rather than the palette.
+            // A plain (unmodified) keypress predicate, used by the command-line
+            // arms below so Ctrl/Alt chords still fall through to the shortcut
+            // handler rather than the palette.
             let plain = !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT);
             // Command shortcuts are dispatched through the single logical
@@ -45,68 +45,70 @@ pub(super) fn handle_chat_event(
             if let Some(name) = crate::state::binding_for(key, app.keyboard_enhanced) {
                 return run_named(name, false, app, client_tx);
             }
+            // A command line is any buffer that starts with `/` — there is no
+            // separate mode flag (see `App::command_palette_active`), so the
+            // palette appears the instant a `/` starts the line and disappears
+            // when the user deletes it.  Read once here, before the match, so
+            // the arms below and the normal prompt bindings agree on which
+            // regime the keystroke belongs to.
+            let command_active = app.command_palette_active();
             match key.code {
-                // ── Command-entry mode ────────────────────────────────
-                // While in command mode the palette is shown and these keys
-                // belong to it: Esc returns to the prompt (never cancels
-                // generation), Enter RUNS the typed command, Tab completes the
-                // highlighted name into the buffer, and ↑/↓ move the palette
-                // highlight.  They are FIRST so they win over the normal
-                // prompt bindings, but only fire for plain keys, so Ctrl+Q and
-                // the other chords keep working; every other key falls through
-                // to normal editing (typing edits the command line).
-                KeyCode::Esc if app.command_mode && plain => {
-                    app.exit_command_mode();
+                // ── Command palette ──────────────────────────────────
+                // While a command line is active these keys belong to the
+                // palette: Esc discards the line (never cancels generation),
+                // Enter RUNS it, Tab completes the highlighted name into the
+                // buffer, and ↑/↓ move the palette highlight.  They are FIRST
+                // so they win over the normal prompt bindings, but only fire
+                // for plain keys, so Ctrl+Q and the other chords keep working;
+                // every other key falls through to normal editing, so typing
+                // (or deleting the leading `/`) edits the command line and can
+                // end it.
+                KeyCode::Esc if command_active && plain => {
+                    app.discard_command_line();
                     return Ok(());
                 }
-                // Enter (plain OR Shift) RUNS the command (it does NOT merely
-                // complete, and is NOT the normal prompt submit).  Shift must
-                // not insert a newline in command mode: the command line is a
+                // Enter (plain OR Shift) RUNS the command line (it does NOT
+                // merely complete, and is NOT the normal prompt submit).
+                // Shift must not insert a newline here: the command line is a
                 // single line, and a stray `\n` would only make the parser
                 // reject an otherwise-valid command.  Only Ctrl/Alt chords fall
                 // through (to the shortcut dispatch above / the Ctrl handler
                 // below).  The line to run is resolved through
                 // `command_palette_enter_line`, so Enter runs the HIGHLIGHTED
                 // command directly — no preceding `Tab` — while a fully-typed
-                // command (`model gpt-4o`) still runs verbatim with its
+                // command (`/model gpt-4o`) still runs verbatim with its
                 // arguments.  An empty command line with nothing highlighted is
-                // a no-op that stays in mode; a run exits the mode, discarding
-                // the buffer AFTER the command runs so its echo is preserved.
-                KeyCode::Enter if app.command_mode && plain => {
+                // a no-op that stays active; a run discards the buffer AFTER
+                // the command runs so its echo is preserved.
+                KeyCode::Enter if command_active && plain => {
                     let line = app.command_palette_enter_line();
                     if !line.is_empty() {
-                        let command =
-                            parse_input_line(&format!("/{line}"), &mut app.next_request_id);
+                        let command = parse_input_line(&line, &mut app.next_request_id);
                         run_command(command, true, app, client_tx)?;
-                        app.exit_command_mode();
+                        app.discard_command_line();
                     }
                     return Ok(());
                 }
-                KeyCode::Tab if app.command_mode && plain => {
+                KeyCode::Tab if command_active && plain => {
                     if !app.command_palette_matches().is_empty() {
                         app.command_palette_complete();
                     }
                     return Ok(());
                 }
-                KeyCode::Up if app.command_mode && plain => {
+                KeyCode::Up if command_active && plain => {
                     app.command_palette_move(-1);
                     return Ok(());
                 }
-                KeyCode::Down if app.command_mode && plain => {
+                KeyCode::Down if command_active && plain => {
                     app.command_palette_move(1);
                     return Ok(());
                 }
-                // `/` on an EMPTY prompt is a TRIGGER: it enters command mode
-                // and is never inserted, so it never appears in the
-                // buffer/prompt.  Anywhere else a `/` is a literal character
-                // (mid-prompt, or inside the command line itself).
-                KeyCode::Char('/')
-                    if !app.command_mode
-                        && key.modifiers == KeyModifiers::NONE
-                        && app.input.text.is_empty() =>
-                {
-                    app.enter_command_mode();
-                }
+                // A `/` is an ORDINARY character: typing one at the start of an
+                // empty prompt begins a command line, and the palette appears
+                // because the buffer now starts with `/`.  Mid-prompt (or
+                // inside a command line) it is literal too.  Nothing special is
+                // needed here — it falls through to the editing arm below.
+                //
                 // All Ctrl+ combinations that are NOT command shortcuts are
                 // delegated to a dedicated handler.  (Alt+Enter's `continue`
                 // binding is handled by the shortcut table at the top of this

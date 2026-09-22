@@ -723,15 +723,14 @@ are only required when running prompts.
 
 In `choreo-tui`:
 
-Pressing `/` on an **empty** prompt enters **command-entry mode** — a
+Typing a line that starts with `/` opens the **inline command palette** — a
 keyboard-only overlay (it floats above the input box, never covering the input
-or the status bar) that lists every command. The `/` is only a trigger: it is
-never shown, and the input holds the command line itself (e.g. `model`, or
-`model gpt-4o`). While in command mode, `↑`/`↓` move the highlight, `Tab`
-completes the highlighted command's name into the input (a trailing space is
-added) and stays in the mode, **`Enter` runs the command**, and `Esc` returns
-to the prompt without cancelling anything. (You can also just type a
-`/command` line directly and press `Enter`, as before.)
+or the status bar) listing every command. The `/` stays in the input exactly as
+you typed it, so the line reads `/model` or `/model gpt-4o`; deleting the `/`
+closes the palette and returns to a plain prompt. While the palette is shown,
+`↑`/`↓` move the highlight, `Tab` completes the highlighted command's name into
+the input (a trailing space is added) and keeps the palette open, **`Enter`
+runs the command**, and `Esc` discards the line without cancelling anything.
 
 - `/ping` — health check
 - `/model` — open the model selector picker

@@ -371,15 +371,15 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
         })
         .collect();
 
-    // In command-entry mode the buffer holds a command line (no leading `/`),
-    // so a block title is the visible affordance telling the user Enter will
-    // RUN the command rather than submit a prompt.  The `/` is never drawn
-    // because it is never in the buffer.  Read the flag before the text borrow
-    // above is consumed so the block can be built without a borrow conflict.
+    // A command line (the buffer starts with `/`) gets a block title as the
+    // visible affordance telling the user Enter will RUN the command rather
+    // than submit a prompt; the `/` itself is drawn from the buffer text above.
+    // Read the derived predicate before the text borrow above is consumed so
+    // the block can be built without a borrow conflict.
     let mut input_block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
         .padding(Padding::new(INPUT_PAD, INPUT_PAD, 0, 0));
-    if app.command_mode {
+    if app.command_palette_active() {
         input_block = input_block
             .title(" command ")
             .border_style(Style::default().fg(Color::Cyan));
