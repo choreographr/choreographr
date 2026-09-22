@@ -373,7 +373,7 @@ fn slug_keyed_catalog_facts_resolve_without_a_live_provider() {
     );
 
     // ...and the attach snapshot reports the model's reasoning capability,
-    // so Ctrl+R never shows "reasoning capability not yet available" on a
+    // so Alt+R never shows "reasoning capability not yet available" on a
     // locked daemon.
     let DaemonMessage::Session {
         event:

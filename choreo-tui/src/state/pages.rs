@@ -736,7 +736,7 @@ pub(crate) struct Marker {
     pub virtual_slot: usize,
 }
 
-/// State for the model-selector popup (Chat page, Ctrl+M).
+/// State for the model-selector popup (Chat page, Alt+M).
 ///
 /// The selector lists the models available on the attached session's account
 /// (fetched from the daemon via `ClientMessage::ListModels`) and lets the user

@@ -62,7 +62,7 @@ pub(crate) struct SessionManagerState {
     pub(crate) view: SessionManagerView,
     pub(crate) selection: Option<usize>,
     /// Session id to highlight on the next list refresh.  `select_session`
-    /// records this when navigating to the session manager (Ctrl+S) so the
+    /// records this when navigating to the session manager (Alt+S) so the
     /// freshly fetched list lands on the session the user was just viewing
     /// — even on the first visit, before the daemon's `ListSessions` reply has
     /// (re)populated `sessions`.

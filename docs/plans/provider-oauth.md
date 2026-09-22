@@ -406,7 +406,7 @@ failures (network / 429 / 5xx) stay on the normal retry path. This mirrors herme
 
 ## 8. Frontend UX
 
-Reuse the existing accounts surface (`/add-key`, `/account`, `Ctrl+A`, the
+Reuse the existing accounts surface (`/add-key`, `/account`, `Alt+A`, the
 new-account wizard):
 
 - **`/login <provider>`** (alias `/add-oauth`) — the provider picker gains a

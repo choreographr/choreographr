@@ -750,7 +750,7 @@ impl SessionState {
         let reasoning_capability = self.config.selected_model.as_ref().and_then(|model| {
             // Slug-keyed lookup (not the provider instance): the capability is
             // a static catalog fact and must be reported even while the
-            // keystore is locked, so Ctrl+R works on an attached session
+            // keystore is locked, so Alt+R works on an attached session
             // before any client has been built.
             let slug = self.effective_provider_slug()?;
             Some(model_reasoning_capability(slug, model))

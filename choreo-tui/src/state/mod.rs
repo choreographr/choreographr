@@ -367,7 +367,7 @@ pub(crate) struct App {
     pub(crate) pending_image_fetch: Vec<(u64, u32, usize)>,
     pub(crate) history_viewport: HistoryViewport,
     pub(crate) should_quit: bool,
-    /// Why the TUI is exiting, when it is NOT a user-initiated quit (Ctrl+Q).
+    /// Why the TUI is exiting, when it is NOT a user-initiated quit (Alt+Q).
     /// Set when the daemon evicts this client, announces shutdown, or the
     /// connection drops; printed to the restored terminal after teardown so
     /// the user sees why the TUI left. `None` on a normal user quit.
@@ -1136,7 +1136,7 @@ impl App {
     pub(crate) fn set_page(&mut self, page: Page) {
         self.page = page;
         // A command line is scoped to the Chat page: a page change (e.g.
-        // Ctrl+S opening the session manager) must never leave one in the
+        // Alt+S opening the session manager) must never leave one in the
         // buffer underneath.  Guarded so a real prompt draft survives a page
         // change (see `discard_command_line`).
         self.discard_command_line();
@@ -3253,7 +3253,7 @@ mod tests {
     #[test]
     fn select_session_wins_over_previous_selection() {
         // The user viewed session 1, but the session they were just looking
-        // at before Ctrl+S is session 2: the pending highlight must win.
+        // at before Alt+S is session 2: the pending highlight must win.
         let mut mgr = SessionManagerState::new();
         mgr.set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
         assert_eq!(mgr.selection, Some(0)); // default: first row

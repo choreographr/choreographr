@@ -774,8 +774,10 @@ runs the command**, and `Esc` discards the line without cancelling anything.
 - `/redo` — redo the most recently undone turn (cleared if new input is sent)
 - any other input — sent as a prompt
 
-In `choreo-tui`, `Ctrl+C` exits the local client and disconnects from the
-daemon without requesting daemon shutdown.
+In `choreo-tui`, `Ctrl+C` is a deliberate no-op (raw mode has no copy/sigint,
+and the chord must not insert a literal `c`); use `Alt+Q` (or `/quit`) to exit
+the local client and disconnect from the daemon without requesting daemon
+shutdown.
 
 ## Security model
 
