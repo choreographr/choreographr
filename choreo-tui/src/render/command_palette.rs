@@ -82,16 +82,10 @@ pub(super) fn render_command_palette(frame: &mut Frame<'_>, app: &mut App, input
         item_rows,
     );
     let focused = app.command_palette_focused();
-    let keyboard_enhanced = app.keyboard_enhanced;
 
     let mut lines: Vec<Line> = Vec::with_capacity(height);
     for (i, command_match) in matches.iter().enumerate().skip(scroll).take(count) {
-        lines.push(palette_row(
-            command_match,
-            i == focused,
-            rect.width,
-            keyboard_enhanced,
-        ));
+        lines.push(palette_row(command_match, i == focused, rect.width));
     }
     if truncated {
         let hidden = len - (scroll + count);
@@ -110,12 +104,7 @@ pub(super) fn render_command_palette(frame: &mut Frame<'_>, app: &mut App, input
 ///
 /// `marker` is `>` on the focused row (else a space), matching the picker
 /// popups' highlight convention.
-fn palette_row(
-    command_match: &CommandMatch,
-    focused: bool,
-    width: u16,
-    keyboard_enhanced: bool,
-) -> Line<'static> {
+fn palette_row(command_match: &CommandMatch, focused: bool, width: u16) -> Line<'static> {
     // Focused rows read Yellow+BOLD (the picker-popup convention); other rows
     // are White.  Matched prefix characters are emphasized brighter (Cyan+BOLD)
     // so the leading characters the query matched stand out from the rest of
@@ -154,7 +143,7 @@ fn palette_row(
     // content width is measured from the same text the spans emit so the label
     // lands flush right (and is simply omitted when the row is too narrow).
     let content = format!("{marker}/{name}  {}", command_match.spec.summary);
-    if let Some(label) = shortcut_label_for(name, keyboard_enhanced) {
+    if let Some(label) = shortcut_label_for(name) {
         let used = display_width(&content);
         let label_width = display_width(&label);
         if (width as usize) > used + label_width + 1 {

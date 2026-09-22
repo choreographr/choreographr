@@ -208,6 +208,12 @@ impl InputBuffer {
                 self.clear();
                 true
             }
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+                // Readline `backward-kill-word` (M-DEL): Alt+Backspace deletes
+                // the word before the cursor.
+                self.delete_word_backward();
+                true
+            }
             KeyCode::Backspace => {
                 self.backspace_at_cursor();
                 true
@@ -260,6 +266,61 @@ impl InputBuffer {
                 self.delete_to_start();
                 true
             }
+            // ── readline / emacs editing chords ──────────────────────
+            // Ctrl+<letter> movement and kill keys match the shell's readline
+            // bindings; the app's command layer lives on Alt+ now (see
+            // `state/keymap.rs`), so these are free here.  Pure cursor moves
+            // leave the buffer `generation` untouched (so a recalled history
+            // entry stays attached), while the mutating chords bump it
+            // (detaching the entry — see `App::edit_input`).
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor_home_line();
+                true
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor_end_line();
+                true
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor_left();
+                true
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor_right();
+                true
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_at_cursor();
+                true
+            }
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Legacy terminals deliver Ctrl+H as Backspace (0x08); kitty
+                // terminals send Char('h')+CONTROL, so it needs an explicit arm
+                // to stay backward-delete-char instead of a no-op.
+                self.backspace_at_cursor();
+                true
+            }
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.kill_line();
+                true
+            }
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.transpose_chars();
+                true
+            }
+            // Alt (Meta) word chords.
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.word_left();
+                true
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.word_right();
+                true
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.delete_word_forward();
+                true
+            }
             KeyCode::Char(c)
                 if !key
                     .modifiers
@@ -298,6 +359,60 @@ impl InputBuffer {
         // Char-boundary invariant as in `cursor_left`.
         let suffix = self.text.get(self.cursor..).unwrap_or("");
         self.cursor += suffix.find('\n').unwrap_or(suffix.len());
+    }
+
+    /// Readline `kill-line` (`Ctrl+K`): delete from the cursor to the end of
+    /// the CURRENT logical line (the next `\n`, or the end of the buffer).
+    /// Line-oriented, mirroring `Home`/`End` and `Ctrl+E`; a cursor already at
+    /// end-of-line is a no-op — the `\n` itself is never consumed, so lines are
+    /// never joined.
+    pub(crate) fn kill_line(&mut self) {
+        // Char-boundary invariant as in `cursor_left`.
+        let suffix = self.text.get(self.cursor..).unwrap_or("");
+        let end = self.cursor + suffix.find('\n').unwrap_or(suffix.len());
+        if end == self.cursor {
+            return;
+        }
+        self.text.drain(self.cursor..end);
+        self.generation += 1;
+    }
+
+    /// Readline `transpose-chars` (`Ctrl+T`): swap the grapheme before the
+    /// cursor with the one after it, leaving the cursor after the pair.  With
+    /// nothing after the cursor (end of buffer) the two graphemes *before* it
+    /// swap instead — readline's end-of-line behaviour.
+    pub(crate) fn transpose_chars(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        // Char-boundary invariants as in `cursor_left`: `cursor` is on a
+        // grapheme boundary, so the slices below reproduce exactly.
+        let prefix = self.text.get(..self.cursor).unwrap_or("");
+        let Some((left_start, left)) = prefix.grapheme_indices(true).next_back() else {
+            return;
+        };
+        let mut new = String::with_capacity(self.text.len());
+        new.push_str(self.text.get(..left_start).unwrap_or(""));
+        let suffix = self.text.get(self.cursor..).unwrap_or("");
+        if let Some(right) = suffix.graphemes(true).next() {
+            new.push_str(right);
+            new.push_str(left);
+            new.push_str(self.text.get(self.cursor + right.len()..).unwrap_or(""));
+            self.cursor = left_start + right.len() + left.len();
+        } else {
+            // At end of buffer: swap the last two graphemes.  `left` is the
+            // final grapheme and `prev` the second-to-last.
+            let before = self.text.get(..left_start).unwrap_or("");
+            let Some((prev_start, prev)) = before.grapheme_indices(true).next_back() else {
+                return;
+            };
+            new.truncate(prev_start);
+            new.push_str(left);
+            new.push_str(prev);
+            self.cursor = self.text.len();
+        }
+        self.text = new;
+        self.generation += 1;
     }
 
     /// Move cursor up one visual line (wrapping-aware).

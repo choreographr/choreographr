@@ -3,8 +3,8 @@ use crate::markdown_render::{display_width, reasoning_expanded_default, render_t
 use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
 use crate::selection;
 use crate::state::{
-    App, CTRL_HELP_LINE1, CTRL_HELP_LINE1_LEGACY, CTRL_HELP_LINE2, INPUT_PAD, Page, RenderCacheKey,
-    cached_or_compute_lines, cached_visual_lines, input_inner_width,
+    App, HELP_LINE1, HELP_LINE2, INPUT_PAD, Page, RenderCacheKey, cached_or_compute_lines,
+    cached_visual_lines, input_inner_width,
 };
 use choreo_proto::{SessionStatus, TokenUsage};
 use ratatui::{
@@ -312,21 +312,8 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
             ..help_area
         };
         let help = Paragraph::new(Text::from(vec![
-            Line::from(Span::styled(
-                // The model-selector key differs on legacy terminals (see
-                // `App::keyboard_enhanced`) — always advertise the one that
-                // works on the terminal the user is actually sitting at.
-                if app.keyboard_enhanced {
-                    CTRL_HELP_LINE1
-                } else {
-                    CTRL_HELP_LINE1_LEGACY
-                },
-                Style::default().fg(Color::Cyan),
-            )),
-            Line::from(Span::styled(
-                CTRL_HELP_LINE2,
-                Style::default().fg(Color::Cyan),
-            )),
+            Line::from(Span::styled(HELP_LINE1, Style::default().fg(Color::Cyan))),
+            Line::from(Span::styled(HELP_LINE2, Style::default().fg(Color::Cyan))),
         ]));
         frame.render_widget(help, help_inner);
     }

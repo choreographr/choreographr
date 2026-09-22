@@ -72,7 +72,7 @@ fn send_continue_generation(
 }
 
 /// Open the model selector and request a fresh model list — the shared body of
-/// the `Ctrl+M`/`Ctrl+O` shortcut and the bare `/model` command.
+/// the `Alt+M` shortcut and the bare `/model` command.
 ///
 /// Clears any armed text selection first: the selector is a modal overlay that
 /// routes mouse events away from the history-pane selection arms, so a mid-drag
@@ -82,10 +82,7 @@ fn open_model_selector(
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
-    tracing::debug!(
-        enhanced = app.keyboard_enhanced,
-        "[choreo-tui] opening model selector"
-    );
+    tracing::debug!("[choreo-tui] opening model selector");
     app.text_selection = None;
     app.model_selector.open();
     client_tx
@@ -95,7 +92,7 @@ fn open_model_selector(
 }
 
 /// Open the session manager, highlighting the session the user was just viewing
-/// — the shared body of the `Ctrl+S` shortcut and the bare `/session` command.
+/// — the shared body of the `Alt+S` shortcut and the bare `/session` command.
 fn open_session_manager(
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
@@ -116,7 +113,7 @@ fn open_session_manager(
     Ok(())
 }
 
-/// Open the AI-provider accounts page — the shared body of the `Ctrl+A`
+/// Open the AI-provider accounts page — the shared body of the `Alt+A`
 /// shortcut and the bare `/account` command.
 fn open_accounts_page(
     app: &mut App,
@@ -131,7 +128,7 @@ fn open_accounts_page(
 }
 
 /// Cycle the attached session's reasoning effort to the next level — the shared
-/// body of the `Ctrl+R` shortcut and the bare `/reasoning` command.
+/// body of the `Alt+R` shortcut and the bare `/reasoning` command.
 ///
 /// Writes the status line directly (there is no shell echo): "no session
 /// attached" when there is no display, the daemon's own `SetReasoningEffort`
@@ -202,7 +199,7 @@ fn cycle_reasoning(
         None => {
             app.status = Some(format!(
                 "no model selected — pick one with {}",
-                app.model_selector_label()
+                App::model_selector_label()
             ));
             tracing::warn!(
                 session_id = ?app.attached_session_id,
@@ -245,7 +242,7 @@ fn reasoning_list(app: &mut App) {
         None => {
             app.status = Some(format!(
                 "no model selected — pick one with {}",
-                app.model_selector_label()
+                App::model_selector_label()
             ));
         }
     }

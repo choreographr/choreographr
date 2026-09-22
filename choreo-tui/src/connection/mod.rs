@@ -76,10 +76,10 @@ use crossterm::event::KeyEvent;
 /// Keyboard enhancements requested from the terminal via the kitty keyboard
 /// protocol (`CSI > flags u`), pushed at startup and re-pushed after resume.
 ///
-/// `DISAMBIGUATE_ESCAPE_CODES` makes `Ctrl+letter` (e.g. Ctrl+M) arrive as an
-/// unambiguous CSI-u sequence (`CSI 109;5 u`) instead of the legacy control
-/// byte (0x0D — identical to Enter), while plain text keys stay as legacy
-/// UTF-8 bytes.
+/// `DISAMBIGUATE_ESCAPE_CODES` makes `Ctrl+letter` arrive as an unambiguous
+/// CSI-u sequence (e.g. `CSI 109;5 u` for Ctrl+M) instead of the legacy
+/// control byte (0x0D — identical to Enter), while plain text keys stay as
+/// legacy UTF-8 bytes.
 ///
 /// `REPORT_ALL_KEYS_AS_ESCAPE_CODES` is deliberately **not** requested.  With
 /// it enabled, kitty-protocol terminals report *every* key as a CSI-u event,
@@ -93,17 +93,19 @@ use crossterm::event::KeyEvent;
 /// crossterm parses into the correct `Char` events.
 ///
 /// Trade-off: with `DISAMBIGUATE_ESCAPE_CODES` alone, the *plain* Enter/Tab/
-/// Backspace keys stay in their legacy encodings (per the protocol), so Ctrl+M
-/// stays distinct from Enter while those keys remain shell-friendly.  Key
-/// combinations with no legacy byte encoding — e.g. Shift+Enter — are still
-/// reported as CSI-u (`CSI 13;2 u`), so modifier variants like Shift+Enter
-/// (newline) remain distinguishable.
+/// Backspace keys stay in their legacy encodings (per the protocol), so a
+/// `Ctrl+letter` editing chord stays distinct from its bare key while those
+/// keys remain shell-friendly.  Key combinations with no legacy byte encoding
+/// — e.g. Shift+Enter — are still reported as CSI-u (`CSI 13;2 u`), so modifier
+/// variants like Shift+Enter (newline) remain distinguishable.
 ///
 /// Terminals that do not implement the kitty protocol simply ignore the push
-/// and keep legacy encodings (there Ctrl+M arrives as Enter).  That case is
-/// detected at startup via `supports_keyboard_enhancement`, and the model
-/// selector's runtime-resolved shortcut (`binding_for`) rebinds it to Ctrl+O
-/// there — see `App::keyboard_enhanced`.
+/// and keep legacy encodings (there `Ctrl+letter` arrives as its control byte,
+/// which crossterm maps back to `Char(letter)+CONTROL` — so the readline
+/// editing chords still work, and `Ctrl+M`/`Ctrl+I`/`Ctrl+H` arrive as Enter/
+/// Tab/Backspace).  The push is what keeps Shift+Enter distinct from Enter; the
+/// app's command shortcuts are all `Alt+` chords and need no rebinding, so
+/// nothing here is consulted for key dispatch any more.
 const KITTY_KEYBOARD_FLAGS: KeyboardEnhancementFlags = KeyboardEnhancementFlags::from_bits_retain(
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES.bits(),
 );
@@ -361,38 +363,6 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     // next keypress.  A zero-timeout poll is non-blocking and consumes nothing.
     let _ = event::poll(Duration::ZERO);
 
-    // Probe whether the terminal actually implemented the kitty protocol we
-    // just pushed.  This MUST run before the terminal-event thread below is
-    // spawned — the probe's response is delivered through the same crossterm
-    // event source the thread would drain, so a running thread would eat it
-    // and the probe would spuriously time out even on kitty terminals.
-    // crossterm's query waits up to 2s for a reply; kitty terminals answer
-    // immediately, legacy ones (Termux et al.) either answer DA-only or stay
-    // silent, both of which land here as "not enhanced".  Err (no response in
-    // time) is treated the same as false — the worst case is the legacy key
-    // binding on a terminal that actually supports the protocol, never the
-    // reverse.
-    let keyboard_enhanced = match crossterm::terminal::supports_keyboard_enhancement() {
-        Ok(true) => {
-            tracing::info!(
-                "[choreo-tui] terminal supports the kitty keyboard protocol — Ctrl+M opens the model selector"
-            );
-            true
-        }
-        Ok(false) => {
-            tracing::info!(
-                "[choreo-tui] terminal answered but lacks kitty keyboard enhancements — rebinding the model selector to Ctrl+O (Ctrl+M is Enter here)"
-            );
-            false
-        }
-        Err(e) => {
-            tracing::info!(
-                "[choreo-tui] terminal did not answer the keyboard-enhancement probe ({e}) — assuming legacy encoding, model selector on Ctrl+O"
-            );
-            false
-        }
-    };
-
     // Spawn a background thread that reads terminal events via crossterm and
     // forwards them through a crossbeam channel so the main loop can block on
     // all event sources simultaneously via select!.
@@ -569,9 +539,6 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
 
     let mut app = App::new();
     app.image_job_tx = Some(worker.job_tx);
-    // The probe ran before the reader thread spawned (see above); thread the
-    // result into App so key handlers and hints know which selector key works.
-    app.keyboard_enhanced = keyboard_enhanced;
     // The address that keys this daemon's unlock key in known_servers (see
     // the derivation up top — `mode` is moved by now).
     app.connection_addr = connection_addr;
@@ -653,7 +620,7 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
 
     // Surface why the TUI exited (daemon eviction / graceful shutdown / a
     // dropped connection) once the alternate screen is gone and the message
-    // is visible on the restored terminal. A normal user quit (Ctrl+Q)
+    // is visible on the restored terminal. A normal user quit (Alt+Q)
     // leaves `quit_message` None and prints nothing.
     if let Some(message) = &app.quit_message {
         println!("{message}");
@@ -985,14 +952,16 @@ pub(crate) fn handle_terminal_event(
         app.mark_terminal_resized();
     }
 
-    // Global Ctrl+Q quits from any page before page-specific dispatch and
-    // fullscreen overlay so the user can always quit.
+    // Global Alt+Q quits from any page before page-specific dispatch and
+    // fullscreen overlay so the user can always quit.  It is deliberately NOT
+    // routed through the Chat-only shortcut table: quitting must work from the
+    // session manager, the accounts page, and every open modal too.
     if let Event::Key(key) = &event
         && key.kind == KeyEventKind::Press
         && key.code == KeyCode::Char('q')
-        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::ALT)
     {
-        tracing::info!("Ctrl+Q requested quit");
+        tracing::info!("Alt+Q requested quit");
         app.should_quit = true;
         return Ok(());
     }
@@ -1002,7 +971,7 @@ pub(crate) fn handle_terminal_event(
         return Ok(());
     }
     // The model selector overlay (Chat page) also takes priority over page
-    // content, mirroring the fullscreen guard above.  Ctrl+Q is handled
+    // content, mirroring the fullscreen guard above.  Alt+Q is handled
     // before this point so the user can always quit while it is open.
     if app.model_selector.is_open() {
         return handle_model_selector_event(&event, app, client_tx);
@@ -1123,7 +1092,7 @@ fn paste_into_text_state(state: &mut impl tui_prompts::State, data: &str) {
 /// Handle events while the fullscreen image overlay is active.
 ///
 /// Only `Esc` (dismiss) is accepted; all other events are silently
-/// consumed.  Quit is handled via Ctrl+Q on the Chat page.
+/// consumed.  Quit is handled via Alt+Q at the terminal-event level.
 fn handle_fullscreen_event(
     event: &Event,
     app: &mut App,
@@ -1349,9 +1318,10 @@ mod tests {
 
     #[test]
     fn kitty_flags_disambiguate_without_report_all_keys() {
-        // Ctrl+M must arrive as a distinct CSI-u key event (CSI 109;5 u);
-        // DISAMBIGUATE_ESCAPE_CODES alone gives us that because Ctrl+letter is
-        // a "disambiguated" key, while plain text stays as legacy bytes.
+        // A Ctrl+letter editing chord must arrive as a distinct CSI-u key
+        // event (e.g. CSI 109;5 u for Ctrl+M); DISAMBIGUATE_ESCAPE_CODES alone
+        // gives us that because Ctrl+letter is a "disambiguated" key, while
+        // plain text stays as legacy bytes.
         assert!(KITTY_KEYBOARD_FLAGS.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
         // REPORT_ALL_KEYS_AS_ESCAPE_CODES must stay OFF: it makes IME-composed
         // text arrive as a `CSI 0;;<codepoints>u` text event, which crossterm

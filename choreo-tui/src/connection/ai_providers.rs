@@ -4,7 +4,9 @@ use crate::state::{
 };
 use choreo_client_core::{ClientError, broken_pipe, is_valid_account_name};
 use choreo_proto::ClientMessage;
-use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use tui_prompts::State;
 
 pub(super) fn handle_ai_providers_event(
@@ -27,6 +29,15 @@ fn handle_ai_providers_list_key(
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     if key.kind != KeyEventKind::Press {
+        return Ok(());
+    }
+    // Ignore Ctrl/Alt chords: every action here is a BARE-letter key, so a
+    // modifier combination must never fire one (e.g. `Ctrl+N` must not open the
+    // new-account wizard).
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
         return Ok(());
     }
 

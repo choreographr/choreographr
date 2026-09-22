@@ -441,48 +441,48 @@ fn terminal_event_ctrl_c_noop_on_chat() {
 }
 
 #[test]
-fn global_ctrl_q_quits_from_chat() {
+fn global_alt_q_quits_from_chat() {
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = test_app();
 
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("handle ctrl+q");
+    .expect("handle alt+q");
 
     assert!(app.should_quit);
 }
 
 #[test]
-fn global_ctrl_q_quits_from_session_manager() {
+fn global_alt_q_quits_from_session_manager() {
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = test_app();
     app.page = Page::SessionManager;
 
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("handle ctrl+q from session manager");
+    .expect("handle alt+q from session manager");
 
     assert!(app.should_quit);
 }
 
 #[test]
-fn global_ctrl_q_quits_from_ai_providers() {
+fn global_alt_q_quits_from_ai_providers() {
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = test_app();
     app.page = Page::AIProviders;
 
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("handle ctrl+q from ai providers");
+    .expect("handle alt+q from ai providers");
 
     assert!(app.should_quit);
 }
@@ -501,8 +501,11 @@ fn ctrl_p_does_not_insert_char_on_chat() {
     )
     .expect("handle ctrl+p");
 
-    assert_eq!(app.input.text, "hello", "Ctrl+P should not insert 'p'");
-    assert_eq!(app.input.cursor, 5);
+    assert_eq!(app.input.text, "hello", "Ctrl+P must not insert 'p'");
+    // Ctrl+P is readline previous-history: with a non-empty draft and empty
+    // history it falls back to the line-start move (as Up does on the first
+    // visual line).
+    assert_eq!(app.input.cursor, 0);
     assert!(!app.should_quit);
 }
 
@@ -526,55 +529,55 @@ fn alt_x_does_not_insert_char_on_chat() {
 }
 
 #[test]
-fn chat_ctrl_h_toggles_help() {
+fn chat_alt_h_toggles_help() {
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = test_app();
     app.show_ctrl_help = false;
 
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("handle ctrl+h");
+    .expect("handle alt+h");
 
     assert!(app.show_ctrl_help, "first press should enable help");
 }
 
 #[test]
-fn chat_ctrl_h_double_toggle_returns_to_off() {
+fn chat_alt_h_double_toggle_returns_to_off() {
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = test_app();
     app.show_ctrl_help = false;
 
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("handle ctrl+h (first)");
+    .expect("handle alt+h (first)");
     assert!(app.show_ctrl_help, "first press should enable help");
 
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("handle ctrl+h (second)");
+    .expect("handle alt+h (second)");
     assert!(!app.show_ctrl_help, "second press should disable help");
 }
 
 #[test]
-fn chat_ctrl_a_enters_ai_providers() {
+fn chat_alt_a_enters_ai_providers() {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut app = test_app();
 
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("handle ctrl+a");
+    .expect("handle alt+a");
 
     assert_eq!(app.page, Page::AIProviders);
     let msg = rx.recv().expect("sent message");
@@ -582,32 +585,32 @@ fn chat_ctrl_a_enters_ai_providers() {
 }
 
 #[test]
-fn chat_ctrl_up_sends_undo() {
+fn chat_alt_up_sends_undo() {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut app = test_app();
 
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("handle ctrl+up");
+    .expect("handle alt+up");
 
     let msg = rx.recv().expect("sent message");
     assert_eq!(msg, ClientMessage::Undo);
 }
 
 #[test]
-fn chat_ctrl_down_sends_redo() {
+fn chat_alt_down_sends_redo() {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut app = test_app();
 
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("handle ctrl+down");
+    .expect("handle alt+down");
 
     let msg = rx.recv().expect("sent message");
     assert_eq!(msg, ClientMessage::Redo);
@@ -876,7 +879,7 @@ mod unsent_draft_tests {
 
         // Back to the session manager, Up to session 1, Enter to attach.
         handle_terminal_event(
-            Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT)),
             &mut app,
             &tx,
         )
@@ -1864,7 +1867,7 @@ fn attaching_a_session_discards_a_command_line_without_a_draft() {
 }
 
 #[test]
-fn ctrl_r_cycles_reasoning_effort() {
+fn alt_r_cycles_reasoning_effort() {
     let mut app = test_app();
     app.display_for(0).reasoning_capability = Some(ReasoningCapability {
         available_effort_levels: vec!["off".into(), "low".into(), "high".into()],
@@ -1872,11 +1875,11 @@ fn ctrl_r_cycles_reasoning_effort() {
     let (tx, rx) = std::sync::mpsc::channel();
 
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("ctrl+r");
+    .expect("alt+r");
 
     assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("low"));
     assert_eq!(app.status.as_deref(), Some("reasoning: low"));
@@ -1889,16 +1892,16 @@ fn ctrl_r_cycles_reasoning_effort() {
 }
 
 #[test]
-fn ctrl_s_opens_session_manager() {
+fn alt_s_opens_session_manager() {
     let mut app = test_app();
     let (tx, rx) = std::sync::mpsc::channel();
 
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("ctrl+s");
+    .expect("alt+s");
 
     assert_eq!(app.page, Page::SessionManager);
     assert_eq!(
@@ -1914,16 +1917,16 @@ fn ctrl_s_opens_session_manager() {
 }
 
 #[test]
-fn ctrl_m_opens_selector_and_requests_models() {
+fn alt_m_opens_selector_and_requests_models() {
     let mut app = test_app();
     let (tx, rx) = std::sync::mpsc::channel();
 
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("ctrl+m");
+    .expect("alt+m");
 
     assert!(app.model_selector.is_open());
     assert_eq!(rx.recv().expect("ListModels"), ClientMessage::ListModels);

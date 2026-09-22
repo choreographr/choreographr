@@ -245,13 +245,37 @@ mod session_manager_key_tests {
     }
 
     #[test]
-    fn chat_ctrl_s_enters_session_manager() {
+    fn session_manager_ctrl_a_does_not_archive() {
+        // The list's actions are bare-letter keys; a Ctrl chord must never fire
+        // one.  `Ctrl+A` is readline beginning-of-line on the Chat input and
+        // must not archive the highlighted session here.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = make_sm_app();
+        app.session_mgr
+            .set_sessions(vec![make_session(7, "s", "m", 1)]);
+        app.session_mgr.selection = Some(0);
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            &mut app,
+            &tx,
+        )
+        .expect("handle ctrl+a");
+
+        assert!(
+            rx.try_recv().is_err(),
+            "Ctrl+A must not send SetSessionArchived"
+        );
+    }
+
+    #[test]
+    fn chat_alt_s_enters_session_manager() {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = test_app();
         assert_eq!(app.page, Page::Chat);
 
         handle_terminal_event(
-            Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT)),
             &mut app,
             &tx,
         )
@@ -265,7 +289,7 @@ mod session_manager_key_tests {
     }
 
     #[test]
-    fn chat_ctrl_s_highlights_previously_viewed_session() {
+    fn chat_alt_s_highlights_previously_viewed_session() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = test_app();
         // The user is viewing session 42 on the chat page.
@@ -280,7 +304,7 @@ mod session_manager_key_tests {
         app.session_mgr.selection = Some(2);
 
         handle_terminal_event(
-            Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT)),
             &mut app,
             &tx,
         )
@@ -295,15 +319,15 @@ mod session_manager_key_tests {
     }
 
     #[test]
-    fn chat_ctrl_s_remembers_viewed_session_before_list_arrives() {
-        // First launch: no session list loaded yet when Ctrl+S is pressed,
+    fn chat_alt_s_remembers_viewed_session_before_list_arrives() {
+        // First launch: no session list loaded yet when Alt+S is pressed,
         // so the highlight is deferred until the ListSessions reply arrives.
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = test_app();
         app.attached_session_id = Some(42);
 
         handle_terminal_event(
-            Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT)),
             &mut app,
             &tx,
         )

@@ -1,6 +1,7 @@
-//! The inline command palette (Chat page), the logical shortcut table (one
-//! shortcut per command), and the chord / `KeyEvent` resolution that rebinds
-//! `Ctrl+M` to `Ctrl+O` on legacy terminals.
+//! The inline command palette (Chat page).
+//!
+//! The logical keymap (the one-shortcut-per-command table and its `KeyEvent`
+//! resolution) lives in [`crate::state::keymap`].
 //!
 //! There is **no separate "command mode" flag**: a line is a COMMAND LINE iff
 //! the shared composer buffer (`App::input`) starts with `/`, and the palette
@@ -19,177 +20,6 @@
 
 use crate::state::App;
 use choreo_client_core::{CommandMatch, command_catalog, match_commands};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-/// A single logical key within a [`Chord`].
-///
-/// `Esc`/`PageUp`/`PageDown` (and some `Char`s) are not bound by the current
-/// shortcut table, but the type models the full logical-key space so extending
-/// the table is a data change, not a type change.
-#[allow(dead_code)] // some variants are unbound today (see above)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Key {
-    Char(char),
-    Up,
-    Down,
-    Enter,
-    Esc,
-    PageUp,
-    PageDown,
-}
-
-/// A logical key chord (modifiers + key).
-///
-/// Constructed with the `ctrl`/`alt` helpers so the shortcut table reads as the
-/// logical binding; `label` renders the human-facing form (e.g. `Ctrl+M`,
-/// `Alt+Enter`, `Ctrl+↑`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Chord {
-    ctrl: bool,
-    alt: bool,
-    shift: bool,
-    key: Key,
-}
-
-impl Chord {
-    /// `Ctrl+<key>`.
-    pub(crate) const fn ctrl(key: Key) -> Self {
-        Self {
-            ctrl: true,
-            alt: false,
-            shift: false,
-            key,
-        }
-    }
-
-    /// `Alt+<key>`.
-    pub(crate) const fn alt(key: Key) -> Self {
-        Self {
-            ctrl: false,
-            alt: true,
-            shift: false,
-            key,
-        }
-    }
-
-    /// Human-facing label, e.g. `"Ctrl+M"`, `"Alt+Enter"`, `"Ctrl+↑"`.
-    pub(crate) fn label(self) -> String {
-        let mut label = String::new();
-        if self.ctrl {
-            label.push_str("Ctrl+");
-        }
-        if self.alt {
-            label.push_str("Alt+");
-        }
-        if self.shift {
-            label.push_str("Shift+");
-        }
-        label.push_str(&key_label(self.key));
-        label
-    }
-}
-
-/// Human-facing label for a bare [`Key`] (the part after the modifiers).
-fn key_label(key: Key) -> String {
-    match key {
-        // Letters render as the uppercase glyph (`Ctrl+M`, not `Ctrl+m`).
-        Key::Char(c) => c.to_ascii_uppercase().to_string(),
-        Key::Up => "↑".to_string(),
-        Key::Down => "↓".to_string(),
-        Key::Enter => "Enter".to_string(),
-        Key::Esc => "Esc".to_string(),
-        Key::PageUp => "PageUp".to_string(),
-        Key::PageDown => "PageDown".to_string(),
-    }
-}
-
-/// One logical shortcut per command: the *initial* binding, before
-/// [`resolve_chord`] applies any terminal-specific rebinding.  The table is the
-/// single source of truth for both key dispatch hints and the palette's
-/// right-aligned shortcut labels.
-///
-/// `Ctrl+Q` is not dispatched through `run_named` — it stays the global
-/// pre-dispatch special case in `connection/mod.rs` (so it quits even while
-/// modals are open).  It is listed here for DISPLAY only.
-const SHORTCUTS: &[(Chord, &str)] = &[
-    (Chord::ctrl(Key::Char('m')), "model"),
-    (Chord::ctrl(Key::Char('r')), "reasoning"),
-    (Chord::alt(Key::Enter), "continue"),
-    (Chord::ctrl(Key::Up), "undo"),
-    (Chord::ctrl(Key::Down), "redo"),
-    (Chord::ctrl(Key::Char('s')), "session"),
-    (Chord::ctrl(Key::Char('a')), "account"),
-    (Chord::ctrl(Key::Char('q')), "quit"),
-];
-
-/// Apply the terminal-specific rebinding for a logical chord.
-///
-/// This is the single place legacy rebinding lives: `Ctrl+M` is byte 0x0D on a
-/// legacy terminal (indistinguishable from Enter), so the model selector is
-/// reached with `Ctrl+O` there (see `App::keyboard_enhanced`).  Extending the
-/// legacy rebinding is a matter of adding another arm here.
-fn resolve_chord(chord: Chord, keyboard_enhanced: bool) -> Chord {
-    if !keyboard_enhanced && chord == Chord::ctrl(Key::Char('m')) {
-        Chord::ctrl(Key::Char('o'))
-    } else {
-        chord
-    }
-}
-
-/// Lower a crossterm `KeyEvent` to a logical [`Chord`], or `None` for keys the
-/// shortcut table never binds.
-///
-/// Used by [`binding_for`], the single-source-of-truth lookup that Chat-page
-/// shortcut dispatch routes through.
-fn chord_from_event(event: &KeyEvent) -> Option<Chord> {
-    let key = match event.code {
-        // Letters fold to lowercase so a kitty Shift-reporting terminal's
-        // `Char('M')+CONTROL` still matches the lowercase table entry.
-        KeyCode::Char(c) => Key::Char(c.to_ascii_lowercase()),
-        KeyCode::Up => Key::Up,
-        KeyCode::Down => Key::Down,
-        KeyCode::Enter => Key::Enter,
-        KeyCode::Esc => Key::Esc,
-        KeyCode::PageUp => Key::PageUp,
-        KeyCode::PageDown => Key::PageDown,
-        _ => return None,
-    };
-    Some(Chord {
-        ctrl: event.modifiers.contains(KeyModifiers::CONTROL),
-        alt: event.modifiers.contains(KeyModifiers::ALT),
-        shift: event.modifiers.contains(KeyModifiers::SHIFT),
-        key,
-    })
-}
-
-/// Resolve a crossterm event to the name of the command whose shortcut it is,
-/// or `None` when it matches no shortcut.
-///
-/// Logical chords are resolved for the current terminal, so a `Ctrl+O` event
-/// maps to `"model"` on a legacy terminal while `Ctrl+M` maps to `"model"` on a
-/// kitty terminal.
-///
-/// This is the single-source-of-truth lookup that Chat-page shortcut dispatch
-/// routes through (`handle_chat_ctrl_key`), so every shortcut runs the same
-/// command path as its typed spelling and the terminal-specific rebinding
-/// lives in exactly one place.
-pub(crate) fn binding_for(event: &KeyEvent, keyboard_enhanced: bool) -> Option<&'static str> {
-    let chord = chord_from_event(event)?;
-    SHORTCUTS
-        .iter()
-        .find(|(logical, _)| resolve_chord(*logical, keyboard_enhanced) == chord)
-        .map(|(_, name)| *name)
-}
-
-/// The display label for a command's shortcut, resolved for the current
-/// terminal (so the model selector advertises `Ctrl+O` on legacy terminals).
-/// `None` when the command has no shortcut.
-pub(crate) fn shortcut_label_for(name: &str, keyboard_enhanced: bool) -> Option<String> {
-    SHORTCUTS
-        .iter()
-        .find(|(_, n)| *n == name)
-        .map(|(chord, _)| resolve_chord(*chord, keyboard_enhanced).label())
-}
 
 /// Transient selection state for the inline command palette.
 pub(crate) struct CommandPaletteState {
@@ -389,7 +219,6 @@ impl App {
 mod tests {
     use super::*;
     use crate::test_util::test_app;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     /// Set the composer to a command line (leading slash included) the way
     /// typing it would — the buffer holds the `/`, so a command line is just a
@@ -586,82 +415,5 @@ mod tests {
             "hello",
             "a plain prompt line is returned untouched"
         );
-    }
-
-    #[test]
-    fn binding_for_resolves_legacy_rebinding() {
-        let ctrl_m = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL);
-        let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
-
-        assert_eq!(binding_for(&ctrl_m, true), Some("model"));
-        assert_eq!(
-            binding_for(&ctrl_m, false),
-            None,
-            "Ctrl+M is unreachable on a legacy terminal"
-        );
-        assert_eq!(binding_for(&ctrl_o, false), Some("model"));
-    }
-
-    #[test]
-    fn one_shortcut_per_command_model_selector() {
-        // There is exactly ONE shortcut per command: the model selector is
-        // Ctrl+M on a kitty terminal and Ctrl+O on a legacy one — never both,
-        // and Ctrl+O is unbound on kitty (it is NOT an alias there).
-        let ctrl_m = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL);
-        let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
-
-        assert_eq!(binding_for(&ctrl_m, true), Some("model"));
-        assert_eq!(
-            binding_for(&ctrl_o, true),
-            None,
-            "Ctrl+O is unbound on a kitty terminal"
-        );
-        assert_eq!(binding_for(&ctrl_o, false), Some("model"));
-    }
-
-    #[test]
-    fn binding_for_covers_the_shortcut_table() {
-        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
-        assert_eq!(binding_for(&ctrl('r'), true), Some("reasoning"));
-        assert_eq!(binding_for(&ctrl('s'), true), Some("session"));
-        assert_eq!(binding_for(&ctrl('a'), true), Some("account"));
-        assert_eq!(binding_for(&ctrl('q'), true), Some("quit"));
-        assert_eq!(
-            binding_for(&KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), true),
-            Some("continue")
-        );
-        assert_eq!(
-            binding_for(&KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), true),
-            Some("undo")
-        );
-        assert_eq!(
-            binding_for(&KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), true),
-            Some("redo")
-        );
-        // Unbound keys resolve to nothing.
-        assert_eq!(
-            binding_for(
-                &KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
-                true
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn shortcut_labels_resolve_for_the_terminal() {
-        assert_eq!(shortcut_label_for("model", true).as_deref(), Some("Ctrl+M"));
-        assert_eq!(
-            shortcut_label_for("model", false).as_deref(),
-            Some("Ctrl+O")
-        );
-        assert_eq!(
-            shortcut_label_for("continue", true).as_deref(),
-            Some("Alt+Enter")
-        );
-        assert_eq!(shortcut_label_for("undo", true).as_deref(), Some("Ctrl+↑"));
-        assert_eq!(shortcut_label_for("redo", true).as_deref(), Some("Ctrl+↓"));
-        assert_eq!(shortcut_label_for("quit", true).as_deref(), Some("Ctrl+Q"));
-        assert_eq!(shortcut_label_for("nope", true), None);
     }
 }

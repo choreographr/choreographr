@@ -674,7 +674,7 @@ fn enter_stop_does_not_scroll() {
     );
 }
 
-// ── Ctrl+R reasoning effort cycling ──────────────────────────────
+// ── Alt+R reasoning effort cycling ──────────────────────────────
 
 #[test]
 fn ctrl_r_no_session_shows_message() {
@@ -691,14 +691,14 @@ fn ctrl_r_no_session_shows_message() {
         ],
     });
 
-    // Ctrl+R should show message even without session attached
+    // Alt+R should show message even without session attached
     // (the handler checks capability, not session_id).
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("handle ctrl+r");
+    .expect("handle alt+r");
 
     assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("low"));
     assert_eq!(app.status.as_deref(), Some("reasoning: low"));
@@ -716,11 +716,11 @@ fn ctrl_r_no_active_display_shows_message() {
     app.attached_session_id = None;
 
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("handle ctrl+r");
+    .expect("handle alt+r");
 
     assert_eq!(app.status.as_deref(), Some("no session attached"));
     assert!(rx.try_iter().next().is_none(), "no client message expected");
@@ -740,13 +740,13 @@ fn ctrl_r_cycles_through_valid_slugs() {
         ],
     });
 
-    // First Ctrl+R: off -> low
+    // First Alt+R: off -> low
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("handle ctrl+r 1");
+    .expect("handle alt+r 1");
     assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("low"));
     assert_eq!(app.status.as_deref(), Some("reasoning: low"));
     let msg = rx.recv().expect("SetReasoningEffort 1");
@@ -757,13 +757,13 @@ fn ctrl_r_cycles_through_valid_slugs() {
         }
     );
 
-    // Second Ctrl+R: low -> medium
+    // Second Alt+R: low -> medium
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("handle ctrl+r 2");
+    .expect("handle alt+r 2");
     assert_eq!(
         app.display_for(0).reasoning_effort.as_deref(),
         Some("medium")
@@ -778,11 +778,11 @@ fn ctrl_r_cycles_through_valid_slugs() {
 
     // Third: medium -> high
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("handle ctrl+r 3");
+    .expect("handle alt+r 3");
     assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("high"));
     let msg = rx.recv().expect("SetReasoningEffort 3");
     assert_eq!(
@@ -794,11 +794,11 @@ fn ctrl_r_cycles_through_valid_slugs() {
 
     // Fourth: high -> off (wraps around)
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("handle ctrl+r 4");
+    .expect("handle alt+r 4");
     assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("off"));
     let msg = rx.recv().expect("SetReasoningEffort 4");
     assert_eq!(
@@ -821,15 +821,15 @@ fn ctrl_r_no_model_selected_shows_message() {
     app.display_for(0).selected_model = None;
 
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("handle ctrl+r");
+    .expect("handle alt+r");
 
     assert_eq!(
         app.status.as_deref(),
-        Some("no model selected — pick one with Ctrl+M")
+        Some("no model selected — pick one with Alt+M")
     );
     // Effort should remain unchanged (still None) and nothing is sent to
     // the daemon (no cycling, so no SetReasoningEffort).
@@ -848,11 +848,11 @@ fn ctrl_r_model_selected_capability_pending_shows_message() {
     app.display_for(0).selected_model = Some("gpt-4o".to_string());
 
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("handle ctrl+r");
+    .expect("handle alt+r");
 
     assert_eq!(
         app.status.as_deref(),
@@ -874,13 +874,13 @@ fn ctrl_r_google_off_on() {
         available_effort_levels: vec!["off".to_string(), "on".to_string()],
     });
 
-    // First Ctrl+R: off -> on
+    // First Alt+R: off -> on
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("handle ctrl+r 1");
+    .expect("handle alt+r 1");
     assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("on"));
     let msg = rx.recv().expect("SetReasoningEffort 1");
     assert_eq!(
@@ -890,13 +890,13 @@ fn ctrl_r_google_off_on() {
         }
     );
 
-    // Second Ctrl+R: on -> off (wraps)
+    // Second Alt+R: on -> off (wraps)
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("handle ctrl+r 2");
+    .expect("handle alt+r 2");
     assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("off"));
     let msg = rx.recv().expect("SetReasoningEffort 2");
     assert_eq!(
@@ -1166,11 +1166,11 @@ fn ctrl_r_with_empty_capability_shows_message() {
     });
 
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
         &mut app,
         &tx,
     )
-    .expect("handle ctrl+r");
+    .expect("handle alt+r");
 
     assert_eq!(
         app.status.as_deref(),

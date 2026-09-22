@@ -25,8 +25,11 @@ pub(super) fn handle_chat_event(
             // Any keypress clears transient status/error messages.
             app.status = None;
             app.error = None;
-            // Don't clear help on Ctrl+H itself — let the toggle arm handle it.
-            if key.code != KeyCode::Char('h') || !key.modifiers.contains(KeyModifiers::CONTROL) {
+            // Don't clear help on the help-toggle chord itself — let the
+            // toggle arm below handle it.
+            let help_toggle =
+                key.code == KeyCode::Char('h') && key.modifiers.contains(KeyModifiers::ALT);
+            if !help_toggle {
                 app.show_ctrl_help = false;
             }
             // A plain (unmodified) keypress predicate, used by the command-line
@@ -42,7 +45,7 @@ pub(super) fn handle_chat_event(
             // below — is what routes `Alt+Enter` through the table too, so the
             // non-Ctrl `continue` binding needs no hard-coded match arm.  A
             // bare keypress passes `echo = false` (no `> …` echo).
-            if let Some(name) = crate::state::binding_for(key, app.keyboard_enhanced) {
+            if let Some(name) = crate::state::binding_for(key) {
                 return run_named(name, false, app, client_tx);
             }
             // A command line is any buffer that starts with `/` — there is no
@@ -59,7 +62,7 @@ pub(super) fn handle_chat_event(
                 // Enter RUNS it, Tab completes the highlighted name into the
                 // buffer, and ↑/↓ move the palette highlight.  They are FIRST
                 // so they win over the normal prompt bindings, but only fire
-                // for plain keys, so Ctrl+Q and the other chords keep working;
+                // for plain keys, so Alt+Q and the other chords keep working;
                 // every other key falls through to normal editing, so typing
                 // (or deleting the leading `/`) edits the command line and can
                 // end it.
@@ -109,6 +112,13 @@ pub(super) fn handle_chat_event(
                 // inside a command line) it is literal too.  Nothing special is
                 // needed here — it falls through to the editing arm below.
                 //
+                // Alt+H toggles the help overlay.  It is not a catalog command
+                // (so it is absent from the shortcut table) and is handled here,
+                // before the generic `Char` editing arm below.
+                KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    tracing::debug!("Alt+H toggling help overlay");
+                    app.show_ctrl_help = !app.show_ctrl_help;
+                }
                 // All Ctrl+ combinations that are NOT command shortcuts are
                 // delegated to a dedicated handler.  (Alt+Enter's `continue`
                 // binding is handled by the shortcut table at the top of this
@@ -127,49 +137,8 @@ pub(super) fn handle_chat_event(
                         app.status = Some("no session attached".to_string());
                     }
                 }
-                KeyCode::Up => {
-                    let inner = app
-                        .last_terminal_size
-                        .map_or(78, |(w, _)| input_inner_width(w));
-                    if app.input.is_on_first_visual_line(inner) {
-                        // Recall requires an empty draft: history is reachable
-                        // only from an empty prompt, or while already browsing.
-                        // With a non-empty draft, Up on the first visual line
-                        // moves the cursor to the start of the line instead —
-                        // the mirror of Down-on-last-line's move-to-end.
-                        if app.history_index.is_some() || app.input.text.is_empty() {
-                            app.navigate_history_up();
-                        } else {
-                            app.input.cursor_home_line();
-                            app.ensure_input_cursor_visible();
-                        }
-                    } else {
-                        app.input.cursor_up(inner);
-                        app.ensure_input_cursor_visible();
-                    }
-                }
-                KeyCode::Down => {
-                    let inner = app
-                        .last_terminal_size
-                        .map_or(78, |(w, _)| input_inner_width(w));
-                    if app.input.is_on_last_visual_line(inner) {
-                        // Down only drives history navigation while an entry
-                        // is loaded.  When editing the draft itself there is
-                        // nothing below it, so Down on the last visual line
-                        // lands at end-of-line instead of being a dead key —
-                        // the mirror of Up recalling history from the first
-                        // line.
-                        if app.history_index.is_some() {
-                            app.navigate_history_down();
-                        } else {
-                            app.input.cursor_end_line();
-                            app.ensure_input_cursor_visible();
-                        }
-                    } else {
-                        app.input.cursor_down(inner);
-                        app.ensure_input_cursor_visible();
-                    }
-                }
+                KeyCode::Up => history_or_line_up(app),
+                KeyCode::Down => history_or_line_down(app),
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     // Inserting a newline mutates the buffer: detach a recalled
                     // history entry into the draft first.
@@ -497,20 +466,22 @@ pub(super) fn handle_chat_event(
     Ok(())
 }
 
-/// Handle the Ctrl+key combinations on the Chat page that are NOT command
-/// shortcuts.
+/// Handle the `Ctrl+<key>` editing chords on the Chat page that are NOT
+/// command shortcuts.
 ///
 /// The command-shortcut table (`crate::state::binding_for`) is consulted
-/// earlier in `handle_chat_event`, so any binding listed there has already been
-/// dispatched; this handler owns only the help toggle, the deliberate Ctrl+C
-/// no-op, and the text-editing chords (Ctrl+Left/Right, Ctrl+Backspace, …)
-/// forwarded to the input buffer.
+/// earlier in `handle_chat_event`, so any `Alt+` command binding has already
+/// been dispatched.  What remains is the readline editing layer: the
+/// `Ctrl+P`/`Ctrl+N` history walk is driven here (it needs `App` state), the
+/// deliberate `Ctrl+C` no-op, and every other chord is forwarded to the input
+/// buffer's kernel (`InputBuffer::handle_key`), which owns the movement/kill
+/// bindings (`Ctrl+A/E/B/F/D/H/K/T/W/U`).
 fn handle_chat_ctrl_key(key: KeyEvent, app: &mut App) {
     match key.code {
-        KeyCode::Char('h') => {
-            tracing::debug!("Ctrl+H toggling help overlay");
-            app.show_ctrl_help = !app.show_ctrl_help;
-        }
+        // Ctrl+P / Ctrl+N are readline `previous-history` / `next-history` —
+        // the same behaviour as ↑/↓ (see `history_or_line_up`/`_down`).
+        KeyCode::Char('p') => history_or_line_up(app),
+        KeyCode::Char('n') => history_or_line_down(app),
         // Ctrl+C is a deliberate no-op on the chat page (no copy/sigint in raw
         // mode).  Absorb it here so it does not fall through to the input
         // handler, which would insert a literal 'c'.
@@ -526,12 +497,57 @@ fn handle_chat_ctrl_key(key: KeyEvent, app: &mut App) {
         {
             tracing::debug!("[choreo-tui] Ctrl+Backspace ignored while browsing history");
         }
-        // Ctrl+Left/Right, Ctrl+Backspace, Ctrl+Delete, Ctrl+Home/End, Ctrl+W,
-        // Ctrl+U etc. are text-editing shortcuts that should still work in the
-        // input box.  All of them go through `edit_input`, which detaches a
+        // Every other editing chord — Ctrl+Left/Right/Backspace/Delete/Home/
+        // End/W/U/A/E/B/F/D/H/K/T — goes through `edit_input`, which detaches a
         // recalled history entry into the draft iff the chord actually edited
-        // the buffer — the pure cursor moves (Ctrl+Left/Right/Home/End) leave
-        // browsing intact, while Ctrl+W/Ctrl+U/Ctrl+Delete detach it.
+        // the buffer.  The pure cursor moves leave browsing intact; the
+        // kill/delete chords detach it.
         _ => app.edit_input(key),
+    }
+}
+
+/// `Up` / readline `Ctrl+P` (`previous-history`): on the first visual line,
+/// recall the previous prompt when the draft is empty (or a recall is already
+/// in progress), else jump to the start of the line; on a lower visual line,
+/// move the cursor up one wrapped line.
+fn history_or_line_up(app: &mut App) {
+    let inner = app
+        .last_terminal_size
+        .map_or(78, |(w, _)| input_inner_width(w));
+    if app.input.is_on_first_visual_line(inner) {
+        // Recall requires an empty draft: history is reachable only from an
+        // empty prompt, or while already browsing.  With a non-empty draft, Up
+        // on the first visual line moves the cursor to the start of the line
+        // instead — the mirror of Down-on-last-line's move-to-end.
+        if app.history_index.is_some() || app.input.text.is_empty() {
+            app.navigate_history_up();
+        } else {
+            app.input.cursor_home_line();
+            app.ensure_input_cursor_visible();
+        }
+    } else {
+        app.input.cursor_up(inner);
+        app.ensure_input_cursor_visible();
+    }
+}
+
+/// `Down` / readline `Ctrl+N` (`next-history`): the mirror of
+/// [`history_or_line_up`].  Down only drives history navigation while an entry
+/// is loaded; on the last visual line while editing the draft it lands at
+/// end-of-line instead of being a dead key.
+fn history_or_line_down(app: &mut App) {
+    let inner = app
+        .last_terminal_size
+        .map_or(78, |(w, _)| input_inner_width(w));
+    if app.input.is_on_last_visual_line(inner) {
+        if app.history_index.is_some() {
+            app.navigate_history_down();
+        } else {
+            app.input.cursor_end_line();
+            app.ensure_input_cursor_visible();
+        }
+    } else {
+        app.input.cursor_down(inner);
+        app.ensure_input_cursor_visible();
     }
 }

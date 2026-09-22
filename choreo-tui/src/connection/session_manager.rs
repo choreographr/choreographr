@@ -1,7 +1,7 @@
 use crate::state::{App, Page, SessionManagerView, session_list_click_index};
 use choreo_client_core::{ClientError, broken_pipe};
 use choreo_proto::ClientMessage;
-use crossterm::event::{Event, KeyCode, KeyEventKind, MouseEvent};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEvent};
 
 pub(super) fn handle_session_manager_event(
     event: &Event,
@@ -48,6 +48,16 @@ fn handle_session_list_key(
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
+    // Ignore Ctrl/Alt chords: every action here is a BARE-letter key, and a
+    // modifier combination must never fire one.  Without this, `Ctrl+A` (which
+    // is readline beginning-of-line in the Chat input) would archive the
+    // highlighted session, `Ctrl+N` would create one, and so on.
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return Ok(());
+    }
     // If in delete-confirmation mode, handle y/n/Esc first
     if app.session_mgr.confirm_delete.is_some() {
         match key.code {
@@ -89,7 +99,7 @@ fn handle_session_list_key(
         KeyCode::Char('i') => app.session_mgr.enter_detail(),
         KeyCode::Tab => {
             // The ONLY view-switch key: toggles the live list and the archived
-            // list (Ctrl+A is the global accounts shortcut and must not be
+            // list (Alt+A is the global accounts shortcut and must not be
             // reused here).
             app.session_mgr.toggle_view();
         }
@@ -220,6 +230,14 @@ fn handle_session_detail_key(
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
+    // Ignore Ctrl/Alt chords (the detail view's keys are bare letters); see
+    // `handle_session_list_key`.
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return Ok(());
+    }
     match key.code {
         KeyCode::Char('b') | KeyCode::Esc => {
             app.session_mgr.leave_detail();

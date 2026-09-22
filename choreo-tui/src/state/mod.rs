@@ -37,6 +37,7 @@ mod command_palette;
 mod draft;
 mod images;
 mod input;
+mod keymap;
 mod layout;
 mod pages;
 mod providers;
@@ -47,6 +48,7 @@ mod session_manager;
 // `app_tests.rs`/`render_tests.rs`) keep resolving exactly as before.
 pub(crate) use command_palette::*;
 pub(crate) use input::*;
+pub(crate) use keymap::*;
 pub(crate) use layout::*;
 pub(crate) use pages::*;
 pub(crate) use providers::*;
@@ -72,15 +74,15 @@ pub(crate) fn input_inner_width(term_width: u16) -> usize {
     term_width.saturating_sub(INPUT_PAD * 2) as usize
 }
 
-pub(crate) const CTRL_HELP_LINE1: &str =
-    "ctrl+h help  ctrl+q quit  ctrl+a accounts  ctrl+s sessions  ctrl+m models";
-/// Help line for terminals WITHOUT the kitty keyboard protocol, where Ctrl+M
-/// is byte 0x0D (indistinguishable from Enter) and the model selector is
-/// rebound to Ctrl+O instead — see `App::keyboard_enhanced`.
-pub(crate) const CTRL_HELP_LINE1_LEGACY: &str =
-    "ctrl+h help  ctrl+q quit  ctrl+a accounts  ctrl+s sessions  ctrl+o models";
-pub(crate) const CTRL_HELP_LINE2: &str =
-    "esc stop  alt+enter continue  ctrl+up undo  ctrl+down redo  ctrl+r reasoning";
+/// The two-line keyboard-shortcut help overlay (toggled with `Alt+H`).
+///
+/// Every app command lives on an `Alt+` chord (see `state/keymap.rs`); the
+/// readline-style `Ctrl+<letter>` editing chords are advertised in the
+/// `README` rather than here so the overlay stays two short lines.
+pub(crate) const HELP_LINE1: &str =
+    "alt+h help  alt+q quit  alt+a accounts  alt+s sessions  alt+m models";
+pub(crate) const HELP_LINE2: &str =
+    "esc stop  alt+enter continue  alt+up undo  alt+down redo  alt+r reasoning";
 
 /// Per-turn content-line ranges used for click hit-testing, computed
 /// alongside `height_prefix`.  Maps a content-line offset within the turn to
@@ -395,14 +397,6 @@ pub(crate) struct App {
     pub(crate) keystore_auto_bind: choreo_client_core::KeystoreAutoBind,
     pub(crate) page: Page,
     pub(crate) show_ctrl_help: bool,
-    /// Whether the terminal implemented the kitty keyboard protocol we push
-    /// at startup (probed via crossterm's `supports_keyboard_enhancement`
-    /// before the terminal-event thread starts). On legacy terminals (Termux
-    /// and friends) Ctrl+M is byte 0x0D — identical to Enter — so the model
-    /// selector is rebound to Ctrl+O and hints reflect it. Defaults to `true`:
-    /// kitty-capable terminals are the desktop majority, and every simulated
-    /// `KeyEvent` in tests is a kitty-encoding event.
-    pub(crate) keyboard_enhanced: bool,
     pub(crate) session_mgr: SessionManagerState,
     pub(crate) ai_providers: AIProvidersState,
     pub(crate) model_selector: ModelSelectorState,
@@ -598,7 +592,6 @@ impl App {
             keystore_auto_bind: choreo_client_core::KeystoreAutoBind::new(),
             page: Page::Chat,
             show_ctrl_help: true,
-            keyboard_enhanced: true,
             session_mgr: SessionManagerState::new(),
             ai_providers: AIProvidersState::new(),
             model_selector: ModelSelectorState::new(),
@@ -635,16 +628,10 @@ impl App {
         }
     }
 
-    /// The key that opens the model selector on THIS terminal: Ctrl+M on
-    /// kitty-protocol terminals; Ctrl+O on legacy terminals where Ctrl+M is
-    /// byte 0x0D (Enter) and can never reach the handler. Used by hint and
-    /// status strings so the user is always told a key that actually works.
-    pub(crate) fn model_selector_label(&self) -> &'static str {
-        if self.keyboard_enhanced {
-            "Ctrl+M"
-        } else {
-            "Ctrl+O"
-        }
+    /// The key that opens the model selector — `Alt+M` on every terminal now
+    /// that commands live on `Alt+` chords.  Used by hint and status strings.
+    pub(crate) fn model_selector_label() -> &'static str {
+        "Alt+M"
     }
 
     pub(crate) fn display_for(&mut self, session_id: u64) -> &mut SessionDisplayState {

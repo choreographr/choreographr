@@ -10,7 +10,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind
 /// PgUp/PgDn page the highlight, and every other key feeds the filter box.
 /// The mouse scroll wheel navigates like the arrows (pin-at-middle); a
 /// left-click on a list row selects it exactly like Enter, and a left-click
-/// on the filter row positions the input cursor.  Quit is handled via Ctrl+Q
+/// on the filter row positions the input cursor.  Quit is handled via Alt+Q
 /// at the terminal-event level.
 pub(super) fn handle_model_selector_event(
     event: &Event,

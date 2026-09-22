@@ -522,6 +522,151 @@ fn handle_key_ctrl_end_on_multi_line() {
     assert_eq!(buf.cursor, 7); // document end
 }
 
+// ── readline / emacs editing chords ──────────────────────────────
+//
+// The editing kernel honours the shell's readline movement and kill keys:
+// `Ctrl+A/E` (line start/end), `Ctrl+B/F` (char), `Ctrl+D` (delete-char),
+// `Ctrl+H` (backspace), `Ctrl+K` (kill-line), `Ctrl+T` (transpose), and the
+// Alt (Meta) word chords `Alt+B/F/D` / `Alt+Backspace`.
+
+#[test]
+fn handle_key_ctrl_a_and_e_move_to_line_edges() {
+    let mut buf = InputBuffer::new();
+    buf.text = "abc\ndef".to_string();
+    buf.cursor = 6; // inside "def"
+    buf.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert_eq!(
+        buf.cursor, 4,
+        "Ctrl+A goes to the start of the logical line"
+    );
+    buf.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+    assert_eq!(buf.cursor, 7, "Ctrl+E goes to the end of the logical line");
+}
+
+#[test]
+fn handle_key_ctrl_b_and_f_move_by_char() {
+    let mut buf = InputBuffer::new();
+    buf.text = "abc".to_string();
+    buf.cursor = 1;
+    buf.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    assert_eq!(buf.cursor, 2);
+    buf.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert_eq!(buf.cursor, 1);
+}
+
+#[test]
+fn handle_key_ctrl_d_deletes_char_at_cursor() {
+    let mut buf = InputBuffer::new();
+    buf.text = "abc".to_string();
+    buf.cursor = 1;
+    buf.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert_eq!(buf.text, "ac");
+}
+
+#[test]
+fn handle_key_ctrl_h_deletes_char_backward() {
+    // On a kitty terminal Ctrl+H arrives as Char('h')+CONTROL (legacy sends
+    // Backspace); both must delete the character before the cursor.
+    let mut buf = InputBuffer::new();
+    buf.text = "abc".to_string();
+    buf.cursor = 3;
+    buf.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+    assert_eq!(buf.text, "ab");
+    assert_eq!(buf.cursor, 2);
+}
+
+#[test]
+fn handle_key_ctrl_k_kills_to_end_of_logical_line() {
+    let mut buf = InputBuffer::new();
+    buf.text = "abc\ndef".to_string();
+    buf.cursor = 1;
+    buf.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+    assert_eq!(
+        buf.text, "a\ndef",
+        "Ctrl+K kills to the newline, not the end"
+    );
+    assert_eq!(buf.cursor, 1);
+
+    // At end-of-line the newline itself is never consumed, so it is a no-op.
+    let mut buf = InputBuffer::new();
+    buf.text = "abc\ndef".to_string();
+    buf.cursor = 3;
+    let before = buf.generation;
+    buf.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+    assert_eq!(buf.text, "abc\ndef");
+    assert_eq!(
+        buf.generation, before,
+        "a no-op kill must not bump generation"
+    );
+}
+
+#[test]
+fn handle_key_ctrl_t_transposes_chars() {
+    let mut buf = InputBuffer::new();
+    buf.text = "abc".to_string();
+    buf.cursor = 1;
+    buf.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+    assert_eq!(buf.text, "bac");
+    assert_eq!(buf.cursor, 2, "cursor lands after the swapped pair");
+
+    // At the end of the buffer the two preceding chars swap instead.
+    let mut buf = InputBuffer::new();
+    buf.text = "ab".to_string();
+    buf.cursor = 2;
+    buf.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+    assert_eq!(buf.text, "ba");
+    assert_eq!(buf.cursor, 2);
+}
+
+#[test]
+fn handle_key_alt_b_and_f_move_by_word() {
+    let mut buf = InputBuffer::new();
+    buf.text = "foo bar".to_string();
+    buf.cursor = 7;
+    buf.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+    assert_eq!(
+        buf.cursor, 4,
+        "Alt+B moves to the start of the previous word"
+    );
+    buf.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT));
+    assert_eq!(buf.cursor, 7, "Alt+F moves past the next word");
+}
+
+#[test]
+fn handle_key_alt_d_kills_word_forward() {
+    let mut buf = InputBuffer::new();
+    buf.text = "foo bar".to_string();
+    buf.cursor = 0;
+    buf.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT));
+    assert_eq!(buf.text, "bar");
+}
+
+#[test]
+fn handle_key_alt_backspace_kills_word_backward() {
+    let mut buf = InputBuffer::new();
+    buf.text = "foo bar".to_string();
+    buf.cursor = 7;
+    buf.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+    assert_eq!(buf.text, "foo ");
+    assert_eq!(buf.cursor, 4);
+}
+
+#[test]
+fn readline_cursor_moves_do_not_bump_generation() {
+    // A pure cursor move must leave `generation` untouched, so a recalled
+    // history entry stays attached (see `App::edit_input`); a kill does not.
+    let mut buf = InputBuffer::new();
+    buf.text = "abc def".to_string();
+    buf.cursor = 7;
+    let before = buf.generation;
+    buf.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    buf.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    buf.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+    assert_eq!(buf.generation, before, "cursor moves are not edits");
+    buf.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+    assert_ne!(buf.generation, before, "a kill is an edit");
+}
+
 #[test]
 fn compute_visual_lines_handles_empty_text() {
     let lines = compute_visual_lines("", 80);
@@ -1631,6 +1776,69 @@ fn terminal_event_ctrl_backspace_inert_while_browsing() {
 }
 
 #[test]
+fn terminal_event_ctrl_a_moves_cursor_to_line_start() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.input.text = "hello world".to_string();
+    app.input.cursor = 11;
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+a");
+
+    assert_eq!(app.input.cursor, 0, "Ctrl+A is readline beginning-of-line");
+    assert_eq!(app.input.text, "hello world", "Ctrl+A must not edit");
+}
+
+#[test]
+fn terminal_event_ctrl_p_recalls_history_like_up() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    add_user_text(&mut app, "recent prompt");
+
+    // Ctrl+P from an empty draft recalls the previous prompt (readline
+    // previous-history), exactly like Up.
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+p");
+    assert!(app.history_index.is_some());
+    assert_eq!(app.input.text, "recent prompt");
+
+    // Ctrl+N walks back to the empty draft (next-history), like Down.
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+n");
+    assert!(app.history_index.is_none());
+    assert_eq!(app.input.text, "");
+}
+
+#[test]
+fn terminal_event_ctrl_k_kills_to_line_end() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.input.text = "abc\ndef".to_string();
+    app.input.cursor = 1;
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+k");
+
+    assert_eq!(app.input.text, "a\ndef");
+}
+
+#[test]
 fn terminal_event_alt_char_while_browsing_does_not_detach() {
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = test_app();
@@ -2521,26 +2729,26 @@ fn scroll_offset_clamped_to_valid_range() {
 // behaviour everywhere.
 
 #[test]
-fn ctrl_shift_m_opens_selector_like_ctrl_m() {
+fn alt_shift_m_opens_selector_like_alt_m() {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut app = test_app();
 
-    // Ctrl+Shift+M arrives as Char('m') + CONTROL + SHIFT under the kitty
-    // protocol; legacy sent the same byte as Ctrl+M, so both must open the
-    // selector.
+    // Alt+Shift+M arrives as Char('M') + ALT under the kitty protocol (the
+    // normaliser maps the shifted glyph and keeps ALT); the shortcut table
+    // folds the letter to lowercase, so it opens the selector like Alt+M.
     handle_terminal_event(
         Event::Key(KeyEvent::new(
             KeyCode::Char('m'),
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
         )),
         &mut app,
         &tx,
     )
-    .expect("handle ctrl+shift+m");
+    .expect("handle alt+shift+m");
 
     assert!(
         app.model_selector.is_open(),
-        "ctrl+shift+m opens the selector"
+        "alt+shift+m opens the selector"
     );
     let msg = rx.recv().expect("sent message");
     assert_eq!(msg, ClientMessage::ListModels);
