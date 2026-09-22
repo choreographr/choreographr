@@ -1,7 +1,7 @@
 use crate::state::{App, Page, SessionManagerView, session_list_click_index};
 use choreo_client_core::{ClientError, broken_pipe};
 use choreo_proto::ClientMessage;
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEvent};
+use crossterm::event::{Event, KeyCode, KeyEventKind, MouseEvent};
 
 pub(super) fn handle_session_manager_event(
     event: &Event,
@@ -51,11 +51,9 @@ fn handle_session_list_key(
     // Ignore Ctrl/Alt chords: every action here is a BARE-letter key, and a
     // modifier combination must never fire one.  Without this, `Ctrl+A` (which
     // is readline beginning-of-line in the Chat input) would archive the
-    // highlighted session, `Ctrl+N` would create one, and so on.
-    if key
-        .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-    {
+    // highlighted session, `Ctrl+N` would create one, and so on.  See
+    // `super::is_modifier_chord`.
+    if super::is_modifier_chord(&key) {
         return Ok(());
     }
     // If in delete-confirmation mode, handle y/n/Esc first
@@ -231,11 +229,8 @@ fn handle_session_detail_key(
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     // Ignore Ctrl/Alt chords (the detail view's keys are bare letters); see
-    // `handle_session_list_key`.
-    if key
-        .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-    {
+    // `handle_session_list_key`.  See `super::is_modifier_chord`.
+    if super::is_modifier_chord(&key) {
         return Ok(());
     }
     match key.code {

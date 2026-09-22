@@ -17,7 +17,7 @@ fn app_starts_in_chat_page() {
     let app = test_app();
     assert_eq!(app.page, Page::Chat);
     assert!(
-        app.show_ctrl_help,
+        app.show_help_overlay,
         "help overlay should be visible by default"
     );
 }
@@ -1803,6 +1803,15 @@ fn session_created_for_user_session_on_session_manager_navigates() {
         msgs.iter()
             .any(|m| matches!(m, ClientMessage::UnsubscribeSessionsSummary)),
         "leaving the Session Manager must drop its summary subscription"
+    );
+    // Exactly-once refresh: the direct reply must NOT also fetch the list from
+    // the Session Manager page — the broadcast `SessionCreated` owns that (and
+    // races this reply), so fetching here too would double the round-trip.
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| matches!(m, ClientMessage::ListSessions)),
+        "a create from the Session Manager must not send a second ListSessions"
     );
 }
 

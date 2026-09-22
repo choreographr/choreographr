@@ -11,9 +11,9 @@ use choreo_proto::ClientMessage;
 use crossbeam::channel;
 use crossbeam::select;
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
-    KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 #[cfg(unix)]
 use mio::unix::pipe;
@@ -70,8 +70,6 @@ pub(crate) use daemon::handle_daemon_message;
 use crate::selection;
 #[cfg(test)]
 use choreo_proto::DaemonMessage;
-#[cfg(test)]
-use crossterm::event::KeyEvent;
 
 /// Keyboard enhancements requested from the terminal via the kitty keyboard
 /// protocol (`CSI > flags u`), pushed at startup and re-pushed after resume.
@@ -109,6 +107,22 @@ use crossterm::event::KeyEvent;
 const KITTY_KEYBOARD_FLAGS: KeyboardEnhancementFlags = KeyboardEnhancementFlags::from_bits_retain(
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES.bits(),
 );
+
+/// Whether `key` is a `Ctrl`/`Alt` *modifier chord*.
+///
+/// The full-page list handlers (Session Manager list + detail, AI-provider
+/// accounts) match on `KeyCode` alone, so without this guard a modifier
+/// combination would fire the bare-letter action of the same key — e.g.
+/// `Ctrl+A` would archive a session and `Ctrl+N` / `Alt+A` would open a wizard.
+/// Chat-page dispatch needs no such guard: it resolves modifiers through the
+/// logical keymap (`crate::state::binding_for`), so only the exact `Alt+` chord
+/// matches a command.
+///
+/// Shared here so the three call sites cannot drift apart.
+pub(super) fn is_modifier_chord(key: &KeyEvent) -> bool {
+    key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
 
 /// High-water mark for the daemon→UI event queue.  The queue is unbounded by
 /// design (see the reader-thread closure in `run_app`), so a stalled UI event

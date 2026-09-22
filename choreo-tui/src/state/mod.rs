@@ -396,7 +396,7 @@ pub(crate) struct App {
     /// [`choreo_client_core::KeystoreAutoBind`]).
     pub(crate) keystore_auto_bind: choreo_client_core::KeystoreAutoBind,
     pub(crate) page: Page,
-    pub(crate) show_ctrl_help: bool,
+    pub(crate) show_help_overlay: bool,
     pub(crate) session_mgr: SessionManagerState,
     pub(crate) ai_providers: AIProvidersState,
     pub(crate) model_selector: ModelSelectorState,
@@ -591,7 +591,7 @@ impl App {
             // re-connecting means restarting the TUI with fresh state.
             keystore_auto_bind: choreo_client_core::KeystoreAutoBind::new(),
             page: Page::Chat,
-            show_ctrl_help: true,
+            show_help_overlay: true,
             session_mgr: SessionManagerState::new(),
             ai_providers: AIProvidersState::new(),
             model_selector: ModelSelectorState::new(),
@@ -758,7 +758,7 @@ impl App {
     /// relocates chunks rather than honouring every `Length`.
     pub(crate) fn chat_page_layout(&mut self, term_width: u16, term_height: u16) -> [Rect; 5] {
         let status_error_height = self.status_error_height(term_width);
-        let help_height = if self.show_ctrl_help { 2u16 } else { 0u16 };
+        let help_height = if self.show_help_overlay { 2u16 } else { 0u16 };
         let input_height = self.input_bar_height(term_width);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1196,14 +1196,22 @@ impl App {
             display.selected_model = selected_model;
             display.reasoning_effort = reasoning_effort;
         }
-        // Send ListSessions before AttachSession so the summary list is
-        // populated when the `SessionAttached` reply fills any remaining
-        // display gaps (working_dir, status, tokens, …).  Unlike the broadcast
-        // refresh in `note_session_created`, this send is propagated: the
-        // attach below depends on the summary reply arriving in order.
-        client_tx
-            .send(ClientMessage::ListSessions)
-            .map_err(broken_pipe)?;
+        // Fetch the session summary before attaching ONLY when leaving another
+        // page (Chat): the reply populates `session_mgr.all`, so the attach's
+        // status-bar priming and the daemon's `SessionAttached` gap-fill have
+        // the data.  On the Session Manager page the fetch is deliberately
+        // SKIPPED: the broadcast `SessionCreated` already refreshes an open list
+        // (`note_session_created`), and the direct reply races that broadcast —
+        // so fetching here too would send a redundant `ListSessions` for a
+        // create the user is navigating away from (the page re-fetches on the
+        // next `open_session_manager` anyway).  This is what restores the
+        // original "one list refresh per create, not two" invariant now that a
+        // create from ANY page funnels through this handler.
+        if self.page != Page::SessionManager {
+            client_tx
+                .send(ClientMessage::ListSessions)
+                .map_err(broken_pipe)?;
+        }
         // Shared attach sequence (also used by the Session Manager's Enter):
         // it sends UnsubscribeSessionsSummary + AttachSession, hands the input
         // bar over, rebinds the active session, and switches to the Chat page.
@@ -1313,7 +1321,7 @@ impl App {
         }
         self.attached_status = status;
         self.refresh_attached_account_slug();
-        self.show_ctrl_help = true;
+        self.show_help_overlay = true;
         if let Some(d) = self.active_display() {
             d.progress_dirty = true;
         }
@@ -5655,13 +5663,13 @@ mod tests {
         app.last_terminal_size = Some((80, 30));
         app.terminal_resized = false;
 
-        app.show_ctrl_help = false;
+        app.show_help_overlay = false;
         app.update_viewport_from_terminal_size();
         let height_without_help = app.history_viewport.height;
 
         app.last_terminal_size = Some((80, 30));
         app.terminal_resized = false;
-        app.show_ctrl_help = true;
+        app.show_help_overlay = true;
         app.update_viewport_from_terminal_size();
         let height_with_help = app.history_viewport.height;
 

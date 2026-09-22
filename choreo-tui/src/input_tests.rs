@@ -2535,7 +2535,7 @@ fn input_box_rect_matches_renderer_layout() {
     app.update_viewport_from_terminal_size();
 
     let status_error_height = app.status_error_height(80);
-    let help_height = if app.show_ctrl_help { 2u16 } else { 0u16 };
+    let help_height = if app.show_help_overlay { 2u16 } else { 0u16 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2571,7 +2571,7 @@ fn input_box_rect_matches_renderer_layout_in_overflow() {
     app.update_viewport_from_terminal_size();
 
     let status_error_height = app.status_error_height(80);
-    let help_height = if app.show_ctrl_help { 2u16 } else { 0u16 };
+    let help_height = if app.show_help_overlay { 2u16 } else { 0u16 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

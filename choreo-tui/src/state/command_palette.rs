@@ -132,7 +132,19 @@ impl App {
         else {
             return;
         };
-        self.input.text = format!("/{} ", found.spec.name);
+        // Keep any argument tail the user already typed (`/mo gpt-4o` →
+        // `/model gpt-4o`), matching `command_palette_enter_line`; a bare
+        // partial (`/mo`) completes to `"/model "` with a trailing space so an
+        // argument can follow.  The tail starts at the first-token boundary, so
+        // its leading whitespace is preserved verbatim.
+        let rest = self.input.text.strip_prefix('/').unwrap_or("");
+        let first = rest.split(char::is_whitespace).next().unwrap_or("");
+        let tail = rest.get(first.len()..).unwrap_or("");
+        self.input.text = if tail.is_empty() {
+            format!("/{} ", found.spec.name)
+        } else {
+            format!("/{}{}", found.spec.name, tail)
+        };
         // Place the cursor at the end of the completed line via the buffer's
         // own accessor.  `InputBuffer::cursor` is a BYTE offset (every edit
         // advances it by `len_utf8`, and the buffer slices on it), so the end
@@ -342,6 +354,17 @@ mod tests {
         app.command_palette_complete();
         assert_eq!(app.input.text, "/model ");
         assert_eq!(app.input.cursor, "/model ".len());
+    }
+
+    #[test]
+    fn complete_keeps_an_argument_tail() {
+        // Tab completion must not drop an argument the user already typed —
+        // `command_palette_enter_line` preserves it, so Tab must agree.
+        let mut app = test_app();
+        set_command(&mut app, "/mo gpt-4o");
+        app.command_palette_complete();
+        assert_eq!(app.input.text, "/model gpt-4o");
+        assert_eq!(app.input.cursor, "/model gpt-4o".len());
     }
 
     #[test]

@@ -305,7 +305,7 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
     }
 
     // ── Help overlay (2 lines, conditional) ───────────────────
-    if app.show_ctrl_help {
+    if app.show_help_overlay {
         let help_inner = Rect {
             x: help_area.x + 1,
             width: help_area.width.saturating_sub(2),

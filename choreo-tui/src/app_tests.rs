@@ -532,7 +532,7 @@ fn alt_x_does_not_insert_char_on_chat() {
 fn chat_alt_h_toggles_help() {
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = test_app();
-    app.show_ctrl_help = false;
+    app.show_help_overlay = false;
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT)),
@@ -541,14 +541,14 @@ fn chat_alt_h_toggles_help() {
     )
     .expect("handle alt+h");
 
-    assert!(app.show_ctrl_help, "first press should enable help");
+    assert!(app.show_help_overlay, "first press should enable help");
 }
 
 #[test]
 fn chat_alt_h_double_toggle_returns_to_off() {
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = test_app();
-    app.show_ctrl_help = false;
+    app.show_help_overlay = false;
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT)),
@@ -556,7 +556,7 @@ fn chat_alt_h_double_toggle_returns_to_off() {
         &tx,
     )
     .expect("handle alt+h (first)");
-    assert!(app.show_ctrl_help, "first press should enable help");
+    assert!(app.show_help_overlay, "first press should enable help");
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT)),
@@ -564,7 +564,7 @@ fn chat_alt_h_double_toggle_returns_to_off() {
         &tx,
     )
     .expect("handle alt+h (second)");
-    assert!(!app.show_ctrl_help, "second press should disable help");
+    assert!(!app.show_help_overlay, "second press should disable help");
 }
 
 #[test]
