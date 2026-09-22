@@ -2260,8 +2260,9 @@ the single file-read tool (the former separate `read_file_range` was merged into
 it). It lives in `tools/read_file.rs`; the shared
 streaming and binary-sniff helpers (`open_text_reader`, `TextStream`, `render_streamed_line`,
 `OutputBudget`, `read_line_capped`, `drain_rest_of_line`) live in `tools/text_stream.rs`
-and are shared with `line_count` (which streams the same way, so its total matches
-`read_file`'s `of N`);
+and are shared with `line_count` (which drains the same `TextStream` via
+`TextStream::drain_counting`, cloning no line content, so its total matches
+`read_file`'s `of N` and a giant file is never loaded whole);
 the sanitization suite (`sanitize_name`, `sanitize_text`/`sanitize_content`,
 `sanitize_transcript`, `sanitize_multiline`, `truncation_marker`, …) lives in
 `tools/sanitize.rs`; and the shared byte budget,
@@ -2299,7 +2300,10 @@ byte cap across appended lines.
   validation error. Output is a `path:` / `lines: a-b of N` header followed by the
   selected lines, each prefixed with its 1-based number and a ` | ` gutter (unpadded —
   padding was measured to cost ~16% more tokens for no accuracy gain). The gutter is a
-  display aid, not file content: `edit_file`'s `old_text` must exclude it.
+  display aid, not file content: `edit_file`'s `old_text` must exclude it. When the
+  window (not the byte budget) caps the output, a `...[more lines follow: showing A of B
+  lines — continue with start_line=N]` marker names the next unread line, mirroring the
+  byte-budget marker below.
 - **Output budget:** tool output is capped at 128 KiB **bytes**
   (`MAX_TOOL_OUTPUT_BYTES`). Bytes are used rather than chars so the effective token cost
   is roughly uniform across scripts (ASCII and CJK are both ~3-4 bytes per token).
@@ -2307,7 +2311,9 @@ byte cap across appended lines.
   the resume value (`continue with start_line=N`), so the agent knows what it is missing
   and can pick up mechanically. X counts the returned content up to the marker — body +
   prepended header + separator newline — so the reported figure matches the
-  bytes actually returned (the marker text itself is appended past the budget).
+  bytes actually returned (the marker text itself is appended past the budget). The
+  window-cap marker above carries the same `continue with start_line=N` contract, so the
+  agent gets a mechanical resume line whether the byte budget or the line window binds.
 - **Per-line cap:** a single line longer than 64 KiB (`MAX_LINE_DISPLAY_BYTES`) is shown
   as a truncated prefix with a `...[line truncated]` marker; the remainder is drained
   (counted for totals, never buffered).
@@ -2330,8 +2336,10 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
   every listing stays one
   line per entry and a hostile name/line cannot inject terminal escapes (`grep` on match
   and context lines; `find` and `list_files` on paths and symlink targets; `pdf_*` on
-  log fields and invocation descriptions). The same policy now covers the raw-content
-  readers: `render_streamed_line` sanitizes every `read_file` line,
+  log fields and invocation descriptions; the file tools on their path labels and
+  invocation descriptions — `read_file`'s header, `line_count`'s result, `edit_file`'s
+  result, and every file tool's `describe_*_invocation` path). The same policy now
+  covers the raw-content readers: `render_streamed_line` sanitizes every `read_file` line,
   and `http_request` runs response bodies through `sanitize_multiline` (a
   newline-preserving variant for content that legitimately spans lines) and header
   values through `sanitize_name` — so a hostile file or HTTP response cannot inject

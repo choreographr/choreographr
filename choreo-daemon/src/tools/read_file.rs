@@ -1,6 +1,6 @@
 use super::{
     MAX_TOOL_OUTPUT_BYTES, OutputBudget, TextStream, ToolExecError, display_path_label,
-    open_text_reader, render_streamed_line, resolve_path,
+    open_text_reader, render_streamed_line, resolve_path, sanitize_content, sanitize_name,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -92,7 +92,7 @@ pub(crate) fn execute_read_file_tool(
         if !in_window || budget.is_truncated() {
             continue;
         }
-        let display_line = render_streamed_line(&line, &resolved, true)?;
+        let display_line = render_streamed_line(&line, &resolved)?;
         if budget.push_line(&mut out, &display_line) {
             lines_shown += 1;
         }
@@ -100,7 +100,10 @@ pub(crate) fn execute_read_file_tool(
 
     let total_lines = stream.total_lines();
     let total_bytes = stream.total_bytes();
-    let label = display_path_label(&resolved, working_dir);
+    // Sanitize the label: a hostile file name (a legal newline, a bidi
+    // override) must not split the header or spoof the numbered view — the
+    // same policy `grep`/`find` apply to their path labels.
+    let label = sanitize_name(&display_path_label(&resolved, working_dir));
 
     if total_lines == 0 {
         // An empty file has no lines to number; report it rather than
@@ -145,6 +148,17 @@ pub(crate) fn execute_read_file_tool(
             "\n...[truncated: showing {returned_bytes} of {total_bytes} bytes \
              ({lines_shown} of {total_lines} lines) — continue with start_line={resume}]"
         );
+    } else if requested_end < total_lines {
+        // The line window (not the byte budget) cut the output: more lines
+        // follow below. Name the resume line so the follow-up call is
+        // mechanical — the same "continue with start_line=" contract the
+        // byte-budget marker above carries.
+        let resume = requested_end + 1;
+        let _ = write!(
+            out,
+            "\n...[more lines follow: showing {lines_shown} of {total_lines} lines \
+             — continue with start_line={resume}]"
+        );
     }
 
     debug!(
@@ -162,12 +176,15 @@ pub(crate) fn execute_read_file_tool(
 }
 
 pub fn describe_read_file_invocation(args: &ReadFileArgs) -> String {
+    // The description is line-oriented (logs, TUI): sanitize the raw path so a
+    // control character cannot split the line or inject terminal escapes.
+    let path = sanitize_content(&args.path);
     if args.start_line <= 1 && args.max_lines >= MAX_READ_FILE_LINES {
-        format!("Reading file `{}`.", args.path)
+        format!("Reading file `{path}`.")
     } else {
         format!(
-            "Reading file `{}` from line {} (max {} lines).",
-            args.path, args.start_line, args.max_lines
+            "Reading file `{path}` from line {} (max {} lines).",
+            args.start_line, args.max_lines
         )
     }
 }
@@ -177,7 +194,7 @@ pub(crate) struct ReadFile;
 define_tool!(
     ReadFile,
     "read_file",
-    "Read a UTF-8 text file from the local workspace as a numbered, optionally windowed view. Each line is prefixed with its 1-based number and a ` | ` gutter — the gutter is a display aid, not file content, so never include it in edit_file's old_text. Returns at most 2000 lines starting at `start_line` (default 1); rejects binary files; truncation reports totals and the `start_line` to continue from.",
+    "Read a UTF-8 text file from the local workspace as a numbered, optionally windowed view. Each line is prefixed with its 1-based number and a ` | ` gutter — the gutter is a display aid, not file content, so never include it in edit_file's old_text. Returns at most 2000 lines starting at `start_line` (default 1); rejects binary files. When the line window or the 128 KiB byte budget cuts the output, the result reports totals and the `start_line` to continue from.",
     ReadFileArgs,
     execute_read_file_tool,
     "core",
@@ -336,6 +353,29 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_utf8_past_sniff_head() {
+        // Invalid bytes beyond the 8 KiB head-sniff window: the up-front sniff
+        // only sees the head, so these are caught by per-line validation when
+        // the line is returned.
+        let mut content = vec![b'a'; 9 * 1024];
+        content.extend_from_slice(b"\xff\xfe");
+        let err = run_bytes(&content).unwrap_err();
+        assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn ignores_invalid_utf8_outside_requested_window() {
+        // Content outside the returned window is not validated: line 2 is
+        // invalid UTF-8 but excluded, so a read starting at line 3 succeeds
+        // (the documented contract).
+        let mut content = vec![b'a'; 9 * 1024];
+        content.extend_from_slice(b"\n\xff\xfe\nok\n");
+        let out = run_args(&content, 3, 1).unwrap();
+        assert!(out.contains("3 | ok"), "{out}");
+        assert!(out.contains("lines: 3-3 of 3"), "{out}");
+    }
+
+    #[test]
     fn reports_totals_and_resume_line_when_truncated() {
         // 3000 lines × 100 bytes, but the final line has no trailing newline,
         // so the file is 299,999 bytes > 128 KiB budget.
@@ -348,6 +388,39 @@ mod tests {
         assert!(out.contains("of 299999 bytes"), "{out}");
         assert!(out.contains("of 3000 lines)"), "{out}");
         assert!(out.contains("continue with start_line="), "{out}");
+    }
+
+    #[test]
+    fn truncation_report_counts_header_bytes() {
+        // The "showing X of Y bytes" figure must match the bytes actually
+        // returned — body + prepended header + the marker's separator
+        // newline — not just the body.
+        let content = (0..3000)
+            .map(|i| format!("{i:>8} {}", "y".repeat(96)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = run(&content).unwrap();
+        let marker_prefix = "...[truncated: showing ";
+        let marker_tail = out.rsplit(marker_prefix).next().expect("marker present");
+        let shown: usize = marker_tail.split(" of ").next().unwrap().parse().unwrap();
+        let returned = out.len() - marker_tail.len() - marker_prefix.len();
+        assert_eq!(shown, returned, "reported bytes != returned bytes: {out}");
+    }
+
+    #[test]
+    fn window_cap_reports_resume_line() {
+        // 3000 short lines fit under the byte budget, so the 2000-line window
+        // is what cuts the output — the result must still name the resume line
+        // so the follow-up call is mechanical.
+        let content = (1..=3000)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let out = run(&content).unwrap();
+        assert!(out.contains("lines: 1-2000 of 3000"), "{out}");
+        assert!(out.contains("more lines follow"), "{out}");
+        assert!(out.contains("continue with start_line=2001"), "{out}");
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use super::{validate_nonempty_path, write_text_file};
-use crate::tools::{ToolExecError, display_path_label, resolve_path, sha256_hex};
+use crate::tools::{
+    ToolExecError, display_path_label, resolve_path, sanitize_content, sanitize_name, sha256_hex,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
@@ -76,7 +78,9 @@ pub fn execute_edit_file_tool(
     let edit_summary = apply_text_edits(&normalized, &args.edits).map_err(ToolExecError)?;
     let final_content = restore_line_endings(&edit_summary.content, line_ending);
 
-    let display = display_path_label(&resolved, working_dir);
+    // Sanitize the display label: a hostile file name must not corrupt the
+    // line-oriented result (the same policy `grep`/`read_file` apply to paths).
+    let display = sanitize_name(&display_path_label(&resolved, working_dir));
 
     if args.dry_run.unwrap_or(false) {
         return Ok(format_edit_result("would edit", &display, &edit_summary));
@@ -301,9 +305,11 @@ fn format_edit_result(action: &str, path: &str, summary: &AppliedEditSummary) ->
 }
 
 pub fn describe_edit_file_invocation(args: &EditFileArgs) -> String {
+    // Line-oriented (logs, TUI): sanitize the raw path so a control character
+    // cannot split the line or inject terminal escapes.
     let mut parts = vec![format!(
         "Editing file `{}` with {} edit(s).",
-        args.path,
+        sanitize_content(&args.path),
         args.edits.len()
     )];
     if let Some(ref sha) = args.expected_sha256 {

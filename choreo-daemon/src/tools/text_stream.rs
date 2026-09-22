@@ -170,6 +170,16 @@ pub(crate) struct TextStream<R: BufRead> {
     finished: bool,
 }
 
+/// Per-line metadata produced by [`TextStream::advance`] — the byte/line
+/// accounting [`TextStream::drain_counting`] needs, but WITHOUT the (possibly
+/// large) line content, so counting a whole file never clones a `Vec` per
+/// line.
+struct StreamedLineMeta {
+    line_number: u64,
+    complete: bool,
+    start_offset: u64,
+}
+
 impl<R: BufRead> TextStream<R> {
     pub(crate) fn new(reader: R) -> Self {
         Self {
@@ -194,12 +204,13 @@ impl<R: BufRead> TextStream<R> {
     pub(crate) fn total_bytes(&self) -> u64 {
         self.total_bytes
     }
-}
 
-impl<R: BufRead> Iterator for TextStream<R> {
-    type Item = io::Result<StreamedLine>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+    /// Advance by one line, reading it into the reused `line_buf` and
+    /// updating the byte/line totals. Returns `None` at EOF and the
+    /// per-line metadata otherwise; the line's bytes live in `line_buf`.
+    /// Shared by [`Iterator::next`] (which clones the content out) and
+    /// [`TextStream::drain_counting`] (which never touches it).
+    fn advance(&mut self) -> Option<io::Result<StreamedLineMeta>> {
         if self.finished {
             return None;
         }
@@ -224,7 +235,7 @@ impl<R: BufRead> Iterator for TextStream<R> {
             self.line_buf.len() as u64
         } else {
             // Over-cap line: count its full length (draining keeps memory
-            // bounded) but hand back only the capped prefix below.
+            // bounded) but hand back only the capped prefix.
             match drain_rest_of_line(&mut self.reader) {
                 Ok(drained) => self.line_buf.len() as u64 + drained,
                 Err(e) => {
@@ -235,12 +246,42 @@ impl<R: BufRead> Iterator for TextStream<R> {
         };
         self.total_bytes += line_total;
         self.lines_read += 1;
-        Some(Ok(StreamedLine {
+        Some(Ok(StreamedLineMeta {
             line_number: self.lines_read,
-            content: self.line_buf.clone(),
             complete,
             start_offset,
         }))
+    }
+
+    /// Drain the whole stream for its line/byte totals only — no per-line
+    /// content clone, so counting a huge file stays O(1) memory and one I/O
+    /// pass. Afterwards [`total_lines`](Self::total_lines) equals a full
+    /// `Iterator` pass (same reading rules, over-cap lines counted once).
+    pub(crate) fn drain_counting(&mut self) -> io::Result<()> {
+        while let Some(meta) = self.advance() {
+            meta?;
+        }
+        Ok(())
+    }
+}
+
+impl<R: BufRead> Iterator for TextStream<R> {
+    type Item = io::Result<StreamedLine>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // `advance` is the shared read step; `next` is the one place a line's
+        // content is materialized (the sole caller that needs it —
+        // `read_file` validates and renders it). `drain_counting` never
+        // comes here, so it never pays the clone.
+        match self.advance()? {
+            Ok(meta) => Some(Ok(StreamedLine {
+                line_number: meta.line_number,
+                content: self.line_buf.clone(),
+                complete: meta.complete,
+                start_offset: meta.start_offset,
+            })),
+            Err(e) => Some(Err(e)),
+        }
     }
 }
 
@@ -299,12 +340,11 @@ impl OutputBudget {
 /// actually returned (reporting the byte offset into the file), normalizes
 /// line endings to `str::lines()` semantics (strip one `\n`, then one `\r`),
 /// and appends a `...[line truncated]` marker when the display cap cut the
-/// line short. With `numbered`, the line is prefixed with its 1-based file
-/// line number and a ` | ` gutter.
+/// line short. The line is prefixed with its 1-based file line number and a
+/// ` | ` gutter — the sole rendering, since `read_file` is the only caller.
 pub(crate) fn render_streamed_line(
     line: &StreamedLine,
     path: &std::path::Path,
-    numbered: bool,
 ) -> Result<String, ToolExecError> {
     if let Some(pos) = line.content.iter().position(|&b| b == 0) {
         return Err(ToolExecError(format!(
@@ -355,11 +395,7 @@ pub(crate) fn render_streamed_line(
     // and must pass through untouched.
     let display = sanitize_content(display);
     let mut display_line = String::new();
-    if numbered {
-        let _ = write!(display_line, "{} | {display}", line.line_number);
-    } else {
-        display_line.push_str(&display);
-    }
+    let _ = write!(display_line, "{} | {display}", line.line_number);
     if !line.complete {
         display_line.push_str("\n...[line truncated: exceeds 64 KiB]");
     }
@@ -405,6 +441,27 @@ mod tests {
     }
 
     #[test]
+    fn drain_counting_matches_iteration_totals() {
+        use std::io::Cursor;
+        // A short line, an empty line, a normal line, and an over-cap final
+        // line (no trailing newline). Draining must report the same totals as
+        // a full iterator pass — and must not clone any line content.
+        let mut bytes = b"a\n\nbb\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', 70 * 1024));
+
+        let mut drained = TextStream::new(Cursor::new(bytes.clone()));
+        drained.drain_counting().unwrap();
+
+        let mut iterated = TextStream::new(Cursor::new(bytes));
+        while iterated.next().is_some() {}
+
+        assert_eq!(drained.total_lines(), iterated.total_lines());
+        assert_eq!(drained.total_bytes(), iterated.total_bytes());
+        // "a", "", "bb", and the 70 KiB tail = 4 lines.
+        assert_eq!(drained.total_lines(), 4);
+    }
+
+    #[test]
     fn output_budget_rejects_lines_past_cap() {
         let mut out = String::new();
         let mut budget = OutputBudget::new(10);
@@ -428,9 +485,7 @@ mod tests {
             complete: true,
             start_offset: 0,
         };
-        let err = render_streamed_line(&nul, path, false)
-            .unwrap_err()
-            .to_string();
+        let err = render_streamed_line(&nul, path).unwrap_err().to_string();
         assert!(err.contains("binary file"), "{err}");
 
         let bad = StreamedLine {
@@ -439,9 +494,7 @@ mod tests {
             complete: true,
             start_offset: 10,
         };
-        let err = render_streamed_line(&bad, path, false)
-            .unwrap_err()
-            .to_string();
+        let err = render_streamed_line(&bad, path).unwrap_err().to_string();
         assert!(err.contains("not valid UTF-8"), "{err}");
         // Offsets are reported relative to the file, not the line.
         assert!(err.contains("offset 12"), "{err}");
@@ -456,8 +509,9 @@ mod tests {
             complete: true,
             start_offset: 0,
         };
-        assert_eq!(render_streamed_line(&line, path, true).unwrap(), "3 | hi");
-        assert_eq!(render_streamed_line(&line, path, false).unwrap(), "hi");
+        // CRLF is normalized to a single '\n' and the 1-based number is
+        // prefixed with the ` | ` gutter (the only rendering).
+        assert_eq!(render_streamed_line(&line, path).unwrap(), "3 | hi");
     }
 
     #[test]
@@ -472,7 +526,7 @@ mod tests {
             complete: false,
             start_offset: 0,
         };
-        let out = render_streamed_line(&line, path, false).unwrap();
+        let out = render_streamed_line(&line, path).unwrap();
         assert!(out.contains("...[line truncated: exceeds 64 KiB]"), "{out}");
         std::str::from_utf8(out.as_bytes()).expect("output must be valid UTF-8");
     }
@@ -490,8 +544,8 @@ mod tests {
             start_offset: 0,
         };
         assert_eq!(
-            render_streamed_line(&esc, path, false).unwrap(),
-            "x\\u{1b}[31mred"
+            render_streamed_line(&esc, path).unwrap(),
+            "1 | x\\u{1b}[31mred"
         );
         let bidi = StreamedLine {
             line_number: 1,
@@ -500,8 +554,8 @@ mod tests {
             start_offset: 0,
         };
         assert_eq!(
-            render_streamed_line(&bidi, path, false).unwrap(),
-            "ok\\u{202e}evil"
+            render_streamed_line(&bidi, path).unwrap(),
+            "1 | ok\\u{202e}evil"
         );
     }
 
@@ -516,14 +570,14 @@ mod tests {
             complete: true,
             start_offset: 0,
         };
-        assert_eq!(render_streamed_line(&tabbed, path, false).unwrap(), "a\tb");
+        assert_eq!(render_streamed_line(&tabbed, path).unwrap(), "1 | a\tb");
         let cjk = StreamedLine {
             line_number: 1,
             content: "日本語".as_bytes().to_vec(),
             complete: true,
             start_offset: 0,
         };
-        assert_eq!(render_streamed_line(&cjk, path, false).unwrap(), "日本語");
+        assert_eq!(render_streamed_line(&cjk, path).unwrap(), "1 | 日本語");
     }
 
     #[test]
@@ -537,9 +591,6 @@ mod tests {
             complete: true,
             start_offset: 0,
         };
-        assert_eq!(
-            render_streamed_line(&line, path, true).unwrap(),
-            "7 | ok\\u{1b}"
-        );
+        assert_eq!(render_streamed_line(&line, path).unwrap(), "7 | ok\\u{1b}");
     }
 }

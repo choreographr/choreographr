@@ -1,7 +1,11 @@
-use crate::tools::{TextStream, ToolExecError, display_path_label, open_text_reader, resolve_path};
+use crate::tools::{
+    TextStream, ToolExecError, display_path_label, open_text_reader, resolve_path,
+    sanitize_content, sanitize_name,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
+use tracing::debug;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LineCountArgs {
@@ -26,22 +30,27 @@ pub(crate) fn execute_line_count_tool(
     }
     let resolved = resolve_path(&args.path, working_dir);
 
-    // Drain the stream without materializing per-line values — only the
-    // running line total (and the exact byte count) is needed.
+    // Drain the stream for its line total only — `drain_counting` walks the
+    // file without materializing (and cloning) each line, so counting a huge
+    // file stays memory-bounded at one line. The total matches `read_file`'s
+    // `of N` because both count through the same `TextStream`.
     let mut stream = TextStream::new(open_text_reader(&resolved)?);
-    for line in &mut stream {
-        line?;
-    }
+    stream.drain_counting()?;
+    let total_lines = stream.total_lines();
+
+    debug!(path = %resolved.display(), total_lines, "line_count completed");
 
     Ok(format!(
         "{}: {} lines",
-        display_path_label(&resolved, working_dir),
-        stream.total_lines()
+        // Sanitize the label: a hostile file name must not corrupt the
+        // line-oriented result.
+        sanitize_name(&display_path_label(&resolved, working_dir)),
+        total_lines
     ))
 }
 
 pub fn describe_line_count_invocation(args: &LineCountArgs) -> String {
-    format!("Counting lines in `{}`.", args.path)
+    format!("Counting lines in `{}`.", sanitize_content(&args.path))
 }
 
 pub(crate) struct LineCount;
@@ -49,7 +58,7 @@ pub(crate) struct LineCount;
 define_tool!(
     LineCount,
     "line_count",
-    "Count the number of lines in a UTF-8 text file.",
+    "Count the number of lines in a UTF-8 text file. Shares read_file's binary/UTF-8 head sniff, so binary files are rejected the same way.",
     LineCountArgs,
     execute_line_count_tool,
     "core",
