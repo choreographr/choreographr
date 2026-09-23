@@ -1536,6 +1536,7 @@ fn tool_result_default_collapsed_quiet_and_error_rules() {
         "spawn_subsession",
         false
     )));
+    assert!(tool_result_default_collapsed(&mk("list_sessions", false)));
     // Shell/exec family all default collapsed.
     assert!(tool_result_default_collapsed(&mk("sh", false)));
     assert!(tool_result_default_collapsed(&mk("nushell", false)));
