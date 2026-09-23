@@ -1536,8 +1536,16 @@ fn tool_result_default_collapsed_quiet_and_error_rules() {
         "spawn_subsession",
         false
     )));
-    assert!(!tool_result_default_collapsed(&mk("sh", false)));
+    // Shell/exec family all default collapsed.
+    assert!(tool_result_default_collapsed(&mk("sh", false)));
+    assert!(tool_result_default_collapsed(&mk("nushell", false)));
+    assert!(tool_result_default_collapsed(&mk("fish", false)));
+    assert!(tool_result_default_collapsed(&mk("powershell", false)));
+    assert!(tool_result_default_collapsed(&mk("exec", false)));
+    // A non-quiet tool still defaults expanded.
+    assert!(!tool_result_default_collapsed(&mk("find", false)));
     assert!(!tool_result_default_collapsed(&mk("read_file", true)));
+    assert!(!tool_result_default_collapsed(&mk("sh", true)));
     assert!(!tool_result_default_collapsed(&mk("http_request", true)));
 }
 

@@ -735,16 +735,23 @@ pub(crate) struct RenderedTurnLines {
 
 /// Tools whose result content is typically bulky and only meaningful to the
 /// LLM (verbatim file contents, raw HTTP responses, search matches, rendered
-/// web pages, sub-session reports) and would spam the user's session history
-/// if rendered in full by default.  Their invocation description (e.g.
-/// "Reading file `main.rs`.") is the primary UI summary; the full body is
-/// one triangle-click away.
+/// web pages, sub-session reports, shell/exec command output) and would spam
+/// the user's session history if rendered in full by default.  Their
+/// invocation description (e.g. "Reading file `main.rs`.") is the primary UI
+/// summary; the full body is one triangle-click away.
 const QUIET_TOOLS: &[&str] = &[
     "read_file",
     "http_request",
     "grep",
     "retrieve_webpage",
     "spawn_subsession",
+    // Shell/exec family — every command runner emits the same kind of bulky
+    // log output, so they share one collapse default.
+    "sh",
+    "nushell",
+    "fish",
+    "powershell",
+    "exec",
 ];
 
 /// Whether a tool result should default to collapsed in the TUI.

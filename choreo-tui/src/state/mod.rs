@@ -4909,7 +4909,7 @@ mod tests {
         };
         let loud = ToolResultRecord {
             call_id: "c2".into(),
-            name: "sh".into(),
+            name: "find".into(),
             content: "y".into(),
             is_error: false,
             invocation_description: String::new(),
@@ -5146,7 +5146,7 @@ mod tests {
         };
         assert_eq!(ranges.len(), 2, "one header range per tool result");
         // No other sections on this turn: both headers are the first two
-        // lines (the quiet read_file is collapsed, the sh result expanded).
+        // lines (both quiet results are collapsed, so each is one header row).
         assert_eq!(ranges[0], (0, 1));
         assert_eq!(ranges[1], (1, 2));
         assert!(
@@ -6114,7 +6114,7 @@ mod tests {
                 },
                 ToolResultRecord {
                     call_id: "loud".into(),
-                    name: "sh".into(), // not quiet → expanded by default
+                    name: "find".into(), // not quiet → expanded by default
                     content: String::new(),
                     is_error: false,
                     invocation_description: "Running `b`.".into(),
@@ -6211,7 +6211,7 @@ mod tests {
             token_usage: None,
             tool_results: vec![ToolResultRecord {
                 call_id: "call-1".into(),
-                name: "sh".into(), // not quiet → expanded by default
+                name: "find".into(), // not quiet → expanded by default
                 content: String::new(),
                 is_error: false,
                 invocation_description: "Running `b`.".into(),
@@ -6305,7 +6305,7 @@ mod tests {
             token_usage: None,
             tool_results: vec![ToolResultRecord {
                 call_id: "call-1".into(),
-                name: "sh".into(), // not quiet → expanded by default
+                name: "find".into(), // not quiet → expanded by default
                 content: String::new(),
                 is_error: false,
                 invocation_description: "Running `b`.".into(),
@@ -6372,7 +6372,7 @@ mod tests {
             token_usage: None,
             tool_results: vec![ToolResultRecord {
                 call_id: "call-1".into(),
-                name: "sh".into(),
+                name: "find".into(),
                 content: String::new(),
                 is_error: false,
                 invocation_description: String::new(),
