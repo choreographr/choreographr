@@ -138,6 +138,14 @@ check: _require-zig
 # Do NOT add `--all-features`: the `blockchain` feature pulls subxt →
 # native-tls → security-framework-sys, whose bindgen step reads Apple's
 # Security.framework headers (SDK territory — fails from Linux).
+#
+# NOTE: this gate does not work on an x86_64 host — the workspace pins
+# `-C target-cpu=native` in [profile.dev], which on x86 expands to e.g.
+# `znver3` (invalid for the aarch64 target), so cargo-zigbuild's `zig cc`
+# probe aborts with `unknown target CPU 'znver3'`. Neither `RUSTFLAGS` nor
+# `--config profile.dev.rustflags=[]` clears it (cargo-zigbuild reads
+# rustflags through cargo-config2, which ignores both). Run it on an arm64
+# host. check-windows is unaffected (x86_64 host == x86_64 target).
 check-macos: _require-zig
     rustup target add aarch64-apple-darwin
     cargo-zigbuild check {{ CARGO_FLAGS }} --target aarch64-apple-darwin --workspace --lib
@@ -150,6 +158,18 @@ check-macos: _require-zig
 check-windows: _require-zig
     rustup target add x86_64-pc-windows-gnu
     cargo-zigbuild check {{ CARGO_FLAGS }} --target x86_64-pc-windows-gnu --workspace --lib
+
+# Both foreign-target gates in one command: `check-windows` + `check-macos`.
+# This is the local stand-in for the release workflow's windows-msvc and macos
+# jobs minus the multi-minute full build/link. It catches `#[cfg(windows)]` /
+# `#[cfg(target_os = "macos")]` breakage that the host gate is structurally
+# blind to — those blocks are cfg'd out on Linux, so `pre-commit`'s
+# clippy/test never even parse them (this is how a Windows-only `Ok(())` vs
+# `Result<SigId, _>` mismatch once reached a release build). Deliberately NOT
+# part of `pre-commit`: it needs zig + cargo-zigbuild and rebuilds the whole
+# dependency tree once per target. Run it by hand when touching platform-gated
+# code or before a release.
+check-cross: check-windows check-macos
 
 # ── Android ───────────────────────────────────────────────────────────────────
 # Termux is the Android runtime for the four suite binaries: they are pushed
