@@ -321,7 +321,10 @@ pub fn run_server(
                 let _ = term_tx.send(());
             })
         }) {
-            Ok(()) => Some(sig_rx),
+            // `low_level::register` returns the installed `SigId`, not `()` —
+            // the id is only useful for unregistering, which we never do, so
+            // discard it and keep just the receiver.
+            Ok(_) => Some(sig_rx),
             Err(e) => {
                 error!("failed to register signal handlers: {e}");
                 None
