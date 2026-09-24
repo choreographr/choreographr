@@ -31,6 +31,20 @@ profile := "release"
 # CI can inject e.g. `CARGO_FLAGS="--offline"` without editing this file.
 CARGO_FLAGS := env_var_or_default("CARGO_FLAGS", "")
 
+# Cross-target gates (check-macos / check-windows) shared flags. The workspace
+# pins `-C target-cpu=native` in [profile.dev] (root Cargo.toml) for host speed,
+# but `native` expands to the *host's* CPU, which a foreign target rejects (e.g.
+# `znver3` on x86 for aarch64) — so the cross gates must not inherit it. Two
+# prongs, because the two consumers read rustflags differently:
+#   * cross_config clears the profile's rustflags for the actual cargo build —
+#     that is where the workspace's native flag lives.
+#   * cross_rustflags (a non-empty RUSTFLAGS; its content is irrelevant to a
+#     type-check) masks any *machine-level* rustflags for cargo-zigbuild's
+#     `zig cc` probe, which reads them via cargo-config2 and — unlike cargo —
+#     ignores `--config`.
+cross_config := "--config 'profile.dev.rustflags=[]'"
+cross_rustflags := "-Cdebuginfo=0"
+
 # ── entry points ──────────────────────────────────────────────────────────────
 
 # Show all recipes (default — run with bare `just`)
@@ -139,25 +153,22 @@ check: _require-zig
 # native-tls → security-framework-sys, whose bindgen step reads Apple's
 # Security.framework headers (SDK territory — fails from Linux).
 #
-# NOTE: this gate does not work on an x86_64 host — the workspace pins
-# `-C target-cpu=native` in [profile.dev], which on x86 expands to e.g.
-# `znver3` (invalid for the aarch64 target), so cargo-zigbuild's `zig cc`
-# probe aborts with `unknown target CPU 'znver3'`. Neither `RUSTFLAGS` nor
-# `--config profile.dev.rustflags=[]` clears it (cargo-zigbuild reads
-# rustflags through cargo-config2, which ignores both). Run it on an arm64
-# host. check-windows is unaffected (x86_64 host == x86_64 target).
+# cross_config + cross_rustflags clear the host-arch `-C target-cpu=native`
+# the workspace pins in [profile.dev] — without them this gate fails on any
+# host whose arch differs from the target (see the cross_config definition).
 check-macos: _require-zig
     rustup target add aarch64-apple-darwin
-    cargo-zigbuild check {{ CARGO_FLAGS }} --target aarch64-apple-darwin --workspace --lib
+    RUSTFLAGS="{{ cross_rustflags }}" cargo-zigbuild check {{ CARGO_FLAGS }} {{ cross_config }} --target aarch64-apple-darwin --workspace --lib
 
 # Windows cross-compile gate: type-check every library crate for
 # x86_64-pc-windows-gnu via zig (MinGW bundled — no mingw install needed).
-# Same libs-only rationale as check-macos; this is the recipe to iterate the
-# Windows port against. A clean build also surfaces the zlob archive-naming
-# quirk (zig emits `zlob.lib`, the windows-gnu target wants `libzlob.a`).
+# Same libs-only rationale and host-arch neutralization as check-macos; this is
+# the recipe to iterate the Windows port against. A clean build also surfaces
+# the zlob archive-naming quirk (zig emits `zlob.lib`, the windows-gnu target
+# wants `libzlob.a`).
 check-windows: _require-zig
     rustup target add x86_64-pc-windows-gnu
-    cargo-zigbuild check {{ CARGO_FLAGS }} --target x86_64-pc-windows-gnu --workspace --lib
+    RUSTFLAGS="{{ cross_rustflags }}" cargo-zigbuild check {{ CARGO_FLAGS }} {{ cross_config }} --target x86_64-pc-windows-gnu --workspace --lib
 
 # Both foreign-target gates in one command: `check-windows` + `check-macos`.
 # This is the local stand-in for the release workflow's windows-msvc and macos
