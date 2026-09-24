@@ -145,10 +145,13 @@ just pre-release
 
 `just pre-release` is everything a release needs before Phase 1, and never edits
 the working tree (no `clippy --fix` / `fmt`): the toolchain check (cargo + zig +
-git-cliff, notes nextest), the git release-state check (on `master`, clean, not
-behind `origin/master`), `fmt --check`, clippy with warnings denied, the full
-unit + integration suite, the supply-chain guard, and the crates.io credential
-check. **As its final step it pushes `master` and kicks the
+git-cliff + cargo-zigbuild, notes nextest), the git release-state check (on
+`master`, clean, not behind `origin/master`), `fmt --check`, clippy with warnings
+denied, the full unit + integration suite, the supply-chain guard, the
+cross-target type-check (`just check-cross` — the only local step that compiles
+the `#[cfg(windows)]` / `#[cfg(target_os = "macos")]` code the host-target steps
+never see, so a platform break fails fast before the pushed dry run), and the
+crates.io credential check. **As its final step it pushes `master` and kicks the
 release workflow** (`gh workflow run release.yml`) — a `workflow_dispatch` dry
 run that builds every platform AND runs the release job's checks (the
 supply-chain gate and the git-cliff release-notes generation) exactly like a tag

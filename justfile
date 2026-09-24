@@ -55,12 +55,14 @@ default:
 help:
     @just --list
 
-# Verify the toolchain: cargo + zig + git-cliff required, cargo-nextest recommended
+# Verify the toolchain: cargo + zig + git-cliff + cargo-zigbuild required,
+# cargo-nextest recommended
 preflight:
     @echo "==> checking toolchain"
     @command -v cargo >/dev/null 2>&1 || { echo "error: cargo not found — install Rust via rustup (https://rustup.rs/)" >&2; exit 1; }
     @command -v zig >/dev/null 2>&1 || { echo "error: zig not found — install it (choreo-daemon's zlob dependency needs it)" >&2; exit 1; }
     @command -v git-cliff >/dev/null 2>&1 || { echo "error: git-cliff not found — release notes are generated from commit messages (run \`just install-git-cliff\`)" >&2; exit 1; }
+    @command -v cargo-zigbuild >/dev/null 2>&1 || { echo "error: cargo-zigbuild not found — check-cross (part of pre-release) needs it (run \`just install-cargo-zigbuild\`)" >&2; exit 1; }
     @command -v cargo-nextest >/dev/null 2>&1 || echo "note: cargo-nextest not found (recommended — run \`just install-nextest\`)"
     @echo "==> toolchain OK: cargo $(cargo --version | cut -d' ' -f2) · zig $(zig version) · git-cliff $(git-cliff --version | cut -d' ' -f2)"
 
@@ -72,6 +74,11 @@ install-nextest:
 # https://github.com/orhun/git-cliff are fine too.
 install-git-cliff:
     cargo install git-cliff
+
+# Install cargo-zigbuild (drives the check-cross foreign-target gates). taiki-e's
+# prebuilt binaries are also fine and much faster: https://github.com/taiki-e/cargo-zigbuild
+install-cargo-zigbuild:
+    cargo install cargo-zigbuild
 
 # ── hidden prerequisites ──────────────────────────────────────────────────────
 
@@ -176,10 +183,12 @@ check-windows: _require-zig
 # `#[cfg(target_os = "macos")]` breakage that the host gate is structurally
 # blind to — those blocks are cfg'd out on Linux, so `pre-commit`'s
 # clippy/test never even parse them (this is how a Windows-only `Ok(())` vs
-# `Result<SigId, _>` mismatch once reached a release build). Deliberately NOT
-# part of `pre-commit`: it needs zig + cargo-zigbuild and rebuilds the whole
+# `Result<SigId, _>` mismatch once reached a release build). It is part of
+# `pre-release` — the ONLY step there that compiles platform-gated code, so a
+# platform break fails fast locally before the pushed `release-workflow-dry-run`
+# — but NOT `pre-commit`: it needs zig + cargo-zigbuild and rebuilds the whole
 # dependency tree once per target. Run it by hand when touching platform-gated
-# code or before a release.
+# code.
 check-cross: check-windows check-macos
 
 # ── Android ───────────────────────────────────────────────────────────────────
@@ -443,13 +452,16 @@ pre-commit: clippy-strict test-all fmt
 # (`preflight`), the git release state (on master, clean, not behind origin), the
 # quality gate with its one tree-mutating step — `fmt` — replaced by the
 # non-mutating `fmt-check` (alongside `clippy-strict`) — the full test suite, the
-# release-only guard `pre-commit` omits (`check-supply-chain`), the crates.io
+# release-only guard `pre-commit` omits (`check-supply-chain`), the foreign-target
+# type-check (`check-cross` — the ONLY step here that compiles the
+# `#[cfg(windows)]` / `#[cfg(target_os = "macos")]` code the host-target steps
+# above never see, so a platform break fails fast locally), the crates.io
 # credential check, and finally the GitHub dry run (`release-workflow-dry-run`):
 # push master + kick the release workflow so the pipeline is proven before a tag.
 # Nothing here edits the working tree. Never use `pre-commit` as a release gate —
 # it still rewrites the source with `cargo fmt`.
 pre-release: preflight check-release-state fmt-check clippy-strict test-all \
-    check-supply-chain check-crates-io-token release-workflow-dry-run
+    check-supply-chain check-cross check-crates-io-token release-workflow-dry-run
 
 # ── running ───────────────────────────────────────────────────────────────────
 
