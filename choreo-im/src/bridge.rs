@@ -5,8 +5,9 @@ use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+use crossbeam_channel::{Receiver, Sender};
 // Windows: std::os::windows::net::UnixStream is unstable (E0658, feature
 // `windows_unix_domain_sockets`, rust-lang/rust#150487), so uds_windows provides
 // the same connect/try_clone/shutdown API over named pipes.
@@ -51,8 +52,8 @@ impl StreamBuffer {
 }
 
 pub struct DaemonBridge {
-    client_tx: mpsc::Sender<ClientMessage>,
-    event_rx: mpsc::Receiver<BridgeEvent>,
+    client_tx: Sender<ClientMessage>,
+    event_rx: Receiver<BridgeEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,8 +88,8 @@ pub enum BridgeEvent {
 
 impl DaemonBridge {
     pub fn spawn(reader: BufReader<UnixStream>, writer: BufWriter<UnixStream>) -> Self {
-        let (client_tx, client_rx) = mpsc::channel::<ClientMessage>();
-        let (event_tx, event_rx) = mpsc::channel::<BridgeEvent>();
+        let (client_tx, client_rx) = crossbeam_channel::unbounded::<ClientMessage>();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded::<BridgeEvent>();
         let writer_event_tx = event_tx.clone();
 
         info!("spawning daemon bridge tasks");
@@ -221,7 +222,7 @@ impl DaemonBridge {
     }
 
     #[must_use]
-    pub fn into_parts(self) -> (mpsc::Sender<ClientMessage>, mpsc::Receiver<BridgeEvent>) {
+    pub fn into_parts(self) -> (Sender<ClientMessage>, Receiver<BridgeEvent>) {
         (self.client_tx, self.event_rx)
     }
 }

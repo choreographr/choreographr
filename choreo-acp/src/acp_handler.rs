@@ -1,5 +1,5 @@
+use crossbeam_channel::{Receiver, Sender};
 use std::io::{BufWriter, Write};
-use std::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent};
@@ -41,8 +41,8 @@ const DISCONNECT_ERR_MSG: &str = "Daemon disconnected";
 /// Returns as soon as both the daemon-reader and ACP-reader threads have
 /// dropped their event senders.
 pub fn run_event_loop(
-    event_rx: &mpsc::Receiver<Event>,
-    daemon_writer: mpsc::Sender<ClientMessage>,
+    event_rx: &Receiver<Event>,
+    daemon_writer: Sender<ClientMessage>,
 ) -> Result<(), AcpError> {
     let mut sessions = SessionManager::new();
     let mut pending = PendingRequests::new();
@@ -163,7 +163,7 @@ fn handle_request(
     req: &acp_jsonrpc::JsonRpcRequest,
     sessions: &mut SessionManager,
     pending: &mut PendingRequests,
-    daemon_writer: &mpsc::Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessage>,
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
     match req.method.as_str() {
@@ -188,7 +188,7 @@ fn handle_request(
 fn handle_notification(
     notif: &acp_jsonrpc::JsonRpcNotification,
     pending: &mut PendingRequests,
-    daemon_writer: &mpsc::Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessage>,
 ) -> Result<(), AcpError> {
     if notif.method.as_str() == "session/cancel" {
         dispatch_cancel(notif, pending, daemon_writer)
@@ -251,7 +251,7 @@ fn handle_initialize(
 fn dispatch_new_session(
     req: &acp_jsonrpc::JsonRpcRequest,
     pending: &mut PendingRequests,
-    daemon_writer: &mpsc::Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessage>,
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
     info!("dispatching session/new (id={})", req.id);
@@ -284,7 +284,7 @@ fn continue_new_session_after_models(
     jsonrpc_id: u64,
     account_name: Option<String>,
     pending: &mut PendingRequests,
-    daemon_writer: &mpsc::Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessage>,
 ) -> Result<(), AcpError> {
     info!(jsonrpc_id, "continuing session/new after ListModels");
     let msg = ClientMessage::CreateSession {
@@ -336,7 +336,7 @@ fn dispatch_load_session(
 
 fn dispatch_list_sessions(
     req: &acp_jsonrpc::JsonRpcRequest,
-    daemon_writer: &mpsc::Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessage>,
     pending: &mut PendingRequests,
 ) -> Result<(), AcpError> {
     info!("dispatching session/list (id={})", req.id);
@@ -348,7 +348,7 @@ fn dispatch_list_sessions(
 fn dispatch_delete_session(
     req: &acp_jsonrpc::JsonRpcRequest,
     sessions: &mut SessionManager,
-    daemon_writer: &mpsc::Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessage>,
     pending: &mut PendingRequests,
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
@@ -415,7 +415,7 @@ fn dispatch_close_session(
 fn dispatch_set_config_option(
     req: &acp_jsonrpc::JsonRpcRequest,
     sessions: &mut SessionManager,
-    daemon_writer: &mpsc::Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessage>,
     pending: &mut PendingRequests,
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
@@ -449,7 +449,7 @@ fn dispatch_set_config_option(
 fn handle_set_model(
     req: &acp_jsonrpc::JsonRpcRequest,
     config_req: &acp_jsonrpc::SetConfigOptionRequest,
-    daemon_writer: &mpsc::Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessage>,
     pending: &mut PendingRequests,
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
@@ -475,7 +475,7 @@ fn handle_set_model(
 fn handle_set_reasoning_effort(
     req: &acp_jsonrpc::JsonRpcRequest,
     config_req: &acp_jsonrpc::SetConfigOptionRequest,
-    daemon_writer: &mpsc::Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessage>,
     pending: &mut PendingRequests,
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
@@ -526,7 +526,7 @@ fn dispatch_prompt(
     req: &acp_jsonrpc::JsonRpcRequest,
     sessions: &mut SessionManager,
     pending: &mut PendingRequests,
-    daemon_writer: &mpsc::Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessage>,
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
     info!("dispatching session/prompt (id={})", req.id);
@@ -582,7 +582,7 @@ fn dispatch_prompt(
 fn dispatch_cancel(
     notif: &acp_jsonrpc::JsonRpcNotification,
     pending: &mut PendingRequests,
-    daemon_writer: &mpsc::Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessage>,
 ) -> Result<(), AcpError> {
     let acp_id = parse_params::<acp_jsonrpc::CancelNotification>(notif.params.as_ref())
         .map(|r| r.session_id)
@@ -615,7 +615,7 @@ fn handle_daemon_message(
     msg: &DaemonMessage,
     sessions: &mut SessionManager,
     pending: &mut PendingRequests,
-    daemon_writer: &mpsc::Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessage>,
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
     match msg {
@@ -779,7 +779,7 @@ fn handle_sync_message(
     msg: &DaemonMessage,
     sessions: &mut SessionManager,
     pending: &mut PendingRequests,
-    daemon_writer: &mpsc::Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessage>,
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
     debug!("handling sync daemon message");
@@ -955,10 +955,7 @@ fn handle_sync_message(
 // Low-level I/O helpers
 // ---------------------------------------------------------------------------
 
-fn send_to_daemon(
-    writer: &mpsc::Sender<ClientMessage>,
-    msg: ClientMessage,
-) -> Result<(), AcpError> {
+fn send_to_daemon(writer: &Sender<ClientMessage>, msg: ClientMessage) -> Result<(), AcpError> {
     writer.send(msg).map_err(|_| {
         error!("daemon writer channel closed");
         AcpError::TransportDisconnected

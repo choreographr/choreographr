@@ -1,5 +1,5 @@
 use choreo_proto::ImageMetadata;
-use crossbeam::channel;
+use crossbeam_channel as channel;
 use image::{DynamicImage, RgbaImage};
 use ratatui::layout::Size;
 use ratatui_image::{Resize, ResizeEncodeRender, picker::Picker, protocol::StatefulProtocol};

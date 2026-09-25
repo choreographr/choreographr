@@ -1,8 +1,8 @@
 use choreo_proto::{ClientMessage, DaemonMessage, read_message, write_message};
+use crossbeam_channel::Sender;
 use std::io::{BufReader, BufWriter, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::sync::mpsc;
 use std::thread;
 use tracing::{debug, error, info};
 // Windows: std::os::windows::net::UnixStream is unstable (E0658, feature
@@ -19,7 +19,7 @@ use crate::error::AcpError;
 // ---------------------------------------------------------------------------
 
 /// Events produced by the ACP stdin reader thread and the daemon socket
-/// reader thread.  The main event loop receives these from a single mpsc
+/// reader thread.  The main event loop receives these from a single crossbeam
 /// channel and dispatches them.
 ///
 /// `DaemonMessage` is deliberately unboxed: the session state variants
@@ -53,7 +53,7 @@ pub enum Event {
 /// finish during shutdown.
 pub struct DaemonClient {
     /// Send `ClientMessage` frames to the daemon writer thread.
-    pub writer_tx: mpsc::Sender<ClientMessage>,
+    pub writer_tx: Sender<ClientMessage>,
     /// Join handle for the daemon reader thread.
     pub join_handle: thread::JoinHandle<()>,
 }
@@ -74,7 +74,7 @@ pub struct DaemonClient {
 /// one of the I/O threads fails.
 pub fn spawn_daemon_io(
     socket_path: &str,
-    event_tx: mpsc::Sender<Event>,
+    event_tx: Sender<Event>,
 ) -> Result<(DaemonClient, thread::JoinHandle<()>), AcpError> {
     info!(socket_path, "connecting to daemon");
 
@@ -87,7 +87,7 @@ pub fn spawn_daemon_io(
     let mut writer_stream = BufWriter::new(stream);
 
     // Writer channel: the main loop sends ClientMessages here.
-    let (writer_tx, writer_rx): (mpsc::Sender<ClientMessage>, _) = mpsc::channel();
+    let (writer_tx, writer_rx): (Sender<ClientMessage>, _) = crossbeam_channel::unbounded();
 
     // ------------------------------------------------------------------
     // Writer thread

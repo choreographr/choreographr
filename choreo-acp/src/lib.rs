@@ -11,7 +11,6 @@ pub mod streaming;
 
 pub use error::AcpError;
 
-use std::sync::mpsc;
 use std::thread;
 
 use anyhow::Context;
@@ -115,7 +114,7 @@ pub fn main() -> Result<(), anyhow::Error> {
     // Shared event channel — both the ACP stdin reader and the daemon
     // socket reader send events here.  The main loop receives on this
     // single receiver so it never needs to poll.
-    let (event_tx, event_rx) = mpsc::channel::<crate::daemon_client::Event>();
+    let (event_tx, event_rx) = crossbeam_channel::unbounded::<crate::daemon_client::Event>();
 
     // Track thread join handles for clean shutdown.
     let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();

@@ -8,8 +8,8 @@ use choreo_client_core::{
     run_daemon_connection_with_mode,
 };
 use choreo_proto::ClientMessage;
-use crossbeam::channel;
-use crossbeam::select;
+use crossbeam_channel as channel;
+use crossbeam_channel::select;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
@@ -176,7 +176,7 @@ fn signal_to_resume_command(signo: i32) -> Option<ResumeCommand> {
 fn notify_disconnected(rx: &channel::Receiver<()>) -> bool {
     matches!(
         rx.try_recv(),
-        Err(crossbeam::channel::TryRecvError::Disconnected)
+        Err(crossbeam_channel::TryRecvError::Disconnected)
     )
 }
 

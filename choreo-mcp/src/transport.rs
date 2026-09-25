@@ -1,14 +1,14 @@
 use crate::error::McpError;
 use crate::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
+use crossbeam_channel::{Receiver, RecvTimeoutError};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{debug, warn};
 
 /// Manages a subprocess' stdio streams, routing stdout lines into typed
@@ -16,8 +16,8 @@ use tracing::{debug, warn};
 pub struct StdioTransport {
     stdin: Option<Box<dyn Write + Send>>,
     reader_handle: Option<thread::JoinHandle<()>>,
-    response_rx: mpsc::Receiver<(u64, Result<JsonRpcResponse, McpError>)>,
-    notification_rx: mpsc::Receiver<JsonRpcNotification>,
+    response_rx: Receiver<(u64, Result<JsonRpcResponse, McpError>)>,
+    notification_rx: Receiver<JsonRpcNotification>,
     /// Shared flag to signal the reader thread to stop.
     shutdown: Arc<Mutex<bool>>,
     child: Option<Child>,
@@ -81,8 +81,8 @@ impl StdioTransport {
             }
         });
 
-        let (response_tx, response_rx) = mpsc::channel();
-        let (notification_tx, notification_rx) = mpsc::channel();
+        let (response_tx, response_rx) = crossbeam_channel::unbounded();
+        let (notification_tx, notification_rx) = crossbeam_channel::unbounded();
         let shutdown = Arc::new(Mutex::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
 
@@ -177,25 +177,22 @@ impl StdioTransport {
         id: u64,
         timeout: std::time::Duration,
     ) -> Result<JsonRpcResponse, McpError> {
-        // Drain queued notifications (non-blocking).
-        loop {
-            match self.notification_rx.try_recv() {
-                Ok(notif) => {
-                    debug!(method = %notif.method, "received MCP notification");
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => break,
-            }
+        // Drain queued notifications (non-blocking). `try_recv` yields `Err`
+        // both when the queue is momentarily empty and when the sender side is
+        // gone, and either way there is nothing more to drain, so a `while let
+        // Ok` loop captures the intent exactly.
+        while let Ok(notif) = self.notification_rx.try_recv() {
+            debug!(method = %notif.method, "received MCP notification");
         }
 
-        // Wait for the matching response.
+        // Wait for the matching response up to an absolute deadline. A single
+        // `recv_deadline` blocks on the channel until a message arrives or the
+        // deadline passes — a real event wait, not a poll-and-resleep loop —
+        // and because the deadline is absolute a mismatched response never
+        // extends the overall wait.
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(McpError::Timeout);
-            }
-            match self.response_rx.recv_timeout(remaining) {
+            match self.response_rx.recv_deadline(deadline) {
                 Ok((resp_id, resp)) => {
                     if resp_id == id {
                         return resp;
@@ -206,8 +203,8 @@ impl StdioTransport {
                         "MCP response ID mismatch, retrying"
                     );
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => return Err(McpError::Timeout),
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(McpError::ServerShutdown),
+                Err(RecvTimeoutError::Timeout) => return Err(McpError::Timeout),
+                Err(RecvTimeoutError::Disconnected) => return Err(McpError::ServerShutdown),
             }
         }
     }
@@ -219,9 +216,11 @@ impl StdioTransport {
         if let Ok(mut guard) = self.shutdown.lock() {
             *guard = true;
         }
-        if let Some(child) = &mut self.child {
+        if let Some(mut child) = self.child.take() {
             // The process-group id is only needed on Unix (the child was
-            // spawned with process_group(0) so it leads its own group).
+            // spawned with process_group(0) so it leads its own group), and it
+            // must be captured BEFORE the child is moved into the reaper
+            // thread below — `id()` is not callable across that boundary.
             #[cfg(unix)]
             let pid = child.id();
             // Kill the direct child, and on Unix the whole process group so
@@ -231,7 +230,9 @@ impl StdioTransport {
             #[cfg(unix)]
             kill_process_group(pid);
 
-            // Reap the child with a bounded wait.
+            // Reap the child with a bounded wait. `wait_bounded` takes
+            // ownership and moves it into its own reaper thread, so shutdown
+            // can never block past the timeout even if the kill is ignored.
             wait_bounded(child, Duration::from_secs(5));
         }
         if let Some(handle) = self.reader_handle.take() {
@@ -264,35 +265,48 @@ fn kill_process_group(pid: u32) {
 }
 
 /// Wait for the child to exit, but give up after `timeout`.
-fn wait_bounded(child: &mut Child, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            // Reaped (or already gone) — done.
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) => {}
-        }
-        if Instant::now() >= deadline {
+///
+/// The child is moved into a dedicated reaper thread that blocks in
+/// `Child::wait()` and signals over a crossbeam channel when it returns; this
+/// thread then waits on that channel with `recv_timeout`. That turns the wait
+/// into a real event block (no `try_wait` sleep-poll), and because the reaper
+/// owns the handle a child that somehow survives the kill cannot wedge shutdown.
+fn wait_bounded(mut child: Child, timeout: Duration) {
+    let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+    thread::spawn(move || {
+        // `wait()` reaps the process and returns once it is gone; the send is
+        // best-effort because the caller may already have detached on timeout.
+        let _ = child.wait();
+        let _ = done_tx.send(());
+    });
+    match done_rx.recv_timeout(timeout) {
+        // Signalled, or the reaper exited without signalling — either way the
+        // process is no longer ours to wait for.
+        Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
+        Err(RecvTimeoutError::Timeout) => {
             warn!(timeout = ?timeout, "MCP child did not exit within timeout; detaching");
-            return;
         }
-        thread::sleep(Duration::from_millis(20));
     }
 }
 
 /// Join a thread, but give up after `timeout` and leave it detached.
+///
+/// The handle is moved into a waiter thread that joins and signals completion
+/// over a crossbeam channel; this thread waits on that channel with
+/// `recv_timeout`. On timeout we drop the receiver and return — the waiter
+/// still owns the handle and reaps the thread in the background, so nothing is
+/// leaked and shutdown cannot hang.
 fn join_bounded(handle: thread::JoinHandle<()>, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if handle.is_finished() {
-            let _ = handle.join();
-            return;
-        }
-        if Instant::now() >= deadline {
+    let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+    thread::spawn(move || {
+        let _ = handle.join();
+        let _ = done_tx.send(());
+    });
+    match done_rx.recv_timeout(timeout) {
+        Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
+        Err(RecvTimeoutError::Timeout) => {
             warn!(timeout = ?timeout, "MCP reader thread did not exit within timeout; detaching");
-            return;
         }
-        thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -334,8 +348,8 @@ mod tests {
                 bytes: Arc::clone(&bytes),
             })),
             reader_handle: None,
-            response_rx: mpsc::channel().1,
-            notification_rx: mpsc::channel().1,
+            response_rx: crossbeam_channel::unbounded().1,
+            notification_rx: crossbeam_channel::unbounded().1,
             shutdown: Arc::new(Mutex::new(false)),
             child: None,
         };

@@ -933,8 +933,8 @@ main()
 │   parses them, sends parsed RpcMessage into the shared event channel
 ├── daemon-reader thread: reads DaemonMessages from the daemon socket,
 │   forwards them into the shared event channel
-├── daemon-writer thread: receives ClientMessages via mpsc and writes
-│   length-prefixed MessagePack frames to the daemon socket
+├── daemon-writer thread: receives ClientMessages via a crossbeam channel
+│   and writes length-prefixed MessagePack frames to the daemon socket
 └── main thread: event loop — receives from the shared event channel
     and dispatches to the appropriate handler
 ```
@@ -957,8 +957,8 @@ main()
 
 **Key behaviors:**
 
-- **Concurrency:** Pure OS threads with `mpsc` message passing. No `Arc<Mutex>` shared state.
-  Threads communicate exclusively through a single shared event channel (`mpsc::Receiver<Event>`).
+- **Concurrency:** Pure OS threads with `crossbeam_channel` message passing. No `Arc<Mutex>` shared state.
+  Threads communicate exclusively through a single shared event channel (`crossbeam_channel::Receiver<Event>`).
 - **Session lifecycle:** Sessions are created on the daemon via `CreateSession` and tracked locally
   in `SessionManager`. `session/close` cleans up local state only (the daemon keeps sessions alive
   until explicitly deleted). `session/delete` sends `DeleteSession` to the daemon and waits for

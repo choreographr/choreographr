@@ -372,7 +372,7 @@ pub(crate) struct App {
     /// connection drops; printed to the restored terminal after teardown so
     /// the user sees why the TUI left. `None` on a normal user quit.
     pub(crate) quit_message: Option<String>,
-    pub(crate) image_job_tx: Option<crossbeam::channel::Sender<ImageJob>>,
+    pub(crate) image_job_tx: Option<crossbeam_channel::Sender<ImageJob>>,
     pub(crate) attached_session_id: Option<u64>,
     /// Account slug shown in the status bar — the attached session's account
     /// name (the account name is its slug). Replaces the inference provider

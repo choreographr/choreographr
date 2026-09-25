@@ -4,8 +4,8 @@ use choreo_client_core::{
 };
 use choreo_markdown::render_markdown_html;
 use choreo_proto::{ClientMessage, socket_path};
+use crossbeam_channel::{Receiver, Sender};
 use std::cell::Cell;
-use std::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::bridge::BridgeEvent;
@@ -14,12 +14,12 @@ use crate::tg_api::Bot;
 pub fn run(
     bot_token: &str,
     admin_ids: Vec<i64>,
-    bridge_tx: mpsc::Sender<ClientMessage>,
-    bridge_rx: mpsc::Receiver<BridgeEvent>,
+    bridge_tx: Sender<ClientMessage>,
+    bridge_rx: Receiver<BridgeEvent>,
 ) {
     let bot = Bot::new(bot_token);
 
-    let (chat_id_tx, chat_id_rx) = mpsc::channel();
+    let (chat_id_tx, chat_id_rx) = crossbeam_channel::unbounded();
 
     {
         let bot = bot.clone();
@@ -71,10 +71,10 @@ pub fn run(
 }
 
 struct TelegramState {
-    bridge_tx: mpsc::Sender<ClientMessage>,
+    bridge_tx: Sender<ClientMessage>,
     admin_ids: Vec<i64>,
     request_id: Cell<u32>,
-    chat_id_tx: mpsc::Sender<i64>,
+    chat_id_tx: Sender<i64>,
 }
 
 fn is_chat_private(msg: &crate::tg_api::Message) -> bool {

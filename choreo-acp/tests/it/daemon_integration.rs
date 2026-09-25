@@ -1,6 +1,6 @@
+use crossbeam_channel::{Receiver, unbounded};
 use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::net::UnixListener;
-use std::sync::mpsc;
 use std::thread;
 
 use choreo_acp::daemon_client::{Event, spawn_daemon_io};
@@ -26,11 +26,11 @@ fn daemon_io_send_and_receive() {
     // Fake daemon: listen then accept one connection.
     // ------------------------------------------------------------------
     let listener = UnixListener::bind(&socket_path).unwrap();
-    let daemon_ready: mpsc::Receiver<()>;
-    let (daemon_done_tx, daemon_done_rx) = mpsc::channel::<()>();
+    let daemon_ready: Receiver<()>;
+    let (daemon_done_tx, daemon_done_rx) = unbounded::<()>();
 
     {
-        let (ready_tx, ready_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = unbounded();
         daemon_ready = ready_rx;
 
         thread::spawn(move || {
@@ -95,7 +95,7 @@ fn daemon_io_send_and_receive() {
     // ------------------------------------------------------------------
     // choreo-acp daemon client connecting to the fake daemon.
     // ------------------------------------------------------------------
-    let (event_tx, event_rx) = mpsc::channel::<Event>();
+    let (event_tx, event_rx) = unbounded::<Event>();
     let (client, writer_handle) = spawn_daemon_io(socket_path.to_str().unwrap(), event_tx).unwrap();
 
     // Wait for the fake daemon to be ready.
