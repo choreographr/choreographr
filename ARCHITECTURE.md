@@ -738,7 +738,7 @@ excludes the crate and the daemon's `mcp/` module compiles to a no-op stub).
 |---|---|
 | `client.rs` | `McpClient` — spawns a subprocess, performs MCP initialize handshake, discovers tools (`list_tools`), and dispatches tool calls (`call_tool`) |
 | `protocol.rs` | JSON-RPC 2.0 wire types (`JsonRpcRequest`, `JsonRpcResponse`) and MCP protocol types (`McpTool`, `CallToolResult`, `McpContent`) |
-| `transport.rs` | `StdioTransport` — manages a subprocess stdin/stdout, routes incoming JSON-RPC lines to response/notification channels |
+| `transport.rs` | `StdioTransport` — manages a subprocess stdin/stdout, routes incoming JSON-RPC lines to response/notification channels. Every cross-thread wait is channel-driven, never a sleep-poll: `recv_response` blocks in `recv_deadline` on the response channel (an absolute deadline, so a mismatched response never extends the overall wait), and shutdown reaps the child via a `Child::wait()` thread and joins the stdout reader via a `JoinHandle` waiter thread, each signalling completion over a `bounded(1)` crossbeam channel the caller waits on with `recv_timeout`. The reader thread's stop hint is a single `Arc<AtomicBool>` (exception #1), set by `shutdown` and read between lines. |
 | `error.rs` | `McpError` enum — `SpawnFailed`, `InitializeFailed`, `JsonRpcError`, `ProtocolError`, `Timeout`, `Io`, `ServerShutdown`, `ToolNotFound`, `InvalidParams` |
 
 
@@ -3115,8 +3115,10 @@ with a no-op stub backend when disabled, re-exported behind the same public
 API) using `std::sync::OnceLock` for a single static `Metrics` struct that
 wraps Prometheus counters/gauges/histograms. All operations are atomic (no
 `Arc<Mutex>` needed). A dedicated thread serves the `/metrics` endpoint via
-`tiny_http`; it polls the shutdown flag every 1 second and exits cleanly when
-the daemon shuts down.
+`tiny_http`; because a blocking `tiny_http` accept cannot be interrupted by a
+channel, its serve loop is the one place that consults the exception-#1
+shutdown flag on a bounded (1 s) `recv_timeout`, exiting cleanly once the flag
+is set.
 
 ### Instrumentation points
 
