@@ -430,7 +430,10 @@ fn render_session_list_shows_ids_parents_and_titles() {
         },
     ]);
 
-    let backend = TestBackend::new(80, 24);
+    // 100 columns (not the usual 80) so every fixed column plus the 4-wide
+    // marker column leaves room for the full "Title" header — the pushpin
+    // pin marker costs one column over the old single-char "P".
+    let backend = TestBackend::new(100, 24);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|frame| render(frame, &mut app))
@@ -848,8 +851,8 @@ fn session_list_shows_pin_marker() {
         .map(Cell::symbol)
         .collect();
     assert!(
-        content.contains(">*P"),
-        "the pinned, selected, attached row draws the P pin marker"
+        content.contains(">*📌"),
+        "the pinned, selected, attached row draws the pushpin pin marker"
     );
 }
 

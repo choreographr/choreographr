@@ -105,7 +105,9 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
         // fixed-width numeric columns; long ids truncate with an ellipsis.
         let session_w = 8u16;
         let parent_w = 8u16;
-        let marker_w = 3u16; // ">" selection + "*" attached + "P" pin markers
+        // ">" selection + "*" attached + "📌" pin marker.  The pushpin emoji
+        // is two display cells wide, so a pinned row needs four columns here.
+        let marker_w = 4u16;
         let status_w = 14u16;
         let model_w = 16u16;
         let turns_w = 5u16;
@@ -151,7 +153,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
 
             let sel = if is_selected { ">" } else { " " };
             let att = if is_attached { "*" } else { " " };
-            let pin = if session.pinned { "P" } else { " " };
+            let pin = if session.pinned { "📌" } else { " " };
             // Child sessions show their parent's id; top-level sessions get a
             // dash so the column stays readable at a glance.
             let parent = session
