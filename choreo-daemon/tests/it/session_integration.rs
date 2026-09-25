@@ -21,9 +21,12 @@ use crate::common;
 fn spawn_session(
     db: Arc<redb::Database>,
     session_id: u64,
-) -> (mpsc::Sender<SessionCommand>, std::thread::JoinHandle<()>) {
-    let (daemon_tx, _daemon_rx) = mpsc::channel();
-    let (session_tx, session_rx) = mpsc::channel();
+) -> (
+    crossbeam_channel::Sender<SessionCommand>,
+    std::thread::JoinHandle<()>,
+) {
+    let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded();
+    let (session_tx, session_rx) = crossbeam_channel::unbounded();
 
     let tool_registry = choreo_daemon::tools::ToolRegistry::new().build();
     let cmd_tx = session_tx.clone();

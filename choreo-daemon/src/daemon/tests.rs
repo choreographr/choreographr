@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 /// `pub(super)` so the sibling `daemon::image_provider` test module can
 /// build a fresh locked state without duplicating the constructor.
-pub(super) fn make_daemon_state() -> (DaemonState, mpsc::Receiver<DaemonCommand>) {
-    let (daemon_tx, daemon_rx) = mpsc::channel();
+pub(super) fn make_daemon_state() -> (DaemonState, crossbeam_channel::Receiver<DaemonCommand>) {
+    let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
     let tool_registry = crate::tools::ToolRegistry::new().build();
@@ -246,7 +246,7 @@ mod cancel_isolation_tests {
     fn seed_session(state: &mut DaemonState, id: u64) -> SocketRegistry {
         let registry = SocketRegistry::default();
         state.session_registries.insert(id, registry.clone());
-        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
         state.active_sessions.insert(
             id,
             ActiveSessionEntry {
@@ -1725,7 +1725,7 @@ fn handle_set_session_title_forwards_to_session() {
 
     // Create an active session entry with a cmd_tx so the daemon
     // can forward the title change.
-    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let (handle_tx, handle_rx) = std::sync::mpsc::channel::<()>();
     let handle = std::thread::spawn(move || {
         // Block until told to stop — we just need the entry to exist.
@@ -1801,8 +1801,11 @@ fn handle_set_session_title_nonexistent_session_logs_warning() {
 fn insert_active_session(
     state: &mut DaemonState,
     session_id: u64,
-) -> (mpsc::Receiver<SessionCommand>, mpsc::Sender<()>) {
-    let (cmd_tx, cmd_rx) = mpsc::channel();
+) -> (
+    crossbeam_channel::Receiver<SessionCommand>,
+    mpsc::Sender<()>,
+) {
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let (release_tx, release_rx) = mpsc::channel::<()>();
     let handle = std::thread::spawn(move || {
         // Block until told to stop — we just need the entry to exist.
@@ -2144,7 +2147,10 @@ fn insert_active_session_with_account(
     state: &mut DaemonState,
     session_id: u64,
     account: &str,
-) -> (mpsc::Receiver<SessionCommand>, mpsc::Sender<()>) {
+) -> (
+    crossbeam_channel::Receiver<SessionCommand>,
+    mpsc::Sender<()>,
+) {
     state.session_metadata.insert(
         session_id,
         SessionMetadata {
@@ -3597,7 +3603,9 @@ fn create_session_with_account_spawns_background_prefetch() {
 /// credentialed account whose endpoint is a dead local port (instant fetch
 /// failure). Shared by the `ListModels` prefetch tests to keep the verbose
 /// `SessionMetadata` boilerplate in one place.
-fn state_with_session_account(account: &str) -> (DaemonState, mpsc::Receiver<DaemonCommand>) {
+fn state_with_session_account(
+    account: &str,
+) -> (DaemonState, crossbeam_channel::Receiver<DaemonCommand>) {
     let (mut state, rx) = make_daemon_state();
     seed_credentialed_account_with_url(&mut state, account, "openai", Some(dead_base_url()));
     state.session_metadata.insert(

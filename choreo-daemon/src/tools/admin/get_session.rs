@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn execute_get_session_disconnected() {
-        let (tx, rx) = std::sync::mpsc::channel::<DaemonCommand>();
+        let (tx, rx) = crossbeam_channel::unbounded::<DaemonCommand>();
         drop(rx);
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());

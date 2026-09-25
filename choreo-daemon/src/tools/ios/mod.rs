@@ -176,7 +176,7 @@ pub(crate) mod test_util {
     /// the `TempDir` still cleans up on drop), and the `TempDir` is dropped
     /// normally, so tests leave no accumulating files behind.
     pub(crate) fn test_ctx() -> ToolContext {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.redb");
         let db = Arc::new(redb::Database::create(&path).unwrap());

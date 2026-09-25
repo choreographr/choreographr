@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn execute_list_sessions_disconnected() {
-        let (tx, rx) = std::sync::mpsc::channel::<DaemonCommand>();
+        let (tx, rx) = crossbeam_channel::unbounded::<DaemonCommand>();
         // Drop the receiver so sends fail.
         drop(rx);
         let dir = tempfile::tempdir().unwrap();

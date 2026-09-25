@@ -265,7 +265,7 @@ pub enum SessionCommand {
 #[derive(Clone)]
 pub struct RequestContext {
     /// Channel to send `SessionCommands` back to the session main loop.
-    pub cmd_tx: mpsc::Sender<SessionCommand>,
+    pub cmd_tx: crossbeam_channel::Sender<SessionCommand>,
     /// The session ID scoping all operations.
     pub session_id: u64,
     /// Database handle for persisting state.
@@ -273,7 +273,7 @@ pub struct RequestContext {
     /// Registry of available tools.
     pub tool_registry: Arc<ToolRegistry>,
     /// Channel to the daemon command loop.
-    pub daemon_tx: mpsc::Sender<DaemonCommand>,
+    pub daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
     /// Daemon-wide cap on agent tool-loop iterations per request (0 = unlimited).
     pub max_turns: u32,
     /// Lag thresholds for the lossless broadcast fan-out (see `crate::broadcast`).
@@ -588,7 +588,7 @@ pub(crate) struct ActiveRequest {
 }
 
 pub struct ActiveSessionEntry {
-    pub cmd_tx: mpsc::Sender<SessionCommand>,
+    pub cmd_tx: crossbeam_channel::Sender<SessionCommand>,
     pub handle: std::thread::JoinHandle<()>,
 }
 
@@ -1278,7 +1278,7 @@ fn default_active_tool_groups() -> HashSet<String> {
 }
 
 pub fn session_main(
-    rx: &std::sync::mpsc::Receiver<SessionCommand>,
+    rx: &crossbeam_channel::Receiver<SessionCommand>,
     initial_provider: Option<InferenceProvider>,
     registry: choreo_ai_protocols::SocketRegistry,
     account_name: Option<String>,
@@ -2805,7 +2805,7 @@ fn persist_and_exit(
     state: &SessionState,
     db: &redb::Database,
     session_id: u64,
-    daemon_tx: &mpsc::Sender<DaemonCommand>,
+    daemon_tx: &crossbeam_channel::Sender<DaemonCommand>,
 ) {
     let record: SessionRecord = SessionRecord::from(state);
     if let Err(e) = write_session_retry(db, session_id, &record) {

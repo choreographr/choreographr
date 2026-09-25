@@ -52,7 +52,6 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::common;
@@ -147,10 +146,13 @@ fn mock_openai_provider(base_url: String) -> InferenceProvider {
 /// instead of blocking forever on a reply that never arrives.
 fn spawn_session_with_provider(
     provider: InferenceProvider,
-) -> (mpsc::Sender<SessionCommand>, std::thread::JoinHandle<()>) {
+) -> (
+    crossbeam_channel::Sender<SessionCommand>,
+    std::thread::JoinHandle<()>,
+) {
     let db = Arc::new(common::test_db());
-    let (daemon_tx, _daemon_rx) = mpsc::channel();
-    let (session_tx, session_rx) = mpsc::channel();
+    let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded();
+    let (session_tx, session_rx) = crossbeam_channel::unbounded();
     let tool_registry = choreo_daemon::tools::ToolRegistry::new().build();
     let cmd_tx = session_tx.clone();
     let handle = std::thread::spawn(move || {
@@ -179,7 +181,7 @@ fn spawn_session_with_provider(
 
 /// Attach a `SubscriberSink` to the session and return its receiver.
 fn attach(
-    session_tx: &mpsc::Sender<SessionCommand>,
+    session_tx: &crossbeam_channel::Sender<SessionCommand>,
     client_id: u64,
 ) -> crossbeam_channel::Receiver<DaemonMessage> {
     let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();

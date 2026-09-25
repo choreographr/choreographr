@@ -49,7 +49,7 @@ use tracing::{debug, warn};
 /// Broadcast a `TurnAppended` message to all session subscribers, if the
 /// given `turn_id` exists in the session's turn map.
 pub(crate) fn broadcast_turn_appended(
-    cmd_tx: &mpsc::Sender<SessionCommand>,
+    cmd_tx: &crossbeam_channel::Sender<SessionCommand>,
     session: &SessionState,
     session_id: u64,
     turn_id: u32,
@@ -89,7 +89,7 @@ pub(crate) fn broadcast_turn_appended(
 /// The turn blob itself is not touched here — it is (re)written in full, blob
 /// plus ALL attachments atomically, at `finalize_turn`.
 pub(crate) fn emit_image(
-    cmd_tx: &mpsc::Sender<SessionCommand>,
+    cmd_tx: &crossbeam_channel::Sender<SessionCommand>,
     db: &redb::Database,
     image: PreparedImage,
     tool_call_id: Option<String>,
@@ -154,7 +154,7 @@ pub(crate) fn emit_image(
 /// Returns the spawned `JoinHandle` so tests can deterministically observe
 /// thread exit (no polling); production callers discard it.
 pub(crate) fn spawn_forwarding_thread(
-    cmd_tx: mpsc::Sender<SessionCommand>,
+    cmd_tx: crossbeam_channel::Sender<SessionCommand>,
     session_id: u64,
     request_id: u32,
     call_id: String,
@@ -379,7 +379,7 @@ pub(crate) struct SpawnToolArgs {
     pub(crate) request_id: u32,
     pub(crate) session_id: u64,
     pub(crate) registry: Arc<ToolRegistry>,
-    pub(crate) cmd_tx: mpsc::Sender<SessionCommand>,
+    pub(crate) cmd_tx: crossbeam_channel::Sender<SessionCommand>,
     pub(crate) x_credentials: Option<ServiceCredential>,
     pub(crate) working_dir: Option<PathBuf>,
     pub(crate) ctx: ToolContext,
@@ -492,7 +492,7 @@ pub(crate) fn spawn_tool_execution(
     x_credentials: Option<ServiceCredential>,
     working_dir: Option<PathBuf>,
     tool_ctx: ToolContext,
-    cmd_tx: mpsc::Sender<SessionCommand>,
+    cmd_tx: crossbeam_channel::Sender<SessionCommand>,
     session_id: u64,
     request_id: u32,
 ) -> SpawnedToolExecution {

@@ -335,7 +335,6 @@ mod tests {
     use image::ImageFormat;
     use std::io::Cursor;
     use std::sync::Arc;
-    use std::sync::mpsc;
 
     fn candidates(list: &[&str]) -> Vec<String> {
         list.iter().map(std::string::ToString::to_string).collect()
@@ -490,7 +489,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
         let _dir_guard = dir;
-        let (daemon_tx, daemon_rx) = mpsc::channel::<crate::daemon::DaemonCommand>();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<crate::daemon::DaemonCommand>();
         // Mock daemon loop: reply to exactly one provider-resolution command
         // with the pre-built handle (never touching real credential state).
         std::thread::spawn(move || match daemon_rx.recv() {

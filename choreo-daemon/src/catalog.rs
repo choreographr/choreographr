@@ -239,7 +239,7 @@ fn ensure_runtime_dirs(paths: &CatalogPaths) {
 /// main, and its sends to the daemon channel fail harmlessly once the command
 /// loop is gone).
 pub(crate) fn spawn_catalog_maintenance(
-    daemon_tx: mpsc::Sender<DaemonCommand>,
+    daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
     db: Arc<redb::Database>,
     paths: CatalogPaths,
     overlay_rx: Receiver<ConfigChange>,
@@ -267,7 +267,7 @@ struct MaintenanceState {
 }
 
 fn maintenance_loop(
-    daemon_tx: &mpsc::Sender<DaemonCommand>,
+    daemon_tx: &crossbeam_channel::Sender<DaemonCommand>,
     db: &Arc<redb::Database>,
     paths: &CatalogPaths,
     rx: &Receiver<MaintenanceEvent>,
@@ -535,7 +535,7 @@ fn record_attempt(db: &redb::Database, state: &mut MaintenanceState) {
 /// recv-timeout cadence), so the catalog revalidates on a fixed schedule no
 /// matter what the last fetch did.
 fn run_refresh(
-    daemon_tx: &mpsc::Sender<DaemonCommand>,
+    daemon_tx: &crossbeam_channel::Sender<DaemonCommand>,
     state: &mut MaintenanceState,
     force: bool,
     reply: Vec<RefreshRequester>,
@@ -557,7 +557,7 @@ fn run_refresh(
 /// requester, with each requester's own `force` flag individualizing
 /// `Forced` vs `Updated`.
 fn run_refresh_impl<F>(
-    daemon_tx: &mpsc::Sender<DaemonCommand>,
+    daemon_tx: &crossbeam_channel::Sender<DaemonCommand>,
     state: &mut MaintenanceState,
     force: bool,
     reply: Vec<RefreshRequester>,
@@ -666,7 +666,7 @@ fn fold_refresh_nows(
 /// falls back to bundled-only; an unreadable-but-present file warns and keeps
 /// the last-applied value rather than churn on a transient read error.
 fn reload_user_overlay(
-    daemon_tx: &mpsc::Sender<DaemonCommand>,
+    daemon_tx: &crossbeam_channel::Sender<DaemonCommand>,
     state: &mut MaintenanceState,
     overlay_path: &Path,
 ) {
@@ -850,7 +850,7 @@ mod tests {
 
     #[test]
     fn run_refresh_fetched_arms_revalidation_and_sends_base_changed() {
-        let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
         let mut state = maintenance_state();
         let (reply_tx, _reply_rx) = mpsc::channel();
 
@@ -905,7 +905,7 @@ mod tests {
 
     #[test]
     fn run_refresh_forced_fetch_marks_the_requester_forced() {
-        let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
         let mut state = maintenance_state();
         let (reply_tx, _reply_rx) = mpsc::channel();
 
@@ -939,7 +939,7 @@ mod tests {
 
     #[test]
     fn run_refresh_not_modified_routes_reply_through_daemon_and_revalidates() {
-        let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
         let mut state = maintenance_state();
         let (reply_tx, reply_rx) = mpsc::channel();
 
@@ -988,7 +988,7 @@ mod tests {
 
     #[test]
     fn run_refresh_error_replies_and_schedules_retry() {
-        let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
         let mut state = maintenance_state();
         let (reply_tx, reply_rx) = mpsc::channel();
 
@@ -1013,7 +1013,7 @@ mod tests {
 
     #[test]
     fn run_refresh_empty_normalization_keeps_current_catalog() {
-        let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
         let mut state = maintenance_state();
         let (reply_tx, reply_rx) = mpsc::channel();
 
@@ -1201,7 +1201,7 @@ mod tests {
     fn reload_user_overlay_fingerprint_gates_the_daemon_command() {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("models-overlay.toml");
-        let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
         let mut state = maintenance_state();
 
         // No file yet → nothing applied, nothing sent.

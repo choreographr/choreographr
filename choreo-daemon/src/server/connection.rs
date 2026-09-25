@@ -238,7 +238,7 @@ fn writer_thread<W: ConnectionWriter>(
 /// still in flight when shutdown began could land its register after the
 /// broadcast was processed — and that client would miss the notification.
 pub(crate) fn register_client_writer(
-    daemon_tx: &mpsc::Sender<DaemonCommand>,
+    daemon_tx: &crossbeam_channel::Sender<DaemonCommand>,
 ) -> (
     u64,
     crate::broadcast::SubscriberSink,
@@ -292,9 +292,9 @@ struct ClientCtx<'a> {
     /// increment it so the writer thread's per-dequeue decrement stays
     /// balanced (see `send_to_writer`).
     global_lag: &'a AtomicUsize,
-    daemon_tx: &'a mpsc::Sender<DaemonCommand>,
+    daemon_tx: &'a crossbeam_channel::Sender<DaemonCommand>,
     attached_session_id: &'a mut Option<u64>,
-    attached_session_tx: &'a mut Option<mpsc::Sender<SessionCommand>>,
+    attached_session_tx: &'a mut Option<crossbeam_channel::Sender<SessionCommand>>,
     client_id: u64,
     /// Whether this connection arrived over the local Unix socket (vs the
     /// TCP/Noise listener). Trust-boundary input for local-only commands:
@@ -307,9 +307,9 @@ struct ClientCtx<'a> {
 /// subscriber, wait for the writer thread to drain, and record the disconnect
 /// metric.  Owns the `writer_tx` sender and writer handle so both are consumed.
 fn cleanup_client(
-    attached_session_tx: Option<&mpsc::Sender<SessionCommand>>,
+    attached_session_tx: Option<&crossbeam_channel::Sender<SessionCommand>>,
     client_id: u64,
-    daemon_tx: &mpsc::Sender<DaemonCommand>,
+    daemon_tx: &crossbeam_channel::Sender<DaemonCommand>,
     writer: crate::broadcast::SubscriberSink,
     writer_handle: std::thread::JoinHandle<()>,
 ) {
@@ -724,7 +724,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
 /// message off the wire and classify transport errors; everything between
 /// message read and teardown lives here.
 pub(crate) struct ClientConn {
-    daemon_tx: mpsc::Sender<DaemonCommand>,
+    daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
     /// This connection's own handle to the shared redb database (see
     /// [`ClientCtx::db`]): on-demand image reads run here, on the connection
     /// thread, never as a command-loop round-trip.
@@ -741,7 +741,7 @@ pub(crate) struct ClientConn {
     /// (see `ClientCtx::is_unix`).
     is_unix: bool,
     attached_session_id: Option<u64>,
-    attached_session_tx: Option<mpsc::Sender<SessionCommand>>,
+    attached_session_tx: Option<crossbeam_channel::Sender<SessionCommand>>,
     /// Handle to the writer thread spawned in `new`; joined (with a bound) by
     /// `finish()` via `cleanup_client`, exactly as the pre-refactor loops did.
     writer_handle: std::thread::JoinHandle<()>,
@@ -753,7 +753,7 @@ pub(crate) struct ClientConn {
 /// The three transport call sites (Unix, TCP/Noise, embedded) stay readable and
 /// the `too_many_arguments` lint never has to be suppressed.
 struct ClientConnSetup<W> {
-    daemon_tx: mpsc::Sender<DaemonCommand>,
+    daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
     /// This connection's own handle to the shared redb database (see
     /// [`ClientCtx::db`]).
     db: Arc<redb::Database>,
@@ -842,7 +842,7 @@ impl ClientConn {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn client_thread(
     stream: UnixStream,
-    daemon_tx: mpsc::Sender<DaemonCommand>,
+    daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
     client_id: u64,
     writer: crate::broadcast::SubscriberSink,
     writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
@@ -936,7 +936,7 @@ pub(crate) fn tcp_handshake_and_client_thread(
     mut tcp: TcpStream,
     transport_sk: [u8; 32],
     acl: &Arc<crate::server::acl::SharedAcl>,
-    daemon_tx: mpsc::Sender<DaemonCommand>,
+    daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
     client_id: u64,
     writer: crate::broadcast::SubscriberSink,
     writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
@@ -1012,7 +1012,7 @@ pub(crate) fn tcp_handshake_and_client_thread(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn tcp_client_thread(
     noise: choreo_transport::noise::NoiseStream,
-    daemon_tx: mpsc::Sender<DaemonCommand>,
+    daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
     client_id: u64,
     writer: crate::broadcast::SubscriberSink,
     writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
@@ -1088,7 +1088,7 @@ pub(crate) struct EmbeddedConnArgs {
     pub client_rx: crossbeam_channel::Receiver<ClientMessage>,
     /// The writer's forward target = the GUI's read half.
     pub out_tx: crossbeam_channel::Sender<DaemonMessage>,
-    pub daemon_tx: mpsc::Sender<DaemonCommand>,
+    pub daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
     pub client_id: u64,
     pub writer: crate::broadcast::SubscriberSink,
     pub writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
@@ -1161,7 +1161,7 @@ pub(crate) fn embedded_client_thread(args: EmbeddedConnArgs) {
 /// killing the session's only subscriber.
 fn switch_attached_session(
     new_session_id: u64,
-    session_tx: mpsc::Sender<SessionCommand>,
+    session_tx: crossbeam_channel::Sender<SessionCommand>,
     ctx: &mut ClientCtx,
 ) {
     // Don't detach when re-attaching to the same session.
@@ -1342,7 +1342,7 @@ fn handle_client_set_session_account(name: String, ctx: &mut ClientCtx) {
 /// Send a `DaemonCommand` that expects a reply and wait for the response.
 /// Returns the reply value, or None if the daemon dropped the sender.
 fn request_daemon<R>(
-    daemon_tx: &mpsc::Sender<DaemonCommand>,
+    daemon_tx: &crossbeam_channel::Sender<DaemonCommand>,
     make_cmd: impl FnOnce(mpsc::Sender<R>) -> DaemonCommand,
 ) -> Result<R, mpsc::RecvError> {
     let (reply, rx) = mpsc::channel();
@@ -2010,7 +2010,7 @@ mod tests {
         // daemon command loop is never even contacted (asserted by the
         // channel receiver staying empty), and the client gets a structured
         // refusal — the approver for a trust decision must be at the machine.
-        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
@@ -2047,7 +2047,7 @@ mod tests {
 
     #[test]
     fn handle_unlock_sync_ok() {
-        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
@@ -2086,7 +2086,7 @@ mod tests {
 
     #[test]
     fn handle_unlock_sync_err() {
-        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
@@ -2132,7 +2132,7 @@ mod tests {
 
     #[test]
     fn handle_unlock_sync_disconnected() {
-        let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
@@ -2158,7 +2158,7 @@ mod tests {
         // replies `Locked` to the acting client; the daemon separately
         // broadcasts `Locked` to every activity subscriber (the acting client
         // included, harmlessly idempotent).
-        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
@@ -2185,7 +2185,7 @@ mod tests {
 
     #[test]
     fn handle_lock_sync_err_replies_locked_error() {
-        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
@@ -2214,7 +2214,7 @@ mod tests {
 
     #[test]
     fn handle_list_models_sync_ok() {
-        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
@@ -2247,7 +2247,7 @@ mod tests {
         // The connection thread asks the daemon for a refresh; the daemon
         // (via the maintenance thread) replies with a report, which the
         // connection routes to the client as ModelsRefreshed.
-        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
@@ -2286,7 +2286,7 @@ mod tests {
 
     #[test]
     fn handle_refresh_models_sync_err() {
-        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
@@ -2315,7 +2315,7 @@ mod tests {
 
     #[test]
     fn handle_list_models_sync_err() {
-        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
@@ -2349,7 +2349,7 @@ mod tests {
         // connection thread reads the bytes straight from its own DB handle
         // (`ctx.db`) and routes them back as Image — no command-loop hop. The
         // bytes are written the way persist-at-emit does, via `write_turn`.
-        let (daemon_tx, _daemon_rx) = mpsc::channel();
+        let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
         let mut attached = Some(5u64);
@@ -2419,7 +2419,7 @@ mod tests {
         // The client is NOT attached to the requested session: the DB must not
         // be consulted for the request (no command is sent to the daemon) and
         // the reply is a not-found None.
-        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
         let mut attached = Some(5u64);
@@ -2453,7 +2453,7 @@ mod tests {
 
     #[test]
     fn handle_get_credential_sync_some() {
-        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
@@ -2485,7 +2485,7 @@ mod tests {
 
     #[test]
     fn handle_get_credential_sync_none() {
-        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
@@ -2517,11 +2517,11 @@ mod tests {
 
     #[test]
     fn switch_session_to_different_sends_detach_to_old() {
-        let (old_tx, old_rx) = mpsc::channel();
-        let (new_tx, new_rx) = mpsc::channel::<SessionCommand>();
+        let (old_tx, old_rx) = crossbeam_channel::unbounded();
+        let (new_tx, new_rx) = crossbeam_channel::unbounded::<SessionCommand>();
         let (sink, _writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
-        let (daemon_tx, _daemon_rx) = mpsc::channel();
+        let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded();
         let mut attached_id = Some(1u64);
         let mut attached_tx = Some(old_tx);
         let mut ctx = ClientCtx {
@@ -2553,11 +2553,11 @@ mod tests {
 
     #[test]
     fn switch_session_same_skips_detach() {
-        let (old_tx, old_rx) = mpsc::channel();
-        let (new_tx, new_rx) = mpsc::channel::<SessionCommand>();
+        let (old_tx, old_rx) = crossbeam_channel::unbounded();
+        let (new_tx, new_rx) = crossbeam_channel::unbounded::<SessionCommand>();
         let (sink, _writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
-        let (daemon_tx, _daemon_rx) = mpsc::channel();
+        let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded();
         let mut attached_id = Some(1u64);
         let mut attached_tx = Some(old_tx);
         let mut ctx = ClientCtx {
@@ -2586,7 +2586,7 @@ mod tests {
 
     #[test]
     fn handle_delete_session_sync_success_no_message_sent() {
-        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
@@ -2613,7 +2613,7 @@ mod tests {
 
     #[test]
     fn handle_delete_session_sync_error() {
-        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
@@ -2654,7 +2654,7 @@ mod tests {
 
     #[test]
     fn handle_delete_session_sync_disconnected() {
-        let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
@@ -2676,12 +2676,12 @@ mod tests {
 
     #[test]
     fn switch_session_from_none_no_detach() {
-        let (new_tx, new_rx) = mpsc::channel::<SessionCommand>();
+        let (new_tx, new_rx) = crossbeam_channel::unbounded::<SessionCommand>();
         let (sink, _writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
-        let (daemon_tx, _daemon_rx) = mpsc::channel();
+        let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded();
         let mut attached_id: Option<u64> = None;
-        let mut attached_tx: Option<mpsc::Sender<SessionCommand>> = None;
+        let mut attached_tx: Option<crossbeam_channel::Sender<SessionCommand>> = None;
         let mut ctx = ClientCtx {
             writer: &sink,
             db: &TEST_DB,
@@ -2706,10 +2706,10 @@ mod tests {
 
     #[test]
     fn dispatch_undo_when_attached_sends_undo_command() {
-        let (daemon_tx, _daemon_rx) = mpsc::channel();
+        let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded();
         let (sink, _writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
-        let (session_tx, session_rx) = mpsc::channel();
+        let (session_tx, session_rx) = crossbeam_channel::unbounded();
         let mut attached_id = Some(1u64);
         let mut attached_tx = Some(session_tx);
         let mut ctx = ClientCtx {
@@ -2733,7 +2733,7 @@ mod tests {
 
     #[test]
     fn dispatch_undo_when_not_attached_is_noop() {
-        let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
@@ -2759,10 +2759,10 @@ mod tests {
 
     #[test]
     fn dispatch_redo_when_attached_sends_redo_command() {
-        let (daemon_tx, _daemon_rx) = mpsc::channel();
+        let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded();
         let (sink, _writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
-        let (session_tx, session_rx) = mpsc::channel();
+        let (session_tx, session_rx) = crossbeam_channel::unbounded();
         let mut attached_id = Some(1u64);
         let mut attached_tx = Some(session_tx);
         let mut ctx = ClientCtx {
@@ -2786,7 +2786,7 @@ mod tests {
 
     #[test]
     fn dispatch_redo_when_not_attached_is_noop() {
-        let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;
@@ -2811,10 +2811,10 @@ mod tests {
 
     #[test]
     fn dispatch_continue_generation_when_attached_sends_run_input() {
-        let (daemon_tx, _daemon_rx) = mpsc::channel();
+        let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded();
         let (sink, _writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
-        let (session_tx, session_rx) = mpsc::channel();
+        let (session_tx, session_rx) = crossbeam_channel::unbounded();
         let mut attached_id = Some(1u64);
         let mut attached_tx = Some(session_tx);
         let mut ctx = ClientCtx {
@@ -2846,7 +2846,7 @@ mod tests {
 
     #[test]
     fn dispatch_continue_generation_when_not_attached_sends_failed() {
-        let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
         let mut none_id = None;

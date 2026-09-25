@@ -14,7 +14,6 @@ use crate::sessions::SessionCommand;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use tracing::debug;
@@ -52,7 +51,7 @@ pub(crate) struct DaemonCore {
     /// Command channel to the daemon command loop. Adapters clone this per
     /// accepted connection; the shutdown drain sends the shutdown commands
     /// over it and then drops its own clone to close the loop.
-    pub daemon_tx: mpsc::Sender<DaemonCommand>,
+    pub daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
     /// Cooperative cancellation flag (thread-comm exception #1): every
     /// transport adapter — signal threads, accept loops, TCP accept thread,
     /// metrics server — polls this single-bit flag as a best-effort stop hint;
@@ -98,7 +97,7 @@ pub(crate) struct DaemonCore {
 /// command channel closes (daemon shutting down); the power monitor's own
 /// thread is daemon-like and reaps itself when its sender fails.
 fn spawn_power_event_forwarder(
-    daemon_tx: mpsc::Sender<DaemonCommand>,
+    daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
     power_rx: crossbeam_channel::Receiver<choreo_power_events::SuspendEvent>,
 ) {
     let _ = thread::Builder::new()
@@ -126,7 +125,7 @@ fn spawn_power_event_forwarder(
 // function returns `DaemonCore` directly instead of a transparent Ok wrapper.
 pub(crate) fn start_daemon_core(state: DaemonState, opts: CoreOptions) -> DaemonCore {
     let mut state = state;
-    let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+    let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
     state.daemon_tx = daemon_tx.clone();
 
     // Install the shared ACL into the state BEFORE the command loop takes
@@ -223,10 +222,10 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: CoreOptions) -> Daemon
     // owns the subscription); on any platform where the notification
     // mechanism is unavailable it degrades to an inert monitor that logs
     // once and never fires. Suspend/wake events reach the command loop via
-    // `DaemonCommand::PowerEvent` — the same forwarder-into-command-channel
-    // pattern the config/ACL watchers use — instead of a select! arm on the
-    // command channel (a std mpsc receiver, which crossbeam's select! cannot
-    // accept without converting every DaemonCommand sender).
+    // `DaemonCommand::PowerEvent` through the same forwarder-into-command-
+    // channel pattern the config/ACL watchers use, keeping every external
+    // event source on one uniform delivery shape rather than special-casing
+    // the command loop with an extra `select!` arm.
     let power_monitor = choreo_power_events::PowerMonitor::best_effort();
     let power_rx = power_monitor.events().clone();
     spawn_power_event_forwarder(daemon_tx.clone(), power_rx);
@@ -314,7 +313,7 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: CoreOptions) -> Daemon
                     break;
                 }
                 Ok(cmd) => state.handle_command(cmd),
-                Err(mpsc::RecvError) => {
+                Err(crossbeam_channel::RecvError) => {
                     info!("command loop: all daemon command senders dropped");
                     break;
                 }

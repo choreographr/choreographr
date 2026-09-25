@@ -19,7 +19,6 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc;
 use tracing::{info, warn};
 
 /// Parameters for [`DaemonState::open`]. Explicit paths (not global helpers)
@@ -174,10 +173,9 @@ impl DaemonState {
             // Placeholder command channel: `start_daemon_core` overwrites
             // `daemon_tx` with the real command-loop channel before any
             // consumer exists, so the dropped receiver here never matters.
-            // std `mpsc` deliberately: this must match the pre-existing
-            // `DaemonState::daemon_tx` field type (the convention converts
-            // existing std channels opportunistically only).
-            daemon_tx: mpsc::channel().0,
+            // Crossbeam unbounded to match `DaemonState::daemon_tx` (the
+            // daemon's `DaemonCommand` transport channel).
+            daemon_tx: crossbeam_channel::unbounded().0,
             // Derive the next session ID from the highest existing record so a
             // fresh daemon never collides with a persisted session.
             next_session_id: session_metadata.keys().max().copied().map_or(1, |m| m + 1),

@@ -28,7 +28,6 @@ use choreo_daemon::{DaemonCommand, providers::ImageProviderHandle};
 use common::test_db;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::mpsc;
 use std::thread;
 
 /// One tiny 1x1 red PNG (67 bytes), so the prepare pipeline (dimension probe)
@@ -96,7 +95,7 @@ fn generate_image_end_to_end_against_mock_server() {
     };
 
     let db = std::sync::Arc::new(test_db());
-    let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+    let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
     // Mock daemon command loop: answer the tool's provider-resolution
     // command with the handle wired to the mock server.
     thread::spawn(move || match daemon_rx.recv().unwrap() {

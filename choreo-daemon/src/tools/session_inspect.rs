@@ -572,7 +572,6 @@ mod tests {
     use crate::tools::context::ToolContext;
     use choreo_proto::{AssistantToolCallRecord, ReasoningProducer, TimestampMs, Turn};
     use std::sync::Arc;
-    use std::sync::mpsc;
 
     // Helper: seed a minimal session record + turns in a temp db and return a
     // ToolContext for the given "owning" session (the TempDir stays alive for
@@ -614,7 +613,7 @@ mod tests {
         for (tid, t) in turns {
             write_turn(&db, target, tid, &t).unwrap();
         }
-        let (daemon_tx, _rx) = mpsc::channel();
+        let (daemon_tx, _rx) = crossbeam_channel::unbounded();
         let ctx = ToolContext::new(owner, db, daemon_tx);
         (dir, ctx)
     }

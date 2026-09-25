@@ -37,7 +37,6 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -60,7 +59,7 @@ pub fn test_daemon_state() -> DaemonState {
 /// daemon state through this seam with tiny caps (see
 /// `tests/stream_integrity.rs`).
 pub fn test_daemon_state_with_limits(limits: LagLimits) -> DaemonState {
-    let (daemon_tx, _daemon_rx) = mpsc::channel();
+    let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded();
 
     let dir = tempfile::tempdir().expect("tempdir");
     let db =

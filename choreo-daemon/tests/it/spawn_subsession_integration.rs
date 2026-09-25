@@ -15,7 +15,6 @@ use choreo_daemon::{ChildResult, DaemonCommand, SessionCommand};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc;
 use std::thread;
 
 use crate::common;
@@ -27,7 +26,7 @@ use crate::common;
 #[test]
 fn spawn_subsession_happy_path() {
     let db = Arc::new(common::test_db());
-    let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+    let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
 
     // ── Daemon handler thread ────────────────────────────────────────
     //
@@ -59,7 +58,7 @@ fn spawn_subsession_happy_path() {
                 assert_eq!(active_tool_groups, [] as [std::string::String; 0]);
 
                 // Create a mock child session channel.
-                let (child_tx, child_rx) = mpsc::channel::<SessionCommand>();
+                let (child_tx, child_rx) = crossbeam_channel::unbounded::<SessionCommand>();
                 let child_id = 42u64;
 
                 // Reply to the tool with the child session sender.
@@ -137,7 +136,7 @@ fn spawn_subsession_happy_path() {
 #[test]
 fn spawn_subsession_daemon_rejects_creation() {
     let db = Arc::new(common::test_db());
-    let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+    let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
 
     let daemon_handle = thread::spawn(move || match daemon_rx.recv().unwrap() {
         DaemonCommand::CreateSession { reply, .. } => {
@@ -192,7 +191,7 @@ fn spawn_subsession_daemon_rejects_creation() {
 #[test]
 fn spawn_subsession_daemon_disconnected() {
     let db = Arc::new(common::test_db());
-    let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+    let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
     drop(daemon_rx);
 
     let tool_ctx = ToolContext {
@@ -265,7 +264,7 @@ fn spawn_subsession_no_context() {
 #[test]
 fn spawn_subsession_inherits_categories() {
     let db = Arc::new(common::test_db());
-    let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+    let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
 
     let daemon_handle = thread::spawn(move || {
         match daemon_rx.recv().unwrap() {
@@ -282,7 +281,7 @@ fn spawn_subsession_inherits_categories() {
                 actual.sort();
                 assert_eq!(actual, expected, "should inherit active_tool_groups");
 
-                let (child_tx, child_rx) = mpsc::channel::<SessionCommand>();
+                let (child_tx, child_rx) = crossbeam_channel::unbounded::<SessionCommand>();
                 reply.send(Ok((1u64, child_tx))).unwrap();
 
                 // Drain child messages so the test thread can join.
@@ -336,7 +335,7 @@ fn spawn_subsession_inherits_categories() {
 #[test]
 fn spawn_subsession_overrides_categories() {
     let db = Arc::new(common::test_db());
-    let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+    let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
 
     let daemon_handle = thread::spawn(move || {
         match daemon_rx.recv().unwrap() {
@@ -352,7 +351,7 @@ fn spawn_subsession_overrides_categories() {
                 actual.sort();
                 assert_eq!(actual, expected, "should use explicit categories");
 
-                let (child_tx, child_rx) = mpsc::channel::<SessionCommand>();
+                let (child_tx, child_rx) = crossbeam_channel::unbounded::<SessionCommand>();
                 reply.send(Ok((1u64, child_tx))).unwrap();
 
                 match child_rx.recv().unwrap() {
@@ -405,7 +404,7 @@ fn spawn_subsession_overrides_categories() {
 #[test]
 fn spawn_subsession_inherits_selected_model() {
     let db = Arc::new(common::test_db());
-    let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+    let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
 
     let daemon_handle = thread::spawn(move || {
         match daemon_rx.recv().unwrap() {
@@ -421,7 +420,7 @@ fn spawn_subsession_inherits_selected_model() {
                     "should inherit selected_model from ToolContext",
                 );
 
-                let (child_tx, child_rx) = mpsc::channel::<SessionCommand>();
+                let (child_tx, child_rx) = crossbeam_channel::unbounded::<SessionCommand>();
                 reply.send(Ok((1u64, child_tx))).unwrap();
 
                 match child_rx.recv().unwrap() {

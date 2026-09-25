@@ -181,10 +181,10 @@ mod tests {
     /// tests can intercept the `DaemonCommand` and reply to it.
     fn test_context() -> (
         ToolContext,
-        std::sync::mpsc::Sender<DaemonCommand>,
-        std::sync::mpsc::Receiver<DaemonCommand>,
+        crossbeam_channel::Sender<DaemonCommand>,
+        crossbeam_channel::Receiver<DaemonCommand>,
     ) {
-        let (daemon_tx, daemon_rx) = std::sync::mpsc::channel::<DaemonCommand>();
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.keep(); // Leak: prevent early cleanup of the temp directory.
         let db = Arc::new(redb::Database::create(db_path.join("test.redb")).unwrap());

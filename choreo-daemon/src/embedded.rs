@@ -23,7 +23,6 @@ use choreo_proto::{ClientMessage, DaemonMessage};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
-use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
 use tracing::{error, info, warn};
@@ -68,7 +67,7 @@ pub struct EmbeddedDaemon {
     core: Option<DaemonCore>,
     /// Command channel to the daemon command loop (clone of the core's, so
     /// `connect()` can register writers while the core keeps its own sender).
-    daemon_tx: Option<mpsc::Sender<DaemonCommand>>,
+    daemon_tx: Option<crossbeam_channel::Sender<DaemonCommand>>,
     /// Daemon-wide delivery-lag byte counter (exception #6), cloned from the
     /// core so `connect()` hands the connection thread the SAME counter the
     /// command loop and session threads increment on enqueue.
@@ -91,9 +90,8 @@ pub struct EmbeddedDaemon {
     /// new code in choreo-daemon): the cloneable Sender matters here — every
     /// `connect()` clones its own sender — and the Receiver's Sync keeps the
     /// whole struct `Sync`-shareable for embedders that stash the handle in a
-    /// static. The `daemon_tx` field stays std `mpsc` because it mirrors the
-    /// pre-existing `DaemonState::daemon_tx` field type (converted
-    /// opportunistically only, per the convention).
+    /// static. `daemon_tx` is the same crossbeam `DaemonCommand` transport
+    /// channel the rest of the daemon uses (see `DaemonState::daemon_tx`).
     handle_tx: crossbeam_channel::Sender<thread::JoinHandle<()>>,
     handle_rx: Option<crossbeam_channel::Receiver<thread::JoinHandle<()>>>,
     /// Set by `shutdown()` so `Drop` can tell "clean drain" from the

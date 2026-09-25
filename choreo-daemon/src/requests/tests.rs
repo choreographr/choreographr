@@ -1595,7 +1595,7 @@ fn pending_unparseable_args_is_noop() {
 
 #[test]
 fn broadcast_turn_appended_sends_when_turn_exists() {
-    let (tx, rx) = mpsc::channel::<SessionCommand>();
+    let (tx, rx) = crossbeam_channel::unbounded::<SessionCommand>();
     let mut session = SessionState::empty();
     let (turn_id, _) = session.start_turn(Some("hello".into()));
 
@@ -1615,7 +1615,7 @@ fn broadcast_turn_appended_sends_when_turn_exists() {
 
 #[test]
 fn broadcast_turn_appended_no_turn_no_broadcast() {
-    let (tx, rx) = mpsc::channel::<SessionCommand>();
+    let (tx, rx) = crossbeam_channel::unbounded::<SessionCommand>();
     let session = SessionState::empty();
 
     broadcast_turn_appended(&tx, &session, 0, 999);
@@ -1625,7 +1625,7 @@ fn broadcast_turn_appended_no_turn_no_broadcast() {
 
 #[test]
 fn broadcast_turn_appended_disconnected_receiver_no_panic() {
-    let (tx, rx) = mpsc::channel::<SessionCommand>();
+    let (tx, rx) = crossbeam_channel::unbounded::<SessionCommand>();
     let mut session = SessionState::empty();
     let (turn_id, _) = session.start_turn(Some("hello".into()));
     drop(rx);
@@ -1638,7 +1638,7 @@ fn broadcast_turn_appended_disconnected_receiver_no_panic() {
 fn broadcast_turn_appended_strips_reasoning_artifact() {
     // The client-bound TurnAppended must never carry the opaque reasoning
     // round-trip payload, even when the session's authoritative turn does.
-    let (tx, rx) = mpsc::channel::<SessionCommand>();
+    let (tx, rx) = crossbeam_channel::unbounded::<SessionCommand>();
     let mut session = SessionState::empty();
     let (turn_id, _) = session.start_turn(Some("hello".into()));
     session.set_assistant_response(
@@ -1689,8 +1689,8 @@ fn finalize_and_broadcast_turn_strips_reasoning_artifact() {
     // TurnAppended is the final turn snapshot sent to clients — the
     // reasoning artifact must be stripped here too, while the DB write
     // (inside finalize_and_broadcast_turn) persists the full turn.
-    let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
-    let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();
+    let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
     let ctx = RequestContext {
@@ -1753,8 +1753,8 @@ fn agent_loop_failure_marks_and_finalizes_turn() {
     // render a red "Error:" block in the transcript and the failure
     // survives a daemon restart — while the loop still reports the
     // original inference error to the caller (RequestOutcome::Failed).
-    let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
-    let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();
+    let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
     let ctx = RequestContext {
@@ -1828,8 +1828,8 @@ fn agent_loop_recovers_from_truncated_tool_call() {
     // the partial call, records an explanatory turn, seeds the recovery
     // instruction as the next user turn, and retries — reaching the provider's
     // normal answer without the user restarting the session.
-    let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
-    let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
+    let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
+    let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
     let ctx = RequestContext {
@@ -1890,8 +1890,8 @@ fn agent_loop_gives_up_after_truncation_recovery_budget() {
     // budget, then end the request cleanly (Ok(false)) instead of spinning
     // forever — critical because this session runs with `max_turns == 0`
     // (unlimited), which cannot bound the loop itself.
-    let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
-    let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
+    let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
+    let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
     let ctx = RequestContext {
@@ -1942,8 +1942,8 @@ fn agent_loop_drops_response_id_chain_on_truncation_recovery() {
     // The retry must instead resend the full history (no chain), and the
     // persisted id must be cleared so a later request cannot resurrect the
     // broken chain.
-    let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
-    let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
+    let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
+    let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
     let ctx = RequestContext {
@@ -2282,9 +2282,13 @@ fn run_exec_tool(
     tool_args: &str,
     timeout_dur: Duration,
     cancel_rx: &crossbeam_channel::Receiver<()>,
-) -> (ToolOutput, bool, mpsc::Receiver<SessionCommand>) {
-    let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
-    let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();
+) -> (
+    ToolOutput,
+    bool,
+    crossbeam_channel::Receiver<SessionCommand>,
+) {
+    let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
 
     let dir = tempfile::tempdir().expect("tempdir");
     let db = redb::Database::create(dir.path().join("test.redb")).expect("Database");
@@ -2576,7 +2580,7 @@ fn execute_tool_forwards_streaming_output() {
 
 #[test]
 fn forwarding_thread_drains_queued_output_before_kill() {
-    let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
     let (output_tx, output_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
     let (kill_tx, kill_rx) = crossbeam_channel::unbounded::<()>();
 
@@ -2609,7 +2613,7 @@ fn forwarding_thread_drains_queued_output_before_kill() {
 
 #[test]
 fn forwarding_thread_exits_when_output_disconnects() {
-    let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
     let (output_tx, output_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
     let (_kill_tx, kill_rx) = crossbeam_channel::unbounded::<()>();
 
@@ -2637,7 +2641,7 @@ fn forwarding_thread_exits_when_output_disconnects() {
 
 #[test]
 fn forwarding_thread_exits_when_kill_sender_dropped() {
-    let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
+    let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
     let (output_tx, output_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
     let (kill_tx, kill_rx) = crossbeam_channel::unbounded::<()>();
 
@@ -2663,7 +2667,7 @@ fn forwarding_thread_honors_kill_while_output_is_still_alive() {
     // sends chunks and then a kill; the forwarder forwards the queued
     // burst (bounded by the queue length at kill time) and then exits,
     // never waiting on the output channel to disconnect.
-    let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
     let (output_tx, output_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
     let (kill_tx, kill_rx) = crossbeam_channel::unbounded::<()>();
 
@@ -2816,12 +2820,12 @@ fn determine_tool_timeout_generate_image_covers_adapter_worst_case() {
 /// Build a throwaway `ToolContext` and command channel for
 /// `spawn_single_tool` tests. Receivers are dropped, which is fine — no
 /// assertion inspects the daemon or session command streams here.
-fn spawn_test_ctx() -> (ToolContext, mpsc::Sender<SessionCommand>) {
-    let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
+fn spawn_test_ctx() -> (ToolContext, crossbeam_channel::Sender<SessionCommand>) {
+    let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
     // Receiver is intentionally dropped immediately (see doc comment above);
     // the sender is moved into the ToolContext, so no underscore binding is
     // ever referenced.
-    let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+    let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
     drop(daemon_rx);
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).expect("Database"));

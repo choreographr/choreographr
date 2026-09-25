@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc;
 
 use crate::daemon::DaemonCommand;
 
@@ -18,7 +17,7 @@ pub struct ToolContext {
     /// Handle to the daemon's shared redb database.
     pub db: Arc<redb::Database>,
     /// Channel to the daemon command loop for daemon-level operations.
-    pub daemon_tx: mpsc::Sender<DaemonCommand>,
+    pub daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
     /// Tool groups active in the parent session (inherited by sub-sessions).
     pub active_tool_groups: HashSet<String>,
     /// Reasoning effort configured for the parent session.
@@ -58,7 +57,7 @@ impl ToolContext {
     pub fn new(
         session_id: u64,
         db: Arc<redb::Database>,
-        daemon_tx: mpsc::Sender<DaemonCommand>,
+        daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
     ) -> Self {
         Self {
             session_id,

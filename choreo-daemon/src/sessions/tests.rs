@@ -64,15 +64,13 @@ fn test_state() -> SessionState {
 /// round-trip the real command loop performs.
 #[test]
 fn resolve_provider_rebuilds_lazily_after_client_drop() {
-    use std::sync::mpsc;
-
     use zeroize::Zeroizing;
 
     let dir = tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("t.redb")).unwrap());
     let tool_registry = ToolRegistry::new().build();
-    let (daemon_tx, daemon_rx) = mpsc::channel();
-    let (cmd_tx, _) = mpsc::channel();
+    let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, _) = crossbeam_channel::unbounded();
     let ctx = RequestContext {
         cmd_tx,
         session_id: 1,
@@ -400,8 +398,8 @@ fn set_provider_slug_command_updates_and_clears_recorded_slug() {
     // clears it so a stale slug can't keep feeding catalog lookups.
     let dir = tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("t.redb")).unwrap());
-    let (daemon_tx, _daemon_rx) = std::sync::mpsc::channel();
-    let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
+    let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
     let ctx = RequestContext {
         cmd_tx,
         session_id: 9,
@@ -434,14 +432,12 @@ fn set_account_switches_slug_and_drops_stale_client_when_locked() {
     // client dropped — `resolve_provider` returns a cached client
     // unconditionally, so keeping it would dial the old provider under the new
     // account name.
-    use std::sync::mpsc;
-
     use choreo_ai_protocols::openai::{OpenAiClient, ServiceConfig};
 
     let dir = tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("t.redb")).unwrap());
-    let (daemon_tx, daemon_rx) = mpsc::channel();
-    let (cmd_tx, _cmd_rx) = mpsc::channel();
+    let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
     let ctx = RequestContext {
         cmd_tx,
         session_id: 3,
@@ -494,14 +490,12 @@ fn set_account_clears_slug_and_client_when_new_account_unknown() {
     // The new account can't be resolved at all (unknown): both the stale
     // client and the stale slug must be cleared so neither keeps serving the
     // old account's facts.
-    use std::sync::mpsc;
-
     use choreo_ai_protocols::openai::{OpenAiClient, ServiceConfig};
 
     let dir = tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("t.redb")).unwrap());
-    let (daemon_tx, daemon_rx) = mpsc::channel();
-    let (cmd_tx, _cmd_rx) = mpsc::channel();
+    let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
     let ctx = RequestContext {
         cmd_tx,
         session_id: 4,
@@ -576,8 +570,8 @@ fn broadcast_setup() -> (SessionState, RequestContext) {
     let dir = tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
     let tool_registry = ToolRegistry::new().build();
-    let (daemon_tx, _) = mpsc::channel();
-    let (cmd_tx, _) = mpsc::channel();
+    let (daemon_tx, _) = crossbeam_channel::unbounded();
+    let (cmd_tx, _) = crossbeam_channel::unbounded();
     let ctx = RequestContext {
         cmd_tx,
         session_id: 1,
@@ -1391,8 +1385,8 @@ fn sync_accumulated_usage_updates_config_and_broadcasts() {
     let dir = tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
     let tool_registry = ToolRegistry::new().build();
-    let (daemon_tx, daemon_rx) = mpsc::channel();
-    let (cmd_tx, _cmd_rx) = mpsc::channel();
+    let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
     let ctx = RequestContext {
         cmd_tx,
         session_id: 1,
@@ -1529,8 +1523,8 @@ fn sync_accumulated_usage_never_regresses_config() {
     let dir = tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
     let tool_registry = ToolRegistry::new().build();
-    let (daemon_tx, _daemon_rx) = mpsc::channel();
-    let (cmd_tx, _cmd_rx) = mpsc::channel();
+    let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
     let ctx = RequestContext {
         cmd_tx,
         session_id: 1,

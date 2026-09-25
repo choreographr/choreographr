@@ -121,7 +121,7 @@ pub struct DaemonState {
     pub keystore_bound: bool,
     pub db: Arc<redb::Database>,
     pub tool_registry: Arc<crate::tools::ToolRegistry>,
-    pub daemon_tx: mpsc::Sender<DaemonCommand>,
+    pub daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
     pub summary_subscribers: HashMap<u64, SubscriberSink>,
     /// Writer channel of EVERY connected client (both transports), registered
     /// on connect and removed on disconnect. The shutdown path uses it to
@@ -186,11 +186,12 @@ pub enum DaemonCommand {
         context_config: Option<ContextConfig>,
         account_name: Option<String>,
         active_tool_groups: Vec<String>,
-        reply: std::sync::mpsc::Sender<io::Result<(u64, std::sync::mpsc::Sender<SessionCommand>)>>,
+        reply:
+            std::sync::mpsc::Sender<io::Result<(u64, crossbeam_channel::Sender<SessionCommand>)>>,
     },
     AttachSession {
         session_id: u64,
-        reply: std::sync::mpsc::Sender<io::Result<std::sync::mpsc::Sender<SessionCommand>>>,
+        reply: std::sync::mpsc::Sender<io::Result<crossbeam_channel::Sender<SessionCommand>>>,
     },
     ListSessions {
         reply: std::sync::mpsc::Sender<Vec<SessionSummary>>,
@@ -517,11 +518,11 @@ pub enum DaemonCommand {
     /// A platform power transition (suspend/wake) detected by the
     /// `choreo-power-events` monitor. Delivered to the command loop by the
     /// dedicated forwarder thread (spawned in `start_daemon_core`) rather
-    /// than a `select!` arm: the command channel is a std mpsc receiver, and
-    /// the codebase's established pattern for external event sources
-    /// (config watchers, ACL watcher) is exactly this forwarder-into-
-    /// `DaemonCommand` shape. Same delivery semantics, zero channel-type
-    /// churn across the ~40 existing `DaemonCommand` senders.
+    /// than a `select!` arm: the codebase's established pattern for external
+    /// event sources (config watchers, ACL watcher) is exactly this
+    /// forwarder-into-`DaemonCommand` shape, so the power monitor reuses it
+    /// for one uniform delivery path. Same delivery semantics, zero special
+    /// casing across the ~40 existing `DaemonCommand` senders.
     PowerEvent(SuspendEvent),
     /// Activate tool groups.  Forwarded to the session's main loop, which
     /// applies the change to the authoritative active-group set and replies
@@ -552,7 +553,7 @@ pub enum DaemonCommand {
 fn finalize_session_delete(
     db: &Arc<redb::Database>,
     session_id: u64,
-    daemon_tx: &mpsc::Sender<DaemonCommand>,
+    daemon_tx: &crossbeam_channel::Sender<DaemonCommand>,
 ) {
     match db::delete_session(db, session_id) {
         Ok(()) => {
@@ -808,7 +809,7 @@ impl DaemonState {
         session_id: u64,
         record: SessionRecord,
         metadata: SessionMetadata,
-    ) -> mpsc::Sender<SessionCommand> {
+    ) -> crossbeam_channel::Sender<SessionCommand> {
         let db = Arc::clone(&self.db);
         let tool_registry = Arc::clone(&self.tool_registry);
         let daemon_tx = self.daemon_tx.clone();
@@ -855,7 +856,12 @@ impl DaemonState {
             .as_ref()
             .and_then(|name| self.account_provider_slug(name));
 
-        let (session_tx, session_rx) = std::sync::mpsc::channel();
+        // Crossbeam (unbounded) for the session transport channel: the daemon
+        // hands this sender to clients/tools and the session control loop
+        // blocks on the receiver, so it must share the workspace's channel
+        // type (AGENTS.md "Channel selection"). Unbounded matches the old
+        // `mpsc::channel` unbounded semantics exactly.
+        let (session_tx, session_rx) = crossbeam_channel::unbounded::<SessionCommand>();
         let cmd_tx = session_tx.clone();
 
         let handle = thread::spawn(move || {
@@ -1179,7 +1185,9 @@ impl DaemonState {
         context_config: Option<&ContextConfig>,
         account_name: Option<String>,
         active_tool_groups: &[String],
-        reply: &std::sync::mpsc::Sender<io::Result<(u64, std::sync::mpsc::Sender<SessionCommand>)>>,
+        reply: &std::sync::mpsc::Sender<
+            io::Result<(u64, crossbeam_channel::Sender<SessionCommand>)>,
+        >,
     ) {
         // A session is just a conversation container — it can be
         // created, browsed, and deleted regardless of whether the
@@ -1324,7 +1332,7 @@ impl DaemonState {
     fn handle_attach_session(
         &mut self,
         session_id: u64,
-        reply: &std::sync::mpsc::Sender<io::Result<std::sync::mpsc::Sender<SessionCommand>>>,
+        reply: &std::sync::mpsc::Sender<io::Result<crossbeam_channel::Sender<SessionCommand>>>,
     ) {
         debug!("AttachSession: id={}", session_id);
         // Attaching to a session is allowed regardless of lock state.

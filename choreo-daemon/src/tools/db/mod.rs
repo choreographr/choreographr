@@ -90,7 +90,7 @@ pub(crate) mod tests {
         // between the two `db` modules.
         crate::db::kv_set(&db, 0, "__init__", b"").unwrap();
         crate::db::kv_delete(&db, 0, "__init__").unwrap();
-        let (daemon_tx, _daemon_rx) = std::sync::mpsc::channel();
+        let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded();
         let ctx = ToolContext::new(42, db, daemon_tx);
         (dir, ctx)
     }

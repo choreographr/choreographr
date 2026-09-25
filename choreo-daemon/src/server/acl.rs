@@ -272,7 +272,7 @@ pub fn append_key_locked(path: &Path, key: &[u8; 32]) -> Result<(), String> {
 /// coalesced into harmless no-ops. The thread is detached and lives until
 /// the process exits.
 pub fn spawn_acl_watcher(
-    daemon_tx: std::sync::mpsc::Sender<crate::daemon::DaemonCommand>,
+    daemon_tx: crossbeam_channel::Sender<crate::daemon::DaemonCommand>,
     acl_rx: crossbeam_channel::Receiver<crate::config_watch::ConfigChange>,
 ) {
     let _ = std::thread::Builder::new()

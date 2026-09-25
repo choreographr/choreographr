@@ -14,8 +14,8 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     /// Build a `ToolContext` with a mock daemon channel.
-    pub(crate) fn test_context() -> (ToolContext, std::sync::mpsc::Sender<DaemonCommand>) {
-        let (daemon_tx, daemon_rx) = std::sync::mpsc::channel::<DaemonCommand>();
+    pub(crate) fn test_context() -> (ToolContext, crossbeam_channel::Sender<DaemonCommand>) {
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
         let ctx = ToolContext::new(42, db, daemon_tx.clone());
