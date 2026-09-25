@@ -94,7 +94,7 @@ fn insert_str_at_cursor_empty_string_no_op() {
 #[test]
 fn paste_event_inserts_into_chat_input() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     app.input.text = "hel".to_string();
     app.input.cursor = 3;
@@ -107,7 +107,7 @@ fn paste_event_inserts_into_chat_input() {
 #[test]
 fn paste_event_inserts_into_chat_input_at_cursor() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     app.input.text = "heorld".to_string();
     app.input.cursor = 2;
@@ -119,7 +119,7 @@ fn paste_event_inserts_into_chat_input_at_cursor() {
 #[test]
 fn paste_event_ignored_during_fullscreen_overlay() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     app.input.text = "original".to_string();
     app.input.cursor = 8;
@@ -134,7 +134,7 @@ fn paste_event_ignored_during_fullscreen_overlay() {
 #[test]
 fn paste_event_noop_on_unhandled_page() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     // SessionManager page has no paste handler — should be a no-op.
     app.page = Page::SessionManager;
@@ -1030,7 +1030,7 @@ fn delete_to_start_when_at_zero_does_nothing() {
 #[test]
 fn terminal_event_enter_scrolls_to_bottom_from_scrolled_up() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     // Set a small viewport so even a few turns are scrollable.
     app.history_viewport = HistoryViewport {
@@ -1081,7 +1081,7 @@ fn terminal_event_submit_resets_cursor() {
     let mut app = test_app();
     app.input.text = "hello".to_string();
     app.input.cursor = 5;
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -1099,7 +1099,7 @@ fn terminal_event_arrow_keys_move_cursor() {
     let mut app = test_app();
     app.input.text = "abc".to_string();
     app.input.cursor = 3;
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
@@ -1123,7 +1123,7 @@ fn terminal_event_home_end_move_cursor() {
     let mut app = test_app();
     app.input.text = "abc".to_string();
     app.input.cursor = 1;
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
@@ -1147,7 +1147,7 @@ fn terminal_event_delete_removes_at_cursor() {
     let mut app = test_app();
     app.input.text = "abcd".to_string();
     app.input.cursor = 1;
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
@@ -1165,7 +1165,7 @@ fn terminal_event_backspace_uses_cursor() {
     let mut app = test_app();
     app.input.text = "abcd".to_string();
     app.input.cursor = 3;
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
@@ -1183,7 +1183,7 @@ fn terminal_event_inserts_char_at_cursor() {
     let mut app = test_app();
     app.input.text = "abd".to_string();
     app.input.cursor = 2;
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
@@ -1203,7 +1203,7 @@ fn terminal_event_ctrl_backspace_clears_draft_prompt() {
     // Cursor parked mid-text: clearing the draft must empty the whole
     // buffer regardless of where the cursor sits.
     app.input.cursor = 6;
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)),
@@ -1224,7 +1224,7 @@ fn terminal_event_ctrl_w_deletes_word_backward() {
     let mut app = test_app();
     app.input.text = "hello world".to_string();
     app.input.cursor = 11;
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)),
@@ -1242,7 +1242,7 @@ fn terminal_event_ctrl_u_deletes_to_start() {
     let mut app = test_app();
     app.input.text = "hello world".to_string();
     app.input.cursor = 6;
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
@@ -1260,7 +1260,7 @@ fn terminal_event_ctrl_delete_deletes_word_forward() {
     let mut app = test_app();
     app.input.text = "hello world foo".to_string();
     app.input.cursor = 6;
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL)),
@@ -1545,7 +1545,7 @@ fn history_nav_resets_after_commit() {
 fn terminal_event_up_down_navigates_history() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     add_user_text(&mut app, "older");
     add_user_text(&mut app, "recent");
@@ -1589,7 +1589,7 @@ fn terminal_event_up_down_navigates_history() {
 
 #[test]
 fn terminal_event_history_up_empty_does_nothing() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
 
     handle_terminal_event(
@@ -1603,7 +1603,7 @@ fn terminal_event_history_up_empty_does_nothing() {
 
 #[test]
 fn terminal_event_down_on_last_draft_line_goes_to_end_of_line() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     // Editing a multi-line draft with no history entry loaded: Down on the
     // last visual line must land at end-of-line (which for the last logical
@@ -1635,7 +1635,7 @@ fn terminal_event_down_on_last_draft_line_goes_to_end_of_line() {
 
 #[test]
 fn terminal_event_down_on_single_line_draft_goes_to_end() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.input.text = "hello".to_string();
     app.input.cursor = 2;
@@ -1651,7 +1651,7 @@ fn terminal_event_down_on_single_line_draft_goes_to_end() {
 
 #[test]
 fn terminal_event_up_on_nonempty_draft_moves_to_line_start() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     add_user_text(&mut app, "older");
     add_user_text(&mut app, "recent");
@@ -1675,7 +1675,7 @@ fn terminal_event_up_on_nonempty_draft_moves_to_line_start() {
 
 #[test]
 fn terminal_event_down_still_navigates_history_after_up() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     add_user_text(&mut app, "older");
     add_user_text(&mut app, "recent");
@@ -1714,7 +1714,7 @@ fn terminal_event_down_still_navigates_history_after_up() {
 
 #[test]
 fn terminal_event_editing_recalled_entry_detaches_it_into_draft() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     add_user_text(&mut app, "recent prompt");
 
@@ -1749,7 +1749,7 @@ fn terminal_event_editing_recalled_entry_detaches_it_into_draft() {
 
 #[test]
 fn terminal_event_ctrl_backspace_inert_while_browsing() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     add_user_text(&mut app, "recent prompt");
 
@@ -1777,7 +1777,7 @@ fn terminal_event_ctrl_backspace_inert_while_browsing() {
 
 #[test]
 fn terminal_event_ctrl_a_moves_cursor_to_line_start() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.input.text = "hello world".to_string();
     app.input.cursor = 11;
@@ -1795,7 +1795,7 @@ fn terminal_event_ctrl_a_moves_cursor_to_line_start() {
 
 #[test]
 fn terminal_event_ctrl_p_recalls_history_like_up() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     add_user_text(&mut app, "recent prompt");
 
@@ -1823,7 +1823,7 @@ fn terminal_event_ctrl_p_recalls_history_like_up() {
 
 #[test]
 fn terminal_event_ctrl_k_kills_to_line_end() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.input.text = "abc\ndef".to_string();
     app.input.cursor = 1;
@@ -1840,7 +1840,7 @@ fn terminal_event_ctrl_k_kills_to_line_end() {
 
 #[test]
 fn terminal_event_alt_char_while_browsing_does_not_detach() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     add_user_text(&mut app, "recent prompt");
 
@@ -1870,7 +1870,7 @@ fn terminal_event_alt_char_while_browsing_does_not_detach() {
 
 #[test]
 fn terminal_event_noop_ctrl_u_while_browsing_does_not_detach() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     add_user_text(&mut app, "recent prompt");
 
@@ -1905,7 +1905,7 @@ fn terminal_event_noop_ctrl_u_while_browsing_does_not_detach() {
 
 #[test]
 fn terminal_event_empty_paste_while_browsing_does_not_detach() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     add_user_text(&mut app, "recent prompt");
 
@@ -1929,7 +1929,7 @@ fn terminal_event_empty_paste_while_browsing_does_not_detach() {
 
 #[test]
 fn terminal_event_down_on_last_draft_line_wrapped_multibyte() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     // Wide characters end up in the middle of the last visual line; Down
     // must land on a char boundary at the very end, not inside a grapheme.
@@ -1960,7 +1960,7 @@ fn commit_does_not_duplicate_user_text() {
 #[allow(clippy::cast_possible_truncation)] // test indices/heights far below u16::MAX
 #[test]
 fn click_on_reasoning_header_toggles_collapse() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.history_viewport.width = 80;
     app.history_viewport.height = 20;
@@ -2026,7 +2026,7 @@ fn click_on_reasoning_header_toggles_collapse_when_content_fits_viewport() {
     // scrollbar), the content is anchored to the bottom of the viewport.
     // Clicking the reasoning header must resolve to the right content line
     // despite the blank band above it.
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.history_viewport.width = 80;
     app.history_viewport.height = 20;
@@ -2090,7 +2090,7 @@ fn click_on_tool_result_header_toggles_collapse() {
     // Clicking a tool result's header row (triangle + description) toggles
     // that result's collapsible body.  A quiet tool (read_file) defaults to
     // collapsed, so the first click expands it and the second collapses it.
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.history_viewport.width = 80;
     app.history_viewport.height = 20;
@@ -2192,7 +2192,7 @@ fn click_on_reasoning_header_toggles_collapse_when_scrolled() {
     // from the bottom the click mapping must account for the scroll offset
     // (content line `c` sits at screen row `vh - total + scroll + c`).  A
     // naive "content starts at row 0" mapping broke header clicks here.
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.history_viewport.width = 80;
     app.history_viewport.height = 10;
@@ -2315,7 +2315,7 @@ fn display_content_line(app: &App, turn_idx: usize) -> usize {
 
 #[test]
 fn scroll_mouse_outside_history_box_does_not_update_accumulator() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.history_viewport.height = 1;
 
@@ -2343,7 +2343,12 @@ fn scroll_mouse_outside_history_box_does_not_update_accumulator() {
 // ── Mouse click positions the input cursor ───────────────────
 
 /// Send a left-click at terminal (column, row) through the event pipeline.
-fn click_input(app: &mut App, tx: &std::sync::mpsc::Sender<ClientMessage>, column: u16, row: u16) {
+fn click_input(
+    app: &mut App,
+    tx: &crossbeam_channel::Sender<ClientMessage>,
+    column: u16,
+    row: u16,
+) {
     handle_terminal_event(
         Event::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -2359,7 +2364,7 @@ fn click_input(app: &mut App, tx: &std::sync::mpsc::Sender<ClientMessage>, colum
 
 #[test]
 fn mouse_click_in_input_box_positions_cursor() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.last_terminal_size = Some((80, 24));
     app.input.text = "hello".to_string();
@@ -2375,7 +2380,7 @@ fn mouse_click_in_input_box_positions_cursor() {
 
 #[test]
 fn mouse_click_in_input_box_left_padding_clamps_to_start() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.last_terminal_size = Some((80, 24));
     app.input.text = "hello".to_string();
@@ -2389,7 +2394,7 @@ fn mouse_click_in_input_box_left_padding_clamps_to_start() {
 
 #[test]
 fn mouse_click_in_input_box_past_line_end_clamps_to_end() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.last_terminal_size = Some((80, 24));
     app.input.text = "hello".to_string();
@@ -2403,7 +2408,7 @@ fn mouse_click_in_input_box_past_line_end_clamps_to_end() {
 
 #[test]
 fn mouse_click_on_input_box_border_does_not_move_cursor() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.last_terminal_size = Some((80, 24));
     app.input.text = "hello".to_string();
@@ -2420,7 +2425,7 @@ fn mouse_click_on_input_box_border_does_not_move_cursor() {
 
 #[test]
 fn mouse_click_in_input_box_second_line_of_multiline_text() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.last_terminal_size = Some((80, 24));
     app.input.text = "abc\ndef".to_string();
@@ -2436,7 +2441,7 @@ fn mouse_click_in_input_box_second_line_of_multiline_text() {
 
 #[test]
 fn mouse_click_in_input_box_wrapped_line() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.last_terminal_size = Some((80, 24));
     // Two words totalling 101 display columns: at inner width 76 this wraps
@@ -2730,7 +2735,7 @@ fn scroll_offset_clamped_to_valid_range() {
 
 #[test]
 fn alt_shift_m_opens_selector_like_alt_m() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
 
     // Alt+Shift+M arrives as Char('M') + ALT under the kitty protocol (the
@@ -2756,7 +2761,7 @@ fn alt_shift_m_opens_selector_like_alt_m() {
 
 #[test]
 fn shift_letter_inserts_uppercase_into_chat_input() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
 
     handle_terminal_event(
@@ -2774,7 +2779,7 @@ fn shift_letter_inserts_uppercase_into_chat_input() {
 
 #[test]
 fn shift_digit_inserts_symbol_into_chat_input() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
 
     // Shift+1 (kitty: Char('1') + SHIFT) must produce '!' like a legacy
@@ -2794,7 +2799,7 @@ fn shift_digit_inserts_symbol_into_chat_input() {
 
 #[test]
 fn shift_enter_still_inserts_newline() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
 
     // Shift+Enter is not a Char key, so normalisation must leave it alone and
@@ -2811,7 +2816,7 @@ fn shift_enter_still_inserts_newline() {
 
 #[test]
 fn model_selector_filter_receives_shifted_chars() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
     app.model_selector
@@ -2840,7 +2845,7 @@ fn model_selector_filter_receives_shifted_chars() {
 
 #[test]
 fn ime_text_event_must_not_insert_nul_into_chat_input() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.input.text = "xin chào".to_string();
     app.input.cursor = app.input.text.len();

@@ -1160,7 +1160,7 @@ impl App {
         account_name: Option<String>,
         selected_model: Option<String>,
         reasoning_effort: Option<String>,
-        client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+        client_tx: &crossbeam_channel::Sender<ClientMessage>,
     ) -> Result<(), ClientError> {
         // Agent-spawned sub-sessions (parent_session_id = Some) are transient
         // tool artifacts, not sessions the user opened.  Navigating to one
@@ -1240,7 +1240,7 @@ impl App {
         &mut self,
         session_id: u64,
         parent_session_id: Option<u64>,
-        client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+        client_tx: &crossbeam_channel::Sender<ClientMessage>,
     ) {
         tracing::debug!(
             session_id,
@@ -1534,7 +1534,7 @@ impl App {
     pub(crate) fn attach_to_session(
         &mut self,
         session_id: u64,
-        client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+        client_tx: &crossbeam_channel::Sender<ClientMessage>,
     ) -> Result<(), ClientError> {
         client_tx
             .send(ClientMessage::UnsubscribeSessionsSummary)
@@ -1579,7 +1579,7 @@ impl App {
         &mut self,
         finished_session_id: u64,
         parent_id: u64,
-        client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+        client_tx: &crossbeam_channel::Sender<ClientMessage>,
     ) -> Result<(), ClientError> {
         // Titles come from the summary list — the same source that told us
         // the sub-session's parent — falling back to "untitled" exactly like
@@ -1611,7 +1611,7 @@ impl App {
     pub(crate) fn handle_sessions(
         &mut self,
         sessions: &[SessionSummary],
-        client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+        client_tx: &crossbeam_channel::Sender<ClientMessage>,
     ) -> Result<(), ClientError> {
         self.session_mgr.set_sessions(sessions.to_vec());
         if self.page == Page::Chat {

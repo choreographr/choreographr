@@ -183,7 +183,7 @@ fn notify_disconnected(rx: &channel::Receiver<()>) -> bool {
 pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     tracing::info!("[choreo-tui] run_app starting");
 
-    let (client_tx, client_rx) = std::sync::mpsc::channel::<ClientMessage>();
+    let (client_tx, client_rx) = crossbeam_channel::unbounded::<ClientMessage>();
     // The address that keys this daemon's unlock key in known_servers: the
     // actual dial address for TCP, the unix socket path otherwise. Derived
     // up front (by reference) because `mode` is moved into the connection
@@ -198,7 +198,9 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         // true`), so per-daemon keys stay consistent.
         ConnectionMode::InProcess { .. } => choreo_proto::socket_path(),
     };
-    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
+    // The shutdown signal is a crossbeam control-plane channel (workspace
+    // channel convention): a single one-shot send, so capacity 1 suffices.
+    let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
     let (ui_tx, ui_rx) = channel::unbounded::<UiEvent>();
 
     let picker = build_picker();
@@ -668,7 +670,7 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
 fn run_ui_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
     ui_rx: &channel::Receiver<UiEvent>,
     image_result_rx: &channel::Receiver<ImageResult>,
     terminal_rx: &channel::Receiver<Event>,
@@ -937,7 +939,7 @@ fn shift_char(c: char) -> char {
 pub(crate) fn handle_terminal_event(
     event: Event,
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     // Normalise kitty-protocol SHIFT reporting before anything else so the
     // paste guard and all page handlers see legacy-equivalent events.
@@ -1110,7 +1112,7 @@ fn paste_into_text_state(state: &mut impl tui_prompts::State, data: &str) {
 fn handle_fullscreen_event(
     event: &Event,
     app: &mut App,
-    _client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    _client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) {
     let Event::Key(key) = event else {
         return;
@@ -1131,7 +1133,7 @@ fn handle_fullscreen_event(
 fn handle_ui_event(
     event: UiEvent,
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<bool, ClientError> {
     match event {
         UiEvent::Daemon(message) => {
@@ -1634,7 +1636,7 @@ mod tests {
     // ── Scrollbar-column click gating ──
 
     fn click_scrollbar_column(app: &mut App, row: u16) {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         handle_terminal_event(
             Event::Mouse(crossterm::event::MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
@@ -1737,7 +1739,7 @@ mod tests {
     /// Drive one mouse event through the full `handle_terminal_event` path
     /// (kitty normalization → page dispatch → Chat page mouse arms).
     fn send_mouse(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         handle_terminal_event(
             Event::Mouse(crossterm::event::MouseEvent {
                 kind,
@@ -2028,7 +2030,7 @@ mod tests {
     #[test]
     fn reader_closed_quits_with_message() {
         let mut app = test_app();
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
 
         assert!(
             !handle_ui_event(UiEvent::ReaderClosed, &mut app, &tx).expect("handle ReaderClosed"),
@@ -2049,7 +2051,7 @@ mod tests {
         // (and count as a re-render trigger) but never touch the views or
         // quit state.
         let mut app = test_app();
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
 
         let dirty = handle_ui_event(
             UiEvent::Status("no daemon running — starting choreographr…".to_string()),
@@ -2080,7 +2082,7 @@ mod tests {
         // (blank) status is observable rather than being overwritten by the
         // handler itself.
         let mut app = test_app();
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         handle_ui_event(UiEvent::Status("daemon started".to_string()), &mut app, &tx)
             .expect("handle Status");
         assert_eq!(app.status.as_deref(), Some("daemon started"));
@@ -2106,7 +2108,7 @@ mod tests {
         // A status the daemon itself set must survive subsequent daemon
         // traffic — only the transient connection-task flag is cleared.
         let mut app = test_app();
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         app.status = Some("a daemon-set status".to_string());
         app.status_is_transient = false;
 
@@ -2128,7 +2130,7 @@ mod tests {
         // the EOF. ReaderClosed must not overwrite that reason with the
         // generic "connection closed" text.
         let mut app = test_app();
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         handle_daemon_message(DaemonMessage::ShuttingDown, &mut app, &tx)
             .expect("handle ShuttingDown");
 

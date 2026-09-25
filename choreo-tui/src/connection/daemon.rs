@@ -15,7 +15,7 @@ use zeroize::Zeroize;
 pub(crate) fn handle_daemon_message(
     message: DaemonMessage,
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     // Dispatch per-variant handlers first, then let the generic
     // dispatch in choreo_client_core handle the rest (text notifications,
@@ -794,7 +794,7 @@ pub(crate) fn handle_daemon_message(
 /// already in flight on this connection.
 fn trigger_keystore_auto_bind(
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> bool {
     match attempt_keystore_auto_bind(&mut app.keystore_auto_bind, &app.connection_addr) {
         AutoBindAttempt::Bind { key, msg } => {
@@ -872,7 +872,7 @@ mod tests {
     /// dispatch's status/error handling needs a sender, but none of the
     /// lock-state messages send anything, so a disconnected sender works.
     fn dispatch(message: DaemonMessage, app: &mut App) {
-        let (tx, _rx) = std::sync::mpsc::channel::<ClientMessage>();
+        let (tx, _rx) = crossbeam_channel::unbounded::<ClientMessage>();
         handle_daemon_message(message, app, &tx).expect("handle_daemon_message");
     }
 
@@ -967,7 +967,7 @@ mod tests {
 
         // Unlike the plain `dispatch` helper, capture what the handler SENDS
         // (a Bound flow must never send anything itself).
-        let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
         handle_daemon_message(DaemonMessage::Bound, &mut app, &tx).unwrap();
 
         assert!(!app.keystore_locked, "Bound must clear the lock flag");
@@ -991,7 +991,7 @@ mod tests {
         // KeystoreUnbound) must be discarded before the bind mints its own.
         app.pending_unlock_key = Some(vec![5u8; 32]);
 
-        let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
         handle_daemon_message(
             DaemonMessage::KeystoreUnbound {
                 error: "keystore has no binding".into(),
@@ -1044,7 +1044,7 @@ mod tests {
         let mut app = test_app();
         app.connection_addr = "e2e-bind:1".to_string();
 
-        let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
         handle_daemon_message(
             DaemonMessage::KeystoreUnbound {
                 error: "unbound".into(),
@@ -1080,7 +1080,7 @@ mod tests {
         let mut app = test_app();
         app.connection_addr = "push-bind:1".to_string();
 
-        let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
         handle_daemon_message(
             DaemonMessage::Keystore {
                 state: KeystoreState::Unbound,
@@ -1123,7 +1123,7 @@ mod tests {
         // The status push latches the banner in both directions.
         let mut app = test_app();
         app.keystore_locked = false;
-        let (tx, _rx) = std::sync::mpsc::channel::<ClientMessage>();
+        let (tx, _rx) = crossbeam_channel::unbounded::<ClientMessage>();
         handle_daemon_message(
             DaemonMessage::Keystore {
                 state: KeystoreState::Locked,

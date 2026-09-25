@@ -16,7 +16,7 @@ use dioxus::prelude::*;
 #[component]
 pub(crate) fn Toolbar(
     state: Signal<AppState>,
-    tx: Signal<Option<std::sync::mpsc::Sender<ClientMessage>>>,
+    tx: Signal<Option<crossbeam_channel::Sender<ClientMessage>>>,
 ) -> Element {
     let on_ping = {
         let t = tx;
@@ -162,7 +162,7 @@ pub(crate) fn HistoryList(state: Signal<AppState>) -> Element {
 #[component]
 pub(crate) fn Composer(
     state: Signal<AppState>,
-    tx: Signal<Option<std::sync::mpsc::Sender<ClientMessage>>>,
+    tx: Signal<Option<crossbeam_channel::Sender<ClientMessage>>>,
 ) -> Element {
     let on_submit = {
         let t = tx;

@@ -10,7 +10,7 @@ use tui_prompts::State;
 pub(super) fn handle_ai_providers_event(
     event: &Event,
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     // The wizard and credential modals are dispatched from `handle_ui_event`
     // before this function; only the accounts list reaches here.
@@ -24,7 +24,7 @@ pub(super) fn handle_ai_providers_event(
 fn handle_ai_providers_list_key(
     key: crossterm::event::KeyEvent,
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     if key.kind != KeyEventKind::Press {
         return Ok(());
@@ -134,7 +134,7 @@ fn handle_ai_providers_list_key(
 fn handle_ai_providers_list_mouse(
     mouse: MouseEvent,
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     super::handle_full_page_list_mouse(
         app,
@@ -184,7 +184,7 @@ fn handle_ai_providers_list_mouse(
 pub(super) fn handle_credential_modal_event(
     event: &Event,
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) {
     let Event::Key(key) = event else {
         return;
@@ -262,7 +262,7 @@ pub(super) fn handle_credential_modal_event(
 pub(super) fn handle_polkadot_import_event(
     event: &Event,
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) {
     let Event::Key(key) = event else {
         return;
@@ -336,7 +336,7 @@ pub(super) fn handle_polkadot_import_event(
 ///
 /// The password is used only here (client-side), never logged and never sent
 /// to the daemon; it is zeroized on every exit path.
-fn submit_polkadot_import(app: &mut App, client_tx: &std::sync::mpsc::Sender<ClientMessage>) {
+fn submit_polkadot_import(app: &mut App, client_tx: &crossbeam_channel::Sender<ClientMessage>) {
     let name = app
         .ai_providers
         .polkadot_import
@@ -420,7 +420,7 @@ fn submit_polkadot_import(app: &mut App, client_tx: &std::sync::mpsc::Sender<Cli
 pub(super) fn handle_account_wizard_event(
     event: &Event,
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     match event {
         Event::Key(key) => {
@@ -564,7 +564,7 @@ pub(super) fn handle_account_wizard_event(
 /// key.
 fn submit_new_account(
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     let slug = app.ai_providers.wizard.slug.value().trim().to_string();
     let provider_str = app

@@ -104,7 +104,7 @@ impl App {
     /// next pass.
     pub(crate) fn flush_image_fetches(
         &mut self,
-        client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+        client_tx: &crossbeam_channel::Sender<ClientMessage>,
     ) {
         for (session_id, turn_id, img_idx) in self.pending_image_fetch.drain(..) {
             // Indices are small; use `try_from` so a hypothetical >u32 index
@@ -235,7 +235,7 @@ mod tests {
         // that actually has bytes (`byte_len > 0`) — never for one whose bytes
         // are already present, nor for a genuinely zero-byte image.
         let mut app = test_app();
-        let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
         let meta = |byte_len| choreo_proto::ImageMetadata {
             mime_type: "image/png".to_string(),
             width: 4,

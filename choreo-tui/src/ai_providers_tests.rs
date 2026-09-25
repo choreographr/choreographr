@@ -15,7 +15,7 @@ fn send_mouse(
     kind: MouseEventKind,
     column: u16,
     row: u16,
-    tx: &std::sync::mpsc::Sender<ClientMessage>,
+    tx: &crossbeam_channel::Sender<ClientMessage>,
 ) {
     handle_terminal_event(
         Event::Mouse(MouseEvent {
@@ -32,7 +32,7 @@ fn send_mouse(
 
 #[test]
 fn ai_providers_enter_selects_account_and_returns_to_chat() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.page = Page::AIProviders;
     app.ai_providers.set_accounts(vec![
@@ -71,7 +71,7 @@ fn ai_providers_enter_selects_account_and_returns_to_chat() {
 
 #[test]
 fn ai_providers_enter_without_selection_stays_on_page() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.page = Page::AIProviders;
     app.ai_providers.set_accounts(vec![AccountInfo {
@@ -101,7 +101,7 @@ fn ai_providers_enter_without_selection_stays_on_page() {
 
 #[test]
 fn ai_providers_list_click_selects_account_and_returns_to_chat() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.page = Page::AIProviders;
     app.ai_providers.set_accounts(vec![
@@ -145,7 +145,7 @@ fn ai_providers_list_click_selects_account_and_returns_to_chat() {
 
 #[test]
 fn ai_providers_list_click_selects_the_highlighted_account() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.page = Page::AIProviders;
     app.ai_providers.set_accounts(vec![
@@ -182,7 +182,7 @@ fn ai_providers_list_click_selects_the_highlighted_account() {
 
 #[test]
 fn ai_providers_list_click_outside_rows_is_noop() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.page = Page::AIProviders;
     app.ai_providers.set_accounts(vec![AccountInfo {
@@ -204,7 +204,7 @@ fn ai_providers_list_click_outside_rows_is_noop() {
 
 #[test]
 fn ai_providers_list_click_before_first_frame_is_noop() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.page = Page::AIProviders;
     app.ai_providers.set_accounts(vec![AccountInfo {
@@ -221,7 +221,7 @@ fn ai_providers_list_click_before_first_frame_is_noop() {
 
 #[test]
 fn ai_providers_list_wheel_scrolls_highlight() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.page = Page::AIProviders;
     app.ai_providers.set_accounts(vec![
@@ -247,7 +247,7 @@ fn ai_providers_list_wheel_scrolls_highlight() {
 #[test]
 fn paste_event_inserts_into_credential_modal() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     app.page = Page::AIProviders;
     app.ai_providers.credential.open("my-account".to_string());
@@ -260,7 +260,7 @@ fn paste_event_inserts_into_credential_modal() {
 #[test]
 fn paste_event_inserts_into_new_account_slug_field() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     app.page = Page::AIProviders;
     app.ai_providers.wizard.open();
@@ -278,7 +278,7 @@ fn paste_event_inserts_into_new_account_slug_field() {
 #[test]
 fn paste_event_goes_into_provider_filter() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     // Step 1 (provider picker) has a search filter — a paste lands there and
     // re-clamps the highlight against the narrowed list.
@@ -312,7 +312,7 @@ fn setup_providers_new_account(app: &mut App) {
 /// returning nothing.  `provider` is matched by slug.
 fn advance_to_slug_phase(
     app: &mut App,
-    tx: &std::sync::mpsc::Sender<ClientMessage>,
+    tx: &crossbeam_channel::Sender<ClientMessage>,
     provider: &str,
 ) {
     setup_providers_new_account(app);
@@ -348,7 +348,7 @@ fn ai_providers_new_account_starts_at_provider_step() {
 #[test]
 fn ai_providers_new_account_enter_advances_to_slug() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     setup_providers_new_account(&mut app);
 
     handle_terminal_event(
@@ -371,7 +371,7 @@ fn ai_providers_new_account_enter_advances_to_slug() {
 #[test]
 fn ai_providers_new_account_jk_types_into_provider_filter() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     setup_providers_new_account(&mut app);
 
     // j/k are NOT navigation keys in the provider picker: they must type into
@@ -434,7 +434,7 @@ fn ai_providers_new_account_jk_types_into_provider_filter() {
 #[test]
 fn ai_providers_new_account_arrows_navigate_provider_list() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     setup_providers_new_account(&mut app);
 
     // Arrow keys are the dedicated navigation in the provider picker (j/k are
@@ -469,7 +469,7 @@ fn ai_providers_new_account_arrows_navigate_provider_list() {
 #[test]
 fn ai_providers_new_account_provider_focus_clamps_at_edges() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     setup_providers_new_account(&mut app);
 
     // Up at the top stays at 0.
@@ -496,7 +496,7 @@ fn ai_providers_new_account_provider_focus_clamps_at_edges() {
 #[test]
 fn ai_providers_new_account_provider_page_keys_move_selection_by_page() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     setup_providers_new_account(&mut app);
 
     // PgDn moves the highlight by a page…
@@ -578,7 +578,7 @@ fn ai_providers_new_account_provider_window_keeps_selection_visible() {
 #[test]
 fn ai_providers_new_account_filter_narrows_provider_list() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     setup_providers_new_account(&mut app);
 
     // Typing filters by case-insensitive substring over display names.
@@ -624,7 +624,7 @@ fn ai_providers_new_account_filter_narrows_provider_list() {
 #[test]
 fn ai_providers_new_account_filter_no_match_blocks_enter() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     setup_providers_new_account(&mut app);
 
     // A filter with no matches empties the list; Enter must be a no-op (stay
@@ -655,7 +655,7 @@ fn ai_providers_new_account_filter_no_match_blocks_enter() {
 #[test]
 fn ai_providers_new_account_slug_validation_empty() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     advance_to_slug_phase(&mut app, &tx, "openai");
 
     // Enter on an empty slug should show an error and stay on the step.
@@ -680,7 +680,7 @@ fn ai_providers_new_account_slug_validation_empty() {
 #[test]
 fn ai_providers_new_account_slug_validation_invalid() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     advance_to_slug_phase(&mut app, &tx, "openai");
 
     // Type uppercase (invalid — must be lowercase).
@@ -711,7 +711,7 @@ fn ai_providers_new_account_slug_validation_invalid() {
 #[test]
 fn ai_providers_new_account_esc_aborts_wizard() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     setup_providers_new_account(&mut app);
 
     assert!(app.ai_providers.wizard.is_open());
@@ -731,7 +731,7 @@ fn ai_providers_new_account_esc_aborts_wizard() {
 #[test]
 fn ai_providers_new_account_esc_backs_to_provider_from_slug() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     advance_to_slug_phase(&mut app, &tx, "anthropic");
 
     let anthro_idx = app
@@ -764,7 +764,7 @@ fn ai_providers_new_account_esc_backs_to_provider_from_slug() {
 #[test]
 fn ai_providers_new_account_submit_creates_account_and_redirects_to_credential() {
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     advance_to_slug_phase(&mut app, &tx, "openai");
 
     // Type a valid slug.
@@ -826,7 +826,7 @@ fn ai_providers_new_account_submit_creates_account_and_redirects_to_credential()
 #[test]
 fn ai_providers_new_account_typing_goes_to_slug_field() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     advance_to_slug_phase(&mut app, &tx, "openai");
 
     // Slug is focused by default; typing goes into the slug buffer.
@@ -843,7 +843,7 @@ fn ai_providers_new_account_typing_goes_to_slug_field() {
 #[test]
 fn ai_providers_new_account_escaped_slug_input_not_leaked_to_credential() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     advance_to_slug_phase(&mut app, &tx, "openai");
 
     // 'k' on the slug page types into the slug field (it is not a nav key
@@ -864,7 +864,7 @@ fn ai_providers_new_account_escaped_slug_input_not_leaked_to_credential() {
 #[test]
 fn ai_providers_credential_added_refreshes_account_list() {
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     // Seed the accounts page with an account that has no credential yet.
     app.ai_providers.set_accounts(vec![AccountInfo {
@@ -909,7 +909,7 @@ fn ai_providers_credential_added_refreshes_account_list() {
 
 #[test]
 fn ai_providers_wizard_wheel_down_pins_at_middle_then_unpins() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.page = Page::AIProviders;
     app.ai_providers.wizard.open();
@@ -958,7 +958,7 @@ fn ai_providers_wizard_wheel_down_pins_at_middle_then_unpins() {
 
 #[test]
 fn ai_providers_wizard_wheel_up_mirrors_wheel_down() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.page = Page::AIProviders;
     app.ai_providers.wizard.open();
@@ -1010,7 +1010,7 @@ fn ai_providers_wizard_wheel_up_mirrors_wheel_down() {
 
 #[test]
 fn ai_providers_wizard_click_row_selects_provider() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.page = Page::AIProviders;
     app.ai_providers.wizard.open();
@@ -1045,7 +1045,7 @@ fn ai_providers_wizard_click_row_selects_provider() {
 
 #[test]
 fn ai_providers_wizard_click_row_maps_scroll_offset() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.page = Page::AIProviders;
     app.ai_providers.wizard.open();
@@ -1083,7 +1083,7 @@ fn ai_providers_wizard_click_row_maps_scroll_offset() {
 
 #[test]
 fn ai_providers_wizard_click_filter_row_positions_cursor() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.page = Page::AIProviders;
     app.ai_providers.wizard.open();
@@ -1119,7 +1119,7 @@ fn ai_providers_wizard_click_filter_row_positions_cursor() {
 
 #[test]
 fn ai_providers_wizard_click_outside_popup_is_noop() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.page = Page::AIProviders;
     app.ai_providers.wizard.open();
@@ -1135,7 +1135,7 @@ fn ai_providers_wizard_click_outside_popup_is_noop() {
 
 #[test]
 fn ai_providers_wizard_click_footer_is_noop() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.page = Page::AIProviders;
     app.ai_providers.wizard.open();
@@ -1162,7 +1162,7 @@ fn ai_providers_wizard_click_footer_is_noop() {
 
 #[test]
 fn ai_providers_wizard_click_below_visible_tail_is_noop() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.page = Page::AIProviders;
     app.ai_providers.wizard.open();

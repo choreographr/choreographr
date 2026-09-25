@@ -164,7 +164,7 @@ mod session_manager_key_tests {
 
     #[test]
     fn session_manager_esc_returns_to_chat() {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = make_sm_app();
 
         handle_terminal_event(
@@ -179,7 +179,7 @@ mod session_manager_key_tests {
 
     #[test]
     fn session_manager_q_returns_to_chat() {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = make_sm_app();
 
         handle_terminal_event(
@@ -194,7 +194,7 @@ mod session_manager_key_tests {
 
     #[test]
     fn session_manager_j_moves_selection_down() {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = make_sm_app();
         assert_eq!(app.session_mgr.selection, Some(0));
 
@@ -210,7 +210,7 @@ mod session_manager_key_tests {
 
     #[test]
     fn session_manager_enter_switches_session_and_returns_to_chat() {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = crossbeam_channel::unbounded();
         let mut app = make_sm_app();
 
         handle_terminal_event(
@@ -230,7 +230,7 @@ mod session_manager_key_tests {
 
     #[test]
     fn session_manager_ctrl_c_does_nothing() {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = make_sm_app();
 
         handle_terminal_event(
@@ -249,7 +249,7 @@ mod session_manager_key_tests {
         // The list's actions are bare-letter keys; a Ctrl chord must never fire
         // one.  `Ctrl+A` is readline beginning-of-line on the Chat input and
         // must not archive the highlighted session here.
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = crossbeam_channel::unbounded();
         let mut app = make_sm_app();
         app.session_mgr
             .set_sessions(vec![make_session(7, "s", "m", 1)]);
@@ -270,7 +270,7 @@ mod session_manager_key_tests {
 
     #[test]
     fn chat_alt_s_enters_session_manager() {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = crossbeam_channel::unbounded();
         let mut app = test_app();
         assert_eq!(app.page, Page::Chat);
 
@@ -290,7 +290,7 @@ mod session_manager_key_tests {
 
     #[test]
     fn chat_alt_s_highlights_previously_viewed_session() {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = test_app();
         // The user is viewing session 42 on the chat page.
         app.attached_session_id = Some(42);
@@ -322,7 +322,7 @@ mod session_manager_key_tests {
     fn chat_alt_s_remembers_viewed_session_before_list_arrives() {
         // First launch: no session list loaded yet when Alt+S is pressed,
         // so the highlight is deferred until the ListSessions reply arrives.
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = test_app();
         app.attached_session_id = Some(42);
 
@@ -354,7 +354,7 @@ mod session_manager_key_tests {
 
     #[test]
     fn session_manager_i_enters_detail() {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = make_sm_app();
 
         handle_terminal_event(
@@ -370,7 +370,7 @@ mod session_manager_key_tests {
 
     #[test]
     fn session_manager_tab_toggles_archived_view() {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = make_sm_app();
         assert_eq!(app.session_mgr.view, SessionManagerView::List);
 
@@ -393,7 +393,7 @@ mod session_manager_key_tests {
 
     #[test]
     fn session_manager_p_sends_toggled_pin() {
-        let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
         let mut app = make_sm_app();
         // The highlighted session (1) starts un-pinned.
         assert_eq!(app.session_mgr.sessions[0].session_id, 1);
@@ -431,7 +431,7 @@ mod session_manager_key_tests {
 
     #[test]
     fn session_manager_a_archives_on_list_and_unarchives_on_archived() {
-        let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
         let mut app = make_sm_app();
 
         handle_terminal_event(
@@ -472,7 +472,7 @@ mod session_manager_key_tests {
 
     #[test]
     fn session_manager_detail_b_returns_to_list() {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = make_sm_app();
         app.session_mgr.enter_detail();
         assert_eq!(app.session_mgr.view, SessionManagerView::Detail);
@@ -490,7 +490,7 @@ mod session_manager_key_tests {
 
     #[test]
     fn session_manager_detail_enter_switches_session() {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = crossbeam_channel::unbounded();
         let mut app = make_sm_app();
         app.session_mgr.enter_detail();
 
@@ -512,7 +512,7 @@ mod session_manager_key_tests {
     #[test]
     fn session_manager_n_sends_create_session() {
         let mut app = make_sm_app();
-        let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
 
         handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
@@ -538,7 +538,7 @@ mod session_manager_key_tests {
 
     #[test]
     fn session_manager_click_selects_and_attaches_session() {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = crossbeam_channel::unbounded();
         let mut app = make_sm_app();
         app.last_terminal_size = Some((100, 40));
         // The list renderer uses `window(viewport_height)` where viewport
@@ -575,7 +575,7 @@ mod session_manager_key_tests {
 
     #[test]
     fn session_manager_click_selects_the_highlighted_session() {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = make_sm_app();
         app.last_terminal_size = Some((100, 40));
         app.session_mgr.viewport_height = 36;
@@ -600,7 +600,7 @@ mod session_manager_key_tests {
 
     #[test]
     fn session_manager_click_header_and_border_are_noop() {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = crossbeam_channel::unbounded();
         let mut app = make_sm_app();
         app.last_terminal_size = Some((100, 40));
         app.session_mgr.viewport_height = 36;
@@ -638,7 +638,7 @@ mod session_manager_key_tests {
 
     #[test]
     fn session_manager_wheel_scrolls_highlight() {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = make_sm_app();
         app.last_terminal_size = Some((100, 40));
         app.session_mgr.viewport_height = 36;
@@ -964,7 +964,7 @@ fn session_switch_at_bottom_follows_new_background_content() {
 fn handle_session_state_keeps_accumulated_live_turn_over_snapshot_placeholder() {
     let mut app = test_app();
     app.attached_session_id = Some(7);
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     // Accumulated via the all-activity subscription: turn 5 is live-streaming.
     {
@@ -1038,7 +1038,7 @@ fn handle_session_state_keeps_accumulated_live_turn_over_snapshot_placeholder() 
 fn done_for_background_session_does_not_pollute_attached_display() {
     let mut app = test_app();
     app.attached_session_id = Some(0);
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     // The attached session already has its own token usage.
     app.display_for(0).token_usage = Some(TokenUsage {
         input_tokens: 1,
@@ -1185,7 +1185,7 @@ fn handle_turn_appended_with_displayed_image_populates_rendered_images() {
 #[test]
 fn model_selected_for_background_session_does_not_write_global_status() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     // The user is viewing session 42.
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
@@ -1224,7 +1224,7 @@ fn model_selected_for_background_session_does_not_write_global_status() {
 #[test]
 fn model_selected_for_attached_session_writes_status_feedback() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
 
@@ -1257,7 +1257,7 @@ fn model_selected_for_attached_session_writes_status_feedback() {
 #[test]
 fn reasoning_effort_set_for_background_session_does_not_write_global_status() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
     assert!(app.status.is_none() && app.error.is_none());
@@ -1285,7 +1285,7 @@ fn reasoning_effort_set_for_background_session_does_not_write_global_status() {
 #[test]
 fn reasoning_effort_set_for_attached_session_writes_status_feedback() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
 
@@ -1315,7 +1315,7 @@ fn reasoning_effort_set_for_attached_session_writes_status_feedback() {
 #[test]
 fn session_account_set_for_background_session_does_not_write_global_status() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
     assert!(app.status.is_none() && app.error.is_none());
@@ -1343,7 +1343,7 @@ fn session_account_set_for_background_session_does_not_write_global_status() {
 #[test]
 fn session_account_set_for_attached_session_writes_status_feedback() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
 
@@ -1370,7 +1370,7 @@ fn session_account_set_for_attached_session_writes_status_feedback() {
 #[test]
 fn reasoning_effort_set_failed_for_background_session_does_not_write_global_status_or_error() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
     assert!(app.status.is_none() && app.error.is_none());
@@ -1404,7 +1404,7 @@ fn reasoning_effort_set_failed_for_background_session_does_not_write_global_stat
 #[test]
 fn reasoning_effort_set_failed_for_attached_session_writes_status_and_error() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
 
@@ -1446,7 +1446,7 @@ fn reasoning_effort_set_failed_for_attached_session_writes_status_and_error() {
 #[test]
 fn reasoning_effort_set_connection_level_writes_status_feedback_for_attached_session() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
 
@@ -1487,7 +1487,7 @@ fn reasoning_effort_set_connection_level_writes_status_feedback_for_attached_ses
 #[test]
 fn reasoning_effort_set_failed_connection_level_writes_status_and_error() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
 
@@ -1525,7 +1525,7 @@ fn reasoning_effort_set_failed_connection_level_writes_status_and_error() {
 #[test]
 fn model_selection_failed_for_background_session_does_not_write_global_error() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
     assert!(app.status.is_none() && app.error.is_none());
@@ -1553,7 +1553,7 @@ fn model_selection_failed_for_background_session_does_not_write_global_error() {
 #[test]
 fn model_selection_failed_for_attached_session_writes_global_error() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
 
@@ -1582,7 +1582,7 @@ fn model_selection_failed_for_attached_session_writes_global_error() {
 #[test]
 fn model_selection_failed_connection_level_writes_global_error() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
 
@@ -1612,7 +1612,7 @@ fn model_selection_failed_connection_level_writes_global_error() {
 #[test]
 fn session_created_for_sub_session_does_not_hijack_chat_view() {
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     // The user is viewing session 42 on the Chat page.
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
@@ -1670,7 +1670,7 @@ fn session_created_for_sub_session_does_not_hijack_chat_view() {
 #[test]
 fn session_created_for_sub_session_on_session_manager_refreshes_list() {
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
     app.page = Page::SessionManager;
@@ -1713,7 +1713,7 @@ fn session_created_for_sub_session_on_session_manager_refreshes_list() {
 #[test]
 fn session_created_for_user_session_attaches_on_chat_page() {
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
 
@@ -1763,7 +1763,7 @@ fn session_created_for_user_session_on_session_manager_navigates() {
     // creates a session; the requester reply must navigate the creator to it
     // (attach + switch to the Chat page), not leave them stranded on the list.
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
     app.page = Page::SessionManager;
@@ -1823,7 +1823,7 @@ fn session_created_broadcast_does_not_attach_on_chat_page() {
     // only sees the broadcast `SessionCreated` (parent_session_id = None).
     // It must not move the view.
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
 
@@ -1869,7 +1869,7 @@ fn session_created_broadcast_does_not_attach_on_chat_page() {
 #[test]
 fn session_created_broadcast_on_session_manager_refreshes_list_only() {
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
     app.page = Page::SessionManager;
@@ -1991,7 +1991,7 @@ fn attached_subsession_finished_detects_active_to_idle_only() {
 #[test]
 fn subsession_finish_switches_back_to_parent_with_notification() {
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     // The user opened the sub-session 99 from the Session Manager and is now
     // reading it on the Chat page while it streams.
     app.attached_session_id = Some(99);
@@ -2046,7 +2046,7 @@ fn subsession_finish_switches_back_to_parent_with_notification() {
 #[test]
 fn subsession_finish_does_not_fire_on_duplicate_idle_broadcast() {
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     // The child already finished before the user opened it; its summary is
     // idle.  A re-broadcast of the idle status (summary refresh / re-attach)
     // must not yank the view back to the parent.
@@ -2082,7 +2082,7 @@ fn subsession_finish_does_not_fire_on_duplicate_idle_broadcast() {
 #[test]
 fn top_level_session_finish_does_not_switch() {
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
     app.session_mgr
@@ -2111,7 +2111,7 @@ fn top_level_session_finish_does_not_switch() {
 #[test]
 fn subsession_finish_with_missing_parent_does_not_switch() {
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     // The parent was deleted while the child ran; the summary only holds the
     // orphaned child.  The switch-back must not fire — attaching to a dead
     // session id would strand the user on a session the daemon rejects.
@@ -2146,7 +2146,7 @@ fn subsession_finish_with_missing_parent_does_not_switch() {
 #[test]
 fn session_attached_does_not_regress_accumulated_live_state() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     // The user is viewing session 42 and its display already accumulated live
     // state via the all-activity subscription while it was in the background:
     // fresher per-turn token usage plus a live streaming count.
@@ -2209,7 +2209,7 @@ fn session_attached_does_not_regress_accumulated_live_state() {
 
 #[test]
 fn handle_sessions_auto_attach_prefers_top_level_session() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     // Fresh App: nothing attached yet, on the chat page.
     let mut app = App::new();
     app.image_job_tx = None;
@@ -2238,7 +2238,7 @@ fn handle_sessions_auto_attach_prefers_top_level_session() {
 
     // A second Sessions reply in the same tick must not re-fire: attachment
     // state was set locally, so the guard skips the auto-attach.
-    let (tx2, rx2) = std::sync::mpsc::channel();
+    let (tx2, rx2) = crossbeam_channel::unbounded();
     app.handle_sessions(&[child.clone(), top.clone(), older.clone()], &tx2)
         .expect("handle_sessions should succeed");
     assert!(
@@ -2251,7 +2251,7 @@ fn handle_sessions_auto_attach_prefers_top_level_session() {
 fn handle_sessions_auto_attach_falls_back_to_child_when_no_top_level() {
     let mut app = App::new();
     app.image_job_tx = None;
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     let mut child = make_session(7, "sub", "m", 0);
     child.parent_session_id = Some(3);
@@ -2267,7 +2267,7 @@ fn handle_sessions_auto_attach_falls_back_to_child_when_no_top_level() {
 fn handle_sessions_empty_creates_default_session_without_working_dir() {
     let mut app = App::new();
     app.image_job_tx = None;
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     // The daemon reports no sessions, so the bootstrap auto-creates a
     // "default" session with no working directory: the TUI's own cwd must
@@ -2299,7 +2299,7 @@ fn handle_sessions_auto_attach_skips_archived_sessions() {
     // still pick the live session.
     let mut app = App::new();
     app.image_job_tx = None;
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     let mut archived = make_session(5, "archived", "m", 0);
     archived.archived_at = Some(1_705_314_000_500);
@@ -2322,7 +2322,7 @@ fn handle_sessions_only_archived_creates_default_instead_of_attaching() {
     // archived one.
     let mut app = App::new();
     app.image_job_tx = None;
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     let mut archived = make_session(5, "archived", "m", 0);
     archived.archived_at = Some(1_705_314_000_500);

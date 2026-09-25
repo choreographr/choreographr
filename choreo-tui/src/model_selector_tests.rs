@@ -14,7 +14,7 @@ fn send_mouse(
     kind: MouseEventKind,
     column: u16,
     row: u16,
-    tx: &std::sync::mpsc::Sender<ClientMessage>,
+    tx: &crossbeam_channel::Sender<ClientMessage>,
 ) {
     handle_terminal_event(
         Event::Mouse(MouseEvent {
@@ -33,7 +33,7 @@ fn send_mouse(
 
 #[test]
 fn chat_alt_m_opens_selector_and_requests_models() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
 
     handle_terminal_event(
@@ -54,7 +54,7 @@ fn ctrl_m_does_not_open_selector() {
     // The model selector moved to Alt+M; Ctrl+M is now readline's accept-line
     // (its legacy byte 0x0D is Enter).  On the Chat page it must neither open
     // the selector nor send anything.
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
 
     handle_terminal_event(
@@ -76,7 +76,7 @@ fn model_selector_label_is_alt_m() {
 
 #[test]
 fn model_selector_populates_from_models_reply() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
 
@@ -107,7 +107,7 @@ fn model_selector_populates_from_models_reply() {
 
 #[test]
 fn model_selector_enter_sends_set_model_and_closes() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
     app.model_selector.apply_models(
@@ -134,7 +134,7 @@ fn model_selector_enter_sends_set_model_and_closes() {
 
 #[test]
 fn model_selector_esc_closes_without_sending() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
 
@@ -154,7 +154,7 @@ fn model_selector_esc_closes_without_sending() {
 
 #[test]
 fn model_selector_filter_narrows_and_submits_highlighted() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
     app.model_selector.apply_models(
@@ -201,7 +201,7 @@ fn model_selector_filter_narrows_and_submits_highlighted() {
 
 #[test]
 fn model_selector_down_moves_highlight() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
     app.model_selector.apply_models(
@@ -222,7 +222,7 @@ fn model_selector_down_moves_highlight() {
 
 #[test]
 fn model_selector_models_reply_falls_through_when_closed() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
 
     // Selector closed: `/model` behavior — the reply prints into the status.
@@ -246,7 +246,7 @@ fn model_selector_models_reply_falls_through_when_closed() {
 
 #[test]
 fn model_selector_failed_reply_shows_error_when_open() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
 
@@ -266,7 +266,7 @@ fn model_selector_failed_reply_shows_error_when_open() {
 
 #[test]
 fn model_selector_paste_goes_to_filter() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
     app.model_selector
@@ -286,7 +286,7 @@ fn model_selector_paste_goes_to_filter() {
 #[allow(clippy::assert_is_empty)]
 #[test]
 fn model_selector_page_keys_jump_highlight() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
     app.model_selector
@@ -333,7 +333,7 @@ fn model_selector_page_keys_jump_highlight() {
 
 #[test]
 fn model_selector_wheel_down_scrolls_with_pin_behavior() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
     app.model_selector.viewport_height = 10;
@@ -378,7 +378,7 @@ fn model_selector_wheel_down_scrolls_with_pin_behavior() {
 
 #[test]
 fn model_selector_wheel_up_mirrors_wheel_down() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
     app.model_selector.viewport_height = 10;
@@ -420,7 +420,7 @@ fn model_selector_wheel_up_mirrors_wheel_down() {
 
 #[test]
 fn model_selector_click_row_selects_and_sends_set_model() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
     app.last_terminal_size = Some((100, 40));
@@ -463,7 +463,7 @@ fn model_selector_click_row_selects_and_sends_set_model() {
 
 #[test]
 fn model_selector_click_filter_row_positions_cursor() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
     app.last_terminal_size = Some((100, 40));
@@ -497,7 +497,7 @@ fn model_selector_click_filter_row_positions_cursor() {
 
 #[test]
 fn model_selector_click_outside_popup_is_noop() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
     app.last_terminal_size = Some((100, 40));
@@ -517,7 +517,7 @@ fn model_selector_click_outside_popup_is_noop() {
 
 #[test]
 fn model_selector_click_footer_is_noop() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
     app.last_terminal_size = Some((100, 40));
@@ -546,7 +546,7 @@ fn model_selector_click_footer_is_noop() {
 
 #[test]
 fn model_selector_click_after_page_jump_maps_to_drawn_row() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
     app.last_terminal_size = Some((100, 40));
@@ -611,7 +611,7 @@ fn model_selector_click_after_page_jump_maps_to_drawn_row() {
 
 #[test]
 fn model_selector_click_while_loading_is_noop() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
     app.last_terminal_size = Some((100, 40));
@@ -648,7 +648,7 @@ fn model_selector_click_while_loading_is_noop() {
 
 #[test]
 fn model_selector_click_after_failed_refresh_is_noop() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
     app.last_terminal_size = Some((100, 40));
@@ -684,7 +684,7 @@ fn model_selector_filter_row_click_while_loading_positions_cursor() {
     // The guard only skips *row* selection while the popup shows no list;
     // the filter row is still drawn, so clicking it must keep positioning
     // the cursor.
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
     app.last_terminal_size = Some((100, 40));

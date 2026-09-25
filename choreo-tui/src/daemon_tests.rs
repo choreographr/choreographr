@@ -14,7 +14,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 #[test]
 fn daemon_message_session_state_updates_progress_for_attached_session() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(7);
 
     handle_daemon_message(
@@ -63,7 +63,7 @@ fn daemon_message_session_state_updates_progress_for_attached_session() {
 #[test]
 fn daemon_message_session_state_sets_tool_groups() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     // Tool groups only reach the status bar when the snapshot belongs to the
     // attached session.
     app.attached_session_id = Some(7);
@@ -97,7 +97,7 @@ fn daemon_message_session_state_sets_tool_groups() {
 #[test]
 fn daemon_message_session_state_ignores_wrong_session() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(7);
 
     handle_daemon_message(
@@ -158,7 +158,7 @@ fn daemon_message_session_state_ignores_wrong_session() {
 #[test]
 fn daemon_message_done_with_token_usage_updates_progress() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     // Session 42 is the hypothetical attached session — a nonzero id the
     // daemon can actually assign (`Some(0)` would be wire-implausible: ids
     // start at 1, and `None` — not `0` — marks a connection-level reply).
@@ -198,7 +198,7 @@ fn daemon_message_done_with_token_usage_updates_progress() {
 #[test]
 fn daemon_message_done_without_token_usage_does_not_change_progress() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     // `Done` is a requires-origin event (the daemon always carries the real
     // session id in `Some`), so the fixture uses a nonzero id.
@@ -224,7 +224,7 @@ fn daemon_message_done_without_token_usage_does_not_change_progress() {
 #[test]
 fn live_output_token_count_from_background_session_does_not_pollute_status_bar() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     // The user is viewing session 0, which already has settled token usage.
     app.attached_session_id = Some(0);
     app.display_for(0).token_usage = Some(TokenUsage {
@@ -268,7 +268,7 @@ fn live_output_token_count_from_background_session_does_not_pollute_status_bar()
 #[test]
 fn live_output_token_count_updates_own_session_after_switch() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     // The user switches to session 7 mid-stream; reset_for_session_switch
     // preserved its accumulated live token estimate.
     app.attached_session_id = Some(7);
@@ -310,7 +310,7 @@ fn live_output_token_count_updates_own_session_after_switch() {
 #[test]
 fn session_state_snapshot_does_not_regress_fresher_token_usage() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(7);
 
     // While the session streamed in the background, the all-activity
@@ -368,7 +368,7 @@ fn session_state_snapshot_does_not_regress_fresher_token_usage() {
 #[test]
 fn session_state_snapshot_with_newer_larger_usage_updates_display() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(7);
 
     // The display holds an older total; the snapshot is authoritative and
@@ -423,7 +423,7 @@ fn session_state_snapshot_with_newer_larger_usage_updates_display() {
 #[test]
 fn session_state_snapshot_does_not_regress_fresher_last_prompt_tokens() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(7);
 
     // The display already holds the fresher value (a mid-turn
@@ -467,7 +467,7 @@ fn session_state_snapshot_does_not_regress_fresher_last_prompt_tokens() {
 #[test]
 fn session_state_snapshot_fills_missing_last_prompt_tokens() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(7);
 
     // No value shown yet — the snapshot's value must still be applied
@@ -511,7 +511,7 @@ fn enter_continue_when_attached_sends_continue_generation() {
     let mut app = test_app();
     app.attached_session_id = Some(1);
     app.input.text = "/continue ".to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -531,7 +531,7 @@ fn enter_continue_when_not_attached_shows_error() {
     let mut app = test_app();
     app.attached_session_id = None;
     app.input.text = "/continue ".to_string();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -560,7 +560,7 @@ fn enter_continue_scrolls_to_bottom() {
     let scrolled = app.effective_scroll();
     assert!(scrolled > 0, "should be scrolled up");
     app.input.text = "/continue ".to_string();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -577,7 +577,7 @@ fn enter_stop_when_attached_sends_cancel_all() {
     let mut app = test_app();
     app.attached_session_id = Some(1);
     app.input.text = "/stop ".to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -596,7 +596,7 @@ fn enter_stop_when_not_attached_shows_error() {
     let mut app = test_app();
     app.attached_session_id = None;
     app.input.text = "/stop ".to_string();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -612,7 +612,7 @@ fn enter_stop_when_not_attached_shows_error() {
 fn enter_undo_sends_undo() {
     let mut app = test_app();
     app.input.text = "/undo ".to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -630,7 +630,7 @@ fn enter_undo_sends_undo() {
 fn enter_redo_sends_redo() {
     let mut app = test_app();
     app.input.text = "/redo ".to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -658,7 +658,7 @@ fn enter_stop_does_not_scroll() {
     let scrolled = app.effective_scroll();
     assert!(scrolled > 0, "should be scrolled up");
     app.input.text = "/stop ".to_string();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -679,7 +679,7 @@ fn enter_stop_does_not_scroll() {
 #[test]
 fn ctrl_r_no_session_shows_message() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     app.attached_session_id = None;
     app.display_for(0).reasoning_capability = Some(ReasoningCapability {
@@ -707,7 +707,7 @@ fn ctrl_r_no_session_shows_message() {
 #[test]
 fn ctrl_r_no_active_display_shows_message() {
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     // No session attached at all: there is no display whose capability
     // could be consulted, so fall back to the established no-session
@@ -729,7 +729,7 @@ fn ctrl_r_no_active_display_shows_message() {
 #[test]
 fn ctrl_r_cycles_through_valid_slugs() {
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     app.display_for(0).reasoning_capability = Some(ReasoningCapability {
         available_effort_levels: vec![
@@ -812,7 +812,7 @@ fn ctrl_r_cycles_through_valid_slugs() {
 #[test]
 fn ctrl_r_no_model_selected_shows_message() {
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     // No model selected yet and no capability reported.  `None` here must
     // NOT be reported as "model does not support reasoning" — the user
@@ -840,7 +840,7 @@ fn ctrl_r_no_model_selected_shows_message() {
 #[test]
 fn ctrl_r_model_selected_capability_pending_shows_message() {
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     // A model is selected but the daemon has not reported its reasoning
     // capability yet — must not be reported as "does not support reasoning".
@@ -867,7 +867,7 @@ fn ctrl_r_model_selected_capability_pending_shows_message() {
 #[test]
 fn ctrl_r_google_off_on() {
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     // Google Gemini style: only "off" and "on".
     app.display_for(0).reasoning_capability = Some(ReasoningCapability {
@@ -910,7 +910,7 @@ fn ctrl_r_google_off_on() {
 #[test]
 fn reasoning_effort_set_updates_session_state() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     app.attached_session_id = Some(42);
 
@@ -943,7 +943,7 @@ fn reasoning_effort_set_updates_session_state() {
 #[test]
 fn reasoning_effort_set_for_background_session_does_not_touch_attached_display() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     // The user is viewing session 42.
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
@@ -983,7 +983,7 @@ fn reasoning_effort_set_for_background_session_does_not_touch_attached_display()
 #[test]
 fn model_selected_for_background_session_does_not_touch_attached_display() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     // The user is viewing session 42.
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
@@ -1019,7 +1019,7 @@ fn model_selected_for_background_session_does_not_touch_attached_display() {
 #[test]
 fn model_selected_for_attached_session_updates_display_and_summary() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     // The user is viewing session 42, which is also the attached session.
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
@@ -1059,7 +1059,7 @@ fn model_selected_for_attached_session_updates_display_and_summary() {
 #[test]
 fn reasoning_effort_set_for_attached_session_updates_display_and_summary() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
     app.display_for(42).reasoning_effort = Some("off".to_string());
@@ -1094,7 +1094,7 @@ fn reasoning_effort_set_for_attached_session_updates_display_and_summary() {
 #[test]
 fn session_account_set_for_background_session_does_not_touch_attached_display() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
     app.display_for(42).account_name = Some("main-account".to_string());
@@ -1127,7 +1127,7 @@ fn session_account_set_for_background_session_does_not_touch_attached_display() 
 #[test]
 fn reasoning_effort_set_failed_for_background_session_does_not_touch_attached_display() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
     app.display_for(42).reasoning_effort = Some("high".to_string());
@@ -1158,7 +1158,7 @@ fn reasoning_effort_set_failed_for_background_session_does_not_touch_attached_di
 #[test]
 fn ctrl_r_with_empty_capability_shows_message() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     // Capability exists but has empty available_effort_levels.
     app.display_for(0).reasoning_capability = Some(ReasoningCapability {
@@ -1183,7 +1183,7 @@ fn ctrl_r_with_empty_capability_shows_message() {
 #[test]
 fn session_flags_changed_updates_list_and_archived_split() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.session_mgr.set_sessions(vec![
         make_session(1, "a", "m", 0),
         make_session(2, "b", "m", 0),
@@ -1246,7 +1246,7 @@ fn session_flags_changed_updates_list_and_archived_split() {
 fn session_failed_for_pin_and_archive_sets_page_error() {
     let mut app = test_app();
     app.page = Page::SessionManager;
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     assert!(app.session_mgr.error.is_none());
 
     handle_daemon_message(

@@ -157,7 +157,7 @@ fn handle_continue_when_attached_sends_continue_generation() {
     let mut state = AppState::new("/tmp/choreographr.sock");
     state.attached_session_id = Some(42);
     state.next_request_id = 5;
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     handle_shell_command(&mut state, Some(tx), Command::Continue);
 
@@ -185,7 +185,7 @@ fn handle_continue_when_not_attached_shows_error() {
 fn handle_stop_when_attached_sends_cancel_all() {
     let mut state = AppState::new("/tmp/choreographr.sock");
     state.attached_session_id = Some(42);
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     handle_shell_command(&mut state, Some(tx), Command::Stop);
 
@@ -211,7 +211,7 @@ fn handle_stop_when_not_attached_shows_error() {
 #[test]
 fn handle_undo_sends_undo_message() {
     let mut state = AppState::new("/tmp/choreographr.sock");
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     handle_shell_command(&mut state, Some(tx), Command::Undo);
 
@@ -222,7 +222,7 @@ fn handle_undo_sends_undo_message() {
 #[test]
 fn handle_redo_sends_redo_message() {
     let mut state = AppState::new("/tmp/choreographr.sock");
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     handle_shell_command(&mut state, Some(tx), Command::Redo);
 
@@ -237,7 +237,7 @@ fn bound_message_records_the_pending_key() {
     let (_dir, _guard) = choreo_client_core::test_support::isolate_config();
     let mut state = AppState::new("/tmp/choreographr.sock");
     state.pending_unlock_key = Some(vec![3u8; 32]);
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     apply_daemon_message(&mut state, DaemonMessage::Bound, Some(tx));
 
@@ -258,7 +258,7 @@ fn keystore_unbound_auto_binds_once() {
     let mut state = AppState::new("/tmp/choreographr.sock");
     // A stale verify-only pending key must be discarded by the unbound arm.
     state.pending_unlock_key = Some(vec![5u8; 32]);
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     apply_daemon_message(
         &mut state,
@@ -307,7 +307,7 @@ fn keystore_unbound_status_push_auto_binds() {
     // auto-bind as the `KeystoreUnbound` reply.
     let (_dir, _guard) = choreo_client_core::test_support::isolate_config();
     let mut state = AppState::new("/tmp/choreographr.sock");
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     apply_daemon_message(
         &mut state,

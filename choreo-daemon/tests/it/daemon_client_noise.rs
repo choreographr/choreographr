@@ -85,9 +85,9 @@ const LARGE_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 /// test can join it with a bounded `recv_timeout` instead of a blocking
 /// `thread::join`.
 struct NoiseClient {
-    from_ui: mpsc::Sender<ClientMessage>,
+    from_ui: crossbeam_channel::Sender<ClientMessage>,
     rx: mpsc::Receiver<DaemonMessage>,
-    shutdown_tx: mpsc::Sender<()>,
+    shutdown_tx: crossbeam_channel::Sender<()>,
     result_rx: mpsc::Receiver<Result<(), ClientError>>,
 }
 
@@ -104,8 +104,8 @@ impl NoiseClient {
     /// the thread's result is sent; if the thread panics first, the
     /// thread-local dies with the thread and leaks nothing.
     fn connect(addr: &str, server_pk: &[u8; 32], key_dir: PathBuf) -> Self {
-        let (from_ui, to_daemon) = mpsc::channel::<ClientMessage>();
-        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+        let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
+        let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
         let (tx, rx) = mpsc::channel::<DaemonMessage>();
         let (result_tx, result_rx) = mpsc::channel::<Result<(), ClientError>>();
         let addr = addr.to_string();
@@ -300,9 +300,9 @@ fn noise_and_unix_share_daemon_state() {
     // Minimal inline Unix client: spawn `run_daemon_connection` in a
     // thread. Only send + recv + join are needed here — the full Client
     // helper lives in daemon_client_unix.rs.
-    let (from_ui, to_daemon) = mpsc::channel::<ClientMessage>();
+    let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
     let (tx, rx) = mpsc::channel::<DaemonMessage>();
-    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+    let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
     let socket = daemon.socket_str();
     let unix_handle = thread::spawn(move || {
         run_daemon_connection(
@@ -756,8 +756,8 @@ fn connect_xx(
     confirm: bool,
     learned_tx: mpsc::Sender<[u8; 32]>,
 ) -> NoiseClient {
-    let (from_ui, to_daemon) = mpsc::channel::<ClientMessage>();
-    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+    let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
+    let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
     let (tx, rx) = mpsc::channel::<DaemonMessage>();
     let (result_tx, result_rx) = mpsc::channel::<Result<(), ClientError>>();
     let addr = addr.to_string();

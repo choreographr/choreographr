@@ -42,14 +42,14 @@ const RELOAD_DEADLINE: Duration = Duration::from_secs(10);
 /// to what this test needs. The keypair override must be re-installed inside
 /// the connection thread (thread-local) — see the doc comment there.
 struct Client {
-    from_ui: mpsc::Sender<choreo_proto::ClientMessage>,
+    from_ui: crossbeam_channel::Sender<choreo_proto::ClientMessage>,
     rx: mpsc::Receiver<choreo_proto::DaemonMessage>,
     result_rx: mpsc::Receiver<Result<(), ClientError>>,
 }
 
 impl Client {
     fn connect(addr: &str, server_pk: &[u8; 32], key_dir: PathBuf) -> Self {
-        let (from_ui, to_daemon) = mpsc::channel();
+        let (from_ui, to_daemon) = crossbeam_channel::unbounded();
         let (tx, rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
         let addr = addr.to_string();
@@ -203,9 +203,9 @@ fn acl_add_from_local_client_enrolls_new_tcp_client() {
     // the reader can be severed deterministically at teardown (the daemon
     // does not close an idle connection just because the client's writer
     // side dropped).
-    let (from_ui, to_daemon) = mpsc::channel();
+    let (from_ui, to_daemon) = crossbeam_channel::unbounded();
     let (tx, rx) = mpsc::channel();
-    let (unix_shutdown_tx, unix_shutdown_rx) = mpsc::channel();
+    let (unix_shutdown_tx, unix_shutdown_rx) = crossbeam_channel::bounded::<()>(1);
     let socket = daemon.socket_str();
     let unix_handle = thread::spawn(move || {
         run_daemon_connection(

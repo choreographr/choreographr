@@ -13,13 +13,9 @@ use choreo_transport::key::ensure_transport_keypair;
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use std::fmt;
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-/// Poll step for the writer's shutdown/queue select loop.
-const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Read `DaemonMessages` from `reader` in a blocking loop, calling
 /// `handle_daemon_message` for each successfully decoded message.
 ///
@@ -82,8 +78,8 @@ pub fn run_daemon_reader<R: BufRead>(
 pub fn run_daemon_connection(
     socket_path: &str,
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: mpsc::Receiver<choreo_proto::ClientMessage>,
-    shutdown_rx: Option<mpsc::Receiver<()>>,
+    from_ui: CrossbeamReceiver<choreo_proto::ClientMessage>,
+    shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     info!("connecting to daemon at {socket_path}");
     let stream = connect_unix(socket_path)?;
@@ -117,8 +113,8 @@ pub fn run_daemon_connection_with_autostart(
     socket_path: &str,
     ensure_daemon: &mut dyn FnMut() -> Result<(), ClientError>,
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: mpsc::Receiver<choreo_proto::ClientMessage>,
-    shutdown_rx: Option<mpsc::Receiver<()>>,
+    from_ui: CrossbeamReceiver<choreo_proto::ClientMessage>,
+    shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     info!("connecting to daemon at {socket_path}");
     let stream = match connect_unix(socket_path) {
@@ -142,33 +138,38 @@ pub fn run_daemon_connection_with_autostart(
 fn pump_connection(
     stream: UnixStream,
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: mpsc::Receiver<choreo_proto::ClientMessage>,
-    shutdown_rx: Option<mpsc::Receiver<()>>,
+    from_ui: CrossbeamReceiver<choreo_proto::ClientMessage>,
+    shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     let reader = BufReader::new(stream.try_clone()?);
     let mut writer = BufWriter::new(stream);
 
     // Channel to signal the writer thread to stop when the reader finishes.
-    let (writer_shutdown_tx, writer_shutdown_rx) = mpsc::channel::<()>();
+    // `bounded(1)` is a crossbeam control-plane channel (workspace convention):
+    // the reader sends at most one stop signal, so capacity 1 never blocks it.
+    let (writer_shutdown_tx, writer_shutdown_rx) = crossbeam_channel::bounded::<()>(1);
 
     let writer_handle = thread::spawn(move || {
         loop {
-            match from_ui.recv_timeout(SHUTDOWN_POLL_INTERVAL) {
-                Ok(msg) => {
-                    if let Err(e) = write_message(&mut writer, &msg) {
-                        warn!("writer thread write error: {e}");
-                        break;
+            // Event-driven wait: block until EITHER a UI message arrives OR the
+            // reader signals shutdown — no polling.  The message arm is FIRST
+            // and the select is BIASED, so a queue that already holds messages
+            // is fully drained before a simultaneous stop signal is honoured,
+            // matching the previous drain-then-stop behaviour exactly.
+            crossbeam_channel::select_biased! {
+                recv(from_ui) -> msg => match msg {
+                    Ok(msg) => {
+                        if let Err(e) = write_message(&mut writer, &msg) {
+                            warn!("writer thread write error: {e}");
+                            break;
+                        }
+                        let _ = writer.flush();
                     }
-                    let _ = writer.flush();
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Poll the shutdown signal periodically so we don't hang
-                    // indefinitely on recv() when the daemon disconnects.
-                    if writer_shutdown_rx.try_recv().is_ok() {
-                        break;
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    // `from_ui` closed: the UI is done sending.
+                    Err(_) => break,
+                },
+                // The reader finished (or dropped its sender): stop the writer.
+                recv(writer_shutdown_rx) -> _ => break,
             }
         }
     });
@@ -176,6 +177,8 @@ fn pump_connection(
     if let Some(shutdown_rx) = shutdown_rx {
         let shutdown_stream = reader.get_ref().try_clone()?;
         thread::spawn(move || {
+            // Crossbeam `recv()` returns a `Result`; a disconnected sender
+            // still means "shut down", so the value is ignored either way.
             let _ = shutdown_rx.recv();
             let _ = shutdown_stream.shutdown(std::net::Shutdown::Both);
         });
@@ -252,12 +255,13 @@ impl Default for ConnectionMode {
 ///
 /// Uses two blocking threads:
 /// - Reader thread: blocks on `NoiseStream::recv_daemon_message()`
-/// - Writer thread: blocks on `from_ui.recv_timeout()`
+/// - Writer thread: blocks in a `select_biased!` on `from_ui` (drained first)
+///   and an internal writer-shutdown channel
 /// - Shutdown: blocks on `shutdown_rx.recv()`, then shuts down the TCP stream
 ///
 /// The reader thread has no read timeout — it blocks until a message arrives
-/// or the connection is closed. The writer thread uses a short timeout on its
-/// channel receive so it can also check for shutdown signals.
+/// or the connection is closed. The writer thread blocks until a real message
+/// or the internal stop signal arrives (no polling).
 ///
 /// # Errors
 ///
@@ -270,8 +274,8 @@ pub fn run_daemon_tcp_connection(
     addr: &str,
     server_pk: &[u8; 32],
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: mpsc::Receiver<ClientMessage>,
-    shutdown_rx: Option<mpsc::Receiver<()>>,
+    from_ui: CrossbeamReceiver<ClientMessage>,
+    shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     info!("connecting to daemon at {addr}");
 
@@ -330,8 +334,8 @@ fn ik_handshake_and_serve(
     client_sk: &[u8; 32],
     server_pk: &[u8; 32],
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: mpsc::Receiver<ClientMessage>,
-    shutdown_rx: Option<mpsc::Receiver<()>>,
+    from_ui: CrossbeamReceiver<ClientMessage>,
+    shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     let noise = ik_handshake_raw(tcp, client_sk, server_pk).map_err(|e| {
         ClientError::Io(std::io::Error::new(
@@ -371,8 +375,8 @@ fn ik_handshake_and_serve(
 pub fn run_daemon_tcp_connection_xx_first_contact(
     addr: &str,
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: mpsc::Receiver<ClientMessage>,
-    shutdown_rx: Option<mpsc::Receiver<()>>,
+    from_ui: CrossbeamReceiver<ClientMessage>,
+    shutdown_rx: Option<CrossbeamReceiver<()>>,
     on_first_contact: impl FnOnce([u8; 32]) -> bool,
 ) -> Result<(), ClientError> {
     info!("first-contact connect to daemon at {addr}");
@@ -410,7 +414,8 @@ pub fn run_daemon_tcp_connection_xx_first_contact(
 ///
 /// Uses two blocking threads:
 /// - Reader thread (the caller's): blocks on `NoiseStream::recv_daemon_message()`
-/// - Writer thread: blocks on `from_ui.recv_timeout()`
+/// - Writer thread: blocks in a `select_biased!` on `from_ui` (drained first)
+///   and an internal writer-shutdown channel
 /// - Shutdown: blocks on `shutdown_rx.recv()`, then shuts down the TCP stream
 ///
 /// Extracted so [`run_daemon_tcp_connection`] (IK) and
@@ -420,32 +425,32 @@ pub fn run_daemon_tcp_connection_xx_first_contact(
 fn serve_noise_connection(
     mut noise: choreo_transport::noise::NoiseStream,
     mut handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: mpsc::Receiver<ClientMessage>,
-    shutdown_rx: Option<mpsc::Receiver<()>>,
+    from_ui: CrossbeamReceiver<ClientMessage>,
+    shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
-    // Channel to signal writer thread to stop when reader finishes.
-    let (writer_shutdown_tx, writer_shutdown_rx) = mpsc::channel::<()>();
+    // Channel to signal the writer thread to stop when the reader finishes.
+    // `bounded(1)` crossbeam control-plane channel; the reader sends at most
+    // one stop signal, so capacity 1 never blocks it (workspace convention).
+    let (writer_shutdown_tx, writer_shutdown_rx) = crossbeam_channel::bounded::<()>(1);
 
-    // Writer thread: blocks on from_ui.recv_timeout(), sends via NoiseStream.
-    // The timeout is only so the writer can check the shutdown signal —
-    // no socket-level timeout is set.
+    // Writer thread: event-driven `select_biased!` over the outgoing-message
+    // channel and the internal stop signal, sending via NoiseStream.  The
+    // message arm is FIRST (biased) so queued UI messages are drained before a
+    // simultaneous stop is honoured; no socket-level timeout is set.
     let mut writer = noise.try_clone().map_err(ClientError::Io)?;
     let writer_handle = thread::spawn(move || {
         loop {
-            match from_ui.recv_timeout(SHUTDOWN_POLL_INTERVAL) {
-                Ok(msg) => {
-                    if let Err(e) = writer.send_client_message(&msg) {
-                        warn!("writer thread error: {e}");
-                        break;
+            crossbeam_channel::select_biased! {
+                recv(from_ui) -> msg => match msg {
+                    Ok(msg) => {
+                        if let Err(e) = writer.send_client_message(&msg) {
+                            warn!("writer thread error: {e}");
+                            break;
+                        }
                     }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Check for shutdown signal so we don't hang on recv.
-                    if writer_shutdown_rx.try_recv().is_ok() {
-                        break;
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(_) => break,
+                },
+                recv(writer_shutdown_rx) -> _ => break,
             }
         }
     });
@@ -454,6 +459,8 @@ fn serve_noise_connection(
     if let Some(shutdown_rx) = shutdown_rx {
         let stream_ref = noise.get_ref().try_clone().map_err(ClientError::Io)?;
         thread::spawn(move || {
+            // Crossbeam `recv()` returns a `Result`; a disconnected sender
+            // still means "shut down", so the value is ignored either way.
             let _ = shutdown_rx.recv();
             let _ = stream_ref.shutdown(std::net::Shutdown::Both);
         });
@@ -648,8 +655,8 @@ pub fn verify_daemon_authorization(addr: &str, server_pk: &[u8; 32]) -> Result<(
 pub fn run_daemon_tcp_connection_pinned(
     addr: &str,
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: mpsc::Receiver<ClientMessage>,
-    shutdown_rx: Option<mpsc::Receiver<()>>,
+    from_ui: CrossbeamReceiver<ClientMessage>,
+    shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     let known = crate::known_servers::KnownServers::load()?;
     let pinned = known
@@ -720,10 +727,11 @@ pub fn run_daemon_tcp_connection_pinned(
 ///   `handle_daemon_message`; the loop ends when the daemon drops its sender
 ///   (channel close IS the EOF — mapped to the same clean `Ok(())` the unix
 ///   path returns on EOF, so `UiEvent::ReaderClosed` semantics are identical).
-/// - Writer: a dedicated thread draining `from_ui` (std mpsc) into
-///   `daemon_tx` — the same `recv_timeout` + shutdown-flag structure the
-///   socket modes use. Dropping `from_ui` ends the writer, which drops the
-///   last client-side `daemon_tx` end — the daemon's embedded connection sees
+/// - Writer: a dedicated thread draining `from_ui` into `daemon_tx` — an
+///   event-driven `select_biased!` over `from_ui` (drained first) and the
+///   internal writer-shutdown channel (the same structure the socket modes
+///   use). Dropping `from_ui` ends the writer, which drops the last
+///   client-side `daemon_tx` end — the daemon's embedded connection sees
 ///   channel close (= EOF) and runs its normal cleanup.
 ///
 /// Shutdown is COOPERATIVE in-process (a deliberate difference from the TCP
@@ -738,50 +746,43 @@ fn run_daemon_connection_in_process(
     daemon_tx: CrossbeamSender<ClientMessage>,
     daemon_rx: CrossbeamReceiver<DaemonMessage>,
     mut handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: mpsc::Receiver<ClientMessage>,
-    shutdown_rx: Option<mpsc::Receiver<()>>,
+    from_ui: CrossbeamReceiver<ClientMessage>,
+    shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) {
     info!("serving in-process (embedded daemon) connection");
 
     // Internal writer-shutdown channel — same shape as the socket modes: the
-    // reader signals it when it finishes, and the optional external
-    // shutdown signal fans into it too (cooperative stop for the writer
-    // only; see the function doc for why the reader cannot be force-closed).
-    // crossbeam per the workspace's channel-selection convention (this is
-    // new code in choreo-client-core): a one-shot flag channel needs no
-    // payload or backpressure, but new channels default to crossbeam here.
-    // The `from_ui` parameter itself stays std `mpsc`: its type is the
-    // pre-existing public signature shared with the socket modes.
-    let (writer_shutdown_tx, writer_shutdown_rx) = crossbeam_channel::bounded::<()>(0);
+    // reader signals it when it finishes, and the optional external shutdown
+    // signal fans into it too (cooperative stop for the writer only; see the
+    // function doc for why the reader cannot be force-closed). `bounded(1)`
+    // crossbeam control-plane channel: the reader sends at most one stop
+    // signal, so capacity 1 never blocks it (workspace channel convention).
+    let (writer_shutdown_tx, writer_shutdown_rx) = crossbeam_channel::bounded::<()>(1);
 
-    // Writer thread: drains `from_ui` into `daemon_tx` — the identical
-    // recv_timeout + shutdown-check loop the socket writer threads run; a
-    // crossbeam send of a value replaces the socket write, and a failed send
-    // (all daemon-side receivers dropped) is the broken-pipe analogue.
+    // Writer thread: drains `from_ui` into `daemon_tx` via an event-driven
+    // `select_biased!` — a crossbeam send of a value replaces the socket
+    // write, and a failed send (all daemon-side receivers dropped) is the
+    // broken-pipe analogue.  The message arm is FIRST (biased) so queued UI
+    // messages are drained before a simultaneous stop is honoured.
     let writer_handle = thread::spawn(move || {
         loop {
-            match from_ui.recv_timeout(SHUTDOWN_POLL_INTERVAL) {
-                Ok(msg) => {
-                    if daemon_tx.send(msg).is_err() {
-                        warn!("writer thread: daemon receiver gone (embedded connection closed)");
-                        break;
+            crossbeam_channel::select_biased! {
+                recv(from_ui) -> msg => match msg {
+                    Ok(msg) => {
+                        if daemon_tx.send(msg).is_err() {
+                            warn!(
+                                "writer thread: daemon receiver gone (embedded connection closed)"
+                            );
+                            break;
+                        }
                     }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Poll the shutdown signal periodically so we don't hang
-                    // indefinitely on recv() when the daemon disconnects.
-                    // `try_recv` on a zero-capacity channel is the rendezvous-
-                    // free obvious check; a success (the reader's send landed)
-                    // means stop. `Empty` is the normal in-service case.
-                    match writer_shutdown_rx.try_recv() {
-                        Ok(()) | Err(crossbeam_channel::TryRecvError::Disconnected) => break,
-                        Err(crossbeam_channel::TryRecvError::Empty) => {}
-                    }
-                }
-                // `from_ui` closed: the UI is done sending. Dropping
-                // `daemon_tx` (owned by this thread) is what delivers EOF to
-                // the daemon's embedded connection.
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    // `from_ui` closed: the UI is done sending. Dropping
+                    // `daemon_tx` (owned by this thread) is what delivers EOF
+                    // to the daemon's embedded connection.
+                    Err(_) => break,
+                },
+                // The reader finished (or the external shutdown fired): stop.
+                recv(writer_shutdown_rx) -> _ => break,
             }
         }
     });
@@ -821,8 +822,8 @@ fn run_daemon_connection_in_process(
 pub fn run_daemon_connection_with_mode(
     mode: ConnectionMode,
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: mpsc::Receiver<ClientMessage>,
-    shutdown_rx: Option<mpsc::Receiver<()>>,
+    from_ui: CrossbeamReceiver<ClientMessage>,
+    shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     match mode {
         ConnectionMode::UnixSocket(path) => {
@@ -867,14 +868,14 @@ mod in_process_tests {
     /// real embedded daemon signals disconnect.
     fn make_link() -> (
         ConnectionMode,
-        mpsc::Sender<ClientMessage>,
-        mpsc::Receiver<ClientMessage>,
+        CrossbeamSender<ClientMessage>,
+        CrossbeamReceiver<ClientMessage>,
         crossbeam_channel::Receiver<ClientMessage>,
         crossbeam_channel::Sender<DaemonMessage>,
     ) {
         let (client_tx, client_rx) = crossbeam_channel::unbounded::<ClientMessage>();
         let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonMessage>();
-        let (from_ui_tx, from_ui_rx) = mpsc::channel::<ClientMessage>();
+        let (from_ui_tx, from_ui_rx) = crossbeam_channel::unbounded::<ClientMessage>();
         let mode = ConnectionMode::InProcess {
             daemon_tx: client_tx,
             daemon_rx,
@@ -887,7 +888,7 @@ mod in_process_tests {
     /// receiver of every `DaemonMessage` it handled, in order.
     fn spawn_connection(
         mode: ConnectionMode,
-        from_ui: mpsc::Receiver<ClientMessage>,
+        from_ui: CrossbeamReceiver<ClientMessage>,
         handle: impl FnMut(DaemonMessage) + Send + 'static,
     ) -> thread::JoinHandle<(
         Result<(), ClientError>,
@@ -1115,7 +1116,7 @@ mod in_process_tests {
             hook_calls += 1;
             Err(ClientError::DaemonStart("test: no daemon".to_string()))
         };
-        let (from_ui_tx, from_ui_rx) = mpsc::channel::<ClientMessage>();
+        let (from_ui_tx, from_ui_rx) = crossbeam_channel::unbounded::<ClientMessage>();
         drop(from_ui_tx); // the pump's writer thread ends immediately
 
         let error = run_daemon_connection_with_autostart(

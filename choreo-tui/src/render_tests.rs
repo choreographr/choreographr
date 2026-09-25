@@ -682,7 +682,7 @@ fn session_list_scrolls_down_then_up_directionally() {
     // update_viewport_from_terminal_size does.
     app.session_mgr.viewport_height = 20;
 
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
     let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
 

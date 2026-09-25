@@ -82,7 +82,7 @@ fn oversized_history_item_keeps_visible_tail() {
 #[test]
 fn terminal_event_appends_characters() {
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
@@ -106,7 +106,7 @@ fn terminal_event_appends_characters() {
 fn terminal_event_submits_run_input() {
     let mut app = test_app();
     app.input.text = "hello".to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -138,7 +138,7 @@ fn submitting_prompt_while_locked_is_rejected_with_feedback() {
     app.attached_session_id = Some(42);
     app.keystore_locked = true;
     app.input.text = "hello".to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -169,7 +169,7 @@ fn submitting_prompt_while_locked_is_rejected_with_feedback() {
 // available so the user can still e.g. `/cancel`.
 
 /// Drive a bare Enter keypress through the full terminal-event pipeline.
-fn press_enter(app: &mut App, tx: &std::sync::mpsc::Sender<ClientMessage>) {
+fn press_enter(app: &mut App, tx: &crossbeam_channel::Sender<ClientMessage>) {
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         app,
@@ -186,7 +186,7 @@ fn submitting_prompt_while_busy_is_rejected_and_preserves_input() {
     app.attached_status = Some(SessionStatus::Inference);
     app.input.text = "hello".to_string();
     app.input.cursor = 5;
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     press_enter(&mut app, &tx);
 
@@ -212,7 +212,7 @@ fn submitting_prompt_while_sleeping_is_rejected() {
     app.attached_session_id = Some(42);
     app.attached_status = Some(SessionStatus::Sleeping);
     app.input.text = "hello".to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     press_enter(&mut app, &tx);
 
@@ -229,7 +229,7 @@ fn submitting_prompt_while_idle_is_sent() {
     app.attached_session_id = Some(42);
     app.attached_status = Some(SessionStatus::Inactive);
     app.input.text = "hello".to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     press_enter(&mut app, &tx);
 
@@ -251,7 +251,7 @@ fn submitting_prompt_with_unknown_status_fails_open() {
     app.attached_session_id = Some(42);
     app.attached_status = None;
     app.input.text = "hello".to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     press_enter(&mut app, &tx);
 
@@ -272,7 +272,7 @@ fn slash_command_is_accepted_while_busy() {
     app.attached_session_id = Some(42);
     app.attached_status = Some(SessionStatus::Inference);
     app.input.text = "/ping ".to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     press_enter(&mut app, &tx);
 
@@ -291,7 +291,7 @@ fn empty_submission_while_busy_is_a_noop() {
     app.attached_session_id = Some(42);
     app.attached_status = Some(SessionStatus::Inference);
     app.input.text = String::new();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     press_enter(&mut app, &tx);
 
@@ -300,7 +300,7 @@ fn empty_submission_while_busy_is_a_noop() {
 }
 
 /// Drive an Alt+Enter keypress through the full terminal-event pipeline.
-fn press_alt_enter(app: &mut App, tx: &std::sync::mpsc::Sender<ClientMessage>) {
+fn press_alt_enter(app: &mut App, tx: &crossbeam_channel::Sender<ClientMessage>) {
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
         app,
@@ -318,7 +318,7 @@ fn alt_enter_while_busy_is_rejected_by_the_same_guard() {
     let mut app = test_app();
     app.attached_session_id = Some(42);
     app.attached_status = Some(SessionStatus::ToolCall("shell".into()));
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     press_alt_enter(&mut app, &tx);
 
@@ -340,7 +340,7 @@ fn alt_enter_while_locked_is_rejected_by_the_same_guard() {
     app.attached_session_id = Some(42);
     app.attached_status = Some(SessionStatus::Inactive);
     app.keystore_locked = true;
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     press_alt_enter(&mut app, &tx);
 
@@ -354,7 +354,7 @@ fn alt_enter_while_idle_is_sent() {
     let mut app = test_app();
     app.attached_session_id = Some(42);
     app.attached_status = Some(SessionStatus::Inactive);
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     press_alt_enter(&mut app, &tx);
 
@@ -373,7 +373,7 @@ fn continue_command_while_busy_is_rejected_by_the_same_guard() {
     app.attached_session_id = Some(42);
     app.attached_status = Some(SessionStatus::Inference);
     app.input.text = "/continue ".to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     press_enter(&mut app, &tx);
 
@@ -394,7 +394,7 @@ fn continue_command_while_locked_is_rejected_by_the_same_guard() {
     app.attached_status = Some(SessionStatus::Inactive);
     app.keystore_locked = true;
     app.input.text = "/continue ".to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     press_enter(&mut app, &tx);
 
@@ -405,7 +405,7 @@ fn continue_command_while_locked_is_rejected_by_the_same_guard() {
 
 #[test]
 fn terminal_event_esc_noop_on_chat() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
 
     let mut app = test_app();
     handle_terminal_event(
@@ -421,7 +421,7 @@ fn terminal_event_esc_noop_on_chat() {
 
 #[test]
 fn terminal_event_ctrl_c_noop_on_chat() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
 
     handle_terminal_event(
@@ -442,7 +442,7 @@ fn terminal_event_ctrl_c_noop_on_chat() {
 
 #[test]
 fn global_alt_q_quits_from_chat() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
 
     handle_terminal_event(
@@ -457,7 +457,7 @@ fn global_alt_q_quits_from_chat() {
 
 #[test]
 fn global_alt_q_quits_from_session_manager() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.page = Page::SessionManager;
 
@@ -473,7 +473,7 @@ fn global_alt_q_quits_from_session_manager() {
 
 #[test]
 fn global_alt_q_quits_from_ai_providers() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.page = Page::AIProviders;
 
@@ -489,7 +489,7 @@ fn global_alt_q_quits_from_ai_providers() {
 
 #[test]
 fn ctrl_p_does_not_insert_char_on_chat() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.input.text = "hello".to_string();
     app.input.cursor = 5;
@@ -511,7 +511,7 @@ fn ctrl_p_does_not_insert_char_on_chat() {
 
 #[test]
 fn alt_x_does_not_insert_char_on_chat() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.input.text = "hello".to_string();
     app.input.cursor = 5;
@@ -530,7 +530,7 @@ fn alt_x_does_not_insert_char_on_chat() {
 
 #[test]
 fn chat_alt_h_toggles_help() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.show_help_overlay = false;
 
@@ -546,7 +546,7 @@ fn chat_alt_h_toggles_help() {
 
 #[test]
 fn chat_alt_h_double_toggle_returns_to_off() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.show_help_overlay = false;
 
@@ -569,7 +569,7 @@ fn chat_alt_h_double_toggle_returns_to_off() {
 
 #[test]
 fn chat_alt_a_enters_ai_providers() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
 
     handle_terminal_event(
@@ -586,7 +586,7 @@ fn chat_alt_a_enters_ai_providers() {
 
 #[test]
 fn chat_alt_up_sends_undo() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
 
     handle_terminal_event(
@@ -602,7 +602,7 @@ fn chat_alt_up_sends_undo() {
 
 #[test]
 fn chat_alt_down_sends_redo() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
 
     handle_terminal_event(
@@ -618,7 +618,7 @@ fn chat_alt_down_sends_redo() {
 
 #[test]
 fn chat_esc_stops_active_session() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.attached_session_id = Some(42);
 
@@ -636,7 +636,7 @@ fn chat_esc_stops_active_session() {
 
 #[test]
 fn chat_esc_no_session_shows_status() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.attached_session_id = None;
 
@@ -652,7 +652,7 @@ fn chat_esc_no_session_shows_status() {
 
 #[test]
 fn chat_alt_enter_continues_generation() {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.attached_session_id = Some(42);
     let next_id = app.next_request_id;
@@ -685,7 +685,7 @@ fn chat_alt_enter_continues_generation() {
 
 #[test]
 fn chat_alt_enter_no_session_shows_status() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.attached_session_id = None;
 
@@ -716,7 +716,7 @@ mod unsent_draft_tests {
     /// Attach to a session with a fresh (empty) display, mirroring what
     /// `attach_to_session` does for a session the user has never opened.
     fn attach(app: &mut App, session_id: u64) {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         app.attach_to_session(session_id, &tx)
             .expect("attach_to_session succeeds");
     }
@@ -768,7 +768,7 @@ mod unsent_draft_tests {
 
     #[test]
     fn submitting_prompt_clears_session_draft() {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = test_app();
         app.attached_session_id = Some(1);
         app.display_for(1);
@@ -798,7 +798,7 @@ mod unsent_draft_tests {
 
     #[test]
     fn switching_while_browsing_history_does_not_stash_recalled_entry() {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = test_app();
         app.attached_session_id = Some(1);
         app.active_session_id = Some(1);
@@ -845,7 +845,7 @@ mod unsent_draft_tests {
 
     #[test]
     fn session_manager_switch_preserves_unsent_prompt_per_session() {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = test_app();
         app.page = Page::SessionManager;
         app.session_mgr.set_sessions(vec![
@@ -983,7 +983,7 @@ mod unsent_draft_tests {
 
     #[test]
     fn editing_history_entry_becomes_the_draft_on_switch() {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = test_app();
         app.attached_session_id = Some(1);
         app.active_session_id = Some(1);
@@ -1043,7 +1043,7 @@ mod unsent_draft_tests {
         // The slash command shows immediate feedback and sends RefreshModels;
         // the reply arrives asynchronously.
         let mut app = test_app();
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = crossbeam_channel::unbounded();
 
         handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -1074,7 +1074,7 @@ mod unsent_draft_tests {
     #[test]
     fn models_refreshed_updates_status() {
         let mut app = test_app();
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
 
         handle_daemon_message(
             DaemonMessage::ModelsRefreshed {
@@ -1122,7 +1122,7 @@ mod unsent_draft_tests {
     #[test]
     fn models_refresh_failed_sets_error() {
         let mut app = test_app();
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
 
         handle_daemon_message(
             DaemonMessage::ModelsRefreshFailed {
@@ -1141,7 +1141,7 @@ mod unsent_draft_tests {
     #[test]
     fn catalog_updated_replaces_provider_list_and_clamps_selection() {
         let mut app = test_app();
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
 
         // The default list starts from PROVIDER_OPTIONS (208 entries); park
         // the wizard highlight deep in the list.
@@ -1184,7 +1184,7 @@ mod unsent_draft_tests {
         // The daemon sends CatalogUpdated on every activity-subscribe; an
         // identical payload must not overwrite an unrelated status message.
         let mut app = test_app();
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         app.status = Some("busy".to_string());
 
         let providers = app
@@ -1316,7 +1316,7 @@ mod unsent_draft_tests {
     #[test]
     fn credential_modal_c_opens_and_esc_cancels() {
         let mut app = test_app();
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         app.page = Page::AIProviders;
         app.ai_providers.set_accounts(vec![AccountInfo {
             name: "main".to_string(),
@@ -1346,7 +1346,7 @@ mod unsent_draft_tests {
     #[test]
     fn credential_modal_empty_key_shows_error() {
         let mut app = test_app();
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         app.ai_providers.credential.open("main".to_string());
 
         // Enter with no key pasted shows the error and keeps the modal open.
@@ -1366,7 +1366,7 @@ mod unsent_draft_tests {
     #[test]
     fn account_add_failed_closes_credential_modal() {
         let mut app = test_app();
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         // The credential modal auto-opens right after submit; the daemon then
         // rejects the account.
         app.ai_providers.credential.open("my-account".to_string());
@@ -1393,7 +1393,7 @@ mod unsent_draft_tests {
     #[test]
     fn account_add_failed_does_not_close_unrelated_credential_modal() {
         let mut app = test_app();
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         // The failure reply can arrive AFTER the user has dismissed the
         // wizard's auto-opened modal and opened a different account's key
         // modal — that in-progress input must survive the late reply.
@@ -1436,7 +1436,7 @@ mod unsent_draft_tests {
     #[test]
     fn daemon_message_evicted_quits_with_message() {
         let mut app = test_app();
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
 
         handle_daemon_message(DaemonMessage::Evicted, &mut app, &tx).expect("handle Evicted");
 
@@ -1451,7 +1451,7 @@ mod unsent_draft_tests {
     #[test]
     fn daemon_message_shutting_down_quits_with_message() {
         let mut app = test_app();
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = crossbeam_channel::unbounded();
 
         handle_daemon_message(DaemonMessage::ShuttingDown, &mut app, &tx)
             .expect("handle ShuttingDown");
@@ -1472,7 +1472,7 @@ mod unsent_draft_tests {
 // drive the full terminal-event pipeline to pin the end-to-end behavior.
 
 /// Send one unmodified key through the full terminal-event pipeline.
-fn press(app: &mut App, tx: &std::sync::mpsc::Sender<ClientMessage>, code: KeyCode) {
+fn press(app: &mut App, tx: &crossbeam_channel::Sender<ClientMessage>, code: KeyCode) {
     handle_terminal_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), app, tx)
         .expect("handle key");
 }
@@ -1480,7 +1480,7 @@ fn press(app: &mut App, tx: &std::sync::mpsc::Sender<ClientMessage>, code: KeyCo
 #[test]
 fn typing_slash_on_empty_prompt_starts_a_command_line() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     assert!(!app.command_palette_active(), "inactive before typing");
 
     press(&mut app, &tx, KeyCode::Char('/'));
@@ -1497,7 +1497,7 @@ fn typing_slash_on_empty_prompt_starts_a_command_line() {
 #[test]
 fn typing_further_narrows_palette_to_model() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     press(&mut app, &tx, KeyCode::Char('/'));
     for c in ['m', 'o'] {
         press(&mut app, &tx, KeyCode::Char(c));
@@ -1514,7 +1514,7 @@ fn typing_further_narrows_palette_to_model() {
 #[test]
 fn palette_up_down_move_the_highlight() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     press(&mut app, &tx, KeyCode::Char('/'));
     assert_eq!(app.command_palette_focused(), 0);
 
@@ -1529,7 +1529,7 @@ fn palette_up_down_move_the_highlight() {
 #[test]
 fn palette_tab_completes_name_without_submitting() {
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     press(&mut app, &tx, KeyCode::Char('/'));
     for c in ['m', 'o'] {
         press(&mut app, &tx, KeyCode::Char(c));
@@ -1552,7 +1552,7 @@ fn palette_tab_completes_name_without_submitting() {
 #[test]
 fn palette_enter_runs_the_command_and_clears_the_line() {
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     press(&mut app, &tx, KeyCode::Char('/'));
     for c in "model".chars() {
         press(&mut app, &tx, KeyCode::Char(c));
@@ -1582,7 +1582,7 @@ fn palette_shift_enter_runs_the_command_without_a_newline() {
     // single-line, so `Shift+Enter` runs the command exactly like plain
     // `Enter` (both are intercepted before the prompt's newline binding).
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     press(&mut app, &tx, KeyCode::Char('/'));
     for c in "model".chars() {
         press(&mut app, &tx, KeyCode::Char(c));
@@ -1626,7 +1626,7 @@ fn palette_enter_on_empty_line_runs_the_highlighted_command() {
     // row is highlighted — no preceding `Tab`.  Drive to `/session` (wherever
     // it sits in the alphabetical catalog) so the assertion can name it.
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     press(&mut app, &tx, KeyCode::Char('/'));
     assert!(app.command_palette_active());
     assert_eq!(app.command_palette_focused(), 0);
@@ -1664,7 +1664,7 @@ fn palette_enter_on_a_partial_token_runs_the_highlighted_command() {
     // Typing a prefix narrows the palette; Enter runs the highlighted command
     // without a `Tab` completing it first.
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     press(&mut app, &tx, KeyCode::Char('/'));
     for c in "mo".chars() {
         press(&mut app, &tx, KeyCode::Char(c));
@@ -1691,7 +1691,7 @@ fn palette_enter_runs_the_row_the_arrows_selected() {
     // current catalog position (the catalog is alphabetical, so this is not
     // hardcoded to a fixed row).
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     press(&mut app, &tx, KeyCode::Char('/'));
     let model_row = palette_row_of("model");
     for _ in 0..model_row {
@@ -1714,7 +1714,7 @@ fn palette_enter_runs_an_unknown_command() {
     // `command_palette_active()` must stay TRUE with zero matches, so an
     // unmatched line still submits (and the daemon/parser reports it).
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     press(&mut app, &tx, KeyCode::Char('/'));
     for c in "zzz-no-such-command".chars() {
         press(&mut app, &tx, KeyCode::Char(c));
@@ -1747,7 +1747,7 @@ fn palette_esc_discards_the_command_line_without_cancelling() {
     let mut app = test_app();
     // A live session means the normal Esc would send Cancel.
     app.attached_session_id = Some(42);
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     press(&mut app, &tx, KeyCode::Char('/'));
     assert!(app.command_palette_active());
 
@@ -1767,7 +1767,7 @@ fn palette_esc_discards_the_command_line_without_cancelling() {
 #[test]
 fn slash_with_existing_text_inserts_literally() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.input.text = "hi".to_string();
     app.input.cursor = 2;
 
@@ -1785,7 +1785,7 @@ fn deleting_the_slash_hides_the_palette() {
     // The palette is derived from the buffer — a `/` starts a command line —
     // so deleting that one character returns to a plain prompt.
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     press(&mut app, &tx, KeyCode::Char('/'));
     assert!(app.command_palette_active());
 
@@ -1805,7 +1805,7 @@ fn a_double_slash_is_run_verbatim_never_silently_prepended() {
     // what runs (rejected as unknown), never a hidden extra `/` turning a
     // typed `/acl` into `//acl`.
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     press(&mut app, &tx, KeyCode::Char('/'));
     press(&mut app, &tx, KeyCode::Char('/'));
     for c in "acl".chars() {
@@ -1829,7 +1829,7 @@ fn literal_slash_command_line_runs() {
     // A `/model` line set directly (e.g. pasted) is a command line (the buffer
     // starts with `/`) and runs when submitted.
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     app.input.text = "/model".to_string();
     app.input.cursor = "/model".len();
 
@@ -1842,7 +1842,7 @@ fn literal_slash_command_line_runs() {
 
 #[test]
 fn attaching_a_session_discards_a_command_line_without_a_draft() {
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.attached_session_id = Some(1);
     app.display_for(1);
@@ -1872,7 +1872,7 @@ fn alt_r_cycles_reasoning_effort() {
     app.display_for(0).reasoning_capability = Some(ReasoningCapability {
         available_effort_levels: vec!["off".into(), "low".into(), "high".into()],
     });
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
@@ -1894,7 +1894,7 @@ fn alt_r_cycles_reasoning_effort() {
 #[test]
 fn alt_s_opens_session_manager() {
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT)),
@@ -1919,7 +1919,7 @@ fn alt_s_opens_session_manager() {
 #[test]
 fn alt_m_opens_selector_and_requests_models() {
     let mut app = test_app();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT)),
@@ -1936,7 +1936,7 @@ fn alt_m_opens_selector_and_requests_models() {
 #[test]
 fn quit_command_sets_should_quit() {
     let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
+    let (tx, _rx) = crossbeam_channel::unbounded();
     app.input.text = "/quit ".to_string();
 
     press_enter(&mut app, &tx);

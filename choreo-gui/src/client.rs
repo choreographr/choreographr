@@ -14,7 +14,7 @@ use zeroize::Zeroize;
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn run_client(
     mode: ConnectionMode,
-    client_rx: std::sync::mpsc::Receiver<ClientMessage>,
+    client_rx: crossbeam_channel::Receiver<ClientMessage>,
     ui_tx: UnboundedSender<UiEvent>,
 ) -> Result<(), ClientError> {
     let result = run_daemon_connection_with_mode(
@@ -37,7 +37,7 @@ pub(crate) fn run_client(
 
 pub(crate) fn submit_input(
     state: &mut Signal<AppState>,
-    daemon_tx: Option<std::sync::mpsc::Sender<ClientMessage>>,
+    daemon_tx: Option<crossbeam_channel::Sender<ClientMessage>>,
 ) {
     let line = state.read().input.trim().to_string();
     state.write().input.clear();
@@ -70,7 +70,7 @@ pub(crate) fn connection_addr() -> String {
 
 pub(crate) fn handle_shell_command(
     state: &mut AppState,
-    daemon_tx: Option<std::sync::mpsc::Sender<ClientMessage>>,
+    daemon_tx: Option<crossbeam_channel::Sender<ClientMessage>>,
     command: Command,
 ) {
     match command {
@@ -172,7 +172,7 @@ pub(crate) fn handle_shell_command(
 
 pub(crate) fn send_client_message(
     state: &mut AppState,
-    daemon_tx: Option<std::sync::mpsc::Sender<ClientMessage>>,
+    daemon_tx: Option<crossbeam_channel::Sender<ClientMessage>>,
     message: ClientMessage,
 ) {
     let Some(sender) = daemon_tx else {
@@ -200,7 +200,7 @@ pub(crate) fn send_client_message(
 /// this function.
 fn handle_session_message(
     state: &mut AppState,
-    daemon_tx: Option<&std::sync::mpsc::Sender<ClientMessage>>,
+    daemon_tx: Option<&crossbeam_channel::Sender<ClientMessage>>,
     message: &DaemonMessage,
 ) -> bool {
     match message {
@@ -274,7 +274,7 @@ fn handle_session_message(
 /// (the callers surface their own reconnect-to-retry message then).
 fn trigger_keystore_auto_bind(
     state: &mut AppState,
-    daemon_tx: Option<std::sync::mpsc::Sender<ClientMessage>>,
+    daemon_tx: Option<crossbeam_channel::Sender<ClientMessage>>,
 ) -> bool {
     match attempt_keystore_auto_bind(&mut state.keystore_auto_bind, &connection_addr()) {
         AutoBindAttempt::Bind { key, msg } => {
@@ -304,7 +304,7 @@ fn trigger_keystore_auto_bind(
 pub(crate) fn apply_daemon_message(
     state: &mut AppState,
     message: DaemonMessage,
-    daemon_tx: Option<std::sync::mpsc::Sender<ClientMessage>>,
+    daemon_tx: Option<crossbeam_channel::Sender<ClientMessage>>,
 ) {
     if handle_session_message(state, daemon_tx.as_ref(), &message) {
         return;

@@ -6,7 +6,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, MouseEvent};
 pub(super) fn handle_session_manager_event(
     event: &Event,
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     match app.session_mgr.view {
         SessionManagerView::List | SessionManagerView::Archived => {
@@ -19,7 +19,7 @@ pub(super) fn handle_session_manager_event(
 fn handle_session_list_event(
     event: &Event,
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     match *event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -33,7 +33,7 @@ fn handle_session_list_event(
 fn handle_session_detail_event(
     event: &Event,
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     match *event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -46,7 +46,7 @@ fn handle_session_detail_event(
 fn handle_session_list_key(
     key: crossterm::event::KeyEvent,
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     // Ignore Ctrl/Alt chords: every action here is a BARE-letter key, and a
     // modifier combination must never fire one.  Without this, `Ctrl+A` (which
@@ -180,7 +180,7 @@ fn handle_session_list_key(
 fn handle_session_list_mouse(
     mouse: MouseEvent,
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     super::handle_full_page_list_mouse(
         app,
@@ -226,7 +226,7 @@ fn handle_session_list_mouse(
 fn handle_session_detail_key(
     key: crossterm::event::KeyEvent,
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     // Ignore Ctrl/Alt chords (the detail view's keys are bare letters); see
     // `handle_session_list_key`.  See `super::is_modifier_chord`.

@@ -5,12 +5,12 @@ use dioxus::prelude::*;
 use futures_channel::mpsc::{self, UnboundedReceiver};
 
 type DaemonConnection = (
-    Signal<Option<std::sync::mpsc::Sender<ClientMessage>>>,
+    Signal<Option<crossbeam_channel::Sender<ClientMessage>>>,
     Signal<Option<UnboundedReceiver<UiEvent>>>,
 );
 
 pub(crate) fn use_daemon_connection() -> DaemonConnection {
-    let mut daemon_tx = use_signal(|| None::<std::sync::mpsc::Sender<ClientMessage>>);
+    let mut daemon_tx = use_signal(|| None::<crossbeam_channel::Sender<ClientMessage>>);
     let mut events_rx = use_signal(|| None::<UnboundedReceiver<UiEvent>>);
 
     // Read the global connection mode set from CLI args in main().
@@ -25,7 +25,7 @@ pub(crate) fn use_daemon_connection() -> DaemonConnection {
     // so these queue in the unbounded channel — there is no handshake window
     // to race, same as the socket transports.
     use_hook(move || {
-        let (client_tx, client_rx) = std::sync::mpsc::channel::<ClientMessage>();
+        let (client_tx, client_rx) = crossbeam_channel::unbounded::<ClientMessage>();
         let (ui_tx, ui_rx) = mpsc::unbounded::<UiEvent>();
         if let Err(e) = client_tx.send(ClientMessage::ListSessions) {
             tracing::error!("failed to send ListSessions: {e}");

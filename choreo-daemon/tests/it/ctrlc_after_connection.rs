@@ -107,8 +107,8 @@ fn sigint_exits_after_ping_pong_connect_and_disconnect() {
     let mut daemon = common::SpawnedDaemon::start(&[]);
     {
         let (tx, rx) = mpsc::channel::<DaemonMessage>();
-        let (from_ui, to_daemon) = mpsc::channel::<ClientMessage>();
-        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+        let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
+        let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
         let socket = daemon.socket_str();
         let handle = thread::spawn(move || {
             run_daemon_connection(
@@ -151,8 +151,8 @@ fn sigint_exits_after_create_session_connect_and_disconnect() {
     let mut daemon = common::SpawnedDaemon::start(&[]);
     {
         let (tx, rx) = mpsc::channel::<DaemonMessage>();
-        let (from_ui, to_daemon) = mpsc::channel::<ClientMessage>();
-        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+        let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
+        let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
         let socket = daemon.socket_str();
         let handle = thread::spawn(move || {
             run_daemon_connection(

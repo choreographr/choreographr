@@ -59,6 +59,12 @@ serde.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# The daemon-connection seam (choreo-client-core's `run_daemon_connection_with_mode`)
+# and the iOS tool bridge both speak crossbeam: the client channel that feeds the
+# connection writer and the boxed reply Sender that travels across the C ABI are
+# crossbeam channel ends, so the dependency is unconditional (it was previously
+# iOS-only, when only the bridge used it).
+crossbeam-channel.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -92,13 +98,11 @@ blitz-shell = "0.2"
 # the embedded daemon needs (DB, accounts, catalog, tools, transport) is
 # unconditional.
 choreo-daemon = { workspace = true }
-# The iOS bridge (src/ios_bridge.rs): crossbeam one-shot reply channels
-# across the C ABI (the boxed Sender travels to Swift and comes back through
-# choreo_ios_tool_reply), and serde_json for the reply payload decode.
-# Leaf-crate note (AGENTS.md): this is the documented exception where the
-# bridge contract itself mandates crossbeam — the channel type is fixed by
-# choreo-daemon's ToolBridgeReply shape.
-crossbeam-channel.workspace = true
+# The iOS bridge (src/ios_bridge.rs): serde_json for the reply payload
+# decode. The crossbeam one-shot reply channels it uses come from the
+# unconditional dependency above (the bridge contract itself mandates
+# crossbeam — the channel type is fixed by choreo-daemon's ToolBridgeReply
+# shape).
 serde_json.workspace = true
 
 # Workspace-wide lints (see [workspace.lints.clippy] in the root Cargo.toml).

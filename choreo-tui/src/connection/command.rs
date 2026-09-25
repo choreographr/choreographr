@@ -36,7 +36,7 @@ use choreo_proto::ClientMessage;
 /// broken client channel is an error, so callers can `?` this directly.
 fn send_continue_generation(
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
     echo: bool,
 ) -> Result<(), ClientError> {
     if app.attached_session_id.is_none() {
@@ -80,7 +80,7 @@ fn send_continue_generation(
 /// the selector closes.
 fn open_model_selector(
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     tracing::debug!("[choreo-tui] opening model selector");
     app.text_selection = None;
@@ -95,7 +95,7 @@ fn open_model_selector(
 /// — the shared body of the `Alt+S` shortcut and the bare `/session` command.
 fn open_session_manager(
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     tracing::debug!("[choreo-tui] navigating to session manager");
     // Record the viewed session so the ListSessions reply lands the highlight
@@ -117,7 +117,7 @@ fn open_session_manager(
 /// shortcut and the bare `/account` command.
 fn open_accounts_page(
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     tracing::debug!("[choreo-tui] navigating to AI provider accounts");
     app.set_page(Page::AIProviders);
@@ -137,7 +137,7 @@ fn open_accounts_page(
 /// model selected) versus "no model selected".
 fn cycle_reasoning(
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     let Some(display) = app.active_display_ref() else {
         // No session attached — there is no display whose capability could be
@@ -260,7 +260,7 @@ pub(super) fn run_command(
     command: Command,
     echo: bool,
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     match command {
         Command::Empty => {}
@@ -487,7 +487,7 @@ pub(super) fn run_named(
     name: &str,
     echo: bool,
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     let command = parse_input_line(&format!("/{name}"), &mut app.next_request_id);
     run_command(command, echo, app, client_tx)

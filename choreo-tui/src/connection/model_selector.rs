@@ -15,7 +15,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind
 pub(super) fn handle_model_selector_event(
     event: &Event,
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     match *event {
         Event::Key(key) => {

@@ -50,24 +50,24 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// thread blocks in the reader loop and forwards every decoded
 /// `DaemonMessage` into `rx`.
 struct Client {
-    from_ui: mpsc::Sender<ClientMessage>,
+    from_ui: crossbeam_channel::Sender<ClientMessage>,
     rx: mpsc::Receiver<DaemonMessage>,
     /// Sender half of `run_daemon_connection`'s optional shutdown channel.
     /// Sending on it makes the connection's shutdown thread call
     /// `shutdown(Shutdown::Both)` on the socket — the only way to sever the
     /// connection from the client side (see [`Client::disconnect`]).
-    shutdown_tx: mpsc::Sender<()>,
+    shutdown_tx: crossbeam_channel::Sender<()>,
     handle: thread::JoinHandle<Result<(), ClientError>>,
 }
 
 impl Client {
     fn connect(socket: &str) -> Self {
-        let (from_ui, to_daemon) = mpsc::channel::<ClientMessage>();
+        let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
         // The shutdown channel is wired for every client even though most
         // tests never use it: `disconnect()` needs it, and an unused one is
         // inert (its thread just blocks on `recv` until the test process
         // exits).
-        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+        let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
         let (tx, rx) = mpsc::channel::<DaemonMessage>();
         let socket = socket.to_string();
         let handle = thread::spawn(move || {
@@ -117,8 +117,9 @@ impl Client {
     /// (detach, `ClientDisconnected`, writer drain).
     fn disconnect(self) {
         // Destructure up front so the fields can be moved independently
-        // (mpsc::Sender is not Copy — `drop(self.from_ui)` would otherwise
-        // partially move `self` and block the later `assert_closed_ok`).
+        // (a crossbeam `Sender` is not `Copy` — `drop(self.from_ui)` would
+        // otherwise partially move `self` and block the later
+        // `assert_closed_ok`).
         let Self {
             from_ui,
             shutdown_tx,

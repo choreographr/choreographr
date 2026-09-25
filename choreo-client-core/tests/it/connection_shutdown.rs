@@ -16,8 +16,8 @@ fn local_shutdown_unblocks_daemon_connection_without_eof() {
     let _ = fs::remove_file(&socket_path);
 
     let listener = UnixListener::bind(&socket_path).expect("bind listener");
-    let (client_tx, client_rx) = mpsc::channel();
-    let (shutdown_tx, shutdown_rx) = mpsc::channel();
+    let (client_tx, client_rx) = crossbeam_channel::unbounded();
+    let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
     let (done_tx, done_rx) = mpsc::channel();
     let socket_path_string = socket_path.to_string_lossy().to_string();
 

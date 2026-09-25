@@ -109,7 +109,7 @@ fn spawn_connection_thread(
     roots: &TestRoots,
     mode: ConnectionMode,
     handle_daemon_message: impl FnMut(DaemonMessage) + Send + 'static,
-    to_daemon: mpsc::Receiver<ClientMessage>,
+    to_daemon: crossbeam_channel::Receiver<ClientMessage>,
 ) -> thread::JoinHandle<Result<(), choreo_client_core::ClientError>> {
     let transport_dir = roots.transport_dir.clone();
     let keystore_dir = roots.keystore_dir.clone();
@@ -284,7 +284,7 @@ fn pinned_mode_connects_and_round_trips() {
             .expect("send Pong");
     });
 
-    let (from_ui, to_daemon) = mpsc::channel::<ClientMessage>();
+    let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
     let (tx, rx) = mpsc::channel::<DaemonMessage>();
     let handle = spawn_connection_thread(
         &roots,
@@ -341,7 +341,7 @@ fn pinned_mode_key_change_fails_loud() {
         });
     });
 
-    let (from_ui, to_daemon) = mpsc::channel::<ClientMessage>();
+    let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
     let (tx, _rx) = mpsc::channel::<DaemonMessage>();
     let result = spawn_connection_thread(
         &roots,
@@ -383,7 +383,7 @@ fn pinned_mode_without_pin_errors() {
     // No pin written — deliberately. (The bound listener only proves the
     // client COULD have dialed: the error must come from the store check.)
 
-    let (from_ui, to_daemon) = mpsc::channel::<ClientMessage>();
+    let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
     let (tx, _rx) = mpsc::channel::<DaemonMessage>();
     let result = spawn_connection_thread(
         &roots,

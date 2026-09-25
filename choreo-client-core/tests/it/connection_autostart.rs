@@ -15,7 +15,6 @@
 
 use choreo_client_core::{ClientError, run_daemon_connection_with_autostart};
 use choreo_proto::ClientMessage;
-use std::sync::mpsc;
 
 /// A LIVE listener means the first dial IS the connection: the autostart
 /// hook must never run, and the pump must end cleanly on the listener's
@@ -45,7 +44,7 @@ fn autostart_hook_skipped_when_daemon_listens() {
         hook_calls += 1;
         Ok(())
     };
-    let (from_ui_tx, from_ui_rx) = mpsc::channel::<ClientMessage>();
+    let (from_ui_tx, from_ui_rx) = crossbeam_channel::unbounded::<ClientMessage>();
     drop(from_ui_tx);
 
     let result =

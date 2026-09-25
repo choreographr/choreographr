@@ -15,7 +15,7 @@ use super::command::{run_command, run_named};
 pub(super) fn handle_chat_event(
     event: &Event,
     app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     match event {
         Event::Key(key) => {
