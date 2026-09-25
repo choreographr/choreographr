@@ -794,9 +794,14 @@ fn run_daemon_connection_in_process(
         // its own end to stop the writer when the loop ends.
         let writer_tx = writer_shutdown_tx.clone();
         thread::spawn(move || {
-            // A send failure here is benign: the reader finished first and
-            // dropped the writer-shutdown sender side.
-            let _ = shutdown_rx.recv().map(|()| writer_tx.send(()));
+            // `recv` returns `Err` when the sender is dropped WITHOUT sending;
+            // either way the external shutdown is over, so stop the writer —
+            // mirroring the socket modes, which force-close the stream when
+            // their shutdown sender is dropped too. A send failure is benign:
+            // the reader may have finished first and dropped its own
+            // writer-shutdown sender side.
+            let _ = shutdown_rx.recv();
+            let _ = writer_tx.send(());
         });
     }
 
@@ -1060,6 +1065,42 @@ mod in_process_tests {
         // drains it): a late send is delivered into the channel — it simply
         // has no consumer. It must not panic or error.
         let _ = from_ui_tx.send(ClientMessage::Ping);
+    }
+
+    /// The optional external shutdown channel stops the writer even when its
+    /// sender is DROPPED without sending — the same "a disconnect means shut
+    /// down" contract the socket modes honor (a dropped sender there still
+    /// force-closes the stream). The writer owns the client→daemon sender, so
+    /// its exit closes the daemon-side receiver: that disconnect is the
+    /// deterministic signal (no timing) that the writer stopped, and it can
+    /// only have come from the external shutdown because `from_ui` stays open
+    /// for the whole test.
+    #[test]
+    fn in_process_external_shutdown_drop_stops_writer() {
+        let (mode, from_ui_tx, from_ui_rx, client_rx, daemon_tx) = make_link();
+        let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
+
+        let handle = thread::spawn(move || {
+            let _ = run_daemon_connection_with_mode(mode, |_| {}, from_ui_rx, Some(shutdown_rx));
+        });
+
+        // Drop WITHOUT sending: the external-shutdown thread must still fire
+        // and stop the writer.
+        drop(shutdown_tx);
+
+        // The writer's exit drops the client→daemon sender, so the fake
+        // daemon's receiver disconnects deterministically.
+        assert!(
+            client_rx.recv().is_err(),
+            "a dropped external-shutdown sender must still stop the writer"
+        );
+
+        // Close the daemon→client channel to end the reader, then join. Keep
+        // `from_ui_tx` alive until now to prove the writer stopped on the
+        // external shutdown, not on a `from_ui` close.
+        drop(daemon_tx);
+        handle.join().expect("in-process pump thread joins");
+        drop(from_ui_tx);
     }
 
     /// The manual `Debug` impl must keep the derived shapes for the socket
