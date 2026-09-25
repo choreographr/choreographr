@@ -20,7 +20,7 @@ path = "src/lib.rs"
 # `ens` enables alloy-ens (Universal Resolver contract calls) for evm_resolve,
 # replacing the fabricated `ens_resolve`/`ens_reverse` RPC methods the old
 # implementation invoked (no node implements those).
-alloy = { version = "2.4", features = ["providers", "rpc-types-eth", "sol-types", "ens"] }
+alloy = { version = "2.5", features = ["providers", "rpc-types-eth", "sol-types", "ens"] }
 # Substrate/Polkadot client (light-client + JSON-RPC paths). Promoted to the
 # workspace because choreo-content (the always-on Coordination Platform tools)
 # uses the same client.

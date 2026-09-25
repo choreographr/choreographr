@@ -127,12 +127,14 @@ resolver = "3"
 default-members = [".", "choreo-tui"]
 
 # Shared package metadata inherited by every member via `*.workspace = true`.
-# MSRV: the workspace builds and tests on Rust 1.94.1 and newer; keep code
+# MSRV: the workspace builds and tests on Rust 1.95.0 and newer; keep code
 # and dependencies within this floor (see ARCHITECTURE.md).
 #
-# Bumped from 1.92 to 1.94.1 in the 2026-08 dependency refresh: serial_test
-# 4.x requires Rust 1.93.1 (it was previously held at 3.x because 4.0.1 sat
-# above the old floor), and alloy 2.4.1 now requires 1.94.1.
+# The floor tracks the resolved dependency tree's high-water mark. It rose
+# from 1.92 to 1.94.1 in the 2026-08 dependency refresh (serial_test 4.x
+# requires Rust 1.93.1), then to 1.95.0 when ckb-vm 0.24.15 — choreo-daemon's
+# RISC-V VM — required it. Recompute after any dependency change (RELEASE.md
+# Phase 2).
 #
 # version/license/repository/homepage/readme/description are required by
 # crates.io for published crates; the publish-set members inherit them, while
@@ -470,7 +472,7 @@ postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 # frames, so the on-disk schema-2 contract is unchanged. Numeric compression
 # levels 1–22 map to C zstd numbering (COMPRESSION_LEVEL=6 keeps the tuned
 # speed/ratio trade-off). Apache-2.0, matching the workspace license.
-structured-zstd = "0.0.53"
+structured-zstd = "0.0.55"
 # Atomic lock-free snapshot swap for process-wide state with a single writer
 # (the provider catalog in choreo-ai-protocols, the client ACL in
 # choreo-daemon — both read from many threads and swapped only from the
@@ -499,12 +501,12 @@ url = "2"
 # uds_windows provides the same bind/connect/try_clone/shutdown API over named
 # pipes; used cfg(windows) only, never on Unix.
 uds_windows = "1.2.1"
-humfmt = "0.6.0"
+humfmt = "0.7.0"
 hex = "0.4"
 # Substrate client (native/light + JSON-RPC) — promoted to the workspace now
 # that BOTH choreo-blockchain (the `blockchain` feature) and choreo-content (the
 # always-on Coordination Platform tools) use it.
-subxt = { version = "0.50", default-features = false, features = ["native", "jsonrpsee", "runtime"] }
+subxt = { version = "0.51", default-features = false, features = ["native", "jsonrpsee", "runtime"] }
 # Protobuf content protocol (choreo-content's ItemMessage/mixin encoding).
 prost = "0.14"
 # SCALE encoding for deterministic item-id derivation (choreo-content).
