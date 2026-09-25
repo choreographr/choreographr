@@ -6,7 +6,8 @@ use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -18,8 +19,12 @@ pub struct StdioTransport {
     reader_handle: Option<thread::JoinHandle<()>>,
     response_rx: Receiver<(u64, Result<JsonRpcResponse, McpError>)>,
     notification_rx: Receiver<JsonRpcNotification>,
-    /// Shared flag to signal the reader thread to stop.
-    shutdown: Arc<Mutex<bool>>,
+    /// Cooperative stop hint for the reader thread (exception #1): a
+    /// single-bit `AtomicBool` set by [`shutdown`](Self::shutdown) and read
+    /// between lines, never mid-line — a blocking stdout read cannot be
+    /// interrupted by a channel message, so a lock-free flag is the sanctioned
+    /// pattern.
+    shutdown: Arc<AtomicBool>,
     child: Option<Child>,
 }
 
@@ -83,17 +88,14 @@ impl StdioTransport {
 
         let (response_tx, response_rx) = crossbeam_channel::unbounded();
         let (notification_tx, notification_rx) = crossbeam_channel::unbounded();
-        let shutdown = Arc::new(Mutex::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
 
         // Stdout reader — parse JSON-RPC lines
         let reader_handle = thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
-                if *shutdown_clone
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                {
+                if shutdown_clone.load(Ordering::Relaxed) {
                     break;
                 }
                 let line = match line {
@@ -213,9 +215,7 @@ impl StdioTransport {
     /// every wait is bounded so a misbehaving server cannot wedge shutdown.
     pub fn shutdown(&mut self) {
         debug!("transport shutdown begin");
-        if let Ok(mut guard) = self.shutdown.lock() {
-            *guard = true;
-        }
+        self.shutdown.store(true, Ordering::SeqCst);
         if let Some(mut child) = self.child.take() {
             // The process-group id is only needed on Unix (the child was
             // spawned with process_group(0) so it leads its own group), and it
@@ -319,6 +319,7 @@ impl Drop for StdioTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     /// A `Write` impl that records every byte written so tests can assert on
     /// the exact wire format without spawning a subprocess.
@@ -350,7 +351,7 @@ mod tests {
             reader_handle: None,
             response_rx: crossbeam_channel::unbounded().1,
             notification_rx: crossbeam_channel::unbounded().1,
-            shutdown: Arc::new(Mutex::new(false)),
+            shutdown: Arc::new(AtomicBool::new(false)),
             child: None,
         };
         (transport, bytes)
