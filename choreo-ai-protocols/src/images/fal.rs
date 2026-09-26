@@ -16,8 +16,9 @@
 //! flux-2-pro takes `prompt` (required), `image_size` (a named enum string
 //! like `square_hd` OR an explicit `{width, height}` object — both
 //! dimensions a multiple of 16 in 256..=2560), `output_format`
-//! (`jpeg`|`png`), and an optional `seed`. Our request has no `seed` field,
-//! so none is sent. flux-2-pro has **no** `quality` or `background` knob:
+//! (`jpeg`|`png`), and an optional `seed` (an integer for reproducible
+//! output) — the adapter sends `seed` when [`ImageGenerationRequest`]'s
+//! `seed` is set. flux-2-pro has **no** `quality` or `background` knob:
 //! those request-level fields are SILENTLY IGNORED (documented best-effort
 //! contract, exactly like [`super::ZaiImageClient`]'s background note) — never
 //! sent, never an error.
@@ -211,12 +212,19 @@ impl FalImageClient {
     /// The outgoing request body: `prompt` always; `image_size` only when the
     /// requested size is non-auto; `output_format` always (mapped, so the
     /// bytes come back in the format we declare rather than fal's own
-    /// default). `quality` and `background` are NOT documented for
-    /// flux-2-pro and are never sent — an explicitly-set
-    /// [`super::Background`]/[`super::ImageQuality`] is silently ignored
-    /// (documented best-effort contract, mirroring z.ai's background note).
-    /// There is no `n` field (see [`ImageGenerationRequest`]) and no `seed`
-    /// (the request struct has no field for it), so neither appears.
+    /// default); and `seed` only when [`ImageGenerationRequest`]'s `seed` is
+    /// set (flux-2-pro documents it for reproducible output). `quality` and
+    /// `background` are NOT documented for flux-2-pro and are never sent — an
+    /// explicitly-set [`super::Background`]/[`super::ImageQuality`] is
+    /// silently ignored (documented best-effort contract, mirroring z.ai's
+    /// background note). There is no `n` field (see
+    /// [`ImageGenerationRequest`]).
+    ///
+    /// `seed` is inserted by hand rather than via serde: the shared request
+    /// struct marks it `skip_serializing` so it can never leak into the
+    /// `#[serde(flatten)]` body the OpenAI-protocol adapter builds — see the
+    /// field's doc for the mechanism. This adapter is the one place the
+    /// documented `seed` knob is honored.
     fn request_body(req: &ImageGenerationRequest) -> serde_json::Value {
         let mut body = serde_json::json!({ "prompt": req.prompt });
         // `Map::insert` (rather than `Value`'s IndexMut, which would panic on a
@@ -230,6 +238,11 @@ impl FalImageClient {
                 "output_format".into(),
                 output_format_wire(req.output_format).into(),
             );
+            // flux-2-pro's documented reproducibility knob; omitted entirely
+            // when unset (never sent as an explicit null/default).
+            if let Some(seed) = req.seed {
+                obj.insert("seed".into(), seed.into());
+            }
         }
         body
     }
@@ -372,8 +385,32 @@ impl ImageGenerationClient for FalImageClient {
 #[cfg(test)]
 mod tests {
     use super::{FalImageClient, data_uri_b64, output_format_wire, size_wire};
-    use crate::images::{ImageSize, OutputFormat};
+    use crate::images::{ImageGenerationRequest, ImageSize, OutputFormat};
     use crate::openai::ServiceConfig;
+
+    // ── request body / seed knob ─────────────────────────────────────────
+
+    #[test]
+    fn request_body_includes_seed_when_set_and_omits_it_otherwise() {
+        // flux-2-pro documents an integer `seed`; the adapter must emit it
+        // only when the caller set one — an unset seed is omitted from the
+        // body, not sent as null or an explicit default (the minimal-body
+        // policy every image adapter follows).
+        let with_seed = ImageGenerationRequest {
+            seed: Some(1234),
+            ..ImageGenerationRequest::new("p", "fal-ai/flux-2-pro")
+        };
+        let body = FalImageClient::request_body(&with_seed);
+        assert_eq!(
+            body.get("seed").and_then(serde_json::Value::as_u64),
+            Some(1234),
+            "{body}"
+        );
+
+        let without_seed = ImageGenerationRequest::new("p", "fal-ai/flux-2-pro");
+        let body = FalImageClient::request_body(&without_seed);
+        assert!(body.get("seed").is_none(), "{body}");
+    }
 
     // ── size mapper ──────────────────────────────────────────────────────
 

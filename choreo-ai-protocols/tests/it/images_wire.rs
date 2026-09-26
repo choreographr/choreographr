@@ -81,9 +81,14 @@ fn wire_body_has_model_prompt_n1_and_no_response_format() {
     // gpt-image-1 rejects `response_format` (it always returns b64_json), so
     // the wire body must never carry it — pinned here so a future refactor
     // cannot silently reintroduce the field and 400 every gpt-image call.
+    // `seed` is likewise never sent: the gpt-image family documents none, and
+    // the shared struct is `skip_serializing` precisely so the flattened body
+    // cannot leak a set seed.
     let mock = MockProvider::start(vec![(200, "application/json", success_body())]);
+    let mut req = sample_request();
+    req.seed = Some(4242);
     client(&mock)
-        .generate_image(&sample_request(), None)
+        .generate_image(&req, None)
         .expect("generation succeeds");
 
     let body = mock.requests()[0].body_json();
@@ -91,6 +96,8 @@ fn wire_body_has_model_prompt_n1_and_no_response_format() {
     assert_eq!(body["prompt"], "a lighthouse at dusk");
     assert_eq!(body["n"], 1);
     assert!(body.get("response_format").is_none());
+    // A set seed must NOT appear in the OpenAI body (no-leak invariant).
+    assert!(body.get("seed").is_none(), "{body}");
     // Default knobs are OMITTED from the wire body entirely (minimal-body
     // policy: proxies that don't implement a knob reject its presence even
     // as an explicit default), so an all-defaults request is just
@@ -433,6 +440,7 @@ fn fal_wire_body_has_prompt_image_size_and_output_format_only() {
         quality: ImageQuality::High,
         output_format: OutputFormat::Jpeg,
         background: Background::Transparent,
+        seed: Some(4242),
         ..fal_request()
     };
     fal_client(&provider)
@@ -447,6 +455,8 @@ fn fal_wire_body_has_prompt_image_size_and_output_format_only() {
         serde_json::json!({ "width": 1536, "height": 1024 })
     );
     assert_eq!(body["output_format"], "jpeg");
+    // The documented seed knob is honored by the fal adapter when set.
+    assert_eq!(body["seed"], 4242, "{body}");
     // The model is the URL path segment, never a body field; flux-2-pro has
     // no quality/background knob (silently ignored) and we never send n.
     assert!(body.get("model").is_none());
@@ -787,6 +797,7 @@ fn zai_wire_body_has_model_prompt_only_plus_mapped_knobs() {
         quality: ImageQuality::High,
         output_format: OutputFormat::Webp,
         background: Background::Transparent,
+        seed: Some(7),
         ..zai_sample_request()
     };
     zai_client(&mock).generate_image(&req, None).expect_err(
@@ -803,6 +814,7 @@ fn zai_wire_body_has_model_prompt_only_plus_mapped_knobs() {
     assert!(body.get("response_format").is_none());
     assert!(body.get("output_format").is_none());
     assert!(body.get("background").is_none());
+    assert!(body.get("seed").is_none(), "{body}");
 }
 
 #[test]

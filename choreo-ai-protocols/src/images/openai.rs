@@ -118,6 +118,13 @@ impl OpenAiImageClient {
 /// dall-e models would need it. v1 speaks gpt-image conventions; if a
 /// dall-e path is added later it belongs behind a model check, not as a
 /// blanket field that breaks the primary model family.
+///
+/// `seed` is likewise never serialized here: the shared request struct marks
+/// the field `skip_serializing`, so a `#[serde(flatten)]` of the request
+/// cannot leak it into this body — the gpt-image family documents no `seed`
+/// parameter, and an undocumented field risks a 400. Only the fal adapter
+/// emits `seed`, and it inserts it explicitly by hand; pinned by the unit
+/// test below so a future change cannot silently re-leak it.
 #[derive(serde::Serialize)]
 struct WireBody<'a> {
     #[serde(flatten)]
@@ -217,5 +224,34 @@ impl ImageGenerationClient for OpenAiImageClient {
             revised_prompt,
             model: req.model.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WireBody;
+    use crate::images::ImageGenerationRequest;
+
+    #[test]
+    fn wire_body_never_carries_seed_even_when_the_request_sets_one() {
+        // The flattened request must NOT leak `seed` to OpenAI-protocol
+        // providers: the gpt-image family documents no seed parameter and an
+        // undocumented field risks a 400. The field is `skip_serializing` on
+        // the shared struct precisely so this body can never carry it —
+        // pinned here so a future change cannot silently re-leak it.
+        let mut req = ImageGenerationRequest::new("a lighthouse", "gpt-image-1");
+        req.seed = Some(77);
+        let value = serde_json::to_value(WireBody { req: &req, n: 1 }).expect("serializes");
+        assert!(value.get("seed").is_none(), "{value}");
+        // The minimal all-knobs-default shape is still {model, prompt, n}.
+        assert_eq!(
+            value.get("model").and_then(serde_json::Value::as_str),
+            Some("gpt-image-1")
+        );
+        assert_eq!(
+            value.get("prompt").and_then(serde_json::Value::as_str),
+            Some("a lighthouse")
+        );
+        assert_eq!(value.get("n").and_then(serde_json::Value::as_u64), Some(1));
     }
 }

@@ -250,6 +250,10 @@ impl super::Tool for GenerateImage {
             quality,
             output_format,
             background,
+            // The tool does not expose a seed arg yet; deterministic
+            // generation is opt-in and the knob is only honored by the fal
+            // adapter. None here leaves every provider's body unchanged.
+            seed: None,
         };
 
         // `None` cancel_rx: the blocking client accepts no mid-flight

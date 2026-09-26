@@ -205,6 +205,24 @@ pub struct ImageGenerationRequest {
     pub output_format: OutputFormat,
     #[serde(skip_serializing_if = "Background::is_default")]
     pub background: Background,
+    /// Optional deterministic-generation seed. Honored ONLY by providers whose
+    /// model family documents a `seed` parameter — currently the fal/flux
+    /// adapter, where `fal-ai/flux-2-pro` accepts an integer `seed` for
+    /// reproducible output. The `OpenAI` (gpt-image) and z.ai (glm-image)
+    /// families document no `seed`, so those adapters omit it: an
+    /// undocumented field can 400 a strict provider — the same stance the
+    /// adapters already take for `response_format`/`n`/`background`.
+    ///
+    /// `skip_serializing` (rather than only `skip_serializing_if`) is
+    /// deliberate: [`OpenAiImageClient`] composes its wire body by
+    /// `#[serde(flatten)]`ing this whole struct, so ANY serialized `seed`
+    /// would leak to every OpenAI-protocol provider. Suppressing it at the
+    /// struct level forces each adapter to opt in explicitly — the fal adapter
+    /// inserts it from this field by hand. `default` keeps the struct
+    /// `Deserialize`-able when the field is absent (it does not change the
+    /// serialize side, which already skips this field unconditionally).
+    #[serde(default, skip_serializing)]
+    pub seed: Option<u64>,
 }
 
 // `skip_serializing_if` needs path-callable predicates; `PartialEq` derives
@@ -290,6 +308,9 @@ impl ImageGenerationRequest {
             quality: ImageQuality::default(),
             output_format: OutputFormat::default(),
             background: Background::default(),
+            // No seed by default: a deterministic image is opt-in, and the
+            // knob is only honored where the provider documents it.
+            seed: None,
         }
     }
 }

@@ -149,8 +149,8 @@ impl ZaiImageClient {
 
     /// The outgoing request body: `{model, prompt}` always; `size` only when
     /// non-auto and `quality` only when explicitly requested. z.ai documents
-    /// NO `n`, `output_format`, or `background` field — they are never sent,
-    /// not even with our request's values: extra undocumented fields are
+    /// NO `n`, `output_format`, `background`, or `seed` field — they are never
+    /// sent, not even with our request's values: extra undocumented fields are
     /// behavior we cannot verify the provider tolerates, and the
     /// request-level knobs are explicitly best-effort per family.
     ///
@@ -375,7 +375,31 @@ impl ImageGenerationClient for ZaiImageClient {
 #[cfg(test)]
 mod tests {
     use super::{ZaiImageClient, image_base_url};
+    use crate::images::ImageGenerationRequest;
     use crate::openai::ServiceConfig;
+
+    // ── request body / seed knob ─────────────────────────────────────────
+
+    #[test]
+    fn request_body_never_carries_seed_even_when_set() {
+        // glm-image documents no seed parameter; an undocumented field risks
+        // a 400, so the z.ai body must omit it even when the request sets one.
+        let req = ImageGenerationRequest {
+            seed: Some(99),
+            ..ImageGenerationRequest::new("p", "glm-image")
+        };
+        let body = ZaiImageClient::request_body(&req);
+        assert!(body.get("seed").is_none(), "{body}");
+        // The documented-shape keys are still present.
+        assert_eq!(
+            body.get("model").and_then(serde_json::Value::as_str),
+            Some("glm-image")
+        );
+        assert_eq!(
+            body.get("prompt").and_then(serde_json::Value::as_str),
+            Some("p")
+        );
+    }
 
     // ── image_base_url: /coding/paas → /paas rewrite ─────────────────────
 
