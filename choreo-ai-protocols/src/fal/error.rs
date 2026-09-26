@@ -163,6 +163,43 @@ fn status_fallback_detail(body: &str) -> String {
     }
 }
 
+/// Read the classifier header, the `Retry-After` budget input, and the body
+/// from a non-2xx fal response and apply the two-shape mapping.
+///
+/// This is the single entry point both fal adapters use for a terminal HTTP
+/// error (the synchronous image POST and the queue's submit/status/result
+/// calls) so their error handling cannot drift — callers only decide WHICH
+/// response is an error and convert the returned [`ProviderError`] to an
+/// [`crate::shared::InferenceError`]. `context` labels the log line (e.g.
+/// `"image generation"`, `"video request"`).
+pub(crate) fn fal_error_from_response(
+    response: ureq::http::Response<ureq::Body>,
+    context: &'static str,
+) -> ProviderError {
+    let status = response.status().as_u16();
+    let header_type = response
+        .headers()
+        .get("x-fal-error-type")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let retry_after_secs = crate::retry::parse_retry_after_secs(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+    );
+    // A body read failure is treated as empty — the status/shape fallbacks
+    // still produce a usable error rather than masking the HTTP failure.
+    let body_text = response.into_body().read_to_string().unwrap_or_default();
+    tracing::warn!(
+        status,
+        error_type = header_type.as_deref().unwrap_or(""),
+        context,
+        "fal request failed"
+    );
+    fal_error(status, header_type.as_deref(), retry_after_secs, &body_text)
+}
+
 /// Map a non-2xx fal response to a provider error, applying the documented
 /// precedence: the 422 validation array shape first, then the flat
 /// request-error shape (body `error_type`, else the header), then the HTTP

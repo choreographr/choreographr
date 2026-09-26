@@ -581,6 +581,64 @@ fn fal_429_with_oversized_retry_after_maps_to_rate_limited() {
     }
 }
 
+/// A local server that answers every request with `302 Found` + `Location:
+/// <target>` and an empty body. Used to prove the download does NOT follow
+/// redirects (the SSRF guard validates only the original URL).
+fn redirecting_server(target: String) -> std::net::SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        use std::io::{Read as _, Write as _};
+        while let Ok((mut stream, _)) = listener.accept() {
+            // Drain the request head before replying so the client does not see
+            // an RST instead of the scripted redirect (same rationale as the
+            // other one-shot helpers above).
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(300)));
+            let mut buf = [0u8; 4096];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    addr
+}
+
+#[test]
+#[ignore = "integration"]
+fn fal_download_does_not_follow_a_redirect() {
+    // The SSRF guard validates only the URL the provider handed us, so a 3xx
+    // must NOT be followed — otherwise a compromised/open-redirect provider URL
+    // could steer the fetch at an internal address the guard never inspected
+    // (classic SSRF guard bypass). The download request disables redirects, so
+    // the redirect surfaces as a (retryable) non-2xx and the target is never
+    // contacted.
+    let target = MockProvider::start(vec![(200, "image/png", IMAGE_BYTES.to_string())]);
+    let redirector = redirecting_server(target.base_url("internal/secret.png"));
+    let provider = MockProvider::start(vec![(
+        200,
+        "application/json",
+        fal_success_body(&format!("http://{redirector}/cdn/out.png")),
+    )]);
+
+    let err = fal_client(&provider)
+        .generate_image(&fal_request(), None)
+        .expect_err("a redirect must not be followed");
+    assert!(matches!(err, InferenceError::NotReady { .. }), "{err:?}");
+    assert_eq!(
+        target.requests().len(),
+        0,
+        "the redirect target must never be fetched"
+    );
+}
+
 // ── ZaiImageClient (z.ai / Zhipu GLM Images API) ─────────────────────────
 //
 // The mock is reused verbatim: it scripts "one canned response per

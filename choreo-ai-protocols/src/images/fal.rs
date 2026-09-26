@@ -27,7 +27,7 @@
 //!
 //! `{"images":[{"url","content_type","file_name","file_size","width","height"}],"seed":N}`.
 //! `images[0].url` is normally an `https://…fal.media/…` URL the adapter must
-//! download (through the shared [`super::download`] machinery), but with
+//! download (through the shared [`crate::download`] machinery), but with
 //! `sync_mode:true` it is a `data:` URI — the adapter handles BOTH: a data
 //! URI is decoded in place (base64 after the first comma), anything else is
 //! fetched. A response with no usable image is
@@ -50,6 +50,9 @@
 //!    (504) and `runner_*`/`internal_error` → [`OpenAiError::ServerError`];
 //!    `bad_request` (400) → [`OpenAiError::ClientError`].
 //!
+//! Both shapes are applied by the shared [`crate::fal::error::fal_error_from_response`]
+//! mapper, so the image and video adapters cannot drift.
+//!
 //! Remaining statuses fall back to the HTTP contract: 401 → `Unauthorized`,
 //! 429 → `RateLimited` (honored via the shared retry budget), other 5xx →
 //! `ServerError`, other 4xx → `ClientError`.
@@ -65,7 +68,7 @@
 
 use crate::SocketRegistry;
 use crate::download;
-use crate::fal::error::fal_error;
+use crate::fal::error::fal_error_from_response;
 use crate::images::{
     IMAGE_MAX_ATTEMPTS, IMAGE_TOTAL_TIMEOUT_SECS, ImageGenerationClient, ImageGenerationRequest,
     ImageGenerationResult, ImageSize, OutputFormat,
@@ -134,7 +137,8 @@ struct FalImage {
     url: Option<String>,
 }
 
-/// The fal response envelope. `seed` is parsed-but-unexposed (no consumer).
+/// The fal response envelope. Only `images` is consumed (the `seed`/
+/// `timings` fields fal may also return have no consumer here).
 #[derive(Debug, Deserialize)]
 struct FalResponse {
     #[serde(default)]
@@ -307,31 +311,11 @@ impl ImageGenerationClient for FalImageClient {
 
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
-            // Read the classifier header, the Retry-After budget input, and
-            // the body, then apply the two-shape error mapping.
-            let header_type = response
-                .headers()
-                .get("x-fal-error-type")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
-            let retry_after_secs = retry::parse_retry_after_secs(
-                response
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok()),
-            );
-            let body_text = response.into_body().read_to_string().unwrap_or_default();
-            tracing::warn!(
-                status,
-                error_type = header_type.as_deref().unwrap_or(""),
-                "fal image generation failed"
-            );
-            return Err(crate::shared::provider_error_to_inference(fal_error(
-                status,
-                header_type.as_deref(),
-                retry_after_secs,
-                &body_text,
-            )));
+            // The shared mapper reads the classifier header, the Retry-After
+            // budget input, and the body, then applies the two-shape mapping.
+            return Err(crate::shared::provider_error_to_inference(
+                fal_error_from_response(response, "image generation"),
+            ));
         }
 
         let payload: FalResponse = response
@@ -466,13 +450,12 @@ mod tests {
 
     #[test]
     fn new_forces_the_image_deadline_and_relaxes_for_local_bases() {
-        let mut config = ServiceConfig {
+        let config = ServiceConfig {
             base_url: "http://127.0.0.1:9/fal".to_string(),
             provider_slug: "fal".to_string(),
             total_timeout_secs: 3600,
             ..Default::default()
         };
-        config.total_timeout_secs = 3600;
         let client = FalImageClient::new(
             config,
             "k".to_string(),

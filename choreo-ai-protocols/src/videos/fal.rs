@@ -47,7 +47,7 @@
 //! normalized [`VideoGenerationRequest`]. See [`build_fal_video_body`].
 
 use crate::SocketRegistry;
-use crate::fal::error::fal_error;
+use crate::fal::error::fal_error_from_response;
 use crate::openai::{ServiceConfig, endpoint_url};
 use crate::retry::{self, AttemptContext, RetryConfig};
 use crate::videos::{
@@ -363,32 +363,14 @@ impl FalVideoClient {
         .map_err(crate::shared::provider_error_to_inference)
     }
 
-    /// Read the classifier header, the Retry-After budget input, and the body
-    /// from a non-2xx response and apply the shared fal error mapping.
+    /// Apply the shared fal error mapping to a non-2xx response: read the
+    /// classifier header, the Retry-After budget input, and the body, then
+    /// classify. Identical handling to the image adapter (both call
+    /// [`fal_error_from_response`]).
     fn response_error(response: ureq::http::Response<ureq::Body>) -> InferenceError {
-        let status = response.status().as_u16();
-        let header_type = response
-            .headers()
-            .get("x-fal-error-type")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        let retry_after_secs = retry::parse_retry_after_secs(
-            response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok()),
-        );
-        let body_text = response.into_body().read_to_string().unwrap_or_default();
-        tracing::warn!(
-            status,
-            error_type = header_type.as_deref().unwrap_or(""),
-            "fal video request failed"
-        );
-        crate::shared::provider_error_to_inference(fal_error(
-            status,
-            header_type.as_deref(),
-            retry_after_secs,
-            &body_text,
+        crate::shared::provider_error_to_inference(fal_error_from_response(
+            response,
+            "video request",
         ))
     }
 }

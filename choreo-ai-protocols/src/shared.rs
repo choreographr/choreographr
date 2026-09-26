@@ -119,6 +119,17 @@ pub(crate) fn read_slice(buf: &[u8], n: usize) -> &[u8] {
     buf.get(..n).unwrap_or(&[])
 }
 
+/// Whether a catalog provider slug is one of the fal.ai provider slugs.
+///
+/// The canonical allowlist — `"fal"` (the platform slug) and `"fal-ai"` (the
+/// models.dev display alias some catalogs use) — lives here so the image
+/// (`images::is_fal_image_provider_slug`) and video
+/// (`videos::is_fal_video_provider_slug`) dispatch helpers cannot drift apart.
+#[must_use]
+pub(crate) fn is_fal_provider_slug(slug: &str) -> bool {
+    matches!(slug, "fal" | "fal-ai")
+}
+
 /// Map a `ProviderError` variant to a stable label string.
 ///
 /// Test-only helper. Delegates to [`InferenceError::metric_label`] so the

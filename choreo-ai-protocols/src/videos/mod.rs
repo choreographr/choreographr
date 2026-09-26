@@ -29,8 +29,11 @@ mod fal;
 ///
 /// fal exposes no caller-settable total-inference deadline for queue jobs, so
 /// the job budget lives here and is enforced by the
-/// [`VideoGenerationClient::generate_video`] driver: it bounds submit + every
-/// poll + the result GET together. 900 s (15 min) covers the slowest
+/// [`VideoGenerationClient::generate_video`] driver: it caps the total time the
+/// driver spends **waiting between polls** (each individual HTTP call is
+/// separately bounded by the adapter's per-attempt deadline, and each retry
+/// restarts it, so the aggregate elapsed time can exceed this by a
+/// request-timeout's worth per call). 900 s (15 min) covers the slowest
 /// legitimate high-resolution render while guaranteeing a wedged job can never
 /// pin a worker indefinitely. On expiry the driver best-effort cancels the job
 /// and returns [`InferenceError::DeadlineExceeded`].
@@ -379,7 +382,16 @@ pub trait VideoGenerationClient: std::fmt::Debug + Send + Sync {
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_secs(VIDEO_TOTAL_TIMEOUT_SECS);
         loop {
-            let status = self.poll(&handle, false)?;
+            // A poll transport/HTTP failure must not orphan a billable job:
+            // once `submit` has succeeded the job is running server-side, so
+            // any early error from here on is preceded by a best-effort cancel.
+            let status = match self.poll(&handle, false) {
+                Ok(status) => status,
+                Err(e) => {
+                    cancel_job(&handle);
+                    return Err(e);
+                }
+            };
             match &status {
                 VideoJobStatus::Completed { .. } => {
                     on_progress(status.clone());
@@ -469,7 +481,7 @@ pub use fal::FalVideoClient;
 /// the chat-protocol dispatch never sees it.
 #[must_use]
 pub fn is_fal_video_provider_slug(slug: &str) -> bool {
-    matches!(slug, "fal" | "fal-ai")
+    crate::shared::is_fal_provider_slug(slug)
 }
 
 #[cfg(test)]

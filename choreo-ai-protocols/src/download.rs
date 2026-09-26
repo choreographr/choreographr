@@ -15,7 +15,10 @@
 //!   `file://`/etc., and an IP-literal host in a loopback/private/link-local
 //!   range is refused (the URL arrives over an authenticated provider TLS
 //!   channel, not from user input, so the residual hostname risk is an
-//!   accepted decision — see [`is_downloadable_url`]).
+//!   accepted decision — see [`is_downloadable_url`]). The guard only sees the
+//!   URL we hand it, so the download request disables redirect **following**
+//!   ([`fetch_once`]): otherwise a provider-controlled 3xx would send the fetch
+//!   to an internal address the guard never inspected.
 //! - **The capped/retried/cancellable fetch** ([`download_media_bytes`]) —
 //!   a caller-supplied in-stream byte ceiling, a small caller-supplied retry
 //!   budget that rides out a CDN propagation race, and cancellation between
@@ -223,11 +226,30 @@ pub(crate) fn download_media_bytes(
     }
 }
 
-/// One download fetch (URL guard → GET → content-type guard → capped stream
-/// read). Split from [`download_media_bytes`] so the retry loop above can
-/// distinguish a *retryable* outcome — [`ProviderError::NotReady`], meaning
-/// "the CDN answered but not with the expected media yet" — from terminal
-/// ones.
+/// Whether a media response's content type satisfies the caller's expected
+/// family `prefix` (e.g. `"image/"`, `"video/"`). An ABSENT header defers to
+/// the daemon's byte-level validation downstream and is allowed.
+fn content_type_allowed(prefix: &str, content_type: Option<&str>) -> bool {
+    content_type.is_none_or(|ct| ct.starts_with(prefix))
+}
+
+/// The human-readable detail for a content-type mismatch: `"non-image content
+/// type (text/html); the object is likely not published yet"` (the family is
+/// the prefix with its trailing slash stripped) so the image and video paths
+/// read naturally while sharing one implementation.
+fn content_type_mismatch_detail(prefix: &str, content_type: Option<&str>) -> String {
+    format!(
+        "non-{} content type ({}); the object is likely not published yet",
+        prefix.trim_end_matches('/'),
+        content_type.unwrap_or("")
+    )
+}
+
+/// One download fetch (URL guard → GET → status guard → content-type guard →
+/// capped stream read). Split from [`download_media_bytes`] so the retry loop
+/// above can distinguish a *retryable* outcome — [`ProviderError::NotReady`],
+/// meaning "the CDN answered but not with the expected media yet" — from
+/// terminal ones.
 fn fetch_once(
     http: &ureq::Agent,
     base_url: &str,
@@ -250,10 +272,35 @@ fn fetch_once(
         return Err(ProviderError::Io(io::Error::other(reason)));
     }
     tracing::debug!(url = %url, "downloading generated media from provider URL");
+    // Redirects are DISABLED for the download: the SSRF guard above validated
+    // only THIS url, so honouring a provider-controlled 3xx could send the
+    // fetch to an internal address the guard never saw (a classic guard
+    // bypass). With `max_redirects(0)` ureq returns the 3xx response verbatim
+    // instead of following it, and the status check below rejects it like any
+    // other non-2xx.
     let response = http
         .get(url)
+        .config()
+        .max_redirects(0)
+        .build()
         .call()
         .map_err(|e| ProviderError::Io(io::Error::other(e)))?;
+
+    // Status guard: only a 2xx can carry the artifact. A non-2xx means the CDN
+    // is not (yet) serving the object — most often the propagation race, or a
+    // 3xx the redirect policy above declined to follow. Surfaced as retryable
+    // `NotReady` (never read as bytes) so the CDN race is still ridden out,
+    // while a genuinely absent object fails cleanly after the retry budget
+    // instead of being mistaken for a body.
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        tracing::warn!(url = %url, status, "media URL returned a non-success status");
+        return Err(ProviderError::NotReady {
+            detail: format!(
+                "CDN answered with status {status}; the object is likely not published yet"
+            ),
+        });
+    }
 
     // Loose content-type guard: the daemon's prepare pipeline validates the
     // bytes properly, but an obviously-wrong content type (an HTML error page
@@ -270,15 +317,7 @@ fn fetch_once(
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let mime_ok = content_type
-        .as_deref()
-        .is_none_or(|ct| ct.starts_with(content_type_prefix)); // absent header → defer to byte-level validation
-    if !mime_ok {
-        // The `non-<family> content type` phrasing is derived from the prefix
-        // (trailing slash stripped) so the image path keeps its long-standing
-        // "non-image content type" wording while a video download reads
-        // "non-video content type".
-        let family = content_type_prefix.trim_end_matches('/');
+    if !content_type_allowed(content_type_prefix, content_type.as_deref()) {
         tracing::warn!(
             url = %url,
             content_type = content_type.as_deref().unwrap_or(""),
@@ -286,8 +325,8 @@ fn fetch_once(
         );
         return Err(ProviderError::NotReady {
             detail: format!(
-                "CDN answered with a non-{family} content type ({}); the object is likely not published yet",
-                content_type.as_deref().unwrap_or(""),
+                "CDN answered with a {}",
+                content_type_mismatch_detail(content_type_prefix, content_type.as_deref()),
             ),
         });
     }
@@ -326,7 +365,35 @@ fn fetch_once(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_blocked_ip_literal, is_downloadable_url};
+    use super::{
+        content_type_allowed, content_type_mismatch_detail, is_blocked_ip_literal,
+        is_downloadable_url,
+    };
+
+    // ── content-type guards (shared image/video path) ───────────────────
+
+    #[test]
+    fn content_type_allowed_matches_the_caller_prefix_and_defers_on_absent() {
+        // A matching family passes; a mismatched one is rejected; an absent
+        // header defers to downstream byte validation (allowed).
+        assert!(content_type_allowed("image/", Some("image/png")));
+        assert!(content_type_allowed("video/", Some("video/mp4")));
+        assert!(!content_type_allowed("image/", Some("text/html")));
+        assert!(!content_type_allowed("video/", Some("image/png")));
+        assert!(content_type_allowed("image/", None));
+    }
+
+    #[test]
+    fn content_type_mismatch_detail_is_derived_from_the_prefix() {
+        assert_eq!(
+            content_type_mismatch_detail("image/", Some("text/html")),
+            "non-image content type (text/html); the object is likely not published yet"
+        );
+        assert_eq!(
+            content_type_mismatch_detail("video/", None),
+            "non-video content type (); the object is likely not published yet"
+        );
+    }
 
     // ── SSRF download guard ─────────────────────────────────────────────
 

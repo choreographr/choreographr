@@ -111,7 +111,7 @@ pub fn is_zhipu_image_provider_slug(slug: &str) -> bool {
 /// image-only backend is being resolved — never by the chat-protocol dispatch.
 #[must_use]
 pub fn is_fal_image_provider_slug(slug: &str) -> bool {
-    matches!(slug, "fal" | "fal-ai")
+    crate::shared::is_fal_provider_slug(slug)
 }
 
 use choreo_proto::InferenceError;
