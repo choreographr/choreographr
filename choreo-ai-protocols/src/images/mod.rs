@@ -8,9 +8,9 @@
 //! [`InferenceError`] so callers of the chat trait and of this trait share one
 //! error type and one metrics-label mapping — no new error taxonomy is
 //! invented for the image path. The URL-download machinery the URL-returning
-//! adapters share lives in the private [`download`] submodule.
+//! adapters share is hoisted to the crate-level [`crate::download`] module
+//! (reused by the video queue's URL downloads).
 
-mod download;
 mod fal;
 mod openai;
 mod zai;

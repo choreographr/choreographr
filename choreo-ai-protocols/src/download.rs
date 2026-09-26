@@ -1,12 +1,13 @@
-//! Shared image-download machinery for URL-returning image adapters.
+//! Shared media-download machinery for URL-returning adapters.
 //!
-//! Two image providers return the generated image as a **URL** the adapter
-//! must fetch itself rather than as inline base64: z.ai's glm-image (a
-//! temporary, 30-day-expiring CDN link) and fal.ai's flux models (a
-//! `fal.media` link, or — with `sync_mode` — a `data:` URI). The download
-//! half they share lives here so the SSRF guards, the capped/retried/
-//! cancellable fetch, and the [`OpenAiError::NotReady`]-versus-terminal
-//! distinction cannot drift between adapters:
+//! Both fal.ai's image models (`fal.media` link, or — with `sync_mode` — a
+//! `data:` URI) and z.ai's glm-image (a temporary, 30-day-expiring CDN link)
+//! return the generated artifact as a **URL** the adapter must fetch itself
+//! rather than as inline base64, and fal's video queue returns a URL-only
+//! result too. The download half they all share lives here so the SSRF
+//! guards, the capped/retried/cancellable fetch, and the
+//! [`ProviderError::NotReady`]-versus-terminal distinction cannot drift
+//! between adapters:
 //!
 //! - **Scheme + SSRF guard** ([`is_downloadable_url`], [`is_http_url`],
 //!   [`is_blocked_ip_literal`]) — the response's `url` field is
@@ -15,10 +16,12 @@
 //!   range is refused (the URL arrives over an authenticated provider TLS
 //!   channel, not from user input, so the residual hostname risk is an
 //!   accepted decision — see [`is_downloadable_url`]).
-//! - **The capped/retried/cancellable fetch** ([`download_image_bytes`]) —
-//!   an in-stream [`IMAGE_DOWNLOAD_CAP_BYTES`] ceiling, a small dedicated
-//!   retry budget ([`IMAGE_DOWNLOAD_ATTEMPTS`]) that rides out a CDN
-//!   propagation race, and cancellation between attempts.
+//! - **The capped/retried/cancellable fetch** ([`download_media_bytes`]) —
+//!   a caller-supplied in-stream byte ceiling, a small caller-supplied retry
+//!   budget that rides out a CDN propagation race, and cancellation between
+//!   attempts. [`download_image_bytes`] is the thin image wrapper (8 MiB cap,
+//!   the image download-attempt budget); a future video download passes a
+//!   larger cap and the `video/` content-type prefix.
 //!
 //! The host half of the guard is RELAXED for a client whose own configured
 //! base is a loopback/private host ([`host_guard_relaxed`]) — a local mock
@@ -31,8 +34,9 @@ use std::io::Read as _;
 use std::net::IpAddr;
 
 use crate::images::{IMAGE_DOWNLOAD_ATTEMPTS, IMAGE_DOWNLOAD_CAP_BYTES};
-use crate::openai::{OpenAiError, ServiceConfig};
+use crate::openai::ServiceConfig;
 use crate::retry;
+use crate::shared::ProviderError;
 
 /// Reject URLs whose host is an IP literal in a range that must never be
 /// dereferenced from provider-controlled response data (SSRF guard).
@@ -44,7 +48,7 @@ use crate::retry;
 /// provider hosts is out of scope here; the residual risk is accepted
 /// because (a) the URL arrives over the authenticated provider TLS channel,
 /// not from user input, and (b) the downloaded bytes are fully validated
-/// downstream by the daemon's image prepare pipeline (magic bytes, size
+/// downstream by the daemon's prepare pipeline (magic bytes, size
 /// cap, decode), so a malicious host can at worst waste the download — it
 /// cannot smuggle content into a session.
 ///
@@ -63,7 +67,7 @@ pub(crate) fn is_downloadable_url(url: &str) -> Result<(), String> {
         });
     if blocked {
         return Err(format!(
-            "image URL host is a private/loopback/link-local IP literal, refusing to fetch: {url}"
+            "media URL host is a private/loopback/link-local IP literal, refusing to fetch: {url}"
         ));
     }
     Ok(())
@@ -72,13 +76,13 @@ pub(crate) fn is_downloadable_url(url: &str) -> Result<(), String> {
 /// Scheme-only half of the download guard (http/https). Used standalone when
 /// the host guard is relaxed for local-dev bases (see [`host_guard_relaxed`]).
 pub(crate) fn is_http_url(url: &str) -> Result<(), String> {
-    let parsed = url::Url::parse(url).map_err(|e| format!("unparseable image URL: {e}"))?;
+    let parsed = url::Url::parse(url).map_err(|e| format!("unparseable media URL: {e}"))?;
     // Only http(s) URLs are honored — the response's `url` field is
     // provider-controlled text, and a `file://` (or any non-HTTP scheme)
     // value must never be dereferenced as one.
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(format!(
-            "image URL uses an unsupported scheme: {}",
+            "media URL uses an unsupported scheme: {}",
             parsed.scheme()
         ));
     }
@@ -122,56 +126,85 @@ pub(crate) fn host_guard_relaxed(base_url: &str) -> bool {
         })
 }
 
-/// Download the generated image bytes from a provider-returned URL.
+/// Download the generated **image** bytes from a provider-returned URL.
 ///
-/// No Authorization header (the URL is pre-signed and the API key must not
-/// travel to a third-party host), and the shared agent's `timeout_global`
-/// bounds each fetch under the same per-attempt budget as the generation
-/// POST — a slow CDN cannot escape the adapter's per-attempt deadline. The
-/// stream is read with a running cap ([`IMAGE_DOWNLOAD_CAP_BYTES`]) so a
-/// hostile/huge response fails at the cap instead of after a full
-/// multi-gigabyte read.
-///
-/// The whole download gets its OWN small retry budget
-/// ([`IMAGE_DOWNLOAD_ATTEMPTS`]) separate from the generation POST's. z.ai's
-/// object storage advertises the URL in the generation response *before* the
-/// object is fully published, so an immediate follow-up GET can hit a
-/// propagation race and receive a non-image body (an error page or metadata
-/// served with a success status) instead of the bytes — the same race fal's
-/// CDN can exhibit. A retry with the account's short initial backoff rides
-/// that race out well within the overall attempt deadline; a scheme
-/// violation, a cap overflow, or an empty body stays terminal — those cannot
-/// be fixed by waiting.
-///
-/// # Errors
-///
-/// Returns [`OpenAiError`] on guard violation, transport error, the download
-/// cap, or (after the retry budget) a not-yet-published artifact.
+/// Thin wrapper over [`download_media_bytes`] preserving the image adapters'
+/// long-standing policy: an `image/` content-type guard, the 8 MiB
+/// [`IMAGE_DOWNLOAD_CAP_BYTES`] ceiling, and the
+/// [`IMAGE_DOWNLOAD_ATTEMPTS`]-attempt budget that rides out a CDN
+/// propagation race.
 pub(crate) fn download_image_bytes(
     http: &ureq::Agent,
     config: &ServiceConfig,
     url: &str,
     cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
-) -> Result<Vec<u8>, OpenAiError> {
+) -> Result<Vec<u8>, ProviderError> {
+    download_media_bytes(
+        http,
+        config,
+        url,
+        "image/",
+        IMAGE_DOWNLOAD_CAP_BYTES,
+        IMAGE_DOWNLOAD_ATTEMPTS,
+        cancel_rx,
+    )
+}
+
+/// Download the generated media bytes from a provider-returned URL.
+///
+/// No Authorization header (the URL is pre-signed and the API key must not
+/// travel to a third-party host), and the shared agent's `timeout_global`
+/// bounds each fetch under the same per-attempt budget as the generation
+/// POST — a slow CDN cannot escape the adapter's per-attempt deadline. The
+/// stream is read with a running `cap` so a hostile/huge response fails at
+/// the cap instead of after a full multi-gigabyte read.
+///
+/// `content_type_prefix` is the content-type family the caller expects (e.g.
+/// `"image/"`, `"video/"`); a response whose content type does not start with
+/// it is treated as the CDN still materializing the object (retryable), not a
+/// hard failure.
+///
+/// `attempts` is the caller's own small retry budget. z.ai's object storage
+/// advertises the URL in the generation response *before* the object is fully
+/// published, so an immediate follow-up GET can hit a propagation race and
+/// receive a non-media body (an error page or metadata served with a success
+/// status) instead of the bytes — the same race fal's CDN can exhibit. A
+/// retry with the account's short initial backoff rides that race out well
+/// within the overall attempt deadline; a scheme violation, a cap overflow,
+/// or an empty body stays terminal — those cannot be fixed by waiting.
+///
+/// # Errors
+///
+/// Returns [`ProviderError`] on guard violation, transport error, the download
+/// cap, or (after the retry budget) a not-yet-published artifact.
+pub(crate) fn download_media_bytes(
+    http: &ureq::Agent,
+    config: &ServiceConfig,
+    url: &str,
+    content_type_prefix: &str,
+    cap: usize,
+    attempts: u32,
+    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
+) -> Result<Vec<u8>, ProviderError> {
     // The loop keeps the not-ready detail of the attempt it is retrying; the
     // retry arm only fires while attempts remain, so every exit path below
     // returns a concrete error — no exhausted-loop fallthrough and no Option
     // bookkeeping needed.
     let mut attempt = 1;
     loop {
-        match fetch_once(http, &config.base_url, url) {
+        match fetch_once(http, &config.base_url, url, content_type_prefix, cap) {
             Ok(bytes) => return Ok(bytes),
-            // Only "the CDN answered but not with an image yet" (NotReady
-            // from fetch_once's content-type / empty-body guards) is
+            // Only "the CDN answered but not with the expected media yet"
+            // (NotReady from fetch_once's content-type / empty-body guards) is
             // retryable — that is the propagation race. Cap overflow,
             // scheme/host-guard violations, transport errors, and the final
             // attempt all return the error verbatim: waiting cannot fix
             // those.
-            Err(OpenAiError::NotReady { detail }) if attempt < IMAGE_DOWNLOAD_ATTEMPTS => {
+            Err(ProviderError::NotReady { detail }) if attempt < attempts => {
                 tracing::warn!(
                     url = %url,
                     attempt,
-                    "image URL not yet published — retrying after backoff"
+                    "media URL not yet published — retrying after backoff"
                 );
                 let wait = std::time::Duration::from_millis(config.retry_initial_backoff_ms);
                 // sleep_or_cancel wakes instantly on a cancel (biased select)
@@ -180,8 +213,8 @@ pub(crate) fn download_image_bytes(
                 // completing, so the saved not-ready error is the honest
                 // outcome.
                 if retry::sleep_or_cancel(wait, cancel_rx).is_err() {
-                    tracing::warn!("image download retry wait aborted (cancel/close)");
-                    return Err(OpenAiError::NotReady { detail });
+                    tracing::warn!("media download retry wait aborted (cancel/close)");
+                    return Err(ProviderError::NotReady { detail });
                 }
                 attempt += 1;
             }
@@ -191,10 +224,17 @@ pub(crate) fn download_image_bytes(
 }
 
 /// One download fetch (URL guard → GET → content-type guard → capped stream
-/// read). Split from [`download_image_bytes`] so the retry loop above can
-/// distinguish a *retryable* outcome — [`OpenAiError::NotReady`], meaning
-/// "the CDN answered but not with an image yet" — from terminal ones.
-fn fetch_once(http: &ureq::Agent, base_url: &str, url: &str) -> Result<Vec<u8>, OpenAiError> {
+/// read). Split from [`download_media_bytes`] so the retry loop above can
+/// distinguish a *retryable* outcome — [`ProviderError::NotReady`], meaning
+/// "the CDN answered but not with the expected media yet" — from terminal
+/// ones.
+fn fetch_once(
+    http: &ureq::Agent,
+    base_url: &str,
+    url: &str,
+    content_type_prefix: &str,
+    cap: usize,
+) -> Result<Vec<u8>, ProviderError> {
     // Scheme + SSRF guard (see `is_downloadable_url`): a scheme violation or
     // a private/loopback IP-literal host is terminal — no amount of waiting
     // makes a hostile URL fetchable. The host half is relaxed only for
@@ -206,25 +246,25 @@ fn fetch_once(http: &ureq::Agent, base_url: &str, url: &str) -> Result<Vec<u8>, 
         is_downloadable_url(url)
     };
     if let Err(reason) = guard {
-        tracing::warn!(url = %url, %reason, "image URL rejected by the download guard");
-        return Err(OpenAiError::Io(io::Error::other(reason)));
+        tracing::warn!(url = %url, %reason, "media URL rejected by the download guard");
+        return Err(ProviderError::Io(io::Error::other(reason)));
     }
-    tracing::debug!(url = %url, "downloading generated image from provider URL");
+    tracing::debug!(url = %url, "downloading generated media from provider URL");
     let response = http
         .get(url)
         .call()
-        .map_err(|e| OpenAiError::Io(io::Error::other(e)))?;
+        .map_err(|e| ProviderError::Io(io::Error::other(e)))?;
 
     // Loose content-type guard: the daemon's prepare pipeline validates the
     // bytes properly, but an obviously-wrong content type (an HTML error page
     // served with a 200 by the CDN — which happens transiently while the
-    // object is still propagating, see download_image_bytes) is cheap to
-    // reject here, before meaningful bytes are read. `image/*` covers the
-    // JPEG/PNG/WebP payloads the providers serve; an octet-stream from a
-    // quirky proxy is let through deliberately (bytes are validated
-    // downstream anyway). Mapped to NotReady rather than a plain Io error so
-    // the download retry loop can treat this specific outcome as retryable
-    // while a genuinely empty body stays EmptyResponse (terminal).
+    // object is still propagating, see download_media_bytes) is cheap to
+    // reject here, before meaningful bytes are read. `content_type_prefix`
+    // covers the payloads the providers serve (e.g. `image/*`, `video/*`); an
+    // octet-stream from a quirky proxy is let through deliberately (bytes are
+    // validated downstream anyway). Mapped to NotReady rather than a plain Io
+    // error so the download retry loop can treat this specific outcome as
+    // retryable while a genuinely empty body stays EmptyResponse (terminal).
     let content_type = response
         .headers()
         .get("content-type")
@@ -232,16 +272,21 @@ fn fetch_once(http: &ureq::Agent, base_url: &str, url: &str) -> Result<Vec<u8>, 
         .map(str::to_owned);
     let mime_ok = content_type
         .as_deref()
-        .is_none_or(|ct| ct.starts_with("image/")); // absent header → defer to byte-level validation
+        .is_none_or(|ct| ct.starts_with(content_type_prefix)); // absent header → defer to byte-level validation
     if !mime_ok {
+        // The `non-<family> content type` phrasing is derived from the prefix
+        // (trailing slash stripped) so the image path keeps its long-standing
+        // "non-image content type" wording while a video download reads
+        // "non-video content type".
+        let family = content_type_prefix.trim_end_matches('/');
         tracing::warn!(
             url = %url,
             content_type = content_type.as_deref().unwrap_or(""),
-            "image URL did not return an image content type"
+            "media URL did not return the expected content type"
         );
-        return Err(OpenAiError::NotReady {
+        return Err(ProviderError::NotReady {
             detail: format!(
-                "CDN answered with a non-image content type ({}); the object is likely not published yet",
+                "CDN answered with a non-{family} content type ({}); the object is likely not published yet",
                 content_type.as_deref().unwrap_or(""),
             ),
         });
@@ -256,24 +301,24 @@ fn fetch_once(http: &ureq::Agent, base_url: &str, url: &str) -> Result<Vec<u8>, 
     loop {
         let n = reader
             .read(&mut chunk)
-            .map_err(|e| OpenAiError::Io(io::Error::other(e)))?;
+            .map_err(|e| ProviderError::Io(io::Error::other(e)))?;
         if n == 0 {
             break;
         }
-        if bytes.len() + n > IMAGE_DOWNLOAD_CAP_BYTES {
-            return Err(OpenAiError::Io(io::Error::other(
-                "generated image exceeds the adapter's download cap",
+        if bytes.len() + n > cap {
+            return Err(ProviderError::Io(io::Error::other(
+                "generated media exceeds the adapter's download cap",
             )));
         }
         bytes.extend_from_slice(crate::shared::read_slice(&chunk, n));
     }
     if bytes.is_empty() {
-        // An empty body with an image content type is the same propagation
+        // An empty body with a matching content type is the same propagation
         // race (the CDN started serving before writing) — retryable, not the
         // terminal "provider returned an empty response" of the generation
         // path.
-        return Err(OpenAiError::NotReady {
-            detail: "CDN returned an empty body for the image URL".to_string(),
+        return Err(ProviderError::NotReady {
+            detail: "CDN returned an empty body for the media URL".to_string(),
         });
     }
     Ok(bytes)

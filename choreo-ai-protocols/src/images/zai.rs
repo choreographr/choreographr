@@ -22,7 +22,7 @@ use choreo_proto::InferenceError;
 use serde::Deserialize;
 use std::io;
 
-use crate::images::download;
+use crate::download;
 use crate::images::{IMAGE_MAX_ATTEMPTS, IMAGE_TOTAL_TIMEOUT_SECS};
 use crate::images::{ImageGenerationClient, ImageGenerationRequest, ImageGenerationResult};
 use crate::openai::endpoint_url;

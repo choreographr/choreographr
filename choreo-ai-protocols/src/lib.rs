@@ -21,6 +21,10 @@
 //! - [`google`] — Google Gemini client.
 //! - [`catalog`] — provider catalog (normalized models.dev base + bundled
 //!   overlay, embedded postcard, and lookups).
+//! - [`images`] — image-generation clients ([`ImageGenerationClient`]) and the
+//!   request/result types they are expressed in.
+//! - [`videos`] — video-generation clients ([`VideoGenerationClient`]) over
+//!   fal's queue protocol.
 //! - [`retry`] — shared HTTP retry machinery used by all clients.
 //! - [`ProviderClient`], [`ChatTurnRequest`], [`ChatTurnResult`] — the trait
 //!   and shared types every client implements/uses.
@@ -33,6 +37,7 @@ pub mod google;
 pub mod images;
 pub mod openai;
 pub mod retry;
+pub mod videos;
 
 // Test-only helpers (scripted HTTP mock provider for the integration tests);
 // compiled only when the `test-utils` feature is enabled (see Cargo.toml).
@@ -40,6 +45,13 @@ pub mod retry;
 pub mod test_utils;
 
 mod context_window;
+// Shared URL-download machinery (SSRF guard + capped/retried/cancellable
+// fetch) used by the image adapters and the video queue's result
+// downloads — crate-internal, never part of the public surface.
+pub(crate) mod download;
+// Shared fal.ai wire-contract helpers (the two-shape error mapper) used by
+// both the image and video fal adapters.
+pub(crate) mod fal;
 mod overrides;
 mod shared;
 mod stream;
@@ -74,4 +86,8 @@ pub use shared::{MaxTokensField, ProviderError};
 pub use traits::{ChatTurnRequest, ProviderClient, ToolResultItem};
 pub use types::{
     CallerInfo, ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
+};
+pub use videos::{
+    FalVideoClient, VideoAspectRatio, VideoGenerationClient, VideoGenerationRequest,
+    VideoGenerationResult, VideoJobHandle, VideoJobStatus, VideoMetrics, VideoResolution,
 };
