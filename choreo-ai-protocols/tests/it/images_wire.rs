@@ -315,6 +315,262 @@ fn defaults_and_trait_accessors() {
     assert_eq!(Background::Opaque.to_string(), "opaque");
 }
 
+// ── FalImageClient (fal.ai synchronous image API) ─────────────────────
+//
+// The generation mock scripts the JSON envelope; the CDN mock (a SECOND
+// MockProvider) serves the image bytes, and the envelope embeds its URL. The
+// download host guard is relaxed because the client's own base is loopback
+// (see `FalImageClient::host_guard_relaxed`).
+
+use choreo_ai_protocols::FalImageClient;
+
+fn fal_request() -> ImageGenerationRequest {
+    ImageGenerationRequest::new("a lighthouse at dusk", "fal-ai/flux-2-pro")
+}
+
+/// Generation-response envelope carrying one image at `url`.
+fn fal_success_body(url: &str) -> String {
+    serde_json::json!({
+        "images": [{
+            "url": url,
+            "content_type": "image/png",
+            "file_name": "out.png",
+            "file_size": 123,
+            "width": 1024,
+            "height": 1024
+        }],
+        "seed": 42
+    })
+    .to_string()
+}
+
+fn fal_client(mock: &MockProvider) -> FalImageClient {
+    let config = ServiceConfig {
+        base_url: mock.base_url("fal"),
+        provider_slug: "fal".to_string(),
+        retry_initial_backoff_ms: 0, // no sleeping in tests
+        ..Default::default()
+    };
+    FalImageClient::new(
+        config,
+        "fal-test-key".to_string(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+}
+
+#[test]
+#[ignore = "integration"]
+fn fal_url_response_downloads_and_decodes() {
+    // Two mocks: the generation POST answers with a URL pointing at the CDN
+    // mock, which serves the raw image bytes.
+    let cdn = MockProvider::start(vec![(200, "image/png", IMAGE_BYTES.to_string())]);
+    let provider = MockProvider::start(vec![(
+        200,
+        "application/json",
+        fal_success_body(&cdn.base_url("cdn/out.png")),
+    )]);
+
+    let result = fal_client(&provider)
+        .generate_image(&fal_request(), None)
+        .expect("generation succeeds");
+
+    // Byte fidelity through the download → re-encode path.
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&result.image_b64)
+        .expect("result b64 decodes");
+    assert_eq!(bytes, IMAGE_BYTES.as_bytes());
+    assert_eq!(result.revised_prompt, None);
+    assert_eq!(result.model, "fal-ai/flux-2-pro");
+
+    // The POST hit the model path with the `Key` auth scheme.
+    let provider_requests = provider.requests();
+    assert_eq!(provider_requests.len(), 1);
+    assert_eq!(provider_requests[0].method, "POST");
+    assert_eq!(provider_requests[0].path, "/fal/fal-ai/flux-2-pro");
+    assert_eq!(
+        provider_requests[0].header("authorization"),
+        Some("Key fal-test-key")
+    );
+
+    // The CDN GET must NOT carry the key (the URL is pre-signed).
+    let cdn_requests = cdn.requests();
+    assert_eq!(cdn_requests.len(), 1);
+    assert_eq!(cdn_requests[0].method, "GET");
+    assert_eq!(cdn_requests[0].path, "/cdn/out.png");
+    assert_eq!(cdn_requests[0].header("authorization"), None);
+}
+
+#[test]
+#[ignore = "integration"]
+fn fal_data_uri_response_is_decoded_in_place() {
+    // `sync_mode` responses inline the bytes as a data: URI — no download.
+    let b64 = base64::engine::general_purpose::STANDARD.encode(IMAGE_BYTES.as_bytes());
+    let body = serde_json::json!({
+        "images": [{ "url": format!("data:image/png;base64,{b64}") }]
+    })
+    .to_string();
+    let mock = MockProvider::start(vec![(200, "application/json", body)]);
+
+    let result = fal_client(&mock)
+        .generate_image(&fal_request(), None)
+        .expect("data-URI generation succeeds");
+    // The payload passes through verbatim.
+    assert_eq!(result.image_b64, b64);
+    assert_eq!(mock.requests().len(), 1, "no CDN fetch for a data URI");
+}
+
+#[test]
+#[ignore = "integration"]
+fn fal_wire_body_has_prompt_image_size_and_output_format_only() {
+    let cdn = MockProvider::start(vec![(200, "image/png", IMAGE_BYTES.to_string())]);
+    let provider = MockProvider::start(vec![(
+        200,
+        "application/json",
+        fal_success_body(&cdn.base_url("cdn/out.png")),
+    )]);
+    let req = ImageGenerationRequest {
+        size: ImageSize::Landscape1536x1024,
+        quality: ImageQuality::High,
+        output_format: OutputFormat::Jpeg,
+        background: Background::Transparent,
+        ..fal_request()
+    };
+    fal_client(&provider)
+        .generate_image(&req, None)
+        .expect("generation succeeds");
+
+    let body = provider.requests()[0].body_json();
+    assert_eq!(body["prompt"], "a lighthouse at dusk");
+    // The explicit-dimensions form (no named enum matches 1536×1024).
+    assert_eq!(
+        body["image_size"],
+        serde_json::json!({ "width": 1536, "height": 1024 })
+    );
+    assert_eq!(body["output_format"], "jpeg");
+    // The model is the URL path segment, never a body field; flux-2-pro has
+    // no quality/background knob (silently ignored) and we never send n.
+    assert!(body.get("model").is_none());
+    assert!(body.get("quality").is_none());
+    assert!(body.get("background").is_none());
+    assert!(body.get("n").is_none());
+}
+
+#[test]
+#[ignore = "integration"]
+fn fal_content_policy_violation_maps_to_content_filtered() {
+    let mock = MockProvider::start(vec![(
+        422,
+        "application/json",
+        r#"{"detail":[{"loc":["body"],"msg":"prompt flagged","type":"content_policy_violation"}]}"#
+            .to_string(),
+    )]);
+    let err = fal_client(&mock)
+        .generate_image(&fal_request(), None)
+        .expect_err("content policy is terminal");
+    match err {
+        InferenceError::ContentFiltered { detail } => assert_eq!(detail, "prompt flagged"),
+        other => panic!("expected ContentFiltered, got {other:?}"),
+    }
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "policy block is terminal — no retry"
+    );
+}
+
+#[test]
+#[ignore = "integration"]
+fn fal_no_media_generated_maps_to_empty_response() {
+    let mock = MockProvider::start(vec![(
+        422,
+        "application/json",
+        r#"{"detail":[{"loc":[],"msg":"no image","type":"no_media_generated"}]}"#.to_string(),
+    )]);
+    let err = fal_client(&mock)
+        .generate_image(&fal_request(), None)
+        .expect_err("no media is an error");
+    assert!(matches!(err, InferenceError::EmptyResponse), "{err:?}");
+}
+
+#[test]
+#[ignore = "integration"]
+fn fal_flat_request_error_maps_to_server_error() {
+    // A 5xx flat infra error (runner_*) surfaces as ServerError with the
+    // body detail; the frugal budget retries it once, then it is terminal.
+    let mock = MockProvider::start(vec![(
+        500,
+        "application/json",
+        r#"{"detail":"runner crashed","error_type":"runner_error"}"#.to_string(),
+    )]);
+    let err = fal_client(&mock)
+        .generate_image(&fal_request(), None)
+        .expect_err("runner failure is a server error");
+    match err {
+        InferenceError::ServerError { status, detail } => {
+            assert_eq!(status, 500);
+            assert_eq!(detail, "runner crashed");
+        }
+        other => panic!("expected ServerError, got {other:?}"),
+    }
+    assert_eq!(
+        mock.requests().len(),
+        2,
+        "5xx retried once within the 2-attempt budget"
+    );
+}
+
+#[test]
+#[ignore = "integration"]
+fn fal_401_maps_to_unauthorized() {
+    let mock = MockProvider::start(vec![(
+        401,
+        "application/json",
+        r#"{"detail":"invalid api key"}"#.to_string(),
+    )]);
+    let err = fal_client(&mock)
+        .generate_image(&fal_request(), None)
+        .expect_err("401 is terminal");
+    match err {
+        InferenceError::Unauthorized { status, .. } => assert_eq!(status, 401),
+        other => panic!("expected Unauthorized, got {other:?}"),
+    }
+    assert_eq!(mock.requests().len(), 1, "401 is terminal — no retry");
+}
+
+#[test]
+#[ignore = "integration"]
+fn fal_429_with_oversized_retry_after_maps_to_rate_limited() {
+    // An hour-long cooldown outlives the 30 s backoff ceiling → terminal on
+    // the first attempt; Retry-After must survive into the typed error.
+    // MockProvider cannot script a Retry-After header, so this one-shot local
+    // server carries it.
+    let addr = single_response_with_header(
+        429,
+        ("Retry-After", "3600"),
+        r#"{"detail":"quota exhausted"}"#,
+    );
+    let config = ServiceConfig {
+        base_url: format!("http://{addr}/fal"),
+        provider_slug: "fal".to_string(),
+        ..Default::default()
+    };
+    let err = FalImageClient::new(
+        config,
+        "fal-test-key".to_string(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .generate_image(&fal_request(), None)
+    .expect_err("oversized Retry-After is terminal");
+    match err {
+        InferenceError::RateLimited {
+            status,
+            retry_after_secs: Some(3600),
+            ..
+        } => assert_eq!(status, 429),
+        other => panic!("expected RateLimited 429 with Retry-After 3600, got {other:?}"),
+    }
+}
+
 // ── ZaiImageClient (z.ai / Zhipu GLM Images API) ─────────────────────────
 //
 // The mock is reused verbatim: it scripts "one canned response per

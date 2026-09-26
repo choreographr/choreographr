@@ -21,87 +21,13 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use choreo_proto::InferenceError;
 use serde::Deserialize;
 use std::io;
-use std::io::Read as _;
 
-use crate::images::{
-    IMAGE_DOWNLOAD_ATTEMPTS, IMAGE_DOWNLOAD_CAP_BYTES, IMAGE_MAX_ATTEMPTS, IMAGE_TOTAL_TIMEOUT_SECS,
-};
+use crate::images::download;
+use crate::images::{IMAGE_MAX_ATTEMPTS, IMAGE_TOTAL_TIMEOUT_SECS};
 use crate::images::{ImageGenerationClient, ImageGenerationRequest, ImageGenerationResult};
 use crate::openai::endpoint_url;
 use crate::openai::{OpenAiError, ServiceConfig};
 use crate::retry::{self, AttemptContext, RetryConfig};
-use std::net::IpAddr;
-
-/// Reject URLs whose host is an IP literal in a range that must never be
-/// dereferenced from provider-controlled response data (SSRF guard).
-///
-/// Blocks loopback (127/8, `::1`), private (RFC 1918, RFC 4193 `fc00::/7`),
-/// and link-local (169.254/16, `fe80::/10`) addresses. Non-IP hostnames
-/// (e.g. `mfile.z.ai`) are ALLOWED — recorded security decision:
-/// the URL's hostname is provider-controlled, but DNS pinning for arbitrary
-/// provider hosts is out of scope here; the residual risk is accepted
-/// because (a) the URL arrives over the authenticated provider TLS channel,
-/// not from user input, and (b) the downloaded bytes are fully validated
-/// downstream by the daemon's image prepare pipeline (magic bytes, size
-/// cap, decode), so a malicious host can at worst waste the download — it
-/// cannot smuggle content into a session.
-///
-/// Returns `Err` with a human-readable reason (surfaced as the error detail).
-fn is_downloadable_url(url: &str) -> Result<(), String> {
-    is_http_url(url)?;
-    // The URL crate renders IPv6 literals bracketed (`[::1]`); unwrap the
-    // brackets before parsing. A hostname that is not an IP literal is
-    // allowed (see the recorded decision above).
-    let blocked = url::Url::parse(url)
-        .ok()
-        .and_then(|parsed| parsed.host_str().map(str::to_owned))
-        .is_some_and(|host| {
-            let host = host.trim_start_matches('[').trim_end_matches(']');
-            host.parse::<IpAddr>().is_ok_and(is_blocked_ip_literal)
-        });
-    if blocked {
-        return Err(format!(
-            "image URL host is a private/loopback/link-local IP literal, refusing to fetch: {url}"
-        ));
-    }
-    Ok(())
-}
-
-/// Scheme-only half of the download guard (http/https). Used standalone when
-/// the host guard is relaxed for local-dev bases (see
-/// `ZaiImageClient::host_guard_relaxed`).
-fn is_http_url(url: &str) -> Result<(), String> {
-    let parsed = url::Url::parse(url).map_err(|e| format!("unparseable image URL: {e}"))?;
-    // Only http(s) URLs are honored — the response's `url` field is
-    // provider-controlled text, and a `file://` (or any non-HTTP scheme)
-    // value must never be dereferenced as one.
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(format!(
-            "image URL uses an unsupported scheme: {}",
-            parsed.scheme()
-        ));
-    }
-    Ok(())
-}
-
-/// Whether a parsed IP literal falls in a range this adapter must never
-/// fetch: loopback, private (RFC 1918 for v4, unique-local `fc00::/7` for
-/// v6), or link-local (169.254/16 for v4, `fe80::/10` for v6).
-fn is_blocked_ip_literal(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                // `is_unique_local` is still unstable on std Ipv6Addr —
-                // test the RFC 4193 prefix bits directly.
-                || (u16::from_be_bytes([v6.octets()[0], v6.octets()[1]]) & 0xfe00) == 0xfc00
-                // fe80::/10 link-local: the top 10 bits are 0xfe80..0xfebf.
-                || (u16::from_be_bytes([v6.octets()[0], v6.octets()[1]]) & 0xffc0) == 0xfe80
-                // IPv4-mapped (::ffff:10.0.0.1 etc.) — judge the embedded v4.
-                || matches!(v6.to_ipv4_mapped(), Some(v4) if v4.is_loopback() || v4.is_private() || v4.is_link_local())
-        }
-    }
-}
 
 /// Images API path under the configured base URL (z.ai: the base already
 /// ends at `/api/paas/v4`, so the composed URL is `/paas/v4/images/generations`).
@@ -211,21 +137,14 @@ impl ZaiImageClient {
     }
 
     /// Whether the SSRF IP-literal host guard may be RELAXED for this
-    /// client's CDN downloads: true only when the daemon is itself
-    /// configured against a loopback/private base (a local mock provider or
-    /// dev proxy — recorded security decision: an operator who already aims
-    /// the account at a private endpoint has made that trust decision, and
-    /// such bases are exactly what the scripted wire tests and local
-    /// proxies serve the download from; production bases are public
-    /// hostnames, where the guard stays fully active).
+    /// client's CDN downloads. Delegates to the shared
+    /// [`download::host_guard_relaxed`] so z.ai and fal cannot drift on the
+    /// trust decision; test-only because production callers reach it through
+    /// [`download::download_image_bytes`], while the wire tests exercise it
+    /// through the client.
+    #[cfg(test)]
     fn host_guard_relaxed(&self) -> bool {
-        url::Url::parse(&self.config.base_url)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_owned))
-            .is_some_and(|host| {
-                let host = host.trim_start_matches('[').trim_end_matches(']');
-                host.parse::<IpAddr>().is_ok_and(is_blocked_ip_literal)
-            })
+        download::host_guard_relaxed(&self.config.base_url)
     }
 
     /// The outgoing request body: `{model, prompt}` always; `size` only when
@@ -264,162 +183,18 @@ impl ZaiImageClient {
         body
     }
 
-    /// Download the generated image bytes from the temporary CDN URL.
-    ///
-    /// No Authorization header (see the module docs: the URL is pre-signed
-    /// and the API key must not travel to a third-party host), and the
-    /// shared agent's `timeout_global` bounds each fetch under the same
-    /// per-attempt budget as the generation POST — a slow CDN cannot escape
-    /// the 180 s per-attempt deadline. The stream is read with a running cap
-    /// ([`IMAGE_DOWNLOAD_CAP_BYTES`]) so a hostile/huge response fails at
-    /// the cap instead of after a full multi-gigabyte read.
-    ///
-    /// The whole download gets its OWN small retry budget
-    /// ([`IMAGE_DOWNLOAD_ATTEMPTS`]) separate from the generation POST's:
-    /// z.ai's object storage advertises the URL in the generation response
-    /// *before* the object is fully published, so an immediate follow-up
-    /// GET can hit a propagation race and receive a non-image body (an
-    /// error page or metadata served with a success status) instead of the
-    /// bytes. Observed in production: the identical URL served an HTML-ish
-    /// body on the first GET and a clean `image/png` seconds later (the
-    /// CDN's `X-Ufile-Create-Time` confirms lazy materialization). A retry
-    /// with the account's short initial backoff (~1-2 s typically) rides
-    /// that race out well within the overall attempt deadline; a scheme
-    /// violation, a cap overflow, or an empty body stays terminal — those
-    /// cannot be fixed by waiting.
+    /// Download the generated image bytes from the temporary CDN URL via the
+    /// shared [`download::download_image_bytes`] (scheme/SSRF guard, capped
+    /// stream read, and the dedicated 3-attempt budget that rides out z.ai's
+    /// CDN propagation race). No Authorization header is sent: the URL is
+    /// pre-signed, so the API key must not travel to a third-party host (see
+    /// the module docs).
     fn download_image(
         &self,
         url: &str,
         cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
     ) -> Result<Vec<u8>, OpenAiError> {
-        // The loop keeps the not-ready detail of the attempt it is retrying;
-        // the retry arm only fires while attempts remain, so every exit
-        // path below returns a concrete error — no exhausted-loop
-        // fallthrough and no Option bookkeeping needed.
-        let mut attempt = 1;
-        loop {
-            match self.fetch_once(url) {
-                Ok(bytes) => return Ok(bytes),
-                // Only "the CDN answered but not with an image yet"
-                // (NotReady from fetch_once's content-type / empty-body
-                // guards) is retryable — that is the propagation race. Cap
-                // overflow, scheme/host-guard violations, transport errors,
-                // and the final attempt all return the error verbatim:
-                // waiting cannot fix those.
-                Err(OpenAiError::NotReady { detail }) if attempt < IMAGE_DOWNLOAD_ATTEMPTS => {
-                    tracing::warn!(
-                        url = %url,
-                        attempt,
-                        "z.ai image URL not yet published — retrying after backoff"
-                    );
-                    let wait =
-                        std::time::Duration::from_millis(self.config.retry_initial_backoff_ms);
-                    // sleep_or_cancel wakes instantly on a cancel (biased
-                    // select) and errors on a dropped/disconnected channel —
-                    // either way the wait is over and the racy fetch is
-                    // nowhere near completing, so the saved not-ready error
-                    // is the honest outcome.
-                    if retry::sleep_or_cancel(wait, cancel_rx).is_err() {
-                        tracing::warn!("z.ai image download retry wait aborted (cancel/close)");
-                        return Err(OpenAiError::NotReady { detail });
-                    }
-                    attempt += 1;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    /// One download fetch (URL guard → GET → content-type guard →
-    /// capped stream read). Split from [`Self::download_image`] so the
-    /// retry loop above can distinguish a *retryable* outcome —
-    /// [`OpenAiError::NotReady`], meaning "the CDN answered but not with an
-    /// image yet" — from terminal ones.
-    fn fetch_once(&self, url: &str) -> Result<Vec<u8>, OpenAiError> {
-        // Scheme + SSRF guard (see `is_downloadable_url`): a scheme
-        // violation or a private/loopback IP-literal host is terminal — no
-        // amount of waiting makes a hostile URL fetchable. The host half is
-        // relaxed only for local-dev bases (mock providers serve the
-        // download from loopback); the scheme half always applies.
-        let guard = if self.host_guard_relaxed() {
-            is_http_url(url)
-        } else {
-            is_downloadable_url(url)
-        };
-        if let Err(reason) = guard {
-            tracing::warn!(url = %url, %reason, "z.ai image URL rejected by the download guard");
-            return Err(OpenAiError::Io(io::Error::other(reason)));
-        }
-        tracing::debug!(url = %url, "downloading generated image from provider URL");
-        let response = self
-            .http
-            .get(url)
-            .call()
-            .map_err(|e| OpenAiError::Io(io::Error::other(e)))?;
-
-        // Loose content-type guard: the daemon's prepare pipeline validates
-        // the bytes properly, but an obviously-wrong content type (an HTML
-        // error page served with a 200 by the CDN — which happens transiently
-        // while the object is still propagating, see download_image) is
-        // cheap to reject here, before meaningful bytes are read.
-        // `image/*` covers the JPEG/PNG/WebP payloads z.ai serves; an
-        // octet-stream from a quirky proxy is let through deliberately
-        // (bytes are validated downstream anyway). Mapped to NotReady rather
-        // than a plain Io error so the download retry loop can treat this
-        // specific outcome as retryable while a genuinely empty body stays
-        // EmptyResponse (terminal).
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        let mime_ok = content_type
-            .as_deref()
-            .is_none_or(|ct| ct.starts_with("image/")); // absent header → defer to byte-level validation
-        if !mime_ok {
-            tracing::warn!(
-                url = %url,
-                content_type = content_type.as_deref().unwrap_or(""),
-                "z.ai image URL did not return an image content type"
-            );
-            return Err(OpenAiError::NotReady {
-                detail: format!(
-                    "CDN answered with a non-image content type ({}); the object is likely not published yet",
-                    content_type.as_deref().unwrap_or(""),
-                ),
-            });
-        }
-
-        // Stream with the cap enforced *during* the read: a +1 reserve byte
-        // lets us abort at the first chunk over the limit instead of
-        // buffering the whole oversized body first.
-        let mut reader = response.into_body().into_reader();
-        let mut bytes = Vec::with_capacity(64 * 1024);
-        let mut chunk = [0u8; 16 * 1024];
-        loop {
-            let n = reader
-                .read(&mut chunk)
-                .map_err(|e| OpenAiError::Io(io::Error::other(e)))?;
-            if n == 0 {
-                break;
-            }
-            if bytes.len() + n > IMAGE_DOWNLOAD_CAP_BYTES {
-                return Err(OpenAiError::Io(io::Error::other(
-                    "generated image exceeds the adapter's download cap",
-                )));
-            }
-            bytes.extend_from_slice(crate::shared::read_slice(&chunk, n));
-        }
-        if bytes.is_empty() {
-            // An empty body with an image content type is the same
-            // propagation race (the CDN started serving before writing) —
-            // retryable, not the terminal "provider returned an empty
-            // response" of the generation path.
-            return Err(OpenAiError::NotReady {
-                detail: "CDN returned an empty body for the image URL".to_string(),
-            });
-        }
-        Ok(bytes)
+        download::download_image_bytes(&self.http, &self.config, url, cancel_rx)
     }
 }
 
@@ -599,7 +374,7 @@ impl ImageGenerationClient for ZaiImageClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{ZaiImageClient, image_base_url, is_blocked_ip_literal, is_downloadable_url};
+    use super::{ZaiImageClient, image_base_url};
     use crate::openai::ServiceConfig;
 
     // ── image_base_url: /coding/paas → /paas rewrite ─────────────────────
@@ -628,91 +403,6 @@ mod tests {
         );
         // And a bare base is left untouched.
         assert_eq!(image_base_url("https://api.z.ai"), "https://api.z.ai");
-    }
-
-    // ── SSRF download guard ─────────────────────────────────────────────
-
-    #[test]
-    fn guard_rejects_private_and_loopback_ip_literals() {
-        for url in [
-            "http://127.0.0.1/cdn/img.png",         // v4 loopback
-            "http://10.1.2.3/cdn/img.png",          // RFC 1918 10/8
-            "http://192.168.1.5/cdn/img.png",       // RFC 1918 192.168/16
-            "http://169.254.7.7/cdn/img.png",       // v4 link-local
-            "http://[::1]/cdn/img.png",             // v6 loopback (bracketed)
-            "http://[fc00::1]/cdn/img.png",         // v6 unique-local (fc00::/7)
-            "http://[fd12:3456::a]/cdn/img.png",    // v6 unique-local (fd00::/8)
-            "http://[fe80::1]/cdn/img.png",         // v6 link-local
-            "http://[::ffff:10.0.0.9]/cdn/img.png", // IPv4-mapped private
-        ] {
-            assert!(
-                is_downloadable_url(url).is_err(),
-                "{url} must be rejected by the download guard"
-            );
-        }
-    }
-
-    #[test]
-    fn guard_accepts_public_hosts_and_hostnames() {
-        // The real z.ai CDN hostname (non-IP hostnames are allowed — see the
-        // recorded security decision on is_downloadable_url) plus public IP
-        // literals and the https scheme.
-        for url in [
-            "https://mfile.z.ai/cdn/img/generated.png",
-            "http://example.com/cdn/img.png",
-            "http://8.8.8.8/cdn/img.png",
-            "https://[2606:4700::1111]/cdn/img.png",
-            "https://[::ffff:8.8.8.8]/cdn/img.png", // IPv4-mapped public
-        ] {
-            assert!(
-                is_downloadable_url(url).is_ok(),
-                "{url} must be accepted by the download guard"
-            );
-        }
-    }
-
-    #[test]
-    fn guard_rejects_non_http_schemes_and_garbage() {
-        for url in [
-            "file:///etc/passwd",
-            "ftp://example.com/img.png",
-            "data:image/png;base64,aGk=",
-            "not a url at all",
-        ] {
-            assert!(
-                is_downloadable_url(url).is_err(),
-                "{url} must be rejected by the download guard"
-            );
-        }
-    }
-
-    #[test]
-    fn ip_literal_classifier_covers_the_documented_ranges() {
-        // Direct coverage of the classifier behind the URL guard, so a
-        // regression in one range cannot hide behind URL-parse behavior.
-        for blocked in [
-            "127.0.0.1",
-            "10.0.0.1",
-            "172.16.0.1",
-            "192.168.0.1",
-            "169.254.0.1",
-        ] {
-            assert!(
-                is_blocked_ip_literal(blocked.parse().unwrap()),
-                "{blocked} must be classified blocked"
-            );
-        }
-        for allowed in ["8.8.8.8", "1.1.1.1", "203.0.113.9"] {
-            assert!(
-                !is_blocked_ip_literal(allowed.parse().unwrap()),
-                "{allowed} must be classified allowed"
-            );
-        }
-        // fc00::/7: both fc and fd prefixes, and fe80::/10 link-local.
-        assert!(is_blocked_ip_literal("fc00::1".parse().unwrap()));
-        assert!(is_blocked_ip_literal("fd00::1".parse().unwrap()));
-        assert!(is_blocked_ip_literal("fe80::1".parse().unwrap()));
-        assert!(!is_blocked_ip_literal("2606:4700::1111".parse().unwrap()));
     }
 
     #[test]

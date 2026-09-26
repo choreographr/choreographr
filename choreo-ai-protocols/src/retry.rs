@@ -496,6 +496,55 @@ pub fn retry_loop<F>(
 where
     F: Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
 {
+    retry_loop_impl(send_request, retry, ctx, Terminal::ConsumeIntoError)
+}
+
+/// Like [`retry_loop`], but a terminal (non-2xx, non-retryable or
+/// attempts-exhausted) response is returned **unconsumed** as `Ok` instead of
+/// being summarized into a [`ProviderHttpError`], so a caller whose error
+/// contract must read the response body can interpret it itself.
+///
+/// The retry/backoff machinery, the retryable-status decision, cancellation,
+/// and transport-error handling are IDENTICAL to [`retry_loop`] — only the
+/// final terminal-response disposition differs. Used by the fal.ai image
+/// adapter, whose contract switches on the error body's `type`/`error_type`
+/// fields (a distinction `retry_loop`'s status-only summary would erase).
+///
+/// # Errors
+///
+/// Returns [`ProviderHttpError`] on transport failure (after the retry
+/// budget), cancellation, or a caller-supplied send error — never for a
+/// terminal HTTP status, which is handed back as `Ok`.
+pub fn retry_loop_raw<F>(
+    send_request: F,
+    retry: &RetryConfig,
+    ctx: &mut AttemptContext,
+) -> Result<ureq::http::Response<ureq::Body>, ProviderHttpError>
+where
+    F: Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+{
+    retry_loop_impl(send_request, retry, ctx, Terminal::ReturnResponse)
+}
+
+/// How [`retry_loop_impl`] disposes of a terminal (non-2xx, non-retryable or
+/// attempts-exhausted) response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Terminal {
+    /// Summarize the body into a [`ProviderHttpError`] (the standard path).
+    ConsumeIntoError,
+    /// Hand the un-read response back to the caller.
+    ReturnResponse,
+}
+
+fn retry_loop_impl<F>(
+    send_request: F,
+    retry: &RetryConfig,
+    ctx: &mut AttemptContext,
+    terminal: Terminal,
+) -> Result<ureq::http::Response<ureq::Body>, ProviderHttpError>
+where
+    F: Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+{
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
@@ -581,6 +630,13 @@ where
                 max_backoff_ms = retry.max_backoff_ms,
                 "retry declined: server Retry-After outlives the backoff budget"
             );
+        }
+
+        // In raw mode the terminal response is handed back UNCONSUMED so the
+        // caller can read its body and apply its own error contract; the
+        // standard mode summarizes the body into the typed error below.
+        if terminal == Terminal::ReturnResponse {
+            return Ok(response);
         }
 
         let body_text = response.into_body().read_to_string().unwrap_or_default();

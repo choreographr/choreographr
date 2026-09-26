@@ -3,11 +3,15 @@
 //!
 //! This mirrors the [`crate::ProviderClient`] split: a provider-agnostic
 //! trait plus per-provider adapters (the `OpenAI` Images API,
-//! [`OpenAiImageClient`], and the z.ai / Zhipu GLM Images API,
-//! [`ZaiImageClient`]). Errors reuse [`InferenceError`] so callers of the
-//! chat trait and of this trait share one error type and one metrics-label
-//! mapping — no new error taxonomy is invented for the image path.
+//! [`OpenAiImageClient`]; the z.ai / Zhipu GLM Images API, [`ZaiImageClient`];
+//! and the fal.ai synchronous image API, [`FalImageClient`]). Errors reuse
+//! [`InferenceError`] so callers of the chat trait and of this trait share one
+//! error type and one metrics-label mapping — no new error taxonomy is
+//! invented for the image path. The URL-download machinery the URL-returning
+//! adapters share lives in the private [`download`] submodule.
 
+mod download;
+mod fal;
 mod openai;
 mod zai;
 
@@ -69,6 +73,7 @@ pub(crate) const IMAGE_DOWNLOAD_CAP_BYTES: usize = 8 * 1024 * 1024;
 /// the adapters' worst case (see [`IMAGE_TOTAL_TIMEOUT_SECS`]).
 pub const IMAGE_DOWNLOAD_ATTEMPTS: u32 = 3;
 
+pub use fal::FalImageClient;
 pub use openai::OpenAiImageClient;
 pub use zai::ZaiImageClient;
 
@@ -90,6 +95,23 @@ pub use zai::ZaiImageClient;
 #[must_use]
 pub fn is_zhipu_image_provider_slug(slug: &str) -> bool {
     matches!(slug, "zai" | "zhipuai")
+}
+
+/// Whether a catalog provider slug is one of the fal.ai image-provider slugs
+/// the daemon must route to the dedicated [`FalImageClient`]:
+///
+/// - `"fal"` — the fal.ai platform slug;
+/// - `"fal-ai"` — the models.dev display alias some catalogs use.
+///
+/// Both serve the synchronous `https://fal.run/{model}` Images contract (see
+/// the module docs on [`FalImageClient`]); every other slug uses the generic
+/// [`OpenAiImageClient`]. The client crate owns this knowledge so the daemon's
+/// dispatch does not hardcode provider-family facts. Note that fal has **no**
+/// chat API, so unlike the Zhipu slugs this helper is consulted only where an
+/// image-only backend is being resolved — never by the chat-protocol dispatch.
+#[must_use]
+pub fn is_fal_image_provider_slug(slug: &str) -> bool {
+    matches!(slug, "fal" | "fal-ai")
 }
 
 use choreo_proto::InferenceError;
@@ -312,7 +334,7 @@ pub trait ImageGenerationClient: std::fmt::Debug + Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::is_zhipu_image_provider_slug;
+    use super::{is_fal_image_provider_slug, is_zhipu_image_provider_slug};
 
     #[test]
     fn zhipu_slug_allowlist_is_exact() {
@@ -336,6 +358,24 @@ mod tests {
             assert!(
                 !is_zhipu_image_provider_slug(slug),
                 "{slug:?} must NOT be a Zhipu image-provider slug"
+            );
+        }
+    }
+
+    #[test]
+    fn fal_slug_allowlist_is_exact() {
+        // Exactly the two documented fal slugs route to the dedicated
+        // FalImageClient; near-misses and other families must not.
+        for slug in ["fal", "fal-ai"] {
+            assert!(
+                is_fal_image_provider_slug(slug),
+                "{slug} must be a fal image-provider slug"
+            );
+        }
+        for slug in ["fal-future", "falai", "fal_ai", "openai", "zai", "", "FAL"] {
+            assert!(
+                !is_fal_image_provider_slug(slug),
+                "{slug:?} must NOT be a fal image-provider slug"
             );
         }
     }
