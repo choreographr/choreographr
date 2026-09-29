@@ -56,12 +56,12 @@ impl PopupSize {
 /// the connection-layer mouse handlers can use it without an import cycle.
 // `size` is not consumed, but taking a reference would change the signature
 // used by the render-layer call sites; a small owned struct is intentional.
-#[allow(clippy::needless_pass_by_value)] // keep the shared call-site signature
+#[expect(clippy::needless_pass_by_value)] // keep the shared call-site signature
 pub(crate) fn centered_popup(area: Rect, size: PopupSize) -> Rect {
     // u16 → u32 widening is lossless and the divided fraction always fits
     // back in u16 here because it is subsequently clamped to `max_w`/`max_h`
     // (both u16) before any other use.
-    #[allow(clippy::cast_possible_truncation)] // clamped to u16 maxes below
+    #[expect(clippy::cast_possible_truncation)] // clamped to u16 maxes below
     {
         let width = ((u32::from(area.width) * size.w_num / size.w_den) as u16)
             .clamp(size.min_w, size.max_w)

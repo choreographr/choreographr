@@ -1957,7 +1957,7 @@ fn commit_does_not_duplicate_user_text() {
     assert_eq!(app.user_texts()[0], "hello");
 }
 
-#[allow(clippy::cast_possible_truncation)] // test indices/heights far below u16::MAX
+#[expect(clippy::cast_possible_truncation)] // test indices/heights far below u16::MAX
 #[test]
 fn click_on_reasoning_header_toggles_collapse() {
     let (tx, _rx) = crossbeam_channel::unbounded();
@@ -2019,7 +2019,7 @@ fn click_on_reasoning_header_toggles_collapse() {
     );
 }
 
-#[allow(clippy::cast_possible_truncation)] // test indices/heights far below u16::MAX
+#[expect(clippy::cast_possible_truncation)] // test indices/heights far below u16::MAX
 #[test]
 fn click_on_reasoning_header_toggles_collapse_when_content_fits_viewport() {
     // Regression: on sessions whose history is shorter than the viewport (no
@@ -2084,7 +2084,7 @@ fn click_on_reasoning_header_toggles_collapse_when_content_fits_viewport() {
     );
 }
 
-#[allow(clippy::cast_possible_truncation)] // test indices/heights far below u16::MAX
+#[expect(clippy::cast_possible_truncation)] // test indices/heights far below u16::MAX
 #[test]
 fn click_on_tool_result_header_toggles_collapse() {
     // Clicking a tool result's header row (triangle + description) toggles
@@ -2181,7 +2181,7 @@ fn click_on_tool_result_header_toggles_collapse() {
     );
 }
 
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_possible_wrap

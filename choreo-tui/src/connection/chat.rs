@@ -438,7 +438,7 @@ pub(super) fn handle_chat_event(
                     // `inner_width` is a terminal column count (always far
                     // below u16::MAX), so the narrowing cast cannot truncate
                     // in practice.
-                    #[allow(clippy::cast_possible_truncation)]
+                    #[expect(clippy::cast_possible_truncation)]
                     let inner_w = inner_width as u16;
                     let content_col = mouse
                         .column

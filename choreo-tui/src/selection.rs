@@ -90,7 +90,7 @@ pub(crate) struct TextSelection {
 /// non-negative height/scroll counts (far below isize range), and the
 /// result is clamped back into the valid non-negative range before the
 /// conversion back.
-#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)] // small non-negative values, see above
+#[expect(clippy::cast_possible_wrap, clippy::cast_sign_loss)] // small non-negative values, see above
 fn screen_to_content(app: &App, row: u16, column: u16) -> (usize, u16) {
     let vh = app.history_viewport.height as isize;
     let total = app.total_history_height() as isize;
@@ -109,7 +109,7 @@ fn screen_to_content(app: &App, row: u16, column: u16) -> (usize, u16) {
 /// Same small-range reasoning as [`screen_to_content`]: isize arithmetic
 /// over u16-bounded rows and non-negative counts, guarded by the range
 /// check before the u16 conversion.
-#[allow(
+#[expect(
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation
@@ -296,7 +296,7 @@ pub(crate) fn finish_selection(app: &mut App) -> Option<String> {
 /// selection (`None` otherwise — a plain click, a cancelled gesture, or any
 /// drag/scroll event).  The caller performs the clipboard write and surfaces
 /// the status; the entire gesture state machine lives here.
-#[allow(clippy::trivially_copy_pass_by_ref)] // &MouseEvent reads naturally at call sites; the copy saving is trivial
+#[expect(clippy::trivially_copy_pass_by_ref)] // &MouseEvent reads naturally at call sites; the copy saving is trivial
 pub(crate) fn handle_selection_mouse(app: &mut App, mouse: &MouseEvent) -> Option<String> {
     match mouse.kind {
         MouseEventKind::Drag(MouseButton::Left) => {

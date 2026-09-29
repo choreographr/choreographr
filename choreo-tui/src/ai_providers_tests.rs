@@ -274,7 +274,7 @@ fn paste_event_inserts_into_new_account_slug_field() {
 
 // fn-level #[allow]: clippy's assert_is_empty rewrite for `assert!(x.is_empty())`
 // is worse than the assertion itself; the empty check is deliberate here.
-#[allow(clippy::assert_is_empty)]
+#[expect(clippy::assert_is_empty)]
 #[test]
 fn paste_event_goes_into_provider_filter() {
     let mut app = test_app();
@@ -332,7 +332,7 @@ fn advance_to_slug_phase(
 
 // fn-level #[allow]: clippy's assert_is_empty rewrite is worse than the
 // deliberate `assert!(x.is_empty())` check below.
-#[allow(clippy::assert_is_empty)]
+#[expect(clippy::assert_is_empty)]
 #[test]
 fn ai_providers_new_account_starts_at_provider_step() {
     let mut app = test_app();
@@ -430,7 +430,7 @@ fn ai_providers_new_account_jk_types_into_provider_filter() {
     assert_eq!(app.ai_providers.wizard.slug.value(), "");
 }
 
-#[allow(clippy::assert_is_empty)] // deliberate empty-check; clippy's rewrite is worse
+#[expect(clippy::assert_is_empty)] // deliberate empty-check; clippy's rewrite is worse
 #[test]
 fn ai_providers_new_account_arrows_navigate_provider_list() {
     let mut app = test_app();
@@ -492,7 +492,7 @@ fn ai_providers_new_account_provider_focus_clamps_at_edges() {
     assert_eq!(app.ai_providers.wizard.focused, app.providers.len() - 1);
 }
 
-#[allow(clippy::assert_is_empty)] // deliberate empty-check; clippy's rewrite is worse
+#[expect(clippy::assert_is_empty)] // deliberate empty-check; clippy's rewrite is worse
 #[test]
 fn ai_providers_new_account_provider_page_keys_move_selection_by_page() {
     let mut app = test_app();
@@ -620,7 +620,7 @@ fn ai_providers_new_account_filter_narrows_provider_list() {
     );
 }
 
-#[allow(clippy::assert_is_empty)] // deliberate empty-check; clippy's rewrite is worse
+#[expect(clippy::assert_is_empty)] // deliberate empty-check; clippy's rewrite is worse
 #[test]
 fn ai_providers_new_account_filter_no_match_blocks_enter() {
     let mut app = test_app();
@@ -822,7 +822,7 @@ fn ai_providers_new_account_submit_creates_account_and_redirects_to_credential()
     assert_eq!(app.ai_providers.wizard.slug.value(), "");
 }
 
-#[allow(clippy::assert_is_empty)] // deliberate empty-check; clippy's rewrite is worse
+#[expect(clippy::assert_is_empty)] // deliberate empty-check; clippy's rewrite is worse
 #[test]
 fn ai_providers_new_account_typing_goes_to_slug_field() {
     let mut app = test_app();

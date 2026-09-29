@@ -380,9 +380,9 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
     // Both casts are safe: `visible_count` is bounded by the input box
     // height (a `u16` area dimension), and `offset <= vrow`, which is itself
     // a `u16` cursor row.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     let max_display_row = (visible_count as u16).saturating_sub(1);
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     let display_vrow = vrow.saturating_sub(offset as u16).min(max_display_row);
     let cursor_x = input_area.x.saturating_add(INPUT_PAD).saturating_add(vcol);
     let cursor_y = input_area.y.saturating_add(1).saturating_add(display_vrow);
@@ -632,7 +632,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 let fully_visible = visible_height >= full_img_height;
                 // `visible_height` is clamped to the viewport height (a `u16`
                 // area dimension), so the cast never truncates.
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 let img_rect = Rect {
                     x: area.x,
                     y,
@@ -732,7 +732,7 @@ fn clipped_area(
 
     // `visible_height` is clamped to `rows_remaining`, which starts at the
     // viewport height (a `u16`), so the cast never truncates.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     let new_y = (*y).saturating_sub(visible_height as u16);
     *y = new_y;
     *rows_remaining -= visible_height;
@@ -755,7 +755,7 @@ fn render_text_block(
 ) {
     // `visible_height` comes from `clipped_area`, which clamps it to the
     // viewport height (a `u16`), so the cast never truncates.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     let height = visible_height as u16;
     let rect = Rect {
         x: area.x,
@@ -904,7 +904,7 @@ fn set_input_cursor(
 ) {
     // Cursor columns beyond `u16::MAX` cannot be addressed by any terminal
     // (ratatui positions are `u16`), so the cast is harmless in practice.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     let x = area.x + prefix_width + display_width(text_before_cursor) as u16;
     let y = area.y + line;
     frame.set_cursor_position((x, y));

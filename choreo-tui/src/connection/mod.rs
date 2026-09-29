@@ -1237,7 +1237,7 @@ pub(super) fn route_session_update(
 // session_manager.rs also calls this with `&MouseEvent`; the signature is
 // shared, so the lint is silenced at function level (param attributes are not
 // honoured for this lint).
-#[allow(clippy::trivially_copy_pass_by_ref)]
+#[expect(clippy::trivially_copy_pass_by_ref)]
 pub(super) fn handle_full_page_list_mouse(
     app: &mut App,
     mouse: &MouseEvent,
@@ -1506,7 +1506,7 @@ mod tests {
             let row = marker.virtual_slot / 2;
             // `virtual_slot` is a u16 track coordinate, so halving it always
             // fits back into u16.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_possible_truncation)]
             let found = find_marker_by_row(&app, row as u16);
             assert!(
                 found.is_some(),

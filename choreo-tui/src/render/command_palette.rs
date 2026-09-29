@@ -54,7 +54,7 @@ pub(super) fn render_command_palette(frame: &mut Frame<'_>, app: &mut App, input
     }
     // `height` is at most `COMMAND_PALETTE_MAX_ROWS` (8), so the narrowing
     // casts to the `u16` rect dimensions cannot truncate.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     let rect = Rect {
         x: input.x,
         y: input.y.saturating_sub(height as u16),

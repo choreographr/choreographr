@@ -283,7 +283,7 @@ fn model_selector_paste_goes_to_filter() {
 
 // fn-level #[allow]: clippy's assert_is_empty rewrite is worse than the
 // deliberate `assert!(x.is_empty())` check below.
-#[allow(clippy::assert_is_empty)]
+#[expect(clippy::assert_is_empty)]
 #[test]
 fn model_selector_page_keys_jump_highlight() {
     let (tx, _rx) = crossbeam_channel::unbounded();

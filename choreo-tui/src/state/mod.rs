@@ -700,7 +700,7 @@ impl App {
     /// is no message to display.
     // Line counts are bounded by the u16 terminal width, so the usize→u16
     // cast cannot truncate in practice.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     pub(crate) fn status_error_height(&self, width: u16) -> u16 {
         let text = if let Some(ref err) = self.error {
             err.as_str()
@@ -723,7 +723,7 @@ impl App {
     /// computed from the text and terminal width.
     // Wrapped-line counts are bounded by the u16 terminal width, so the
     // usize→u16 cast cannot truncate in practice.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     pub(crate) fn input_bar_content_lines(&mut self, term_width: u16) -> u16 {
         // Must use the same inner width as the renderer (term_width minus the
         // INPUT_PAD padding on each side), or the box height can disagree with
@@ -1074,7 +1074,7 @@ impl App {
     }
 
     // The branches below guarantee a non-negative delta before each cast.
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_sign_loss)]
     pub(crate) fn apply_scroll_delta(&mut self) {
         let delta = self.scroll_accumulator;
         self.scroll_accumulator = 0;
@@ -1389,7 +1389,7 @@ impl App {
 
     // Call sites in `connection/daemon.rs` pass `&Option<String>`; changing
     // the signature would touch files outside this one.
-    #[allow(clippy::ref_option)]
+    #[expect(clippy::ref_option)]
     pub(crate) fn handle_session_working_dir_set(
         &mut self,
         session_id: u64,
@@ -1793,7 +1793,7 @@ impl App {
 /// snapshot must never wipe an accumulated total.
 // Call sites in `connection/daemon.rs` pass `&Option<TokenUsage>`;
 // changing the signature would touch files outside this one.
-#[allow(clippy::ref_option)]
+#[expect(clippy::ref_option)]
 pub(crate) fn merge_token_usage(
     current: &Option<TokenUsage>,
     incoming: &Option<TokenUsage>,
@@ -1815,7 +1815,7 @@ pub(crate) fn merge_token_usage(
 // `HistoryViewport` is a 4-byte Copy struct; every call site already holds a
 // reference (App-level wrappers, tests), so taking it by value would churn
 // signatures across the crate for no measurable gain.
-#[allow(clippy::trivially_copy_pass_by_ref)]
+#[expect(clippy::trivially_copy_pass_by_ref)]
 impl SessionDisplayState {
     pub(crate) fn total_history_height(&self) -> usize {
         self.height_prefix.last().copied().unwrap_or(0)
@@ -3352,7 +3352,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::assert_is_empty)] // clearer than assert_eq! against []
+    #[expect(clippy::assert_is_empty)] // clearer than assert_eq! against []
     fn toggle_view_empty_clears_selection() {
         let mut mgr = SessionManagerState::new();
         mgr.set_sessions(vec![make_session(1, "live")]);
@@ -3536,7 +3536,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::assert_is_empty)] // clearer than assert_eq! against []
+    #[expect(clippy::assert_is_empty)] // clearer than assert_eq! against []
     fn remove_session_last_item_clears_selection() {
         let mut mgr = SessionManagerState::new();
         mgr.set_sessions(vec![make_session(1, "a")]);
@@ -3838,7 +3838,7 @@ mod tests {
         // The history is shorter than the viewport, so content is anchored to
         // the bottom: content line 0 sits at screen row `vh - total`.
         let total = app.active_display().unwrap().total_history_height();
-        #[allow(clippy::cast_possible_truncation)] // height-derived values fit u16
+        #[expect(clippy::cast_possible_truncation)] // height-derived values fit u16
         let first_row = (app.history_viewport.height as usize - total) as u16;
         let (turn_idx, offset) = find_turn_at_row(&app, first_row).unwrap();
         assert_eq!(turn_idx, 0);
@@ -3896,7 +3896,7 @@ mod tests {
         let (idx, offset) = find_turn_at_row(&app, 0).expect("top row must map to a turn");
         assert_eq!(offset, top_line - turn_start(&app, idx));
 
-        #[allow(clippy::cast_possible_truncation)] // viewport row fits u16
+        #[expect(clippy::cast_possible_truncation)] // viewport row fits u16
         let bottom_row = (vh - 1) as u16;
         let (idx_b, offset_b) = find_turn_at_row(&app, bottom_row).expect("bottom row must map");
         assert_eq!(
@@ -3964,7 +3964,7 @@ mod tests {
         // The header is drawn at screen row `vh - total + start` (bottom
         // anchored); clicking that row must resolve to the header's content
         // line `start`.
-        #[allow(clippy::cast_possible_truncation)] // viewport row fits u16
+        #[expect(clippy::cast_possible_truncation)] // viewport row fits u16
         let screen_row = (app.history_viewport.height as usize - total + start) as u16;
         let (turn_idx, offset) =
             find_turn_at_row(&app, screen_row).expect("row must map to a turn");
@@ -3972,8 +3972,7 @@ mod tests {
         assert_eq!(offset, start);
 
         // The blank band above the content must not map to any turn.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        // height-derived; non-negative
+        #[expect(clippy::cast_possible_truncation)] // viewport row fits u16
         let blank_row = (app.history_viewport.height as usize - total - 1) as u16;
         assert!(
             find_turn_at_row(&app, blank_row).is_none(),
@@ -4450,7 +4449,7 @@ mod tests {
     // ── TurnImageLayout image_ranges ──
 
     #[test]
-    #[allow(clippy::assert_is_empty)] // clearer than assert_eq! against []
+    #[expect(clippy::assert_is_empty)] // clearer than assert_eq! against []
     fn turn_layout_empty_when_no_images() {
         let mut app = test_app();
         app.history_viewport.width = 80;
@@ -6677,7 +6676,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::assert_is_empty)] // clearer than assert_eq! against ""
+    #[expect(clippy::assert_is_empty)] // clearer than assert_eq! against ""
     fn model_selector_open_resets_state_and_marks_loading() {
         let mut sel = ModelSelectorState::new();
         sel.all_models = vec!["a".into()];
@@ -6752,7 +6751,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::assert_is_empty)] // clearer than assert_eq! against []
+    #[expect(clippy::assert_is_empty)] // clearer than assert_eq! against []
     fn model_selector_no_match_returns_empty() {
         let mut sel = selector_with_models(&["a", "b"]);
         sel.filter.text = "zzz".to_string();
@@ -6850,7 +6849,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::assert_is_empty)] // clearer than assert_eq! against ""
+    #[expect(clippy::assert_is_empty)] // clearer than assert_eq! against ""
     fn model_selector_filter_key_consumes_chars_and_backspace() {
         let mut sel = selector_with_models(&["gpt-4o", "claude-3"]);
         sel.filter_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));

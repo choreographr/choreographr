@@ -24,7 +24,7 @@ fn app_starts_in_chat_page() {
 
 // The suggested rewrite (asserting on a match of the concrete collection type)
 // is worse; clippy::assert_is_empty fires on plain is_empty asserts here.
-#[allow(clippy::assert_is_empty)]
+#[expect(clippy::assert_is_empty)]
 #[test]
 fn session_manager_state_new_is_empty() {
     let state = SessionManagerState::new();
@@ -36,7 +36,7 @@ fn session_manager_state_new_is_empty() {
     assert!(state.detail_data.is_none());
 }
 
-#[allow(clippy::assert_is_empty)] // plain is_empty asserts read best here
+#[expect(clippy::assert_is_empty)] // plain is_empty asserts read best here
 #[test]
 fn session_manager_set_sessions_empty() {
     let mut state = SessionManagerState::new();
@@ -711,7 +711,7 @@ fn placeholder_turn(user_text: &str) -> Turn {
     }
 }
 
-#[allow(clippy::assert_is_empty)] // plain is_empty asserts read best here
+#[expect(clippy::assert_is_empty)] // plain is_empty asserts read best here
 #[test]
 fn reset_for_session_switch_preserves_accumulated_streaming_state() {
     let mut app = test_app();

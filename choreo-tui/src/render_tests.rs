@@ -480,7 +480,7 @@ fn render_session_list_shows_ids_parents_and_titles() {
 // Indices 1..=30 fit every narrower field they are cast into in the session
 // fixtures below (closures are separate HIR bodies, so the allow lives on the
 // test fn).
-#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
 #[test]
 fn session_list_selected_row_highlight_is_solid_across_width() {
     use crate::test_util::test_app;
@@ -574,7 +574,7 @@ fn session_list_selected_row_highlight_is_solid_across_width() {
 // ── Session list scrolls with selection ──────────────────────────────
 
 // Indices 1..=30 fit u32, so the `turn_count` cast never truncates.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 #[test]
 fn session_list_scrolls_to_keep_selection_visible() {
     use crate::test_util::test_app;
@@ -645,7 +645,7 @@ fn session_list_scrolls_to_keep_selection_visible() {
 // ── Session list directional scrolling ──────────────────────────────
 
 // Indices 1..=30 fit u32, so the `turn_count` cast never truncates.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 #[test]
 fn session_list_scrolls_down_then_up_directionally() {
     use crate::connection::handle_terminal_event;

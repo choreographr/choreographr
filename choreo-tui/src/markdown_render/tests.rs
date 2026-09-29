@@ -97,14 +97,14 @@ fn highlight_code_unknown_language_produces_output() {
 }
 
 #[test]
-#[allow(clippy::assert_is_empty)] // this clippy version wants assert_ne!(v, [] as [...]) here — worse
+#[expect(clippy::assert_is_empty)] // this clippy version wants assert_ne!(v, [] as [...]) here — worse
 fn highlight_code_none_language_uses_plain_text() {
     let lines = highlight_code(None, "plain text");
     assert!(!lines.is_empty());
 }
 
 #[test]
-#[allow(clippy::assert_is_empty)] // this clippy version wants assert_ne!(v, [] as [...]) here — worse
+#[expect(clippy::assert_is_empty)] // this clippy version wants assert_ne!(v, [] as [...]) here — worse
 fn highlight_code_empty_string() {
     let lines = highlight_code(Some("rust"), "");
     assert!(!lines.is_empty());
@@ -371,7 +371,7 @@ fn markdown_lines_code_block_no_language() {
 // ── BlockQuote ──────────────────────────────────────────────────────
 
 #[test]
-#[allow(clippy::assert_is_empty)] // this clippy version wants assert_ne!(v, [] as [...]) here — worse
+#[expect(clippy::assert_is_empty)] // this clippy version wants assert_ne!(v, [] as [...]) here — worse
 fn markdown_lines_blockquote_simple() {
     let md = "> hello world";
     let result = markdown_lines(md, 80);
@@ -703,7 +703,7 @@ fn markdown_lines_list_within_budget() {
 }
 
 #[test]
-#[allow(clippy::assert_is_empty)] // this clippy version wants assert_ne!(v, [] as [...]) here — worse
+#[expect(clippy::assert_is_empty)] // this clippy version wants assert_ne!(v, [] as [...]) here — worse
 fn markdown_lines_list_continuation_preserves_spans() {
     let md = "- **bold** and `code`";
     let result = markdown_lines(md, 80);
@@ -871,7 +871,7 @@ fn display_width_empty() {
 // ── render_turn_lines ────────────────────────────────────────────────
 
 #[test]
-#[allow(clippy::assert_is_empty)] // this clippy version wants assert_ne!(v, [] as [...]) here — worse
+#[expect(clippy::assert_is_empty)] // this clippy version wants assert_ne!(v, [] as [...]) here — worse
 fn render_turn_lines_error_shows_red_header() {
     let turn = Turn {
         created_at: choreo_proto::TimestampMs::now(),
@@ -1781,7 +1781,7 @@ fn render_turn_lines_tool_result_header_idxs_aligned_and_stable() {
 }
 
 #[test]
-#[allow(clippy::assert_is_empty)] // this clippy version wants assert_ne!(v, [] as [...]) here — worse
+#[expect(clippy::assert_is_empty)] // this clippy version wants assert_ne!(v, [] as [...]) here — worse
 fn render_turn_lines_tool_result_header_idxs_empty_without_results() {
     let turn = Turn {
         created_at: choreo_proto::TimestampMs::now(),
@@ -4147,7 +4147,7 @@ fn code_block_wrap_trailing_whitespace_stripped() {
 }
 
 #[test]
-#[allow(clippy::assert_is_empty)] // this clippy version wants assert_ne!(v, [] as [...]) here — worse
+#[expect(clippy::assert_is_empty)] // this clippy version wants assert_ne!(v, [] as [...]) here — worse
 fn code_block_no_wrap_when_fits() {
     let md = "```\nshort\n```";
     let result = markdown_lines(md, 80);

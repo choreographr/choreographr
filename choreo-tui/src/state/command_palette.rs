@@ -106,7 +106,7 @@ impl App {
     /// A no-op while there is nothing to select.
     // `len` is catalog-sized (a handful of commands) and `focused` is folded
     // into `[0, len)`, so the isize round-trip cannot actually wrap.
-    #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+    #[expect(clippy::cast_possible_wrap)]
     pub(crate) fn command_palette_move(&mut self, delta: isize) {
         let len = self.command_palette_matches().len();
         if len == 0 {

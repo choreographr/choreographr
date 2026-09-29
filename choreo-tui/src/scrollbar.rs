@@ -174,7 +174,7 @@ impl StatefulWidget for SmoothScrollbar {
 
             // `i` ranges over `0..track_height` where `track_height` is
             // `area.height as usize`, so it always fits back into a `u16`.
-            #[allow(clippy::cast_possible_truncation)] // i < area.height <= u16::MAX
+            #[expect(clippy::cast_possible_truncation)] // i < area.height <= u16::MAX
             let y = area.y + i as u16;
             let x = area.x;
 

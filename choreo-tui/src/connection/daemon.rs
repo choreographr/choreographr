@@ -9,9 +9,7 @@ use choreo_proto::{ClientMessage, DaemonMessage, KeystoreState, RefreshStatus, S
 use zeroize::Zeroize;
 
 // Owned-message call sites live in test files outside connection/, so the
-// by-value signature is kept and the lint silenced at function level (param
-// attributes are not honoured for this lint).
-#[allow(clippy::needless_pass_by_value)]
+// by-value signature is kept for those ergonomic owned-value call sites.
 pub(crate) fn handle_daemon_message(
     message: DaemonMessage,
     app: &mut App,

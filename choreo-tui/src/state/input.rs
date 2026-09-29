@@ -460,7 +460,7 @@ impl InputBuffer {
         let (current_line, col) = find_cursor_pos(&self.text, self.cursor, lines);
         // `current_line + 1 < lines.len()`: the next line exists; the u16
         // conversion is bounded by the count this comparison checks.
-        #[allow(clippy::cast_possible_truncation)] // bounds checked against lines.len() as u16
+        #[expect(clippy::cast_possible_truncation)] // bounds checked against lines.len() as u16
         if current_line + 1 >= lines.len() as u16 {
             return;
         }
@@ -500,7 +500,7 @@ impl InputBuffer {
 
     /// True when the cursor is on the last visual line of the input.
     // The u16 cast mirrors `cursor_down`'s comparison against `lines.len()`.
-    #[allow(clippy::cast_possible_truncation)] // bounds compared in the same expression
+    #[expect(clippy::cast_possible_truncation)] // bounds compared in the same expression
     pub(crate) fn is_on_last_visual_line(&mut self, max_width: usize) -> bool {
         if max_width < 1 {
             return true;
@@ -658,7 +658,7 @@ pub(crate) fn find_cursor_pos(text: &str, cursor: usize, lines: &[VisualLineInfo
             // Row/col indexes are display positions well below u16::MAX for
             // terminal-sized inputs; wrapping would only occur on absurdly
             // tall/wide buffers, which the terminal cannot render anyway.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_possible_truncation)]
             // display coords fit u16 for terminal-sized input
             return (i as u16, col as u16);
         }
@@ -669,7 +669,7 @@ pub(crate) fn find_cursor_pos(text: &str, cursor: usize, lines: &[VisualLineInfo
     };
     let col = UnicodeWidthStr::width(text.get(last.start_byte..last.end_byte).unwrap_or(""));
     // Display coords fit u16 for terminal-sized input (see loop above).
-    #[allow(clippy::cast_possible_truncation)] // display coords fit u16 for terminal-sized input
+    #[expect(clippy::cast_possible_truncation)] // display coords fit u16 for terminal-sized input
     (lines.len().saturating_sub(1) as u16, col as u16)
 }
 

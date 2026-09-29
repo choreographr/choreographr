@@ -177,14 +177,10 @@ fn rasterize_svg_at_size(
     // lose precision for huge dimensions, and the f32 -> u32 ceiling casts
     // can truncate, but both are harmless here — the result is only a
     // raster size, clamped to >= 1 below and bounded by the target box.
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
+    #[expect(clippy::cast_precision_loss)]
     let scale = (target_px_w as f32 / svg_size.width()).min(target_px_h as f32 / svg_size.height());
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let (out_w, out_h) = (
         (svg_size.width() * scale).ceil() as u32,
         (svg_size.height() * scale).ceil() as u32,
@@ -289,7 +285,7 @@ mod tests {
         let buf = image::RgbaImage::from_fn(4, 3, |x, y| {
             // Test-gradient values (x < 4, y < 3) always fit in u8; the cast
             // cannot truncate for these dimensions.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_possible_truncation)]
             let px = |v: u32| v as u8;
             image::Rgba([px(x) * 60, px(y) * 80, 0, 255])
         });
