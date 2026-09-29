@@ -839,7 +839,7 @@ impl ClientConn {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn client_thread(
     stream: UnixStream,
     daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
@@ -931,7 +931,7 @@ pub(crate) fn client_thread(
 /// server's private key), and the daemon's ACL check runs inside whichever
 /// handshake the client picked. The worst an attacker controls is which
 /// of two equally-authenticated handshakes runs.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn tcp_handshake_and_client_thread(
     mut tcp: TcpStream,
     transport_sk: [u8; 32],
@@ -1009,7 +1009,7 @@ pub(crate) fn tcp_handshake_and_client_thread(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn tcp_client_thread(
     noise: choreo_transport::noise::NoiseStream,
     daemon_tx: crossbeam_channel::Sender<DaemonCommand>,

@@ -81,9 +81,6 @@ pub trait TurnEventHandler {
     fn handle_status_text(&mut self, text: String);
     fn handle_error(&mut self, error: String);
     fn handle_session_attached(&mut self, session_id: u64);
-    // The parameter list mirrors the SessionCreated message fields 1:1; a
-    // struct would just re-wrap fields the dispatcher already destructures.
-    #[allow(clippy::too_many_arguments)]
     fn handle_session_created(
         &mut self,
         session_id: u64,

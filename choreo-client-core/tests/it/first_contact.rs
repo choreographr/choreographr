@@ -104,7 +104,6 @@ impl TestRoots {
 
 /// Run `run_daemon_connection_with_mode` on a thread with BOTH config-root
 /// overrides re-installed (see [`TestRoots`] for why).
-#[allow(clippy::too_many_arguments)]
 fn spawn_connection_thread(
     roots: &TestRoots,
     mode: ConnectionMode,

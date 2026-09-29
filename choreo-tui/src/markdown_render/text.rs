@@ -431,7 +431,7 @@ pub(crate) fn wrap_styled_line_joined(
 
     /// Split an over-long word across lines, used when the word alone does
     /// not fit on the current (possibly just-flushed) line.
-    #[allow(clippy::too_many_arguments)] // all args are distinct writer state; a struct would obscure the loop
+    #[expect(clippy::too_many_arguments)] // all args are distinct writer state; a struct would obscure the loop
     fn push_split_word(
         text: &str,
         style: Style,
