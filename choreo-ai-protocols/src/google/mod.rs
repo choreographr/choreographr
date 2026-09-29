@@ -191,17 +191,7 @@ impl GoogleClient {
         params: ChatTurnRequest<'_>,
     ) -> Result<ChatTurnResult, GoogleError> {
         debug!(effort = %params.thinking_effort, "Google chat completion turn");
-        requests::generate_content_request(
-            &self.http,
-            &self.config,
-            &self.api_key,
-            params.model,
-            params.messages,
-            params.tools,
-            &params.thinking_effort,
-            params.on_retry,
-            params.cancel_rx,
-        )
+        requests::generate_content_request(&self.http, &self.config, &self.api_key, params)
     }
 
     /// Streaming chat completion turn via the Gemini streamGenerateContent API.
@@ -230,12 +220,7 @@ impl GoogleClient {
             &self.http,
             &self.config,
             &self.api_key,
-            params.model,
-            params.messages,
-            params.tools,
-            &params.thinking_effort,
-            params.on_retry,
-            params.cancel_rx,
+            params,
             on_event,
         )
     }

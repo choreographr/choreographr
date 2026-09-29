@@ -5,7 +5,7 @@ use choreo_proto::TokenUsage;
 use serde::Deserialize;
 use tracing::{debug, trace};
 
-use crate::openai::{ChatRequestMessage, ChatToolDefinition};
+use crate::ChatTurnRequest;
 use crate::retry;
 use crate::shared::MAX_TOOL_CALLS;
 use crate::types::{
@@ -81,23 +81,28 @@ fn endpoint_url(base_url: &str, path: &str) -> io::Result<String> {
 }
 
 /// Send a POST /v1/messages request with retry.
-#[expect(clippy::too_many_arguments)]
 pub(super) fn messages_request(
     agent: &ureq::Agent,
     config: &AnthropicConfig,
     api_key: &str,
-    model: &str,
-    messages: &[ChatRequestMessage],
-    tools: &[ChatToolDefinition],
-    thinking_effort: &str,
+    params: ChatTurnRequest<'_>,
     stream: bool,
-    on_retry: &mut Option<retry::RetryCallback>,
-    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
+) -> Result<ChatTurnResult, AnthropicError> {
+    let ChatTurnRequest {
+        model,
+        messages,
+        tools,
+        thinking_effort,
+        on_retry,
+        cancel_rx,
+        session_id,
+        request_id,
+        ..
+    } = params;
     // Gateway routing identity (session_id, request_id) for the opencode
     // zen/go providers (the gateway reads x-opencode-* before protocol
     // dispatch, so the Anthropic wire format routes identically).
-    route: Option<(&str, &str)>,
-) -> Result<ChatTurnResult, AnthropicError> {
+    let route = Some((session_id.as_str(), request_id.as_str()));
     let url = endpoint_url(&config.base_url, MESSAGES_PATH)?;
     let retry_cfg = retry::RetryConfig::new(
         config.retry_max_attempts,
@@ -109,7 +114,7 @@ pub(super) fn messages_request(
     // thinking is enabled for this request (goose's `!thinking_disabled`
     // gate) — Anthropic rejects thinking blocks sent without a thinking
     // config. Compute the payload first so the builder sees the gate.
-    let thinking = thinking_payload(thinking_effort, config.max_tokens);
+    let thinking = thinking_payload(&thinking_effort, config.max_tokens);
     if thinking.is_some() {
         debug!(
             budget_tokens = ?thinking.as_ref().map(|t| t.budget_tokens),
@@ -168,25 +173,30 @@ pub(super) fn messages_request(
 }
 
 /// Streaming POST /v1/messages request via SSE with retry.
-#[expect(clippy::too_many_arguments)]
 pub(super) fn messages_request_streaming<F>(
     agent: &ureq::Agent,
     config: &AnthropicConfig,
     api_key: &str,
-    model: &str,
-    messages: &[ChatRequestMessage],
-    tools: &[ChatToolDefinition],
-    thinking_effort: &str,
-    on_retry: &mut Option<retry::RetryCallback>,
-    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
-    // Gateway routing identity (session_id, request_id) — same semantics as
-    // the non-streaming `messages_request` route parameter.
-    route: Option<(&str, &str)>,
+    params: ChatTurnRequest<'_>,
     mut on_event: F,
 ) -> Result<ChatTurnResult, AnthropicError>
 where
     F: FnMut(StreamEvent) -> io::Result<()>,
 {
+    let ChatTurnRequest {
+        model,
+        messages,
+        tools,
+        thinking_effort,
+        on_retry,
+        cancel_rx,
+        session_id,
+        request_id,
+        ..
+    } = params;
+    // Gateway routing identity — same semantics as the non-streaming
+    // `messages_request` route.
+    let route = Some((session_id.as_str(), request_id.as_str()));
     let url = endpoint_url(&config.base_url, MESSAGES_PATH)?;
     let retry_cfg = retry::RetryConfig::new(
         config.retry_max_attempts,
@@ -197,7 +207,7 @@ where
     // Thinking blocks are replayed from the round-trip artifact only when
     // thinking is enabled for this request (see the non-streaming path for
     // the reasoning). Compute the payload first so the builder sees the gate.
-    let thinking = thinking_payload(thinking_effort, config.max_tokens);
+    let thinking = thinking_payload(&thinking_effort, config.max_tokens);
     if thinking.is_some() {
         debug!(
             budget_tokens = ?thinking.as_ref().map(|t| t.budget_tokens),

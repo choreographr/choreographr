@@ -4,7 +4,7 @@ use std::time::Duration;
 use choreo_proto::TokenUsage;
 use tracing::{debug, trace};
 
-use crate::openai::{ChatRequestMessage, ChatToolDefinition};
+use crate::ChatTurnRequest;
 use crate::retry;
 use crate::shared::MAX_TOOL_CALLS;
 use crate::types::{ChatTurnResult, StreamEvent};
@@ -78,18 +78,21 @@ pub(super) fn list_models_request(
 }
 
 /// Send a POST /v1beta/models/{model}:generateContent request with retry.
-#[expect(clippy::too_many_arguments)]
 pub(super) fn generate_content_request(
     agent: &ureq::Agent,
     config: &GoogleConfig,
     api_key: &str,
-    model: &str,
-    messages: &[ChatRequestMessage],
-    tools: &[ChatToolDefinition],
-    thinking_effort: &str,
-    on_retry: &mut Option<retry::RetryCallback>,
-    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
+    params: ChatTurnRequest<'_>,
 ) -> Result<ChatTurnResult, GoogleError> {
+    let ChatTurnRequest {
+        model,
+        messages,
+        tools,
+        thinking_effort,
+        on_retry,
+        cancel_rx,
+        ..
+    } = params;
     let url = model_url(&config.base_url, model, GENERATE_CONTENT);
     let retry_cfg = retry::RetryConfig::new(
         config.retry_max_attempts,
@@ -106,7 +109,7 @@ pub(super) fn generate_content_request(
 
     let system_value = system_instruction.map(|s| serde_json::json!({"parts": [{"text": s}]}));
 
-    let thinking_config = thinking_config_payload(thinking_effort);
+    let thinking_config = thinking_config_payload(&thinking_effort);
     debug!(
         "Google non-streaming request body built (thinking: {})",
         thinking_config.is_some()
@@ -149,22 +152,25 @@ pub(super) fn generate_content_request(
 }
 
 /// Streaming POST /v1beta/models/{model}:streamGenerateContent?alt=sse via SSE with retry.
-#[expect(clippy::too_many_arguments)]
 pub(super) fn generate_content_request_streaming<F>(
     agent: &ureq::Agent,
     config: &GoogleConfig,
     api_key: &str,
-    model: &str,
-    messages: &[ChatRequestMessage],
-    tools: &[ChatToolDefinition],
-    thinking_effort: &str,
-    on_retry: &mut Option<retry::RetryCallback>,
-    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
+    params: ChatTurnRequest<'_>,
     mut on_event: F,
 ) -> Result<ChatTurnResult, GoogleError>
 where
     F: FnMut(StreamEvent) -> io::Result<()>,
 {
+    let ChatTurnRequest {
+        model,
+        messages,
+        tools,
+        thinking_effort,
+        on_retry,
+        cancel_rx,
+        ..
+    } = params;
     let url = model_url(&config.base_url, model, STREAM_GENERATE_CONTENT);
     let retry_cfg = retry::RetryConfig::new(
         config.retry_max_attempts,
@@ -181,7 +187,7 @@ where
 
     let system_value = system_instruction.map(|s| serde_json::json!({"parts": [{"text": s}]}));
 
-    let thinking_config = thinking_config_payload(thinking_effort);
+    let thinking_config = thinking_config_payload(&thinking_effort);
     debug!(
         "Google streaming request body built (thinking: {})",
         thinking_config.is_some()

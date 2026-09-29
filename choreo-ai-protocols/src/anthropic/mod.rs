@@ -249,22 +249,7 @@ impl AnthropicClient {
             effort = %params.thinking_effort,
             "Anthropic chat completion turn"
         );
-        // The turn's real session/request ids drive the opencode gateway's
-        // per-session sticky routing (see `shared::opencode_gateway_headers`).
-        let route = Some((params.session_id.as_str(), params.request_id.as_str()));
-        requests::messages_request(
-            &self.http,
-            &self.config,
-            &self.api_key,
-            params.model,
-            params.messages,
-            params.tools,
-            &params.thinking_effort,
-            false,
-            params.on_retry,
-            params.cancel_rx,
-            route,
-        )
+        requests::messages_request(&self.http, &self.config, &self.api_key, params, false)
     }
 
     /// Streaming chat completion turn via the Messages API.
@@ -289,20 +274,11 @@ impl AnthropicClient {
             return Ok(result);
         }
 
-        // The turn's real session/request ids drive the opencode gateway's
-        // per-session sticky routing (see `shared::opencode_gateway_headers`).
-        let route = Some((params.session_id.as_str(), params.request_id.as_str()));
         requests::messages_request_streaming(
             &self.http,
             &self.config,
             &self.api_key,
-            params.model,
-            params.messages,
-            params.tools,
-            &params.thinking_effort,
-            params.on_retry,
-            params.cancel_rx,
-            route,
+            params,
             on_event,
         )
     }
