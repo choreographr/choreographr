@@ -215,15 +215,15 @@ fn render_fullscreen_image(
                 // `render_turn_image` for the full rationale).
                 app.request_image_fetch(session_id, turn_id, img_idx);
             } else {
-                app.submit_image_job(
+                app.submit_image_job(crate::state::ImageJobRequest {
                     session_id,
                     turn_id,
                     img_idx,
                     data,
-                    meta,
-                    full,
-                    crate::IMAGE_RESIZE,
-                );
+                    metadata: meta,
+                    cell_size: full,
+                    resize: crate::IMAGE_RESIZE,
+                });
             }
         }
     }
@@ -846,15 +846,15 @@ fn render_turn_image(
             // state so a later frame submits the decode job.
             app.request_image_fetch(session_id, turn_id, img_idx);
         } else {
-            app.submit_image_job(
+            app.submit_image_job(crate::state::ImageJobRequest {
                 session_id,
                 turn_id,
                 img_idx,
                 data,
-                meta.clone(),
-                inline_size,
-                crate::IMAGE_RESIZE,
-            );
+                metadata: meta.clone(),
+                cell_size: inline_size,
+                resize: crate::IMAGE_RESIZE,
+            });
         }
     }
 

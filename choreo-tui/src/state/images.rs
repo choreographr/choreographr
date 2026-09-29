@@ -16,6 +16,22 @@ use choreo_proto::{ClientMessage, Turn};
 use ratatui::layout::Size;
 use std::sync::Arc;
 
+/// A request to encode one displayed image into terminal-renderable form: the
+/// target slot (session/turn/image index) plus the image bytes, metadata, and
+/// the cell size / resize policy the encoder needs. Bundled so
+/// [`App::submit_image_job`] takes one value instead of a seven-argument
+/// positional list (and clippy's `too_many_arguments` lint needs no
+/// suppression).
+pub(crate) struct ImageJobRequest {
+    pub session_id: u64,
+    pub turn_id: u32,
+    pub img_idx: usize,
+    pub data: Arc<[u8]>,
+    pub metadata: choreo_proto::ImageMetadata,
+    pub cell_size: Size,
+    pub resize: ratatui_image::Resize,
+}
+
 impl App {
     pub(crate) fn sync_turn_images(&mut self, session_id: u64, turn_id: u32, turn: &Turn) {
         let images = self
@@ -172,20 +188,20 @@ impl App {
         }
     }
 
-    // All eight parameters are already owned by the caller (an image-ready
-    // event handler); grouping them would only add a wrapper struct without
-    // reducing the information flow.
-    #[expect(clippy::too_many_arguments)]
-    pub(crate) fn submit_image_job(
-        &mut self,
-        session_id: u64,
-        turn_id: u32,
-        img_idx: usize,
-        data: std::sync::Arc<[u8]>,
-        metadata: choreo_proto::ImageMetadata,
-        cell_size: Size,
-        resize: ratatui_image::Resize,
-    ) -> Option<ImageId> {
+    /// Queue a background encode job for one displayed image, returning its
+    /// job id (or `None` when the worker is absent). The request carries the
+    /// target slot and the already-owned encode inputs; see
+    /// [`ImageJobRequest`].
+    pub(crate) fn submit_image_job(&mut self, req: ImageJobRequest) -> Option<ImageId> {
+        let ImageJobRequest {
+            session_id,
+            turn_id,
+            img_idx,
+            data,
+            metadata,
+            cell_size,
+            resize,
+        } = req;
         let tx = self.image_job_tx.as_ref()?;
         let id = next_job_id();
 

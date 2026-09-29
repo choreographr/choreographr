@@ -398,6 +398,57 @@ pub(crate) fn ansi_lines_joined(text: &str, width: u16) -> (Vec<Line<'static>>, 
     }
 }
 
+/// Running state for [`wrap_styled_line_joined`]: the rows emitted so far and
+/// their aligned joins (`out`/`joins`), the row currently being built
+/// (`line_spans`/`line_width`), and the join pending for the next row.
+///
+/// Exists so the wrap loop and its split-word helper share this state through
+/// `&mut self` methods rather than threading five distinct `&mut` arguments —
+/// the argument count that previously forced a `too_many_arguments` suppression.
+struct LineBuilder<'a> {
+    out: &'a mut Vec<Line<'static>>,
+    joins: &'a mut Vec<LineJoin>,
+    line_spans: Vec<Span<'static>>,
+    line_width: usize,
+    /// The [`LineJoin`] recorded for the row pushed next: a fresh line is
+    /// [`LineJoin::Break`]; after a word-boundary flush the next row continues
+    /// the sentence ([`LineJoin::Space`]); after a split-word flush it is a
+    /// mid-word continuation ([`LineJoin::Join`]).
+    pending_join: LineJoin,
+}
+
+impl LineBuilder<'_> {
+    /// Push the row currently accumulated in `line_spans`, recording the join
+    /// pending for it and resetting the width. `next` is the join recorded for
+    /// the FOLLOWING row: [`LineJoin::Join`] for a mid-word continuation (the
+    /// split-word case), [`LineJoin::Space`] for a row that continues the
+    /// sentence at a word boundary.
+    fn flush(&mut self, next: LineJoin) {
+        self.out
+            .push(Line::from(std::mem::take(&mut self.line_spans)));
+        self.joins.push(self.pending_join);
+        self.line_width = 0;
+        self.pending_join = next;
+    }
+
+    /// Split an over-long word across rows, used when the word alone does not
+    /// fit on the current (possibly just-flushed) row. Each continuation row
+    /// joins mid-word ([`LineJoin::Join`]).
+    fn push_split_word(&mut self, text: &str, style: Style, max_width: usize) {
+        let chunks = split_word_to_width(text, max_width);
+        for (ci, chunk) in chunks.iter().enumerate() {
+            if ci > 0 {
+                // A new row begins with this chunk — a mid-word continuation
+                // of the previous row's text.
+                self.flush(LineJoin::Join);
+            }
+            let cw = display_width(chunk);
+            self.line_spans.push(Span::styled(chunk.clone(), style));
+            self.line_width += cw;
+        }
+    }
+}
+
 /// Word-wrap a pre-styled ratatui line so that no output line exceeds `max_width`.
 ///
 /// Walks the line's styled spans left-to-right, splitting at word (whitespace)
@@ -413,48 +464,6 @@ pub(crate) fn wrap_styled_line_joined(
     out: &mut Vec<Line<'static>>,
     joins: &mut Vec<LineJoin>,
 ) {
-    /// Push the line currently in `line_spans`, recording the join that was
-    /// pending for it, then set the join for the row that follows (a mid-word
-    /// continuation — used by split-word handling).
-    fn push_current(
-        out: &mut Vec<Line<'static>>,
-        joins: &mut Vec<LineJoin>,
-        line_spans: &mut Vec<Span<'static>>,
-        pending_join: &mut LineJoin,
-        line_width: &mut usize,
-    ) {
-        out.push(Line::from(std::mem::take(line_spans)));
-        joins.push(*pending_join);
-        *line_width = 0;
-        *pending_join = LineJoin::Join;
-    }
-
-    /// Split an over-long word across lines, used when the word alone does
-    /// not fit on the current (possibly just-flushed) line.
-    #[expect(clippy::too_many_arguments)] // all args are distinct writer state; a struct would obscure the loop
-    fn push_split_word(
-        text: &str,
-        style: Style,
-        max_width: usize,
-        out: &mut Vec<Line<'static>>,
-        joins: &mut Vec<LineJoin>,
-        pending_join: &mut LineJoin,
-        line_spans: &mut Vec<Span<'static>>,
-        line_width: &mut usize,
-    ) {
-        let chunks = split_word_to_width(text, max_width);
-        for (ci, chunk) in chunks.iter().enumerate() {
-            if ci > 0 {
-                // A new row begins with this chunk — a mid-word continuation
-                // of the previous row's text.
-                push_current(out, joins, line_spans, pending_join, line_width);
-            }
-            let cw = display_width(chunk);
-            line_spans.push(Span::styled(chunk.clone(), style));
-            *line_width += cw;
-        }
-    }
-
     // ── 1. Tokenize the line into (style, text, is_space) triplets ───────
     //
     // We split each span's content at whitespace boundaries so that we can
@@ -505,24 +514,27 @@ pub(crate) fn wrap_styled_line_joined(
     }
 
     // ── 2. Word-wrap the token stream onto lines of at most max_width ──
-    let mut line_spans: Vec<Span<'static>> = Vec::new();
-    let mut line_width = 0usize;
+    // `out`/`joins` (the function's output vectors) move into the builder;
+    // `pending_join` starts at Break — the first row is a fresh line.
+    let mut builder = LineBuilder {
+        out,
+        joins,
+        line_spans: Vec::new(),
+        line_width: 0,
+        pending_join: LineJoin::Break,
+    };
     // Did we just add a space at the end?  We keep at most one trailing space
     // so that flush + re-start doesn't introduce a leading space.
     let mut trailing_space = false;
-    // The join recorded for the row that will be pushed into `out` next: the
-    // very first row of this input line is a fresh line ([`LineJoin::Break`]);
-    // after a word-boundary flush the next row continues the sentence
-    // ([`LineJoin::Space`]); after a split-word flush the next row is a
-    // mid-word continuation ([`LineJoin::Join`]).
-    let mut pending_join = LineJoin::Break;
 
     for token in &tokens {
         if token.is_space {
             // Collapse runs of whitespace to a single space.
-            if !line_spans.is_empty() && !trailing_space {
-                line_spans.push(Span::styled(" ".to_string(), token.style));
-                line_width += 1;
+            if !builder.line_spans.is_empty() && !trailing_space {
+                builder
+                    .line_spans
+                    .push(Span::styled(" ".to_string(), token.style));
+                builder.line_width += 1;
                 trailing_space = true;
             }
             continue;
@@ -530,55 +542,39 @@ pub(crate) fn wrap_styled_line_joined(
 
         let word_width = display_width(&token.text);
 
-        if line_width + word_width <= max_width {
+        if builder.line_width + word_width <= max_width {
             // Fits on the current line.
             trailing_space = false;
-            line_spans.push(Span::styled(token.text.clone(), token.style));
-            line_width += word_width;
-        } else if line_spans.is_empty() {
+            builder
+                .line_spans
+                .push(Span::styled(token.text.clone(), token.style));
+            builder.line_width += word_width;
+        } else if builder.line_spans.is_empty() {
             // The word alone is too wide for the empty line — split it.
             trailing_space = false;
-            push_split_word(
-                &token.text,
-                token.style,
-                max_width,
-                out,
-                joins,
-                &mut pending_join,
-                &mut line_spans,
-                &mut line_width,
-            );
+            builder.push_split_word(&token.text, token.style, max_width);
         } else {
             // Flush the current line and start a fresh line with this word.
-            // The previous row is pushed with the join pending for it; the
-            // fresh row continues the sentence, so it joins with a space.
-            out.push(Line::from(std::mem::take(&mut line_spans)));
-            joins.push(pending_join);
-            line_width = 0;
+            // The fresh row continues the sentence, so it joins with a space.
+            builder.flush(LineJoin::Space);
             trailing_space = false;
-            pending_join = LineJoin::Space;
 
             if word_width <= max_width {
-                line_spans.push(Span::styled(token.text.clone(), token.style));
-                line_width = word_width;
+                builder
+                    .line_spans
+                    .push(Span::styled(token.text.clone(), token.style));
+                builder.line_width = word_width;
             } else {
-                push_split_word(
-                    &token.text,
-                    token.style,
-                    max_width,
-                    out,
-                    joins,
-                    &mut pending_join,
-                    &mut line_spans,
-                    &mut line_width,
-                );
+                builder.push_split_word(&token.text, token.style, max_width);
             }
         }
     }
 
-    if !line_spans.is_empty() {
-        out.push(Line::from(line_spans));
-        joins.push(pending_join);
+    if !builder.line_spans.is_empty() {
+        builder
+            .out
+            .push(Line::from(std::mem::take(&mut builder.line_spans)));
+        builder.joins.push(builder.pending_join);
     }
 }
 

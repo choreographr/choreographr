@@ -47,6 +47,7 @@ mod session_manager;
 // re-exported here so `crate::state::X` references (in this crate and in
 // `app_tests.rs`/`render_tests.rs`) keep resolving exactly as before.
 pub(crate) use command_palette::*;
+pub(crate) use images::ImageJobRequest;
 pub(crate) use input::*;
 pub(crate) use keymap::*;
 pub(crate) use layout::*;
