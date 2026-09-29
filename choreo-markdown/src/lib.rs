@@ -177,18 +177,18 @@ pub fn render_markdown_html(input: &str) -> String {
     sanitize_html(&html_output)
 }
 
-/// Reclassify a `$...$` span that is plainly prose (or currency) rather than
-/// mathematics back into the literal text the author typed.
+/// Reclassify a `$...$` span that is prose (or currency, or a shell variable)
+/// rather than mathematics back into the literal text the author typed.
 ///
 /// pulldown-cmark's `$…$` rule is deliberately loose: any `$` not followed by
 /// whitespace *opens* a span and any `$` not preceded by whitespace *closes*
-/// it. Prose that merely *contains* two amounts therefore collapses into one
-/// giant `InlineMath` span — e.g. `… with a $0 to start? … time-sensitive($) I
-/// should …` becomes a single span whose inner text is several whole sentences.
-/// The TUI then tints it yellow and routes it through [`render_math_pretty`],
-/// which drops inter-token whitespace, rendering the paragraph as a
-/// run-together smear. Re-emit such spans as literal `$…$` text so the prose
-/// survives; genuine equations are untouched (see [`looks_like_inline_math`]).
+/// it. `$`-heavy prose therefore collapses into one giant `InlineMath` span —
+/// e.g. `… with a $0 to start? … time-sensitive($) I should …` becomes a single
+/// span whose inner text is several whole sentences. The TUI then tints it
+/// yellow and routes it through [`render_math_pretty`], which drops inter-token
+/// whitespace, rendering the paragraph as a run-together smear. Re-emit such
+/// spans as literal `$…$` text so the prose survives; genuine equations are
+/// untouched (see [`looks_like_inline_math`]).
 fn normalize_math_event(event: Event<'_>) -> Event<'_> {
     match event {
         Event::InlineMath(content) if !looks_like_inline_math(content.as_ref()) => {
@@ -200,25 +200,63 @@ fn normalize_math_event(event: Event<'_>) -> Event<'_> {
 
 /// Whether a pulldown-cmark `InlineMath` span really looks like mathematics.
 ///
-/// Because pulldown-cmark matches `$…$` purely on whitespace adjacency, a span
-/// produced for text that merely *contains* two `$` signs is often a whole
-/// sentence. Two conservative signals mark such a span as prose rather than
-/// math; anything else stays math so genuine equations are never disturbed:
+/// Because pulldown-cmark matches `$…$` purely on whitespace adjacency, `$`-heavy
+/// prose — currency, shell variables, and meta-discussion of the math syntax
+/// itself — yields spurious spans that the TUI would tint and whitespace-
+/// collapse. Recognising *prose* is an open-ended list the reasoning corpus kept
+/// defeating (glued pairs such as `$x and y$` or `($HOME) and ($PATH)`), so the
+/// default is **inverted: a span is math only when it looks like math**:
 ///
-/// * a sentence terminator followed by whitespace (`. `, `? `, `! `) — an
-///   equation virtually never contains one, while running prose almost always
-///   does;
-/// * a leading decimal digit followed by whitespace (`5 and …`, `2 per month`)
-///   — the shape of a currency amount, not an expression.
+/// * a span with no interior whitespace is always math — there is nothing for
+///   the pretty-printer to collapse, so a wrong call costs at most a tint;
+/// * a span with interior whitespace is math only if it carries a positive math
+///   signal (see [`contains_math_signal`]); otherwise it is literal text;
+/// * a sentence terminator followed by whitespace (`. `, `? `, `! `) is a hard
+///   prose veto that overrides even a present signal.
 fn looks_like_inline_math(content: &str) -> bool {
-    let starts_with_digit = content.as_bytes().first().is_some_and(u8::is_ascii_digit);
-    if starts_with_digit && content.contains(char::is_whitespace) {
+    if has_sentence_break(content) {
         return false;
     }
-    !content
+    if !content.contains(char::is_whitespace) {
+        return true;
+    }
+    contains_math_signal(content)
+}
+
+/// A sentence terminator immediately followed by whitespace (`. `, `? `, `! `)
+/// — a sentence boundary that a single equation does not contain. Multibyte
+/// UTF-8 is safe here: continuation bytes are `>= 0x80` and so never equal the
+/// ASCII punctuation or whitespace bytes being matched.
+fn has_sentence_break(content: &str) -> bool {
+    content
         .as_bytes()
         .windows(2)
         .any(|pair| matches!(pair, [b'.' | b'?' | b'!', ws] if ws.is_ascii_whitespace()))
+}
+
+/// A positive gauge that a whitespace-bearing `$…$` span is an equation rather
+/// than prose: a TeX command (`\`), a sub/superscript (`^`/`_`), a relation
+/// (`=`/`<`/`>`), or an arithmetic operator (`+`/`-`/`*`/`/`) used as a
+/// separator. The bare operator set only counts when *space-adjacent*, so a
+/// hyphen inside a word (`time-sensitive`) is not mistaken for a minus sign.
+fn contains_math_signal(content: &str) -> bool {
+    // Whitespace immediately before the character under inspection, tracked so
+    // the space-adjacency test needs no indexing or look-behind.
+    let mut prev_was_space = false;
+    let mut chars = content.chars().peekable();
+    while let Some(c) = chars.next() {
+        if matches!(c, '\\' | '^' | '_' | '=' | '<' | '>') {
+            return true;
+        }
+        if matches!(c, '+' | '-' | '*' | '/') {
+            let next_is_space = chars.peek().is_some_and(|&next| next.is_whitespace());
+            if prev_was_space || next_is_space {
+                return true;
+            }
+        }
+        prev_was_space = c.is_whitespace();
+    }
+    false
 }
 
 impl MarkdownDocument {
@@ -2269,8 +2307,8 @@ mod tests {
 
     #[test]
     fn currency_pair_stays_literal_text() {
-        // A leading-digit span with interior whitespace reads as currency, not
-        // math, even without sentence punctuation.
+        // Currency with interior whitespace carries no math signal, so it stays
+        // literal text even without sentence punctuation.
         let document = MarkdownDocument::parse("it costs $5 and $10 today");
         let MarkdownBlock::Paragraph(content) = &document.blocks[0] else {
             panic!("expected paragraph");
@@ -2285,8 +2323,61 @@ mod tests {
     }
 
     #[test]
+    fn glued_prose_pair_stays_literal_text() {
+        // Both `$` glued to non-space (pulldown accepts the pair) and content
+        // with interior whitespace but no math signal is prose, not math — the
+        // shapes the old prose-detection heuristic missed.
+        for input in ["see $x and y$ here", "in ($HOME) and ($PATH) now"] {
+            let document = MarkdownDocument::parse(input);
+            let MarkdownBlock::Paragraph(content) = &document.blocks[0] else {
+                panic!("expected paragraph");
+            };
+            assert!(
+                !content
+                    .iter()
+                    .any(|node| matches!(node, MarkdownInline::InlineMath(_))),
+                "prose was misclassified as inline math: {input:?} -> {content:?}"
+            );
+            assert_eq!(inline_text(content), input);
+        }
+    }
+
+    #[test]
+    fn math_signal_keeps_inline_math() {
+        // A whitespace-bearing span with a positive math signal stays math —
+        // including digit-led expressions the old leading-digit rule dropped.
+        for input in ["$2x + 1$", "$a - b$", "$x = y$", "$n < m$"] {
+            let document = MarkdownDocument::parse(input);
+            let MarkdownBlock::Paragraph(content) = &document.blocks[0] else {
+                panic!("expected paragraph");
+            };
+            assert!(
+                content
+                    .iter()
+                    .any(|node| matches!(node, MarkdownInline::InlineMath(_))),
+                "real math was not captured: {input:?} -> {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sentence_break_vetoes_a_math_signal() {
+        // A sentence boundary on top of a signal is still prose: the veto wins.
+        let document = MarkdownDocument::parse("$x = 5. Then $y");
+        let MarkdownBlock::Paragraph(content) = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(
+            !content
+                .iter()
+                .any(|node| matches!(node, MarkdownInline::InlineMath(_))),
+            "prose was misclassified as inline math: {content:?}"
+        );
+    }
+
+    #[test]
     fn genuine_inline_math_is_preserved() {
-        // A real expression — no sentence punctuation, no leading digit — is
+        // A real expression — a script signal with no sentence punctuation — is
         // still captured as math and round-trips through `$…$`.
         let document = MarkdownDocument::parse("solve $x^2 + 1$ now");
         let MarkdownBlock::Paragraph(content) = &document.blocks[0] else {

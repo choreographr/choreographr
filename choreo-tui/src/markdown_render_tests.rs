@@ -4143,6 +4143,28 @@ fn dollar_pair_in_prose_does_not_render_as_math() {
 }
 
 #[test]
+fn glued_dollar_pair_in_prose_does_not_render_as_math() {
+    // Regression follow-up: when both `$` are glued to non-space pulldown still
+    // pairs them, and the old prose-detection heuristic let signal-less prose
+    // through (`$x and y$`, `($HOME) and ($PATH)`), which rendered as a
+    // whitespace-collapsed yellow smear. It must stay literal text instead.
+    for text in ["see $x and y$ here", "in ($HOME) and ($PATH) now"] {
+        let result = markdown_lines(text, 200);
+        let joined = result
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(joined, text, "prose was corrupted");
+        let tinted = result
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| span.style.fg == Some(Color::Yellow));
+        assert!(!tinted, "prose was tinted as inline math: {joined:?}");
+    }
+}
+
+#[test]
 fn table_uses_rounded_corners_and_a_plain_header_rule() {
     // nushell-style frame: rounded OUTER corners, square T-junctions, and a
     // uniform header rule — the GFM delimiter row's alignment colons are
