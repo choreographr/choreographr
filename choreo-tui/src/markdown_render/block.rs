@@ -215,12 +215,25 @@ fn render_code_box(
 
     // ── Code rows: `│ ` + code padded to the inner width + ` │` ──
     for (row_line, join) in code_rows {
-        let content_width = row_line.width();
-        let mut row = Vec::with_capacity(row_line.spans.len() + 3);
+        let mut spans = row_line.spans;
+        // The word-wrapper can leave the separator space that triggered a
+        // wrap on the row it broke off, making that row one column wider than
+        // the code area.  Drop trailing whitespace-only spans so the row fits
+        // the interior exactly — without this the row's right `│` would jut one
+        // column past the frame.  The row's `Space` copy-join re-inserts that
+        // separator at the seam, so nothing is lost from a copy.
+        let mut content_width: usize = spans.iter().map(Span::width).sum();
+        if content_width > inner {
+            while spans.last().is_some_and(|s| s.content.trim().is_empty()) {
+                spans.pop();
+            }
+            content_width = spans.iter().map(Span::width).sum();
+        }
+        let mut row = Vec::with_capacity(spans.len() + 3);
         row.push(Span::styled("│ ".to_string(), Style::default()));
         // The code keeps its syntect foreground colours; the box adds no
         // background of its own.
-        row.extend(row_line.spans);
+        row.extend(spans);
         if inner > content_width {
             row.push(Span::styled(
                 " ".repeat(inner - content_width),

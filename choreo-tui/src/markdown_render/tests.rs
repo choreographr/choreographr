@@ -491,6 +491,34 @@ fn code_box_uses_table_corner_glyphs() {
 }
 
 #[test]
+fn code_box_rows_stay_uniform_when_wrapping() {
+    // Regression: a wrapped code line whose first chunk exactly fills the code
+    // area could keep a trailing separator space from the word-wrapper, ending
+    // up one column wider than the box interior, so its right `│` jutted past
+    // the frame.  Every row of a box — borders included — must be one width.
+    let samples = [
+        "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm",
+        "The quick brown fox jumps over the lazy dog near the river bank today",
+        "Always write inline comments around new code explaining how it works",
+        "always_write_inline_comments_around_new_code_explaining_how_it_works",
+    ];
+    for code in samples {
+        for width in 20u16..80 {
+            let md = format!("```text\n{code}\n```");
+            let (lines, _joins, _chrome) = markdown_lines_joined(&md, width);
+            let w = lines[0].width();
+            for (i, line) in lines.iter().enumerate() {
+                assert_eq!(
+                    line.width(),
+                    w,
+                    "width {width} row {i} is not the box width ({w}): {line:#?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn code_box_language_tag_is_bold() {
     let (lines, _joins, _chrome) = markdown_lines_joined("```rust\nlet x = 1;\n```", 80);
     // Row 1 is the language tag row.
