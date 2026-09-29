@@ -240,7 +240,7 @@ pub fn item_image(
     // `index` comes from `select_image_level`, which only returns valid
     // indices into `mipmap_levels` (a Vec, far below u32::MAX in any real
     // pyramid); keep the reference's narrowing cast semantics.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     let level = index as u32;
     Ok(ItemImage {
         width: image.width,
@@ -275,7 +275,7 @@ fn revision_entries_from_events(item_id_hex: &str, events: &[DecodedEvent]) -> V
             // The indexer renders `revision_id` as a u32 scalar (see the
             // `custom_scalar("u32", …)` key encoding); keep the reference's
             // wrapping truncation semantics for out-of-range values.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_possible_truncation)]
             let rev = e.field_u64("revision_id")? as u32;
             let hash = e.field_str("ipfs_hash")?.to_string();
             Some(RevisionEntry {

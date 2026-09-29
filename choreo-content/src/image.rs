@@ -171,7 +171,7 @@ mod tests {
         DynamicImage::ImageRgba8(ImageBuffer::from_fn(300, 200, |x, y| {
             // Pixel components wrap modulo 256 to stay deterministic across
             // the coordinate range; u32->u8 truncation is intentional here.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_possible_truncation)]
             Rgba([(x % 256) as u8, (y % 256) as u8, 128, 255])
         }))
     }

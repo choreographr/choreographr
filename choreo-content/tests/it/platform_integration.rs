@@ -19,16 +19,6 @@
 //! or, failing that, imports the well-known dev "Alice" keystore. The account
 //! must be funded (the dev chain funds Alice by default).
 
-// AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
-// allow-*-in-tests config only recognizes #[test]-annotated functions —
-// helper fns in this file need this file-level allowance.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::panic_in_result_fn,
-    clippy::indexing_slicing
-)]
 // The publish/round-trip test below is TEMPORARILY DISABLED (block comment):
 // it requires live Coordination Platform services (node, indexer, IPFS).
 // `#[cfg(any())]` keeps these imports (and `test_account` below, used only
