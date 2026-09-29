@@ -1578,16 +1578,16 @@ fn handle_run_input(
     let ctx = ctx.clone();
     let user_text = Some(text);
     std::thread::spawn(move || {
-        run_request_worker(
+        run_request_worker(RequestWorkerArgs {
             request_id,
-            &provider,
-            &mut worker_session,
-            &model,
-            &cancel_rx,
-            &ctx,
-            None,
-            user_text.as_deref(),
-        );
+            client: &provider,
+            session: &mut worker_session,
+            model: &model,
+            cancel_rx: &cancel_rx,
+            ctx: &ctx,
+            child_reply: None,
+            user_text: user_text.as_deref(),
+        });
     });
     false
 }
@@ -1652,16 +1652,16 @@ fn handle_run_child_input(
     let ctx = ctx.clone();
     let provider = provider.clone();
     std::thread::spawn(move || {
-        run_request_worker(
+        run_request_worker(RequestWorkerArgs {
             request_id,
-            &provider,
-            &mut worker_session,
-            &model,
-            &cancel_rx,
-            &ctx,
-            Some(&reply),
-            user_text_owned.as_deref(),
-        );
+            client: &provider,
+            session: &mut worker_session,
+            model: &model,
+            cancel_rx: &cancel_rx,
+            ctx: &ctx,
+            child_reply: Some(&reply),
+            user_text: user_text_owned.as_deref(),
+        });
     });
     false
 }
@@ -2676,20 +2676,34 @@ fn handle_shutdown(
     state.active_requests.is_empty()
 }
 
-#[expect(clippy::too_many_arguments)]
-fn run_request_worker(
+/// Inputs for [`run_request_worker`], grouped so the worker entry point takes
+/// one value instead of eight positional arguments (and the
+/// `too_many_arguments` lint needs no suppression).
+struct RequestWorkerArgs<'a> {
     request_id: u32,
     // Borrowed only: `run_agent_loop` also takes the client by reference;
     // the worker thread outlives the call via its own clones of `ctx` and
     // `model` at the spawn site.
-    client: &InferenceProvider,
-    session: &mut SessionState,
-    model: &str,
-    cancel_rx: &crossbeam_channel::Receiver<()>,
-    ctx: &RequestContext,
-    child_reply: Option<&mpsc::Sender<io::Result<ChildResult>>>,
-    user_text: Option<&str>,
-) {
+    client: &'a InferenceProvider,
+    session: &'a mut SessionState,
+    model: &'a str,
+    cancel_rx: &'a crossbeam_channel::Receiver<()>,
+    ctx: &'a RequestContext,
+    child_reply: Option<&'a mpsc::Sender<io::Result<ChildResult>>>,
+    user_text: Option<&'a str>,
+}
+
+fn run_request_worker(args: RequestWorkerArgs<'_>) {
+    let RequestWorkerArgs {
+        request_id,
+        client,
+        session,
+        model,
+        cancel_rx,
+        ctx,
+        child_reply,
+        user_text,
+    } = args;
     // No error path: every failure mode is folded into a RequestOutcome and
     // routed back through the command channel, so the function returns ()
     // instead of a transparent Ok wrapper.
