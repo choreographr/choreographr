@@ -25,12 +25,7 @@
 // (clippy.toml) only recognize `#[cfg(test)]`/`#[test]` contexts, not feature
 // gates, so the sanctioned unwrap/expect/panic/indexing exception is granted
 // here at module level — mirroring the AGENTS.md test-only exception.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
+#![expect(clippy::expect_used, clippy::indexing_slicing)]
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};

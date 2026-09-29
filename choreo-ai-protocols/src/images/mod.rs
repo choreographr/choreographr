@@ -231,25 +231,25 @@ pub struct ImageGenerationRequest {
 impl ImageSize {
     // `skip_serializing_if` needs a path-callable `&Self` predicate, so the
     // by-ref signature is required; the tiny enum Copy loss is immaterial.
-    #[allow(clippy::trivially_copy_pass_by_ref)]
+    #[expect(clippy::trivially_copy_pass_by_ref)]
     fn is_default(v: &Self) -> bool {
         *v == Self::default()
     }
 }
 impl ImageQuality {
-    #[allow(clippy::trivially_copy_pass_by_ref)]
+    #[expect(clippy::trivially_copy_pass_by_ref)]
     fn is_default(v: &Self) -> bool {
         *v == Self::default()
     }
 }
 impl OutputFormat {
-    #[allow(clippy::trivially_copy_pass_by_ref)]
+    #[expect(clippy::trivially_copy_pass_by_ref)]
     fn is_default(v: &Self) -> bool {
         *v == Self::default()
     }
 }
 impl Background {
-    #[allow(clippy::trivially_copy_pass_by_ref)]
+    #[expect(clippy::trivially_copy_pass_by_ref)]
     fn is_default(v: &Self) -> bool {
         *v == Self::default()
     }

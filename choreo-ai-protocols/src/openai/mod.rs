@@ -601,7 +601,7 @@ impl OpenAiClient {
     // TEMP(`needless_pass_by_value`): the body moves `params`' borrowed
     // parts straight into the request builders; taking a reference would
     // ripple through every caller across the daemon and tests.
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn chat_completion_turn(
         &self,
         params: crate::ChatTurnRequest<'_>,
@@ -660,7 +660,6 @@ impl OpenAiClient {
     ///
     /// Returns [`OpenAiError`] on HTTP, provider, cancellation, or
     /// event-callback failures.
-    #[allow(clippy::needless_pass_by_value)]
     pub fn chat_completion_turn_streaming<F>(
         &self,
         params: crate::ChatTurnRequest<'_>,

@@ -232,7 +232,7 @@ impl std::error::Error for ProviderHttpError {
 }
 
 #[must_use]
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
@@ -695,7 +695,7 @@ fn extract_error_message(body: &str) -> Option<String> {
 #[cfg(test)]
 // Test-module casts: f64 comparisons for backoff math are intentionally
 // approximate, and the u128->u64 millis downcast is bounded by the backoff cap.
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+#[expect(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
     use std::sync::Arc;

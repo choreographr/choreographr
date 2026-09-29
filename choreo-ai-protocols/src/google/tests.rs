@@ -1,4 +1,4 @@
-#![allow(clippy::match_wildcard_for_single_variants)] // test-only exhaustive-ish matches
+#![expect(clippy::match_wildcard_for_single_variants)] // test-only exhaustive-ish matches
 use super::*;
 use crate::google::requests::extract_error_detail;
 use crate::openai::{AssistantToolCall, AssistantToolFunction};

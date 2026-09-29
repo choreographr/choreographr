@@ -240,7 +240,6 @@ impl AnthropicClient {
     // TEMP(`needless_pass_by_value`): the body moves `params`' borrowed
     // parts straight into `messages_request`; taking a reference would
     // ripple through every caller across the daemon and tests.
-    #[allow(clippy::needless_pass_by_value)]
     pub fn chat_completion_turn(
         &self,
         params: ChatTurnRequest<'_>,
@@ -258,7 +257,6 @@ impl AnthropicClient {
     ///
     /// Returns [`AnthropicError`] on HTTP, provider, decoding, cancellation,
     /// or event-callback failures.
-    #[allow(clippy::needless_pass_by_value)]
     pub fn chat_completion_turn_streaming<F>(
         &self,
         params: ChatTurnRequest<'_>,

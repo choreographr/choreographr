@@ -191,7 +191,7 @@ fn apply_models_overlay(
 /// already rejected by the `max(0)` above; values above `u32::MAX` give the
 /// same wrapped result as before the lint (behavior is pinned by tests), so
 /// the raw cast is kept rather than clamping.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn u32_len(n: i64) -> u32 {
     n.max(0) as u32
 }
