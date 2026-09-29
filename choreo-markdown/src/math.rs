@@ -1024,7 +1024,7 @@ fn split_environment_rows(body: &[char]) -> Vec<Vec<Vec<char>>> {
 
 /// Look up a single-token math command (Greek letters, operator/relation
 /// symbols, named functions) — every name that needs no argument handling.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn math_symbol(name: &str) -> Option<&'static str> {
     Some(match name {
         // Greek letters.
