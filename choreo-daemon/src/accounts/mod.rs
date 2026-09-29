@@ -70,6 +70,41 @@ pub struct AccountConfig {
     pub retry_max_backoff_ms: Option<u64>,
 }
 
+/// The optional per-account knobs a client may supply when adding an account.
+///
+/// Only the fields a client can set at creation time live here; the remaining
+/// [`AccountConfig`] fields (endpoint-path overrides, token caps, context
+/// windows, retry timing) are populated from the persisted config or the
+/// provider default. Grouped into one value so the add-account handler takes a
+/// single argument instead of six positional `Option`s — and clippy's
+/// `too_many_arguments` lint needs no suppression.
+#[derive(Debug, Default, Clone)]
+pub struct AccountOverrides {
+    pub base_url: Option<String>,
+    pub streaming: Option<bool>,
+    pub retry_max_attempts: Option<u32>,
+    pub connect_timeout_secs: Option<u64>,
+    pub request_timeout_secs: Option<u64>,
+    pub total_timeout_secs: Option<u64>,
+}
+
+impl AccountOverrides {
+    /// Fold these overrides onto an [`AccountConfig::simple`] base, yielding
+    /// the full config to register.
+    #[must_use]
+    pub fn into_config(self, name: &str, provider: &str) -> AccountConfig {
+        AccountConfig {
+            base_url: self.base_url,
+            streaming: self.streaming,
+            retry_max_attempts: self.retry_max_attempts,
+            connect_timeout_secs: self.connect_timeout_secs,
+            request_timeout_secs: self.request_timeout_secs,
+            total_timeout_secs: self.total_timeout_secs,
+            ..AccountConfig::simple(name, provider)
+        }
+    }
+}
+
 impl AccountConfig {
     /// Create an `AccountConfig` with just a name and provider; all other
     /// fields are `None` (meaning "use the provider default").

@@ -1,4 +1,4 @@
-use crate::accounts::{AccountConfig, AccountManager};
+use crate::accounts::{AccountConfig, AccountManager, AccountOverrides};
 use crate::broadcast::{LagLimits, SubscriberSink};
 use crate::catalog::{CatalogPaths, MaintenanceEvent, RefreshReport, RefreshRequester};
 use crate::db::{self, SessionRecord};
@@ -577,6 +577,23 @@ fn finalize_session_delete(
     }
 }
 
+/// The inputs for creating a session, grouped so
+/// [`DaemonState::handle_create_session`] takes one value instead of nine
+/// positional arguments (and clippy's `too_many_arguments` lint needs no
+/// suppression). Mirrors the fields of [`DaemonCommand::CreateSession`] minus
+/// the reply channel; every field is optional because a session can be created
+/// with pure defaults.
+struct CreateSessionParams {
+    title: Option<String>,
+    parent_session_id: Option<u64>,
+    working_dir: Option<PathBuf>,
+    reasoning_effort: Option<String>,
+    selected_model: Option<String>,
+    context_config: Option<ContextConfig>,
+    account_name: Option<String>,
+    active_tool_groups: Vec<String>,
+}
+
 impl DaemonState {
     pub fn handle_command(&mut self, cmd: DaemonCommand) {
         match cmd {
@@ -591,14 +608,16 @@ impl DaemonState {
                 active_tool_groups,
                 reply,
             } => self.handle_create_session(
-                title,
-                parent_session_id,
-                working_dir.as_ref(),
-                reasoning_effort,
-                selected_model,
-                context_config.as_ref(),
-                account_name,
-                &active_tool_groups,
+                CreateSessionParams {
+                    title,
+                    parent_session_id,
+                    working_dir,
+                    reasoning_effort,
+                    selected_model,
+                    context_config,
+                    account_name,
+                    active_tool_groups,
+                },
                 &reply,
             ),
             DaemonCommand::AttachSession { session_id, reply } => {
@@ -723,12 +742,14 @@ impl DaemonState {
             } => self.handle_add_account(
                 &name,
                 &provider,
-                base_url,
-                streaming,
-                retry_max_attempts,
-                connect_timeout_secs,
-                request_timeout_secs,
-                total_timeout_secs,
+                AccountOverrides {
+                    base_url,
+                    streaming,
+                    retry_max_attempts,
+                    connect_timeout_secs,
+                    request_timeout_secs,
+                    total_timeout_secs,
+                },
                 &reply,
             ),
             DaemonCommand::RemoveAccountCmd { name, reply } => {
@@ -1172,23 +1193,25 @@ impl DaemonState {
         }
     }
 
-    #[expect(clippy::too_many_arguments)]
     /// Create a new session. Sessions are lightweight containers that can be
     /// created regardless of lock state.
     fn handle_create_session(
         &mut self,
-        title: Option<String>,
-        parent_session_id: Option<u64>,
-        working_dir: Option<&PathBuf>,
-        reasoning_effort: Option<String>,
-        selected_model: Option<String>,
-        context_config: Option<&ContextConfig>,
-        account_name: Option<String>,
-        active_tool_groups: &[String],
+        params: CreateSessionParams,
         reply: &std::sync::mpsc::Sender<
             io::Result<(u64, crossbeam_channel::Sender<SessionCommand>)>,
         >,
     ) {
+        let CreateSessionParams {
+            title,
+            parent_session_id,
+            working_dir,
+            reasoning_effort,
+            selected_model,
+            context_config,
+            account_name,
+            active_tool_groups,
+        } = params;
         // A session is just a conversation container — it can be
         // created, browsed, and deleted regardless of whether the
         // daemon is locked.  Credentials are only needed when running
@@ -1219,7 +1242,7 @@ impl DaemonState {
         let active_cats = if active_tool_groups.is_empty() {
             default_groups
         } else {
-            active_tool_groups.to_vec()
+            active_tool_groups
         };
 
         // Resolve context window from the provider catalog at creation time
@@ -1248,7 +1271,7 @@ impl DaemonState {
             created_at,
             last_modified: created_at,
             active_tool_groups: active_cats.clone(),
-            context_config: context_config.cloned().unwrap_or_default(),
+            context_config: context_config.unwrap_or_default(),
             account_name: account_name.clone(),
             last_response_id: None,
             last_response_id_producer: None,
@@ -2255,28 +2278,14 @@ impl DaemonState {
     }
 
     /// Add a new inference account.
-    #[expect(clippy::too_many_arguments)]
     fn handle_add_account(
         &mut self,
         name: &str,
         provider: &str,
-        base_url: Option<String>,
-        streaming: Option<bool>,
-        retry_max_attempts: Option<u32>,
-        connect_timeout_secs: Option<u64>,
-        request_timeout_secs: Option<u64>,
-        total_timeout_secs: Option<u64>,
+        overrides: AccountOverrides,
         reply: &std::sync::mpsc::Sender<Result<(), String>>,
     ) {
-        let config = AccountConfig {
-            base_url,
-            streaming,
-            retry_max_attempts,
-            connect_timeout_secs,
-            request_timeout_secs,
-            total_timeout_secs,
-            ..AccountConfig::simple(name, provider)
-        };
+        let config = overrides.into_config(name, provider);
         let result = self.accounts.add(config);
         match &result {
             Ok(()) => info!(
