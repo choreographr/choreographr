@@ -470,6 +470,22 @@ pub(crate) struct SpawnedToolExecution {
     forwarder: std::thread::JoinHandle<()>,
 }
 
+/// Everything [`spawn_tool_execution`] needs to wire one tool call: the call,
+/// its output format, the registry, and the per-session context. Grouped so
+/// the spawner takes one value instead of nine positional arguments (and the
+/// `too_many_arguments` lint needs no suppression).
+pub(crate) struct ToolExecutionSpec<'a> {
+    pub(crate) tool_call: &'a ChatToolCall,
+    pub(crate) format: ToolOutputFormat,
+    pub(crate) registry: Arc<ToolRegistry>,
+    pub(crate) x_credentials: Option<ServiceCredential>,
+    pub(crate) working_dir: Option<PathBuf>,
+    pub(crate) tool_ctx: ToolContext,
+    pub(crate) cmd_tx: crossbeam_channel::Sender<SessionCommand>,
+    pub(crate) session_id: u64,
+    pub(crate) request_id: u32,
+}
+
 /// Spawn the forwarding thread and the tool execution thread for one call,
 /// wiring them to fresh channels.  Shared by the serial
 /// (`execute_tool_with_timeout`) and concurrent (`spawn_single_tool`) paths so
@@ -484,18 +500,18 @@ pub(crate) struct SpawnedToolExecution {
 /// into is unbounded (std `mpsc::Sender::send` never blocks), so this cannot
 /// deadlock; when the forwarder exits it drops the receiver, failing any
 /// blocked `send`.
-#[expect(clippy::too_many_arguments)]
-pub(crate) fn spawn_tool_execution(
-    tool_call: &ChatToolCall,
-    format: ToolOutputFormat,
-    registry: Arc<ToolRegistry>,
-    x_credentials: Option<ServiceCredential>,
-    working_dir: Option<PathBuf>,
-    tool_ctx: ToolContext,
-    cmd_tx: crossbeam_channel::Sender<SessionCommand>,
-    session_id: u64,
-    request_id: u32,
-) -> SpawnedToolExecution {
+pub(crate) fn spawn_tool_execution(spec: ToolExecutionSpec<'_>) -> SpawnedToolExecution {
+    let ToolExecutionSpec {
+        tool_call,
+        format,
+        registry,
+        x_credentials,
+        working_dir,
+        tool_ctx,
+        cmd_tx,
+        session_id,
+        request_id,
+    } = spec;
     // The execution thread delivers its final result here.
     let (exec_tx, exec_rx) = crossbeam_channel::unbounded::<Result<ToolOutput, ToolError>>();
 
@@ -607,17 +623,17 @@ pub(crate) fn spawn_single_tool(args: SpawnToolArgs) -> crossbeam_channel::Sende
         // Destructured by value to keep the handle alive for this frame, then
         // detached (never joined) — see the field docs.
         forwarder: _forwarder_handle,
-    } = spawn_tool_execution(
-        &tool_call,
-        ToolOutputFormat::Text,
+    } = spawn_tool_execution(ToolExecutionSpec {
+        tool_call: &tool_call,
+        format: ToolOutputFormat::Text,
         registry,
         x_credentials,
         working_dir,
-        ctx,
+        tool_ctx: ctx,
         cmd_tx,
         session_id,
         request_id,
-    );
+    });
 
     // ── Wait loop ──────────────────────────────────────────────────
     //
@@ -832,25 +848,41 @@ pub(crate) fn finish_tool_call(
     }
 }
 
+/// Inputs for [`record_tool_completion`], grouped so the recorder takes one
+/// value instead of ten positional arguments (and the `too_many_arguments`
+/// lint needs no suppression).
+pub(crate) struct ToolCompletionParams<'a> {
+    pub(crate) request_id: u32,
+    pub(crate) session: &'a mut SessionState,
+    pub(crate) tool_call: &'a ChatToolCall,
+    pub(crate) output: &'a mut ToolOutput,
+    pub(crate) image: Option<PreparedImage>,
+    pub(crate) ctx: &'a RequestContext,
+    pub(crate) current_turn_id: u32,
+    pub(crate) tool_results: &'a mut Vec<ToolResultItem>,
+    pub(crate) known_hint_paths: &'a mut Vec<PathBuf>,
+    pub(crate) pending_hints: &'a mut Vec<String>,
+}
+
 /// Record a completed tool in the session and the next-call accumulator.
 ///
 /// Shared by the serial and concurrent completion paths so both record a
 /// result identically: emit any produced image, fill the tool's seeded
 /// placeholder result in place (see [`SessionState::update_tool_result`]),
 /// and collect the output for the provider's next request.
-#[expect(clippy::too_many_arguments)]
-pub(crate) fn record_tool_completion(
-    request_id: u32,
-    session: &mut SessionState,
-    tool_call: &ChatToolCall,
-    output: &mut ToolOutput,
-    image: Option<PreparedImage>,
-    ctx: &RequestContext,
-    current_turn_id: u32,
-    tool_results: &mut Vec<ToolResultItem>,
-    known_hint_paths: &mut Vec<PathBuf>,
-    pending_hints: &mut Vec<String>,
-) {
+pub(crate) fn record_tool_completion(params: ToolCompletionParams<'_>) {
+    let ToolCompletionParams {
+        request_id,
+        session,
+        tool_call,
+        output,
+        image,
+        ctx,
+        current_turn_id,
+        tool_results,
+        known_hint_paths,
+        pending_hints,
+    } = params;
     // Escape Unicode format characters (bidi overrides, ZWSP, …) before the
     // content enters the transcript — the session record AND the next-call
     // accumulator both derive from `output.content`, so this single point
@@ -1021,18 +1053,24 @@ pub(crate) fn drain_queued_or_synthesize(
     }
 }
 
-#[expect(clippy::too_many_arguments)]
+/// Inputs for [`execute_tool_with_timeout`]'s serial path, grouped so the
+/// function takes one value instead of ten positional arguments (and the
+/// `too_many_arguments` lint needs no suppression).
+pub(crate) struct ExecuteToolParams<'a> {
+    pub(crate) tool_call: &'a ChatToolCall,
+    pub(crate) x_credentials: Option<&'a ServiceCredential>,
+    pub(crate) working_dir: Option<&'a Path>,
+    pub(crate) timeout_dur: Duration,
+    pub(crate) request_id: u32,
+    pub(crate) session_id: u64,
+    pub(crate) session: &'a mut SessionState,
+    pub(crate) cancel_rx: &'a crossbeam_channel::Receiver<()>,
+    pub(crate) ctx: &'a RequestContext,
+    pub(crate) invocation_description: &'a str,
+}
+
 pub(crate) fn execute_tool_with_timeout(
-    tool_call: &ChatToolCall,
-    x_credentials: Option<&ServiceCredential>,
-    working_dir: Option<&Path>,
-    timeout_dur: Duration,
-    request_id: u32,
-    session_id: u64,
-    session: &mut SessionState,
-    cancel_rx: &crossbeam_channel::Receiver<()>,
-    ctx: &RequestContext,
-    invocation_description: &str,
+    params: ExecuteToolParams<'_>,
 ) -> (ToolOutput, bool, Option<PreparedImage>) {
     // Drop guard: when the main loop exits (for any reason), signal the
     // forwarder to stop so it doesn't orphan waiting on output_rx.
@@ -1043,6 +1081,19 @@ pub(crate) fn execute_tool_with_timeout(
             let _ = self.0.send(());
         }
     }
+
+    let ExecuteToolParams {
+        tool_call,
+        x_credentials,
+        working_dir,
+        timeout_dur,
+        request_id,
+        session_id,
+        session,
+        cancel_rx,
+        ctx,
+        invocation_description,
+    } = params;
 
     let format = match &tool_call.caller {
         Some(caller) if caller.kind == "program" => ToolOutputFormat::Json,
@@ -1085,17 +1136,17 @@ pub(crate) fn execute_tool_with_timeout(
         // Destructured by value to keep the handle alive for this frame, then
         // detached (never joined) — see the field docs.
         forwarder: _forwarder_handle,
-    } = spawn_tool_execution(
+    } = spawn_tool_execution(ToolExecutionSpec {
         tool_call,
         format,
-        Arc::clone(&ctx.tool_registry),
-        x_credentials.cloned(),
-        working_dir.map(std::path::Path::to_path_buf),
+        registry: Arc::clone(&ctx.tool_registry),
+        x_credentials: x_credentials.cloned(),
+        working_dir: working_dir.map(std::path::Path::to_path_buf),
         tool_ctx,
-        ctx.cmd_tx.clone(),
+        cmd_tx: ctx.cmd_tx.clone(),
         session_id,
         request_id,
-    );
+    });
 
     let _kill_guard = KillGuard(kill_tx);
 

@@ -894,18 +894,19 @@ pub(crate) fn run_agent_loop(
                     // stopgap (the X tools use the same slot, so only one
                     // credential rides it) until a proper tool→keystore
                     // credential-access system replaces it.
-                    let (mut output, tool_cancelled, image) = execute_tool_with_timeout(
-                        &tool_call,
-                        ctx.substrate_credential.as_ref(),
-                        turn_working_dir.as_deref(),
-                        tool_timeout,
-                        request_id,
-                        ctx.session_id,
-                        session,
-                        cancel_rx,
-                        ctx,
-                        &invocation_description,
-                    );
+                    let (mut output, tool_cancelled, image) =
+                        execute_tool_with_timeout(ExecuteToolParams {
+                            tool_call: &tool_call,
+                            x_credentials: ctx.substrate_credential.as_ref(),
+                            working_dir: turn_working_dir.as_deref(),
+                            timeout_dur: tool_timeout,
+                            request_id,
+                            session_id: ctx.session_id,
+                            session: &mut *session,
+                            cancel_rx,
+                            ctx,
+                            invocation_description: &invocation_description,
+                        });
                     if tool_cancelled {
                         // The wait observed a cancellation signal (consumed by
                         // its `select!`), so the request must stop after this
@@ -913,18 +914,18 @@ pub(crate) fn run_agent_loop(
                         cancelled = true;
                     }
 
-                    record_tool_completion(
+                    record_tool_completion(ToolCompletionParams {
                         request_id,
-                        session,
-                        &tool_call,
-                        &mut output,
+                        session: &mut *session,
+                        tool_call: &tool_call,
+                        output: &mut output,
                         image,
                         ctx,
                         current_turn_id,
-                        &mut tool_results,
-                        &mut known_hint_paths,
-                        &mut pending_hints,
-                    );
+                        tool_results: &mut tool_results,
+                        known_hint_paths: &mut known_hint_paths,
+                        pending_hints: &mut pending_hints,
+                    });
                     executed_tool_calls.insert(tool_call.id.clone());
 
                     // Only mirror mutations that were actually accepted: an
@@ -1113,18 +1114,18 @@ pub(crate) fn run_agent_loop(
                                 "tool finished (concurrent)",
                             );
 
-                            record_tool_completion(
+                            record_tool_completion(ToolCompletionParams {
                                 request_id,
-                                session,
-                                &tool_call,
-                                &mut output,
+                                session: &mut *session,
+                                tool_call: &tool_call,
+                                output: &mut output,
                                 image,
                                 ctx,
                                 current_turn_id,
-                                &mut tool_results,
-                                &mut known_hint_paths,
-                                &mut pending_hints,
-                            );
+                                tool_results: &mut tool_results,
+                                known_hint_paths: &mut known_hint_paths,
+                                pending_hints: &mut pending_hints,
+                            });
                             // The result is recorded now — this call_id must
                             // not be swept by the cancelled-turn placeholder
                             // sweep (`mark_unexecuted_tool_results`).

@@ -2317,18 +2317,18 @@ fn run_exec_tool(
         global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         substrate_credential: None,
     };
-    let (result, cancelled, _image) = execute_tool_with_timeout(
-        &tool_call,
-        None,
-        None,
+    let (result, cancelled, _image) = execute_tool_with_timeout(ExecuteToolParams {
+        tool_call: &tool_call,
+        x_credentials: None,
+        working_dir: None,
         timeout_dur,
-        1,
-        1,
-        &mut session,
+        request_id: 1,
+        session_id: 1,
+        session: &mut session,
         cancel_rx,
-        &ctx,
-        "test invocation",
-    );
+        ctx: &ctx,
+        invocation_description: "test invocation",
+    });
     (result, cancelled, cmd_rx)
 }
 
