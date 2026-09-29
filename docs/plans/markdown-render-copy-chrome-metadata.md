@@ -1,9 +1,17 @@
 # Plan: First-class copy-chrome metadata in the markdown renderer
 
-**Status:** proposed — *not started*. Deferred follow-up to the `choreo-tui`
-markdown-renderer module split; the current string/colour detection is correct
-today, so this is a robustness/clarity change, not a bug fix.
+**Status:** implemented. Landed as the series `90e0707` (buffer + plumbing) →
+`3db637c` (consumers subtract) → `6497c60` (producers emit chrome; the
+string/colour detection — `copyable_columns`, `CODE_PANEL_PAD`, `is_panel_*` —
+deleted) → `54cd17a` (code blocks render as a table-style bordered box).
+Deferred follow-up to the `choreo-tui` markdown-renderer module split.
 **Date:** 2026-09-29
+
+> **Note on the code anchors below.** The plan was written before the code-block
+> "panel" work landed, so it names `leading_quote_prefix` — by the time it was
+> implemented that detector was `copyable_columns`, and it (plus the
+> `CODE_BG`/`CODE_PANEL_PAD` sentinel machinery) has now been deleted entirely.
+> The appendix code anchors are therefore historical.
 **Target:** `choreo-tui` only. No daemon, wire (`choreo-proto`), or schema
 change; no persisted state changes.
 **Touches:** `choreo-tui/src/markdown_render/` (`mod.rs`, `block.rs`),
