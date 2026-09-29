@@ -144,7 +144,7 @@ enum RawInterleaved {
     Shorthand(String),
     /// `true` — interleaved thinking supported, but no echo-field fact. The
     /// payload is intentionally ignored (a capability flag, not a fact).
-    Just(#[allow(dead_code)] bool),
+    Just(#[expect(dead_code)] bool),
 }
 
 impl RawInterleaved {

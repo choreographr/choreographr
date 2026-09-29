@@ -114,7 +114,11 @@ pub struct PowerMonitor {
     /// The sending half kept alive so the receiver reports `Empty` (never
     /// `Disconnected`) while the monitor exists — an inert monitor must be
     /// indistinguishable from an active-but-quiet one to a `select!`
-    /// consumer. `allow(dead_code)`: only read implicitly via Drop.
+    /// consumer. Read only via the `Debug`/`Drop` paths, so `dead_code` does
+    /// not fire in this build — an `expect` would be unfulfilled — but the
+    /// `allow` is kept (with its `allow_attributes` exemption) for builds
+    /// where the field is genuinely unused.
+    #[allow(clippy::allow_attributes)]
     #[allow(dead_code)]
     sender: Option<crossbeam_channel::Sender<SuspendEvent>>,
     /// Whether real platform notifications are wired up (`true`) or this

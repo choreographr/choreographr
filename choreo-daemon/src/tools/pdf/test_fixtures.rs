@@ -12,11 +12,18 @@
 // Fixture builders index and size the hand-built PDFs with `as u32` casts;
 // the page counts are tiny, so the truncation is safe by construction.
 #![expect(clippy::cast_possible_truncation)]
-// `write_temp` uses `unwrap`. This file is compiled twice: as a `#[cfg(test)]`
-// module (clippy's test exemption covers it, so an `#[expect]` would be
-// unfulfilled) and pulled into the integration test via `#[path]` in a crate
-// WITHOUT `cfg(test)`, where the lint DOES fire. No single attribute is
-// fulfilled in both builds, so this one lint stays an `allow`.
+// This file is compiled in two contexts (a `#[cfg(test)]` module AND a
+// `#[path]`-included integration-test module), so a lint that fires in one
+// build but not the other can be neither a firing `#[allow]` nor a fulfilled
+// `#[expect]` in both — making `clippy::allow_attributes` itself fire on the
+// remaining `#[allow]`s. Exempt the whole file so the `#[allow(...)]`s below
+// (and their `dead_code`) stay authoritative for both contexts.
+#![allow(clippy::allow_attributes)]
+// `write_temp` uses `unwrap`. As a `#[cfg(test)]` module clippy's test
+// exemption covers it (so an `#[expect]` would be unfulfilled), while pulled
+// into the integration test via `#[path]` in a crate WITHOUT `cfg(test)` the
+// lint DOES fire. No single attribute is fulfilled in both builds, so this one
+// lint stays an `allow`.
 #![allow(clippy::unwrap_used)]
 use std::fmt::Write as _;
 use std::io::Write;

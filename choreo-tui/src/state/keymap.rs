@@ -23,6 +23,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// `Esc`/`PageUp`/`PageDown` (and some `Char`s) are not bound by the current
 /// shortcut table, but the type models the full logical-key space so extending
 /// the table is a data change, not a type change.
+// Some variants are unbound today (see above); which ones are read varies by
+// build target, so `dead_code` cannot be an `expect` — kept as an `allow`.
+#[allow(clippy::allow_attributes)]
 #[allow(dead_code)] // some variants are unbound today (see above)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Key {

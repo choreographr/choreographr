@@ -75,6 +75,10 @@ pub struct SubstrateCredentialView<'a> {
 struct KeyringPairJson {
     encoded: String,
     encoding: Encoding,
+    // Read only on the verification path; `dead_code` does not fire in every
+    // build, so an `expect` would be unfulfilled. Kept as an `allow` with its
+    // `allow_attributes` exemption.
+    #[allow(clippy::allow_attributes)]
     #[allow(dead_code)]
     address: String,
 }

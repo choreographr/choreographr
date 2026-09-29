@@ -44,7 +44,7 @@ pub fn spawn_monitor() -> Result<PowerMonitor, PowerMonitorError> {
 // platform module below handles subscription and this fallback is never
 // called, but it MUST stay compiled everywhere so the unsupported-platform
 // path is never accidentally deleted when a new platform module is added.
-#[allow(dead_code)]
+#[expect(dead_code)]
 fn unsupported_monitor() -> PowerMonitor {
     tracing::info!(
         platform = std::env::consts::OS,
@@ -61,6 +61,11 @@ fn unsupported_monitor() -> PowerMonitor {
 // thread) and the unsupported fallback never spawns one either, but the
 // helper must stay compiled on every target so each platform module can
 // rely on it.
+// `allow`, not `expect`: on Windows and unsupported platforms this helper is
+// never called, so `dead_code` fires there — but on Linux/macOS (this build)
+// it is used, so an `expect` would be unfulfilled. The `allow_attributes`
+// exemption is the recorded reason this stays an outer `allow`.
+#[allow(clippy::allow_attributes)]
 #[allow(dead_code)]
 pub(crate) fn spawn_thread(
     name: &'static str,

@@ -151,6 +151,9 @@ pub(crate) struct StreamToolCallDelta {
     pub(crate) id: Option<String>,
     // Deserialised from the API's "type" field but never read in Rust — kept
     // so serde doesn't choke on unknown fields and to document the wire format.
+    // Read only in some build targets, so `dead_code` cannot be an `expect`;
+    // kept as an `allow` with its `allow_attributes` exemption.
+    #[allow(clippy::allow_attributes)]
     #[allow(dead_code)]
     #[serde(rename = "type")]
     pub(crate) kind: Option<String>,

@@ -623,7 +623,7 @@ pub fn set_profile(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), Cont
 }
 
 /// The `MultiAddress` identity for an account (for extrinsics that need it).
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub(crate) fn multi_address(account: [u8; 32]) -> MultiAddress<AccountId32, ()> {
     MultiAddress::Id(AccountId32(account))
 }

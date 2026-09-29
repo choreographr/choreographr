@@ -29,7 +29,7 @@ fn level_dimensions(original: u32, level: u32) -> u32 {
     // The reference protocol performs this ratio in f32 (with its inherent
     // precision loss and f32->u32 truncation); reproducing it exactly in
     // integer math would change the produced dimensions, so keep the casts.
-    #[allow(
+    #[expect(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss

@@ -222,6 +222,14 @@ indexing_slicing = "deny"
 string_slice = "deny"
 # ── time arithmetic that can underflow (Instant - Duration panic) ──
 unchecked_time_subtraction = "deny"
+# ── suppression hygiene: every `#[allow]` must be `#[expect]` or exempted ──
+# `allow_attributes` flags every OUTER `#[allow(lint)]` (rustc or clippy) and
+# demands it be written as `#[expect(lint)]`, so a stale `#[allow]` whose lint
+# no longer fires is caught — its `#[expect]` would be unfulfilled. Where an
+# `#[expect]` genuinely cannot be satisfied (a lint that fires in one build
+# but not another, or generated/vendored code) the site keeps `#[allow]` with
+# a sibling `#[allow(clippy::allow_attributes)]` recording the reason.
+allow_attributes = "deny"
 
 # Dev profile (the default for `cargo build` / `cargo run` / `cargo test`).
 # debug = "line-tables-only": emit line tables (file:line for backtraces)

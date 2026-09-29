@@ -635,6 +635,10 @@ pub fn static_groups() -> &'static [ToolGroup] {
     static GROUPS: OnceLock<Vec<ToolGroup>> = OnceLock::new();
     GROUPS.get_or_init(|| {
         // `mut` is only needed when the `blockchain` feature pushes its group.
+        // With `--all-features` (the gate) the push happens, so `unused_mut`
+        // does not fire and an `expect` would be unfulfilled; kept as an
+        // `allow` with its `allow_attributes` exemption.
+        #[allow(clippy::allow_attributes)]
         #[allow(unused_mut)]
         let mut groups = vec![
             ToolGroup {

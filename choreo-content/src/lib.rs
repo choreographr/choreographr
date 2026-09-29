@@ -21,6 +21,12 @@
 //!
 //! [tokio sidecar runtime]: runtime
 
+// `acuity_runtime` is codegen output (subxt's runtime types, ~10k lines): its
+// many `#[allow(...)]`s (rustc lints + `clippy::all`) cannot be `#[expect]`ed —
+// which lints fire varies by feature/consumer — and the file must not be
+// hand-edited (regenerated on every subxt upgrade). Exempt the whole module
+// from `clippy::allow_attributes` here, in the non-generated parent.
+#[allow(clippy::allow_attributes)]
 pub mod acuity_runtime;
 pub mod chain;
 pub mod config;

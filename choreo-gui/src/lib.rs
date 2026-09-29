@@ -44,7 +44,7 @@ static CONNECTION_MODE: OnceLock<ConnectionMode> = OnceLock::new();
 // Desktop/Android never reference the fallback constant (only the iOS body of
 // `default_connection_mode` does), so silence the dead_code warning there —
 // the constant is deliberately shared, not cfg-duplicated.
-#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+#[cfg_attr(not(target_os = "ios"), expect(dead_code))]
 const IOS_DEFAULT_TCP_ADDR: &str = "127.0.0.1:9443";
 
 // ── iOS embedded daemon ────────────────────────────────────────────────────

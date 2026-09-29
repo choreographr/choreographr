@@ -333,6 +333,9 @@ struct MessagePayload<'a> {
 
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
+// Used in some build targets but not others, so `dead_code` cannot be an
+// `expect`; kept as an `allow` with its `allow_attributes` exemption.
+#[allow(clippy::allow_attributes)]
 #[allow(dead_code)]
 enum ContentBlockPayload<'a> {
     Text {
@@ -482,6 +485,9 @@ fn anthropic_thinking_artifact(
 }
 
 #[derive(Debug, Deserialize)]
+// Deserialized for wire completeness but not read in every target, so
+// `dead_code` cannot be an `expect`; kept as an `allow` with its exemption.
+#[allow(clippy::allow_attributes)]
 #[allow(dead_code)]
 struct UsageInfo {
     #[serde(default)]

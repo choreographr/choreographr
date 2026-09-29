@@ -2221,6 +2221,12 @@ mod tests {
     // which is included here as a module.
 
     mod vm_allocator {
+        // `vm_allocator_dynamic_inner.rs` is vendored (adapted from the
+        // `linked_list_allocator` crate) and is also emitted as guest source
+        // via `include_str!`; its `#[allow(...)]`s cannot all be `#[expect]`ed
+        // and the file must not be hand-edited. Exempt the whole module from
+        // `clippy::allow_attributes` here, at the (non-vendored) include site.
+        #![allow(clippy::allow_attributes)]
         // Include the production allocator source for host-side testing.
         // Items marked #[cfg(not(test))] (e.g. the global allocator) are
         // excluded when compiled under `cargo test`.

@@ -141,7 +141,7 @@ const UI_EVENT_QUEUE_HIGH_WATER_MARK: usize = 16_384;
 /// A `Copy` enum keeps `handle_resume_command(cmd, …)` call sites
 /// pass-by-value without triggering `needless_pass_by_value`.
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg_attr(windows, expect(dead_code))]
 enum ResumeCommand {
     /// SIGCONT was received — re-initialise raw mode, alternate screen,
     /// and mouse capture after the terminal pty state was reset.
@@ -172,6 +172,10 @@ fn signal_to_resume_command(signo: i32) -> Option<ResumeCommand> {
 /// Only the Windows terminal thread uses it in the lib build (the unit test
 /// below exercises it on every platform); `allow(dead_code)` keeps the Unix
 /// lib build warning-free.
+// Unix lib build: unused (dead). Unix test build: used by the unit test
+// below. So `dead_code` fires in one target but not the other and cannot be
+// an `expect`; kept as an `allow` with its `allow_attributes` exemption.
+#[allow(clippy::allow_attributes)]
 #[cfg_attr(unix, allow(dead_code))]
 fn notify_disconnected(rx: &channel::Receiver<()>) -> bool {
     matches!(

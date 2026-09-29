@@ -87,6 +87,9 @@ pub(crate) struct ResponsesRequest<'a> {
 /// `ResponseOutputItem`, while the reasoning round-trip artifact preserves
 /// every field (including unknown ones) byte-for-byte.
 #[derive(Debug, Deserialize)]
+// Read only in some build targets, so `dead_code` cannot be an `expect`;
+// kept as an `allow` with its `allow_attributes` exemption.
+#[allow(clippy::allow_attributes)]
 #[allow(dead_code)]
 pub(crate) struct ResponsesResponse {
     #[serde(default)]
@@ -109,7 +112,7 @@ pub(crate) struct ResponsesResponse {
 /// `ResponsesResponse`) even though the current code reads only the fields it
 /// needs.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ResponseOutputItem {
     Message {
