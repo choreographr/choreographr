@@ -108,7 +108,7 @@ impl TimestampMs {
     /// year 29247 — practically never, so keep the original `as i64` behavior
     /// here rather than introducing an error path.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     pub fn now() -> Self {
         Self(
             std::time::SystemTime::now()
@@ -977,7 +977,7 @@ pub enum KeystoreState {
 // same as removing one — and without the attribute every consumer match must
 // enumerate the whole set, so the compiler points at every site that needs
 // revisiting when that happens.)
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DaemonMessage {
     /// Single home for all session-scoped events. The envelope supplies the
