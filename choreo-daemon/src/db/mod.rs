@@ -2128,7 +2128,7 @@ mod tests {
                 for (i, turn) in turns.iter().enumerate() {
                     let raw = rmp_serde::to_vec_named(turn).unwrap();
                     // usize→u32 table key: the fixture writes 3 turns.
-                    #[allow(clippy::cast_possible_truncation)]
+                    #[expect(clippy::cast_possible_truncation)]
                     table.insert((sid, i as u32), raw.as_slice()).unwrap();
                 }
             }

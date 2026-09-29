@@ -80,7 +80,7 @@ pub(crate) fn run_bridge_tool<T: serde::Serialize>(
     })?;
 
     // u128→u64: iOS tool timeouts are seconds-to-minutes; no truncation in practice.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     let timeout_ms = timeout.as_millis() as u64;
     tracing::debug!(tool = tool_name, timeout_ms, "dispatching ios tool");
     let pending = bridge

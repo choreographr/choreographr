@@ -2,13 +2,7 @@
 // re-emits it without the #[cfg(test)] marker, so clippy's
 // allow-*-in-tests config no longer recognizes it as test code —
 // the AGENTS.md test allowances are spelled out here instead.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::panic_in_result_fn,
-    clippy::indexing_slicing
-)]
+#![expect(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 use super::*;
 use crate::context::LoadedSkill;
 use crate::daemon::DaemonCommand;
@@ -130,7 +124,7 @@ fn build_chat_request_messages_with_tool_calls() {
 fn write_temp_png() -> tempfile::NamedTempFile {
     let buf = image::ImageBuffer::from_fn(3, 2, |x, y| {
         // u8 pixel coordinates (3×2 image): the arithmetic never exceeds u8.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         image::Rgb([(x * 80) as u8, (y * 90) as u8, 40])
     });
     let mut file = tempfile::NamedTempFile::new().expect("temp png");

@@ -270,7 +270,7 @@ mod tests {
     #[test]
     // why: the `value || !value` tautology is the point — it only type-checks
     // that the parsed value is a bool, so silence the logic-bug lint here.
-    #[allow(clippy::overly_complex_bool_expr)]
+    #[expect(clippy::overly_complex_bool_expr)]
     fn random_bool() {
         let args = RandomArgs {
             r#type: Some(RandomType::Bool),

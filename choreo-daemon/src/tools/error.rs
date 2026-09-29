@@ -71,7 +71,7 @@ pub(crate) fn tool_ok(content: impl Into<String>) -> ToolOutput {
 // why: `impl ToString` keeps the many heterogeneous call sites (thiserror
 // types, `String`, literals) one-line clean; re-borrowing each caller here is
 // churn.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 pub(crate) fn tool_err(error: impl ToString) -> ToolOutput {
     ToolOutput {
         content: error.to_string(),

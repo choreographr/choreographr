@@ -348,7 +348,7 @@ pub(crate) fn determine_tool_timeout(name: &str, arguments_json: &str) -> Option
         .map_or(base, |raised| raised.max(base));
     if effective > base {
         // u128→u64: tool timeouts are seconds-to-minutes; no truncation in practice.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let requested_ms = requested.map(|r| r.as_millis() as u64);
         debug!(
             tool = name,

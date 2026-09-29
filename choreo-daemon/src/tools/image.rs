@@ -416,7 +416,7 @@ mod tests {
         // A valid PNG goes through the guarded decoder and reports its size.
         let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(4, 3, |x, y| {
             // u8 pixel coordinates (4×3 image): the arithmetic never exceeds u8.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_possible_truncation)]
             image::Rgba([x as u8 * 60, y as u8 * 80, 0, 255])
         }));
         let mut png = Cursor::new(Vec::new());

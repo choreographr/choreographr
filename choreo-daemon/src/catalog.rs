@@ -456,7 +456,7 @@ fn should_fetch_at_startup(cache_valid: bool, last_attempt_ms: Option<u64>, now_
         None => true,
         // u128→u64 interval millis: the constant is a Duration well under u64::MAX.
         Some(at) => {
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_possible_truncation)]
             let interval_ms = REFRESH_ATTEMPT_INTERVAL.as_millis() as u64;
             now_ms.saturating_sub(at) >= interval_ms
         }
@@ -490,7 +490,7 @@ fn next_retry_deadline(last_attempt_ms: Option<u64>, now: Instant, now_ms: u64) 
 fn wall_now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
         // u128→u64 epoch millis: fits u64 for the next ~292 million years.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         {
             d.as_millis() as u64
         }

@@ -187,7 +187,7 @@ fn open_pidfd(pid: u32) -> Option<OwnedFd> {
     // exits. `Pid::from_raw` yields None only for pid 0, which child.id()
     // never produces — kept defensive rather than unwrapping.
     // u32→i32 pid: pids live in the positive i32 range by kernel ABI.
-    #[allow(clippy::cast_possible_wrap)]
+    #[expect(clippy::cast_possible_wrap)]
     let pid = rustix::process::Pid::from_raw(pid as i32)?;
     match rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) {
         Ok(fd) => Some(fd),
@@ -239,7 +239,7 @@ fn kill_child_tree(pid: u32, pidfd: Option<&OwnedFd>) -> bool {
     // `Option` and production code must not unwrap — keep the conversion
     // defensive rather than assuming.
     // u32→i32 pid: pids live in the positive i32 range by kernel ABI.
-    #[allow(clippy::cast_possible_wrap)]
+    #[expect(clippy::cast_possible_wrap)]
     let Some(pid) = rustix::process::Pid::from_raw(pid as i32) else {
         debug!(raw_pid = pid, "refusing to signal pid 0");
         return false;
@@ -692,7 +692,7 @@ fn poll_readable(
     // (`Timespec` is re-exported from rustix::event; rustix::timespec is private.)
     // u64→i64 seconds: poll slices are bounded by tool timeouts (minutes),
     // never anywhere near i64::MAX.
-    #[allow(clippy::cast_possible_wrap)]
+    #[expect(clippy::cast_possible_wrap)]
     let timeout = rustix::event::Timespec {
         tv_sec: poll.as_secs() as i64,
         tv_nsec: i64::from(poll.subsec_nanos()),

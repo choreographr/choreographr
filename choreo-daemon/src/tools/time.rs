@@ -15,7 +15,7 @@ pub(crate) fn execute_get_current_time(
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| ToolExecError(format!("system clock before epoch: {e}")))?;
     // u128→u64 keeps semantics: epoch millis fit u64 for the next ~292 million years.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     let millis = duration.as_millis() as u64;
     tracing::debug!(millis, "get_current_time");
     Ok(millis)

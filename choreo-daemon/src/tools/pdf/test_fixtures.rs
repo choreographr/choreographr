@@ -9,17 +9,15 @@
 //! the fixture layout (xref offsets, object numbering, content streams) lands
 //! in exactly one place and the two sides can never drift apart.
 
-// AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
-// allow-*-in-tests config only recognizes #[test]-annotated functions —
-// helper fns in this file need this file-level allowance.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::panic_in_result_fn,
-    clippy::indexing_slicing,
-    clippy::cast_possible_truncation
-)]
+// Fixture builders index and size the hand-built PDFs with `as u32` casts;
+// the page counts are tiny, so the truncation is safe by construction.
+#![expect(clippy::cast_possible_truncation)]
+// `write_temp` uses `unwrap`. This file is compiled twice: as a `#[cfg(test)]`
+// module (clippy's test exemption covers it, so an `#[expect]` would be
+// unfulfilled) and pulled into the integration test via `#[path]` in a crate
+// WITHOUT `cfg(test)`, where the lint DOES fire. No single attribute is
+// fulfilled in both builds, so this one lint stays an `allow`.
+#![allow(clippy::unwrap_used)]
 use std::fmt::Write as _;
 use std::io::Write;
 

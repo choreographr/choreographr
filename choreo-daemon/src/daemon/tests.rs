@@ -492,7 +492,7 @@ fn handle_list_sessions_tiebreaks_by_session_id_desc() {
                 parent_session_id: None,
                 working_dir: None,
                 // u64→i64 id*1000: test ids are tiny (1..=3); no wrap possible.
-                #[allow(clippy::cast_possible_wrap)]
+                #[expect(clippy::cast_possible_wrap)]
                 created_at: id as i64 * 1000,
                 last_modified: 5000,
                 turn_count: 0,

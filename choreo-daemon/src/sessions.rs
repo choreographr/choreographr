@@ -397,7 +397,7 @@ impl From<&SessionState> for SessionMetadata {
         let mut meta = SessionMetadata::from(&state.config);
         // usize→u32 turn count: a session with 4 billion turns is impossible
         // in practice (each turn is a full provider round-trip).
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         {
             meta.turn_count = state.turns.len() as u32;
         }
@@ -723,7 +723,7 @@ impl SessionState {
     fn from_snapshot(snapshot: SessionSnapshot, subscribers: HashMap<u64, SubscriberSink>) -> Self {
         // usize→u32 turn count: a session with 4 billion turns is impossible
         // in practice (each turn is a full provider round-trip).
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let turn_count = snapshot.turns.len() as u32;
         Self {
             config: snapshot.config,
@@ -1993,7 +1993,7 @@ fn handle_get_summary(
         last_modified: state.config.last_modified,
         // usize→u32 turn count: a session with 4 billion turns is impossible
         // in practice (each turn is a full provider round-trip).
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         turn_count: state.turns.len() as u32,
         status: state.config.status.clone(),
         active_tool_groups: state.config.active_tool_groups.iter().cloned().collect(),

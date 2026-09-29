@@ -240,7 +240,7 @@ fn rasterize_svg(bytes: &[u8]) -> std::io::Result<DynamicImage> {
     // f64→f32: the SVG intrinsic size feeds a raster target capped at
     // MAX_IMAGE_DIMENSION (2000 px), where f32 precision is far beyond pixel
     // granularity.
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     let scale = if longest > MAX_IMAGE_DIMENSION as f32 {
         MAX_IMAGE_DIMENSION as f32 / longest
     } else {
@@ -249,9 +249,9 @@ fn rasterize_svg(bytes: &[u8]) -> std::io::Result<DynamicImage> {
     // f64→u32 raster dimensions: values are ceil()ed and clamped to >= 1
     // before the cast, and the Pixmap::new allocation below fails if they
     // exceed the rasterizer's limits — identical behavior, just lint-silenced.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let out_w = (intrinsic_w * scale).ceil().max(1.0) as u32;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let out_h = (intrinsic_h * scale).ceil().max(1.0) as u32;
 
     let mut pixmap = tiny_skia::Pixmap::new(out_w, out_h).ok_or_else(|| {
@@ -379,7 +379,7 @@ mod tests {
     fn opaque_rgb() -> DynamicImage {
         let buf: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(3, 2, |x, y| {
             // u8 pixel coordinates (3×2 image): the arithmetic never exceeds u8.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_possible_truncation)]
             Rgb([(x * 80) as u8, (y * 90) as u8, 40])
         });
         DynamicImage::ImageRgb8(buf)
@@ -407,7 +407,7 @@ mod tests {
     fn transparent_image_reencodes_to_png() {
         let buf: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_fn(4, 4, |x, y| {
             // u8 pixel coordinates (4×4 image): the arithmetic never exceeds u8.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_possible_truncation)]
             Rgba([x as u8, y as u8, 0, if x % 2 == 0 { 0 } else { 255 }])
         });
         let img = DynamicImage::ImageRgba8(buf);
@@ -437,7 +437,7 @@ mod tests {
         let buf: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(2002, 1001, |x, y| {
             // u8 pixel coordinates: x wraps by design across the 2002-px width,
             // y (0..1001) is truncated mod 256 — the pattern is cosmetic.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_possible_truncation)]
             Rgb([x as u8, y as u8, 100])
         });
         let img = DynamicImage::ImageRgb8(buf);

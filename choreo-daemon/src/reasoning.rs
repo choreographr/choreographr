@@ -583,14 +583,14 @@ pub(crate) fn reasoning_artifact_tokens(
         Ok(text) => {
             // u128→u32 token counts: informational estimate only; real
             // payloads are far below u32::MAX tokens.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_possible_truncation)]
             {
                 enc.count(text) as u32
             }
         }
         Err(_) => {
             // Same estimate, byte/4 heuristic branch.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_possible_truncation)]
             {
                 (bytes.len() / 4) as u32
             }

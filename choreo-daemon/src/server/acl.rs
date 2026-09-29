@@ -322,7 +322,7 @@ pubkey = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
         for (i, elem) in expected.iter_mut().enumerate() {
             // Index 0..32 into u8: the loop bound is the array length.
             *elem = {
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 let v = i as u8;
                 v + 1
             };
@@ -361,7 +361,7 @@ pubkey = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
         for (i, elem) in expected.iter_mut().enumerate() {
             // Index 0..32 into u8: the loop bound is the array length.
             *elem = {
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 let v = i as u8;
                 v + 1
             };
@@ -390,7 +390,7 @@ pubkey = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
         for (i, elem) in expected.iter_mut().enumerate() {
             // Index 0..32 into u8: the loop bound is the array length.
             *elem = {
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 let v = i as u8;
                 v + 1
             };

@@ -593,7 +593,7 @@ mod tests {
             // usize→u32 turn count: test fixtures carry a handful of turns.
             turn_count: {
                 let n = turns.len();
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 {
                     n as u32
                 }

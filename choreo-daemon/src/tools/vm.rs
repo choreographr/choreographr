@@ -804,7 +804,7 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for ChoreographrSyscall 
 
                 // u64→usize register read: guest buffer sizes are bounded by
                 // the VM's memory (far below usize::MAX on all targets).
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 let to_write = result_bytes.len().min(out_size as usize);
                 if to_write > 0 {
                     // `to_write <= result_bytes.len()` per the min() above.
@@ -938,14 +938,14 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for ChoreographrSyscall 
                 // length so the guest's dec_result_raw can find frame boundaries.
                 // usize→u32 frame count: a batch of 4 billion tool calls is
                 // impossible (each call is a full tool execution).
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 let count_encoded: Vec<u8> = postcard::to_allocvec(&(results.len() as u32))
                     .map_err(|_| VmError::Unexpected("batch encode count failed".into()))?;
                 let mut response = count_encoded;
                 for r in &results {
                     // usize→u32 frame length: single tool results are far
                     // below u32::MAX bytes (the guest buffer is smaller yet).
-                    #[allow(clippy::cast_possible_truncation)]
+                    #[expect(clippy::cast_possible_truncation)]
                     let frame_len: u32 = r.len() as u32;
                     let len_encoded = postcard::to_allocvec(&frame_len)
                         .map_err(|_| VmError::Unexpected("batch encode len failed".into()))?;
@@ -955,7 +955,7 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for ChoreographrSyscall 
 
                 // u64→usize register read: guest buffer sizes are bounded by
                 // the VM's memory (far below usize::MAX on all targets).
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 let to_write = response.len().min(out_size as usize);
                 if to_write > 0 {
                     // `to_write <= response.len()` per the min() above.
@@ -2772,7 +2772,7 @@ mod tests {
                 .wrapping_add(1_442_695_040_888_963_407);
             // u64→usize: on 64-bit targets identical; the heap index only
             // needs the low bits regardless.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_possible_truncation)]
             {
                 *state as usize
             }

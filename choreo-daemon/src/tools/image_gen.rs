@@ -437,7 +437,7 @@ mod tests {
     fn sample_png_b64() -> String {
         let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(4, 3, |x, y| {
             // u8 pixel coordinates (4×3 image): the arithmetic never exceeds u8.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_possible_truncation)]
             image::Rgba([x as u8 * 60, y as u8 * 80, 0, 255])
         }));
         let mut png = Cursor::new(Vec::new());
@@ -455,7 +455,7 @@ mod tests {
     impl ImageGenerationClient for StubImageClient {
         // &'static str is the trait's required return lifetime for
         // `provider_slug`, not an over-bound string literal.
-        #[allow(clippy::unnecessary_literal_bound)]
+        #[expect(clippy::unnecessary_literal_bound)]
         fn provider_slug(&self) -> &str {
             "openai"
         }
@@ -467,8 +467,7 @@ mod tests {
             // The stub ignores the cancel channel but must echo the request's
             // model; `revised_prompt` comes from the stub's field (the request
             // carries no prompt-rewrite). The `Some(..)` literal is the
-            // per-test override path, hence the field + allow.
-            #[allow(clippy::unnecessary_literal_bound)]
+            // per-test override path, hence the field.
             let revised_prompt = self.revised_prompt.clone();
             Ok(ImageGenerationResult {
                 image_b64: self.png_b64.clone(),
@@ -482,7 +481,7 @@ mod tests {
     /// returns the given handle.
     // Test helper whose panic paths are intentional test failures;
     // clippy::panic_in_result_fn has no allow-*-in-tests config option.
-    #[allow(clippy::panic_in_result_fn)]
+    #[expect(clippy::panic_in_result_fn)]
     fn execute_with_handle(
         handle: ImageProviderHandle,
         args: GenerateImageArgs,

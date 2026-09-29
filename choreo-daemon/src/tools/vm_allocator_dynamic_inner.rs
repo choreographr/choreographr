@@ -21,7 +21,7 @@
 // host's global allocator and to suppress unused-import warnings.
 
 #[allow(dead_code, unused_imports)]
-#[allow(clippy::useless_attribute)]
+#[expect(clippy::useless_attribute)]
 extern crate alloc;
 
 #[allow(dead_code, unused_imports)]
@@ -87,7 +87,7 @@ impl HoleList {
     /// empty so that all allocations will fail).
     // why: the caller hands us a `*mut u8` that the allocator has already
     // aligned for `Hole`; the u8→Hole cast is the whole point of this API.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(clippy::cast_ptr_alignment)]
     pub unsafe fn init(&mut self, addr: *mut u8, size: usize) -> bool {
         if size < Hole::min_size() {
             self.front = None;
@@ -105,7 +105,7 @@ impl HoleList {
     /// `Hole::min_size()`), aligned to `layout.align()`.
     // why: tail-hole addresses come from our own align_up arithmetic and are
     // already `Hole`-aligned; the u8→Hole cast is deliberate.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(clippy::cast_ptr_alignment)]
     pub unsafe fn allocate_first_fit(&mut self, layout: Layout) -> *mut u8 {
         // The allocation must be at least min_size and must maintain
         // Hole alignment so that any tail hole starts at a valid address.
@@ -175,7 +175,7 @@ impl HoleList {
     /// Return a block of memory back to the free list, merging adjacent holes.
     // why: `ptr` was produced by our own allocator and is already `Hole`-
     // aligned; the u8→Hole cast is deliberate.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(clippy::cast_ptr_alignment)]
     pub unsafe fn deallocate(&mut self, ptr: *mut u8, layout: Layout) {
         // Must use the same rounded size as allocate_first_fit so that
         // the freed block exactly matches the consumed region.

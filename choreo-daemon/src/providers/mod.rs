@@ -596,10 +596,10 @@ pub(crate) mod test_util {
 
     // Test stub: the panics are intentional misuse detectors, and
     // clippy::panic_in_result_fn has no allow-*-in-tests config option.
-    #[allow(clippy::panic_in_result_fn)]
+    #[expect(clippy::panic_in_result_fn)]
     impl ProviderClient for StubProviderClient {
         // &'static str is the trait's required lifetime, not an over-bound literal.
-        #[allow(clippy::unnecessary_literal_bound)]
+        #[expect(clippy::unnecessary_literal_bound)]
         fn provider_slug(&self) -> &str {
             "test-stub"
         }
@@ -640,7 +640,7 @@ pub(crate) mod test_util {
 
     impl ProviderClient for FailingProviderClient {
         // &'static str is the trait's required lifetime, not an over-bound literal.
-        #[allow(clippy::unnecessary_literal_bound)]
+        #[expect(clippy::unnecessary_literal_bound)]
         fn provider_slug(&self) -> &str {
             "test-failing"
         }
@@ -748,7 +748,7 @@ pub(crate) mod test_util {
 
     impl ProviderClient for TruncatingProviderClient {
         // &'static str is the trait's required lifetime, not an over-bound literal.
-        #[allow(clippy::unnecessary_literal_bound)]
+        #[expect(clippy::unnecessary_literal_bound)]
         fn provider_slug(&self) -> &str {
             "test-truncating"
         }

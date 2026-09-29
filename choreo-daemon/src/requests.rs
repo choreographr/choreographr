@@ -109,7 +109,7 @@ fn estimate_prompt_tokens(
             // and the estimate is informational (billing uses provider usage).
             .map(|text| {
                 let n = enc.count(text);
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 {
                     n as u32
                 }
@@ -124,7 +124,7 @@ fn estimate_prompt_tokens(
         let image_tokens: u32 = messages
             .iter()
             .map(|m| {
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 // usize→u32 image count: turns never carry 4 billion images
                 (m.images.len() as u32).saturating_mul(IMAGE_TOKEN_ESTIMATE)
             })
@@ -135,7 +135,7 @@ fn estimate_prompt_tokens(
             .filter_map(|m| m.tool_calls.as_ref())
             .flat_map(|calls| calls.iter())
             .map(|tc| {
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 // u128→u32 token counts, informational only
                 let tc_tokens = (enc.count(&tc.id) + enc.count(&tc.kind)) as u32
                     + (enc.count(&tc.function.name) + enc.count(&tc.function.arguments)) as u32;
@@ -147,7 +147,7 @@ fn estimate_prompt_tokens(
             .iter()
             .filter_map(|def| match serde_json::to_string(def) {
                 Ok(s) => {
-                    #[allow(clippy::cast_possible_truncation)]
+                    #[expect(clippy::cast_possible_truncation)]
                     // u128→u32 token counts, informational only
                     Some(enc.count(&s) as u32)
                 }
@@ -540,7 +540,7 @@ pub(crate) fn run_agent_loop(
                     attempt,
                     max_attempts,
                     // u128→u64: retry delays are at most minutes; no truncation in practice.
-                    #[allow(clippy::cast_possible_truncation)]
+                    #[expect(clippy::cast_possible_truncation)]
                     delay_ms: delay.as_millis() as u64,
                 }));
             }
@@ -577,7 +577,7 @@ pub(crate) fn run_agent_loop(
                         if let Some(enc) = &encoding {
                             // u128→u32 token counts, informational only.
                             let n = enc.count(&text);
-                            #[allow(clippy::cast_possible_truncation)]
+                            #[expect(clippy::cast_possible_truncation)]
                             {
                                 output_token_count += n as u32;
                             }
@@ -608,7 +608,7 @@ pub(crate) fn run_agent_loop(
                         if let Some(enc) = &encoding {
                             // u128→u32 token counts, informational only.
                             let n = enc.count(&text);
-                            #[allow(clippy::cast_possible_truncation)]
+                            #[expect(clippy::cast_possible_truncation)]
                             {
                                 output_token_count += n as u32;
                             }

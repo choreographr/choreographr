@@ -34,13 +34,7 @@
 // AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
 // allow-*-in-tests config only recognizes #[test]-annotated functions —
 // helper fns in this file need this file-level allowance.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::panic_in_result_fn,
-    clippy::indexing_slicing
-)]
+#![expect(clippy::expect_used, clippy::panic)]
 use choreo_ai_protocols::openai::{MaxTokensField, OpenAiClient, ServiceConfig};
 use choreo_ai_protocols::test_utils::MockProvider;
 use choreo_daemon::broadcast::{LagLimits, SubscriberSink};

@@ -9,13 +9,7 @@
 // AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
 // allow-*-in-tests config only recognizes #[test]-annotated functions —
 // helper fns in this file need this file-level allowance.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::panic_in_result_fn,
-    clippy::indexing_slicing
-)]
+#![expect(clippy::panic)]
 use choreo_daemon::config_watch::{ChangeKind, ConfigChange, ConfigWatcher};
 use crossbeam_channel::Receiver;
 use std::thread;

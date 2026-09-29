@@ -1,12 +1,9 @@
 // AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
 // allow-*-in-tests config only recognizes #[test]-annotated functions —
 // helper fns in this file need this file-level allowance.
-#![allow(
+#![expect(
     clippy::unwrap_used,
     clippy::expect_used,
-    clippy::panic,
-    clippy::panic_in_result_fn,
-    clippy::indexing_slicing,
     // Test helper mirrors the tools' `Option<String>` arg shape; the Option is
     // the point, not a Result, so the wrap lint is silenced file-wide.
     clippy::unnecessary_wraps

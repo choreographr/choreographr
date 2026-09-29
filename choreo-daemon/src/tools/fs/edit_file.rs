@@ -260,7 +260,7 @@ fn apply_text_edits(
         replacement_count += replacements_for_edit;
         // usize→isize char-count delta: the delta may legitimately be negative
         // (shorter replacement), so the cast is the intended wrap, not a bug.
-        #[allow(clippy::cast_possible_wrap)]
+        #[expect(clippy::cast_possible_wrap)]
         {
             char_delta += (new_text.chars().count() as isize - old_text.chars().count() as isize)
                 * replacements_for_edit as isize;
