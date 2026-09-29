@@ -30,7 +30,7 @@ use crate::error::AcpError;
 /// the largest variant past clippy's size-difference threshold — the size is
 /// inherent to carrying whole session snapshots, not an accident.
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 pub enum Event {
     /// A JSON-RPC request or notification received from the editor (stdin).
     AcpRequest(acp_jsonrpc::RpcMessage),
