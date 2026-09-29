@@ -445,7 +445,7 @@ data model.
 | `choreo-gui` | Desktop/Android GUI client (Dioxus Native / Blitz renderer — no webview) |
 | `choreo-im` | Instant messaging bridge (Telegram) |
 | `choreo-client-core` | Shared parsing, markdown, image assembly, and daemon-message dispatch for UI clients |
-| `choreo-markdown` | Markdown parser, HTML renderer (pulldown-cmark + ammonia), and a LaTeX-math → Unicode pretty-printer (`render_math_pretty`) |
+| `choreo-markdown` | Markdown parser, HTML renderer (pulldown-cmark + ammonia), and a LaTeX-math → Unicode pretty-printer (`render_math_pretty`); prose that merely contains two `$` signs is kept as literal text rather than mis-detected as math |
 
 ## Concepts
 

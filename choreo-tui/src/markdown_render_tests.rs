@@ -4116,6 +4116,33 @@ fn table_cells_pretty_print_math() {
 }
 
 #[test]
+fn dollar_pair_in_prose_does_not_render_as_math() {
+    // Regression: two `$` signs in ordinary prose used to be captured as one
+    // inline-math span, which the renderer tinted yellow and whitespace-collapsed
+    // (`render_math_pretty`), turning the sentence into a run-together smear.
+    // It must instead render as literal text with its spacing intact and no
+    // math styling.
+    let text = "Also: Fly now has a $0 to start? They removed the free tier in \
+                Oct 2024; need to verify. This is time-sensitive($) I should flag \
+                uncertainty.";
+    let result = markdown_lines(text, 200);
+    let joined = result
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        joined.contains("start? They removed") && joined.contains("time-sensitive($) I should"),
+        "prose spacing was corrupted: {joined:?}"
+    );
+    let tinted = result
+        .iter()
+        .flat_map(|line| &line.spans)
+        .any(|span| span.style.fg == Some(Color::Yellow));
+    assert!(!tinted, "prose was tinted as inline math: {joined:?}");
+}
+
+#[test]
 fn table_uses_rounded_corners_and_a_plain_header_rule() {
     // nushell-style frame: rounded OUTER corners, square T-junctions, and a
     // uniform header rule — the GFM delimiter row's alignment colons are

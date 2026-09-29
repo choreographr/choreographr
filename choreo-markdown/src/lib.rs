@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use ammonia::Builder as HtmlSanitizer;
 use pulldown_cmark::{
-    Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd, html,
+    Alignment, CodeBlockKind, CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd, html,
 };
 
 /// Error type for markdown parsing. Currently all operations are infallible,
@@ -170,8 +170,55 @@ enum InlineContext {
 #[must_use]
 pub fn render_markdown_html(input: &str) -> String {
     let mut html_output = String::new();
-    html::push_html(&mut html_output, Parser::new_ext(input, markdown_options()));
+    html::push_html(
+        &mut html_output,
+        Parser::new_ext(input, markdown_options()).map(normalize_math_event),
+    );
     sanitize_html(&html_output)
+}
+
+/// Reclassify a `$...$` span that is plainly prose (or currency) rather than
+/// mathematics back into the literal text the author typed.
+///
+/// pulldown-cmark's `$…$` rule is deliberately loose: any `$` not followed by
+/// whitespace *opens* a span and any `$` not preceded by whitespace *closes*
+/// it. Prose that merely *contains* two amounts therefore collapses into one
+/// giant `InlineMath` span — e.g. `… with a $0 to start? … time-sensitive($) I
+/// should …` becomes a single span whose inner text is several whole sentences.
+/// The TUI then tints it yellow and routes it through [`render_math_pretty`],
+/// which drops inter-token whitespace, rendering the paragraph as a
+/// run-together smear. Re-emit such spans as literal `$…$` text so the prose
+/// survives; genuine equations are untouched (see [`looks_like_inline_math`]).
+fn normalize_math_event(event: Event<'_>) -> Event<'_> {
+    match event {
+        Event::InlineMath(content) if !looks_like_inline_math(content.as_ref()) => {
+            Event::Text(CowStr::from(format!("${}$", content.as_ref())))
+        }
+        other => other,
+    }
+}
+
+/// Whether a pulldown-cmark `InlineMath` span really looks like mathematics.
+///
+/// Because pulldown-cmark matches `$…$` purely on whitespace adjacency, a span
+/// produced for text that merely *contains* two `$` signs is often a whole
+/// sentence. Two conservative signals mark such a span as prose rather than
+/// math; anything else stays math so genuine equations are never disturbed:
+///
+/// * a sentence terminator followed by whitespace (`. `, `? `, `! `) — an
+///   equation virtually never contains one, while running prose almost always
+///   does;
+/// * a leading decimal digit followed by whitespace (`5 and …`, `2 per month`)
+///   — the shape of a currency amount, not an expression.
+fn looks_like_inline_math(content: &str) -> bool {
+    let starts_with_digit = content.as_bytes().first().is_some_and(u8::is_ascii_digit);
+    if starts_with_digit && content.contains(char::is_whitespace) {
+        return false;
+    }
+    !content
+        .as_bytes()
+        .windows(2)
+        .any(|pair| matches!(pair, [b'.' | b'?' | b'!', ws] if ws.is_ascii_whitespace()))
 }
 
 impl MarkdownDocument {
@@ -180,7 +227,7 @@ impl MarkdownDocument {
     /// Uses `pulldown-cmark` with a curated set of extensions enabled.
     /// The returned document can be inspected, modified, and re-serialized.
     pub fn parse(input: &str) -> Self {
-        let parser = Parser::new_ext(input, markdown_options());
+        let parser = Parser::new_ext(input, markdown_options()).map(normalize_math_event);
         let mut blocks = Vec::new();
         let mut block_stack = Vec::<BlockContext>::new();
         let mut inline_stack = Vec::<InlineContext>::new();
@@ -2198,6 +2245,60 @@ mod tests {
         assert!(matches!(content[0], MarkdownInline::InlineMath(_)));
         assert!(matches!(content[2], MarkdownInline::DisplayMath(_)));
         assert_eq!(inline_text(content), "x^2 and \\sum");
+    }
+
+    #[test]
+    fn prose_with_two_dollars_stays_literal_text() {
+        // Two `$` signs in running prose must not be captured as one giant
+        // inline-math span (which the TUI would tint and whitespace-collapse).
+        let input = "Also: Fly now has a $0 to start? They removed the free tier \
+                     in Oct 2024; need to verify. This is time-sensitive($) I should \
+                     flag uncertainty.";
+        let document = MarkdownDocument::parse(input);
+        let MarkdownBlock::Paragraph(content) = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(
+            !content
+                .iter()
+                .any(|node| matches!(node, MarkdownInline::InlineMath(_))),
+            "prose was misclassified as inline math: {content:?}"
+        );
+        assert_eq!(inline_text(content), input.replace('\n', ""));
+    }
+
+    #[test]
+    fn currency_pair_stays_literal_text() {
+        // A leading-digit span with interior whitespace reads as currency, not
+        // math, even without sentence punctuation.
+        let document = MarkdownDocument::parse("it costs $5 and $10 today");
+        let MarkdownBlock::Paragraph(content) = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(
+            !content
+                .iter()
+                .any(|node| matches!(node, MarkdownInline::InlineMath(_))),
+            "currency was misclassified as inline math: {content:?}"
+        );
+        assert_eq!(inline_text(content), "it costs $5 and $10 today");
+    }
+
+    #[test]
+    fn genuine_inline_math_is_preserved() {
+        // A real expression — no sentence punctuation, no leading digit — is
+        // still captured as math and round-trips through `$…$`.
+        let document = MarkdownDocument::parse("solve $x^2 + 1$ now");
+        let MarkdownBlock::Paragraph(content) = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(
+            content
+                .iter()
+                .any(|node| matches!(node, MarkdownInline::InlineMath(_))),
+            "real math was not captured: {content:?}"
+        );
+        assert_eq!(document.to_markdown(), "solve $x^2 + 1$ now");
     }
 
     #[test]
