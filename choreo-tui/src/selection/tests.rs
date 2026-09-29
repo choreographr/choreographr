@@ -959,6 +959,26 @@ fn blockquote_in_list_copies_without_bar_keeping_marker() {
 }
 
 #[test]
+fn literal_bar_in_prose_is_copied() {
+    // A `│ ` in ordinary prose is text, not block-quote/box chrome: the
+    // renderer records no chrome for it, so a copy keeps it verbatim.
+    let mut app = app_with_turns(&[(0, "a │ b")], 20);
+    let ((row, _), _) = locate(&app, "│");
+    // Drag from the line's first column to past its end: the bar is in the
+    // middle, so the whole row is selected and the bar must survive.
+    let copied = drag_and_finish(&mut app, (row, 0), (row, 200)).expect("selection should extract");
+    assert!(
+        copied.contains('│'),
+        "literal bar must be copied: {copied:?}"
+    );
+    assert_eq!(
+        copied.trim(),
+        "a │ b",
+        "prose is copied verbatim: {copied:?}"
+    );
+}
+
+#[test]
 fn code_box_copy_preserves_interior_blank_line() {
     // Regression: a blank line *inside* a fence is code content, not box
     // padding, and must survive a copy.  It used to be classified as pure

@@ -614,6 +614,55 @@ fn blockquote_in_list_chrome_hides_bar_keeps_marker() {
     assert_eq!(dchrome[0].intervals(), &[(2, 4), (4, 6)]);
 }
 
+// ── copy-chrome negatives (chrome is emitted, never inferred) ─────────
+
+#[test]
+fn plain_bar_text_has_no_chrome() {
+    // Chrome is emitted *explicitly* by the block-quote bar and the code box,
+    // so a row whose text merely contains `│ ` (a literal pipe in prose) is
+    // never mistaken for chrome — it carries none and copies in full.  This is
+    // the guard against the old string/colour re-scan.
+    let (lines, _joins, chrome) = markdown_lines_joined("a \u{2502} b", 80);
+    assert_eq!(lines.len(), chrome.len());
+    assert!(
+        chrome.iter().all(LineChrome::is_empty),
+        "prose containing a bar must have no chrome: {chrome:#?}"
+    );
+}
+
+#[test]
+fn diff_gutter_has_no_chrome() {
+    // A ` ```diff ` fence renders side-by-side rows with their own `│` gutter.
+    // That gutter is diff *content*, not block-quote/box chrome, so every diff
+    // row carries empty chrome and a copy reproduces it verbatim.
+    let md = "```diff\ndiff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n```";
+    let (lines, _joins, chrome) = markdown_lines_joined(md, 80);
+    assert!(
+        lines.iter().any(|l| l.to_string().contains('\u{2502}')),
+        "side-by-side diff must have a `│` gutter: {lines:#?}"
+    );
+    assert!(
+        chrome.iter().all(LineChrome::is_empty),
+        "the diff gutter must not be chrome: {chrome:#?}"
+    );
+}
+
+#[test]
+fn non_quote_non_box_rows_have_no_chrome() {
+    // Chrome is emitted only by the block-quote bar and the code box.  Every
+    // other markdown construct — headings, paragraphs (with emphasis, inline
+    // code, and a literal `│`), lists, tables, rules — must carry no chrome, so
+    // its content range is exactly what it was before chrome existed.
+    let md = "# Heading\n\nA paragraph with `code`, **bold**, a literal \u{2502} bar, and a\nsecond line.\n\n\
+              - one\n- two\n\n\
+              | a | b |\n|---|---|\n| 1 | 2 |\n\n---\n";
+    let (lines, _joins, chrome) = markdown_lines_joined(md, 60);
+    assert_eq!(lines.len(), chrome.len(), "chrome must align with lines");
+    for (i, c) in chrome.iter().enumerate() {
+        assert!(c.is_empty(), "row {i} unexpectedly has chrome: {lines:#?}");
+    }
+}
+
 #[test]
 fn markdown_blockquote_bar_is_excluded_from_copy_range() {
     let (body, body_joins, body_chrome) = markdown_lines_joined("> hello world", 40);
