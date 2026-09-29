@@ -957,3 +957,24 @@ fn blockquote_in_list_copies_without_bar_keeping_marker() {
         assert_eq!(copied, expected, "marker kept, bar dropped: {copied:?}");
     }
 }
+
+#[test]
+fn code_box_copy_preserves_interior_blank_line() {
+    // Regression: a blank line *inside* a fence is code content, not box
+    // padding, and must survive a copy.  It used to be classified as pure
+    // chrome (the box's frame plus the pad covered the whole row) and dropped,
+    // so copying a multi-line code block collapsed its blank lines away.
+    let md = "```rust\nalpha\n\nbeta\n```";
+    let mut app = test_app();
+    app.history_viewport.width = 30;
+    app.history_viewport.height = 40;
+    app.display_for(0).view.insert_or_replace(0, turn(md));
+    app.rebuild_height_prefix();
+    let (start, _) = locate(&app, "alpha");
+    let (_, end) = locate(&app, "beta");
+    let copied = drag_and_finish(&mut app, start, end).expect("selection should extract");
+    assert_eq!(
+        copied, "alpha\n\nbeta",
+        "the interior blank line must survive the copy: {copied:?}"
+    );
+}

@@ -1,5 +1,10 @@
 use super::*;
 
+// `format_timestamp` previously reached the tests through the façade's import
+// hub; after the turn-assembly split it lives with the renderer, so import it
+// directly here.
+use crate::render::format_timestamp;
+
 /// Run `check` over every Unicode scalar value, sharded across the available
 /// cores. The code-space sweep below is exhaustive by design (it pins the TUI's
 /// per-char terminal keep policy against the shared spoofing predicate for
@@ -4533,4 +4538,67 @@ fn table_uses_rounded_corners_and_a_plain_header_rule() {
             .any(|s| s.style.add_modifier.contains(Modifier::BOLD)),
         "body row must not be bold: {body:?}"
     );
+}
+
+// ── Code box: copy classification edge cases ─────────────────────────
+
+#[test]
+fn code_box_interior_blank_line_is_blank_content() {
+    // Regression: a blank line *inside* a fence renders as a box row whose only
+    // non-chrome columns are the interior padding.  It must classify as *blank
+    // content* (like the language-tag padding row), not pure chrome, so a copy
+    // keeps the blank line instead of silently dropping it.
+    let (lines, _joins, chrome) = markdown_lines_joined("```\na\n\nb\n```", 80);
+    // rows: top border, "a", blank interior line, "b", bottom border.
+    assert_eq!(lines.len(), 5, "rows: {lines:#?}");
+    assert!(
+        matches!(
+            classify_row_content(&lines[2], &chrome[2]),
+            RowContent::Blank
+        ),
+        "interior blank code line must be blank content: {:?}",
+        chrome[2].intervals()
+    );
+    // The blank row's chrome is the frame only — the one-column interior is
+    // left non-chrome so it reads as blank content.
+    assert_eq!(chrome[2].intervals(), &[(0, 2), (3, 5)]);
+}
+
+#[test]
+fn code_box_over_long_language_tag_is_capped_to_the_frame() {
+    // A language tag wider than the available code area must be truncated to
+    // the box interior, never pushing its row past the (width-capped) frame.
+    let tag = "verylonglanguagetagname";
+    let (lines, _joins, _chrome) = markdown_lines_joined(&format!("```{tag}\ncode\n```"), 20);
+    for line in &lines {
+        assert!(line.width() <= 20, "box row must fit the width: {line:#?}");
+    }
+    // Every row is the same width — the box still hugs its widest interior row.
+    let w = lines[0].width();
+    assert_eq!(w, 20, "box should use the full available width: {lines:#?}");
+    assert!(
+        lines.iter().all(|l| l.width() == w),
+        "all box rows share one width: {lines:#?}"
+    );
+}
+
+#[test]
+fn chrome_covered_width_merges_overlapping_intervals() {
+    // Overlapping intervals must not double-count a covered column.
+    let mut overlap = LineChrome::default();
+    overlap.push(0, 5);
+    overlap.push(3, 8);
+    assert_eq!(chrome_covered_width(&overlap), 8);
+
+    // Touching intervals merge into one run.
+    let mut touching = LineChrome::default();
+    touching.push(0, 2);
+    touching.push(2, 5);
+    assert_eq!(chrome_covered_width(&touching), 5);
+
+    // Empty / inverted intervals credit nothing.
+    let mut degenerate = LineChrome::default();
+    degenerate.push(4, 4);
+    degenerate.push(7, 3);
+    assert_eq!(chrome_covered_width(&degenerate), 0);
 }

@@ -4,8 +4,8 @@
 use super::{
     Color, GlobalLruCache, HighlightLines, Line, LineChrome, LineJoin, MarkdownBlock, Modifier,
     QUOTE_BAR, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH, Span, Style, TABLE_BORDERS, debug, display_width,
-    ensure_blank_line_joined, heading_prefix, highlight_theme, inlines_to_lines, pad_marker,
-    render_table_lines, syntax_set, to_ratatui_color, try_render_diff_content,
+    ensure_blank_line_joined, grapheme_chunks, heading_prefix, highlight_theme, inlines_to_lines,
+    pad_marker, render_table_lines, syntax_set, to_ratatui_color, try_render_diff_content,
     wrap_styled_line_joined,
 };
 pub(crate) fn find_syntax<'a>(
@@ -83,9 +83,9 @@ fn render_code_box(
     let code = code.strip_suffix('\n').unwrap_or(code);
     // The box must fit the block's available width.  Its frame costs four
     // columns — `│ ` on the left and ` │` on the right — so the interior code
-    // area (and hence the box) is capped at `panel_avail - 4`.
-    let panel_avail = width.saturating_sub(indent).max(2);
-    let code_avail = panel_avail.saturating_sub(4);
+    // area (and hence the box) is capped at `block_avail - 4`.
+    let block_avail = width.saturating_sub(indent).max(2);
+    let code_avail = block_avail.saturating_sub(4);
 
     // Highlight, then wrap every row that exceeds the code area so the box
     // never overflows.  Each row keeps the [`LineJoin`] the wrapper recorded so
@@ -114,6 +114,21 @@ fn render_code_box(
     let label_width = label.map_or(0, display_width);
     let inner = code_max.max(label_width).min(code_avail);
     let box_width = inner + 4;
+
+    // The tag is drawn inside the frame, so cap it to the interior width: an
+    // absurdly long language tag must not push its row past the (already
+    // width-capped) frame.  A normal tag is shorter than `inner` and passes
+    // through untouched; only the over-long case is truncated at a grapheme
+    // boundary, and only an empty interior drops it.
+    let tag_text: String = match label {
+        Some(tag) if label_width > inner && inner > 0 => grapheme_chunks(tag, inner, 1)
+            .into_iter()
+            .next()
+            .unwrap_or_default(),
+        Some(_) if inner == 0 => String::new(),
+        Some(tag) => tag.to_string(),
+        None => String::new(),
+    };
 
     // The rounded corners come from the table renderer's shared frame glyphs, so
     // the box and the tables draw one identical frame.
@@ -152,14 +167,14 @@ fn render_code_box(
     );
 
     // ── Language tag + one blank padding row (only when a tag is given) ──
-    if let Some(tag) = label {
-        let tag_width = display_width(tag);
+    if label.is_some() {
+        let tag_width = display_width(&tag_text);
         let mut row = vec![
             Span::styled("│ ".to_string(), Style::default()),
             // The tag is a label, not content: bold distinguishes it from the
             // code without a colour that could clash with the syntax colours.
             Span::styled(
-                tag.to_string(),
+                tag_text,
                 Style::default()
                     .fg(Color::Gray)
                     .add_modifier(Modifier::BOLD),
@@ -213,11 +228,22 @@ fn render_code_box(
             ));
         }
         row.push(Span::styled(" │".to_string(), Style::default()));
-        // The `│ ` / ` │` runs are chrome; the code text between them (and only
-        // it) stays selectable, so a copy never grabs the frame or the pad.
+        // The `│ ` / ` │` runs are chrome, and so is the right-hand fill that
+        // pads the code out to the box width — the code text between them (and
+        // only it) stays selectable, so a copy never grabs the frame or the
+        // pad.  An *empty* code line is the exception: its interior is all
+        // padding, so marking that padding as chrome would cover the whole row
+        // and classify it as pure chrome, dropping an interior blank line from
+        // a copy.  Leaving the padding non-chrome instead makes the row *blank
+        // content* (mirroring the language-tag padding row), so the blank line
+        // is copied as a genuinely blank line.
         let mut c = LineChrome::default();
         c.push(indent, indent + 2);
-        c.push(indent + 2 + content_width, indent + box_width);
+        if content_width == 0 {
+            c.push(indent + 2 + inner, indent + box_width);
+        } else {
+            c.push(indent + 2 + content_width, indent + box_width);
+        }
         emit(row, join, c);
     }
 
