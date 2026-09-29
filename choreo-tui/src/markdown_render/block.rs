@@ -63,8 +63,9 @@ pub(crate) fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'st
 /// half-row of padding at the top and bottom (drawn with half-block glyphs so
 /// the panel colour has the same one-column thickness on all four sides).  The
 /// literal triple-backtick fence markers are never emitted.  When a language
-/// tag is given it is shown on the panel's first interior row, followed by one
-/// blank padding row; without a tag the code starts on the first interior row.
+/// tag is given it is shown on the panel's first interior row (bold), followed
+/// by one blank padding row; without a tag the code starts on the first
+/// interior row.
 fn render_code_panel(
     language: Option<&str>,
     code: &str,
@@ -73,6 +74,12 @@ fn render_code_panel(
     indent: usize,
     width: usize,
 ) {
+    // Drop the single trailing newline the fence interior normally carries
+    // (the `\n` before the closing fence).  Left in, it splits into a final
+    // empty line that would render as a spurious full-height blank panel row
+    // above the bottom margin.  A deliberately blank last line (two newlines)
+    // survives, since only one suffix is stripped.
+    let code = code.strip_suffix('\n').unwrap_or(code);
     // The whole panel must fit the block's available width; the code area is
     // the panel minus the 1-column pad on each side.
     let panel_avail = width.saturating_sub(indent).max(2);
@@ -139,9 +146,14 @@ fn render_code_panel(
     if let Some(tag) = label {
         let mut row = vec![
             pad(1),
+            // The tag is a label, not content: bold distinguishes it from the
+            // code without a colour that could clash with the syntax colours.
             Span::styled(
                 tag.to_string(),
-                Style::default().fg(Color::Gray).bg(CODE_BG),
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(CODE_BG),
             ),
         ];
         let used = 1 + display_width(tag);

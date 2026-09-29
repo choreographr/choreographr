@@ -399,16 +399,17 @@ fn markdown_lines_code_block_no_language() {
 #[test]
 fn code_panel_copy_ranges_trim_chrome() {
     let (lines, _joins) = markdown_lines_joined("```rust\nfn main() {}\n```", 80);
-    // Row 0 top margin, 1 language tag, 2 blank padding, 3 code, 4 the code's
-    // trailing-newline blank row, 5 bottom margin.
-    assert_eq!(lines.len(), 6, "rows: {lines:#?}");
+    // Row 0 top margin, 1 language tag, 2 blank padding, 3 code, 4 bottom
+    // margin (the fence interior's trailing newline is stripped, so there is no
+    // trailing blank row).
+    assert_eq!(lines.len(), 5, "rows: {lines:#?}");
     // The half-block margin rows are pure chrome — never copyable.
     assert!(
         copyable_columns(&lines[0]).is_none(),
         "top margin is chrome"
     );
     assert!(
-        copyable_columns(&lines[5]).is_none(),
+        copyable_columns(&lines[4]).is_none(),
         "bottom margin is chrome"
     );
     // The language row copies exactly the tag, padding trimmed.
@@ -457,13 +458,26 @@ fn code_panel_margins_are_half_blocks_in_panel_colour() {
 }
 
 #[test]
+fn code_panel_language_tag_is_bold() {
+    let (lines, _joins) = markdown_lines_joined("```rust\nlet x = 1;\n```", 80);
+    // Row 1 is the language tag row.
+    let label_row = &lines[1];
+    assert!(
+        label_row.spans.iter().any(|s| {
+            s.content.as_ref() == "rust" && s.style.add_modifier.contains(Modifier::BOLD)
+        }),
+        "language tag should be bold: {label_row:#?}"
+    );
+}
+
+#[test]
 fn code_panel_hugs_code_width() {
     // A single short line with no language tag: the panel is the code (3 cols)
     // plus one column of padding each side (2) = 5, and every row — margins
     // included — spans exactly that width.
     let (lines, _joins) = markdown_lines_joined("```\nabc\n```", 80);
-    // Top margin, the code (+ its trailing-newline blank row), bottom margin.
-    assert_eq!(lines.len(), 4, "no tag → no label/blank rows: {lines:#?}");
+    // Top margin, the code, bottom margin.
+    assert_eq!(lines.len(), 3, "no tag → no label/blank rows: {lines:#?}");
     for line in &lines {
         assert_eq!(line.width(), 5, "panel should hug the code: {line:#?}");
     }
@@ -907,11 +921,9 @@ fn code_block_lines_break_but_wrapped_line_joins() {
     let md = "```text\nshort line\nverylongwordthatexceedsthewidth\n```";
     let (lines, joins) = markdown_lines_joined(md, 20);
     // Top margin | text | (blank) | short line | verylongwordth… (wrap row 1)
-    // | …edsthewidth (wrap row 2) | (blank) | bottom margin.
-    // The blank row before the bottom margin is the markdown parser's trailing
-    // newline in the code content (pre-existing renderer behavior); as a
-    // content-free row it contributes nothing to a copy.
-    assert_eq!(lines.len(), 8);
+    // | …edsthewidth (wrap row 2) | bottom margin.  The fence interior's trailing
+    // newline is stripped, so there is no trailing blank code row.
+    assert_eq!(lines.len(), 7);
     assert_eq!(
         joins,
         vec![
@@ -921,7 +933,6 @@ fn code_block_lines_break_but_wrapped_line_joins() {
             LineJoin::Break, // short line
             LineJoin::Break, // verylongwordth… (row 1 of the wrap)
             LineJoin::Join,  // …edsthewidth (hard split continuation)
-            LineJoin::Break, // blank row (parser trailing newline)
             LineJoin::Break, // bottom margin (▀)
         ]
     );
