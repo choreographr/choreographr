@@ -46,22 +46,6 @@ const QUOTE_BAR_WIDTH: usize = 2;
 /// renderer uses for its own `│` gutter (see `diff_render.rs`).
 const QUOTE_BAR_COLOR: Color = Color::DarkGray;
 
-/// Background colour of a fenced code block's "panel" — the solid rectangle the
-/// code sits in.  A fixed neutral grey, deliberately distinct from the
-/// surrounding message shading ([`crate::render::BG_SHADE`]) so the block reads
-/// as its own container.  It reaches the terminal via each panel span's `bg`:
-/// `add_margin_lines` preserves an explicit background rather than stamping
-/// `BG_SHADE` over it.
-pub(crate) const CODE_BG: Color = Color::Rgb(35, 35, 35);
-
-/// The half-block glyphs that draw a code panel's half-row top and bottom
-/// padding.  A terminal cell is roughly twice as tall as it is wide, so a
-/// *lower*-half block on the top row and an *upper*-half block on the bottom
-/// row give the panel colour the same one-column thickness vertically as the
-/// one-column left/right padding has horizontally.
-pub(crate) const CODE_PANEL_TOP: char = '▄';
-pub(crate) const CODE_PANEL_BOTTOM: char = '▀';
-
 /// How a rendered line joins the rendered line *before* it when both end up
 /// in a copied selection.
 ///
@@ -101,8 +85,8 @@ pub(crate) enum LineJoin {
 /// these intervals per line as first-class, typed metadata so the
 /// selection/copy machinery can subtract them without re-scanning the
 /// finished [`Line`]'s spans for a magic `(content string, foreground
-/// colour)` pair.  A block-quote bar (`QUOTE_BAR`) and a code panel's
-/// padding/fill (see `render_code_panel`) are the producers today; table
+/// colour)` pair.  A block-quote bar (`QUOTE_BAR`) and a fenced-code box's
+/// frame and padding (see `render_code_box`) are the producers today; table
 /// borders could adopt the same channel later.
 ///
 /// Empty for the overwhelming majority of lines; a [`SmallVec`] keeps the
@@ -294,9 +278,9 @@ pub(crate) fn render_turn_lines(
     // The selection extraction uses this to undo the renderer's wrapping.
     let mut all_joins: Vec<LineJoin> = Vec::new();
     // Per-line non-selectable-chrome metadata, aligned with `all_lines` (see
-    // `LineChrome`).  The block layer records the block-quote bars and code
-    // panel padding/fill here; the assembly translates them into each row's
-    // gutter-offset column space so the selection/copy can subtract them
+    // `LineChrome`).  The block layer records the block-quote bars and the
+    // code box's frame/padding here; the assembly translates them into each
+    // row's gutter-offset column space so the selection/copy can subtract them
     // without re-scanning span text.
     let mut all_chrome: Vec<LineChrome> = Vec::new();
 
@@ -623,9 +607,12 @@ pub(crate) fn render_turn_lines(
             // The row's content span before the unboxed trailing fill is
             // appended: the base content interval ends where the fill begins.
             let content_sum: usize = line.spans.iter().map(ratatui::prelude::Span::width).sum();
-            // A whitespace-only row is *blank content* (see `add_margin_lines`):
-            // an empty base range copies a blank line, not the padding spaces.
-            let blank = line_is_blank(&line);
+            // Classify the row against its recorded chrome (see
+            // `classify_row_content`): a code box's bordered padding row is
+            // blank content, a box rule is pure chrome (dropped), and any other
+            // row is content.  This replaces the old whitespace-only test, which
+            // can no longer see that a `│`-bordered row is blank.
+            let row_content = classify_row_content(&line, &chrome);
             let fill = (tool_content_width as usize).saturating_sub(content_sum);
             line.spans
                 .push(Span::styled(" ".repeat(fill), Style::default()));
@@ -634,7 +621,11 @@ pub(crate) fn render_turn_lines(
             // full row width and the block-layer chrome sits in the same
             // column space already (no prefix to translate).
             let end = content_sum.min(tool_content_width as usize);
-            all_content_ranges.push(Some((0, if blank { 0 } else { end })));
+            all_content_ranges.push(match row_content {
+                RowContent::Chrome => None,
+                RowContent::Blank => Some((0, 0)),
+                RowContent::Content => Some((0, end)),
+            });
             all_joins.push(join);
             all_chrome.push(chrome);
             all_lines.push(line);
@@ -704,8 +695,8 @@ type MarginLines = (
 /// unchanged: structural chrome rows are fresh lines, content rows keep the
 /// join their producer gave them.  The [`LineChrome`] buffer is translated by
 /// the gutter's 5-column prefix and carried through: the inner block-layer
-/// chrome (block-quote bars, code-panel padding) then sits in the same column
-/// space as the base range, so the selection/copy can subtract it.
+/// chrome (block-quote bars, code-box frame/padding) then sits in the same
+/// column space as the base range, so the selection/copy can subtract it.
 fn add_margin_lines(
     lines: Vec<Line<'static>>,
     joins: Vec<LineJoin>,
@@ -757,11 +748,12 @@ fn add_margin_lines(
         // fill is layout chrome outside any content range and needs no
         // exclusion interval of its own.
         let row_width = line.width();
-        // A row whose visible content is entirely whitespace is *blank content*
-        // (the code panel's blank padding row, a markdown spacer, an indented
-        // alignment blank): it keeps an empty base range so the selection copies
-        // a blank line rather than the padding spaces.
-        let blank = line_is_blank(&line);
+        // Classify the row against its recorded chrome: a code box's bordered
+        // padding row is *blank content* (its non-chrome columns are spaces), so
+        // it keeps an empty base range and the selection copies a blank line
+        // rather than the padding spaces; a pure-chrome row (a box rule) is
+        // dropped; everything else is real content.
+        let row_content = classify_row_content(&line, &chrome);
         let fill = (content_width as usize).saturating_sub(row_width);
 
         // 2-column blank margin, then the gutter, then 2 shaded columns before
@@ -771,13 +763,15 @@ fn add_margin_lines(
             Span::styled("┃", accent_line),
             Span::styled("  ", gray),
         ];
-        // Content spans — stamp the message background on any span that has
-        // none, but *preserve* an explicit background (a code panel's
-        // `CODE_BG`) so the panel keeps its own colour inside the shaded box.
-        spans.extend(line.spans.into_iter().map(|s| {
-            let bg = s.style.bg.unwrap_or(BG_SHADE);
-            Span::styled(s.content, s.style.bg(bg))
-        }));
+        // Content spans — stamp the message background on every span so the
+        // content sits inside the shaded box.  No producer sets its own
+        // background anymore (the code box draws a table-style frame instead of
+        // a filled panel), so the shading is unconditional.
+        spans.extend(
+            line.spans
+                .into_iter()
+                .map(|s| Span::styled(s.content, s.style.bg(BG_SHADE))),
+        );
         spans.push(Span::styled(" ".repeat(fill), gray));
         spans.push(Span::styled("  ", gray));
         // 2-column blank margin between the shaded box and the scrollbar.
@@ -788,7 +782,11 @@ fn add_margin_lines(
         // `"  ┃  "` gutter (2-col margin + gutter + 2-col shading = 5 columns);
         // the producer's chrome is shifted into that same column space.  A blank
         // row keeps an empty range so the selection copies a blank line.
-        content_ranges.push(Some((5, if blank { 5 } else { 5 + row_width })));
+        content_ranges.push(match row_content {
+            RowContent::Chrome => None,
+            RowContent::Blank => Some((5, 5)),
+            RowContent::Content => Some((5, 5 + row_width)),
+        });
         box_joins.push(join);
         let mut row_chrome = LineChrome::default();
         row_chrome.extend_shifted(&chrome, 5);
@@ -890,6 +888,88 @@ pub(crate) fn markdown_lines_joined(
 /// continuation line inside an outer item.
 fn line_is_blank(line: &Line<'_>) -> bool {
     line.spans.iter().all(|s| s.content.trim().is_empty())
+}
+
+/// How a rendered row's copy content classifies for the selection, given its
+/// renderer-emitted [`LineChrome`].
+///
+/// The assembly layer (`add_margin_lines` and the tool-body loop) turns this
+/// into a `content_ranges` entry.  A single [`line_is_blank`] check no longer
+/// suffices: a code box's padding row (`│` borders around spaces) is
+/// non-whitespace, yet its *non-chrome* columns are blank, so it must still
+/// copy as a genuinely blank line.
+enum RowContent {
+    /// The row is entirely chrome (a box rule, a quote bar with no text): no
+    /// selectable cells, so the selection drops the row (`content_range =
+    /// None`).
+    Chrome,
+    /// The row's non-chrome columns are empty or whitespace-only: an empty
+    /// content range, so the selection copies it as a blank line rather than
+    /// dropping it.
+    Blank,
+    /// The row carries real content: the full base range.
+    Content,
+}
+
+/// Classify `line`'s copy content against its recorded `chrome`.
+///
+/// A row with no chrome keeps the historical [`line_is_blank`] rule (a plain
+/// spacer is blank, a text/code row is content) so no existing selectable
+/// result changes.  A row with chrome is *pure* chrome when the chrome covers
+/// its whole width, *blank* when its non-chrome columns are whitespace-only,
+/// and content otherwise.
+fn classify_row_content(line: &Line<'_>, chrome: &LineChrome) -> RowContent {
+    if chrome.is_empty() {
+        return if line_is_blank(line) {
+            RowContent::Blank
+        } else {
+            RowContent::Content
+        };
+    }
+    let width = line.width();
+    // Pure chrome: the intervals cover every column (the box's top/bottom
+    // rules).  A zero-width line is never "covered" — it falls through to the
+    // blank arm below, matching the legacy blank-spacer behaviour.
+    let covered: usize = chrome
+        .intervals()
+        .iter()
+        .map(|&(lo, hi)| usize::from(hi).saturating_sub(usize::from(lo)))
+        .sum();
+    if width > 0 && covered >= width {
+        return RowContent::Chrome;
+    }
+    if non_chrome_is_blank(line, chrome.intervals()) {
+        RowContent::Blank
+    } else {
+        RowContent::Content
+    }
+}
+
+/// Whether every non-chrome display column of `line` is whitespace.
+///
+/// Walks the spans with their display widths, skipping the columns named by
+/// `chrome`; the first non-whitespace character outside chrome proves the row
+/// has content.  Used only on rows that carry chrome (the common empty-chrome
+/// case short-circuits in [`classify_row_content`]).
+fn non_chrome_is_blank(line: &Line<'_>, intervals: &[(u16, u16)]) -> bool {
+    let mut col = 0usize;
+    for span in &line.spans {
+        for ch in span.content.chars() {
+            // Zero-width graphemes occupy no column and never carry content.
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if w == 0 {
+                continue;
+            }
+            let is_chrome = intervals
+                .iter()
+                .any(|&(lo, hi)| col >= usize::from(lo) && col < usize::from(hi));
+            if !is_chrome && !ch.is_whitespace() {
+                return false;
+            }
+            col += w;
+        }
+    }
+    true
 }
 
 /// Push a blank (zero-width) line onto `lines` unless the last line is

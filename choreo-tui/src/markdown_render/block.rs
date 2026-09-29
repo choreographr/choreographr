@@ -2,11 +2,11 @@
 //! block quotes, tables, and rules into styled lines.
 
 use super::{
-    CODE_BG, CODE_PANEL_BOTTOM, CODE_PANEL_TOP, Color, GlobalLruCache, HighlightLines, Line,
-    LineChrome, LineJoin, MarkdownBlock, Modifier, QUOTE_BAR, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH,
-    Span, Style, debug, display_width, ensure_blank_line_joined, heading_prefix, highlight_theme,
-    inlines_to_lines, pad_marker, render_table_lines, syntax_set, to_ratatui_color,
-    try_render_diff_content, wrap_styled_line_joined,
+    Color, GlobalLruCache, HighlightLines, Line, LineChrome, LineJoin, MarkdownBlock, Modifier,
+    QUOTE_BAR, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH, Span, Style, TABLE_BORDERS, debug, display_width,
+    ensure_blank_line_joined, heading_prefix, highlight_theme, inlines_to_lines, pad_marker,
+    render_table_lines, syntax_set, to_ratatui_color, try_render_diff_content,
+    wrap_styled_line_joined,
 };
 pub(crate) fn find_syntax<'a>(
     ss: &'a syntect::parsing::SyntaxSet,
@@ -58,15 +58,15 @@ pub(crate) fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'st
     })
 }
 
-/// Render a fenced code block as a "panel": a solid [`CODE_BG`] rectangle that
-/// hugs the code, with one column of padding on the left and right and a
-/// half-row of padding at the top and bottom (drawn with half-block glyphs so
-/// the panel colour has the same one-column thickness on all four sides).  The
-/// literal triple-backtick fence markers are never emitted.  When a language
-/// tag is given it is shown on the panel's first interior row (bold), followed
-/// by one blank padding row; without a tag the code starts on the first
-/// interior row.
-fn render_code_panel(
+/// Render a fenced code block as a **bordered box** styled exactly like the
+/// markdown table frame: rounded corners (`╭ ╮ ╰ ╯`), `─` horizontals, and `│`
+/// verticals, all in the default terminal style (no background colour).  The
+/// box hugs the code — `inner = max(widest code row, language tag)` — with one
+/// column of padding inside each `│`; the literal triple-backtick fence markers
+/// are never emitted.  When a language tag is given it is shown bold on the
+/// box's first interior row, followed by one blank padding row; without a tag
+/// the code starts on the first interior row.
+fn render_code_box(
     language: Option<&str>,
     code: &str,
     lines: &mut Vec<Line<'static>>,
@@ -77,16 +77,17 @@ fn render_code_panel(
 ) {
     // Drop the single trailing newline the fence interior normally carries
     // (the `\n` before the closing fence).  Left in, it splits into a final
-    // empty line that would render as a spurious full-height blank panel row
-    // above the bottom margin.  A deliberately blank last line (two newlines)
-    // survives, since only one suffix is stripped.
+    // empty line that would render as a spurious blank interior row above the
+    // bottom border.  A deliberately blank last line (two newlines) survives,
+    // since only one suffix is stripped.
     let code = code.strip_suffix('\n').unwrap_or(code);
-    // The whole panel must fit the block's available width; the code area is
-    // the panel minus the 1-column pad on each side.
+    // The box must fit the block's available width.  Its frame costs four
+    // columns — `│ ` on the left and ` │` on the right — so the interior code
+    // area (and hence the box) is capped at `panel_avail - 4`.
     let panel_avail = width.saturating_sub(indent).max(2);
-    let code_avail = panel_avail.saturating_sub(2);
+    let code_avail = panel_avail.saturating_sub(4);
 
-    // Highlight, then wrap every row that exceeds the code area so the panel
+    // Highlight, then wrap every row that exceeds the code area so the box
     // never overflows.  Each row keeps the [`LineJoin`] the wrapper recorded so
     // a wrapped source line still rejoins when copied.
     let mut code_rows: Vec<(Line<'static>, LineJoin)> = Vec::new();
@@ -106,116 +107,128 @@ fn render_code_panel(
         }
     }
 
-    // The panel hugs the widest row (code or language tag), plus one column of
-    // padding each side, capped at the available width.
+    // The box hugs the widest interior row (code or language tag) and is capped
+    // at `code_avail` so the whole frame fits the block's available width.
     let code_max = code_rows.iter().map(|(l, _)| l.width()).max().unwrap_or(0);
     let label = language.filter(|tag| !tag.is_empty());
     let label_width = label.map_or(0, display_width);
-    let panel_width = (code_max.max(label_width) + 2).min(panel_avail);
+    let inner = code_max.max(label_width).min(code_avail);
+    let box_width = inner + 4;
 
-    // A run of padding/fill: spaces on the panel background.  The spaces are
-    // blank, so only the background colour shows; the copy machinery learns
-    // which columns are chrome from the `LineChrome` intervals recorded below.
-    let pad = |n: usize| Span::styled(" ".repeat(n), Style::default().bg(CODE_BG));
-
-    // Chrome for a panel *margin* row (the half-block top/bottom): the whole
-    // panel is chrome, so a selection over it yields nothing.
-    let margin_chrome = || {
-        let mut c = LineChrome::default();
-        c.push(indent, indent + panel_width);
-        c
-    };
-    // Chrome for a panel *interior* row (a language tag or code line): the
-    // one-column left pad and the right-edge fill, leaving `content_width`
-    // columns of real content selectable between them.
-    let interior_chrome = |content_width: usize| {
-        let mut c = LineChrome::default();
-        c.push(indent, indent + 1);
-        c.push(indent + 1 + content_width, indent + panel_width);
-        c
-    };
+    // The rounded corners come from the table renderer's shared frame glyphs, so
+    // the box and the tables draw one identical frame.
+    let (top_left, top_right) = (TABLE_BORDERS.top_left, TABLE_BORDERS.top_right);
+    let (bottom_left, bottom_right) = (TABLE_BORDERS.bottom_left, TABLE_BORDERS.bottom_right);
 
     // Push one physical row: the block's outer indent (always 0 today) sits to
-    // the left of the panel, outside its background.  `row_chrome` records the
-    // row's non-selectable intervals in the row's own column space (the indent
+    // the left of the box, outside its frame.  `row_chrome` records the row's
+    // non-selectable intervals in the row's own column space (the indent
     // included), for the assembly layer to translate by its prefix.
-    let mut push_row = |spans: Vec<Span<'static>>, join: LineJoin, row_chrome: LineChrome| {
-        let mut row = Vec::with_capacity(spans.len() + usize::from(indent > 0));
+    let mut emit = |mut row: Vec<Span<'static>>, join: LineJoin, row_chrome: LineChrome| {
         if indent > 0 {
-            row.push(Span::styled(" ".repeat(indent), Style::default()));
+            row.insert(0, Span::styled(" ".repeat(indent), Style::default()));
         }
-        row.extend(spans);
         lines.push(Line::from(row));
         joins.push(join);
         chrome.push(row_chrome);
     };
 
-    // ── Top padding: panel colour in the row's lower half ──
-    push_row(
+    // Chrome for a *border* row: the whole rule is non-selectable, so a
+    // selection over it yields nothing.
+    let border_chrome = || {
+        let mut c = LineChrome::default();
+        c.push(indent, indent + box_width);
+        c
+    };
+
+    // ── Top border: `╭` + `─`×(inner + 2) + `╮` ──
+    emit(
         vec![Span::styled(
-            CODE_PANEL_TOP.to_string().repeat(panel_width),
-            Style::default().fg(CODE_BG),
+            format!("{top_left}{}{top_right}", "─".repeat(inner + 2)),
+            Style::default(),
         )],
         LineJoin::Break,
-        margin_chrome(),
+        border_chrome(),
     );
 
     // ── Language tag + one blank padding row (only when a tag is given) ──
     if let Some(tag) = label {
         let tag_width = display_width(tag);
         let mut row = vec![
-            pad(1),
+            Span::styled("│ ".to_string(), Style::default()),
             // The tag is a label, not content: bold distinguishes it from the
             // code without a colour that could clash with the syntax colours.
             Span::styled(
                 tag.to_string(),
                 Style::default()
                     .fg(Color::Gray)
-                    .add_modifier(Modifier::BOLD)
-                    .bg(CODE_BG),
+                    .add_modifier(Modifier::BOLD),
             ),
         ];
-        let used = 1 + tag_width;
-        if panel_width > used {
-            row.push(pad(panel_width - used));
+        if inner > tag_width {
+            row.push(Span::styled(
+                " ".repeat(inner - tag_width),
+                Style::default(),
+            ));
         }
-        push_row(row, LineJoin::Break, interior_chrome(tag_width));
-        // The blank padding row stays *blank content*: it carries no chrome, so
-        // the selection copies it as an empty line (matching the pre-chrome
-        // behaviour) rather than dropping it as pure chrome.
-        push_row(
-            vec![pad(panel_width)],
+        row.push(Span::styled(" │".to_string(), Style::default()));
+        // The `│ ` / ` │` frame-plus-padding runs are chrome; the trailing pad
+        // after the tag is chrome too, so the label copies as the bare tag.
+        let mut c = LineChrome::default();
+        c.push(indent, indent + 2);
+        c.push(indent + 2 + tag_width, indent + box_width);
+        emit(row, LineJoin::Break, c);
+
+        // The blank padding row: its borders are chrome, but the interior is
+        // spaces, so the assembly classifies it as blank content and the
+        // selection copies a genuinely blank line (never the frame).
+        emit(
+            vec![
+                Span::styled("│ ".to_string(), Style::default()),
+                Span::styled(" ".repeat(inner), Style::default()),
+                Span::styled(" │".to_string(), Style::default()),
+            ],
             LineJoin::Break,
-            LineChrome::default(),
+            {
+                let mut c = LineChrome::default();
+                c.push(indent, indent + 2);
+                c.push(indent + 2 + inner, indent + box_width);
+                c
+            },
         );
     }
 
-    // ── Code rows ──
+    // ── Code rows: `│ ` + code padded to the inner width + ` │` ──
     for (row_line, join) in code_rows {
         let content_width = row_line.width();
-        let used = 1 + content_width;
         let mut row = Vec::with_capacity(row_line.spans.len() + 3);
-        row.push(pad(1));
-        row.extend(
-            row_line
-                .spans
-                .into_iter()
-                .map(|s| Span::styled(s.content, s.style.bg(CODE_BG))),
-        );
-        if panel_width > used {
-            row.push(pad(panel_width - used));
+        row.push(Span::styled("│ ".to_string(), Style::default()));
+        // The code keeps its syntect foreground colours; the box adds no
+        // background of its own.
+        row.extend(row_line.spans);
+        if inner > content_width {
+            row.push(Span::styled(
+                " ".repeat(inner - content_width),
+                Style::default(),
+            ));
         }
-        push_row(row, join, interior_chrome(content_width));
+        row.push(Span::styled(" │".to_string(), Style::default()));
+        // The `│ ` / ` │` runs are chrome; the code text between them (and only
+        // it) stays selectable, so a copy never grabs the frame or the pad.
+        let mut c = LineChrome::default();
+        c.push(indent, indent + 2);
+        c.push(indent + 2 + content_width, indent + box_width);
+        emit(row, join, c);
     }
 
-    // ── Bottom padding: panel colour in the row's upper half ──
-    push_row(
+    // ── Bottom border: `╰` + `─`×(inner + 2) + `╯` ──
+    emit(
         vec![Span::styled(
-            CODE_PANEL_BOTTOM.to_string().repeat(panel_width),
-            Style::default().fg(CODE_BG),
+            format!("{bottom_left}{}{bottom_right}", "─".repeat(inner + 2)),
+            Style::default(),
         )],
         LineJoin::Break,
-        margin_chrome(),
+        border_chrome(),
     );
 }
 
@@ -334,7 +347,7 @@ pub(crate) fn render_markdown_block(
                 );
             }
 
-            render_code_panel(
+            render_code_box(
                 language.as_deref(),
                 code,
                 lines,

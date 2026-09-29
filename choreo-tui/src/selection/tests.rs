@@ -900,7 +900,8 @@ fn wrapped_code_block_line_rejoins_with_space() {
     app.display_for(0).view.insert_or_replace(0, t);
     app.rebuild_height_prefix();
     let first = locate_row(&app, "function");
-    let last = locate_row(&app, "return");
+    // The closing brace is on the final wrapped row of the boxed code line.
+    let last = locate_row(&app, "}");
     assert!(last > first, "code line must wrap to multiple rows");
 
     let copied =
@@ -917,13 +918,13 @@ fn wrapped_code_block_line_rejoins_with_space() {
 }
 
 #[test]
-fn code_panel_copy_is_label_blank_and_code() {
-    // Dragging across a whole code panel copies the language tag, the blank
-    // padding row, and the code — never the half-block margins or the panel
-    // padding around the code.
+fn code_box_copy_is_label_blank_and_code() {
+    // Dragging across a whole code box copies the language tag, the blank
+    // padding row, and the code — never the `│`/`─` frame or the padding
+    // around the code.
     let md = "```rust\nfn main() {}\n```";
     let mut app = test_app();
-    app.history_viewport.width = 30; // content width 21 → panel hugs the code
+    app.history_viewport.width = 30; // content width 21 → box hugs the code
     app.history_viewport.height = 40;
     app.display_for(0).view.insert_or_replace(0, turn(md));
     app.rebuild_height_prefix();

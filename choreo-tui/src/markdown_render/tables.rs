@@ -14,12 +14,16 @@ use super::{
 /// T-junctions identical and rounds only the frame's corners, so those
 /// junctions stay plain literals at their use sites below.
 pub(crate) struct TableBorders {
-    top_left: char,
+    // The four rounded corners are `pub(crate)` so the fenced-code box
+    // (`render_code_box`) draws its frame from the very same glyphs the tables
+    // use — one source of truth for the rounded frame.  The junctions stay
+    // private: only the tables draw them.
+    pub(crate) top_left: char,
     top_mid: char,
-    top_right: char,
-    bottom_left: char,
+    pub(crate) top_right: char,
+    pub(crate) bottom_left: char,
     bottom_mid: char,
-    bottom_right: char,
+    pub(crate) bottom_right: char,
 }
 
 pub(crate) const TABLE_BORDERS: TableBorders = TableBorders {

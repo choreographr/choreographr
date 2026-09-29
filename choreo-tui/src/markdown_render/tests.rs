@@ -320,14 +320,20 @@ fn markdown_lines_paragraph() {
 fn markdown_lines_code_block() {
     let md = "```rust\nfn main() {}\n```";
     let result = markdown_lines(md, 80);
-    // Top margin, language row, blank padding row, code row, bottom margin.
+    // Top border, language row, blank padding row, code row, bottom border.
     assert!(result.len() >= 5, "code block should have at least 5 lines");
-    // The ``` fences are never rendered — half-block margin rows close the
-    // panel instead.
+    // The ``` fences are never rendered — a table-style rounded border closes
+    // the box instead.
     let first = result[0].to_string();
-    assert!(first.chars().all(|c| c == '▄'), "top margin: {first:?}");
+    assert!(
+        first.starts_with('╭') && first.ends_with('╮') && first.contains('─'),
+        "top border: {first:?}"
+    );
     let last = result.last().unwrap().to_string();
-    assert!(last.chars().all(|c| c == '▀'), "bottom margin: {last:?}");
+    assert!(
+        last.starts_with('╰') && last.ends_with('╯') && last.contains('─'),
+        "bottom border: {last:?}"
+    );
     let text = result
         .iter()
         .map(ToString::to_string)
@@ -369,25 +375,40 @@ fn markdown_lines_diff_fence_with_junk_falls_back_to_literal_fence() {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
-    // The junk interior stays visible (in a code panel tagged `diff`), but it
+    // The junk interior stays visible (in a code box tagged `diff`), but it
     // must never be dragged into the side-by-side diff renderer.
     assert!(
         text.contains("just some words"),
         "raw interior must stay visible: {text}"
     );
-    assert!(!text.contains('│'), "no diff artifacts expected: {text}");
+    // The junk renders as a table-style code box (the literal-fence fallback),
+    // not a side-by-side diff: the box's rounded corner is present and no
+    // `+++ b/` diff header appears.
+    assert!(
+        text.contains('╭'),
+        "fallback should render the code box: {text}"
+    );
+    assert!(
+        !text.contains("+++ b/"),
+        "no diff artifacts expected: {text}"
+    );
 }
 
 #[test]
 fn markdown_lines_code_block_no_language() {
     let md = "```\nplain code\n```";
     let result = markdown_lines(md, 80);
-    // No language tag → no label row and no blank row: top margin, the code,
-    // bottom margin.
+    // No language tag → no label row and no blank row: top border, the code,
+    // bottom border.
     assert!(result.len() >= 3, "rows: {result:#?}");
     let first = result[0].to_string();
-    assert!(first.chars().all(|c| c == '▄'), "top margin: {first:?}");
-    assert_eq!(result[1].to_string().trim(), "plain code");
+    assert!(first.starts_with('╭'), "top border: {first:?}");
+    // The code row is the box's first interior row: `│ plain code │`.
+    assert!(
+        result[1].to_string().contains("plain code"),
+        "{:#?}",
+        result[1]
+    );
     let text = result
         .iter()
         .map(ToString::to_string)
@@ -397,68 +418,75 @@ fn markdown_lines_code_block_no_language() {
 }
 
 #[test]
-fn code_panel_copy_ranges_trim_chrome() {
+fn code_box_copy_ranges_trim_chrome() {
     let (lines, _joins, chrome) = markdown_lines_joined("```rust\nfn main() {}\n```", 80);
-    // Row 0 top margin, 1 language tag, 2 blank padding, 3 code, 4 bottom
-    // margin (the fence interior's trailing newline is stripped, so there is no
+    // Row 0 top border, 1 language tag, 2 blank padding, 3 code, 4 bottom
+    // border (the fence interior's trailing newline is stripped, so there is no
     // trailing blank row).
     assert_eq!(lines.len(), 5, "rows: {lines:#?}");
-    // Panel width: the widest interior row ("fn main() {}", 12 columns) plus
-    // the one-column pad on each side.  Rows are viewport-bounded, so the
-    // width fits `u16` (the chrome interval's column unit).
-    let panel_width = u16::try_from(lines[0].width()).expect("panel width fits u16");
-    assert_eq!(panel_width, 14, "panel hugs the code: {lines:#?}");
-    // The half-block margin rows are pure chrome — every cell excluded, so a
-    // selection over them yields nothing.
+    // Box width: the widest interior row ("fn main() {}", 12 columns) plus the
+    // `│ ` / ` │` frame (4 columns).  Rows are viewport-bounded, so the width
+    // fits `u16` (the chrome interval's column unit).
+    let box_width = u16::try_from(lines[0].width()).expect("box width fits u16");
+    assert_eq!(box_width, 16, "box hugs the code: {lines:#?}");
+    // The border rows are pure chrome — every cell excluded, so a selection
+    // over them yields nothing.
     assert_eq!(
         chrome[0].intervals(),
-        &[(0, panel_width)],
-        "top margin is chrome"
+        &[(0, box_width)],
+        "top border is chrome"
     );
     assert_eq!(
         chrome[4].intervals(),
-        &[(0, panel_width)],
-        "bottom margin is chrome"
+        &[(0, box_width)],
+        "bottom border is chrome"
     );
-    // The language row keeps exactly the tag selectable: the leading pad and the
-    // trailing fill are chrome ("rust" occupies columns 1..5).
-    assert_eq!(chrome[1].intervals(), &[(0, 1), (5, panel_width)]);
-    // The blank padding row is *content* with no chrome, so it copies as a blank
-    // line rather than vanishing as chrome.
-    assert!(chrome[2].is_empty(), "blank padding row has no chrome");
-    // The code row keeps exactly the code selectable, padding trimmed.
-    assert_eq!(chrome[3].intervals(), &[(0, 1), (13, panel_width)]);
+    // The language row keeps exactly the tag selectable: the leading `│ ` and
+    // the trailing pad + ` │` are chrome ("rust" occupies columns 2..6).
+    assert_eq!(chrome[1].intervals(), &[(0, 2), (6, box_width)]);
+    // The blank padding row's `│` borders are chrome, but the interior spaces
+    // stay non-chrome so the row still copies as a genuinely blank line.
+    assert_eq!(chrome[2].intervals(), &[(0, 2), (14, box_width)]);
+    // The code row keeps exactly the code selectable, frame and pad trimmed.
+    assert_eq!(chrome[3].intervals(), &[(0, 2), (14, box_width)]);
 }
 
 #[test]
-fn code_panel_margins_are_half_blocks_in_panel_colour() {
-    let (lines, _joins, _chrome) = markdown_lines_joined("```x\nlet x = 1;\n```", 80);
-    let top = &lines[0];
+fn code_box_uses_table_corner_glyphs() {
+    let (lines, _joins, chrome) = markdown_lines_joined("```x\nlet x = 1;\n```", 80);
+    let top = lines[0].to_string();
     assert!(
-        top.spans
-            .iter()
-            .all(|s| s.style.fg == Some(CODE_BG) && s.content.chars().all(|c| c == '▄')),
-        "top margin should be a run of ▄ in CODE_BG: {top:#?}"
+        top.starts_with(TABLE_BORDERS.top_left),
+        "top border must open with the table corner glyph: {top:?}"
     );
-    let bottom = lines.last().unwrap();
     assert!(
-        bottom
-            .spans
-            .iter()
-            .all(|s| s.style.fg == Some(CODE_BG) && s.content.chars().all(|c| c == '▀')),
-        "bottom margin should be a run of ▀ in CODE_BG: {bottom:#?}"
+        top.ends_with(TABLE_BORDERS.top_right),
+        "top border must close with the table corner glyph: {top:?}"
     );
-    // Every interior row sits on the panel background.
-    for row in &lines[1..lines.len() - 1] {
+    let bottom = lines.last().unwrap().to_string();
+    assert!(
+        bottom.starts_with(TABLE_BORDERS.bottom_left),
+        "bottom border must open with the table corner glyph: {bottom:?}"
+    );
+    assert!(
+        bottom.ends_with(TABLE_BORDERS.bottom_right),
+        "bottom border must close with the table corner glyph: {bottom:?}"
+    );
+    // The border rows are pure chrome: nothing selectable, and no span paints a
+    // background (the box has no fill).
+    let border_width = u16::try_from(lines[0].width()).expect("border width fits u16");
+    assert_eq!(chrome[0].intervals(), &[(0, border_width)]);
+    assert_eq!(chrome[lines.len() - 1].intervals(), &[(0, border_width)]);
+    for line in &lines {
         assert!(
-            row.spans.iter().all(|s| s.style.bg == Some(CODE_BG)),
-            "interior row not on the panel background: {row:#?}"
+            line.spans.iter().all(|s| s.style.bg.is_none()),
+            "the code box must not paint a background: {line:#?}"
         );
     }
 }
 
 #[test]
-fn code_panel_language_tag_is_bold() {
+fn code_box_language_tag_is_bold() {
     let (lines, _joins, _chrome) = markdown_lines_joined("```rust\nlet x = 1;\n```", 80);
     // Row 1 is the language tag row.
     let label_row = &lines[1];
@@ -471,15 +499,15 @@ fn code_panel_language_tag_is_bold() {
 }
 
 #[test]
-fn code_panel_hugs_code_width() {
-    // A single short line with no language tag: the panel is the code (3 cols)
-    // plus one column of padding each side (2) = 5, and every row — margins
-    // included — spans exactly that width.
+fn code_box_hugs_code_width() {
+    // A single short line with no language tag: the box is the code (3 cols)
+    // plus the `│ ` / ` │` frame (4) = 7, and every row spans exactly that
+    // width.
     let (lines, _joins, _chrome) = markdown_lines_joined("```\nabc\n```", 80);
-    // Top margin, the code, bottom margin.
+    // Top border, the code, bottom border.
     assert_eq!(lines.len(), 3, "no tag → no label/blank rows: {lines:#?}");
     for line in &lines {
-        assert_eq!(line.width(), 5, "panel should hug the code: {line:#?}");
+        assert_eq!(line.width(), 7, "box should hug the code: {line:#?}");
     }
 }
 
@@ -944,20 +972,20 @@ fn code_block_lines_break_but_wrapped_line_joins() {
     // over-long source line records its own continuation joins.
     let md = "```text\nshort line\nverylongwordthatexceedsthewidth\n```";
     let (lines, joins, _chrome) = markdown_lines_joined(md, 20);
-    // Top margin | text | (blank) | short line | verylongwordth… (wrap row 1)
-    // | …edsthewidth (wrap row 2) | bottom margin.  The fence interior's trailing
+    // Top border | text | (blank) | short line | verylongwordth… (wrap row 1)
+    // | …edsthewidth (wrap row 2) | bottom border.  The fence interior's trailing
     // newline is stripped, so there is no trailing blank code row.
     assert_eq!(lines.len(), 7);
     assert_eq!(
         joins,
         vec![
-            LineJoin::Break, // top margin (▄)
+            LineJoin::Break, // top border
             LineJoin::Break, // language tag (text)
             LineJoin::Break, // blank padding row
             LineJoin::Break, // short line
             LineJoin::Break, // verylongwordth… (row 1 of the wrap)
             LineJoin::Join,  // …edsthewidth (hard split continuation)
-            LineJoin::Break, // bottom margin (▀)
+            LineJoin::Break, // bottom border
         ]
     );
 }
@@ -1521,11 +1549,11 @@ fn render_turn_lines_reasoning_code_block() {
     );
     assert!(
         !text.contains("```"),
-        "fences are replaced by the code panel: {text}"
+        "fences are replaced by the code box: {text}"
     );
     assert!(
-        text.contains('▄'),
-        "the code panel's top margin should render: {text}"
+        text.contains('╭'),
+        "the code box's top border should render: {text}"
     );
 }
 
@@ -2250,8 +2278,17 @@ fn render_turn_lines_git_show_fenced_message_renders_verbatim() {
     );
     assert!(text.contains("body line one"), "{text}");
     assert!(text.contains("body line two"), "{text}");
-    assert!(
-        text.contains("body line one\nbody line two"),
+    // The two body source lines each render on their own box row (never merged
+    // into one row by the code box).
+    let row_one = lines
+        .iter()
+        .position(|l| l.to_string().contains("body line one"));
+    let row_two = lines
+        .iter()
+        .position(|l| l.to_string().contains("body line two"));
+    assert!(row_one.is_some() && row_two.is_some(), "{text}");
+    assert_ne!(
+        row_one, row_two,
         "body rows must stay on separate lines: {text}"
     );
     // The following ` ```diff ` fence is its own block and must still
@@ -2300,10 +2337,13 @@ fn render_turn_lines_git_show_message_fence_with_backticks_is_not_a_diff() {
         text.contains("```diff"),
         "the literal ```diff line inside the message must survive: {text}"
     );
+    // The message stays a literal code box (its rounded frame is present) and
+    // is never dragged into the diff renderer (no `+++ b/` path header).
     assert!(
-        !text.contains('│'),
-        "a message containing a ```diff line must never diff-render: {text}"
+        text.contains('╭'),
+        "the message must render as a code box: {text}"
     );
+    assert!(!text.contains("+++ b/"), "must never diff-render: {text}");
 }
 
 #[test]
@@ -4272,26 +4312,25 @@ fn code_block_wraps_long_line() {
 
 #[test]
 fn code_block_wrap_trailing_whitespace_stripped() {
-    // A line that *exactly* fills the width produces a trailing space
-    // span from the word-wrapper; the code-block renderer should strip it.
+    // A code line that *exactly* fills the box interior must not leave a
+    // trailing whitespace character from the word-wrapper in a content span.
     let md = format!("```\n{}\n```", "a".repeat(30));
     let result = markdown_lines(&md, 30);
-    // The code line should not end with a visible trailing whitespace span
-    // from the word-wrapper.  The panel's own padding/fill spans *are* pure
-    // whitespace by design (a run of spaces on the panel background, with no
-    // foreground of their own); skip them and check only real content spans.
+    // The box's frame glyphs and its whitespace padding are layout, not code;
+    // skip them (frame glyph spans carry a glyph, padding spans are pure
+    // whitespace) so the check sees only the code content spans.
+    let is_frame = |s: &str| s.chars().any(|c| "│─╭╮╰╯".contains(c));
     for line in &result {
         for span in &line.spans {
-            if span.style.fg.is_none() && span.style.bg == Some(CODE_BG) {
+            let content = span.content.as_ref();
+            if is_frame(content) {
                 continue;
             }
-            let trimmed = span.content.trim();
-            if trimmed.is_empty() {
-                // Allow empty spans only at width 0 (blank lines)
+            if content.chars().any(|c| !c.is_whitespace()) {
                 assert_eq!(
-                    span.width(),
-                    0,
-                    "non-empty whitespace-only span should not exist"
+                    content.trim_end(),
+                    content,
+                    "code content span must not carry trailing whitespace: {content:?}"
                 );
             }
         }
@@ -4304,13 +4343,12 @@ fn code_block_no_wrap_when_fits() {
     let md = "```\nshort\n```";
     let result = markdown_lines(md, 80);
     assert!(!result.is_empty());
-    // `result[0]` is the top margin; the code row is next.  Its own text is
-    // wrapped in panel padding, so compare trimmed.
+    // `result[0]` is the top border; the code row is next, framed as
+    // `│ short │`.
     let code_line = result.get(1).expect("second line should be code");
-    assert_eq!(
-        code_line.to_string().trim(),
-        "short",
-        "code should not wrap when short"
+    assert!(
+        code_line.to_string().contains("short"),
+        "code should not wrap when short: {code_line:?}"
     );
 }
 
