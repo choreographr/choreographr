@@ -178,10 +178,6 @@ pub(crate) struct RenderedTurn {
     /// subtracts these non-selectable-chrome intervals from each row's
     /// `content_ranges` interval so a drag over a block quote never copies the
     /// `│ ` bar.  Empty for the overwhelming majority of rows.
-    #[expect(
-        dead_code,
-        reason = "the selection/copy path consumes this in a later phase; Phase 0 only plumbs the buffer"
-    )]
     pub chrome_ranges: Arc<[LineChrome]>,
     /// Semantic-line index of the reasoning header within `lines` (see
     /// [`RenderedTurnLines`]), so click hit-testing never re-scans the

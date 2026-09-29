@@ -523,13 +523,14 @@ fn row_highlighted(app: &mut App, screen_row: u16) -> bool {
         head_sync: None,
     });
     let (turn_idx, visual_row) = find_turn_at_row(app, screen_row).expect("row maps");
-    let (cached_lines, offsets, content_ranges, turn_start) = {
+    let (cached_lines, offsets, content_ranges, chrome_ranges, turn_start) = {
         let display = app.active_display_ref().unwrap();
         let cached = display.render_cache[turn_idx].as_ref().unwrap();
         (
             cached.rendered.lines.clone(),
             cached.rendered.visual_offsets.clone(),
             cached.rendered.content_ranges.clone(),
+            cached.rendered.chrome_ranges.clone(),
             display
                 .height_prefix
                 .get(turn_idx.wrapping_sub(1))
@@ -538,7 +539,15 @@ fn row_highlighted(app: &mut App, screen_row: u16) -> bool {
         )
     };
     let mut lines = cached_lines.to_vec();
-    apply_selection_to_lines(app, turn_start, &offsets, &content_ranges, 0, &mut lines);
+    apply_selection_to_lines(
+        app,
+        turn_start,
+        &offsets,
+        &content_ranges,
+        &chrome_ranges,
+        0,
+        &mut lines,
+    );
     let line_idx = offsets
         .partition_point(|&o| o <= visual_row)
         .min(lines.len().saturating_sub(1));
@@ -632,13 +641,14 @@ fn apply_selection_to_lines_short_history_styles_visible_rows() {
     start_selection(&mut app, start.0, start.1);
     update_selection(&mut app, start.0, start.1.saturating_add(5));
     let (turn_idx, _) = find_turn_at_row(&app, start.0).expect("row maps");
-    let (cached_lines, offsets, content_ranges, turn_start) = {
+    let (cached_lines, offsets, content_ranges, chrome_ranges, turn_start) = {
         let display = app.active_display_ref().unwrap();
         let cached = display.render_cache[turn_idx].as_ref().unwrap();
         (
             cached.rendered.lines.clone(),
             cached.rendered.visual_offsets.clone(),
             cached.rendered.content_ranges.clone(),
+            cached.rendered.chrome_ranges.clone(),
             display
                 .height_prefix
                 .get(turn_idx.wrapping_sub(1))
@@ -647,7 +657,15 @@ fn apply_selection_to_lines_short_history_styles_visible_rows() {
         )
     };
     let mut lines = cached_lines.to_vec();
-    apply_selection_to_lines(&app, turn_start, &offsets, &content_ranges, 0, &mut lines);
+    apply_selection_to_lines(
+        &app,
+        turn_start,
+        &offsets,
+        &content_ranges,
+        &chrome_ranges,
+        0,
+        &mut lines,
+    );
     assert!(
         lines
             .iter()
@@ -677,6 +695,27 @@ fn slice_columns_wide_chars() {
     let line = Line::from("日本語x");
     // Columns 0..3 → the first two CJK chars.
     assert_eq!(slice_line_columns(&line, 0, 3), "日本");
+}
+
+// ── selectable_intervals (content − chrome) ──
+//
+// Chrome is empty everywhere until the producers emit it, so these tests pin
+// only the chrome-free and blank-base paths the current build exercises.
+// `LineChrome::push` cannot be used from here: it still carries its Phase-0
+// `#[expect(dead_code)]` (it stays unused until the producer task), and a test
+// call would leave that expectation unfulfilled.  The full subtraction is
+// covered end-to-end by the nested-quote copy tests once chrome is emitted.
+
+#[test]
+fn selectable_intervals_empty_chrome_returns_base() {
+    let out = selectable_intervals((2, 5), &LineChrome::default());
+    assert_eq!(&out[..], &[(2, 5)]);
+}
+
+#[test]
+fn selectable_intervals_blank_base_is_empty() {
+    // A blank content row (`(lo, lo)`) has no cells to select.
+    assert!(selectable_intervals((4, 4), &LineChrome::default()).is_empty());
 }
 
 // ── wrapped-text copy (unwrapping) ──

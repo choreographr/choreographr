@@ -227,19 +227,11 @@ impl LineChrome {
     }
 
     /// True when the line has no non-selectable chrome.
-    #[expect(
-        dead_code,
-        reason = "the selection/copy path consumes this in a later phase; Phase 0 only plumbs the buffer"
-    )]
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
     /// The recorded chrome intervals, in display columns.
-    #[expect(
-        dead_code,
-        reason = "the selection/copy path consumes this in a later phase; Phase 0 only plumbs the buffer"
-    )]
     pub(crate) fn intervals(&self) -> &[(u16, u16)] {
         &self.0
     }

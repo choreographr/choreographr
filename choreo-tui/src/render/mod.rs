@@ -557,9 +557,10 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         }
 
         // Get cached lines (Arc clone is O(1)), the pre-computed height,
-        // cumulative visual-row offsets for O(log n) row→line lookups, and
-        // the per-line content column ranges (for selection clamping).
-        let (text_lines_arc, text_height, text_offsets, content_ranges, img_count) = {
+        // cumulative visual-row offsets for O(log n) row→line lookups, the
+        // per-line content column ranges (for selection clamping), and the
+        // per-line chrome intervals the highlight subtracts from them.
+        let (text_lines_arc, text_height, text_offsets, content_ranges, chrome_ranges, img_count) = {
             let display = app.display_for(session_id);
             let Some(turn) = display.view.turns.get(&turn_id) else {
                 continue;
@@ -616,6 +617,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 rendered.height,
                 rendered.visual_offsets,
                 rendered.content_ranges,
+                rendered.chrome_ranges,
                 count,
             )
         };
@@ -688,6 +690,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 turn_start,
                 &text_offsets[..],
                 &content_ranges[..],
+                &chrome_ranges[..],
                 line_start,
                 &mut visible_lines,
             );

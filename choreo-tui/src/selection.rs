@@ -27,11 +27,12 @@
 //! semantic line occupies exactly one visual row; the code still walks the
 //! cached `visual_offsets` so a hypothetical multi-row line maps correctly.
 
-use crate::markdown_render::LineJoin;
+use crate::markdown_render::{LineChrome, LineJoin};
 use crate::state::{App, RenderedTurn, SessionDisplayState, grapheme_offset_at_column};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::style::Color;
 use ratatui::text::{Line, Span};
+use smallvec::SmallVec;
 use unicode_width::UnicodeWidthStr;
 
 /// Background color for the in-progress selection highlight.
@@ -482,7 +483,7 @@ fn text_and_join_for_content_line(
         rendered.joins.len(),
         "joins must align with the rendered lines"
     );
-    let (line_idx, (lo, hi)) = content_range_for_row(
+    let (line_idx, base) = content_range_for_row(
         &rendered.visual_offsets,
         &rendered.content_ranges,
         visual_row,
@@ -499,7 +500,32 @@ fn text_and_join_for_content_line(
     // asserted above (debug builds) and `content_range_for_row`'s mapping;
     // bail to an empty selection if a cache drift ever breaks it.
     let line = rendered.lines.get(line_idx)?;
-    Some((slice_line_columns(line, lo, hi), join, turn_idx, line_idx))
+    // Cut the row's renderer-emitted chrome out of its base range so the copy
+    // is content−chrome: a block-quote bar nested inside a list item is
+    // dropped while the list marker before it is kept.  The chrome buffer is
+    // empty today, so `selectable` is exactly `base` until the producers emit
+    // intervals.  A missing entry (cache drift) falls back to no chrome.
+    let chrome = rendered
+        .chrome_ranges
+        .get(line_idx)
+        .cloned()
+        .unwrap_or_default();
+    let selectable = selectable_intervals(base, &chrome);
+    if selectable.is_empty() && base.0 < base.1 {
+        // The clamped base was non-blank (a real content row) but the chrome
+        // covered all of it: no copyable cells, just like a pure-chrome row.
+        // A blank base (`(lo, lo)`) instead falls through to the empty slot
+        // below, so a blank line inside the selection survives the copy.
+        return None;
+    }
+    // Concatenate the selected slices of each selectable sub-interval in
+    // order; the pieces rejoin directly because chrome (not whitespace) was
+    // cut out between them.
+    let mut text = String::new();
+    for (lo, hi) in &selectable {
+        text.push_str(&slice_line_columns(line, *lo, *hi));
+    }
+    Some((text, join, turn_idx, line_idx))
 }
 
 /// Resolve a turn-local visual row and viewport column range to the
@@ -584,6 +610,75 @@ fn content_range_for_row(
     }
 }
 
+/// The selectable display-column intervals of a row: `base` with every chrome
+/// interval removed.
+///
+/// `base` is the row's clamped `content_ranges` entry — a half-open
+/// `(lo, hi)` in the semantic line's own column space (already intersected
+/// with the drag's viewport columns by [`content_range_for_row`]).  `chrome`
+/// is the row's renderer-emitted [`LineChrome`]: the non-selectable intervals
+/// *within* that same column space.  The result is the pieces of `base` left
+/// once the chrome is cut out — i.e. `drag ∩ (content − chrome)` — a list
+/// because chrome can name more than one interval (a block quote nested in a
+/// list item records both its marker-relative and inner-bar intervals).
+///
+/// This is the **only** place the subtraction lives: the highlight
+/// ([`apply_selection_to_lines`]) and the copy
+/// ([`text_and_join_for_content_line`]) both consume this list, so they can
+/// never disagree about which cells are selectable.  The returned intervals
+/// are disjoint and in ascending order; an all-chrome (or blank) row yields
+/// an empty list.
+fn selectable_intervals(
+    base: (usize, usize),
+    chrome: &LineChrome,
+) -> SmallVec<[(usize, usize); 2]> {
+    let (base_lo, base_hi) = base;
+    let mut out: SmallVec<[(usize, usize); 2]> = SmallVec::new();
+    if base_lo >= base_hi {
+        // A blank content row (`(lo, lo)`) has no cells to select.
+        return out;
+    }
+    if chrome.is_empty() {
+        // The overwhelmingly common case: no chrome, one interval.
+        out.push((base_lo, base_hi));
+        return out;
+    }
+    // Clip each chrome interval to the base range and drop the empties.  The
+    // producers push chrome left-to-right, but normalise defensively so the
+    // complement below is well-formed for any input.
+    let mut clipped: SmallVec<[(usize, usize); 2]> = SmallVec::new();
+    for &(clo, chi) in chrome.intervals() {
+        let lo = usize::from(clo).max(base_lo);
+        let hi = usize::from(chi).min(base_hi);
+        if lo < hi {
+            clipped.push((lo, hi));
+        }
+    }
+    clipped.sort_unstable();
+    // Merge touching/overlapping chrome so the gaps between them are the
+    // selectable pieces.
+    let mut merged: SmallVec<[(usize, usize); 2]> = SmallVec::new();
+    for (lo, hi) in clipped {
+        match merged.last_mut() {
+            Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+            _ => merged.push((lo, hi)),
+        }
+    }
+    // Complement of `merged` within `[base_lo, base_hi)`: everything the chrome
+    // did not cover, in ascending order.
+    let mut cursor = base_lo;
+    for (lo, hi) in merged {
+        if cursor < lo {
+            out.push((cursor, lo));
+        }
+        cursor = cursor.max(hi);
+    }
+    if cursor < base_hi {
+        out.push((cursor, base_hi));
+    }
+    out
+}
+
 /// Read-only render-cache lookup for a turn's rendered lines.
 ///
 /// Mirrors the key the renderer computes (see `render_history`): only an
@@ -610,14 +705,16 @@ fn cached_rendered_turn(
 ///
 /// Called from `render_history` for the visible semantic-line slice of each
 /// turn.  For every line occupying any selected *content* line, the covered
-/// column range (translated into the line's own column space) is restyled
-/// with the selection background.  The render cache is never mutated: lines
-/// are restyled at draw time only.
+/// column ranges (the row's content range minus its renderer-emitted chrome,
+/// translated into the line's own column space) are restyled with the
+/// selection background.  The render cache is never mutated: lines are
+/// restyled at draw time only.
 pub(crate) fn apply_selection_to_lines(
     app: &App,
     turn_start: usize,
     text_offsets: &[usize],
     content_ranges: &[Option<(usize, usize)>],
+    chrome_ranges: &[LineChrome],
     line_start: usize,
     lines: &mut [Line<'static>],
 ) {
@@ -659,7 +756,7 @@ pub(crate) fn apply_selection_to_lines(
             // highlight and the copy can never disagree about which cells
             // are selected.  Pure-chrome rows and rows outside the line's
             // content range stay unhighlighted.
-            let Some((_, (c_lo, c_hi))) = content_range_for_row(
+            let Some((line_idx, base)) = content_range_for_row(
                 text_offsets,
                 content_ranges,
                 vr,
@@ -669,7 +766,23 @@ pub(crate) fn apply_selection_to_lines(
             ) else {
                 continue;
             };
-            *line = style_line_selection(line, c_lo, c_hi);
+            // Subtract the row's chrome from the clamped base: the highlight is
+            // the union of the selectable sub-intervals, styled in one pass.
+            // Chrome is empty today, so `selectable` is exactly `base`.  A
+            // missing entry (cache drift) falls back to no chrome.
+            let chrome = chrome_ranges.get(line_idx).cloned().unwrap_or_default();
+            let selectable = selectable_intervals(base, &chrome);
+            if selectable.is_empty() {
+                continue;
+            }
+            // Style each disjoint sub-interval in turn.  Restyling only the
+            // background (the text is preserved), so the column offsets stay
+            // valid across successive calls.
+            let mut styled = line.clone();
+            for (c_lo, c_hi) in &selectable {
+                styled = style_line_selection(&styled, *c_lo, *c_hi);
+            }
+            *line = styled;
             // A real (single-visual-row) line is fully covered by its one row.
             if row_hi - row_lo <= 1 {
                 break;
