@@ -17,17 +17,10 @@ use serde::Deserialize;
 use url::Url;
 
 sol! {
-    // `missing_docs` is not enabled in this workspace, so an `expect` would be
-    // unfulfilled; the `allow` (with its `allow_attributes` exemption) stays
-    // to suppress the macro-generated item's missing docs where it is.
-    #[allow(clippy::allow_attributes)]
-    #[allow(missing_docs)]
     function balanceOf(address account) external view returns (uint256);
 }
 
 sol! {
-    #[allow(clippy::allow_attributes)]
-    #[allow(missing_docs)]
     function symbol() external view returns (string);
 }
 
