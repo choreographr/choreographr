@@ -67,8 +67,8 @@ pub(crate) struct RenderCtx<'a> {
     lines: &'a mut Vec<Line<'static>>,
     /// Per-line [`LineJoin`] copy metadata, pushed in lockstep with `lines`.
     joins: &'a mut Vec<LineJoin>,
-    /// Per-line [`LineChrome`] copy metadata, pushed in lockstep with `lines`.
-    /// Phase 0 only ever pushes empty values (see [`LineChrome`]).
+    /// Per-line [`LineChrome`] copy metadata, pushed in lockstep with `lines`
+    /// (inline content emits no chrome, so every row pushes an empty value).
     chrome: &'a mut Vec<LineChrome>,
     /// Spans being accumulated for the line currently being built.
     current: &'a mut Vec<Span<'static>>,

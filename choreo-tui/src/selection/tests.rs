@@ -698,13 +698,6 @@ fn slice_columns_wide_chars() {
 }
 
 // ── selectable_intervals (content − chrome) ──
-//
-// Chrome is empty everywhere until the producers emit it, so these tests pin
-// only the chrome-free and blank-base paths the current build exercises.
-// `LineChrome::push` cannot be used from here: it still carries its Phase-0
-// `#[expect(dead_code)]` (it stays unused until the producer task), and a test
-// call would leave that expectation unfulfilled.  The full subtraction is
-// covered end-to-end by the nested-quote copy tests once chrome is emitted.
 
 #[test]
 fn selectable_intervals_empty_chrome_returns_base() {
@@ -716,6 +709,27 @@ fn selectable_intervals_empty_chrome_returns_base() {
 fn selectable_intervals_blank_base_is_empty() {
     // A blank content row (`(lo, lo)`) has no cells to select.
     assert!(selectable_intervals((4, 4), &LineChrome::default()).is_empty());
+}
+
+#[test]
+fn selectable_intervals_subtracts_chrome() {
+    // A block quote nested in a list item: the bar (2..4) is cut out of the
+    // base range, keeping both the marker before it and the text after.
+    let mut chrome = LineChrome::default();
+    chrome.push(2, 4);
+    assert_eq!(
+        &selectable_intervals((0, 9), &chrome)[..],
+        &[(0, 2), (4, 9)]
+    );
+}
+
+#[test]
+fn selectable_intervals_clips_leading_chrome_to_base() {
+    // Leading chrome already excluded from the base (`(2, 7)`) clips to an
+    // empty interval, leaving the whole base selectable.
+    let mut chrome = LineChrome::default();
+    chrome.push(0, 2);
+    assert_eq!(&selectable_intervals((2, 7), &chrome)[..], &[(2, 7)]);
 }
 
 // ── wrapped-text copy (unwrapping) ──
@@ -920,4 +934,25 @@ fn code_panel_copy_is_label_blank_and_code() {
         copied, "rust\n\nfn main() {}",
         "label, blank padding row and code must be copied verbatim: {copied:?}"
     );
+}
+
+#[test]
+fn blockquote_in_list_copies_without_bar_keeping_marker() {
+    // The fix: a block quote nested directly inside a list item used to copy
+    // its `│ ` bar — the old leading-run detector stopped at the list marker, so
+    // the bar was neither recognised nor excluded.  The renderer now records the
+    // bar as chrome (shifted past the marker), so the copy keeps the list marker
+    // and drops only the bar.  The unordered marker renders as `• `.
+    for (source, needle, expected) in [
+        ("- > hello", "hello", "• hello"),
+        ("- > > hi", "hi", "• hi"),
+    ] {
+        let mut app = app_with_turns(&[(0, source)], 20);
+        let ((row, _), end) = locate(&app, needle);
+        // Start at the line's first column so the list marker is inside the
+        // selection: the marker must survive the copy.
+        let copied = drag_and_finish(&mut app, (row, 0), end).expect("selection should extract");
+        assert!(!copied.contains('│'), "bar must not be copied: {copied:?}");
+        assert_eq!(copied, expected, "marker kept, bar dropped: {copied:?}");
+    }
 }

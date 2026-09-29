@@ -2,11 +2,11 @@
 //! block quotes, tables, and rules into styled lines.
 
 use super::{
-    CODE_BG, CODE_PANEL_BOTTOM, CODE_PANEL_PAD, CODE_PANEL_TOP, Color, GlobalLruCache,
-    HighlightLines, Line, LineChrome, LineJoin, MarkdownBlock, Modifier, QUOTE_BAR,
-    QUOTE_BAR_COLOR, Span, Style, debug, display_width, ensure_blank_line_joined, heading_prefix,
-    highlight_theme, inlines_to_lines, pad_marker, render_table_lines, syntax_set,
-    to_ratatui_color, try_render_diff_content, wrap_styled_line_joined,
+    CODE_BG, CODE_PANEL_BOTTOM, CODE_PANEL_TOP, Color, GlobalLruCache, HighlightLines, Line,
+    LineChrome, LineJoin, MarkdownBlock, Modifier, QUOTE_BAR, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH,
+    Span, Style, debug, display_width, ensure_blank_line_joined, heading_prefix, highlight_theme,
+    inlines_to_lines, pad_marker, render_table_lines, syntax_set, to_ratatui_color,
+    try_render_diff_content, wrap_styled_line_joined,
 };
 pub(crate) fn find_syntax<'a>(
     ss: &'a syntect::parsing::SyntaxSet,
@@ -113,18 +113,33 @@ fn render_code_panel(
     let label_width = label.map_or(0, display_width);
     let panel_width = (code_max.max(label_width) + 2).min(panel_avail);
 
-    // A run of padding/fill: spaces tagged with the reserved foreground (never
-    // seen, since spaces are blank) and the panel background, so the copy
-    // machinery recognises it as chrome (see `copyable_columns`).
-    let pad = |n: usize| {
-        Span::styled(
-            " ".repeat(n),
-            Style::default().fg(CODE_PANEL_PAD).bg(CODE_BG),
-        )
+    // A run of padding/fill: spaces on the panel background.  The spaces are
+    // blank, so only the background colour shows; the copy machinery learns
+    // which columns are chrome from the `LineChrome` intervals recorded below.
+    let pad = |n: usize| Span::styled(" ".repeat(n), Style::default().bg(CODE_BG));
+
+    // Chrome for a panel *margin* row (the half-block top/bottom): the whole
+    // panel is chrome, so a selection over it yields nothing.
+    let margin_chrome = || {
+        let mut c = LineChrome::default();
+        c.push(indent, indent + panel_width);
+        c
     };
+    // Chrome for a panel *interior* row (a language tag or code line): the
+    // one-column left pad and the right-edge fill, leaving `content_width`
+    // columns of real content selectable between them.
+    let interior_chrome = |content_width: usize| {
+        let mut c = LineChrome::default();
+        c.push(indent, indent + 1);
+        c.push(indent + 1 + content_width, indent + panel_width);
+        c
+    };
+
     // Push one physical row: the block's outer indent (always 0 today) sits to
-    // the left of the panel, outside its background.
-    let mut push_row = |spans: Vec<Span<'static>>, join: LineJoin| {
+    // the left of the panel, outside its background.  `row_chrome` records the
+    // row's non-selectable intervals in the row's own column space (the indent
+    // included), for the assembly layer to translate by its prefix.
+    let mut push_row = |spans: Vec<Span<'static>>, join: LineJoin, row_chrome: LineChrome| {
         let mut row = Vec::with_capacity(spans.len() + usize::from(indent > 0));
         if indent > 0 {
             row.push(Span::styled(" ".repeat(indent), Style::default()));
@@ -132,10 +147,7 @@ fn render_code_panel(
         row.extend(spans);
         lines.push(Line::from(row));
         joins.push(join);
-        // Code-panel rows carry no renderer-emitted chrome yet (the panel's
-        // padding/fill is still recognised by `copyable_columns`); keep the
-        // buffer aligned with a default entry.
-        chrome.push(LineChrome::default());
+        chrome.push(row_chrome);
     };
 
     // ── Top padding: panel colour in the row's lower half ──
@@ -145,10 +157,12 @@ fn render_code_panel(
             Style::default().fg(CODE_BG),
         )],
         LineJoin::Break,
+        margin_chrome(),
     );
 
     // ── Language tag + one blank padding row (only when a tag is given) ──
     if let Some(tag) = label {
+        let tag_width = display_width(tag);
         let mut row = vec![
             pad(1),
             // The tag is a label, not content: bold distinguishes it from the
@@ -161,17 +175,25 @@ fn render_code_panel(
                     .bg(CODE_BG),
             ),
         ];
-        let used = 1 + display_width(tag);
+        let used = 1 + tag_width;
         if panel_width > used {
             row.push(pad(panel_width - used));
         }
-        push_row(row, LineJoin::Break);
-        push_row(vec![pad(panel_width)], LineJoin::Break);
+        push_row(row, LineJoin::Break, interior_chrome(tag_width));
+        // The blank padding row stays *blank content*: it carries no chrome, so
+        // the selection copies it as an empty line (matching the pre-chrome
+        // behaviour) rather than dropping it as pure chrome.
+        push_row(
+            vec![pad(panel_width)],
+            LineJoin::Break,
+            LineChrome::default(),
+        );
     }
 
     // ── Code rows ──
     for (row_line, join) in code_rows {
-        let used = 1 + row_line.width();
+        let content_width = row_line.width();
+        let used = 1 + content_width;
         let mut row = Vec::with_capacity(row_line.spans.len() + 3);
         row.push(pad(1));
         row.extend(
@@ -183,7 +205,7 @@ fn render_code_panel(
         if panel_width > used {
             row.push(pad(panel_width - used));
         }
-        push_row(row, join);
+        push_row(row, join, interior_chrome(content_width));
     }
 
     // ── Bottom padding: panel colour in the row's upper half ──
@@ -193,6 +215,7 @@ fn render_code_panel(
             Style::default().fg(CODE_BG),
         )],
         LineJoin::Break,
+        margin_chrome(),
     );
 }
 
@@ -359,8 +382,8 @@ pub(crate) fn render_markdown_block(
                     })
                     .collect();
                 // The two-column muted bar replaces the old literal `"> "`
-                // text marker.  `leading_quote_prefix` recognises this exact
-                // span so the selection/copy can start *after* it.
+                // text marker.  It is recorded as chrome (below) so the
+                // selection/copy starts *after* it.
                 spans.insert(
                     0,
                     Span::styled(QUOTE_BAR.to_string(), Style::default().fg(QUOTE_BAR_COLOR)),
@@ -371,9 +394,14 @@ pub(crate) fn render_markdown_block(
                 // into one line would merge the gutters into the text.
                 // Copying proceeds row by row.
                 joins.push(LineJoin::Break);
-                // Carry the inner chrome through (Phase 0: empty; the bar
-                // interval and the indent shift are a later phase).
-                chrome.push(inner_chrome);
+                // The bar occupies columns `(indent, indent + QUOTE_BAR_WIDTH)`;
+                // every inner chrome interval sits to its right, so shifting
+                // them by the bar's width (plus the indent) records the bar as
+                // chrome while preserving nested bars (a quote inside a quote).
+                let mut row_chrome = LineChrome::default();
+                row_chrome.push(indent, indent + QUOTE_BAR_WIDTH);
+                row_chrome.extend_shifted(&inner_chrome, indent + QUOTE_BAR_WIDTH);
+                chrome.push(row_chrome);
             }
         }
         MarkdownBlock::List {
@@ -469,6 +497,12 @@ pub(crate) fn render_markdown_block(
                     .zip(rendered_joins)
                     .zip(rendered_chrome);
                 if let Some(((first, _first_join), first_chrome)) = zipped.next() {
+                    // The marker (a content span, not chrome — list markers stay
+                    // copyable) plus the outer indent prepend
+                    // `indent + marker_width` columns, so the item's own chrome
+                    // shifts right by that much to stay in the emitted row's
+                    // column space.
+                    let marker_width = display_width(&marker);
                     let mut spans = vec![Span::styled(
                         format!("{}{}", " ".repeat(indent), marker),
                         Style::default(),
@@ -476,9 +510,9 @@ pub(crate) fn render_markdown_block(
                     spans.extend(first.spans.clone());
                     lines.push(Line::from(spans));
                     joins.push(LineJoin::Break);
-                    // Carry the inner chrome through (Phase 0: empty; shifting
-                    // it right by the marker width is a later phase).
-                    chrome.push(first_chrome);
+                    let mut row_chrome = LineChrome::default();
+                    row_chrome.extend_shifted(&first_chrome, indent + marker_width);
+                    chrome.push(row_chrome);
                 } else {
                     lines.push(indented_line(indent, marker));
                     joins.push(LineJoin::Break);
@@ -495,7 +529,11 @@ pub(crate) fn render_markdown_block(
                     // Space/Join exactly as the inner renderer recorded
                     // (their predecessor's text is the line above them).
                     joins.push(join);
-                    chrome.push(inner_chrome);
+                    // The continuation indent is layout chrome (outside the
+                    // content), so the row's own chrome shifts right by it.
+                    let mut row_chrome = LineChrome::default();
+                    row_chrome.extend_shifted(&inner_chrome, continuation_indent);
+                    chrome.push(row_chrome);
                 }
 
                 // Blank line between items only when the list is spaced out as

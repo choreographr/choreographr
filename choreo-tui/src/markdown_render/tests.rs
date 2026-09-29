@@ -398,36 +398,36 @@ fn markdown_lines_code_block_no_language() {
 
 #[test]
 fn code_panel_copy_ranges_trim_chrome() {
-    let (lines, _joins, _chrome) = markdown_lines_joined("```rust\nfn main() {}\n```", 80);
+    let (lines, _joins, chrome) = markdown_lines_joined("```rust\nfn main() {}\n```", 80);
     // Row 0 top margin, 1 language tag, 2 blank padding, 3 code, 4 bottom
     // margin (the fence interior's trailing newline is stripped, so there is no
     // trailing blank row).
     assert_eq!(lines.len(), 5, "rows: {lines:#?}");
-    // The half-block margin rows are pure chrome — never copyable.
-    assert!(
-        copyable_columns(&lines[0]).is_none(),
+    // Panel width: the widest interior row ("fn main() {}", 12 columns) plus
+    // the one-column pad on each side.  Rows are viewport-bounded, so the
+    // width fits `u16` (the chrome interval's column unit).
+    let panel_width = u16::try_from(lines[0].width()).expect("panel width fits u16");
+    assert_eq!(panel_width, 14, "panel hugs the code: {lines:#?}");
+    // The half-block margin rows are pure chrome — every cell excluded, so a
+    // selection over them yields nothing.
+    assert_eq!(
+        chrome[0].intervals(),
+        &[(0, panel_width)],
         "top margin is chrome"
     );
-    assert!(
-        copyable_columns(&lines[4]).is_none(),
+    assert_eq!(
+        chrome[4].intervals(),
+        &[(0, panel_width)],
         "bottom margin is chrome"
     );
-    // The language row copies exactly the tag, padding trimmed.
-    assert_eq!(
-        copyable_columns(&lines[1]),
-        Some((1, 5)),
-        "'rust' occupies columns 1..5"
-    );
-    // The blank padding row is *content* with an empty range, so it copies as
-    // a blank line rather than vanishing as chrome.
-    let (lo, hi) = copyable_columns(&lines[2]).expect("blank row is content");
-    assert_eq!(lo, hi, "blank row has an empty content range");
-    // The code row copies the code, not the surrounding padding.
-    assert_eq!(
-        copyable_columns(&lines[3]),
-        Some((1, 13)),
-        "the code row occupies columns 1..13"
-    );
+    // The language row keeps exactly the tag selectable: the leading pad and the
+    // trailing fill are chrome ("rust" occupies columns 1..5).
+    assert_eq!(chrome[1].intervals(), &[(0, 1), (5, panel_width)]);
+    // The blank padding row is *content* with no chrome, so it copies as a blank
+    // line rather than vanishing as chrome.
+    assert!(chrome[2].is_empty(), "blank padding row has no chrome");
+    // The code row keeps exactly the code selectable, padding trimmed.
+    assert_eq!(chrome[3].intervals(), &[(0, 1), (13, panel_width)]);
 }
 
 #[test]
@@ -552,27 +552,47 @@ fn markdown_blockquote_text_is_italic_but_inline_code_is_not() {
 }
 
 #[test]
-fn copyable_columns_counts_leading_bars() {
-    let single = markdown_lines("> one", 80);
-    assert_eq!(copyable_columns(&single[0]).unwrap().0, 2);
-    // `>>` nests: the outer bar is prepended in front of the inner bar.
-    let nested = markdown_lines(">> two", 80);
-    assert_eq!(copyable_columns(&nested[0]).unwrap().0, 4);
-    // A non-quote line has no leading chrome.
-    let plain = markdown_lines("just text", 80);
-    assert_eq!(copyable_columns(&plain[0]).unwrap().0, 0);
+fn blockquote_chrome_counts_leading_bars() {
+    let (single, _joins, chrome) = markdown_lines_joined("> one", 80);
+    assert_eq!(single[0].width(), 5, "│ one");
+    assert_eq!(chrome[0].intervals(), &[(0, 2)]);
+    // `>>` nests: the outer bar is prepended in front of the inner bar, and the
+    // inner chrome shifts right, so both bars are recorded.
+    let (nested, _joins, nchrome) = markdown_lines_joined(">> two", 80);
+    assert_eq!(nested[0].width(), 7, "│ │ two");
+    assert_eq!(nchrome[0].intervals(), &[(0, 2), (2, 4)]);
+    // A non-quote line has no chrome.
+    let (_plain, _joins, pchrome) = markdown_lines_joined("just text", 80);
+    assert!(pchrome[0].is_empty());
+}
+
+#[test]
+fn blockquote_in_list_chrome_hides_bar_keeps_marker() {
+    // The fix this task exists for: a block quote nested directly inside a list
+    // item records the bar as chrome (shifted past the marker) so a copy keeps
+    // the list marker and drops only the bar.
+    let (lines, _joins, chrome) = markdown_lines_joined("- > hello", 80);
+    assert_eq!(lines[0].to_string(), "• │ hello");
+    // Marker columns 0..2 are content; the bar (2..4) is chrome.
+    assert_eq!(chrome[0].intervals(), &[(2, 4)]);
+    // Deeper `- > > hi`: both nested bars are chrome, shifted past the marker.
+    let (deep, _joins, dchrome) = markdown_lines_joined("- > > hi", 80);
+    assert_eq!(deep[0].to_string(), "• │ │ hi");
+    assert_eq!(dchrome[0].intervals(), &[(2, 4), (4, 6)]);
 }
 
 #[test]
 fn markdown_blockquote_bar_is_excluded_from_copy_range() {
     let (body, body_joins, body_chrome) = markdown_lines_joined("> hello world", 40);
     let body_width = body[0].width(); // "│ hello world" = 13
-    let (_lines, _rows, ranges, _joins, _chrome) =
+    let (_lines, _rows, ranges, _joins, chrome) =
         add_margin_lines(body, body_joins, body_chrome, 40, Color::Green, None);
-    // Row 2 is the single content row (separator, padding, content, …).
-    // Content begins at column 5 in the gutter layout; the two-column bar
-    // pushes the copyable start to 7, so the bar is never copied.
-    assert_eq!(ranges[2], Some((7, 5 + body_width)));
+    // Row 2 is the single content row (separator, padding, content, …).  The
+    // base range spans the whole content interval at the gutter offset (5); the
+    // two-column bar is recorded as chrome shifted into that same column space
+    // (5..7), so the selectable result still starts after the bar.
+    assert_eq!(ranges[2], Some((5, 5 + body_width)));
+    assert_eq!(chrome[2].intervals(), &[(5, 7)]);
 }
 
 #[test]
@@ -597,10 +617,12 @@ fn render_turn_lines_quote_bar_is_not_copyable() {
         .iter()
         .position(|l| l.to_string().contains("│ quoted line"))
         .expect("quote row");
-    let (lo, _hi) = rendered.content_ranges[row].expect("content row");
-    // The `┃` gutter puts message content at column 5; the two-column quote
-    // bar pushes the copyable start to 7, so a drag-copy skips the bar.
-    assert_eq!(lo, 7);
+    // The `┃` gutter puts message content at column 5; the base range spans the
+    // whole content, and the two-column quote bar is recorded as chrome at
+    // (5, 7), so a drag-copy skips the bar.
+    let base = rendered.content_ranges[row].expect("content row");
+    assert_eq!(base.0, 5);
+    assert_eq!(rendered.chrome_ranges[row].intervals(), &[(5, 7)]);
 }
 
 #[test]
@@ -633,9 +655,11 @@ fn render_turn_lines_tool_markdown_quote_bar_is_not_copyable() {
         .iter()
         .position(|l| l.to_string().contains("│ quoted"))
         .expect("quote body row");
-    // Tool bodies are unboxed: content starts at column 0, so the leading
-    // two-column bar pushes the copyable start to 2.
-    assert_eq!(rendered.content_ranges[row].map(|(lo, _)| lo), Some(2));
+    // Tool bodies are unboxed: the base range starts at column 0, and the
+    // leading two-column bar is recorded as chrome at (0, 2).
+    let base = rendered.content_ranges[row].expect("content row");
+    assert_eq!(base.0, 0);
+    assert_eq!(rendered.chrome_ranges[row].intervals(), &[(0, 2)]);
 }
 
 // ── List ─────────────────────────────────────────────────────────────
@@ -4254,11 +4278,11 @@ fn code_block_wrap_trailing_whitespace_stripped() {
     let result = markdown_lines(&md, 30);
     // The code line should not end with a visible trailing whitespace span
     // from the word-wrapper.  The panel's own padding/fill spans *are* pure
-    // whitespace by design (tagged with the reserved `CODE_PANEL_PAD`
-    // foreground); skip them and check only real content spans.
+    // whitespace by design (a run of spaces on the panel background, with no
+    // foreground of their own); skip them and check only real content spans.
     for line in &result {
         for span in &line.spans {
-            if span.style.fg == Some(CODE_PANEL_PAD) {
+            if span.style.fg.is_none() && span.style.bg == Some(CODE_BG) {
                 continue;
             }
             let trimmed = span.content.trim();
