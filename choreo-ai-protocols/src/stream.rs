@@ -146,6 +146,24 @@ where
                     let _ = tx.send(SseStreamMsg::End);
                     return;
                 }
+                // A body-read idle timeout: the socket is blocking-with-a-
+                // timeout, so `read` simply re-blocks for another interval and
+                // reports `WouldBlock` (EAGAIN) when no bytes arrive in time.
+                // That is "no progress", not a failure — the terminator for a
+                // genuinely stalled stream is the consumer's wall-clock
+                // deadline (checked in `recv_sse_event`), which fires even
+                // while keep-alive bytes trickle. Looping re-checks the abort
+                // flag each iteration, so a cancel is still observed within one
+                // timeout interval — and this is the single place the handling
+                // lives, so every provider's stream inherits it.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    // No-op: fall through to the next loop iteration.
+                }
                 Err(e) => {
                     tracing::debug!(error = %e, "SSE reader error; forwarding to consumer");
                     let _ = tx.send(SseStreamMsg::Err(e));
@@ -439,5 +457,27 @@ mod tests {
             Err(ProviderError::Io(e)) => assert_eq!(e.to_string(), "socket reset"),
             other => panic!("expected ProviderError::Io, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn idle_timeout_is_absorbed_not_surfaced_as_error() {
+        // A body-read idle timeout returns `WouldBlock` (EAGAIN) on Unix, or a
+        // `TimedOut`-classified error depending on the transport; BOTH mean
+        // "no progress", not a stream failure.  The reader must loop past them
+        // and still deliver the eventual event rather than mapping the timeout
+        // to `ProviderError::Io(EAGAIN)`.  Deterministic: each closure call
+        // pops one queued value (no sleeps), first the two timeout kinds, then
+        // the event.
+        let mut results = vec![
+            Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            Err(io::Error::from(io::ErrorKind::TimedOut)),
+            Ok(Some("after idle".to_string())),
+        ]
+        .into_iter();
+        let sse = spawn_sse_reader(move || results.next().unwrap_or(Ok(None)), None);
+        assert_eq!(
+            recv_sse_event(&sse, None).unwrap().as_deref(),
+            Some("after idle")
+        );
     }
 }

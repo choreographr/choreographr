@@ -1,5 +1,4 @@
 use std::io::{self, BufReader, Read};
-use std::time::Duration;
 
 use choreo_proto::TokenUsage;
 use tracing::{debug, trace};
@@ -469,10 +468,10 @@ impl GeminiSseReader {
                     return Ok(self.flush_lines());
                 }
                 Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
+                // A read idle-timeout (`WouldBlock`/`TimedOut`) is no-progress,
+                // not a stream failure — the SSE reader thread owns absorbing
+                // it (looping and re-checking its abort flag; see
+                // `crate::stream`), so it is propagated here unchanged.
                 Err(e) => return Err(e),
             };
             // `read` returns n <= buf.len() by contract (enforced centrally
