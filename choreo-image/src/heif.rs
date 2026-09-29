@@ -376,7 +376,7 @@ fn for_each_box<'a>(bytes: &'a [u8], mut f: impl FnMut([u8; 4], &'a [u8]) -> boo
                 // size fits `usize` on this target); the truncating cast is
                 // unreachable in practice and `saturating_add` keeps the
                 // walk bounded regardless.
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 Some(large) => off.saturating_add(large as usize),
                 None => return,
             },

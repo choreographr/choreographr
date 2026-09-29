@@ -202,7 +202,7 @@ mod tests {
         // A valid PNG with no EXIF orientation decodes to the same dimensions
         // (the orientation path must be a no-op for the default orientation).
         // Pixel values wrap modulo 256 by design — only dimensions matter.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let img = RgbaImage::from_fn(4, 3, |x, y| {
             image::Rgba([(x * 60) as u8, (y * 80) as u8, 0, 255])
         });
