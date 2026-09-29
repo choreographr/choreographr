@@ -105,7 +105,7 @@ unsafe extern "system" fn power_callback(
 // the inert monitor rather than surfacing an error. Silencing the wrap lint
 // here is narrower than dropping the `Result` and special-casing the Windows
 // arm at the dispatch site.
-#[allow(clippy::unnecessary_wraps)]
+#[expect(clippy::unnecessary_wraps)]
 pub fn spawn_monitor() -> Result<PowerMonitor, PowerMonitorError> {
     // Unbounded, like the other backends: events are human-rate.
     let (sender, receiver) = crossbeam_channel::unbounded();
