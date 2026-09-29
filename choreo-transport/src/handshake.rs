@@ -63,7 +63,7 @@ fn invalid_slice(what: &str) -> TransportError {
 /// prefix needs a cast. Truncation is impossible by the snow message-size
 /// limit, and keeping the plain cast (not `try_from`) preserves the exact
 /// byte behavior of the handshakes, which round-trip tests pin down.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn len16(n: usize) -> [u8; 2] {
     (n as u16).to_be_bytes()
 }

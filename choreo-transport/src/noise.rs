@@ -192,7 +192,7 @@ impl NoiseStream {
     // The `usize` ciphertext length `n` is snow's plaintext-plus-tag output
     // and is bounded by the [`MAX_FRAME_SIZE`] check above, far under
     // `u32::MAX`; keeping the plain cast preserves exact wire behavior.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     pub fn send_message(&mut self, plaintext: &[u8]) -> Result<(), TransportError> {
         // The single-writer-per-connection invariant is load-bearing:
         // fragments of one logical message must never interleave with
