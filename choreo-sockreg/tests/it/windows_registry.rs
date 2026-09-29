@@ -10,7 +10,7 @@
 // allow-expect-in-tests config only recognizes #[test]-annotated functions —
 // the `loopback_pair` helper below needs this file-level allowance (same
 // pattern as choreo-daemon/tests/common/mod.rs).
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used)]
 
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};

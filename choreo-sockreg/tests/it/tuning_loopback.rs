@@ -15,7 +15,7 @@ use choreo_sockreg::SocketTuning;
 /// Per the workspace's crossbeam house rule, everything below is single-
 /// threaded, so no channel is needed here.
 #[cfg(any(unix, windows))]
-#[allow(clippy::expect_used)] // tests/ files only; see file-level note above
+#[expect(clippy::expect_used)] // tests/ files only; see file-level note above
 fn loopback_pair() -> (std::net::TcpStream, std::net::TcpStream) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let client =

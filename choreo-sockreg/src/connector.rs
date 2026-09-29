@@ -174,7 +174,7 @@ fn try_connect_with<T>(
     // Weights [1, 1/2, 1/4, ..., 1/2^(n-1)] sum to 2 * (1 - 1/2^n).
     // `addrs.len()` is capped at MAX_ADDRS (16) by the resolver type, so
     // the usize→i32 shift below can never truncate or wrap.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let num_addrs_i32 = addrs.len() as i32;
     let total_weight = 2.0 * (1.0 - 0.5_f64.powi(num_addrs_i32));
     let mut weight = 1.0_f64;
@@ -191,7 +191,7 @@ fn try_connect_with<T>(
             // non-negative timeout product, and sub-millisecond truncation
             // is absorbed by the 10 ms floor right after.
             let secs = t.as_secs_f64() * weight / total_weight;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let millis = (secs * 1000.0) as u64;
             Duration::from_millis(millis.max(MIN_PER_ADDRESS_TIMEOUT_MS))
         });
