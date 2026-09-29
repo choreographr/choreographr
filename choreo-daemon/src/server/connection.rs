@@ -747,29 +747,33 @@ pub(crate) struct ClientConn {
     writer_handle: std::thread::JoinHandle<()>,
 }
 
-/// The inputs a freshly-accepted connection hands to [`ClientConn::new`],
-/// bundled so the constructor takes ONE value instead of eight positional
-/// arguments (the transport-specific writer buffer is the only generic field).
-/// The three transport call sites (Unix, TCP/Noise, embedded) stay readable and
-/// the `too_many_arguments` lint never has to be suppressed.
-struct ClientConnSetup<W> {
-    daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
+/// The transport-independent inputs shared by every connection thread: the
+/// daemon command channel, this connection's writer sink and its receiver, the
+/// daemon-wide lag counter, this connection's DB handle, and the local-domain
+/// flag.
+///
+/// Bundled so each of the three transport entry points ([`client_thread`],
+/// [`tcp_handshake_and_client_thread`]/[`tcp_client_thread`], and
+/// [`embedded_client_thread`]) takes ONE such value instead of seven positional
+/// arguments, and so [`ClientConn::new`] takes a single value plus the one
+/// transport-specific field (the byte-writer buffer). The `too_many_arguments`
+/// lint then never applies.
+pub(crate) struct ConnThreadArgs {
+    pub daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
     /// This connection's own handle to the shared redb database (see
     /// [`ClientCtx::db`]).
-    db: Arc<redb::Database>,
+    pub db: Arc<redb::Database>,
     /// This connection's delivery sink (see `send_to_writer`).
-    writer: crate::broadcast::SubscriberSink,
-    /// Transport-specific writer buffer the spawned writer thread sends through.
-    writer_buf: W,
+    pub writer: crate::broadcast::SubscriberSink,
     /// The receiver end of this connection's writer channel.
-    writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
+    pub writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
     /// Daemon-wide lag counter, shared by every connection.
-    global_lag: Arc<AtomicUsize>,
-    client_id: u64,
-    /// Whether this connection arrived over the local Unix socket (vs the
-    /// TCP/Noise listener). Trust-boundary input for local-only commands (see
-    /// [`ClientCtx::is_unix`]).
-    is_unix: bool,
+    pub global_lag: Arc<AtomicUsize>,
+    pub client_id: u64,
+    /// Whether this connection is the LOCAL trust domain — the Unix socket or
+    /// the in-process embedded link — as opposed to the TCP/Noise listener.
+    /// Trust-boundary input for local-only commands (see [`ClientCtx::is_unix`]).
+    pub is_unix: bool,
 }
 
 impl ClientConn {
@@ -777,17 +781,16 @@ impl ClientConn {
     /// transport-specific writer buffer. Spawning here keeps the socket
     /// threads to just: set write timeout, clone the stream into a writer
     /// buffer, call this, then read/dispatch/finish.
-    fn new<W: ConnectionWriter + Send + 'static>(setup: ClientConnSetup<W>) -> Self {
-        let ClientConnSetup {
+    fn new<W: ConnectionWriter + Send + 'static>(args: ConnThreadArgs, writer_buf: W) -> Self {
+        let ConnThreadArgs {
             daemon_tx,
             db,
             writer,
-            writer_buf,
             writer_rx,
             global_lag,
             client_id,
             is_unix,
-        } = setup;
+        } = args;
         // The writer thread decrements the SAME per-client byte counter the
         // daemon's sinks increment on enqueue, plus the daemon-wide counter.
         let bytes = Arc::clone(&writer.bytes_in_flight);
@@ -839,15 +842,9 @@ impl ClientConn {
     }
 }
 
-#[expect(clippy::too_many_arguments)]
 pub(crate) fn client_thread(
     stream: UnixStream,
-    daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
-    client_id: u64,
-    writer: crate::broadcast::SubscriberSink,
-    writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
-    global_lag: Arc<AtomicUsize>,
-    db: Arc<redb::Database>,
+    args: ConnThreadArgs,
     writer_write_timeout: Duration,
 ) -> io::Result<()> {
     // Bound the writer's blocking socket writes so a wedged client (receive
@@ -861,16 +858,10 @@ pub(crate) fn client_thread(
     let reader = BufReader::new(stream.try_clone()?);
     let writer_buf = BufWriter::new(stream);
 
-    let mut conn = ClientConn::new(ClientConnSetup {
-        daemon_tx,
-        db,
-        writer,
-        writer_buf,
-        writer_rx,
-        global_lag,
-        client_id,
-        is_unix: true,
-    });
+    // Capture the id before `args` is consumed by `ClientConn::new`; it is
+    // only used for this connect log here.
+    let client_id = args.client_id;
+    let mut conn = ClientConn::new(args, writer_buf);
 
     // The writer channel was registered with the daemon by the acceptor
     // (register_client_writer) before this thread was spawned, so the shutdown
@@ -931,17 +922,11 @@ pub(crate) fn client_thread(
 /// server's private key), and the daemon's ACL check runs inside whichever
 /// handshake the client picked. The worst an attacker controls is which
 /// of two equally-authenticated handshakes runs.
-#[expect(clippy::too_many_arguments)]
 pub(crate) fn tcp_handshake_and_client_thread(
     mut tcp: TcpStream,
     transport_sk: [u8; 32],
     acl: &Arc<crate::server::acl::SharedAcl>,
-    daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
-    client_id: u64,
-    writer: crate::broadcast::SubscriberSink,
-    writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
-    global_lag: Arc<AtomicUsize>,
-    db: Arc<redb::Database>,
+    args: ConnThreadArgs,
     writer_write_timeout: Duration,
 ) -> io::Result<()> {
     // The preamble read runs BEFORE any authentication, so it is bounded by
@@ -957,7 +942,9 @@ pub(crate) fn tcp_handshake_and_client_thread(
             );
             // Drop `tcp` (closes the socket) and unregister the writer
             // channel this connection registered at accept time.
-            let _ = daemon_tx.send(DaemonCommand::ClientDisconnected { client_id });
+            let _ = args.daemon_tx.send(DaemonCommand::ClientDisconnected {
+                client_id: args.client_id,
+            });
             return Ok(());
         }
     };
@@ -983,7 +970,9 @@ pub(crate) fn tcp_handshake_and_client_thread(
                 preamble = other,
                 "unknown handshake-mode preamble byte; closing connection"
             );
-            let _ = daemon_tx.send(DaemonCommand::ClientDisconnected { client_id });
+            let _ = args.daemon_tx.send(DaemonCommand::ClientDisconnected {
+                client_id: args.client_id,
+            });
             return Ok(()); // dropping `tcp` closes the connection
         }
     };
@@ -992,32 +981,19 @@ pub(crate) fn tcp_handshake_and_client_thread(
         Ok(noise) => noise,
         Err(e) => {
             error!(error = %e, "Noise handshake rejected");
-            let _ = daemon_tx.send(DaemonCommand::ClientDisconnected { client_id });
+            let _ = args.daemon_tx.send(DaemonCommand::ClientDisconnected {
+                client_id: args.client_id,
+            });
             return Ok(());
         }
     };
 
-    tcp_client_thread(
-        noise,
-        daemon_tx,
-        client_id,
-        writer,
-        writer_rx,
-        global_lag,
-        db,
-        writer_write_timeout,
-    )
+    tcp_client_thread(noise, args, writer_write_timeout)
 }
 
-#[expect(clippy::too_many_arguments)]
 pub(crate) fn tcp_client_thread(
     noise: choreo_transport::noise::NoiseStream,
-    daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
-    client_id: u64,
-    writer: crate::broadcast::SubscriberSink,
-    writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
-    global_lag: Arc<AtomicUsize>,
-    db: Arc<redb::Database>,
+    args: ConnThreadArgs,
     writer_write_timeout: Duration,
 ) -> io::Result<()> {
     // Writer thread: blocks on writer_rx, sends via NoiseStream encryption.
@@ -1030,16 +1006,8 @@ pub(crate) fn tcp_client_thread(
         .set_write_timeout(Some(writer_write_timeout))?;
     let writer_buf = noise.try_clone()?;
 
-    let mut conn = ClientConn::new(ClientConnSetup {
-        daemon_tx,
-        db,
-        writer,
-        writer_buf,
-        writer_rx,
-        global_lag,
-        client_id,
-        is_unix: false,
-    });
+    let client_id = args.client_id;
+    let mut conn = ClientConn::new(args, writer_buf);
 
     // The writer channel was registered with the daemon by the acceptor
     // (register_client_writer) before this thread was spawned, so the shutdown
@@ -1080,22 +1048,17 @@ pub(crate) fn tcp_client_thread(
 }
 
 /// Per-connection inputs for the embedded (in-process) transport, bundled
-/// into one struct so the spawn call site stays a single argument (and no
-/// `too_many_arguments` lint ever applies). Mirrors the parameter lists the
-/// Unix/TCP connection threads take, minus the socket.
+/// into one struct so the spawn call site stays a single argument. The
+/// transport-independent half is the shared [`ConnThreadArgs`]; the embedded
+/// path adds only its channel endpoints (it has no socket).
 pub(crate) struct EmbeddedConnArgs {
     /// GUI→daemon message values. Channel close IS the EOF.
     pub client_rx: crossbeam_channel::Receiver<ClientMessage>,
     /// The writer's forward target = the GUI's read half.
     pub out_tx: crossbeam_channel::Sender<DaemonMessage>,
-    pub daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
-    pub client_id: u64,
-    pub writer: crate::broadcast::SubscriberSink,
-    pub writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
-    pub global_lag: Arc<AtomicUsize>,
-    /// This connection's own handle to the shared redb database (on-demand
-    /// image reads run on the connection thread; see [`ClientCtx::db`]).
-    pub db: Arc<redb::Database>,
+    /// The shared per-connection inputs; the embedded link is the LOCAL trust
+    /// domain, so the caller sets `is_unix: true`.
+    pub conn: ConnThreadArgs,
 }
 
 /// The embedded (in-process) connection thread — the third transport, next
@@ -1119,24 +1082,11 @@ pub(crate) fn embedded_client_thread(args: EmbeddedConnArgs) {
     let EmbeddedConnArgs {
         client_rx,
         out_tx,
-        daemon_tx,
-        client_id,
-        writer,
-        writer_rx,
-        global_lag,
-        db,
+        conn: conn_args,
     } = args;
 
-    let mut conn = ClientConn::new(ClientConnSetup {
-        daemon_tx,
-        db,
-        writer,
-        writer_buf: ChannelConnectionWriter::new(out_tx),
-        writer_rx,
-        global_lag,
-        client_id,
-        is_unix: true,
-    });
+    let client_id = conn_args.client_id;
+    let mut conn = ClientConn::new(conn_args, ChannelConnectionWriter::new(out_tx));
 
     // The writer channel was registered with the daemon by `connect()`
     // (register_client_writer) BEFORE this thread was spawned, so the

@@ -558,17 +558,22 @@ pub fn run_server(
                             // so the accept thread stays a pure spawn loop; it
                             // also unregisters the writer channel on every
                             // pre-transport failure path.
+                            let conn_args = crate::server::connection::ConnThreadArgs {
+                                daemon_tx: tx,
+                                db,
+                                writer: writer_tx,
+                                writer_rx,
+                                global_lag,
+                                client_id,
+                                // TCP/Noise is the remote trust domain.
+                                is_unix: false,
+                            };
                             if let Err(e) =
                                 crate::server::connection::tcp_handshake_and_client_thread(
                                     tcp,
                                     sk_bytes,
                                     &acl,
-                                    tx,
-                                    client_id,
-                                    writer_tx,
-                                    writer_rx,
-                                    global_lag,
-                                    db,
+                                    conn_args,
                                     writer_write_timeout,
                                 )
                             {
@@ -646,14 +651,19 @@ pub fn run_server(
                         // (decrementing the counter) when the connection
                         // thread exits, even on panic.
                         let conn_slot = slot;
-                        let result = crate::server::connection::client_thread(
-                            stream,
-                            tx,
-                            client_id,
-                            writer_tx,
+                        let conn_args = crate::server::connection::ConnThreadArgs {
+                            daemon_tx: tx,
+                            db,
+                            writer: writer_tx,
                             writer_rx,
                             global_lag,
-                            db,
+                            client_id,
+                            // The Unix socket is the LOCAL trust domain.
+                            is_unix: true,
+                        };
+                        let result = crate::server::connection::client_thread(
+                            stream,
+                            conn_args,
                             writer_write_timeout,
                         );
                         if let Err(e) = result {

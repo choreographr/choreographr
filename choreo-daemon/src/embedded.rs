@@ -220,12 +220,16 @@ impl EmbeddedDaemon {
             let args = crate::server::connection::EmbeddedConnArgs {
                 client_rx,
                 out_tx,
-                daemon_tx,
-                client_id,
-                writer,
-                writer_rx,
-                global_lag,
-                db,
+                conn: crate::server::connection::ConnThreadArgs {
+                    daemon_tx,
+                    db,
+                    writer,
+                    writer_rx,
+                    global_lag,
+                    client_id,
+                    // An embedded link is the LOCAL trust domain.
+                    is_unix: true,
+                },
             };
             crate::server::connection::embedded_client_thread(args);
         });
