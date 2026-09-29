@@ -111,6 +111,8 @@ Apply it as follows:
 
 Always write inline comments around new code explaining how it works. Focus on the "why" — the reasoning, intent, and non-obvious details — rather than restating what the code literally does.
 
+Write comments as if the diff never happened: describe the code as it is now. Rationale is *current* design intent — "why it is this way", never "how it used to be" (no "previously…", "used to…", "the old behavior…", "this fixes the bug where…"). Change history lives in the commit message (which *is* the release note), not in the source. A warning against a tempting wrong approach is still welcome when it is current rationale, but phrase it present-tense and imperative ("Do not fall back to a sleep-poll here, because …") rather than as a narrative of what was changed or removed.
+
 ## Commit Workflow
 
 Finishing an implementation run means the work is **not done until it is committed**. When a run of implementation turns completes, verify and commit it yourself, in the same run. Do not stop to ask the user whether to commit — the commit is part of the task, not a separate approval step.
