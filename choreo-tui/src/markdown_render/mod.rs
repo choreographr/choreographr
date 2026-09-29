@@ -45,33 +45,112 @@ const QUOTE_BAR_WIDTH: usize = 2;
 /// renderer uses for its own `│` gutter (see `diff_render.rs`).
 const QUOTE_BAR_COLOR: Color = Color::DarkGray;
 
-/// Number of leading display columns of `line` occupied by block-quote chrome
-/// (the run of [`QUOTE_BAR`] gutter spans that `render_markdown_block`'s
-/// `BlockQuote` arm prepends, two columns each).
-///
-/// The selection/copy machinery starts a quote row's content *after* this run
-/// (see `add_margin_lines` and the tool-body loop in `render_turn_lines`) so
-/// the bar is never copied — it is per-row rendering chrome, exactly like the
-/// `┃` margin gutter.  Recognition keys on the exact span content *and* the
-/// reserved [`QUOTE_BAR_COLOR`] foreground, so ordinary prose that happens to
-/// begin with `│ ` (default-styled) is never mistaken for a gutter, and a code
-/// span that renders `│ ` stays upright (its fg is `Cyan`, not the reserved
-/// grey).
-///
-/// Only a *leading* run counts: a block quote nested directly inside a list
-/// item has the list marker prepended in front of its bar, so the bar is no
-/// longer leading and falls back to being copied.  That nesting is rare and
-/// the fallback degrades gracefully (the whole row is copied).
-fn leading_quote_prefix(line: &Line<'_>) -> usize {
-    let mut width = 0;
+/// Background colour of a fenced code block's "panel" — the solid rectangle the
+/// code sits in.  A fixed neutral grey, deliberately distinct from the
+/// surrounding message shading ([`crate::render::BG_SHADE`]) so the block reads
+/// as its own container.  It reaches the terminal via each panel span's `bg`:
+/// `add_margin_lines` preserves an explicit background rather than stamping
+/// `BG_SHADE` over it.
+pub(crate) const CODE_BG: Color = Color::Rgb(35, 35, 35);
+
+/// Reserved foreground colour tagging a code panel's padding/fill span.  The
+/// span is a run of spaces, so the colour itself is never seen — it exists only
+/// so the copy machinery can tell the panel's one-column side padding and
+/// right-edge fill apart from real code, exactly as [`QUOTE_BAR_COLOR`] lets it
+/// recognise the block-quote gutter.  An unusual RGB chosen never to collide
+/// with a syntect theme colour.
+pub(crate) const CODE_PANEL_PAD: Color = Color::Rgb(1, 2, 3);
+
+/// The half-block glyphs that draw a code panel's half-row top and bottom
+/// padding.  A terminal cell is roughly twice as tall as it is wide, so a
+/// *lower*-half block on the top row and an *upper*-half block on the bottom
+/// row give the panel colour the same one-column thickness vertically as the
+/// one-column left/right padding has horizontally.
+pub(crate) const CODE_PANEL_TOP: char = '▄';
+pub(crate) const CODE_PANEL_BOTTOM: char = '▀';
+
+/// True when `span` is a code-panel padding/fill span: a non-empty run tagged
+/// with the reserved [`CODE_PANEL_PAD`] foreground.
+fn is_panel_pad(span: &Span<'_>) -> bool {
+    !span.content.is_empty() && span.style.fg == Some(CODE_PANEL_PAD)
+}
+
+/// True when a rendered line is a code panel's top/bottom margin row: every
+/// non-empty span is a run of half-block glyphs in the panel background colour.
+/// Such a row is pure chrome and must never enter a copy.
+fn is_panel_margin(line: &Line<'_>) -> bool {
+    let mut any = false;
     for span in &line.spans {
+        if span.content.is_empty() {
+            continue;
+        }
+        any = true;
+        if span.style.fg != Some(CODE_BG)
+            || !span
+                .content
+                .chars()
+                .all(|c| c == CODE_PANEL_TOP || c == CODE_PANEL_BOTTOM)
+        {
+            return false;
+        }
+    }
+    any
+}
+
+/// The copyable display-column range `(start, end)` within a rendered markdown
+/// line, or `None` when the whole line is chrome (a code panel's margin row).
+///
+/// Leading chrome — a block-quote bar run (see [`QUOTE_BAR`]) followed by a
+/// code panel's one-column left padding — and trailing chrome — the panel's
+/// right-edge fill — are trimmed away, so a drag-copy yields the code (or the
+/// language tag, or a bare blank padding row) and never the container.  A plain
+/// line has no insets and returns its full `(0, width)` range; a blank panel row
+/// (all padding) returns an empty `(lo, lo)` range so it still copies as a blank
+/// line rather than vanishing as chrome.
+///
+/// Recognition keys on reserved colours (the quote bar's [`QUOTE_BAR_COLOR`],
+/// the panel padding's [`CODE_PANEL_PAD`]) so ordinary text is never mistaken
+/// for chrome.  Only a *leading* bar run counts: a block quote nested directly
+/// inside a list item has the list marker prepended in front of its bar, so the
+/// bar is no longer leading and the whole row falls back to being copied — a
+/// rare, graceful degradation.
+pub(crate) fn copyable_columns(line: &Line<'_>) -> Option<(usize, usize)> {
+    if is_panel_margin(line) {
+        return None;
+    }
+    let total = line.width();
+    let mut lead = 0usize;
+    let mut idx = 0usize;
+    // Leading block-quote bar run.
+    while let Some(span) = line.spans.get(idx) {
         if span.content.as_ref() == QUOTE_BAR && span.style.fg == Some(QUOTE_BAR_COLOR) {
-            width += QUOTE_BAR_WIDTH;
+            lead += QUOTE_BAR_WIDTH;
+            idx += 1;
         } else {
             break;
         }
     }
-    width
+    // Leading code-panel padding.
+    while let Some(span) = line.spans.get(idx) {
+        if is_panel_pad(span) {
+            lead += span.width();
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+    // Trailing code-panel fill.
+    let mut trail = 0usize;
+    for span in line.spans.iter().rev() {
+        if is_panel_pad(span) {
+            trail += span.width();
+        } else {
+            break;
+        }
+    }
+    let hi = total.saturating_sub(trail);
+    let lo = lead.min(hi);
+    Some((lo, hi))
 }
 
 /// How a rendered line joins the rendered line *before* it when both end up
@@ -513,23 +592,26 @@ pub(crate) fn render_turn_lines(
         // the full area width with exactly 1 column of right margin.
         for (line, join) in body.into_iter().zip(body_joins) {
             let mut line = line;
-            // Block-quote bars in a markdown tool body are chrome: start the
-            // copy range after them (see `leading_quote_prefix`).  Computed
-            // before the trailing fill spans are appended.
-            let quote_prefix = leading_quote_prefix(&line);
+            // The row's copyable columns, computed before the trailing fill
+            // spans are appended (so it is the code panel's right-edge fill,
+            // not the unboxed tool fill, that is trimmed).  `None` marks a
+            // code-panel margin row; otherwise block-quote bars and code-panel
+            // padding are excluded, exactly as in `add_margin_lines`.
+            let copy = copyable_columns(&line);
             let content_sum: usize = line.spans.iter().map(ratatui::prelude::Span::width).sum();
             let fill = (tool_content_width as usize).saturating_sub(content_sum);
             line.spans
                 .push(Span::styled(" ".repeat(fill), Style::default()));
             line.spans.push(Span::styled(" ", Style::default()));
-            // Unboxed rows: content starts at column 0 and ends where the
-            // fill begins.  Blank body rows (the renderer's spacer rows and
+            // Unboxed rows: content starts at column 0 and ends where the fill
+            // begins.  Blank body rows (the renderer's spacer rows and
             // genuinely blank tool-output lines) carry no characters but are
-            // *content*, not chrome: they keep an empty `(0, 0)` range so the
-            // selection copies the source's blank lines, while the
-            // turn-edge separators/padding stay `None` and are dropped.
+            // *content*, not chrome: they keep an empty range so the selection
+            // copies the source's blank lines, while the turn-edge
+            // separators/padding and the code-panel margins stay `None` and
+            // are dropped.
             let end = content_sum.min(tool_content_width as usize);
-            all_content_ranges.push(Some((quote_prefix.min(end), end)));
+            all_content_ranges.push(copy.map(|(lo, hi)| (lo.min(end), hi.min(end))));
             all_joins.push(join);
             all_lines.push(line);
         }
@@ -637,11 +719,12 @@ fn add_margin_lines(
 
     for (line, join) in lines.into_iter().zip(joins) {
         let text_width = line.width();
-        // Leading block-quote chrome (the `│ ` bars) is drawn but excluded
-        // from the row's copyable range, so a selection never picks up the
-        // gutter.  Computed from the raw line, before the spans are restyled
-        // with the message background below.
-        let quote_prefix = leading_quote_prefix(&line);
+        // The row's copyable columns, computed from the raw line before its
+        // spans are restyled with the message background below.  `None` marks a
+        // code-panel margin row (pure chrome); otherwise leading block-quote
+        // bars and code-panel padding, and the panel's right-edge fill, are
+        // excluded so a selection never picks up the container.
+        let copy = copyable_columns(&line);
         let fill = (content_width as usize).saturating_sub(text_width);
 
         // 2-column blank margin, then the gutter, then 2 shaded columns before
@@ -651,24 +734,22 @@ fn add_margin_lines(
             Span::styled("┃", accent_line),
             Span::styled("  ", gray),
         ];
-        // Content spans — explicitly set bg so they display correctly even without
-        // a paragraph-level background.
-        spans.extend(
-            line.spans
-                .into_iter()
-                .map(|s| Span::styled(s.content, s.style.bg(BG_SHADE))),
-        );
+        // Content spans — stamp the message background on any span that has
+        // none, but *preserve* an explicit background (a code panel's
+        // `CODE_BG`) so the panel keeps its own colour inside the shaded box.
+        spans.extend(line.spans.into_iter().map(|s| {
+            let bg = s.style.bg.unwrap_or(BG_SHADE);
+            Span::styled(s.content, s.style.bg(bg))
+        }));
         spans.push(Span::styled(" ".repeat(fill), gray));
         spans.push(Span::styled("  ", gray));
         // 2-column blank margin between the shaded box and the scrollbar.
         spans.push(Span::styled("  ", no_shading));
 
         result.push(Line::from(spans));
-        // Content occupies columns [5, 5 + text width): after the
-        // `"  ┃  "` gutter (2-col margin + gutter + 2-col shading), up to
-        // where the trailing fill begins.  A quoted row starts after its
-        // leading bar run (`quote_prefix`), so the bar is copy-proof.
-        content_ranges.push(Some((5 + quote_prefix, 5 + text_width)));
+        // Content occupies the row's copyable columns, offset by the
+        // `"  ┃  "` gutter (2-col margin + gutter + 2-col shading = 5 columns).
+        content_ranges.push(copy.map(|(lo, hi)| (5 + lo, 5 + hi)));
         box_joins.push(join);
     }
 

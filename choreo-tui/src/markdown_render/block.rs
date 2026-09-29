@@ -2,10 +2,11 @@
 //! block quotes, tables, and rules into styled lines.
 
 use super::{
-    GlobalLruCache, HighlightLines, Line, LineJoin, MarkdownBlock, Modifier, QUOTE_BAR,
-    QUOTE_BAR_COLOR, Span, Style, debug, display_width, ensure_blank_line_joined, heading_prefix,
-    highlight_theme, inlines_to_lines, pad_marker, render_table_lines, syntax_set,
-    to_ratatui_color, try_render_diff_content, wrap_styled_line_joined,
+    CODE_BG, CODE_PANEL_BOTTOM, CODE_PANEL_PAD, CODE_PANEL_TOP, Color, GlobalLruCache,
+    HighlightLines, Line, LineJoin, MarkdownBlock, Modifier, QUOTE_BAR, QUOTE_BAR_COLOR, Span,
+    Style, debug, display_width, ensure_blank_line_joined, heading_prefix, highlight_theme,
+    inlines_to_lines, pad_marker, render_table_lines, syntax_set, to_ratatui_color,
+    try_render_diff_content, wrap_styled_line_joined,
 };
 pub(crate) fn find_syntax<'a>(
     ss: &'a syntect::parsing::SyntaxSet,
@@ -55,6 +56,127 @@ pub(crate) fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'st
 
         result
     })
+}
+
+/// Render a fenced code block as a "panel": a solid [`CODE_BG`] rectangle that
+/// hugs the code, with one column of padding on the left and right and a
+/// half-row of padding at the top and bottom (drawn with half-block glyphs so
+/// the panel colour has the same one-column thickness on all four sides).  The
+/// literal triple-backtick fence markers are never emitted.  When a language
+/// tag is given it is shown on the panel's first interior row, followed by one
+/// blank padding row; without a tag the code starts on the first interior row.
+fn render_code_panel(
+    language: Option<&str>,
+    code: &str,
+    lines: &mut Vec<Line<'static>>,
+    joins: &mut Vec<LineJoin>,
+    indent: usize,
+    width: usize,
+) {
+    // The whole panel must fit the block's available width; the code area is
+    // the panel minus the 1-column pad on each side.
+    let panel_avail = width.saturating_sub(indent).max(2);
+    let code_avail = panel_avail.saturating_sub(2);
+
+    // Highlight, then wrap every row that exceeds the code area so the panel
+    // never overflows.  Each row keeps the [`LineJoin`] the wrapper recorded so
+    // a wrapped source line still rejoins when copied.
+    let mut code_rows: Vec<(Line<'static>, LineJoin)> = Vec::new();
+    for hl_line in highlight_code(language, code) {
+        if hl_line.width() > code_avail {
+            let mut wrapped: Vec<Line<'static>> = Vec::new();
+            let mut wrapped_joins: Vec<LineJoin> = Vec::new();
+            wrap_styled_line_joined(&hl_line, code_avail, &mut wrapped, &mut wrapped_joins);
+            for (wi, wl) in wrapped.into_iter().enumerate() {
+                // `wrapped_joins` is produced in lockstep with `wrapped`, so
+                // `wi` is in bounds; a hard break is the safe fallback.
+                let join = wrapped_joins.get(wi).copied().unwrap_or(LineJoin::Break);
+                code_rows.push((wl, join));
+            }
+        } else {
+            code_rows.push((hl_line, LineJoin::Break));
+        }
+    }
+
+    // The panel hugs the widest row (code or language tag), plus one column of
+    // padding each side, capped at the available width.
+    let code_max = code_rows.iter().map(|(l, _)| l.width()).max().unwrap_or(0);
+    let label = language.filter(|tag| !tag.is_empty());
+    let label_width = label.map_or(0, display_width);
+    let panel_width = (code_max.max(label_width) + 2).min(panel_avail);
+
+    // A run of padding/fill: spaces tagged with the reserved foreground (never
+    // seen, since spaces are blank) and the panel background, so the copy
+    // machinery recognises it as chrome (see `copyable_columns`).
+    let pad = |n: usize| {
+        Span::styled(
+            " ".repeat(n),
+            Style::default().fg(CODE_PANEL_PAD).bg(CODE_BG),
+        )
+    };
+    // Push one physical row: the block's outer indent (always 0 today) sits to
+    // the left of the panel, outside its background.
+    let mut push_row = |spans: Vec<Span<'static>>, join: LineJoin| {
+        let mut row = Vec::with_capacity(spans.len() + usize::from(indent > 0));
+        if indent > 0 {
+            row.push(Span::styled(" ".repeat(indent), Style::default()));
+        }
+        row.extend(spans);
+        lines.push(Line::from(row));
+        joins.push(join);
+    };
+
+    // ── Top padding: panel colour in the row's lower half ──
+    push_row(
+        vec![Span::styled(
+            CODE_PANEL_TOP.to_string().repeat(panel_width),
+            Style::default().fg(CODE_BG),
+        )],
+        LineJoin::Break,
+    );
+
+    // ── Language tag + one blank padding row (only when a tag is given) ──
+    if let Some(tag) = label {
+        let mut row = vec![
+            pad(1),
+            Span::styled(
+                tag.to_string(),
+                Style::default().fg(Color::Gray).bg(CODE_BG),
+            ),
+        ];
+        let used = 1 + display_width(tag);
+        if panel_width > used {
+            row.push(pad(panel_width - used));
+        }
+        push_row(row, LineJoin::Break);
+        push_row(vec![pad(panel_width)], LineJoin::Break);
+    }
+
+    // ── Code rows ──
+    for (row_line, join) in code_rows {
+        let used = 1 + row_line.width();
+        let mut row = Vec::with_capacity(row_line.spans.len() + 3);
+        row.push(pad(1));
+        row.extend(
+            row_line
+                .spans
+                .into_iter()
+                .map(|s| Span::styled(s.content, s.style.bg(CODE_BG))),
+        );
+        if panel_width > used {
+            row.push(pad(panel_width - used));
+        }
+        push_row(row, join);
+    }
+
+    // ── Bottom padding: panel colour in the row's upper half ──
+    push_row(
+        vec![Span::styled(
+            CODE_PANEL_BOTTOM.to_string().repeat(panel_width),
+            Style::default().fg(CODE_BG),
+        )],
+        LineJoin::Break,
+    );
 }
 
 // ── Public API ────────────────────────────────────────────────────────────
@@ -160,64 +282,7 @@ pub(crate) fn render_markdown_block(
                 );
             }
 
-            let header = language
-                .as_deref()
-                .map_or_else(|| "```".to_string(), |value| format!("```{value}"));
-            lines.push(indented_line(indent, header));
-            joins.push(LineJoin::Break);
-
-            let max_code_width = width.saturating_sub(indent);
-            let highlighted = highlight_code(language.as_deref(), code);
-            for hl_line in highlighted {
-                // Wrap code block lines that exceed the available width so
-                // they don't overflow the terminal.  Uses word-wrap via
-                // wrap_styled_line which falls back to grapheme-cluster
-                // splitting for words that don't fit.
-                if hl_line.width() > max_code_width {
-                    let mut wrapped: Vec<Line<'static>> = Vec::new();
-                    let mut wrapped_joins: Vec<LineJoin> = Vec::new();
-                    wrap_styled_line_joined(
-                        &hl_line,
-                        max_code_width,
-                        &mut wrapped,
-                        &mut wrapped_joins,
-                    );
-                    for (wi, wl) in wrapped.into_iter().enumerate() {
-                        // Strip trailing space spans so they don't get rendered
-                        // with shading as an extra column outside the code box.
-                        let mut spans = wl.spans;
-                        while spans.last().is_some_and(|s| s.content.trim().is_empty()) {
-                            spans.pop();
-                        }
-                        if indent > 0 {
-                            let mut with_indent =
-                                vec![Span::styled(" ".repeat(indent), Style::default())];
-                            with_indent.extend(spans);
-                            lines.push(Line::from(with_indent));
-                        } else {
-                            lines.push(Line::from(spans));
-                        }
-                        // The wrapper accounts for the actual row break type
-                        // (Space at word boundaries, Join for hard splits);
-                        // the first row of each source line is a fresh line.
-                        // `wrapped_joins` is produced in lockstep with
-                        // `wrapped`, so `wi` is in bounds; fall back to a
-                        // hard break if the wrapper ever desynchronizes.
-                        joins.push(wrapped_joins.get(wi).copied().unwrap_or(LineJoin::Break));
-                    }
-                } else if indent > 0 {
-                    let mut spans = vec![Span::styled(" ".repeat(indent), Style::default())];
-                    spans.extend(hl_line.spans.clone());
-                    lines.push(Line::from(spans));
-                    joins.push(LineJoin::Break);
-                } else {
-                    lines.push(hl_line);
-                    joins.push(LineJoin::Break);
-                }
-            }
-
-            lines.push(indented_line(indent, "```".to_string()));
-            joins.push(LineJoin::Break);
+            render_code_panel(language.as_deref(), code, lines, joins, indent, width);
         }
         MarkdownBlock::BlockQuote(blocks) => {
             let mut quoted = Vec::new();

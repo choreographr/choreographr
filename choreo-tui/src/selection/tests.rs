@@ -862,3 +862,23 @@ fn wrapped_code_block_line_rejoins_with_space() {
         "the code line reads exactly as written"
     );
 }
+
+#[test]
+fn code_panel_copy_is_label_blank_and_code() {
+    // Dragging across a whole code panel copies the language tag, the blank
+    // padding row, and the code — never the half-block margins or the panel
+    // padding around the code.
+    let md = "```rust\nfn main() {}\n```";
+    let mut app = test_app();
+    app.history_viewport.width = 30; // content width 21 → panel hugs the code
+    app.history_viewport.height = 40;
+    app.display_for(0).view.insert_or_replace(0, turn(md));
+    app.rebuild_height_prefix();
+    let (start, _) = locate(&app, "rust");
+    let (_, end) = locate(&app, "fn main() {}");
+    let copied = drag_and_finish(&mut app, start, end).expect("selection should extract");
+    assert_eq!(
+        copied, "rust\n\nfn main() {}",
+        "label, blank padding row and code must be copied verbatim: {copied:?}"
+    );
+}
