@@ -9,7 +9,7 @@
 // `allow-*-in-tests` config only recognizes `#[cfg(test)]`/`#[test]`
 // contexts, not feature-gated test modules, so the allowance is spelled
 // out here instead of in clippy.toml.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![expect(clippy::unwrap_used)]
 
 /// Isolate `known_servers` writes (bind pre-send recording and the `Bound`
 /// confirmation record) in a temp config root. Returns the `TempDir` AND the

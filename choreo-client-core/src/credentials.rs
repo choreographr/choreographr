@@ -307,7 +307,7 @@ pub fn bind_fresh_daemon(addr: &str) -> Result<([u8; 32], ClientMessage), Client
 /// by the shared builder.
 // needless_pass_by_value waived: pub API — TUI/GUI/IM callers pass owned
 // field strings (which get zeroized) and rely on this signature.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 pub fn build_add_credential_message(
     addr: &str,
     service: String,
@@ -490,7 +490,7 @@ pub fn attempt_keystore_auto_bind(bind: &mut KeystoreAutoBind, addr: &str) -> Au
 /// resolved or the encrypted credential cannot be built.
 // needless_pass_by_value waived: pub API — callers move the parsed
 // credential in; taking a reference would complicate every call site.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 pub fn build_add_credential_from_credential(
     addr: &str,
     service: String,

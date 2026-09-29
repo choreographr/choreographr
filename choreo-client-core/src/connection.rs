@@ -72,9 +72,6 @@ pub fn run_daemon_reader<R: BufRead>(
 /// Returns [`ClientError`] if the unix socket cannot be connected, the
 /// Noise handshake fails, or the connection loop hits an I/O or protocol
 /// error.
-// needless_pass_by_value waived: the receivers are channel endpoints the
-// caller must move in; external TUI/GUI/IM callers rely on this signature.
-#[allow(clippy::needless_pass_by_value)]
 pub fn run_daemon_connection(
     socket_path: &str,
     handle_daemon_message: impl FnMut(DaemonMessage),
@@ -267,9 +264,6 @@ impl Default for ConnectionMode {
 ///
 /// Returns [`ClientError`] if dialing fails, the Noise IK handshake fails,
 /// or any reader/writer I/O error kills the connection.
-// needless_pass_by_value waived: same channel-endpoint ownership as
-// run_daemon_connection; external callers rely on this signature.
-#[allow(clippy::needless_pass_by_value)]
 pub fn run_daemon_tcp_connection(
     addr: &str,
     server_pk: &[u8; 32],
