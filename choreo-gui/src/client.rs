@@ -11,7 +11,7 @@ use zeroize::Zeroize;
 
 // needless_pass_by_value waived: the sender is handed to the daemon
 // closure for the whole connection lifetime.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 pub(crate) fn run_client(
     mode: ConnectionMode,
     client_rx: crossbeam_channel::Receiver<ClientMessage>,
@@ -297,10 +297,6 @@ fn trigger_keystore_auto_bind(
     }
 }
 
-// needless_pass_by_value waived: callers pass an owned message envelope and
-// an owned sender exactly once per message; keeping by-value clarity beats
-// an extra lifetime dance at every call site.
-#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn apply_daemon_message(
     state: &mut AppState,
     message: DaemonMessage,

@@ -287,10 +287,8 @@ pub fn main() {
                     // Deliberate CLI startup exit: this is pre-launch argument
                     // validation in a binary entry point (before any UI runs),
                     // not daemon or library code — there is nothing to fail
-                    // gracefully in yet, so the clippy::exit deny is waived
-                    // here only. Wrapped in a closure so the `allow` stays
-                    // scoped to this single exit path.
-                    #[allow(clippy::exit)]
+                    // gracefully in yet. Wrapped in a closure so the exit stays
+                    // scoped to this single startup path.
                     let startup_exit = |code: i32| std::process::exit(code);
                     startup_exit(1)
                 }

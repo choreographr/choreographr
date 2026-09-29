@@ -4,7 +4,7 @@
 // fires on every interp. clippy's suggested `.to_string()` rewrite is wrong for
 // dioxus (it fails to parse and defeats the reactive interpolation), so allow the
 // false positive here.
-#![allow(clippy::useless_format)]
+#![expect(clippy::useless_format)]
 use choreo_markdown::render_markdown_html;
 use choreo_proto::{AssistantToolCallRecord, DisplayedImageRecord, ToolResultRecord, Turn};
 use dioxus::prelude::*;
