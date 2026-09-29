@@ -256,7 +256,7 @@ fn kill_process_group(pid: u32) {
     // SAFETY: `-pgid` targets the process group created at spawn time. The
     // cast is intentional: pid values from the kernel fit in i32 on every
     // supported platform (pid_t is i32), so wrapping cannot occur in practice.
-    #[allow(clippy::cast_possible_wrap)]
+    #[expect(clippy::cast_possible_wrap)]
     let rc = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
     if rc != 0 {
         // E.g. ESRCH if the group is already gone — nothing to do.
