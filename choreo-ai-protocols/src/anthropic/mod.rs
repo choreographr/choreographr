@@ -237,9 +237,9 @@ impl AnthropicClient {
     ///
     /// Returns [`AnthropicError`] on HTTP, provider, decoding, cancellation,
     /// or retry-callback failures.
-    // TEMP(`needless_pass_by_value`): the body moves `params`' borrowed
-    // parts straight into `messages_request`; taking a reference would
-    // ripple through every caller across the daemon and tests.
+    // Passed by value: the body moves `params`' borrowed parts straight into
+    // `messages_request`; taking a reference would ripple through every caller
+    // across the daemon and tests.
     pub fn chat_completion_turn(
         &self,
         params: ChatTurnRequest<'_>,
