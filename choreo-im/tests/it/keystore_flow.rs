@@ -11,15 +11,11 @@
 // AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
 // allow-*-in-tests config only recognizes #[test]-annotated functions —
 // helper fns in this file need this file-level allowance.
-#![allow(
+#![expect(
     clippy::unwrap_used,
-    clippy::expect_used,
     clippy::panic,
-    clippy::panic_in_result_fn,
-    clippy::indexing_slicing,
     // pedantic backfill: these helpers predate the pedantic sweep and
     // were only covered by the deny-set allowance above.
-    clippy::items_after_statements,
     clippy::used_underscore_binding,
     clippy::doc_markdown
 )]

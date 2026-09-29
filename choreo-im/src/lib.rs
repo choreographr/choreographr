@@ -243,10 +243,9 @@ pub fn establish_keystore<R: std::io::Read, W: std::io::Write>(
 
 // needless_pass_by_value waived: the reader/writer halves are moved into
 // the bridge threads; taking references would fight the thread handoff.
-#[allow(clippy::needless_pass_by_value)]
 fn run_platform(
     platform: &str,
-    #[allow(clippy::needless_pass_by_value)] bot_token: String,
+    #[expect(clippy::needless_pass_by_value)] bot_token: String,
     reader: BufReader<UnixStream>,
     writer: BufWriter<UnixStream>,
 ) -> anyhow::Result<()> {
