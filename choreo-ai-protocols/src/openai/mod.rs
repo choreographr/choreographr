@@ -11,6 +11,7 @@ use crate::types::{ChatTurnResult, StreamEvent};
 use tracing::{debug, info, warn};
 
 use crate::SocketRegistry;
+use crate::ToolResultItem;
 use choreo_proto::{ChatReasoningField, ReasoningArtifact};
 
 pub(crate) use config::endpoint_url;
@@ -41,6 +42,41 @@ pub use crate::shared::ProviderError as OpenAiError;
 pub enum RequestFormat {
     Responses,
     ChatCompletions,
+}
+
+/// The per-turn inputs the `OpenAI` tool-request builders share after the fixed
+/// `agent`/`config`/`api_key`: the conversation, tool definitions, the mapped
+/// reasoning effort, the retry/cancellation hooks, the gateway route, and the
+/// Responses-API chaining fields. Bundled so each builder takes one params
+/// value instead of a long positional list (no `too_many_arguments`
+/// suppression).
+pub(crate) struct TurnParams<'a> {
+    pub model: &'a str,
+    pub messages: &'a [ChatRequestMessage],
+    pub tools: &'a [ChatToolDefinition],
+    pub reasoning_effort: Option<&'a str>,
+    pub on_retry: &'a mut Option<RetryCallback>,
+    pub cancel_rx: Option<&'a crossbeam_channel::Receiver<()>>,
+    /// Gateway routing identity (`session_id`, `request_id`) for the opencode
+    /// zen/go providers; `None` when the caller has no session.
+    pub route: Option<(&'a str, &'a str)>,
+    /// Responses API: the previous turn's response id to chain onto.
+    pub previous_response_id: Option<&'a str>,
+    /// Responses API: tool results fed back from the previous turn.
+    pub tool_results: &'a [ToolResultItem],
+    /// Responses API: enable the programmatic tool-calling tool (gpt-5.6+).
+    pub programmatic_tool_calling: bool,
+}
+
+/// Inputs for a one-shot (prompt, no tools, no session) streaming completion,
+/// shared by the Responses and Chat Completions simple paths. Bundled so each
+/// takes one value instead of a positional list.
+#[derive(Clone, Copy)]
+pub(crate) struct SimpleParams<'a> {
+    pub model: &'a str,
+    pub prompt: &'a str,
+    pub reasoning_effort: Option<&'a str>,
+    pub cancel_rx: Option<&'a crossbeam_channel::Receiver<()>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -532,19 +568,24 @@ impl OpenAiClient {
                 &self.http,
                 &self.config,
                 &self.api_key,
-                model,
-                prompt,
-                None,
+                SimpleParams {
+                    model,
+                    prompt,
+                    reasoning_effort: None,
+                    cancel_rx: None,
+                },
                 &mut on_event,
             ),
             RequestFormat::ChatCompletions => chat_completions::chat_completions_request_streaming(
                 &self.http,
                 &self.config,
                 &self.api_key,
-                model,
-                prompt,
-                None,
-                None,
+                SimpleParams {
+                    model,
+                    prompt,
+                    reasoning_effort: None,
+                    cancel_rx: None,
+                },
                 &mut on_event,
             ),
         };
@@ -582,34 +623,31 @@ impl OpenAiClient {
         // The turn's real session/request ids drive the opencode gateway's
         // per-session sticky routing (see `shared::opencode_gateway_headers`).
         let route = Some((params.session_id.as_str(), params.request_id.as_str()));
+        let turn = TurnParams {
+            model,
+            messages: params.messages,
+            tools: params.tools,
+            reasoning_effort,
+            on_retry: params.on_retry,
+            cancel_rx: params.cancel_rx,
+            route,
+            previous_response_id: params.previous_response_id,
+            tool_results: params.tool_results,
+            programmatic_tool_calling: params.programmatic_tool_calling,
+        };
         let result = match self.config.request_format_for_model(model) {
             RequestFormat::Responses => responses::responses_request_with_tools(
                 &self.http,
                 &self.config,
                 &self.api_key,
-                params.model,
-                params.messages,
-                params.tools,
-                reasoning_effort,
-                params.previous_response_id,
-                params.tool_results,
-                params.on_retry,
-                params.cancel_rx,
-                params.programmatic_tool_calling,
-                route,
+                turn,
             ),
             RequestFormat::ChatCompletions => {
                 chat_completions::chat_completions_request_with_tools(
                     &self.http,
                     &self.config,
                     &self.api_key,
-                    params.model,
-                    params.messages,
-                    params.tools,
-                    reasoning_effort,
-                    params.on_retry,
-                    params.cancel_rx,
-                    route,
+                    turn,
                 )
             }
         };
@@ -656,21 +694,24 @@ impl OpenAiClient {
         // The turn's real session/request ids drive the opencode gateway's
         // per-session sticky routing (see `shared::opencode_gateway_headers`).
         let route = Some((params.session_id.as_str(), params.request_id.as_str()));
+        let turn = TurnParams {
+            model,
+            messages: params.messages,
+            tools: params.tools,
+            reasoning_effort,
+            on_retry: params.on_retry,
+            cancel_rx: params.cancel_rx,
+            route,
+            previous_response_id: params.previous_response_id,
+            tool_results: params.tool_results,
+            programmatic_tool_calling: params.programmatic_tool_calling,
+        };
         let result = match self.config.request_format_for_model(model) {
             RequestFormat::Responses => responses::responses_request_streaming_with_tools(
                 &self.http,
                 &self.config,
                 &self.api_key,
-                params.model,
-                params.messages,
-                params.tools,
-                reasoning_effort,
-                params.previous_response_id,
-                params.tool_results,
-                params.on_retry,
-                params.cancel_rx,
-                params.programmatic_tool_calling,
-                route,
+                turn,
                 &mut on_event,
             ),
             RequestFormat::ChatCompletions => {
@@ -678,13 +719,7 @@ impl OpenAiClient {
                     &self.http,
                     &self.config,
                     &self.api_key,
-                    params.model,
-                    params.messages,
-                    params.tools,
-                    reasoning_effort,
-                    params.on_retry,
-                    params.cancel_rx,
-                    route,
+                    turn,
                     &mut on_event,
                 )
             }

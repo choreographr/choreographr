@@ -318,24 +318,22 @@ fn extract_reasoning_text(summary: &[serde_json::Value]) -> Option<String> {
 /// Shared helper: build the URL and serialised request body for a
 /// Responses API request with tools (and optionally tool results from a
 /// previous turn).
-#[expect(clippy::too_many_arguments)]
 fn build_responses_request_body(
     config: &super::ServiceConfig,
-    model: &str,
-    messages: &[ChatRequestMessage],
-    tools: &[ChatToolDefinition],
-    reasoning_effort: Option<&str>,
-    previous_response_id: Option<&str>,
-    tool_results: &[ToolResultItem],
+    params: &super::TurnParams<'_>,
     stream: bool,
-    programmatic_tool_calling: bool,
 ) -> Result<(String, serde_json::Value), super::OpenAiError> {
     let url = endpoint_url(&config.base_url, &config.responses_path)?;
-    let max_output_tokens = config.max_output_tokens_for_model(model);
-    let input_value = build_responses_input(tool_results, messages, previous_response_id)?;
+    let max_output_tokens = config.max_output_tokens_for_model(params.model);
+    let input_value = build_responses_input(
+        params.tool_results,
+        params.messages,
+        params.previous_response_id,
+    )?;
 
-    let mut responses_tools: Vec<ResponsesTool> = tools.iter().map(ResponsesTool::from).collect();
-    if programmatic_tool_calling {
+    let mut responses_tools: Vec<ResponsesTool> =
+        params.tools.iter().map(ResponsesTool::from).collect();
+    if params.programmatic_tool_calling {
         responses_tools.push(ResponsesTool {
             kind: "programmatic_tool_calling".to_string(),
             name: String::new(),
@@ -365,9 +363,9 @@ fn build_responses_request_body(
     // reasoning-capable: non-reasoning models (gpt-4o, gpt-4.1, …) reject any
     // reasoning config outright (400), so a stray non-`off` effort must never
     // leak one through — gate on the capability, not on effort being present.
-    let reasoning_capable = config.model_supports_reasoning(model);
+    let reasoning_capable = config.model_supports_reasoning(params.model);
     let reasoning = reasoning_capable.then_some(ResponsesReasoning {
-        effort: reasoning_effort,
+        effort: params.reasoning_effort,
         summary: Some("auto"),
     });
 
@@ -380,7 +378,7 @@ fn build_responses_request_body(
     };
 
     let body = serde_json::to_value(&ResponsesRequest {
-        model,
+        model: params.model,
         input: input_value,
         instructions: None,
         tools: tools_opt,
@@ -390,7 +388,7 @@ fn build_responses_request_body(
         // store: true is required for previous_response_id to work correctly
         // and matches the @ai-sdk/openai default behavior.
         store: true,
-        previous_response_id,
+        previous_response_id: params.previous_response_id,
         parallel_tool_calls: None,
         tool_choice,
     })
@@ -484,14 +482,18 @@ pub(crate) fn responses_request_streaming<F>(
     agent: &ureq::Agent,
     config: &super::ServiceConfig,
     api_key: &str,
-    model: &str,
-    prompt: &str,
-    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
+    params: super::SimpleParams<'_>,
     on_event: &mut F,
 ) -> Result<(), super::OpenAiError>
 where
     F: FnMut(StreamEvent) -> io::Result<()>,
 {
+    let super::SimpleParams {
+        model,
+        prompt,
+        cancel_rx,
+        ..
+    } = params;
     let (url, body) = build_simple_responses_body(config, model, prompt, true)?;
     let retry = retry::retry_config_from_config(config);
     // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
@@ -544,37 +546,25 @@ where
 
 /// Non-streaming Responses API turn with tool definitions, reasoning effort,
 /// and optional tool results from a previous turn.
-#[expect(clippy::too_many_arguments)]
 pub(crate) fn responses_request_with_tools(
     agent: &ureq::Agent,
     config: &super::ServiceConfig,
     api_key: &str,
-    model: &str,
-    messages: &[ChatRequestMessage],
-    tools: &[ChatToolDefinition],
-    reasoning_effort: Option<&str>,
-    previous_response_id: Option<&str>,
-    tool_results: &[ToolResultItem],
-    on_retry: &mut Option<retry::RetryCallback>,
-    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
-    programmatic_tool_calling: bool,
-    // Gateway routing identity (session_id, request_id) for the opencode
-    // zen/go providers; `None` when the caller has no session (prompt API).
-    route: Option<(&str, &str)>,
+    params: super::TurnParams<'_>,
 ) -> Result<ChatTurnResult, super::OpenAiError> {
     let start = std::time::Instant::now();
 
-    let (url, body) = build_responses_request_body(
-        config,
+    let (url, body) = build_responses_request_body(config, &params, false)?;
+    let super::TurnParams {
         model,
         messages,
         tools,
-        reasoning_effort,
-        previous_response_id,
+        on_retry,
+        cancel_rx,
+        route,
         tool_results,
-        false,
-        programmatic_tool_calling,
-    )?;
+        ..
+    } = params;
 
     let has_instructions = messages.iter().any(|m| m.role == "system");
     info!(
@@ -864,39 +854,27 @@ impl AccCall {
 /// `on_chunk` for each content / reasoning delta so the caller can forward
 /// it to subscribers immediately.  Tool call deltas are accumulated across
 /// chunks and returned as `ChatTurnResult::ToolUse` when the stream ends.
-#[expect(clippy::too_many_arguments)]
 pub(crate) fn responses_request_streaming_with_tools<F>(
     agent: &ureq::Agent,
     config: &super::ServiceConfig,
     api_key: &str,
-    model: &str,
-    messages: &[ChatRequestMessage],
-    tools: &[ChatToolDefinition],
-    reasoning_effort: Option<&str>,
-    previous_response_id: Option<&str>,
-    tool_results: &[ToolResultItem],
-    on_retry: &mut Option<retry::RetryCallback>,
-    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
-    programmatic_tool_calling: bool,
-    // Gateway routing identity (session_id, request_id) for the opencode
-    // zen/go providers; `None` when the caller has no session (prompt API).
-    route: Option<(&str, &str)>,
+    params: super::TurnParams<'_>,
     on_event: &mut F,
 ) -> Result<ChatTurnResult, super::OpenAiError>
 where
     F: FnMut(StreamEvent) -> io::Result<()>,
 {
-    let (url, body) = build_responses_request_body(
-        config,
+    let (url, body) = build_responses_request_body(config, &params, true)?;
+    let super::TurnParams {
         model,
-        messages,
+        messages: _,
         tools,
-        reasoning_effort,
-        previous_response_id,
+        on_retry,
+        cancel_rx,
+        route,
         tool_results,
-        true,
-        programmatic_tool_calling,
-    )?;
+        ..
+    } = params;
 
     info!(
         model = %model,
@@ -1243,39 +1221,37 @@ mod tests {
             keys
         };
 
+        // Build a tool-less Responses body for `model` with `effort` mapped to
+        // the reasoning config; the retry/cancellation/route/chaining fields
+        // are inert for body construction.
+        let build = |model: &str, effort: Option<&str>| {
+            let mut no_retry = None;
+            let params = super::super::TurnParams {
+                model,
+                messages: &[],
+                tools: &[],
+                reasoning_effort: effort,
+                on_retry: &mut no_retry,
+                cancel_rx: None,
+                route: None,
+                previous_response_id: None,
+                tool_results: &[],
+                programmatic_tool_calling: false,
+            };
+            build_responses_request_body(&config, &params, false).expect("body builds")
+        };
+
         // Case 1: non-reasoning model, no effort — no `reasoning` object at
         // all. A top-level `reasoning_effort` or `include:
         // ["reasoning.summary"]` is a hard 400 on the Responses API, so
         // neither may appear.
-        let (_url, body) = build_responses_request_body(
-            &config,
-            "gpt-4o",
-            &[],
-            &[],
-            None,
-            None,
-            &[],
-            false,
-            false,
-        )
-        .expect("non-reasoning body builds");
+        let (_url, body) = build("gpt-4o", None);
         assert!(body.get("reasoning").is_none(), "{body}");
         assert_eq!(body_keys(&body), ["input", "model", "store"]);
 
         // Case 2: reasoning model with effort "high" — effort and summary
         // both live under the nested `reasoning` object (never top-level).
-        let (_url, body) = build_responses_request_body(
-            &config,
-            "gpt-5.4",
-            &[],
-            &[],
-            Some("high"),
-            None,
-            &[],
-            false,
-            false,
-        )
-        .expect("reasoning body builds");
+        let (_url, body) = build("gpt-5.4", Some("high"));
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["reasoning"]["summary"], "auto");
         assert_eq!(body_keys(&body), ["input", "model", "reasoning", "store"]);
@@ -1284,18 +1260,7 @@ mod tests {
         // whole `reasoning` object must still be suppressed (gated on the
         // capability, not on effort being present). This pins the fix:
         // emitting `reasoning: { effort }` here would be a provider 400.
-        let (_url, body) = build_responses_request_body(
-            &config,
-            "gpt-4o",
-            &[],
-            &[],
-            Some("high"),
-            None,
-            &[],
-            false,
-            false,
-        )
-        .expect("non-reasoning body with stray effort builds");
+        let (_url, body) = build("gpt-4o", Some("high"));
         assert!(body.get("reasoning").is_none(), "{body}");
         assert_eq!(body_keys(&body), ["input", "model", "store"]);
     }

@@ -285,21 +285,22 @@ pub(crate) fn chat_completions_request(
 
 // ── Non-streaming chat completions with tools ────────────────────────────
 
-#[expect(clippy::too_many_arguments)]
 pub(crate) fn chat_completions_request_with_tools(
     agent: &ureq::Agent,
     config: &super::ServiceConfig,
     api_key: &str,
-    model: &str,
-    messages: &[ChatRequestMessage],
-    tools: &[ChatToolDefinition],
-    reasoning_effort: Option<&str>,
-    on_retry: &mut Option<retry::RetryCallback>,
-    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
-    // Gateway routing identity (session_id, request_id) for the opencode
-    // zen/go providers; `None` when the caller has no session (prompt API).
-    route: Option<(&str, &str)>,
+    params: super::TurnParams<'_>,
 ) -> Result<ChatTurnResult, super::OpenAiError> {
+    let super::TurnParams {
+        model,
+        messages,
+        tools,
+        reasoning_effort,
+        on_retry,
+        cancel_rx,
+        route,
+        ..
+    } = params;
     let start = std::time::Instant::now();
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
     let (max_tokens_field, max_completion_tokens_field) = config.max_tokens_field_pair(model);
@@ -480,20 +481,22 @@ fn chat_completions_response_to_turn(
 
 // ── Simple streaming chat completions ────────────────────────────────────
 
-#[expect(clippy::too_many_arguments)]
 pub(crate) fn chat_completions_request_streaming<F>(
     agent: &ureq::Agent,
     config: &super::ServiceConfig,
     api_key: &str,
-    model: &str,
-    prompt: &str,
-    reasoning_effort: Option<&str>,
-    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
+    params: super::SimpleParams<'_>,
     on_event: &mut F,
 ) -> Result<(), super::OpenAiError>
 where
     F: FnMut(StreamEvent) -> io::Result<()>,
 {
+    let super::SimpleParams {
+        model,
+        prompt,
+        reasoning_effort,
+        cancel_rx,
+    } = params;
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
     let (max_tokens_field, max_completion_tokens_field) = config.max_tokens_field_pair(model);
     let retry = retry::retry_config_from_config(config);
@@ -864,25 +867,26 @@ impl ChatCompletionsStreamAccumulator {
 /// `on_chunk` for each content / reasoning delta so the caller can forward
 /// it to subscribers immediately.  Tool call deltas are accumulated across
 /// chunks and returned as `ChatTurnResult::ToolUse` when the stream ends.
-#[expect(clippy::too_many_arguments)]
 pub(crate) fn chat_completions_request_streaming_with_tools<F>(
     agent: &ureq::Agent,
     config: &super::ServiceConfig,
     api_key: &str,
-    model: &str,
-    messages: &[ChatRequestMessage],
-    tools: &[ChatToolDefinition],
-    reasoning_effort: Option<&str>,
-    on_retry: &mut Option<retry::RetryCallback>,
-    cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
-    // Gateway routing identity (session_id, request_id) for the opencode
-    // zen/go providers; `None` when the caller has no session (prompt API).
-    route: Option<(&str, &str)>,
+    params: super::TurnParams<'_>,
     on_event: &mut F,
 ) -> Result<ChatTurnResult, super::OpenAiError>
 where
     F: FnMut(StreamEvent) -> io::Result<()>,
 {
+    let super::TurnParams {
+        model,
+        messages,
+        tools,
+        reasoning_effort,
+        on_retry,
+        cancel_rx,
+        route,
+        ..
+    } = params;
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
     let (max_tokens_field, max_completion_tokens_field) = config.max_tokens_field_pair(model);
     let retry = retry::retry_config_from_config(config);
