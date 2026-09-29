@@ -376,7 +376,7 @@ fn markdown_lines_blockquote_simple() {
     let md = "> hello world";
     let result = markdown_lines(md, 80);
     assert!(!result.is_empty());
-    assert_eq!(result[0].to_string(), "> hello world");
+    assert_eq!(result[0].to_string(), "│ hello world");
 }
 
 #[test]
@@ -395,7 +395,132 @@ fn markdown_lines_blockquote_within_budget() {
             line.width()
         );
     }
-    assert!(text.contains("> hello world"), "text should be present");
+    assert!(text.contains("│ hello world"), "text should be present");
+}
+
+#[test]
+fn markdown_blockquote_bar_replaces_angle_marker() {
+    // The literal `"> "` marker is gone; a two-column bar takes its place so
+    // the wrap budget (width - 2) is unchanged but the block reads as a quote
+    // rather than as body text with ASCII markers.
+    let result = markdown_lines("> quoted", 80);
+    assert_eq!(result[0].to_string(), "│ quoted");
+    assert!(!result[0].to_string().contains('>'));
+}
+
+#[test]
+fn markdown_blockquote_text_is_italic_but_inline_code_is_not() {
+    let result = markdown_lines("> plain and `code`", 80);
+    let spans: Vec<&Span<'static>> = result.iter().flat_map(|l| l.spans.iter()).collect();
+    // Plain prose (no foreground colour) is italicised.
+    assert!(
+        spans.iter().any(|s| s.style.fg.is_none()
+            && s.content.contains("plain")
+            && s.style.add_modifier.contains(Modifier::ITALIC)),
+        "plain quote text should be italic: {spans:#?}"
+    );
+    // Inline code keeps its Cyan foreground and stays upright so syntax
+    // highlighting is not smeared.
+    assert!(
+        spans.iter().any(|s| s.style.fg == Some(Color::Cyan)
+            && s.content.contains("code")
+            && !s.style.add_modifier.contains(Modifier::ITALIC)),
+        "inline code should stay upright: {spans:#?}"
+    );
+    // The bar itself is drawn in the reserved gutter colour, not italic.
+    assert!(
+        spans.iter().any(|s| s.content.as_ref() == QUOTE_BAR
+            && s.style.fg == Some(QUOTE_BAR_COLOR)
+            && !s.style.add_modifier.contains(Modifier::ITALIC)),
+        "bar span should be the reserved gutter span: {spans:#?}"
+    );
+}
+
+#[test]
+fn leading_quote_prefix_counts_nested_bars() {
+    let single = markdown_lines("> one", 80);
+    assert_eq!(leading_quote_prefix(&single[0]), 2);
+    // `>>` nests: the outer bar is prepended in front of the inner bar.
+    let nested = markdown_lines(">> two", 80);
+    assert_eq!(leading_quote_prefix(&nested[0]), 4);
+    // A non-quote line has no leading chrome.
+    let plain = markdown_lines("just text", 80);
+    assert_eq!(leading_quote_prefix(&plain[0]), 0);
+}
+
+#[test]
+fn markdown_blockquote_bar_is_excluded_from_copy_range() {
+    let (body, body_joins) = markdown_lines_joined("> hello world", 40);
+    let body_width = body[0].width(); // "│ hello world" = 13
+    let (_lines, _rows, ranges, _joins) =
+        add_margin_lines(body, body_joins, 40, Color::Green, None);
+    // Row 2 is the single content row (separator, padding, content, …).
+    // Content begins at column 5 in the gutter layout; the two-column bar
+    // pushes the copyable start to 7, so the bar is never copied.
+    assert_eq!(ranges[2], Some((7, 5 + body_width)));
+}
+
+#[test]
+fn render_turn_lines_quote_bar_is_not_copyable() {
+    let turn = Turn {
+        created_at: choreo_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: Some("> quoted line".into()),
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![],
+        displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    };
+    let rendered = render_turn_lines(&turn, 40, 40, false, &[]);
+    let row = rendered
+        .lines
+        .iter()
+        .position(|l| l.to_string().contains("│ quoted line"))
+        .expect("quote row");
+    let (lo, _hi) = rendered.content_ranges[row].expect("content row");
+    // The `┃` gutter puts message content at column 5; the two-column quote
+    // bar pushes the copyable start to 7, so a drag-copy skips the bar.
+    assert_eq!(lo, 7);
+}
+
+#[test]
+fn render_turn_lines_tool_markdown_quote_bar_is_not_copyable() {
+    let turn = Turn {
+        created_at: choreo_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: None,
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![choreo_proto::ToolResultRecord {
+            call_id: "c".into(),
+            name: "pdf_to_markdown".into(),
+            content: "> quoted".into(),
+            is_error: false,
+            invocation_description: String::new(),
+            image: None,
+        }],
+        displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    };
+    // pdf_to_markdown is not a quiet tool, so the result is expanded by default.
+    let rendered = render_turn_lines(&turn, 80, 80, false, &[false]);
+    let row = rendered
+        .lines
+        .iter()
+        .position(|l| l.to_string().contains("│ quoted"))
+        .expect("quote body row");
+    // Tool bodies are unboxed: content starts at column 0, so the leading
+    // two-column bar pushes the copyable start to 2.
+    assert_eq!(rendered.content_ranges[row].map(|(lo, _)| lo), Some(2));
 }
 
 // ── List ─────────────────────────────────────────────────────────────
@@ -4040,10 +4165,10 @@ fn code_block_indented_wrapping() {
     let long = "x".repeat(100);
     let md = format!("> ```\n> {long}\n> ```");
     let result = markdown_lines(&md, 40);
-    // Each code content line in the blockquote should be ≤ 40 (indent 2 + " > " prefix).
+    // Each code content line in the blockquote should be ≤ 40 (indent 2 + "│ " prefix).
     for line in &result {
         let text = line.to_string();
-        if text.starts_with(" ```") || text.starts_with("> ```") || text.starts_with(">  ```") {
+        if text.starts_with(" ```") || text.starts_with("│ ```") || text.starts_with("│  ```") {
             continue;
         }
         assert!(

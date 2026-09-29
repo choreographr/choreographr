@@ -14,6 +14,46 @@ use crate::render::{BG_SHADE, format_timestamp};
 use crate::syntax::{highlight_theme, syntax_set, to_ratatui_color};
 use tracing::{debug, warn};
 
+/// The block-quote gutter: a light vertical bar plus one space.  Two display
+/// columns wide — exactly the footprint of the legacy literal `"> "` marker —
+/// so the content width handed to a quote body (`width - indent - 2`) and
+/// every wrap-budget test stay valid.
+const QUOTE_BAR: &str = "│ ";
+
+/// Colour of the block-quote bar.  `DarkGray` reads as a quiet rule against
+/// the message's shaded background (#353535) — the same colour the diff
+/// renderer uses for its own `│` gutter (see `diff_render.rs`).
+const QUOTE_BAR_COLOR: Color = Color::DarkGray;
+
+/// Number of leading display columns of `line` occupied by block-quote chrome
+/// (the run of [`QUOTE_BAR`] gutter spans that `render_markdown_block`'s
+/// `BlockQuote` arm prepends, two columns each).
+///
+/// The selection/copy machinery starts a quote row's content *after* this run
+/// (see `add_margin_lines` and the tool-body loop in `render_turn_lines`) so
+/// the bar is never copied — it is per-row rendering chrome, exactly like the
+/// `┃` margin gutter.  Recognition keys on the exact span content *and* the
+/// reserved [`QUOTE_BAR_COLOR`] foreground, so ordinary prose that happens to
+/// begin with `│ ` (default-styled) is never mistaken for a gutter, and a code
+/// span that renders `│ ` stays upright (its fg is `Cyan`, not the reserved
+/// grey).
+///
+/// Only a *leading* run counts: a block quote nested directly inside a list
+/// item has the list marker prepended in front of its bar, so the bar is no
+/// longer leading and falls back to being copied.  That nesting is rare and
+/// the fallback degrades gracefully (the whole row is copied).
+fn leading_quote_prefix(line: &Line<'_>) -> usize {
+    let mut width = 0;
+    for span in &line.spans {
+        if span.content.as_ref() == QUOTE_BAR && span.style.fg == Some(QUOTE_BAR_COLOR) {
+            width += display_width(QUOTE_BAR);
+        } else {
+            break;
+        }
+    }
+    width
+}
+
 fn find_syntax<'a>(
     ss: &'a syntect::parsing::SyntaxSet,
     lang: &str,
@@ -1105,6 +1145,10 @@ pub(crate) fn render_turn_lines(
         // the full area width with exactly 1 column of right margin.
         for (line, join) in body.into_iter().zip(body_joins) {
             let mut line = line;
+            // Block-quote bars in a markdown tool body are chrome: start the
+            // copy range after them (see `leading_quote_prefix`).  Computed
+            // before the trailing fill spans are appended.
+            let quote_prefix = leading_quote_prefix(&line);
             let content_sum: usize = line.spans.iter().map(ratatui::prelude::Span::width).sum();
             let fill = (tool_content_width as usize).saturating_sub(content_sum);
             line.spans
@@ -1117,7 +1161,7 @@ pub(crate) fn render_turn_lines(
             // selection copies the source's blank lines, while the
             // turn-edge separators/padding stay `None` and are dropped.
             let end = content_sum.min(tool_content_width as usize);
-            all_content_ranges.push(Some((0, end)));
+            all_content_ranges.push(Some((quote_prefix.min(end), end)));
             all_joins.push(join);
             all_lines.push(line);
         }
@@ -1225,6 +1269,11 @@ fn add_margin_lines(
 
     for (line, join) in lines.into_iter().zip(joins) {
         let text_width = line.width();
+        // Leading block-quote chrome (the `│ ` bars) is drawn but excluded
+        // from the row's copyable range, so a selection never picks up the
+        // gutter.  Computed from the raw line, before the spans are restyled
+        // with the message background below.
+        let quote_prefix = leading_quote_prefix(&line);
         let fill = (content_width as usize).saturating_sub(text_width);
 
         // 2-column blank margin, then the gutter, then 2 shaded columns before
@@ -1249,8 +1298,9 @@ fn add_margin_lines(
         result.push(Line::from(spans));
         // Content occupies columns [5, 5 + text width): after the
         // `"  ┃  "` gutter (2-col margin + gutter + 2-col shading), up to
-        // where the trailing fill begins.
-        content_ranges.push(Some((5, 5 + text_width)));
+        // where the trailing fill begins.  A quoted row starts after its
+        // leading bar run (`quote_prefix`), so the bar is copy-proof.
+        content_ranges.push(Some((5 + quote_prefix, 5 + text_width)));
         box_joins.push(join);
     }
 
@@ -1565,8 +1615,9 @@ fn render_markdown_block(
         MarkdownBlock::BlockQuote(blocks) => {
             let mut quoted = Vec::new();
             let mut quoted_joins = Vec::new();
-            // Content is rendered at (width - indent - 2) so that when "> " and the
-            // outer indent are prepended on each line the total stays within `width`.
+            // Content is rendered at (width - indent - 2) so that when the
+            // `QUOTE_BAR` gutter and the outer indent are prepended on each
+            // line the total stays within `width`.
             render_markdown_blocks(
                 blocks,
                 &mut quoted,
@@ -1576,13 +1627,36 @@ fn render_markdown_block(
                 heading_shift,
             );
             for (line, _inner_join) in quoted.into_iter().zip(quoted_joins) {
-                let mut spans = line.spans.clone();
-                spans.insert(0, Span::styled("> ".to_string(), Style::default()));
+                // Quoted text is dimmed with ITALIC so it reads as secondary to
+                // the surrounding prose.  Inline code and math carry their own
+                // foreground colour (Cyan/Yellow/Magenta), so they are left
+                // upright — italicising them would smear the syntax
+                // highlighting — and the leading bar (below) is the primary
+                // visual cue that the block is a quote.
+                let mut spans: Vec<Span<'static>> = line
+                    .spans
+                    .into_iter()
+                    .map(|span| {
+                        let style = if span.style.fg.is_none() {
+                            span.style.add_modifier(Modifier::ITALIC)
+                        } else {
+                            span.style
+                        };
+                        Span::styled(span.content, style)
+                    })
+                    .collect();
+                // The two-column muted bar replaces the old literal `"> "`
+                // text marker.  `leading_quote_prefix` recognises this exact
+                // span so the selection/copy can start *after* it.
+                spans.insert(
+                    0,
+                    Span::styled(QUOTE_BAR.to_string(), Style::default().fg(QUOTE_BAR_COLOR)),
+                );
                 lines.push(indented_line_as_spans(indent, spans));
-                // Every quoted row is a distinct line in the copy: the "> "
-                // prefix is per-row rendering chrome, and re-glueing wrapped
-                // quote rows into one line would merge the markers into the
-                // text.  Copying proceeds row by row.
+                // Every quoted row is a distinct line in the copy: the bar is
+                // per-row rendering chrome, and re-glueing wrapped quote rows
+                // into one line would merge the gutters into the text.
+                // Copying proceeds row by row.
                 joins.push(LineJoin::Break);
             }
         }
