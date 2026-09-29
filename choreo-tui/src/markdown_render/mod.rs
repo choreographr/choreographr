@@ -4,6 +4,7 @@ use choreo_proto::{ToolResultRecord, Turn};
 use choreo_sanitize::is_unsafe_unicode;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use smallvec::SmallVec;
 use syntect::easy::HighlightLines;
 
 use std::sync::Arc;
@@ -185,6 +186,65 @@ pub(crate) enum LineJoin {
     Join,
 }
 
+/// Display-column intervals of a rendered line that are **non-selectable
+/// chrome** (the value is relative to the line buffer its producer built).
+///
+/// The renderer is the single source of truth for what is chrome: it emits
+/// these intervals per line as first-class, typed metadata so the
+/// selection/copy machinery can subtract them without re-scanning the
+/// finished [`Line`]'s spans for a magic `(content string, foreground
+/// colour)` pair.  A block-quote bar (`QUOTE_BAR`) is the first such chrome;
+/// list markers, code-panel padding, and table borders could adopt the same
+/// channel later.
+///
+/// Empty for the overwhelming majority of lines; a [`SmallVec`] keeps the
+/// common empty case allocation-free while still allowing more than one
+/// interval on the rare row that nests chrome (a block quote inside a list
+/// item records both the marker-relative and nested-bar intervals).  Each
+/// entry is `(lo, hi)` in display columns, half-open.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LineChrome(SmallVec<[(u16, u16); 1]>);
+
+impl LineChrome {
+    /// Record one chrome interval `[lo, hi)` in display columns.
+    ///
+    /// Columns are viewport-bounded, so `u16` is ample; the cast saturates
+    /// (mirroring the renderer's other viewport-bounded width casts) and a
+    /// `debug_assert!` flags an out-of-range value in development builds.
+    #[expect(
+        dead_code,
+        reason = "the block-quote arm calls this in a later phase; Phase 0 only plumbs the buffer"
+    )]
+    pub(crate) fn push(&mut self, lo: usize, hi: usize) {
+        debug_assert!(
+            u16::try_from(lo).is_ok() && u16::try_from(hi).is_ok(),
+            "chrome column out of u16 range"
+        );
+        self.0.push((
+            u16::try_from(lo).unwrap_or(u16::MAX),
+            u16::try_from(hi).unwrap_or(u16::MAX),
+        ));
+    }
+
+    /// True when the line has no non-selectable chrome.
+    #[expect(
+        dead_code,
+        reason = "the selection/copy path consumes this in a later phase; Phase 0 only plumbs the buffer"
+    )]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The recorded chrome intervals, in display columns.
+    #[expect(
+        dead_code,
+        reason = "the selection/copy path consumes this in a later phase; Phase 0 only plumbs the buffer"
+    )]
+    pub(crate) fn intervals(&self) -> &[(u16, u16)] {
+        &self.0
+    }
+}
+
 /// A turn rendered into styled lines, plus the metadata the TUI needs to
 /// hit-test the collapsible reasoning header without re-scanning the output.
 pub(crate) struct RenderedTurnLines {
@@ -201,6 +261,13 @@ pub(crate) struct RenderedTurnLines {
     /// Mouse selection highlights and copies only these cells, so dragging
     /// over an assistant response never grabs the box around it.
     pub content_ranges: Vec<Option<(usize, usize)>>,
+    /// Per-line [`LineChrome`] copy metadata, aligned with `lines`: the
+    /// display-column intervals of each row that are **non-selectable chrome**
+    /// (renderer-emitted, see [`LineChrome`]).  The selection/copy machinery
+    /// subtracts these from the row's `content_ranges` interval so a drag over
+    /// a block quote copies the text and never the `│ ` bar.  Empty for the
+    /// overwhelming majority of rows.
+    pub chrome_ranges: Vec<LineChrome>,
     /// Semantic-line index of the reasoning header line within `lines`,
     /// present iff the turn has non-whitespace reasoning content.  The
     /// index is stable across collapse/expand (the header is always the
@@ -250,6 +317,16 @@ const QUIET_TOOLS: &[&str] = &[
 /// the point — and remain expanded by default.
 pub(crate) fn tool_result_default_collapsed(record: &ToolResultRecord) -> bool {
     !record.is_error && QUIET_TOOLS.contains(&record.name.as_str())
+}
+
+/// Push `n` empty [`LineChrome`] entries onto `chrome`.
+///
+/// Used for the sources that do not yet emit chrome intervals (plain-text and
+/// ANSI tool bodies): they still need one aligned entry per emitted row so the
+/// chrome buffer stays in lockstep with `lines`/`joins` (Phase 0 records only
+/// empty chrome).
+fn push_empty_chrome(chrome: &mut Vec<LineChrome>, n: usize) {
+    chrome.extend(std::iter::repeat_with(LineChrome::default).take(n));
 }
 
 /// Render a complete Turn as styled lines suitable for the chat history.
@@ -309,18 +386,30 @@ pub(crate) fn render_turn_lines(
     // Per-line copy-join metadata, aligned with `all_lines` (see `LineJoin`).
     // The selection extraction uses this to undo the renderer's wrapping.
     let mut all_joins: Vec<LineJoin> = Vec::new();
+    // Per-line non-selectable-chrome metadata, aligned with `all_lines` (see
+    // `LineChrome`).  Phase 0 only plumbs the buffer end-to-end — every
+    // producer records an empty `LineChrome` — so the selection/copy path can
+    // later subtract renderer-emitted chrome without re-scanning span text.
+    let mut all_chrome: Vec<LineChrome> = Vec::new();
 
     // ── User text block (green accent) ───────────────────────
     // Rendered first so a failed request's transcript still shows what the
     // user asked for above the error that stopped it.
     if let Some(ref text) = turn.user_text {
-        let (body, body_joins) = markdown_lines_joined(text, content_width);
+        let (body, body_joins, body_chrome) = markdown_lines_joined(text, content_width);
         let timestamp_ms = Some(turn.created_at.as_millis());
-        let (margin_lines, _rows, margin_ranges, margin_joins) =
-            add_margin_lines(body, body_joins, content_width, Color::Green, timestamp_ms);
+        let (margin_lines, _rows, margin_ranges, margin_joins, margin_chrome) = add_margin_lines(
+            body,
+            body_joins,
+            body_chrome,
+            content_width,
+            Color::Green,
+            timestamp_ms,
+        );
         all_lines.extend(margin_lines);
         all_content_ranges.extend(margin_ranges);
         all_joins.extend(margin_joins);
+        all_chrome.extend(margin_chrome);
     }
 
     // ── Error block (red) ────────────────────────────────────
@@ -355,12 +444,14 @@ pub(crate) fn render_turn_lines(
             let width = line.width();
             all_content_ranges.push((width > 0).then_some((0, width)));
             all_joins.push(join);
+            all_chrome.push(LineChrome::default());
             all_lines.push(line);
         }
         return RenderedTurnLines {
             lines: all_lines,
             joins: all_joins,
             content_ranges: all_content_ranges,
+            chrome_ranges: all_chrome,
             reasoning_header_idx: None,
             tool_result_header_idxs: Vec::new(),
         };
@@ -384,6 +475,7 @@ pub(crate) fn render_turn_lines(
     if has_assistant {
         let mut body: Vec<Line<'static>> = Vec::new();
         let mut body_joins: Vec<LineJoin> = Vec::new();
+        let mut body_chrome: Vec<LineChrome> = Vec::new();
 
         let has_reasoning = turn
             .assistant_reasoning
@@ -398,9 +490,10 @@ pub(crate) fn render_turn_lines(
         if let Some(ref text) = turn.assistant_text {
             let trimmed = text.trim();
             if !trimmed.is_empty() {
-                let (lines, joins) = markdown_lines_joined(trimmed, content_width);
+                let (lines, joins, chrome) = markdown_lines_joined(trimmed, content_width);
                 body.extend(lines);
                 body_joins.extend(joins);
+                body_chrome.extend(chrome);
             }
         }
 
@@ -414,6 +507,7 @@ pub(crate) fn render_turn_lines(
                 // don't merge into one paragraph.
                 body.push(Line::from(Span::styled(String::new(), Style::default())));
                 body_joins.push(LineJoin::Break);
+                body_chrome.push(LineChrome::default());
             }
             let arrow = if reasoning_expanded { "▼" } else { "▶" };
             // Record the header's position *within the body* before pushing
@@ -426,10 +520,12 @@ pub(crate) fn render_turn_lines(
                 Span::styled("Reasoning", Style::default().fg(Color::Gray)),
             ]));
             body_joins.push(LineJoin::Break);
+            body_chrome.push(LineChrome::default());
             if reasoning_expanded && let Some(ref reasoning) = turn.assistant_reasoning {
-                let (lines, joins) = markdown_lines_joined(reasoning.trim(), content_width);
+                let (lines, joins, chrome) = markdown_lines_joined(reasoning.trim(), content_width);
                 body.extend(lines);
                 body_joins.extend(joins);
+                body_chrome.extend(chrome);
             }
             reasoning_header_idx =
                 Some(all_lines.len() + MARGIN_STRUCTURAL_ROWS / 2 + header_idx_in_body);
@@ -437,11 +533,19 @@ pub(crate) fn render_turn_lines(
 
         // If we have content, wrap with margin lines (no timestamp).
         if !body.is_empty() {
-            let (margin_lines, _rows, margin_ranges, margin_joins) =
-                add_margin_lines(body, body_joins, content_width, Color::Blue, None);
+            let (margin_lines, _rows, margin_ranges, margin_joins, margin_chrome) =
+                add_margin_lines(
+                    body,
+                    body_joins,
+                    body_chrome,
+                    content_width,
+                    Color::Blue,
+                    None,
+                );
             all_lines.extend(margin_lines);
             all_content_ranges.extend(margin_ranges);
             all_joins.extend(margin_joins);
+            all_chrome.extend(margin_chrome);
         }
     }
 
@@ -474,6 +578,7 @@ pub(crate) fn render_turn_lines(
 
         let mut body: Vec<Line<'static>> = Vec::new();
         let mut body_joins: Vec<LineJoin> = Vec::new();
+        let mut body_chrome: Vec<LineChrome> = Vec::new();
 
         // Invocation description rendered as markdown so inline code and
         // emphasis highlight properly.  Its first line becomes the header
@@ -482,8 +587,8 @@ pub(crate) fn render_turn_lines(
         // narrower than the content width because the header prepends the
         // triangle glyph ("▶ ") to the first line — wrapping at the full
         // width would push the header row past the right edge.
-        let (desc_lines, desc_joins) = if tr.invocation_description.is_empty() {
-            (Vec::new(), Vec::new())
+        let (desc_lines, desc_joins, desc_chrome) = if tr.invocation_description.is_empty() {
+            (Vec::new(), Vec::new(), Vec::new())
         } else {
             markdown_lines_joined(
                 &tr.invocation_description,
@@ -511,6 +616,7 @@ pub(crate) fn render_turn_lines(
         }
         body.push(Line::from(header_spans));
         body_joins.push(LineJoin::Break);
+        body_chrome.push(LineChrome::default());
         tool_result_header_idxs.push(all_lines.len() + header_idx_in_body);
 
         // Continuation lines of a multi-line invocation description are
@@ -523,6 +629,7 @@ pub(crate) fn render_turn_lines(
             // line above it.  Since desc[0] now lives on the header row, the
             // first continuation's join applies to the header row itself.
             body_joins.extend(desc_joins.into_iter().skip(1));
+            body_chrome.extend(desc_chrome.into_iter().skip(1));
         }
 
         // Expanded body only — a collapsed result is its header row plus
@@ -534,11 +641,13 @@ pub(crate) fn render_turn_lines(
             if desc_len > 0 {
                 body.push(Line::from(Span::styled(String::new(), Style::default())));
                 body_joins.push(LineJoin::Break);
+                body_chrome.push(LineChrome::default());
                 body.push(Line::from(Span::styled(
                     format!("{label}: {}", tr.name),
                     Style::default().fg(accent),
                 )));
                 body_joins.push(LineJoin::Break);
+                body_chrome.push(LineChrome::default());
             }
             // Full content body — rendered for every expanded result.  The
             // old hard "quiet" suppression is now just the default collapse
@@ -546,6 +655,7 @@ pub(crate) fn render_turn_lines(
             if !tr.content.is_empty() {
                 body.push(Line::from(Span::styled(String::new(), Style::default())));
                 body_joins.push(LineJoin::Break);
+                body_chrome.push(LineChrome::default());
                 // Terminal-safety gate: escape everything except SGR color
                 // sequences so hostile file/URL/shell bytes (OSC clipboard
                 // writes, CSI clears, bidi overrides, …) render as inert text
@@ -562,10 +672,12 @@ pub(crate) fn render_turn_lines(
                 // Content with ANSI escape codes gets colored rendering.
                 if content.contains("\x1b[") {
                     let (lines, joins) = ansi_lines_joined(&content, tool_content_width);
+                    push_empty_chrome(&mut body_chrome, lines.len());
                     body.extend(lines);
                     body_joins.extend(joins);
                 } else if tr.is_error {
                     let (lines, joins) = plain_text_lines_joined(&content, tool_content_width);
+                    push_empty_chrome(&mut body_chrome, lines.len());
                     body.extend(lines);
                     body_joins.extend(joins);
                 } else if MARKDOWN_TOOLS.contains(&tr.name.as_str()) {
@@ -577,11 +689,14 @@ pub(crate) fn render_turn_lines(
                     // is verbatim data and must NOT be re-interpreted as
                     // markdown (see MARKDOWN_TOOLS); there is no content-based
                     // diff or markdown auto-detection anymore.
-                    let (lines, joins) = markdown_lines_joined(&content, tool_content_width);
+                    let (lines, joins, chrome) =
+                        markdown_lines_joined(&content, tool_content_width);
                     body.extend(lines);
                     body_joins.extend(joins);
+                    body_chrome.extend(chrome);
                 } else {
                     let (lines, joins) = plain_text_lines_joined(&content, tool_content_width);
+                    push_empty_chrome(&mut body_chrome, lines.len());
                     body.extend(lines);
                     body_joins.extend(joins);
                 }
@@ -590,7 +705,12 @@ pub(crate) fn render_turn_lines(
 
         // No left indent (the 2-column margin was removed); every row spans
         // the full area width with exactly 1 column of right margin.
-        for (line, join) in body.into_iter().zip(body_joins) {
+        debug_assert_eq!(
+            body.len(),
+            body_chrome.len(),
+            "tool-body chrome must align with its rows"
+        );
+        for ((line, join), chrome) in body.into_iter().zip(body_joins).zip(body_chrome) {
             let mut line = line;
             // The row's copyable columns, computed before the trailing fill
             // spans are appended (so it is the code panel's right-edge fill,
@@ -613,6 +733,7 @@ pub(crate) fn render_turn_lines(
             let end = content_sum.min(tool_content_width as usize);
             all_content_ranges.push(copy.map(|(lo, hi)| (lo.min(end), hi.min(end))));
             all_joins.push(join);
+            all_chrome.push(chrome);
             all_lines.push(line);
         }
     }
@@ -622,12 +743,14 @@ pub(crate) fn render_turn_lines(
         all_lines.push(Line::from(Span::styled(String::new(), Style::default())));
         all_content_ranges.push(None);
         all_joins.push(LineJoin::Break);
+        all_chrome.push(LineChrome::default());
     }
 
     RenderedTurnLines {
         lines: all_lines,
         joins: all_joins,
         content_ranges: all_content_ranges,
+        chrome_ranges: all_chrome,
         reasoning_header_idx,
         tool_result_header_idxs,
     }
@@ -657,12 +780,14 @@ pub(crate) fn reasoning_expanded_default(turn: &Turn) -> bool {
 pub(crate) const MARGIN_STRUCTURAL_ROWS: usize = 4;
 
 /// Return type of [`add_margin_lines`]: the wrapped lines, their total
-/// height, and the per-line content column ranges and copy-join metadata.
+/// height, the per-line content column ranges, and the copy-join and
+/// copy-chrome metadata.
 type MarginLines = (
     Vec<Line<'static>>,
     usize,
     Vec<Option<(usize, usize)>>,
     Vec<LineJoin>,
+    Vec<LineChrome>,
 );
 
 /// Wrap content lines with a vertical accent bar on the left and dark-gray
@@ -674,10 +799,13 @@ type MarginLines = (
 /// fill), `None` for the structural chrome rows (separator, padding).  The
 /// per-line [`LineJoin`] metadata is carried through unchanged: structural
 /// chrome rows are fresh lines, content rows keep the join their producer
-/// gave them.
+/// gave them.  The [`LineChrome`] buffer is carried through the same way
+/// (Phase 0 leaves it empty; translating the inner intervals by the gutter's
+/// 5-column prefix is a later phase).
 fn add_margin_lines(
     lines: Vec<Line<'static>>,
     joins: Vec<LineJoin>,
+    chrome: Vec<LineChrome>,
     content_width: u16,
     accent: Color,
     timestamp_ms: Option<i64>,
@@ -710,14 +838,17 @@ fn add_margin_lines(
     let mut content_ranges: Vec<Option<(usize, usize)>> =
         Vec::with_capacity(lines.len() + MARGIN_STRUCTURAL_ROWS);
     let mut box_joins: Vec<LineJoin> = Vec::with_capacity(lines.len() + MARGIN_STRUCTURAL_ROWS);
+    let mut box_chrome: Vec<LineChrome> = Vec::with_capacity(lines.len() + MARGIN_STRUCTURAL_ROWS);
     result.push(separator);
     content_ranges.push(None);
     box_joins.push(LineJoin::Break);
+    box_chrome.push(LineChrome::default());
     result.push(padding.clone());
     content_ranges.push(None);
     box_joins.push(LineJoin::Break);
+    box_chrome.push(LineChrome::default());
 
-    for (line, join) in lines.into_iter().zip(joins) {
+    for ((line, join), chrome) in lines.into_iter().zip(joins).zip(chrome) {
         let text_width = line.width();
         // The row's copyable columns, computed from the raw line before its
         // spans are restyled with the message background below.  `None` marks a
@@ -751,11 +882,14 @@ fn add_margin_lines(
         // `"  ┃  "` gutter (2-col margin + gutter + 2-col shading = 5 columns).
         content_ranges.push(copy.map(|(lo, hi)| (5 + lo, 5 + hi)));
         box_joins.push(join);
+        // Carry the producer's chrome intervals through (Phase 0: empty).
+        box_chrome.push(chrome);
     }
 
     result.push(padding);
     content_ranges.push(None);
     box_joins.push(LineJoin::Break);
+    box_chrome.push(LineChrome::default());
 
     // Bottom separator: right-aligned timestamp (user messages only).
     if let Some(ms) = timestamp_ms {
@@ -784,9 +918,10 @@ fn add_margin_lines(
     }
     content_ranges.push(None);
     box_joins.push(LineJoin::Break);
+    box_chrome.push(LineChrome::default());
 
     let total_rows = result.len();
-    (result, total_rows, content_ranges, box_joins)
+    (result, total_rows, content_ranges, box_joins, box_chrome)
 }
 
 #[cfg(test)]
@@ -795,13 +930,13 @@ pub(crate) fn markdown_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
 }
 
 /// [`markdown_lines`] plus the per-line [`LineJoin`] copy metadata (see the
-/// enum docs).  Wrapped continuations of one paragraph rejoin with a space;
-/// paragraph/section boundaries, list items, code lines, and table rows are
-/// fresh lines.
+/// enum docs) and the aligned per-line [`LineChrome`] buffer.  Wrapped
+/// continuations of one paragraph rejoin with a space; paragraph/section
+/// boundaries, list items, code lines, and table rows are fresh lines.
 pub(crate) fn markdown_lines_joined(
     markdown: &str,
     width: u16,
-) -> (Vec<Line<'static>>, Vec<LineJoin>) {
+) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
     let document = MarkdownDocument::parse(markdown);
     // Normalize heading levels so the document's first heading always renders
     // as level 1.  LLM output sometimes starts a document at `##` (or deeper)
@@ -812,10 +947,12 @@ pub(crate) fn markdown_lines_joined(
         first_heading_level(&document.blocks).map_or(0, |level| (level.saturating_sub(1)) as usize);
     let mut lines = Vec::new();
     let mut joins = Vec::new();
+    let mut chrome = Vec::new();
     render_markdown_blocks(
         &document.blocks,
         &mut lines,
         &mut joins,
+        &mut chrome,
         0,
         width as usize,
         heading_shift,
@@ -823,16 +960,19 @@ pub(crate) fn markdown_lines_joined(
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(String::new(), Style::default())));
         joins.push(LineJoin::Break);
+        chrome.push(LineChrome::default());
     }
     while matches!(lines.last(), Some(line) if line_is_blank(line)) {
         lines.pop();
         joins.pop();
+        chrome.pop();
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(String::new(), Style::default())));
         joins.push(LineJoin::Break);
+        chrome.push(LineChrome::default());
     }
-    (lines, joins)
+    (lines, joins, chrome)
 }
 
 /// True when a rendered line is visually blank: every span is empty or
@@ -854,12 +994,18 @@ fn ensure_blank_line(lines: &mut Vec<Line<'static>>) {
     }
 }
 
-/// [`ensure_blank_line`] keeping the per-line [`LineJoin`] vector aligned:
-/// every blank row it inserts is a fresh line ([`LineJoin::Break`]).
-fn ensure_blank_line_joined(lines: &mut Vec<Line<'static>>, joins: &mut Vec<LineJoin>) {
+/// [`ensure_blank_line`] keeping the per-line [`LineJoin`] and [`LineChrome`]
+/// vectors aligned: every blank row it inserts is a fresh line
+/// ([`LineJoin::Break`]) carrying no chrome ([`LineChrome::default`]).
+fn ensure_blank_line_joined(
+    lines: &mut Vec<Line<'static>>,
+    joins: &mut Vec<LineJoin>,
+    chrome: &mut Vec<LineChrome>,
+) {
     if lines.last().is_none_or(|l| !line_is_blank(l)) {
         lines.push(Line::from(Span::styled(String::new(), Style::default())));
         joins.push(LineJoin::Break);
+        chrome.push(LineChrome::default());
     }
 }
 

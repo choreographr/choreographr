@@ -976,7 +976,7 @@ pub(crate) fn session_detail_tokens_line(usage: &TokenUsage) -> String {
 mod tests {
     use super::*;
     use crate::markdown_render::{
-        LineJoin, RenderedTurnLines, compute_visual_offsets, lines_height,
+        LineChrome, LineJoin, RenderedTurnLines, compute_visual_offsets, lines_height,
     };
     use crate::state::{RenderCacheKey, RenderedCache, RenderedTurn};
 
@@ -987,10 +987,14 @@ mod tests {
         // fixtures too (each entry must align with `lines`).
         let joins = lines.iter().map(|_| LineJoin::Break).collect();
         let content_ranges = lines.iter().map(|l| Some((0, l.width()))).collect();
+        // Empty chrome for every row keeps the third aligned buffer in
+        // lockstep with `lines` (see the alignment asserts).
+        let chrome_ranges = lines.iter().map(|_| LineChrome::default()).collect();
         RenderedTurnLines {
             lines,
             joins,
             content_ranges,
+            chrome_ranges,
             reasoning_header_idx: None,
             tool_result_header_idxs: Vec::new(),
         }
@@ -1015,6 +1019,11 @@ mod tests {
             .iter()
             .map(|l| Some((0, l.width())))
             .collect::<Vec<_>>();
+        // Keep the chrome buffer aligned with the lines too (empty rows).
+        let chrome_ranges = lines
+            .iter()
+            .map(|_| LineChrome::default())
+            .collect::<Vec<_>>();
         RenderedCache {
             key,
             rendered: RenderedTurn {
@@ -1023,6 +1032,7 @@ mod tests {
                 visual_offsets,
                 joins: Arc::from(joins),
                 content_ranges: Arc::from(content_ranges),
+                chrome_ranges: Arc::from(chrome_ranges),
                 reasoning_header_idx: None,
                 tool_result_header_idxs: Vec::new(),
             },
@@ -1518,6 +1528,7 @@ mod tests {
                 visual_offsets: Arc::from([1]),
                 joins: Arc::from([LineJoin::Break]),
                 content_ranges: Arc::from([Some((0, 5))]),
+                chrome_ranges: Arc::from([LineChrome::default()]),
                 reasoning_header_idx: None,
                 tool_result_header_idxs: vec![0],
             },

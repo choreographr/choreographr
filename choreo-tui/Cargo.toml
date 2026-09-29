@@ -31,6 +31,11 @@ ratatui-image = { version = "11", default-features = false, features = ["crosste
 signal-hook.workspace = true
 resvg.workspace = true
 syntect = "5.3"
+# Small-vector storage for the renderer's per-line copy-chrome metadata
+# (`LineChrome`): the overwhelmingly common case is empty, and a `SmallVec`
+# keeps that allocation-free while still allowing multiple intervals on the
+# rare nested-chrome row.  Only choreo-tui uses it, so it stays crate-local.
+smallvec = "1.16.2"
 choreo-client-core.workspace = true
 choreo-keystore.workspace = true
 postcard.workspace = true

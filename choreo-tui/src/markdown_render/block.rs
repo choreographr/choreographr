@@ -3,10 +3,10 @@
 
 use super::{
     CODE_BG, CODE_PANEL_BOTTOM, CODE_PANEL_PAD, CODE_PANEL_TOP, Color, GlobalLruCache,
-    HighlightLines, Line, LineJoin, MarkdownBlock, Modifier, QUOTE_BAR, QUOTE_BAR_COLOR, Span,
-    Style, debug, display_width, ensure_blank_line_joined, heading_prefix, highlight_theme,
-    inlines_to_lines, pad_marker, render_table_lines, syntax_set, to_ratatui_color,
-    try_render_diff_content, wrap_styled_line_joined,
+    HighlightLines, Line, LineChrome, LineJoin, MarkdownBlock, Modifier, QUOTE_BAR,
+    QUOTE_BAR_COLOR, Span, Style, debug, display_width, ensure_blank_line_joined, heading_prefix,
+    highlight_theme, inlines_to_lines, pad_marker, render_table_lines, syntax_set,
+    to_ratatui_color, try_render_diff_content, wrap_styled_line_joined,
 };
 pub(crate) fn find_syntax<'a>(
     ss: &'a syntect::parsing::SyntaxSet,
@@ -71,6 +71,7 @@ fn render_code_panel(
     code: &str,
     lines: &mut Vec<Line<'static>>,
     joins: &mut Vec<LineJoin>,
+    chrome: &mut Vec<LineChrome>,
     indent: usize,
     width: usize,
 ) {
@@ -131,6 +132,10 @@ fn render_code_panel(
         row.extend(spans);
         lines.push(Line::from(row));
         joins.push(join);
+        // Code-panel rows carry no renderer-emitted chrome yet (the panel's
+        // padding/fill is still recognised by `copyable_columns`); keep the
+        // buffer aligned with a default entry.
+        chrome.push(LineChrome::default());
     };
 
     // ── Top padding: panel colour in the row's lower half ──
@@ -193,17 +198,24 @@ fn render_code_panel(
 
 // ── Public API ────────────────────────────────────────────────────────────
 
+/// One rendered list item: its padded marker, its rendered rows, and the
+/// aligned per-row [`LineJoin`]/[`LineChrome`] metadata.  A named alias keeps
+/// the four-element tuple out of the `rendered_items` declaration (past the
+/// `clippy::type_complexity` bar) and gives the tuple one place to evolve.
+type RenderedItem = (String, Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>);
+
 pub(crate) fn render_markdown_blocks(
     blocks: &[MarkdownBlock],
     lines: &mut Vec<Line<'static>>,
     joins: &mut Vec<LineJoin>,
+    chrome: &mut Vec<LineChrome>,
     indent: usize,
     width: usize,
     heading_shift: usize,
 ) {
     for (index, block) in blocks.iter().enumerate() {
         if index > 0 {
-            ensure_blank_line_joined(lines, joins);
+            ensure_blank_line_joined(lines, joins, chrome);
         }
         // Headings get a *second* blank line for extra visual separation —
         // except when the heading is the first block (index 0) of the
@@ -213,8 +225,9 @@ pub(crate) fn render_markdown_blocks(
         if index > 0 && matches!(block, MarkdownBlock::Heading { .. }) {
             lines.push(Line::from(Span::styled(String::new(), Style::default())));
             joins.push(LineJoin::Break);
+            chrome.push(LineChrome::default());
         }
-        render_markdown_block(block, lines, joins, indent, width, heading_shift);
+        render_markdown_block(block, lines, joins, chrome, indent, width, heading_shift);
     }
 }
 
@@ -222,16 +235,18 @@ pub(crate) fn render_markdown_block(
     block: &MarkdownBlock,
     lines: &mut Vec<Line<'static>>,
     joins: &mut Vec<LineJoin>,
+    chrome: &mut Vec<LineChrome>,
     indent: usize,
     width: usize,
     heading_shift: usize,
 ) {
     match block {
         MarkdownBlock::Paragraph(content) => {
-            let (para_lines, para_joins) =
+            let (para_lines, para_joins, para_chrome) =
                 inlines_to_lines(content, indent, None, width, Modifier::empty());
             lines.extend(para_lines);
             joins.extend(para_joins);
+            chrome.extend(para_chrome);
         }
         MarkdownBlock::Heading { level, content } => {
             // Normalize the raw markdown level by the document-wide shift so
@@ -239,7 +254,7 @@ pub(crate) fn render_markdown_block(
             let normalized = (*level as usize).saturating_sub(heading_shift).max(1);
             let prefix = heading_prefix(normalized);
             // Headings are rendered bold + underlined for visual distinction.
-            let (heading_lines, heading_joins) = inlines_to_lines(
+            let (heading_lines, heading_joins, heading_chrome) = inlines_to_lines(
                 content,
                 indent,
                 prefix.as_deref(),
@@ -248,6 +263,7 @@ pub(crate) fn render_markdown_block(
             );
             lines.extend(heading_lines);
             joins.extend(heading_joins);
+            chrome.extend(heading_chrome);
         }
         MarkdownBlock::CodeBlock { language, code } => {
             // A ` ```diff ` fence is an explicit opt-in: the emitting tool
@@ -285,6 +301,7 @@ pub(crate) fn render_markdown_block(
                         // reflowed and never space-joined — so the copy
                         // reproduces the diff verbatim.
                         joins.push(LineJoin::Break);
+                        chrome.push(LineChrome::default());
                     }
                     return;
                 }
@@ -294,11 +311,20 @@ pub(crate) fn render_markdown_block(
                 );
             }
 
-            render_code_panel(language.as_deref(), code, lines, joins, indent, width);
+            render_code_panel(
+                language.as_deref(),
+                code,
+                lines,
+                joins,
+                chrome,
+                indent,
+                width,
+            );
         }
         MarkdownBlock::BlockQuote(blocks) => {
             let mut quoted = Vec::new();
             let mut quoted_joins = Vec::new();
+            let mut quoted_chrome = Vec::new();
             // Content is rendered at (width - indent - 2) so that when the
             // `QUOTE_BAR` gutter and the outer indent are prepended on each
             // line the total stays within `width`.
@@ -306,11 +332,14 @@ pub(crate) fn render_markdown_block(
                 blocks,
                 &mut quoted,
                 &mut quoted_joins,
+                &mut quoted_chrome,
                 0,
                 width.saturating_sub(indent + 2),
                 heading_shift,
             );
-            for (line, _inner_join) in quoted.into_iter().zip(quoted_joins) {
+            for ((line, _inner_join), inner_chrome) in
+                quoted.into_iter().zip(quoted_joins).zip(quoted_chrome)
+            {
                 // Quoted text is dimmed with ITALIC so it reads as secondary to
                 // the surrounding prose.  Inline code and math carry their own
                 // foreground colour (Cyan/Yellow/Magenta), so they are left
@@ -342,6 +371,9 @@ pub(crate) fn render_markdown_block(
                 // into one line would merge the gutters into the text.
                 // Copying proceeds row by row.
                 joins.push(LineJoin::Break);
+                // Carry the inner chrome through (Phase 0: empty; the bar
+                // interval and the indent shift are a later phase).
+                chrome.push(inner_chrome);
             }
         }
         MarkdownBlock::List {
@@ -377,8 +409,7 @@ pub(crate) fn render_markdown_block(
             } else {
                 display_width("• ")
             };
-            let mut rendered_items: Vec<(String, Vec<Line<'static>>, Vec<LineJoin>)> =
-                Vec::with_capacity(items.len());
+            let mut rendered_items: Vec<RenderedItem> = Vec::with_capacity(items.len());
             for (index, item) in items.iter().enumerate() {
                 let marker = if *ordered {
                     // saturating_add: a huge literal list start must render,
@@ -395,6 +426,7 @@ pub(crate) fn render_markdown_block(
                 let marker = pad_marker(&marker, max_marker_width);
                 let mut rendered = Vec::new();
                 let mut rendered_joins = Vec::new();
+                let mut rendered_chrome = Vec::new();
                 // Content is rendered at (width - indent - max_marker_width):
                 // with every marker padded to that width, a first line totals
                 // exactly `width`, and continuation lines (indented to the same
@@ -403,11 +435,12 @@ pub(crate) fn render_markdown_block(
                     item,
                     &mut rendered,
                     &mut rendered_joins,
+                    &mut rendered_chrome,
                     0,
                     width.saturating_sub(indent + max_marker_width),
                     heading_shift,
                 );
-                rendered_items.push((marker, rendered, rendered_joins));
+                rendered_items.push((marker, rendered, rendered_joins, rendered_chrome));
             }
 
             // Strict majority: more than half of the items must be multi-line
@@ -415,11 +448,11 @@ pub(crate) fn render_markdown_block(
             // stays tight because 1 * 2 == 2 is not > 2.
             let multi_line_count = rendered_items
                 .iter()
-                .filter(|(_, rendered, _)| rendered.len() > 1)
+                .filter(|(_, rendered, _, _)| rendered.len() > 1)
                 .count();
             let spaced = multi_line_count * 2 > items.len();
 
-            for (index, (marker, rendered, rendered_joins)) in
+            for (index, (marker, rendered, rendered_joins, rendered_chrome)) in
                 rendered_items.into_iter().enumerate()
             {
                 // All continuation lines align under the widest marker so wrapped
@@ -431,8 +464,11 @@ pub(crate) fn render_markdown_block(
                 // carries the marker) is consumed with its join — each item
                 // starts a fresh line, whatever the inner renderer said about
                 // its first line is superseded.
-                let mut zipped = rendered.into_iter().zip(rendered_joins);
-                if let Some((first, _first_join)) = zipped.next() {
+                let mut zipped = rendered
+                    .into_iter()
+                    .zip(rendered_joins)
+                    .zip(rendered_chrome);
+                if let Some(((first, _first_join), first_chrome)) = zipped.next() {
                     let mut spans = vec![Span::styled(
                         format!("{}{}", " ".repeat(indent), marker),
                         Style::default(),
@@ -440,11 +476,15 @@ pub(crate) fn render_markdown_block(
                     spans.extend(first.spans.clone());
                     lines.push(Line::from(spans));
                     joins.push(LineJoin::Break);
+                    // Carry the inner chrome through (Phase 0: empty; shifting
+                    // it right by the marker width is a later phase).
+                    chrome.push(first_chrome);
                 } else {
                     lines.push(indented_line(indent, marker));
                     joins.push(LineJoin::Break);
+                    chrome.push(LineChrome::default());
                 }
-                for (line, join) in zipped {
+                for ((line, join), inner_chrome) in zipped {
                     let mut spans = vec![Span::styled(
                         " ".repeat(continuation_indent),
                         Style::default(),
@@ -455,6 +495,7 @@ pub(crate) fn render_markdown_block(
                     // Space/Join exactly as the inner renderer recorded
                     // (their predecessor's text is the line above them).
                     joins.push(join);
+                    chrome.push(inner_chrome);
                 }
 
                 // Blank line between items only when the list is spaced out as
@@ -462,7 +503,7 @@ pub(crate) fn render_markdown_block(
                 // consecutive blanks collapse into one (e.g. when a spaced
                 // item ends with a nested list that already produced a blank).
                 if index + 1 < items.len() && spaced {
-                    ensure_blank_line_joined(lines, joins);
+                    ensure_blank_line_joined(lines, joins, chrome);
                 }
             }
 
@@ -477,7 +518,7 @@ pub(crate) fn render_markdown_block(
             // block, so the rule is invisible everywhere except the boundary
             // that was previously missing it.
             if !items.is_empty() {
-                ensure_blank_line_joined(lines, joins);
+                ensure_blank_line_joined(lines, joins, chrome);
             }
         }
         MarkdownBlock::Table {
@@ -485,14 +526,16 @@ pub(crate) fn render_markdown_block(
             header,
             rows,
         } => {
-            let (table_lines, table_joins) =
+            let (table_lines, table_joins, table_chrome) =
                 render_table_lines(alignments, header, rows, indent, width);
             lines.extend(table_lines);
             joins.extend(table_joins);
+            chrome.extend(table_chrome);
         }
         MarkdownBlock::Rule => {
             lines.push(indented_line(indent, "---".to_string()));
             joins.push(LineJoin::Break);
+            chrome.push(LineChrome::default());
         }
     }
 }

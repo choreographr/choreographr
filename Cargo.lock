@@ -3175,6 +3175,7 @@ dependencies = [
  "resvg",
  "serde",
  "signal-hook 0.4.4",
+ "smallvec",
  "syntect",
  "tempfile",
  "tracing",
@@ -12849,9 +12850,9 @@ dependencies = [
 
 [[package]]
 name = "smallvec"
-version = "1.16.1"
+version = "1.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
+checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 dependencies = [
  "serde",
 ]

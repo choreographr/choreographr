@@ -2,7 +2,7 @@
 //! styled spans, with wrapping.
 
 use super::{
-    Color, Line, LineJoin, MarkdownInline, Modifier, Span, Style, display_width,
+    Color, Line, LineChrome, LineJoin, MarkdownInline, Modifier, Span, Style, display_width,
     render_math_pretty, split_word_to_width, wrap_plain_line,
 };
 pub(crate) fn inlines_to_lines(
@@ -11,9 +11,10 @@ pub(crate) fn inlines_to_lines(
     prefix: Option<&str>,
     width: usize,
     modifier: Modifier,
-) -> (Vec<Line<'static>>, Vec<LineJoin>) {
+) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
     let mut lines = Vec::new();
     let mut joins = Vec::new();
+    let mut chrome = Vec::new();
     let mut current_spans: Vec<Span<'static>> = Vec::new();
     let mut current_width: usize = 0;
     if indent > 0 {
@@ -29,6 +30,7 @@ pub(crate) fn inlines_to_lines(
         let mut ctx = RenderCtx {
             lines: &mut lines,
             joins: &mut joins,
+            chrome: &mut chrome,
             current: &mut current_spans,
             current_width: &mut current_width,
             needs_separator: &mut needs_separator,
@@ -46,8 +48,9 @@ pub(crate) fn inlines_to_lines(
     if !current_spans.is_empty() || lines.is_empty() {
         lines.push(Line::from(std::mem::take(&mut current_spans)));
         joins.push(final_join);
+        chrome.push(LineChrome::default());
     }
-    (lines, joins)
+    (lines, joins, chrome)
 }
 
 /// Bundles all mutable state and parameters needed to render a flat list of
@@ -64,6 +67,9 @@ pub(crate) struct RenderCtx<'a> {
     lines: &'a mut Vec<Line<'static>>,
     /// Per-line [`LineJoin`] copy metadata, pushed in lockstep with `lines`.
     joins: &'a mut Vec<LineJoin>,
+    /// Per-line [`LineChrome`] copy metadata, pushed in lockstep with `lines`.
+    /// Phase 0 only ever pushes empty values (see [`LineChrome`]).
+    chrome: &'a mut Vec<LineChrome>,
     /// Spans being accumulated for the line currently being built.
     current: &'a mut Vec<Span<'static>>,
     /// Display width of `current` (updated alongside every push).
@@ -108,6 +114,7 @@ impl RenderCtx<'_> {
     fn flush_line_with_next(&mut self, next_join: LineJoin) {
         self.lines.push(Line::from(std::mem::take(self.current)));
         self.joins.push(self.current_join);
+        self.chrome.push(LineChrome::default());
         *self.current_width = self.indent;
         if self.indent > 0 {
             self.current
@@ -346,6 +353,7 @@ pub(crate) fn render_display_math(text: &str, ctx: &mut RenderCtx) {
         spans.push(Span::styled(body.to_string(), style));
         ctx.lines.push(Line::from(spans));
         ctx.joins.push(LineJoin::Break);
+        ctx.chrome.push(LineChrome::default());
     } else if !body.is_empty() {
         // Too wide for one line: wrap left-aligned at the content width.  The
         // equation is still one visual block, so every continuation row is a
@@ -358,6 +366,7 @@ pub(crate) fn render_display_math(text: &str, ctx: &mut RenderCtx) {
             spans.push(Span::styled(chunk, style));
             ctx.lines.push(Line::from(spans));
             ctx.joins.push(LineJoin::Break);
+            ctx.chrome.push(LineChrome::default());
         }
     }
 

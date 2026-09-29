@@ -2,8 +2,8 @@
 //! cell wrapping, and alignment.
 
 use super::{
-    Line, LineJoin, MarkdownAlignment, MarkdownInline, Modifier, Span, Style, display_width,
-    indented_line, indented_styled_line, render_math_pretty, split_word_to_width,
+    Line, LineChrome, LineJoin, MarkdownAlignment, MarkdownInline, Modifier, Span, Style,
+    display_width, indented_line, indented_styled_line, render_math_pretty, split_word_to_width,
 };
 // ── Table rendering ───────────────────────────────────────────────────────
 
@@ -37,7 +37,7 @@ pub(crate) fn render_table_lines(
     rows: &[Vec<Vec<MarkdownInline>>],
     indent: usize,
     width: usize,
-) -> (Vec<Line<'static>>, Vec<LineJoin>) {
+) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
     let column_count = alignments
         .len()
         .max(header.len())
@@ -46,6 +46,7 @@ pub(crate) fn render_table_lines(
         return (
             vec![Line::from(Span::styled(String::new(), Style::default()))],
             vec![LineJoin::Break],
+            vec![LineChrome::default()],
         );
     }
     let mut table_rows = Vec::with_capacity(rows.len() + 1);
@@ -76,6 +77,7 @@ pub(crate) fn render_table_lines(
     let header_alignment = normalized_alignments(alignments, column_count);
     let mut lines = Vec::new();
     let mut joins = Vec::new();
+    let mut chrome = Vec::new();
     lines.push(table_border_line(
         TABLE_BORDERS.top_left,
         TABLE_BORDERS.top_mid,
@@ -84,9 +86,10 @@ pub(crate) fn render_table_lines(
         indent,
     ));
     joins.push(LineJoin::Break);
+    chrome.push(LineChrome::default());
     // The header row is the table's first row and the only one drawn bold —
     // the same emphasis nushell gives its column headers.
-    let (header_lines, header_joins) = table_rows
+    let (header_lines, header_joins, header_chrome) = table_rows
         .first()
         .map(|row| {
             render_table_row_wrapped(row, &widths, &header_alignment, indent, Modifier::BOLD)
@@ -94,18 +97,22 @@ pub(crate) fn render_table_lines(
         .unwrap_or_default();
     lines.extend(header_lines);
     joins.extend(header_joins);
+    chrome.extend(header_chrome);
     lines.push(table_separator_line(&widths, indent));
     joins.push(LineJoin::Break);
+    chrome.push(LineChrome::default());
     for (index, row) in table_rows.iter().enumerate().skip(1) {
-        let (row_lines, row_joins) =
+        let (row_lines, row_joins, row_chrome) =
             render_table_row_wrapped(row, &widths, &header_alignment, indent, Modifier::empty());
         lines.extend(row_lines);
         joins.extend(row_joins);
+        chrome.extend(row_chrome);
         if index < table_rows.len() - 1 {
             // Inter-row junctions stay square: nushell's rounded preset
             // rounds only the outer corners, never the T-junctions.
             lines.push(table_border_line('├', '┼', '┤', &widths, indent));
             joins.push(LineJoin::Break);
+            chrome.push(LineChrome::default());
         }
     }
     lines.push(table_border_line(
@@ -116,7 +123,8 @@ pub(crate) fn render_table_lines(
         indent,
     ));
     joins.push(LineJoin::Break);
-    (lines, joins)
+    chrome.push(LineChrome::default());
+    (lines, joins, chrome)
 }
 
 pub(crate) fn normalized_alignments(
@@ -213,7 +221,7 @@ pub(crate) fn render_table_row_wrapped(
     alignments: &[MarkdownAlignment],
     indent: usize,
     modifier: Modifier,
-) -> (Vec<Line<'static>>, Vec<LineJoin>) {
+) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
     let wrapped_cells: Vec<Vec<String>> = row
         .iter()
         .zip(widths.iter())
@@ -253,7 +261,10 @@ pub(crate) fn render_table_row_wrapped(
     // the cell borders and padding are per-row rendering chrome that must
     // not be re-glueed into a paragraph.
     let joins = vec![LineJoin::Break; lines.len()];
-    (lines, joins)
+    // No renderer-emitted chrome yet (borders are still handled by the copy
+    // path); keep the buffer aligned with one default entry per row.
+    let chrome = vec![LineChrome::default(); lines.len()];
+    (lines, joins, chrome)
 }
 
 pub(crate) fn wrap_cell_text(text: &str, width: usize) -> Vec<String> {

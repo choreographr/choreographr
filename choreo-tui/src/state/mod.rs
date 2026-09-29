@@ -22,8 +22,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::markdown_render::{
-    LineJoin, RenderedTurnLines, compute_visual_offsets, lines_height, plain_text_lines,
-    reasoning_expanded_default, render_turn_lines, tool_result_default_collapsed,
+    LineChrome, LineJoin, RenderedTurnLines, compute_visual_offsets, lines_height,
+    plain_text_lines, reasoning_expanded_default, render_turn_lines, tool_result_default_collapsed,
 };
 
 // The input-editing key types are referenced only from the test module
@@ -173,6 +173,16 @@ pub(crate) struct RenderedTurn {
     /// Mouse selection clamps its highlight and its copy to these ranges so
     /// a drag never captures UI chrome (the `┃` gutter, indents, fill).
     pub content_ranges: Arc<[Option<(usize, usize)>]>,
+    /// Per-line [`LineChrome`] copy metadata aligned with `lines` — see
+    /// [`RenderedTurnLines::chrome_ranges`].  The selection/copy machinery
+    /// subtracts these non-selectable-chrome intervals from each row's
+    /// `content_ranges` interval so a drag over a block quote never copies the
+    /// `│ ` bar.  Empty for the overwhelming majority of rows.
+    #[expect(
+        dead_code,
+        reason = "the selection/copy path consumes this in a later phase; Phase 0 only plumbs the buffer"
+    )]
+    pub chrome_ranges: Arc<[LineChrome]>,
     /// Semantic-line index of the reasoning header within `lines` (see
     /// [`RenderedTurnLines`]), so click hit-testing never re-scans the
     /// rendered output.
@@ -214,6 +224,7 @@ pub(crate) fn cached_or_compute_lines(
     let lines: Arc<[Line<'static>]> = Arc::from(rendered.lines);
     let joins: Arc<[LineJoin]> = Arc::from(rendered.joins);
     let content_ranges: Arc<[Option<(usize, usize)>]> = Arc::from(rendered.content_ranges);
+    let chrome_ranges: Arc<[LineChrome]> = Arc::from(rendered.chrome_ranges);
     let visual_offsets = compute_visual_offsets(&lines, key.viewport_width);
     // Pin the parallel-array invariant the selection machinery relies on:
     // every rendered line must carry a content range (`None` marks
@@ -231,12 +242,18 @@ pub(crate) fn cached_or_compute_lines(
         "visual offsets must stay aligned with the rendered lines"
     );
     debug_assert_eq!(joins.len(), lines.len(), "joins must align with the lines");
+    debug_assert_eq!(
+        chrome_ranges.len(),
+        lines.len(),
+        "chrome ranges must align with the lines"
+    );
     let turn = RenderedTurn {
         height: lines_height(&lines, key.viewport_width).max(1),
         visual_offsets,
         lines,
         joins,
         content_ranges,
+        chrome_ranges,
         reasoning_header_idx: rendered.reasoning_header_idx,
         tool_result_header_idxs: rendered.tool_result_header_idxs,
     };
@@ -2211,11 +2228,17 @@ impl SessionDisplayState {
                 rendered.content_ranges.len(),
                 "content ranges must align with the lines"
             );
+            debug_assert_eq!(
+                rendered.lines.len(),
+                rendered.chrome_ranges.len(),
+                "chrome ranges must align with the lines"
+            );
             let text_lines = rendered.lines;
             let text_height = lines_height(&text_lines, viewport.width).max(1);
             let visual_offsets = compute_visual_offsets(&text_lines, viewport.width);
             let content_ranges = Arc::from(rendered.content_ranges);
             let joins = Arc::from(rendered.joins);
+            let chrome_ranges = Arc::from(rendered.chrome_ranges);
 
             // Keep the reasoning header's click-hit range and the precomputed
             // default in sync as the response streams — the header sits below
@@ -2273,6 +2296,7 @@ impl SessionDisplayState {
                     visual_offsets,
                     joins,
                     content_ranges,
+                    chrome_ranges,
                     reasoning_header_idx: rendered.reasoning_header_idx,
                     tool_result_header_idxs: rendered.tool_result_header_idxs,
                 },
@@ -4724,6 +4748,7 @@ mod tests {
                 visual_offsets: Arc::from([1]),
                 joins: Arc::from([LineJoin::Break]),
                 content_ranges: Arc::from([Some((0, 5))]),
+                chrome_ranges: Arc::from([LineChrome::default()]),
                 reasoning_header_idx: None,
                 tool_result_header_idxs: vec![],
             },
@@ -4978,6 +5003,7 @@ mod tests {
                 visual_offsets: Arc::from([1]),
                 joins: Arc::from([LineJoin::Break]),
                 content_ranges: Arc::from([Some((0, 5))]),
+                chrome_ranges: Arc::from([LineChrome::default()]),
                 reasoning_header_idx: None,
                 tool_result_header_idxs: vec![0],
             },
@@ -5711,6 +5737,7 @@ mod tests {
                     visual_offsets: Arc::from([]),
                     joins: Arc::from([]),
                     content_ranges: Arc::from([]),
+                    chrome_ranges: Arc::from([]),
                     reasoning_header_idx: None,
                     tool_result_header_idxs: vec![],
                 },
@@ -5761,6 +5788,7 @@ mod tests {
                     visual_offsets: Arc::from([]),
                     joins: Arc::from([]),
                     content_ranges: Arc::from([]),
+                    chrome_ranges: Arc::from([]),
                     reasoning_header_idx: None,
                     tool_result_header_idxs: vec![],
                 },

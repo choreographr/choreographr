@@ -398,7 +398,7 @@ fn markdown_lines_code_block_no_language() {
 
 #[test]
 fn code_panel_copy_ranges_trim_chrome() {
-    let (lines, _joins) = markdown_lines_joined("```rust\nfn main() {}\n```", 80);
+    let (lines, _joins, _chrome) = markdown_lines_joined("```rust\nfn main() {}\n```", 80);
     // Row 0 top margin, 1 language tag, 2 blank padding, 3 code, 4 bottom
     // margin (the fence interior's trailing newline is stripped, so there is no
     // trailing blank row).
@@ -432,7 +432,7 @@ fn code_panel_copy_ranges_trim_chrome() {
 
 #[test]
 fn code_panel_margins_are_half_blocks_in_panel_colour() {
-    let (lines, _joins) = markdown_lines_joined("```x\nlet x = 1;\n```", 80);
+    let (lines, _joins, _chrome) = markdown_lines_joined("```x\nlet x = 1;\n```", 80);
     let top = &lines[0];
     assert!(
         top.spans
@@ -459,7 +459,7 @@ fn code_panel_margins_are_half_blocks_in_panel_colour() {
 
 #[test]
 fn code_panel_language_tag_is_bold() {
-    let (lines, _joins) = markdown_lines_joined("```rust\nlet x = 1;\n```", 80);
+    let (lines, _joins, _chrome) = markdown_lines_joined("```rust\nlet x = 1;\n```", 80);
     // Row 1 is the language tag row.
     let label_row = &lines[1];
     assert!(
@@ -475,7 +475,7 @@ fn code_panel_hugs_code_width() {
     // A single short line with no language tag: the panel is the code (3 cols)
     // plus one column of padding each side (2) = 5, and every row — margins
     // included — spans exactly that width.
-    let (lines, _joins) = markdown_lines_joined("```\nabc\n```", 80);
+    let (lines, _joins, _chrome) = markdown_lines_joined("```\nabc\n```", 80);
     // Top margin, the code, bottom margin.
     assert_eq!(lines.len(), 3, "no tag → no label/blank rows: {lines:#?}");
     for line in &lines {
@@ -565,10 +565,10 @@ fn copyable_columns_counts_leading_bars() {
 
 #[test]
 fn markdown_blockquote_bar_is_excluded_from_copy_range() {
-    let (body, body_joins) = markdown_lines_joined("> hello world", 40);
+    let (body, body_joins, body_chrome) = markdown_lines_joined("> hello world", 40);
     let body_width = body[0].width(); // "│ hello world" = 13
-    let (_lines, _rows, ranges, _joins) =
-        add_margin_lines(body, body_joins, 40, Color::Green, None);
+    let (_lines, _rows, ranges, _joins, _chrome) =
+        add_margin_lines(body, body_joins, body_chrome, 40, Color::Green, None);
     // Row 2 is the single content row (separator, padding, content, …).
     // Content begins at column 5 in the gutter layout; the two-column bar
     // pushes the copyable start to 7, so the bar is never copied.
@@ -841,7 +841,7 @@ fn wrapped_paragraph_joins_with_space() {
     // row and Space for each continuation — the copy re-inserts the
     // separating space the reflow consumed.
     let text = "the quick brown fox jumps over the lazy dog and runs far away";
-    let (lines, joins) = markdown_lines_joined(text, 21);
+    let (lines, joins, _chrome) = markdown_lines_joined(text, 21);
     assert_eq!(lines.len(), 3, "paragraph must wrap to three rows");
     assert_eq!(
         joins,
@@ -861,7 +861,7 @@ fn wrapped_paragraph_joins_with_space() {
 #[test]
 fn paragraphs_break_between_blocks() {
     let md = "one paragraph here\n\nanother paragraph there";
-    let (lines, joins) = markdown_lines_joined(md, 80);
+    let (lines, joins, _chrome) = markdown_lines_joined(md, 80);
     assert_eq!(lines.len(), 3, "two paragraphs plus a blank spacer");
     assert_eq!(
         joins,
@@ -874,7 +874,7 @@ fn hard_split_word_joins_directly() {
     // A single word wider than the line is hard-split by grapheme; the
     // copy joins the pieces directly (no space exists in the original).
     let word = "supercalifragilisticexpialidocious";
-    let (lines, joins) = markdown_lines_joined(word, 10);
+    let (lines, joins, _chrome) = markdown_lines_joined(word, 10);
     assert!(lines.len() >= 3, "word must split across rows");
     assert_eq!(joins[0], LineJoin::Break, "first row is fresh");
     assert!(
@@ -919,7 +919,7 @@ fn code_block_lines_break_but_wrapped_line_joins() {
     // Each source line of a code block is a fresh line; a wrapped
     // over-long source line records its own continuation joins.
     let md = "```text\nshort line\nverylongwordthatexceedsthewidth\n```";
-    let (lines, joins) = markdown_lines_joined(md, 20);
+    let (lines, joins, _chrome) = markdown_lines_joined(md, 20);
     // Top margin | text | (blank) | short line | verylongwordth… (wrap row 1)
     // | …edsthewidth (wrap row 2) | bottom margin.  The fence interior's trailing
     // newline is stripped, so there is no trailing blank code row.
@@ -2679,8 +2679,14 @@ fn user_text_timestamp_rendered_in_milliseconds() {
     // being passed to format_timestamp (which takes milliseconds),
     // so every user message rendered as a 1970 date (e.g. "Jan 21 1970").
     let ts_ms = 1_705_314_000_000i64; // a plausible modern timestamp
-    let (lines, _rows, _content_ranges, _joins) =
-        add_margin_lines(Vec::new(), Vec::new(), 80, Color::Green, Some(ts_ms));
+    let (lines, _rows, _content_ranges, _joins, _chrome) = add_margin_lines(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        80,
+        Color::Green,
+        Some(ts_ms),
+    );
     let bottom = lines.last().expect("bottom separator line");
     let rendered = bottom.to_string();
     let expected = format_timestamp(ts_ms);
@@ -2749,9 +2755,10 @@ fn margin_block_rows_indented_two_columns_on_both_sides() {
     // message-block row spans exactly content_width + 9 columns.  With one
     // content line the row count is MARGIN_STRUCTURAL_ROWS(4) + 1 = 5:
     // separator, padding, content, padding, separator.
-    let (lines, _rows, content_ranges, _joins) = add_margin_lines(
+    let (lines, _rows, content_ranges, _joins, _chrome) = add_margin_lines(
         vec![Line::from("hello")],
         vec![LineJoin::Break],
+        vec![LineChrome::default()],
         20,
         Color::Blue,
         None,
