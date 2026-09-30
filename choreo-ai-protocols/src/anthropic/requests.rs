@@ -263,7 +263,12 @@ where
     // (see `crate::stream`); the abort flag on `sse` stops the thread at its
     // next loop boundary once the consumer cancels or drops it.
     let mut reader = AnthropicSseReader::from_reader(response.into_body().into_reader());
-    let sse = crate::stream::spawn_sse_reader(move || reader.next_event(), deadline.current());
+    let context = crate::stream::SseContext {
+        provider: config.provider_slug.clone(),
+        model: model.to_owned(),
+    };
+    let sse =
+        crate::stream::spawn_sse_reader(context, move || reader.next_event(), deadline.current());
     let mut has_any_output = false;
     let mut full_text = String::new();
     let mut full_reasoning = String::new();
