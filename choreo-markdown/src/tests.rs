@@ -272,6 +272,44 @@ fn tex_command_keeps_math_despite_words() {
 }
 
 #[test]
+fn whitespace_free_number_span_stays_literal_text() {
+    // A whitespace-free `$…$` span of only digits and symbols (`0.60→`, the
+    // shape of a price range) carries no variable or TeX command, so it is data
+    // rather than an equation — pulldown still pairs the `$`s.
+    for input in ["p 768p $0.60→$ q", "p 1080p $1.20→$ q"] {
+        let document = MarkdownDocument::parse(input);
+        let MarkdownBlock::Paragraph(content) = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(
+            !content
+                .iter()
+                .any(|node| matches!(node, MarkdownInline::InlineMath(_))),
+            "a price range was misclassified as math: {input:?} -> {content:?}"
+        );
+        assert_eq!(inline_text(content), input);
+    }
+}
+
+#[test]
+fn whitespace_free_letter_span_keeps_math() {
+    // A whitespace-free span that carries a variable or a TeX command is still
+    // math — the refinement must not drop ordinary short expressions.
+    for input in ["$x^2$", "$n_i$", "$v_0$", "$\\alpha$"] {
+        let document = MarkdownDocument::parse(input);
+        let MarkdownBlock::Paragraph(content) = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(
+            content
+                .iter()
+                .any(|node| matches!(node, MarkdownInline::InlineMath(_))),
+            "short math was dropped: {input:?} -> {content:?}"
+        );
+    }
+}
+
+#[test]
 fn math_signal_keeps_inline_math() {
     // A whitespace-bearing span with a positive math signal stays math —
     // including digit-led expressions the old leading-digit rule dropped.

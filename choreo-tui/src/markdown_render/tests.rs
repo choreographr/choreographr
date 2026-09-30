@@ -4570,6 +4570,29 @@ fn glued_dollar_pair_in_prose_does_not_render_as_math() {
 }
 
 #[test]
+fn whitespace_free_number_span_is_not_math_tinted() {
+    // A `$…$` span of only digits and symbols (a price range like `0.60→`) has
+    // no variable or command, so it must not be tinted as inline math.
+    for text in ["768p $0.60→$1.20", "1080p $1.20→$2.40"] {
+        let result = markdown_lines(text, 200);
+        let joined = result
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(joined, text, "text was altered");
+        let tinted = result
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| span.style.fg == Some(Color::Yellow));
+        assert!(
+            !tinted,
+            "a price range was tinted as inline math: {joined:?}"
+        );
+    }
+}
+
+#[test]
 fn table_uses_rounded_corners_and_a_plain_header_rule() {
     // nushell-style frame: rounded OUTER corners, square T-junctions, and a
     // uniform header rule — the GFM delimiter row's alignment colons are

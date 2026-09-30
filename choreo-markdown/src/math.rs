@@ -48,8 +48,10 @@ pub(crate) fn normalize_math_event(event: Event<'_>) -> Event<'_> {
 /// ($PATH)`, or `$revenue = 4×$`), so the default is **inverted: a span is math
 /// only when it looks like math**:
 ///
-/// * a span with no interior whitespace is always math — there is nothing for
-///   the pretty-printer to collapse, so a wrong call costs at most a tint;
+/// * a whitespace-free span is math only when it carries a variable or TeX
+///   command (an ASCII letter or `\` — see [`contains_math_letter`]); a price
+///   or range such as `0.60→` is left literal, and because nothing can be
+///   collapsed a wrong call here costs at most a tint anyway;
 /// * a span carrying a TeX command (`\`) is math — a backslash is an
 ///   unambiguous math marker;
 /// * a span containing a natural-language word (a run of at least
@@ -66,7 +68,7 @@ fn looks_like_math(content: &str) -> bool {
         return false;
     }
     if !content.contains(char::is_whitespace) {
-        return true;
+        return contains_math_letter(content);
     }
     if content.contains('\\') {
         return true;
@@ -75,6 +77,16 @@ fn looks_like_math(content: &str) -> bool {
         return false;
     }
     contains_math_signal(content)
+}
+
+/// Whether a whitespace-free span carries a variable or a TeX command — an
+/// ASCII letter or a backslash. A span of only digits and symbols (a price, a
+/// percentage, a range like `0.60→` or `5%+50¢`) has neither, so it is prose or
+/// data rather than an equation and stays literal.
+fn contains_math_letter(content: &str) -> bool {
+    content
+        .chars()
+        .any(|c| c.is_ascii_alphabetic() || c == '\\')
 }
 
 /// Shortest run of ASCII letters counted as a natural-language word. Two-letter
