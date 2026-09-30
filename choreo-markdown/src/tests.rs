@@ -233,6 +233,45 @@ fn glued_prose_pair_stays_literal_text() {
 }
 
 #[test]
+fn arithmetic_prose_with_a_signal_stays_literal_text() {
+    // A glued `$…$` pair whose content is a natural-language note carrying an
+    // arithmetic signal (`=` / `/` / `×`) is prose, not an equation — the
+    // operator alone must not promote it to math.
+    for input in [
+        "calc $5 Story, shown only, now: revenue = 4×$ tail",
+        "calc $1/take(custom-move floor), shown only, now: revenue = 4×$ tail",
+    ] {
+        let document = MarkdownDocument::parse(input);
+        let MarkdownBlock::Paragraph(content) = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(
+            !content
+                .iter()
+                .any(|node| matches!(node, MarkdownInline::InlineMath(_))),
+            "arithmetic prose was misclassified as math: {input:?} -> {content:?}"
+        );
+        assert_eq!(inline_text(content), input);
+    }
+}
+
+#[test]
+fn tex_command_keeps_math_despite_words() {
+    // A backslash command is an unambiguous math marker, so a `\text{…}` word
+    // inside an equation does not trip the natural-language-word rule.
+    let document = MarkdownDocument::parse("value $v = \\text{shown only}$ end");
+    let MarkdownBlock::Paragraph(content) = &document.blocks[0] else {
+        panic!("expected paragraph");
+    };
+    assert!(
+        content
+            .iter()
+            .any(|node| matches!(node, MarkdownInline::InlineMath(_))),
+        "real math was not captured: {content:?}"
+    );
+}
+
+#[test]
 fn math_signal_keeps_inline_math() {
     // A whitespace-bearing span with a positive math signal stays math —
     // including digit-led expressions the old leading-digit rule dropped.

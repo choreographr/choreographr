@@ -4544,10 +4544,16 @@ fn dollar_pair_in_prose_does_not_render_as_math() {
 #[test]
 fn glued_dollar_pair_in_prose_does_not_render_as_math() {
     // Regression follow-up: when both `$` are glued to non-space pulldown still
-    // pairs them, and the old prose-detection heuristic let signal-less prose
-    // through (`$x and y$`, `($HOME) and ($PATH)`), which rendered as a
-    // whitespace-collapsed yellow smear. It must stay literal text instead.
-    for text in ["see $x and y$ here", "in ($HOME) and ($PATH) now"] {
+    // pairs them, and a signal-less heuristic let prose through (`$x and y$`,
+    // `($HOME) and ($PATH)`). A later case added arithmetic notes whose text
+    // carries an operator signal (`=`, `/`, `×`) but is still prose. All must
+    // stay literal text rather than render as a whitespace-collapsed smear.
+    for text in [
+        "see $x and y$ here",
+        "in ($HOME) and ($PATH) now",
+        "calc $5 Story, shown only, now: revenue = 4×$ tail",
+        "calc $1/take(custom-move floor), shown only, now: revenue = 4×$ tail",
+    ] {
         let result = markdown_lines(text, 200);
         let joined = result
             .iter()

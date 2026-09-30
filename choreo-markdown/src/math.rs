@@ -41,18 +41,26 @@ pub(crate) fn normalize_math_event(event: Event<'_>) -> Event<'_> {
 /// looks like mathematics.
 ///
 /// Because pulldown-cmark matches math purely on whitespace adjacency, `$`-heavy
-/// prose — currency, shell variables, and meta-discussion of the math syntax
-/// itself — yields spurious spans that the TUI would tint and whitespace-
-/// collapse. Recognising *prose* is an open-ended list the reasoning corpus kept
-/// defeating (glued pairs such as `$x and y$` or `($HOME) and ($PATH)`), so the
-/// default is **inverted: a span is math only when it looks like math**:
+/// prose — currency, shell variables, arithmetic notes, and meta-discussion of
+/// the math syntax itself — yields spurious spans that the TUI would tint and
+/// whitespace-collapse. Recognising *prose* is an open-ended list the reasoning
+/// corpus kept defeating (glued pairs such as `$x and y$`, `($HOME) and
+/// ($PATH)`, or `$revenue = 4×$`), so the default is **inverted: a span is math
+/// only when it looks like math**:
 ///
 /// * a span with no interior whitespace is always math — there is nothing for
 ///   the pretty-printer to collapse, so a wrong call costs at most a tint;
-/// * a span with interior whitespace is math only if it carries a positive math
-///   signal (see [`contains_math_signal`]); otherwise it is literal text;
+/// * a span carrying a TeX command (`\`) is math — a backslash is an
+///   unambiguous math marker;
+/// * a span containing a natural-language word (a run of at least
+///   [`MIN_WORD_LEN`] ASCII letters — see [`contains_natural_word`]) is prose,
+///   even when it also carries an operator signal such as `=`, so an arithmetic
+///   note (`5 Story, shown only, now: revenue = 4×`) is not taken for an
+///   equation;
+/// * otherwise a whitespace-bearing span is math only if it carries a positive
+///   math signal (see [`contains_math_signal`]);
 /// * a sentence terminator followed by whitespace (`. `, `? `, `! `) is a hard
-///   prose veto that overrides even a present signal.
+///   prose veto that overrides everything else.
 fn looks_like_math(content: &str) -> bool {
     if has_sentence_break(content) {
         return false;
@@ -60,7 +68,37 @@ fn looks_like_math(content: &str) -> bool {
     if !content.contains(char::is_whitespace) {
         return true;
     }
+    if content.contains('\\') {
+        return true;
+    }
+    if contains_natural_word(content) {
+        return false;
+    }
     contains_math_signal(content)
+}
+
+/// Shortest run of ASCII letters counted as a natural-language word. Two-letter
+/// runs are left alone so short math tokens (`dy`, `mv`, `dx`) survive; three
+/// catches the common prose words (`and`, `the`, `now`, `revenue`).
+const MIN_WORD_LEN: usize = 3;
+
+/// Whether `content` contains a run of at least [`MIN_WORD_LEN`] consecutive
+/// ASCII letters — the mark of a natural-language word. Only whitespace-bearing
+/// content that carries no TeX command reaches this, so a backslash-named macro
+/// (`\lim`, `\mathbb`) is never examined here.
+fn contains_natural_word(content: &str) -> bool {
+    let mut run = 0usize;
+    for c in content.chars() {
+        if c.is_ascii_alphabetic() {
+            run += 1;
+            if run >= MIN_WORD_LEN {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
 }
 
 /// A sentence terminator immediately followed by whitespace (`. `, `? `, `! `)
