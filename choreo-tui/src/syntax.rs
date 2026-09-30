@@ -22,11 +22,14 @@ fn theme_set() -> &'static ThemeSet {
 
 /// The theme shared across all syntax-highlighted output in choreo-tui.
 ///
-/// Uses a dark-terminal-friendly theme by default; falls back to the first
-/// available theme if the named one is missing (shouldn't happen in practice
-/// since syntect ships `base16-ocean.dark` in its default set).
+/// `base16-eighties.dark` is a dark, warm palette whose foregrounds read a touch
+/// brighter than `base16-ocean.dark` on a typical terminal — since the code box
+/// paints no background of its own, the tokens sit directly on the terminal (or
+/// the message shading), so a brighter palette matters.  Falls back to the first
+/// available theme if the named one is missing (shouldn't happen in practice —
+/// syntect ships `base16-eighties.dark` in its default set).
 pub(crate) fn highlight_theme() -> &'static Theme {
-    const THEME_NAME: &str = "base16-ocean.dark";
+    const THEME_NAME: &str = "base16-eighties.dark";
     theme_set().themes.get(THEME_NAME).unwrap_or_else(|| {
         theme_set().themes.values().next().unwrap_or_else(|| {
             // Fallback: create a minimal empty theme. This should never
