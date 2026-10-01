@@ -14,6 +14,11 @@
 //! guard change lands in the model path and the UI path together, so they can
 //! never drift apart.
 
+// Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
+// every public item carries docs, enforced as a hard error by clippy-strict's
+// `-D warnings`.
+#![warn(missing_docs)]
+
 mod heif;
 
 use image::metadata::Orientation;
@@ -87,7 +92,7 @@ pub fn decode_raster_oriented(data: &[u8]) -> Result<DynamicImage, String> {
 /// `heif-oxide` applies the container's orientation transforms and delivers
 /// display-ready sRGB, so no further rotation is needed. A *pre-decode*
 /// allocation guard rejects hostile declared geometry before the decoder runs
-/// (see [`heic_geometry_within_limits`]).
+/// (see `heic_geometry_within_limits`).
 ///
 /// # Errors
 ///

@@ -47,6 +47,10 @@
 //! simply drop the receiver; the producer's `send` then fails and the
 //! monitor thread exits on its own.
 
+// Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
+// every public item carries docs, enforced as a hard error by clippy-strict's
+// `-D warnings`.
+#![warn(missing_docs)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod platform;

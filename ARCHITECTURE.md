@@ -422,6 +422,17 @@ is declared by the root package's `src/bin/choreographr.rs`.
 
 ## Crate details
 
+This section keeps the **cross-cutting** story; the per-module **API reference**
+for each crate lives in its in-source rustdoc (`cargo doc`, `just doc`). The two
+are complementary by design: rustdoc owns a module's purpose, its public items'
+contracts, and its local invariants/portability notes (everything that changes
+when exactly one crate changes), while this file owns what spans two or more
+crates — topology, data flow, the security model, and design rationale. A crate
+is **migrated** once every public item carries docs and its rustdoc is
+warning-free; it then carries `#![warn(missing_docs)]` at its crate root and
+joins the `doc_crates` list that `just doc-check` (a `pre-commit` step) holds to
+`-D warnings`.
+
 ### `choreo-shared` — Shared binary helpers
 
 A deliberately tiny **leaf crate** (dependencies: `clap`, `tracing`, and

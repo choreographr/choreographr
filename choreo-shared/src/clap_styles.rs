@@ -1,10 +1,10 @@
-//! The suite's shared clap [`Styles`].
+//! The suite's shared clap [`Styles`](clap::builder::Styles).
 //!
 //! Previously copy-pasted (identically) into every CLI crate's `lib.rs`; this
 //! is that single copy. Each crate still *owns* its own `#[command(...)]`
 //! declaration — only the styling is shared.
 
-/// Shared clap [`Styles`] for the suite's CLI binaries.
+/// Shared clap [`Styles`](clap::builder::Styles) for the suite's CLI binaries.
 ///
 /// Uses real ANSI hues (green headers/usage, cyan literals/placeholders) rather
 /// than bold/underline only, so help output stays legible even in terminals whose

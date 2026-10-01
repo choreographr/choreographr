@@ -62,7 +62,7 @@ struct Entry {
 /// docs for the ownership contract. Entries are normally removed by the RAII
 /// guard on the transport that created them (`unregister` on `Drop`), so in
 /// steady state the registry tracks only LIVE connections; `prune_dead` and
-/// the [`MAX_REGISTERED_SOCKETS`] cap stay purely as backstops.
+/// the `MAX_REGISTERED_SOCKETS` cap stay purely as backstops.
 #[derive(Debug, Clone)]
 pub struct SocketRegistry {
     // A std Mutex is fine here despite the channel-first house rule: this is
@@ -100,7 +100,7 @@ impl SocketRegistry {
     /// Registered fds whose socket has already been closed elsewhere are
     /// tolerated: `shutdown_all` and `prune_dead` treat `EBADF` as "already
     /// gone" rather than an error. When the list exceeds
-    /// [`MAX_REGISTERED_SOCKETS`], an opportunistic [`Self::prune_dead`] runs
+    /// `MAX_REGISTERED_SOCKETS`, an opportunistic [`Self::prune_dead`] runs
     /// first to bound memory growth.
     ///
     /// Returns the [`SocketId`] for this registration: the caller (normally

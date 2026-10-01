@@ -45,6 +45,16 @@ CARGO_FLAGS := env_var_or_default("CARGO_FLAGS", "")
 cross_config := "--config 'profile.dev.rustflags=[]'"
 cross_rustflags := "-Cdebuginfo=0"
 
+# The crates whose rustdoc is held to `--no-deps -D warnings` by `doc-check` and
+# whose public API carries `#![warn(missing_docs)]` (enforced as an error by
+# clippy-strict's `-D warnings` via the normal compile). This list GROWS as each
+# crate is migrated from ARCHITECTURE.md prose to self-contained in-source
+# rustdoc, so the gate stays green throughout the migration — a crate joins only
+# once its public items are documented and its rustdoc is warning-free. See
+# AGENTS.md → Documentation for the split (rustdoc owns the per-module API
+# reference; ARCHITECTURE.md owns the cross-cutting system view).
+doc_crates := "-p choreo-shared -p choreo-image -p choreo-sockreg -p choreo-power-events"
+
 # ── entry points ──────────────────────────────────────────────────────────────
 
 # Show all recipes (default — run with bare `just`)
@@ -437,15 +447,16 @@ release-workflow-dry-run:
 install-cargo-deny:
     cargo install cargo-deny
 
-# The commit gate (AGENTS.md → Commit Workflow): prove clippy-clean → full test
-# suite → format LAST. `clippy-strict` denies warnings, so any remaining lint
-# fails the gate and is hand-fixed (run `just clippy-fix` first if you want the
-# machine-applicable lints applied automatically). Formatting runs last, not
-# first, so the formatted bytes stay behaviourally identical to the tested bytes.
-# Safe to re-run: loop it (fix by hand, re-run) until it passes green, then
-# `git commit`. The supply-chain guard is a RELEASE guard — it runs in the
-# release workflow, not here.
-pre-commit: clippy-strict test-all fmt
+# The commit gate (AGENTS.md → Commit Workflow): prove clippy-clean → rustdoc
+# warning-free (`doc-check`) → full test suite → format LAST. `clippy-strict`
+# denies warnings, so any remaining lint — including a `missing_docs` gap in a
+# migrated crate — fails the gate and is hand-fixed (run `just clippy-fix` first
+# if you want the machine-applicable lints applied automatically). Formatting
+# runs last, not first, so the formatted bytes stay behaviourally identical to
+# the tested bytes. Safe to re-run: loop it (fix by hand, re-run) until it passes
+# green, then `git commit`. The supply-chain guard is a RELEASE guard — it runs
+# in the release workflow, not here.
+pre-commit: clippy-strict doc-check test-all fmt
 
 # The release gate (RELEASE.md → Preflight) — the single command the conductor
 # runs before Phase 1. Every local check, in one pass: the toolchain
@@ -563,6 +574,14 @@ install args="":
     ./scripts/install.sh {{ args }}
 
 # ── docs & maintenance ────────────────────────────────────────────────────────
+
+# Fail on any rustdoc warning across the migrated crates (`doc_crates`): broken
+# and private intra-doc links, bare URLs, invalid HTML/code blocks, redundant
+# links. `--no-deps` documents only the named crates, so a dependency's docs
+# never fail our gate. A `pre-commit` step; the crate list grows as the
+# ARCHITECTURE.md → rustdoc migration advances.
+doc-check: _require-zig
+    RUSTDOCFLAGS="-D warnings" cargo doc {{ CARGO_FLAGS }} --no-deps {{ doc_crates }}
 
 # Build API documentation for the workspace (without dependencies)
 doc: _require-zig

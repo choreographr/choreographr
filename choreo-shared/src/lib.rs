@@ -6,7 +6,7 @@
 //! - [`release_name`] — the dance-style release-name metadata compiled into
 //!   every binary (`--version`, startup banners) and read by CI for the GitHub
 //!   release title.
-//! - [`clap_styles`] — the one shared clap [`Styles`](clap::builder::Styles)
+//! - [`clap_styles()`] — the one shared clap [`Styles`](clap::builder::Styles)
 //!   used by every CLI (previously copy-pasted into each crate).
 //! - [`logging`] — the shared `-v`/`-q` verbosity flags, the log-level
 //!   resolution every binary applies identically, and the one hardened
@@ -18,6 +18,11 @@
 //!
 //! Logging precedence follows the Unix convention: **explicit CLI flags win
 //! over the ambient environment** (see [`logging`]).
+
+// Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
+// every public item carries docs, enforced as a hard error by clippy-strict's
+// `-D warnings`.
+#![warn(missing_docs)]
 
 pub mod clap_styles;
 pub mod logging;

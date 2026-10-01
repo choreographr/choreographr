@@ -46,6 +46,10 @@
 //! and `SocketTuning::apply` sets `SO_KEEPALIVE` plus the timings through
 //! `WSAIoctl(SIO_KEEPALIVE_VALS)`.
 
+// Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
+// every public item carries docs, enforced as a hard error by clippy-strict's
+// `-D warnings`.
+#![warn(missing_docs)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod socket_registry;
