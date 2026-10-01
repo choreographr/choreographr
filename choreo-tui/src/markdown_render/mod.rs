@@ -403,15 +403,17 @@ fn non_chrome_is_blank(line: &Line<'_>, intervals: &[(u16, u16)]) -> bool {
     true
 }
 
-/// Push a blank (zero-width) line onto `lines` unless the last line is
-/// already blank (zero-width or whitespace-only).  This gives us CSS-like
-/// margin collapsing: multiple adjacent blocks that each want vertical
-/// space produce at most one blank line between them.
+/// Test-only convenience wrapper over [`ensure_blank_line_joined`]: the
+/// margin-collapsing rule (push a blank line unless the last line is already
+/// blank, so adjacent blocks that each want vertical space produce at most one
+/// blank line) lives in exactly one place, and the tests exercise that same
+/// path.  The renderer itself always calls the joined variant so the parallel
+/// `joins`/`chrome` buffers stay aligned.
 #[cfg(test)]
 fn ensure_blank_line(lines: &mut Vec<Line<'static>>) {
-    if lines.last().is_none_or(|l| !line_is_blank(l)) {
-        lines.push(Line::from(Span::styled(String::new(), Style::default())));
-    }
+    let mut joins = Vec::new();
+    let mut chrome = Vec::new();
+    ensure_blank_line_joined(lines, &mut joins, &mut chrome);
 }
 
 /// [`ensure_blank_line`] keeping the per-line [`LineJoin`] and [`LineChrome`]
