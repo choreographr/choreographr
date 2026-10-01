@@ -22,7 +22,9 @@
 //! `MAX_TOOL_OUTPUT_BYTES` budget by dropping whole turn blocks — the newest
 //! first when reading the default tail window (so the answer you came for
 //! survives), the earliest first when reading forward from `from` (so the
-//! requested start survives).
+//! requested start survives).  A single surviving block that is still too
+//! large — a multi-byte field near the character ceiling — is truncated at a
+//! char boundary, so the byte budget holds whatever the field contents.
 
 use crate::db::{read_session as read_session_record, read_turns};
 use crate::tools::context::ToolContext;
@@ -41,9 +43,11 @@ const DEFAULT_LIMIT: usize = 40;
 /// Head-room reserved for the header and the trailing range/hint footer, so the
 /// final text never exceeds `MAX_TOOL_OUTPUT_BYTES`.
 const FOOTER_RESERVE: usize = 256;
-/// Upper bound on the per-field cap: three fields at this size plus labels and
-/// footer still fit inside the budget, so a single rendered turn can never
-/// overflow it (the trimming loop only removes *whole* turns).
+/// Upper bound on the per-field cap: keeps one field's work bounded so a single
+/// turn stays cheap to render and format.  This is a *character* cap — the
+/// assembled text's *byte* budget is enforced separately by [`render`], because
+/// a multi-byte field can occupy several bytes per character and so cannot be
+/// bounded by a character count alone.
 const MAX_FIELD_CEILING: usize = MAX_TOOL_OUTPUT_BYTES / 4;
 
 // ── Args struct ─────────────────────────────────────────────────────────────
@@ -163,7 +167,19 @@ fn render(
 
     let mut out = header;
     if blocks.is_empty() {
-        out.push_str("(no user or assistant text)\n");
+        // Distinguish "the session has no readable text at all" from "the
+        // requested window held none" (a `from` past the last turn, or a window
+        // whose turns carry only tool activity) — the two call for different
+        // follow-ups from the reader.
+        if all.is_empty() {
+            out.push_str("(no user or assistant text)\n");
+        } else {
+            let _ = writeln!(
+                out,
+                "(no readable text in the requested window of {} turns)",
+                all.len()
+            );
+        }
         return out;
     }
 
@@ -176,6 +192,15 @@ fn render(
     // last rendered line.
     while out.ends_with('\n') {
         out.pop();
+    }
+    // A per-field *character* cap does not bound the *bytes* a multi-byte field
+    // occupies, so the whole-block trimming above cannot guarantee the byte
+    // budget on its own.  Cap the assembled body `FOOTER_RESERVE` below the
+    // shared budget — leaving room for the footer appended below — so the final
+    // text never exceeds `MAX_TOOL_OUTPUT_BYTES` whatever the field contents.
+    let body_budget = MAX_TOOL_OUTPUT_BYTES.saturating_sub(FOOTER_RESERVE);
+    if out.len() > body_budget {
+        out = truncate_bytes(&out, body_budget);
     }
 
     let first_id = all.first().map_or(shown_first, |(id, _)| *id);
@@ -202,7 +227,8 @@ fn render(
 /// Render one turn's readable text: the user message, then the assistant's
 /// displayed reasoning, then the assistant response. Tool calls and tool
 /// results are intentionally omitted; image bytes and reasoning artifacts never
-/// appear.
+/// appear.  A turn's request-level `error` text is likewise omitted — a failed
+/// turn is read from its session directly for the provider error.
 fn render_turn(turn_id: u32, turn: &Turn, max_field: usize) -> String {
     let mut out = String::new();
     push_section(
@@ -247,6 +273,29 @@ fn truncate_chars(text: &str, max: usize) -> String {
         return text.to_string();
     }
     let mut out: String = text.chars().take(max).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// Cap `text` at `max_bytes` UTF-8 bytes, cutting on a char boundary and
+/// appending an ellipsis when anything was dropped.
+///
+/// The byte twin of [`truncate_chars`]: used to enforce the assembled text's
+/// byte budget, which a character cap cannot guarantee for multi-byte content.
+fn truncate_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    // Reserve room for the ellipsis, then back up to the nearest char boundary
+    // so the slice below never splits a code point.
+    let budget = max_bytes.saturating_sub('\u{2026}'.len_utf8());
+    let mut end = budget.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + '\u{2026}'.len_utf8());
+    // `end` was snapped to a char boundary above; `.get` keeps the slice total.
+    out.push_str(text.get(..end).unwrap_or(""));
     out.push('\u{2026}');
     out
 }
@@ -502,10 +551,50 @@ mod tests {
             .collect();
         let (_dir, ctx) = seed(42, 99, turns);
         let out = run(&ctx, args(99)).unwrap();
+        assert!(out.len() <= MAX_TOOL_OUTPUT_BYTES, "{} bytes", out.len());
+    }
+
+    #[test]
+    fn output_stays_within_budget_for_multibyte_fields() {
+        // A per-field *character* cap does not bound bytes: '€' is 3 bytes, so a
+        // field near the character ceiling can occupy 3× its char count.  The
+        // assembled body is byte-capped, so the shared budget holds regardless.
+        let big = "€".repeat(200_000);
+        let turns: Vec<(u32, Turn)> = (0..50)
+            .map(|i| (i, turn(Some(&big), Some(&big), Some(&big))))
+            .collect();
+        let (_dir, ctx) = seed(42, 99, turns);
+        let out = run(&ctx, args(99)).unwrap();
+        assert!(out.len() <= MAX_TOOL_OUTPUT_BYTES, "{} bytes", out.len());
+    }
+
+    #[test]
+    fn from_past_the_last_turn_reports_an_empty_window() {
+        // `from` beyond the last turn selects nothing; the reader must say the
+        // window was empty rather than that the session has no text.
+        let turns: Vec<(u32, Turn)> = (0..3)
+            .map(|i| {
+                (
+                    i,
+                    turn(
+                        Some(&format!("user-{i}")),
+                        Some(&format!("answer-{i}")),
+                        None,
+                    ),
+                )
+            })
+            .collect();
+        let (_dir, ctx) = seed(42, 99, turns);
+        let a = ReadSessionArgs {
+            session_id: 99,
+            from: Some(99),
+            limit: None,
+            max_field_chars: None,
+        };
+        let out = run(&ctx, a).unwrap();
         assert!(
-            out.len() <= MAX_TOOL_OUTPUT_BYTES + FOOTER_RESERVE,
-            "{} bytes",
-            out.len()
+            out.contains("no readable text in the requested window"),
+            "{out}"
         );
     }
 
