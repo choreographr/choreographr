@@ -627,7 +627,7 @@ impl super::Tool for CoordImage {
                 .map_err(|e| ToolExecError(e.to_string()))?;
         // Normalize the fetched bytes the same way `read_image` does so the
         // reference carries a known-good MIME and bounded dimensions.
-        let prep = crate::image_prep::normalize_bytes(&img.data)
+        let prep = crate::image_prep::normalize_bytes(&img.data, None)
             .map_err(|e| ToolExecError(format!("failed to normalize fetched image: {e}")))?;
         let byte_len = prep.data.len();
         let text = truncate_tool_output(&format!(

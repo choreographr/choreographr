@@ -2514,7 +2514,7 @@ Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protoc
 |---|---|
 | **Core** | `list_sessions`, `get_session`, `read_session`, `load_skill`, `set_session_title`, `set_working_dir`, `load_tools`, `unload_tools`, `read_file`, `write_file`, `edit_file`, `list_files`, `delete_files`, `line_count`, `random` (integers, floats, booleans, bytes, UUID v4 — with optional seed), `get_current_time` (Unix millisecond timestamp), `pdf_classify` (PDF type/confidence/OCR pages), `pdf_to_markdown` (PDF → Markdown, optional pages + compact), `retrieve_webpage` (render a URL in a local headless Chromium/Chrome — `http`/`https`/`file` — content / text / screenshot (PNG, inline or to `output_path`) / pdf (to `output_path`); opt-in `webgl` for new-headless + SwiftShader WebGL rendering) |
 | **HTTP** | `http_request` (GET/POST/HEAD with headers, body, timeout) |
-| **Image** | `display_image` (from path, URL, base64, or SVG text), `read_image` (read an image file from disk and feed it to a vision-capable model as image input) |
+| **Image** | `display_image` (from path, URL, base64, or SVG text), `read_image` (read an image file — optionally a fractional sub-region — from disk and feed it to a vision-capable model as image input) |
 | **Git** | `git_status`, `git_diff`, `git_log`, `git_add`, `git_commit`, `git_push`, `git_show` |
 > **`git_diff` output:** Always returns a line-by-line unified diff wrapped in a ````diff` fenced code block. The old `full` parameter (which previously toggled between summary-only and full diff modes) has been removed — the tool now always produces full diffs. The diff output for each file change is enclosed in ````diff` ... ```` fences for clear markdown formatting. Every diff fence the daemon emits (`append_fenced_diff` for git tools, `edit_file` in `format_edit_result`) routes through the shared `fence_content` helper in `tools/fs/mod.rs`, so a diff whose content carries a backtick run (e.g. a bare ``` context line while editing a Markdown file) cannot close the fence early in the TUI's markdown renderer; backtick-free diffs keep the canonical 3-backtick fence.
 
@@ -3228,7 +3228,11 @@ shared guarded decoders for *every* source — raster (via `decode_raster_orient
 `image::Limits` guard) and HEIC (via its pre-decode guard) — so a hostile image cannot
 drive a huge allocation during the probe, not just during the display/model decode.
 All sources are resized to ≤2000px, and re-encoded to PNG (alpha) or JPEG (opaque) under
-a decompression-bomb guard. The tool reports a text handle (path, dimensions, MIME,
+a decompression-bomb guard. An optional `region` (given as fractions of the image) crops
+before that resize — raster/HEIC sources are cropped from the decoded pixels (after EXIF
+orientation is baked), while SVG sources render only the region into the pixmap — so
+a small crop reaches the model at native resolution instead of the ≤2000px downscale, and
+no cropped copy is written to disk. The tool reports a text handle (path, dimensions, MIME,
 bytes), and returns an `ImageReference` that carries the **normalized bytes**
 (`ImageReference::data`)
 via the `Tool::extract_image_ref` hook. The framework moves that reference onto the

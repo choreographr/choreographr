@@ -493,6 +493,10 @@ before it allocates.
 `read_image` reads a file from disk,
 normalizes it (resize to ≤2000px, re-encode to PNG/JPEG under a decompression-bomb
 guard), and feeds it to a vision-capable model as image input on the next request.
+An optional `region` argument (fractions of the image) reads just a sub-rectangle —
+cropped from the decoded pixels, or rendered region-only for SVG — so a small crop
+reaches the model at native resolution instead of the ≤2000px downscale, without
+writing a cropped copy to disk.
 The normalized bytes are
 stored durably in the `session_attachments` DB table (kept out of the compressed
 turn blob, so the source file can disappear without breaking later turns), and the

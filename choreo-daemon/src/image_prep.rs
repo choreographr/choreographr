@@ -29,6 +29,15 @@
 //! [`choreo_image::decode_heic`] gates hostile declared geometry pre-decode),
 //! and re-encoded to PNG (when the image has alpha) or JPEG (opaque) so the
 //! wire bytes are always in a provider-allowlisted format.
+//!
+//! Optional crop: both [`load_and_normalize`] and [`normalize_bytes`] accept a
+//! [`CropRegion`] expressed as fractions of the displayed extent. Raster and
+//! HEIC sources are cropped from the decoded pixels (after EXIF orientation is
+//! baked); SVG sources pass the region into the rasterizer so only that
+//! rectangle of the vector tree is drawn — so a crop keeps full source detail
+//! instead of downscaling the whole image first. With no region the pipeline is
+//! byte-for-byte unchanged, and the crop lands *before* [`finalize`], so a
+//! region smaller than [`MAX_IMAGE_DIMENSION`] bypasses the downscale entirely.
 
 use std::io::{Cursor, Read};
 use std::path::Path;
@@ -58,6 +67,79 @@ pub struct PreparedVisionImage {
     pub height: u32,
 }
 
+/// A sub-rectangle of an image, given as fractions of its displayed extent.
+///
+/// Fractions (rather than pixels) keep a crop request independent of the source
+/// file's resolution — a Retina screenshot is twice its CSS size — and of the
+/// normalization downscale, so the same `region` selects the same visual area
+/// whatever the file's pixel dimensions. The caller validates the fractions;
+/// [`CropRegion::to_pixels`] still clamps defensively.
+#[derive(Debug, Clone, Copy)]
+pub struct CropRegion {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// A pixel rectangle resolved from a [`CropRegion`] against a concrete image
+/// size, in the decoded image's coordinate space (after EXIF orientation is
+/// baked).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PixelCrop {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl CropRegion {
+    /// Resolve the fractional region against an image of `width` × `height`
+    /// pixels, clamped to the image bounds.
+    ///
+    /// Returns `None` when the region is empty (zero area after rounding) or
+    /// lies entirely outside the image, so callers reject it rather than crop
+    /// to nothing.
+    #[must_use]
+    pub fn to_pixels(self, width: u32, height: u32) -> Option<PixelCrop> {
+        let x0 = self.x.clamp(0.0, 1.0);
+        let y0 = self.y.clamp(0.0, 1.0);
+        let x1 = (self.x + self.width).clamp(0.0, 1.0);
+        let y1 = (self.y + self.height).clamp(0.0, 1.0);
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        // Round each edge to the nearest pixel; `scaled_edge` clamps to
+        // `[0, extent]`, so the resulting rectangle is always in bounds.
+        let left = scaled_edge(f64::from(x0), width);
+        let top = scaled_edge(f64::from(y0), height);
+        let right = scaled_edge(f64::from(x1), width);
+        let bottom = scaled_edge(f64::from(y1), height);
+        let crop_width = right.saturating_sub(left);
+        let crop_height = bottom.saturating_sub(top);
+        if crop_width == 0 || crop_height == 0 {
+            return None;
+        }
+        Some(PixelCrop {
+            x: left,
+            y: top,
+            width: crop_width,
+            height: crop_height,
+        })
+    }
+}
+
+/// Map a `[0, 1]` fraction to a pixel edge along an `extent`-pixel axis,
+/// rounding to the nearest pixel and clamping to `[0, extent]`.
+// The clamped value is within `[0, extent]` (≤ u32::MAX), so the cast is exact
+// and never negative — the lints cannot fire here by construction.
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn scaled_edge(fraction: f64, extent: u32) -> u32 {
+    (fraction * f64::from(extent))
+        .round()
+        .clamp(0.0, f64::from(extent)) as u32
+}
+
 /// Read `path`, normalize it, and return the prepared image.
 ///
 /// Fails (never panics) on: an oversized/unreadable file, an unsupported or
@@ -68,9 +150,12 @@ pub struct PreparedVisionImage {
 ///
 /// Returns Err if the file cannot be read (missing, unreadable, or over
 /// [`MAX_SOURCE_BYTES`]) or normalization fails (see [`normalize_bytes`]).
-pub fn load_and_normalize(path: &Path) -> std::io::Result<PreparedVisionImage> {
+pub fn load_and_normalize(
+    path: &Path,
+    region: Option<CropRegion>,
+) -> std::io::Result<PreparedVisionImage> {
     let bytes = read_bounded(path)?;
-    normalize_bytes(&bytes)
+    normalize_bytes(&bytes, region)
 }
 
 /// Read a file with a hard [`MAX_SOURCE_BYTES`] bound, guarding against a
@@ -107,13 +192,16 @@ fn read_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
 ///
 /// Returns Err on an unsupported or undecodable image format, a
 /// decompression-bomb allocation, or a re-encode failure.
-pub fn normalize_bytes(bytes: &[u8]) -> std::io::Result<PreparedVisionImage> {
+pub fn normalize_bytes(
+    bytes: &[u8],
+    region: Option<CropRegion>,
+) -> std::io::Result<PreparedVisionImage> {
     if is_heic(bytes) {
-        normalize_heic(bytes)
+        normalize_heic(bytes, region)
     } else if is_svg(bytes) {
-        normalize_svg(bytes)
+        normalize_svg(bytes, region)
     } else {
-        normalize_raster(bytes)
+        normalize_raster(bytes, region)
     }
 }
 
@@ -142,7 +230,10 @@ fn is_supported_raster(format: ImageFormat) -> bool {
 }
 
 /// Normalize a raster image via the `image` crate, baking EXIF orientation.
-fn normalize_raster(bytes: &[u8]) -> std::io::Result<PreparedVisionImage> {
+fn normalize_raster(
+    bytes: &[u8],
+    region: Option<CropRegion>,
+) -> std::io::Result<PreparedVisionImage> {
     let format = image::guess_format(bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     if !is_supported_raster(format) {
@@ -160,7 +251,7 @@ fn normalize_raster(bytes: &[u8]) -> std::io::Result<PreparedVisionImage> {
         warn!(error = %e, "failed to decode image (unsupported or decompression-bomb source)");
         std::io::Error::new(std::io::ErrorKind::InvalidData, e)
     })?;
-    finalize(img, &format!("{format:?}"))
+    finalize_region(img, &format!("{format:?}"), region)
 }
 
 /// Normalize a HEIC/HEIF image via the shared pure-Rust decoder.
@@ -169,16 +260,50 @@ fn normalize_raster(bytes: &[u8]) -> std::io::Result<PreparedVisionImage> {
 /// container's declared `ispe` extents) so a hostile HEIC cannot drive a huge
 /// allocation, then applies the container's orientation and delivers
 /// display-ready sRGB.
-fn normalize_heic(bytes: &[u8]) -> std::io::Result<PreparedVisionImage> {
+fn normalize_heic(
+    bytes: &[u8],
+    region: Option<CropRegion>,
+) -> std::io::Result<PreparedVisionImage> {
     let img = choreo_image::decode_heic(bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    finalize(img, "heic")
+    finalize_region(img, "heic", region)
 }
 
 /// Normalize an SVG by rasterizing it to an RGBA bitmap via `resvg`.
-fn normalize_svg(bytes: &[u8]) -> std::io::Result<PreparedVisionImage> {
-    let img = rasterize_svg(bytes)?;
+fn normalize_svg(bytes: &[u8], region: Option<CropRegion>) -> std::io::Result<PreparedVisionImage> {
+    // The region is applied *during* rasterization (see `rasterize_svg`), so the
+    // output here is already the crop and needs only the shared downscale/encode.
+    let img = rasterize_svg(bytes, region)?;
     finalize(img, "svg")
+}
+
+/// Crop a decoded image to `region`, returning the sub-image.
+///
+/// Returns `Err` when the region resolves to no pixels of this image, so a
+/// caller never silently receives the whole image for an empty region.
+fn crop_decoded(img: &DynamicImage, region: CropRegion) -> std::io::Result<DynamicImage> {
+    let (width, height) = img.dimensions();
+    let Some(rect) = region.to_pixels(width, height) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "crop region does not overlap the image",
+        ));
+    };
+    Ok(img.crop_imm(rect.x, rect.y, rect.width, rect.height))
+}
+
+/// Crop (when a region is given) and then resize/re-encode. Shared by the raster
+/// and HEIC paths, which both start from a full-size decoded image.
+fn finalize_region(
+    img: DynamicImage,
+    source_label: &str,
+    region: Option<CropRegion>,
+) -> std::io::Result<PreparedVisionImage> {
+    let img = match region {
+        Some(region) => crop_decoded(&img, region)?,
+        None => img,
+    };
+    finalize(img, source_label)
 }
 
 /// Resize to [`MAX_IMAGE_DIMENSION`] and re-encode to PNG (alpha) or JPEG
@@ -222,10 +347,15 @@ fn finalize(img: DynamicImage, source_label: &str) -> std::io::Result<PreparedVi
     })
 }
 
-/// Rasterize SVG bytes to an RGBA bitmap. Faces are rendered at the SVG's
-/// intrinsic size, capped to [`MAX_IMAGE_DIMENSION`]; `finalize` downscales
-/// anything larger with Lanczos3.
-fn rasterize_svg(bytes: &[u8]) -> std::io::Result<DynamicImage> {
+/// Rasterize SVG bytes to an RGBA bitmap.
+///
+/// With no `region` the whole viewport is drawn at its intrinsic size, capped to
+/// [`MAX_IMAGE_DIMENSION`] (`finalize` downscales anything larger with Lanczos3).
+/// With a `region`, only that rectangle is drawn — the region is resolved into
+/// viewport coordinates, sized to its own extent, and the transform translates
+/// its top-left to the pixmap origin — so the crop keeps the vector detail the
+/// full-tree render would have downscaled away.
+fn rasterize_svg(bytes: &[u8], region: Option<CropRegion>) -> std::io::Result<DynamicImage> {
     let mut options = usvg::Options::default();
     // Load system fonts so `<text>` elements render (matching the TUI's SVG
     // rasterizer). Failure to load is non-fatal — missing glyphs are skipped.
@@ -233,11 +363,41 @@ fn rasterize_svg(bytes: &[u8]) -> std::io::Result<DynamicImage> {
     let tree = usvg::Tree::from_data(bytes, &options)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
+    // Resolve the fractional region into the viewport's own coordinate space
+    // (the space `tree.size()` reports, after the viewBox is applied), or the
+    // whole viewport when no crop is requested. Cropping by *rendering only the
+    // region* keeps full vector detail: downscaling the whole tree first and
+    // cutting afterward would discard the detail the crop is meant to recover.
     let size = tree.size();
-    let intrinsic_w = size.width();
-    let intrinsic_h = size.height();
-    let longest = intrinsic_w.max(intrinsic_h);
-    // f64→f32: the SVG intrinsic size feeds a raster target capped at
+    let view_w = size.width();
+    let view_h = size.height();
+    let (origin_x, origin_y, region_w, region_h) = match region {
+        Some(region) => {
+            let x0 = region.x.clamp(0.0, 1.0);
+            let y0 = region.y.clamp(0.0, 1.0);
+            let x1 = (region.x + region.width).clamp(0.0, 1.0);
+            let y1 = (region.y + region.height).clamp(0.0, 1.0);
+            if x1 <= x0 || y1 <= y0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "crop region does not overlap the image",
+                ));
+            }
+            (
+                x0 * view_w,
+                y0 * view_h,
+                (x1 - x0) * view_w,
+                (y1 - y0) * view_h,
+            )
+        }
+        None => (0.0, 0.0, view_w, view_h),
+    };
+
+    // Cap the *rendered region* (not the whole tree) to MAX_IMAGE_DIMENSION, so
+    // a small crop renders at native resolution and only an oversized region is
+    // downscaled.
+    let longest = region_w.max(region_h);
+    // f64→f32: the region extent feeds a raster target capped at
     // MAX_IMAGE_DIMENSION (2000 px), where f32 precision is far beyond pixel
     // granularity.
     #[expect(clippy::cast_precision_loss)]
@@ -250,9 +410,9 @@ fn rasterize_svg(bytes: &[u8]) -> std::io::Result<DynamicImage> {
     // before the cast, and the Pixmap::new allocation below fails if they
     // exceed the rasterizer's limits — identical behavior, just lint-silenced.
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let out_w = (intrinsic_w * scale).ceil().max(1.0) as u32;
+    let out_w = (region_w * scale).ceil().max(1.0) as u32;
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let out_h = (intrinsic_h * scale).ceil().max(1.0) as u32;
+    let out_h = (region_h * scale).ceil().max(1.0) as u32;
 
     let mut pixmap = tiny_skia::Pixmap::new(out_w, out_h).ok_or_else(|| {
         std::io::Error::new(
@@ -260,11 +420,18 @@ fn rasterize_svg(bytes: &[u8]) -> std::io::Result<DynamicImage> {
             "svg dimensions are too large to rasterize",
         )
     })?;
-    resvg::render(
-        &tree,
-        tiny_skia::Transform::from_scale(scale, scale),
-        &mut pixmap.as_mut(),
+    // Scale by `scale` and shift the region's top-left corner to the pixmap
+    // origin: a viewport point (vx, vy) lands at ((vx - origin_x) * scale,
+    // (vy - origin_y) * scale). Content outside the pixmap is clipped.
+    let transform = tiny_skia::Transform::from_row(
+        scale,
+        0.0,
+        0.0,
+        scale,
+        -origin_x * scale,
+        -origin_y * scale,
     );
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
     let rgba = RgbaImage::from_raw(out_w, out_h, pixmap.take()).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -394,7 +561,7 @@ mod tests {
     #[test]
     fn opaque_image_reencodes_to_jpeg() {
         let bytes = as_png(&opaque_rgb());
-        let out = normalize_bytes(&bytes).unwrap();
+        let out = normalize_bytes(&bytes, None).unwrap();
         assert_eq!(out.mime_type, "image/jpeg");
         assert_eq!(out.width, 3);
         assert_eq!(out.height, 2);
@@ -412,10 +579,94 @@ mod tests {
         });
         let img = DynamicImage::ImageRgba8(buf);
         let bytes = as_png(&img);
-        let out = normalize_bytes(&bytes).unwrap();
+        let out = normalize_bytes(&bytes, None).unwrap();
         assert_eq!(out.mime_type, "image/png");
         assert_eq!(out.width, 4);
         assert_eq!(out.height, 4);
+    }
+
+    #[test]
+    fn fractional_crop_selects_the_sub_rectangle() {
+        // 3×2 source; middle third by width, top half by height → 1×1 px.
+        let bytes = as_png(&opaque_rgb());
+        let region = CropRegion {
+            x: 1.0 / 3.0,
+            y: 0.0,
+            width: 1.0 / 3.0,
+            height: 0.5,
+        };
+        let out = normalize_bytes(&bytes, Some(region)).unwrap();
+        assert_eq!((out.width, out.height), (1, 1));
+        assert_eq!(out.mime_type, "image/jpeg");
+    }
+
+    #[test]
+    fn empty_crop_region_is_rejected() {
+        // A zero-width region resolves to no pixels — reject it rather than
+        // silently returning the whole image.
+        let bytes = as_png(&opaque_rgb());
+        let region = CropRegion {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 1.0,
+        };
+        let err = normalize_bytes(&bytes, Some(region)).unwrap_err();
+        assert!(err.to_string().contains("does not overlap"), "{err}");
+    }
+
+    #[test]
+    fn full_region_matches_no_region() {
+        // A full-image region must be a no-op: same dimensions as no crop.
+        let bytes = as_png(&opaque_rgb());
+        let region = CropRegion {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        let cropped = normalize_bytes(&bytes, Some(region)).unwrap();
+        assert_eq!((cropped.width, cropped.height), (3, 2));
+    }
+
+    #[test]
+    fn svg_crop_renders_only_the_region() {
+        // A 100×100 SVG cropped to the top-left quarter renders 50×25 at native
+        // resolution: the region is drawn, not the whole tree downscaled.
+        let svg = b"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'>\
+                    <rect width='100' height='100' fill='blue'/></svg>";
+        let region = CropRegion {
+            x: 0.0,
+            y: 0.0,
+            width: 0.5,
+            height: 0.25,
+        };
+        let out = normalize_bytes(svg, Some(region)).unwrap();
+        assert_eq!((out.width, out.height), (50, 25));
+    }
+
+    #[test]
+    fn svg_crop_translates_to_the_requested_region() {
+        // A left-black / right-white split SVG: cropping the right half must
+        // show the white fill, proving the transform shifts the region to the
+        // origin rather than merely resizing the output.
+        let svg = b"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'>\
+                    <rect width='50' height='100' fill='black'/>\
+                    <rect x='50' width='50' height='100' fill='white'/></svg>";
+        let region = CropRegion {
+            x: 0.5,
+            y: 0.0,
+            width: 0.5,
+            height: 1.0,
+        };
+        let out = normalize_bytes(svg, Some(region)).unwrap();
+        assert_eq!((out.width, out.height), (50, 100));
+        let decoded = image::load_from_memory(&out.data).unwrap().to_rgb8();
+        let pixel = decoded.get_pixel(25, 50).0;
+        assert!(
+            pixel[0] > 200 && pixel[1] > 200 && pixel[2] > 200,
+            "expected the white right-hand fill, got {pixel:?}"
+        );
     }
 
     #[test]
@@ -443,7 +694,7 @@ mod tests {
         let img = DynamicImage::ImageRgb8(buf);
         let mut bytes = Cursor::new(Vec::new());
         img.write_to(&mut bytes, ImageFormat::Bmp).unwrap();
-        let out = normalize_bytes(&bytes.into_inner()).unwrap();
+        let out = normalize_bytes(&bytes.into_inner(), None).unwrap();
         assert!(out.width <= MAX_IMAGE_DIMENSION);
         assert!(out.height <= MAX_IMAGE_DIMENSION);
         // Aspect ratio preserved (2000×1000), opaque input → JPEG output.
@@ -457,7 +708,7 @@ mod tests {
     fn gated_avif_is_rejected_when_feature_disabled() {
         // An AVIF `ftyp` header is recognized by magic regardless, but is only
         // accepted when the gated `avif` feature is enabled.
-        let err = normalize_bytes(b"\0\0\0\x18ftypavif").unwrap_err();
+        let err = normalize_bytes(b"\0\0\0\x18ftypavif", None).unwrap_err();
         assert!(
             err.to_string().contains("unsupported image format"),
             "{err}"
@@ -469,7 +720,7 @@ mod tests {
         // BMP is a guessable raster format and is in the supported set.
         // (This is a decode that will fail on truncation, not an unsupported
         // format — assert it is *not* the unsupported-format rejection.)
-        let err = normalize_bytes(b"BM\0\0\0\0\0\0\0\0").unwrap_err();
+        let err = normalize_bytes(b"BM\0\0\0\0\0\0\0\0", None).unwrap_err();
         assert!(
             !err.to_string().contains("unsupported image format"),
             "{err}"
@@ -478,7 +729,7 @@ mod tests {
 
     #[test]
     fn empty_bytes_are_rejected() {
-        assert!(normalize_bytes(&[]).is_err());
+        assert!(normalize_bytes(&[], None).is_err());
     }
 
     #[test]

@@ -15,10 +15,16 @@
 //! concurrent session's invocation overwrite it before this invocation's hook
 //! reads it back.
 //!
+//! An optional `region` (fractions of the image) crops the image server-side
+//! before it is normalized, so a caller can inspect a sub-area at native
+//! resolution without writing a cropped copy to disk. The crop is applied by
+//! `crate::image_prep` (from decoded pixels for raster/HEIC sources, or into the
+//! rasterizer for SVG); the reference then carries the cropped bytes.
+//!
 //! v1 accepts local file paths only. URLs / clipboard paste are future work.
 
 use super::{ToolExecError, truncate_tool_output};
-use crate::image_prep;
+use crate::image_prep::{self, CropRegion};
 use choreo_keystore::ServiceCredential;
 use choreo_proto::ImageReference;
 use schemars::JsonSchema;
@@ -31,6 +37,62 @@ pub struct ReadImageArgs {
     /// Path to an image file to read (relative to the working directory, or
     /// absolute).
     pub path: String,
+    /// Optional sub-rectangle to read instead of the whole image, as fractions
+    /// (0.0–1.0) of the image's width and height. Omit to read the whole image.
+    /// A crop reaches the model at native resolution (the whole image is
+    /// otherwise downscaled to fit 2000px on its longest edge), so this is the
+    /// way to inspect fine detail without writing a cropped copy to disk.
+    pub region: Option<RegionArg>,
+}
+
+/// An optional sub-rectangle to read, given as fractions of the image's
+/// displayed extent.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RegionArg {
+    /// Left edge as a fraction of the image width (0.0 = left edge).
+    pub x: f32,
+    /// Top edge as a fraction of the image height (0.0 = top edge).
+    pub y: f32,
+    /// Region width as a fraction of the image width (must be > 0.0).
+    pub width: f32,
+    /// Region height as a fraction of the image height (must be > 0.0).
+    pub height: f32,
+}
+
+impl RegionArg {
+    /// Validate the fractions and convert to the crate's crop type.
+    ///
+    /// The fractions must be finite, `x`/`y` in `[0, 1)`, `width`/`height`
+    /// positive, and the region must stay within the unit square. A tiny
+    /// tolerance lets `x + width` sum to exactly 1.0 through float rounding.
+    fn validate(&self, path: &str) -> Result<CropRegion, ToolExecError> {
+        const TOL: f32 = 1e-6;
+        let finite = self.x.is_finite()
+            && self.y.is_finite()
+            && self.width.is_finite()
+            && self.height.is_finite();
+        let valid = finite
+            && (0.0..1.0).contains(&self.x)
+            && (0.0..1.0).contains(&self.y)
+            && self.width > 0.0
+            && self.height > 0.0
+            && self.x + self.width <= 1.0 + TOL
+            && self.y + self.height <= 1.0 + TOL;
+        if !valid {
+            return Err(ToolExecError(format!(
+                "invalid region for `{path}`: x and y must be in [0, 1), width and \
+                 height must be > 0, and x+width and y+height must not exceed 1 \
+                 (got x={}, y={}, width={}, height={})",
+                self.x, self.y, self.width, self.height
+            )));
+        }
+        Ok(CropRegion {
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+        })
+    }
 }
 
 /// The `read_image` tool's return value: a human-readable text handle plus the
@@ -78,6 +140,7 @@ impl ReadImage {
 fn resolve_and_normalize(
     args: &ReadImageArgs,
     working_dir: Option<&Path>,
+    region: Option<CropRegion>,
 ) -> Result<(std::path::PathBuf, image_prep::PreparedVisionImage), ToolExecError> {
     if args.path.trim().is_empty() {
         return Err(ToolExecError(
@@ -85,7 +148,7 @@ fn resolve_and_normalize(
         ));
     }
     let resolved = super::resolve_path(&args.path, working_dir);
-    match image_prep::load_and_normalize(&resolved) {
+    match image_prep::load_and_normalize(&resolved, region) {
         Ok(prep) => {
             debug!(
                 path = %resolved.display(),
@@ -112,7 +175,13 @@ impl super::Tool for ReadImage {
         "Read an image file from the local workspace and provide it to a vision-capable model as image input. Returns the image's path, dimensions, and MIME type, and feeds the image to the model on the next request."
     }
     fn describe_invocation(&self, args: &Self::Args) -> String {
-        format!("Reading image `{}`.", args.path)
+        match &args.region {
+            Some(r) => format!(
+                "Reading region (x={}, y={}, {}×{}) of image `{}`.",
+                r.x, r.y, r.width, r.height, args.path
+            ),
+            None => format!("Reading image `{}`.", args.path),
+        }
     }
 
     fn return_string(ret: &Self::Return) -> String {
@@ -126,7 +195,13 @@ impl super::Tool for ReadImage {
         working_dir: Option<&Path>,
         _ctx: Option<&super::context::ToolContext>,
     ) -> Result<Self::Return, Self::Error> {
-        let (resolved, prep) = resolve_and_normalize(&args, working_dir)?;
+        // Validate the crop before touching disk so a bad region fails fast.
+        let region = args
+            .region
+            .as_ref()
+            .map(|r| r.validate(&args.path))
+            .transpose()?;
+        let (resolved, prep) = resolve_and_normalize(&args, working_dir, region)?;
         // Capture the byte length before moving `prep.data` into the reference
         // (the text handle and log below still need it).
         let byte_len = prep.data.len();
@@ -176,6 +251,21 @@ mod tests {
         tool.execute(
             ReadImageArgs {
                 path: path.to_string(),
+                region: None,
+            },
+            None,
+            None,
+            None,
+        )
+        .map(|ret| ret.text)
+    }
+
+    fn run_with_region(path: &str, region: RegionArg) -> Result<String, ToolExecError> {
+        let tool = ReadImage::new();
+        tool.execute(
+            ReadImageArgs {
+                path: path.to_string(),
+                region: Some(region),
             },
             None,
             None,
@@ -214,6 +304,7 @@ mod tests {
         let file = write_png();
         let args = ReadImageArgs {
             path: file.path().display().to_string(),
+            region: None,
         };
         let ret = tool.execute(args, None, None, None).expect("execute");
         let reference = tool.extract_image_ref(&ret).expect("image ref");
@@ -232,6 +323,7 @@ mod tests {
         let file = write_png();
         let args = ReadImageArgs {
             path: file.path().display().to_string(),
+            region: None,
         };
         let ret = tool.execute(args, None, None, None).expect("execute");
         assert_eq!(ReadImage::return_string(&ret), ret.text);
@@ -276,5 +368,54 @@ mod tests {
         file.write_all(b"just text, not an image").unwrap();
         let err = run(&file.path().display().to_string()).unwrap_err();
         assert!(err.to_string().contains("failed to read image"), "{err}");
+    }
+
+    #[test]
+    fn region_crops_the_image_to_the_requested_fraction() {
+        // 3×2 source; left third by width, top half by height → 1×1 px crop.
+        let file = write_png();
+        let out = run_with_region(
+            &file.path().display().to_string(),
+            RegionArg {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0 / 3.0,
+                height: 0.5,
+            },
+        )
+        .unwrap();
+        assert!(out.contains("1x1"), "{out}");
+    }
+
+    #[test]
+    fn rejects_region_outside_the_unit_square() {
+        let file = write_png();
+        let err = run_with_region(
+            &file.path().display().to_string(),
+            RegionArg {
+                x: 0.0,
+                y: 0.0,
+                width: 1.5,
+                height: 1.0,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid region"), "{err}");
+    }
+
+    #[test]
+    fn rejects_non_finite_region() {
+        let file = write_png();
+        let err = run_with_region(
+            &file.path().display().to_string(),
+            RegionArg {
+                x: 0.0,
+                y: 0.0,
+                width: f32::NAN,
+                height: 1.0,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid region"), "{err}");
     }
 }
