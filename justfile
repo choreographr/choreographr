@@ -53,7 +53,7 @@ cross_rustflags := "-Cdebuginfo=0"
 # once its public items are documented and its rustdoc is warning-free. See
 # AGENTS.md → Documentation for the split (rustdoc owns the per-module API
 # reference; ARCHITECTURE.md owns the cross-cutting system view).
-doc_crates := "-p choreo-shared -p choreo-image -p choreo-sockreg -p choreo-power-events -p choreo-sanitize -p choreo-markdown -p choreo-keystore -p choreo-transport -p choreo-tui -p choreo-gui -p choreo-blockchain -p choreo-mcp"
+doc_crates := "-p choreo-shared -p choreo-image -p choreo-sockreg -p choreo-power-events -p choreo-sanitize -p choreo-markdown -p choreo-keystore -p choreo-transport -p choreo-tui -p choreo-gui -p choreo-blockchain -p choreo-mcp -p choreo-im -p choreo-content"
 
 # ── entry points ──────────────────────────────────────────────────────────────
 

@@ -44,6 +44,8 @@ pub const DEFAULT_LANGUAGE_TAG: &str = "en";
 /// The top-level content envelope: an ordered list of mixins.
 #[derive(Clone, PartialEq, Message)]
 pub struct ItemMessage {
+    /// Ordered mixin list. An item's semantic type is implied by which mixins
+    /// appear (and their order): type markers first, then ordinal content.
     #[prost(message, repeated, tag = "1")]
     pub mixin_payload: Vec<MixinPayloadMessage>,
 }
@@ -51,8 +53,11 @@ pub struct ItemMessage {
 /// A single tagged mixin: a 32-bit type discriminator plus its payload.
 #[derive(Clone, PartialEq, Message)]
 pub struct MixinPayloadMessage {
+    /// 32-bit discriminator selecting how to read `payload` (one of the
+    /// `*_MIXIN_ID` constants in this module).
     #[prost(fixed32, tag = "1")]
     pub mixin_id: u32,
+    /// Mixin-specific protobuf payload bytes; empty for the bare type markers.
     #[prost(bytes = "vec", tag = "2")]
     pub payload: Vec<u8>,
 }
@@ -60,6 +65,7 @@ pub struct MixinPayloadMessage {
 /// BCP-47 language tag.
 #[derive(Clone, PartialEq, Message)]
 pub struct LanguageMixinMessage {
+    /// BCP-47 language tag (e.g. `"en"`).
     #[prost(string, tag = "1")]
     pub language_tag: String,
 }
@@ -67,6 +73,7 @@ pub struct LanguageMixinMessage {
 /// Human-readable title.
 #[derive(Clone, PartialEq, Message)]
 pub struct TitleMixinMessage {
+    /// Human-readable title text.
     #[prost(string, tag = "1")]
     pub title: String,
 }
@@ -74,6 +81,7 @@ pub struct TitleMixinMessage {
 /// Body text.
 #[derive(Clone, PartialEq, Message)]
 pub struct BodyTextMixinMessage {
+    /// Body text (markdown or plain).
     #[prost(string, tag = "1")]
     pub body_text: String,
 }
@@ -81,16 +89,23 @@ pub struct BodyTextMixinMessage {
 /// An image reference plus its mipmap pyramid (each level a separate IPFS CID).
 #[derive(Clone, PartialEq, Message)]
 pub struct ImageMixinMessage {
+    /// Stored filename of the original image.
     #[prost(string, tag = "1")]
     pub filename: String,
+    /// Size of the full-resolution image in bytes.
     #[prost(uint64, tag = "2")]
     pub filesize: u64,
+    /// Full 34-byte sha2-256 multihash (`0x12 0x20 ‖ digest`) of the
+    /// full-resolution image — the reference wire form (see `encode_image_mixin`).
     #[prost(bytes = "vec", tag = "3")]
     pub ipfs_hash: Vec<u8>,
+    /// Full-resolution width in pixels.
     #[prost(uint32, tag = "4")]
     pub width: u32,
+    /// Full-resolution height in pixels.
     #[prost(uint32, tag = "5")]
     pub height: u32,
+    /// Reduced-resolution mipmap pyramid, largest level first.
     #[prost(message, repeated, tag = "6")]
     pub mipmap_level: Vec<MipmapLevelMessage>,
 }
@@ -98,8 +113,12 @@ pub struct ImageMixinMessage {
 /// One mipmap level of an [`ImageMixinMessage`].
 #[derive(Clone, PartialEq, Message)]
 pub struct MipmapLevelMessage {
+    /// Size of this level's image in bytes.
     #[prost(uint64, tag = "1")]
     pub filesize: u64,
+    /// Full 34-byte sha2-256 multihash (`0x12 0x20 ‖ digest`) of this level's
+    /// image — stored in the reference wire form so a bare `bs58::encode`
+    /// reproduces the CID.
     #[prost(bytes = "vec", tag = "2")]
     pub ipfs_hash: Vec<u8>,
 }
@@ -107,8 +126,11 @@ pub struct MipmapLevelMessage {
 /// Account profile mixin: signed account type + free-text location.
 #[derive(Clone, PartialEq, Message)]
 pub struct ProfileMixinMessage {
+    /// Signed account type (`0..=8`, see [`AccountType`]); stored as the raw
+    /// enum ordinal so unknown future values survive a round-trip.
     #[prost(int32, tag = "1")]
     pub account_type: i32,
+    /// Free-text location string.
     #[prost(string, tag = "2")]
     pub location: String,
 }
@@ -117,14 +139,23 @@ pub struct ProfileMixinMessage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
 #[repr(i32)]
 pub enum AccountType {
+    /// Unattributed or anonymous account.
     Anon = 0,
+    /// An individual person.
     Person = 1,
+    /// A software or content project.
     Project = 2,
+    /// An organization or company.
     Organization = 3,
+    /// An account acting on behalf of another.
     Proxy = 4,
+    /// A parody or satirical account.
     Parody = 5,
+    /// An automated account.
     Bot = 6,
+    /// A promotional or shilling account.
     Shill = 7,
+    /// A throwaway test account.
     Test = 8,
 }
 
@@ -149,9 +180,13 @@ pub enum ContentType {
     /// Title + body + language — the default item shape.
     #[default]
     Document,
+    /// An activity-feed post, carrying the feed-type marker mixin.
     Feed,
+    /// A comment on another item, carrying the comment-type marker mixin.
     Comment,
+    /// An account profile, carrying the profile mixin.
     Profile,
+    /// A standalone image, carrying the image mixin.
     Image,
 }
 
@@ -172,12 +207,17 @@ pub struct MipmapLevel {
     Clone, Debug, Default, PartialEq, Eq, schemars::JsonSchema, serde::Serialize, serde::Deserialize,
 )]
 pub struct ImageSpec {
+    /// Stored filename of the original image.
     pub filename: String,
+    /// Size of the full-resolution image in bytes.
     pub filesize: u64,
     /// sha2-256 digest hex (`0x`-prefixed) of the full-resolution image.
     pub digest_hex: String,
+    /// Full-resolution width in pixels.
     pub width: u32,
+    /// Full-resolution height in pixels.
     pub height: u32,
+    /// Reduced-resolution mipmap pyramid, largest level first.
     pub mipmap_levels: Vec<MipmapLevel>,
 }
 
@@ -188,6 +228,7 @@ pub struct ImageSpec {
 pub struct ProfileSpec {
     /// Account type (0..=8, see [`AccountType`]).
     pub account_type: i32,
+    /// Free-text location string.
     pub location: String,
 }
 
@@ -218,12 +259,17 @@ pub struct ImageInput {
 /// which performs the IPFS work for `path`-based inputs).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PreparedContent {
+    /// Content type the item will be tagged as.
     pub content_type: ContentType,
+    /// Human-readable title, when present.
     pub title: Option<String>,
+    /// Body text, when present.
     pub body: Option<String>,
     /// BCP-47 language tag; defaults to [`DEFAULT_LANGUAGE_TAG`].
     pub language: Option<String>,
+    /// Resolved image reference, when present.
     pub image: Option<ImageSpec>,
+    /// Profile fields, when present.
     pub profile: Option<ProfileSpec>,
 }
 
@@ -236,12 +282,17 @@ pub struct PreparedContent {
     Clone, Debug, Default, PartialEq, Eq, schemars::JsonSchema, serde::Serialize, serde::Deserialize,
 )]
 pub struct ContentInput {
+    /// Content type to tag the item with.
     pub content_type: ContentType,
+    /// Human-readable title, when present.
     pub title: Option<String>,
+    /// Body text, when present.
     pub body: Option<String>,
     /// BCP-47 language tag; defaults to [`DEFAULT_LANGUAGE_TAG`].
     pub language: Option<String>,
+    /// Image reference; resolved to a full [`ImageSpec`] before encoding.
     pub image: Option<ImageInput>,
+    /// Profile fields, when present.
     pub profile: Option<ProfileSpec>,
 }
 
@@ -269,10 +320,15 @@ impl ContentInput {
 pub struct DecodedItem {
     /// The type inferred from the present marker/profile mixins.
     pub content_type: ContentType,
+    /// Decoded title, absent when the item carried no title mixin.
     pub title: Option<String>,
+    /// Decoded body text, absent when the item carried no body mixin.
     pub body: Option<String>,
+    /// Decoded language tag, absent when the item carried no language mixin.
     pub language: Option<String>,
+    /// Decoded image reference, absent when the item carried no image mixin.
     pub image: Option<ImageSpec>,
+    /// Decoded profile fields, absent when the item carried no profile mixin.
     pub profile: Option<ProfileSpec>,
 }
 
@@ -444,8 +500,8 @@ fn marker(mixin_id: u32) -> MixinPayloadMessage {
 /// # Errors
 ///
 /// Fails with [`crate::ContentError::Cid`] when the image's `digest_hex` is
-/// not 32 bytes of `0x` hex (via [`multihash_bytes`]) or any mipmap level's
-/// `cid` is not a sha2-256 `CIDv0` multihash (via [`cid_to_multihash_bytes`]).
+/// not 32 bytes of `0x` hex (via `multihash_bytes`) or any mipmap level's
+/// `cid` is not a sha2-256 `CIDv0` multihash (via `cid_to_multihash_bytes`).
 pub fn encode_image_mixin(image: &ImageSpec) -> Result<Vec<u8>, crate::ContentError> {
     let mipmap_levels = image
         .mipmap_levels

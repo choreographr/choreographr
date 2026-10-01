@@ -34,10 +34,20 @@ pub enum QueryKey {
     /// Exact `ipfs_hash` (32 bytes) match.
     IpfsHash([u8; 32]),
     /// Composite `item_id` + `revision_id` match.
-    ItemRevision { item_id: [u8; 32], revision_id: u32 },
+    ItemRevision {
+        /// 32-byte item id to match.
+        item_id: [u8; 32],
+        /// Revision id to match within the item.
+        revision_id: u32,
+    },
     /// Raw custom key with an explicit name and kind/value (for the arbitrary
     /// declared keys, e.g. `index`-style keys not wrapped by this crate).
-    Raw { name: String, value: Value },
+    Raw {
+        /// Declared query-key name (from `acuity.toml`).
+        name: String,
+        /// Already-shaped `CustomValue` object (`{"kind":…,"value":…}`).
+        value: Value,
+    },
 }
 
 impl QueryKey {
@@ -94,7 +104,9 @@ fn custom_scalar(kind: &str, value: &Value) -> Value {
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DecodedEvent {
+    /// Block number the event was emitted in.
     pub block_number: u32,
+    /// Position of the event within its block.
     pub event_index: u32,
     /// Milliseconds since Unix epoch (from the block's `Timestamp::Now`).
     pub timestamp: u64,
@@ -108,10 +120,15 @@ pub struct DecodedEvent {
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoredEvent {
+    /// Name of the emitting pallet.
     pub pallet_name: String,
+    /// Name of the event variant.
     pub event_name: String,
+    /// Pallet index within the runtime.
     pub pallet_index: u8,
+    /// Event-variant index within the pallet.
     pub variant_index: u8,
+    /// Event index within the block.
     pub event_index: u8,
     /// Free-form field map; string keys map event params to their values.
     pub fields: Value,
@@ -150,19 +167,23 @@ impl DecodedEvent {
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetEventsResult {
+    /// Matching events, newest first.
     pub events: Vec<DecodedEvent>,
 }
 
 /// Status result for `acuity_indexStatus`.
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 pub struct IndexStatusResult {
+    /// Block ranges the indexer has processed.
     pub spans: Vec<Span>,
 }
 
 /// An indexed span (block range).
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 pub struct Span {
+    /// First block of the span (inclusive).
     pub start: u32,
+    /// Last block of the span (inclusive).
     pub end: u32,
 }
 

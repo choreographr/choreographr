@@ -1,40 +1,69 @@
+//! Minimal Telegram Bot API client covering the three calls the bridge needs:
+//! `getUpdates`, `sendMessage`, and `sendPhoto`.
+//!
+//! Hand-rolled over [`ureq`](https://docs.rs/ureq) rather than a full bot
+//! framework — the bridge only needs long-polling, a JSON message send, and a
+//! multipart photo upload, and the response shapes it decodes ([`Update`],
+//! [`Message`], [`Chat`], [`User`]) are the subset it reads. Every call surfaces
+//! failures as [`TelegramError`].
+
 use std::io::Write;
 use thiserror::Error;
 use ureq::Agent;
 use ureq::config::Config;
 
+/// Failure returned by a [`Bot`] API call.
 #[derive(Debug, Error)]
 pub enum TelegramError {
+    /// The HTTP request failed to send, or its response failed to parse.
     #[error("HTTP request failed: {0}")]
     Http(#[from] ureq::Error),
+    /// An I/O error while assembling a request body.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// The Bot API replied with `ok: false`.
     #[error("Telegram API error: {description}")]
-    Api { description: String },
+    Api {
+        /// The human-readable error description from the API.
+        description: String,
+    },
 }
 
+/// One entry from `getUpdates`: the poll cursor and the message it carried, if
+/// any.
 #[derive(serde::Deserialize, Debug)]
 pub struct Update {
+    /// Monotonic update id; passed back as the next poll offset.
     pub update_id: u32,
+    /// The message payload, if this update carried one.
     pub message: Option<Message>,
 }
 
+/// A Telegram message, reduced to the fields the bridge reads.
 #[derive(serde::Deserialize, Debug)]
 pub struct Message {
+    /// The chat the message belongs to.
     pub chat: Chat,
+    /// The message text, if any (non-text messages are ignored).
     pub text: Option<String>,
+    /// The sending user, if known.
     pub from: Option<User>,
 }
 
+/// The chat a [`Message`] belongs to.
 #[derive(serde::Deserialize, Debug)]
 pub struct Chat {
+    /// The chat id, echoed back as the destination of outbound messages.
     pub id: i64,
+    /// The chat type (e.g. `private`); only private chats are served.
     #[serde(rename = "type")]
     pub type_field: String,
 }
 
+/// The user who sent a [`Message`], reduced to the id used for the admin check.
 #[derive(serde::Deserialize, Debug)]
 pub struct User {
+    /// The Telegram user id, matched against the configured admin list.
     pub id: i64,
 }
 
@@ -45,6 +74,11 @@ struct ApiResponse<T> {
     description: Option<String>,
 }
 
+/// A Telegram Bot API client bound to one bot token.
+///
+/// Cloning shares the underlying [`ureq::Agent`] connection pool, so a clone is
+/// cheap; that is how the polling loop and the event-render thread share one
+/// client.
 #[derive(Clone)]
 pub struct Bot {
     token: String,
@@ -52,6 +86,12 @@ pub struct Bot {
 }
 
 impl Bot {
+    /// Build a client for `token` (the bot token, i.e. the part after `bot` in
+    /// the API URL).
+    ///
+    /// Uses a 10-second connect timeout and disables ureq's status-as-error
+    /// behaviour, so the Bot API's JSON `ok`/`description` body can be read and
+    /// mapped to [`TelegramError::Api`] regardless of HTTP status.
     #[must_use]
     pub fn new(token: &str) -> Self {
         Self {
@@ -65,6 +105,11 @@ impl Bot {
         }
     }
 
+    /// Long-poll `getUpdates` for new messages after `offset`.
+    ///
+    /// `timeout` is the server-side long-poll hold, in seconds; Telegram
+    /// returns an empty result once it elapses. `offset` is the id one past the
+    /// last processed update, so already-acknowledged updates are dropped.
     ///
     /// # Errors
     ///
@@ -86,6 +131,10 @@ impl Bot {
         Ok(api_resp.result.unwrap_or_default())
     }
 
+    /// Send a text message to `chat_id`.
+    ///
+    /// `parse_mode` (e.g. `Some("HTML")`) selects how Telegram interprets the
+    /// markup in `text`; `None` sends it verbatim.
     ///
     /// # Errors
     ///
@@ -119,6 +168,11 @@ impl Bot {
         Ok(())
     }
 
+    /// Upload `data` as a photo to `chat_id` via a multipart `sendPhoto`.
+    ///
+    /// The image is sent inline (never as a URL), so bytes fetched on demand
+    /// from the daemon are uploaded directly. The multipart boundary is made
+    /// unique from the current time.
     ///
     /// # Errors
     ///

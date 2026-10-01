@@ -1,3 +1,12 @@
+//! Telegram platform bridge: a long-polling bot that relays admin messages to
+//! the daemon and renders the daemon's [`BridgeEvent`]s back to Telegram.
+//!
+//! Only private-chat messages from a configured admin user are accepted (the
+//! ids come from `CHOREOGRAPHR_TELEGRAM_USER_IDS`); everything else is ignored.
+//! Inbound text is parsed with the shared command grammar
+//! (`choreo_client_core::parse_input_line`) and forwarded as wire messages, and
+//! outbound events are rendered to Telegram's HTML subset.
+
 use ammonia::Builder as HtmlSanitizer;
 use choreo_client_core::{
     Command, build_add_credential_message, parse_input_line, resolve_private_key,
@@ -11,6 +20,13 @@ use tracing::{debug, error, info, warn};
 use crate::bridge::BridgeEvent;
 use crate::tg_api::Bot;
 
+/// Run the Telegram bridge until the process exits.
+///
+/// Consumes the bridge's halves: `bridge_tx` carries [`ClientMessage`]s to the
+/// daemon and `bridge_rx` yields the [`BridgeEvent`]s to render. `admin_ids` is
+/// the set of Telegram user ids allowed to drive the daemon. Blocks forever in
+/// the poll loop — an update-fetch error is logged and retried after a short
+/// delay — so it is the final call of [`main`](crate::main).
 pub fn run(
     bot_token: &str,
     admin_ids: Vec<i64>,

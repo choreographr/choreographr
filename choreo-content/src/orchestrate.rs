@@ -70,29 +70,39 @@ pub struct ProfileResult {
     pub item_id: Option<String>,
     /// Decoded content fields.
     pub name: Option<String>,
+    /// Decoded biography text, when resolvable.
     pub bio: Option<String>,
+    /// Decoded free-text location, when resolvable.
     pub location: Option<String>,
+    /// Decoded account type (`0..=8`), when resolvable.
     pub account_type: Option<i32>,
 }
 
 /// Aggregated status of the three platform services.
 #[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
 pub struct CoordStatus {
+    /// Chain probe result, absent when the node is unreachable or the genesis
+    /// hash mismatches.
     pub chain: Option<ChainStatus>,
+    /// Indexer probe result, absent when unreachable.
     pub indexer: Option<IndexerStatus>,
+    /// IPFS probe result, absent when the daemon is unreachable.
     pub ipfs: Option<ipfs::IpfsStatus>,
 }
 
 /// A snapshot of the event indexer's indexed spans.
 #[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
 pub struct IndexerStatus {
+    /// Block ranges the indexer has processed.
     pub spans: Vec<Span>,
 }
 
 /// An indexed block span.
 #[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
 pub struct Span {
+    /// First block of the span (inclusive).
     pub start: u32,
+    /// Last block of the span (inclusive).
     pub end: u32,
 }
 
@@ -114,10 +124,15 @@ impl From<indexer::IndexStatusResult> for IndexerStatus {
 /// Chain/status snapshot.
 #[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
 pub struct ChainStatus {
+    /// The connected node's genesis hash (`0x` hex).
     pub genesis_hash: String,
+    /// SS58 address prefix the node's runtime uses.
     pub ss58_prefix: u16,
+    /// Best (head) block height.
     pub best_block: u64,
+    /// Finalized block height.
     pub finalized_block: u64,
+    /// Item-id derivation namespace pinned by the runtime.
     pub item_id_namespace: u32,
 }
 
@@ -176,6 +191,7 @@ pub fn item(item_id_hex: &str, revision_id: Option<u32>) -> Result<ResolvedItem,
 pub struct ItemImage {
     /// Full-resolution dimensions declared in the image mixin.
     pub width: u32,
+    /// Full-resolution height in pixels declared in the image mixin.
     pub height: u32,
     /// The mipmap level that was fetched (0 = full resolution).
     pub level: u32,
@@ -514,7 +530,7 @@ fn resolve_content(input: &ContentInput) -> Result<PreparedContent, ContentError
 ///
 /// Fails with [`ContentError::InvalidArgument`] when `flags` is outside
 /// [`crate::config::VALID_PUBLISH_FLAGS`] or the image input is ambiguous
-/// (via [`resolve_content`]); with [`ContentError::Image`]/[`ContentError::Ipfs`]/[`ContentError::Cid`]
+/// (via `resolve_content`); with [`ContentError::Image`]/[`ContentError::Ipfs`]/[`ContentError::Cid`]
 /// when a `path`-based image cannot be prepared or the encoded payload
 /// cannot be uploaded to IPFS; with [`ContentError::Cid`] when the returned
 /// digest is malformed; and with [`ContentError::Transaction`],
@@ -568,7 +584,7 @@ pub fn publish_item(
 ///
 /// Fails with [`ContentError::Image`], [`ContentError::Ipfs`], or
 /// [`ContentError::Cid`] when a `path`-based image cannot be prepared (via
-/// [`resolve_content`]) or the encoded payload cannot be uploaded to IPFS;
+/// `resolve_content`) or the encoded payload cannot be uploaded to IPFS;
 /// with [`ContentError::Content`] when the payload cannot be encoded; and
 /// with [`ContentError::Transaction`], [`ContentError::Substrate`],
 /// [`ContentError::Account`], or [`ContentError::RuntimeNotInitialized`]
@@ -635,7 +651,7 @@ pub fn account_link(
 /// # Errors
 ///
 /// Fails with [`ContentError::Image`]/[`ContentError::Ipfs`]/[`ContentError::Cid`]
-/// when a `path`-based image cannot be prepared (via [`resolve_content`]) or
+/// when a `path`-based image cannot be prepared (via `resolve_content`) or
 /// the encoded payload cannot be uploaded to IPFS; with
 /// [`ContentError::Content`] when the payload cannot be encoded; and with
 /// [`ContentError::Transaction`], [`ContentError::Substrate`],
@@ -674,8 +690,11 @@ pub fn set_profile(
 )]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleAction {
+    /// Mark the item retracted (sets the retracted flag bit).
     Retract,
+    /// Clear the revisionable flag so no further revisions are accepted.
     SetNotRevisionable,
+    /// Clear the retractable flag so the item can no longer be retracted.
     SetNotRetractable,
 }
 
@@ -685,16 +704,21 @@ pub enum LifecycleAction {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum AccountLinkAction {
+    /// Pin the item to the account.
     Add,
+    /// Unpin the item from the account.
     Remove,
 }
 
 // ── IPFS status wrapper (re-exported shape) ──────────────────────────────────
+/// Tool-facing IPFS status shape, re-exported under [`crate::orchestrate`].
 pub mod ipfs {
     /// A resolved IPFS peer identity.
     #[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
     pub struct IpfsStatus {
+        /// The daemon's peer id.
         pub peer_id: String,
+        /// The multiaddrs the daemon is reachable at.
         pub addresses: Vec<String>,
     }
 }

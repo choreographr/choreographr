@@ -1,3 +1,28 @@
+//! Library logic for the `choreo-im` IM-platform bridge binary.
+//!
+//! The `choreo-im` package owns a single binary whose `src/main.rs` is a thin
+//! wrapper that calls [`main`] here; all of the bridge's behaviour lives in this
+//! crate. It connects to the daemon over the platform socket (a Unix socket, or
+//! a named pipe on Windows via `uds_windows`, because std's Windows
+//! `UnixStream` is still unstable), runs the connect-time keystore handshake,
+//! requests the platform credential named by the command-line positional, and
+//! runs the selected platform bridge — currently Telegram.
+//!
+//! - [`establish_keystore()`] — the connect-time unlock / auto-bind / probe-bind
+//!   handshake, generic over the socket halves so it is exercisable over any
+//!   read/write pair.
+//! - [`bridge`] — the daemon-facing read/write threads and the
+//!   platform-agnostic [`BridgeEvent`](bridge::BridgeEvent) stream.
+//! - [`telegram`] — the Telegram bot: admin-only filtering, command dispatch,
+//!   and event rendering.
+//! - [`tg_api`] — the minimal Telegram Bot API client ([`Bot`](tg_api::Bot))
+//!   that [`telegram`] drives.
+
+// Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
+// every public item carries docs, enforced as a hard error by clippy-strict's
+// `-D warnings`.
+#![warn(missing_docs)]
+
 use anyhow::{Context, bail};
 use choreo_proto::{ClientMessage, DaemonMessage, read_message, socket_path, write_message};
 use choreo_shared::clap_styles;

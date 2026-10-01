@@ -1,3 +1,14 @@
+//! Daemon socket bridge: the read/write threads that speak the wire protocol on
+//! one side and expose a platform-agnostic [`BridgeEvent`] stream on the other.
+//!
+//! [`DaemonBridge::spawn`] takes the connected socket halves, spawns a writer
+//! thread (channel → socket) and a reader thread (socket → events, via
+//! `choreo_client_core::run_daemon_reader`), and hands back
+//! [`into_parts`](DaemonBridge::into_parts) so a platform layer (Telegram) can
+//! drive both directions from its own threads. The module is deliberately
+//! platform-agnostic: it folds daemon wire messages into [`BridgeEvent`]s and
+//! knows nothing about how they are rendered.
+
 use choreo_proto::{
     ClientMessage, DaemonMessage, OutputStream, SessionEvent, SessionSummary, Turn, write_message,
 };
@@ -51,42 +62,86 @@ impl StreamBuffer {
     }
 }
 
+/// Handle onto the spawned daemon bridge: a channel for sending
+/// [`ClientMessage`]s to the daemon and one for receiving [`BridgeEvent`]s from
+/// it.
+///
+/// Created by [`DaemonBridge::spawn`] and split into its two halves with
+/// [`DaemonBridge::into_parts`], so a platform layer can hand the send and
+/// receive halves to different threads.
 pub struct DaemonBridge {
     client_tx: Sender<ClientMessage>,
     event_rx: Receiver<BridgeEvent>,
 }
 
+/// Platform-agnostic event extracted from the daemon's message stream, ready
+/// for a platform layer to render.
+///
+/// The bridge reader thread folds the raw wire messages into this small
+/// vocabulary so a platform implementation never sees the wire protocol.
+/// Streamed content is emitted only once the relevant stream completes.
 #[derive(Debug, Clone)]
 pub enum BridgeEvent {
+    /// A completed assistant response, with any reasoning prepended.
     Text(String),
+    /// A tool invocation has begun.
     ToolCallStarted {
+        /// Name of the tool being invoked.
         name: String,
+        /// The tool's arguments, as JSON.
         arguments_json: String,
     },
+    /// A tool invocation finished successfully.
     ToolCallFinished {
+        /// Name of the tool that finished.
         name: String,
+        /// The tool's captured output.
         output: String,
     },
+    /// A tool invocation failed.
     ToolCallFailed {
+        /// Name of the tool that failed.
         name: String,
+        /// The failure description.
         error: String,
     },
+    /// Image bytes fetched for a displayed turn image.
     Image {
+        /// MIME type; currently always empty — the daemon's on-demand image
+        /// reply carries no metadata, so the platform infers the type from the
+        /// bytes.
         _mime: String,
+        /// The image bytes.
         data: Vec<u8>,
     },
+    /// An error surfaced by the daemon: a failed request, a cancellation, or a
+    /// transport error.
     Error(String),
+    /// The available models and, if one is set, the selected model.
     Models {
+        /// All selectable model names.
         models: Vec<String>,
+        /// The selected model, or `None` if none is set.
         selected: Option<String>,
     },
+    /// The daemon reported a change of selected model.
     ModelSelected(String),
+    /// The daemon keystore was unlocked.
     Unlocked,
+    /// The daemon keystore was locked.
     Locked,
+    /// A liveness reply.
     Pong,
 }
 
 impl DaemonBridge {
+    /// Spawn the writer and reader threads and return a handle onto them.
+    ///
+    /// The writer thread drains the returned send half onto the socket; the
+    /// reader thread turns daemon messages into [`BridgeEvent`]s and drives the
+    /// attach handshake and on-demand image fetch. Both channels are unbounded
+    /// crossbeam channels, so a send never blocks on a busy peer.
+    #[must_use]
     pub fn spawn(reader: BufReader<UnixStream>, writer: BufWriter<UnixStream>) -> Self {
         let (client_tx, client_rx) = crossbeam_channel::unbounded::<ClientMessage>();
         let (event_tx, event_rx) = crossbeam_channel::unbounded::<BridgeEvent>();
@@ -221,6 +276,8 @@ impl DaemonBridge {
         }
     }
 
+    /// Split the handle into its send and receive halves, for handing to
+    /// separate threads.
     #[must_use]
     pub fn into_parts(self) -> (Sender<ClientMessage>, Receiver<BridgeEvent>) {
         (self.client_tx, self.event_rx)

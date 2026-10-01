@@ -3,9 +3,9 @@
 //! The daemon and this crate's blocking `execute_*` entry points are
 //! synchronous, thread-based code. Only `subxt` is async, so the crate owns a
 //! single process-wide runtime created once at startup; the blocking
-//! `execute_*` functions run their subxt futures on it via
-//! [`Runtime::block_on`]. IPFS (`ureq`) and the indexer (`tungstenite`,
-//! synchronous mode) do NOT use this runtime.
+//! `execute_*` functions run their subxt futures on it via `block_on`. IPFS
+//! (`ureq`) and the indexer (`tungstenite`, synchronous mode) do NOT use this
+//! runtime.
 //!
 //! [`init`] must be called exactly once before any tx/state tool executes
 //! (the daemon does so from `main()`). [`get`] returns `None` before init or

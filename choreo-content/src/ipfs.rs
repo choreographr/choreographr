@@ -37,8 +37,10 @@ struct IpfsAddEntry {
 /// A live `api/v0/id` snapshot (peer identity) used by `coord_status`.
 #[derive(Deserialize)]
 pub struct IpfsPeerInfo {
+    /// The daemon's peer id.
     #[serde(rename = "ID")]
     pub peer_id: String,
+    /// The multiaddrs the daemon is reachable at.
     #[serde(rename = "Addresses")]
     pub addresses: Vec<String>,
 }

@@ -21,11 +21,20 @@
 //!
 //! [tokio sidecar runtime]: runtime
 
+// Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
+// every public item carries docs, enforced as a hard error by clippy-strict's
+// `-D warnings`.
+#![warn(missing_docs)]
+
 // `acuity_runtime` is codegen output (subxt's runtime types, ~10k lines): its
 // many `#[allow(...)]`s (rustc lints + `clippy::all`) cannot be `#[expect]`ed —
 // which lints fire varies by feature/consumer — and the file must not be
 // hand-edited (regenerated on every subxt upgrade). Exempt the whole module
 // from `clippy::allow_attributes` here, in the non-generated parent.
+/// Generated subxt runtime types for the Coordination Platform chain
+/// (`subxt` codegen output, ~10k lines): the on-chain storage, calls, and
+/// events this crate reads and submits. Regenerated on every subxt upgrade —
+/// do not edit by hand.
 #[allow(clippy::allow_attributes)]
 pub mod acuity_runtime;
 pub mod chain;

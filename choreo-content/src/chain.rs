@@ -10,7 +10,7 @@
 //! secret** (the 64 bytes that Polkadot-JS stores in its scrypt+XSalsa20
 //! envelope, see `choreo-keystore::substrate`). `subxt-signer` cannot rebuild a
 //! keypair from that form, so this module reconstructs a `schnorrkel::Keypair`
-//! and wraps it in a [`ChoreoSigner`] implementing `subxt::tx::Signer<PolkadotConfig>`.
+//! and wraps it in a `ChoreoSigner` implementing `subxt::tx::Signer<PolkadotConfig>`.
 //!
 //! [tokio sidecar]: crate::runtime
 
@@ -161,7 +161,7 @@ async fn connect() -> Result<OnlineClient<PolkadotConfig>, ContentError> {
 /// future runs inside this timeout on the sidecar.
 const CHAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Run a chain async operation, bounding it with [`CHAIN_TIMEOUT`]. The future
+/// Run a chain async operation, bounding it with `CHAIN_TIMEOUT`. The future
 /// must resolve to a `ContentError`-bearing `Result` so a timeout maps to a
 /// [`ContentError::Substrate`] that flows through the caller's `?`.
 async fn with_chain_timeout<T, F>(fut: F) -> Result<T, ContentError>
@@ -229,7 +229,7 @@ where
 #[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
 pub struct ChainStatus {
     /// Genesis hash as reported by the node (hex, `0x`-prefixed). Verified
-    /// against the pinned [`crate::config::GENESIS_HASH`] by [`connect`].
+    /// against the pinned [`crate::config::GENESIS_HASH`] by `connect`.
     pub genesis_hash: String,
     /// The chain's designated SS58 prefix (`System::SS58Prefix` constant).
     pub ss58_prefix: u16,
@@ -247,7 +247,7 @@ pub struct ChainStatus {
 /// [`crate::config::GENESIS_HASH`]), reads the SS58 prefix from the on-chain
 /// `System` constants, and reads the best + finalized block headers. A down
 /// node, a mismatched chain, or an RPC that never answers surfaces as an error
-/// (bounded by [`CHAIN_TIMEOUT`]) so the caller's status report can show the
+/// (bounded by `CHAIN_TIMEOUT`) so the caller's status report can show the
 /// chain as unavailable rather than fabricating a healthy snapshot from pinned
 /// configuration.
 ///
@@ -257,7 +257,7 @@ pub struct ChainStatus {
 /// [`crate::config::CHAIN_WS_URL`], its genesis hash does not match the pinned
 /// [`crate::config::GENESIS_HASH`], the `System::SS58Prefix` constant or best
 /// block header cannot be read, the node returns no best header, or the whole
-/// probe exceeds [`CHAIN_TIMEOUT`]; with
+/// probe exceeds `CHAIN_TIMEOUT`; with
 /// [`ContentError::RuntimeNotInitialized`] when the sidecar runtime was never
 /// initialized.
 pub fn chain_status() -> Result<ChainStatus, ContentError> {
@@ -319,7 +319,7 @@ pub fn chain_status() -> Result<ChainStatus, ContentError> {
 ///
 /// Fails with [`ContentError::Content`] when the item does not exist on-chain;
 /// with [`ContentError::Substrate`] when the node is unreachable, the genesis
-/// hash mismatches, the storage query or decode fails, or [`CHAIN_TIMEOUT`]
+/// hash mismatches, the storage query or decode fails, or `CHAIN_TIMEOUT`
 /// is exceeded; with [`ContentError::RuntimeNotInitialized`] when the sidecar
 /// runtime was never initialized.
 pub fn item_state(item_id: [u8; 32]) -> Result<ItemState, ContentError> {
@@ -360,7 +360,7 @@ pub fn item_state(item_id: [u8; 32]) -> Result<ItemState, ContentError> {
 ///
 /// Fails with [`ContentError::Substrate`] when the node is unreachable, the
 /// genesis hash mismatches, the storage query or bounded-vec decode fails, or
-/// [`CHAIN_TIMEOUT`] is exceeded; with
+/// `CHAIN_TIMEOUT` is exceeded; with
 /// [`ContentError::RuntimeNotInitialized`] when the sidecar runtime was never
 /// initialized. An account with no pinned items yields `Ok(vec![])`.
 pub fn account_item_ids(account: [u8; 32]) -> Result<Vec<[u8; 32]>, ContentError> {
@@ -394,7 +394,7 @@ pub fn account_item_ids(account: [u8; 32]) -> Result<Vec<[u8; 32]>, ContentError
 ///
 /// Fails with [`ContentError::Substrate`] when the node is unreachable, the
 /// genesis hash mismatches, the storage query or decode fails, or
-/// [`CHAIN_TIMEOUT`] is exceeded; with
+/// `CHAIN_TIMEOUT` is exceeded; with
 /// [`ContentError::RuntimeNotInitialized`] when the sidecar runtime was never
 /// initialized. `Ok(None)` means the account has no profile set.
 pub fn profile_item(account: [u8; 32]) -> Result<Option<[u8; 32]>, ContentError> {
@@ -457,7 +457,7 @@ fn account_bounded(list: &[[u8; 32]]) -> BoundedVec<AccountId32> {
 /// Fails with [`ContentError::Transaction`] when the extrinsic cannot be
 /// submitted, is not finalized successfully, or the `PublishItem` event
 /// cannot be decoded; with [`ContentError::Substrate`] when the node is
-/// unreachable, the genesis hash mismatches, or [`CHAIN_TIMEOUT`] is
+/// unreachable, the genesis hash mismatches, or `CHAIN_TIMEOUT` is
 /// exceeded; with [`ContentError::Account`] when the stored secret cannot be
 /// rebuilt into a signer; with [`ContentError::RuntimeNotInitialized`] when
 /// the sidecar runtime was never initialized.
@@ -488,7 +488,7 @@ pub fn publish_item(
 /// Fails with [`ContentError::Transaction`] when the extrinsic cannot be
 /// submitted, is not finalized successfully, or the `PublishItem` event
 /// cannot be decoded; with [`ContentError::Substrate`] when the node is
-/// unreachable, the genesis hash mismatches, or [`CHAIN_TIMEOUT`] is
+/// unreachable, the genesis hash mismatches, or `CHAIN_TIMEOUT` is
 /// exceeded; with [`ContentError::Account`] when the stored secret cannot be
 /// rebuilt into a signer; with [`ContentError::RuntimeNotInitialized`] when
 /// the sidecar runtime was never initialized.
@@ -515,7 +515,7 @@ pub fn publish_revision(
 /// Fails with [`ContentError::Transaction`] when the extrinsic cannot be
 /// submitted or is not finalized successfully; with
 /// [`ContentError::Substrate`] when the node is unreachable, the genesis
-/// hash mismatches, or [`CHAIN_TIMEOUT`] is exceeded; with
+/// hash mismatches, or `CHAIN_TIMEOUT` is exceeded; with
 /// [`ContentError::Account`] when the stored secret cannot be rebuilt into a
 /// signer; with [`ContentError::RuntimeNotInitialized`] when the sidecar
 /// runtime was never initialized.
@@ -534,7 +534,7 @@ pub fn retract_item(account: &ChainAccount, item_id: [u8; 32]) -> Result<(), Con
 /// Fails with [`ContentError::Transaction`] when the extrinsic cannot be
 /// submitted or is not finalized successfully; with
 /// [`ContentError::Substrate`] when the node is unreachable, the genesis
-/// hash mismatches, or [`CHAIN_TIMEOUT`] is exceeded; with
+/// hash mismatches, or `CHAIN_TIMEOUT` is exceeded; with
 /// [`ContentError::Account`] when the stored secret cannot be rebuilt into a
 /// signer; with [`ContentError::RuntimeNotInitialized`] when the sidecar
 /// runtime was never initialized.
@@ -553,7 +553,7 @@ pub fn set_not_revisionable(account: &ChainAccount, item_id: [u8; 32]) -> Result
 /// Fails with [`ContentError::Transaction`] when the extrinsic cannot be
 /// submitted or is not finalized successfully; with
 /// [`ContentError::Substrate`] when the node is unreachable, the genesis
-/// hash mismatches, or [`CHAIN_TIMEOUT`] is exceeded; with
+/// hash mismatches, or `CHAIN_TIMEOUT` is exceeded; with
 /// [`ContentError::Account`] when the stored secret cannot be rebuilt into a
 /// signer; with [`ContentError::RuntimeNotInitialized`] when the sidecar
 /// runtime was never initialized.
@@ -572,7 +572,7 @@ pub fn set_not_retractable(account: &ChainAccount, item_id: [u8; 32]) -> Result<
 /// Fails with [`ContentError::Transaction`] when the extrinsic cannot be
 /// submitted or is not finalized successfully; with
 /// [`ContentError::Substrate`] when the node is unreachable, the genesis
-/// hash mismatches, or [`CHAIN_TIMEOUT`] is exceeded; with
+/// hash mismatches, or `CHAIN_TIMEOUT` is exceeded; with
 /// [`ContentError::Account`] when the stored secret cannot be rebuilt into a
 /// signer; with [`ContentError::RuntimeNotInitialized`] when the sidecar
 /// runtime was never initialized.
@@ -591,7 +591,7 @@ pub fn add_account_item(account: &ChainAccount, item_id: [u8; 32]) -> Result<(),
 /// Fails with [`ContentError::Transaction`] when the extrinsic cannot be
 /// submitted or is not finalized successfully; with
 /// [`ContentError::Substrate`] when the node is unreachable, the genesis
-/// hash mismatches, or [`CHAIN_TIMEOUT`] is exceeded; with
+/// hash mismatches, or `CHAIN_TIMEOUT` is exceeded; with
 /// [`ContentError::Account`] when the stored secret cannot be rebuilt into a
 /// signer; with [`ContentError::RuntimeNotInitialized`] when the sidecar
 /// runtime was never initialized.
@@ -610,7 +610,7 @@ pub fn remove_account_item(account: &ChainAccount, item_id: [u8; 32]) -> Result<
 /// Fails with [`ContentError::Transaction`] when the extrinsic cannot be
 /// submitted or is not finalized successfully; with
 /// [`ContentError::Substrate`] when the node is unreachable, the genesis
-/// hash mismatches, or [`CHAIN_TIMEOUT`] is exceeded; with
+/// hash mismatches, or `CHAIN_TIMEOUT` is exceeded; with
 /// [`ContentError::Account`] when the stored secret cannot be rebuilt into a
 /// signer; with [`ContentError::RuntimeNotInitialized`] when the sidecar
 /// runtime was never initialized.
