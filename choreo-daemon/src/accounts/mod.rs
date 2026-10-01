@@ -63,6 +63,12 @@ pub struct AccountConfig {
     pub context_window: Option<u32>,
     #[serde(default)]
     pub model_context_windows: Option<HashMap<String, u32>>,
+    /// Enable prompt caching for providers that support it (Anthropic's
+    /// `cache_control`). `None` keeps the provider default (on for the
+    /// Anthropic Messages adapter). Anthropic-format gateways that reject the
+    /// field set this to `false`.
+    #[serde(default)]
+    pub prompt_cache: Option<bool>,
     // Retry timing (all providers)
     #[serde(default)]
     pub retry_initial_backoff_ms: Option<u64>,
@@ -135,6 +141,7 @@ impl AccountConfig {
             retry_max_backoff_ms: None,
             context_window: None,
             model_context_windows: None,
+            prompt_cache: None,
         }
     }
 
@@ -299,6 +306,7 @@ impl From<&AccountConfig> for choreo_ai_protocols::ProviderOverrides {
             retry_max_backoff_ms: config.retry_max_backoff_ms,
             context_window: config.context_window,
             model_context_windows: config.model_context_windows.clone(),
+            prompt_cache: config.prompt_cache,
         }
     }
 }

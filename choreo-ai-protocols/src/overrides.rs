@@ -32,4 +32,8 @@ pub struct ProviderOverrides {
     pub context_window: Option<u32>,
     /// Per-model context window overrides.
     pub model_context_windows: Option<HashMap<String, u32>>,
+    /// Enable provider prompt caching (Anthropic `cache_control`). `None`
+    /// keeps the provider default (on for the Anthropic Messages adapter).
+    /// Anthropic-format gateways that reject the field set this to `false`.
+    pub prompt_cache: Option<bool>,
 }

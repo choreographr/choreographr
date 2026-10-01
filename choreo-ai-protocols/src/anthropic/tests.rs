@@ -385,6 +385,9 @@ fn anthropic_config_defaults_are_sensible() {
     assert_eq!(cfg.api_version, "2023-06-01");
     assert_eq!(cfg.max_tokens, 4096);
     assert!(cfg.streaming);
+    // Prompt caching is on by default so the daemon benefits without extra
+    // wiring; accounts/gateways opt out via the override.
+    assert!(cfg.prompt_cache);
 }
 
 #[test]
@@ -408,6 +411,32 @@ fn config_apply_overrides() {
     assert_eq!(cfg.request_timeout_secs, 60);
     assert_eq!(cfg.retry_initial_backoff_ms, 2000);
     assert_eq!(cfg.retry_max_backoff_ms, 40000);
+}
+
+#[test]
+fn config_apply_overrides_prompt_cache() {
+    // The account overlay can turn caching off (Anthropic-format gateways that
+    // reject `cache_control`), or force it back on; an unset override leaves
+    // the provider default untouched.
+    let mut cfg = AnthropicConfig::default();
+    cfg.apply_overrides(&ProviderOverrides {
+        prompt_cache: Some(false),
+        ..ProviderOverrides::default()
+    });
+    assert!(!cfg.prompt_cache);
+
+    cfg.apply_overrides(&ProviderOverrides {
+        prompt_cache: Some(true),
+        ..ProviderOverrides::default()
+    });
+    assert!(cfg.prompt_cache);
+
+    cfg.prompt_cache = false;
+    cfg.apply_overrides(&ProviderOverrides::default());
+    assert!(
+        !cfg.prompt_cache,
+        "unset override leaves the default in place"
+    );
 }
 
 #[test]
@@ -720,4 +749,83 @@ fn build_message_payloads_unsupported_image_mime_degrades_to_text_only() {
     let blocks = blocks.as_array().unwrap();
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0], json!({"type": "text", "text": "note"}));
+}
+
+// ── prompt caching (phase 1) ────────────────────────────────────────────
+
+/// Serialize a minimal [`MessagesRequest`] carrying the given cache marker so
+/// the tests can assert the exact top-level shape of the outgoing body.
+fn serialize_messages_request(cache_control: Option<CacheControl>) -> serde_json::Value {
+    serde_json::to_value(&MessagesRequest {
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 100,
+        system: None,
+        messages: Vec::new(),
+        tools: None,
+        stream: false,
+        thinking: None,
+        cache_control,
+    })
+    .unwrap()
+}
+
+#[test]
+fn request_body_includes_top_level_cache_control_when_enabled() {
+    // The default-on knob produces a single top-level ephemeral breakpoint,
+    // which Anthropic uses to cache the full request prefix automatically.
+    let body = serialize_messages_request(prompt_cache_control(true));
+    assert_eq!(body["cache_control"], json!({"type": "ephemeral"}));
+}
+
+#[test]
+fn request_body_omits_cache_control_when_disabled() {
+    // A gateway that rejects the field must get a body with no `cache_control`
+    // key at all (the knob is the opt-out).
+    let body = serialize_messages_request(prompt_cache_control(false));
+    assert!(body.get("cache_control").is_none(), "body: {body}");
+}
+
+#[test]
+fn response_maps_cache_read_tokens_into_cached_tokens() {
+    // `cache_read_input_tokens` is the prompt-cache hit count and must land in
+    // `TokenUsage.cached_tokens` (the write count is logged only).
+    let resp: MessagesResponse = serde_json::from_value(json!({
+        "id": "msg_cache",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "cached!"}],
+        "model": "claude-sonnet-4-20250514",
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "cache_read_input_tokens": 64,
+            "cache_creation_input_tokens": 8
+        }
+    }))
+    .unwrap();
+    let turn = response_to_turn_result(resp).unwrap();
+    let ChatTurnResult::FinalText(ft) = turn else {
+        panic!("expected FinalText");
+    };
+    assert_eq!(ft.usage.expect("usage").cached_tokens, 64);
+}
+
+#[test]
+fn response_absent_cache_read_defaults_to_zero() {
+    // Providers (or gateways) that omit the cache fields must still parse, with
+    // a zero hit count.
+    let resp: MessagesResponse = serde_json::from_value(json!({
+        "id": "msg_nocache",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "hi"}],
+        "model": "claude-sonnet-4-20250514",
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    }))
+    .unwrap();
+    let turn = response_to_turn_result(resp).unwrap();
+    let ChatTurnResult::FinalText(ft) = turn else {
+        panic!("expected FinalText");
+    };
+    assert_eq!(ft.usage.expect("usage").cached_tokens, 0);
 }

@@ -14,7 +14,7 @@ use crate::types::{
 use super::{
     AnthropicConfig, AnthropicError, MessagesRequest, MessagesResponse, ModelListResponse,
     ThinkingArtifactBlock, anthropic_thinking_artifact, build_message_payloads,
-    build_tool_payloads, response_to_turn_result, thinking_payload,
+    build_tool_payloads, prompt_cache_control, response_to_turn_result, thinking_payload,
 };
 
 /// Endpoint path for the Messages API.
@@ -136,6 +136,7 @@ pub(super) fn messages_request(
         tools: tool_payloads,
         thinking,
         stream,
+        cache_control: prompt_cache_control(config.prompt_cache),
     })
     .map_err(io::Error::other)?;
 
@@ -229,6 +230,7 @@ where
         tools: tool_payloads,
         thinking,
         stream: true,
+        cache_control: prompt_cache_control(config.prompt_cache),
     })
     .map_err(io::Error::other)?;
 
@@ -275,9 +277,11 @@ where
     // Accumulates tool call fields across content_block_delta chunks keyed
     // by the content block index.
     let mut pending_tool_calls: Vec<StreamToolCall> = Vec::new();
-    // Track input/output tokens delivered via message_start and message_delta.
+    // Track input/output tokens delivered via message_start and message_delta,
+    // plus the prompt-cache read count reported in message_start.
     let mut input_tokens: Option<u32> = None;
     let mut output_tokens: Option<u32> = None;
+    let mut cached_tokens: u32 = 0;
     // Reconstructs the thinking / `redacted_thinking` blocks in wire order for
     // the opaque round-trip artifact (same shape as the non-streaming path).
     let mut thinking_blocks = ThinkingBlockAccumulator::new();
@@ -392,10 +396,20 @@ where
                 thinking_blocks.on_content_block_stop();
             }
             "message_start" => {
-                // Parse input_tokens from the message_start event.
+                // Parse input_tokens (and the prompt-cache read count) from the
+                // message_start event.
                 let start: MessageStart = serde_json::from_str(&data)
                     .map_err(|e| AnthropicError::Io(io::Error::other(e)))?;
-                input_tokens = start.message.usage.map(|u| u.input_tokens);
+                if let Some(u) = start.message.usage {
+                    input_tokens = Some(u.input_tokens);
+                    cached_tokens = u.cache_read_input_tokens;
+                    if u.cache_creation_input_tokens > 0 {
+                        trace!(
+                            cache_creation_input_tokens = u.cache_creation_input_tokens,
+                            "Anthropic streaming prompt cache write"
+                        );
+                    }
+                }
             }
             "message_delta" => {
                 // Parse output_tokens from the message_delta event.
@@ -412,7 +426,9 @@ where
     }
 
     // Build usage from the tokens collected during message_start and
-    // message_delta events.
+    // message_delta events. `cached_tokens` is the prompt-cache read count from
+    // message_start and maps onto the shared `cached_tokens` field; the
+    // cache-write count is logged only (see the non-streaming path).
     let usage: Option<TokenUsage> = match (input_tokens, output_tokens) {
         (Some(in_tok), Some(out_tok)) => {
             let total = in_tok + out_tok;
@@ -420,13 +436,17 @@ where
                 input_tokens = in_tok,
                 output_tokens = out_tok,
                 total_tokens = total,
+                cached_tokens,
                 "Anthropic streaming turn usage"
             );
+            if cached_tokens > 0 {
+                debug!(cached_tokens, "Anthropic streaming prompt cache hit");
+            }
             Some(TokenUsage {
                 input_tokens: in_tok,
                 output_tokens: out_tok,
                 total_tokens: total,
-                cached_tokens: 0,
+                cached_tokens,
             })
         }
         _ => None,
@@ -773,6 +793,14 @@ struct MessageDelta {
 #[derive(Debug, Deserialize)]
 struct AnthropicStreamUsage {
     input_tokens: u32,
+    /// Prompt tokens served from the cache (the cache "hit"), reported in
+    /// `message_start`; mapped into `TokenUsage.cached_tokens`.
+    #[serde(default)]
+    cache_read_input_tokens: u32,
+    /// Prompt tokens written to the cache; logged only (see the non-streaming
+    /// path for why `TokenUsage` has no cache-write field yet).
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -892,5 +920,39 @@ mod tests {
             StreamDelta::SignatureDelta { signature } => assert_eq!(signature, "sig_1"),
             other => panic!("expected SignatureDelta, got {other:?}"),
         }
+    }
+
+    /// `message_start` carries the prompt-cache read count alongside
+    /// `input_tokens`; it must parse and be carried through to `cached_tokens`.
+    #[test]
+    fn message_start_usage_parses_cache_read_tokens() {
+        let start: MessageStart = serde_json::from_value(json!({
+            "message": {
+                "usage": {
+                    "input_tokens": 20,
+                    "cache_read_input_tokens": 128,
+                    "cache_creation_input_tokens": 4
+                }
+            }
+        }))
+        .unwrap();
+        let usage = start.message.usage.expect("usage present");
+        assert_eq!(usage.input_tokens, 20);
+        assert_eq!(usage.cache_read_input_tokens, 128);
+        assert_eq!(usage.cache_creation_input_tokens, 4);
+    }
+
+    /// A usage object without the cache fields (older or third-party providers)
+    /// must still parse, defaulting the cache counts to zero.
+    #[test]
+    fn message_start_usage_defaults_cache_fields_to_zero() {
+        let start: MessageStart = serde_json::from_value(json!({
+            "message": {"usage": {"input_tokens": 7}}
+        }))
+        .unwrap();
+        let usage = start.message.usage.expect("usage present");
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
     }
 }

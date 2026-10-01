@@ -3,7 +3,7 @@ mod requests;
 mod tests;
 
 use std::io;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +50,20 @@ pub struct AnthropicConfig {
     /// User-Agent for inference requests. The daemon sets
     /// `choreographr/<version>`; `None` keeps ureq's default (tests).
     pub user_agent: Option<String>,
+    /// Enable Anthropic automatic prompt caching: a single top-level
+    /// `cache_control: {"type":"ephemeral"}` marker on the request body that
+    /// caches the full message prefix up to the last cacheable block,
+    /// refreshing as the conversation grows. On by default so the daemon
+    /// benefits without extra wiring; the account overlay
+    /// ([`ProviderOverrides::prompt_cache`]) can turn it off. This also serves
+    /// Anthropic-format gateways, so a gateway that rejects `cache_control`
+    /// must be able to opt out via that knob.
+    ///
+    /// Only the default 5-minute ephemeral cache is enabled here. The 1-hour
+    /// extended TTL (a per-breakpoint `ttl:"1h"` plus the
+    /// `anthropic-beta: extended-cache-ttl-2025-04-11` header) is the future
+    /// long-retention path and is not wired in this phase.
+    pub prompt_cache: bool,
 }
 
 impl Default for AnthropicConfig {
@@ -68,6 +82,7 @@ impl Default for AnthropicConfig {
             connect_timeout_secs: 30,
             request_timeout_secs: 120,
             total_timeout_secs: 3600,
+            prompt_cache: true,
         }
     }
 }
@@ -102,6 +117,9 @@ impl AnthropicConfig {
         }
         if let Some(ms) = overrides.retry_max_backoff_ms {
             self.retry_max_backoff_ms = ms;
+        }
+        if let Some(prompt_cache) = overrides.prompt_cache {
+            self.prompt_cache = prompt_cache;
         }
         self.context_window_config.apply_overrides(
             overrides.context_window,
@@ -323,6 +341,26 @@ struct MessagesRequest<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<ThinkingPayload>,
+    /// Automatic prompt caching marker. A single top-level breakpoint caches
+    /// the full prefix through the last cacheable block; omitted entirely when
+    /// caching is disabled (gateways that reject the field).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+/// Top-level Anthropic prompt-cache control marker. `ephemeral` is the only
+/// supported cache type today; the default 5-minute TTL is implied by omitting
+/// `ttl` (the 1-hour extended TTL is the future long-retention path).
+#[derive(Debug, Serialize)]
+pub(super) struct CacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+/// Build the top-level automatic prompt-cache marker for an outgoing request,
+/// or `None` when caching is disabled so the field is omitted from the body.
+pub(super) fn prompt_cache_control(enabled: bool) -> Option<CacheControl> {
+    enabled.then_some(CacheControl { kind: "ephemeral" })
 }
 
 #[derive(Debug, Serialize)]
@@ -494,6 +532,16 @@ struct UsageInfo {
     input_tokens: u32,
     #[serde(default)]
     output_tokens: u32,
+    /// Prompt tokens served from the cache (the cache "hit"). Mapped into
+    /// `TokenUsage.cached_tokens`.
+    #[serde(default)]
+    cache_read_input_tokens: u32,
+    /// Prompt tokens written to the cache. Carried for logging only: the
+    /// shared `TokenUsage` has no cache-write field yet, and adding one would
+    /// ripple through every struct literal in the workspace, so the write
+    /// count is surfaced at trace level until a later phase needs it.
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
 }
 
 /// Convert the content blocks from a Messages API response into a
@@ -546,23 +594,35 @@ fn response_to_turn_result(response: MessagesResponse) -> Result<ChatTurnResult,
         Some(reasoning_parts.join("\n"))
     };
 
-    // Convert Anthropic's usage info (input_tokens + output_tokens) to our
-    // canonical TokenUsage struct. Anthropic does not provide total_tokens,
-    // so we compute it.
+    // Convert Anthropic's usage info (input_tokens + output_tokens, plus the
+    // cache accounting) to our canonical TokenUsage struct. Anthropic does not
+    // provide total_tokens, so we compute it. `cache_read_input_tokens` is the
+    // prompt-cache hit count and maps onto the existing `cached_tokens` field;
+    // the cache-write count is logged only (see `UsageInfo`).
     let usage: Option<TokenUsage> = response.usage.map(|u| {
         let total = u.input_tokens + u.output_tokens;
+        let cached_tokens = u.cache_read_input_tokens;
         debug!(
             input_tokens = u.input_tokens,
             output_tokens = u.output_tokens,
             total_tokens = total,
+            cached_tokens,
             "Anthropic turn usage"
         );
+        if cached_tokens > 0 {
+            debug!(cached_tokens, "Anthropic prompt cache hit");
+        }
+        if u.cache_creation_input_tokens > 0 {
+            trace!(
+                cache_creation_input_tokens = u.cache_creation_input_tokens,
+                "Anthropic prompt cache write"
+            );
+        }
         TokenUsage {
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
             total_tokens: total,
-            // Provider response shape exposes no cached-prompt count here.
-            cached_tokens: 0,
+            cached_tokens,
         }
     });
 
