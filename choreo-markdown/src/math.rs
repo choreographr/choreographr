@@ -127,14 +127,17 @@ fn has_sentence_break(content: &str) -> bool {
 /// A positive gauge that a whitespace-bearing math span is an equation rather
 /// than prose: a TeX command (`\`), a relation (`=`/`<`/`>`), a script that
 /// attaches to an operand (`^`/`_` — see below), or an arithmetic operator
-/// (`+`/`-`/`*`/`/`) used as a separator.
+/// (`+`/`-`/`/`) used as a separator.
 ///
 /// The arithmetic operator set only counts when *space-adjacent*, so a hyphen
-/// inside a word (`time-sensitive`) is not mistaken for a minus sign. Likewise
-/// `^`/`_` only counts as a script when it attaches to an operand on at least
-/// one side — a digit, `{`, or TeX command immediately after it, or a digit,
-/// `)`, or `}` immediately before it — so an identifier such as `snake_case`
-/// is not mistaken for a subscript.
+/// inside a word (`time-sensitive`) is not mistaken for a minus sign. `*` is
+/// deliberately excluded: it is markdown's emphasis delimiter (`**bold**`,
+/// `*italic*`), which clings to words and would otherwise promote prose such as
+/// `3k/mo, so a **` to an equation, while multiplication is written `×` or
+/// `\times`. Likewise `^`/`_` only counts as a script when it attaches to an
+/// operand on at least one side — a digit, `{`, or TeX command immediately
+/// after it, or a digit, `)`, or `}` immediately before it — so an identifier
+/// such as `snake_case` is not mistaken for a subscript.
 fn contains_math_signal(content: &str) -> bool {
     // The character immediately before the one under inspection, tracked so the
     // adjacency tests need no indexing or look-behind.
@@ -152,7 +155,7 @@ fn contains_math_signal(content: &str) -> bool {
                     return true;
                 }
             }
-            '+' | '-' | '*' | '/' => {
+            '+' | '-' | '/' => {
                 let next_is_space = chars.peek().is_some_and(|&next| next.is_whitespace());
                 if prev.is_some_and(char::is_whitespace) || next_is_space {
                     return true;

@@ -310,6 +310,29 @@ fn whitespace_free_letter_span_keeps_math() {
 }
 
 #[test]
+fn markdown_emphasis_in_a_span_stays_literal_text() {
+    // A `**` bold delimiter swallowed into a `$…$` span is not a multiplication
+    // signal, so this arithmetic-looking prose stays literal instead of being
+    // whitespace-collapsed (`3k/mo,soa**`).
+    for input in [
+        "founders ~ $3k/mo, so a **$5k–$10k upfront** fee",
+        "rate $3k/mo, so a **$ tail",
+    ] {
+        let document = MarkdownDocument::parse(input);
+        let MarkdownBlock::Paragraph(content) = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(
+            !content
+                .iter()
+                .any(|node| matches!(node, MarkdownInline::InlineMath(_))),
+            "emphasis prose was misclassified as math: {input:?} -> {content:?}"
+        );
+        assert_eq!(inline_text(content), input);
+    }
+}
+
+#[test]
 fn math_signal_keeps_inline_math() {
     // A whitespace-bearing span with a positive math signal stays math —
     // including digit-led expressions the old leading-digit rule dropped.

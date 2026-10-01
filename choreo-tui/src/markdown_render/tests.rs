@@ -4593,6 +4593,28 @@ fn whitespace_free_number_span_is_not_math_tinted() {
 }
 
 #[test]
+fn markdown_emphasis_span_is_not_math_tinted() {
+    // A `**` bold marker swallowed into a `$…$` span must not promote the span
+    // to math (which would tint and whitespace-collapse it to `3k/mo,soa**`).
+    let text = "founders ~ $3k/mo, so a **$5k–$10k upfront** fee";
+    let result = markdown_lines(text, 200);
+    let joined = result
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(joined, text, "text was altered");
+    let tinted = result
+        .iter()
+        .flat_map(|line| &line.spans)
+        .any(|span| span.style.fg == Some(Color::Yellow));
+    assert!(
+        !tinted,
+        "emphasis prose was tinted as inline math: {joined:?}"
+    );
+}
+
+#[test]
 fn table_uses_rounded_corners_and_a_plain_header_rule() {
     // nushell-style frame: rounded OUTER corners, square T-junctions, and a
     // uniform header rule — the GFM delimiter row's alignment colons are
