@@ -81,6 +81,7 @@ fn resolve_provider_rebuilds_lazily_after_client_drop() {
         lag_limits: LagLimits::default(),
         global_lag: Arc::new(AtomicUsize::new(0)),
         substrate_credential: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
     };
 
     // The fake daemon: answer exactly ONE ResolveAccountCmd, then exit when
@@ -410,6 +411,7 @@ fn set_provider_slug_command_updates_and_clears_recorded_slug() {
         lag_limits: LagLimits::default(),
         global_lag: Arc::new(AtomicUsize::new(0)),
         substrate_credential: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
     };
 
     let mut state = SessionState::empty();
@@ -448,6 +450,7 @@ fn set_account_switches_slug_and_drops_stale_client_when_locked() {
         lag_limits: LagLimits::default(),
         global_lag: Arc::new(AtomicUsize::new(0)),
         substrate_credential: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
     };
 
     // The fake daemon resolves the new account's CONFIG but serves no key
@@ -506,6 +509,7 @@ fn set_account_clears_slug_and_client_when_new_account_unknown() {
         lag_limits: LagLimits::default(),
         global_lag: Arc::new(AtomicUsize::new(0)),
         substrate_credential: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
     };
 
     // Unknown account: the daemon replies `None`.
@@ -582,6 +586,7 @@ fn broadcast_setup() -> (SessionState, RequestContext) {
         lag_limits: LagLimits::default(),
         global_lag: Arc::new(AtomicUsize::new(0)),
         substrate_credential: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
     };
     (test_state(), ctx)
 }
@@ -1405,6 +1410,7 @@ fn sync_accumulated_usage_updates_config_and_broadcasts() {
         lag_limits: LagLimits::default(),
         global_lag: Arc::new(AtomicUsize::new(0)),
         substrate_credential: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
     };
     let mut state = test_state();
 
@@ -1545,6 +1551,7 @@ fn sync_accumulated_usage_never_regresses_config() {
         lag_limits: LagLimits::default(),
         global_lag: Arc::new(AtomicUsize::new(0)),
         substrate_credential: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
     };
     let mut state = test_state();
     let mut shutdown = false;

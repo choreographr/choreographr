@@ -55,6 +55,7 @@ pub(super) fn make_daemon_state() -> (DaemonState, crossbeam_channel::Receiver<D
         maintenance_tx: None,
         acl: None,
         catalog_paths: CatalogPaths::default(),
+        cache_warming: crate::cache_warm::CacheWarmingConfig::default(),
     };
     (state, daemon_rx)
 }

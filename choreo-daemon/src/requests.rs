@@ -1,3 +1,6 @@
+use crate::cache_warm::{
+    CacheWarmingMode, RetentionTier, WarmFacts, WarmRequest, is_replayable, spawn_warmer,
+};
 use crate::context::{self, SkillMeta};
 use crate::providers::InferenceProvider;
 use crate::reasoning::{
@@ -15,6 +18,7 @@ use choreo_ai_protocols::{
     ChatToolCall, ChatTurnRequest, ChatTurnResult, StreamEvent, ToolResultItem,
     model_reasoning_capability,
 };
+use choreo_ai_protocols::{ProviderProtocol, lookup_provider, model_cost, prompt_cache_ttl};
 use choreo_proto::{
     AssistantToolCallRecord, DaemonMessage, OutputStream, ReasoningProducer, SessionEvent,
     SessionStatus,
@@ -379,6 +383,14 @@ const TRUNCATION_RECOVERY_INSTRUCTION: &str = "Your previous response was \
      tool calls (write a file in sections and append, or use multiple smaller \
      files), and avoid emitting very large tool arguments in a single call.";
 
+/// Whether a provider's catalog protocol is the Anthropic Messages wire
+/// format. Used by the cache-warming arm: an Anthropic request with thinking
+/// enabled is the one non-replayable shape (a 1-token cap changes the thinking
+/// budget, hence the prompt-cache key) — see [`is_replayable`].
+fn protocol_is_anthropic(slug: &str) -> bool {
+    lookup_provider(slug).is_some_and(|p| matches!(p.protocol, ProviderProtocol::AnthropicMessages))
+}
+
 pub(crate) fn run_agent_loop(
     client: &InferenceProvider,
     session: &mut SessionState,
@@ -393,6 +405,26 @@ pub(crate) fn run_agent_loop(
     // produces a final answer, is cancelled, or hits an error.
     let limited = max_turns > 0;
     let provider_slug = client.provider_slug();
+
+    // Cache warmer: spawn the per-request thread only in Streaming mode (the
+    // common default is Off, which must cost nothing). It owns a clone of the
+    // provider and is armed after each `ToolUse` result, just before the tools
+    // run — the blocking window a warm ping bridges. The `WarmHandle` is an
+    // RAII guard: it is dropped at every exit path (final text, cancel, error,
+    // panic during unwind), stopping and joining the thread.
+    //
+    // The warmer gets its OWN cancel channel, relayed onto below at each point
+    // the loop observes a cancel. It must NOT share the loop's `cancel_rx`:
+    // crossbeam delivers each message to exactly one receiver, so a shared
+    // receiver would let the warmer steal a cancel the loop needs to act on.
+    let (warm_cancel_tx, warm_cancel_rx) = crossbeam_channel::unbounded::<()>();
+    let warmer = (ctx.warm_policy.mode == CacheWarmingMode::Streaming).then(|| {
+        spawn_warmer(
+            InferenceProvider::clone(client),
+            ctx.warm_policy,
+            warm_cancel_rx,
+        )
+    });
 
     // Phase 4c: ResponseId-policy providers chain reasoning continuity across
     // user turns via `previous_response_id`. The last response id is persisted
@@ -461,11 +493,17 @@ pub(crate) fn run_agent_loop(
         let configured = session.config.reasoning_effort.as_deref().unwrap_or("off");
         let thinking_effort =
             resolve_reasoning_effort(client, model, ctx.session_id, turn_iter, configured);
+        // Snapshot the reasoning gate before `thinking_effort` is moved into the
+        // request below: the warmer's replayability check needs it (an Anthropic
+        // request with thinking enabled cannot be replayed with a 1-token cap).
+        let thinking_enabled = thinking_effort != "off";
         crate::metrics::record_turn(model);
         let tools = ctx
             .tool_registry
             .available_definitions(&session.config.active_tool_groups);
         if is_cancelled_once(cancel_rx) {
+            // Relay the cancel so an armed warmer stops pinging promptly.
+            let _ = warm_cancel_tx.send(());
             return Ok(true);
         }
 
@@ -789,6 +827,37 @@ pub(crate) fn run_agent_loop(
                 session.config.last_response_id_producer = Some(producer);
                 tool_results.clear();
 
+                // Arm the cache warmer for the blocking tool window that
+                // follows: the request just sent is the prefix the next real
+                // turn will re-read, so a 1-token re-send mid-tool refreshes
+                // its provider cache TTL. `messages`/`tools` are cloned into the
+                // snapshot — O(conversation), the same order
+                // `build_chat_request_messages` already costs each iteration —
+                // but ONLY on a tool turn, which is exactly the turn that then
+                // blocks. No arm happens on a `FinalText` result (the loop
+                // returns).
+                if let Some(warmer) = &warmer {
+                    let facts = WarmFacts {
+                        prompt_cache_enabled: ctx.warm_policy.prompt_cache_enabled,
+                        cache_ttl: prompt_cache_ttl(provider_slug, model),
+                        retention: RetentionTier::Short,
+                        prefix_tokens: estimated_prompt_tokens,
+                        cost: model_cost(provider_slug, model),
+                        replayable: is_replayable(
+                            protocol_is_anthropic(provider_slug),
+                            thinking_enabled,
+                        ),
+                    };
+                    warmer.arm(WarmRequest {
+                        model: model.to_string(),
+                        messages: messages.clone(),
+                        tools: tools.clone(),
+                        facts,
+                        session_id: ctx.session_id.to_string(),
+                        request_id: request_id.to_string(),
+                    });
+                }
+
                 // Partition tool calls into serial and concurrent.
                 // Session-config tools (load_tools, unload_tools,
                 // set_working_dir) run serially even though they are now
@@ -829,6 +898,9 @@ pub(crate) fn run_agent_loop(
                 // ── Phase 1: Session-config tools (serial) ────────
                 for tool_call in mutators {
                     if is_cancelled_once(cancel_rx) {
+                        // Relay the cancel so an armed warmer stops pinging
+                        // promptly (it must not share the loop's receiver).
+                        let _ = warm_cancel_tx.send(());
                         cancelled = true;
                         break;
                     }
@@ -914,6 +986,9 @@ pub(crate) fn run_agent_loop(
                         // its `select!`), so the request must stop after this
                         // tool's result is recorded below.
                         cancelled = true;
+                        // Relay the cancel to the warmer too (see the shared-
+                        // receiver note at the spawn site).
+                        let _ = warm_cancel_tx.send(());
                     }
 
                     record_tool_completion(ToolCompletionParams {
@@ -1162,6 +1237,11 @@ pub(crate) fn run_agent_loop(
                         if cancelled_now {
                             cancel_flag.store(true, Ordering::Relaxed);
                             cancelled = true;
+                            // Relay the cancel to the warmer too (see the shared-
+                            // receiver note at the spawn site): it must not share
+                            // this receiver, so this is where it hears about a
+                            // cancel that fired during a concurrent tool batch.
+                            let _ = warm_cancel_tx.send(());
                             // NOTE: no provider-socket force-close here. The
                             // cancel is DECIDED on the daemon command loop
                             // (`handle_cancel_request`), which closes THIS

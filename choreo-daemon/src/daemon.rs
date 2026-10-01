@@ -1,5 +1,6 @@
 use crate::accounts::{AccountConfig, AccountManager, AccountOverrides};
 use crate::broadcast::{LagLimits, SubscriberSink};
+use crate::cache_warm::{CacheWarmingConfig, WarmPolicy};
 use crate::catalog::{CatalogPaths, MaintenanceEvent, RefreshReport, RefreshRequester};
 use crate::db::{self, SessionRecord};
 use crate::mcp::McpManager;
@@ -173,6 +174,12 @@ pub struct DaemonState {
     /// Filesystem locations of the runtime catalog cache + user overlay
     /// (resolved from the standard XDG dirs; see `crate::catalog`).
     pub catalog_paths: CatalogPaths,
+    /// The daemon's loaded `[cache_warming]` config.toml table. Loaded ONCE at
+    /// startup (see `OpenOptions::cache_warming` / `cli.rs`), then merged with
+    /// each account's `meter`/`cache_warming`/`prompt_cache` in `spawn_session`
+    /// to resolve that session's [`WarmPolicy`] — no request re-reads or
+    /// re-parses the file.
+    pub cache_warming: CacheWarmingConfig,
 }
 
 pub enum DaemonCommand {
@@ -877,6 +884,22 @@ impl DaemonState {
             .as_ref()
             .and_then(|name| self.account_provider_slug(name));
 
+        // Resolve this session's cache-warming policy ONCE here, merging the
+        // daemon's loaded `[cache_warming]` config with the account's
+        // `meter`/`cache_warming`/`prompt_cache` overrides. The account's
+        // `prompt_cache` default is `true` (`None` = the account default).
+        // Resolving per account rather than per request keeps the request path
+        // free of config parsing and file reads.
+        let account = account_name
+            .as_ref()
+            .and_then(|name| self.accounts.get(name));
+        let warm_policy = WarmPolicy::resolve(
+            &self.cache_warming,
+            account.and_then(|a| a.meter),
+            account.and_then(|a| a.cache_warming),
+            account.and_then(|a| a.prompt_cache).unwrap_or(true),
+        );
+
         // Crossbeam (unbounded) for the session transport channel: the daemon
         // hands this sender to clients/tools and the session control loop
         // blocks on the receiver, so it must share the workspace's channel
@@ -903,6 +926,7 @@ impl DaemonState {
                     lag_limits,
                     global_lag,
                     substrate_credential,
+                    warm_policy,
                     // No socket registry here: the session owns its own (see
                     // `SessionState::registry`); cancel/suspend closes it via
                     // the daemon's `session_registries` clone, not via the

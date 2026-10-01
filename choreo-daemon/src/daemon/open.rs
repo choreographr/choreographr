@@ -37,6 +37,12 @@ pub struct OpenOptions {
     /// Tool-loop iteration limit (0 = unlimited). The CLI resolves this from
     /// env/config; an embedder decides it directly.
     pub max_turns: u32,
+    /// The daemon's `[cache_warming]` config.toml table (global defaults the
+    /// per-account overrides layer onto). Loaded once by the caller — the CLI
+    /// via `load_daemon_config`, an embedder via whatever it chooses — and
+    /// carried on [`DaemonState`] so `spawn_session` resolves each session's
+    /// [`WarmPolicy`](crate::cache_warm::WarmPolicy) without re-reading the file.
+    pub cache_warming: crate::cache_warm::CacheWarmingConfig,
     /// Optional bridge to the host's platform-native tools (clipboard,
     /// `open_url`, notify on iOS). When `Some`, the `ios` tool group is
     /// registered and PROTECTED (always active, unloadable by no one); the
@@ -218,6 +224,7 @@ impl DaemonState {
             // (the command loop needs the same Arc the accept paths read).
             acl: None,
             catalog_paths: opts.catalog_paths,
+            cache_warming: opts.cache_warming,
         })
     }
 }
@@ -245,6 +252,7 @@ mod tests {
             },
             tool_policy: ToolPolicy::Full,
             max_turns: 0,
+            cache_warming: crate::cache_warm::CacheWarmingConfig::default(),
             platform_tool_bridge: None,
         })
         .unwrap();
@@ -271,6 +279,7 @@ mod tests {
             catalog_paths: CatalogPaths::default(),
             tool_policy: ToolPolicy::Mobile,
             max_turns: 0,
+            cache_warming: crate::cache_warm::CacheWarmingConfig::default(),
             platform_tool_bridge: None,
         })
         .unwrap();
@@ -307,6 +316,7 @@ mod tests {
             catalog_paths: CatalogPaths::default(),
             tool_policy: ToolPolicy::Mobile,
             max_turns: 0,
+            cache_warming: crate::cache_warm::CacheWarmingConfig::default(),
             platform_tool_bridge: Some(std::sync::Arc::new(
                 crate::tools::ios_bridge::MockBridge::default(),
             )),

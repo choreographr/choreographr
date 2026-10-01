@@ -613,9 +613,12 @@ per-account `meter` gates it:
 The dollar gate is only meaningful under pay-as-you-go; under a monthly or
 request-metered plan the binding resource is quota, not dollars, so a ping
 actively *costs*. Set `mode = "streaming"` (globally in `[cache_warming]`, or
-per account) and a `meter` to opt in. **The warmer itself ships in a later
-step** — this release parses the config and computes the decision, but nothing
-is wired into the request loop yet.
+per account) and a `meter` to opt in. When enabled, the agent loop spawns a
+per-request warmer thread that fires while a tool call is blocking — a single
+non-streaming, non-retrying 1-token re-send of the just-sent request that never
+enters the session transcript or turn state. It is observable through the
+`choreo_cache_warm_attempts_total` and `choreo_cache_warm_skips_total{reason}`
+metrics and the daemon `tracing` logs (no session event is emitted).
 
 Credentials are encrypted per-credential with the daemon's keystore X25519
 public key (derived from the client-held unlock key) and stored in the `redb`

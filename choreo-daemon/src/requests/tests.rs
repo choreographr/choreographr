@@ -1697,6 +1697,7 @@ fn finalize_and_broadcast_turn_strips_reasoning_artifact() {
         lag_limits: crate::broadcast::LagLimits::default(),
         global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         substrate_credential: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
     };
     let mut session = SessionState::empty();
     let (turn_id, _) = session.start_turn(Some("hello".into()));
@@ -1761,6 +1762,7 @@ fn agent_loop_failure_marks_and_finalizes_turn() {
         lag_limits: crate::broadcast::LagLimits::default(),
         global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         substrate_credential: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
     };
     let provider = make_failing_provider();
     let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
@@ -1836,6 +1838,7 @@ fn agent_loop_recovers_from_truncated_tool_call() {
         lag_limits: crate::broadcast::LagLimits::default(),
         global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         substrate_credential: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
     };
     let provider = make_truncating_provider(1);
     let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
@@ -1898,6 +1901,7 @@ fn agent_loop_gives_up_after_truncation_recovery_budget() {
         lag_limits: crate::broadcast::LagLimits::default(),
         global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         substrate_credential: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
     };
     let provider = make_truncating_provider(MAX_TRUNCATION_RECOVERIES as usize + 5);
     let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
@@ -1950,6 +1954,7 @@ fn agent_loop_drops_response_id_chain_on_truncation_recovery() {
         lag_limits: crate::broadcast::LagLimits::default(),
         global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         substrate_credential: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
     };
     // Slug "openai" + model "gpt-5.4" is a ResponseId-policy pair, so the seeded
     // chain id below is restored as `prev_resp_id` on the first turn.
@@ -2310,6 +2315,7 @@ fn run_exec_tool(
         lag_limits: crate::broadcast::LagLimits::default(),
         global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         substrate_credential: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
     };
     let (result, cancelled, _image) = execute_tool_with_timeout(ExecuteToolParams {
         tool_call: &tool_call,

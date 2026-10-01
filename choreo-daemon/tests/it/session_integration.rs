@@ -39,6 +39,7 @@ fn spawn_session(
                 lag_limits: LagLimits::default(),
                 global_lag: Arc::new(AtomicUsize::new(0)),
                 substrate_credential: None,
+                warm_policy: choreo_daemon::cache_warm::WarmPolicy::default(),
             },
         );
     });

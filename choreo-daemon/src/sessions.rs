@@ -1,4 +1,5 @@
 use crate::broadcast::{LagLimits, SubscriberSink, fan_out_evicting};
+use crate::cache_warm::WarmPolicy;
 use crate::context::{LoadedSkill, SkillMeta};
 use crate::daemon::DaemonCommand;
 use crate::db::{self, SessionRecord, write_session_retry, write_turn_retry};
@@ -292,6 +293,13 @@ pub struct RequestContext {
     /// credential-access system replaces it. Only populated when the
     /// `content` feature is compiled in (see daemon.rs `spawn_session`).
     pub substrate_credential: Option<ServiceCredential>,
+    /// The resolved cache-warming policy for this session's account (see
+    /// [`crate::cache_warm::WarmPolicy`]). Resolved once in `spawn_session`
+    /// from the daemon's loaded `[cache_warming]` config plus the account's
+    /// `meter`/`cache_warming`/`prompt_cache`, so no request re-reads or
+    /// re-parses config. The agent loop spawns a warmer only when `mode ==
+    /// Streaming`, so the default (off) policy costs nothing.
+    pub warm_policy: WarmPolicy,
 }
 
 pub struct ChildResult {

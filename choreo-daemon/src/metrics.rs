@@ -31,6 +31,8 @@ mod backend {
         connections_total: IntCounter,
         turns_total: IntCounterVec,
         evictions_total: IntCounter,
+        cache_warm_attempts_total: IntCounter,
+        cache_warm_skips_total: IntCounterVec,
         request_duration_seconds: HistogramVec,
         tool_execution_duration_seconds: HistogramVec,
         api_call_duration_seconds: HistogramVec,
@@ -92,6 +94,15 @@ mod backend {
             evictions_total: prometheus::register_int_counter!(
                 "choreo_evictions_total",
                 "Total number of lagging clients evicted (disconnected) because their queue fell too far behind"
+            )?,
+            cache_warm_attempts_total: prometheus::register_int_counter!(
+                "choreo_cache_warm_attempts_total",
+                "Total number of prompt-cache warm pings actually sent"
+            )?,
+            cache_warm_skips_total: prometheus::register_int_counter_vec!(
+                "choreo_cache_warm_skips_total",
+                "Total number of prompt-cache warm attempts skipped, by reason",
+                &["reason"]
             )?,
             request_duration_seconds: prometheus::register_histogram_vec!(
                 "choreo_request_duration_seconds",
@@ -227,6 +238,24 @@ mod backend {
     pub fn record_eviction() {
         if let Some(m) = METRICS.get() {
             m.evictions_total.inc();
+        }
+    }
+
+    /// Count a prompt-cache warm ping that was actually sent. Recorded on
+    /// every attempt regardless of outcome (the attempt is what costs money).
+    /// No-op when metrics were never initialized (e.g. unit-test binaries).
+    pub fn record_cache_warm_attempt() {
+        if let Some(m) = METRICS.get() {
+            m.cache_warm_attempts_total.inc();
+        }
+    }
+
+    /// Count a warm attempt that was skipped, keyed by the policy's
+    /// [`SkipReason`](crate::cache_warm::SkipReason) label. The label set is a
+    /// fixed enum, so the series stays cardinality-bounded.
+    pub fn record_cache_warm_skip(reason: &str) {
+        if let Some(m) = METRICS.get() {
+            m.cache_warm_skips_total.with_label_values(&[reason]).inc();
         }
     }
 
@@ -372,6 +401,27 @@ mod backend {
 
         #[serial(metrics)]
         #[test]
+        fn test_cache_warm_counters() {
+            ensure_init();
+            let m = METRICS.get().unwrap();
+            let before_attempts = m.cache_warm_attempts_total.get();
+            let before_skips = m
+                .cache_warm_skips_total
+                .with_label_values(&["meter_incompatible"])
+                .get();
+            record_cache_warm_attempt();
+            record_cache_warm_skip("meter_incompatible");
+            assert_eq!(m.cache_warm_attempts_total.get(), before_attempts + 1);
+            assert_eq!(
+                m.cache_warm_skips_total
+                    .with_label_values(&["meter_incompatible"])
+                    .get(),
+                before_skips + 1
+            );
+        }
+
+        #[serial(metrics)]
+        #[test]
         fn test_metrics_output_contains_help_and_type_lines() {
             ensure_init();
             // Call each metric function at least once to seed label values.
@@ -387,6 +437,8 @@ mod backend {
             record_client_connected();
             record_connection_accepted();
             record_eviction();
+            record_cache_warm_attempt();
+            record_cache_warm_skip("no_ttl");
             // Gather and encode all metrics via the text encoder, verify
             // that the output contains expected HELP/TYPE lines.
             let metric_families = prometheus::gather();
@@ -401,6 +453,10 @@ mod backend {
             assert!(output.contains("# TYPE choreo_requests_total counter"));
             assert!(output.contains("# HELP choreo_evictions_total"));
             assert!(output.contains("# TYPE choreo_evictions_total counter"));
+            assert!(output.contains("# HELP choreo_cache_warm_attempts_total"));
+            assert!(output.contains("# TYPE choreo_cache_warm_attempts_total counter"));
+            assert!(output.contains("# HELP choreo_cache_warm_skips_total"));
+            assert!(output.contains("# TYPE choreo_cache_warm_skips_total counter"));
             assert!(output.contains("# HELP choreo_request_duration_seconds"));
             assert!(output.contains("# TYPE choreo_request_duration_seconds histogram"));
         }
@@ -452,6 +508,10 @@ mod backend {
     pub fn record_api_error(_model: &str, _error_type: &str) {}
 
     pub fn record_eviction() {}
+
+    pub fn record_cache_warm_attempt() {}
+
+    pub fn record_cache_warm_skip(_reason: &str) {}
 
     /// No-op: the daemon refuses `--metrics-addr` at startup when the feature
     /// is off, so this should never run — warn loudly if something calls it.

@@ -108,6 +108,7 @@ pub fn test_daemon_state_with_limits(limits: LagLimits) -> DaemonState {
         // Installed by run_server from the `acl` parameter.
         acl: None,
         catalog_paths: choreo_daemon::catalog::CatalogPaths::default(),
+        cache_warming: choreo_daemon::cache_warm::CacheWarmingConfig::default(),
     }
 }
 

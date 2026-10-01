@@ -52,4 +52,5 @@ mod shell_streaming_integration;
 mod spawn_subsession_integration;
 mod stream_integrity;
 mod vm_integration;
+mod warm;
 mod write_file_integration;

@@ -20,21 +20,32 @@
 //! a ping actively *costs* — hence the gate is meter-kind aware and defaults to
 //! "do not warm".
 //!
-//! Everything here is **pure and unwired**: [`WarmPolicy`] is resolved from the
-//! parsed config and [`WarmPolicy::arm`]/[`WarmPlan::poll`] form a clock-injected
-//! state machine, but **no runtime path calls any of it yet** — the daemon's
-//! request loop, the provider adapters, and the metrics broadcast are untouched.
-//! The intended consumer is a later warmer thread; until that lands this module
-//! is exercised only by its unit tests. The decision logic takes an injected
+//! Everything here is **pure and clock-injected**: [`WarmPolicy`] is resolved
+//! from the parsed config and [`WarmPolicy::arm`]/[`WarmPlan::decide`] form a
+//! state machine whose only variable is the injected clock. It takes an injected
 //! `now` (`Duration`, a monotonic value the caller supplies) and never reads a
 //! clock itself, so it is fully deterministic and testable without any timers.
+//!
+//! The runtime consumer is the warmer thread in this module ([`spawn_warmer`]):
+//! it owns an [`InferenceProvider`], waits event-driven on a control channel plus
+//! a timer, and on [`Action::Ping`] re-sends the armed request with a 1-token
+//! cap. The agent loop arms it after a `ToolUse` result and just before the tools
+//! run (the blocking window), and the returned [`WarmHandle`] is dropped at
+//! request end so the thread is always joined. The ping is best-effort: it never
+//! touches session/turn state, never retries, and swallows every error.
 
 use std::fmt;
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use choreo_ai_protocols::catalog::{ModelCost, PromptCacheTtl};
+use choreo_ai_protocols::openai::{ChatRequestMessage, ChatToolDefinition, RetryCallback};
+use choreo_ai_protocols::{ChatTurnRequest, ChatTurnResult};
+use crossbeam_channel::{Receiver, Sender};
 use serde::{Deserialize, Deserializer, Serialize};
-use tracing::warn;
+use tracing::{debug, trace, warn};
+
+use crate::providers::InferenceProvider;
 
 /// Default minimum prefix (prompt) size, in tokens, for the `tokens`-metered
 /// gate. Sits above the ~24 000-token break-even so warming has margin.
@@ -258,6 +269,20 @@ impl WarmPolicy {
     }
 }
 
+impl Default for WarmPolicy {
+    /// The conservative default: warming **off**, meter unknown (never warm).
+    ///
+    /// Used by the many `RequestContext` construction sites (mostly tests)
+    /// that predate the warmer and do not exercise warming — a defaulted
+    /// policy never spawns a warmer (the agent loop skips the spawn when `mode
+    /// == Off`), so the field is inert there. `prompt_cache_enabled` defaults
+    /// to `true` because that is the account default (`prompt_cache =
+    /// None`); with `mode == Off` it is moot in any case.
+    fn default() -> Self {
+        Self::resolve(&CacheWarmingConfig::default(), None, None, true)
+    }
+}
+
 /// The per-request facts a warm decision is evaluated against. All fields are
 /// static for the lifetime of one request — the clock is the only variable.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -352,6 +377,29 @@ impl fmt::Display for SkipReason {
             Self::ContextChanged => "the request context changed",
         };
         f.write_str(text)
+    }
+}
+
+impl SkipReason {
+    /// A stable cardinality-bounded label for the `cache_warm` skip metric.
+    ///
+    /// Distinct from [`Display`](fmt::Display): the metric label is
+    /// `snake_case` and never carries prose, so the Prometheus series stays a
+    /// fixed enum rather than growing one label value per phrasing.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ModeOff => "mode_off",
+            Self::CachingDisabled => "caching_disabled",
+            Self::NoTtl => "no_ttl",
+            Self::TtlTooShort => "ttl_too_short",
+            Self::NotReplayable => "not_replayable",
+            Self::MeterIncompatible => "meter_incompatible",
+            Self::BelowThreshold => "below_threshold",
+            Self::EconomicsUnavailable => "economics_unavailable",
+            Self::DeadlineMissed => "deadline_missed",
+            Self::ContextChanged => "context_changed",
+        }
     }
 }
 
@@ -562,9 +610,281 @@ fn economics(cost: Option<ModelCost>, prefix_tokens: u32) -> Option<Economics> {
     })
 }
 
+// ── The warmer thread ─────────────────────────────────────────────────────
+//
+// The runtime half of the module: a per-request thread that owns a clone of
+// the session's [`InferenceProvider`] and, while a long tool call blocks,
+// re-sends the last request with a 1-token cap to refresh the provider's
+// prompt-cache TTL. Everything decision-shaped lives in the pure state
+// machine above; this section only drives it, pings, and reports metrics.
+
+/// The exact request a warm ping replays: the just-sent turn's wire prefix,
+/// the routing identity, and the facts the policy evaluated.
+///
+/// Owned (not borrowed) because the warmer runs on its own thread while the
+/// agent loop rebuilds the next iteration's payload — see the O(conversation)
+/// clone note at the arm site in `run_agent_loop`.
+pub struct WarmRequest {
+    /// The model slug of the just-sent request.
+    pub model: String,
+    /// The full message prefix sent to the provider on the just-sent turn.
+    pub messages: Vec<ChatRequestMessage>,
+    /// The tool definitions sent on the just-sent turn.
+    pub tools: Vec<ChatToolDefinition>,
+    /// The facts the (pure) policy is armed against.
+    pub facts: WarmFacts,
+    /// Gateway routing identity (opencode sticky routing) the real turn used.
+    pub session_id: String,
+    /// The per-turn request id the real turn used.
+    pub request_id: String,
+}
+
+/// A message from the agent loop to the warmer thread.
+enum Command {
+    /// Arm (or re-arm) the plan from a fresh tool-loop iteration's request.
+    Arm(Box<WarmRequest>),
+    /// Stop the thread; the request is ending.
+    Stop,
+}
+
+/// Handle to a running warmer thread.
+///
+/// This is an RAII guard: [`WarmHandle::stop`] (and therefore `Drop`) sends
+/// [`Command::Stop`] and joins, so holding it in [`crate::requests::run_agent_loop`]
+/// guarantees the thread is joined on **every** exit path — final text, cancel,
+/// error, and panic (the drop runs during unwinding, before
+/// `run_request_worker`'s `catch_unwind` catches).
+pub struct WarmHandle {
+    tx: Sender<Command>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl WarmHandle {
+    /// Arm the warmer with the current iteration's request snapshot.
+    ///
+    /// A send failure means the thread already exited (only possible after a
+    /// `Stop`), in which case there is nothing to warm and the arm is dropped.
+    pub fn arm(&self, request: WarmRequest) {
+        if self.tx.send(Command::Arm(Box::new(request))).is_err() {
+            trace!("cache warmer thread already stopped; dropping arm");
+        }
+    }
+
+    /// Stop and join the thread. Idempotent.
+    pub fn stop(&mut self) {
+        // A closed channel (the thread already exited) is fine.
+        let _ = self.tx.send(Command::Stop);
+        if let Some(join) = self.join.take() {
+            // A panic in the driver is swallowed: the ping is best-effort and
+            // must never affect the active run. Log it so it is not invisible.
+            if join.join().is_err() {
+                warn!("cache warmer thread panicked; ignoring (best-effort ping)");
+            }
+        }
+    }
+}
+
+impl Drop for WarmHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Spawn the cache-warming thread for one request.
+///
+/// The caller owns the returned handle and must drop it before the request
+/// ends (`Drop` stops and joins). The agent loop skips this spawn entirely when
+/// `policy.mode == Off` (the default), so the off path has zero overhead.
+///
+/// `cancel_rx` is a channel the caller relays this request's cancellation
+/// signal onto (NOT the loop's own `cancel_rx`: crossbeam channels deliver each
+/// message to exactly one receiver, so sharing the loop's receiver would let
+/// the warmer steal a cancel the loop needs to observe). When a cancel arrives
+/// the warmer exits promptly; the request's end also stops it via `Drop`.
+#[must_use]
+pub fn spawn_warmer(
+    client: InferenceProvider,
+    policy: WarmPolicy,
+    cancel_rx: Receiver<()>,
+) -> WarmHandle {
+    let (tx, rx) = crossbeam_channel::unbounded::<Command>();
+    let join = std::thread::spawn(move || warmer_loop(&client, policy, &rx, &cancel_rx));
+    WarmHandle {
+        tx,
+        join: Some(join),
+    }
+}
+
+/// The state of an armed plan: the pure plan plus the request to replay.
+struct Armed {
+    plan: WarmPlan,
+    request: WarmRequest,
+}
+
+/// What woke the driver out of its wait.
+enum Wake {
+    /// A fresh request snapshot to (re-)arm with.
+    Arm(WarmRequest),
+    /// The timer elapsed; re-evaluate the plan at the loop top.
+    Timer,
+}
+
+/// The warmer thread body.
+///
+/// The clock is a single `Instant` captured at spawn; every decision is made
+/// against `start.elapsed()`, matching the policy's injected-`now` contract.
+/// The wait is fully event-driven (no sleep-poll): `select_biased!` over the
+/// control receiver, the relayed cancel receiver, and — only while a plan is
+/// armed with a future deadline — a `crossbeam_channel::after(wait)` timer.
+/// Cancel/stop arms come first so a cancel is observed the instant it is sent.
+fn warmer_loop(
+    client: &InferenceProvider,
+    policy: WarmPolicy,
+    control_rx: &Receiver<Command>,
+    cancel_rx: &Receiver<()>,
+) {
+    let start = Instant::now();
+    let mut armed: Option<Armed> = None;
+
+    loop {
+        // (1) Evaluate the armed plan at the current clock. `decide` is Copy
+        // and takes the clock by value, so the `map` ends the borrow of
+        // `armed` before the arms below mutate it.
+        let action = armed
+            .as_ref()
+            .map(|a| a.plan.decide(start.elapsed()).action);
+        match action {
+            Some(Action::Ping) => {
+                // Take the request out (ending the borrow) so the same snapshot
+                // can be re-armed after the ping, at the current clock.
+                let Some(Armed { request, .. }) = armed.take() else {
+                    continue;
+                };
+                do_ping(client, &request);
+                let now = start.elapsed();
+                let plan = policy.arm(request.facts, now);
+                armed = Some(Armed { plan, request });
+                continue;
+            }
+            Some(Action::Stop(reason)) => {
+                // The request will not be warmed (or is no longer worth
+                // warming): drop the plan and go idle. Do NOT exit the thread —
+                // streaming-phase warming resumes on the next tool iteration.
+                debug!(reason = %reason, "cache warming stopped for this request");
+                crate::metrics::record_cache_warm_skip(reason.label());
+                armed = None;
+                continue;
+            }
+            // `None` (nothing armed) and `Some(Wait(_))` both fall through to
+            // the wait below; only `Wait` schedules a timer.
+            _ => {}
+        }
+        let wait = match action {
+            Some(Action::Wait(d)) => Some(d),
+            _ => None,
+        };
+
+        // (2) Wait, event-driven. Bias cancel/stop first so a stop is observed
+        // the instant it is sent; the timer arm exists only while a plan is
+        // armed with a future ping deadline.
+        let wake = if let Some(wait) = wait {
+            crossbeam_channel::select_biased! {
+                recv(control_rx) -> msg => match msg {
+                    Ok(Command::Arm(req)) => Wake::Arm(*req),
+                    // `Stop`, or the control sender disconnecting, both end the
+                    // driver: nothing can re-arm it once the owner is gone.
+                    Ok(Command::Stop) | Err(_) => return,
+                },
+                recv(cancel_rx) -> _ => return,
+                recv(crossbeam_channel::after(wait)) -> _ => Wake::Timer,
+            }
+        } else {
+            crossbeam_channel::select_biased! {
+                recv(control_rx) -> msg => match msg {
+                    Ok(Command::Arm(req)) => Wake::Arm(*req),
+                    Ok(Command::Stop) | Err(_) => return,
+                },
+                recv(cancel_rx) -> _ => return,
+            }
+        };
+        match wake {
+            // Re-evaluate at the loop top: at/after `next_warm_at` this yields
+            // Ping, past the deadline Stop, otherwise a fresh Wait.
+            Wake::Timer => {}
+            Wake::Arm(request) => {
+                let now = start.elapsed();
+                let plan = policy.arm(request.facts, now);
+                armed = Some(Armed { plan, request });
+            }
+        }
+    }
+}
+
+/// Build the non-streaming ping request for `request`.
+///
+/// Factored out so the request shape is unit-testable without a socket. The
+/// shape is deliberate: `thinking_effort: "off"` (a 1-token cap would corrupt
+/// an Anthropic `thinking.budget_tokens`, which derives from `max_tokens`),
+/// `cancel_rx: None` (the ping must not consume a cancel the loop still needs —
+/// the sockreg `shutdown_all` is the force-close path for a wedged ping),
+/// `max_output_tokens_override: Some(1)` (touch the prefix, emit one token), and
+/// `no_retry: true` (exactly one attempt).
+fn ping_request<'a>(
+    request: &'a WarmRequest,
+    on_retry: &'a mut Option<RetryCallback>,
+) -> ChatTurnRequest<'a> {
+    ChatTurnRequest {
+        model: &request.model,
+        messages: &request.messages,
+        tools: &request.tools,
+        thinking_effort: "off".to_string(),
+        on_retry,
+        cancel_rx: None,
+        previous_response_id: None,
+        tool_results: &[],
+        programmatic_tool_calling: false,
+        session_id: request.session_id.clone(),
+        request_id: request.request_id.clone(),
+        max_output_tokens_override: Some(1),
+        no_retry: true,
+    }
+}
+
+/// Send one warm ping and record its outcome. Best-effort: every error is
+/// swallowed (logged at `debug`/`trace`) and the result never reaches session
+/// or turn state.
+fn do_ping(client: &InferenceProvider, request: &WarmRequest) {
+    let mut on_retry: Option<RetryCallback> = None;
+    let result = client.chat_completion_turn(ping_request(request, &mut on_retry));
+    // Count the attempt regardless of outcome: the attempt is what costs money.
+    crate::metrics::record_cache_warm_attempt();
+    match result {
+        Ok(ChatTurnResult::FinalText(final_text)) => {
+            // Surface the ping's usage to metrics/logs ONLY — it must never
+            // enter the session's accumulated usage or a turn.
+            if let Some(usage) = final_text.usage {
+                trace!(
+                    input_tokens = usage.input_tokens,
+                    output_tokens = usage.output_tokens,
+                    "cache warm ping usage"
+                );
+            }
+        }
+        Ok(_) => {
+            trace!("cache warm ping returned a non-final-text result; ignoring");
+        }
+        Err(e) => {
+            // A failed ping is expected sometimes (expired cache, transient
+            // 5xx); it never affects the active run.
+            debug!(error = %e, "cache warm ping failed (best-effort)");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::test_util::make_recording_provider;
 
     /// A floating-point comparison that tolerates the tiny rounding of the
     /// cost arithmetic (clippy's `float_cmp` forbids bare `==` on floats).
@@ -1045,5 +1365,91 @@ mod tests {
         ] {
             assert!(!reason.to_string().is_empty(), "{reason:?}");
         }
+    }
+
+    #[test]
+    fn skip_reason_labels_are_stable_snake_case() {
+        // The metric label must not track the prose Display form.
+        assert_eq!(SkipReason::ModeOff.label(), "mode_off");
+        assert_eq!(SkipReason::DeadlineMissed.label(), "deadline_missed");
+        assert_eq!(SkipReason::MeterIncompatible.label(), "meter_incompatible");
+    }
+
+    // ── Warmer-driver tests ────────────────────────────────────────────
+
+    /// A `WarmRequest` built from the shared `facts()` fixture.
+    fn warm_request() -> WarmRequest {
+        WarmRequest {
+            model: "tiny-model".into(),
+            messages: vec![ChatRequestMessage::simple("user", "hello".into())],
+            tools: Vec::new(),
+            facts: facts(),
+            session_id: "42".into(),
+            request_id: "7".into(),
+        }
+    }
+
+    #[test]
+    fn ping_request_shape_is_one_token_no_retry_thinking_off() {
+        let request = warm_request();
+        let mut on_retry = None;
+        let ping = ping_request(&request, &mut on_retry);
+        // The exact 4a-honoured shape: cap output, never retry, never think,
+        // never share the loop's cancel receiver.
+        assert_eq!(ping.max_output_tokens_override, Some(1));
+        assert!(ping.no_retry);
+        assert_eq!(ping.thinking_effort, "off");
+        assert!(ping.cancel_rx.is_none());
+        assert!(ping.previous_response_id.is_none());
+        // The prefix and routing identity are carried verbatim.
+        assert_eq!(ping.model, "tiny-model");
+        assert_eq!(ping.messages.len(), 1);
+        assert_eq!(ping.session_id, "42");
+        assert_eq!(ping.request_id, "7");
+    }
+
+    #[test]
+    fn driver_stop_ends_the_thread() {
+        // A `Stop` (also sent by `Drop`) must end the driver; `stop()` joins,
+        // so a driver that failed to observe it would hang this test.
+        let (provider, recorder) = make_recording_provider();
+        let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+        let mut handle = spawn_warmer(provider, policy(MeterKind::Tokens), cancel_rx);
+        handle.stop();
+        assert_eq!(recorder.calls(), 0, "stopping must not ping");
+    }
+
+    #[test]
+    fn driver_ignores_ineligible_arm() {
+        // Mode off is statically ineligible: arming yields an inactive plan,
+        // so the driver declines without ever contacting the provider. Arm and
+        // Stop are ordered on the same control channel, so by the time
+        // `stop()` joins the arm has been fully processed and declined.
+        let (provider, recorder) = make_recording_provider();
+        let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+        let off = WarmPolicy {
+            mode: CacheWarmingMode::Off,
+            ..policy(MeterKind::Tokens)
+        };
+        let mut handle = spawn_warmer(provider, off, cancel_rx);
+        handle.arm(warm_request());
+        handle.stop();
+        assert_eq!(recorder.calls(), 0, "an ineligible arm must never ping");
+    }
+
+    #[test]
+    fn driver_observes_relayed_cancel() {
+        // A cancel relayed on the dedicated receiver must end the driver
+        // (and `stop()` joins, so a miss would hang the test).
+        let (provider, recorder) = make_recording_provider();
+        let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+        let mut handle = spawn_warmer(provider, policy(MeterKind::Tokens), cancel_rx);
+        cancel_tx.send(()).unwrap();
+        handle.stop();
+        assert_eq!(
+            recorder.calls(),
+            0,
+            "a cancel before any ping must not ping"
+        );
     }
 }

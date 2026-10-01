@@ -28,6 +28,7 @@ fn open_state(dir: &tempfile::TempDir) -> DaemonState {
         },
         tool_policy: ToolPolicy::Full,
         max_turns: 0,
+        cache_warming: choreo_daemon::cache_warm::CacheWarmingConfig::default(),
         // No platform bridge in these tests — the ios group stays unregistered.
         platform_tool_bridge: None,
     })

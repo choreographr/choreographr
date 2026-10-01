@@ -793,4 +793,78 @@ pub(crate) mod test_util {
         };
         (provider, client)
     }
+
+    /// Provider client that counts how many non-streaming turns it served and
+    /// returns an empty final answer.
+    ///
+    /// The "recording sink" the cache-warm driver tests arm against: they prove
+    /// a ping did (or did not) fire by inspecting [`calls`](Self::calls),
+    /// without binding a socket. The warmer only ever calls the non-streaming
+    /// path, so the streaming method is a never-reached error stub.
+    #[derive(Debug, Default)]
+    pub(crate) struct RecordingProviderClient {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RecordingProviderClient {
+        /// How many non-streaming turns this client has served.
+        pub(crate) fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl ProviderClient for RecordingProviderClient {
+        // &'static str is the trait's required lifetime, not an over-bound literal.
+        #[expect(clippy::unnecessary_literal_bound)]
+        fn provider_slug(&self) -> &str {
+            "test-recording"
+        }
+
+        fn chat_completion_turn(
+            &self,
+            _params: ChatTurnRequest<'_>,
+        ) -> Result<ChatTurnResult, InferenceError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ChatTurnResult::FinalText(
+                choreo_ai_protocols::FinalTextResult {
+                    content: String::new(),
+                    truncated: false,
+                    reasoning: None,
+                    usage: None,
+                    response_id: None,
+                    reasoning_artifact: None,
+                },
+            ))
+        }
+
+        fn chat_completion_turn_streaming(
+            &self,
+            _params: ChatTurnRequest<'_>,
+            _on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>,
+        ) -> Result<ChatTurnResult, InferenceError> {
+            // The cache warmer only ever calls the non-streaming path; a
+            // streaming call here is a bug, so surface it as an error rather
+            // than pretending to work.
+            Err(InferenceError::ClientError {
+                status: 500,
+                detail: "RecordingProviderClient has no streaming path".to_string(),
+            })
+        }
+
+        fn list_models(&self) -> Result<Vec<String>, InferenceError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Build a provider backed by a [`RecordingProviderClient`], returning the
+    /// concrete client so a test can inspect [`RecordingProviderClient::calls`].
+    pub(crate) fn make_recording_provider() -> (InferenceProvider, Arc<RecordingProviderClient>) {
+        let client = Arc::new(RecordingProviderClient::default());
+        let provider = InferenceProvider {
+            client: client.clone(),
+            slug: "openai".to_string(),
+            image_client: None,
+        };
+        (provider, client)
+    }
 }

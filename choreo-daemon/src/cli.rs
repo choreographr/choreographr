@@ -1,4 +1,4 @@
-use crate::config::load_daemon_config;
+use crate::config::{DaemonConfig, load_daemon_config};
 use crate::daemon::DaemonState;
 use anyhow::Context;
 use choreo_proto::socket_path;
@@ -137,9 +137,12 @@ const DEFAULT_MAX_TURNS: u32 = 0;
 /// A value of `0` means *unlimited* — the agent loop will run until the
 /// model produces a final answer, is cancelled, or hits an error.
 ///
+/// The already-loaded `[config.toml]` is passed in (the CLI loads it once and
+/// also reads its `[cache_warming]` table) rather than re-reading the file here.
+///
 /// A `CHOREOGRAPHR_MAX_TURNS` that is set but not a valid `u32` is a
 /// configuration error: failing startup beats silently running unbounded.
-fn resolve_max_turns() -> anyhow::Result<u32> {
+fn resolve_max_turns(config: &DaemonConfig) -> anyhow::Result<u32> {
     match std::env::var("CHOREOGRAPHR_MAX_TURNS") {
         Ok(val) => return parse_max_turns_env(&val),
         Err(std::env::VarError::NotPresent) => {}
@@ -149,9 +152,7 @@ fn resolve_max_turns() -> anyhow::Result<u32> {
             ));
         }
     }
-    if let Ok(config) = load_daemon_config()
-        && let Some(n) = config.max_turns
-    {
+    if let Some(n) = config.max_turns {
         return Ok(n);
     }
     Ok(DEFAULT_MAX_TURNS)
@@ -320,7 +321,21 @@ pub fn main() -> anyhow::Result<()> {
     // `DaemonState::open` so the embedded daemon can share the exact same
     // sequence. The CLI supplies the standard paths and the unrestricted tool
     // policy, so its behavior is unchanged.
-    let max_turns = resolve_max_turns().context("failed to resolve tool-loop iteration limit")?;
+    //
+    // The daemon-level config.toml is loaded ONCE here: its `max_turns` feeds
+    // the loop limit and its `[cache_warming]` table rides on `DaemonState` so
+    // `spawn_session` resolves each session's warm policy without re-reading
+    // the file. A read/parse error logs and falls back to defaults, matching
+    // `load_daemon_config`'s tolerant contract elsewhere.
+    let daemon_config = match load_daemon_config() {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load config.toml; using defaults");
+            DaemonConfig::default()
+        }
+    };
+    let max_turns =
+        resolve_max_turns(&daemon_config).context("failed to resolve tool-loop iteration limit")?;
     info!(max_turns, "tool loop iteration limit");
     // The release name (choreo-shared/release-name.txt) is part of the startup
     // banner alongside the crate version, so logs identify the exact series.
@@ -336,6 +351,7 @@ pub fn main() -> anyhow::Result<()> {
         catalog_paths: crate::catalog::CatalogPaths::from_dirs(),
         tool_policy: crate::tools::ToolPolicy::Full,
         max_turns,
+        cache_warming: daemon_config.cache_warming,
         // Desktop CLI: no platform-native tool host exists in this process.
         platform_tool_bridge: None,
     })
