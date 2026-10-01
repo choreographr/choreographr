@@ -8,7 +8,8 @@
 //! * [`parse`] — the pulldown-cmark event → AST parser;
 //! * [`serialize`] — the AST → markdown re-serializer;
 //! * [`html`] — markdown → sanitized HTML rendering;
-//! * [`math`] — math/prose classification and the LaTeX → Unicode printer.
+//! * [`math`] — math/prose classification (`math::detect`) and the LaTeX →
+//!   Unicode printer (`math::pretty`).
 
 use thiserror::Error;
 
