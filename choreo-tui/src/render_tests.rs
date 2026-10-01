@@ -45,6 +45,7 @@ fn status_token_readout_small_counts_pass_through() {
         output_tokens: 23,
         total_tokens: 870,
         cached_tokens: 0,
+        cache_write_tokens: 0,
     };
     assert_eq!(status_token_readout(&usage), "↑847 ↓23");
 }
@@ -60,6 +61,7 @@ fn status_token_readout_compacts_large_counts() {
         output_tokens: 1_280,
         total_tokens: 16_600,
         cached_tokens: 0,
+        cache_write_tokens: 0,
     };
     assert_eq!(status_token_readout(&usage), "↑15.3K ↓1.3K");
 }
@@ -76,6 +78,7 @@ fn session_detail_tokens_line_compacts_and_keeps_label_alignment() {
         output_tokens: 1_280,
         total_tokens: 16_600,
         cached_tokens: 0,
+        cache_write_tokens: 0,
     };
     assert_eq!(
         session_detail_tokens_line(&usage),
@@ -92,6 +95,7 @@ fn session_detail_tokens_line_annotates_cached_tokens_when_reported() {
         output_tokens: 1_280,
         total_tokens: 16_600,
         cached_tokens: 10_000,
+        cache_write_tokens: 0,
     };
     assert_eq!(
         session_detail_tokens_line(&usage),
@@ -106,6 +110,7 @@ fn session_detail_tokens_line_small_counts_pass_through() {
         output_tokens: 7,
         total_tokens: 49,
         cached_tokens: 0,
+        cache_write_tokens: 0,
     };
     assert_eq!(
         session_detail_tokens_line(&usage),

@@ -148,7 +148,7 @@ fn decode_tolerates_array_encoded_struct() {
             input_tokens: 10,
             output_tokens: 20,
             total_tokens: 30,
-            cached_tokens: 0,
+            ..Default::default()
         }
     );
 }
@@ -328,7 +328,7 @@ fn turn_with_tool_results_round_trip() {
             input_tokens: 10,
             output_tokens: 20,
             total_tokens: 30,
-            cached_tokens: 0,
+            ..Default::default()
         }),
         tool_results: vec![ToolResultRecord {
             call_id: "call_1".into(),
@@ -356,6 +356,7 @@ fn token_usage_default_is_zero() {
     assert_eq!(u.output_tokens, 0);
     assert_eq!(u.total_tokens, 0);
     assert_eq!(u.cached_tokens, 0);
+    assert_eq!(u.cache_write_tokens, 0);
 }
 
 #[test]
@@ -365,6 +366,7 @@ fn token_usage_serde_round_trip() {
         output_tokens: 75,
         total_tokens: 225,
         cached_tokens: 40,
+        cache_write_tokens: 12,
     };
     let frame = encode_frame(&usage).expect("encode");
     let decoded: TokenUsage = decode_frame(&frame[4..]).expect("decode");
@@ -460,7 +462,7 @@ fn daemon_message_done_with_usage_round_trip() {
         input_tokens: 100,
         output_tokens: 50,
         total_tokens: 150,
-        cached_tokens: 0,
+        ..Default::default()
     };
     let msg = DaemonMessage::Session {
         session_id: Some(1),
@@ -571,7 +573,7 @@ fn session_summary_some_token_usage_round_trip() {
         input_tokens: 10,
         output_tokens: 20,
         total_tokens: 30,
-        cached_tokens: 0,
+        ..Default::default()
     };
     let summary = SessionSummary {
         session_id: 2,

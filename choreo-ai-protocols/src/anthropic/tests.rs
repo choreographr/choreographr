@@ -788,7 +788,7 @@ fn request_body_omits_cache_control_when_disabled() {
 #[test]
 fn response_maps_cache_read_tokens_into_cached_tokens() {
     // `cache_read_input_tokens` is the prompt-cache hit count and must land in
-    // `TokenUsage.cached_tokens` (the write count is logged only).
+    // `TokenUsage.cached_tokens` (the write count is mapped separately).
     let resp: MessagesResponse = serde_json::from_value(json!({
         "id": "msg_cache",
         "type": "message",
@@ -808,6 +808,34 @@ fn response_maps_cache_read_tokens_into_cached_tokens() {
         panic!("expected FinalText");
     };
     assert_eq!(ft.usage.expect("usage").cached_tokens, 64);
+}
+
+#[test]
+fn response_maps_cache_creation_tokens_into_cache_write_tokens() {
+    // `cache_creation_input_tokens` is the prompt-cache WRITE count (priced
+    // differently from a read) and must land in
+    // `TokenUsage.cache_write_tokens`, alongside the read count.
+    let resp: MessagesResponse = serde_json::from_value(json!({
+        "id": "msg_cache_write",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "written!"}],
+        "model": "claude-sonnet-4-20250514",
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "cache_read_input_tokens": 64,
+            "cache_creation_input_tokens": 8
+        }
+    }))
+    .unwrap();
+    let turn = response_to_turn_result(resp).unwrap();
+    let ChatTurnResult::FinalText(ft) = turn else {
+        panic!("expected FinalText");
+    };
+    let usage = ft.usage.expect("usage");
+    assert_eq!(usage.cache_write_tokens, 8);
+    assert_eq!(usage.cached_tokens, 64);
 }
 
 #[test]

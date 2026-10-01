@@ -3,7 +3,7 @@ mod requests;
 mod tests;
 
 use std::io;
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 use serde::{Deserialize, Serialize};
 
@@ -550,12 +550,34 @@ struct UsageInfo {
     /// `TokenUsage.cached_tokens`.
     #[serde(default)]
     cache_read_input_tokens: u32,
-    /// Prompt tokens written to the cache. Carried for logging only: the
-    /// shared `TokenUsage` has no cache-write field yet, and adding one would
-    /// ripple through every struct literal in the workspace, so the write
-    /// count is surfaced at trace level until a later phase needs it.
+    /// Prompt tokens written to the cache. Mapped into
+    /// `TokenUsage.cache_write_tokens` — tracked separately from the read count
+    /// because a cache write is priced differently from a read.
     #[serde(default)]
     cache_creation_input_tokens: u32,
+}
+
+/// Assemble the canonical [`TokenUsage`] from Anthropic's split token counters.
+///
+/// Anthropic reports input and output tokens separately (there is no
+/// `total_tokens`), so the total is summed here. `cache_read`/`cache_write` are
+/// the prompt-cache hit/write counts (`cache_read_input_tokens` /
+/// `cache_creation_input_tokens`); they are kept as separate fields because a
+/// cache write is priced differently from a read. Shared by the non-streaming
+/// and streaming response paths so a new counter is added in one place.
+pub(super) fn anthropic_token_usage(
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_read: u32,
+    cache_write: u32,
+) -> TokenUsage {
+    TokenUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens: input_tokens + output_tokens,
+        cached_tokens: cache_read,
+        cache_write_tokens: cache_write,
+    }
 }
 
 /// Convert the content blocks from a Messages API response into a
@@ -609,35 +631,35 @@ fn response_to_turn_result(response: MessagesResponse) -> Result<ChatTurnResult,
     };
 
     // Convert Anthropic's usage info (input_tokens + output_tokens, plus the
-    // cache accounting) to our canonical TokenUsage struct. Anthropic does not
-    // provide total_tokens, so we compute it. `cache_read_input_tokens` is the
-    // prompt-cache hit count and maps onto the existing `cached_tokens` field;
-    // the cache-write count is logged only (see `UsageInfo`).
+    // cache accounting) to our canonical TokenUsage struct.
     let usage: Option<TokenUsage> = response.usage.map(|u| {
-        let total = u.input_tokens + u.output_tokens;
-        let cached_tokens = u.cache_read_input_tokens;
+        let usage = anthropic_token_usage(
+            u.input_tokens,
+            u.output_tokens,
+            u.cache_read_input_tokens,
+            u.cache_creation_input_tokens,
+        );
         debug!(
             input_tokens = u.input_tokens,
             output_tokens = u.output_tokens,
-            total_tokens = total,
-            cached_tokens,
+            total_tokens = usage.total_tokens,
+            cached_tokens = usage.cached_tokens,
+            cache_write_tokens = usage.cache_write_tokens,
             "Anthropic turn usage"
         );
-        if cached_tokens > 0 {
-            debug!(cached_tokens, "Anthropic prompt cache hit");
+        if usage.cached_tokens > 0 {
+            debug!(
+                cached_tokens = usage.cached_tokens,
+                "Anthropic prompt cache hit"
+            );
         }
-        if u.cache_creation_input_tokens > 0 {
-            trace!(
-                cache_creation_input_tokens = u.cache_creation_input_tokens,
+        if usage.cache_write_tokens > 0 {
+            debug!(
+                cache_write_tokens = usage.cache_write_tokens,
                 "Anthropic prompt cache write"
             );
         }
-        TokenUsage {
-            input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens,
-            total_tokens: total,
-            cached_tokens,
-        }
+        usage
     });
 
     if !tool_uses.is_empty() {

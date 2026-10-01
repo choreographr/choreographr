@@ -265,6 +265,7 @@ where
                 output_tokens: u.candidates_token_count,
                 total_tokens: u.total_token_count,
                 cached_tokens: 0,
+                cache_write_tokens: 0,
             });
         }
 

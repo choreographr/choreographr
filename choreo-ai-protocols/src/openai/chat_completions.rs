@@ -409,6 +409,7 @@ fn chat_completions_response_to_turn(
             output_tokens: u.completion_tokens,
             total_tokens: u.total_tokens,
             cached_tokens,
+            cache_write_tokens: 0,
         }
     });
 
@@ -701,6 +702,7 @@ impl ChatCompletionsStreamAccumulator {
                 output_tokens: u.completion_tokens,
                 total_tokens: u.total_tokens,
                 cached_tokens,
+                cache_write_tokens: 0,
             };
             self.last_usage = Some(usage);
         }
@@ -1687,6 +1689,7 @@ mod tests {
                 output_tokens: 20,
                 total_tokens: 120,
                 cached_tokens: 64,
+                cache_write_tokens: 0,
             })
         );
     }
@@ -1706,6 +1709,7 @@ mod tests {
                 output_tokens: 5,
                 total_tokens: 15,
                 cached_tokens: 0,
+                cache_write_tokens: 0,
             })
         );
     }

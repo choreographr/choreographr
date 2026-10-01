@@ -299,6 +299,7 @@ mod tests {
                     output_tokens: 20,
                     total_tokens: 30,
                     cached_tokens: 0,
+                    cache_write_tokens: 0,
                 }),
                 last_prompt_tokens: None,
             },

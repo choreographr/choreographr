@@ -1045,6 +1045,7 @@ fn done_for_background_session_does_not_pollute_attached_display() {
         output_tokens: 2,
         total_tokens: 3,
         cached_tokens: 0,
+        cache_write_tokens: 0,
     });
     // Session 7 (background, streamed via SubscribeAllActivity) has an
     // in-flight request that is about to finish.
@@ -1064,6 +1065,7 @@ fn done_for_background_session_does_not_pollute_attached_display() {
                     output_tokens: 99,
                     total_tokens: 99,
                     cached_tokens: 0,
+                    cache_write_tokens: 0,
                 }),
                 last_prompt_tokens: Some(99),
             },
@@ -1082,6 +1084,7 @@ fn done_for_background_session_does_not_pollute_attached_display() {
             output_tokens: 2,
             total_tokens: 3,
             cached_tokens: 0,
+            cache_write_tokens: 0,
         })
     );
     assert!(!app.display_for(0).progress_dirty);
@@ -1094,6 +1097,7 @@ fn done_for_background_session_does_not_pollute_attached_display() {
             output_tokens: 99,
             total_tokens: 99,
             cached_tokens: 0,
+            cache_write_tokens: 0,
         })
     );
     assert!(!app.display_for(7).active.contains(&50));
@@ -2158,6 +2162,7 @@ fn session_attached_does_not_regress_accumulated_live_state() {
         output_tokens: 60,
         total_tokens: 110,
         cached_tokens: 0,
+        cache_write_tokens: 0,
     });
     display.live_output_tokens = 5;
     display.selected_model = Some("gpt-live".to_string());
@@ -2173,6 +2178,7 @@ fn session_attached_does_not_regress_accumulated_live_state() {
             output_tokens: 2,
             total_tokens: 3,
             cached_tokens: 0,
+            cache_write_tokens: 0,
         });
         s.context_window = Some(4096);
     }
@@ -2196,6 +2202,7 @@ fn session_attached_does_not_regress_accumulated_live_state() {
             output_tokens: 60,
             total_tokens: 110,
             cached_tokens: 0,
+            cache_write_tokens: 0,
         })
     );
     assert_eq!(app.display_for(42).live_output_tokens, 5);

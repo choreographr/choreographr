@@ -13,9 +13,9 @@ use crate::types::{
 
 use super::{
     AnthropicConfig, AnthropicError, MessagesRequest, MessagesResponse, ModelListResponse,
-    ThinkingArtifactBlock, anthropic_thinking_artifact, build_message_payloads,
-    build_tool_payloads, effective_max_tokens, prompt_cache_control, response_to_turn_result,
-    thinking_payload,
+    ThinkingArtifactBlock, anthropic_thinking_artifact, anthropic_token_usage,
+    build_message_payloads, build_tool_payloads, effective_max_tokens, prompt_cache_control,
+    response_to_turn_result, thinking_payload,
 };
 
 /// Endpoint path for the Messages API.
@@ -297,10 +297,11 @@ where
     // by the content block index.
     let mut pending_tool_calls: Vec<StreamToolCall> = Vec::new();
     // Track input/output tokens delivered via message_start and message_delta,
-    // plus the prompt-cache read count reported in message_start.
+    // plus the prompt-cache read/write counts reported in message_start.
     let mut input_tokens: Option<u32> = None;
     let mut output_tokens: Option<u32> = None;
     let mut cached_tokens: u32 = 0;
+    let mut cache_write_tokens: u32 = 0;
     // Reconstructs the thinking / `redacted_thinking` blocks in wire order for
     // the opaque round-trip artifact (same shape as the non-streaming path).
     let mut thinking_blocks = ThinkingBlockAccumulator::new();
@@ -415,19 +416,14 @@ where
                 thinking_blocks.on_content_block_stop();
             }
             "message_start" => {
-                // Parse input_tokens (and the prompt-cache read count) from the
-                // message_start event.
+                // Parse input_tokens (and the prompt-cache read/write counts)
+                // from the message_start event.
                 let start: MessageStart = serde_json::from_str(&data)
                     .map_err(|e| AnthropicError::Io(io::Error::other(e)))?;
                 if let Some(u) = start.message.usage {
                     input_tokens = Some(u.input_tokens);
                     cached_tokens = u.cache_read_input_tokens;
-                    if u.cache_creation_input_tokens > 0 {
-                        trace!(
-                            cache_creation_input_tokens = u.cache_creation_input_tokens,
-                            "Anthropic streaming prompt cache write"
-                        );
-                    }
+                    cache_write_tokens = u.cache_creation_input_tokens;
                 }
             }
             "message_delta" => {
@@ -445,28 +441,32 @@ where
     }
 
     // Build usage from the tokens collected during message_start and
-    // message_delta events. `cached_tokens` is the prompt-cache read count from
-    // message_start and maps onto the shared `cached_tokens` field; the
-    // cache-write count is logged only (see the non-streaming path).
+    // message_delta events. `cached_tokens`/`cache_write_tokens` are the
+    // prompt-cache read/write counts from message_start.
     let usage: Option<TokenUsage> = match (input_tokens, output_tokens) {
         (Some(in_tok), Some(out_tok)) => {
-            let total = in_tok + out_tok;
+            let usage = anthropic_token_usage(in_tok, out_tok, cached_tokens, cache_write_tokens);
             debug!(
                 input_tokens = in_tok,
                 output_tokens = out_tok,
-                total_tokens = total,
-                cached_tokens,
+                total_tokens = usage.total_tokens,
+                cached_tokens = usage.cached_tokens,
+                cache_write_tokens = usage.cache_write_tokens,
                 "Anthropic streaming turn usage"
             );
-            if cached_tokens > 0 {
-                debug!(cached_tokens, "Anthropic streaming prompt cache hit");
+            if usage.cached_tokens > 0 {
+                debug!(
+                    cached_tokens = usage.cached_tokens,
+                    "Anthropic streaming prompt cache hit"
+                );
             }
-            Some(TokenUsage {
-                input_tokens: in_tok,
-                output_tokens: out_tok,
-                total_tokens: total,
-                cached_tokens,
-            })
+            if usage.cache_write_tokens > 0 {
+                debug!(
+                    cache_write_tokens = usage.cache_write_tokens,
+                    "Anthropic streaming prompt cache write"
+                );
+            }
+            Some(usage)
         }
         _ => None,
     };
@@ -816,8 +816,8 @@ struct AnthropicStreamUsage {
     /// `message_start`; mapped into `TokenUsage.cached_tokens`.
     #[serde(default)]
     cache_read_input_tokens: u32,
-    /// Prompt tokens written to the cache; logged only (see the non-streaming
-    /// path for why `TokenUsage` has no cache-write field yet).
+    /// Prompt tokens written to the cache; mapped into
+    /// `TokenUsage.cache_write_tokens`.
     #[serde(default)]
     cache_creation_input_tokens: u32,
 }
@@ -973,5 +973,38 @@ mod tests {
         assert_eq!(usage.input_tokens, 7);
         assert_eq!(usage.cache_read_input_tokens, 0);
         assert_eq!(usage.cache_creation_input_tokens, 0);
+    }
+
+    /// The streaming loop reads input + cache counts from `message_start` and
+    /// output from `message_delta`, then assembles the canonical `TokenUsage`.
+    /// Pin that the cache-WRITE count reported at `message_start` reaches
+    /// `cache_write_tokens` (not just the parsed struct), while the read count
+    /// stays on `cached_tokens`.
+    #[test]
+    fn streaming_message_start_cache_write_reaches_token_usage() {
+        let start: MessageStart = serde_json::from_value(json!({
+            "message": {
+                "usage": {
+                    "input_tokens": 20,
+                    "cache_read_input_tokens": 128,
+                    "cache_creation_input_tokens": 4
+                }
+            }
+        }))
+        .unwrap();
+        let usage_info = start.message.usage.expect("usage present");
+        let delta: MessageDelta =
+            serde_json::from_value(json!({"usage": {"output_tokens": 9}})).unwrap();
+        let out = delta.usage.expect("delta usage").output_tokens;
+
+        let usage = anthropic_token_usage(
+            usage_info.input_tokens,
+            out,
+            usage_info.cache_read_input_tokens,
+            usage_info.cache_creation_input_tokens,
+        );
+        assert_eq!(usage.cached_tokens, 128);
+        assert_eq!(usage.cache_write_tokens, 4);
+        assert_eq!(usage.total_tokens, 29);
     }
 }

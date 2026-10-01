@@ -1787,7 +1787,9 @@ impl App {
                 + display.live_output_tokens,
             // Cached tokens are only reported in settled usage, not in the live
             // per-chunk estimates, so carry the settled value through untouched.
+            // The cache-write count is settled-only for the same reason.
             cached_tokens: usage.cached_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
         })
     }
 }

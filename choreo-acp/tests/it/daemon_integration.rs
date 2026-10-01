@@ -80,6 +80,7 @@ fn daemon_io_send_and_receive() {
                         output_tokens: 3,
                         total_tokens: 8,
                         cached_tokens: 0,
+                        cache_write_tokens: 0,
                     }),
                     last_prompt_tokens: None,
                 },

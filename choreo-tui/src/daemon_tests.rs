@@ -32,6 +32,7 @@ fn daemon_message_session_state_updates_progress_for_attached_session() {
                     output_tokens: 2,
                     total_tokens: 3,
                     cached_tokens: 0,
+                    cache_write_tokens: 0,
                 }),
                 context_window: Some(4096),
                 last_prompt_tokens: Some(1),
@@ -52,6 +53,7 @@ fn daemon_message_session_state_updates_progress_for_attached_session() {
             output_tokens: 2,
             total_tokens: 3,
             cached_tokens: 0,
+            cache_write_tokens: 0,
         })
     );
     assert_eq!(app.display_for(7).context_window, Some(4096));
@@ -115,6 +117,7 @@ fn daemon_message_session_state_ignores_wrong_session() {
                     output_tokens: 99,
                     total_tokens: 99,
                     cached_tokens: 0,
+                    cache_write_tokens: 0,
                 }),
                 context_window: Some(1024),
                 last_prompt_tokens: None,
@@ -146,6 +149,7 @@ fn daemon_message_session_state_ignores_wrong_session() {
             output_tokens: 99,
             total_tokens: 99,
             cached_tokens: 0,
+            cache_write_tokens: 0,
         })
     );
     assert_eq!(app.display_for(99).context_window, Some(1024));
@@ -174,6 +178,7 @@ fn daemon_message_done_with_token_usage_updates_progress() {
                     output_tokens: 10,
                     total_tokens: 15,
                     cached_tokens: 0,
+                    cache_write_tokens: 0,
                 }),
                 last_prompt_tokens: Some(5),
             },
@@ -190,6 +195,7 @@ fn daemon_message_done_with_token_usage_updates_progress() {
             output_tokens: 10,
             total_tokens: 15,
             cached_tokens: 0,
+            cache_write_tokens: 0,
         })
     );
     assert!(app.display_for(42).progress_dirty);
@@ -232,6 +238,7 @@ fn live_output_token_count_from_background_session_does_not_pollute_status_bar()
         output_tokens: 2,
         total_tokens: 3,
         cached_tokens: 0,
+        cache_write_tokens: 0,
     });
 
     // Session 7 (background, streamed via SubscribeAllActivity) reports its
@@ -261,6 +268,7 @@ fn live_output_token_count_from_background_session_does_not_pollute_status_bar()
             output_tokens: 2,
             total_tokens: 3,
             cached_tokens: 0,
+            cache_write_tokens: 0,
         })
     );
 }
@@ -278,6 +286,7 @@ fn live_output_token_count_updates_own_session_after_switch() {
         output_tokens: 5,
         total_tokens: 15,
         cached_tokens: 0,
+        cache_write_tokens: 0,
     });
 
     handle_daemon_message(
@@ -303,6 +312,7 @@ fn live_output_token_count_updates_own_session_after_switch() {
             output_tokens: 47,
             total_tokens: 57,
             cached_tokens: 0,
+            cache_write_tokens: 0,
         })
     );
 }
@@ -320,6 +330,7 @@ fn session_state_snapshot_does_not_regress_fresher_token_usage() {
         output_tokens: 5,
         total_tokens: 15,
         cached_tokens: 0,
+        cache_write_tokens: 0,
     });
 
     // The attach snapshot is built from the session thread's config, which
@@ -340,6 +351,7 @@ fn session_state_snapshot_does_not_regress_fresher_token_usage() {
                     output_tokens: 2,
                     total_tokens: 3,
                     cached_tokens: 0,
+                    cache_write_tokens: 0,
                 }),
                 context_window: None,
                 last_prompt_tokens: None,
@@ -361,6 +373,7 @@ fn session_state_snapshot_does_not_regress_fresher_token_usage() {
             output_tokens: 5,
             total_tokens: 15,
             cached_tokens: 0,
+            cache_write_tokens: 0,
         })
     );
 }
@@ -378,6 +391,7 @@ fn session_state_snapshot_with_newer_larger_usage_updates_display() {
         output_tokens: 2,
         total_tokens: 3,
         cached_tokens: 0,
+        cache_write_tokens: 0,
     });
 
     handle_daemon_message(
@@ -395,6 +409,7 @@ fn session_state_snapshot_with_newer_larger_usage_updates_display() {
                     output_tokens: 5,
                     total_tokens: 15,
                     cached_tokens: 0,
+                    cache_write_tokens: 0,
                 }),
                 context_window: None,
                 last_prompt_tokens: None,
@@ -416,6 +431,7 @@ fn session_state_snapshot_with_newer_larger_usage_updates_display() {
             output_tokens: 5,
             total_tokens: 15,
             cached_tokens: 0,
+            cache_write_tokens: 0,
         })
     );
 }
