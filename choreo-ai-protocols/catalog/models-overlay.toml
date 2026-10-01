@@ -34,6 +34,8 @@
 #   base_url = "https://…"
 #   default_model = "…"
 #   display_name = "…"          # only needed for providers not in the base
+#   prompt_cache_short = 300     # provider default ephemeral tier TTL, seconds
+#   prompt_cache_long = 3600     # provider default extended tier TTL, seconds
 #
 #   [provider.<slug>.models."<model>"]
 #   context_window = 123456
@@ -41,6 +43,8 @@
 #   reasoning_levels = ["off", "high", "max"]
 #   responses = true
 #   reasoning_passback = "tool_loop" | "all_turns" | "none" | "signature" | "response_id"
+#   prompt_cache_short = 300     # per-model TTL override (wins over the provider default)
+#   prompt_cache_long = 3600
 
 # alibaba -> alibaba (policy from the pre-models.dev TOML)
 [provider.alibaba]
@@ -49,6 +53,13 @@
 # anthropic -> anthropic (policy from the pre-models.dev TOML)
 [provider.anthropic]
   base_url = "https://api.anthropic.com"
+  # Prompt-cache TTLs in seconds: the default 5-minute ephemeral tier and the
+  # 1-hour extended tier (models.dev carries no TTL fact — this is policy).
+  # Other anthropic-protocol providers below are gateways whose upstream cache
+  # behavior differs, so they stay opt-in rather than inheriting this default;
+  # custom-anthropic is the exception (it points straight at the Anthropic API).
+  prompt_cache_short = 300
+  prompt_cache_long = 3600
 
 # atomic-chat -> atomic-chat (policy from the pre-models.dev TOML)
 [provider.atomic-chat]
@@ -422,6 +433,9 @@
   protocol = "anthropic"
   base_url = "https://api.anthropic.com"
   default_model = "custom-model"
+  # Points straight at the Anthropic API, so it shares Anthropic's cache TTLs.
+  prompt_cache_short = 300
+  prompt_cache_long = 3600
 
 # Custom OpenAI-Compatible (not covered by models.dev; defined wholesale)
 [provider.custom-openai]

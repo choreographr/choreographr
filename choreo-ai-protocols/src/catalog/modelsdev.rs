@@ -2,12 +2,13 @@
 //!
 //! The local models.dev snapshot (`catalog/models.dev.json`, fetched
 //! 2026-08-13) is the source of *facts*: provider slugs/names/base URLs and
-//! per-model reasoning/context facts. The snapshot is a **gitignored local
+//! per-model reasoning/context/cost facts. The snapshot is a **gitignored local
 //! artifact** — `catalog-gen` fetches a fresh copy from models.dev when it is
 //! missing and caches it at that path — so `catalog.bin` is the only
 //! committed catalog data file. Policy (protocol selection, per-model passback
-//! exceptions, and the providers models.dev does not cover) lives in
-//! `models-overlay.toml` and is merged at load time by [`merge_overlay`].
+//! exceptions, the prompt-cache TTL, and the providers models.dev does not
+//! cover) lives in `models-overlay.toml` and is merged at load time by
+//! [`merge_overlay`].
 //!
 //! The generator binary (`src/bin/catalog-gen.rs`) runs [`normalize_modelsdev`]
 //! over the snapshot and postcard-serializes the result into
@@ -23,7 +24,7 @@
 use indexmap::IndexMap;
 use serde::Deserialize;
 
-use super::{ModelEntry, ProviderEntry, ProviderProtocol};
+use super::{ModelCost, ModelEntry, ProviderEntry, ProviderProtocol};
 use crate::shared::MaxTokensField;
 
 /// One provider as recorded by the models.dev snapshot.
@@ -94,6 +95,29 @@ struct RawModel {
     /// [`ModelEntry::supports_image_output`] the same way.
     #[serde(default)]
     modalities: Option<RawModalities>,
+    /// Token prices, USD per million tokens. Absent → `None` (the model records
+    /// no cost). The snapshot's `cost` object carries nested/aux keys
+    /// (`tiers`, `context_over_200k`, `input_audio`, `output_audio`,
+    /// `reasoning`) that this catalog does not model; serde ignores unknown
+    /// fields, so only the four flat prices below are ingested.
+    #[serde(default)]
+    cost: Option<RawCost>,
+}
+
+/// One model's `cost` object as recorded by models.dev, restricted to the four
+/// flat per-token prices this catalog models. `input`/`output` are present
+/// whenever the object exists; `cache_read`/`cache_write` are frequently absent
+/// (many OpenAI-compatible models record only the first three) → `Option`.
+#[derive(Debug, Deserialize)]
+struct RawCost {
+    #[serde(default)]
+    input: f64,
+    #[serde(default)]
+    output: f64,
+    #[serde(default)]
+    cache_read: Option<f64>,
+    #[serde(default)]
+    cache_write: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,6 +262,18 @@ fn normalize_provider(slug: String, raw: RawProvider) -> ProviderEntry {
                 .modalities
                 .as_ref()
                 .is_some_and(|mods| mods.output.iter().any(|m| m == "image")),
+            // Token prices (USD per million tokens): a fact from the snapshot's
+            // `cost` object when present; `None` when the model records no cost.
+            // Only the four flat prices are modelled — the aux/nested cost keys
+            // are out of scope (see RawCost).
+            cost: m.cost.map(|c| ModelCost {
+                input: c.input,
+                output: c.output,
+                cache_read: c.cache_read,
+                cache_write: c.cache_write,
+            }),
+            // Prompt-cache TTL is overlay policy, never a models.dev fact.
+            prompt_cache: None,
         })
         .collect();
 
@@ -248,6 +284,9 @@ fn normalize_provider(slug: String, raw: RawProvider) -> ProviderEntry {
         base_url: raw.api.unwrap_or_default(),
         default_model,
         models,
+        // Provider-level prompt-cache TTL is overlay policy, never a base
+        // fact.
+        prompt_cache: None,
     }
 }
 
@@ -307,7 +346,8 @@ mod tests {
                 "glm-5.1": {
                     "reasoning": true,
                     "reasoning_options": [{"type": "effort", "values": ["high", "max"]}],
-                    "limit": {"context": 202800, "output": 131072}
+                    "limit": {"context": 202800, "output": 131072},
+                    "cost": {"input": 0.6, "output": 2.2, "cache_read": 0.11, "cache_write": 0.3, "tiers": [], "reasoning": 0.9}
                 },
                 "glm-5": {
                     "reasoning": true,
@@ -324,7 +364,8 @@ mod tests {
                     "reasoning": true,
                     "reasoning_options": [{"type": "effort", "values": ["none", "low", "medium", "high", "xhigh"]}],
                     "limit": {"context": 400000, "output": 131072},
-                    "modalities": {"input": ["text", "image"], "output": ["text"]}
+                    "modalities": {"input": ["text", "image"], "output": ["text"]},
+                    "cost": {"input": 1.25, "output": 10.0, "cache_read": 0.125}
                 },
                 "gpt-image-1": {
                     "limit": {"context": 128000, "output": 4096},
@@ -550,5 +591,31 @@ mod tests {
         let catalog = normalize_modelsdev(SNAPSHOT);
         // "no-facts" carries no limit at all → 0 (= unknown).
         assert_eq!(catalog[5].models[3].max_output_tokens, 0);
+    }
+
+    #[test]
+    fn ingests_model_cost_and_partial_cache_fields() {
+        let catalog = normalize_modelsdev(SNAPSHOT);
+        // Full cost object: all four prices are ingested, and the aux/nested
+        // keys (`tiers`, `reasoning`) are ignored without error.
+        let glm = catalog[0].models[0].cost.expect("glm-5.1 records a cost");
+        assert_eq!(glm.input, 0.6);
+        assert_eq!(glm.output, 2.2);
+        assert_eq!(glm.cache_read, Some(0.11));
+        assert_eq!(glm.cache_write, Some(0.3));
+        // Partial cost object (OpenAI-style: input/output/cache_read only) →
+        // the absent cache_write stays None.
+        let gpt = catalog[1].models[0].cost.expect("gpt-5.4 records a cost");
+        assert_eq!(gpt.input, 1.25);
+        assert_eq!(gpt.output, 10.0);
+        assert_eq!(gpt.cache_read, Some(0.125));
+        assert_eq!(gpt.cache_write, None);
+    }
+
+    #[test]
+    fn model_without_cost_is_none() {
+        let catalog = normalize_modelsdev(SNAPSHOT);
+        // gpt-image-1 records no cost object → None (never a zero-price fact).
+        assert_eq!(catalog[1].models[1].cost, None);
     }
 }

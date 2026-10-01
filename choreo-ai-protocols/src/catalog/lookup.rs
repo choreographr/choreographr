@@ -18,7 +18,10 @@ use choreo_proto::ReasoningCapability;
 
 use crate::openai::RequestFormat;
 
-use super::{ModelEntry, PROVIDER_CATALOG, ProviderProtocol, ReasoningPassback};
+use super::{
+    ModelCost, ModelEntry, PROVIDER_CATALOG, PromptCacheTtl, ProviderEntry, ProviderProtocol,
+    ReasoningPassback,
+};
 
 /// Shared walker: find the model entry for `(provider_slug, model)` against
 /// the live catalog, holding the `ArcSwap` guard only for the duration of the
@@ -53,6 +56,71 @@ fn with_model_fact<T>(
         "model fact lookup"
     );
     fact
+}
+
+/// Sibling of [`with_model_fact`] for facts whose fallback lives on the
+/// *provider* entry rather than the model: it holds the `ArcSwap` guard once
+/// across a single walk and hands the closure both the matched
+/// [`ProviderEntry`] and the matched [`ModelEntry`]. Kept in the same style as
+/// `with_model_fact` so the traversal logic never drifts between the two.
+///
+/// Returns `None` when the provider slug or the model slug does not match any
+/// catalog entry.
+fn with_provider_and_model_fact<T>(
+    provider_slug: &str,
+    model: &str,
+    f: impl FnOnce(&ProviderEntry, &ModelEntry) -> T,
+) -> Option<T> {
+    let catalog = PROVIDER_CATALOG.load();
+    let fact = catalog
+        .iter()
+        .find(|e| e.slug == provider_slug)
+        .and_then(|provider| {
+            provider
+                .models
+                .iter()
+                .find(|m| m.model == model)
+                .map(|m| f(provider, m))
+        });
+    trace!(
+        provider = %provider_slug,
+        model = %model,
+        found = fact.is_some(),
+        "model fact lookup (provider-scoped fallback)"
+    );
+    fact
+}
+
+/// Look up the recorded token prices for a model on a given provider, cloning
+/// the [`ModelCost`] out of the catalog. Returns `None` for an unknown
+/// provider or model, and `None` when the model records no cost object (the
+/// snapshot simply carries no price fact for it — never a synthetic zero).
+///
+/// Consumed by the cache-warming cost gate — currently **recorded but
+/// unwired** (no production caller yet; see the catalog-facts paragraph in
+/// ARCHITECTURE.md, alongside `model_supports_temperature`).
+#[must_use]
+pub fn model_cost(provider_slug: &str, model: &str) -> Option<ModelCost> {
+    // `ModelCost` is `Copy`, so the projection is a plain value clone.
+    with_model_fact(provider_slug, model, |m| m.cost).flatten()
+}
+
+/// Resolve the effective prompt-cache TTL for a model on a given provider.
+///
+/// Precedence, highest wins: the model's own `prompt_cache` override, else the
+/// provider-level `prompt_cache` default, else `None` (the provider declares no
+/// TTL — the caller then treats cache-warming as unschedulable). Returns `None`
+/// for an unknown provider or model too.
+///
+/// Consumed by cache-warming TTL scheduling — currently **recorded but
+/// unwired** (no production caller yet).
+#[must_use]
+pub fn prompt_cache_ttl(provider_slug: &str, model: &str) -> Option<PromptCacheTtl> {
+    // `PromptCacheTtl` is `Copy`, so `or` between the two levels needs no clone.
+    with_provider_and_model_fact(provider_slug, model, |provider, model| {
+        model.prompt_cache.or(provider.prompt_cache)
+    })
+    .flatten()
 }
 
 /// Look up the context window for a model on a given provider.
@@ -970,5 +1038,99 @@ mod tests {
         );
         // Sanity: chat models under the same slug stay non-image.
         assert!(!model_supports_image_output("zai", "glm-5.1"));
+    }
+
+    #[test]
+    fn model_cost_returns_recorded_cost_and_none_when_absent() {
+        let _restore = RestoreBundledOnDrop;
+        let bundled = catalog_snapshot();
+        crate::catalog::replace_catalog({
+            let mut c = tiny_catalog();
+            c[0].models[0].cost = Some(ModelCost {
+                input: 1.5,
+                output: 6.0,
+                cache_read: Some(0.15),
+                cache_write: None,
+            });
+            c[0].models.push(crate::catalog::ModelEntry {
+                model: "no-cost".into(),
+                ..Default::default()
+            });
+            c
+        });
+        let cost = model_cost("tiny-test", "tiny-model").expect("recorded cost");
+        assert_eq!(cost.input, 1.5);
+        assert_eq!(cost.output, 6.0);
+        assert_eq!(cost.cache_read, Some(0.15));
+        assert_eq!(cost.cache_write, None);
+        // A model with no cost fact, an unknown model, and an unknown provider
+        // all resolve None.
+        assert_eq!(model_cost("tiny-test", "no-cost"), None);
+        assert_eq!(model_cost("tiny-test", "no-such-model"), None);
+        assert_eq!(model_cost("no-such-provider", "tiny-model"), None);
+        crate::catalog::replace_catalog(bundled.to_vec());
+    }
+
+    #[test]
+    fn prompt_cache_ttl_prefers_model_override_then_provider_default() {
+        let _restore = RestoreBundledOnDrop;
+        let bundled = catalog_snapshot();
+        // Provider default only.
+        crate::catalog::replace_catalog({
+            let mut c = tiny_catalog();
+            c[0].prompt_cache = Some(PromptCacheTtl {
+                short_secs: Some(300),
+                long_secs: Some(3_600),
+            });
+            c
+        });
+        let ttl = prompt_cache_ttl("tiny-test", "tiny-model").expect("provider default");
+        assert_eq!(ttl.short_secs, Some(300));
+        assert_eq!(ttl.long_secs, Some(3_600));
+
+        // The model override wins wholesale over the provider default (its
+        // unset long tier does NOT fall back to the provider's).
+        crate::catalog::replace_catalog({
+            let mut c = tiny_catalog();
+            c[0].prompt_cache = Some(PromptCacheTtl {
+                short_secs: Some(300),
+                long_secs: Some(3_600),
+            });
+            c[0].models[0].prompt_cache = Some(PromptCacheTtl {
+                short_secs: Some(60),
+                long_secs: None,
+            });
+            c
+        });
+        let ttl = prompt_cache_ttl("tiny-test", "tiny-model").expect("model override");
+        assert_eq!(ttl.short_secs, Some(60));
+        assert_eq!(ttl.long_secs, None);
+
+        // Neither level declares a TTL → None; unknown provider/model → None.
+        crate::catalog::replace_catalog(tiny_catalog());
+        assert_eq!(prompt_cache_ttl("tiny-test", "tiny-model"), None);
+        assert_eq!(prompt_cache_ttl("no-such-provider", "tiny-model"), None);
+        assert_eq!(prompt_cache_ttl("tiny-test", "no-such-model"), None);
+        crate::catalog::replace_catalog(bundled.to_vec());
+    }
+
+    #[test]
+    fn bundled_overlay_sets_anthropic_prompt_cache_ttl() {
+        // The REAL bundled catalog: the anthropic provider default comes solely
+        // from the bundled overlay's `[provider.anthropic]` TTL keys, so this
+        // pins the overlay plumbing end to end. Read-only (no catalog swap), so
+        // no restore guard is needed.
+        let entry = lookup_provider("anthropic").expect("anthropic in bundled catalog");
+        let ttl = entry.prompt_cache.expect("anthropic provider default");
+        assert_eq!(ttl.short_secs, Some(300));
+        assert_eq!(ttl.long_secs, Some(3_600));
+        // A real model resolves the provider default (no per-model override).
+        assert_eq!(
+            prompt_cache_ttl("anthropic", "claude-sonnet-4-6"),
+            Some(PromptCacheTtl {
+                short_secs: Some(300),
+                long_secs: Some(3_600),
+            })
+        );
     }
 }

@@ -45,10 +45,10 @@ pub mod refresh;
 
 pub use loader::{bundled_overlay_src, load_bundled_base};
 pub use lookup::{
-    image_models_for_provider, lookup_context_window, lookup_max_output_tokens,
+    image_models_for_provider, lookup_context_window, lookup_max_output_tokens, model_cost,
     model_reasoning_capability, model_reasoning_passback, model_request_format,
     model_supports_image_output, model_supports_temperature, model_supports_vision,
-    requires_reasoning_content,
+    prompt_cache_ttl, requires_reasoning_content,
 };
 pub use modelsdev::normalize_modelsdev;
 pub use overlay::merge_overlay;
@@ -76,6 +76,52 @@ pub enum ReasoningPassback {
     /// Chain via `previous_response_id` / opaque reasoning items
     /// (OpenAI/xAI Responses).
     ResponseId,
+}
+
+/// Per-model token prices as recorded by models.dev, in **USD per million
+/// tokens** ($/M).
+///
+/// `input`/`output` are always present whenever the snapshot records a cost
+/// object; `cache_read`/`cache_write` are frequently absent (many
+/// OpenAI-compatible models record only `input`/`output`/`cache_read`), so
+/// they are optional. Consumed by the cache-warming cost gate — currently
+/// **recorded but unwired**: no production caller reads it yet (see the
+/// catalog-facts paragraph in ARCHITECTURE.md, alongside
+/// `model_supports_temperature`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ModelCost {
+    /// Prompt (input) price, USD per million tokens.
+    pub input: f64,
+    /// Completion (output) price, USD per million tokens.
+    pub output: f64,
+    /// Cache-read (cached prompt) price, USD per million tokens, when the
+    /// snapshot records one.
+    #[serde(default)]
+    pub cache_read: Option<f64>,
+    /// Cache-write price, USD per million tokens, when the snapshot records
+    /// one.
+    #[serde(default)]
+    pub cache_write: Option<f64>,
+}
+
+/// Prompt-cache TTL policy for a provider or model: the lifetimes, in seconds,
+/// of the ephemeral prompt-cache tiers a provider exposes.
+///
+/// `short_secs` is the default ephemeral tier (~5 minutes at Anthropic);
+/// `long_secs` is the extended tier (~1 hour). Both are optional so a provider
+/// or model can declare only the tiers it actually supports. This is **overlay
+/// policy** — models.dev carries no TTL fact — and the per-model value,
+/// when present, overrides the provider default (see [`prompt_cache_ttl`]).
+/// Consumed by cache-warming TTL scheduling — currently **recorded but
+/// unwired** (no production caller yet).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptCacheTtl {
+    /// Short (default) ephemeral tier lifetime, in seconds.
+    #[serde(default)]
+    pub short_secs: Option<u32>,
+    /// Long (extended) ephemeral tier lifetime, in seconds.
+    #[serde(default)]
+    pub long_secs: Option<u32>,
 }
 
 /// Per-model metadata in the provider catalog.
@@ -156,6 +202,15 @@ pub struct ModelEntry {
     /// `false` is the safe default for unknown models (text generation only).
     #[serde(default)]
     pub supports_image_output: bool,
+    /// Token prices (USD per million tokens) from the snapshot's `cost` object,
+    /// or `None` when the model records no cost. Consumed by the cache-warming
+    /// cost gate — currently recorded but unwired.
+    #[serde(default)]
+    pub cost: Option<ModelCost>,
+    /// Per-model prompt-cache TTL override (overlay policy). `None` means "no
+    /// override — fall through to the provider default" in [`prompt_cache_ttl`].
+    #[serde(default)]
+    pub prompt_cache: Option<PromptCacheTtl>,
 }
 
 // Manual `impl` rather than `#[derive(Default)]` + `#[default]` because
@@ -180,6 +235,8 @@ impl Default for ModelEntry {
             deprecated: false,
             supports_vision: false,
             supports_image_output: false,
+            cost: None,
+            prompt_cache: None,
         }
     }
 }
@@ -207,6 +264,11 @@ pub struct ProviderEntry {
     pub base_url: String,
     pub default_model: String,
     pub models: Vec<ModelEntry>,
+    /// Provider-level prompt-cache TTL default (overlay policy). `None` means
+    /// the provider declares no TTL; a per-model override on a [`ModelEntry`]
+    /// still takes precedence when present (see [`prompt_cache_ttl`]).
+    #[serde(default)]
+    pub prompt_cache: Option<PromptCacheTtl>,
 }
 
 /// Process-wide catalog of all known providers, backed by an [`ArcSwap`] so a
@@ -344,6 +406,7 @@ pub(crate) mod test_util {
             },
             base_url: "https://tiny-test.example/v1".into(),
             default_model: "tiny-model".into(),
+            prompt_cache: None,
             models: vec![crate::catalog::ModelEntry {
                 model: "tiny-model".into(),
                 context_window: 4096,
@@ -607,5 +670,49 @@ mod tests {
         assert_eq!(entry.base_url, "https://api.openai.com/v1");
         assert_eq!(entry.default_model, "gpt-5.4");
         assert!(!entry.models.is_empty());
+    }
+
+    #[test]
+    fn model_cost_and_prompt_cache_round_trip_through_postcard() {
+        // `catalog.bin` is postcard (positional, non-self-describing), so adding
+        // the `f64`-bearing `ModelCost` and the `PromptCacheTtl` fields changes
+        // the wire format. Pin that a catalog carrying both survives the exact
+        // serialize/deserialize path the embedded artifact uses — `f64`
+        // round-trips bit-exactly, and the optional tiers/fields survive too.
+        let mut catalog = test_util::tiny_catalog();
+        catalog[0].prompt_cache = Some(PromptCacheTtl {
+            short_secs: Some(300),
+            long_secs: None,
+        });
+        catalog[0].models[0].cost = Some(ModelCost {
+            input: 3.0,
+            output: 15.0,
+            cache_read: Some(0.3),
+            cache_write: None,
+        });
+        catalog[0].models[0].prompt_cache = Some(PromptCacheTtl {
+            short_secs: Some(60),
+            long_secs: Some(3_600),
+        });
+
+        let bytes = postcard::to_allocvec(&catalog).expect("postcard serialization succeeds");
+        let decoded: Vec<ProviderEntry> =
+            postcard::from_bytes(&bytes).expect("postcard deserialization succeeds");
+
+        // `f64` round-trips bit-exactly and the optional tiers/fields survive;
+        // compare the fields (ProviderEntry has no PartialEq).
+        assert_eq!(decoded[0].models[0].cost, catalog[0].models[0].cost);
+        assert_eq!(
+            decoded[0].models[0].prompt_cache,
+            catalog[0].models[0].prompt_cache
+        );
+        assert_eq!(decoded[0].prompt_cache, catalog[0].prompt_cache);
+        let cost = decoded[0].models[0]
+            .cost
+            .expect("cost survived the round-trip");
+        assert_eq!(cost.input, 3.0);
+        assert_eq!(cost.output, 15.0);
+        assert_eq!(cost.cache_read, Some(0.3));
+        assert_eq!(cost.cache_write, None);
     }
 }

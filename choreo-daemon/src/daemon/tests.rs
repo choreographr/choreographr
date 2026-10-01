@@ -2994,6 +2994,7 @@ fn tiny_base() -> Vec<choreo_ai_protocols::ProviderEntry> {
         },
         base_url: "https://tiny.example/v1".into(),
         default_model: "tiny-1".into(),
+        prompt_cache: None,
         models: vec![choreo_ai_protocols::ModelEntry {
             model: "tiny-1".into(),
             context_window: 4096,

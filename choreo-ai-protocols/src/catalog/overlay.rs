@@ -11,10 +11,14 @@
 //! base_url = "https://api.deepseek.com"
 //! default_model = "deepseek-v4-pro"
 //! display_name = "DeepSeek"            # only needed for new providers
+//! prompt_cache_short = 300             # provider-level TTL default, seconds
+//! prompt_cache_long = 3600
 //!
 //! [provider.opencode.models."gpt-5.4"]
 //! responses = true
 //! reasoning_passback = "response_id"
+//! prompt_cache_short = 300             # per-model TTL override
+//! prompt_cache_long = 3600
 //! ```
 //!
 //! Merge semantics, lowest → highest wins:
@@ -29,6 +33,12 @@
 //!   overlay does not mention (context windows, reasoning support, levels),
 //!   so a partial override like the Anthropic `tool_loop` passback pin never
 //!   destroys the model's other facts.
+//! - **Prompt-cache TTL** (`prompt_cache_short` / `prompt_cache_long`, in
+//!   seconds) is provider-level policy with a per-model override: the two
+//!   provider keys set the default on `[provider.<slug>]`, and the same two
+//!   keys on a model entry set that model's override (which wins over the
+//!   provider default at lookup time — see `prompt_cache_ttl`). Each tier is
+//!   optional and set independently.
 //! - **New providers** (models.dev does not cover them) are defined
 //!   wholesale: a `[provider.<slug>]` table that does not exist in the base
 //!   creates the provider, and its `models` sub-table fills in the entries.
@@ -88,6 +98,7 @@ pub fn merge_overlay(base: &[ProviderEntry], overlay_src: &str) -> Vec<ProviderE
                 base_url: String::new(),
                 default_model: String::new(),
                 models: Vec::new(),
+                prompt_cache: None,
             };
             apply_provider_overlay(&mut entry, table, &mut models_touched);
             merged.push(entry);
@@ -141,6 +152,35 @@ fn apply_provider_overlay(
                     warn!(slug = %entry.slug, "overlay: display_name is not a string; skipping");
                 }
             },
+            // Prompt-cache TTL default: provider policy, set tier-by-tier. Both
+            // keys are optional and independent, so mentioning either one
+            // creates the `PromptCacheTtl` and only that tier is set.
+            "prompt_cache_short" => {
+                if let Some(n) = value.as_integer() {
+                    entry
+                        .prompt_cache
+                        .get_or_insert_with(Default::default)
+                        .short_secs = Some(u32_len(n));
+                } else {
+                    warn!(
+                        slug = %entry.slug,
+                        "overlay: prompt_cache_short is not an integer; skipping",
+                    );
+                }
+            }
+            "prompt_cache_long" => {
+                if let Some(n) = value.as_integer() {
+                    entry
+                        .prompt_cache
+                        .get_or_insert_with(Default::default)
+                        .long_secs = Some(u32_len(n));
+                } else {
+                    warn!(
+                        slug = %entry.slug,
+                        "overlay: prompt_cache_long is not an integer; skipping",
+                    );
+                }
+            }
             "models" => apply_models_overlay(entry, value, models_touched),
             other => warn!(
                 slug = %entry.slug,
@@ -319,6 +359,35 @@ fn apply_model_overlay(model: &mut ModelEntry, table: &toml::Table) {
                     );
                 }
             }
+            // Per-model prompt-cache TTL override: same tier-by-tier shape as
+            // the provider-level default; a set tier here wins over the
+            // provider default at lookup time (see `prompt_cache_ttl`).
+            "prompt_cache_short" => {
+                if let Some(n) = value.as_integer() {
+                    model
+                        .prompt_cache
+                        .get_or_insert_with(Default::default)
+                        .short_secs = Some(u32_len(n));
+                } else {
+                    warn!(
+                        model = %model.model,
+                        "overlay: prompt_cache_short is not an integer; skipping",
+                    );
+                }
+            }
+            "prompt_cache_long" => {
+                if let Some(n) = value.as_integer() {
+                    model
+                        .prompt_cache
+                        .get_or_insert_with(Default::default)
+                        .long_secs = Some(u32_len(n));
+                } else {
+                    warn!(
+                        model = %model.model,
+                        "overlay: prompt_cache_long is not an integer; skipping",
+                    );
+                }
+            }
             other => warn!(
                 model = %model.model,
                 key = other,
@@ -400,6 +469,7 @@ mod tests {
                 },
                 base_url: "https://api.acme.dev/v1".into(),
                 default_model: "acme-base".into(),
+                prompt_cache: None,
                 models: vec![
                     ModelEntry {
                         model: "acme-base".into(),
@@ -422,6 +492,7 @@ mod tests {
                 protocol: ProviderProtocol::AnthropicMessages,
                 base_url: "https://api.zoocorp.dev".into(),
                 default_model: "zoo-1".into(),
+                prompt_cache: None,
                 models: vec![ModelEntry {
                     model: "zoo-1".into(),
                     context_window: 200_000,
@@ -729,5 +800,99 @@ max_tokens_field = "max_tokens"
             .find(|e| e.slug == "zoocorp")
             .expect("zoocorp");
         assert!(matches!(zoo.protocol, ProviderProtocol::AnthropicMessages));
+    }
+
+    #[test]
+    fn provider_level_prompt_cache_sets_the_default() {
+        let merged = merge_overlay(
+            &base(),
+            r"
+[provider.acme]
+prompt_cache_short = 300
+prompt_cache_long = 3600
+",
+        );
+        let acme = merged.iter().find(|e| e.slug == "acme").expect("acme");
+        let ttl = acme.prompt_cache.expect("provider default set");
+        assert_eq!(ttl.short_secs, Some(300));
+        assert_eq!(ttl.long_secs, Some(3_600));
+        // A single tier may be declared on its own.
+        let merged = merge_overlay(
+            &base(),
+            r"
+[provider.acme]
+prompt_cache_short = 300
+",
+        );
+        let ttl = merged
+            .iter()
+            .find(|e| e.slug == "acme")
+            .expect("acme")
+            .prompt_cache
+            .expect("provider default set");
+        assert_eq!(ttl.short_secs, Some(300));
+        assert_eq!(ttl.long_secs, None);
+        // The untouched provider keeps no TTL.
+        assert!(
+            merged
+                .iter()
+                .find(|e| e.slug == "zoocorp")
+                .expect("zoocorp")
+                .prompt_cache
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn model_level_prompt_cache_sets_the_override() {
+        let merged = merge_overlay(
+            &base(),
+            r#"
+[provider.acme.models."acme-base"]
+prompt_cache_short = 60
+prompt_cache_long = 1800
+"#,
+        );
+        let acme = merged.iter().find(|e| e.slug == "acme").expect("acme");
+        let base_model = acme
+            .models
+            .iter()
+            .find(|m| m.model == "acme-base")
+            .expect("acme-base");
+        let ttl = base_model.prompt_cache.expect("model override set");
+        assert_eq!(ttl.short_secs, Some(60));
+        assert_eq!(ttl.long_secs, Some(1_800));
+        // The sibling model carries no override.
+        let lite = acme
+            .models
+            .iter()
+            .find(|m| m.model == "acme-lite")
+            .expect("acme-lite");
+        assert!(lite.prompt_cache.is_none());
+    }
+
+    #[test]
+    fn prompt_cache_wrong_type_warns_and_is_skipped() {
+        // A non-integer TTL is skipped (warn), while a valid sibling still
+        // applies — same warn-and-skip contract as every other overlay key.
+        let merged = merge_overlay(
+            &base(),
+            r#"
+[provider.acme]
+prompt_cache_short = "soon"
+
+[provider.acme.models."acme-base"]
+prompt_cache_long = true
+"#,
+        );
+        let acme = merged.iter().find(|e| e.slug == "acme").expect("acme");
+        // The bad provider key is skipped: no provider default is created.
+        assert!(acme.prompt_cache.is_none());
+        let base_model = acme
+            .models
+            .iter()
+            .find(|m| m.model == "acme-base")
+            .expect("acme-base");
+        assert!(base_model.prompt_cache.is_none());
     }
 }
