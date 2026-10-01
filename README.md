@@ -615,9 +615,10 @@ request-metered plan the binding resource is quota, not dollars, so a ping
 actively *costs*. Set `mode = "streaming"` (globally in `[cache_warming]`, or
 per account) and a `meter` to opt in. When enabled, the agent loop spawns a
 per-request warmer thread that fires while a tool call is blocking — a single
-non-streaming, non-retrying 1-token re-send of the just-sent request that never
-enters the session transcript or turn state. It is observable through the
-`choreo_cache_warm_attempts_total` and `choreo_cache_warm_skips_total{reason}`
+non-streaming, non-retrying re-send of the just-sent request, bounded to one
+output token (or `max_tokens: 0` on Anthropic, its documented cache pre-warm),
+that never enters the session transcript or turn state. It is observable through
+the `choreo_cache_warm_attempts_total` and `choreo_cache_warm_skips_total{reason}`
 metrics and the daemon `tracing` logs (no session event is emitted).
 
 Credentials are encrypted per-credential with the daemon's keystore X25519

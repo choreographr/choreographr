@@ -988,3 +988,27 @@ fn build_message_payloads_user_image_renders_inline_data() {
     assert_eq!(parts[1]["inline_data"]["mime_type"], "image/png");
     assert_eq!(parts[1]["inline_data"]["data"], "iVBORy1mYWtl");
 }
+
+#[test]
+fn request_body_carries_generation_config_output_cap() {
+    // A per-call output cap (the cache-warming ping) maps onto
+    // `generationConfig.maxOutputTokens`; when absent the field stays off the
+    // wire so ordinary turns are unchanged.
+    let build = |generation_config| {
+        serde_json::to_value(&GenerateContentRequest {
+            contents: Vec::new(),
+            system_instruction: None,
+            tools: None,
+            thinking_config: None,
+            generation_config,
+        })
+        .unwrap()
+    };
+    let with_cap = build(Some(GenerationConfigPayload {
+        max_output_tokens: 1,
+    }));
+    assert_eq!(with_cap["generationConfig"]["maxOutputTokens"], 1);
+
+    let no_cap = build(None);
+    assert!(no_cap.get("generationConfig").is_none(), "{no_cap}");
+}

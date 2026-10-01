@@ -1,7 +1,7 @@
 use crate::broadcast::{LagLimits, SubscriberSink, fan_out_evicting};
 use crate::cache_warm::WarmPolicy;
 use crate::context::{LoadedSkill, SkillMeta};
-use crate::daemon::DaemonCommand;
+use crate::daemon::{DaemonCommand, ResolvedAccount};
 use crate::db::{self, SessionRecord, write_session_retry, write_turn_retry};
 use crate::providers::InferenceProvider;
 use crate::requests::run_agent_loop;
@@ -578,6 +578,10 @@ pub struct SessionSnapshot {
     /// The recorded provider slug (see `SessionState::provider_slug`) —
     /// restored so slug-keyed catalog lookups survive the worker swap.
     pub provider_slug: Option<String>,
+    /// The session's cache-warming policy (runtime, not persisted). Carried
+    /// across the worker snapshot so the worker's agent loop reads the same
+    /// policy the session resolved.
+    pub warm_policy: WarmPolicy,
 }
 
 pub(crate) struct ActiveRequest {
@@ -621,6 +625,13 @@ pub struct SessionState {
     /// through it made the context window and effort cycling blink in and out
     /// of availability around keystore transitions.
     provider_slug: Option<String>,
+    /// This session's cache-warming policy — resolved by the daemon per account
+    /// (the global `[cache_warming]` merged with the account's `meter`/
+    /// `cache_warming`/`prompt_cache`) and refreshed whenever the session
+    /// (re-)resolves its account (lazy first resolve, account switch, accounts
+    /// reload). The agent loop reads it to decide whether to spawn a warmer; see
+    /// [`crate::cache_warm`].
+    pub warm_policy: WarmPolicy,
     /// This session's provider-socket registry. The provider client built for
     /// this session registers every dialed socket here, so closing the
     /// registry (cancel / suspend / keystore-lock) force-closes THIS
@@ -725,6 +736,7 @@ impl SessionState {
             context_cache: self.context_cache.clone(),
             discovered_skills: self.discovered_skills.clone(),
             provider_slug: self.provider_slug.clone(),
+            warm_policy: self.warm_policy,
         }
     }
 
@@ -742,6 +754,7 @@ impl SessionState {
             active_requests: BTreeMap::new(),
             provider: None,
             provider_slug: snapshot.provider_slug,
+            warm_policy: snapshot.warm_policy,
             // Restored snapshots never carry a live provider client; the next
             // request rebuilds one lazily against this fresh registry.
             registry: choreo_ai_protocols::SocketRegistry::default(),
@@ -1000,6 +1013,7 @@ impl SessionState {
             active_requests: BTreeMap::new(),
             provider: None,
             provider_slug: None,
+            warm_policy: WarmPolicy::default(),
             // A fresh empty registry: any provider client built for this
             // state registers its sockets here, so cancelling this session
             // (or dropping it) never touches another session's connections.
@@ -1046,14 +1060,24 @@ impl SessionState {
         // (Crossbeam per AGENTS.md: this reply may outlive the quick path —
         // e.g. a dropped channel when the session dies mid-request — and
         // Zeroizing wipes any unconsumed key from the queue on drop.)
-        let Some((config, api_key)) = rx.recv().ok().flatten() else {
+        let Some(ResolvedAccount {
+            config,
+            api_key,
+            warm_policy,
+        }) = rx.recv().ok().flatten()
+        else {
+            // Unknown/locked account: reset to the conservative policy so a
+            // removed account cannot keep warming on a stale meter.
+            self.warm_policy = WarmPolicy::default();
             return Err(format!(
                 "no credential stored for account '{name}' — add one via the AI Providers page or /add-key"
             ));
         };
-        // Record the provider slug BEFORE the key check: the slug is a
-        // non-secret catalog fact, so static catalog lookups (context window,
-        // reasoning capability) stay correct even on this failed resolution.
+        // The warm policy and provider slug are non-secret facts the daemon
+        // resolved for this account; record them BEFORE the key check so
+        // warming and static catalog lookups (context window, reasoning
+        // capability) stay correct even on this failed resolution.
+        self.warm_policy = warm_policy;
         self.provider_slug = Some(config.provider.clone());
         let Some(api_key) = api_key else {
             return Err(format!(
@@ -1348,6 +1372,7 @@ pub fn session_main(
         provider: initial_provider,
         provider_slug,
         registry,
+        warm_policy: ctx.warm_policy,
         ..SessionState::empty()
     };
 
@@ -2422,18 +2447,22 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
         reply,
     });
     let resolved = rx.recv().ok().flatten();
-    // The provider slug is a NON-SECRET catalog fact: record it from the
-    // account config even when the keystore is locked (config present, key
-    // absent) or the client can't be built. A `None` reply (unknown account)
-    // clears it so stale facts can't masquerade for the new account.
-    state.provider_slug = resolved.as_ref().map(|(config, _)| config.provider.clone());
+    // The provider slug and warm policy are NON-SECRET facts the daemon
+    // resolved for this account: record them from the account config even when
+    // the keystore is locked (config present, key absent) or the client can't be
+    // built. A `None` reply (unknown account) clears them so stale facts can't
+    // masquerade for the new account.
+    state.provider_slug = resolved.as_ref().map(|a| a.config.provider.clone());
+    state.warm_policy = resolved
+        .as_ref()
+        .map_or_else(WarmPolicy::default, |a| a.warm_policy);
     // Build the client when a credential is present. Held in a local so the
     // immutable borrow of `state.registry` is released before the assignment
     // below (a let-chain condition would otherwise keep it live into the body).
-    let new_provider = resolved.as_ref().and_then(|(config, api_key)| {
-        let key = api_key.as_ref()?;
+    let new_provider = resolved.as_ref().and_then(|a| {
+        let key = a.api_key.as_ref()?;
         InferenceProvider::from_account_config(
-            config,
+            &a.config,
             // See resolve_provider: the Zeroizing wrapper protects the
             // in-transit key; the client constructor takes ownership from here
             // and stores the credential in its own config.

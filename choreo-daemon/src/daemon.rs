@@ -57,11 +57,27 @@ const MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 pub(super) type ListModelsReply =
     std::sync::mpsc::Sender<Result<(Vec<String>, Option<String>), String>>;
 
-/// Reply channel for `ResolveAccountCmd`: the resolved account config plus its
-/// API key wrapped in `Zeroizing` (wipe-on-drop). Aliased because the
-/// reference-taking handler signature otherwise trips `type_complexity`.
-type ResolveAccountReply =
-    crossbeam_channel::Sender<Option<(crate::accounts::AccountConfig, Option<Zeroizing<String>>)>>;
+/// Reply channel for `ResolveAccountCmd`: the resolved account's ingredients
+/// (see [`ResolvedAccount`]). Aliased because the reference-taking handler
+/// signature otherwise trips `type_complexity`.
+type ResolveAccountReply = crossbeam_channel::Sender<Option<ResolvedAccount>>;
+
+/// The daemon's reply to `ResolveAccountCmd`: the resolved account config, its
+/// API key wrapped in `Zeroizing` (wipe-on-drop — the single hop where cleartext
+/// leaves the daemon), and the cache-warming policy resolved for that account
+/// (the global `[cache_warming]` merged with the account overrides). Grouping
+/// them means the session learns its warm policy exactly when it learns its
+/// account config: the lazy first resolve, an account switch, and an accounts
+/// reload all flow through this reply.
+pub struct ResolvedAccount {
+    /// The account's configuration.
+    pub config: crate::accounts::AccountConfig,
+    /// The account's API key, wipe-on-drop. `None` when no credential is stored
+    /// (the config is still valid for slug/warm-policy resolution).
+    pub api_key: Option<Zeroizing<String>>,
+    /// The cache-warming policy resolved for this account.
+    pub warm_policy: WarmPolicy,
+}
 
 pub struct DaemonState {
     pub next_session_id: u64,
@@ -458,9 +474,7 @@ pub enum DaemonCommand {
     /// keystore locked, and no credential stored.
     ResolveAccountCmd {
         account: String,
-        reply: crossbeam_channel::Sender<
-            Option<(crate::accounts::AccountConfig, Option<Zeroizing<String>>)>,
-        >,
+        reply: crossbeam_channel::Sender<Option<ResolvedAccount>>,
     },
     /// Fetch an opaque image-generation client (plus the provider slug) for
     /// an account. The reply goes back to the TOOL thread directly over the
@@ -884,21 +898,15 @@ impl DaemonState {
             .as_ref()
             .and_then(|name| self.account_provider_slug(name));
 
-        // Resolve this session's cache-warming policy ONCE here, merging the
-        // daemon's loaded `[cache_warming]` config with the account's
-        // `meter`/`cache_warming`/`prompt_cache` overrides. The account's
-        // `prompt_cache` default is `true` (`None` = the account default).
+        // Resolve this session's cache-warming policy from the daemon's loaded
+        // `[cache_warming]` config merged with the account's `meter`/
+        // `cache_warming`/`prompt_cache` overrides. This is the INITIAL seed —
+        // the session refreshes it from the same resolution whenever it
+        // (re-)resolves its account (see `handle_resolve_account`), so a session
+        // created before the keystore unlocks still picks up the right policy.
         // Resolving per account rather than per request keeps the request path
         // free of config parsing and file reads.
-        let account = account_name
-            .as_ref()
-            .and_then(|name| self.accounts.get(name));
-        let warm_policy = WarmPolicy::resolve(
-            &self.cache_warming,
-            account.and_then(|a| a.meter),
-            account.and_then(|a| a.cache_warming),
-            account.and_then(|a| a.prompt_cache).unwrap_or(true),
-        );
+        let warm_policy = self.warm_policy_for(account_name.as_deref());
 
         // Crossbeam (unbounded) for the session transport channel: the daemon
         // hands this sender to clients/tools and the session control loop
@@ -2592,20 +2600,36 @@ impl DaemonState {
         self.handle_broadcast_activity(None, &DaemonMessage::Accounts { accounts });
     }
 
+    /// Resolve the cache-warming policy for a session's account: the daemon's
+    /// loaded `[cache_warming]` table merged with the account's `meter`/
+    /// `cache_warming`/`prompt_cache` overrides. An unknown/`None` account gets
+    /// the conservative default (never warm). Shared by `spawn_session` (the
+    /// initial policy) and `handle_resolve_account` (the refresh the session
+    /// applies on every (re-)resolve).
+    fn warm_policy_for(&self, account: Option<&str>) -> WarmPolicy {
+        let account = account.and_then(|name| self.accounts.get(name));
+        WarmPolicy::resolve(
+            &self.cache_warming,
+            account.and_then(|a| a.meter),
+            account.and_then(|a| a.cache_warming),
+            account.and_then(|a| a.prompt_cache).unwrap_or(true),
+        )
+    }
+
     /// Reply to a session's lazy provider-resolution request with the raw
-    /// ingredients (config + API key). The session thread builds the client
-    /// itself, against its own socket registry. The key is wrapped in
-    /// `Zeroizing` here — the single hop where the daemon hands cleartext
-    /// across a thread boundary — so unconsumed replies are wiped on drop.
+    /// ingredients (config + API key) plus the resolved warm policy. The session
+    /// thread builds the client itself, against its own socket registry. The key
+    /// is wrapped in `Zeroizing` here — the single hop where the daemon hands
+    /// cleartext across a thread boundary — so unconsumed replies are wiped on
+    /// drop.
     fn handle_resolve_account(&mut self, account: &str, reply: &ResolveAccountReply) {
-        let resolved = self.accounts.get(account).map(|config| {
-            (
-                config.clone(),
-                // api_key_for returns an inert String for internal gates
-                // (prefetch/validate checks); this reply is the credential
-                // EXIT point, so the wipe-on-drop wrapper goes on here.
-                self.api_key_for(account).map(Zeroizing::new),
-            )
+        let resolved = self.accounts.get(account).map(|config| ResolvedAccount {
+            config: config.clone(),
+            // api_key_for returns an inert String for internal gates
+            // (prefetch/validate checks); this reply is the credential
+            // EXIT point, so the wipe-on-drop wrapper goes on here.
+            api_key: self.api_key_for(account).map(Zeroizing::new),
+            warm_policy: self.warm_policy_for(Some(account)),
         });
         let _ = reply.send(resolved);
     }

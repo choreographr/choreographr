@@ -53,6 +53,7 @@ fn test_state() -> SessionState {
         active_requests: BTreeMap::new(),
         provider: None,
         provider_slug: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
         // A fresh empty registry: any provider client this test state builds
         // registers here, mirroring the production per-session scope.
         registry: choreo_ai_protocols::SocketRegistry::default(),
@@ -93,8 +94,19 @@ fn resolve_provider_rebuilds_lazily_after_client_drop() {
             let mut config = crate::accounts::AccountConfig::simple("mock-account", "openai");
             config.base_url = Some("https://mock.invalid/v1".to_string());
             // Same Zeroizing shape the real command loop sends: the reply
-            // payload is the credential exit-point.
-            let _ = reply.send(Some((config, Some(Zeroizing::new("test-key".to_string())))));
+            // payload is the credential exit-point. The warm policy rides the
+            // same reply, so resolving the account also refreshes warming.
+            let _ = reply.send(Some(crate::daemon::ResolvedAccount {
+                config,
+                api_key: Some(Zeroizing::new("test-key".to_string())),
+                warm_policy: crate::cache_warm::WarmPolicy {
+                    mode: crate::cache_warm::CacheWarmingMode::Streaming,
+                    meter: crate::cache_warm::MeterKind::Tokens,
+                    prompt_cache_enabled: true,
+                    min_prefix_tokens: 1,
+                    min_expected_savings: 0.0,
+                },
+            }));
         }
     });
 
@@ -112,6 +124,13 @@ fn resolve_provider_rebuilds_lazily_after_client_drop() {
             .as_ref()
             .map(super::super::providers::InferenceProvider::provider_slug),
         Some("openai")
+    );
+    // The reply's warm policy is applied to the session, so warming follows the
+    // account rather than a value frozen at spawn.
+    assert_eq!(
+        state.warm_policy.mode,
+        crate::cache_warm::CacheWarmingMode::Streaming,
+        "resolve applied the reply's warm policy"
     );
 
     // Drop the handles; the channel disconnects and the server thread exits
@@ -458,7 +477,11 @@ fn set_account_switches_slug_and_drops_stale_client_when_locked() {
     let server = std::thread::spawn(move || {
         while let Ok(DaemonCommand::ResolveAccountCmd { reply, .. }) = daemon_rx.recv() {
             let config = crate::accounts::AccountConfig::simple("new-account", "anthropic");
-            let _ = reply.send(Some((config, None)));
+            let _ = reply.send(Some(crate::daemon::ResolvedAccount {
+                config,
+                api_key: None,
+                warm_policy: crate::cache_warm::WarmPolicy::default(),
+            }));
         }
     });
 

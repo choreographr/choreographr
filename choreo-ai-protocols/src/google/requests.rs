@@ -9,9 +9,10 @@ use crate::shared::MAX_TOOL_CALLS;
 use crate::types::{ChatTurnResult, StreamEvent};
 
 use super::{
-    ClassifiedPart, GenerateContentRequest, GenerateContentResponse, GoogleConfig, GoogleError,
-    ModelListResponse, build_message_payloads, build_tool_payloads, capture_signature,
-    google_signatures_artifact, model_url, response_to_turn_result, thinking_config_payload,
+    ClassifiedPart, GenerateContentRequest, GenerateContentResponse, GenerationConfigPayload,
+    GoogleConfig, GoogleError, ModelListResponse, build_message_payloads, build_tool_payloads,
+    capture_signature, google_signatures_artifact, model_url, response_to_turn_result,
+    thinking_config_payload,
 };
 
 /// Endpoint action for non-streaming content generation.
@@ -90,6 +91,7 @@ pub(super) fn generate_content_request(
         thinking_effort,
         on_retry,
         cancel_rx,
+        max_output_tokens_override,
         no_retry,
         ..
     } = params;
@@ -116,16 +118,17 @@ pub(super) fn generate_content_request(
         thinking_config.is_some()
     );
 
-    // `ChatTurnRequest::max_output_tokens_override` is deliberately a no-op on
-    // the Google path: `GenerateContentRequest` has no output-length field to
-    // carry it (there is no `generationConfig.maxOutputTokens` wired here), so
-    // the cache-warming ping cannot shrink Gemini output. Only `no_retry` is
-    // honoured.
+    // A per-call output cap (the cache-warming ping) maps onto Gemini's
+    // `generationConfig.maxOutputTokens`; `None` leaves the field off the wire
+    // so ordinary turns are unchanged.
+    let generation_config = max_output_tokens_override
+        .map(|max_output_tokens| GenerationConfigPayload { max_output_tokens });
     let body = serde_json::to_value(&GenerateContentRequest {
         contents: payloads,
         system_instruction: system_value,
         tools: tool_payloads,
         thinking_config,
+        generation_config,
     })
     .map_err(io::Error::other)?;
 
@@ -175,6 +178,7 @@ where
         thinking_effort,
         on_retry,
         cancel_rx,
+        max_output_tokens_override,
         no_retry,
         ..
     } = params;
@@ -201,14 +205,16 @@ where
         thinking_config.is_some()
     );
 
-    // See the non-streaming path: `max_output_tokens_override` is a no-op on
-    // Google because the request body has no output-token cap field to carry
-    // it; only `no_retry` is honoured.
+    // See the non-streaming path: a per-call output cap maps onto
+    // `generationConfig.maxOutputTokens`.
+    let generation_config = max_output_tokens_override
+        .map(|max_output_tokens| GenerationConfigPayload { max_output_tokens });
     let body = serde_json::to_value(&GenerateContentRequest {
         contents: payloads,
         system_instruction: system_value,
         tools: tool_payloads,
         thinking_config,
+        generation_config,
     })
     .map_err(io::Error::other)?;
 

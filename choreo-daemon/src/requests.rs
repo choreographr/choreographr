@@ -417,14 +417,23 @@ pub(crate) fn run_agent_loop(
     // the loop observes a cancel. It must NOT share the loop's `cancel_rx`:
     // crossbeam delivers each message to exactly one receiver, so a shared
     // receiver would let the warmer steal a cancel the loop needs to act on.
+    //
+    // The policy is the session's own (refreshed whenever the account is
+    // (re-)resolved), read once here so nothing below borrows it.
+    let warm_policy = session.warm_policy;
     let (warm_cancel_tx, warm_cancel_rx) = crossbeam_channel::unbounded::<()>();
-    let warmer = (ctx.warm_policy.mode == CacheWarmingMode::Streaming).then(|| {
+    let warmer = (warm_policy.mode == CacheWarmingMode::Streaming).then(|| {
         spawn_warmer(
             InferenceProvider::clone(client),
-            ctx.warm_policy,
+            warm_policy,
             warm_cancel_rx,
         )
     });
+    // Relay a cancel to the warmer at each point the loop observes one. A single
+    // closure keeps the relay sites in sync (see the shared-receiver note above).
+    let relay_warm_cancel = || {
+        let _ = warm_cancel_tx.send(());
+    };
 
     // Phase 4c: ResponseId-policy providers chain reasoning continuity across
     // user turns via `previous_response_id`. The last response id is persisted
@@ -503,7 +512,7 @@ pub(crate) fn run_agent_loop(
             .available_definitions(&session.config.active_tool_groups);
         if is_cancelled_once(cancel_rx) {
             // Relay the cancel so an armed warmer stops pinging promptly.
-            let _ = warm_cancel_tx.send(());
+            relay_warm_cancel();
             return Ok(true);
         }
 
@@ -837,16 +846,13 @@ pub(crate) fn run_agent_loop(
                 // blocks. No arm happens on a `FinalText` result (the loop
                 // returns).
                 if let Some(warmer) = &warmer {
+                    let is_anthropic = protocol_is_anthropic(provider_slug);
                     let facts = WarmFacts {
-                        prompt_cache_enabled: ctx.warm_policy.prompt_cache_enabled,
                         cache_ttl: prompt_cache_ttl(provider_slug, model),
                         retention: RetentionTier::Short,
                         prefix_tokens: estimated_prompt_tokens,
                         cost: model_cost(provider_slug, model),
-                        replayable: is_replayable(
-                            protocol_is_anthropic(provider_slug),
-                            thinking_enabled,
-                        ),
+                        replayable: is_replayable(is_anthropic, thinking_enabled),
                     };
                     warmer.arm(WarmRequest {
                         model: model.to_string(),
@@ -855,6 +861,11 @@ pub(crate) fn run_agent_loop(
                         facts,
                         session_id: ctx.session_id.to_string(),
                         request_id: request_id.to_string(),
+                        // Anthropic accepts `max_tokens: 0` as its documented
+                        // cache pre-warm (writes the cache, bills no output) —
+                        // hence the inverted flag; every other protocol needs at
+                        // least one output token.
+                        max_output_tokens: u32::from(!is_anthropic),
                     });
                 }
 
@@ -900,7 +911,7 @@ pub(crate) fn run_agent_loop(
                     if is_cancelled_once(cancel_rx) {
                         // Relay the cancel so an armed warmer stops pinging
                         // promptly (it must not share the loop's receiver).
-                        let _ = warm_cancel_tx.send(());
+                        relay_warm_cancel();
                         cancelled = true;
                         break;
                     }
@@ -988,7 +999,7 @@ pub(crate) fn run_agent_loop(
                         cancelled = true;
                         // Relay the cancel to the warmer too (see the shared-
                         // receiver note at the spawn site).
-                        let _ = warm_cancel_tx.send(());
+                        relay_warm_cancel();
                     }
 
                     record_tool_completion(ToolCompletionParams {
@@ -1241,7 +1252,7 @@ pub(crate) fn run_agent_loop(
                             // receiver note at the spawn site): it must not share
                             // this receiver, so this is where it hears about a
                             // cancel that fired during a concurrent tool batch.
-                            let _ = warm_cancel_tx.send(());
+                            relay_warm_cancel();
                             // NOTE: no provider-socket force-close here. The
                             // cancel is DECIDED on the daemon command loop
                             // (`handle_cancel_request`), which closes THIS

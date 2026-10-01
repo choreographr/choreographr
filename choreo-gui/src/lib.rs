@@ -125,6 +125,10 @@ fn embedded_connection_mode() -> Option<ConnectionMode> {
         catalog_paths: choreo_daemon::catalog::CatalogPaths::from_dirs(),
         tool_policy: choreo_daemon::ToolPolicy::Mobile,
         max_turns: 0,
+        // No config.toml knob surface on the embedded daemon (same posture as
+        // `max_turns`): prompt-cache warming defaults off and is opt-in via the
+        // daemon's `[cache_warming]` table, which this embedder never loads.
+        cache_warming: choreo_daemon::cache_warm::CacheWarmingConfig::default(),
         // iOS: hand the embedded daemon the Swift-host bridge so the
         // clipboard/open_url/notify tools are registered (protected group).
         // The cfg mirrors the choreo-daemon dependency gate in Cargo.toml —

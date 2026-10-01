@@ -312,6 +312,17 @@ struct GenerateContentRequest<'a> {
     tools: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "thinkingConfig")]
     thinking_config: Option<ThinkingConfigPayload>,
+    /// Output-length cap. `None` keeps the model default (so ordinary turns are
+    /// unchanged); the cache-warming ping sets `maxOutputTokens` to cap its
+    /// output. `skip_serializing_if` keeps the field off the wire otherwise.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "generationConfig")]
+    generation_config: Option<GenerationConfigPayload>,
+}
+
+#[derive(Debug, Serialize)]
+struct GenerationConfigPayload {
+    #[serde(rename = "maxOutputTokens")]
+    max_output_tokens: u32,
 }
 
 #[derive(Debug, Serialize)]
