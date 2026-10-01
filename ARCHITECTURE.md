@@ -2,7 +2,7 @@
 
 ## Overview
 
-`Choreographr` is a local-first AI assistant built as a Rust workspace. A **daemon** process
+`Choreographr` is a client/server AI assistant built as a Rust workspace. A **daemon** process
 communicates with multiple LLM providers through a pluggable trait-based provider
 system, while **clients** (terminal, desktop, and IM platforms) connect to the daemon
 over a Unix domain socket (or Noise IK encrypted TCP for remote connections) using a custom length-prefixed binary protocol.
