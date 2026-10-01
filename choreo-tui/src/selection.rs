@@ -502,9 +502,9 @@ fn text_and_join_for_content_line(
     let line = rendered.lines.get(line_idx)?;
     // Cut the row's renderer-emitted chrome out of its base range so the copy
     // is content−chrome: a block-quote bar nested inside a list item is
-    // dropped while the list marker before it is kept.  The chrome buffer is
-    // empty today, so `selectable` is exactly `base` until the producers emit
-    // intervals.  A missing entry (cache drift) falls back to no chrome.
+    // dropped while the list marker before it is kept.  A row that records no
+    // chrome yields `base` unchanged.  A missing entry (cache drift) falls
+    // back to no chrome.
     let chrome = rendered
         .chrome_ranges
         .get(line_idx)
@@ -768,8 +768,8 @@ pub(crate) fn apply_selection_to_lines(
             };
             // Subtract the row's chrome from the clamped base: the highlight is
             // the union of the selectable sub-intervals, styled in one pass.
-            // Chrome is empty today, so `selectable` is exactly `base`.  A
-            // missing entry (cache drift) falls back to no chrome.
+            // A chromeless row yields `base` unchanged.  A missing entry
+            // (cache drift) falls back to no chrome.
             let chrome = chrome_ranges.get(line_idx).cloned().unwrap_or_default();
             let selectable = selectable_intervals(base, &chrome);
             if selectable.is_empty() {
