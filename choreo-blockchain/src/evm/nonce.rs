@@ -19,7 +19,7 @@ async fn evm_nonce_impl(rpc_url: &str, address_str: &str) -> Result<String, Bloc
     ))
 }
 
-/// Synchronous entry point: runs [`evm_nonce_impl`] on the sidecar runtime and
+/// Synchronous entry point: runs `evm_nonce_impl` on the sidecar runtime and
 /// caps the output at the shared byte budget.
 ///
 /// # Errors
@@ -32,6 +32,8 @@ pub fn execute_evm_nonce(args: &EvmNonceArgs) -> Result<String, BlockchainError>
     Ok(truncate_tool_output(&output))
 }
 
+/// Human-readable one-line description of an `evm_nonce` call, shown in the
+/// tool transcript before the query runs.
 #[must_use]
 pub fn describe_evm_nonce_invocation(args: &EvmNonceArgs) -> String {
     format!(

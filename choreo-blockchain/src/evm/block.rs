@@ -37,7 +37,7 @@ async fn evm_block_impl(rpc_url: &str, block_tag: Option<&str>) -> Result<String
     Ok(out)
 }
 
-/// Synchronous entry point: runs [`evm_block_impl`] on the sidecar runtime and
+/// Synchronous entry point: runs `evm_block_impl` on the sidecar runtime and
 /// caps the output at the shared byte budget.
 ///
 /// # Errors
@@ -53,6 +53,8 @@ pub fn execute_evm_block(args: &EvmBlockArgs) -> Result<String, BlockchainError>
     Ok(truncate_tool_output(&output))
 }
 
+/// Human-readable one-line description of an `evm_block` call, shown in the
+/// tool transcript before the query runs.
 #[must_use]
 pub fn describe_evm_block_invocation(args: &EvmBlockArgs) -> String {
     match args.block_tag.as_deref() {

@@ -41,7 +41,7 @@ async fn evm_call_impl(
     ))
 }
 
-/// Synchronous entry point: runs [`evm_call_impl`] on the sidecar runtime and
+/// Synchronous entry point: runs `evm_call_impl` on the sidecar runtime and
 /// caps the output at the shared byte budget.
 ///
 /// # Errors
@@ -59,6 +59,8 @@ pub fn execute_evm_call(args: &EvmCallArgs) -> Result<String, BlockchainError> {
     Ok(truncate_tool_output(&output))
 }
 
+/// Human-readable one-line description of an `evm_call` call, shown in the
+/// tool transcript before the query runs.
 #[must_use]
 pub fn describe_evm_call_invocation(args: &EvmCallArgs) -> String {
     match args.block_tag.as_deref() {

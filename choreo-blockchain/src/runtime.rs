@@ -4,7 +4,7 @@
 //! synchronous, thread-based code. alloy and subxt, however, are async
 //! libraries that require a tokio reactor, so this crate owns a single
 //! process-wide runtime created once at startup. The blocking `execute_*`
-//! functions in `evm`/`subxt` run their futures on it via [`Runtime::block_on`].
+//! functions in `evm`/`subxt` run their futures on it via `Runtime::block_on`.
 //!
 //! [`init`] must be called exactly once before any tool executes (the daemon
 //! does so from `main()` behind its `blockchain` feature). [`get`] returns

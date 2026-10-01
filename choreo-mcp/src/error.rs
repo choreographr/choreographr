@@ -1,31 +1,52 @@
+//! Error type shared across the MCP client, transport, and protocol layers.
+
 use std::io;
 
+/// Errors produced by the MCP client, transport, and protocol layers.
+///
+/// The daemon maps this into its own `ToolExecError` at the boundary; the
+/// variants distinguish the failure stage (spawn, handshake, transport I/O,
+/// protocol framing, or a server-reported JSON-RPC error).
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
+    /// The MCP server subprocess could not be spawned or its stdio captured.
     #[error("failed to spawn subprocess: {0}")]
     SpawnFailed(String),
 
+    /// The `initialize` handshake failed or returned a malformed response.
     #[error("MCP initialize handshake failed: {0}")]
     InitializeFailed(String),
 
+    /// The server returned a JSON-RPC error response.
     #[error("JSON-RPC error: code={code} message={message}")]
-    JsonRpcError { code: i64, message: String },
+    JsonRpcError {
+        /// The JSON-RPC error code (e.g. `-32601`).
+        code: i64,
+        /// The server-supplied error message.
+        message: String,
+    },
 
+    /// A protocol-level error (serialization failure or malformed response).
     #[error("protocol error: {0}")]
     ProtocolError(String),
 
+    /// No response arrived before the call's deadline.
     #[error("tool call timed out")]
     Timeout,
 
+    /// An underlying I/O error on the transport.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
 
+    /// The server or its reader thread shut down unexpectedly.
     #[error("MCP server shut down unexpectedly")]
     ServerShutdown,
 
+    /// The requested tool was not found on the server.
     #[error("tool not found: {0}")]
     ToolNotFound(String),
 
+    /// The tool arguments were invalid.
     #[error("invalid params: {0}")]
     InvalidParams(String),
 }

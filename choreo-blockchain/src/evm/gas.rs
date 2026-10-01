@@ -32,7 +32,7 @@ async fn evm_gas_impl(rpc_url: &str) -> Result<String, BlockchainError> {
     Ok(out)
 }
 
-/// Synchronous entry point: runs [`evm_gas_impl`] on the sidecar runtime and
+/// Synchronous entry point: runs `evm_gas_impl` on the sidecar runtime and
 /// caps the output at the shared byte budget.
 ///
 /// # Errors
@@ -45,6 +45,8 @@ pub fn execute_evm_gas(args: &RpcUrlArgs) -> Result<String, BlockchainError> {
     Ok(truncate_tool_output(&output))
 }
 
+/// Human-readable one-line description of an `evm_gas` call, shown in the
+/// tool transcript before the query runs.
 #[must_use]
 pub fn describe_evm_gas_invocation(args: &RpcUrlArgs) -> String {
     format!("Querying gas fee estimates on {}.", args.rpc_url)

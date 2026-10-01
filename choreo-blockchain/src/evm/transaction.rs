@@ -41,7 +41,7 @@ async fn evm_transaction_impl(rpc_url: &str, tx_hash_str: &str) -> Result<String
     Ok(out)
 }
 
-/// Synchronous entry point: runs [`evm_transaction_impl`] on the sidecar
+/// Synchronous entry point: runs `evm_transaction_impl` on the sidecar
 /// runtime and caps the output at the shared byte budget.
 ///
 /// # Errors
@@ -54,6 +54,8 @@ pub fn execute_evm_transaction(args: &EvmTransactionArgs) -> Result<String, Bloc
     Ok(truncate_tool_output(&output))
 }
 
+/// Human-readable one-line description of an `evm_transaction` call, shown in
+/// the tool transcript before the query runs.
 #[must_use]
 pub fn describe_evm_transaction_invocation(args: &EvmTransactionArgs) -> String {
     format!("Querying transaction {} on {}.", args.tx_hash, args.rpc_url)

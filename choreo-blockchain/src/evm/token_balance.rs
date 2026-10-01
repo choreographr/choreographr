@@ -56,7 +56,7 @@ async fn evm_token_balance_impl(
     Ok(out)
 }
 
-/// Synchronous entry point: runs [`evm_token_balance_impl`] on the sidecar
+/// Synchronous entry point: runs `evm_token_balance_impl` on the sidecar
 /// runtime and caps the output at the shared byte budget.
 ///
 /// # Errors
@@ -73,6 +73,8 @@ pub fn execute_evm_token_balance(args: &EvmTokenBalanceArgs) -> Result<String, B
     Ok(truncate_tool_output(&output))
 }
 
+/// Human-readable one-line description of an `evm_token_balance` call, shown
+/// in the tool transcript before the query runs.
 #[must_use]
 pub fn describe_evm_token_balance_invocation(args: &EvmTokenBalanceArgs) -> String {
     format!(

@@ -1,3 +1,11 @@
+//! MCP wire types and the `initialize` request builder.
+//!
+//! This module owns the JSON shapes exchanged with an MCP server: the generic
+//! JSON-RPC 2.0 envelope ([`JsonRpcRequest`] / [`JsonRpcResponse`] /
+//! [`JsonRpcNotification`]) and the MCP-specific payloads carried inside it
+//! (handshake params, tool descriptors, call results). Field names follow the
+//! MCP spec's `camelCase` wire form via `serde(rename_all = "camelCase")`.
+
 use crate::McpError;
 use std::collections::HashMap;
 
@@ -5,39 +13,65 @@ use std::collections::HashMap;
 // JSON-RPC 2.0 wire types
 // ---------------------------------------------------------------------------
 
+/// Monotonic request identifier correlating a request with its response.
+///
+/// The client assigns these from a process-local counter; the transport drops
+/// any response whose id does not match the one it is awaiting.
 pub type RequestId = u64;
 
+/// A JSON-RPC 2.0 request: a method invocation that expects a matching
+/// response.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct JsonRpcRequest {
+    /// Protocol version string; always `"2.0"`.
     pub jsonrpc: String,
+    /// Identifier echoed back on the matching response.
     pub id: RequestId,
+    /// Method name (e.g. `initialize`, `tools/list`, `tools/call`).
     pub method: String,
+    /// Method parameters; omitted from the wire form when `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
 }
 
+/// A JSON-RPC 2.0 response: either a `result` or an `error`, correlated to its
+/// request by `id`.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct JsonRpcResponse {
+    /// Protocol version string; always `"2.0"`.
     pub jsonrpc: String,
+    /// Identifier of the request this response answers.
     pub id: RequestId,
+    /// Successful result payload, present when the call succeeded.
     #[serde(default)]
     pub result: Option<serde_json::Value>,
+    /// Error payload, present when the call failed; mutually exclusive with
+    /// `result`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcErrorObject>,
 }
 
+/// The `error` member of a JSON-RPC 2.0 error response.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct JsonRpcErrorObject {
+    /// Numeric JSON-RPC error code (e.g. `-32601` for method not found).
     pub code: i64,
+    /// Human-readable error message.
     pub message: String,
+    /// Optional structured error details supplied by the server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
 }
 
+/// A JSON-RPC 2.0 notification: a method invocation that carries **no** `id`
+/// and therefore expects no response.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct JsonRpcNotification {
+    /// Protocol version string; always `"2.0"`.
     pub jsonrpc: String,
+    /// Notification method (e.g. `notifications/initialized`).
     pub method: String,
+    /// Notification parameters; omitted from the wire form when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
 }
@@ -46,81 +80,127 @@ pub struct JsonRpcNotification {
 // MCP protocol types
 // ---------------------------------------------------------------------------
 
+/// Parameters for the MCP `initialize` handshake request.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeParams {
+    /// The MCP protocol version the client speaks (e.g. `2024-11-05`).
     pub protocol_version: String,
+    /// Capabilities this client declares to the server.
     pub capabilities: ClientCapabilities,
+    /// Identifying name and version of this client.
     pub client_info: ClientInfo,
 }
 
+/// The capabilities an MCP client declares during the handshake.
+///
+/// Each field is an optional capability object; it is omitted from the wire
+/// form when `None` (an empty capability is not advertised).
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientCapabilities {
+    /// Tools capability; `Some` advertises interest in tool listing/calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<HashMap<String, serde_json::Value>>,
+    /// Resources capability, if the client supports resources.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<HashMap<String, serde_json::Value>>,
+    /// Prompts capability, if the client supports prompts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompts: Option<HashMap<String, serde_json::Value>>,
 }
 
+/// Identifying name and version of the MCP client, sent in the handshake.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientInfo {
+    /// Client name (e.g. `choreographr`).
     pub name: String,
+    /// Client version string.
     pub version: String,
 }
 
+/// The server's response to the `initialize` handshake.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerCapabilities {
+    /// The MCP protocol version the server selected.
     pub protocol_version: String,
+    /// Identifying name and version of the server.
     pub server_info: ServerInfo,
+    /// Opaque capability object advertised by the server.
     #[serde(default)]
     pub capabilities: serde_json::Value,
 }
 
+/// Identifying name and version of the MCP server.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerInfo {
+    /// Server name.
     pub name: String,
+    /// Server version string.
     pub version: String,
 }
 
+/// A tool advertised by an MCP server in a `tools/list` response.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct McpTool {
+    /// The tool name used to invoke it via `tools/call`.
     pub name: String,
+    /// Human-readable description, if the server supplied one.
     pub description: Option<String>,
+    /// JSON Schema for the tool's arguments (empty when the server omits it).
     #[serde(default)]
     pub input_schema: serde_json::Value,
 }
 
+/// Parameters for a `tools/call` request.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct CallToolParams {
+    /// Name of the tool to invoke.
     pub name: String,
+    /// Arguments matching the tool's input schema, if any.
     pub arguments: Option<serde_json::Value>,
 }
 
+/// The result of a `tools/call` request.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct CallToolResult {
+    /// The content blocks the tool returned.
     pub content: Vec<McpContent>,
+    /// Whether the server marked the call as an error (`isError` on the wire).
     #[serde(default)]
     pub is_error: bool,
 }
 
+/// A single content block in a [`CallToolResult`].
+///
+/// Tagged by `type` on the wire, so each variant serializes with an explicit
+/// content-type discriminator.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 #[serde(tag = "type")]
 pub enum McpContent {
+    /// Plain text content.
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        /// The text payload.
+        text: String,
+    },
+    /// Base64-encoded binary content (e.g. an image).
     #[serde(rename = "image")]
     Image {
+        /// Base64-encoded image data.
         data: String,
+        /// The image MIME type, if the server supplied one.
         mime_type: Option<String>,
     },
+    /// An embedded resource reference.
     #[serde(rename = "resource")]
-    Resource { resource: serde_json::Value },
+    Resource {
+        /// The opaque resource object (e.g. `{ "uri": ... }`).
+        resource: serde_json::Value,
+    },
 }
 
 // ---------------------------------------------------------------------------

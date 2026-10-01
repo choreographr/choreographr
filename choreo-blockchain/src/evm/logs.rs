@@ -65,7 +65,7 @@ async fn evm_logs_impl(
     Ok(out)
 }
 
-/// Synchronous entry point: runs [`evm_logs_impl`] on the sidecar runtime and
+/// Synchronous entry point: runs `evm_logs_impl` on the sidecar runtime and
 /// caps the output at the shared byte budget.
 ///
 /// # Errors
@@ -84,6 +84,8 @@ pub fn execute_evm_logs(args: &EvmLogsArgs) -> Result<String, BlockchainError> {
     Ok(truncate_tool_output(&output))
 }
 
+/// Human-readable one-line description of an `evm_logs` call, shown in the
+/// tool transcript before the query runs.
 #[must_use]
 pub fn describe_evm_logs_invocation(args: &EvmLogsArgs) -> String {
     let mut desc = format!("Querying event logs on {}.", args.rpc_url);

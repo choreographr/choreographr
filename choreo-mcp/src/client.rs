@@ -1,3 +1,6 @@
+//! MCP client: spawns a server subprocess, performs the handshake, discovers
+//! its tools, and invokes them over a [`StdioTransport`].
+
 use crate::error::McpError;
 use crate::protocol::{
     CallToolParams, CallToolResult, JsonRpcNotification, JsonRpcRequest, McpTool,
@@ -21,11 +24,17 @@ const LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(10);
 /// Configuration for spawning an MCP server subprocess.
 #[derive(Debug, Clone)]
 pub struct McpServerConfig {
+    /// Stable identifier for this server, used as a tool-name prefix.
     pub slug: String,
+    /// The executable to launch (e.g. `npx`, `uvx`, or a server binary).
     pub command: String,
+    /// Command-line arguments passed to `command`.
     pub args: Vec<String>,
+    /// Extra environment variables for the subprocess.
     pub env: HashMap<String, String>,
+    /// Whether this server is enabled for use.
     pub enabled: bool,
+    /// Whether its tools load automatically at startup or on explicit request.
     pub auto_load: bool,
 }
 
@@ -202,10 +211,12 @@ impl McpClient {
         self.transport.shutdown();
     }
 
+    /// The server's advertised name, captured during the handshake.
     pub fn server_name(&self) -> &str {
         &self.server_name
     }
 
+    /// The server's advertised version, captured during the handshake.
     pub fn server_version(&self) -> &str {
         &self.server_version
     }

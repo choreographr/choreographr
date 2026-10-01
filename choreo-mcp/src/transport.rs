@@ -1,3 +1,6 @@
+//! Subprocess stdio transport: spawns an MCP server and frames JSON-RPC
+//! messages over its stdin/stdout.
+
 use crate::error::McpError;
 use crate::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
 use crossbeam_channel::{Receiver, RecvTimeoutError};

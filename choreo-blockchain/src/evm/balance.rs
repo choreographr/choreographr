@@ -14,7 +14,7 @@ async fn evm_balance_impl(rpc_url: &str, address_str: &str) -> Result<String, Bl
     Ok(format!("address: {address_str}\nbalance: {balance} wei"))
 }
 
-/// Synchronous entry point: runs [`evm_balance_impl`] on the sidecar runtime
+/// Synchronous entry point: runs `evm_balance_impl` on the sidecar runtime
 /// and caps the output at the shared byte budget.
 ///
 /// # Errors
@@ -27,6 +27,8 @@ pub fn execute_evm_balance(args: &EvmBalanceArgs) -> Result<String, BlockchainEr
     Ok(truncate_tool_output(&output))
 }
 
+/// Human-readable one-line description of an `evm_balance` call, shown in the
+/// tool transcript before the query runs.
 #[must_use]
 pub fn describe_evm_balance_invocation(args: &EvmBalanceArgs) -> String {
     format!(

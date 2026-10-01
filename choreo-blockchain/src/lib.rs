@@ -16,9 +16,14 @@
 //! feature (off by default) precisely because they extend the daemon's
 //! network reach into chain-specific clients. Every node-supplied string is
 //! sanitized before it enters the tool transcript: scalar strings (chain
-//! names, ENS records) via [`sanitize_value`], serde-rendered JSON (decoded
-//! storage/block values) via [`sanitize_json`]. Output is capped at
-//! [`MAX_TOOL_OUTPUT_BYTES`], and every call is bounded by [`RPC_TIMEOUT`].
+//! names, ENS records) via `sanitize_value`, serde-rendered JSON (decoded
+//! storage/block values) via `sanitize_json`. Output is capped at
+//! `MAX_TOOL_OUTPUT_BYTES`, and every call is bounded by `RPC_TIMEOUT`.
+
+// Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
+// every public item carries docs, enforced as a hard error by clippy-strict's
+// `-D warnings`.
+#![warn(missing_docs)]
 
 pub mod evm;
 pub mod runtime;

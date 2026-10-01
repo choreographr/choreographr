@@ -26,12 +26,14 @@ sol! {
 
 // ── Shared argument types (public so the daemon can derive JSON Schemas) ──
 
+/// Arguments for tools that need only an RPC endpoint (chain info, gas fees).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RpcUrlArgs {
     /// JSON-RPC URL of the EVM node (e.g., `<https://ethereum-rpc.publicnode.com>`)
     pub rpc_url: String,
 }
 
+/// Arguments for `evm_balance`: a node URL and the address to query.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EvmBalanceArgs {
     /// JSON-RPC URL of the EVM node
@@ -40,6 +42,8 @@ pub struct EvmBalanceArgs {
     pub address: String,
 }
 
+/// Arguments for `evm_token_balance`: a node URL, the ERC-20 contract, and
+/// the wallet whose token balance is requested.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EvmTokenBalanceArgs {
     /// JSON-RPC URL of the EVM node
@@ -50,6 +54,8 @@ pub struct EvmTokenBalanceArgs {
     pub address: String,
 }
 
+/// Arguments for `evm_block`: a node URL and an optional block selector
+/// (defaults to the latest block when omitted).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EvmBlockArgs {
     /// JSON-RPC URL of the EVM node
@@ -59,6 +65,8 @@ pub struct EvmBlockArgs {
     pub block_tag: Option<String>,
 }
 
+/// Arguments for `evm_transaction`: a node URL and the transaction hash to
+/// look up the receipt for.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EvmTransactionArgs {
     /// JSON-RPC URL of the EVM node
@@ -67,6 +75,8 @@ pub struct EvmTransactionArgs {
     pub tx_hash: String,
 }
 
+/// Arguments for `evm_call`: a node URL, the contract to call, its ABI-encoded
+/// call data, and an optional block selector.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EvmCallArgs {
     /// JSON-RPC URL of the EVM node
@@ -80,6 +90,8 @@ pub struct EvmCallArgs {
     pub block_tag: Option<String>,
 }
 
+/// Arguments for `evm_logs`: a node URL plus optional address, topic, and
+/// block-range filters (each unset filter widens the query).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EvmLogsArgs {
     /// JSON-RPC URL of the EVM node
@@ -96,6 +108,8 @@ pub struct EvmLogsArgs {
     pub to_block: Option<String>,
 }
 
+/// Arguments for `evm_nonce`: a node URL and the address whose transaction
+/// count (nonce) is requested.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EvmNonceArgs {
     /// JSON-RPC URL of the EVM node
@@ -104,6 +118,8 @@ pub struct EvmNonceArgs {
     pub address: String,
 }
 
+/// Arguments for `evm_resolve`: a node URL and an ENS name (forward lookup) or
+/// address (reverse lookup).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EvmResolveArgs {
     /// JSON-RPC URL of the EVM node (must support ENS)

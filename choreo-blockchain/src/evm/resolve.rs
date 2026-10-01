@@ -42,7 +42,7 @@ async fn evm_resolve_impl(rpc_url: &str, name_or_address: &str) -> Result<String
     }
 }
 
-/// Synchronous entry point: runs [`evm_resolve_impl`] on the sidecar runtime
+/// Synchronous entry point: runs `evm_resolve_impl` on the sidecar runtime
 /// and caps the output at the shared byte budget.
 ///
 /// # Errors
@@ -58,6 +58,8 @@ pub fn execute_evm_resolve(args: &EvmResolveArgs) -> Result<String, BlockchainEr
     Ok(truncate_tool_output(&output))
 }
 
+/// Human-readable one-line description of an `evm_resolve` call, shown in the
+/// tool transcript before the query runs.
 #[must_use]
 pub fn describe_evm_resolve_invocation(args: &EvmResolveArgs) -> String {
     format!(

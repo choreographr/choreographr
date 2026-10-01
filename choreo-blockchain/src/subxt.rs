@@ -5,12 +5,12 @@
 //! point (used by the daemon's `Tool` wrappers) that runs an async subxt
 //! implementation on the crate's sidecar tokio runtime (see [`crate::runtime`]).
 //!
-//! Every call is bounded by [`crate::RPC_TIMEOUT`] via [`crate::rpc_call`], so
+//! Every call is bounded by `crate::RPC_TIMEOUT` via `crate::rpc_call`, so
 //! a black-holed `ws_url` returns a clean error instead of leaking the blocked
 //! execution thread until the network gives up. Node-supplied strings are
 //! sanitized before they enter the transcript: scalar strings (chain/version)
-//! via [`crate::sanitize_value`], serde-rendered JSON (decoded storage values,
-//! block dumps) via [`crate::sanitize_json`], which keeps the JSON's
+//! via `crate::sanitize_value`, serde-rendered JSON (decoded storage values,
+//! block dumps) via `crate::sanitize_json`, which keeps the JSON's
 //! structural line breaks while escaping anything hostile on each line.
 
 use crate::{
@@ -29,12 +29,16 @@ type SubxtClient = subxt::OnlineClient<subxt::PolkadotConfig>;
 
 // ── Argument types (public so the daemon can derive JSON Schemas) ────────
 
+/// Arguments for `subxt_chain`: an optional node URL (defaults to Polkadot's
+/// public RPC when omitted).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SubxtChainArgs {
     /// WebSocket URL of the Substrate node (e.g., `<wss://rpc.polkadot.io>`)
     pub ws_url: Option<String>,
 }
 
+/// Arguments for `subxt_balance`: the SS58 account to query and an optional
+/// node URL.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SubxtBalanceArgs {
     /// SS58-encoded account address
@@ -43,6 +47,8 @@ pub struct SubxtBalanceArgs {
     pub ws_url: Option<String>,
 }
 
+/// Arguments for `subxt_query`: the pallet and storage item to read, an
+/// optional raw key, and an optional node URL.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SubxtQueryArgs {
     /// Pallet name (e.g., `System`, `Balances`, `Staking`)
@@ -59,6 +65,8 @@ pub struct SubxtQueryArgs {
     pub ws_url: Option<String>,
 }
 
+/// Arguments for `subxt_block`: an optional block number (defaults to the
+/// latest finalized block) and an optional node URL.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SubxtBlockArgs {
     /// Optional block number (if omitted, gets the latest finalized block)
@@ -144,18 +152,24 @@ pub fn execute_subxt_block(args: &SubxtBlockArgs) -> Result<String, BlockchainEr
 
 // ── Invocation descriptions (shown in the TUI / tool transcripts) ────────
 
+/// Human-readable one-line description of a `subxt_chain` call, shown in the
+/// tool transcript before the query runs.
 #[must_use]
 pub fn describe_subxt_chain_invocation(args: &SubxtChainArgs) -> String {
     let url = args.ws_url.as_deref().unwrap_or(DEFAULT_WS_URL);
     format!("Querying Substrate/Polkadot chain info from {url}.")
 }
 
+/// Human-readable one-line description of a `subxt_balance` call, shown in
+/// the tool transcript before the query runs.
 #[must_use]
 pub fn describe_subxt_balance_invocation(args: &SubxtBalanceArgs) -> String {
     let url = args.ws_url.as_deref().unwrap_or(DEFAULT_WS_URL);
     format!("Querying balance of {} on {url}.", args.address)
 }
 
+/// Human-readable one-line description of a `subxt_query` call, shown in the
+/// tool transcript before the query runs.
 #[must_use]
 pub fn describe_subxt_query_invocation(args: &SubxtQueryArgs) -> String {
     let url = args.ws_url.as_deref().unwrap_or(DEFAULT_WS_URL);
@@ -165,6 +179,8 @@ pub fn describe_subxt_query_invocation(args: &SubxtQueryArgs) -> String {
     )
 }
 
+/// Human-readable one-line description of a `subxt_block` call, shown in the
+/// tool transcript before the query runs.
 #[must_use]
 pub fn describe_subxt_block_invocation(args: &SubxtBlockArgs) -> String {
     let url = args.ws_url.as_deref().unwrap_or(DEFAULT_WS_URL);
