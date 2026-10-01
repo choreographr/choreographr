@@ -14,7 +14,8 @@ use crate::types::{
 use super::{
     AnthropicConfig, AnthropicError, MessagesRequest, MessagesResponse, ModelListResponse,
     ThinkingArtifactBlock, anthropic_thinking_artifact, build_message_payloads,
-    build_tool_payloads, prompt_cache_control, response_to_turn_result, thinking_payload,
+    build_tool_payloads, effective_max_tokens, prompt_cache_control, response_to_turn_result,
+    thinking_payload,
 };
 
 /// Endpoint path for the Messages API.
@@ -96,6 +97,8 @@ pub(super) fn messages_request(
         cancel_rx,
         session_id,
         request_id,
+        max_output_tokens_override,
+        no_retry,
         ..
     } = params;
     // Gateway routing identity (session_id, request_id) for the opencode
@@ -107,12 +110,17 @@ pub(super) fn messages_request(
         config.retry_max_attempts,
         config.retry_initial_backoff_ms,
         config.retry_max_backoff_ms,
-    );
+    )
+    .with_no_retry(no_retry);
 
     // Thinking blocks are replayed from the round-trip artifact only when
     // thinking is enabled for this request (goose's `!thinking_disabled`
     // gate) — Anthropic rejects thinking blocks sent without a thinking
     // config. Compute the payload first so the builder sees the gate.
+    //
+    // The thinking budget derives from the ORIGINAL `config.max_tokens`, not
+    // the per-call override: a 1-token output cap (the cache-warming ping)
+    // would otherwise collapse `budget_tokens` to an invalid value.
     let thinking = thinking_payload(&thinking_effort, config.max_tokens);
     if thinking.is_some() {
         debug!(
@@ -130,7 +138,9 @@ pub(super) fn messages_request(
 
     let body = serde_json::to_value(&MessagesRequest {
         model,
-        max_tokens: config.max_tokens,
+        // A per-call cap replaces the configured default (the cache-warming
+        // ping sends `Some(1)`); `None` keeps the configured default.
+        max_tokens: effective_max_tokens(max_output_tokens_override, config.max_tokens),
         system: system.as_deref(),
         messages: payloads,
         tools: tool_payloads,
@@ -192,6 +202,8 @@ where
         cancel_rx,
         session_id,
         request_id,
+        max_output_tokens_override,
+        no_retry,
         ..
     } = params;
     // Gateway routing identity — same semantics as the non-streaming
@@ -202,11 +214,16 @@ where
         config.retry_max_attempts,
         config.retry_initial_backoff_ms,
         config.retry_max_backoff_ms,
-    );
+    )
+    .with_no_retry(no_retry);
 
     // Thinking blocks are replayed from the round-trip artifact only when
     // thinking is enabled for this request (see the non-streaming path for
     // the reasoning). Compute the payload first so the builder sees the gate.
+    //
+    // The thinking budget derives from the ORIGINAL `config.max_tokens`, not
+    // the per-call override: a 1-token output cap (the cache-warming ping)
+    // would otherwise collapse `budget_tokens` to an invalid value.
     let thinking = thinking_payload(&thinking_effort, config.max_tokens);
     if thinking.is_some() {
         debug!(
@@ -224,7 +241,9 @@ where
 
     let body = serde_json::to_value(&MessagesRequest {
         model,
-        max_tokens: config.max_tokens,
+        // A per-call cap replaces the configured default (the cache-warming
+        // ping sends `Some(1)`); `None` keeps the configured default.
+        max_tokens: effective_max_tokens(max_output_tokens_override, config.max_tokens),
         system: system.as_deref(),
         messages: payloads,
         tools: tool_payloads,

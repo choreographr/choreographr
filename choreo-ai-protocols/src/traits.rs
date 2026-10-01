@@ -38,6 +38,16 @@ pub struct ChatTurnRequest<'a> {
     /// Per-turn request id (same id the daemon broadcasts in `SessionEvent::
     /// Started`); sent as `x-opencode-request` alongside `session_id`.
     pub request_id: String,
+    /// Per-call output-token cap. `Some(n)` caps THIS call's output at `n`
+    /// tokens wherever the protocol exposes an output-length field; `None`
+    /// leaves the provider/config default in place. The cache-warming ping
+    /// sets this to 1 so the warm request is cheap — it only needs to touch
+    /// the prompt prefix, so a single token of output is enough.
+    pub max_output_tokens_override: Option<u32>,
+    /// When true, make a single best-effort attempt and never retry. The
+    /// cache-warming ping must be cheap and must never linger: a retry would
+    /// multiply the ping's cost and delay the real turn behind it.
+    pub no_retry: bool,
 }
 
 /// Trait that every provider client must implement.

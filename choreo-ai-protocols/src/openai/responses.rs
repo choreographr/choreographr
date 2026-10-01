@@ -327,7 +327,11 @@ fn build_responses_request_body(
     stream: bool,
 ) -> Result<(String, serde_json::Value), super::OpenAiError> {
     let url = endpoint_url(&config.base_url, &config.responses_path)?;
-    let max_output_tokens = config.max_output_tokens_for_model(params.model);
+    // A per-call cap (the cache-warming ping's 1-token cap) takes precedence
+    // over the configured output cap; `None` falls back to the config value.
+    let max_output_tokens = params
+        .max_output_tokens_override
+        .or(config.max_output_tokens_for_model(params.model));
     let input_value = build_responses_input(
         params.tool_results,
         params.messages,
@@ -571,6 +575,7 @@ pub(crate) fn responses_request_with_tools(
         cancel_rx,
         route,
         tool_results,
+        no_retry,
         ..
     } = params;
 
@@ -583,7 +588,7 @@ pub(crate) fn responses_request_with_tools(
         "responses request with tools",
     );
 
-    let retry = retry::retry_config_from_config(config);
+    let retry = retry::retry_config_from_config(config).with_no_retry(no_retry);
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, None);
     let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx, route)?;
     let payload: ResponsesResponse = response
@@ -881,6 +886,7 @@ where
         cancel_rx,
         route,
         tool_results,
+        no_retry,
         ..
     } = params;
 
@@ -892,7 +898,7 @@ where
         "responses streaming request with tools",
     );
 
-    let retry = retry::retry_config_from_config(config);
+    let retry = retry::retry_config_from_config(config).with_no_retry(no_retry);
     // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));
@@ -1250,6 +1256,8 @@ mod tests {
                 previous_response_id: None,
                 tool_results: &[],
                 programmatic_tool_calling: false,
+                max_output_tokens_override: None,
+                no_retry: false,
             };
             build_responses_request_body(&config, &params, false).expect("body builds")
         };
@@ -2111,5 +2119,39 @@ mod tests {
         assert_eq!(items[0]["type"], "message");
         assert!(items[0].get("reasoning_content").is_none());
         assert!(items[0].get("reasoning_artifact").is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(catalog)]
+    fn responses_max_output_tokens_prefers_the_override() {
+        // A per-call cap (the cache-warming ping's 1-token cap) must win over
+        // the configured output cap on the wire; `None` keeps the config value.
+        let config = super::super::ServiceConfig {
+            provider_slug: "openai".to_string(),
+            responses_max_output_tokens: Some(4096),
+            ..Default::default()
+        };
+        let build = |override_: Option<u32>| {
+            let mut no_retry = None;
+            let params = super::super::TurnParams {
+                model: "gpt-5.4",
+                messages: &[],
+                tools: &[],
+                reasoning_effort: None,
+                on_retry: &mut no_retry,
+                cancel_rx: None,
+                route: None,
+                previous_response_id: None,
+                tool_results: &[],
+                programmatic_tool_calling: false,
+                max_output_tokens_override: override_,
+                no_retry: false,
+            };
+            build_responses_request_body(&config, &params, false)
+                .expect("body builds")
+                .1
+        };
+        assert_eq!(build(Some(1))["max_output_tokens"], 1);
+        assert_eq!(build(None)["max_output_tokens"], 4096);
     }
 }

@@ -302,12 +302,15 @@ pub(crate) fn chat_completions_request_with_tools(
         on_retry,
         cancel_rx,
         route,
+        max_output_tokens_override,
+        no_retry,
         ..
     } = params;
     let start = std::time::Instant::now();
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
-    let (max_tokens_field, max_completion_tokens_field) = config.max_tokens_field_pair(model);
-    let retry = retry::retry_config_from_config(config);
+    let (max_tokens_field, max_completion_tokens_field) =
+        config.max_tokens_field_pair_with_override(model, max_output_tokens_override);
+    let retry = retry::retry_config_from_config(config).with_no_retry(no_retry);
     let body = serde_json::to_value(&ChatCompletionsRequest {
         model,
         messages,
@@ -893,11 +896,14 @@ where
         on_retry,
         cancel_rx,
         route,
+        max_output_tokens_override,
+        no_retry,
         ..
     } = params;
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
-    let (max_tokens_field, max_completion_tokens_field) = config.max_tokens_field_pair(model);
-    let retry = retry::retry_config_from_config(config);
+    let (max_tokens_field, max_completion_tokens_field) =
+        config.max_tokens_field_pair_with_override(model, max_output_tokens_override);
+    let retry = retry::retry_config_from_config(config).with_no_retry(no_retry);
     let body = serde_json::to_value(&ChatCompletionsRequest {
         model,
         messages,
@@ -2185,5 +2191,48 @@ mod tests {
         let body = serde_json::to_value(&msg).unwrap();
         assert!(body.get("reasoning_content").is_none());
         assert!(body.get("reasoning_artifact").is_none());
+    }
+
+    // -- per-call output cap (cache-warming ping) --------------------------
+
+    #[test]
+    fn max_tokens_override_lands_in_the_models_output_field() {
+        // The cache-warming ping's cap must reach the wire in the ONE field a
+        // model uses, with the other slot absent. Build the body the turn
+        // builder would from the resolved pair and assert the serialized keys.
+        let serialize =
+            |model: &str, config: &super::super::ServiceConfig, override_: Option<u32>| {
+                let (max_tokens, max_completion_tokens) =
+                    config.max_tokens_field_pair_with_override(model, override_);
+                serde_json::to_value(&ChatCompletionsRequest {
+                    model,
+                    messages: &[] as &[super::super::ChatRequestMessage],
+                    tools: None,
+                    stream: false,
+                    stream_options: None,
+                    max_tokens,
+                    max_completion_tokens,
+                    reasoning_effort: None,
+                })
+                .unwrap()
+            };
+
+        // Default field is MaxCompletionTokens (o-series / gpt-5.x): the cap
+        // lands in the second slot and `max_tokens` is omitted entirely.
+        let config = super::super::ServiceConfig::default();
+        let body = serialize("gpt-5.4", &config, Some(1));
+        assert_eq!(body["max_completion_tokens"], 1);
+        assert!(body.get("max_tokens").is_none(), "{body}");
+
+        // A model pinned to `max_tokens` gets the cap in the first slot and
+        // omits `max_completion_tokens`.
+        let mut config = super::super::ServiceConfig::default();
+        config.model_max_tokens_fields.insert(
+            "legacy-gpt".to_string(),
+            super::super::MaxTokensField::MaxTokens,
+        );
+        let body = serialize("legacy-gpt", &config, Some(1));
+        assert_eq!(body["max_tokens"], 1);
+        assert!(body.get("max_completion_tokens").is_none(), "{body}");
     }
 }

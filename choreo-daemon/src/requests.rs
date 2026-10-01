@@ -570,6 +570,8 @@ pub(crate) fn run_agent_loop(
                 programmatic_tool_calling: client.supports_programmatic_tool_calling(model),
                 session_id: oc_session_id,
                 request_id: oc_request_id,
+                max_output_tokens_override: None,
+                no_retry: false,
             },
             &mut |event| {
                 match event {

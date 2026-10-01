@@ -66,6 +66,11 @@ pub(crate) struct TurnParams<'a> {
     pub tool_results: &'a [ToolResultItem],
     /// Responses API: enable the programmatic tool-calling tool (gpt-5.6+).
     pub programmatic_tool_calling: bool,
+    /// Per-call output-token cap (see `ChatTurnRequest`): `Some(n)` replaces the
+    /// provider/config default for this call's output length.
+    pub max_output_tokens_override: Option<u32>,
+    /// Single best-effort attempt, no retries (see `ChatTurnRequest`).
+    pub no_retry: bool,
 }
 
 /// Inputs for a one-shot (prompt, no tools, no session) streaming completion,
@@ -634,6 +639,8 @@ impl OpenAiClient {
             previous_response_id: params.previous_response_id,
             tool_results: params.tool_results,
             programmatic_tool_calling: params.programmatic_tool_calling,
+            max_output_tokens_override: params.max_output_tokens_override,
+            no_retry: params.no_retry,
         };
         let result = match self.config.request_format_for_model(model) {
             RequestFormat::Responses => responses::responses_request_with_tools(
@@ -704,6 +711,8 @@ impl OpenAiClient {
             previous_response_id: params.previous_response_id,
             tool_results: params.tool_results,
             programmatic_tool_calling: params.programmatic_tool_calling,
+            max_output_tokens_override: params.max_output_tokens_override,
+            no_retry: params.no_retry,
         };
         let result = match self.config.request_format_for_model(model) {
             RequestFormat::Responses => responses::responses_request_streaming_with_tools(

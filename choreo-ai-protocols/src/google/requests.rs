@@ -90,6 +90,7 @@ pub(super) fn generate_content_request(
         thinking_effort,
         on_retry,
         cancel_rx,
+        no_retry,
         ..
     } = params;
     let url = model_url(&config.base_url, model, GENERATE_CONTENT);
@@ -97,7 +98,8 @@ pub(super) fn generate_content_request(
         config.retry_max_attempts,
         config.retry_initial_backoff_ms,
         config.retry_max_backoff_ms,
-    );
+    )
+    .with_no_retry(no_retry);
 
     let (payloads, system_instruction) = build_message_payloads(messages)?;
     let tool_payloads = if tools.is_empty() {
@@ -114,6 +116,11 @@ pub(super) fn generate_content_request(
         thinking_config.is_some()
     );
 
+    // `ChatTurnRequest::max_output_tokens_override` is deliberately a no-op on
+    // the Google path: `GenerateContentRequest` has no output-length field to
+    // carry it (there is no `generationConfig.maxOutputTokens` wired here), so
+    // the cache-warming ping cannot shrink Gemini output. Only `no_retry` is
+    // honoured.
     let body = serde_json::to_value(&GenerateContentRequest {
         contents: payloads,
         system_instruction: system_value,
@@ -168,6 +175,7 @@ where
         thinking_effort,
         on_retry,
         cancel_rx,
+        no_retry,
         ..
     } = params;
     let url = model_url(&config.base_url, model, STREAM_GENERATE_CONTENT);
@@ -175,7 +183,8 @@ where
         config.retry_max_attempts,
         config.retry_initial_backoff_ms,
         config.retry_max_backoff_ms,
-    );
+    )
+    .with_no_retry(no_retry);
 
     let (payloads, system_instruction) = build_message_payloads(messages)?;
     let tool_payloads = if tools.is_empty() {
@@ -192,6 +201,9 @@ where
         thinking_config.is_some()
     );
 
+    // See the non-streaming path: `max_output_tokens_override` is a no-op on
+    // Google because the request body has no output-token cap field to carry
+    // it; only `no_retry` is honoured.
     let body = serde_json::to_value(&GenerateContentRequest {
         contents: payloads,
         system_instruction: system_value,

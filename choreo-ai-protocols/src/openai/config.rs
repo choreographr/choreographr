@@ -229,6 +229,29 @@ impl ServiceConfig {
             MaxTokensField::MaxCompletionTokens => (None, max_tokens),
         }
     }
+
+    /// Resolve the `(max_tokens, max_completion_tokens)` pair for a model,
+    /// honouring a per-call output-token cap.
+    ///
+    /// When `max_output_tokens_override` is `Some(n)`, `n` replaces the
+    /// configured default in the slot the model would use (chosen by
+    /// [`Self::max_tokens_field_for_model`]), leaving the other slot `None`;
+    /// the override is a hard per-call cap, so it is not run through the
+    /// catalog clamp.  When `None`, this is exactly [`Self::max_tokens_field_pair`].
+    /// The cache-warming ping passes `Some(1)` here.
+    pub(crate) fn max_tokens_field_pair_with_override(
+        &self,
+        model: &str,
+        max_output_tokens_override: Option<u32>,
+    ) -> (Option<u32>, Option<u32>) {
+        match max_output_tokens_override {
+            Some(n) => match self.max_tokens_field_for_model(model) {
+                MaxTokensField::MaxTokens => (Some(n), None),
+                MaxTokensField::MaxCompletionTokens => (None, Some(n)),
+            },
+            None => self.max_tokens_field_pair(model),
+        }
+    }
 }
 
 /// List models via the provider's own base/config (used by the
@@ -294,6 +317,33 @@ mod tests {
         assert_eq!(
             config.max_tokens_field_pair("gpt-5.4"),
             (None, Some(128_000))
+        );
+    }
+
+    #[test]
+    fn max_tokens_override_lands_in_the_models_field() {
+        // The per-call cap (the cache-warming ping's 1-token cap) replaces the
+        // configured default in whatever field the model uses, leaving the
+        // other slot empty. The default field is MaxCompletionTokens (o-series /
+        // gpt-5.x), so an override lands in the second slot...
+        let config = ServiceConfig::default();
+        assert_eq!(
+            config.max_tokens_field_pair_with_override("gpt-5.4", Some(1)),
+            (None, Some(1))
+        );
+        // ...while a model pinned to `max_tokens` gets it in the first slot.
+        let mut config = ServiceConfig::default();
+        config
+            .model_max_tokens_fields
+            .insert("legacy-gpt".to_string(), MaxTokensField::MaxTokens);
+        assert_eq!(
+            config.max_tokens_field_pair_with_override("legacy-gpt", Some(1)),
+            (Some(1), None)
+        );
+        // With no override the plain pair resolution is used unchanged.
+        assert_eq!(
+            config.max_tokens_field_pair_with_override("legacy-gpt", None),
+            config.max_tokens_field_pair("legacy-gpt")
         );
     }
 

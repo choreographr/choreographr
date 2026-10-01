@@ -57,6 +57,8 @@ fn provider_connection_is_registered_and_shutdown_all_does_not_panic() {
             programmatic_tool_calling: false,
             session_id: "42".to_string(),
             request_id: "7".to_string(),
+            max_output_tokens_override: None,
+            no_retry: false,
         })
         .expect("turn succeeds over the registered connection");
     assert!(matches!(result, ChatTurnResult::FinalText(_)));

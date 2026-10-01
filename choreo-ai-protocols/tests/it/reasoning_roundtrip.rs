@@ -181,6 +181,8 @@ fn deepseek_tool_loop_echoes_reasoning_content_verbatim() {
             programmatic_tool_calling: false,
             session_id: "42".to_string(),
             request_id: "7".to_string(),
+            max_output_tokens_override: None,
+            no_retry: false,
         })
         .expect("turn 1");
     let ChatTurnResult::ToolUse(tool_use) = turn1 else {
@@ -217,6 +219,8 @@ fn deepseek_tool_loop_echoes_reasoning_content_verbatim() {
             programmatic_tool_calling: false,
             session_id: "42".to_string(),
             request_id: "7".to_string(),
+            max_output_tokens_override: None,
+            no_retry: false,
         })
         .expect("turn 2");
     assert!(matches!(turn2, ChatTurnResult::FinalText(_)));
@@ -328,6 +332,8 @@ fn anthropic_thinking_blocks_echoed_byte_identical() {
             programmatic_tool_calling: false,
             session_id: "42".to_string(),
             request_id: "7".to_string(),
+            max_output_tokens_override: None,
+            no_retry: false,
         })
         .expect("turn 1");
     let ChatTurnResult::ToolUse(tool_use) = turn1 else {
@@ -362,6 +368,8 @@ fn anthropic_thinking_blocks_echoed_byte_identical() {
             programmatic_tool_calling: false,
             session_id: "42".to_string(),
             request_id: "7".to_string(),
+            max_output_tokens_override: None,
+            no_retry: false,
         })
         .expect("turn 2");
     assert!(matches!(turn2, ChatTurnResult::FinalText(_)));
@@ -475,6 +483,8 @@ fn gemini_thought_signatures_reemitted() {
             programmatic_tool_calling: false,
             session_id: "42".to_string(),
             request_id: "7".to_string(),
+            max_output_tokens_override: None,
+            no_retry: false,
         })
         .expect("turn 1");
     let ChatTurnResult::ToolUse(tool_use) = turn1 else {
@@ -510,6 +520,8 @@ fn gemini_thought_signatures_reemitted() {
             programmatic_tool_calling: false,
             session_id: "42".to_string(),
             request_id: "7".to_string(),
+            max_output_tokens_override: None,
+            no_retry: false,
         })
         .expect("turn 2");
     assert!(matches!(turn2, ChatTurnResult::FinalText(_)));
@@ -631,6 +643,8 @@ fn responses_chains_reasoning_continuity_via_response_id() {
             programmatic_tool_calling: false,
             session_id: "42".to_string(),
             request_id: "7".to_string(),
+            max_output_tokens_override: None,
+            no_retry: false,
         })
         .expect("turn 1");
     let ChatTurnResult::ToolUse(tool_use) = turn1 else {
@@ -687,6 +701,8 @@ fn responses_chains_reasoning_continuity_via_response_id() {
             programmatic_tool_calling: false,
             session_id: "42".to_string(),
             request_id: "7".to_string(),
+            max_output_tokens_override: None,
+            no_retry: false,
         })
         .expect("turn 2");
     assert!(matches!(turn2, ChatTurnResult::FinalText(_)));
@@ -757,6 +773,8 @@ fn chat_turn_request(config: ServiceConfig) -> CapturedRequest {
             programmatic_tool_calling: false,
             session_id: "18446744073709551615".to_string(),
             request_id: "7".to_string(),
+            max_output_tokens_override: None,
+            no_retry: false,
         })
         .expect("turn");
     mock.requests().into_iter().next().expect("one request")

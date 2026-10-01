@@ -829,3 +829,36 @@ fn response_absent_cache_read_defaults_to_zero() {
     };
     assert_eq!(ft.usage.expect("usage").cached_tokens, 0);
 }
+
+// ── per-call output cap (cache-warming ping) ────────────────────────────
+
+/// Serialize a minimal [`MessagesRequest`] carrying `max_tokens` so the tests
+/// can assert the wire value the builder would emit.
+fn serialize_messages_request_with_max_tokens(max_tokens: u32) -> serde_json::Value {
+    serde_json::to_value(&MessagesRequest {
+        model: "claude-sonnet-4-20250514",
+        max_tokens,
+        system: None,
+        messages: Vec::new(),
+        tools: None,
+        stream: false,
+        thinking: None,
+        cache_control: None,
+    })
+    .unwrap()
+}
+
+#[test]
+fn request_body_carries_per_call_max_tokens_override() {
+    // The cache-warming ping's 1-token cap replaces the configured default
+    // (4096) verbatim on the wire.
+    let body = serialize_messages_request_with_max_tokens(effective_max_tokens(Some(1), 4096));
+    assert_eq!(body["max_tokens"], 1);
+}
+
+#[test]
+fn request_body_carries_configured_max_tokens_without_override() {
+    // With no per-call cap the configured default is sent unchanged.
+    let body = serialize_messages_request_with_max_tokens(effective_max_tokens(None, 4096));
+    assert_eq!(body["max_tokens"], 4096);
+}

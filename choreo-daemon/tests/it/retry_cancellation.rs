@@ -130,6 +130,8 @@ fn retry_succeeds_with_callback() {
         programmatic_tool_calling: false,
         session_id: "42".to_string(),
         request_id: "7".to_string(),
+        max_output_tokens_override: None,
+        no_retry: false,
     });
 
     match result {
@@ -202,6 +204,8 @@ fn retry_cancelled_during_backoff() {
         programmatic_tool_calling: false,
         session_id: "42".to_string(),
         request_id: "7".to_string(),
+        max_output_tokens_override: None,
+        no_retry: false,
     });
 
     assert!(
@@ -265,6 +269,8 @@ fn hard_rate_limit_fails_without_retrying() {
         programmatic_tool_calling: false,
         session_id: "42".to_string(),
         request_id: "7".to_string(),
+        max_output_tokens_override: None,
+        no_retry: false,
     });
 
     // The error surfaces the provider's message — the same terminal path
@@ -335,6 +341,8 @@ fn server_503_with_long_retry_after_fails_without_retrying() {
         programmatic_tool_calling: false,
         session_id: "42".to_string(),
         request_id: "7".to_string(),
+        max_output_tokens_override: None,
+        no_retry: false,
     });
 
     assert!(
@@ -404,6 +412,8 @@ fn retry_after_in_budget_is_honored_on_503() {
         programmatic_tool_calling: false,
         session_id: "42".to_string(),
         request_id: "7".to_string(),
+        max_output_tokens_override: None,
+        no_retry: false,
     });
 
     match result {
@@ -519,6 +529,8 @@ fn streaming_cancelled_during_sse_events() {
             programmatic_tool_calling: false,
             session_id: "42".to_string(),
             request_id: "7".to_string(),
+            max_output_tokens_override: None,
+            no_retry: false,
         },
         |_event: StreamEvent| -> std::io::Result<()> { Ok(()) },
     );
@@ -561,6 +573,8 @@ fn streaming_cancelled_before_first_event() {
             programmatic_tool_calling: false,
             session_id: "42".to_string(),
             request_id: "7".to_string(),
+            max_output_tokens_override: None,
+            no_retry: false,
         },
         |_event: StreamEvent| -> std::io::Result<()> { Ok(()) },
     );

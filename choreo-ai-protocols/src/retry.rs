@@ -85,6 +85,22 @@ impl RetryConfig {
             max_backoff_ms,
         }
     }
+
+    /// Collapse this config to a single attempt when `no_retry` is set,
+    /// preserving the backoff/ceiling values; a no-op otherwise.
+    ///
+    /// The retry loop only resends while `attempt < retry.max_attempts`, so
+    /// `max_attempts == 1` means exactly one attempt and no wait: the request
+    /// is a single best-effort call. This is how `ChatTurnRequest::no_retry`
+    /// is realised — the cache-warming ping must never linger retrying, so it
+    /// pays neither the extra cost nor the delay a second attempt would add.
+    #[must_use]
+    pub fn with_no_retry(mut self, no_retry: bool) -> Self {
+        if no_retry {
+            self.max_attempts = 1;
+        }
+        self
+    }
 }
 
 /// Per-attempt wall-clock deadline, re-armed by [`retry_loop`] at the start
@@ -833,6 +849,25 @@ mod tests {
         let retry = RetryConfig::new(5, u64::MAX, u64::MAX);
         assert_eq!(retry.initial_backoff_ms, MAX_BACKOFF_MS);
         assert_eq!(retry.max_backoff_ms, MAX_BACKOFF_MS);
+    }
+
+    #[test]
+    fn with_no_retry_collapses_to_a_single_attempt() {
+        // `no_retry` forces exactly one attempt (the retry loop only resends
+        // while `attempt < max_attempts`), while the backoff values are kept
+        // intact so the config stays a valid, consistently-built value.
+        let retry = RetryConfig::new(5, 1000, 30000).with_no_retry(true);
+        assert_eq!(retry.max_attempts, 1);
+        assert_eq!(retry.initial_backoff_ms, 1000);
+        assert_eq!(retry.max_backoff_ms, 30000);
+    }
+
+    #[test]
+    fn with_no_retry_false_leaves_the_config_unchanged() {
+        // The default path: `no_retry == false` must not touch the config, so
+        // ordinary turns keep their full retry budget.
+        let retry = RetryConfig::new(5, 1000, 30000).with_no_retry(false);
+        assert_eq!(retry.max_attempts, 5);
     }
 
     #[test]

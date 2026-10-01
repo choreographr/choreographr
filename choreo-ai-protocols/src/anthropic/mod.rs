@@ -363,6 +363,20 @@ pub(super) fn prompt_cache_control(enabled: bool) -> Option<CacheControl> {
     enabled.then_some(CacheControl { kind: "ephemeral" })
 }
 
+/// The effective `max_tokens` for an outgoing request.
+///
+/// A per-call override (the cache-warming ping's 1-token cap) wins over the
+/// configured default; `None` keeps the configured value. This is separate
+/// from the thinking budget, which always derives from the configured
+/// `max_tokens` (see `requests.rs`) so a tiny cap cannot collapse
+/// `budget_tokens`.
+pub(super) fn effective_max_tokens(
+    max_output_tokens_override: Option<u32>,
+    config_max_tokens: u32,
+) -> u32 {
+    max_output_tokens_override.unwrap_or(config_max_tokens)
+}
+
 #[derive(Debug, Serialize)]
 struct MessagePayload<'a> {
     role: &'a str,
