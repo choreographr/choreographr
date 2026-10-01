@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use choreo_ai_protocols::openai::{MaxTokensField, RequestFormat};
 use choreo_ai_protocols::retry::MAX_BACKOFF_MS;
 
+use crate::cache_warm::{CacheWarmingMode, MeterKind};
+
 /// Configuration for a single inference account.
 ///
 /// `PartialEq`/`Eq` are derived so two managers can be compared for *logical*
@@ -69,6 +71,14 @@ pub struct AccountConfig {
     /// field set this to `false`.
     #[serde(default)]
     pub prompt_cache: Option<bool>,
+    /// Billing meter for this account's cache-warming gate. `None` means the
+    /// meter is unknown, which never warms. See [`crate::cache_warm`].
+    #[serde(default)]
+    pub meter: Option<MeterKind>,
+    /// Per-account cache-warming mode override; `None` falls through to the
+    /// global `[cache_warming]` mode. See [`crate::cache_warm`].
+    #[serde(default)]
+    pub cache_warming: Option<CacheWarmingMode>,
     // Retry timing (all providers)
     #[serde(default)]
     pub retry_initial_backoff_ms: Option<u64>,
@@ -142,6 +152,8 @@ impl AccountConfig {
             context_window: None,
             model_context_windows: None,
             prompt_cache: None,
+            meter: None,
+            cache_warming: None,
         }
     }
 
@@ -595,6 +607,52 @@ model = "claude-4"
         assert_eq!(mgr.accounts.len(), 2);
         assert!(mgr.contains("main"));
         assert!(mgr.contains("backup"));
+    }
+
+    #[test]
+    fn load_parses_meter_and_cache_warming() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("accounts.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[account]]
+name = "metered"
+provider = "anthropic"
+meter = "payg"
+cache_warming = "streaming"
+
+[[account]]
+name = "defaults"
+provider = "openai"
+"#,
+        )
+        .unwrap();
+        let mgr = manager(&path);
+        let metered = mgr.get("metered").unwrap();
+        assert_eq!(metered.meter, Some(MeterKind::Payg));
+        assert_eq!(metered.cache_warming, Some(CacheWarmingMode::Streaming));
+        // Absent fields stay `None` (fall through to the global config).
+        let defaults = mgr.get("defaults").unwrap();
+        assert_eq!(defaults.meter, None);
+        assert_eq!(defaults.cache_warming, None);
+    }
+
+    #[test]
+    fn load_unknown_meter_falls_back_without_failing() {
+        // A typo'd meter/mode must not brick the accounts file: the enums warn
+        // and fall back to their defaults instead of rejecting the parse.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("accounts.toml");
+        std::fs::write(
+            &path,
+            "[[account]]\nname = \"typo\"\nprovider = \"openai\"\nmeter = \"banana\"\ncache_warming = \"turbo\"\n",
+        )
+        .unwrap();
+        let mgr = manager(&path);
+        let cfg = mgr.get("typo").unwrap();
+        assert_eq!(cfg.meter, Some(MeterKind::Unknown));
+        assert_eq!(cfg.cache_warming, Some(CacheWarmingMode::Off));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 pub mod accounts;
 pub mod broadcast;
+pub mod cache_warm;
 pub mod catalog;
 pub mod cli;
 pub use cli::main;

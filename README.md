@@ -585,11 +585,37 @@ max_turns = 0      # daemon-wide tool-loop budget; 0 = unlimited (default)
 context_file_names = ["AGENTS.md", "CLAUDE.md"]
 context_file_max_bytes = 32768
 disable_claude_code_prompt = false
+
+[cache_warming]              # prompt-cache warming — off by default (see below)
+mode = "off"                 # off | streaming (warm the cache while a tool call blocks)
+min_prefix_tokens = 32000    # `tokens`-metered gate: minimum cacheable prefix, in tokens
+min_expected_savings = 0.05  # `payg`-metered gate: minimum USD saved per ping
 ```
 
 > **Note:** Provider-level settings (`base_url`, `streaming`, `retry_*`,
 > timeouts, endpoint paths, request format, etc.) have moved to per-account
 > overrides in `accounts.toml`. They are no longer read from `config.toml`.
+
+**Prompt-cache warming (off by default).** A warm ping re-sends the last
+request with a 1-token output cap to refresh the provider's prompt cache before
+its TTL expires, so the next real turn reads the prefix from cache instead of
+re-writing it. Whether that pays off depends on how the account is billed, so a
+per-account `meter` gates it:
+
+| `meter` | Warms when |
+|---|---|
+| `payg` | the expected dollar saving clears `min_expected_savings` |
+| `tokens` | the cacheable prefix is at least `min_prefix_tokens` |
+| `requests` | never — a ping burns request budget and saves none |
+| `flat` | never — an unmetered plan saves nothing |
+| `unknown` | never (the default) — we do not guess |
+
+The dollar gate is only meaningful under pay-as-you-go; under a monthly or
+request-metered plan the binding resource is quota, not dollars, so a ping
+actively *costs*. Set `mode = "streaming"` (globally in `[cache_warming]`, or
+per account) and a `meter` to opt in. **The warmer itself ships in a later
+step** — this release parses the config and computes the decision, but nothing
+is wired into the request loop yet.
 
 Credentials are encrypted per-credential with the daemon's keystore X25519
 public key (derived from the client-held unlock key) and stored in the `redb`
@@ -631,6 +657,8 @@ provider = "openai"
 [[account]]
 name = "claude"
 provider = "anthropic"
+meter = "payg"                 # billing meter for the warm gate: payg|tokens|requests|flat|unknown
+cache_warming = "streaming"    # override the global [cache_warming] mode
 
 [[account]]
 name = "gemini"

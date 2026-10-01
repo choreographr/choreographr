@@ -2,6 +2,8 @@ use choreo_proto::ContextConfig;
 use serde::Deserialize;
 use std::{fs, io, path::PathBuf};
 
+use crate::cache_warm::CacheWarmingConfig;
+
 /// Daemon-level configuration from config.toml.
 ///
 /// Only truly global settings belong here.  All provider-level
@@ -13,6 +15,11 @@ pub struct DaemonConfig {
     pub max_turns: Option<u32>,
     #[serde(default)]
     pub context: ContextConfig,
+    /// Global cache-warming defaults (off by default). Per-account `meter`/
+    /// `cache_warming` overrides in accounts.toml take precedence — see
+    /// [`crate::cache_warm`].
+    #[serde(default)]
+    pub cache_warming: CacheWarmingConfig,
 }
 
 /// Resolve the config.toml path (e.g. ~/.config/choreographr/config.toml).
@@ -127,6 +134,45 @@ streaming = false
     fn daemon_config_defaults_when_empty() {
         let config: DaemonConfig = toml::from_str("").unwrap();
         assert_eq!(config.max_turns, None);
+        // Cache warming is off by default with the documented thresholds.
+        assert_eq!(
+            config.cache_warming.mode,
+            crate::cache_warm::CacheWarmingMode::Off
+        );
+        assert_eq!(
+            config.cache_warming.min_prefix_tokens,
+            crate::cache_warm::DEFAULT_MIN_PREFIX_TOKENS
+        );
+        let default_savings = crate::cache_warm::DEFAULT_MIN_EXPECTED_SAVINGS;
+        assert!((config.cache_warming.min_expected_savings - default_savings).abs() < 1e-12);
+    }
+
+    #[test]
+    fn daemon_config_parses_cache_warming() {
+        let raw = r#"
+[cache_warming]
+mode = "streaming"
+min_prefix_tokens = 64000
+min_expected_savings = 0.1
+"#;
+        let config: DaemonConfig = toml::from_str(raw).unwrap();
+        assert_eq!(
+            config.cache_warming.mode,
+            crate::cache_warm::CacheWarmingMode::Streaming
+        );
+        assert_eq!(config.cache_warming.min_prefix_tokens, 64_000);
+        assert!((config.cache_warming.min_expected_savings - 0.1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn daemon_config_cache_warming_unknown_mode_falls_back() {
+        // A typo'd mode warns and falls back to Off rather than failing the
+        // whole config parse.
+        let config: DaemonConfig = toml::from_str("[cache_warming]\nmode = \"turbo\"\n").unwrap();
+        assert_eq!(
+            config.cache_warming.mode,
+            crate::cache_warm::CacheWarmingMode::Off
+        );
     }
 
     #[test]
