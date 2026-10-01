@@ -1,3 +1,9 @@
+//! Filesystem layout for the keystore under `{config}/choreographr`.
+//!
+//! Resolves the config directory and the files within it (the identity private
+//! key and the authorized-clients ACL). A thread-local test override redirects
+//! the root so tests never touch the user's real config directory.
+
 use crate::error::KeystoreError;
 use std::path::PathBuf;
 use tracing::debug;

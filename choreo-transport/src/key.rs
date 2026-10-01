@@ -1,3 +1,9 @@
+//! On-disk Noise IK transport keypair management and public-key fingerprints.
+//!
+//! Provides the standard keypair paths under `{config}/choreographr`, the
+//! [`ensure_transport_keypair`] generator (race-safe via an advisory file
+//! lock), and the human-comparable [`fingerprint`] of a 32-byte public key.
+
 use std::path::PathBuf;
 use tracing::{debug, info};
 

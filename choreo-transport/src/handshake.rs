@@ -1,3 +1,10 @@
+//! The Noise IK and XX handshake state machines over a `TcpStream`.
+//!
+//! Every handshake read and write is bounded by an absolute deadline —
+//! `HANDSHAKE_TIMEOUT` by default, or an explicit budget via the
+//! `_with_timeout` variants — so a silent or slow-drip unauthenticated peer
+//! cannot hold a connection thread and socket FD open.
+
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::slice;
@@ -13,7 +20,7 @@ use crate::noise::NoiseStream;
 ///
 /// The budget is an ABSOLUTE deadline, not a per-read socket timeout: every
 /// handshake read is bounded by the time remaining until it (see
-/// [`read_handshake_exact`]), so a peer that dribbles bytes to keep resetting
+/// `read_handshake_exact`), so a peer that dribbles bytes to keep resetting
 /// a per-recv timeout is still cut off at the deadline. It is cleared before
 /// the `TransportState` is handed over; the data plane has no timeout by design
 /// — readers block until a message or EOF, and the daemon's shutdown path
@@ -177,7 +184,7 @@ fn read_handshake_exact(
 }
 
 /// Write exactly `data` to `stream`, never taking longer than `deadline` in
-/// total. Mirrors [`read_handshake_exact`]: the socket write timeout is
+/// total. Mirrors `read_handshake_exact`: the socket write timeout is
 /// re-armed to the time remaining until `deadline` before every write, so a
 /// peer that stops reading mid-handshake cannot hold the writer past the
 /// deadline (in practice handshake messages are a few hundred bytes and fit
@@ -217,7 +224,7 @@ fn write_handshake_all(
 }
 
 /// Read the 1-byte handshake-mode preamble from `stream`, using the default
-/// [`HANDSHAKE_TIMEOUT`] budget (see [`read_handshake_preamble_with_timeout`]).
+/// `HANDSHAKE_TIMEOUT` budget (see [`read_handshake_preamble_with_timeout`]).
 ///
 /// The preamble runs BEFORE any authentication, so it must be bounded by the
 /// same absolute-deadline machinery as the handshake itself: an
@@ -230,7 +237,7 @@ fn write_handshake_all(
 /// # Errors
 ///
 /// Returns [`TransportError::HandshakeTimeout`] if the peer does not send
-/// the preamble byte within the [`HANDSHAKE_TIMEOUT`] budget, or any
+/// the preamble byte within the `HANDSHAKE_TIMEOUT` budget, or any
 /// propagated socket I/O error (EOF before the byte reads as
 /// `UnexpectedEof`).
 pub fn read_handshake_preamble(stream: &mut TcpStream) -> Result<u8, TransportError> {
@@ -238,7 +245,7 @@ pub fn read_handshake_preamble(stream: &mut TcpStream) -> Result<u8, TransportEr
 }
 
 /// [`read_handshake_preamble`] with an explicit total-duration budget.
-/// Reuses [`read_handshake_exact`] (1 byte), so the deadline semantics are
+/// Reuses `read_handshake_exact` (1 byte), so the deadline semantics are
 /// byte-for-byte the handshake's: a silent peer is cut off with
 /// `HandshakeTimeout`, and a dribbling peer cannot stretch the read past the
 /// deadline by keeping per-read timers alive.
@@ -260,7 +267,7 @@ pub fn read_handshake_preamble_with_timeout(
 }
 
 /// Perform the Noise IK handshake as the **initiator** (client side), using
-/// the default [`HANDSHAKE_TIMEOUT`] budget.
+/// the default `HANDSHAKE_TIMEOUT` budget.
 ///
 /// * `stream` — the already-connected TCP stream.
 /// * `static_sk` — the client's transport.sec (32-byte X25519 secret key).
@@ -271,7 +278,7 @@ pub fn read_handshake_preamble_with_timeout(
 /// # Errors
 ///
 /// Returns [`TransportError::HandshakeTimeout`] if the exchange exceeds the
-/// [`HANDSHAKE_TIMEOUT`] budget, or the snow/`TransportError` I/O and
+/// `HANDSHAKE_TIMEOUT` budget, or the snow/`TransportError` I/O and
 /// protocol errors raised by the exchange itself.
 pub fn handshake_initiator(
     stream: TcpStream,
@@ -282,7 +289,7 @@ pub fn handshake_initiator(
 }
 
 /// [`handshake_initiator`] with an explicit total-duration budget for the
-/// WHOLE handshake (see [`HANDSHAKE_TIMEOUT`] for why the budget is absolute,
+/// WHOLE handshake (see `HANDSHAKE_TIMEOUT` for why the budget is absolute,
 /// not per-read). Exposed so integration tests can exercise the timeout path
 /// in milliseconds instead of waiting out the 10 s default.
 ///
@@ -340,7 +347,7 @@ pub fn handshake_initiator_with_timeout(
 }
 
 /// Perform the Noise IK handshake as the **responder** (server side), using
-/// the default [`HANDSHAKE_TIMEOUT`] budget.
+/// the default `HANDSHAKE_TIMEOUT` budget.
 ///
 /// * `stream` — the accepted TCP stream from the listener.
 /// * `static_sk` — the server's transport.sec (32-byte X25519 secret key).
@@ -355,7 +362,7 @@ pub fn handshake_initiator_with_timeout(
 ///
 /// Returns [`TransportError::AuthFailed`] if the client is not authorized
 /// or never sent its static key, [`TransportError::HandshakeTimeout`] if
-/// the exchange exceeds the [`HANDSHAKE_TIMEOUT`] budget, or the snow/
+/// the exchange exceeds the `HANDSHAKE_TIMEOUT` budget, or the snow/
 /// `TransportError` I/O and protocol errors raised by the exchange itself.
 pub fn handshake_responder<F>(
     stream: TcpStream,
@@ -369,7 +376,7 @@ where
 }
 
 /// [`handshake_responder`] with an explicit total-duration budget for the
-/// WHOLE handshake (see [`HANDSHAKE_TIMEOUT`]). Exposed so integration tests
+/// WHOLE handshake (see `HANDSHAKE_TIMEOUT`). Exposed so integration tests
 /// can exercise the timeout path in milliseconds instead of waiting out the
 /// 10 s default.
 ///
@@ -441,7 +448,7 @@ where
 }
 
 /// Perform the Noise XX handshake as the **initiator** (client side, first
-/// contact), using the default [`HANDSHAKE_TIMEOUT`] budget.
+/// contact), using the default `HANDSHAKE_TIMEOUT` budget.
 ///
 /// Unlike [`handshake_initiator`] (Noise IK), the XX initiator does NOT know
 /// the server's static key in advance — that is the point of first-contact
@@ -462,7 +469,7 @@ where
 /// # Errors
 ///
 /// Returns [`TransportError::HandshakeTimeout`] if the exchange exceeds the
-/// [`HANDSHAKE_TIMEOUT`] budget, [`TransportError::InvalidFragment`] if the
+/// `HANDSHAKE_TIMEOUT` budget, [`TransportError::InvalidFragment`] if the
 /// server omits its static key, or the snow/`TransportError` errors raised
 /// by the exchange itself.
 pub fn handshake_initiator_xx(
@@ -473,9 +480,9 @@ pub fn handshake_initiator_xx(
 }
 
 /// [`handshake_initiator_xx`] with an explicit total-duration budget for the
-/// WHOLE handshake (see [`HANDSHAKE_TIMEOUT`]). Reuses the exact same
-/// absolute-deadline plumbing as the IK variants — [`read_handshake_exact`]
-/// and [`write_handshake_all`] — so the XX timeout semantics are identical:
+/// WHOLE handshake (see `HANDSHAKE_TIMEOUT`). Reuses the exact same
+/// absolute-deadline plumbing as the IK variants — `read_handshake_exact`
+/// and `write_handshake_all` — so the XX timeout semantics are identical:
 /// a silent or dribbling peer is cut off at the deadline with
 /// `HandshakeTimeout`, and both socket timeouts are cleared before the data
 /// plane.
@@ -556,7 +563,7 @@ pub fn handshake_initiator_xx_with_timeout(
 }
 
 /// Perform the Noise XX handshake as the **responder** (server side,
-/// first-contact), using the default [`HANDSHAKE_TIMEOUT`] budget.
+/// first-contact), using the default `HANDSHAKE_TIMEOUT` budget.
 ///
 /// Mirrors [`handshake_responder`] (Noise IK) except for the message flow:
 /// XX is 3 messages instead of IK's 2, and the client's static key arrives
@@ -568,7 +575,7 @@ pub fn handshake_initiator_xx_with_timeout(
 ///
 /// Returns [`TransportError::AuthFailed`] if the client is not authorized
 /// or never sent its static key, [`TransportError::HandshakeTimeout`] if
-/// the exchange exceeds the [`HANDSHAKE_TIMEOUT`] budget, or the snow/
+/// the exchange exceeds the `HANDSHAKE_TIMEOUT` budget, or the snow/
 /// `TransportError` I/O and protocol errors raised by the exchange itself.
 pub fn handshake_responder_xx<F>(
     stream: TcpStream,
@@ -582,7 +589,7 @@ where
 }
 
 /// [`handshake_responder_xx`] with an explicit total-duration budget for the
-/// WHOLE handshake (see [`HANDSHAKE_TIMEOUT`]). Same absolute-deadline
+/// WHOLE handshake (see `HANDSHAKE_TIMEOUT`). Same absolute-deadline
 /// plumbing as the IK responder — every read AND write is bounded by the
 /// time remaining until the deadline.
 ///

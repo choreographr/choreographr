@@ -1,3 +1,10 @@
+//! The encrypted Noise transport stream, its message framing, and the
+//! single-writer send guard.
+//!
+//! [`NoiseStream`] length-prefixes (4-byte big-endian) and fragments plaintext
+//! into AES-256-GCM messages, with an authenticated per-fragment continuation
+//! byte driving reassembly.
+
 use choreo_proto::{ClientMessage, DaemonMessage, MAX_FRAME_SIZE, decode_frame, encode_payload};
 use snow::TransportState;
 use std::io::{self, Read, Write};
@@ -14,7 +21,7 @@ use tracing::{debug, trace};
 const GCM_TAG_LEN: usize = 16;
 /// Length of the authenticated per-fragment continuation header: one byte at
 /// the START of each fragment's plaintext, so the AES-GCM tag covers it (see
-/// [`FRAGMENT_CONTINUATION`]).
+/// `FRAGMENT_CONTINUATION`).
 const FRAGMENT_HEADER_LEN: usize = 1;
 /// Maximum payload bytes in a single Noise fragment. snow caps one message's
 /// ciphertext at 65535 bytes (MAXMSGLEN); the 16-byte GCM tag and the 1-byte
@@ -165,9 +172,9 @@ impl NoiseStream {
     /// Encrypts the plaintext into one or more ciphertext fragments (leaving
     /// the input untouched), then writes each fragment's 4-byte big-endian
     /// ciphertext length prefix followed by the ciphertext. Payloads larger
-    /// than [`MAX_PLAINTEXT_CHUNK`] are split into multiple fragments; each
+    /// than `MAX_PLAINTEXT_CHUNK` are split into multiple fragments; each
     /// fragment's plaintext starts with an AUTHENTICATED continuation byte
-    /// ([`FRAGMENT_CONTINUATION`]) that tells the receiver whether to keep
+    /// (`FRAGMENT_CONTINUATION`) that tells the receiver whether to keep
     /// reading.
     ///
     /// The shared `TransportState` lock is held only per-chunk, during the

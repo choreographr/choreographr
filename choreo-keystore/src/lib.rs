@@ -1,3 +1,19 @@
+//! Credential storage and cryptographic key management for the daemon, TUI,
+//! and CLI.
+//!
+//! This crate owns the material every credentialed feature depends on: the
+//! [`ServiceCredential`] enum (API keys, X/Twitter OAuth tokens, and Polkadot
+//! sr25519 accounts) with secret-redacting `Display` and `zeroize`-on-drop, the
+//! X25519 + AES-256-GCM envelope that moves a credential to a client
+//! ([`crypto`]), the on-disk path layout under `{config}/choreographr`
+//! ([`paths`]), and the Polkadot-JS keystore import and sr25519 validation
+//! path ([`substrate`]).
+
+// Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
+// every public item carries docs, enforced as a hard error by clippy-strict's
+// `-D warnings`.
+#![warn(missing_docs)]
+
 use std::fmt;
 
 pub mod crypto;
@@ -11,19 +27,37 @@ pub use substrate::SubstrateCredentialView;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
+/// A stored service credential.
+///
+/// The variants discriminate the per-service secret material the daemon holds
+/// on a user's behalf. The whole enum is `zeroize`d on drop so secret bytes
+/// are not left in freed memory, and its [`Display`](fmt::Display) redacts
+/// every secret field so a credential can be logged without leaking.
 #[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
 #[zeroize(drop)]
 pub enum ServiceCredential {
+    /// A plain API-key service (the provider is identified out-of-band).
     #[serde(rename = "api_key")]
-    ApiKey { key: String },
+    ApiKey {
+        /// The secret API key.
+        key: String,
+    },
+    /// An X/Twitter OAuth 1.0a credential, optionally with an OAuth 2.0 bearer
+    /// token for endpoints that require app-only auth.
     #[serde(rename = "x")]
     X {
+        /// OAuth 1.0a consumer key.
         api_key: String,
+        /// OAuth 1.0a consumer secret.
         api_key_secret: String,
+        /// OAuth 1.0a access token.
         access_token: String,
+        /// OAuth 1.0a access-token secret.
         access_token_secret: String,
+        /// Optional OAuth 2.0 bearer token, when the app is bearer-configured.
         bearer_token: Option<String>,
     },
+    /// A Polkadot sr25519 account imported from a Polkadot-JS keystore export.
     #[serde(rename = "substrate")]
     Substrate {
         /// Account name (matches the daemon's credential key, e.g. "main").
@@ -62,10 +96,15 @@ impl fmt::Display for ServiceCredential {
 /// Borrowed view of X credential fields. Avoids allocating a separate struct.
 #[derive(Debug, Clone, Copy)]
 pub struct XCredentialView<'a> {
+    /// OAuth 1.0a consumer key.
     pub api_key: &'a str,
+    /// OAuth 1.0a consumer secret.
     pub api_key_secret: &'a str,
+    /// OAuth 1.0a access token.
     pub access_token: &'a str,
+    /// OAuth 1.0a access-token secret.
     pub access_token_secret: &'a str,
+    /// Optional OAuth 2.0 bearer token.
     pub bearer_token: Option<&'a str>,
 }
 

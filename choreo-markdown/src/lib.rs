@@ -5,11 +5,16 @@
 //! * this module — the public AST types ([`MarkdownDocument`],
 //!   [`MarkdownBlock`], [`MarkdownInline`], [`MarkdownAlignment`]) and the
 //!   crate's public re-exports;
-//! * [`parse`] — the pulldown-cmark event → AST parser;
-//! * [`serialize`] — the AST → markdown re-serializer;
-//! * [`html`] — markdown → sanitized HTML rendering;
-//! * [`math`] — math/prose classification (`math::detect`) and the LaTeX →
+//! * `parse` — the pulldown-cmark event → AST parser;
+//! * `serialize` — the AST → markdown re-serializer;
+//! * `html` — markdown → sanitized HTML rendering;
+//! * `math` — math/prose classification (`math::detect`) and the LaTeX →
 //!   Unicode printer (`math::pretty`).
+
+// Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
+// every public item carries docs, enforced as a hard error by clippy-strict's
+// `-D warnings`.
+#![warn(missing_docs)]
 
 use thiserror::Error;
 

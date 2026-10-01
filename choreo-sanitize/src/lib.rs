@@ -24,6 +24,11 @@
 //! (terminal render filter), `choreo-blockchain` (node-output sanitizer),
 //! `choreo-client-core` (live streaming cap).
 
+// Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
+// every public item carries docs, enforced as a hard error by clippy-strict's
+// `-D warnings`.
+#![warn(missing_docs)]
+
 use unicode_general_category::{GeneralCategory, get_general_category};
 
 /// Shared byte budget for tool output (128 KiB ≈ ~32K tokens for ASCII,
@@ -152,6 +157,7 @@ pub struct ByteBudget {
 }
 
 impl ByteBudget {
+    /// Create a budget that admits the first `limit` bytes.
     #[must_use]
     pub fn new(limit: usize) -> Self {
         Self {

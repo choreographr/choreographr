@@ -63,9 +63,13 @@ const SS58_SUBSTRATE_PREFIX: u16 = 42;
 /// view used for the `X` variant; avoids allocating a separate struct.
 #[derive(Debug, Clone, Copy)]
 pub struct SubstrateCredentialView<'a> {
+    /// Account name (matches the daemon's credential key).
     pub name: &'a str,
+    /// SS58 address of the account.
     pub account_id: &'a str,
+    /// Expanded ed25519 secret key (64 bytes).
     pub secret: &'a [u8],
+    /// Raw 32-byte public key (the account id bytes).
     pub public: &'a [u8],
 }
 

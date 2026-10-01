@@ -1,11 +1,17 @@
+//! The shared transport error type.
+
 use thiserror::Error;
 
+/// Errors surfaced by the transport: handshake, framing, and socket failures.
 #[derive(Error, Debug)]
 pub enum TransportError {
+    /// An underlying socket I/O failure that is not a peer close.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// A failure inside the snow Noise state machine.
     #[error("Noise protocol error: {0}")]
     Noise(#[from] snow::Error),
+    /// A wire-protocol error from the shared codec.
     #[error("Protocol error: {0}")]
     Protocol(#[from] choreo_proto::ProtoError),
     /// The peer (or this stream's usage) violated the transport framing
@@ -20,6 +26,7 @@ pub enum TransportError {
     /// cut off (see `handshake::read_handshake_exact`).
     #[error("Noise handshake timed out")]
     HandshakeTimeout,
+    /// The peer presented credentials that the ACL check rejected.
     #[error("Authentication failed")]
     AuthFailed,
     /// The peer closed the connection (EOF before a full frame, or a
@@ -29,6 +36,7 @@ pub enum TransportError {
     /// distinct from a protocol failure.
     #[error("Connection closed")]
     ConnectionClosed,
+    /// The OS exposed no configuration directory to place the keypair in.
     #[error("could not determine config directory")]
     ConfigDirNotFound,
 }

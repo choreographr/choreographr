@@ -1,3 +1,11 @@
+//! X25519 ECDH + HKDF + AES-256-GCM envelope for credentials in transit.
+//!
+//! [`encrypt_with_public_key`] and [`decrypt_with_private_key`] are the
+//! daemon↔client credential-transfer primitives: a fresh ephemeral X25519
+//! keypair is generated per message, ECDH with the recipient's static key
+//! feeds HKDF-SHA256 (with a per-message random salt and nonce), and the
+//! payload is sealed with AES-256-GCM.
+
 use crate::error::KeystoreError;
 
 use aes_gcm::{
