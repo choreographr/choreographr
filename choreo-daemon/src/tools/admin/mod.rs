@@ -1,10 +1,12 @@
 mod get_session;
 mod list_sessions;
 mod load_skill;
+mod read_session;
 
 pub(crate) use get_session::GetSession;
 pub(crate) use list_sessions::ListSessions;
 pub(crate) use load_skill::LoadSkill;
+pub(crate) use read_session::ReadSession;
 
 #[cfg(test)]
 pub(crate) mod tests {

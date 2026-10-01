@@ -62,7 +62,7 @@ impl Tool for GetSession {
     }
 
     fn description(&self) -> &'static str {
-        "Read the full message history of a session by its ID. Returns all messages (system, user, assistant, tool calls, tool results) with role labels."
+        "Return a session's metadata summary by ID: title, model, turn count, parent session, working directory, and token usage. This does NOT return message text — use read_session to read another session's conversation text."
     }
 
     fn describe_invocation(&self, args: &Self::Args) -> String {

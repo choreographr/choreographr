@@ -859,6 +859,7 @@ impl ToolRegistry {
         reg.register(db::DbCount);
         reg.register(admin::ListSessions);
         reg.register(admin::GetSession);
+        reg.register(admin::ReadSession);
         reg.register(admin::LoadSkill);
         reg.register(set_session_title::SetSessionTitle);
         reg.register(set_working_dir::SetWorkingDir);

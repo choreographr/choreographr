@@ -68,6 +68,14 @@ Each server can run multiple sessions simultaneously (only limited by system res
 
 Rather than having a multi-session terminal multiplexor, you can manage all your sessions directly from a client program.
 
+Sessions can read each other's conversations: the `read_session` tool returns
+another session's user messages, assistant responses, and reasoning text (given
+its ID from `list_sessions`), so a result researched in one session can be
+reused in another. It reads the most recent turns by default and reports the
+assistant's displayed reasoning, but never the raw tool-input/output or the
+opaque reasoning artifacts (encrypted provider blobs / thinking blocks) — those
+stay inside the daemon.
+
 Sessions have undo/redo functionality. If an LLM is mis-prompted it is often better to remove the prompt than to prompt more to try to "fix it".
 
 ### Hierarchical Sessions
