@@ -94,6 +94,24 @@ pub struct PixelCrop {
 }
 
 impl CropRegion {
+    /// The region clamped to the unit square as `(x0, y0, x1, y1)`, or `None`
+    /// when it is empty (zero area) after clamping.
+    ///
+    /// The single source of the "empty region is rejected" rule: both the
+    /// pixel-crop path ([`CropRegion::to_pixels`]) and the SVG rasterizer
+    /// (`rasterize_svg`, which needs the fractional edges directly) resolve the
+    /// edges here, so the two can never disagree about what counts as empty.
+    fn normalized_bounds(self) -> Option<(f32, f32, f32, f32)> {
+        let x0 = self.x.clamp(0.0, 1.0);
+        let y0 = self.y.clamp(0.0, 1.0);
+        let x1 = (self.x + self.width).clamp(0.0, 1.0);
+        let y1 = (self.y + self.height).clamp(0.0, 1.0);
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        Some((x0, y0, x1, y1))
+    }
+
     /// Resolve the fractional region against an image of `width` × `height`
     /// pixels, clamped to the image bounds.
     ///
@@ -102,13 +120,7 @@ impl CropRegion {
     /// to nothing.
     #[must_use]
     pub fn to_pixels(self, width: u32, height: u32) -> Option<PixelCrop> {
-        let x0 = self.x.clamp(0.0, 1.0);
-        let y0 = self.y.clamp(0.0, 1.0);
-        let x1 = (self.x + self.width).clamp(0.0, 1.0);
-        let y1 = (self.y + self.height).clamp(0.0, 1.0);
-        if x1 <= x0 || y1 <= y0 {
-            return None;
-        }
+        let (x0, y0, x1, y1) = self.normalized_bounds()?;
         // Round each edge to the nearest pixel; `scaled_edge` clamps to
         // `[0, extent]`, so the resulting rectangle is always in bounds.
         let left = scaled_edge(f64::from(x0), width);
@@ -373,16 +385,12 @@ fn rasterize_svg(bytes: &[u8], region: Option<CropRegion>) -> std::io::Result<Dy
     let view_h = size.height();
     let (origin_x, origin_y, region_w, region_h) = match region {
         Some(region) => {
-            let x0 = region.x.clamp(0.0, 1.0);
-            let y0 = region.y.clamp(0.0, 1.0);
-            let x1 = (region.x + region.width).clamp(0.0, 1.0);
-            let y1 = (region.y + region.height).clamp(0.0, 1.0);
-            if x1 <= x0 || y1 <= y0 {
-                return Err(std::io::Error::new(
+            let (x0, y0, x1, y1) = region.normalized_bounds().ok_or_else(|| {
+                std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "crop region does not overlap the image",
-                ));
-            }
+                )
+            })?;
             (
                 x0 * view_w,
                 y0 * view_h,
