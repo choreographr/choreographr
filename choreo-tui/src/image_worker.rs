@@ -1,3 +1,12 @@
+//! Background image-encoding worker.
+//!
+//! Terminal image protocols are expensive to encode, so the TUI offloads them
+//! to a single worker thread: the UI thread submits an [`ImageJob`] and later
+//! drains [`ImageResult`]s, keeping the render path free of blocking encodes.
+//! A job whose bytes fail to decode still yields a result (with
+//! `protocol: None`) so the caller can clear its pending marker and retry at a
+//! later frame rather than re-submitting every frame.
+
 use choreo_proto::ImageMetadata;
 use crossbeam_channel as channel;
 use image::{DynamicImage, RgbaImage};
@@ -8,16 +17,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
+/// Identifier pairing an [`ImageJob`] with the [`ImageResult`] it produces.
 pub type ImageId = usize;
 
 /// A job submitted to the background image worker.
 pub struct ImageJob {
+    /// Identifier echoed back in the matching [`ImageResult`], assigned by
+    /// [`next_job_id`] so the UI can pair a result with its request.
     pub id: ImageId,
     /// Raw image bytes, shared via Arc so no deep copy is needed when
     /// submitting the same image at multiple sizes (inline + fullscreen).
     pub data: Arc<[u8]>,
+    /// Source image metadata (mime type, declared dimensions, alt text).
     pub metadata: ImageMetadata,
+    /// Terminal cell size to encode for; one job is submitted per size.
     pub cell_size: Size,
+    /// Resize strategy applied when encoding to `cell_size`.
     pub resize: Resize,
 }
 
@@ -27,19 +42,36 @@ pub struct ImageJob {
 /// always clear `pending_job` on receipt so the image can be re-attempted
 /// on a subsequent frame.
 pub struct ImageResult {
+    /// Identifier of the [`ImageJob`] this result answers.
     pub id: ImageId,
+    /// The encoded protocol on success, or `None` when decoding/encoding failed.
     pub protocol: Option<StatefulProtocol>,
+    /// Cell size the job was submitted for; populated even on failure so the
+    /// caller can record exactly which size failed.
     pub cell_size: Size,
 }
 
+/// The image worker: its job/result channels and the backing thread.
+///
+/// Dropping the worker drops `job_tx`, which ends the worker thread's `recv`
+/// loop; join `handle` to wait for it to drain and exit.
 pub struct ImageWorker {
+    /// Submits encoding jobs to the worker thread.
     pub job_tx: channel::Sender<ImageJob>,
+    /// Receives completed encoding results on the UI thread.
     pub result_rx: channel::Receiver<ImageResult>,
+    /// The background thread running the encode loop; it exits once `job_tx`
+    /// is dropped, so joining it observes clean shutdown.
     pub handle: thread::JoinHandle<()>,
 }
 
 static NEXT_JOB_ID: AtomicUsize = AtomicUsize::new(1);
 
+/// Allocate the next unique [`ImageId`], shared across every worker.
+///
+/// Ids only need to be unique within the process (they pair a job with its
+/// result), so a relaxed atomic counter suffices — the id synchronizes no
+/// other memory.
 pub fn next_job_id() -> ImageId {
     NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed)
 }

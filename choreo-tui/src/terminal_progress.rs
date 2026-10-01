@@ -1,3 +1,10 @@
+//! Terminal-native progress bar (OSC 9;4).
+//!
+//! Emits the `OSC 9;4` escape sequence that terminal emulators render as a
+//! native progress indicator, so a long model turn shows progress outside the
+//! TUI's own viewport (taskbar/tab). The sequence is a no-op on terminals that
+//! don't advertise support, which is why the support probe is cached.
+
 use std::io::Write;
 use std::sync::OnceLock;
 

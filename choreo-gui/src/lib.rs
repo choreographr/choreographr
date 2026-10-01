@@ -1,3 +1,19 @@
+//! Desktop, Android and iOS client for the Choreographr daemon.
+//!
+//! `choreo-gui` renders the chat client with Dioxus components on the Dioxus
+//! Native (Blitz/wgpu) renderer — one renderer for desktop, Android and iOS,
+//! with no webview anywhere. It connects to the daemon over a Unix socket or
+//! Noise-IK-encrypted TCP; on iOS the daemon instead runs in-process (the
+//! embedded-daemon wiring in this module's `embedded_connection_mode`).
+//!
+//! The crate's binary (`src/bin/choreo-gui.rs`) is a thin wrapper around
+//! [`main`], which resolves the connection mode and launches the Dioxus app.
+
+// Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
+// every public item carries docs, enforced as a hard error by clippy-strict's
+// `-D warnings`.
+#![warn(missing_docs)]
+
 mod client;
 mod components;
 mod hooks;
@@ -382,6 +398,11 @@ fn android_main(app: android_activity::AndroidApp) {
 // creates the app's window from ApplicationHandler::resumed — the point
 // winit's docs require window creation to happen at, after UIApplicationMain
 // has done the UIKit init all UI code needs (rust-windowing/winit#1705).
+/// C-callable iOS entry point, invoked from the host bootstrap (`ios/main.m`).
+///
+/// It runs the exact same [`main`] the desktop and Android builds use; winit's
+/// iOS backend owns `UIApplicationMain`, so this trampoline must be called
+/// before any UIKit bootstrap (see the surrounding comment for the contract).
 #[cfg(target_os = "ios")]
 #[unsafe(no_mangle)] // edition 2024: no_mangle is an unsafe attribute
 pub extern "C" fn choreo_gui_ios_main() {

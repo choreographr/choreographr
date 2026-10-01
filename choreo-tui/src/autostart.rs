@@ -11,7 +11,7 @@
 //!
 //! All helpers are factored as pure functions over injected parameters (paths,
 //! a probe closure) so they are unit-testable without real sockets; only
-//! [`start_daemon`] performs the actual spawn.
+//! `start_daemon` performs the actual spawn.
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};

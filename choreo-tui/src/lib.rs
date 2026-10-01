@@ -1,3 +1,23 @@
+//! Terminal user interface for the Choreographr daemon.
+//!
+//! `choreo-tui` renders an interactive chat client over `ratatui`/`crossterm`
+//! on top of `choreo-client-core`'s daemon connection. All of the TUI's logic
+//! lives in this library crate; the shipped `choreo-tui` binary (`src/main.rs`)
+//! is a thin wrapper that calls [`main`], so the connection and session logic
+//! stays unit-testable without a real terminal.
+//!
+//! The public surface is intentionally small: the entry point ([`main`]), the
+//! background image-encoding [`image_worker`], the terminal-native progress
+//! helper ([`terminal_progress`]), the [`RenderedImage`] model shared with the
+//! render path, its [`IMAGE_RESIZE`] filter, and [`build_picker`]. Everything
+//! else — rendering, selection, syntax highlighting, connection handling — is
+//! crate-private.
+
+// Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
+// every public item carries docs, enforced as a hard error by clippy-strict's
+// `-D warnings`.
+#![warn(missing_docs)]
+
 // `pub`: the poll/dial helpers are exercised from tests/it/autostart_poll.rs
 // (the integration suite — real waits and real sockets must not live in the
 // unit-test module per AGENTS.md), which needs cross-crate visibility.
@@ -37,6 +57,7 @@ use crate::image_worker::ImageResult;
 /// to the background worker thread for encoding at multiple sizes (inline
 /// and fullscreen) without a deep copy of the byte buffer.
 pub struct RenderedImage {
+    /// Source image metadata (mime type, declared dimensions, alt text).
     pub metadata: ImageMetadata,
     /// Raw image bytes (SVG or raster).  Kept permanently so the image
     /// can be re-encoded at any display resolution via the worker thread.
@@ -98,6 +119,9 @@ impl RenderedImage {
     }
 }
 
+/// Build the terminal image picker, probing the terminal's graphics
+/// capabilities and falling back to half-block rendering when the query fails
+/// (for example, when stdout is not a TTY).
 #[must_use]
 pub fn build_picker() -> Picker {
     Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())

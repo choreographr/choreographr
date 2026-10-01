@@ -123,6 +123,8 @@ pub struct SwiftIosToolBridge {
 }
 
 impl SwiftIosToolBridge {
+    /// Create a fresh bridge. It is stateless apart from the request-id
+    /// counter, so one instance per embedded-daemon process is enough.
     pub fn new() -> Self {
         Self::default()
     }
