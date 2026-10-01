@@ -1,3 +1,12 @@
+//! Translation of daemon streaming events into ACP session updates.
+//!
+//! During a prompt, the daemon streams `SessionEvent`s (output chunks, tool
+//! call lifecycle, terminal states). [`translate_message`] maps each into zero
+//! or more [`SessionUpdateParams`] notifications for the editor, and
+//! [`text_block`] builds the text content blocks those updates carry. This
+//! module is pure data transformation; request-ID filtering and output happen
+//! in the event loop.
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use choreo_proto::{DaemonMessage, SessionEvent};

@@ -17,9 +17,13 @@ use std::sync::LazyLock;
 /// Coarse grouping used to organize commands in discovery surfaces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandGroup {
+    /// Session lifecycle and control (new, switch, cancel, model, …).
     Session,
+    /// Account and credential management.
     Account,
+    /// ACL and keystore security operations.
     Security,
+    /// Client/system operations (quit, catalog refresh).
     System,
 }
 
@@ -42,9 +46,13 @@ impl CommandGroup {
 /// arguments/subcommands (or `None` for a bare command); `summary` is the
 /// one-line description shown to users.
 pub struct CommandSpec {
+    /// The bare invocation, without the leading slash (e.g. `"model"`).
     pub name: &'static str,
+    /// The one-line description shown in discovery surfaces.
     pub summary: &'static str,
+    /// The accepted arguments/subcommands, or `None` for a bare command.
     pub arg_hint: Option<&'static str>,
+    /// The [`CommandGroup`] this command belongs to.
     pub group: CommandGroup,
 }
 
@@ -179,6 +187,7 @@ pub fn command_catalog() -> &'static [CommandSpec] {
 
 /// A single match produced by [`match_commands`].
 pub struct CommandMatch {
+    /// The matched catalog entry.
     pub spec: &'static CommandSpec,
     /// Char indices into `spec.name` to emphasize; empty when the query is empty.
     pub name_positions: Vec<usize>,

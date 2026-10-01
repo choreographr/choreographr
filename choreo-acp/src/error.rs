@@ -1,3 +1,10 @@
+//! The crate-wide error type for the ACP bridge.
+//!
+//! [`AcpError`] is the single error returned by the bridge's fallible entry
+//! points. Variants that carry an underlying cause use `#[from]` so `?`
+//! conversions compose over I/O, protocol, and JSON errors without wrapper
+//! noise.
+
 use std::io;
 use thiserror::Error;
 
@@ -13,8 +20,11 @@ pub enum AcpError {
     /// programmatically without re-parsing.
     #[error("JSON-RPC error: code={code} message={message}")]
     JsonRpc {
+        /// The JSON-RPC error code.
         code: i64,
+        /// The human-readable error message.
         message: String,
+        /// Optional structured error details from the peer.
         data: Option<serde_json::Value>,
     },
 

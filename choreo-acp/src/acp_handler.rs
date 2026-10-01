@@ -1,3 +1,14 @@
+//! The single-threaded event loop and ACP request/dispatch logic.
+//!
+//! [`run_event_loop`] owns the bridge's control flow: it pulls [`Event`]s off
+//! the shared channel, applies the `initialize` handshake gate, and routes each
+//! editor request/notification to a per-method handler that sends the matching
+//! [`ClientMessage`] to the daemon. Incoming
+//! [`DaemonMessage`]s are split into streaming turn events (translated into
+//! `session/update` notifications via [`streaming`]) and
+//! synchronous replies (matched against [`PendingRequests`] to complete the
+//! originating JSON-RPC call). All outbound JSON is buffered to stdout.
+
 use crossbeam_channel::{Receiver, Sender};
 use std::io::{BufWriter, Write};
 use tracing::{debug, error, info, warn};

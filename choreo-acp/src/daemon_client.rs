@@ -1,3 +1,11 @@
+//! The daemon-facing side of the bridge: connection, reader, and writer.
+//!
+//! The bridge talks to the Choreographr daemon over its Unix socket using the
+//! MessagePack-framed `choreo-proto` protocol. This module owns both I/O
+//! threads — one draining [`DaemonMessage`]s into the shared event channel and
+//! one consuming [`ClientMessage`]s from the event loop — plus the unified
+//! [`Event`] type the main loop dispatches on.
+
 use choreo_proto::{ClientMessage, DaemonMessage, read_message, write_message};
 use crossbeam_channel::Sender;
 use std::io::{BufReader, BufWriter, Write};

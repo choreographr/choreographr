@@ -1,12 +1,27 @@
+//! In-flight request tracking for the single-threaded event loop.
+//!
+//! ACP requests are asynchronous on the wire: the loop sends a
+//! [`ClientMessage`](choreo_proto::ClientMessage) to the daemon and must later
+//! match the daemon's reply back to the original JSON-RPC id. [`PendingRequests`]
+//! holds that bookkeeping — synchronous replies keyed by [`PendingKind`],
+//! streaming prompts keyed by session id, and the [`ModelsPending`] slot that
+//! disambiguates the shared `Models` reply. Because the loop is single-threaded
+//! and all I/O blocks, plain `HashMap`s suffice; no locking is needed.
+
 use std::collections::HashMap;
 
 /// Identifies the kind of synchronous daemon response we're waiting for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PendingKind {
+    /// Waiting for the session-creation reply.
     CreateSession,
+    /// Waiting for the session-list reply.
     ListSessions,
+    /// Waiting for the deletion reply for a specific daemon session id.
     DeleteSession(u64),
+    /// Waiting for the model-selection reply.
     SetModel,
+    /// Waiting for the reasoning-effort reply.
     SetReasoningEffort,
 }
 
@@ -15,15 +30,20 @@ pub enum PendingKind {
 /// JSON-RPC response to the editor.
 #[derive(Debug)]
 pub struct PendingEntry {
+    /// The JSON-RPC id of the editor request awaiting this reply.
     pub jsonrpc_id: u64,
+    /// What the reply is for.
     pub kind: PendingKind,
 }
 
 /// Tracks an active streaming prompt (`session/prompt`).
 #[derive(Debug)]
 pub struct ActivePrompt {
+    /// The JSON-RPC id of the editor's `session/prompt` request.
     pub jsonrpc_id: u64,
+    /// The daemon-assigned request id this prompt's stream is tagged with.
     pub daemon_request_id: u32,
+    /// The ACP session id the prompt belongs to.
     pub session_acp_id: String,
 }
 
@@ -34,13 +54,19 @@ pub struct ActivePrompt {
 /// without relying on implicit ordering or side effects.
 #[derive(Debug)]
 pub enum ModelsPending {
+    /// A `Models` reply completing the `session/new` handshake; the embedded
+    /// `account_name` was requested by the editor and is forwarded on the
+    /// follow-up `CreateSession`.
     CreateSession {
+        /// The JSON-RPC id of the pending `session/new` request.
         jsonrpc_id: u64,
+        /// The account name the editor asked for, if any.
         account_name: Option<String>,
     },
 }
 
 impl ModelsPending {
+    /// The JSON-RPC id of the request this pending reply belongs to.
     #[must_use]
     pub fn jsonrpc_id(&self) -> u64 {
         match self {
@@ -56,7 +82,9 @@ impl ModelsPending {
 /// and another `HashMap` keyed by session ID for streaming prompts.
 #[derive(Debug)]
 pub struct PendingRequests {
+    /// Synchronous requests awaiting a matching daemon reply, keyed by kind.
     pub sync: HashMap<PendingKind, PendingEntry>,
+    /// Active streaming prompts, keyed by ACP session id.
     pub prompts: HashMap<String, ActivePrompt>,
     /// Tracks what a pending `Models` response is expected for.
     /// `ListModels` (for `session/new`) and `SetModel` both produce a
@@ -76,6 +104,7 @@ impl Default for PendingRequests {
 }
 
 impl PendingRequests {
+    /// Create an empty tracker (nothing in flight).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -108,11 +137,13 @@ impl PendingRequests {
         self.pending_sessions.remove(kind)
     }
 
+    /// Record a synchronous request awaiting a daemon reply of the given kind.
     pub fn insert_sync(&mut self, kind: PendingKind, jsonrpc_id: u64) {
         tracing::debug!(?kind, jsonrpc_id, "registering pending sync request");
         self.sync.insert(kind, PendingEntry { jsonrpc_id, kind });
     }
 
+    /// Take (and clear) the pending synchronous entry of the given kind, if any.
     pub fn take_sync(&mut self, kind: &PendingKind) -> Option<PendingEntry> {
         let entry = self.sync.remove(kind);
         if let Some(ref e) = entry {
@@ -125,11 +156,13 @@ impl PendingRequests {
         entry
     }
 
+    /// Register an active streaming prompt for the given session.
     pub fn insert_prompt(&mut self, session_id: &str, prompt: ActivePrompt) {
         tracing::debug!(session_id, "registering active prompt");
         self.prompts.insert(session_id.to_string(), prompt);
     }
 
+    /// Take (and clear) the active prompt for the given session, if any.
     pub fn take_prompt(&mut self, session_id: &str) -> Option<ActivePrompt> {
         let prompt = self.prompts.remove(session_id);
         if prompt.is_some() {
@@ -138,6 +171,7 @@ impl PendingRequests {
         prompt
     }
 
+    /// Borrow the active prompt for the given session without removing it.
     #[must_use]
     pub fn get_prompt(&self, session_id: &str) -> Option<&ActivePrompt> {
         self.prompts.get(session_id)

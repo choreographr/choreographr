@@ -1,3 +1,15 @@
+//! Daemon-message dispatch: turn decoded protocol events into UI callbacks.
+//!
+//! [`dispatch_daemon_message`] is the entry point the connection layer (and
+//! any front-end) calls for every [`DaemonMessage`] it reads. It routes each
+//! message to the [`TurnEventHandler`] methods the front-end implements, so
+//! the TUI and GUI share one wire-to-UI mapping instead of decoding the
+//! protocol themselves. The dispatch splits the two message families —
+//! session-scoped [`SessionEvent`]s (wrapped in the `Session` envelope) and
+//! the flat connection/reply variants — and enumerates every variant
+//! explicitly, so a new wire variant forces a compile-time decision here
+//! rather than being silently swallowed.
+
 use choreo_proto::{
     DaemonMessage, OutputStream, ReasoningCapability, SessionEvent, SessionStatus, TokenUsage, Turn,
 };
@@ -5,24 +17,39 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use tracing::{debug, warn};
 
+/// A tool-call lifecycle event, resolved from the wire's
+/// `ToolCall{Started,Finished,Failed}` session events for
+/// [`TurnEventHandler::handle_tool_call_event`].
 #[derive(Debug, Clone)]
 pub enum ToolCallEvent {
+    /// A tool call started; carries the invocation details.
     Started {
+        /// The daemon-assigned id correlating this call's streamed result
+        /// chunks and terminal event.
         call_id: String,
+        /// The tool's registered name (e.g. `read_file`).
         tool_name: String,
+        /// The call's arguments as the model supplied them, serialized JSON.
         arguments_json: String,
         /// Human-readable invocation description from `ToolCallStarted` (e.g.
         /// "Running command: `cargo build`.") so clients can render the tool's
         /// context immediately, before any streaming output arrives.
         invocation_description: String,
     },
+    /// A tool call completed successfully.
     Finished {
+        /// The id correlating this call's result chunks.
         call_id: String,
+        /// The tool's registered name.
         tool_name: String,
     },
+    /// A tool call failed.
     Failed {
+        /// The id correlating this call's result chunks.
         call_id: String,
+        /// The tool's registered name.
         tool_name: String,
+        /// The failure message the tool reported.
         error: String,
     },
 }
@@ -30,23 +57,47 @@ pub enum ToolCallEvent {
 /// Grouped payload for [`TurnEventHandler::handle_session_state`].
 #[derive(Debug, Clone)]
 pub struct SessionStateData {
+    /// The session this state describes.
     pub session_id: u64,
+    /// The session's turns keyed by turn id, in turn order.
     pub turns: BTreeMap<u32, Turn>,
+    /// The session title, if set.
     pub title: Option<String>,
+    /// The model currently selected for the session, if pinned.
     pub selected_model: Option<String>,
+    /// The tool groups currently active on the session.
     pub active_tool_groups: Vec<String>,
+    /// Cumulative token usage for the session, when known.
     pub token_usage: Option<TokenUsage>,
+    /// The model's context-window size in tokens, once resolved.
     pub context_window: Option<u32>,
+    /// The prompt-token count of the most recent request.
     pub last_prompt_tokens: Option<u32>,
+    /// The session's current lifecycle status.
     pub status: SessionStatus,
+    /// The session's current reasoning-effort setting, if any.
     pub reasoning_effort: Option<String>,
+    /// The selected model's reasoning capability, once the catalog resolves
+    /// it.
     pub reasoning_capability: Option<ReasoningCapability>,
 }
 
+/// The callback surface a front-end implements to receive dispatched daemon
+/// events.
+///
+/// Each method corresponds to a client-visible wire event; the dispatcher
+/// ([`dispatch_daemon_message`]) is the only caller. Implementors own their
+/// render state and update it here — the trait itself carries no state.
+/// Methods with a default body are events most front-ends can ignore.
 pub trait TurnEventHandler {
+    /// A turn was appended to the session, given its id and full [`Turn`].
     fn handle_turn_appended(&mut self, session_id: u64, turn_id: u32, turn: Turn);
+    /// The turns with the given ids were undone.
     fn handle_turns_undone(&mut self, session_id: u64, turn_ids: &[u32]);
+    /// The given turns were redone (keyed by turn id, in turn order).
     fn handle_turns_redone(&mut self, session_id: u64, turns: BTreeMap<u32, Turn>);
+    /// A chunk of streamed output (`stream`) arrived for `request_id`,
+    /// carrying `data` (lossily converted to UTF-8).
     fn handle_request_stream(
         &mut self,
         session_id: u64,
@@ -54,6 +105,8 @@ pub trait TurnEventHandler {
         stream: OutputStream,
         data: Cow<'_, str>,
     );
+    /// A request started on `request_id`, producing turn `turn_id` with the
+    /// given estimated prompt-token count.
     fn handle_started(
         &mut self,
         session_id: u64,
@@ -61,6 +114,8 @@ pub trait TurnEventHandler {
         turn_id: u32,
         estimated_prompt_tokens: u32,
     );
+    /// A request completed, with the final token usage and last prompt-token
+    /// count (either `None` when the model reported none).
     fn handle_done(
         &mut self,
         session_id: u64,
@@ -68,8 +123,12 @@ pub trait TurnEventHandler {
         token_usage: Option<TokenUsage>,
         last_prompt_tokens: Option<u32>,
     );
+    /// A request failed or was cancelled. `session_id` is `None` for
+    /// connection-level failures with no originating session.
     fn handle_failed(&mut self, session_id: Option<u64>, request_id: u32, error: String);
+    /// A tool-call lifecycle event occurred for `request_id`.
     fn handle_tool_call_event(&mut self, session_id: u64, request_id: u32, event: ToolCallEvent);
+    /// A chunk of raw tool-result bytes arrived for `call_id` on `request_id`.
     fn handle_tool_result_chunk(
         &mut self,
         session_id: u64,
@@ -77,10 +136,17 @@ pub trait TurnEventHandler {
         call_id: String,
         data: Vec<u8>,
     );
+    /// The session's full state snapshot arrived (at subscribe time and on
+    /// change).
     fn handle_session_state(&mut self, state: SessionStateData);
+    /// A human-readable status line arrived for display.
     fn handle_status_text(&mut self, text: String);
+    /// An error message arrived for display.
     fn handle_error(&mut self, error: String);
+    /// This client became attached to `session_id`.
     fn handle_session_attached(&mut self, session_id: u64);
+    /// A session this client created was confirmed, with its initial
+    /// metadata.
     fn handle_session_created(
         &mut self,
         session_id: u64,
@@ -90,12 +156,15 @@ pub trait TurnEventHandler {
         selected_model: Option<String>,
         reasoning_effort: Option<String>,
     );
+    /// A session's lifecycle status changed; `last_modified` is the daemon's
+    /// update timestamp in milliseconds.
     fn handle_session_status_changed(
         &mut self,
         session_id: u64,
         status: SessionStatus,
         last_modified: i64,
     );
+    /// A session's cumulative token usage advanced.
     fn handle_token_usage_update(
         &mut self,
         session_id: u64,

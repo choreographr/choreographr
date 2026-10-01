@@ -1,3 +1,11 @@
+//! Builders for the config options the bridge advertises to the editor.
+//!
+//! Each function returns a [`ConfigOption`]
+//! describing one editable setting (`model`, `reasoning_effort`, or
+//! `tool_groups`) that the bridge reports in `initialize` and session results.
+//! They are pure constructors over the daemon's current state — no daemon I/O
+//! happens here.
+
 use crate::acp_jsonrpc::{ConfigOption, ConfigOptionType, ConfigOptionValue, SelectOption};
 
 /// Build a `"model"` config option from the daemon's model list.

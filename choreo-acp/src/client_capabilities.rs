@@ -1,3 +1,11 @@
+//! Storage for the capabilities the editor declares during `initialize`.
+//!
+//! ACP lets the editor advertise optional features (filesystem read/write
+//! proxying, terminal proxying, prompt content types). The bridge records them
+//! here so later decisions can consult them; in v1 every tool call still runs
+//! through the daemon, so the store is informational except for the queries
+//! [`ClientCapabilitiesStore`] exposes.
+
 use crate::acp_jsonrpc::ClientCapabilities;
 
 /// Stores the capabilities declared by the editor during `initialize`.
@@ -9,10 +17,13 @@ use crate::acp_jsonrpc::ClientCapabilities;
 /// the daemon (the default).
 #[derive(Debug, Default)]
 pub struct ClientCapabilitiesStore {
+    /// The capabilities last declared by the editor, or `None` before
+    /// `initialize` (or if the editor sent no `capabilities` block).
     pub capabilities: Option<ClientCapabilities>,
 }
 
 impl ClientCapabilitiesStore {
+    /// Create an empty store (no capabilities recorded yet).
     #[must_use]
     pub fn new() -> Self {
         Self { capabilities: None }

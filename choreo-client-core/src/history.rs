@@ -1,3 +1,11 @@
+//! The client-side session transcript view.
+//!
+//! [`SessionView`] holds the turn history a front-end renders and routes the
+//! daemon's streaming events (`OutputChunk`, tool-result chunks, …) into the
+//! right turn. It owns the `turn_id → Turn` and `request_id → turn_id`
+//! mappings plus a bounded stash of tool-call descriptions, so the TUI/GUI
+//! need not track that correlation themselves.
+
 use choreo_proto::{AssistantToolCallRecord, OutputStream, ToolResultRecord, Turn};
 use choreo_sanitize::{MAX_TOOL_OUTPUT_BYTES, TRUNCATION_SUFFIX};
 use std::collections::{BTreeMap, HashMap};
@@ -68,6 +76,7 @@ pub struct SessionView {
 }
 
 impl SessionView {
+    /// An empty view for a freshly attached session.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -77,6 +86,10 @@ impl SessionView {
         }
     }
 
+    /// Insert `turn` under `turn_id`, replacing any accumulated turn with the
+    /// same id. Replacing also drops the invocation-description stash entries
+    /// for the replaced turn's calls, keeping that stash map bounded by
+    /// in-flight calls.
     pub fn insert_or_replace(&mut self, turn_id: u32, turn: Turn) {
         // Once the authoritative turn (with the final records) replaces the
         // accumulated one, no more chunks arrive for its calls — drop their
@@ -104,21 +117,25 @@ impl SessionView {
         }
     }
 
+    /// The turn with `turn_id`, if present.
     #[must_use]
     pub fn get(&self, turn_id: u32) -> Option<&Turn> {
         self.turns.get(&turn_id)
     }
 
+    /// The turn with `turn_id`, mutable, if present.
     pub fn get_mut(&mut self, turn_id: u32) -> Option<&mut Turn> {
         self.turns.get_mut(&turn_id)
     }
 
+    /// The turn currently associated with the streaming `request_id`, if any.
     #[must_use]
     pub fn request_turn(&self, request_id: u32) -> Option<&Turn> {
         let turn_id = self.request_to_turn.get(&request_id)?;
         self.turns.get(turn_id)
     }
 
+    /// The turn associated with `request_id`, mutable, if any.
     pub fn request_turn_mut(&mut self, request_id: u32) -> Option<&mut Turn> {
         let turn_id = self.request_to_turn.get(&request_id)?;
         self.turns.get_mut(turn_id)
@@ -268,6 +285,7 @@ impl SessionView {
         }
     }
 
+    /// Iterate the view's turns as `(turn_id, turn)` pairs in turn order.
     pub fn iter(&self) -> impl Iterator<Item = (&u32, &Turn)> {
         self.turns.iter()
     }

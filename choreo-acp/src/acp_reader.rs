@@ -1,3 +1,12 @@
+//! The stdin reader thread that turns editor lines into events.
+//!
+//! The editor speaks newline-delimited JSON-RPC 2.0 on the bridge's stdin.
+//! This module owns the dedicated thread that reads those lines, parses each
+//! into an [`RpcMessage`](crate::acp_jsonrpc::RpcMessage), and forwards it to
+//! the main event loop over the shared event channel. Reaching EOF is reported
+//! as [`Event::AcpEof`] so the loop can
+//! shut down once the editor disconnects.
+
 use crossbeam_channel::Sender;
 use std::io::{BufRead, BufReader};
 use std::thread;

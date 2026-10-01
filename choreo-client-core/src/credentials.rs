@@ -1,3 +1,16 @@
+//! Connect-time keystore handshake and credential-message building.
+//!
+//! A daemon's credential keystore is TOFU: it adopts a key only through
+//! `ClientMessage::BindKeystore`, and `Unlock`/`AddCredential` are verify-only
+//! against that adopted key. This module owns the client half of that design —
+//! resolving the unlock key already associated with an address
+//! ([`resolve_private_key`], [`try_auto_unlock_key`]), minting and
+//! pre-send-recording a fresh binding key for an unbound daemon
+//! ([`bind_fresh_daemon`], [`KeystoreAutoBind`]), and building the encrypted
+//! `AddCredential` message ([`build_add_credential_message`]). The invariant
+//! running through all of it: the store is written only on a daemon
+//! confirmation (or, for a bind, before send), never optimistically.
+
 use base64::Engine as _;
 use choreo_keystore::ServiceCredential;
 use choreo_proto::ClientMessage;
@@ -429,7 +442,13 @@ pub enum AutoBindAttempt {
     /// for the targeted `DaemonMessage::Bound` confirmation (`record_unlock_key`
     /// re-records the already-persisted key, so the confirm is a no-op-safe
     /// uniform path).
-    Bind { key: [u8; 32], msg: ClientMessage },
+    Bind {
+        /// The freshly-minted binding key, recorded into `known_servers`
+        /// before the message is sent.
+        key: [u8; 32],
+        /// The `BindKeystore` message carrying that same key.
+        msg: ClientMessage,
+    },
     /// Bind-loop guard: a `BindKeystore` was already minted on this
     /// connection. The caller must NOT re-mint; it surfaces its own
     /// "reconnect to retry" UI.
@@ -439,7 +458,11 @@ pub enum AutoBindAttempt {
     /// (an unrecorded bind key risks an unrecoverable orphaned binding).
     /// The latch stays set; the caller surfaces the error (structured, not a
     /// pre-flattened string — keep the cause type for future UI branching).
-    Failed { error: ClientError },
+    Failed {
+        /// The structured error that refused the bind (a store load or
+        /// pre-send persist failure).
+        error: ClientError,
+    },
 }
 
 /// Trigger the once-per-connection auto-bind of an unbound daemon — the

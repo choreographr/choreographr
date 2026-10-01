@@ -1,3 +1,11 @@
+//! Client-side model of a unified diff for the front-ends to render.
+//!
+//! Front-ends receive diffs as plain text from tool output; these types give
+//! that text a structured shape (file → hunks → classified lines) so a UI can
+//! colour and collapse it without re-parsing the patch. The model is purely
+//! descriptive — parsing lives with whoever produces the diff — and holds no
+//! rendering opinion, so each front-end is free to lay it out its own way.
+
 /// Classifies a single line in a unified diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffLineKind {
@@ -12,7 +20,10 @@ pub enum DiffLineKind {
 /// A single line in a diff hunk, with its kind and text content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffLine {
+    /// Whether this line is context, an addition, or a deletion.
     pub kind: DiffLineKind,
+    /// The line's text WITHOUT its leading diff marker (the space, `+`, or
+    /// `-`), which is implied by `kind` so renderers need not strip it.
     pub content: String,
 }
 
@@ -21,14 +32,19 @@ pub struct DiffLine {
 pub struct DiffHunk {
     /// The `@@ -a,b +c,d @@` header line.
     pub header: String,
+    /// The hunk's lines in file order, each classified by [`DiffLineKind`].
     pub lines: Vec<DiffLine>,
 }
 
 /// Represents the full diff for one file, containing one or more hunks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDiff {
+    /// The pre-image path (the `a/…` side of the header).
     pub old_path: String,
+    /// The post-image path (the `b/…` side of the header); differs from
+    /// `old_path` only for renames.
     pub new_path: String,
+    /// The file's hunks in file order; empty for a file with no changes.
     pub hunks: Vec<DiffHunk>,
 }
 

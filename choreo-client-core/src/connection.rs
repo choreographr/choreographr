@@ -1,3 +1,16 @@
+//! Daemon-connection entry points: dial, handshake, and serve.
+//!
+//! Every `run_daemon_*` function takes the UI's outgoing-message channel plus
+//! an optional shutdown channel, and blocks on a reader loop until the daemon
+//! closes the stream — pairing a writer thread that drains the UI channel
+//! (biased, so queued messages flush before a stop) with the reader thread
+//! that forwards each decoded message to the caller's handler. The variants
+//! split by transport ([`ConnectionMode`]): Unix socket, TCP/Noise IK (pinned
+//! or explicit key), TCP/Noise XX first contact, and an in-process channel
+//! pair to an embedded daemon. The preflight helpers ([`probe_server_key`],
+//! [`verify_daemon_authorization`], [`own_transport_pubkey`]) let a front-end
+//! establish trust and enrollment before committing to a session.
+
 use crate::error::ClientError;
 use choreo_proto::{
     ClientMessage, DaemonMessage, ProtoError, UnixStream, connect_unix, read_message, write_message,
@@ -199,7 +212,13 @@ pub enum ConnectionMode {
     UnixSocket(String),
     /// Connect via TCP/Noise IK at the given address with the server's
     /// 32-byte X25519 public key (resolved before constructing this variant).
-    Tcp { addr: String, server_pk: [u8; 32] },
+    Tcp {
+        /// The `host:port` to dial.
+        addr: String,
+        /// The server's 32-byte X25519 static public key, which the Noise IK
+        /// handshake authenticates.
+        server_pk: [u8; 32],
+    },
     /// Connect via TCP/Noise IK against the key PINNED in
     /// `known_servers.toml` for the address. The pin is loaded at connect
     /// time; a handshake failure is reported WITH the pinned fingerprint and
@@ -214,7 +233,11 @@ pub enum ConnectionMode {
     /// embedded path. client-core never links choreo-daemon: the GUI (the
     /// owner of the `EmbeddedDaemon`) creates the link and hands over the ends.
     InProcess {
+        /// The client→daemon channel end: the writer forwards UI messages
+        /// here.
         daemon_tx: CrossbeamSender<ClientMessage>,
+        /// The daemon→client channel end the reader loop drains until the
+        /// daemon drops its sender.
         daemon_rx: CrossbeamReceiver<DaemonMessage>,
     },
 }
@@ -359,7 +382,7 @@ fn ik_handshake_and_serve(
 /// made — the gating is by construction, not by convention.
 ///
 /// Otherwise identical to [`run_daemon_tcp_connection`] (same reader/writer
-/// thread shape, same shutdown semantics — see [`serve_noise_connection`]).
+/// thread shape, same shutdown semantics — see `serve_noise_connection`).
 ///
 /// # Errors
 ///
@@ -640,7 +663,8 @@ pub fn verify_daemon_authorization(addr: &str, server_pk: &[u8; 32]) -> Result<(
 /// to (the server's key changed).
 ///
 /// Errors if no pin exists for `addr` — callers must resolve first contact
-/// (probe + confirm + [`KnownServers::pin`]) before using this mode.
+/// (probe + confirm + [`crate::known_servers::KnownServers::pin`]) before
+/// using this mode.
 ///
 /// # Errors
 ///

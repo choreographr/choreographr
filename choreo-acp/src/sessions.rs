@@ -1,3 +1,12 @@
+//! The ACP↔daemon session-ID mapping and per-session state.
+//!
+//! The daemon identifies sessions by numeric id; ACP identifies them by string
+//! id (`"sess_<counter>"`). [`SessionManager`] keeps the bidirectional mapping,
+//! the per-session config/state ([`AcpSession`]), and the active-prompt guard
+//! that enforces ACP's rule against concurrent prompts on one session. It also
+//! mints the monotonically-increasing daemon request ids used to tag streaming
+//! turns.
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -54,6 +63,7 @@ impl Default for SessionManager {
 }
 
 impl SessionManager {
+    /// Create an empty manager with no sessions.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -99,15 +109,18 @@ impl SessionManager {
         self.by_daemon_id.insert(daemon_id, owned);
     }
 
+    /// Borrow the session for an ACP session id.
     #[must_use]
     pub fn get(&self, acp_id: &str) -> Option<&AcpSession> {
         self.sessions.get(acp_id)
     }
 
+    /// Mutably borrow the session for an ACP session id.
     pub fn get_mut(&mut self, acp_id: &str) -> Option<&mut AcpSession> {
         self.sessions.get_mut(acp_id)
     }
 
+    /// Look up the ACP session id for a daemon session id.
     #[must_use]
     pub fn get_by_daemon_id(&self, daemon_id: u64) -> Option<&str> {
         self.by_daemon_id.get(&daemon_id).map(String::as_str)

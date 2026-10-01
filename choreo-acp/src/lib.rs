@@ -1,3 +1,50 @@
+//! The Agent Client Protocol (ACP) bridge for Choreographr.
+//!
+//! `choreo-acp` is the adapter that lets an ACP-speaking editor (Zed and
+//! friends) drive a Choreographr daemon. It speaks newline-delimited JSON-RPC
+//! 2.0 on stdin/stdout to the editor and the MessagePack-framed `choreo-proto`
+//! protocol to the daemon's Unix socket, translating between the two.
+//!
+//! ## Module layout
+//!
+//! - [`acp_handler`] — the single-threaded event loop and the request /
+//!   notification / daemon-message dispatch that turns ACP calls into daemon
+//!   messages and back.
+//! - [`acp_jsonrpc`] — the JSON-RPC 2.0 wire types and the ACP protocol
+//!   payload types (initialize, session management, prompt, config options,
+//!   streaming updates).
+//! - [`acp_reader`] — the stdin reader thread that parses editor lines into
+//!   [`acp_jsonrpc::RpcMessage`] values and feeds the shared event channel.
+//! - [`daemon_client`] — the daemon Unix-socket reader/writer threads and the
+//!   unified [`Event`](daemon_client::Event) type the event loop consumes.
+//! - [`client_capabilities`] — the store of editor capabilities declared
+//!   during `initialize`.
+//! - [`config`] — builders for the `model`, `reasoning_effort`, and
+//!   `tool_groups` config options the adapter advertises.
+//! - [`sessions`] — the bidirectional ACP↔daemon session-ID mapping and the
+//!   per-session prompt guard.
+//! - [`pending`] — in-flight request tracking that routes asynchronous daemon
+//!   replies (sync responses and streaming turn events) back to their
+//!   originating JSON-RPC calls.
+//! - [`streaming`] — the translation of daemon `SessionEvent`s into ACP
+//!   `session/update` notifications.
+//! - [`error`] — the crate-wide [`AcpError`] type.
+//!
+//! ## Threading model
+//!
+//! The bridge is three threads joined by one crossbeam event channel: the
+//! stdin reader and the daemon reader each send [`Event`](daemon_client::Event)
+//! values into it, and the main thread runs the event loop over the single
+//! receiver. A separate daemon writer thread consumes `ClientMessage`s sent
+//! over its own channel. The event loop is single-threaded and all I/O is
+//! blocking, so the per-loop state ([`sessions::SessionManager`],
+//! [`pending::PendingRequests`]) needs no locking.
+
+// Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
+// every public item carries docs, enforced as a hard error by clippy-strict's
+// `-D warnings`.
+#![warn(missing_docs)]
+
 pub mod acp_handler;
 pub mod acp_jsonrpc;
 pub mod acp_reader;
@@ -94,7 +141,7 @@ fn setup_logging(log_file: &str, verbosity: Verbosity) {
 ///
 /// # Errors
 ///
-/// Returns an error when the given [`Cli`] arguments fail to parse
+/// Returns an error when the given `Cli` arguments fail to parse
 /// (`error = ...` returned by clap-derived parsing) or when daemon
 /// initialization fails. A user-C-cancellation returns `Err` with the
 /// propagated [`anyhow::Error`].

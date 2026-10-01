@@ -1,32 +1,65 @@
+//! The crate-wide error type.
+//!
+//! [`ClientError`] is the single error every fallible entry point in this
+//! crate returns. It flattens the underlying transport/protocol/I/O failures
+//! into one `thiserror` enum so callers in the TUI, GUI, and IM bridge can
+//! match on a small, stable set of cases, and it converts into [`std::io::Error`]
+//! so a connection thread can propagate through generic `io`-shaped plumbing.
+
 use choreo_proto::ProtoError;
 use std::io;
 use thiserror::Error;
 
+/// Errors surfaced by the client-core connection, keystore, and credential
+/// paths.
+///
+/// Variants that wrap an underlying error via `#[from]` are transparent in
+/// their `Display`; the rest carry a human-readable message the front-ends
+/// present verbatim.
 #[derive(Error, Debug)]
 pub enum ClientError {
+    /// A wire-protocol framing or decode error (see [`ProtoError`]).
     #[error(transparent)]
     Proto(#[from] ProtoError),
+    /// An I/O failure on a socket, the config store, or a filesystem read.
     #[error(transparent)]
     Io(#[from] io::Error),
+    /// A protocol payload was not valid UTF-8 where text was expected.
     #[error(transparent)]
     Utf8(#[from] std::string::FromUtf8Error),
 
+    /// No unlock key could be resolved for the addressed daemon, so the
+    /// caller cannot unlock it. The string is the address; the remedy (store
+    /// an `unlock_key` in `known_servers.toml`, or `/unlock`) is in the
+    /// message.
     #[error(
         "no unlock key available for {0}: add `unlock_key` (base64) to known_servers.toml, or run /unlock <base64 unlock-key>"
     )]
     NoUnlockKey(String),
+    /// The legacy raw private-key file could not be read; the string carries
+    /// the underlying I/O error.
     #[error("failed to read private key: {0}")]
     PrivateKeyRead(String),
+    /// The private-key file exists but is not the expected 32 bytes.
     #[error("invalid private key file: expected 32 bytes")]
     PrivateKeyInvalid,
+    /// A public-key file could not be read; the string carries the
+    /// underlying I/O error.
     #[error("failed to read public key: {0}")]
     PublicKeyRead(String),
+    /// A public-key file exists but is not a valid key.
     #[error("invalid public key file")]
     PublicKeyInvalid,
+    /// A credential's typed fields could not be parsed for the requested
+    /// credential type; the string explains which field or type was wrong.
     #[error("{0}")]
     CredentialParse(String),
+    /// The credential blob could not be postcard-serialized; the string is
+    /// the serializer's error.
     #[error("postcard serialization failed: {0}")]
     Postcard(String),
+    /// The credential blob could not be encrypted to the daemon's unlock
+    /// public key; the string is the crypto error.
     #[error("encryption failed: {0}")]
     Encryption(String),
     /// Daemon autostart (the caller-provided `ensure_daemon` hook of

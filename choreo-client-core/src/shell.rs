@@ -1,9 +1,20 @@
+//! The client-side command-line parser shared by the front-ends.
+//!
+//! [`parse_input_line`] turns a line typed into a TUI input box into a
+//! [`Command`]: a slash-prefixed command becomes a structured variant
+//! (either a [`ClientMessage`] to send or a local-UI action), while a plain
+//! line becomes a `RunInput` message carrying a fresh request id. It is pure
+//! syntax — decoding and validation of keys and credentials happen where
+//! those values are owned — so the same parser drives every front-end, and
+//! [`command_echo`] renders the canonical transcript form of a parsed command.
+
 use choreo_proto::ClientMessage;
 use tracing::debug;
 
 const INVALID_ACCOUNT_NAME: &str =
     "account name must be lowercase alphanumeric, hyphens, or underscores";
 
+/// How a bare or keyed `/unlock` should resolve its key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnlockMethod {
     /// Unlock with the key ALREADY associated with this daemon: the stored
@@ -18,27 +29,43 @@ pub enum UnlockMethod {
     Key(String),
 }
 
+/// A parsed input line: either a message to send to the daemon or a local-UI
+/// action the front-end handles itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    /// Send this pre-built message to the daemon verbatim.
     Send(ClientMessage),
+    /// Unlock the daemon keystore, by the given [`UnlockMethod`].
     Unlock {
+        /// Where the unlock key comes from (stored/legacy, or a supplied key).
         method: UnlockMethod,
     },
+    /// Add a credential, from the typed field strings (the front-end resolves
+    /// the unlock key and builds the wire message).
     AddCredential {
+        /// The service the credential is for.
         service: String,
+        /// The credential type (`api_key`, `x`, …) selecting the field layout.
         credential_type: String,
+        /// The type-specific field values, in the order `credential_type`
+        /// defines.
         fields: Vec<String>,
     },
+    /// Remove the stored credential for a service.
     RemoveCredential {
+        /// The service whose credential is removed.
         service: String,
     },
     /// `/acl add <base64-pubkey>` — enroll a new client in the daemon's
     /// ACL. Rejected by the daemon unless this connection is local (Unix
     /// socket): the approver must be physically at the machine.
     AclAdd {
+        /// The base64-encoded 32-byte transport public key to enroll.
         pubkey: String,
     },
+    /// Undo the last turn on the attached session.
     Undo,
+    /// Redo the last undone turn on the attached session.
     Redo,
     /// Continue a stopped/idle session — sends a "Please continue." prompt
     /// to the currently attached session.
@@ -49,6 +76,8 @@ pub enum Command {
     /// Refresh the models.dev catalog from upstream (conditional GET against
     /// the cached etag). `--force` bypasses the etag.
     RefreshModels {
+        /// Whether to bypass the cached etag and force an unconditional
+        /// fetch.
         force: bool,
     },
     /// `/quit` — exit the TUI.
@@ -64,8 +93,13 @@ pub enum Command {
     ReasoningCycle,
     /// `/reasoning list` — list the available reasoning levels.
     ReasoningList,
+    /// `/cancel` with a non-numeric argument; carries the offending argument
+    /// so the front-end can show a usage error.
     InvalidCancel(String),
+    /// A slash command with no matching parse arm; carries the rest of the
+    /// line for the error message.
     UnknownCommand(String),
+    /// An empty (whitespace-only) line — nothing to do.
     Empty,
 }
 
@@ -245,6 +279,14 @@ fn parse_model_command(rest: &str) -> Option<Command> {
     None
 }
 
+/// Parse a line of user input into a [`Command`].
+///
+/// A plain (non-slash) non-empty line becomes a `ClientMessage::RunInput` and
+/// consumes `next_request_id`, which is then incremented — the caller owns
+/// the id counter, so successive prompts get distinct request ids that route
+/// the daemon's streaming replies. Slash commands (`/name …`) never touch the
+/// counter; unknown ones come back as [`Command::UnknownCommand`].
+#[must_use]
 pub fn parse_input_line(line: &str, next_request_id: &mut u32) -> Command {
     let line = line.trim();
     if line.is_empty() {
@@ -499,6 +541,13 @@ fn parse_command(rest: &str) -> Command {
     Command::UnknownCommand(format!("unknown command: /{rest}"))
 }
 
+/// The canonical one-line echo for a parsed [`Command`], or `None` when the
+/// command should not be echoed (e.g. a plain prompt, which the front-end
+/// renders as the user's message).
+///
+/// Used to show a transcript entry for commands that do not otherwise produce
+/// visible output. Secret-bearing arguments (an unlock key) are deliberately
+/// omitted from the echo.
 #[must_use]
 pub fn command_echo(command: &Command) -> Option<String> {
     match command {
