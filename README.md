@@ -335,12 +335,13 @@ is up, attach a client (`choreo-tui`; the bridges via `cargo run -p choreo-im`
 / `-p choreo-acp`)
 and follow
 [First conversation](#first-conversation) below. The daemon listens on the
-Unix socket `/tmp/Choreographr.sock` and stores its data under
+Unix socket `$XDG_RUNTIME_DIR/choreographr.sock` and stores its data under
 `~/.local/share/choreographr/` (see [Configuration](#configuration)).
 You don't strictly need to start the daemon yourself: when `choreo-tui`'s
 connection attempt finds nothing listening on the socket, it autostarts one
 (a private daemon spawned with `--auto-exit`, which shuts down when the last
-client disconnects; daemon logs land in `$TMPDIR/choreo-daemon-<pid>.log`),
+client disconnects; daemon logs land in
+`$XDG_STATE_HOME/choreographr/daemon-<pid>.log`),
 and a second `choreographr` refuses to start while another daemon is already
 listening.
 
@@ -398,9 +399,10 @@ cargo run --release -p choreo-acp      # ACP bridge for editors
 ```
 
 Each client accepts the same `-v`/`-q` flags as the daemon. The TUI and GUI
-write diagnostics to `$TMPDIR/choreo-tui-<pid>.log` and
-`$TMPDIR/choreo-gui-<pid>.log`; the ACP adapter writes to its `--log-file`
-(default `$TMPDIR/choreo-acp.log`).
+write diagnostics to `$XDG_STATE_HOME/choreographr/tui-<pid>.log` and
+`$XDG_STATE_HOME/choreographr/gui-<pid>.log` (falling back to the platform temp
+dir where there is no XDG state dir); the ACP adapter writes to its `--log-file`
+(default `$XDG_STATE_HOME/choreographr/acp.log`, else the temp dir).
 
 ### First conversation
 
@@ -628,7 +630,8 @@ the binding is created once via the `BindKeystore` wire path (TOFU-once), and
 the legacy raw `identity.pk` file is an unlock-verification fallback that is
 copied into `known_servers.toml` on first use (never deleted, never binds).
 
-The socket path defaults to `/tmp/choreographr.sock` (override with
+The socket path defaults to `$XDG_RUNTIME_DIR/choreographr.sock` (or
+`/tmp/choreographr.sock` when no runtime dir is available; override with
 `CHOREOGRAPHR_SOCKET_PATH`). The database path defaults to
 `~/.local/share/choreographr/state.redb` (override with `CHOREOGRAPHR_DB_PATH`).
 Turn history (conversation text, tool output, reasoning) is stored
@@ -650,13 +653,18 @@ longer carry their own `max_turns`.
 the platform defaults:
 
 ```text
-{base}/config/choreographr/   config.toml, accounts.toml, mcp_servers.json,
-                              models-overlay.toml, authorized_clients.toml,
-                              identity.pk, transport.sec/.pub, known_servers.toml
-{base}/data/choreographr/     state.redb, catalog.bin
-{base}/run/choreographr.sock
-{base}/log/<binary>.log
+{base}/config/   config.toml, accounts.toml, mcp_servers.json,
+                 models-overlay.toml, authorized_clients.toml,
+                 identity.pk, transport.sec/.pub, known_servers.toml
+{base}/data/     state.redb, catalog.bin
+{base}/run/      choreographr.sock
+{base}/log/      <binary>.log
 ```
+
+(The default layout is the XDG split — `$XDG_CONFIG_HOME/choreographr`,
+`$XDG_DATA_HOME/choreographr`, the socket in `$XDG_RUNTIME_DIR`, logs in
+`$XDG_STATE_HOME/choreographr`; a base adds no `choreographr` segment because its
+parent is already app-private.)
 
 It is **opt-in**: with no `--base-dir` (and no `CHOREOGRAPHR_BASE_DIR`) every
 path resolves exactly as before, so existing installs are unaffected.
@@ -1264,9 +1272,10 @@ choreographr`).
 
 ## Troubleshooting
 
-- `choreo-tui` writes its diagnostics to `$TMPDIR/choreo-tui-<pid>.log`
-  (platform temp dir — set `TMPDIR` to relocate); check there for client-side
-  issues, and pass `-v`/`-vv` for more detail.
+- `choreo-tui` writes its diagnostics to
+  `$XDG_STATE_HOME/choreographr/tui-<pid>.log` (falling back to the platform
+  temp dir); check there for client-side issues, and pass `-v`/`-vv` for more
+  detail.
 - The daemon logs to stderr; use `-v`/`-vv` for more detail, or set
   `RUST_LOG`. Every binary takes the same `-v`/`-q` flags (explicit flags win
   over `RUST_LOG`).

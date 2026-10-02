@@ -1,27 +1,40 @@
 //! Filesystem layout resolution for the Choreographr instance.
 //!
 //! Every suite crate resolves its on-disk locations through this module, so a
-//! single override relocates the whole instance — config, data, socket, and
-//! logs together. Two layouts exist:
+//! single override relocates the whole instance. Two layouts exist:
 //!
-//! - **Default.** The platform dirs: `dirs::config_dir()/choreographr` for
-//!   config, `dirs::data_dir()/choreographr` for data, and the platform temp
-//!   dir for the socket. With no override, these are byte-for-byte the
-//!   historical locations, so existing installs keep working untouched.
-//! - **Base dir.** When `CHOREOGRAPHR_BASE_DIR` is set — the `--base-dir` flag
-//!   the binaries accept writes it (see [`set_base_dir_from_cli`]) — every
-//!   per-instance location lives under it:
+//! - **Default (XDG).** Each category resolves through its own XDG base
+//!   directory, exactly as the specification mandates — there is deliberately
+//!   no single XDG base:
 //!
 //!   ```text
-//!   {base}/config/choreographr/
-//!   {base}/data/choreographr/
-//!   {base}/run/choreographr.sock
-//!   {base}/log/<binary>.log
+//!   $XDG_CONFIG_HOME/choreographr/   config.toml, accounts.toml, transport.*, …
+//!   $XDG_DATA_HOME/choreographr/     state.redb, catalog.bin
+//!   $XDG_RUNTIME_DIR/choreographr.sock
+//!   $XDG_STATE_HOME/choreographr/    <binary>.log
 //!   ```
 //!
-//! Precedence is **base dir over the platform dirs**; the file-specific
-//! `CHOREOGRAPHR_DB_PATH` / `CHOREOGRAPHR_SOCKET_PATH` overrides still win over
-//! both, so one file can be pinned independently of the rest.
+//!   `dirs::{runtime,state}_dir()` are `None` off Linux (and `$XDG_RUNTIME_DIR`
+//!   can be unset in a bare environment), so the socket and logs fall back to
+//!   the platform temp dir there — the spec's "replacement directory" posture.
+//!
+//! - **Base dir.** When `CHOREOGRAPHR_BASE_DIR` is set — the `--base-dir` flag
+//!   the binaries accept writes it (see [`set_base_dir_from_cli`]) — the
+//!   instance is relocated under one private root. Because that root plays the
+//!   role of the whole XDG home, the `choreographr` segment is dropped (the
+//!   parent is already app-private), unlike the default where each parent is
+//!   shared:
+//!
+//!   ```text
+//!   {base}/config/   config.toml, accounts.toml, transport.*, …
+//!   {base}/data/     state.redb, catalog.bin
+//!   {base}/run/      choreographr.sock
+//!   {base}/log/      <binary>.log
+//!   ```
+//!
+//! The file-specific `CHOREOGRAPHR_DB_PATH` / `CHOREOGRAPHR_SOCKET_PATH`
+//! overrides still win over both layouts, so one file can be pinned
+//! independently of the rest.
 //!
 //! The override travels by environment rather than in-process state: the
 //! socket path is resolved in `choreo-proto` (which has no reason to know about
@@ -33,12 +46,12 @@
 //!
 //! # Legacy layout note
 //!
-//! The default config and data roots are two separate platform dirs, so they
-//! cannot both be expressed as one base. [`default_config_dir`] and
-//! [`default_data_dir`] always return the *platform-default* locations
-//! (ignoring any base override); `choreographr migrate` uses them as the source
-//! when moving an existing install into a base dir.
+//! [`default_config_dir`] / [`default_data_dir`] always return the
+//! *platform-default* locations (ignoring any base override); `choreographr
+//! migrate` uses them as the source when copying an existing install into a
+//! base dir.
 
+use std::cell::RefCell;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -58,9 +71,12 @@ const RUN_SUBDIR: &str = "run";
 /// Directory (inside the base) holding the per-binary log files.
 const LOG_SUBDIR: &str = "log";
 
-/// The one subdirectory every location hangs off, matching the historical
-/// `choreographr` segment under the platform dirs.
+/// The app namespace segment used under the SHARED platform dirs (the default
+/// XDG layout). Deliberately absent under a base, whose parent is app-private.
 const APP_SUBDIR: &str = "choreographr";
+
+/// The socket file name, used under both layouts.
+const SOCKET_NAME: &str = "choreographr.sock";
 
 /// Apply a `--base-dir` value from a parsed CLI, if any.
 ///
@@ -122,8 +138,8 @@ pub fn default_data_dir() -> io::Result<PathBuf> {
     })
 }
 
-/// The config root: `{base}/config/choreographr` when a base is set, else the
-/// platform default.
+/// The config root: `{base}/config` when a base is set, else the platform
+/// default (`dirs::config_dir()/choreographr`).
 ///
 /// # Errors
 ///
@@ -135,8 +151,8 @@ pub fn config_dir() -> io::Result<PathBuf> {
     }
 }
 
-/// The data root: `{base}/data/choreographr` when a base is set, else the
-/// platform default.
+/// The data root: `{base}/data` when a base is set, else the platform default
+/// (`dirs::data_dir()/choreographr`).
 ///
 /// # Errors
 ///
@@ -166,40 +182,52 @@ pub fn data_file(name: &str) -> io::Result<PathBuf> {
     Ok(data_dir()?.join(name))
 }
 
-/// The runtime directory (`{base}/run`), or `None` when no base is set.
+/// The default socket path: `{base}/run/choreographr.sock` under a base, else
+/// `$XDG_RUNTIME_DIR/choreographr.sock`.
 ///
-/// The default layout keeps the socket in the platform temp dir; only a base
-/// gives it a stable, instance-owned home.
+/// Returns `None` when neither a base nor an XDG runtime dir is available
+/// (macOS/Windows, or a bare environment with `$XDG_RUNTIME_DIR` unset), so the
+/// caller falls back to the platform temp dir.
 #[must_use]
-pub fn run_dir() -> Option<PathBuf> {
-    base_dir().map(|b| run_dir_under(&b))
+pub fn default_socket_path() -> Option<PathBuf> {
+    match base_dir() {
+        Some(base) => Some(socket_path_under(&base)),
+        None => dirs::runtime_dir().map(|d| d.join(SOCKET_NAME)),
+    }
 }
 
-/// The base-derived socket path (`{base}/run/choreographr.sock`), or `None`
-/// when no base is set (the caller falls back to the platform temp dir).
-#[must_use]
-pub fn base_socket_path() -> Option<PathBuf> {
-    base_dir().map(|b| socket_path_under(&b))
-}
-
-/// The base-derived log directory (`{base}/log`), or `None` when no base is
-/// set.
-#[must_use]
-pub fn log_dir() -> Option<PathBuf> {
-    base_dir().map(|b| b.join(LOG_SUBDIR))
-}
-
-/// The default log file for `binary` under a base dir
-/// (`{base}/log/<binary>.log`), creating the log directory if needed.
+/// The base-derived log file for `binary` (`{base}/log/<binary>.log`),
+/// creating the log directory if needed; `None` without a base.
 ///
-/// Returns `None` when no base is set (the caller keeps its own default, such
-/// as a pid-keyed temp file or stderr). A create failure is not fatal here:
-/// the caller's log-file open will fail too and degrade to no file logging.
+/// For the always-stderr binaries (the daemon and the IM bridge) — they keep
+/// the console/journald as their default sink and only write a file when a base
+/// relocates them.
+#[must_use]
+pub fn base_log_file(binary: &str) -> Option<PathBuf> {
+    let base = base_dir()?;
+    Some(log_file_in(&base.join(LOG_SUBDIR), binary))
+}
+
+/// The default log file for a file-logging `binary`.
+///
+/// Under a base: `{base}/log/<binary>.log`. Otherwise the XDG state dir
+/// (`$XDG_STATE_HOME/choreographr/<binary>.log`), or `None` when the state dir
+/// is unavailable (macOS/Windows) so the caller keeps its own fallback.
 #[must_use]
 pub fn log_file_default(binary: &str) -> Option<PathBuf> {
-    let dir = log_dir()?;
-    let _ = std::fs::create_dir_all(&dir);
-    Some(dir.join(format!("{binary}.log")))
+    log_dir().map(|dir| log_file_in(&dir, binary))
+}
+
+/// The log/state directory: the test override, else `{base}/log`, else
+/// `$XDG_STATE_HOME/choreographr`.
+fn log_dir() -> Option<PathBuf> {
+    if let Some(dir) = TEST_LOG_DIR.with(|c| c.borrow().clone()) {
+        return Some(dir);
+    }
+    if let Some(base) = base_dir() {
+        return Some(base.join(LOG_SUBDIR));
+    }
+    dirs::state_dir().map(|d| d.join(APP_SUBDIR))
 }
 
 /// Whether a base-dir layout (config or data root) already exists under `base`.
@@ -233,19 +261,60 @@ pub fn warn_if_base_shadows_legacy_install() {
 }
 
 fn config_dir_under(base: &Path) -> PathBuf {
-    base.join(CONFIG_SUBDIR).join(APP_SUBDIR)
+    base.join(CONFIG_SUBDIR)
 }
 
 fn data_dir_under(base: &Path) -> PathBuf {
-    base.join(DATA_SUBDIR).join(APP_SUBDIR)
-}
-
-fn run_dir_under(base: &Path) -> PathBuf {
-    base.join(RUN_SUBDIR)
+    base.join(DATA_SUBDIR)
 }
 
 fn socket_path_under(base: &Path) -> PathBuf {
-    run_dir_under(base).join("choreographr.sock")
+    base.join(RUN_SUBDIR).join(SOCKET_NAME)
+}
+
+/// Create `dir` and return `dir/<binary>.log`. A create failure is not fatal:
+/// the caller's log-file open fails too and degrades to no file logging.
+fn log_file_in(dir: &Path, binary: &str) -> PathBuf {
+    let _ = std::fs::create_dir_all(dir);
+    dir.join(format!("{binary}.log"))
+}
+
+thread_local! {
+    /// Test-only override for the log directory. When set, `log_file_default`
+    /// writes under it instead of the base/state dir, so tests never create a
+    /// log in the developer's real `$XDG_STATE_HOME`.
+    ///
+    /// Deliberately NOT `#[cfg(test)]`-gated: integration tests compile the
+    /// crate without `cfg(test)`, so the hook must exist in normal builds too
+    /// (it is a no-op unless explicitly set).
+    static TEST_LOG_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Set the log-directory test override (see `TEST_LOG_DIR`).
+#[doc(hidden)]
+pub fn set_test_log_dir(dir: Option<PathBuf>) {
+    TEST_LOG_DIR.with(|c| c.replace(dir));
+}
+
+/// Guard that resets the log-directory test override on drop, even on panic.
+#[doc(hidden)]
+pub struct TestLogDirGuard;
+
+#[doc(hidden)]
+impl TestLogDirGuard {
+    /// Set the log directory, returning a guard that resets it to `None`.
+    #[must_use]
+    pub fn set(dir: Option<PathBuf>) -> Self {
+        set_test_log_dir(dir);
+        TestLogDirGuard
+    }
+}
+
+#[doc(hidden)]
+impl Drop for TestLogDirGuard {
+    fn drop(&mut self) {
+        set_test_log_dir(None);
+    }
 }
 
 #[cfg(test)]
@@ -253,15 +322,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_dir_under_nests_config_and_app() {
+    fn config_dir_under_has_no_app_segment() {
         let path = config_dir_under(Path::new("/inst"));
-        assert_eq!(path, PathBuf::from("/inst/config/choreographr"));
+        assert_eq!(path, PathBuf::from("/inst/config"));
     }
 
     #[test]
-    fn data_dir_under_nests_data_and_app() {
+    fn data_dir_under_has_no_app_segment() {
         let path = data_dir_under(Path::new("/inst"));
-        assert_eq!(path, PathBuf::from("/inst/data/choreographr"));
+        assert_eq!(path, PathBuf::from("/inst/data"));
     }
 
     #[test]
@@ -271,22 +340,20 @@ mod tests {
     }
 
     #[test]
-    fn log_file_name_is_binary_keyed() {
-        let dir = Path::new("/inst").join(LOG_SUBDIR);
-        assert_eq!(
-            dir.join("daemon.log"),
-            PathBuf::from("/inst/log/daemon.log")
-        );
-    }
-
-    #[test]
-    fn default_roots_ignore_a_base_override() {
-        // default_config_dir / default_data_dir are the platform locations by
-        // definition; setting the env var must not consume them. We assert the
-        // Ok shape without asserting a specific OS path.
+    fn default_roots_keep_the_app_segment() {
+        // The platform dirs are SHARED (e.g. ~/.config), so they keep the app
+        // namespace; a base (whose parent is app-private) does not.
         let cfg = default_config_dir().unwrap();
         assert!(cfg.ends_with(APP_SUBDIR));
         let data = default_data_dir().unwrap();
         assert!(data.ends_with(APP_SUBDIR));
+    }
+
+    #[test]
+    fn log_file_default_honors_the_test_override() {
+        let temp = std::env::temp_dir().join("choreo-paths-log-override");
+        let _guard = TestLogDirGuard::set(Some(temp.clone()));
+        let path = log_file_default("tui-1").unwrap();
+        assert_eq!(path, temp.join("tui-1.log"));
     }
 }

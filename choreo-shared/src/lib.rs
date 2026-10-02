@@ -11,9 +11,9 @@
 //! - [`logging`] — the shared `-v`/`-q` verbosity flags, the log-level
 //!   resolution every binary applies identically, and the one hardened
 //!   pid-keyed log-file opener the file-only binaries share.
-//! - [`paths`] — the one filesystem-layout resolver: the platform-default
-//!   config/data/socket locations and the `--base-dir` override that relocates
-//!   an entire instance under a single root.
+//! - [`paths`] — the one filesystem-layout resolver: the XDG config/data/
+//!   runtime/state locations and the `--base-dir` override that relocates an
+//!   entire instance under a single root.
 //!
 //! It is deliberately a *leaf* (deps: `clap`, `dirs`, `tracing`, and
 //! `tracing-subscriber` only) and holds no protocol or transport logic —

@@ -478,20 +478,25 @@ and `LoggingConfig::resolve`, the one place the suite's level policy lives (see
 
 ### The base directory (`--base-dir`)
 
-By default every path resolves through the platform dirs, exactly as it always
-has (`dirs::config_dir()/choreographr`, `dirs::data_dir()/choreographr`, the
-platform temp dir for the socket) — an existing install is untouched. The
+By default each path resolves through its own XDG base directory (the spec
+mandates no single base): `dirs::config_dir()/choreographr`,
+`dirs::data_dir()/choreographr`, the socket in `$XDG_RUNTIME_DIR`, and logs in
+`$XDG_STATE_HOME/choreographr` (the last two falling back to the platform temp
+dir where no runtime/state dir exists — macOS/Windows). The
 `--base-dir <PATH>` flag (all five binaries: `choreographr`, `choreo-tui`,
 `choreo-gui`, `choreo-acp`, `choreo-im`) — or the `CHOREOGRAPHR_BASE_DIR`
-environment variable — relocates the WHOLE instance under one root:
+environment variable — relocates the WHOLE instance under one root. Because the
+base plays the role of the entire XDG home, its parents are already
+app-private, so the `choreographr` segment is dropped (unlike the default,
+where `~/.config` / `~/.local/share` are shared):
 
 ```text
-{base}/config/choreographr/   config.toml, accounts.toml, mcp_servers.json,
-                              models-overlay.toml, authorized_clients.toml,
-                              identity.pk, transport.sec/.pub, known_servers.toml
-{base}/data/choreographr/     state.redb, catalog.bin
-{base}/run/choreographr.sock
-{base}/log/<binary>.log
+{base}/config/   config.toml, accounts.toml, mcp_servers.json,
+                 models-overlay.toml, authorized_clients.toml,
+                 identity.pk, transport.sec/.pub, known_servers.toml
+{base}/data/     state.redb, catalog.bin
+{base}/run/      choreographr.sock
+{base}/log/      <binary>.log
 ```
 
 Precedence: `--base-dir` / `CHOREOGRAPHR_BASE_DIR` over the platform dirs; the
@@ -524,7 +529,8 @@ only for the filesystem-layout resolver (the base-dir-aware socket default).
 It also owns the two unix-socket-path helpers every side of the wire must agree
 on: `socket_path()` (the `CHOREOGRAPHR_SOCKET_PATH`-aware default, which falls
 back to `default_socket_path()` — `{base}/run/choreographr.sock` under a base
-dir, else the platform temp dir) and the
+dir, else `$XDG_RUNTIME_DIR/choreographr.sock`, else the platform temp dir) and
+the
 dial primitives `connect_unix` / `socket_listening` / `dial_error_means_no_listener`
 (with the platform-resolved `UnixStream` re-export: std on unix, `uds_windows`
 on Windows). Keeping the dial and its "nothing is listening" classification
@@ -1649,7 +1655,7 @@ the SIBLING
 `choreographr` binary (same directory as its own executable, via
 `current_exe` — so both must be installed side by side, which the
 .tarball/.deb/binstall layouts already guarantee) as a detached child with
-`--auto-exit --log-file $TMPDIR/choreo-daemon-<tui-pid>.log`, polls the
+`--auto-exit --log-file <state-dir>/choreographr/daemon-<tui-pid>.log`, polls the
 socket (100 ms interval, 5 s budget — waiting for OUR OWN spawned child, not
 probing a foreign daemon) via `choreo_proto::socket_listening` and returns; the
 connection is then retried.
@@ -3194,7 +3200,7 @@ event is a deliberate follow-up).
 
 **Database:** `~/.local/share/choreographr/state.redb` (override via `CHOREOGRAPHR_DB_PATH` env var)
 
-**Socket path:** `/tmp/Choreographr.sock` (override via `CHOREOGRAPHR_SOCKET_PATH` env var)
+**Socket path:** `$XDG_RUNTIME_DIR/choreographr.sock` (falls back to `/tmp/choreographr.sock` when no runtime dir; override via `CHOREOGRAPHR_SOCKET_PATH` env var)
 
 **Tool loop limit:** `CHOREOGRAPHR_MAX_TURNS` env var overrides `config.toml` `max_turns`. Resolution
 chain: `CHOREOGRAPHR_MAX_TURNS` env var → `config.toml` → default 0 (unlimited).
@@ -3210,8 +3216,10 @@ flag parsing (`Verbosity`) and the level resolution (`LoggingConfig::resolve`)
 live once in `choreo-shared::logging`, so all five binaries — daemon, TUI, GUI,
 IM, and ACP — share the exact same policy. Subscriber construction stays
 per-crate because destinations differ: the daemon logs to stderr or `--log-file`,
-the TUI and GUI to `$TMPDIR/choreo-tui-<pid>.log` / `choreo-gui-<pid>.log`, and
-the ACP adapter to `--log-file` (default `$TMPDIR/choreo-acp.log`).
+the TUI and GUI to `$XDG_STATE_HOME/choreographr/tui-<pid>.log` /
+`gui-<pid>.log`, and the ACP adapter to `--log-file` (default
+`$XDG_STATE_HOME/choreographr/acp.log`) — all three falling back to the platform
+temp dir where no XDG state dir exists.
 
 **Session persistence:** On daemon start, sessions are loaded from the database into
 `session_metadata` (in-memory). Model selection (`/model <name>`) updates both the

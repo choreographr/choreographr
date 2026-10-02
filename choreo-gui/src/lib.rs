@@ -340,19 +340,19 @@ pub fn main() {
     dioxus::launch(App);
 }
 
-/// Initialize file logging to `{base}/log/gui.log` under a base dir, else
-/// `$TMPDIR/choreo-gui-<pid>.log`.
+/// Initialize file logging to `{base}/log/gui-<pid>.log` under a base dir, else
+/// `$XDG_STATE_HOME/choreographr/gui-<pid>.log`, else `$TMPDIR/choreo-gui-<pid>.log`.
 ///
-/// The platform temp dir (not a hardcoded `/tmp`) keeps this working on
+/// The platform temp dir (not a hardcoded `/tmp`) keeps the fallback working on
 /// Termux/Android, where `/tmp` is not writable, and the pid-keyed name lets
 /// parallel instances coexist. A failure to create the log degrades to no file
 /// logging (an event before a subscriber exists is dropped) — logging is never
 /// a startup precondition. ANSI is off (escape codes are unreadable in a file);
 /// the shared `env_filter` sets the level exactly as every other binary does.
 fn init_file_logging(env_filter: EnvFilter) {
-    let log_path = choreo_shared::paths::log_file_default("gui").unwrap_or_else(|| {
-        std::env::temp_dir().join(format!("choreo-gui-{}.log", std::process::id()))
-    });
+    let pid = std::process::id();
+    let log_path = choreo_shared::paths::log_file_default(&format!("gui-{pid}"))
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("choreo-gui-{pid}.log")));
     // Owner-only (0600) and symlink-refusing via the shared opener: the
     // platform temp dir is shared and the pid-keyed name is predictable, so a
     // planted symlink or a world-readable file must not divert or expose the

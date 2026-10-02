@@ -41,8 +41,8 @@ pub fn run(base: &Path, do_move: bool, dry_run: bool, force: bool) -> anyhow::Re
         .context("could not resolve the platform-default data directory")?;
 
     let pairs = [
-        (config_src, base.join(CONFIG_SUBDIR).join("choreographr")),
-        (data_src, base.join(DATA_SUBDIR).join("choreographr")),
+        (config_src, base.join(CONFIG_SUBDIR)),
+        (data_src, base.join(DATA_SUBDIR)),
     ];
     let total = migrate(&pairs, do_move, dry_run, force)?;
 

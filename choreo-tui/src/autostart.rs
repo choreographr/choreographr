@@ -40,14 +40,18 @@ pub(crate) fn daemon_binary_path(exe_dir: &Path) -> PathBuf {
     exe_dir.join(name)
 }
 
-/// The daemon's log file path: under the PLATFORM temp dir (TMPDIR-aware —
-/// see `init_file_logging` for the Termux rationale), keyed by the TUI's OWN
-/// pid. The child's pid is unknowable before spawn via `std::process::Command`
-/// (`Command` has no pre-spawn handle), so the TUI pid is the unique key that
-/// distinguishes parallel spawns from different TUI instances sharing one
-/// machine — each spawn gets its own log file and never clobbers another's.
+/// The daemon's log file path: `{base}/log/daemon-<tui-pid>.log` under a base
+/// dir, else `$XDG_STATE_HOME/choreographr/daemon-<tui-pid>.log`, else under
+/// the PLATFORM temp dir (TMPDIR-aware — see `init_file_logging` for the Termux
+/// rationale), keyed by the TUI's OWN pid. The child's pid is unknowable before
+/// spawn via `std::process::Command` (`Command` has no pre-spawn handle), so
+/// the TUI pid is the unique key that distinguishes parallel spawns from
+/// different TUI instances sharing one machine — each spawn gets its own log
+/// file and never clobbers another's.
 pub(crate) fn daemon_log_path() -> PathBuf {
-    std::env::temp_dir().join(format!("choreo-daemon-{}.log", std::process::id()))
+    let pid = std::process::id();
+    choreo_shared::paths::log_file_default(&format!("daemon-{pid}"))
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("choreo-daemon-{pid}.log")))
 }
 
 /// Wait for the daemon WE JUST SPAWNED to come up: poll the socket path until
@@ -196,19 +200,30 @@ mod tests {
     }
 
     #[test]
-    fn daemon_log_path_is_under_the_platform_temp_dir() {
-        // Mirrors the TUI log-path contract: TMPDIR-aware platform temp dir,
-        // pid-keyed name so parallel TUI spawns never clobber each other.
+    fn daemon_log_path_is_pid_keyed_under_state_or_temp() {
+        // The daemon log follows the shared log policy: the XDG state dir
+        // (`$XDG_STATE_HOME/choreographr/<name>.log`) when available, else the
+        // TMPDIR-aware platform temp dir. The pid keeps parallel TUI spawns
+        // from clobbering each other.
+        let pid = std::process::id();
         let path = daemon_log_path();
-        assert_eq!(
-            path.parent(),
-            Some(std::env::temp_dir().as_path()),
-            "the daemon log must be under env::temp_dir(), got {path:?}"
-        );
         let name = path.file_name().and_then(|n| n.to_str()).expect("utf8");
         assert!(
-            name.starts_with("choreo-daemon-") && name.to_lowercase().ends_with(".log"),
-            "the log name must be choreo-daemon-<pid>.log, got {name}"
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("log")),
+            "log name must end in .log, got {name}"
+        );
+        assert!(
+            name.contains(&pid.to_string()),
+            "log name must be pid-keyed, got {name}"
+        );
+        let state = dirs::state_dir().map(|d| d.join("choreographr"));
+        let temp = std::env::temp_dir();
+        let parent = path.parent().expect("has parent");
+        assert!(
+            Some(parent) == state.as_deref() || parent == temp,
+            "{path:?} must be under the state dir or the temp dir"
         );
     }
 

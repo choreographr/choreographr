@@ -148,7 +148,7 @@ pub fn main() -> anyhow::Result<()> {
 /// `{base}/log/im.log` (a bridge is often detached from a terminal); otherwise
 /// they stay on stderr. `.with_target(false)` keeps the log lines terse.
 fn init_logging(filter: tracing_subscriber::EnvFilter) {
-    if let Some(log_path) = choreo_shared::paths::log_file_default("im")
+    if let Some(log_path) = choreo_shared::paths::base_log_file("im")
         && let Some(file) = choreo_shared::logging::create_log_file(&log_path)
     {
         fmt()

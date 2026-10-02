@@ -707,8 +707,9 @@ Then the **manual daemon smoke test** (the tarball smoke test only checks
 `--version`/`--help`; CI's `scripts/daemon-smoke.sh` covers this normally):
 
 1. Extract the tarball, run `./choreographr` — confirm the socket
-   (`choreographr.sock` under the platform temp dir, i.e.
-   `/tmp/choreographr.sock` on Linux) and keystore initialize.
+   (`choreographr.sock` in `$XDG_RUNTIME_DIR`, i.e.
+   `/run/user/<uid>/choreographr.sock` on Linux, or `/tmp/choreographr.sock`
+   when no runtime dir is set) and keystore initialize.
 2. Load the bundled `com.choreographr.daemon.plist` in a throwaway launch
    agents dir; confirm the daemon starts and logs to `/tmp/choreographr.log`.
 3. Run `./choreo-tui` and complete one round-trip with a configured account.

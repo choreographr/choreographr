@@ -479,17 +479,18 @@ pub fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Initialize file logging to `$TMPDIR/choreo-tui-<pid>.log` and return the
-/// path, or `None` when the log file cannot be created.
+/// Initialize file logging to `$XDG_STATE_HOME/choreographr/tui-<pid>.log`
+/// (or `{base}/log/tui-<pid>.log` under `--base-dir`) and return the path, or
+/// `None` when the log file cannot be created.
 ///
-/// The platform temp dir (not a hardcoded `/tmp`) is essential: on
-/// Android/Termux there is no writable `/tmp`, and a bare `?` on the
-/// log-file create used to kill the TUI before it started with a context-
-/// free "Permission denied (os error 13)" — logging is auxiliary
-/// diagnostics and must never be a startup precondition. `env::temp_dir()`
-/// respects `TMPDIR` (Termux sets it to its prefix tmp dir); any remaining
-/// failure degrades this run to no file logging (tracing events are then
-/// simply dropped — no subscriber is installed).
+/// Where neither a base nor an XDG state dir exists (macOS/Windows), this falls
+/// back to the platform temp dir (not a hardcoded `/tmp`) — essential on
+/// Android/Termux where there is no writable `/tmp`, where a bare `?` on the
+/// log-file create used to kill the TUI before it started with a context-free
+/// "Permission denied (os error 13)". Logging is auxiliary diagnostics and must
+/// never be a startup precondition: any failure degrades this run to no file
+/// logging (tracing events are then simply dropped — no subscriber is
+/// installed).
 ///
 /// `env_filter` sets the subscriber's level exactly as every other binary does.
 /// It is applied via `fmt()` (NOT `registry().with(fmt::layer())`): a bare
@@ -518,15 +519,17 @@ fn init_file_logging(env_filter: EnvFilter) -> Option<std::path::PathBuf> {
     Some(log_path)
 }
 
-/// The per-process log file path: `{base}/log/tui.log` under a base dir,
-/// otherwise under the PLATFORM temp dir (respects `TMPDIR` — critical on
-/// Termux/Android where `/tmp` is not writable), named with the pid so parallel
-/// instances do not clobber each other.
+/// The per-process log file path: `{base}/log/tui-<pid>.log` under a base dir,
+/// otherwise `$XDG_STATE_HOME/choreographr/tui-<pid>.log`, otherwise (no state
+/// dir — macOS/Windows) under the PLATFORM temp dir (respects `TMPDIR` —
+/// critical on Termux/Android where `/tmp` is not writable). The pid keeps
+/// parallel instances from clobbering each other.
 fn log_file_path() -> std::path::PathBuf {
-    if let Some(path) = choreo_shared::paths::log_file_default("tui") {
+    let pid = std::process::id();
+    if let Some(path) = choreo_shared::paths::log_file_default(&format!("tui-{pid}")) {
         return path;
     }
-    std::env::temp_dir().join(format!("choreo-tui-{}.log", std::process::id()))
+    std::env::temp_dir().join(format!("choreo-tui-{pid}.log"))
 }
 
 #[cfg(test)]
@@ -712,40 +715,46 @@ mod cli_tests {
 
     // ── File logging setup (the Termux /tmp regression) ────
 
-    /// The log file must live under the PLATFORM temp dir — never a
-    /// hardcoded `/tmp`. On Android/Termux `/tmp` is not writable and the
-    /// hardcoded path killed the TUI with a bare "Permission denied (os
-    /// error 13)" before the UI started.
+    /// The log file must be pid-keyed and land in the resolved log directory
+    /// (the test override here, so the test does not touch the developer's real
+    /// state dir; `$XDG_STATE_HOME/choreographr` in production) — never a bare
+    /// hardcoded path.
     #[test]
-    fn log_file_path_is_under_the_platform_temp_dir() {
+    fn log_file_path_is_pid_keyed_in_the_log_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _guard = choreo_shared::paths::TestLogDirGuard::set(Some(dir.path().to_path_buf()));
         let path = log_file_path();
+        assert_eq!(path.parent(), Some(dir.path()));
         assert_eq!(
-            path.parent(),
-            Some(std::env::temp_dir().as_path()),
-            "the log must be under env::temp_dir() (TMPDIR-aware), got {path:?}"
+            path,
+            dir.path().join(format!("tui-{}.log", std::process::id()))
         );
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .expect("utf8 name");
         assert!(
-            name.starts_with("choreo-tui-")
+            name.starts_with("tui-")
                 && std::path::Path::new(name)
                     .extension()
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("log")),
-            "the log name must be choreo-tui-<pid>.log, got {name}"
+            "the log name must be tui-<pid>.log, got {name}"
         );
     }
 
-    /// A writable temp dir must yield a created, writable log file (the
-    /// happy path). Sole caller of `init_file_logging` in the test suite:
-    /// it installs the process-global tracing subscriber, which must only
-    /// happen once per process.
+    /// A writable log dir must yield a created, writable log file (the happy
+    /// path). Sole caller of `init_file_logging` in the test suite: it installs
+    /// the process-global tracing subscriber, which must only happen once per
+    /// process. The override keeps the file out of the developer's real state
+    /// dir.
     #[test]
     fn init_file_logging_creates_the_log_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _guard = choreo_shared::paths::TestLogDirGuard::set(Some(dir.path().to_path_buf()));
         let path = init_file_logging(EnvFilter::new("info"))
-            .expect("a writable temp dir must yield a log file");
+            .expect("a writable dir must yield a log file");
         assert!(path.exists(), "the log file must have been created");
+        assert!(path.starts_with(dir.path()));
     }
 
     /// The shared `-v`/`-q` flags are flattened into the TUI's CLI, so `-vv`

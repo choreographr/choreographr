@@ -284,13 +284,14 @@ pub fn main() -> anyhow::Result<()> {
     // Logging init happens HERE — before any subcommand/state work — because
     // everything after it wants to log. Under a base dir with no explicit
     // `--log-file`, the daemon logs to `{base}/log/daemon.log` so a redirected
-    // instance keeps its diagnostics with it; otherwise it stays on stderr.
-    // With --log-file, open the file first and make failure fatal: a
-    // TUI-spawned daemon whose log path is bad must fail loudly with the path,
-    // not silently lose all diagnostics. ANSI is always off for file output
-    // (escape codes are unreadable in a log file).
+    // instance keeps its diagnostics with it; otherwise it stays on stderr (a
+    // standalone daemon's console/journald sink). With --log-file, open the
+    // file first and make failure fatal: a TUI-spawned daemon whose log path
+    // is bad must fail loudly with the path, not silently lose all
+    // diagnostics. ANSI is always off for file output (escape codes are
+    // unreadable in a log file).
     let log_file: Option<String> = cli.log_file.clone().or_else(|| {
-        choreo_shared::paths::log_file_default("daemon").map(|p| p.to_string_lossy().into_owned())
+        choreo_shared::paths::base_log_file("daemon").map(|p| p.to_string_lossy().into_owned())
     });
     if let Some(path) = &log_file {
         let file = open_log_file(path)?;
