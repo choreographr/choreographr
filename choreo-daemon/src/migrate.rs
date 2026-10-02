@@ -15,13 +15,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use choreo_shared::paths::{config_dir_under, data_dir_under};
 use tracing::info;
-
-/// Directory name under a base that holds the config root (mirrors
-/// `choreo_shared::paths`).
-const CONFIG_SUBDIR: &str = "config";
-/// Directory name under a base that holds the data root.
-const DATA_SUBDIR: &str = "data";
 
 /// Run the migration of the platform-default layout into `base`.
 ///
@@ -40,9 +35,12 @@ pub fn run(base: &Path, do_move: bool, dry_run: bool, force: bool) -> anyhow::Re
     let data_src = choreo_shared::paths::default_data_dir()
         .context("could not resolve the platform-default data directory")?;
 
+    // The destinations come from the shared resolver (not a local constant), so
+    // the migrate layout is the same base layout the daemon reads at runtime and
+    // the two can never drift apart.
     let pairs = [
-        (config_src, base.join(CONFIG_SUBDIR)),
-        (data_src, base.join(DATA_SUBDIR)),
+        (config_src, config_dir_under(base)),
+        (data_src, data_dir_under(base)),
     ];
     let total = migrate(&pairs, do_move, dry_run, force)?;
 
@@ -148,6 +146,20 @@ fn count_files(path: &Path) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn destinations_follow_the_shared_base_layout() {
+        // Pin migrate's destination to the shared resolver's base layout, so a
+        // future layout change breaks a test here too — not only in choreo-shared.
+        assert_eq!(
+            config_dir_under(Path::new("/inst")),
+            PathBuf::from("/inst/config")
+        );
+        assert_eq!(
+            data_dir_under(Path::new("/inst")),
+            PathBuf::from("/inst/data")
+        );
+    }
 
     #[test]
     fn copies_a_layout_preserving_files() {

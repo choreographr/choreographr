@@ -260,11 +260,23 @@ pub fn warn_if_base_shadows_legacy_install() {
     }
 }
 
-fn config_dir_under(base: &Path) -> PathBuf {
+/// The config root under a base dir: `{base}/config`.
+///
+/// This is the canonical under-base config root — `choreo_daemon::migrate`
+/// reuses it to compute its destination, so the layout has exactly one
+/// definition and the two cannot drift.
+#[must_use]
+pub fn config_dir_under(base: &Path) -> PathBuf {
     base.join(CONFIG_SUBDIR)
 }
 
-fn data_dir_under(base: &Path) -> PathBuf {
+/// The data root under a base dir: `{base}/data`.
+///
+/// This is the canonical under-base data root — `choreo_daemon::migrate`
+/// reuses it to compute its destination, so the layout has exactly one
+/// definition and the two cannot drift.
+#[must_use]
+pub fn data_dir_under(base: &Path) -> PathBuf {
     base.join(DATA_SUBDIR)
 }
 
