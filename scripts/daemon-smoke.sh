@@ -86,8 +86,10 @@ SCRATCH_CONFIG="$TMP/config"
 SCRATCH_STATE="$TMP/state"
 SCRATCH_RUNTIME="$TMP/run"
 mkdir -p "$SCRATCH_CONFIG" "$SCRATCH_STATE"
-# XDG_RUNTIME_DIR must be 0700 per the spec (the daemon puts its default socket
-# there when CHOREOGRAPHR_SOCKET_PATH is unset, and refuses a loose dir).
+# The spec requires XDG_RUNTIME_DIR to be 0700, and the process creating it is
+# responsible for that — so this scratch replacement sets the mode here.
+# The daemon resolves its default socket into $XDG_RUNTIME_DIR when
+# CHOREOGRAPHR_SOCKET_PATH is unset.
 mkdir -p "$SCRATCH_RUNTIME"
 chmod 700 "$SCRATCH_RUNTIME"
 DAEMON_LOG="$TMP/daemon.log"
