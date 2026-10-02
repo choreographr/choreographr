@@ -3031,8 +3031,8 @@ version = "0.2.3"
 dependencies = [
  "aes-gcm 0.11.1",
  "base64 0.23.1",
+ "choreo-shared",
  "crypto_secretbox",
- "dirs",
  "hkdf",
  "rand 0.10.3",
  "rand_core 0.10.1",
@@ -3088,6 +3088,7 @@ dependencies = [
 name = "choreo-proto"
 version = "0.2.3"
 dependencies = [
+ "choreo-shared",
  "rmp-serde",
  "serde",
  "serde_json",
@@ -3108,6 +3109,7 @@ name = "choreo-shared"
 version = "0.2.3"
 dependencies = [
  "clap",
+ "dirs",
  "tempfile",
  "tracing",
  "tracing-subscriber",
@@ -3130,7 +3132,7 @@ version = "0.2.3"
 dependencies = [
  "base64 0.23.1",
  "choreo-proto",
- "dirs",
+ "choreo-shared",
  "nix 0.31.3",
  "rand 0.10.3",
  "serial_test",

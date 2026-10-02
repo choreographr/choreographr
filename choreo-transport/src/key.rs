@@ -82,17 +82,19 @@ fn generate_keypair() -> ([u8; 32], [u8; 32]) {
 
 /// Directory that holds the transport keypair files (`<config>/choreographr`).
 ///
-/// Under test, `set_test_config_root` redirects this to a temp dir. This
-/// cannot be done via `XDG_CONFIG_HOME`: `dirs::config_dir()` honors it only
-/// on Linux — on macOS it always returns `$HOME/Library/Application Support`,
-/// so a test relying on it would write the keypair into the user's real
-/// config directory.
+/// Resolved through the shared [`choreo_shared::paths::config_dir`], so the
+/// `--base-dir` / `CHOREOGRAPHR_BASE_DIR` override relocates the keypair with
+/// the rest of the instance. Under test, `set_test_config_root` redirects this
+/// to a temp dir (and wins over the shared resolver). This env override is the
+/// portable seam: `XDG_CONFIG_HOME` cannot be used for it because
+/// `dirs::config_dir()` honors it only on Linux — on macOS it always returns
+/// `$HOME/Library/Application Support`, so a test relying on it would write the
+/// keypair into the user's real config directory.
 fn keypair_dir() -> Result<PathBuf, TransportError> {
     if let Some(root) = TEST_CONFIG_ROOT.with(|cell| cell.borrow().clone()) {
         return Ok(root.join("choreographr"));
     }
-    let config = dirs::config_dir().ok_or(TransportError::ConfigDirNotFound)?;
-    Ok(config.join("choreographr"))
+    choreo_shared::paths::config_dir().map_err(|_| TransportError::ConfigDirNotFound)
 }
 
 /// Path to the Noise IK static secret key (~/.config/choreographr/transport.sec)

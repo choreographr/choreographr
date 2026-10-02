@@ -22,19 +22,14 @@ pub struct DaemonConfig {
     pub cache_warming: CacheWarmingConfig,
 }
 
-/// Resolve the config.toml path (e.g. ~/.config/choreographr/config.toml).
+/// Resolve the config.toml path (e.g. ~/.config/choreographr/config.toml,
+/// or `{base}/config/choreographr/config.toml` under `--base-dir`).
 ///
 /// # Errors
 ///
-/// Returns Err if the user's standard config directory cannot be determined.
+/// Returns Err if the config directory cannot be determined.
 pub fn config_path() -> io::Result<PathBuf> {
-    let config_dir = dirs::config_dir().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "could not determine standard config directory",
-        )
-    })?;
-    Ok(config_dir.join("choreographr").join("config.toml"))
+    choreo_shared::paths::config_file("config.toml")
 }
 /// Load daemon-level configuration from config.toml.
 ///

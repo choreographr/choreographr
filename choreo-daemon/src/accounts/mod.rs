@@ -327,19 +327,14 @@ impl From<&AccountConfig> for choreo_ai_protocols::ProviderOverrides {
 /// resolver and the unified config watcher's subscription.
 pub const ACCOUNTS_TOML_NAME: &str = "accounts.toml";
 
-/// Resolve the accounts.toml path (e.g. ~/.config/choreographr/accounts.toml).
+/// Resolve the accounts.toml path (e.g. ~/.config/choreographr/accounts.toml,
+/// or `{base}/config/choreographr/accounts.toml` under `--base-dir`).
 ///
 /// # Errors
 ///
-/// Returns Err if the user's config directory cannot be determined.
+/// Returns Err if the config directory cannot be determined.
 pub fn accounts_config_path() -> io::Result<PathBuf> {
-    let config_dir = dirs::config_dir().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "could not determine config directory",
-        )
-    })?;
-    Ok(config_dir.join("choreographr").join("accounts.toml"))
+    choreo_shared::paths::config_file(ACCOUNTS_TOML_NAME)
 }
 
 /// Spawn the thin consumer that watches `accounts.toml` edits surfaced by the

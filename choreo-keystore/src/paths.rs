@@ -46,20 +46,22 @@ impl Drop for TestConfigGuard {
 
 /// Returns the config directory (`{config}/choreographr`).
 ///
-/// Under test, this can be overridden with [`set_test_config_root`].
+/// Resolved through the shared [`choreo_shared::paths::config_dir`], so the
+/// `--base-dir` / `CHOREOGRAPHR_BASE_DIR` override relocates the keystore
+/// alongside the rest of the instance. Under test, this can be overridden with
+/// [`set_test_config_root`] (which wins over the shared resolver).
 ///
 /// # Errors
 ///
 /// Returns [`KeystoreError::ConfigDirNotFound`] when the OS provides no
-/// configuration directory.
+/// configuration directory and no base dir is set.
 pub fn config_dir() -> Result<PathBuf, KeystoreError> {
     if let Some(root) = TEST_CONFIG_ROOT.with(|cell| cell.borrow().clone()) {
         let path = root.join("choreographr");
         debug!(?path, "config_dir (test override)");
         return Ok(path);
     }
-    let config_dir = dirs::config_dir().ok_or(KeystoreError::ConfigDirNotFound)?;
-    let path = config_dir.join("choreographr");
+    let path = choreo_shared::paths::config_dir().map_err(|_| KeystoreError::ConfigDirNotFound)?;
     debug!(?path, "resolved config directory");
     Ok(path)
 }

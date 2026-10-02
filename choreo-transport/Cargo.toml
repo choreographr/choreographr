@@ -11,10 +11,10 @@ rust-version.workspace = true
 
 [dependencies]
 choreo-proto.workspace = true
+choreo-shared.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 snow.workspace = true
-dirs.workspace = true
 x25519-dalek.workspace = true
 rand.workspace = true
 # Fingerprint rendering of transport public keys (base64, standard alphabet —

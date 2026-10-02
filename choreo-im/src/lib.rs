@@ -60,6 +60,12 @@ struct Cli {
     /// IM platform to bridge (e.g. telegram)
     platform: String,
 
+    /// Run the instance out of this base directory instead of the platform
+    /// defaults: `{base}/run` (the socket) and `{base}/log`. Equivalent to
+    /// exporting `CHOREOGRAPHR_BASE_DIR`.
+    #[arg(long = "base-dir", value_name = "PATH")]
+    base_dir: Option<std::path::PathBuf>,
+
     // Increase logging verbosity (-v debug, -vv trace)
     #[command(flatten)]
     verbosity: Verbosity,
@@ -78,16 +84,14 @@ pub fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let platform = cli.platform;
 
+    // Apply the base-dir override before any path (socket, log) is resolved.
+    choreo_shared::paths::set_base_dir_from_cli(cli.base_dir.clone());
+
     // Logging init AFTER arg parsing so the `-v`/`-q` flags can be honored
     // (flags win over RUST_LOG); the shared resolver keeps every binary's
     // policy identical.
     let logging = LoggingConfig::resolve(cli.verbosity);
-    // `.with_target(false)` keeps the bridge's log lines terse, matching its
-    // format before the shared logging wiring (which had dropped it).
-    fmt()
-        .with_env_filter(logging.filter.clone())
-        .with_target(false)
-        .init();
+    init_logging(logging.filter.clone());
     logging.emit_startup_logs();
 
     let path = socket_path();
@@ -138,6 +142,24 @@ pub fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Install the bridge's subscriber. Under a base dir, diagnostics go to
+/// `{base}/log/im.log` (a bridge is often detached from a terminal); otherwise
+/// they stay on stderr. `.with_target(false)` keeps the log lines terse.
+fn init_logging(filter: tracing_subscriber::EnvFilter) {
+    if let Some(log_path) = choreo_shared::paths::log_file_default("im")
+        && let Some(file) = choreo_shared::logging::create_log_file(&log_path)
+    {
+        fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init();
+        return;
+    }
+    fmt().with_env_filter(filter).with_target(false).init();
 }
 
 /// Connect-time keystore establishment: auto-unlock with the stored/legacy

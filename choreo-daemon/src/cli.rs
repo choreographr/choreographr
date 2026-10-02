@@ -6,6 +6,7 @@ use choreo_shared::clap_styles;
 use choreo_shared::logging::{LoggingConfig, Verbosity};
 use choreo_transport::key::ensure_transport_keypair;
 use clap::Parser;
+use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::fmt;
 
@@ -27,6 +28,14 @@ struct Cli {
     // Increase logging verbosity (-v debug, -vv trace)
     #[command(flatten)]
     verbosity: Verbosity,
+
+    /// Run the whole instance out of this base directory instead of the
+    /// platform defaults: `{base}/config`, `{base}/data`, `{base}/run`
+    /// (the socket), and `{base}/log`. Equivalent to exporting
+    /// `CHOREOGRAPHR_BASE_DIR`. Global so it works before the CLI, the daemon
+    /// (no subcommand), and the utility subcommands alike.
+    #[arg(long = "base-dir", value_name = "PATH", global = true)]
+    base_dir: Option<PathBuf>,
 
     /// Enable Prometheus metrics HTTP server on this socket address
     /// (e.g. 127.0.0.1:9464).  When absent no metrics server is started.
@@ -83,6 +92,20 @@ enum Command {
         /// Path to a 32-byte raw transport public key file
         #[arg(default_value = None)]
         path: Option<String>,
+    },
+    /// Move an existing platform-default install (config + data) into a base
+    /// dir, preserving the instance identity. Requires `--base-dir <PATH>`.
+    Migrate {
+        /// Move instead of copy (the default copy leaves the old layout in
+        /// place, so the migration is reversible).
+        #[arg(long = "move")]
+        move_: bool,
+        /// Report what would be transferred without touching the filesystem.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Merge into a non-empty destination instead of refusing.
+        #[arg(long = "force")]
+        force: bool,
     },
 }
 
@@ -245,6 +268,12 @@ fn open_log_file(path: &str) -> anyhow::Result<std::fs::File> {
 pub fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Apply the `--base-dir` override FIRST: it must be in the environment
+    // before any path (the log file, config.toml, the DB, the keystore, the
+    // socket) is resolved. Single-threaded here, so the contained `set_var` is
+    // sound.
+    choreo_shared::paths::set_base_dir_from_cli(cli.base_dir.clone());
+
     // Resolve the log configuration from the shared `-v`/`-q` flags. Explicit
     // flags win over RUST_LOG (the Unix precedence convention); the decision is
     // made here but the "flags take precedence" warning is emitted AFTER the
@@ -253,11 +282,17 @@ pub fn main() -> anyhow::Result<()> {
     let logging = LoggingConfig::resolve(cli.verbosity);
 
     // Logging init happens HERE — before any subcommand/state work — because
-    // everything after it wants to log. With --log-file, open the file first
-    // and make failure fatal: a TUI-spawned daemon whose log path is bad must
-    // fail loudly with the path, not silently lose all diagnostics. ANSI is
-    // always off for file output (escape codes are unreadable in a log file).
-    if let Some(path) = &cli.log_file {
+    // everything after it wants to log. Under a base dir with no explicit
+    // `--log-file`, the daemon logs to `{base}/log/daemon.log` so a redirected
+    // instance keeps its diagnostics with it; otherwise it stays on stderr.
+    // With --log-file, open the file first and make failure fatal: a
+    // TUI-spawned daemon whose log path is bad must fail loudly with the path,
+    // not silently lose all diagnostics. ANSI is always off for file output
+    // (escape codes are unreadable in a log file).
+    let log_file: Option<String> = cli.log_file.clone().or_else(|| {
+        choreo_shared::paths::log_file_default("daemon").map(|p| p.to_string_lossy().into_owned())
+    });
+    if let Some(path) = &log_file {
         let file = open_log_file(path)?;
         // `Mutex<File>` is a `MakeWriter`: each tracing event locks the file
         // briefly, serializing writes without any extra plumbing.
@@ -286,8 +321,22 @@ pub fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some(Command::Fingerprint { path }) => return fingerprint_cli(path.as_deref()),
+        Some(Command::Migrate {
+            move_,
+            dry_run,
+            force,
+        }) => {
+            let base = choreo_shared::paths::base_dir()
+                .context("migrate requires --base-dir <PATH> (or CHOREOGRAPHR_BASE_DIR)")?;
+            return crate::migrate::run(&base, *move_, *dry_run, *force);
+        }
         None => {}
     }
+
+    // Serve path only: a fresh empty base that shadows an existing install is
+    // almost certainly a mistake (a silent identity reset), so warn loudly
+    // before opening state.
+    choreo_shared::paths::warn_if_base_shadows_legacy_install();
 
     // The blockchain tools (EVM/Substrate) run on a tokio sidecar runtime owned
     // by the `choreo-blockchain` crate. Initialize it once at startup when the

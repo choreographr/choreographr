@@ -266,6 +266,13 @@ struct Cli {
     #[command(flatten)]
     verbosity: Verbosity,
 
+    /// Run the instance out of this base directory instead of the platform
+    /// defaults: `{config,data,run,log}` subdirectories under it. Equivalent
+    /// to exporting `CHOREOGRAPHR_BASE_DIR`. The embedded daemon and the
+    /// `gui-settings.toml` store both resolve through it.
+    #[arg(long = "base-dir", value_name = "PATH")]
+    base_dir: Option<std::path::PathBuf>,
+
     /// Connect via TCP/Noise IK at this address (e.g. 127.0.0.1:9443)
     #[arg(long = "tcp-addr")]
     tcp_addr: Option<String>,
@@ -285,9 +292,14 @@ struct Cli {
 pub fn main() {
     let cli = Cli::parse();
 
+    // Apply the `--base-dir` override before ANY path is resolved (the log
+    // file, the embedded daemon's DB/config, and the GUI settings store).
+    choreo_shared::paths::set_base_dir_from_cli(cli.base_dir.clone());
+
     // A windowed app has no reliable stderr (launched from a desktop icon it is
-    // lost), so diagnostics go to a pid-keyed file under the platform temp dir,
-    // selected by the shared `-v`/`-q`/RUST_LOG policy every other binary uses.
+    // lost), so diagnostics go to a file selected by the shared
+    // `-v`/`-q`/RUST_LOG policy every other binary uses: `{base}/log/gui.log`
+    // under a base dir, else a pid-keyed file under the platform temp dir.
     let logging = LoggingConfig::resolve(cli.verbosity);
     init_file_logging(logging.filter.clone());
     logging.emit_startup_logs();
@@ -328,7 +340,8 @@ pub fn main() {
     dioxus::launch(App);
 }
 
-/// Initialize file logging to `$TMPDIR/choreo-gui-<pid>.log`.
+/// Initialize file logging to `{base}/log/gui.log` under a base dir, else
+/// `$TMPDIR/choreo-gui-<pid>.log`.
 ///
 /// The platform temp dir (not a hardcoded `/tmp`) keeps this working on
 /// Termux/Android, where `/tmp` is not writable, and the pid-keyed name lets
@@ -337,7 +350,9 @@ pub fn main() {
 /// a startup precondition. ANSI is off (escape codes are unreadable in a file);
 /// the shared `env_filter` sets the level exactly as every other binary does.
 fn init_file_logging(env_filter: EnvFilter) {
-    let log_path = std::env::temp_dir().join(format!("choreo-gui-{}.log", std::process::id()));
+    let log_path = choreo_shared::paths::log_file_default("gui").unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("choreo-gui-{}.log", std::process::id()))
+    });
     // Owner-only (0600) and symlink-refusing via the shared opener: the
     // platform temp dir is shared and the pid-keyed name is predictable, so a
     // planted symlink or a world-readable file must not divert or expose the

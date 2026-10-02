@@ -628,7 +628,7 @@ the binding is created once via the `BindKeystore` wire path (TOFU-once), and
 the legacy raw `identity.pk` file is an unlock-verification fallback that is
 copied into `known_servers.toml` on first use (never deleted, never binds).
 
-The socket path defaults to `/tmp/Choreographr.sock` (override with
+The socket path defaults to `/tmp/choreographr.sock` (override with
 `CHOREOGRAPHR_SOCKET_PATH`). The database path defaults to
 `~/.local/share/choreographr/state.redb` (override with `CHOREOGRAPHR_DB_PATH`).
 Turn history (conversation text, tool output, reasoning) is stored
@@ -641,6 +641,33 @@ a `state.redb.bak-v1` backup.
 unlimited — the agent loop runs until the model produces a final answer, is
 cancelled, or hits an error). This is a daemon-wide cap; individual sessions no
 longer carry their own `max_turns`.
+
+### Base directory
+
+`--base-dir <PATH>` (on every binary — `choreographr`, `choreo-tui`,
+`choreo-gui`, `choreo-acp`, `choreo-im` — and equivalent to exporting
+`CHOREOGRAPHR_BASE_DIR`) relocates the whole instance under one root instead of
+the platform defaults:
+
+```text
+{base}/config/choreographr/   config.toml, accounts.toml, mcp_servers.json,
+                              models-overlay.toml, authorized_clients.toml,
+                              identity.pk, transport.sec/.pub, known_servers.toml
+{base}/data/choreographr/     state.redb, catalog.bin
+{base}/run/choreographr.sock
+{base}/log/<binary>.log
+```
+
+It is **opt-in**: with no `--base-dir` (and no `CHOREOGRAPHR_BASE_DIR`) every
+path resolves exactly as before, so existing installs are unaffected.
+`CHOREOGRAPHR_DB_PATH` and `CHOREOGRAPHR_SOCKET_PATH` still win over the base
+for their one file.
+
+To relocate an existing install, run `choreographr migrate --base-dir <PATH>`
+(copies config + data; `--move` moves instead, `--dry-run` previews, `--force`
+merges into a non-empty destination). Because the keystore files are copied
+verbatim, the server identity is preserved — clients keep their pinned server
+key and do not need to re-pair.
 
 ### Accounts
 

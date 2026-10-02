@@ -173,6 +173,13 @@ struct Cli {
     #[command(flatten)]
     verbosity: Verbosity,
 
+    /// Run the instance out of this base directory instead of the platform
+    /// defaults: `{base}/config`, `{base}/data`, `{base}/run` (the socket),
+    /// and `{base}/log`. Equivalent to exporting `CHOREOGRAPHR_BASE_DIR`; the
+    /// TUI-spawned daemon inherits it.
+    #[arg(long = "base-dir", value_name = "PATH")]
+    base_dir: Option<std::path::PathBuf>,
+
     /// Connect via TCP/Noise IK at this address (e.g. 127.0.0.1:9443)
     #[arg(long = "tcp-addr")]
     tcp_addr: Option<String>,
@@ -424,6 +431,12 @@ fn confirm_first_contact(
 pub fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Apply the `--base-dir` override before ANY path is resolved (the log file
+    // and, for a TCP connect, the transport keypair + known_servers). Setting
+    // the process env also propagates it to the daemon this TUI autostarts, so
+    // the child shares the instance root.
+    choreo_shared::paths::set_base_dir_from_cli(cli.base_dir.clone());
+
     // Logging is initialized FIRST — before the TCP trust flow below, which
     // emits `tracing` events (this mirrors the daemon, whose logging init is
     // its very first act). The file subscriber's level comes from the shared
@@ -505,10 +518,14 @@ fn init_file_logging(env_filter: EnvFilter) -> Option<std::path::PathBuf> {
     Some(log_path)
 }
 
-/// The per-process log file path: under the PLATFORM temp dir (respects
-/// `TMPDIR` — critical on Termux/Android where `/tmp` is not writable),
-/// named with the pid so parallel instances do not clobber each other.
+/// The per-process log file path: `{base}/log/tui.log` under a base dir,
+/// otherwise under the PLATFORM temp dir (respects `TMPDIR` — critical on
+/// Termux/Android where `/tmp` is not writable), named with the pid so parallel
+/// instances do not clobber each other.
 fn log_file_path() -> std::path::PathBuf {
+    if let Some(path) = choreo_shared::paths::log_file_default("tui") {
+        return path;
+    }
     std::env::temp_dir().join(format!("choreo-tui-{}.log", std::process::id()))
 }
 

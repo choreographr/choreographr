@@ -16,16 +16,22 @@ pub use std::os::unix::net::UnixStream;
 #[cfg(windows)]
 pub use uds_windows::UnixStream;
 
-/// The default Unix-socket path when `CHOREOGRAPHR_SOCKET_PATH` is unset:
-/// `choreographr.sock` under the PLATFORM temp dir (`std::env::temp_dir()`).
+/// The default Unix-socket path when `CHOREOGRAPHR_SOCKET_PATH` is unset.
 ///
-/// That is `/tmp/choreographr.sock` on a desktop Linux (TMPDIR unset), so
-/// behavior there is unchanged — but on Android/Termux `TMPDIR` points at
-/// the app's writable prefix tmp dir, which is the difference between the
-/// daemon and TUI working at all and dying with a context-free
-/// "Permission denied (os error 13)" on a hardcoded `/tmp`.
+/// With a base dir (`CHOREOGRAPHR_BASE_DIR`) set, this is
+/// `{base}/run/choreographr.sock` — the instance owns its socket, so two
+/// instances on one host no longer collide. Without a base it is
+/// `choreographr.sock` under the PLATFORM temp dir (`std::env::temp_dir()`):
+/// `/tmp/choreographr.sock` on a desktop Linux (TMPDIR unset), so behavior
+/// there is unchanged — but on Android/Termux `TMPDIR` points at the app's
+/// writable prefix tmp dir, which is the difference between the daemon and TUI
+/// working at all and dying with a context-free "Permission denied (os error
+/// 13)" on a hardcoded `/tmp`.
 #[must_use]
 pub fn default_socket_path() -> String {
+    if let Some(path) = choreo_shared::paths::base_socket_path() {
+        return path.to_string_lossy().into_owned();
+    }
     std::env::temp_dir()
         .join("choreographr.sock")
         .to_string_lossy()

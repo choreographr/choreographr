@@ -59,8 +59,8 @@ pub fn discover_context(working_dir: &Path, config: &ContextConfig) -> io::Resul
 // Neither loader can fail (file loads degrade to skips), so they return () —
 // no transparent Ok(()) wrappers to force `?` on callers.
 fn load_global_files(files: &mut Vec<DiscoveredFile>, config: &ContextConfig) {
-    if let Some(config_dir) = dirs::config_dir() {
-        let path = config_dir.join("choreographr").join("AGENTS.md");
+    if let Ok(config_dir) = choreo_shared::paths::config_dir() {
+        let path = config_dir.join("AGENTS.md");
         if let Some(df) = try_load_file(&path) {
             files.push(df);
         }
@@ -227,8 +227,7 @@ pub fn build_base_prompt(
 }
 
 fn load_user_system_prompt() -> Option<String> {
-    let config_dir = dirs::config_dir()?;
-    let path = config_dir.join("choreographr").join("system.md");
+    let path = choreo_shared::paths::config_dir().ok()?.join("system.md");
     let content = fs::read_to_string(&path).ok()?;
     let content = content.trim().to_string();
     if content.is_empty() {

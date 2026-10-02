@@ -14,6 +14,7 @@ pub mod embedded;
 pub mod image_prep;
 pub mod mcp;
 pub mod metrics;
+pub mod migrate;
 pub mod providers;
 mod reasoning;
 mod requests;

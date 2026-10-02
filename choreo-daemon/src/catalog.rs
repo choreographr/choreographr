@@ -122,15 +122,16 @@ pub struct CatalogPaths {
 
 impl CatalogPaths {
     /// Resolve the standard locations, mirroring `crate::db::db_path` and
-    /// `crate::config::config_path` (same `dirs::data_dir()` /
-    /// `dirs::config_dir()` convention, `choreographr` subdirectory). Falls
-    /// back to empty paths (everything degrades to the embedded catalog) when
-    /// the dirs lookup fails, so startup never hard-fails on an exotic
-    /// HOME-less environment.
+    /// `crate::config::config_path`: the shared resolver's data/config roots
+    /// (platform `dirs` by default, or `{base}/data` and `{base}/config` under
+    /// `--base-dir`), joined with the `choreographr` subdirectory. Falls back
+    /// to empty paths (everything degrades to the embedded catalog) when the
+    /// dirs lookup fails, so startup never hard-fails on an exotic HOME-less
+    /// environment.
     pub fn from_dirs() -> Self {
-        let data_dir = dirs::data_dir().map(|d| d.join("choreographr"));
-        let config_dir = dirs::config_dir().map(|d| d.join("choreographr"));
-        if let (Some(data), Some(config)) = (&data_dir, &config_dir) {
+        let data_dir = choreo_shared::paths::data_dir();
+        let config_dir = choreo_shared::paths::config_dir();
+        if let (Ok(data), Ok(config)) = (&data_dir, &config_dir) {
             Self {
                 bin: data.join(CATALOG_BIN_NAME),
                 overlay: config.join(USER_OVERLAY_NAME),

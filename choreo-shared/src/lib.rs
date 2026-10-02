@@ -11,8 +11,11 @@
 //! - [`logging`] — the shared `-v`/`-q` verbosity flags, the log-level
 //!   resolution every binary applies identically, and the one hardened
 //!   pid-keyed log-file opener the file-only binaries share.
+//! - [`paths`] — the one filesystem-layout resolver: the platform-default
+//!   config/data/socket locations and the `--base-dir` override that relocates
+//!   an entire instance under a single root.
 //!
-//! It is deliberately a *leaf* (deps: `clap`, `tracing`, and
+//! It is deliberately a *leaf* (deps: `clap`, `dirs`, `tracing`, and
 //! `tracing-subscriber` only) and holds no protocol or transport logic —
 //! `choreo-proto` stays the wire protocol.
 //!
@@ -26,6 +29,7 @@
 
 pub mod clap_styles;
 pub mod logging;
+pub mod paths;
 pub mod release_name;
 
 pub use clap_styles::clap_styles;

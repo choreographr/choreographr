@@ -16,6 +16,7 @@ rust-version.workspace = true
 # cheap to depend on from every binary.
 [dependencies]
 clap.workspace = true
+dirs.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

@@ -41,9 +41,11 @@ Choreographr (workspace)
 │                       choreo-gui, deliberately excluded from default-members)
 ├── choreo-proto           Wire protocol (shared types + framing)
 ├── choreo-shared         Leaf crate — shared binary-facing helpers:
-│                       release-name metadata, clap styling, and the
-│                       `-v`/`-q` verbosity + log-level policy every CLI
-│                       binary uses; no protocol or transport logic
+│                       release-name metadata, clap styling, the `-v`/`-q`
+│                       verbosity + log-level policy every CLI binary uses,
+│                       and the filesystem-layout resolver (platform dirs +
+│                       the `--base-dir` instance-root override); no protocol
+│                       or transport logic
 ├── choreo-sanitize        Leaf crate — shared Unicode "spoofing" predicates
 │                       and the tool-output byte budget + truncation marker
 ├── choreo-image          Leaf crate — shared image decode (EXIF-orientation
@@ -435,8 +437,9 @@ joins the `doc_crates` list that `just doc-check` (a `pre-commit` step) holds to
 
 ### `choreo-shared` — Shared binary helpers
 
-A deliberately tiny **leaf crate** (dependencies: `clap`, `tracing`, and
-`tracing-subscriber` only) holding the small, binary-facing helpers that every
+A deliberately tiny **leaf crate** (dependencies: `clap`, `dirs`, `tracing`,
+and `tracing-subscriber` only) holding the small, binary-facing helpers that
+every
 CLI crate in the
 suite used to duplicate. It carries no protocol or transport logic —
 `choreo-proto` stays the wire protocol.
@@ -461,12 +464,67 @@ copy-pasted into each crate.
 - **`logging`** — the shared `Verbosity` flags (`#[command(flatten)]` `-v`/`-q`)
 and `LoggingConfig::resolve`, the one place the suite's level policy lives (see
 **Logging** below).
+- **`paths`** — the ONE filesystem-layout resolver for the whole suite:
+  `config_dir()` / `data_dir()` (the historical
+  `dirs::{config,data}_dir()/choreographr` by default) plus the
+  `--base-dir` / `CHOREOGRAPHR_BASE_DIR` override that relocates an entire
+  instance under one root (`{base}/config`, `{base}/data`, `{base}/run` for the
+  socket, `{base}/log`). `default_config_dir` / `default_data_dir` ignore the
+  override and are the migration source. The base choice travels by environment
+  (written once at startup by `set_base_dir_from_cli`, read by every resolver
+  AND by `choreo-proto`'s socket default), so the daemon a TUI autostarts and
+  the ACP/IM bridges an operator launches inherit it without any forwarding.
+  See **The base directory** below.
+
+### The base directory (`--base-dir`)
+
+By default every path resolves through the platform dirs, exactly as it always
+has (`dirs::config_dir()/choreographr`, `dirs::data_dir()/choreographr`, the
+platform temp dir for the socket) — an existing install is untouched. The
+`--base-dir <PATH>` flag (all five binaries: `choreographr`, `choreo-tui`,
+`choreo-gui`, `choreo-acp`, `choreo-im`) — or the `CHOREOGRAPHR_BASE_DIR`
+environment variable — relocates the WHOLE instance under one root:
+
+```text
+{base}/config/choreographr/   config.toml, accounts.toml, mcp_servers.json,
+                              models-overlay.toml, authorized_clients.toml,
+                              identity.pk, transport.sec/.pub, known_servers.toml
+{base}/data/choreographr/     state.redb, catalog.bin
+{base}/run/choreographr.sock
+{base}/log/<binary>.log
+```
+
+Precedence: `--base-dir` / `CHOREOGRAPHR_BASE_DIR` over the platform dirs; the
+file-specific `CHOREOGRAPHR_DB_PATH` / `CHOREOGRAPHR_SOCKET_PATH` still win over
+both, so a single file can be pinned independently.
+
+**Why an environment variable carries it.** The base must be visible to path
+resolution in *separate processes* — the daemon is a child of the TUI, the ACP
+adapter is launched by an editor, the IM bridge by an operator — and the socket
+path is resolved in `choreo-proto`, which has no other reason to know the
+config dir. `set_base_dir_from_cli` writes `CHOREOGRAPHR_BASE_DIR` once at
+startup (single-threaded, before any thread spawns — the one contained
+`set_var` in the suite), so every resolver and every child process agrees
+without explicit forwarding.
+
+**Migration.** The default layout's config and data roots are two separate
+platform dirs, so they cannot both be expressed as one base. `choreographr
+migrate --base-dir <PATH> [--move] [--dry-run] [--force]` relocates an existing
+install (copy by default, leaving the old layout reversible); it reads the
+*platform-default* locations as the source and copies the keystore files
+verbatim, so the transport identity is preserved and a client's pinned server
+key keeps verifying (no re-pair). With a base set but its dirs empty while the
+default dirs exist, startup logs a loud warning (a silent fresh instance is the
+one real footgun).
 
 ### `choreo-proto` — Wire protocol
 
-Defines all shared message types and framing. No dependencies on other workspace crates.
+Defines all shared message types and framing. It depends on `choreo-shared`
+only for the filesystem-layout resolver (the base-dir-aware socket default).
 It also owns the two unix-socket-path helpers every side of the wire must agree
-on: `socket_path()` (the `CHOREOGRAPHR_SOCKET_PATH`-aware default) and the
+on: `socket_path()` (the `CHOREOGRAPHR_SOCKET_PATH`-aware default, which falls
+back to `default_socket_path()` — `{base}/run/choreographr.sock` under a base
+dir, else the platform temp dir) and the
 dial primitives `connect_unix` / `socket_listening` / `dial_error_means_no_listener`
 (with the platform-resolved `UnixStream` re-export: std on unix, `uds_windows`
 on Windows). Keeping the dial and its "nothing is listening" classification
@@ -653,7 +711,7 @@ credential in a keystore shares one key).
 | Module | Purpose |
 |---|---|
 | `crypto.rs` | X25519 keypair generation, ECDH + HKDF + AES-256-GCM encrypt/decrypt; shared AES-256-GCM helpers |
-| `paths.rs` | Resolves filesystem paths for the legacy key files (migration source only) |
+| `paths.rs` | Resolves filesystem paths for the legacy key files (migration source only), via the shared `choreo_shared::paths::config_dir()` so the `--base-dir` override relocates the keystore with the rest of the instance |
 | `error.rs` | `KeystoreError` enum |
 
 **Credential types:** `ApiKey` (OpenAI), `X` (Twitter OAuth 1.0a credentials)
@@ -670,7 +728,7 @@ TCP.  Used by both `choreo-client-core` (client side) and `choreo-daemon` (serve
 | `noise.rs` | `NoiseStream` — wraps `TcpStream` + `snow::TransportState` with length-prefixed AES-256-GCM framing. Payloads above snow's 65535-byte single-message ciphertext cap are split into fragments and reassembled transparently, so the effective per-message cap is now the proto codec's 64 MiB `MAX_FRAME_SIZE`. The reassembly decision is made from an AUTHENTICATED continuation byte embedded as the first byte of each fragment's plaintext (covered by the AES-GCM tag) — the 4-byte wire length prefix carries no continuation flag, so a wire-level tamper can never silently truncate or extend a message: any prefix flip either trips the size cap or fails the GCM authentication. The unauthenticated prefix is validated before any allocation (snow's 65535-byte ciphertext cap) and reassembly is capped at the codec's 64 MiB `MAX_FRAME_SIZE` (enforced on both send and receive), so a hostile or corrupted peer cannot force a huge buffer allocation. The shared `TransportState` lock is held only per-chunk during encryption, never during the blocking socket writes — together with the single-writer-per-connection discipline on the daemon, this prevents a bidirectional large-message deadlock (see `noise_concurrent_bidirectional_large_messages`). A runtime single-writer guard on `send_message` rejects a concurrent second sender instead of interleaving fragments. The data plane reuses per-stream buffers (`send_buf`/`send_frag`/`recv_ct_buf`/`recv_pt_buf`) so no buffer is allocated per message or fragment, and each frame is written as ONE coalesced `write_all` (4-byte prefix + ciphertext); an empty payload still emits a single real frame (a cleared continuation header), so `recv_message` never blocks forever on a missing length prefix. EOF-class read failures (the peer closing its end mid-read) surface as `TransportError::ConnectionClosed` rather than a raw `Io(UnexpectedEof)`, so the daemon's read loop logs a graceful disconnect instead of an error. The `Arc<Mutex<TransportState>>` and the `Arc<AtomicBool>` single-writer guard are shared across `try_clone` reader/writer clones — a deliberate, documented exception to the workspace's message-passing rule (the transport state must be shared for the clones to interleave encrypt/decrypt on one connection; the guard is a single-bit flag in the spirit of the sanctioned cooperative-cancellation-flag exception). |
 | `handshake.rs` | Noise handshake (split out of `noise.rs`): `handshake_initiator()` / `handshake_responder()` implement Noise IK, and `handshake_initiator_xx()` / `handshake_responder_xx()` implement Noise XX — both with X25519 key agreement over 2-byte-BE-length-prefixed handshake messages. **TCP wire v5: every TCP connection starts with a 1-byte unauthenticated mode preamble** (`PREAMBLE_IK` = 0x01, `PREAMBLE_XX` = 0x02; 0x00 is deliberately never assigned so all-zero garbage can never select a mode), read by the daemon via `read_handshake_preamble()` to pick the responder. The preamble authorizes NOTHING — it only selects which equally-authenticated handshake runs; a MITM cannot downgrade or impersonate via it because both handshakes authenticate both static keys. IK is the normal authenticated mode (client knows the server's static in advance — the pinned `transport.pub`); XX is first-contact mode (the client does NOT know the server's static, learns it from handshake message 2, and `handshake_initiator_xx` returns it alongside the transport so the caller can verify it out-of-band — fingerprint confirmation — BEFORE any protocol traffic flows; `run_daemon_tcp_connection_xx_first_contact` enforces that gate by starting the writer thread only after the caller's `on_first_contact` callback approves, so an `Unlock` can never leak to an unconfirmed server). XX's ACL check necessarily runs after message 3 (the client's static only arrives there), so a rejected XX client's handshake succeeds client-side and the rejection surfaces as a clean `ConnectionClosed` on the data plane — the rejected client never sends or receives a single data-plane byte. All four handshakes are bounded by an ABSOLUTE deadline (an `Instant` budget enforced across every handshake read AND write — `read_handshake_exact` / `write_handshake_all` re-arm the socket timeout to the time *remaining* until the deadline, so a per-read timeout alone (resettable by a peer dribbling bytes) cannot stretch the total, and a peer that stops reading mid-handshake cannot hold the writer past the deadline; both timeouts are cleared before the data plane, which has no timeout by design): the ACL check happens mid-handshake, so a peer that connects and stalls — or dribbles to keep per-read timers from firing — must not be able to hold a connection thread + FD forever. Deadline expiry surfaces as `TransportError::HandshakeTimeout` (read/write `WouldBlock`/`TimedOut` map to it, since the socket is blocking and the timeout is armed to the remaining budget). Pinned by `noise_handshake_times_out_when_peer_silent` and `noise_handshake_times_out_against_dribbling_peer` (and their `*_xx_*` twins). The budget is injectable: `handshake_initiator_with_timeout` / `handshake_responder_with_timeout` / `handshake_initiator_xx_with_timeout` / `handshake_responder_xx_with_timeout` take their own `Duration` (the plain functions delegate to them with the 10 s default), so tests exercise the timeout path in milliseconds. |
 | `error.rs` | `TransportError` enum — `Io`, `Noise`, `Protocol`, `InvalidFragment`, `HandshakeTimeout` (absolute-deadline expiry), `AuthFailed`, `ConnectionClosed` (peer closed the connection mid-read; classified from EOF/reset kinds by `noise::recv_message`). |
-| `key.rs` | Transport keypair handling — `TransportSecretKey` (type-safe X25519 secret), `ensure_transport_keypair()` (generate-or-load with advisory file locking), `read_server_pk()`, `fingerprint()` / `fingerprint_of_file()` (human-comparable rendering of a public key: base64 clustered into 4-char groups — bijective with the 32-byte key, no hashing, and cross-checkable against the ACL's plain-base64 form by stripping separators; `fingerprint_of_file` enforces exactly-32-bytes so a truncated file errors rather than rendering a plausible lie). `set_test_config_root()` is the keypair-directory test override, now `pub` (and `#[doc(hidden)]` — a test seam, not part of the public contract) so integration tests can redirect keypair generation to a temp dir — matching the `choreo_keystore::paths` / `choreo_daemon::mcp::config` precedent. |
+| `key.rs` | Transport keypair handling — `TransportSecretKey` (type-safe X25519 secret), `ensure_transport_keypair()` (generate-or-load with advisory file locking), `read_server_pk()`, `fingerprint()` / `fingerprint_of_file()` (human-comparable rendering of a public key: base64 clustered into 4-char groups — bijective with the 32-byte key, no hashing, and cross-checkable against the ACL's plain-base64 form by stripping separators; `fingerprint_of_file` enforces exactly-32-bytes so a truncated file errors rather than rendering a plausible lie). `set_test_config_root()` is the keypair-directory test override, now `pub` (and `#[doc(hidden)]` — a test seam, not part of the public contract) so integration tests can redirect keypair generation to a temp dir — matching the `choreo_keystore::paths` / `choreo_daemon::mcp::config` precedent. The directory itself resolves through the shared `choreo_shared::paths::config_dir()`, so `--base-dir` relocates the keypair with the rest of the instance. |
 
 The server-side TCP/Noise handler lives in `choreo-daemon/src/server/connection.rs`
 (`tcp_client_thread`, with the preamble read + handshake-mode dispatch in
@@ -1009,7 +1067,9 @@ and the indexer (`tungstenite`) are synchronous.
 ### `choreo-daemon` — Core server (binary `choreographr`)
 
 Entry point: `choreo_daemon::main` — invoked from the root package's
-`src/bin/choreographr.rs` wrapper — initializes tracing (to stderr, or to a
+`src/bin/choreographr.rs` wrapper — first applies `--base-dir` (equivalently
+`CHOREOGRAPHR_BASE_DIR`; see **The base directory**), then initializes tracing
+(to stderr, or to a
 file with `--log-file <path>` — append mode, ANSI off, created 0600 on unix
 and opened `O_NOFOLLOW`, with the opened file verified to be a regular file
 owned by the daemon's own euid and its mode tightened to 0600 — the TUI
@@ -1017,11 +1077,16 @@ autostart writes the log into the shared temp dir under a predictable
 pid-keyed name, so a planted symlink or a pre-created file owned by another
 user must not redirect or collect the daemon's (potentially sensitive)
 diagnostics; level control
-unchanged; an unopenable log file is a fatal startup error), creates
+unchanged; an unopenable log file is a fatal startup error; under a base dir
+with no explicit `--log-file`, the default log is `{base}/log/daemon.log`),
+creates
 `DaemonState`, runs socket server. `--auto-exit` (see the
 `server/lifecycle.rs` and `server/core.rs` rows) shuts the daemon down
 gracefully when the last client disconnects — a mode intended for the TUI's
-autospawned daemon, never needed for a user-managed service.
+autospawned daemon, never needed for a user-managed service. The one-shot
+utility subcommands (`acl-add`, `fingerprint`, `migrate`) exit before any
+daemon work; `migrate` is the base-dir relocation helper (see **The base
+directory**).
 
 **Concurrency model:** Pure OS threads with message passing (actor model). No async code
 in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads. The one
@@ -1045,7 +1110,8 @@ alloy/subxt clients, and the daemon calls their synchronous `execute_*` entry po
 | `daemon/open.rs` | `DaemonState::open(OpenOptions)` — the state constructor lifted out of the CLI so an embedder (the GUI's embedded daemon) can open state without the CLI's anyhow chain or global-path assumptions: explicit DB/accounts/catalog paths (the Windows-safe open → schema-version → drop → pre-migration backup → reopen → migrate sequence verbatim), tombstone purge, session index load, accounts load, and the tool registry under a registration-time `ToolPolicy` (`Full` = shipped CLI behavior; `Mobile` = shell/exec, the RISC-V sandbox, and MCP subprocesses are simply NOT registered — an unregistered tool can never be re-activated by any prompt or persisted group name). Returns `io::Result` so embedders consume it directly. The CLI delegates with standard paths + `Full`, so behavior is unchanged (pinned by `open_full_policy_on_temp_paths` / `open_mobile_policy_omits_shell_and_vm`). |
 | `daemon/image_provider.rs` | Image-generation provider resolution, lifted out of `daemon.rs` (same child-module pattern as `daemon/subscriber_handlers.rs`: `pub(super)` methods on `DaemonState`; `handle_command` dispatches `DaemonCommand::GetImageGenerationProvider` here). `handle_get_image_generation_provider` replies over the caller's crossbeam channel — never the broadcast machinery — with the opaque `ImageProviderHandle { slug, client }` (which itself stays in `providers/mod.rs`, next to the `InferenceProvider` facade it is protocol-erased alongside): explicit account name, else the deterministic FIRST image-capable account in sorted-key order (never HashMap iteration order). The pure resolution logic (`resolve_image_generation_provider`) is split from the channel-replying handler so the error precedence is unit-testable, and it returns the structured `ImageProviderError` (thiserror; re-exported next to `DaemonCommand`) — `Locked` (empty providers map: keystore locked or never unlocked), `AccountNotConfigured` (named account missing — names the account so a typo is not misdiagnosed), `NoImageBackend` (account resolved but its protocol has no image client), `NoImageCapableAccount` (unlocked but every provider lacks a backend; names the deterministic slug) — preserving the precise guidance wording the `generate_image` tool maps into its `ToolExecError`. Revocation is free: `/lock` and `RemoveCredential` invalidate every affected session's cached client via `SessionCommand::DropProvider`, so no handle can be resolved against revoked credentials and each session rebuilds its client (image client included) lazily from a fresh unlock — no new credential state and no new credential plumbing beyond the TEMPORARY `x_credentials` slot story (see AGENTS.md). |
 | `accounts/` | `AccountManager` — loads/saves `accounts.toml`, manages named inference accounts with per-account config overrides. `save` is **deterministic** (accounts sorted by name) and **atomic** (temp + fsync + rename via `write_file_atomic`), so the config watcher can never observe a torn file and identical logical state always serializes to identical bytes. `spawn_accounts_watcher` is the thin consumer that forwards `accounts.toml` edits surfaced by the config transport to the daemon command loop as `DaemonCommand::AccountsReload` (it does no reading itself). `AccountConfig` applies OpenAI-specific overrides directly to `ServiceConfig` (including `total_timeout_secs`) and converts the shared fields into `ProviderOverrides` for the other protocols (including the `prompt_cache` prompt-caching opt-out consumed by the Anthropic adapter). Two daemon-only fields — `meter: Option<MeterKind>` and `cache_warming: Option<CacheWarmingMode>` — feed the cache-warming policy (see the `cache_warm/` row); they are parsed and persisted but **not** forwarded to any provider. `AccountConfig::validate()` is Layer 3 of the retry budget: it rejects `retry_max_backoff_ms` past the 1 h ceiling (`MAX_BACKOFF_MS`, re-exported from `choreo-ai-protocols`), `retry_initial_backoff_ms` past the same ceiling even when no `max` is set (otherwise the library clamp would silently widen the budget gate), and inverted `retry_initial_backoff_ms > retry_max_backoff_ms` at accounts-file load and at `add`, so a typo'd config is refused with a pinpointed message (see the `retry.rs` row for the other two layers). |
-| `config.rs` | Daemon-level configuration: `DaemonConfig` (`max_turns`, `[context]`, `[cache_warming]`), `config_path()`, `load_daemon_config()`, and the deprecated `load_service_config()`. (Previously lived in `openai/config.rs`; it is daemon config, not provider config.) |
+| `config.rs` | Daemon-level configuration: `DaemonConfig` (`max_turns`, `[context]`, `[cache_warming]`), `config_path()` (resolved through the shared `choreo_shared::paths::config_file`, so `--base-dir` relocates it), `load_daemon_config()`, and the deprecated `load_service_config()`. (Previously lived in `openai/config.rs`; it is daemon config, not provider config.) |
+| `migrate.rs` | The `choreographr migrate` subcommand: relocates an existing platform-default install (config + data) into a base dir. Reads the *platform-default* roots (`choreo_shared::paths::default_config_dir` / `default_data_dir`, which ignore the base override) and copies them under `{base}/config` and `{base}/data`, preserving file modes and thus the keystore identity. Copy by default (`--move` removes the source; `--dry-run` reports only; `--force` merges into a non-empty destination; otherwise a non-empty destination is refused). |
 | `cache_warm/` | The cache-warming feature: the **pure policy** (the config surface, the billing **meter** model, the warm-decision state machine) in `policy.rs`, plus the **warmer thread** that drives it at runtime in `driver.rs`. The state machine is clock-injected (every decision takes an injected `now` and reads no clock); the runtime half is [`spawn_warmer`] + [`WarmHandle`], resolved per account (the spawn-time value seeds it) and refreshed on every account (re-)resolve, and armed by `run_agent_loop`. `MeterKind` (`payg`/`tokens`/`requests`/`flat`/`unknown`, default `unknown`) and `CacheWarmingMode` (`off`/`streaming`, default `off`) deserialize an unrecognized string to their default with a `warn!` (a typo must not brick the config file — the catalog overlay's warn-and-skip posture) and serialize `snake_case`. `CacheWarmingConfig` is the `[cache_warming]` table (`mode`, `min_prefix_tokens` = 32 000, `min_expected_savings` = 0.05 USD). `WarmPolicy::resolve` merges the global config with the account's `meter`/`cache_warming` overrides and its prompt-cache setting (account mode overrides the global; meter defaults to `unknown`; caching off is permanently ineligible). `WarmPolicy::arm(facts, now)` + `WarmPlan::poll(now)` form a **clock-injected** state machine — the caller passes `now` as a `Duration`, nothing inside reads a clock, so it is deterministic and needs no timers. Arm computes `delay = min(ttl*0.9, ttl-10s)`, `next_warm_at = now+delay`, and `refresh_deadline = next_warm_at + (ttl-delay)/2`; poll returns `Wait` / `Ping` / `Stop(reason)`, with the **hard deadline guard**: a poll strictly past `refresh_deadline` returns `Stop(DeadlineMissed)` because a late ping is a ~1.25x cache *write*, strictly worse than not pinging. The meter-aware `gate` is the economics core: `payg` warms iff `expected_savings >= min_expected_savings` (`warm_cost` = cache-read of the prefix + one output token, `miss_cost` = write-or-input minus cache-read of the prefix, computed from the catalog's `ModelCost`; `cache_write` of `0`/absent falls back to `input` and an absent `cache_read` is `0`), `tokens` warms iff `prefix_tokens >= min_prefix_tokens`, and `requests`/`flat`/`unknown` never warm (a ping burns request budget, and an unmetered plan saves nothing). `is_replayable` marks an Anthropic-protocol request with thinking enabled as non-replayable — its `budget_tokens` derives from `max_tokens`, so a 1-token cap changes the cache key. **The warmer thread** (`spawn_warmer(client, policy, cancel_rx) -> WarmHandle`) owns a CLONE of the session's `InferenceProvider` (`Clone + Send + Sync`) and a single `Instant` clock; it waits event-driven via `select_biased!` over a control receiver (`Command::Arm(Box<WarmRequest>)` / `Stop`), a dedicated cancel receiver, and — only while a plan is armed — `crossbeam_channel::after(wait)` where `wait = plan.decide(now).action == Wait(d)`. On `Ping` it sends a **non-streaming** `client.chat_completion_turn` with `max_output_tokens_override: Some(request.max_output_tokens)` (0 on Anthropic's pre-warm, else 1), `no_retry: true`, `thinking_effort: "off"`, and `cancel_rx: None` (a ping must not enable thinking — a 1-token cap would corrupt an Anthropic `budget_tokens` — and must not steal a cancel the loop still needs; the sockreg `shutdown_all` is the force-close path for a wedged ping), then re-arms with the same facts at the current `now`. `Stop(reason)` drops the plan and goes idle (streaming-phase warming resumes on the next tool iteration) without exiting the thread. The ping is **best-effort**: its result never reaches session or turn state, every error is swallowed (`debug`/`trace`), and `WarmHandle::Drop` sends `Stop` and joins — so the thread is stopped on every `run_agent_loop` exit path, including the panic path (the guard drops during unwind, before `run_request_worker`'s `catch_unwind`). `spawn_warmer` is summoned only when `policy.mode == Streaming` (the common default is `Off` — zero overhead). It records `choreo_cache_warm_attempts_total` (one per ping sent) and `choreo_cache_warm_skips_total{reason}` (one per declined plan, keyed by `SkipReason::label`). **Deferred:** status/`SessionEvent` surfacing is deliberately not added yet (metrics + `tracing` only). |
 | `config_watch.rs` | The **unified config-file watching transport**: ONE `notify` watcher on the config directory (`$XDG_CONFIG_HOME/choreographr`) fanned out per-basename to consumers over their own crossbeam channels (`ConfigWatcher::subscribe`, `ConfigChange`/`ChangeKind`). It is **transport only, no policy** — it owns the config-dir creation (so the watch installs first-time on a fresh system), the directory watch (rename-safe), the re-arm retry while unarmed, and basename + coarse-kind filtering (`classify` strips `Access`/`Other` noise); it never reads a file or mutates any state. `ConfigWatcher::spawn` creates the dir and arms the initial watch **synchronously on the caller's thread** before starting the transport thread (the thread receives the pre-armed `Option<RecommendedWatcher>` + raw-event receiver + `armed` flag), so no filesystem event can be lost in the window between `spawn()` returning and the transport thread's first watch call — an async-arm startup race that made the config-watch integration tests flake under full-suite load. LOST-EVENT RECOVERY: the kernel's inotify queue can overflow under load (notify 8.x surfaces `IN_Q_OVERFLOW` as an `EventKind::Other` event with the `Flag::Rescan` attribute); on that signal — and on watch read-errors, which can equally mean missed events — the transport rescans the directory and replays divergences from a per-basename last-known-content view (maintained by the transport thread alone, refreshed after each real routed event and by each rescan) as synthesized Create/Modify/Remove through the same `deliver` path as real events; rescans are idempotent (unchanged content replays nothing), so at worst a subscriber sees a duplicate reload signal that its own fingerprint gate no-ops on. Consumers (the catalog overlay reload, the accounts watcher, and the ACL watcher — the latter over a DEDICATED watcher instance on the ACL file's own directory, since the ACL path is a parameter, not a fixed config-dir member) subscribe to the basenames they care about and own their reload policy, forwarding reload requests to the daemon command loop — the single writer of whatever they govern. Spawned once by `run_server` before the consumers. |
 | `catalog.rs` | Runtime catalog maintenance (S4): `CatalogPaths` (XDG data/config locations for the cache bin + user overlay), atomic cache persistence (temp → fsync → rename, `catalog.bin` postcard), the ONE background **maintenance thread** (ensures the cache data dir, loads the cache → embedded `catalog.bin`, reads the user overlay, runs the startup conditional GET — **gated**: fetch immediately iff no valid cache / no recorded attempt / stale, else skip and arm the timer for the remaining time — records the DB `catalog_state.last_attempt_ms` BEFORE every fetch (the crash-safe 25 h cooldown, single writer of the attempt timestamp), serves `/refresh-models` requests with **coalescing** of bursts into one fetch (per-requester status; one recorded attempt per burst), and reacts to overlay edits from the config transport — all channel-driven, multiplexed via `crossbeam_channel::select!` whose `after(timeout)` arm doubles as the revalidation timer, and never mutating the catalog itself), plus the **fingerprint-gated overlay reload** (pure compare collapses editor save-event storms; shared by the config transport and the `/refresh-models` path). Every change is delivered to the daemon command loop as `DaemonCommand::CatalogBaseChanged` (a swap) or `DaemonCommand::CatalogNotModified` (a 304 — a pure reply routed through the loop so a queued overlay reload is applied before the `UpToDate` counts are computed). |

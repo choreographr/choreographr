@@ -86,22 +86,17 @@ fn db_err(msg: String) -> io::Error {
 }
 
 /// Resolve the database file path: the `CHOREOGRAPHR_DB_PATH` override when
-/// set, otherwise the standard data directory location.
+/// set, otherwise the standard data directory (platform `dirs::data_dir()` by
+/// default, or `{base}/data` under `--base-dir`).
 ///
 /// # Errors
 ///
-/// Returns Err if the user's data directory cannot be determined.
+/// Returns Err if the data directory cannot be determined.
 pub fn db_path() -> io::Result<PathBuf> {
     if let Ok(override_path) = std::env::var("CHOREOGRAPHR_DB_PATH") {
         return Ok(PathBuf::from(override_path));
     }
-    let data_dir = dirs::data_dir().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "could not determine data directory",
-        )
-    })?;
-    Ok(data_dir.join("choreographr").join("state.redb"))
+    choreo_shared::paths::data_file("state.redb")
 }
 
 // ── Schema versioning & migrations ─────────────────────────────────────────────

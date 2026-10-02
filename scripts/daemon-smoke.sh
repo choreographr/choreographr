@@ -149,8 +149,10 @@ export RUST_LOG=info
 # the SHGetKnownFolderPath API and does NOT honor the APPDATA override —
 # observed in CI as "could not determine data directory" when only the env
 # vars were redirected. The daemon has a first-class CHOREOGRAPHR_DB_PATH
-# override (choreo-daemon/src/db/mod.rs), so use that. The config dir has no
-# equivalent override; on Windows dirs may therefore resolve it to the
+# override (choreo-daemon/src/db/mod.rs), so use that. A CHOREOGRAPHR_BASE_DIR
+# override now also exists (it relocates config, data, socket, and logs under
+# one root; see `--base-dir`), but this script keeps its per-file env pins; on
+# Windows dirs may therefore still resolve the config dir to the
 # runner's real profile — acceptable here because the runner is ephemeral
 # and the smoke run only auto-generates a throwaway keypair there.
 if [ "$OS" = windows ]; then

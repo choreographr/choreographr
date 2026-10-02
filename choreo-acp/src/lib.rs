@@ -80,13 +80,22 @@ use clap::Parser;
     styles = clap_styles()
 )]
 struct Cli {
-    /// Path to the Choreographr Unix socket.
-    #[arg(long = "socket-path", default_value_t = choreo_proto::socket_path())]
-    socket_path: String,
+    /// Path to the Choreographr Unix socket (defaults to the daemon's standard
+    /// path, or `{base-dir}/run/choreographr.sock` under `--base-dir`).
+    #[arg(long = "socket-path")]
+    socket_path: Option<String>,
 
-    /// Path to the log file (stderr is unused to avoid corrupting the ACP protocol stream).
-    #[arg(long = "log-file", default_value_t = default_log_file())]
-    log_file: String,
+    /// Path to the log file (defaults to `{base-dir}/log/acp.log` under a base
+    /// dir, else the platform temp dir). stderr is unused to avoid corrupting
+    /// the ACP protocol stream.
+    #[arg(long = "log-file")]
+    log_file: Option<String>,
+
+    /// Run the instance out of this base directory instead of the platform
+    /// defaults: `{base}/config`, `{base}/data`, `{base}/run` (the socket),
+    /// and `{base}/log`. Equivalent to exporting `CHOREOGRAPHR_BASE_DIR`.
+    #[arg(long = "base-dir", value_name = "PATH")]
+    base_dir: Option<std::path::PathBuf>,
 
     // Increase logging verbosity (-v debug, -vv trace)
     #[command(flatten)]
@@ -148,13 +157,29 @@ fn setup_logging(log_file: &str, verbosity: Verbosity) {
 pub fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
 
-    // Logging goes to $TMPDIR/choreo-acp.log (never stderr, which is unused
-    // in the ACP protocol — stdout carries the JSON-RPC stream); if the log
-    // file cannot be created the adapter continues without file logging.
-    setup_logging(&cli.log_file, cli.verbosity);
+    // Apply the base-dir override BEFORE resolving the socket/log paths: clap
+    // evaluates `default_value_t` at parse time, before a sibling `--base-dir`
+    // is applied, so those defaults are resolved here instead.
+    choreo_shared::paths::set_base_dir_from_cli(cli.base_dir.clone());
+    let socket_path = cli
+        .socket_path
+        .clone()
+        .unwrap_or_else(choreo_proto::socket_path);
+    let log_file = cli
+        .log_file
+        .clone()
+        .or_else(|| {
+            choreo_shared::paths::log_file_default("acp").map(|p| p.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(default_log_file);
+
+    // Logging goes to the log file (never stderr, which is unused in the ACP
+    // protocol — stdout carries the JSON-RPC stream); if the log file cannot
+    // be created the adapter continues without file logging.
+    setup_logging(&log_file, cli.verbosity);
 
     tracing::info!(
-        socket_path = %cli.socket_path,
+        socket_path = %socket_path,
         "choreographr starting"
     );
 
@@ -170,9 +195,8 @@ pub fn main() -> Result<(), anyhow::Error> {
     //    If this fails, no other threads have been spawned yet, so there
     //    is nothing to clean up.
     let (daemon_client, writer_handle) =
-        crate::daemon_client::spawn_daemon_io(&cli.socket_path, event_tx.clone()).with_context(
-            || format!("could not connect to Choreographr at '{}'", cli.socket_path),
-        )?;
+        crate::daemon_client::spawn_daemon_io(&socket_path, event_tx.clone())
+            .with_context(|| format!("could not connect to Choreographr at '{socket_path}'"))?;
     handles.push(writer_handle);
     handles.push(daemon_client.join_handle);
 

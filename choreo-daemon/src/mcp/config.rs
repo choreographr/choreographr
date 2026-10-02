@@ -60,8 +60,8 @@ pub fn mcp_config_path() -> Result<PathBuf> {
     if let Some(root) = TEST_CONFIG_ROOT.with(|cell| cell.borrow().clone()) {
         return Ok(root.join("choreographr").join("mcp_servers.json"));
     }
-    let config_dir = dirs::config_dir().context("could not determine config directory")?;
-    Ok(config_dir.join("choreographr").join("mcp_servers.json"))
+    choreo_shared::paths::config_file("mcp_servers.json")
+        .context("could not determine config directory")
 }
 
 /// Load MCP server configurations from `mcp_servers.json`.
