@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use tracing::debug;
 
 thread_local! {
-    /// Test-only override for config_dir. When set, config_dir() returns
+    /// Test-only override for `config_dir`. When set, `config_dir()` returns
     /// a choreographr subdirectory inside this path instead of the real
     /// user config directory.
     static TEST_CONFIG_ROOT: std::cell::RefCell<Option<PathBuf>> =
