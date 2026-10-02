@@ -15,9 +15,11 @@
 # redirected into a scratch dir:
 #
 #   * CHOREOGRAPHR_SOCKET_PATH → scratch socket (choreo-proto/src/io.rs)
-#   * XDG_CONFIG_HOME / HOME → scratch config dir on POSIX (transport keypair
-#     transport.sec/pub, authorized_clients.toml, config.toml, accounts.toml
-#     all resolve under dirs::config_dir()/choreographr)
+#   * XDG_CONFIG_HOME / XDG_STATE_HOME / XDG_RUNTIME_DIR / HOME → scratch tree
+#     on POSIX: config (transport.sec/pub, authorized_clients.toml, config.toml,
+#     accounts.toml — under dirs::config_dir()/choreographr), state (log files
+#     under $XDG_STATE_HOME/choreographr), and runtime (the default socket under
+#     $XDG_RUNTIME_DIR) all resolve inside the scratch dir
 #   * On WINDOWS hermeticity is deliberately relaxed: dirs resolves config/
 #     data dirs through the known-folder API, which ignores env redirects, and
 #     redirecting APPDATA/USERPROFILE proved flaky-fatal in CI. The runner
@@ -81,7 +83,13 @@ esac
 
 TMP="$(mktemp -d)"
 SCRATCH_CONFIG="$TMP/config"
-mkdir -p "$SCRATCH_CONFIG"
+SCRATCH_STATE="$TMP/state"
+SCRATCH_RUNTIME="$TMP/run"
+mkdir -p "$SCRATCH_CONFIG" "$SCRATCH_STATE"
+# XDG_RUNTIME_DIR must be 0700 per the spec (the daemon puts its default socket
+# there when CHOREOGRAPHR_SOCKET_PATH is unset, and refuses a loose dir).
+mkdir -p "$SCRATCH_RUNTIME"
+chmod 700 "$SCRATCH_RUNTIME"
 DAEMON_LOG="$TMP/daemon.log"
 FAIL=0
 DAEMON_PID=""
@@ -130,9 +138,15 @@ if [ "$OS" = windows ]; then
     export CHOREOGRAPHR_DB_PATH="$(cygpath -w "$TMP/choreographr.redb")"
 else
     DAEMON="$TMP/choreographr"
-    # macOS has no XDG_CONFIG_HOME by default but dirs::config_dir() honors it
-    # when set; on Linux it is the primary knob. HOME backs both up.
+    # Redirect every XDG base the daemon or a client might resolve through into
+    # the scratch tree: config (keypair/ACL/config.toml/accounts.toml), state
+    # (log files), and runtime (the default socket). The socket is ALSO pinned
+    # below, so XDG_RUNTIME_DIR is defense-in-depth — but redirecting it keeps
+    # the run hermetic if a future change stops pinning the socket. HOME backs
+    # all of them up (and covers any code path that bypasses dirs).
     export XDG_CONFIG_HOME="$SCRATCH_CONFIG"
+    export XDG_STATE_HOME="$SCRATCH_STATE"
+    export XDG_RUNTIME_DIR="$SCRATCH_RUNTIME"
     export HOME="$TMP"
 fi
 export CHOREOGRAPHR_SOCKET_PATH="$TMP/choreographr.sock"
