@@ -197,6 +197,21 @@ fn handle_accept_error(e: &io::Error) {
     }
 }
 
+/// Create the socket's parent directory if it does not already exist.
+///
+/// Idempotent, and a no-op when the parent already exists (the platform temp
+/// dir default) or the path has no parent. A `--base-dir` socket lives at
+/// `{base}/run/choreographr.sock`, and nothing else creates that directory —
+/// without this the bind would fail with a context-free ENOENT.
+fn ensure_socket_dir(socket_path: &str) -> io::Result<()> {
+    if let Some(parent) = Path::new(socket_path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
 /// Refuse to delete a live daemon's socket; clean up a stale one.
 ///
 /// When the socket path exists, probe it with [`choreo_proto::socket_listening`]
@@ -337,7 +352,11 @@ pub fn run_server(
     // denied (os error 13)" (the Termux /tmp failure mode) with no hint WHICH
     // path was the problem. The probe refuses to unlink a socket a live
     // daemon is still listening on — a second daemon must not orphan the
-    // first one.
+    // first one. The socket's parent directory must exist before the bind: the
+    // platform temp dir (the default socket) always does, but a `--base-dir`
+    // socket lives at `{base}/run/choreographr.sock` and nothing else creates
+    // that directory.
+    ensure_socket_dir(socket_path)?;
     remove_stale_socket(socket_path)?;
     let listener = UnixListener::bind(socket_path).map_err(|e| {
         io::Error::new(
@@ -895,6 +914,18 @@ mod tests {
         let path = dir.path().join("absent");
         remove_stale_socket(path.to_str().unwrap()).unwrap();
         assert!(!path.exists());
+    }
+
+    /// The `--base-dir` socket lives under `{base}/run`, which nothing else
+    /// creates: the parent must be created before the bind.
+    #[test]
+    fn ensure_socket_dir_creates_a_missing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("run").join("choreographr.sock");
+        ensure_socket_dir(sock.to_str().unwrap()).unwrap();
+        assert!(sock.parent().unwrap().is_dir(), "run dir must exist");
+        // Idempotent: a second call on an existing dir is a no-op.
+        ensure_socket_dir(sock.to_str().unwrap()).unwrap();
     }
 
     // The live-listener refusal case needs a real Unix socket at a real
