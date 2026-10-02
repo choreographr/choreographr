@@ -272,14 +272,7 @@ mod tests {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&encoded)
             .expect("valid base64");
-        assert_eq!(bytes.len() % 2, 0, "UTF-16LE is whole 2-byte units");
-        let units: Vec<u16> = bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| u16::from_le_bytes(*c))
-            .collect();
-        let decoded = String::from_utf16(&units).expect("valid UTF-16");
+        let decoded = String::from_utf16le(&bytes).expect("valid UTF-16");
         assert_eq!(decoded, script);
     }
 
@@ -305,13 +298,7 @@ mod tests {
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .expect("valid base64");
-        let units: Vec<u16> = decoded
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| u16::from_le_bytes(*c))
-            .collect();
-        let script = String::from_utf16(&units).expect("valid UTF-16");
+        let script = String::from_utf16le(&decoded).expect("valid UTF-16");
         assert!(script.ends_with("Get-ChildItem"));
     }
 

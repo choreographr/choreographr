@@ -63,7 +63,7 @@ impl Tool for DbGet {
         match db::kv_get(ctx.db.as_ref(), ctx.session_id, &args.key) {
             Ok(value) => {
                 let value_len = value.as_ref().map_or(0, Vec::len);
-                let value_str = value.map(|v| String::from_utf8_lossy(&v).into_owned());
+                let value_str = value.map(String::from_utf8_lossy_owned);
                 debug!(
                     session = ctx.session_id,
                     key = &args.key,

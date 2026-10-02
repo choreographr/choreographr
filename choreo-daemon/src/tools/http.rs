@@ -241,7 +241,7 @@ fn read_bounded_text_body(response: ureq::http::Response<ureq::Body>) -> String 
         );
     }
     let text = if truncated {
-        String::from_utf8_lossy(&bytes).into_owned()
+        String::from_utf8_lossy_owned(bytes)
     } else {
         match String::from_utf8(bytes) {
             Ok(s) => s,

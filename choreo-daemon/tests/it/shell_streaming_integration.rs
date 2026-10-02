@@ -41,10 +41,7 @@ fn spawn_with_streaming_stderr_is_streamed_into_the_body() {
         spawn_with_streaming(&mut c, 5000, RecordFraming::none(), tx).unwrap();
     // The channel is unbounded, so every forwarded chunk is buffered by the
     // time the tool returns — collect them all.
-    let streamed: String = rx
-        .try_iter()
-        .map(|c| String::from_utf8_lossy(&c).into_owned())
-        .collect();
+    let streamed: String = rx.try_iter().map(String::from_utf8_lossy_owned).collect();
     assert!(!was_killed);
 
     // stderr content lands in the interleaved body (returned as stdout)…
@@ -67,10 +64,7 @@ fn spawn_with_streaming_interleaves_stdout_and_stderr() {
 
     let (output, _was_killed) =
         spawn_with_streaming(&mut c, 5000, RecordFraming::none(), tx).unwrap();
-    let streamed: String = rx
-        .try_iter()
-        .map(|c| String::from_utf8_lossy(&c).into_owned())
-        .collect();
+    let streamed: String = rx.try_iter().map(String::from_utf8_lossy_owned).collect();
 
     let body = String::from_utf8_lossy(&output.stdout);
     let pos1 = body.find("out1").expect("out1 in body");

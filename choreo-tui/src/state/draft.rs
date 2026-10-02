@@ -21,16 +21,14 @@ use crossterm::event::KeyEvent;
 
 impl App {
     pub(crate) fn user_texts(&self) -> Vec<String> {
-        self.active_display_ref()
-            .map(|d| {
-                d.view
-                    .turns
-                    .iter()
-                    .rev()
-                    .filter_map(|(_, turn)| turn.user_text.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.active_display_ref().map_or_default(|d| {
+            d.view
+                .turns
+                .iter()
+                .rev()
+                .filter_map(|(_, turn)| turn.user_text.clone())
+                .collect()
+        })
     }
 
     pub(crate) fn navigate_history_up(&mut self) {

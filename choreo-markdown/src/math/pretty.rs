@@ -508,8 +508,7 @@ impl MathPretty {
                     // Non-letter escaped delimiter (`\left\{`): fall back to
                     // the escaped-character table.
                     self.bump()
-                        .map(|c| escaped_math_char(c).to_string())
-                        .unwrap_or_default()
+                        .map_or_default(|c| escaped_math_char(c).to_string())
                 } else {
                     mapped.to_string()
                 }

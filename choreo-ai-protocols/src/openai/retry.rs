@@ -35,11 +35,9 @@ pub(crate) fn retry_send(
     // are derived from the config + route here, so every call site stays a
     // plain "send with retry" and cannot forget or duplicate them. Empty for
     // non-gateway providers, so the closure loop is a no-op there.
-    let headers = route
-        .map(|(session_id, request_id)| {
-            crate::shared::opencode_gateway_headers(&config.provider_slug, session_id, request_id)
-        })
-        .unwrap_or_default();
+    let headers = route.map_or_default(|(session_id, request_id)| {
+        crate::shared::opencode_gateway_headers(&config.provider_slug, session_id, request_id)
+    });
     // The closure captures `auth_header` and `headers` by reference (it stays
     // `Fn`); the Zeroizing wrapper ensures the temporary `Bearer …` string is
     // wiped when it goes out of scope.

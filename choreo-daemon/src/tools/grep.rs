@@ -928,8 +928,7 @@ impl Sink for GrepSink {
 fn path_label(path: &Path, resolved: &Path, single_file: bool) -> String {
     if single_file {
         path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
+            .map_or_default(|n| n.to_string_lossy().into_owned())
     } else {
         // Delegate to the shared label helper so `grep`'s multi-file paths and
         // the file-read tools' paths use one rule (relative to the search root
@@ -1176,10 +1175,7 @@ fn run_grep_walk(resolved: &Path, config: GrepConfig<'_>) -> Result<String, Tool
         // output displays. Bare globs (`*.rs`) match by basename as before;
         // a path-anchored glob (`src/*.rs`) requires the pattern to match
         // the bare file name, consistent with the root-relative contract.
-        let raw_name = resolved
-            .file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_default();
+        let raw_name = resolved.file_name().map_or_default(|n| n.to_string_lossy());
         if let Some(ref filter) = include_filter
             && !filter.matches(Path::new(raw_name.as_ref()))
         {

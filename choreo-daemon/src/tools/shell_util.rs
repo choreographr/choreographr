@@ -1540,11 +1540,11 @@ pub fn spawn_with_streaming(
             // to the live view even for Cf-heavy output, which previously
             // expanded past the cap at `finish_tool_output` and got re-cut
             // (dropping streamed tail bytes and appending a second marker).
-            // `from_utf8_lossy` is lossless here: the drains only emit
+            // `from_utf8_lossy_owned` is lossless here: the drains only emit
             // char-aligned chunks (see `flush_partial_line`), so no real
-            // char is ever split across chunks. The named binding keeps the
-            // lossy Cow alive for the duration of the escape.
-            let lossy = String::from_utf8_lossy(&line);
+            // char is ever split across chunks. Taking the line by value lets
+            // the fast path reuse its buffer instead of copying it.
+            let lossy = String::from_utf8_lossy_owned(line);
             let escaped = sanitize_transcript(&lossy);
             if !stream_cap.push(escaped.as_bytes(), &mut full) {
                 // Abort (timeout) or client gone: stop accumulating. The
@@ -1752,7 +1752,7 @@ pub(crate) fn format_shell_output(
     } else {
         let mut combined = output.stdout.clone();
         combined.extend_from_slice(&output.stderr);
-        std::borrow::Cow::Owned(String::from_utf8_lossy(&combined).into_owned())
+        std::borrow::Cow::Owned(String::from_utf8_lossy_owned(combined))
     };
     let exit_code = output.status.code().unwrap_or(-1);
     finish_tool_output_sanitized(
@@ -2295,7 +2295,7 @@ mod tests {
 
         let merged: Vec<String> = merge_rx
             .try_iter()
-            .map(|l| String::from_utf8_lossy(&l).into_owned())
+            .map(String::from_utf8_lossy_owned)
             .collect();
         let outs: Vec<String> = merged
             .iter()

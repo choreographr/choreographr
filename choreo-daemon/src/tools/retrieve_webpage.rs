@@ -816,12 +816,12 @@ impl RetrieveWebpage {
 /// Pull the returned string out of a CDP `RemoteObject`: the protocol encodes
 /// a primitive string result as a JSON value (`value.as_str()`).
 fn extract_text(value: &serde_json::Value) -> String {
-    value.as_str().map(str::to_owned).unwrap_or_default()
+    value.as_str().map_or_default(str::to_owned)
 }
 
 /// Convenience: unwrap a `RemoteObject`'s optional `value` and extract text.
 fn remote_text(object: &headless_chrome::protocol::cdp::Runtime::RemoteObject) -> String {
-    object.value.as_ref().map(extract_text).unwrap_or_default()
+    object.value.as_ref().map_or_default(extract_text)
 }
 
 /// Write `bytes` to `path`, creating parent directories as needed.

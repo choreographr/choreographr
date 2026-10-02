@@ -1768,16 +1768,12 @@ fn seed_then_update_tool_results_preserves_call_order() {
     );
 
     let order_of = |state: &SessionState| {
-        state
-            .turns
-            .get(&tid)
-            .map(|t| {
-                t.tool_results
-                    .iter()
-                    .map(|r| r.call_id.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
+        state.turns.get(&tid).map_or_default(|t| {
+            t.tool_results
+                .iter()
+                .map(|r| r.call_id.clone())
+                .collect::<Vec<_>>()
+        })
     };
     assert_eq!(order_of(&state), vec!["a", "b", "c"]);
     // Each placeholder carries its invocation description from the start

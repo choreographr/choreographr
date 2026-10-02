@@ -153,11 +153,9 @@ pub(super) fn messages_request(
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, None);
     // Gateway headers (empty for non-gateway providers — see the shared
     // helper); applied alongside the auth headers inside the retry closure.
-    let extra_headers = route
-        .map(|(session_id, request_id)| {
-            crate::shared::opencode_gateway_headers(&config.provider_slug, session_id, request_id)
-        })
-        .unwrap_or_default();
+    let extra_headers = route.map_or_default(|(session_id, request_id)| {
+        crate::shared::opencode_gateway_headers(&config.provider_slug, session_id, request_id)
+    });
     let response = retry::retry_loop(
         || {
             let mut request = agent
@@ -258,11 +256,9 @@ where
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));
     // Gateway headers (empty for non-gateway providers — see the shared
     // helper); applied alongside the auth headers inside the retry closure.
-    let extra_headers = route
-        .map(|(session_id, request_id)| {
-            crate::shared::opencode_gateway_headers(&config.provider_slug, session_id, request_id)
-        })
-        .unwrap_or_default();
+    let extra_headers = route.map_or_default(|(session_id, request_id)| {
+        crate::shared::opencode_gateway_headers(&config.provider_slug, session_id, request_id)
+    });
     let response = retry::retry_loop(
         || {
             let mut request = agent

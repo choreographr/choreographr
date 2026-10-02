@@ -264,8 +264,7 @@ impl SessionView {
                 .tool_calls
                 .iter()
                 .find(|tc| tc.call_id == call_id)
-                .map(|tc| tc.name.clone())
-                .unwrap_or_default();
+                .map_or_default(|tc| tc.name.clone());
             let mut content = String::new();
             push_capped(&mut content, data);
             turn.tool_results.push(ToolResultRecord {

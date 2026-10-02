@@ -59,8 +59,7 @@ pub(crate) fn git_log_impl(
             .message
             .lines()
             .next()
-            .map(|line| String::from_utf8_lossy(line.trim()).into_owned())
-            .unwrap_or_default();
+            .map_or_default(|line| String::from_utf8_lossy(line.trim()).into_owned());
         writeln!(
             &mut out,
             "{} {} <{}> {}",

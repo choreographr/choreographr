@@ -4211,7 +4211,12 @@ run on the current stable, and `.cargo/config.toml` sets
 `resolver.incompatible-rust-versions = "allow"` so dependency resolution
 always picks the newest available versions even when their declared
 `rust-version` exceeds the workspace floor. Consequently the MSRV number may
-lag the resolved tree during development; that is fine. Before publishing,
+lag the resolved tree during development; that is fine. The floor is also
+raised deliberately when the workspace adopts a newly stabilized std API (for
+example `String::from_utf8_lossy_owned` or `Option::map_or_default`): the API becomes
+the true build floor even when no dependency demands it, so the declared
+`rust-version` then reflects the workspace's own sources rather than the
+dependency tree alone. Before publishing,
 sync it: compute the resolved tree's floor with
 `cargo metadata --format-version 1 | jq -r '[.packages[].rust_version |
 select(. != null)] | sort_by(split(".") | map(tonumber)) | last'`, set the

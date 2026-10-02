@@ -330,10 +330,7 @@ fn heading_has_two_blank_lines_before() {
         "expected two blank lines before heading, got lines around index {idx}: \
              lines[{}]='{}' lines[{}]='{}' lines[{}]='{}'",
         idx.saturating_sub(2),
-        result
-            .get(idx - 2)
-            .map(|l| format!("{l}"))
-            .unwrap_or_default(),
+        result.get(idx - 2).map_or_default(|l| format!("{l}")),
         idx - 1,
         result[idx - 1],
         idx,

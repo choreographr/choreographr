@@ -187,14 +187,13 @@ pub fn image_models_for_provider(provider_slug: &str) -> Vec<String> {
     catalog
         .iter()
         .find(|e| e.slug == provider_slug)
-        .map(|e| {
+        .map_or_default(|e| {
             e.models
                 .iter()
                 .filter(|m| m.supports_image_output)
                 .map(|m| m.model.clone())
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// Whether the model requires `reasoning_content` to be present on every

@@ -93,12 +93,9 @@ pub(crate) fn render_table_lines(
     chrome.push(LineChrome::default());
     // The header row is the table's first row and the only one drawn bold —
     // the same emphasis nushell gives its column headers.
-    let (header_lines, header_joins, header_chrome) = table_rows
-        .first()
-        .map(|row| {
-            render_table_row_wrapped(row, &widths, &header_alignment, indent, Modifier::BOLD)
-        })
-        .unwrap_or_default();
+    let (header_lines, header_joins, header_chrome) = table_rows.first().map_or_default(|row| {
+        render_table_row_wrapped(row, &widths, &header_alignment, indent, Modifier::BOLD)
+    });
     lines.extend(header_lines);
     joins.extend(header_joins);
     chrome.extend(header_chrome);
@@ -149,8 +146,7 @@ pub(crate) fn normalize_table_row(row: &[Vec<MarkdownInline>], column_count: usi
     (0..column_count)
         .map(|index| {
             row.get(index)
-                .map(|cell| inline_plain_text(cell))
-                .unwrap_or_default()
+                .map_or_default(|cell| inline_plain_text(cell))
         })
         .collect()
 }

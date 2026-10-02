@@ -2858,7 +2858,7 @@ impl TurnEventHandler for App {
         call_id: String,
         data: Vec<u8>,
     ) {
-        let text = String::from_utf8_lossy(&data).into_owned();
+        let text = String::from_utf8_lossy_owned(data);
         let display = self.display_for(session_id);
         // The chunk appends to `turn.tool_results[i].content` (rendered
         // live); bump the turn's content version so a rebuild between chunks

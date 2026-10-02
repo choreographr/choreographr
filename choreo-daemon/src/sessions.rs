@@ -1351,8 +1351,7 @@ pub fn session_main(
             .unwrap_or_else(default_active_tool_groups),
         context_config: init_record
             .as_ref()
-            .map(|r| r.context_config.clone())
-            .unwrap_or_default(),
+            .map_or_default(|r| r.context_config.clone()),
         account_name,
         accumulated_usage: TokenUsage::default(),
         context_window: None,

@@ -1188,7 +1188,7 @@ pub fn kv_count(db: &redb::Database, session_id: u64, prefix: Option<&str>) -> i
         // bound value itself is never returned, only used for range termination.
         let mut end_bytes = prefix.as_bytes().to_vec();
         end_bytes.push(0xFF);
-        let range_end_str = String::from_utf8_lossy(&end_bytes).into_owned();
+        let range_end_str = String::from_utf8_lossy_owned(end_bytes);
         let range_end = (session_id, range_end_str);
         table
             .range::<(u64, String)>((range_start)..(range_end))

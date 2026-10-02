@@ -120,10 +120,7 @@ impl UnloadTools {
     /// always active).  Falls back to an empty enum if the registry is
     /// gone — the model can still pass any valid group name.
     fn group_names(&self) -> Vec<String> {
-        self.registry
-            .upgrade()
-            .map(|r| r.group_names())
-            .unwrap_or_default()
+        self.registry.upgrade().map_or_default(|r| r.group_names())
     }
 }
 

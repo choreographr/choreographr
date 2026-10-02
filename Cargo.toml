@@ -127,13 +127,17 @@ resolver = "3"
 default-members = [".", "choreo-tui"]
 
 # Shared package metadata inherited by every member via `*.workspace = true`.
-# MSRV: the workspace builds and tests on Rust 1.95.0 and newer; keep code
+# MSRV: the workspace builds and tests on Rust 1.99.0 and newer; keep code
 # and dependencies within this floor (see ARCHITECTURE.md).
 #
-# The floor tracks the resolved dependency tree's high-water mark. It rose
-# from 1.92 to 1.94.1 in the 2026-08 dependency refresh (serial_test 4.x
+# The floor tracks the resolved dependency tree's high-water mark, and is also
+# raised deliberately when the workspace adopts a newly stabilized std API (the
+# newer API becomes the true floor even though no dependency demands it). It
+# rose from 1.92 to 1.94.1 in the 2026-08 dependency refresh (serial_test 4.x
 # requires Rust 1.93.1), then to 1.95.0 when ckb-vm 0.24.15 — choreo-daemon's
-# RISC-V VM — required it. Recompute after any dependency change (RELEASE.md
+# RISC-V VM — required it, then to 1.99.0 to adopt the APIs stabilized across
+# Rust 1.96–1.99 (`String::from_utf8_lossy_owned`, `String::from_utf16le`,
+# `Option::map_or_default`, …). Recompute after any dependency change (RELEASE.md
 # Phase 2).
 #
 # version/license/repository/homepage/readme/description are required by
@@ -141,7 +145,7 @@ default-members = [".", "choreo-tui"]
 # private members opt out with `publish = false`. `readme` is resolved
 # relative to the workspace root (the file that lives at ./README.md).
 [workspace.package]
-rust-version = "1.95.0"
+rust-version = "1.99.0"
 version = "0.2.3"
 license = "Apache-2.0"
 repository = "https://github.com/choreographr/choreographr"

@@ -320,8 +320,7 @@ fn dispatch_load_session(
     info!("dispatching session/load (id={})", req.id);
 
     let acp_id = parse_params::<acp_jsonrpc::LoadSessionRequest>(req.params.as_ref())
-        .map(|r| r.session_id)
-        .unwrap_or_default();
+        .map_or_default(|r| r.session_id);
 
     if acp_id.is_empty() {
         return respond_err(req.id, -32602, "Missing session_id", out);
@@ -333,11 +332,7 @@ fn dispatch_load_session(
 
     // Include the current model as the only entry so the editor sees it
     // as a valid selection even when the full model list isn't available.
-    let models: Vec<String> = session
-        .model
-        .as_ref()
-        .map(|m| vec![m.clone()])
-        .unwrap_or_default();
+    let models: Vec<String> = session.model.as_ref().map_or_default(|m| vec![m.clone()]);
     let opts = config::build_config_options(&models, &session.model, None);
     let result = acp_jsonrpc::LoadSessionResult {
         config_options: Some(opts),
@@ -366,8 +361,7 @@ fn dispatch_delete_session(
     info!("dispatching session/delete (id={})", req.id);
 
     let session_id = parse_params::<acp_jsonrpc::DeleteSessionRequest>(req.params.as_ref())
-        .map(|r| r.session_id)
-        .unwrap_or_default();
+        .map_or_default(|r| r.session_id);
 
     let daemon_id = match sessions.get(&session_id) {
         Some(s) => s.daemon_id,
@@ -401,8 +395,7 @@ fn dispatch_close_session(
     info!("dispatching session/close (id={})", req.id);
 
     let session_id = parse_params::<acp_jsonrpc::CloseSessionRequest>(req.params.as_ref())
-        .map(|r| r.session_id)
-        .unwrap_or_default();
+        .map_or_default(|r| r.session_id);
 
     // Validate the session exists in the bridge state before removing it.
     if sessions.get(&session_id).is_none() {
@@ -596,8 +589,7 @@ fn dispatch_cancel(
     daemon_writer: &Sender<ClientMessage>,
 ) -> Result<(), AcpError> {
     let acp_id = parse_params::<acp_jsonrpc::CancelNotification>(notif.params.as_ref())
-        .map(|r| r.session_id)
-        .unwrap_or_default();
+        .map_or_default(|r| r.session_id);
 
     let Some(prompt) = pending.get_prompt(&acp_id) else {
         warn!(acp_id, "cancel for session with no active prompt");

@@ -303,8 +303,7 @@ impl super::Tool for GenerateImage {
         let revised = result
             .revised_prompt
             .as_deref()
-            .map(|p| format!("\nrevised prompt: {p}"))
-            .unwrap_or_default();
+            .map_or_default(|p| format!("\nrevised prompt: {p}"));
         let text = truncate_tool_output(&format!(
             "generated image ({mime_type}, {width}x{height}, {}) via {result_model}{revised}",
             humfmt::bytes(byte_len as u64),

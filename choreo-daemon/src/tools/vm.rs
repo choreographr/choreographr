@@ -694,7 +694,7 @@ fn format_rust_source(source: &str) -> String {
         Ok(output) if output.status.success() => {
             // Trim trailing newline so the output doesn't get a gratuitous
             // blank line when embedded in a markdown code block.
-            let formatted = String::from_utf8_lossy(&output.stdout).to_string();
+            let formatted = String::from_utf8_lossy_owned(output.stdout);
             if formatted.ends_with('\n') {
                 // Strip exactly the trailing newline; len() >= 1 per the
                 // ends_with check, fallback preserves behavior.
@@ -988,7 +988,7 @@ fn compile(source: &str) -> Result<Vec<u8>, String> {
         .output()
         .map_err(|e| format!("rustc not found: {e}\nInstall from https://rustup.rs"))?;
     if !version.status.success() {
-        let stderr = String::from_utf8_lossy(&version.stderr);
+        let stderr = String::from_utf8_lossy_owned(version.stderr);
         return Err(format!("rustc +stable check failed: {stderr}"));
     }
 

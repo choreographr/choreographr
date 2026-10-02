@@ -82,8 +82,7 @@ fn spawn_http_tool_server() -> (String, std::thread::JoinHandle<()>) {
                         .lines()
                         .find(|line| line.to_ascii_lowercase().starts_with("range:"))
                         .and_then(|line| line.split_once(':'))
-                        .map(|(_, value)| value.trim().to_string())
-                        .unwrap_or_default();
+                        .map_or_default(|(_, value)| value.trim().to_string());
                     let body = "abcdefghij";
                     let response = format!(
                         "HTTP/1.1 206 Partial Content\r\ncontent-type: text/plain\r\ncontent-length: {}\r\ncontent-range: bytes 0-9/100\r\naccept-ranges: bytes\r\nconnection: close\r\n\r\n{}",
@@ -123,8 +122,7 @@ fn spawn_http_tool_server() -> (String, std::thread::JoinHandle<()>) {
                 if first_line.starts_with("POST /echo ") {
                     let body = request
                         .split_once("\r\n\r\n")
-                        .map(|(_, body)| body)
-                        .unwrap_or_default();
+                        .map_or_default(|(_, body)| body);
                     let response_body = format!("echo:{body}");
                     let response = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",

@@ -186,8 +186,7 @@ fn run_find_walk(
                 let name = entry
                     .path()
                     .file_name()
-                    .map(|n| n.to_string_lossy())
-                    .unwrap_or_default();
+                    .map_or_default(|n| n.to_string_lossy());
                 matcher.matches_default(&name)
             } else {
                 // Substring mode: case-insensitive contains check using the
@@ -195,8 +194,7 @@ fn run_find_walk(
                 let name = entry
                     .path()
                     .file_name()
-                    .map(|n| n.to_string_lossy())
-                    .unwrap_or_default();
+                    .map_or_default(|n| n.to_string_lossy());
                 name.to_lowercase().contains(&pattern_lower)
             };
 

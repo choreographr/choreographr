@@ -207,13 +207,11 @@ pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<Resp
             let call_id = payload
                 .get("call_id")
                 .and_then(|value| value.as_str())
-                .map(std::string::ToString::to_string)
-                .unwrap_or_default();
+                .map_or_default(std::string::ToString::to_string);
             let delta = payload
                 .get("delta")
                 .and_then(|value| value.as_str())
-                .map(std::string::ToString::to_string)
-                .unwrap_or_default();
+                .map_or_default(std::string::ToString::to_string);
             Ok(Some(ResponsesStreamEvent::FunctionCallArgumentsDelta {
                 call_id,
                 delta,
@@ -223,18 +221,15 @@ pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<Resp
             let call_id = payload
                 .get("call_id")
                 .and_then(|value| value.as_str())
-                .map(std::string::ToString::to_string)
-                .unwrap_or_default();
+                .map_or_default(std::string::ToString::to_string);
             let name = payload
                 .get("name")
                 .and_then(|value| value.as_str())
-                .map(std::string::ToString::to_string)
-                .unwrap_or_default();
+                .map_or_default(std::string::ToString::to_string);
             let arguments = payload
                 .get("arguments")
                 .and_then(|value| value.as_str())
-                .map(std::string::ToString::to_string)
-                .unwrap_or_default();
+                .map_or_default(std::string::ToString::to_string);
             Ok(Some(ResponsesStreamEvent::FunctionCallArgumentsDone {
                 call_id,
                 name,
@@ -258,16 +253,13 @@ pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<Resp
             // emulators emit a plain string instead, so accept both; last
             // resort is the serialized error object so a mid-stream failure
             // is never silently blank.
-            let error = payload
-                .get("error")
-                .map(|value| match value {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .map_or_else(|| other.to_string(), String::from),
-                })
-                .unwrap_or_default();
+            let error = payload.get("error").map_or_default(|value| match value {
+                serde_json::Value::String(s) => s.clone(),
+                other => other
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .map_or_else(|| other.to_string(), String::from),
+            });
             Ok(Some(ResponsesStreamEvent::ResponseFailed(error)))
         }
         "response.incomplete" => Ok(Some(ResponsesStreamEvent::ResponseIncomplete)),
@@ -312,13 +304,11 @@ pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<Resp
             let result = payload
                 .get("result")
                 .and_then(|value| value.as_str())
-                .map(std::string::ToString::to_string)
-                .unwrap_or_default();
+                .map_or_default(std::string::ToString::to_string);
             let status = payload
                 .get("status")
                 .and_then(|value| value.as_str())
-                .map(std::string::ToString::to_string)
-                .unwrap_or_default();
+                .map_or_default(std::string::ToString::to_string);
             Ok(Some(ResponsesStreamEvent::ProgramOutputDone {
                 call_id,
                 result,

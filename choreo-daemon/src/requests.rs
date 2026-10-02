@@ -245,7 +245,7 @@ fn is_session_config_tool(name: &str) -> bool {
 fn concurrent_tool_status_label(tools: &[ChatToolCall]) -> String {
     if tools.len() == 1 {
         // Single-element slice per the len() check above; fallback is unreachable.
-        tools.first().map(|t| t.name.clone()).unwrap_or_default()
+        tools.first().map_or_default(|t| t.name.clone())
     } else {
         "(parallel)".into()
     }

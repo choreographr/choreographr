@@ -275,8 +275,7 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
             .saturating_sub(app.effective_scroll());
         let marker_slots: Vec<usize> = app
             .active_display_ref()
-            .map(|d| d.markers.iter().map(|m| m.virtual_slot).collect())
-            .unwrap_or_default();
+            .map_or_default(|d| d.markers.iter().map(|m| m.virtual_slot).collect());
         frame.render_stateful_widget(
             vertical_scrollbar().with_markers(&marker_slots),
             history_chunks.get(1).copied().unwrap_or_default(), // always present (2-chunk split); safe fallback
