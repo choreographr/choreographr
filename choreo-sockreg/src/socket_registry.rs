@@ -611,7 +611,7 @@ fn close_logged(socket: OwnedSock) {
 #[cfg(unix)]
 mod tests {
     use super::*;
-    use std::os::fd::{AsFd, OwnedFd};
+    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
     use nix::unistd::{dup, read};
@@ -648,6 +648,33 @@ mod tests {
         // and reused — the registry owns `a` exclusively until it closes it.
         drop(peer);
         a
+    }
+
+    /// An `OwnedFd` naming a descriptor number the kernel can never have open:
+    /// `i32::MAX` sits far above any process's fd ceiling (`RLIMIT_NOFILE`,
+    /// which is bounded well under a million), so it is never a live descriptor
+    /// and never gets recycled into one. Handing it to the registry drives the
+    /// EBADF-tolerant close paths: the fd is "already gone" for every syscall
+    /// (`shutdown`, `fcntl`, and `close` all return `EBADF`), which the registry
+    /// must LOG and move past rather than let `OwnedFd`'s `Drop` abort the
+    /// process on.
+    ///
+    /// This is a different fixture from [`dead_socket`], not a return to the
+    /// removed one: `dead_socket` is a REAL, exclusively-owned fd whose peer
+    /// closed (EOF / `ENOTCONN`), whereas this names a number no descriptor ever
+    /// occupied. The old `dead_fd` fixture freed a real fd number and reused it
+    /// — a number the kernel could then recycle to another thread, so the
+    /// registry closed a live descriptor and its owner aborted on `Drop`. A
+    /// number above the ceiling is never freed and never recycled, so that
+    /// hazard cannot arise.
+    fn never_open_fd() -> OwnedFd {
+        // SAFETY: `i32::MAX` is above every fd the process can allocate, so it
+        // is an unopened descriptor number — never a live descriptor and never
+        // recycled. The value is never `Drop`ped: every registry path that
+        // receives it consumes it through `close_logged` (`into_raw_fd` +
+        // `close`), whose whole purpose is to tolerate the resulting EBADF, so
+        // std's IO-safety `Drop` check never runs.
+        unsafe { OwnedFd::from_raw_fd(i32::MAX) }
     }
 
     #[test]
@@ -777,6 +804,36 @@ mod tests {
         }
         // Idempotent: shutting down an empty registry is a no-op.
         registry.shutdown_all();
+    }
+
+    #[test]
+    fn already_gone_fds_are_tolerated_by_every_close_path() {
+        // `register`/`shutdown_all`/`prune_dead`/`unregister` all promise to
+        // treat an fd that is "already gone" (`EBADF`) as a tolerated close —
+        // logged, never fatal. `dead_socket` covers the EOF / `ENOTCONN` shape
+        // of "gone"; this covers the distinct `EBADF` shape, so the two
+        // already-dead verdicts each have a fixture.
+        let registry = SocketRegistry::new();
+
+        // shutdown_all: both `shutdown` and the close report EBADF, yet the
+        // entry is still drained and the registry emptied without aborting.
+        registry.register(never_open_fd());
+        assert_eq!(registry.registered_count(), 1);
+        registry.shutdown_all();
+        assert_eq!(registry.registered_count(), 0);
+
+        // unregister: the RAII-drop path tolerates the very same EBADF.
+        let id = registry.register(never_open_fd());
+        registry.unregister(id);
+        assert_eq!(registry.registered_count(), 0);
+
+        // prune_dead: the probe's `fcntl` fails with EBADF, so the entry is
+        // classified dead and removed-and-closed — again without aborting.
+        registry.register(never_open_fd());
+        // must_use: discard the pruned count; the assertion observes the effect
+        // through `registered_count`.
+        let _ = registry.prune_dead();
+        assert_eq!(registry.registered_count(), 0);
     }
 
     #[test]
