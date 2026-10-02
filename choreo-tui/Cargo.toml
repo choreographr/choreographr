@@ -22,7 +22,6 @@ anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
 crossterm = "0.29"
-dirs.workspace = true
 image.workspace = true
 heif-oxide.workspace = true
 serde.workspace = true

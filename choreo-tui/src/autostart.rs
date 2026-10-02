@@ -199,31 +199,22 @@ mod tests {
         assert_eq!(path, PathBuf::from(r"C:\tools\choreographr.exe"));
     }
 
+    /// The daemon log name must be pid-keyed with a `.log` extension, and the
+    /// path must come from the shared log-dir seam rather than the real state or
+    /// temp dirs. The pid keeps parallel TUI spawns from clobbering each other's
+    /// log; installing `TestLogDirGuard` redirects the shared policy at a temp
+    /// dir so this unit test never creates `$XDG_STATE_HOME/choreographr/` on the
+    /// machine running it (the state/temp-dir fallback itself is
+    /// `choreo_shared::paths::log_file_default`'s concern, tested there).
     #[test]
     fn daemon_log_path_is_pid_keyed_under_state_or_temp() {
-        // The daemon log follows the shared log policy: the XDG state dir
-        // (`$XDG_STATE_HOME/choreographr/<name>.log`) when available, else the
-        // TMPDIR-aware platform temp dir. The pid keeps parallel TUI spawns
-        // from clobbering each other.
-        let pid = std::process::id();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _guard = choreo_shared::paths::TestLogDirGuard::set(Some(dir.path().to_path_buf()));
         let path = daemon_log_path();
-        let name = path.file_name().and_then(|n| n.to_str()).expect("utf8");
-        assert!(
-            std::path::Path::new(name)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("log")),
-            "log name must end in .log, got {name}"
-        );
-        assert!(
-            name.contains(&pid.to_string()),
-            "log name must be pid-keyed, got {name}"
-        );
-        let state = dirs::state_dir().map(|d| d.join("choreographr"));
-        let temp = std::env::temp_dir();
-        let parent = path.parent().expect("has parent");
-        assert!(
-            Some(parent) == state.as_deref() || parent == temp,
-            "{path:?} must be under the state dir or the temp dir"
+        assert_eq!(
+            path,
+            dir.path()
+                .join(format!("daemon-{}.log", std::process::id()))
         );
     }
 
