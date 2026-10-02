@@ -611,10 +611,10 @@ fn close_logged(socket: OwnedSock) {
 #[cfg(unix)]
 mod tests {
     use super::*;
-    use std::os::fd::{AsFd, FromRawFd, IntoRawFd, OwnedFd};
+    use std::os::fd::{AsFd, OwnedFd};
 
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
-    use nix::unistd::{close, dup, read};
+    use nix::unistd::{dup, read};
 
     /// Creates a connected Unix socket pair for tests.
     fn pair() -> (OwnedFd, OwnedFd) {
@@ -627,16 +627,27 @@ mod tests {
         .expect("socketpair")
     }
 
-    /// Closes a raw fd "elsewhere" (simulating the caller closing its twin)
-    /// and hands the raw number back wrapped in a fresh `OwnedFd`, exactly the
-    /// shape `register` expects to receive for an already-dead `OwnedFd`.
-    fn dead_fd() -> OwnedFd {
-        let (a, _b) = pair();
-        let raw = a.into_raw_fd();
-        close(raw).expect("close");
-        // SAFETY: raw was just closed and this test never closes it again
-        // except through the registry (which tolerates the resulting EBADF).
-        unsafe { OwnedFd::from_raw_fd(raw) }
+    /// A socket that is genuinely dead for the liveness probe but whose fd is
+    /// still open and exclusively owned: one end of a pair whose peer has been
+    /// dropped, so a non-blocking `recv(MSG_PEEK)` sees EOF and `probe_alive`
+    /// classifies it dead. The "dead entry" fixture for the prune/shutdown
+    /// tests — and the real production shape, since `prune_dead` exists to
+    /// reap exactly these.
+    ///
+    /// Deliberately NOT an `OwnedFd` over an fd number that was already
+    /// closed (the tempting `into_raw_fd` then `from_raw_fd` over the freed
+    /// number). That fabricates a phantom fd whose number the kernel may
+    /// recycle to an unrelated live descriptor before the registry closes it,
+    /// so the registry would close someone else's fd and that owner's `Drop`
+    /// would abort with "owned file descriptor already closed" — a real
+    /// hazard under parallel tests, since fd numbers are process-global.
+    fn dead_socket() -> OwnedFd {
+        let (a, peer) = pair();
+        // Dropping the peer signals EOF to `a`; the probe's `MSG_PEEK` then
+        // returns `Ok(0)` and classifies `a` as dead. No fd number is freed
+        // and reused — the registry owns `a` exclusively until it closes it.
+        drop(peer);
+        a
     }
 
     #[test]
@@ -740,14 +751,17 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_all_closes_sockets_and_tolerates_already_closed_fds() {
+    fn shutdown_all_closes_sockets_and_handles_dead_ones() {
         let registry = SocketRegistry::new();
         let (a, b) = pair();
         // Duplicate of `a` is registered; the original stays with the test so
         // we can observe the shutdown from the peer side.
         let a_dup = dup(&a).expect("dup");
         registry.register(a_dup);
-        registry.register(dead_fd());
+        // A peer-closed socket must be shut down and closed alongside the live
+        // one (shutdown reports ENOTCONN, the close is an ordinary close),
+        // each fd exactly once.
+        registry.register(dead_socket());
         assert_eq!(registry.registered_count(), 2);
 
         registry.shutdown_all();
@@ -775,7 +789,7 @@ mod tests {
         // after the registry (possibly) closes its copy.
         let live_dup = dup(&live).expect("dup");
         registry.register(live_dup);
-        registry.register(dead_fd());
+        registry.register(dead_socket());
         assert_eq!(registry.registered_count(), 2);
 
         // must_use: discard the pruned count, the assertions below observe
