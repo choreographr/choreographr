@@ -1,12 +1,13 @@
 # Plan: MCP modernization — stateless protocol (2026-07-28) and a first-class client
 
-**Status:** **in progress — P0–P2 implemented; M1 (ship without OAuth) is the
-active goal.** Commits: `ab3dc2e` "fix(choreo-mcp): harden the MCP client and
-drop the npx test dependency", `976edf6` "feat(choreo-mcp): rebuild the MCP
-client on the official rmcp SDK", `9f6209a` "feat(choreo-mcp): add the MCP
-Streamable HTTP transport". The remaining work runs as **M1 = P4 → P5 → P6**;
-**OAuth (P3) is deferred to post-ship** — it is not a ship blocker. See §1.2 for
-what landed and §7 for the milestone definition.
+**Status:** **in progress — P0–P2 and most of P4 implemented; M1 (ship without
+OAuth, `mcp` on by default) is the active goal.** Commits: `ab3dc2e` "fix: harden
+the MCP client and drop the npx test dependency", `976edf6` "feat: rebuild the
+MCP client on the official rmcp SDK", `9f6209a` "feat: add the MCP Streamable HTTP
+transport", `274f736` "feat: stream progress, drive MRTR, and expose resources".
+The one remaining P4 item is `subscriptions/listen` + the registry hot-swap (§7);
+then P5 → P6. **OAuth (P3) is deferred to post-ship.** M1 flips `mcp` into the
+default feature set (D9). See §1.2 and §7.
 **Lifecycle:** this file is **deleted once the plan is fully implemented**. Nothing
 written during implementation may reference it — rustdoc, `ARCHITECTURE.md`,
 `README.md`, release notes, and commit messages must stand on their own, because a
@@ -14,7 +15,8 @@ reference to this plan would go stale the moment it is removed.
 **Date:** 2026-10-03
 **Targets:** `choreo-mcp` (protocol engine), `choreo-daemon` (`src/mcp/` manager +
 `McpToolWrapper`), `choreo-tui` / `choreo-client-core` (later phases: `/mcp` control
-surface), root `Cargo.toml` + `Cargo.lock` (new dependencies).
+surface), root `Cargo.toml` + `Cargo.lock` (new dependencies; `mcp` moves into
+the default feature set for M1 — D9).
 **Touches (when implemented):** `choreo-mcp` (rewritten around `rmcp`; new
 `runtime.rs` / `session.rs` / `engine.rs` / `config.rs` modules landed in P1–P2;
 `auth.rs` and the OAuth glue are post-ship), `choreo-daemon`
@@ -106,7 +108,7 @@ Doc comment in `choreo-mcp/src/lib.rs` claimed the crate spoke "over a transport
 variants (`ToolNotFound`, `InvalidParams`) were never constructed. Both were fixed
 in P0.
 
-### 1.2 Implementation progress (P0–P2)
+### 1.2 Implementation progress (P0–P2, P4)
 
 **P0** (`ab3dc2e`) landed the correctness and safety fixes against the then-current
 hand-rolled engine; **P1** (`976edf6`) replaced that engine with `rmcp` 3.5 behind
@@ -163,6 +165,21 @@ phases. What exists now:
   covers JSON and SSE responses, generated-header validation, the `auto`
   fallback, a retried `503`, and the HTTP+SSE rejection; the daemon's suite
   shares the stdio fixture source via `include!`.
+- Server→client notifications, MRTR, and resources (P4, `274f736`): a real
+  `ClientHandler` replaces the bare service config, so server notifications
+  reach the client — `notifications/progress` is forwarded to the in-flight
+  call's chunk sink (rate-limited via `PROGRESS_MIN_INTERVAL`, best-effort
+  `try_send`), `notifications/message` goes to tracing, and tool/resource
+  list-changed events surface as `ServerEvent`s. An `input_required`
+  `tools/call` result drives the bounded MRTR loop: elicitation and roots are
+  declined and the call is re-issued with `inputResponses` plus the echoed
+  opaque `requestState`; sampling is refused with a clear error; a peer that
+  keeps asking fails cleanly instead of hanging. Resources are readable
+  (`list_resources`/`read_resource`, paginated, behind a `supports_resources`
+  capability flag), and a server that declares the capability gets
+  `mcp/<slug>/list_resources` and `mcp/<slug>/read_resource` catalogue tools.
+  Tests cover progress→chunk (client and daemon), MRTR, resources, and a
+  fixture that records the server-observed `notifications/cancelled`.
 
 Deltas the plan now tracks (detailed in §7): the stdio read path is rmcp's, whose
 `AsyncRwTransport` reads lines with no cap — the P0 8 MiB bound was lost in the
@@ -171,8 +188,11 @@ the config keys `cwd`/`exposure`/`disabledTools` are not implemented; `auto_load
 was removed (reported as an unknown key) rather than mapped to a deferred
 exposure; `Retry-After` is not honored by the HTTP retry policy; OAuth is not
 implemented — deferred to post-ship (P3), with static tokens via config
-`headers` as the M1 credential path; and elicitation/`input_required` results are refused with a
-clear error rather than driven (P4).
+`headers` as the M1 credential path. The one P4 item not taken is
+`subscriptions/listen` + the registry hot-swap (§7): the registry refresh needs
+the daemon's shared `Arc<ToolRegistry>` rebuilt and swapped, which the P4 run
+deliberately left out rather than half-wire. M1 also flips the `mcp` feature
+into the default set (D9).
 
 ### 1.3 The protocol delta
 
@@ -429,11 +449,11 @@ missing capability that blocks real servers; **S3** = robustness/quality;
 | G5 | MCP images are never attached to the model (rendered as text) | S1 | `image_tx` ignored; `[Image: …]` placeholder | **Closed (P0)** — base64 decode + image pipeline; placeholder only without a sink/invalid |
 | G6 | `inputSchema` default is JSON `null` when a server omits the key; invalid per spec | S2 | `#[serde(default)] input_schema: Value` in `protocol.rs` | **Closed (P0/P1)** — `normalize_input_schema` + rmcp's object-shape enforcement |
 | G7 | `tools/list` ignores `nextCursor` → large servers lose tools silently | S2 | `client.rs::list_tools` | **Closed (P1)** — rmcp `list_all_tools` follows cursors |
-| G8 | No `subscriptions/listen`; new tools require a daemon restart | S2 | notifications discarded in `transport.rs` | **Open (P4)** |
+| G8 | No `subscriptions/listen`; new tools require a daemon restart | S2 | notifications discarded in `transport.rs` | **Partial (P4)** — list-changed events now reach the client (ServerEvent) and progress/logging are handled; `subscriptions/listen` + the registry hot-swap remain |
 | G9 | No `structuredContent`/`outputSchema` capture into `ToolOutput.result_json` | S2 | `tool.rs` mapping | **Closed (P1)** — `result_json` set; real `outputSchema` advertised |
-| G10 | No resources, prompts | S2 | no protocol types | **Open (P4)** — content blocks convert; resource/prompt *tools* pending |
-| G11 | No cancellation; a cancelled session leaves the MCP call running | S2 | `ctx.cancelled` never consulted | **Closed (P1)** — cancel wired end-to-end incl. child sessions |
-| G12 | No progress notifications; `supports_streaming_output` emits one final chunk | S2 | `execute_streaming_json` | **Partial (P1/P4)** — progress resets the deadline; progress→chunks pending |
+| G10 | No resources, prompts | S2 | no protocol types | **Partial (P4)** — resource tools (`list_resources`/`read_resource`) landed; prompts remain deferred |
+| G11 | No cancellation; a cancelled session leaves the MCP call running | S2 | `ctx.cancelled` never consulted | **Closed (P1/P4)** — cancel wired end-to-end incl. child sessions; the server-observed `notifications/cancelled` test landed in P4 |
+| G12 | No progress notifications; `supports_streaming_output` emits one final chunk | S2 | `execute_streaming_json` | **Closed (P4)** — progress forwarded as rate-limited streaming chunks (client + daemon tests) |
 | G13 | Unbounded stdout line + unbounded channels (memory DoS from a hostile server) | S2 | `transport.rs` | **Partial (P0→P1)** — P0 capped lines at 8 MiB; the rmcp swap reads uncapped; reinstatement in P6 |
 | G14 | No per-server timeouts in config; fixed 60 s | S3 | `client.rs` constants | **Closed (P0)** — `timeout` key + `DEFAULT_TIMEOUT` |
 | G15 | `auto_load` parsed but ignored | S3 | `config.rs` | **Closed (P0)** — key removed; unknown keys are logged |
@@ -588,12 +608,40 @@ error that names what the server asked for. This avoids promising a capability
 we cannot honor — the spec forbids servers from demanding undeclared
 capabilities, and a hard failure is better than a silent hang.
 
-### D9 — Feature gating and policy stay as they are
+Status: the bounded decline-and-retry loop landed in P4 (`274f736`) — elicitation
+and roots are declined, sampling is refused with a clear error, and a peer that
+keeps asking fails rather than hanging. Elicitation is still **not advertised**
+(no prompt surface yet).
 
-`choreo-mcp` remains the only crate in the tree with MCP dependencies; the
-daemon's `mcp` feature remains off by default; `ToolPolicy::Mobile` continues to
-exclude MCP entirely (subprocesses + network are the mobile threat surface). The
-new dependency tree (reqwest/rustls etc.) only compiles with the feature on.
+### D9 — MCP becomes a default feature for M1
+
+M1 flips the `mcp` cargo feature into the default set, at both layers the shipped
+binary is built from: the daemon's `default` gains `mcp`, and the root package
+re-enables it the way it already re-enables `pdf` (the root consumes
+`choreo-daemon` with `default-features = false`, so the workspace default alone
+would not reach the binary). Rationale: MCP is a core capability of the product,
+not an experiment — a feature that ships disabled is one nobody uses, and the
+remaining M1 work (bounds, name hygiene, status surface, conformance) exists
+precisely to make the default safe.
+
+Trade-offs accepted, with their mitigations:
+
+- Every default build now compiles `choreo-mcp`, `rmcp`, `reqwest`/rustls, and
+the sidecar tokio runtime. `rmcp` stays `default-features = false` with only the
+needed transports (D1/D11); the named feature remains for opt-out, so an
+embedder that cannot host subprocesses or the dependency tree uses
+`--no-default-features` (and re-enables what it needs).
+- The iOS embedded daemon already consumes the daemon with
+`default-features = false` (the `pdf` precedent), so it stays MCP-free at compile
+time, and `ToolPolicy::Mobile` keeps filtering MCP at registration time
+regardless.
+- Release jobs pass explicit `--features` lists but keep defaults on, so
+`scripts/release.sh` gains MCP automatically once the default flips; P6 verifies
+the static-musl build with it and records the size/build-time delta.
+- The "off by default" statements in `ARCHITECTURE.md`, `README.md`, and the
+`Cargo.toml` feature comments all flip in the same change (§11).
+
+`choreo-mcp` remains the only crate in the tree with MCP dependencies.
 
 ### D10 — Content mapping
 
@@ -705,9 +753,10 @@ Lifecycle per server: connect at startup under the 2 s batch budget (`ready`, or
 skipped with a log); at runtime a transport failure triggers a reconnect under
 the restart policy (attempts reset on success, never retried in a loop after the
 budget is spent); `McpManager::shutdown_all` drains the slots with bounded joins.
-Remaining lifecycle work (P4/P5): a `needs_auth` state and
-`subscriptions/listen`-driven tool-list refresh (new tools registered, withdrawn
-ones dropped from the group, session group membership unchanged).
+Remaining lifecycle work: `subscriptions/listen`-driven tool-list refresh (the
+remaining P4 item) and a `needs_auth` state (P3, post-ship). New tools are
+registered and withdrawn tools dropped from the group, with session group
+membership unchanged.
 
 ## 7. Work breakdown
 
@@ -729,23 +778,27 @@ mapping is an M1 item (P5).
 
 M1 includes, at minimum:
 
+- **Default on**: the `mcp` feature moves into the default feature set (D9), so
+  a plain build has MCP — M1 is "MCP ships enabled", not "MCP compiles".
 - **P6**: the bounded stdio frame reader (the P1 regression), the per-server
   concurrency cap, the conformance baseline, the lockfile/supply-chain check, the
-  release posture, and the §9 security checklist.
+  release verification with the default feature set, and the §9 security
+  checklist.
 - **P5**: tool-name sanitization, `cwd`/`disabledTools`, the `/mcp` status
   surface + per-server logs + `session_inspect`, the auth-required error, config
   layers, and user docs (including the "OAuth not yet supported" limitation).
-- **P4**: `subscriptions/listen` tool-list refresh, progress chunks, MRTR
-  handling, resource tools, and the server-observed cancellation test.
+- **P4**: progress chunks, MRTR handling, resource tools, and the server-observed
+  cancellation test are **done** (`274f736`); only the `subscriptions/listen` +
+  registry hot-swap item remains (see P4).
 
 Explicitly deferred past M1 (not ship blockers): **OAuth (P3)**, `exposure` +
 [tool-search-driven deferred loading](#13-out-of-scope--future-work), `mcp
 reload`, and the MCP-server role (§13).
 
-If M1 needs to be smaller, the safely trimmable items are resource tools,
-progress chunks, and config layers — do not trim the frame cap, the concurrency
-cap, tool-name sanitization, or the conformance baseline: those are what make the
-feature safe to enable.
+If M1 needs to be smaller, the safely trimmable items are config layers and
+`disabledTools` — do not trim the frame cap, the concurrency cap, tool-name
+sanitization, the conformance baseline, or the subscriptions item: those are
+what make the default-on feature safe to enable.
 
 M1 shipping does **not** delete this plan: the Lifecycle rule ties deletion to
 full implementation, and P3 remains here for post-ship work.
@@ -815,25 +868,36 @@ Residuals:
 
 ### P4 — Feature plumbing into the daemon (M1)
 
-Content mapping (the first item below, D10) already landed in P0/P1; the rest
-remains.
+Content mapping (D10) landed in P0/P1; notifications, MRTR, progress, and
+resources landed in `274f736`. One item remains.
 
 - [x] D10 content mapping, including `image_tx` and `result_json` — landed P0/P1.
-- [ ] `subscriptions/listen` per server when `listChanged` is declared; tool-list
-      refresh updates the registry group in place.
-- [ ] Progress → `ToolResultChunk`s (rate-limited); logging notifications →
-      per-server log file + tracing (progress currently only resets the deadline).
-- [ ] MRTR loop for `input_required`: today the engine turns an
-      `input_required` result (and any other unhandled result type) into a clear
-      `ProtocolError` instead of hanging; the decline policy (D8) then the
-      pluggable handler land here.
-- [ ] Resource tools (per server, when `resources` capability declared):
-      `mcp/<slug>/read_resource` (+ `list_resources`), paginated; prompts tools
-      deferred.
+- [x] Progress → `ToolResultChunk`s (rate-limited via `PROGRESS_MIN_INTERVAL`,
+      best-effort); logging notifications → tracing; a real `ClientHandler` so
+      notifications reach the client instead of being dropped — landed P4.
+- [x] MRTR loop for `input_required`: elicitation/roots are declined and the
+      call re-issued with `inputResponses` + the echoed `requestState`; sampling
+      is refused with a clear error; a peer that keeps asking fails cleanly —
+      landed P4 (D8).
+- [x] Resource tools (per server, when the `resources` capability is declared):
+      `mcp/<slug>/list_resources` + `mcp/<slug>/read_resource`, paginated —
+      landed P4; prompt tools remain deferred.
 - [x] `outputSchema` → `ToolDyn::output_schema()` (real schema) and
       `structuredContent` → `result_json` — landed P1.
-- [ ] Cancellation end-to-end test that also asserts the *server* observed
-      `notifications/cancelled` (the client-side cancellation test landed in P1).
+- [x] Cancellation end-to-end test asserting the *server* observed
+      `notifications/cancelled` — landed P4 (the fixture records it).
+- [ ] `subscriptions/listen` + registry refresh — the one remaining item,
+      deliberately not half-wired:
+  - [ ] Client wiring: open a `subscriptions/listen` stream when the server
+        declares list-changed (rmcp's peer listen API) and surface
+        `toolsListChanged` / `resourcesListChanged` events to the daemon.
+  - [ ] Registry hot-swap: rebuild the `ToolRegistry` on the daemon command loop
+        and swap the shared `Arc<ToolRegistry>` so a list change updates the
+        `mcp/<slug>` group in place. Today `DaemonState::tool_registry` is an
+        immutable `Arc` shared into every session, and the core-tool /
+        platform-bridge construction lives in startup (`daemon/open.rs`), so
+        this factors that construction into a rebuildable function first — a
+        daemon-lifecycle change, not a wrapper tweak.
 
 ### P5 — Configuration, UX, observability (M1)
 
@@ -883,10 +947,12 @@ Post-ship (fast-follow, around P3):
       base64 header sentinel; property tests for the tool-name sanitizer.
 - [ ] Supply-chain: lockfile review, `cargo deny` stays green, note `rmcp` in
       the dependency policy docs.
-- [ ] Release posture: decide whether any shipped channel enables the `mcp`
-      feature. If yes, extend the static-musl build matrix to cover it; if it
-      stays a source-build opt-in, document the enable path. Either way, the
-      release notes state the feature's status.
+- [ ] Default-feature release verification: `mcp` is a default feature in M1
+      (D9), so the static-musl/release matrix must build with it — defaults
+      still apply to the explicit `--features` lists in `scripts/release.sh`,
+      so the builds gain MCP automatically; confirm the tarball builds, record
+      the size/build-time delta, and keep the opt-out paths documented (iOS
+      `default-features = false`; `--no-default-features` for embedders).
 - [ ] Security checklist from §9 executed and recorded in the PR.
 
 ### P3 — OAuth for remote servers (post-ship, deferred)
@@ -921,29 +987,32 @@ integration tests live in `tests/it/` (one binary per crate, `#[ignore]`).
   structured/slow) with a real `outputSchema`, and a slow call for cancellation.
   The daemon suite re-uses the same source through an `include!` in
   `choreo-daemon/tests/fixtures/mcp_fixture_server.rs`. No Node/npx, no network.
-  Still to add: `list_changed` + `subscriptions/listen`, `notifications/progress`,
-  paged `tools/list`, and bad-schema variants (P4/P6).
+  P4 added scenarios for progress, MRTR, resources, and a fixture-recorded
+  `notifications/cancelled`. Still to add: `subscriptions/listen` (and the
+  registry refresh), paged `tools/list`, and bad-schema variants (P4/P6).
 - **HTTP fixture.** `choreo-mcp/tests/it/mcp_http_integration.rs` (P2) drives a
   local `TcpListener` fixture: JSON and SSE responses, generated-header
   validation (`Mcp-Method`/`Mcp-Name`/`MCP-Protocol-Version` and custom
   headers), the `auto` fallback to a legacy server, a retried `503`, and the
   deprecated HTTP+SSE rejection. Still to add: an OAuth challenge
   (`401`/`WWW-Authenticate`) in P3 and a long-lived `subscriptions/listen`
-  stream in P4.
+  stream when that P4 item lands.
 - **Unit tests** cover: schema normalization, content mapping, name/desc
   formatting, error mapping, the dispatcher protocol + cancellation + restart
   backoff against a mock engine, config parsing (transport inference,
   `${VAR}` expansion, timeout/protocol/unknown keys), the HTTP retry policy
-  (status classification + capped backoff), and runtime init. All wait-free —
-  the restart tests exercise the backoff math without sleeping, and the
-  cancellation test synchronizes over channels (mock signals `started`, then
-  the test cancels).
+  (status classification + capped backoff), the P4 progress rate-limit and MRTR
+  decline helpers, and runtime init. All wait-free — the restart tests exercise
+  the backoff math without sleeping, and the cancellation test synchronizes
+  over channels (mock signals `started`, then the test cancels).
 - **Integration tests** cover: stdio against the fixture server per era, the
-  `auto` fallback, structured content, crash/garbage/oversized/no-init, and
-  cancellation; HTTP against the `TcpListener` fixture (above). The stdio
-  cancellation case waits for the fixture's in-flight marker with a bounded
-  5 ms poll (integration-only; the unit-test wait-free rule is intact), and the
-  daemon case asserts the image sink path end-to-end.
+  `auto` fallback, structured content, crash/garbage/oversized/no-init,
+  cancellation, P4's progress→chunk path (client and daemon), MRTR,
+  resource list/read, and the server-observed `notifications/cancelled`; HTTP
+  against the `TcpListener` fixture (above). The stdio cancellation case waits
+  for the fixture's in-flight marker with a bounded 5 ms poll
+  (integration-only; the unit-test wait-free rule is intact), and the daemon
+  case asserts the image sink path end-to-end.
 - **Conformance** runs the official suite (P6) and diffs against a baseline.
 - **Manual interop matrix** (documented, run at release): current
   `@modelcontextprotocol/server-everything`, a filesystem server, a remote OAuth
@@ -1022,11 +1091,16 @@ its deferred-loading work.
 
 - `ARCHITECTURE.md`: rewrite the `choreo-mcp` module table (§`choreo-mcp`), the
   `mcp/` daemon row, the feature list row, the test-coverage table rows, and the
-  threading-model paragraph (sidecar + dispatcher). Keep the "off by default"
-  statement.
+  threading-model paragraph (sidecar + dispatcher). The feature row flips to
+  default-on for M1 (D9) — no "off by default" claim remains.
 - `README.md`: update the MCP capability lines (transport, features, OAuth).
 - `choreo-mcp` rustdoc: module headers per the migration rules; keep
   `#![warn(missing_docs)]` green (`doc-check` covers the crate).
+- Flip the "off by default" statements for M1 (D9): the `ARCHITECTURE.md` and
+  `README.md` feature/module rows and the `Cargo.toml` feature comments in the
+  root and `choreo-daemon` all describe `mcp` as opt-in today; they change with
+  the default flip, and the opt-out paths (iOS `default-features = false`,
+  `--no-default-features`) are stated where the default is.
 - Release note: one `feat(choreo-mcp):` commit (or a small series: `feat`,
   `fix`, `refactor`) with user-facing prose. `choreo-mcp` and `choreo-daemon`
   scopes preferred.
@@ -1043,7 +1117,8 @@ this plan — verified at `976edf6`.
 
 | Risk | Mitigation |
 |---|---|
-| Dependency weight (tokio/reqwest/hyper via rmcp) | `mcp` feature stays off by default; verify both `--no-default-features` and `--all-features` builds; static-musl release job with the feature enabled (P6). P1 scoped rmcp to `client` + `transport-child-process` and promoted `tokio`/`process-wrap`; P2 added `transport-streamable-http-client-reqwest` and declared `reqwest` 0.13, which shares one build with rmcp and alloy (D11). |
+| Dependency weight is now paid by default builds (tokio/reqwest/rustls via rmcp, D9) | `rmcp` stays `default-features = false` with only the needed transports; the named feature remains the opt-out (`--no-default-features`; iOS keeps `default-features = false`); verify both `--no-default-features` and `--all-features` builds, and the static-musl release with defaults (P6). P1 scoped rmcp to `client` + `transport-child-process`; P2 added `transport-streamable-http-client-reqwest` and `reqwest` 0.13 (shared with rmcp and alloy — D11). |
+| Tool-list refresh needs the shared `Arc<ToolRegistry>` replaced | `DaemonState::tool_registry` is immutable and shared into every session; rebuild on the command loop with the core-tool/platform-bridge construction factored out of startup, swap once atomically, and let in-flight holders keep the old `Arc`. Sized as a daemon-lifecycle change — the remaining P4 item. |
 | rmcp's stdio transport buffers unbounded lines (`AsyncRwTransport` has no cap) | Reinstate a capped reader in P6 (custom transport over a bounded `AsyncRead` adapter, or an upstream rmcp hook); the `oversized` integration test currently passes on fixture exit, not a client-side bound. (The HTTP path *is* bounded: SSE events are capped at 16 MiB.) |
 | Two `reqwest` majors in the lockfile (0.12.28 via `blitz-net`/`dioxus-native` → `choreo-gui`; 0.13.5 shared by `alloy` + `rmcp` + `choreo-mcp`) | The duplicate predates MCP and belongs to the GUI renderer; the MCP path shares one 0.13 build (D11). `deny.toml` keeps `multiple-versions = "warn"`. |
 | rmcp API churn (3.x is moving fast) | Pin `3.5`, upgrade deliberately; the blocking facade isolates the daemon from rmcp types (rmcp types do not cross the crate boundary). |
@@ -1099,20 +1174,24 @@ P0–P2 are done; the unchecked M1 items are what remains.
       authenticated server; a server that requires OAuth fails with the P5
       actionable error, not a hang or a raw status string. No credential store,
       no sign-in flow (P3, post-ship).
-- [ ] Tool calls: parallel per server, cancellable, deadline-bounded, restart on
-      crash, progress-streamed, with images attached, structured content
-      preserved, and typed errors. *(Met except progress streaming (P4) and the
-      per-server concurrency cap (P6).)*
-- [ ] Tool list changes propagate without a daemon restart; resources readable
-      via wrapper tools (P4).
+- [ ] Tool calls: parallel per server, cancellable, deadline-bounded, restart
+      on crash, progress-streamed, with images attached, structured content
+      preserved, and typed errors. *(Met except the per-server concurrency cap
+      (P6).)*
+- [x] Resources readable via wrapper tools (`list_resources`/`read_resource`,
+      P4).
+- [ ] Tool and resource list changes propagate without a daemon restart
+      (`subscriptions/listen` + registry hot-swap — the one remaining P4 item).
 - [ ] Bounds enforced and tested: schema/text caps (done), the stdio frame cap
       reinstated, and the per-server concurrency cap (P6).
 - [ ] Tool names sanitized and collision-proofed (P5).
 - [ ] `/mcp` status surface + `mcp list/add/remove/reconnect` CLI, per-server
       logs, and a `session_inspect` section (P5).
-- [ ] Release posture decided and documented — whether any shipped channel
-      enables the `mcp` feature and, if so, the static-musl build covering it
-      (P6).
+- [ ] `mcp` is a default cargo feature: a plain build has MCP; the opt-out
+      paths (iOS embedded daemon, `--no-default-features`) stay documented
+      (D9).
+- [ ] Release artifacts verified with the default (MCP-on) feature set; the
+      static-musl build covers it and the size delta is recorded (P6).
 - [ ] `ARCHITECTURE.md`/`README.md`/rustdoc updated; `just pre-commit` green;
       release notes written from the commit messages. *(P0–P2 did exactly this,
       each commit its own release note.)*
