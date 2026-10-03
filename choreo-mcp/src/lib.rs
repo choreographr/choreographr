@@ -21,10 +21,11 @@
 //!
 //! The split is deliberate: [`protocol`] owns the daemon-facing value types,
 //! [`config`] the per-server configuration (transport + protocol era), [`error`]
-//! the shared failure type, [`runtime`] the async sidecar, [`session`] the
-//! dispatcher + blocking facade, and the private `engine` / `retry` / `stdio`
-//! modules the `rmcp` plumbing, the HTTP connect-retry policy, and the capped
-//! child-process transport.
+//! the shared failure type, [`naming`] the provider-safe tool/group name
+//! construction, [`runtime`] the async sidecar, [`session`] the dispatcher +
+//! blocking facade, and the private `engine` / `retry` / `stdio` modules the
+//! `rmcp` plumbing, the HTTP connect-retry policy, and the capped child-process
+//! transport.
 //!
 //! [Model Context Protocol]: https://modelcontextprotocol.io
 
@@ -36,6 +37,7 @@
 pub mod config;
 mod engine;
 pub mod error;
+pub mod naming;
 pub mod protocol;
 mod retry;
 pub mod runtime;
@@ -47,6 +49,10 @@ pub use config::{
     McpTransportKind,
 };
 pub use error::McpError;
+pub use naming::{
+    MAX_TOOL_NAME_LEN, TOOL_NAME_PREFIX, build_tool_name, build_tool_name_with_suffix, group_name,
+    sanitize_segment, short_hash,
+};
 pub use protocol::{
     CallToolResult, EMPTY_INPUT_SCHEMA, MAX_SCHEMA_BYTES, McpContent, McpListChange, McpListKind,
     McpResource, McpTool, normalize_input_schema,

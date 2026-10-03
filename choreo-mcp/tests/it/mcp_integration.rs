@@ -30,11 +30,13 @@ fn fixture_config(scenario: Option<&str>, protocol: McpProtocolMode) -> McpServe
             command: FIXTURE_BIN.to_string(),
             args: scenario.map_or_else(Vec::new, |s| vec![s.to_string()]),
             env: HashMap::new(),
+            cwd: None,
         },
         enabled: true,
         timeout: Some(Duration::from_secs(10)),
         protocol,
         max_concurrent_calls: None,
+        disabled_tools: Vec::new(),
     }
 }
 

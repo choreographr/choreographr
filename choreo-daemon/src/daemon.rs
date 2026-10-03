@@ -528,6 +528,19 @@ pub enum DaemonCommand {
     McpListChanged {
         slug: String,
     },
+    /// Report the state of every configured MCP server (for the `/mcp` status
+    /// surface and `session_inspect`). Read-only; replies on a plain channel so
+    /// a blocked tool execution (or a connection handler) can wait for it.
+    McpStatus {
+        reply: std::sync::mpsc::Sender<Vec<crate::mcp::McpServerStatus>>,
+    },
+    /// Reconnect one MCP server (rebuild its connection), then rebuild the tool
+    /// catalogue. Replies with the outcome, targeted to the requesting
+    /// connection (or the tool caller).
+    McpReconnect {
+        slug: String,
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
     /// Set the display title for a session, forwarded to the session's
     /// main loop for in-memory update, broadcast, and persistence.
     SetSessionTitle {
@@ -824,6 +837,12 @@ impl DaemonState {
                 request_id,
             } => self.handle_cancel_request(session_id, request_id),
             DaemonCommand::McpListChanged { slug } => self.handle_mcp_list_changed(&slug),
+            DaemonCommand::McpStatus { reply } => {
+                let _ = reply.send(self.mcp_manager.status());
+            }
+            DaemonCommand::McpReconnect { slug, reply } => {
+                self.handle_mcp_reconnect(&slug, &reply);
+            }
             DaemonCommand::SetSessionTitle { session_id, title } => {
                 self.handle_set_session_title(session_id, title);
             }
@@ -2052,13 +2071,49 @@ impl DaemonState {
     /// the catalogue has a single writer, and a list change is a rare event.
     fn handle_mcp_list_changed(&mut self, slug: &str) {
         info!(server = %slug, "MCP list changed; rebuilding the tool catalogue");
+        self.rebuild_tool_catalogue();
+        info!(server = %slug, "MCP tool catalogue refreshed");
+    }
+
+    /// Rebuild the whole tool catalogue from the current `McpManager` and swap
+    /// it into the shared registry.
+    ///
+    /// The command loop is the single writer of `tool_registry` (the sanctioned
+    /// `ArcSwap` rule); this is the one place the swap happens, so a list change
+    /// and a manual reconnect take the identical path. A request already holding
+    /// the previous registry keeps using it safely; the swap is atomic and never
+    /// tears a live load.
+    fn rebuild_tool_catalogue(&mut self) {
         let registry = open::build_tool_registry(
             self.tool_policy,
             self.platform_tool_bridge.as_ref(),
             &self.mcp_manager,
         );
         self.tool_registry.store(registry);
-        info!(server = %slug, "MCP tool catalogue refreshed");
+    }
+
+    /// Reconnect one MCP server and refresh the catalogue.
+    ///
+    /// On success the whole catalogue is rebuilt (so the reconnected server's
+    /// tools — whose sanitized names the manager may have disambiguated
+    /// differently from a prior connection — are registered fresh). The outcome
+    /// is reported back to the requester.
+    fn handle_mcp_reconnect(
+        &mut self,
+        slug: &str,
+        reply: &std::sync::mpsc::Sender<Result<(), String>>,
+    ) {
+        let result = self.mcp_manager.reconnect(slug);
+        match &result {
+            Ok(()) => {
+                self.rebuild_tool_catalogue();
+                info!(server = %slug, "MCP server reconnected; tool catalogue refreshed");
+            }
+            Err(e) => {
+                warn!(server = %slug, error = %e, "MCP reconnect failed");
+            }
+        }
+        let _ = reply.send(result);
     }
 
     /// Force-close one session's provider sockets by shutting down its

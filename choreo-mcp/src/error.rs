@@ -73,6 +73,21 @@ pub enum McpError {
     /// Streamable HTTP rather than debugging an opaque connect failure.
     #[error("unsupported MCP transport: {0}")]
     UnsupportedTransport(String),
+
+    /// The remote server rejected the request as unauthorized
+    /// (HTTP 401 or 403).
+    ///
+    /// A remote server that requires a credential this client did not send
+    /// fails here. The message is actionable: it names the two supported
+    /// options — a static token in the server's `headers`, or waiting for
+    /// OAuth support — rather than leaving the raw status to be decoded.
+    #[error("authorization required by {server}: {hint}")]
+    AuthRequired {
+        /// The server slug whose endpoint rejected the request.
+        server: String,
+        /// The actionable guidance (which header to set, and the OAuth note).
+        hint: String,
+    },
 }
 
 #[cfg(test)]
@@ -138,5 +153,16 @@ mod tests {
     fn error_unsupported_transport_display() {
         let err = McpError::UnsupportedTransport("HTTP+SSE".into());
         assert!(err.to_string().contains("HTTP+SSE"));
+    }
+
+    #[test]
+    fn error_auth_required_display_names_server_and_guidance() {
+        let err = McpError::AuthRequired {
+            server: "docs".into(),
+            hint: "set a token".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("docs"), "{msg}");
+        assert!(msg.contains("set a token"), "{msg}");
     }
 }

@@ -25,6 +25,7 @@
 //! `turn_for_client`), and raw reasoning additionally requires `include_raw`.
 
 use super::ToolExecError;
+use crate::daemon::DaemonCommand;
 use crate::db::{read_session, read_turns};
 use crate::reasoning::{
     build_chat_request_messages, include_reasoning_artifact, warn_on_missing_reasoning_artifacts,
@@ -438,6 +439,7 @@ fn build_report(
         assistant_count,
         messages.len()
     );
+    out.push_str(&mcp_section(ctx));
     out.push('\n');
     let _ = writeln!(
         out,
@@ -503,6 +505,34 @@ fn build_report(
         ledger.join("\n")
     );
     Ok(out)
+}
+
+/// The `session_inspect` MCP section: every configured MCP server's state and
+/// tool count (never a secret).
+///
+/// Queried live from the daemon command loop (the owner of the `McpManager`)
+/// over the session's `daemon_tx`, with a short timeout so an unresponsive
+/// daemon cannot hang the diagnostic instead of reporting it.
+fn mcp_section(ctx: &ToolContext) -> String {
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    if ctx
+        .daemon_tx
+        .send(DaemonCommand::McpStatus { reply: reply_tx })
+        .is_err()
+    {
+        return "  MCP: daemon command loop unavailable\n".to_string();
+    }
+    let Ok(statuses) = reply_rx.recv_timeout(std::time::Duration::from_secs(2)) else {
+        return "  MCP: status query timed out\n".to_string();
+    };
+    if statuses.is_empty() {
+        return "  MCP: no servers configured\n".to_string();
+    }
+    let mut out = format!("  MCP servers ({}):\n", statuses.len());
+    for status in statuses {
+        let _ = writeln!(out, "    {}", status.summary());
+    }
+    out
 }
 
 /// Count occurrences of each distinct producer across the session's turns;

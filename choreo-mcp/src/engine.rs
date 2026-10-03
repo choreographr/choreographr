@@ -110,6 +110,9 @@ pub(crate) struct RmcpEngine {
     timeout: Duration,
     /// Whether the server declared the `resources` capability.
     has_resources: bool,
+    /// The server slug, used to name the server in an actionable
+    /// authorization-required error.
+    slug: String,
 }
 
 /// The `ClientHandler` for one connection.
@@ -223,6 +226,7 @@ pub(crate) fn connect(
         version,
         timeout,
         has_resources,
+        slug: config.slug.clone(),
     }))
 }
 
@@ -412,6 +416,16 @@ async fn connect_http(
                          specification; point the server at a Streamable HTTP endpoint"
                     )));
                 }
+                // An authorization failure is surfaced before anything else: the
+                // legacy-SSE probe above only runs for a non-auth failure.
+                if let Some(status) = connect_error_status(&error)
+                    && matches!(status, 401 | 403)
+                {
+                    return Err(McpError::AuthRequired {
+                        server: config.slug.clone(),
+                        hint: auth_hint(status),
+                    });
+                }
                 return Err(McpError::InitializeFailed(error.to_string()));
             }
         }
@@ -488,25 +502,31 @@ fn is_reserved_header(name: &HeaderName) -> bool {
 
 /// Whether a failed connect is worth retrying under [`crate::retry`].
 ///
-/// The HTTP status is recovered by walking the transport error's source chain
-/// for rmcp's `StreamableHttpError`: a bare `reqwest::Error` carries a status
-/// directly, whereas a rejected POST surfaces the status inside rmcp's
-/// `"HTTP <status>: <body>"` message.
+/// The HTTP status is recovered by [`connect_error_status`].
 fn retryable_connect(error: &ClientInitializeError) -> bool {
+    connect_error_status(error).is_some_and(crate::retry::is_retryable_status)
+}
+
+/// Recover the HTTP status from a failed connect, if it carries one.
+///
+/// Walks the transport error's source chain for rmcp's `StreamableHttpError`: a
+/// bare `reqwest::Error` carries a status directly, whereas a rejected POST
+/// surfaces the status inside rmcp's `"HTTP <status>: <body>"` message.
+fn connect_error_status(error: &ClientInitializeError) -> Option<u16> {
     let root: &dyn std::error::Error = match error {
         ClientInitializeError::TransportError { error, .. } => error.error.as_ref(),
-        _ => return false,
+        _ => return None,
     };
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(root);
     while let Some(err) = current {
         if let Some(http) = err.downcast_ref::<StreamableHttpError<reqwest::Error>>()
             && let Some(status) = http_error_status(http)
         {
-            return crate::retry::is_retryable_status(status);
+            return Some(status);
         }
         current = err.source();
     }
-    false
+    None
 }
 
 /// Extract the HTTP status from an rmcp Streamable HTTP error, when it carries
@@ -515,6 +535,11 @@ fn http_error_status(error: &StreamableHttpError<reqwest::Error>) -> Option<u16>
     match error {
         StreamableHttpError::Client(e) => e.status().map(|s| s.as_u16()),
         StreamableHttpError::UnexpectedServerResponse(message) => parse_http_status(message),
+        // rmcp models a 401 challenge and an insufficient-scope 403 as their
+        // own variants (no status number); map them to the codes they represent
+        // so the caller can turn either into an actionable `AuthRequired`.
+        StreamableHttpError::AuthRequired(_) => Some(401),
+        StreamableHttpError::InsufficientScope(_) => Some(403),
         _ => None,
     }
 }
@@ -641,12 +666,13 @@ impl McpEngine for RmcpEngine {
     fn list_tools(&self) -> BoxFuture<'_, Result<Vec<McpTool>, McpError>> {
         let peer = self.peer.clone();
         let timeout = self.timeout;
+        let slug = self.slug.clone();
         Box::pin(async move {
             // `list_all_tools` follows `nextCursor` to completion; the total is
             // bounded by the server's configured timeout.
             match tokio::time::timeout(timeout, peer.list_all_tools()).await {
                 Ok(Ok(tools)) => Ok(convert_tools(tools)),
-                Ok(Err(e)) => Err(map_service_error(e)),
+                Ok(Err(e)) => Err(map_service_error(e, &slug)),
                 Err(_) => Err(McpError::Timeout),
             }
         })
@@ -655,18 +681,20 @@ impl McpEngine for RmcpEngine {
     fn call_tool(&self, call: EngineCall) -> BoxFuture<'_, Result<CallToolResult, McpError>> {
         let peer = self.peer.clone();
         let events = self.events.clone();
-        Box::pin(async move { call_tool_impl(&peer, &events, call).await })
+        let slug = self.slug.clone();
+        Box::pin(async move { call_tool_impl(&peer, &events, call, &slug).await })
     }
 
     fn list_resources(&self) -> BoxFuture<'_, Result<Vec<McpResource>, McpError>> {
         let peer = self.peer.clone();
         let timeout = self.timeout;
+        let slug = self.slug.clone();
         Box::pin(async move {
             match tokio::time::timeout(timeout, peer.list_all_resources()).await {
                 Ok(Ok(resources)) => {
                     Ok(resources.into_iter().map(convert_listed_resource).collect())
                 }
-                Ok(Err(e)) => Err(map_service_error(e)),
+                Ok(Err(e)) => Err(map_service_error(e, &slug)),
                 Err(_) => Err(McpError::Timeout),
             }
         })
@@ -675,6 +703,7 @@ impl McpEngine for RmcpEngine {
     fn read_resource(&self, uri: String) -> BoxFuture<'_, Result<Vec<McpContent>, McpError>> {
         let peer = self.peer.clone();
         let timeout = self.timeout;
+        let slug = self.slug.clone();
         Box::pin(async move {
             let params = rmcp::model::ReadResourceRequestParams::new(uri);
             match tokio::time::timeout(timeout, peer.read_resource_once(params)).await {
@@ -693,7 +722,7 @@ impl McpEngine for RmcpEngine {
                 Ok(Ok(_)) => Err(McpError::ProtocolError(
                     "resources/read returned an unsupported result type".into(),
                 )),
-                Ok(Err(e)) => Err(map_service_error(e)),
+                Ok(Err(e)) => Err(map_service_error(e, &slug)),
                 Err(_) => Err(McpError::Timeout),
             }
         })
@@ -738,6 +767,7 @@ async fn call_tool_impl(
     peer: &Peer<RoleClient>,
     events: &tokio::sync::broadcast::Sender<ServerEvent>,
     call: EngineCall,
+    slug: &str,
 ) -> Result<CallToolResult, McpError> {
     let EngineCall {
         request,
@@ -782,7 +812,7 @@ async fn call_tool_impl(
                 options,
             )
             .await
-            .map_err(map_service_error)?;
+            .map_err(|e| map_service_error(e, slug))?;
         let request_id = handle.id.clone();
         let progress_token = handle.progress_token.clone();
 
@@ -817,7 +847,7 @@ async fn call_tool_impl(
             }
         };
 
-        match response.map_err(map_service_error)? {
+        match response.map_err(|e| map_service_error(e, slug))? {
             ServerResult::CallToolResult(result) => return Ok(convert_call_result(result)),
             ServerResult::InputRequiredResult(required) => {
                 rounds += 1;
@@ -917,7 +947,12 @@ fn decline_responses(input_requests: Option<&InputRequests>) -> Result<InputResp
 }
 
 /// Map an `rmcp` service error onto this crate's error type.
-fn map_service_error(error: ServiceError) -> McpError {
+///
+/// An error carrying an HTTP 401/403 status is surfaced as an actionable
+/// [`McpError::AuthRequired`] naming `slug`, so a mid-session authorization
+/// failure (not just a connect-time one) explains itself rather than appearing
+/// as an opaque transport error.
+fn map_service_error(error: ServiceError, slug: &str) -> McpError {
     match error {
         ServiceError::McpError(data) => McpError::JsonRpcError {
             code: i64::from(data.code.0),
@@ -926,8 +961,53 @@ fn map_service_error(error: ServiceError) -> McpError {
         ServiceError::TransportClosed => McpError::ServerShutdown,
         ServiceError::Timeout { .. } => McpError::Timeout,
         ServiceError::Cancelled { .. } => McpError::Cancelled,
-        other => McpError::ProtocolError(other.to_string()),
+        other => {
+            // A transport error may embed a rejected POST's status (or rmcp's
+            // dedicated auth variants); surface an authorization failure plainly
+            // when it does.
+            match service_error_status(&other) {
+                Some(status @ (401 | 403)) => McpError::AuthRequired {
+                    server: slug.to_string(),
+                    hint: auth_hint(status),
+                },
+                _ => McpError::ProtocolError(other.to_string()),
+            }
+        }
     }
+}
+
+/// Recover an HTTP status from a service error by walking its source chain for
+/// rmcp's `StreamableHttpError`.
+fn service_error_status(error: &ServiceError) -> Option<u16> {
+    // `TransportSend`'s inner error is not exposed through `source()`, so the
+    // walk starts at the dynamic error's boxed payload, where the transport
+    // error actually lives.
+    let root: &(dyn std::error::Error + 'static) = match error {
+        ServiceError::TransportSend(dynamic) => dynamic.error.as_ref(),
+        _ => error,
+    };
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(root);
+    while let Some(err) = current {
+        if let Some(http) = err.downcast_ref::<StreamableHttpError<reqwest::Error>>()
+            && let Some(status) = http_error_status(http)
+        {
+            return Some(status);
+        }
+        current = err.source();
+    }
+    None
+}
+
+/// The actionable guidance attached to an authorization-required error.
+///
+/// Names both supported paths: a static token in the server's `headers`, and
+/// the OAuth support that is not yet shipped.
+fn auth_hint(status: u16) -> String {
+    format!(
+        "the server answered HTTP {status}; configure a static token in this server's \
+         \"headers\" (for example \"Authorization\": \"Bearer ${{TOKEN}}\"), or wait \
+         for OAuth support, which is not yet available"
+    )
 }
 
 /// Convert rmcp tools, dropping any whose `inputSchema` is unusable.
@@ -1105,10 +1185,31 @@ mod tests {
             "nope".to_string(),
             None,
         );
-        match map_service_error(ServiceError::McpError(data)) {
+        match map_service_error(ServiceError::McpError(data), "test") {
             McpError::JsonRpcError { code, message } => {
                 assert_eq!(code, -32601);
                 assert_eq!(message, "nope");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_error_maps_unauthorized_to_auth_required() {
+        // A transport error whose source carries a 401 is surfaced as the
+        // actionable AuthRequired naming the server, not an opaque error.
+        let inner = StreamableHttpError::<reqwest::Error>::UnexpectedServerResponse(
+            "HTTP 401 Unauthorized: token missing".into(),
+        );
+        let dynamic = rmcp::transport::DynamicTransportError::from_parts(
+            "test",
+            std::any::TypeId::of::<()>(),
+            Box::new(inner),
+        );
+        match map_service_error(ServiceError::TransportSend(dynamic), "docs") {
+            McpError::AuthRequired { server, hint } => {
+                assert_eq!(server, "docs");
+                assert!(hint.contains("headers"), "{hint}");
             }
             other => panic!("unexpected: {other:?}"),
         }

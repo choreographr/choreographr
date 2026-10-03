@@ -100,6 +100,10 @@ pub enum McpTransport {
         args: Vec<String>,
         /// Extra environment variables for the subprocess.
         env: HashMap<String, String>,
+        /// Working directory for the subprocess, when the config set one. A
+        /// relative server bundle often expects to run from a specific
+        /// directory; `None` inherits the daemon's own cwd.
+        cwd: Option<String>,
     },
     /// Connect to a remote server over the Streamable HTTP transport.
     Http {
@@ -148,6 +152,11 @@ pub struct McpServerConfig {
     /// `None`, [`DEFAULT_MAX_CONCURRENT_CALLS`] is used. Values below 1 are
     /// treated as 1 by [`max_concurrent_calls`](Self::max_concurrent_calls).
     pub max_concurrent_calls: Option<usize>,
+    /// Tool names (as the server advertises them) to hide from the model.
+    /// A server with many tools can have a few the operator never wants
+    /// offered; listing them here keeps the rest of the server's catalogue
+    /// intact. Matching is exact and against the server's original name.
+    pub disabled_tools: Vec<String>,
 }
 
 impl McpServerConfig {
@@ -179,11 +188,13 @@ mod tests {
                 command: "echo".into(),
                 args: vec![],
                 env: HashMap::new(),
+                cwd: None,
             },
             enabled: true,
             timeout,
             protocol: McpProtocolMode::Auto,
             max_concurrent_calls: None,
+            disabled_tools: Vec::new(),
         }
     }
 
@@ -229,6 +240,7 @@ mod tests {
             command: "npx".into(),
             args: vec![],
             env: HashMap::new(),
+            cwd: None,
         };
         assert_eq!(stdio.label(), "stdio");
         assert_eq!(stdio.target(), "npx");

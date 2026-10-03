@@ -43,6 +43,8 @@ pub struct McpToolWrapper {
 }
 
 impl McpToolWrapper {
+    /// Build a wrapper, deriving the provider-safe name and group from the
+    /// server slug and the server's own tool name.
     #[must_use]
     pub fn new(
         server_slug: &str,
@@ -52,13 +54,37 @@ impl McpToolWrapper {
         output_schema: Option<Value>,
         handle: McpServerHandle,
     ) -> Self {
-        Self {
-            name: format!("mcp/{server_slug}/{tool_name}"),
-            group: format!("mcp/{server_slug}"),
-            description: format!("[MCP {server_slug}] {description}"),
+        Self::with_name(
+            choreo_mcp::build_tool_name(server_slug, tool_name),
+            choreo_mcp::group_name(server_slug),
+            format!("[MCP {server_slug}] {description}"),
+            tool_name.to_string(),
             input_schema,
             output_schema,
-            original_name: tool_name.to_string(),
+            handle,
+        )
+    }
+
+    /// Build a wrapper with an already-resolved provider-safe `name` and
+    /// catalogue `group` (used by the daemon when it must disambiguate a
+    /// collision by appending a hash).
+    #[must_use]
+    pub fn with_name(
+        name: String,
+        group: String,
+        description: String,
+        original_name: String,
+        input_schema: Value,
+        output_schema: Option<Value>,
+        handle: McpServerHandle,
+    ) -> Self {
+        Self {
+            name,
+            group,
+            description,
+            input_schema,
+            output_schema,
+            original_name,
             handle,
         }
     }
@@ -407,10 +433,26 @@ impl McpListResourcesTool {
     /// Build the listing tool for one server.
     #[must_use]
     pub fn new(server_slug: &str, handle: McpServerHandle) -> Self {
+        Self::with_name(
+            choreo_mcp::build_tool_name(server_slug, "list_resources"),
+            choreo_mcp::group_name(server_slug),
+            format!("[MCP {server_slug}] List the resources this server exposes."),
+            handle,
+        )
+    }
+
+    /// Build the listing tool with an already-resolved name and group.
+    #[must_use]
+    pub fn with_name(
+        name: String,
+        group: String,
+        description: String,
+        handle: McpServerHandle,
+    ) -> Self {
         Self {
-            name: format!("mcp/{server_slug}/list_resources"),
-            group: format!("mcp/{server_slug}"),
-            description: format!("[MCP {server_slug}] List the resources this server exposes."),
+            name,
+            group,
+            description,
             handle,
         }
     }
@@ -528,12 +570,26 @@ impl McpReadResourceTool {
     /// Build the read tool for one server.
     #[must_use]
     pub fn new(server_slug: &str, handle: McpServerHandle) -> Self {
+        Self::with_name(
+            choreo_mcp::build_tool_name(server_slug, "read_resource"),
+            choreo_mcp::group_name(server_slug),
+            format!("[MCP {server_slug}] Read one resource by URI (see list_resources)."),
+            handle,
+        )
+    }
+
+    /// Build the read tool with an already-resolved name and group.
+    #[must_use]
+    pub fn with_name(
+        name: String,
+        group: String,
+        description: String,
+        handle: McpServerHandle,
+    ) -> Self {
         Self {
-            name: format!("mcp/{server_slug}/read_resource"),
-            group: format!("mcp/{server_slug}"),
-            description: format!(
-                "[MCP {server_slug}] Read one resource by URI (see list_resources)."
-            ),
+            name,
+            group,
+            description,
             handle,
         }
     }

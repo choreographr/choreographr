@@ -152,7 +152,10 @@ impl StdioTransport {
     /// when called for a non-stdio server.
     pub(crate) fn spawn(config: &McpServerConfig) -> Result<Self, McpError> {
         let McpTransport::Stdio {
-            command, args, env, ..
+            command,
+            args,
+            env,
+            cwd,
         } = &config.transport
         else {
             return Err(McpError::ProtocolError(
@@ -166,6 +169,12 @@ impl StdioTransport {
         // values cannot be reinterpreted as shell syntax.
         for (key, value) in env {
             cmd.env(key, value);
+        }
+        // A configured working directory is applied to the child only; it must
+        // exist, or the spawn fails with a clear error rather than the child
+        // silently inheriting the daemon's cwd.
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
         }
         // stdin/stdout are the JSON-RPC channel; stderr stays inherited so the
         // server's own logging reaches the daemon's stderr.

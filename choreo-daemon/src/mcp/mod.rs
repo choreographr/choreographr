@@ -11,9 +11,9 @@ pub mod tool;
 #[cfg(feature = "mcp")]
 use crate::tools::{ToolDyn, ToolRegistry};
 #[cfg(feature = "mcp")]
-use choreo_mcp::{McpListChange, McpServer, McpServerHandle};
+use choreo_mcp::{McpListChange, McpServer, McpServerConfig, McpServerHandle};
 #[cfg(feature = "mcp")]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(feature = "mcp")]
 use std::time::{Duration, Instant};
 #[cfg(feature = "mcp")]
@@ -29,6 +29,62 @@ use tracing::{debug, error, info, warn};
 #[cfg(feature = "mcp")]
 const STARTUP_BUDGET: Duration = Duration::from_secs(2);
 
+/// Budget for a single manual reconnect attempt (the `/mcp` surface's
+/// reconnect action). Longer than the per-server startup share because it is
+/// user-initiated and can afford to wait for one server.
+#[cfg(feature = "mcp")]
+const RECONNECT_BUDGET: Duration = Duration::from_secs(10);
+
+/// A read-only snapshot of one configured server's state, for the `/mcp`
+/// status surface and `session_inspect`.
+///
+/// Defined unconditionally (outside the `mcp` feature gate) so a status-returning
+/// daemon command and its callers compile no matter how the daemon is built;
+/// without the feature the list is simply always empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerStatus {
+    /// The server's config key (tool-name prefix).
+    pub slug: String,
+    /// The resolved transport label (`"stdio"` / `"http"`).
+    pub transport: String,
+    /// The command (stdio) or URL (http) the transport targets.
+    pub target: String,
+    /// Whether the server is connected and its tools are registered.
+    pub connected: bool,
+    /// How many tools (excluding the resource catalogue tools) are registered.
+    pub tool_count: usize,
+    /// The server's self-reported name, once connected.
+    pub server_name: Option<String>,
+    /// The server's self-reported version, once connected.
+    pub server_version: Option<String>,
+    /// The last connect/refresh error, when the server is not connected (or a
+    /// refresh failed).
+    pub last_error: Option<String>,
+}
+
+impl McpServerStatus {
+    /// A one-line human-readable summary of this server's state.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        if self.connected {
+            let name = self.server_name.as_deref().unwrap_or("unknown");
+            let version = self.server_version.as_deref().unwrap_or("?");
+            format!(
+                "{} [{} → {}] connected: {name} {version}, {} tool(s)",
+                self.slug, self.transport, self.target, self.tool_count
+            )
+        } else {
+            format!(
+                "{} [{} → {}] not connected: {}",
+                self.slug,
+                self.transport,
+                self.target,
+                self.last_error.as_deref().unwrap_or("not connected")
+            )
+        }
+    }
+}
+
 /// One connected server: the live connection (owns the dispatcher thread) plus
 /// a cloneable handle shared with that server's tool wrappers.
 #[cfg(feature = "mcp")]
@@ -41,13 +97,31 @@ struct ServerSlot {
         reason = "kept only for its Drop (bounded dispatcher shutdown)"
     )]
     server: McpServer,
+    /// The resolved config this server was connected from; kept so a manual
+    /// reconnect can re-attempt the same server.
+    config: McpServerConfig,
+    /// How many tools are registered for this server (excluding the resource
+    /// catalogue tools).
+    tool_count: usize,
 }
 
 /// Manages all MCP server connections and their registered tools.
 #[cfg(feature = "mcp")]
 pub struct McpManager {
-    /// One slot per server, keyed by server slug.
+    /// One slot per *connected* server, keyed by server slug.
     servers: HashMap<String, ServerSlot>,
+    /// The resolved config of *every* configured server (connected or not),
+    /// keyed by slug, so a failed/skipped server can be retried and reported.
+    configs: HashMap<String, McpServerConfig>,
+    /// The configured slugs in a stable (sorted) order, so status and
+    /// registration are deterministic.
+    order: Vec<String>,
+    /// Startup connect failures, keyed by slug, for the status surface (a
+    /// server that is not connected because its connect failed or timed out).
+    failures: HashMap<String, String>,
+    /// Sender half of the shared list-changed channel, kept so a reconnect can
+    /// re-subscribe the rebuilt transport.
+    list_change_tx: crossbeam_channel::Sender<McpListChange>,
     /// Receiver end of the shared list-changed channel every server's
     /// `subscriptions/listen` stream feeds. The daemon takes it out (via
     /// [`McpManager::take_list_change_rx`]) and pumps it into the command loop;
@@ -63,15 +137,21 @@ impl McpManager {
     /// Servers connect in parallel on background threads; the whole batch is
     /// bounded by [`STARTUP_BUDGET`] so a hung server cannot stall startup. A
     /// server that is not ready in time is logged and skipped (its thread
-    /// detaches and its connection is dropped).
+    /// detaches and its connection is dropped), but it stays in the manager's
+    /// status list and config map so `/mcp` can report it and a reconnect can
+    /// retry it.
     pub fn from_config(registry: &mut ToolRegistry) -> Self {
-        let configs = match config::load_mcp_config() {
+        let mut configs: Vec<McpServerConfig> = match config::load_mcp_config() {
             Ok(configs) => configs,
             Err(e) => {
                 warn!("failed to load MCP config: {e}");
                 Vec::new()
             }
         };
+        // Deterministic registration order (a HashMap-derived Vec is not), so a
+        // name collision between two servers always resolves the same way and a
+        // reconnect reproduces the same names.
+        configs.sort_by(|a, b| a.slug.cmp(&b.slug));
 
         // One shared list-changed channel: every server's subscription task
         // sends into this sender, and the daemon consumes the single receiver
@@ -82,6 +162,13 @@ impl McpManager {
 
         let mut manager = Self {
             servers: HashMap::new(),
+            configs: configs
+                .iter()
+                .map(|c| (c.slug.clone(), c.clone()))
+                .collect(),
+            order: configs.iter().map(|c| c.slug.clone()).collect(),
+            failures: HashMap::new(),
+            list_change_tx: list_change_tx.clone(),
             list_change_rx: Some(list_change_rx),
         };
 
@@ -105,20 +192,36 @@ impl McpManager {
         }
 
         let deadline = Instant::now() + STARTUP_BUDGET;
+        // One collision set for the whole startup batch, so two servers whose
+        // tool names sanitize identically are disambiguated deterministically.
+        let mut used: HashSet<String> = HashSet::new();
         for (slug, handle) in pending {
             let remaining = deadline.saturating_duration_since(Instant::now());
             match join_with_budget(handle, remaining) {
                 Some(Ok(server)) => {
-                    Self::register_server(&slug, server, registry, &mut manager);
+                    if let Err(e) =
+                        Self::register_server(&slug, server, &mut used, registry, &mut manager)
+                    {
+                        error!(server = %slug, error = %e, "failed to register MCP server");
+                        manager.failures.insert(slug, e);
+                    }
                 }
                 Some(Err(e)) => {
                     error!(server = %slug, error = %e, "failed to connect MCP server");
+                    manager.failures.insert(slug, e.to_string());
                 }
                 None => {
                     warn!(
                         server = %slug,
                         budget_ms = STARTUP_BUDGET.as_millis(),
                         "MCP server did not connect within the startup budget; skipping"
+                    );
+                    manager.failures.insert(
+                        slug,
+                        format!(
+                            "did not connect within the {}s startup budget",
+                            STARTUP_BUDGET.as_secs()
+                        ),
                     );
                 }
             }
@@ -143,44 +246,74 @@ impl McpManager {
     /// refresh names the failure and keeps the server connected, because a
     /// transient listing error must not take a working server offline.
     pub fn register_all(&self, registry: &mut ToolRegistry) {
-        for (slug, slot) in &self.servers {
-            if let Err(e) = Self::register_server_tools(slug, &slot.handle, registry) {
+        // A fresh collision set per refresh; the sorted order keeps a name
+        // stable across refreshes (and identical to startup).
+        let mut used: HashSet<String> = HashSet::new();
+        for slug in &self.order {
+            let Some(slot) = self.servers.get(slug) else {
+                continue;
+            };
+            if let Err(e) = Self::register_server_tools(
+                slug,
+                &slot.handle,
+                &slot.config.disabled_tools,
+                &mut used,
+                registry,
+            ) {
                 warn!(server = %slug, error = %e, "failed to list MCP tools during registry refresh");
             }
         }
     }
 
     /// Discover a server's tools and register them (and the server) in the
-    /// manager. A listing failure drops the server, which shuts it down.
+    /// manager.
+    ///
+    /// # Errors
+    ///
+    /// Returns the listing error (as text) when `tools/list` fails, in which
+    /// case the server is not inserted.
     fn register_server(
         slug: &str,
         server: McpServer,
+        used: &mut HashSet<String>,
         registry: &mut ToolRegistry,
         manager: &mut Self,
-    ) {
+    ) -> Result<(), String> {
         let handle = server.handle();
-        match Self::register_server_tools(slug, &handle, registry) {
-            Ok(()) => {
-                manager
-                    .servers
-                    .insert(slug.to_string(), ServerSlot { handle, server });
-            }
-            Err(e) => {
-                error!(server = %slug, error = %e, "failed to list MCP tools; dropping server");
-                // `server` is dropped here, shutting the connection down.
-            }
-        }
+        let config = manager
+            .configs
+            .get(slug)
+            .cloned()
+            .ok_or_else(|| format!("no config for server {slug:?}"))?;
+        let tool_count =
+            Self::register_server_tools(slug, &handle, &config.disabled_tools, used, registry)
+                .map_err(|e| e.to_string())?;
+        manager.servers.insert(
+            slug.to_string(),
+            ServerSlot {
+                handle,
+                server,
+                config,
+                tool_count,
+            },
+        );
+        manager.failures.remove(slug);
+        Ok(())
     }
 
     /// Register one server's advertised tools (and its catalogue group) into
-    /// `registry`.
+    /// `registry`, returning the number of tools registered.
     ///
     /// Shared by startup ([`register_server`](Self::register_server)) and a
     /// post-list-change refresh ([`register_all`](Self::register_all)) so the
     /// naming and resource-tool rules never drift. A server that declares the
     /// `resources` capability additionally gets the `list_resources` /
     /// `read_resource` catalogue tools; a server without it would only fail the
-    /// call, so they are not offered.
+    /// call, so they are not offered. Tools named in `disabled` (the config's
+    /// `disabledTools`) are not offered. `used` carries the provider-safe names
+    /// already claimed by earlier servers so a collision (two names that
+    /// sanitize the same) is disambiguated with a hash suffix rather than
+    /// silently overwriting.
     ///
     /// # Errors
     ///
@@ -188,40 +321,52 @@ impl McpManager {
     fn register_server_tools(
         slug: &str,
         handle: &McpServerHandle,
+        disabled: &[String],
+        used: &mut HashSet<String>,
         registry: &mut ToolRegistry,
-    ) -> Result<(), choreo_mcp::McpError> {
+    ) -> Result<usize, choreo_mcp::McpError> {
         let server_name = handle.name().to_string();
         let tools = handle.list_tools()?;
-        registry
-            .register_dynamic_group(format!("mcp/{slug}"), format!("MCP server: {server_name}"));
-        info!(
-            server = %slug,
-            name = %server_name,
-            tool_count = tools.len(),
-            "registered MCP server tools"
-        );
+        let group = choreo_mcp::group_name(slug);
+        registry.register_dynamic_group(group.clone(), format!("MCP server: {server_name}"));
+        let disabled: HashSet<&str> = disabled.iter().map(String::as_str).collect();
+
+        // Reserve the resource tools' names first so a server tool that happens
+        // to share a name cannot displace them (they are always registered after
+        // the server's own tools).
+        if handle.supports_resources() {
+            for suffix in ["list_resources", "read_resource"] {
+                let name = Self::resolve_name(slug, suffix, used);
+                used.insert(name);
+            }
+        }
+
+        let mut count = 0usize;
         for mcp_tool in tools {
+            if disabled.contains(mcp_tool.name.as_str()) {
+                debug!(server = %slug, tool = %mcp_tool.name, "MCP tool disabled by config");
+                continue;
+            }
             let description = mcp_tool.description.unwrap_or_default();
-            let wrapper = McpToolWrapper::new(
-                slug,
-                &mcp_tool.name,
-                &description,
+            let name = Self::resolve_name(slug, &mcp_tool.name, used);
+            used.insert(name.clone());
+            let wrapper = McpToolWrapper::with_name(
+                name.clone(),
+                group.clone(),
+                format!("[MCP {slug}] {description}"),
+                mcp_tool.name,
                 mcp_tool.input_schema,
                 mcp_tool.output_schema,
                 handle.clone(),
             );
-            // Own the strings BEFORE moving `wrapper` into the box: a
-            // borrow extending into the call would conflict with the
-            // move.
-            let name = wrapper.name().to_string();
-            let group = wrapper.group().to_string();
             registry.register_dynamic(name, &group, Box::new(wrapper));
+            count += 1;
         }
+
         // A server that declares the `resources` capability gets the
         // catalogue tools; a server without it would only fail the call, so
         // they are not offered.
         if handle.supports_resources() {
-            let group = format!("mcp/{slug}");
             let lister = McpListResourcesTool::new(slug, handle.clone());
             let reader = McpReadResourceTool::new(slug, handle.clone());
             for tool in [
@@ -233,7 +378,137 @@ impl McpManager {
             }
             info!(server = %slug, "registered MCP resource tools");
         }
+        info!(
+            server = %slug,
+            name = %server_name,
+            tool_count = count,
+            "registered MCP server tools"
+        );
+        Ok(count)
+    }
+
+    /// Compute the provider-safe name for `tool` on `slug`, appending a hash
+    /// suffix when another server already claimed the sanitized name.
+    fn resolve_name(slug: &str, tool: &str, used: &HashSet<String>) -> String {
+        let base = choreo_mcp::build_tool_name(slug, tool);
+        if !used.contains(&base) {
+            return base;
+        }
+        // The seed ties the suffix to the originating identity, so two colliding
+        // tools get different suffixes deterministically.
+        choreo_mcp::build_tool_name_with_suffix(slug, tool, &format!("{slug}\u{0}{tool}"))
+    }
+
+    /// A snapshot of every configured server's state, in stable slug order.
+    ///
+    /// Reports connected servers (with their tool counts) and servers that
+    /// failed or timed out at startup (with the recorded error), so the `/mcp`
+    /// status surface and `session_inspect` can show the whole configured set.
+    #[must_use]
+    pub fn status(&self) -> Vec<McpServerStatus> {
+        self.order
+            .iter()
+            .map(|slug| {
+                let config = self.configs.get(slug);
+                let transport =
+                    config.map_or_else(String::new, |c| c.transport.label().to_string());
+                let target = config.map_or_else(String::new, |c| c.transport.target().to_string());
+                match self.servers.get(slug) {
+                    Some(slot) => McpServerStatus {
+                        slug: slug.clone(),
+                        transport,
+                        target,
+                        connected: true,
+                        tool_count: slot.tool_count,
+                        server_name: Some(slot.handle.name().to_string()),
+                        server_version: Some(slot.handle.version().to_string()),
+                        last_error: None,
+                    },
+                    None => McpServerStatus {
+                        slug: slug.clone(),
+                        transport,
+                        target,
+                        connected: false,
+                        tool_count: 0,
+                        server_name: None,
+                        server_version: None,
+                        last_error: self.failures.get(slug).cloned(),
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// Rebuild the connection to `slug`, re-registering its tools.
+    ///
+    /// Used by the `/mcp` surface's reconnect action: a server that failed at
+    /// startup (or was stopped) is re-attempted with the current config, and a
+    /// live connection is torn down and replaced. Bounded by [`RECONNECT_BUDGET`].
+    /// The caller rebuilds the tool catalogue afterwards (this does not touch a
+    /// `ToolRegistry`), so a reconnect cannot leave a half-updated catalogue.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when `slug` is unknown, the connect fails or times out,
+    /// or the tool listing fails.
+    pub fn reconnect(&mut self, slug: &str) -> Result<(), String> {
+        let config = self
+            .configs
+            .get(slug)
+            .cloned()
+            .ok_or_else(|| format!("unknown MCP server {slug:?}"))?;
+        // Drop any existing slot first: its `Drop` shuts the old dispatcher
+        // down, so the fresh connect does not leave a stale connection behind.
+        self.servers.remove(slug);
+
+        let list_changes = Some(self.list_change_tx.clone());
+        let cfg = config.clone();
+        let handle = std::thread::spawn(move || {
+            McpServer::connect_with_list_changes(&cfg, list_changes).map_err(anyhow::Error::from)
+        });
+        let server = match join_with_budget(handle, RECONNECT_BUDGET) {
+            Some(Ok(server)) => server,
+            Some(Err(e)) => {
+                let msg = e.to_string();
+                self.failures.insert(slug.to_string(), msg.clone());
+                return Err(msg);
+            }
+            None => {
+                let msg = format!("reconnect timed out after {}s", RECONNECT_BUDGET.as_secs());
+                self.failures.insert(slug.to_string(), msg.clone());
+                return Err(msg);
+            }
+        };
+        let slot = Self::slot_from_server(server, config)?;
+        self.servers.insert(slug.to_string(), slot);
+        self.failures.remove(slug);
+        info!(server = %slug, "reconnected MCP server");
         Ok(())
+    }
+
+    /// Build a `ServerSlot` from a freshly connected `server`, listing its
+    /// tools once to count those that will be registered (honouring
+    /// `disabledTools`).
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the tool listing fails.
+    fn slot_from_server(server: McpServer, config: McpServerConfig) -> Result<ServerSlot, String> {
+        let handle = server.handle();
+        let tools = handle
+            .list_tools()
+            .map_err(|e| format!("failed to list tools: {e}"))?;
+        let disabled: HashSet<&str> = config.disabled_tools.iter().map(String::as_str).collect();
+        let tool_count = tools
+            .iter()
+            .filter(|t| !disabled.contains(t.name.as_str()))
+            .count();
+        Ok(ServerSlot {
+            handle,
+            server,
+            config,
+            tool_count,
+        })
     }
 
     /// Shut down all MCP servers, joining each dispatcher with a bounded wait.
@@ -265,9 +540,14 @@ impl McpManager {
     /// Create an empty `McpManager` with no servers (for testing).
     #[must_use]
     pub fn empty() -> Self {
+        let (list_change_tx, list_change_rx) = crossbeam_channel::unbounded::<McpListChange>();
         Self {
             servers: HashMap::new(),
-            list_change_rx: None,
+            configs: HashMap::new(),
+            order: Vec::new(),
+            failures: HashMap::new(),
+            list_change_tx,
+            list_change_rx: Some(list_change_rx),
         }
     }
 
@@ -326,6 +606,8 @@ fn join_with_budget<T: Send + 'static>(
 mod imp {
     use crate::tools::ToolRegistry;
 
+    use super::McpServerStatus;
+
     /// No-op stand-in for the real `McpManager` (see the module-level cfg note).
     pub struct McpManager;
 
@@ -343,6 +625,17 @@ mod imp {
 
         /// Stub: no server has any in-flight call to cancel.
         pub fn cancel_session(&self, _session_id: u64) {}
+
+        /// Stub: there are no servers to reconnect.
+        pub fn reconnect(&mut self, slug: &str) -> Result<(), String> {
+            Err(format!("unknown MCP server {slug:?} (MCP is not built in)"))
+        }
+
+        /// Stub: there are never any servers, so no status rows.
+        #[must_use]
+        pub fn status(&self) -> Vec<McpServerStatus> {
+            Vec::new()
+        }
 
         /// Stub: creates an empty manager (same seam the real one exposes for
         /// tests).
@@ -378,6 +671,7 @@ mod tests {
         let manager = McpManager::empty();
         assert!(manager.is_empty());
         assert_eq!(manager.server_count(), 0);
+        assert_eq!(manager.status().len(), 0);
     }
 
     #[test]
@@ -402,8 +696,29 @@ mod tests {
 
     #[test]
     fn from_config_with_no_file_creates_empty() {
+        // Point the loaders at a nonexistent dir so no real user/project config
+        // is picked up regardless of the test machine.
+        let dir = tempfile::tempdir().unwrap();
+        config::set_test_config_root(Some(dir.path().to_path_buf()));
+        config::set_test_project_root(Some(None));
         let mut registry = crate::tools::ToolRegistry::new();
         let manager = McpManager::from_config(&mut registry);
+        config::set_test_config_root(None);
+        config::set_test_project_root(None);
         assert!(manager.is_empty());
+        assert_eq!(manager.status().len(), 0);
+    }
+
+    #[test]
+    fn resolve_name_disambiguates_a_collision() {
+        let mut used = HashSet::new();
+        let first = McpManager::resolve_name("s", "a.b", &used);
+        used.insert(first.clone());
+        // A second tool that sanitizes to the same base gets a hashed suffix.
+        let second = McpManager::resolve_name("s", "a_b", &used);
+        assert_ne!(first, second);
+        assert!(second.len() <= choreo_mcp::MAX_TOOL_NAME_LEN);
+        // Deterministic: the same inputs reproduce the same name.
+        assert_eq!(second, McpManager::resolve_name("s", "a_b", &used));
     }
 }

@@ -33,6 +33,13 @@ struct ServerEntry {
     /// Explicit transport selector: `"http"`/`"stdio"`/`"auto"` (default).
     #[serde(default)]
     transport: Option<String>,
+    /// Working directory for a stdio subprocess. A leading `~`/`~/` is expanded
+    /// to the user's home directory.
+    #[serde(default)]
+    cwd: Option<String>,
+    /// Tool names (as the server advertises them) to hide from the model.
+    #[serde(default, rename = "disabledTools", alias = "disabled_tools")]
+    disabled_tools: Vec<String>,
     #[serde(default = "default_true")]
     enabled: bool,
     /// Optional per-server request timeout, in seconds.
@@ -122,6 +129,7 @@ fn resolve_transport(slug: &str, entry: &ServerEntry) -> Option<McpTransport> {
                 command,
                 args: entry.args.clone(),
                 env: expand_env_map(&entry.env),
+                cwd: entry.cwd.as_deref().map(expand_tilde),
             })
         }
         McpTransportKind::Http => {
@@ -161,7 +169,29 @@ fn resolve_entry(slug: &str, entry: &ServerEntry) -> Option<McpServerConfig> {
         timeout: entry.timeout.map(Duration::from_secs),
         protocol: parse_protocol(entry.protocol.as_deref()),
         max_concurrent_calls: entry.max_concurrent_calls,
+        disabled_tools: entry.disabled_tools.clone(),
     })
+}
+
+/// Expand a leading `~` (or `~/`) in `path` to the user's home directory.
+///
+/// A config author writes `~/work` expecting a shell-like expansion, not a
+/// literal directory named `~`. Expansion applies only to a *leading* `~`; an
+/// embedded `~` is left alone (it is a valid path character). When the home
+/// directory cannot be resolved the path is returned unchanged.
+fn expand_tilde(path: &str) -> String {
+    if path == "~" {
+        return dirs::home_dir().map_or_else(
+            || path.to_string(),
+            |home| home.to_string_lossy().into_owned(),
+        );
+    }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest).to_string_lossy().into_owned();
+    }
+    path.to_string()
 }
 
 /// Expand `${VAR}` references in every value of `map` from the environment.
@@ -231,6 +261,13 @@ thread_local! {
     /// normal builds too (it is a no-op unless explicitly set).
     static TEST_CONFIG_ROOT: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
+
+    /// Test-only override for the project config root. `Disabled` forces "no
+    /// project file"; `Path(root)` points the project file at
+    /// `<root>/.choreographr/mcp_servers.json`; `Unset` falls back to the base
+    /// dir / current dir.
+    static TEST_PROJECT_ROOT: std::cell::RefCell<ProjectRootOverride> =
+        const { std::cell::RefCell::new(ProjectRootOverride::Unset) };
 }
 
 /// Test-only override for the base config directory (see `TEST_CONFIG_ROOT`).
@@ -244,7 +281,18 @@ pub fn set_test_config_root(root: Option<PathBuf>) {
     TEST_CONFIG_ROOT.with(|cell| cell.replace(root));
 }
 
-/// Resolve the path to `mcp_servers.json`.
+/// Test-only override for the project config root (see `TEST_PROJECT_ROOT`).
+#[doc(hidden)]
+pub fn set_test_project_root(root: Option<Option<PathBuf>>) {
+    let override_value = match root {
+        None => ProjectRootOverride::Unset,
+        Some(None) => ProjectRootOverride::Disabled,
+        Some(Some(path)) => ProjectRootOverride::Path(path),
+    };
+    TEST_PROJECT_ROOT.with(|cell| cell.replace(override_value));
+}
+
+/// Resolve the path to the **user** `mcp_servers.json`.
 ///
 /// # Errors
 ///
@@ -257,27 +305,92 @@ pub fn mcp_config_path() -> Result<PathBuf> {
         .context("could not determine config directory")
 }
 
-/// Load MCP server configurations from `mcp_servers.json`.
-/// Returns an empty Vec if the file doesn't exist.
+/// Resolve the path to the **project** `mcp_servers.json`, if one can be placed.
+///
+/// The project file lives at `<root>/.choreographr/mcp_servers.json`, where
+/// `<root>` is the base dir when the daemon runs under `--base-dir` and the
+/// process's current directory otherwise. A project file lets a checkout carry
+/// its own server set without editing the user config; its entries override the
+/// user file's per server slug. `None` when neither a base dir nor a current
+/// directory is resolvable (the project layer is then simply absent).
+#[must_use]
+pub fn project_config_path() -> Option<PathBuf> {
+    match TEST_PROJECT_ROOT.with(|cell| cell.borrow().clone()) {
+        ProjectRootOverride::Path(root) => {
+            return Some(root.join(".choreographr").join("mcp_servers.json"));
+        }
+        ProjectRootOverride::Disabled => return None,
+        ProjectRootOverride::Unset => {}
+    }
+    let root = choreo_shared::paths::base_dir().or_else(|| std::env::current_dir().ok());
+    root.map(|root| root.join(".choreographr").join("mcp_servers.json"))
+}
+
+/// Test-only override for the project config root (see `TEST_PROJECT_ROOT`),
+/// distinguishing "unset" from "explicitly no project file".
+#[derive(Clone)]
+enum ProjectRootOverride {
+    /// No override: resolve from the base dir / current dir.
+    Unset,
+    /// The project layer is disabled.
+    Disabled,
+    /// The project file root is this directory.
+    Path(PathBuf),
+}
+
+/// Load MCP server configurations from the user file, overlaying the project
+/// file when present.
+///
+/// Returns an empty Vec if neither file exists. Project entries replace user
+/// entries per server slug (a whole-entry override, so a project can point a
+/// server at a different command/URL entirely).
 ///
 /// # Errors
 ///
-/// Returns an error when the file exists but cannot be read or parsed.
+/// Returns an error when a present file cannot be read or parsed.
 pub fn load_mcp_config() -> Result<Vec<McpServerConfig>> {
-    let path = mcp_config_path()?;
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let contents = std::fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    let parsed: McpServersFile = serde_json::from_str(&contents)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let user = mcp_config_path()?;
+    let project = project_config_path();
+    load_from_paths(&user, project.as_deref())
+}
 
-    Ok(parsed
-        .mcp_servers
+/// [`load_mcp_config`] parameterised on the two file paths, so the merge can be
+/// exercised without mutating the process environment or base dir.
+///
+/// # Errors
+///
+/// Returns an error when a present file cannot be read or parsed.
+fn load_from_paths(
+    user: &std::path::Path,
+    project: Option<&std::path::Path>,
+) -> Result<Vec<McpServerConfig>> {
+    let mut entries: HashMap<String, ServerEntry> = HashMap::new();
+    read_servers_into(user, &mut entries)?;
+    if let Some(project) = project {
+        // Project entries extend and override the user's — re-keyed by slug, so
+        // a project's `docs` replaces the user's `docs` outright.
+        read_servers_into(project, &mut entries)?;
+    }
+    Ok(entries
         .into_iter()
         .filter_map(|(slug, entry)| resolve_entry(&slug, &entry))
         .collect())
+}
+
+/// Parse one `mcp_servers.json` (if it exists) into `entries`, keyed by slug.
+fn read_servers_into(
+    path: &std::path::Path,
+    entries: &mut HashMap<String, ServerEntry>,
+) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let parsed: McpServersFile = serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    entries.extend(parsed.mcp_servers);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -495,5 +608,104 @@ mod tests {
         let expanded = expand_env_map(&map);
         assert_eq!(expanded.get("A").map(String::as_str), Some("plain"));
         assert_eq!(expanded.get("B").map(String::as_str), Some("no refs"));
+    }
+
+    #[test]
+    fn server_entry_deserializes_cwd_and_disabled_tools() {
+        // camelCase is documented; the snake_case alias is accepted too, and
+        // both keys are recognized (not collected as "unknown").
+        let camel: ServerEntry = serde_json::from_value(serde_json::json!({
+            "command": "python",
+            "cwd": "/work",
+            "disabledTools": ["dangerous", "admin"]
+        }))
+        .expect("entry with cwd/disabledTools");
+        assert_eq!(camel.cwd.as_deref(), Some("/work"));
+        assert_eq!(camel.disabled_tools, vec!["dangerous", "admin"]);
+        assert!(
+            camel.unknown.is_empty(),
+            "recognized keys are not 'unknown'"
+        );
+
+        let snake: ServerEntry = serde_json::from_value(serde_json::json!({
+            "command": "python",
+            "disabled_tools": ["x"]
+        }))
+        .expect("entry with disabled_tools alias");
+        assert_eq!(snake.disabled_tools, vec!["x"]);
+    }
+
+    #[test]
+    fn stdio_transport_carries_cwd() {
+        let entry = entry_from(serde_json::json!({"command": "npx", "cwd": "/srv/mcp"}));
+        match resolve_transport("s", &entry).expect("resolved") {
+            McpTransport::Stdio { cwd, .. } => assert_eq!(cwd.as_deref(), Some("/srv/mcp")),
+            other @ McpTransport::Http { .. } => panic!("expected stdio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expand_tilde_expands_leading_tilde_only() {
+        // `~` and `~/x` expand; an embedded or mid-string `~` is untouched.
+        if let Some(home) = dirs::home_dir() {
+            let home_s = home.to_string_lossy();
+            assert_eq!(expand_tilde("~"), home_s);
+            assert_eq!(expand_tilde("~/work"), home.join("work").to_string_lossy());
+        }
+        assert_eq!(expand_tilde("/abs/path"), "/abs/path");
+        assert_eq!(expand_tilde("rel/~/path"), "rel/~/path");
+    }
+
+    #[test]
+    fn resolve_entry_carries_disabled_tools() {
+        let entry = entry_from(serde_json::json!({
+            "command": "python",
+            "disabledTools": ["a", "b"]
+        }));
+        let config = resolve_entry("s", &entry).expect("resolved");
+        assert_eq!(config.disabled_tools, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn project_layer_overrides_user_per_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.json");
+        let project = dir.path().join("project.json");
+        std::fs::write(
+            &user,
+            r#"{"mcpServers":{
+                "docs":{"url":"https://user.example/mcp"},
+                "fs":{"command":"user-fs"}
+            }}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project,
+            r#"{"mcpServers":{
+                "docs":{"url":"https://project.example/mcp"},
+                "extra":{"command":"project-extra"}
+            }}"#,
+        )
+        .unwrap();
+
+        let configs = load_from_paths(&user, Some(&project)).unwrap();
+        let by_slug: HashMap<&str, &McpServerConfig> =
+            configs.iter().map(|c| (c.slug.as_str(), c)).collect();
+        // The project's `docs` wins outright.
+        match &by_slug["docs"].transport {
+            McpTransport::Http { url, .. } => assert_eq!(url, "https://project.example/mcp"),
+            other @ McpTransport::Stdio { .. } => panic!("expected http, got {other:?}"),
+        }
+        // The user's `fs` survives; the project's `extra` is added.
+        assert!(by_slug.contains_key("fs"));
+        assert!(by_slug.contains_key("extra"));
+    }
+
+    #[test]
+    fn load_from_paths_handles_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("none.json");
+        let configs = load_from_paths(&missing, Some(&missing)).unwrap();
+        assert!(configs.is_empty());
     }
 }
