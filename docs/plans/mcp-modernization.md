@@ -1,12 +1,14 @@
 # Plan: MCP modernization — stateless protocol (2026-07-28) and a first-class client
 
-**Status:** **in progress — P0–P2 and P4 complete; the two P6 bounds (stdio frame
-cap, per-server concurrency cap) landed. M1 (ship without OAuth, `mcp` on by
-default) is the active goal.** Commits: `ab3dc2e` (hardening), `976edf6` (the
+**Status:** **in progress — P0–P2, P4, and P5 complete; the two P6 bounds (stdio
+frame cap, per-server concurrency cap) landed. M1 (ship without OAuth, `mcp` on
+by default) is the active goal.** Commits: `ab3dc2e` (hardening), `976edf6` (the
 rmcp engine swap), `9f6209a` (Streamable HTTP), `274f736`
 (progress/MRTR/resources), `1d7d239` (stdio frame cap + per-server concurrency
-cap), `15aa3ff` (`subscriptions/listen` + registry hot-swap). Remaining M1 work:
-**P5 and the rest of P6** (conformance suite, fuzz, supply-chain,
+cap), `15aa3ff` (`subscriptions/listen` + registry hot-swap), `f037383` (tool
+name hygiene, `cwd`/`disabledTools`, config layers, auth error, status API),
+`8d27006` (`/mcp` surface + `choreographr mcp` CLI), `a348c89` (per-server logs).
+Remaining M1 work: **the rest of P6** (conformance suite, fuzz, supply-chain,
 default-feature release verification, security checklist). **OAuth (P3) is
 deferred to post-ship.** See §1.2 and §7.
 **Lifecycle:** this file is **deleted once the plan is fully implemented**. Nothing
@@ -197,16 +199,28 @@ phases. What exists now:
   excess, starting each as a slot frees and waking on commands or completions
   via `select!` (no polling); a session cancel still reaches queued calls.
 
-Deltas the plan now tracks (detailed in §7): the config keys
-`cwd`/`exposure`/`disabledTools` are not implemented; `auto_load` was removed
-(reported as an unknown key) rather than mapped to a deferred exposure;
+- P5 (`f037383`, `8d27006`, `a348c89`): tool names are sanitized to the
+  provider-safe alphabet and capped at 64 chars with a stable hash suffix on
+  collision; a server entry gains `cwd` (with `~` expansion) and
+  `disabledTools`; a project config layer (`<root>/.choreographr/mcp_servers.json`)
+  overrides the user file per slug; a 401/403 at connect or on a request maps to
+  an actionable `McpError::AuthRequired` naming the static-token and OAuth
+  options; `McpManager::status`/`reconnect` back a `/mcp` status surface and a
+  `choreographr mcp list|add|remove|reconnect` CLI; `session_inspect` reports
+  each server's state and tool count; and each stdio server's `stderr` is
+  captured to a size-capped per-server log file.
+
+Deltas the plan now tracks (detailed in §7): the config key `exposure` is not
+implemented (it defers with the deferred-tool-loading work); `auto_load` was
+removed (reported as an unknown key) rather than mapped to a deferred exposure;
 `Retry-After` is not honored by the HTTP retry policy (upstream-blocked, P2
 residuals); OAuth is not implemented — deferred to post-ship (P3), with static
 tokens via config `headers` as the M1 credential path; and M1 still has to flip
 the `mcp` feature into the default set (D9). P4's last item,
-`subscriptions/listen` + the registry hot-swap, landed in `15aa3ff`, and the two
-P6 bounds in `1d7d239`; the remaining P6 work is conformance, fuzzing,
-supply-chain, release verification, and the security checklist.
+`subscriptions/listen` + the registry hot-swap, landed in `15aa3ff`, the two
+P6 bounds in `1d7d239`, and P5 in `f037383`/`8d27006`/`a348c89`; the remaining
+P6 work is conformance, fuzzing, supply-chain, release verification, and the
+security checklist.
 
 ### 1.3 The protocol delta
 
@@ -457,7 +471,7 @@ missing capability that blocks real servers; **S3** = robustness/quality;
 | # | Gap | Severity | Evidence | Status |
 |---|---|---|---|---|
 | G1 | Cannot talk to 2026-07-28 (stateless-only) servers at all | S1 | `make_initialize_request` pins `2024-11-05` | **Closed (P1)** — `auto`/`modern` negotiate `server/discover` via rmcp |
-| G2 | No HTTP transport; no remote servers, no OAuth | S1 | `transport.rs` is stdio-only | **Partial (P2)** — Streamable HTTP landed; M1 ships with static-token `headers` + an actionable auth-required error, OAuth is post-ship (P3) |
+| G2 | No HTTP transport; no remote servers, no OAuth | S1 | `transport.rs` is stdio-only | **Partial (P2/P5)** — Streamable HTTP landed; M1 ships with static-token `headers` + an actionable auth-required error (`f037383`), OAuth is post-ship (P3) |
 | G3 | Server crash is permanent for the daemon's lifetime | S1 | no restart anywhere in `mcp/` | **Closed (P1)** — bounded restart policy rebuilds a dead transport |
 | G4 | One `Mutex` per server serializes calls and blocks shutdown | S1 | `Arc<Mutex<McpClient>>`, `tool.rs` | **Closed (P1)** — per-server dispatcher, concurrent calls, bounded joins |
 | G5 | MCP images are never attached to the model (rendered as text) | S1 | `image_tx` ignored; `[Image: …]` placeholder | **Closed (P0)** — base64 decode + image pipeline; placeholder only without a sink/invalid |
@@ -473,10 +487,10 @@ missing capability that blocks real servers; **S3** = robustness/quality;
 | G15 | `auto_load` parsed but ignored | S3 | `config.rs` | **Closed (P0)** — key removed; unknown keys are logged |
 | G16 | `output_schema()` hard-codes `{"type":"string"}` | S3 | `tool.rs` | **Closed (P1)** — the server's real `outputSchema`, else `None` |
 | G17 | `isError` dropped on the postcard path; `describe_invocation_json` appends a stray period | S3 | `tool.rs` | **Closed (P0/P1)** — `is_error` on all paths; description returned verbatim |
-| G18 | Tool names unsanitized (`mcp/<slug>/<tool>` may exceed provider name limits or contain bad chars) | S3 | `tool.rs::new` | **Open (P5)** — name format unchanged |
+| G18 | Tool names unsanitized (`mcp/<slug>/<tool>` may exceed provider name limits or contain bad chars) | S3 | `tool.rs::new` | **Closed (P5)** — segments sanitized to `[A-Za-z0-9_-]`, name capped at 64 chars, hash suffix on collision |
 | G19 | No startup budget: a hung server can hold up `DaemonState::open` | S3 | `open.rs` joins spawn threads | **Closed (P1)** — 2 s batch budget, stragglers skipped |
 | G20 | Integration tests depend on Node/npx + network | S3 | `tests/it/*` | **Closed (P0)** — in-tree fixture server, shared via `include!` |
-| G21 | No user surface: no `/mcp`, no status, no login/logout | S3 | nothing in `choreo-tui` | **Open (P5)** |
+| G21 | No user surface: no `/mcp`, no status, no login/logout | S3 | nothing in `choreo-tui` | **Closed (P5)** — `/mcp` status + `mcp reconnect <slug>` in the TUI and `choreographr mcp list/add/remove/reconnect` CLI (login/logout is P3) |
 | G22 | `lib.rs` claims HTTP support that does not exist; unused error variants | S4 | `lib.rs`, `error.rs` | **Closed (P0)** |
 
 ---
@@ -553,12 +567,14 @@ Same file, same directory (`<config>/choreographr/mcp_servers.json`), same
 `mcpServers` top level. Landed: `timeout` and `protocol` (P0/P1); `url`,
 `headers`, `transport` (`auto` infers HTTP from `url` and stdio from `command`;
 both or neither warns and skips the server) and `${VAR}` expansion in
-`env`/`headers` values (P2; an unset variable expands to empty with a warning).
+`env`/`headers` values (P2; an unset variable expands to empty with a warning);
+`cwd` and `disabledTools` (P5; a leading `~` in `cwd` is expanded); and a
+project-config layer that overlays the user file per server slug (P5).
 Unknown keys are collected, logged, and ignored — never fatal; `auto_load` was
 removed in P0 and is now reported like any other unknown key.
 
-Still to come: `cwd` and `disabledTools` (M1/P5); `oauth` is post-ship (P3) and
-`exposure` moves with the deferred-loading work. When
+Still to come: `oauth` is post-ship (P3) and `exposure` moves with the
+deferred-loading work. When
 `exposure` lands, a legacy `auto_load: false` can be mapped to
 `exposure: "deferred"`; there is no such mapping on purpose today, because
 deferred registration does not exist yet.
@@ -572,8 +588,9 @@ sanitization or truncation collides. Description prefix `[MCP <slug>] ` is kept
 (stable prompt text). `title`/`icons`/`annotations` are captured into group
 metadata for later UI use but never fed to the model as instructions (untrusted).
 
-Status: the name format and description prefix landed unchanged in P0/P1; the
-sanitizer and collision hash are still open (G18, P5).
+Status: the name format and description prefix landed in P0/P1; the sanitizer,
+64-char cap, and collision hash landed in P5 (`f037383`, G18). `title`/`icons`/
+`annotations` capture is not yet implemented (post-ship UI work).
 
 ### D6 — Concurrency, deadlines, cancellation
 
@@ -795,16 +812,15 @@ P4 are done** (see §1.2); their sections come first for history. The remaining
 phases are listed in execution order — **P5 → P6** (M1), then the deferred
 **P3** (post-ship) — and keep their original P-numbers for continuity.
 
-### M1 — ship without OAuth (P4 done; P5 → P6 remain)
+### M1 — ship without OAuth (P5 done; P6 remains)
 
-MCP is shippable when P5 and P6 are complete (P4 is done). **OAuth is explicitly
-not part of M1** — it is P3, post-ship. Servers that need credentials are
-covered in the interim by the path that already works: a static token in
+MCP is shippable when P5 and P6 are complete (P4 and P5 are done). **OAuth is
+explicitly not part of M1** — it is P3, post-ship. Servers that need credentials
+are covered in the interim by the path that already works: a static token in
 `mcp_servers.json` headers, e.g. `"headers": {"Authorization": "Bearer ${DOCS_TOKEN}"}` (only
 `accept`, `mcp-session-id`, and `last-event-id` are reserved, and `${VAR}` is
-expanded at load). A server that insists on OAuth and has no static token must
-fail with a clear, actionable error instead of a raw status string — that
-mapping is an M1 item (P5).
+expanded at load). A server that insists on OAuth and has no static token fails
+with a clear, actionable error instead of a raw status string (`f037383`).
 
 M1 includes, at minimum:
 
@@ -814,9 +830,10 @@ M1 includes, at minimum:
   concurrency cap are **done** (`1d7d239`); remaining: the conformance baseline,
   the lockfile/supply-chain check, the release verification with the default
   feature set, and the §9 security checklist.
-- **P5**: tool-name sanitization, `cwd`/`disabledTools`, the `/mcp` status
-  surface + per-server logs + `session_inspect`, the auth-required error, config
-  layers, and user docs (including the "OAuth not yet supported" limitation).
+- **P5**: **complete** — tool-name sanitization, `cwd`/`disabledTools`, the
+  `/mcp` status surface + `choreographr mcp` CLI + per-server logs +
+  `session_inspect`, the auth-required error, config layers, and user docs
+  (`f037383`, `8d27006`, `a348c89`).
 - **P4**: **complete** — progress chunks, MRTR handling, resource tools, and the
   server-observed cancellation test (`274f736`), plus `subscriptions/listen` +
   the registry hot-swap (`15aa3ff`).
@@ -825,9 +842,9 @@ Explicitly deferred past M1 (not ship blockers): **OAuth (P3)**, `exposure` +
 [tool-search-driven deferred loading](#13-out-of-scope--future-work), `mcp
 reload`, and the MCP-server role (§13).
 
-If M1 needs to be smaller, the safely trimmable items are config layers and
-`disabledTools` — do not trim tool-name sanitization or the conformance
-baseline: those are what make the default-on feature safe to enable.
+The remaining M1 blocker is the P6 conformance baseline (and the supply-chain /
+release-verification passes) — the default-on flip makes those the last gate
+before shipping; P5's sanitization landed ahead of any trimming.
 
 M1 shipping does **not** delete this plan: the Lifecycle rule ties deletion to
 full implementation, and P3 remains here for post-ship work.
@@ -937,24 +954,27 @@ resources, and the server-observed cancellation test in `274f736`; the
 
 ### P5 — Configuration, UX, observability (M1)
 
-- [ ] Remaining config keys: `cwd` and `disabledTools` (P2 landed
-      `url`/`headers`/`transport` and `${VAR}` expansion; `exposure` defers with
-      the deferred-tool-loading work below).
-- [ ] Tool-name sanitization and collision hashing (G18, D5).
-- [ ] Actionable "authorization required" error: a `401`/`403` at connect (or on
-      a request) maps to a message naming the server and the two options —
-      configure a static token via `headers`, or wait for OAuth (post-ship) —
-      instead of a raw `HTTP 401` string. The status-parsing helper already
-      exists (`parse_http_status` in `engine.rs`).
-- [ ] Config layers: user file + project file (`.choreographr/mcp_servers.json`),
-      project overrides user per server (pi's merge rules).
-- [ ] `choreographr mcp list/add/remove/reconnect` CLI + `/mcp` status surface
+**Done** (`f037383`, `8d27006`, `a348c89`).
+
+- [x] Remaining config keys: `cwd` and `disabledTools` landed (`f037383`);
+      `exposure` defers with the deferred-tool-loading work below.
+- [x] Tool-name sanitization and collision hashing (G18, D5) — `f037383`.
+- [x] Actionable "authorization required" error: a `401`/`403` at connect (or on
+      a request) maps to `McpError::AuthRequired` naming the server and the two
+      options — a static token via `headers`, or OAuth (post-ship) — instead of
+      a raw `HTTP 401` string — `f037383` (extends `parse_http_status`).
+- [x] Config layers: user file + project file (`.choreographr/mcp_servers.json`),
+      project overrides user per server — `f037383`.
+- [x] `choreographr mcp list/add/remove/reconnect` CLI + `/mcp` status surface
       (server state, tool counts, last error — no auth state yet) rendered from
-      `ServerSlot`.
-- [ ] `session_inspect` includes MCP server status/tool counts (no secrets).
-- [ ] Per-server log file (`mcp-<slug>.log`, size-capped rotation).
-- [ ] User docs: `mcp_servers.json` reference incl. the static-token pattern and
-      the "OAuth not yet supported" limitation (post-ship P3).
+      `McpManager::status` — `8d27006`. `enable`/`disable` are not offered (no
+      runtime add/remove command); the TUI reports them as unsupported.
+- [x] `session_inspect` includes MCP server status/tool counts (no secrets) —
+      `f037383`.
+- [x] Per-server log file (`mcp-<slug>.log`, size-capped) — `a348c89`.
+- [x] User docs: `mcp_servers.json` reference incl. the static-token pattern and
+      the "OAuth not yet supported" limitation (post-ship P3) — `f037383`/
+      `a348c89`.
 
 Post-ship (fast-follow, around P3):
 
@@ -1094,9 +1114,10 @@ the pre-existing 120 s watchdog and one bounded marker poll (above).
 ## 10. Configuration & control surface
 
 Target config shape (superset, all keys optional except command/url). Landed in
-P0–P2: `command`/`args`/`env`, `url`/`headers`, `transport`, `protocol`,
-`timeout`, `enabled`, and `${VAR}` expansion. Still pending: `cwd`/`disabledTools`
-(M1); `exposure` and `oauth` are post-ship (`oauth` with P3).
+P0–P5: `command`/`args`/`env`/`cwd`, `url`/`headers`, `transport`, `protocol`,
+`timeout`, `enabled`, `maxConcurrentCalls`, `disabledTools`, `${VAR}` expansion,
+and the project-config layer. Still pending: `exposure` (post-ship) and `oauth`
+(post-ship, with P3).
 
 ```json
 {
@@ -1123,10 +1144,11 @@ P0–P2: `command`/`args`/`env`, `url`/`headers`, `transport`, `protocol`,
 ```
 
 Surfaces: M1 ships `choreographr mcp list|add|remove|reconnect` and the TUI
-`/mcp` status surface (server state, tool counts, last error, reconnect,
-enable/disable), a `session_inspect` section, and per-server log files. Sign-in
-(`login`/`logout`, auth state) arrives with P3 post-ship; `exposure` moves with
-its deferred-loading work.
+`/mcp` status surface (server state, tool counts, last error, reconnect), a
+`session_inspect` section, and per-server log files. Sign-in (`login`/`logout`,
+auth state) arrives with P3 post-ship; `exposure` moves with its deferred-loading
+work; `enable`/`disable` from the surface need a runtime add/remove command and
+are not offered (the TUI reports them as unsupported).
 
 ## 11. Documentation deliverables
 
@@ -1152,7 +1174,11 @@ its deferred-loading work.
 
 Status: P0/P1 kept `ARCHITECTURE.md` (module tables, `mcp/` row, threading model,
 test-coverage rows) and `README.md` in step, and the tree contains no reference to
-this plan — verified at `15aa3ff`.
+this plan — verified at `15aa3ff`. P4/P5/P6-bounds kept both in step too (the
+`choreo-mcp` module table gained `naming.rs` and the auth/`cwd`/`disabledTools`
+notes, the `mcp/` row gained the config layers, name hygiene, status/reconnect,
+and per-server logs, and `README.md` gained the `mcp_servers.json` reference).
+The feature-row flip (D9) still waits on the default-on change.
 
 ## 12. Risks & mitigations
 
@@ -1201,8 +1227,8 @@ this plan — verified at `15aa3ff`.
 ## 15. Definition of done
 
 Two sets: **M1 — ship without OAuth** (the active goal) and **post-ship** (P3).
-P0–P2 and P4 are complete and the P6 bounds landed; the unchecked M1 items are
-what remains.
+P0–P2, P4, and P5 are complete and the P6 bounds landed; the unchecked M1 items
+are what remains.
 
 ### M1 — ship without OAuth
 
@@ -1211,10 +1237,10 @@ what remains.
       covered by integration tests on **both** transports (P1 stdio, P2 HTTP).
 - [ ] The official conformance suite's client scenarios run green against the
       supported eras, with a committed baseline (P6).
-- [ ] Authentication without OAuth: a static token in `headers` reaches an
+- [x] Authentication without OAuth: a static token in `headers` reaches an
       authenticated server; a server that requires OAuth fails with the P5
       actionable error, not a hang or a raw status string. No credential store,
-      no sign-in flow (P3, post-ship).
+      no sign-in flow (P3, post-ship) — `f037383`.
 - [ ] Tool calls: parallel per server, cancellable, deadline-bounded, restart
       on crash, progress-streamed, with images attached, structured content
       preserved, and typed errors. *(Met except the per-server concurrency cap
@@ -1226,9 +1252,10 @@ what remains.
 - [ ] Bounds enforced and tested: schema/text caps, the stdio frame cap, and
       the per-server concurrency cap landed (`1d7d239`); remaining: max tool
       count, schema depth, max restarts, and notification-rate caps (P6).
-- [ ] Tool names sanitized and collision-proofed (P5).
-- [ ] `/mcp` status surface + `mcp list/add/remove/reconnect` CLI, per-server
-      logs, and a `session_inspect` section (P5).
+- [x] Tool names sanitized and collision-proofed (P5) — `f037383`.
+- [x] `/mcp` status surface + `mcp list/add/remove/reconnect` CLI, per-server
+      logs, and a `session_inspect` section (P5) — `8d27006`, `a348c89`,
+      `f037383`.
 - [ ] `mcp` is a default cargo feature: a plain build has MCP; the opt-out
       paths (iOS embedded daemon, `--no-default-features`) stay documented
       (D9).
