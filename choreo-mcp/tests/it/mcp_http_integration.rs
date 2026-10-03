@@ -32,6 +32,7 @@ fn http_config(url: &str, protocol: McpProtocolMode) -> McpServerConfig {
         timeout: Some(Duration::from_secs(10)),
         protocol,
         max_concurrent_calls: None,
+        max_restarts: None,
         disabled_tools: Vec::new(),
     }
 }

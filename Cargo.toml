@@ -15,10 +15,15 @@ default-run = "choreographr"
 [dependencies]
 # default-features = false is inherited from the workspace definition (a member
 # cannot override default-features of an inherited dep — older stable cargo
-# rejects it, which broke the release workflow). The root package explicitly
-# re-enables the default `pdf` feature here: desktop daemons parse PDFs. The
-# feature-forwarding entries below (metrics/blockchain/…) compose on top.
-choreo-daemon = { workspace = true, features = ["pdf"] }
+# rejects it, which broke the release workflow). The root package therefore
+# re-enables the features the shipped desktop binary needs unconditionally:
+# `pdf` (desktop daemons parse PDFs) and `mcp` (the Model Context Protocol tool
+# group is a core product capability, not an experiment). The
+# feature-forwarding entries below (metrics/blockchain/…) compose on top. An
+# embedder that cannot host MCP subprocesses or its dependency tree uses
+# `choreo-daemon` with `default-features = false` directly (the iOS embedded
+# daemon does exactly this — see choreo-gui's target-gated dependency).
+choreo-daemon = { workspace = true, features = ["pdf", "mcp"] }
 anyhow.workspace = true
 mimalloc = { version = "0.1", optional = true }
 # (inline, not workspace: cargo rejects `optional` on workspace.dependencies)
@@ -43,8 +48,11 @@ content = ["choreo-daemon/content"]
 # `choreo-tui` package's own `avif` feature now that the TUI binary is its own
 # crate.
 avif = ["choreo-daemon/avif"]
-# MCP tool group in the daemon (dynamic tools from stdio MCP server
-# subprocesses). Off by default; forwards to choreo-daemon/mcp.
+# MCP tool group in the daemon (dynamic tools from MCP servers over a stdio
+# subprocess or the Streamable HTTP transport). On by default — the shipped
+# binary re-enables `mcp` above alongside `pdf`; this forwarding feature
+# remains for an explicit `--features mcp` and for symmetry with the other
+# tool-group features.
 mcp = ["choreo-daemon/mcp"]
 # mimalloc — process-wide allocator, enabled ONLY by the static musl tarball
 # build in scripts/release.sh (musl's default malloc is weaker; mimalloc's
@@ -556,7 +564,7 @@ unicode-general-category = "1.1"
 # extra features (e.g. choreo-mcp's `sync`/`macros`) add them at the member.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
 # Official Model Context Protocol Rust SDK, maintained by the MCP project. It is
-# the protocol engine behind `choreo-mcp` (feature `mcp`, off by default); the
+# the protocol engine behind `choreo-mcp` (feature `mcp`, on by default); the
 # daemon never sees rmcp types — they stay inside the crate. Default features
 # are off so a consumer enables exactly the transports it needs.
 rmcp = { version = "3.5", default-features = false }

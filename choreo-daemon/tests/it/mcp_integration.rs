@@ -289,6 +289,58 @@ fn mcp_list_change_is_forwarded_and_reregisters() {
 
 #[test]
 #[ignore = "integration"]
+fn mcp_shutdown_all_is_bounded_with_a_stubborn_server() {
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(120));
+        eprintln!("mcp_integration: test exceeded 120s; aborting");
+        std::process::abort();
+    });
+
+    // A server that ignores stdin EOF and never exits must not be able to wedge
+    // `McpManager::shutdown_all`: each slot's `Drop` joins its dispatcher with a
+    // bounded wait. `protocol` is left at the default (`auto`) so the legacy
+    // `stubborn` fixture is reachable via the discover→initialize fallback.
+    let config_dir = tempfile::tempdir().expect("tempdir for config");
+    let config_path = config_dir.path().join("choreographr");
+    std::fs::create_dir_all(&config_path).expect("create config dir");
+    let mcp_config = serde_json::json!({
+        "mcpServers": {
+            "stubborn": {
+                "command": FIXTURE_BIN,
+                "args": ["stubborn"],
+                "enabled": true,
+                "timeout": 60
+            }
+        }
+    });
+    std::fs::write(
+        config_path.join("mcp_servers.json"),
+        serde_json::to_string_pretty(&mcp_config).expect("serialize config"),
+    )
+    .expect("write mcp_servers.json");
+    choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
+
+    let mut registry = choreo_daemon::tools::ToolRegistry::new();
+    let manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
+    assert_eq!(
+        manager.server_count(),
+        1,
+        "the stubborn server should connect"
+    );
+
+    let start = std::time::Instant::now();
+    drop(manager);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "shutdown_all exceeded its bounded wait: {elapsed:?}"
+    );
+
+    choreo_daemon::mcp::config::set_test_config_root(None);
+}
+
+#[test]
+#[ignore = "integration"]
 fn mcp_progress_streams_through_the_wrapper() {
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_secs(120));

@@ -22,6 +22,24 @@ pub const EMPTY_INPUT_SCHEMA: &str = r#"{"type":"object","additionalProperties":
 /// server or the prompt sent to a model.
 pub const MAX_SCHEMA_BYTES: usize = 256 * 1024;
 
+/// Upper bound on the nesting depth of a tool's schema.
+///
+/// JSON Schema permits unbounded nesting, so a malicious schema could recurse
+/// arbitrarily deep — costly to validate and a stack-depth hazard for any
+/// consumer that walks it. The depth cap (counting nested objects/arrays, where
+/// a top-level container is depth 1) rejects such a schema before it reaches a
+/// validator. The bound is far deeper than any real tool schema needs.
+pub const MAX_SCHEMA_DEPTH: usize = 32;
+
+/// Upper bound on how many tools one server's catalogue may contribute.
+///
+/// A server can advertise an unbounded number of tools; forwarding them all
+/// would flood the model's tool array and the daemon's registry. The cap keeps
+/// the first [`MAX_TOOLS_PER_SERVER`] (the spec recommends servers list
+/// deterministically, so the kept prefix is stable) and reports the rest as
+/// dropped.
+pub const MAX_TOOLS_PER_SERVER: usize = 1024;
+
 /// A tool advertised by an MCP server.
 #[derive(Debug, Clone, PartialEq)]
 pub struct McpTool {
@@ -152,23 +170,90 @@ pub fn empty_input_schema() -> serde_json::Value {
 /// Normalize a tool's raw `inputSchema` to a valid JSON Schema object.
 ///
 /// Returns `None` when the schema is not an object (arrays, strings, numbers,
-/// booleans) or exceeds [`MAX_SCHEMA_BYTES`] — the caller drops such tools while
-/// keeping the rest, per the spec's "exclude the tool, keep the others" rule.
-/// A `null` schema is treated as absent and replaced with
-/// [`EMPTY_INPUT_SCHEMA`].
+/// booleans) or exceeds [`MAX_SCHEMA_BYTES`] / [`MAX_SCHEMA_DEPTH`] — the caller
+/// drops such tools while keeping the rest, per the spec's "exclude the tool,
+/// keep the others" rule. A `null` schema is treated as absent and replaced
+/// with [`EMPTY_INPUT_SCHEMA`].
 #[must_use]
 pub fn normalize_input_schema(value: serde_json::Value) -> Option<serde_json::Value> {
     match value {
         serde_json::Value::Null => Some(empty_input_schema()),
-        serde_json::Value::Object(_) => {
-            // `to_string` of a `Value` is infallible in practice; treat the
-            // unlikely failure as "cannot bound the schema" and reject it so
-            // an unmeasurable schema never reaches the model.
-            let size = serde_json::to_string(&value).ok()?.len();
-            (size <= MAX_SCHEMA_BYTES).then_some(value)
-        }
+        serde_json::Value::Object(_) if schema_within_bounds(&value) => Some(value),
         _ => None,
     }
+}
+
+/// Normalize a tool's optional `outputSchema`, dropping it when it is not a
+/// bounded object.
+///
+/// The output schema is advisory (a caller may validate a tool's
+/// `structuredContent` against it), so an out-of-bounds schema is dropped while
+/// the tool itself is kept — unlike an input schema, whose absence would change
+/// how the tool is invoked.
+#[must_use]
+pub fn normalize_output_schema(value: serde_json::Value) -> Option<serde_json::Value> {
+    match value {
+        serde_json::Value::Object(_) if schema_within_bounds(&value) => Some(value),
+        _ => None,
+    }
+}
+
+/// Whether `schema` respects the byte and depth bounds (and is measurable).
+fn schema_within_bounds(schema: &serde_json::Value) -> bool {
+    // Depth first: the walk is iterative, so an over-deep schema is rejected
+    // before reaching the recursive serializer below.
+    if json_depth(schema) > MAX_SCHEMA_DEPTH {
+        return false;
+    }
+    // `to_string` of a `Value` is infallible in practice; the unlikely failure is
+    // treated as "cannot bound the schema", rejecting it so an unmeasurable
+    // schema never reaches a validator.
+    let Ok(size) = serde_json::to_string(schema).map(|s| s.len()) else {
+        return false;
+    };
+    size <= MAX_SCHEMA_BYTES
+}
+
+/// The nesting depth of a JSON value: a scalar is depth 0, and each object or
+/// array level adds one, so a top-level object is depth 1.
+///
+/// Iterative by way of an explicit stack so a hostile deeply-nested schema
+/// cannot overflow the native stack while being measured (the recursion this
+/// replaces would itself be the hazard the depth cap exists to prevent).
+#[must_use]
+pub fn json_depth(value: &serde_json::Value) -> usize {
+    // Each stack entry is `(value, depth-at-this-value)`; children are pushed
+    // with `depth + 1` and the running max is tracked as they pop.
+    let mut max = 0usize;
+    let mut stack: Vec<(&serde_json::Value, usize)> = vec![(value, 0)];
+    while let Some((value, depth)) = stack.pop() {
+        max = max.max(depth);
+        match value {
+            serde_json::Value::Object(map) => {
+                stack.extend(map.values().map(|child| (child, depth + 1)));
+            }
+            serde_json::Value::Array(items) => {
+                stack.extend(items.iter().map(|child| (child, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+    max
+}
+
+/// Truncate a tool list to [`MAX_TOOLS_PER_SERVER`], returning the kept tools
+/// and how many were dropped.
+///
+/// Keeps the leading prefix (servers SHOULD list deterministically), so the
+/// retained set is stable across calls.
+#[must_use]
+pub fn cap_tools(tools: Vec<McpTool>) -> (Vec<McpTool>, usize) {
+    if tools.len() <= MAX_TOOLS_PER_SERVER {
+        return (tools, 0);
+    }
+    let dropped = tools.len() - MAX_TOOLS_PER_SERVER;
+    let kept = tools.into_iter().take(MAX_TOOLS_PER_SERVER).collect();
+    (kept, dropped)
 }
 
 #[cfg(test)]
@@ -200,5 +285,90 @@ mod tests {
         let filler = "x".repeat(MAX_SCHEMA_BYTES + 1);
         let schema = serde_json::json!({ "type": "object", "description": filler });
         assert!(normalize_input_schema(schema).is_none());
+    }
+
+    #[test]
+    fn json_depth_counts_container_nesting() {
+        assert_eq!(json_depth(&serde_json::json!(42)), 0);
+        assert_eq!(json_depth(&serde_json::json!({"a": 1})), 1);
+        assert_eq!(json_depth(&serde_json::json!({"a": {"b": {"c": 1}}})), 3);
+        // Arrays count too, and a mixed object/array nest accumulates.
+        assert_eq!(json_depth(&serde_json::json!([[[1]]])), 3);
+        assert_eq!(json_depth(&serde_json::json!({"a": [{"b": 1}]})), 3);
+    }
+
+    #[test]
+    fn normalize_rejects_over_deep_input_schema() {
+        // Build an object nested one level beyond the cap.
+        let mut schema = serde_json::json!(1);
+        for _ in 0..=MAX_SCHEMA_DEPTH {
+            schema = serde_json::json!({"n": schema});
+        }
+        // A shallow schema of the same shape passes, so the rejection is the
+        // depth, not the shape.
+        let shallow = serde_json::json!({"type": "object"});
+        assert!(normalize_input_schema(shallow).is_some());
+        assert!(normalize_input_schema(schema).is_none());
+    }
+
+    #[test]
+    fn normalize_output_schema_bounds_depth_and_shape() {
+        let ok = serde_json::json!({"type": "object", "properties": {}});
+        assert_eq!(normalize_output_schema(ok.clone()), Some(ok));
+        // A non-object output schema is dropped.
+        assert!(normalize_output_schema(serde_json::json!(["nope"])).is_none());
+        let mut deep = serde_json::json!(1);
+        for _ in 0..=MAX_SCHEMA_DEPTH {
+            deep = serde_json::json!({"n": deep});
+        }
+        assert!(normalize_output_schema(deep).is_none());
+    }
+
+    #[test]
+    fn json_depth_measures_deep_nesting_without_stack_overflow() {
+        // `json_depth` is iterative, so a value far deeper than any real schema
+        // is measured rather than recursing. (The value is built directly — a
+        // serde_json parse would stop at its own recursion limit.)
+        let mut deep = serde_json::json!(0);
+        for _ in 0..2_000 {
+            deep = serde_json::Value::Array(vec![deep]);
+        }
+        assert_eq!(json_depth(&deep), 2_000);
+        // Such a value is rejected by the schema bound.
+        assert!(normalize_input_schema(serde_json::json!({"type": "object"})).is_some());
+        assert!(
+            normalize_input_schema({
+                let mut s = serde_json::json!(0);
+                for _ in 0..=MAX_SCHEMA_DEPTH {
+                    s = serde_json::Value::Array(vec![s]);
+                }
+                s
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn cap_tools_keeps_prefix_and_reports_dropped() {
+        let make = |n: usize| McpTool {
+            name: format!("t{n}"),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+        };
+        // Under the cap: returned unchanged, nothing dropped.
+        let (kept, dropped) = cap_tools((0..10).map(make).collect());
+        assert_eq!(kept.len(), 10);
+        assert_eq!(dropped, 0);
+        // Over the cap: exactly MAX kept (the leading prefix), the rest dropped.
+        let total = MAX_TOOLS_PER_SERVER + 7;
+        let (kept, dropped) = cap_tools((0..total).map(make).collect());
+        assert_eq!(kept.len(), MAX_TOOLS_PER_SERVER);
+        assert_eq!(dropped, 7);
+        assert_eq!(kept.first().map(|t| t.name.as_str()), Some("t0"));
+        assert_eq!(
+            kept.last().map(|t| t.name.as_str()),
+            Some(format!("t{}", MAX_TOOLS_PER_SERVER - 1).as_str())
+        );
     }
 }

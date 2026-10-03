@@ -21,6 +21,8 @@
 // - `crash-on-call` — the process exits the moment `tools/call` arrives.
 // - `garbage` — emits a non-JSON line before each real response.
 // - `oversized` — emits one line far larger than any sane frame.
+// - `stubborn` — never exits on stdin EOF (it sleeps forever), so the client's
+//   bounded shutdown is exercised against a child that does not cooperate.
 // - `modern-list-changed` — a 2026-07-28 server that declares
 //   `tools.listChanged` and, on `subscriptions/listen`, acknowledges the
 //   subscription and immediately emits a `notifications/tools/list_changed`
@@ -58,7 +60,18 @@ fn main() {
     loop {
         line.clear();
         match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
+            Ok(0) | Err(_) => {
+                // A `stubborn` server ignores stdin EOF and keeps running, so
+                // the client's bounded shutdown/join is exercised against a
+                // child that does not exit on its own. The client's process
+                // group kill is what ultimately ends it.
+                if scenario == "stubborn" {
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(3600));
+                    }
+                }
+                break;
+            }
             Ok(_) => {}
         }
         let trimmed = line.trim();

@@ -449,7 +449,7 @@ data model.
 | `choreo-image` | Leaf crate — the single raster decode path (EXIF orientation baked in) and HEIC/HEIF decode (with a pre-decode allocation guard), shared by the daemon and the TUI so the model and UI paths cannot drift |
 | `choreo-keystore` | X25519 + ECDH/AES-256-GCM crypto library for the per-daemon unlock-key keystore |
 | `choreo-transport` | Noise-IK encrypted transport over TCP |
-| `choreo-mcp` | MCP (Model Context Protocol) client built on the official `rmcp` SDK — connects over a stdio subprocess or a remote Streamable HTTP endpoint, negotiates the protocol era (`server/discover` with an `initialize` fallback), lists paginated tools, and dispatches cancellable, deadline-bounded, concurrency-capped calls behind a blocking facade (one dispatcher thread per server). Streams server progress notifications as live output, drives the MRTR `input_required` retry loop, exposes a server's resources (list/read) as wrapper tools when the capability is declared, and opens a `subscriptions/listen` stream so a server that changes its tool or resource list refreshes the daemon's catalogue live (no restart). Tool names are sanitized to the provider-safe alphabet and capped at 64 chars (with a stable hash suffix on collision), a server config can set a `cwd`, a `disabledTools` list, and a per-server log file (`mcp-<slug>.log`), and a server that requires authorization fails with an actionable message naming the static-token and OAuth paths. The stdio read path is capped (a single oversized frame drops the connection instead of allocating without limit), and each server's in-flight calls are bounded by `maxConcurrentCalls` (default 4). Linked via the daemon's `mcp` feature (off by default); ships no binary (its only `[[bin]]` is a test fixture server) |
+| `choreo-mcp` | MCP (Model Context Protocol) client built on the official `rmcp` SDK — connects over a stdio subprocess or a remote Streamable HTTP endpoint, negotiates the protocol era (`server/discover` with an `initialize` fallback), lists paginated tools, and dispatches cancellable, deadline-bounded, concurrency-capped calls behind a blocking facade (one dispatcher thread per server). Streams server progress notifications as live output, drives the MRTR `input_required` retry loop, exposes a server's resources (list/read) as wrapper tools when the capability is declared, and opens a `subscriptions/listen` stream so a server that changes its tool or resource list refreshes the daemon's catalogue live (no restart). Tool names are sanitized to the provider-safe alphabet and capped at 64 chars (with a stable hash suffix on collision), a server config can set a `cwd`, a `disabledTools` list, and a per-server log file (`mcp-<slug>.log`), and a server that requires authorization fails with an actionable message naming the static-token and OAuth paths. The stdio read path is capped (a single oversized frame drops the connection instead of allocating without limit), and each server's in-flight calls are bounded by `maxConcurrentCalls` (default 4). Linked via the daemon's `mcp` feature, which is on by default (an embedder opts out with `default-features = false`); ships no binary (its only `[[bin]]` is a test fixture server) |
 | `choreo-acp` | ACP (Agent Communication Protocol) bridge — translates JSON-RPC 2.0 over stdin/stdout into `choreo-proto` messages so ACP-compatible editors can drive sessions |
 | `choreo-tui` | Full-screen terminal UI client (ratatui + crossterm) |
 | `choreo-gui` | Desktop/Android GUI client (Dioxus Native / Blitz renderer — no webview) |
@@ -531,7 +531,8 @@ it on the next turn.
 `content`, `image`, `x`, `vm`, `db`, `mcp`, `blockchain`). Only `core`, `git`, and
 `shell` are active by default; the `content` group additionally becomes
 available when the daemon is built with the `content` cargo feature (off by
-default; opt in with `--features content`). The model can activate additional groups with
+default; opt in with `--features content`), and the `mcp` group is available in
+a default build (opt out with `default-features = false`). The model can activate additional groups with
 `load_tools` and deactivate them with
 `unload_tools`. Groups are a discovery mechanism, not access control — the
 RISC-V VM always has access to all tools.
@@ -809,13 +810,16 @@ project file at `<root>/.choreographr/mcp_servers.json`, which overrides the
 user file per server slug). Each entry is a named server under `mcpServers`;
 a stdio server sets `command` (plus optional `args`/`env`/`cwd`) and a remote
 server sets `url` (plus optional `headers`). Discovered tools are exposed to
-the model under an `mcp/<slug>` group. A running daemon (built with the `mcp`
-feature) connects the enabled servers at startup and registers their tools.
+the model under an `mcp/<slug>` group. A running daemon (the `mcp` feature is
+on by default) connects the enabled servers at startup and registers their
+tools.
 
 Per-server keys (all optional except `command`/`url`): `enabled`, `transport`
 (`auto`/`stdio`/`http`), `protocol` (`auto`/`legacy`/`modern`), `timeout`
-(seconds), `maxConcurrentCalls`, `disabledTools` (tool names to hide), and —
-for a stdio server — `cwd` (a leading `~` is expanded). `${VAR}` references in
+(seconds), `maxConcurrentCalls`, `maxRestarts` (consecutive transport-rebuild
+attempts before the server is left alone until its next call; `0` disables
+automatic reconnect), `disabledTools` (tool names to hide), and — for a stdio
+server — `cwd` (a leading `~` is expanded). `${VAR}` references in
 `env`/`headers` values are expanded from the environment. Each stdio server's
 `stderr` is captured into a per-server log file (`mcp-<slug>.log` under the
 log/state directory, capped at 2 MiB).
@@ -1086,11 +1090,15 @@ cargo fmt --all             # formatting
 ```
 
 `cargo test-lean` is the feature-off run: it compiles the workspace with every
-optional feature disabled (metrics, blockchain, mimalloc), which is the only
+optional feature that is NOT in `default` disabled (metrics, blockchain,
+mimalloc), which is the only
 way the metrics no-op stub backend and the feature-off `--metrics-addr` startup
 refusal in `server/lifecycle.rs` get built — the `--all-features` aliases never
 compile that configuration, so `test-lean` guards against the stubs drifting
-out of sync with the real backend.
+out of sync with the real backend. The MCP tool group is on by default now, so
+`test-lean` compiles the real backend; the feature-off `McpManager` stub is
+exercised by the iOS build instead (it consumes `choreo-daemon` with
+`default-features = false`).
 
 The nextest profile lives in `.config/nextest.toml`: `fail-fast = false` (run
 the whole suite even after a failure) and a 120s `slow-timeout` that aborts any
@@ -1109,6 +1117,15 @@ cargo nextest run --workspace --partition count:1/2   # shard for CI
 Note that the `test-*` aliases bake in `--workspace`, so passing `-p <crate>`
 to them is rejected by cargo (conflicting flags) — run
 `cargo nextest run -p <crate>` directly to scope a run to a single crate.
+
+The MCP client is additionally checked against the official
+`@modelcontextprotocol/conformance` **client** suite: `just mcp-conformance`
+(or `scripts/mcp-conformance.sh`) builds the `mcp-conformance-client` harness and
+runs the pinned suite against it, diffed against the committed expected-failures
+baseline at `choreo-mcp/tests/conformance/expected-failures.yml` (it needs
+Node.js and network access, so it is a CI/release-time gate, not part of
+`pre-commit`). A new regression fails the run; so does a baseline entry that has
+started passing, which is how the baseline shrinks as gaps are fixed.
 
 ### justfile
 

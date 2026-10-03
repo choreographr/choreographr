@@ -37,6 +37,7 @@ fn fixture_config(scenario: Option<&str>, protocol: McpProtocolMode) -> McpServe
         timeout: Some(Duration::from_secs(10)),
         protocol,
         max_concurrent_calls: None,
+        max_restarts: None,
         disabled_tools: Vec::new(),
     }
 }
@@ -399,4 +400,48 @@ fn server_observes_cancellation() {
         waited += 1;
         assert!(waited < 2000, "fixture never observed the cancellation");
     }
+}
+
+#[test]
+#[ignore = "integration: spawns the fixture subprocess per workspace test discipline"]
+fn shutdown_is_bounded_with_a_stubborn_server() {
+    watchdog();
+    // A server that ignores stdin EOF and never exits must not be able to wedge
+    // shutdown: dropping the `McpServer` sends the shutdown command and joins
+    // the dispatcher with a bounded wait regardless.
+    let marker_dir = tempfile::tempdir().expect("tempdir for marker");
+    let marker = marker_dir.path().join("started");
+
+    let mut config = fixture_config(Some("stubborn"), McpProtocolMode::Legacy);
+    config.timeout = Some(Duration::from_secs(60));
+    if let McpTransport::Stdio { env, .. } = &mut config.transport {
+        env.insert(
+            "MCP_FIXTURE_MARKER".to_string(),
+            marker.display().to_string(),
+        );
+    }
+    let server = McpServer::connect(&config).expect("connect stubborn fixture");
+
+    // Start a call that will never complete, and wait until the fixture reports
+    // it is in flight, so shutdown runs against a genuinely busy connection.
+    let handle = server.handle();
+    let caller = handle.clone();
+    let call = std::thread::spawn(move || caller.call_tool(1, "slow", serde_json::json!({}), None));
+    let mut waited = 0;
+    while !marker.exists() {
+        std::thread::sleep(Duration::from_millis(5));
+        waited += 1;
+        assert!(waited < 2000, "fixture never started the slow call");
+    }
+
+    let start = std::time::Instant::now();
+    drop(server);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "shutdown exceeded its bounded wait: {elapsed:?}"
+    );
+    // The abandoned caller observes the dispatcher going away rather than
+    // blocking forever.
+    let _ = call.join();
 }

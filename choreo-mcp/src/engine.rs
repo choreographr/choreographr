@@ -10,8 +10,8 @@
 use crate::config::{McpProtocolMode, McpServerConfig, McpTransport};
 use crate::error::McpError;
 use crate::protocol::{
-    CallToolResult, McpContent, McpListChange, McpListKind, McpResource, McpTool,
-    normalize_input_schema,
+    CallToolResult, McpContent, McpListChange, McpListKind, McpResource, McpTool, cap_tools,
+    normalize_input_schema, normalize_output_schema,
 };
 use crate::session::{BoxFuture, CallRequest, EngineCall, EngineFactory, McpEngine};
 use reqwest::header::{HeaderName, HeaderValue};
@@ -27,6 +27,7 @@ use rmcp::service::{
     RoleClient, RunningService, ServiceError,
 };
 use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::common::client_side_sse::SseRetryPolicy;
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransportConfig, StreamableHttpError,
 };
@@ -65,6 +66,24 @@ const MAX_MRTR_ROUNDS: usize = 3;
 /// one would flood the chunk sink. Coalescing to at most one chunk per interval
 /// keeps the display live without the traffic.
 const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Maximum server logging notifications (`notifications/message`) forwarded to
+/// `tracing` per second, per connection.
+///
+/// A server can emit log notifications far faster than is useful; without a
+/// bound a chatty or hostile server would flood the daemon's log (and the I/O
+/// behind it). Notifications beyond the budget are dropped and the count is
+/// reported once the window rolls over. (`notifications/progress` has its own
+/// per-call throttle, [`PROGRESS_MIN_INTERVAL`].)
+const MAX_LOG_NOTIFICATIONS_PER_SECOND: u32 = 100;
+
+/// Maximum SSE reconnect attempts before the transport gives up on an ended
+/// server stream.
+///
+/// rmcp's default SSE retry policy reconnects forever. This bounds the attempts
+/// (with the same exponential backoff and ceiling as [`crate::retry`]) so a
+/// permanently dead endpoint is not hammered and the failure surfaces instead.
+const SSE_MAX_RECONNECTS: usize = 3;
 
 /// Buffer depth of the per-connection server-event broadcast.
 ///
@@ -115,6 +134,82 @@ pub(crate) struct RmcpEngine {
     slug: String,
 }
 
+/// A fixed-window rate limiter for server-originated notifications.
+///
+/// Kept as a tiny counter with an injectable clock, so the allow/deny decision
+/// is unit-testable without waiting on wall-clock time. One instance is shared
+/// across a connection's notification callbacks through an `Arc`; the `Mutex`
+/// guards only a few integers (no protocol data), and the same lock is never
+/// held across an `await`.
+#[derive(Debug)]
+struct NotificationLimiter {
+    /// Allowed notifications per window.
+    max: u32,
+    /// Window length.
+    window: Duration,
+    state: std::sync::Mutex<LimiterState>,
+}
+
+/// Mutable state behind a [`NotificationLimiter`].
+#[derive(Debug)]
+struct LimiterState {
+    /// Start of the current window, or `None` before the first notification.
+    window_start: Option<Instant>,
+    /// Notifications allowed so far in the current window.
+    count: u32,
+    /// Notifications dropped in the current window.
+    suppressed: u64,
+}
+
+impl NotificationLimiter {
+    /// Build a limiter allowing `max` notifications per one-second window.
+    fn new(max: u32) -> Self {
+        Self {
+            max,
+            window: Duration::from_secs(1),
+            state: std::sync::Mutex::new(LimiterState {
+                window_start: None,
+                count: 0,
+                suppressed: 0,
+            }),
+        }
+    }
+
+    /// Record one notification observed at `now`; returns whether it is within
+    /// the budget (and so should be forwarded).
+    ///
+    /// Rolling into a new window resets the allowance and, when the previous
+    /// window dropped anything, emits a single trace line naming the count — so
+    /// a throttled server is visible without logging every dropped notification.
+    fn allow_at(&self, now: Instant) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let in_window = state
+            .window_start
+            .is_some_and(|start| now.duration_since(start) < self.window);
+        if !in_window {
+            let suppressed = std::mem::take(&mut state.suppressed);
+            if suppressed > 0 {
+                tracing::debug!(
+                    suppressed,
+                    "MCP server logging notifications were rate-limited"
+                );
+            }
+            state.count = 0;
+            state.window_start = Some(now);
+        }
+        if state.count < self.max {
+            state.count += 1;
+            true
+        } else {
+            state.suppressed += 1;
+            false
+        }
+    }
+}
+
 /// The `ClientHandler` for one connection.
 ///
 /// rmcp routes every server-to-client notification here rather than to the
@@ -126,6 +221,8 @@ pub(crate) struct RmcpEngine {
 struct ServerHandler {
     config: ClientConfig,
     events: tokio::sync::broadcast::Sender<ServerEvent>,
+    /// Per-connection rate limiter for logging notifications.
+    limiter: Arc<NotificationLimiter>,
 }
 
 impl ClientHandler for ServerHandler {
@@ -169,6 +266,11 @@ impl ClientHandler for ServerHandler {
         params: rmcp::model::LoggingMessageNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) {
+        // Bound the notification rate: a server that floods the log is
+        // throttled rather than allowed to dominate the daemon's log output.
+        if !self.limiter.allow_at(Instant::now()) {
+            return;
+        }
         let logger = params.logger.as_deref().unwrap_or("server");
         let data = params.data;
         tracing::info!(logger = %logger, level = ?params.level, "MCP server log: {data}");
@@ -358,6 +460,7 @@ async fn connect_transport(
     let handler = ServerHandler {
         config: client_config(config.protocol),
         events: events.clone(),
+        limiter: Arc::new(NotificationLimiter::new(MAX_LOG_NOTIFICATIONS_PER_SECOND)),
     };
     match &config.transport {
         McpTransport::Stdio { .. } => {
@@ -479,13 +582,53 @@ fn build_http_transport(
         })?;
         custom.insert(header, value);
     }
-    let http_config = StreamableHttpClientTransportConfig::with_uri(url.as_str())
+    let mut http_config = StreamableHttpClientTransportConfig::with_uri(url.as_str())
         .custom_headers(custom)
         .max_sse_event_size(MAX_SSE_EVENT_BYTES);
+    // Bound the SSE reconnect policy. rmcp's default retries a dropped server
+    // stream forever, which would hammer a permanently dead endpoint; this caps
+    // the attempts with a bounded exponential backoff so the failure surfaces.
+    // No idle-read timeout is set: rmcp exposes no read-idle hook, and the
+    // per-request deadline (`PeerRequestOptions::with_timeout`) already bounds
+    // every ordinary request, while a `subscriptions/listen` stream is
+    // re-established by the dispatcher's own restart policy.
+    http_config.retry_config = Arc::new(BoundedSseRetry {
+        max_attempts: SSE_MAX_RECONNECTS,
+        base: crate::retry::BASE_BACKOFF,
+        ceiling: crate::retry::MAX_BACKOFF,
+    });
     Ok(StreamableHttpClientTransport::with_client(
         client,
         http_config,
     ))
+}
+
+/// A bounded SSE stream-reconnect policy for the Streamable HTTP transport.
+///
+/// Implements rmcp's [`SseRetryPolicy`] with a finite attempt budget and a
+/// capped exponential backoff (the same shape as [`crate::retry`]'s connect
+/// policy), replacing the crate default of unbounded reconnection. rmcp's own
+/// policy types are `#[non_exhaustive]` and so cannot be constructed here.
+#[derive(Debug)]
+struct BoundedSseRetry {
+    /// Maximum reconnect attempts before the stream is abandoned.
+    max_attempts: usize,
+    /// First-retry delay.
+    base: Duration,
+    /// Ceiling on a single reconnect delay.
+    ceiling: Duration,
+}
+
+impl SseRetryPolicy for BoundedSseRetry {
+    fn retry(&self, current_times: usize) -> Option<Duration> {
+        if current_times >= self.max_attempts {
+            return None;
+        }
+        // `current_times` is bounded by `max_attempts` in practice, but clamp
+        // the shift so a hostile value cannot overflow the left shift.
+        let shift = u32::try_from(current_times).unwrap_or(u32::MAX).min(7);
+        Some(self.base.saturating_mul(1u32 << shift).min(self.ceiling))
+    }
 }
 
 /// Whether a config-supplied header collides with one the transport owns.
@@ -1010,20 +1153,33 @@ fn auth_hint(status: u16) -> String {
     )
 }
 
-/// Convert rmcp tools, dropping any whose `inputSchema` is unusable.
+/// Convert rmcp tools, dropping any whose `inputSchema` is unusable and
+/// truncating the catalogue at [`MAX_TOOLS_PER_SERVER`].
 fn convert_tools(tools: Vec<rmcp::model::Tool>) -> Vec<McpTool> {
-    tools.into_iter().filter_map(convert_tool).collect()
+    let converted: Vec<McpTool> = tools.into_iter().filter_map(convert_tool).collect();
+    let (kept, dropped) = cap_tools(converted);
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            cap = crate::MAX_TOOLS_PER_SERVER,
+            "MCP server advertised more tools than the per-server cap; extra tools dropped"
+        );
+    }
+    kept
 }
 
 /// Convert one rmcp tool, returning `None` when its schema must be rejected.
 ///
-/// A tool with a non-object or oversized schema is dropped (the rest are kept),
-/// per the spec's "exclude the offending tool" rule.
+/// A tool with a non-object, oversized, or over-deep `inputSchema` is dropped
+/// (the rest are kept), per the spec's "exclude the offending tool" rule. An
+/// out-of-bounds `outputSchema` is dropped while the tool is kept, since it is
+/// advisory.
 fn convert_tool(tool: rmcp::model::Tool) -> Option<McpTool> {
     let input_schema = normalize_input_schema(tool.schema_as_json_value())?;
     let output_schema = tool
         .output_schema
-        .map(|schema| serde_json::Value::Object(schema.as_ref().clone()));
+        .map(|schema| serde_json::Value::Object(schema.as_ref().clone()))
+        .and_then(normalize_output_schema);
     Some(McpTool {
         name: tool.name.into_owned(),
         description: tool.description.map(std::borrow::Cow::into_owned),
@@ -1377,5 +1533,52 @@ mod tests {
         });
         let tool: rmcp::model::Tool = serde_json::from_value(json).expect("tool decodes");
         assert!(convert_tool(tool).is_none());
+    }
+
+    #[test]
+    fn convert_tools_truncates_to_the_cap() {
+        // A server advertising more tools than the cap keeps the leading prefix.
+        let json: Vec<serde_json::Value> = (0..crate::MAX_TOOLS_PER_SERVER + 5)
+            .map(|n| {
+                serde_json::json!({
+                    "name": format!("t{n}"),
+                    "inputSchema": {"type": "object"}
+                })
+            })
+            .collect();
+        let tools: Vec<rmcp::model::Tool> = json
+            .into_iter()
+            .map(|v| serde_json::from_value(v).expect("tool decodes"))
+            .collect();
+        let converted = convert_tools(tools);
+        assert_eq!(converted.len(), crate::MAX_TOOLS_PER_SERVER);
+        assert_eq!(converted.first().map(|t| t.name.as_str()), Some("t0"));
+    }
+
+    #[test]
+    fn notification_limiter_enforces_a_per_window_budget() {
+        let limiter = NotificationLimiter::new(2);
+        let base = Instant::now();
+        assert!(limiter.allow_at(base), "first is within budget");
+        assert!(limiter.allow_at(base), "second is within budget");
+        assert!(!limiter.allow_at(base), "third exceeds the budget");
+        assert!(!limiter.allow_at(base), "fourth too");
+        // A fresh window restores the allowance.
+        assert!(limiter.allow_at(base + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn bounded_sse_retry_stops_after_the_budget() {
+        let policy = BoundedSseRetry {
+            max_attempts: 3,
+            base: Duration::from_millis(500),
+            ceiling: Duration::from_mins(1),
+        };
+        // The first retries back off exponentially from the base...
+        assert_eq!(policy.retry(0), Some(Duration::from_millis(500)));
+        assert_eq!(policy.retry(1), Some(Duration::from_secs(1)));
+        assert_eq!(policy.retry(2), Some(Duration::from_secs(2)));
+        // ...then the budget is spent and the stream is abandoned.
+        assert_eq!(policy.retry(3), None);
     }
 }

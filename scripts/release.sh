@@ -134,7 +134,13 @@ BINARIES=(choreographr choreo-tui)
 # Prometheus `/metrics` endpoint and the EVM/Substrate blockchain tools for
 # the daemon — both are off by default so the published crates.io manifests
 # stay lean (the metrics machinery and the optional `choreo-blockchain`
-# crate, which pulls tokio/alloy/subxt into the binary). Each package
+# crate, which pulls tokio/alloy/subxt into the binary). The `mcp` tool group,
+# by contrast, is ON by default (the daemon's `default` and the root package's
+# re-enabled feature): a plain `cargo build` ships it, so these explicit
+# `--features` lists gain it automatically — no flag needed. It links the
+# `choreo-mcp`/`rmcp`/`reqwest` tree and the sidecar tokio runtime. Measured on
+# a local `cargo build --release -p choreographr` when the default flipped, the
+# shipped daemon grew ~11 MB (50.9 MB → 61.9 MB, ~+21.7%) for that tree. Each package
 # carries its OWN `mimalloc` feature (cargo rejects `optional = true` in
 # [workspace.dependencies]), so the musl build enables it once per package.
 # The native PDF tools (pdf_classify / pdf_to_markdown) need no feature

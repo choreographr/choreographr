@@ -9,8 +9,9 @@
 //! the negotiated era and the server's capabilities allow it, it also opens a
 //! `subscriptions/listen` stream and forwards each list-changed event as a
 //! [`McpListChange`] so the daemon can refresh its tool catalogue live. The
-//! daemon depends on it behind its `mcp` cargo feature (off by default) and
-//! registers thin `Tool` wrappers over [`McpServerHandle`].
+//! daemon depends on it behind its `mcp` cargo feature (on by default; an
+//! embedder opts out with `default-features = false`) and registers thin `Tool`
+//! wrappers over [`McpServerHandle`].
 //!
 //! Because `rmcp` is async and the daemon is thread-only, this crate owns the
 //! sidecar tokio runtime for its async client ([`runtime`]) and a per-server
@@ -45,8 +46,8 @@ pub mod session;
 mod stdio;
 
 pub use config::{
-    DEFAULT_MAX_CONCURRENT_CALLS, DEFAULT_TIMEOUT, McpProtocolMode, McpServerConfig, McpTransport,
-    McpTransportKind,
+    DEFAULT_MAX_CONCURRENT_CALLS, DEFAULT_MAX_RESTARTS, DEFAULT_TIMEOUT, McpProtocolMode,
+    McpServerConfig, McpTransport, McpTransportKind,
 };
 pub use error::McpError;
 pub use naming::{
@@ -54,8 +55,9 @@ pub use naming::{
     sanitize_segment, short_hash,
 };
 pub use protocol::{
-    CallToolResult, EMPTY_INPUT_SCHEMA, MAX_SCHEMA_BYTES, McpContent, McpListChange, McpListKind,
-    McpResource, McpTool, normalize_input_schema,
+    CallToolResult, EMPTY_INPUT_SCHEMA, MAX_SCHEMA_BYTES, MAX_SCHEMA_DEPTH, MAX_TOOLS_PER_SERVER,
+    McpContent, McpListChange, McpListKind, McpResource, McpTool, cap_tools, json_depth,
+    normalize_input_schema, normalize_output_schema,
 };
 pub use session::{McpServer, McpServerHandle};
 pub use stdio::MAX_STDIO_FRAME_BYTES;

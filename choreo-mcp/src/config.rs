@@ -22,6 +22,17 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 /// A server config may raise or lower it with `maxConcurrentCalls`.
 pub const DEFAULT_MAX_CONCURRENT_CALLS: usize = 4;
 
+/// Default cap on how many times a dead transport is rebuilt in a row before
+/// the server is left alone until the next request.
+///
+/// The dispatcher rebuilds a connection whose transport failed (a crashed
+/// child, a dropped HTTP stream), backing off exponentially between attempts.
+/// Without a cap, a permanently dead server would be retried forever; a few
+/// attempts absorb a transient crash while bounding the reconnect churn. A
+/// server config may raise or lower it with `maxRestarts` (0 disables
+/// automatic reconnect entirely).
+pub const DEFAULT_MAX_RESTARTS: u32 = 3;
+
 /// Which MCP protocol era a client should establish with a server.
 ///
 /// The default is [`Self::Auto`], the spec-recommended behaviour: probe the
@@ -157,6 +168,11 @@ pub struct McpServerConfig {
     /// `None`, [`DEFAULT_MAX_CONCURRENT_CALLS`] is used. Values below 1 are
     /// treated as 1 by [`max_concurrent_calls`](Self::max_concurrent_calls).
     pub max_concurrent_calls: Option<usize>,
+    /// Optional cap on consecutive transport-rebuild attempts before the
+    /// dispatcher stops reconnecting until the next request. When `None`,
+    /// [`DEFAULT_MAX_RESTARTS`] is used; `Some(0)` disables automatic
+    /// reconnect.
+    pub max_restarts: Option<u32>,
     /// Tool names (as the server advertises them) to hide from the model.
     /// A server with many tools can have a few the operator never wants
     /// offered; listing them here keeps the rest of the server's catalogue
@@ -180,6 +196,14 @@ impl McpServerConfig {
             .unwrap_or(DEFAULT_MAX_CONCURRENT_CALLS)
             .max(1)
     }
+
+    /// The effective cap on consecutive transport-rebuild attempts (configured
+    /// value or [`DEFAULT_MAX_RESTARTS`]). `0` is honored: it disables
+    /// automatic reconnect, leaving a dead server dead until the next request.
+    #[must_use]
+    pub fn max_restarts(&self) -> u32 {
+        self.max_restarts.unwrap_or(DEFAULT_MAX_RESTARTS)
+    }
 }
 
 #[cfg(test)]
@@ -200,6 +224,7 @@ mod tests {
             timeout,
             protocol: McpProtocolMode::Auto,
             max_concurrent_calls: None,
+            max_restarts: None,
             disabled_tools: Vec::new(),
         }
     }
@@ -291,5 +316,16 @@ mod tests {
         let mut cfg = config(None);
         cfg.max_concurrent_calls = Some(0);
         assert_eq!(cfg.max_concurrent_calls(), 1);
+    }
+
+    #[test]
+    fn max_restarts_defaults_and_honors_zero() {
+        assert_eq!(config(None).max_restarts(), DEFAULT_MAX_RESTARTS);
+        let mut cfg = config(None);
+        cfg.max_restarts = Some(9);
+        assert_eq!(cfg.max_restarts(), 9);
+        // Zero is a deliberate cap (no automatic reconnect), not a fallback.
+        cfg.max_restarts = Some(0);
+        assert_eq!(cfg.max_restarts(), 0);
     }
 }

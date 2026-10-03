@@ -54,6 +54,12 @@ struct ServerEntry {
     /// When unset, the client's default applies.
     #[serde(default, rename = "maxConcurrentCalls", alias = "max_concurrent_calls")]
     max_concurrent_calls: Option<usize>,
+    /// Optional cap on consecutive transport-rebuild attempts before the
+    /// dispatcher stops reconnecting until the next request (`maxRestarts`;
+    /// `max_restarts` is accepted as an alias). When unset, the client's
+    /// default applies; `0` disables automatic reconnect.
+    #[serde(default, rename = "maxRestarts", alias = "max_restarts")]
+    max_restarts: Option<u32>,
     /// Any keys this client does not recognize. Collected so loading can
     /// report them (never fatal) — a typo'd or not-yet-supported key should
     /// surface in the log rather than being silently dropped.
@@ -170,6 +176,7 @@ fn resolve_entry(slug: &str, entry: &ServerEntry) -> Option<McpServerConfig> {
         timeout: entry.timeout.map(Duration::from_secs),
         protocol: parse_protocol(entry.protocol.as_deref()),
         max_concurrent_calls: entry.max_concurrent_calls,
+        max_restarts: entry.max_restarts,
         disabled_tools: entry.disabled_tools.clone(),
     })
 }
@@ -501,6 +508,24 @@ mod tests {
     }
 
     #[test]
+    fn server_entry_deserializes_max_restarts() {
+        let camel: ServerEntry = serde_json::from_value(serde_json::json!({
+            "command": "python",
+            "maxRestarts": 5
+        }))
+        .expect("entry with maxRestarts");
+        assert_eq!(camel.max_restarts, Some(5));
+        assert!(camel.unknown.is_empty(), "recognized key is not 'unknown'");
+
+        let snake: ServerEntry = serde_json::from_value(serde_json::json!({
+            "command": "python",
+            "max_restarts": 0
+        }))
+        .expect("entry with max_restarts alias");
+        assert_eq!(snake.max_restarts, Some(0));
+    }
+
+    #[test]
     fn server_entry_deserializes_http() {
         let json = serde_json::json!({
             "url": "https://example.com/mcp",
@@ -727,6 +752,57 @@ mod tests {
         // The user's `fs` survives; the project's `extra` is added.
         assert!(by_slug.contains_key("fs"));
         assert!(by_slug.contains_key("extra"));
+    }
+
+    #[test]
+    fn parsing_malformed_config_never_panics() {
+        // Fuzz-style: a deterministic corpus of truncated, adversarial, and
+        // wrongly-typed JSON through the exact type `read_servers_into` parses.
+        // A parse error is fine; a panic is not.
+        let corpus = [
+            "",
+            "{",
+            "}",
+            "null",
+            "[]",
+            "{\"mcpServers\":\"not-an-object\"}",
+            "{\"mcpServers\":[]}",
+            "{\"mcpServers\":{\"s\":\"a-string\"}}",
+            "{\"mcpServers\":{\"s\":{\"command\":42}}}",
+            "{\"mcpServers\":{\"s\":{\"timeout\":-1,\"args\":\"x\"}}}",
+            "{\"mcpServers\":{\"☃\":{\"url\":\"\",\"headers\":{\"a\":null}}}}",
+            "{\"unknown_top\":1}",
+        ];
+        for raw in corpus {
+            let _ = serde_json::from_str::<McpServersFile>(raw);
+        }
+        // Deeply nested input must fail cleanly (serde_json's recursion limit)
+        // rather than overflow the stack.
+        let deep = format!("{}{}", "[".repeat(10_000), "]".repeat(10_000));
+        assert!(serde_json::from_str::<McpServersFile>(&deep).is_err());
+    }
+
+    #[test]
+    fn expand_env_handles_adversarial_input() {
+        // An empty/odd `${...}` sequence must never panic, and an unset variable
+        // expands to nothing rather than the literal text.
+        let lookup = |_name: &str| -> Option<String> { None };
+        let cases = [
+            "${",
+            "${
+}",
+            "${x",
+            "}",
+            "a${b}c",
+            "${}${}",
+            "${a}${b}${c}",
+            "プレースホルダ",
+        ];
+        for case in cases {
+            let _ = expand_env_with(case, lookup);
+        }
+        assert_eq!(expand_env_with("${UNSET}", lookup), "");
+        assert_eq!(expand_env_with("keep ${UNSET} me", lookup), "keep  me");
     }
 
     #[test]

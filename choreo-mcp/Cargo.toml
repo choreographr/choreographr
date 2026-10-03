@@ -50,6 +50,15 @@ tracing.workspace = true
 name = "mcp-fixture-server"
 path = "tests/fixtures/fixture_server.rs"
 
+# Conformance harness: the client process the official
+# `@modelcontextprotocol/conformance` suite runs against each scenario server
+# (see `scripts/mcp-conformance.sh`). A test fixture like the one above — never
+# shipped, and not built by release packaging (which selects only the root and
+# `choreo-tui` packages).
+[[bin]]
+name = "mcp-conformance-client"
+path = "tests/fixtures/conformance_client.rs"
+
 [dev-dependencies]
 # Temporary directories for the cancellation test's in-flight marker file.
 tempfile.workspace = true

@@ -107,9 +107,12 @@ impl McpServer {
 
         let factory = crate::engine::factory(config.clone(), list_changes);
         let max_concurrent_calls = config.max_concurrent_calls();
+        let max_restarts = config.max_restarts();
         let join = std::thread::Builder::new()
             .name(format!("mcp-{}", config.slug))
-            .spawn(move || run_dispatcher(engine, factory, &cmd_rx, max_concurrent_calls))
+            .spawn(move || {
+                run_dispatcher(engine, factory, &cmd_rx, max_concurrent_calls, max_restarts);
+            })
             .map_err(|e| McpError::SpawnFailed(format!("failed to start dispatcher: {e}")))?;
 
         tracing::info!(server = %config.slug, %name, %version, "MCP server connected");
@@ -502,15 +505,21 @@ struct RestartPolicy {
 
 impl Default for RestartPolicy {
     fn default() -> Self {
-        Self {
-            max_attempts: 3,
-            base_backoff: Duration::from_millis(500),
-            failures: 0,
-        }
+        Self::new(crate::config::DEFAULT_MAX_RESTARTS)
     }
 }
 
 impl RestartPolicy {
+    /// Build a policy that rebuilds a dead transport at most `max_attempts`
+    /// times in a row (`0` disables reconnect).
+    fn new(max_attempts: u32) -> Self {
+        Self {
+            max_attempts,
+            base_backoff: Duration::from_millis(500),
+            failures: 0,
+        }
+    }
+
     /// Backoff for the current failure count: `base * 2^(n-1)`, capped at 60 s.
     fn backoff(&self) -> Duration {
         let shift = self.failures.saturating_sub(1).min(7);
@@ -562,12 +571,14 @@ fn is_transport_error(error: &McpError) -> bool {
 /// `max_concurrent_calls` bounds how many tool calls to this server run at once;
 /// calls beyond the cap wait in a queue and are started as slots free. Listings
 /// and resource reads run synchronously on this thread and so are naturally
-/// serialized and not subject to the cap.
+/// serialized and not subject to the cap. `max_restarts` bounds how many times
+/// a dead transport is rebuilt in a row before the server is left alone.
 fn run_dispatcher(
     initial: Arc<dyn McpEngine>,
     factory: EngineFactory,
     cmd_rx: &Receiver<McpCommand>,
     max_concurrent_calls: usize,
+    max_restarts: u32,
 ) {
     let rt = match crate::runtime::handle() {
         Ok(handle) => handle,
@@ -578,7 +589,7 @@ fn run_dispatcher(
     };
 
     let mut engine = initial;
-    let mut policy = RestartPolicy::default();
+    let mut policy = RestartPolicy::new(max_restarts);
     let mut inflight: HashMap<u64, (CancelToken, u64)> = HashMap::new();
     let mut queued: VecDeque<QueuedCall> = VecDeque::new();
     let mut gate = CallGate::new(max_concurrent_calls);
@@ -1047,7 +1058,13 @@ mod tests {
         let factory: EngineFactory =
             Box::new(move || Ok(Arc::clone(&factory_engine) as Arc<dyn McpEngine>));
         let join = std::thread::spawn(move || {
-            run_dispatcher(engine as Arc<dyn McpEngine>, factory, &cmd_rx, cap);
+            run_dispatcher(
+                engine as Arc<dyn McpEngine>,
+                factory,
+                &cmd_rx,
+                cap,
+                crate::DEFAULT_MAX_RESTARTS,
+            );
         });
         (handle, join)
     }
@@ -1162,6 +1179,22 @@ mod tests {
         assert_eq!(policy.backoff(), Duration::from_secs(4));
         policy.failures = 20;
         assert_eq!(policy.backoff(), Duration::from_mins(1));
+    }
+
+    #[test]
+    fn restart_policy_zero_disables_reconnect() {
+        // A `max_restarts` of 0 must leave the engine untouched: the very first
+        // failure already exceeds the budget, so the factory is never called.
+        let engine: Arc<dyn McpEngine> = Arc::new(MockEngine::new(vec![], ok_result()));
+        let mut current = Arc::clone(&engine);
+        let mut policy = RestartPolicy::new(0);
+        let factory: EngineFactory =
+            Box::new(|| Ok(Arc::new(MockEngine::new(vec![], ok_result())) as Arc<dyn McpEngine>));
+        policy.on_transport_failure(&factory, &mut current);
+        assert!(
+            Arc::ptr_eq(&current, &engine),
+            "no rebuild happens when max_restarts is 0"
+        );
     }
 
     #[test]

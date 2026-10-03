@@ -66,13 +66,14 @@ choreo-keystore.workspace = true
 # this crate's synchronous `execute_*` entry points) and pulls in the crate's
 # subxt/chain-client dependency tree that a plain build has no use for.
 choreo-content = { workspace = true, optional = true }
-# MCP client-protocol primitives (stdio subprocess spawn, JSON-RPC tool
-# listing/calls). Behind the `mcp` feature (off by default): enabling it
-# compiles in the daemon's `mcp` tool group (McpManager + dynamic tool
-# wrappers) and pulls in the choreo-mcp dependency tree that a plain build
-# has no use for. The module's public API degrades to no-op stubs when
-# disabled, so McpManager call sites (cli.rs, daemon.rs, lifecycle.rs)
-# compile unchanged in both configurations.
+# MCP client-protocol primitives (stdio subprocess spawn, Streamable HTTP
+# connect, JSON-RPC tool listing/calls). Enabled by the `mcp` feature, which
+# is in `default`: MCP is a core product capability, so a plain desktop build
+# has it. An embedder that cannot host subprocesses or the dependency tree
+# opts out with `default-features = false` (the iOS embedded daemon does). The
+# module's public API degrades to no-op stubs when disabled, so McpManager
+# call sites (cli.rs, daemon.rs, lifecycle.rs) compile unchanged in both
+# configurations.
 choreo-mcp = { workspace = true, optional = true }
 choreo-proto.workspace = true
 choreo-sanitize.workspace = true
@@ -118,10 +119,10 @@ structured-zstd.workspace = true
 pdf-inspector = { version = "1", optional = true }
 
 [features]
-# Default features: the `pdf` tool group. Consumers that cannot use the
-# C-dylib-building pdf-inspector (the iOS GUI build) opt out via
-# `default-features = false`.
-default = ["pdf"]
+# Default features: the `pdf` tool group and the `mcp` tool group. Consumers
+# that cannot use the C-dylib-building pdf-inspector or host MCP subprocesses
+# (the iOS GUI build) opt out via `default-features = false`.
+default = ["pdf", "mcp"]
 # Native PDF tools (pdf_classify / pdf_to_markdown). Off only for the iOS
 # embedded-daemon build (see the pdf-inspector comment above); the module's
 # registration is feature-gated in tools/mod.rs and its public re-exports
@@ -146,9 +147,10 @@ blockchain = ["dep:choreo-blockchain"]
 # with `--features content` (or the root package's `content` feature, which
 # forwards here).
 content = ["dep:choreo-content"]
-# MCP tool group (dynamic tools from stdio MCP server subprocesses, managed
-# by src/mcp/). Off by default; opt in with `--features mcp` (or the root
-# package's `mcp` feature, which forwards here).
+# MCP tool group (dynamic tools from MCP servers over a stdio subprocess or
+# the Streamable HTTP transport, managed by src/mcp/). In `default`; an
+# embedder that cannot host the subprocess/dependency tree opts out with
+# `default-features = false`.
 mcp = ["dep:choreo-mcp"]
 # Opt-in AVIF decode via `image/avif-native` (dav1d, a C library). OFF by
 # default so the default/release build stays C-free (see the release.sh

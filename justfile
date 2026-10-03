@@ -384,6 +384,14 @@ clippy-fix: _require-zig
 check-supply-chain:
     ./scripts/check-supply-chain.sh
 
+# MCP client conformance suite: build the `mcp-conformance-client` harness and
+# run the official `@modelcontextprotocol/conformance` client suite against it,
+# diffed against the committed expected-failures baseline. Requires Node.js
+# (npx) and network access, so it is a CI/release-time gate, not part of
+# `pre-commit`. See scripts/mcp-conformance.sh.
+mcp-conformance:
+    ./scripts/mcp-conformance.sh
+
 # Preview the release notes, generated from commit messages by git-cliff
 # (cliff.toml, via scripts/release-notes.sh). Defaults to the workspace version;
 # pass one to preview an upcoming release, e.g. `just release-notes 0.3.0`.

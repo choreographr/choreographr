@@ -178,6 +178,39 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_segment_is_provider_safe_and_shape_preserving() {
+        // A deterministic fuzz-style corpus (no external RNG, no sleeps): every
+        // character class a hostile server slug or tool name might carry.
+        let alphabet: Vec<char> = "aZ09._-/ \\~!@#$%^&*()[]{}|;:'\",<>?\t\n☃\u{1f600}"
+            .chars()
+            .collect();
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        for len in 0..64usize {
+            let mut input = String::new();
+            for _ in 0..len {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let index = (state >> 33) as usize % alphabet.len();
+                input.push(alphabet[index]);
+            }
+            let out = sanitize_segment(&input);
+            // Output is exactly the provider-safe alphabet.
+            assert!(
+                out.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "unsafe output for {input:?}: {out:?}"
+            );
+            // One output character per input character (a multi-byte char maps
+            // to a single '_').
+            assert_eq!(out.chars().count(), input.chars().count());
+            // Deterministic, and a built name always respects the cap.
+            assert_eq!(out, sanitize_segment(&input));
+            assert!(build_tool_name("slug", &input).len() <= MAX_TOOL_NAME_LEN);
+        }
+    }
+
+    #[test]
     fn short_hash_is_stable_and_six_hex_digits() {
         let h = short_hash("hello");
         assert_eq!(h.len(), SUFFIX_HEX_LEN);
