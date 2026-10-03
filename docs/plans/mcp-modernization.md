@@ -1,10 +1,12 @@
 # Plan: MCP modernization — stateless protocol (2026-07-28) and a first-class client
 
-**Status:** **in progress — P0, P1, and P2 implemented** (commits `ab3dc2e`
-"fix(choreo-mcp): harden the MCP client and drop the npx test dependency",
-`976edf6` "feat(choreo-mcp): rebuild the MCP client on the official rmcp SDK",
-and `9f6209a` "feat(choreo-mcp): add the MCP Streamable HTTP transport").
-P3–P6 remain. See §1.2 for what landed.
+**Status:** **in progress — P0–P2 implemented; M1 (ship without OAuth) is the
+active goal.** Commits: `ab3dc2e` "fix(choreo-mcp): harden the MCP client and
+drop the npx test dependency", `976edf6` "feat(choreo-mcp): rebuild the MCP
+client on the official rmcp SDK", `9f6209a` "feat(choreo-mcp): add the MCP
+Streamable HTTP transport". The remaining work runs as **M1 = P4 → P5 → P6**;
+**OAuth (P3) is deferred to post-ship** — it is not a ship blocker. See §1.2 for
+what landed and §7 for the milestone definition.
 **Lifecycle:** this file is **deleted once the plan is fully implemented**. Nothing
 written during implementation may reference it — rustdoc, `ARCHITECTURE.md`,
 `README.md`, release notes, and commit messages must stand on their own, because a
@@ -14,12 +16,13 @@ reference to this plan would go stale the moment it is removed.
 `McpToolWrapper`), `choreo-tui` / `choreo-client-core` (later phases: `/mcp` control
 surface), root `Cargo.toml` + `Cargo.lock` (new dependencies).
 **Touches (when implemented):** `choreo-mcp` (rewritten around `rmcp`; new
-`runtime.rs` / `session.rs` / `engine.rs` / `config.rs` modules landed in P1;
-`auth.rs` still to come), `choreo-daemon` (`src/mcp/{mod,config,tool}.rs` and
-`src/daemon.rs` cancel plumbing landed in P1; `src/daemon/open.rs`,
-`src/server/core.rs` unchanged), `choreo-tui` (`/mcp` UI, pending), `choreo-proto`
-(only if a new client message is added), the justfile (`doc_crates` stays current),
-`ARCHITECTURE.md`, `README.md`, `packaging/`.
+`runtime.rs` / `session.rs` / `engine.rs` / `config.rs` modules landed in P1–P2;
+`auth.rs` and the OAuth glue are post-ship), `choreo-daemon`
+(`src/mcp/{mod,config,tool}.rs` and `src/daemon.rs` cancel plumbing landed in P1;
+`src/daemon/open.rs`, `src/server/core.rs` unchanged), `choreo-tui` (`/mcp`
+status in M1; sign-in post-ship), `choreo-proto` (only if a new client message is
+added), the justfile (`doc_crates` stays current), `ARCHITECTURE.md`, `README.md`,
+`packaging/`.
 
 > **TL;DR.** The MCP specification's current revision is **2026-07-28**, a
 > *stateless* protocol: the `initialize` handshake is gone, every request carries
@@ -43,11 +46,11 @@ surface), root `Cargo.toml` + `Cargo.lock` (new dependencies).
 > cancellation, OAuth sign-in, tool-name hygiene, bounds, and the official
 > conformance suite in CI.
 >
-> **Update (2026-10-03):** P0 (hardening) and P1 (the `rmcp` engine swap) are
-> implemented — the client now negotiates the stateless and legacy eras on stdio
-> behind the dispatcher facade, with cancellation, restart, pagination, and the
-> content mapping in place. See §1.2 for the landed state and the deltas the plan
-> now tracks.
+> **Update (2026-10-03):** P0–P2 are implemented — the client negotiates the
+> stateless and legacy eras on stdio **and** over Streamable HTTP behind the
+> dispatcher facade, with cancellation, restart, pagination, content mapping,
+> and the remote-server config. The remaining work is sequenced as **M1 (ship
+> without OAuth)**: P4 → P5 → P6, then OAuth (P3) post-ship. See §1.2 and §7.
 
 ---
 
@@ -167,7 +170,8 @@ engine swap and must be reinstated; there is no per-server concurrency cap yet;
 the config keys `cwd`/`exposure`/`disabledTools` are not implemented; `auto_load`
 was removed (reported as an unknown key) rather than mapped to a deferred
 exposure; `Retry-After` is not honored by the HTTP retry policy; OAuth is not
-implemented (P3); and elicitation/`input_required` results are refused with a
+implemented — deferred to post-ship (P3), with static tokens via config
+`headers` as the M1 credential path; and elicitation/`input_required` results are refused with a
 clear error rather than driven (P4).
 
 ### 1.3 The protocol delta
@@ -419,7 +423,7 @@ missing capability that blocks real servers; **S3** = robustness/quality;
 | # | Gap | Severity | Evidence | Status |
 |---|---|---|---|---|
 | G1 | Cannot talk to 2026-07-28 (stateless-only) servers at all | S1 | `make_initialize_request` pins `2024-11-05` | **Closed (P1)** — `auto`/`modern` negotiate `server/discover` via rmcp |
-| G2 | No HTTP transport; no remote servers, no OAuth | S1 | `transport.rs` is stdio-only | **Partial (P2)** — Streamable HTTP landed; OAuth is P3 |
+| G2 | No HTTP transport; no remote servers, no OAuth | S1 | `transport.rs` is stdio-only | **Partial (P2)** — Streamable HTTP landed; M1 ships with static-token `headers` + an actionable auth-required error, OAuth is post-ship (P3) |
 | G3 | Server crash is permanent for the daemon's lifetime | S1 | no restart anywhere in `mcp/` | **Closed (P1)** — bounded restart policy rebuilds a dead transport |
 | G4 | One `Mutex` per server serializes calls and blocks shutdown | S1 | `Arc<Mutex<McpClient>>`, `tool.rs` | **Closed (P1)** — per-server dispatcher, concurrent calls, bounded joins |
 | G5 | MCP images are never attached to the model (rendered as text) | S1 | `image_tx` ignored; `[Image: …]` placeholder | **Closed (P0)** — base64 decode + image pipeline; placeholder only without a sink/invalid |
@@ -473,7 +477,7 @@ Feature set is enabled **per phase** with `default-features = false`. P1 enabled
 `client` + `transport-child-process` (plus `process-wrap` for the process group);
 P2 enabled `transport-streamable-http-client-reqwest` and declared `reqwest` 0.13
 directly in the workspace — feature-unified with rmcp's own copy and with the
-alloy stack that already used 0.13 (see D11); P3 adds `auth`; P4 adds
+alloy stack that already used 0.13 (see D11); P3 (post-ship) adds `auth`; P4 adds
 `elicitation`/`request-state` only if the pipeline drives them. `tokio`,
 `process-wrap`, and `reqwest` were promoted to `[workspace.dependencies]` in
 P1/P2.
@@ -519,7 +523,8 @@ both or neither warns and skips the server) and `${VAR}` expansion in
 Unknown keys are collected, logged, and ignored — never fatal; `auto_load` was
 removed in P0 and is now reported like any other unknown key.
 
-Still to come: `oauth` (P3); `cwd`, `exposure`, and `disabledTools` (P5). When
+Still to come: `cwd` and `disabledTools` (M1/P5); `oauth` is post-ship (P3) and
+`exposure` moves with the deferred-loading work. When
 `exposure` lands, a legacy `auto_load: false` can be mapped to
 `exposure: "deferred"`; there is no such mapping on purpose today, because
 deferred registration does not exist yet.
@@ -569,6 +574,10 @@ DB, never in logs, never shared across issuers (SEP-2352). Config-file
 `headers`/`env` secrets are redacted in logs and `session_inspect` output.
 Remote-server auth is opt-in per server; a server without `oauth` simply gets no
 `Authorization` header (explicit `headers` percolate as configured).
+
+Status: **post-ship (P3)**. M1 has no `oauth` key and no credential store — the
+supported credential path is an explicit `Authorization` (or other) header in
+`mcp_servers.json`, `${VAR}`-expanded. This D7 design is what P3 implements.
 
 ### D8 — Elicitation: advertise only with a UI
 
@@ -702,8 +711,44 @@ ones dropped from the group, session group membership unchanged).
 
 ## 7. Work breakdown
 
-Each phase is independently shippable and lands with tests + docs. **P0 and P1 are
-done**; the remaining phases are unchanged in scope except where noted below.
+Each phase is independently shippable and lands with tests + docs. **P0–P2 are
+done** (see §1.2); their sections come first for history. The remaining phases
+are listed in execution order — **P4 → P5 → P6** (M1), then the deferred **P3**
+(post-ship) — and keep their original P-numbers for continuity.
+
+### M1 — ship without OAuth (P4 → P5 → P6)
+
+MCP is shippable when P4, P5, and P6 are complete. **OAuth is explicitly not part
+of M1** — it is P3, post-ship. Servers that need credentials are covered in the
+interim by the path that already works: a static token in `mcp_servers.json`
+headers, e.g. `"headers": {"Authorization": "Bearer ${DOCS_TOKEN}"}` (only
+`accept`, `mcp-session-id`, and `last-event-id` are reserved, and `${VAR}` is
+expanded at load). A server that insists on OAuth and has no static token must
+fail with a clear, actionable error instead of a raw status string — that
+mapping is an M1 item (P5).
+
+M1 includes, at minimum:
+
+- **P6**: the bounded stdio frame reader (the P1 regression), the per-server
+  concurrency cap, the conformance baseline, the lockfile/supply-chain check, the
+  release posture, and the §9 security checklist.
+- **P5**: tool-name sanitization, `cwd`/`disabledTools`, the `/mcp` status
+  surface + per-server logs + `session_inspect`, the auth-required error, config
+  layers, and user docs (including the "OAuth not yet supported" limitation).
+- **P4**: `subscriptions/listen` tool-list refresh, progress chunks, MRTR
+  handling, resource tools, and the server-observed cancellation test.
+
+Explicitly deferred past M1 (not ship blockers): **OAuth (P3)**, `exposure` +
+[tool-search-driven deferred loading](#13-out-of-scope--future-work), `mcp
+reload`, and the MCP-server role (§13).
+
+If M1 needs to be smaller, the safely trimmable items are resource tools,
+progress chunks, and config layers — do not trim the frame cap, the concurrency
+cap, tool-name sanitization, or the conformance baseline: those are what make the
+feature safe to enable.
+
+M1 shipping does **not** delete this plan: the Lifecycle rule ties deletion to
+full implementation, and P3 remains here for post-ship work.
 
 ### P0 — Correctness and safety on the current engine (small, no new deps)
 
@@ -768,20 +813,7 @@ Residuals:
       rmcp exposes an `SseRetryPolicy` hook (`retry_config` on the transport
       config) for exactly this layer — use it then.
 
-### P3 — OAuth for remote servers
-
-- [ ] rmcp `auth`; protected-resource metadata discovery (RFC 9728) + AS
-      metadata (RFC 8414) + `iss` validation (RFC 9207).
-- [ ] Client registration: DCR per SEP-837 with `application_type`, CIMD support,
-      pre-registered client config, callback on loopback with paste-URL fallback.
-- [ ] Credential store (D7) + refresh + logout; keyed by issuer/resource.
-- [ ] TUI/CLI: `mcp login <slug>`, `mcp logout <slug>`, `mcp list`; `/mcp`
-      status page showing auth state.
-- [ ] Tests: in-repo mock authorization server (borrow the shape of pi's
-      `mcp-oauth-server.ts` and hermes' e2e fixtures), scope step-up, refresh,
-      revocation.
-
-### P4 — Feature plumbing into the daemon
+### P4 — Feature plumbing into the daemon (M1)
 
 Content mapping (the first item below, D10) already landed in P0/P1; the rest
 remains.
@@ -803,23 +835,35 @@ remains.
 - [ ] Cancellation end-to-end test that also asserts the *server* observed
       `notifications/cancelled` (the client-side cancellation test landed in P1).
 
-### P5 — Configuration, UX, observability
+### P5 — Configuration, UX, observability (M1)
 
-- [ ] Remaining config keys: `cwd`, `exposure`, and `disabledTools` (P2 landed
-      `url`/`headers`/`transport` and `${VAR}` expansion).
+- [ ] Remaining config keys: `cwd` and `disabledTools` (P2 landed
+      `url`/`headers`/`transport` and `${VAR}` expansion; `exposure` defers with
+      the deferred-tool-loading work below).
 - [ ] Tool-name sanitization and collision hashing (G18, D5).
+- [ ] Actionable "authorization required" error: a `401`/`403` at connect (or on
+      a request) maps to a message naming the server and the two options —
+      configure a static token via `headers`, or wait for OAuth (post-ship) —
+      instead of a raw `HTTP 401` string. The status-parsing helper already
+      exists (`parse_http_status` in `engine.rs`).
 - [ ] Config layers: user file + project file (`.choreographr/mcp_servers.json`),
       project overrides user per server (pi's merge rules).
-- [ ] `choreographr mcp add/remove/list/login/logout/reconnect` CLI + `/mcp` TUI
-      command; status rendered from `ServerSlot`.
+- [ ] `choreographr mcp list/add/remove/reconnect` CLI + `/mcp` status surface
+      (server state, tool counts, last error — no auth state yet) rendered from
+      `ServerSlot`.
 - [ ] `session_inspect` includes MCP server status/tool counts (no secrets).
 - [ ] Per-server log file (`mcp-<slug>.log`, size-capped rotation).
-- [ ] Optional deferred exposure + tool search integration for servers with many
-      tools (reuse `load_tools` groups; measure first).
+- [ ] User docs: `mcp_servers.json` reference incl. the static-token pattern and
+      the "OAuth not yet supported" limitation (post-ship P3).
+
+Post-ship (fast-follow, around P3):
+
+- [ ] `exposure` + deferred exposure/tool search for servers with many tools
+      (reuse `load_tools` groups; measure first — open question 1).
 - [ ] `mcp reload` (re-read config, add/remove/restart servers without a daemon
       restart).
 
-### P6 — Bounds, conformance, hardening
+### P6 — Bounds, conformance, hardening (M1)
 
 - [ ] Reinstate the bounded stdio frame reader: rmcp 3.5's `TokioChildProcess` →
       `AsyncRwTransport` reads lines with no cap (`JsonRpcMessageCodec::new()`
@@ -839,7 +883,29 @@ remains.
       base64 header sentinel; property tests for the tool-name sanitizer.
 - [ ] Supply-chain: lockfile review, `cargo deny` stays green, note `rmcp` in
       the dependency policy docs.
+- [ ] Release posture: decide whether any shipped channel enables the `mcp`
+      feature. If yes, extend the static-musl build matrix to cover it; if it
+      stays a source-build opt-in, document the enable path. Either way, the
+      release notes state the feature's status.
 - [ ] Security checklist from §9 executed and recorded in the PR.
+
+### P3 — OAuth for remote servers (post-ship, deferred)
+
+**Not part of M1.** This is the natural first post-ship phase: it closes the last
+S1 gap (the auth half of G2) and unlocks managed remote servers. Until it lands,
+a static token in `headers` is the supported credential path and an
+OAuth-requiring server fails with the P5 actionable error.
+
+- [ ] rmcp `auth`; protected-resource metadata discovery (RFC 9728) + AS
+      metadata (RFC 8414) + `iss` validation (RFC 9207).
+- [ ] Client registration: DCR per SEP-837 with `application_type`, CIMD support,
+      pre-registered client config, callback on loopback with paste-URL fallback.
+- [ ] Credential store (D7) + refresh + logout; keyed by issuer/resource.
+- [ ] TUI/CLI: `mcp login <slug>`, `mcp logout <slug>`, plus auth state in the
+      `/mcp` status surface (the surface itself ships in M1).
+- [ ] Tests: in-repo mock authorization server (borrow the shape of pi's
+      `mcp-oauth-server.ts` and hermes' e2e fixtures), scope step-up, refresh,
+      revocation.
 
 ## 8. Testing strategy
 
@@ -919,8 +985,8 @@ the pre-existing 120 s watchdog and one bounded marker poll (above).
 
 Target config shape (superset, all keys optional except command/url). Landed in
 P0–P2: `command`/`args`/`env`, `url`/`headers`, `transport`, `protocol`,
-`timeout`, `enabled`, and `${VAR}` expansion. Still pending: `cwd`, `exposure`
-(P5), and `oauth` (P3).
+`timeout`, `enabled`, and `${VAR}` expansion. Still pending: `cwd`/`disabledTools`
+(M1); `exposure` and `oauth` are post-ship (`oauth` with P3).
 
 ```json
 {
@@ -946,9 +1012,11 @@ P0–P2: `command`/`args`/`env`, `url`/`headers`, `transport`, `protocol`,
 }
 ```
 
-Surfaces (P5): `choreographr mcp list|add|remove|login|logout|reconnect`,
-TUI `/mcp` (status, sign-in, reconnect, enable/disable, exposure), a
-`session_inspect` section, and per-server log files.
+Surfaces: M1 ships `choreographr mcp list|add|remove|reconnect` and the TUI
+`/mcp` status surface (server state, tool counts, last error, reconnect,
+enable/disable), a `session_inspect` section, and per-server log files. Sign-in
+(`login`/`logout`, auth state) arrives with P3 post-ship; `exposure` moves with
+its deferred-loading work.
 
 ## 11. Documentation deliverables
 
@@ -980,13 +1048,17 @@ this plan — verified at `976edf6`.
 | Two `reqwest` majors in the lockfile (0.12.28 via `blitz-net`/`dioxus-native` → `choreo-gui`; 0.13.5 shared by `alloy` + `rmcp` + `choreo-mcp`) | The duplicate predates MCP and belongs to the GUI renderer; the MCP path shares one 0.13 build (D11). `deny.toml` keeps `multiple-versions = "warn"`. |
 | rmcp API churn (3.x is moving fast) | Pin `3.5`, upgrade deliberately; the blocking facade isolates the daemon from rmcp types (rmcp types do not cross the crate boundary). |
 | Sidecar runtime + threads complicate shutdown | Follow the `choreo-content` runtime pattern; dispatcher replies are bounded; `shutdown_all` joins with deadlines; add the "no MCP lock can wedge Ctrl-C" test. P1 landed the bounded joins; the Ctrl-C test is still to write. |
-| OAuth UX on headless devices (TUI over SSH, Termux) | Paste-the-redirected-URL fallback (pi's flow), device-code path only if a provider requires it; document. |
+| (M1) Remote servers that require OAuth have no credential path until P3 | Document the static-token `headers` workaround (P5 docs); the P5 actionable `401`/`403` error names both options, so the failure explains itself. |
+| (Post-ship, P3) OAuth UX on headless devices (TUI over SSH, Termux) | Paste-the-redirected-URL fallback (pi's flow), device-code path only if a provider requires it; document. |
 | Tool-name collisions/limits change prompt text vs persisted sessions | Keep names stable; sanitize only what is invalid; hash only on collision; pin with tests. |
 | rmcp licenses/advisories | Apache-2.0; `cargo deny check` already gates the tree. |
 | Fixture server drifts from real servers | Keep the `npx`-based interop test as an opt-in ignored test plus the official conformance suite. |
 
 ## 13. Out of scope / future work
 
+- **OAuth is not out of scope** — it is deliberately deferred to post-ship (P3,
+  §7): M1 ships without it, with static-token `headers` and an actionable
+  auth-required error as the interim.
 - **MCP server role** (expose choreographr tools to other agents, the buzz/oar
   pattern) — natural follow-on once the client core exists; not in this plan.
 - **Sampling, roots, logging feature support** — deprecated; do not adopt.
@@ -1004,8 +1076,8 @@ this plan — verified at `976edf6`.
    sessions (jcode-style shared pool), or per-session processes for stateful
    servers (`shared: false`)? Default stays one global process; add a per-server
    `"shared": false` escape hatch if a stateful server needs it.
-3. Where does `mcp login` live for the GUI (embedded daemon) — GUI modal or
-   loopback browser? Follow the existing provider-OAuth plan
+3. *(Post-ship, P3)* Where does `mcp login` live for the GUI (embedded daemon) —
+   GUI modal or loopback browser? Follow the existing provider-OAuth plan
    (`docs/plans/provider-oauth.md`) precedent.
 4. Is the 2 s startup budget right, or should server availability be fully lazy
    (tools appear when connected)? P1 shipped the 2 s batch budget (stragglers
@@ -1013,31 +1085,42 @@ this plan — verified at `976edf6`.
 
 ## 15. Definition of done
 
-Progress (P0–P2): the transport half of the first two bullets is done and tested;
-the rest of the list is the remaining work.
+Two sets: **M1 — ship without OAuth** (the active goal) and **post-ship** (P3).
+P0–P2 are done; the unchecked M1 items are what remains.
 
-- A 2026-07-28 server (`server/discover`, per-request `_meta`, `resultType`)
-  and a 2024-11-05…2025-11-25 server both work, selectable per server, proven
-  by integration tests and the official conformance suite baseline.
-  *(Stdio: met in P1; Streamable HTTP: met in P2 — both transports negotiate
-  both eras, covered by integration tests; OAuth arrives in P3 and the
-  conformance baseline in P6.)*
-- Stdio and Streamable HTTP transports work; remote OAuth server sign-in works
-  end-to-end with refresh and logout. *(Stdio and Streamable HTTP: met; OAuth
-  pending.)*
-- Tool calls: parallel per server, cancellable, deadline-bounded, restart on
-  crash, progress-streamed, with images attached, structured content preserved,
-  and typed errors. *(Met except progress streaming (P4) and the per-server
-  concurrency cap (P6).)*
-- Tool list changes propagate without a daemon restart; resources readable via
-  wrapper tools. *(Pending — P4.)*
-- Bounds (lines, tools, schemas, bytes, concurrency) enforced and tested.
-  *(Partial: schema and text caps done; the frame cap is missing (P6) and the
-  concurrency cap is pending.)*
-- `/mcp` + CLI surfaces report status and manage auth/reload. *(Pending — P3/P5.)*
-- `ARCHITECTURE.md`/`README.md`/rustdoc updated; `just pre-commit` green; release
-  notes written from the commit messages. *(P0/P1 did exactly this, each commit
-  its own release note.)*
-- **This plan document is deleted.** No source file, doc, comment, or commit
-  message in the tree references it (grep for `mcp-modernization` returns
-  nothing).
+### M1 — ship without OAuth
+
+- [x] A 2026-07-28 server (`server/discover`, per-request `_meta`, `resultType`)
+      and a 2024-11-05…2025-11-25 server both work, selectable per server,
+      covered by integration tests on **both** transports (P1 stdio, P2 HTTP).
+- [ ] The official conformance suite's client scenarios run green against the
+      supported eras, with a committed baseline (P6).
+- [ ] Authentication without OAuth: a static token in `headers` reaches an
+      authenticated server; a server that requires OAuth fails with the P5
+      actionable error, not a hang or a raw status string. No credential store,
+      no sign-in flow (P3, post-ship).
+- [ ] Tool calls: parallel per server, cancellable, deadline-bounded, restart on
+      crash, progress-streamed, with images attached, structured content
+      preserved, and typed errors. *(Met except progress streaming (P4) and the
+      per-server concurrency cap (P6).)*
+- [ ] Tool list changes propagate without a daemon restart; resources readable
+      via wrapper tools (P4).
+- [ ] Bounds enforced and tested: schema/text caps (done), the stdio frame cap
+      reinstated, and the per-server concurrency cap (P6).
+- [ ] Tool names sanitized and collision-proofed (P5).
+- [ ] `/mcp` status surface + `mcp list/add/remove/reconnect` CLI, per-server
+      logs, and a `session_inspect` section (P5).
+- [ ] Release posture decided and documented — whether any shipped channel
+      enables the `mcp` feature and, if so, the static-musl build covering it
+      (P6).
+- [ ] `ARCHITECTURE.md`/`README.md`/rustdoc updated; `just pre-commit` green;
+      release notes written from the commit messages. *(P0–P2 did exactly this,
+      each commit its own release note.)*
+
+### Post-ship
+
+- [ ] Remote OAuth server sign-in works end-to-end with refresh and logout
+      (P3).
+- [ ] **This plan document is deleted** once everything above — including P3 —
+      is implemented. No source file, doc, comment, or commit message in the
+      tree references it (grep for `mcp-modernization` returns nothing).
