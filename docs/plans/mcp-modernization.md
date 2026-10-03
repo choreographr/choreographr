@@ -3,7 +3,8 @@
 **Status:** **in progress — P0, P1, and P2 implemented** (commits `ab3dc2e`
 "fix(choreo-mcp): harden the MCP client and drop the npx test dependency",
 `976edf6` "feat(choreo-mcp): rebuild the MCP client on the official rmcp SDK",
-and the P2 Streamable HTTP commit). P3–P6 remain. See §1.2 for what landed.
+and `9f6209a` "feat(choreo-mcp): add the MCP Streamable HTTP transport").
+P3–P6 remain. See §1.2 for what landed.
 **Lifecycle:** this file is **deleted once the plan is fully implemented**. Nothing
 written during implementation may reference it — rustdoc, `ARCHITECTURE.md`,
 `README.md`, release notes, and commit messages must stand on their own, because a
@@ -102,13 +103,14 @@ Doc comment in `choreo-mcp/src/lib.rs` claimed the crate spoke "over a transport
 variants (`ToolNotFound`, `InvalidParams`) were never constructed. Both were fixed
 in P0.
 
-### 1.2 Implementation progress (P0–P1)
+### 1.2 Implementation progress (P0–P2)
 
 **P0** (`ab3dc2e`) landed the correctness and safety fixes against the then-current
 hand-rolled engine; **P1** (`976edf6`) replaced that engine with `rmcp` 3.5 behind
-the blocking dispatcher facade. Together they closed G1, G3–G7, G9, G11,
-G14–G17, G19–G20, and G22 (§4) and left G2 and G8–G10, G12, G13, G18, and G21
-for the later phases. What exists now:
+the blocking dispatcher facade; **P2** (`9f6209a`) added the Streamable HTTP
+transport. Together they closed G1, G3–G7, G9, G11, G14–G17, G19–G20, and G22
+(§4) and left G2 (OAuth half), G8–G10, G12, G13, G18, and G21 for the later
+phases. What exists now:
 
 - `choreo-mcp` is six modules: `protocol` (daemon-facing value types, the
   empty-schema fallback, `normalize_input_schema`), `config`
@@ -138,22 +140,35 @@ for the later phases. What exists now:
   audio/blob resources and resource links are described rather than dropped;
   text is truncated at 256 KiB with an explicit marker; `isError` survives the
   JSON, streaming, and postcard paths.
+- Remote servers (P2): `mcp_servers.json` gained `url`, `headers`, and
+  `transport` (`auto` infers HTTP from `url` and stdio from `command`; both or
+  neither warns and skips the server), with `${VAR}` expansion in `env`/`headers`
+  values (an unset variable expands to empty, with a warning). The engine
+  connects over rmcp's `StreamableHttpClientTransport` with an injected `reqwest`
+  (rustls) client — connect timeout from the server's request timeout, idle
+  pooling and redirects disabled — validates config headers up front (reserved
+  MCP headers are rejected), bounds SSE events at 16 MiB, retries a transient
+  connect (`408`/`429`/`5xx`; 3 attempts, 500 ms·2^(n-1) capped at 60 s), and
+  rejects a 2024-11-05 HTTP+SSE endpoint with a typed `UnsupportedTransport`.
 - Startup is bounded by a 2 s budget for the whole batch (`STARTUP_BUDGET`); a
   server that misses it is logged and skipped, so a hung server cannot stall
   `DaemonState::open`.
 - The test suites are hermetic and fixture-driven (no Node/npx, no network):
   `choreo-mcp`'s scripted stdio server covers both eras, `auto` fallback,
   crash-on-call, garbage lines, oversized lines, a rejected `initialize`,
-  structured content, and cancellation; the daemon's suite shares that fixture
-  source via `include!`.
+  structured content, and cancellation; a local `TcpListener` HTTP fixture
+  covers JSON and SSE responses, generated-header validation, the `auto`
+  fallback, a retried `503`, and the HTTP+SSE rejection; the daemon's suite
+  shares the stdio fixture source via `include!`.
 
 Deltas the plan now tracks (detailed in §7): the stdio read path is rmcp's, whose
 `AsyncRwTransport` reads lines with no cap — the P0 8 MiB bound was lost in the
 engine swap and must be reinstated; there is no per-server concurrency cap yet;
-the config keys `cwd`/`exposure`/`disabledTools` and `${ENV}` expansion are not
-implemented; `auto_load` was removed (reported as an unknown key) rather than
-mapped to a deferred exposure; and elicitation/`input_required` results are
-refused with a clear error rather than driven (P4).
+the config keys `cwd`/`exposure`/`disabledTools` are not implemented; `auto_load`
+was removed (reported as an unknown key) rather than mapped to a deferred
+exposure; `Retry-After` is not honored by the HTTP retry policy; OAuth is not
+implemented (P3); and elicitation/`input_required` results are refused with a
+clear error rather than driven (P4).
 
 ### 1.3 The protocol delta
 
@@ -455,11 +470,13 @@ Codex's git pin exists for unreleased enterprise-auth work only; we do not need
 it.
 
 Feature set is enabled **per phase** with `default-features = false`. P1 enabled
-`client` + `transport-child-process` only (plus `process-wrap` for the process
-group). P2 adds `transport-streamable-http-client-reqwest` (TLS rides reqwest →
-rustls, whose crates are already in the lockfile); P3 adds `auth`; P4 adds
-`elicitation`/`request-state` only if the pipeline drives them. `tokio` and
-`process-wrap` were promoted to `[workspace.dependencies]` in P1.
+`client` + `transport-child-process` (plus `process-wrap` for the process group);
+P2 enabled `transport-streamable-http-client-reqwest` and declared `reqwest` 0.13
+directly in the workspace — feature-unified with rmcp's own copy and with the
+alloy stack that already used 0.13 (see D11); P3 adds `auth`; P4 adds
+`elicitation`/`request-state` only if the pipeline drives them. `tokio`,
+`process-wrap`, and `reqwest` were promoted to `[workspace.dependencies]` in
+P1/P2.
 
 ### D2 — Keep the daemon thread-only: sidecar runtime + per-server dispatcher thread
 
@@ -495,15 +512,14 @@ plus `auto` as default).
 ### D4 — Config: extend `mcp_servers.json` in place; keep the path
 
 Same file, same directory (`<config>/choreographr/mcp_servers.json`), same
-`mcpServers` top level. Landed in P0/P1: `timeout` (seconds; applied to the
-handshake, listing, and calls) and `protocol` (`auto`/`legacy`/`modern`, with
-`2026-07-28` and `initialize` as aliases; an unrecognized value warns and falls
-back to `auto`), plus unknown-key collection — every unrecognized key is logged
-and ignored, never fatal. `auto_load` was **removed** in P0 and is now reported
-like any other unknown key.
+`mcpServers` top level. Landed: `timeout` and `protocol` (P0/P1); `url`,
+`headers`, `transport` (`auto` infers HTTP from `url` and stdio from `command`;
+both or neither warns and skips the server) and `${VAR}` expansion in
+`env`/`headers` values (P2; an unset variable expands to empty with a warning).
+Unknown keys are collected, logged, and ignored — never fatal; `auto_load` was
+removed in P0 and is now reported like any other unknown key.
 
-Still to come: `url`, `headers`, `oauth` (P2/P3); `cwd`, `exposure`,
-`disabledTools`, and `${VAR}` expansion in `env`/`headers` values (P5). When
+Still to come: `oauth` (P3); `cwd`, `exposure`, and `disabledTools` (P5). When
 `exposure` lands, a legacy `auto_load: false` can be mapped to
 `exposure: "deferred"`; there is no such mapping on purpose today, because
 deferred registration does not exist yet.
@@ -588,6 +604,43 @@ MCP content maps onto `ToolOutput` as follows:
 Status: this mapping landed in P0/P1 (image attachment, audio/blob/resource-link
 descriptors, `result_json`, truncation); only the progress and logging
 notification paths remain (P4).
+
+### D11 — Streamable HTTP runs on rmcp's `reqwest` transport, not `ureq`
+
+`choreo-mcp` uses **`reqwest` 0.13 (rustls)** for the MCP HTTP transport, not the
+daemon's synchronous `ureq`. This is not a preference over ureq — it follows from
+D1 plus the async/streaming shape of the transport:
+
+1. **rmcp's Streamable HTTP client is reqwest-based.** The crate enables
+   `transport-streamable-http-client-reqwest`; rmcp offers no `ureq` (or any
+   sync) client. Its alternatives are the Unix-socket-only hyper transport and
+   the raw `async_rw` framing — neither is a TCP HTTP client.
+2. **The transport is async and streaming.** It runs on the sidecar tokio
+   runtime and must consume per-request SSE streams (progress now,
+   `subscriptions/listen` in P4) and treat stream close as cancellation. `ureq`
+   is synchronous and runtime-less: a ureq-based transport would need an
+   `spawn_blocking` bridge per request plus a hand-rolled SSE parser, header
+   generation (`Mcp-Method`/`Mcp-Name`/`Mcp-Param-*`), and cancellation —
+   re-implementing exactly the layer rmcp was adopted to own (D1).
+3. **No new HTTP stack.** `reqwest` 0.13 was already in the lockfile via
+   `alloy` (choreo-blockchain's RPC stack). Declaring it directly — rather than
+   only through rmcp's feature — makes choreo-mcp, rmcp, and alloy share one
+   compiled reqwest 0.13.5. A ureq transport here would have put two HTTP
+   clients on the MCP path. (The lock's *other* reqwest major, 0.12.28, comes
+   from `blitz-net` → `dioxus-native` → `choreo-gui` and predates MCP;
+   `deny.toml` keeps `multiple-versions = "warn"`.)
+4. **We build the client for policy, not plumbing.** `choreo-mcp` constructs
+   the `reqwest::Client` itself to set `connect_timeout` (the server's request
+   timeout), disable idle pooling and redirects (matching rmcp's defaults; a
+   redirect would replay config headers to a new host), bound SSE events at
+   16 MiB (`max_sse_event_size`), and run the deprecated-HTTP+SSE GET probe —
+   rmcp accepts the injected client via
+   `StreamableHttpClientTransport::with_client`.
+
+`ureq` remains the right client for the daemon's synchronous HTTP (AI providers,
+the `http` tool); this decision is scoped to the MCP transport. Not done: the
+retry policy honors its exponential backoff only, not a `Retry-After` header
+(see the P2 residuals).
 
 ---
 
@@ -686,14 +739,26 @@ Carried forward: the per-server concurrency cap (D6) and the bounded frame reade
 
 ### P2 — Streamable HTTP transport
 
-**Done.** Config grew `url`, `headers`, and `transport: "http" | "stdio" |
-"auto"` (with `${ENV}` expansion in `env`/`headers` values); the engine connects
-over rmcp's `StreamableHttpClientTransport` (reqwest/rustls) and negotiates the
-same `Auto`/`modern`/`legacy` eras, with a bounded connect retry on
-`408`/`429`/`5xx` and a clear rejection of the removed 2024-11-05 HTTP+SSE
-transport. Hermetic integration tests drive a local `TcpListener` HTTP fixture
-(JSON + SSE responses, generated-header validation, `Auto` fallback, a
-retryable `503`, and the HTTP+SSE rejection).
+**Done** — `9f6209a`. Config grew `url`, `headers`, and `transport: "http" |
+"stdio" | "auto"` (with `${VAR}` expansion in `env`/`headers` values; `auto`
+infers HTTP from `url` and stdio from `command`, and both-or-neither skips the
+server with a warning). The engine connects over rmcp's
+`StreamableHttpClientTransport` with an injected `reqwest`/rustls client
+(connect timeout, pooling/redirects off — D11) and negotiates the same
+`Auto`/`modern`/`legacy` eras; config headers are validated up front (invalid or
+reserved names fail the connect), and SSE events are bounded at 16 MiB. A
+connect that fails with `408`/`429`/`5xx` is retried (3 attempts, 500 ms·2^(n-1)
+capped at 60 s); a `4xx` is settled; an endpoint that answers a GET with the
+removed 2024-11-05 HTTP+SSE transport is rejected with a typed
+`UnsupportedTransport`. Hermetic integration tests drive a local `TcpListener`
+HTTP fixture (JSON and SSE responses, generated-header validation, `auto`
+fallback, a retryable `503`, and the HTTP+SSE rejection).
+
+Residuals (not in P3/P4 scope unless noted):
+
+- [ ] `Retry-After` is not honored — the retry policy is purely exponential.
+- [ ] No explicit idle-read timeout for a long-lived SSE response stream beyond
+      the per-request deadline; verify when `subscriptions/listen` lands (P4).
 
 ### P3 — OAuth for remote servers
 
@@ -732,8 +797,8 @@ remains.
 
 ### P5 — Configuration, UX, observability
 
-- [ ] Remaining config keys: `cwd`, `exposure`, `disabledTools`, and `${VAR}`
-      expansion in `env`/`headers` values.
+- [ ] Remaining config keys: `cwd`, `exposure`, and `disabledTools` (P2 landed
+      `url`/`headers`/`transport` and `${VAR}` expansion).
 - [ ] Tool-name sanitization and collision hashing (G18, D5).
 - [ ] Config layers: user file + project file (`.choreographr/mcp_servers.json`),
       project overrides user per server (pi's merge rules).
@@ -784,18 +849,27 @@ integration tests live in `tests/it/` (one binary per crate, `#[ignore]`).
   `choreo-daemon/tests/fixtures/mcp_fixture_server.rs`. No Node/npx, no network.
   Still to add: `list_changed` + `subscriptions/listen`, `notifications/progress`,
   paged `tools/list`, and bad-schema variants (P4/P6).
+- **HTTP fixture.** `choreo-mcp/tests/it/mcp_http_integration.rs` (P2) drives a
+  local `TcpListener` fixture: JSON and SSE responses, generated-header
+  validation (`Mcp-Method`/`Mcp-Name`/`MCP-Protocol-Version` and custom
+  headers), the `auto` fallback to a legacy server, a retried `503`, and the
+  deprecated HTTP+SSE rejection. Still to add: an OAuth challenge
+  (`401`/`WWW-Authenticate`) in P3 and a long-lived `subscriptions/listen`
+  stream in P4.
 - **Unit tests** cover: schema normalization, content mapping, name/desc
   formatting, error mapping, the dispatcher protocol + cancellation + restart
-  backoff against a mock engine, config parsing (timeout/protocol/unknown keys),
-  and runtime init. All wait-free — the restart tests exercise the backoff math
-  without sleeping, and the cancellation test synchronizes over channels
-  (mock signals `started`, then the test cancels).
+  backoff against a mock engine, config parsing (transport inference,
+  `${VAR}` expansion, timeout/protocol/unknown keys), the HTTP retry policy
+  (status classification + capped backoff), and runtime init. All wait-free —
+  the restart tests exercise the backoff math without sleeping, and the
+  cancellation test synchronizes over channels (mock signals `started`, then
+  the test cancels).
 - **Integration tests** cover: stdio against the fixture server per era, the
   `auto` fallback, structured content, crash/garbage/oversized/no-init, and
-  cancellation; HTTP arrives in P2. The cancellation case waits for the fixture's
-  in-flight marker with a bounded 5 ms poll (integration-only; the unit-test
-  wait-free rule is intact), and the daemon case asserts the image sink path
-  end-to-end.
+  cancellation; HTTP against the `TcpListener` fixture (above). The stdio
+  cancellation case waits for the fixture's in-flight marker with a bounded
+  5 ms poll (integration-only; the unit-test wait-free rule is intact), and the
+  daemon case asserts the image sink path end-to-end.
 - **Conformance** runs the official suite (P6) and diffs against a baseline.
 - **Manual interop matrix** (documented, run at release): current
   `@modelcontextprotocol/server-everything`, a filesystem server, a remote OAuth
@@ -835,7 +909,10 @@ the pre-existing 120 s watchdog and one bounded marker poll (above).
 
 ## 10. Configuration & control surface
 
-Target config shape (superset, all keys optional except command/url):
+Target config shape (superset, all keys optional except command/url). Landed in
+P0–P2: `command`/`args`/`env`, `url`/`headers`, `transport`, `protocol`,
+`timeout`, `enabled`, and `${VAR}` expansion. Still pending: `cwd`, `exposure`
+(P5), and `oauth` (P3).
 
 ```json
 {
@@ -890,8 +967,9 @@ this plan — verified at `976edf6`.
 
 | Risk | Mitigation |
 |---|---|
-| Dependency weight (tokio/reqwest/hyper via rmcp) | `mcp` feature stays off by default; verify both `--no-default-features` and `--all-features` builds; static-musl release job with the feature enabled (P6). P1 already scoped rmcp to `client` + `transport-child-process`, promoting `tokio`/`process-wrap` to workspace deps. |
-| rmcp's stdio transport buffers unbounded lines (`AsyncRwTransport` has no cap) | Reinstate a capped reader in P6 (custom transport over a bounded `AsyncRead` adapter, or an upstream rmcp hook); the `oversized` integration test currently passes on fixture exit, not a client-side bound. |
+| Dependency weight (tokio/reqwest/hyper via rmcp) | `mcp` feature stays off by default; verify both `--no-default-features` and `--all-features` builds; static-musl release job with the feature enabled (P6). P1 scoped rmcp to `client` + `transport-child-process` and promoted `tokio`/`process-wrap`; P2 added `transport-streamable-http-client-reqwest` and declared `reqwest` 0.13, which shares one build with rmcp and alloy (D11). |
+| rmcp's stdio transport buffers unbounded lines (`AsyncRwTransport` has no cap) | Reinstate a capped reader in P6 (custom transport over a bounded `AsyncRead` adapter, or an upstream rmcp hook); the `oversized` integration test currently passes on fixture exit, not a client-side bound. (The HTTP path *is* bounded: SSE events are capped at 16 MiB.) |
+| Two `reqwest` majors in the lockfile (0.12.28 via `blitz-net`/`dioxus-native` → `choreo-gui`; 0.13.5 shared by `alloy` + `rmcp` + `choreo-mcp`) | The duplicate predates MCP and belongs to the GUI renderer; the MCP path shares one 0.13 build (D11). `deny.toml` keeps `multiple-versions = "warn"`. |
 | rmcp API churn (3.x is moving fast) | Pin `3.5`, upgrade deliberately; the blocking facade isolates the daemon from rmcp types (rmcp types do not cross the crate boundary). |
 | Sidecar runtime + threads complicate shutdown | Follow the `choreo-content` runtime pattern; dispatcher replies are bounded; `shutdown_all` joins with deadlines; add the "no MCP lock can wedge Ctrl-C" test. P1 landed the bounded joins; the Ctrl-C test is still to write. |
 | OAuth UX on headless devices (TUI over SSH, Termux) | Paste-the-redirected-URL fallback (pi's flow), device-code path only if a provider requires it; document. |
@@ -927,17 +1005,18 @@ this plan — verified at `976edf6`.
 
 ## 15. Definition of done
 
-Progress (P0/P1): the stdio half of the first two bullets is done and tested; the
-rest of the list is the remaining work.
+Progress (P0–P2): the transport half of the first two bullets is done and tested;
+the rest of the list is the remaining work.
 
 - A 2026-07-28 server (`server/discover`, per-request `_meta`, `resultType`)
   and a 2024-11-05…2025-11-25 server both work, selectable per server, proven
   by integration tests and the official conformance suite baseline.
-  *(Stdio: met in P1 — both eras plus the `auto` fallback are covered by
-  integration tests; HTTP/OAuth arrive in P2/P3 and the conformance baseline in
-  P6.)*
+  *(Stdio: met in P1; Streamable HTTP: met in P2 — both transports negotiate
+  both eras, covered by integration tests; OAuth arrives in P3 and the
+  conformance baseline in P6.)*
 - Stdio and Streamable HTTP transports work; remote OAuth server sign-in works
-  end-to-end with refresh and logout. *(Stdio: met; HTTP/OAuth pending.)*
+  end-to-end with refresh and logout. *(Stdio and Streamable HTTP: met; OAuth
+  pending.)*
 - Tool calls: parallel per server, cancellable, deadline-bounded, restart on
   crash, progress-streamed, with images attached, structured content preserved,
   and typed errors. *(Met except progress streaming (P4) and the per-server
