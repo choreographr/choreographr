@@ -12,17 +12,27 @@
 //
 // Scenarios:
 // - `legacy` (default) — legacy `initialize` server; rejects `server/discover`.
-//   Full tool set (`echo`, `boom`, `image`, `structured`, `slow`).
-// - `modern` — 2026-07-28 stateless server; answers `server/discover`.
+//   Full tool set (`echo`, `boom`, `image`, `structured`, `slow`, `progress`,
+//   `need_input`).
+// - `modern*` — any scenario whose name starts with `modern` is a 2026-07-28
+//   stateless server answering `server/discover`; the `modern-resources`
+//   variant declares (and serves) the `resources` capability.
 // - `no-init` — the `initialize` handshake returns a JSON-RPC error.
 // - `crash-on-call` — the process exits the moment `tools/call` arrives.
 // - `garbage` — emits a non-JSON line before each real response.
 // - `oversized` — emits one line far larger than any sane frame.
-// - `slow` — the `slow` tool blocks, for the cancellation test.
+//
+// Tools:
+// - `slow` answers from a background thread so the read loop can observe a
+//   `notifications/cancelled` (the cancellation-observation test).
+// - `progress` emits two `notifications/progress` for the request's token.
+// - `need_input` answers `input_required` first, then `complete` once the retry
+//   carries `inputResponses` (the MRTR test).
 //
 // When `MCP_FIXTURE_MARKER` is set, the `slow` tool creates that file as soon
-// as a `tools/call` for it arrives, so the cancellation test can synchronise
-// without sleeping.
+// as a `tools/call` for it arrives; when `MCP_FIXTURE_CANCEL_MARKER` is set, a
+// received `notifications/cancelled` writes that file, so the cancellation
+// tests can synchronise without sleeping.
 
 use std::io::{BufRead, Write};
 
@@ -58,6 +68,18 @@ fn main() {
 
         // Notifications carry no `id` and expect no response.
         let Some(id) = req.get("id").cloned() else {
+            // Record a cancellation so the client-side cancellation test can
+            // assert the SERVER observed `notifications/cancelled` (not just
+            // that the client stopped waiting).
+            if req.get("method").and_then(|m| m.as_str()) == Some("notifications/cancelled")
+                && let Ok(marker) = std::env::var("MCP_FIXTURE_CANCEL_MARKER")
+            {
+                let request_id = req
+                    .pointer("/params/requestId")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let _ = std::fs::write(marker, request_id.to_string());
+            }
             continue;
         };
         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
@@ -80,13 +102,13 @@ fn main() {
         }
 
         match method {
-            "server/discover" if scenario == "modern" => respond_result(
+            "server/discover" if scenario.starts_with("modern") => respond_result(
                 &mut out,
                 &id,
                 &serde_json::json!({
                     "resultType": "complete",
                     "supportedVersions": ["2026-07-28"],
-                    "capabilities": {"tools": {}},
+                    "capabilities": capabilities(&scenario),
                     "ttlMs": 0,
                     "cacheScope": "public",
                     "_meta": {
@@ -107,7 +129,7 @@ fn main() {
                         &id,
                         &serde_json::json!({
                             "protocolVersion": "2025-11-25",
-                            "capabilities": {"tools": {}},
+                            "capabilities": capabilities(&scenario),
                             "serverInfo": {"name": "fixture", "version": "0.1.0"},
                         }),
                     );
@@ -121,9 +143,49 @@ fn main() {
                 );
             }
             "tools/call" => handle_call(&mut out, &id, &req, &scenario),
+            "resources/list" => respond_result(
+                &mut out,
+                &id,
+                &serde_json::json!({
+                    "resources": [
+                        {"uri": "file:///readme.txt", "name": "readme", "mimeType": "text/plain"},
+                        {"uri": "file:///data.bin", "name": "data", "mimeType": "application/octet-stream", "description": "binary data"}
+                    ]
+                }),
+            ),
+            "resources/read" => {
+                let uri = req
+                    .pointer("/params/uri")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("");
+                if uri == "file:///readme.txt" {
+                    respond_result(
+                        &mut out,
+                        &id,
+                        &serde_json::json!({
+                            "contents": [
+                                {"uri": uri, "mimeType": "text/plain", "text": "hello from a resource"}
+                            ]
+                        }),
+                    );
+                } else {
+                    respond_error(&mut out, &id, -32602, "resource not found");
+                }
+            }
             _ => respond_error(&mut out, &id, -32601, "method not found"),
         }
         let _ = out.flush();
+    }
+}
+
+/// Server capabilities advertised for a scenario: the `resources` scenarios
+/// additionally declare the `resources` capability so the client registers its
+/// resource wrapper tools.
+fn capabilities(scenario: &str) -> serde_json::Value {
+    if scenario.contains("resources") {
+        serde_json::json!({"tools": {}, "resources": {}})
+    } else {
+        serde_json::json!({"tools": {}})
     }
 }
 
@@ -142,6 +204,8 @@ fn fixture_tools() -> serde_json::Value {
          "inputSchema": {"type": "object"},
          "outputSchema": {"type": "object", "properties": {"value": {"type": "number"}}}},
         {"name": "slow", "description": "Block until cancelled.", "inputSchema": {"type": "object"}},
+        {"name": "progress", "description": "Report progress then complete.", "inputSchema": {"type": "object"}},
+        {"name": "need_input", "description": "Ask for input, then complete on retry.", "inputSchema": {"type": "object"}},
     ])
 }
 
@@ -170,6 +234,65 @@ fn handle_call(
                 "isError": false,
             }),
         ),
+        // Emit two progress notifications echoing the request's progress token,
+        // then complete — exercises progress → streaming chunks.
+        "progress" => {
+            if let Some(token) = req.pointer("/params/_meta/progressToken").cloned() {
+                for (step, message) in [(1, "working"), (2, "almost done")] {
+                    let note = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/progress",
+                        "params": {"progressToken": token, "progress": step, "total": 2, "message": message},
+                    });
+                    let _ = writeln!(out, "{note}");
+                }
+            }
+            respond_result(
+                out,
+                id,
+                &serde_json::json!({
+                    "content": [{"type": "text", "text": "progress done"}],
+                    "isError": false,
+                }),
+            );
+        }
+        // Answer the first call with `input_required`; a retry that carries
+        // `inputResponses` completes. Exercises the MRTR decline loop.
+        "need_input" => {
+            let has_responses = req
+                .pointer("/params/inputResponses")
+                .and_then(|v| v.as_object())
+                .is_some_and(|m| !m.is_empty());
+            if has_responses {
+                respond_result(
+                    out,
+                    id,
+                    &serde_json::json!({
+                        "content": [{"type": "text", "text": "input accepted"}],
+                        "isError": false,
+                    }),
+                );
+            } else {
+                respond_result(
+                    out,
+                    id,
+                    &serde_json::json!({
+                        "resultType": "input_required",
+                        "inputRequests": {
+                            "q1": {
+                                "method": "elicitation/create",
+                                "params": {
+                                    "mode": "form",
+                                    "message": "Which environment?",
+                                    "requestedSchema": {"type": "object", "properties": {}}
+                                }
+                            }
+                        },
+                        "requestState": "opaque-state-1"
+                    }),
+                );
+            }
+        }
         "boom" => respond_result(
             out,
             id,
@@ -197,21 +320,27 @@ fn handle_call(
         ),
         "slow" => {
             // Signal that the call is in flight (used by the cancellation test),
-            // then block well past any plausible test window.
+            // then answer from a background thread. The sleep must NOT run on
+            // the read loop: a cancellation can only be observed by the loop
+            // reading the next line, so blocking here would hide the very
+            // `notifications/cancelled` the test asserts on.
             if let Ok(marker) = std::env::var("MCP_FIXTURE_MARKER") {
                 let _ = std::fs::write(marker, b"started");
             }
-            // A scenario-independent block: the client is expected to cancel
-            // long before this returns.
-            std::thread::sleep(std::time::Duration::from_secs(30));
-            respond_result(
-                out,
-                id,
-                &serde_json::json!({
-                    "content": [{"type": "text", "text": "slow done"}],
-                    "isError": false,
-                }),
-            );
+            let id = id.clone();
+            std::thread::spawn(move || {
+                // Long enough that the client always cancels first.
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "content": [{"type": "text", "text": "slow done"}],
+                        "isError": false,
+                    }
+                });
+                println!("{response}");
+            });
         }
         _ => {
             let _ = scenario;

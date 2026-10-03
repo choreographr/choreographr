@@ -17,7 +17,7 @@ use std::collections::HashMap;
 #[cfg(feature = "mcp")]
 use std::time::{Duration, Instant};
 #[cfg(feature = "mcp")]
-use tool::McpToolWrapper;
+use tool::{McpListResourcesTool, McpReadResourceTool, McpToolWrapper};
 #[cfg(feature = "mcp")]
 use tracing::{debug, error, info, warn};
 
@@ -150,6 +150,22 @@ impl McpManager {
                     let name = wrapper.name().to_string();
                     let group = wrapper.group().to_string();
                     registry.register_dynamic(name, &group, Box::new(wrapper));
+                }
+                // A server that declares the `resources` capability gets the
+                // catalogue tools; a server without it would only fail the
+                // call, so they are not offered.
+                if handle.supports_resources() {
+                    let group = format!("mcp/{slug}");
+                    let lister = McpListResourcesTool::new(slug, handle.clone());
+                    let reader = McpReadResourceTool::new(slug, handle.clone());
+                    for tool in [
+                        Box::new(lister) as Box<dyn ToolDyn>,
+                        Box::new(reader) as Box<dyn ToolDyn>,
+                    ] {
+                        let name = tool.name().to_string();
+                        registry.register_dynamic(name, &group, tool);
+                    }
+                    info!(server = %slug, "registered MCP resource tools");
                 }
                 manager
                     .servers

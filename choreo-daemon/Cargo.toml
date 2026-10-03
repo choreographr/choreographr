@@ -174,6 +174,9 @@ choreo-ai-protocols = { workspace = true, features = ["test-utils"] }
 # The real client-side connection library used by the daemon<->client
 # integration tests (tests/it/daemon_client_unix.rs, tests/it/daemon_client_noise.rs).
 choreo-client-core.workspace = true
+# The MCP integration tests build a streaming chunk channel to exercise the
+# progress-to-chunk path through the daemon tool wrapper.
+crossbeam-channel.workspace = true
 
 # Windows-only deps: process-tree isolation for shell tools (the Job Object
 # FFI — the Windows analogue of Unix process-group killpg(2), used by

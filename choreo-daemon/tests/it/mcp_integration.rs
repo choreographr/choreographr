@@ -151,3 +151,139 @@ fn mcp_fixture_tools_are_discovered_and_callable() {
     // ── 10. Restore the config-root override ──
     choreo_daemon::mcp::config::set_test_config_root(None);
 }
+
+/// Write an `mcp_servers.json` for a single server into a fresh config dir and
+/// return the tempdir (kept alive by the caller) plus the server slug.
+fn write_single_server_config(
+    slug: &str,
+    scenario: &str,
+) -> Result<(tempfile::TempDir, String), Box<dyn std::error::Error>> {
+    let config_dir = tempfile::tempdir()?;
+    let config_path = config_dir.path().join("choreographr");
+    std::fs::create_dir_all(&config_path)?;
+    let server = serde_json::json!({
+        "command": FIXTURE_BIN,
+        "args": [scenario],
+        "protocol": "modern",
+        "enabled": true,
+        "timeout": 10
+    });
+    let mut servers = serde_json::Map::new();
+    servers.insert(slug.to_string(), server);
+    let mcp_config = serde_json::json!({ "mcpServers": servers });
+    std::fs::write(
+        config_path.join("mcp_servers.json"),
+        serde_json::to_string_pretty(&mcp_config)?,
+    )?;
+    Ok((config_dir, slug.to_string()))
+}
+
+#[test]
+#[ignore = "integration"]
+fn mcp_resource_tools_are_registered_and_callable() {
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(120));
+        eprintln!("mcp_integration: test exceeded 120s; aborting");
+        std::process::abort();
+    });
+
+    let (config_dir, slug) =
+        write_single_server_config("res", "modern-resources").expect("write config");
+    choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
+
+    let mut registry = choreo_daemon::tools::ToolRegistry::new();
+    let manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
+    let registry = Arc::new(registry);
+
+    let mut active = HashSet::new();
+    active.insert(format!("mcp/{slug}"));
+    active.insert("core".to_string());
+    let defs = registry.available_definitions(&active);
+    for expected in ["list_resources", "read_resource"] {
+        let name = format!("mcp/{slug}/{expected}");
+        assert!(
+            defs.iter().any(|d| d.function.name == name),
+            "expected resource tool '{name}', got: {:?}",
+            defs.iter().map(|d| &d.function.name).collect::<Vec<_>>()
+        );
+    }
+
+    let list_call = choreo_ai_protocols::ChatToolCall {
+        id: "call_r1".to_string(),
+        name: format!("mcp/{slug}/list_resources"),
+        arguments_json: "{}".to_string(),
+        caller: None,
+    };
+    let listed = registry
+        .execute_json(&list_call, ToolOutputFormat::Text, None, None, None, None)
+        .expect("list_resources executes");
+    assert!(
+        listed.content.contains("readme"),
+        "listing should name resources, got: {}",
+        listed.content
+    );
+
+    let read_call = choreo_ai_protocols::ChatToolCall {
+        id: "call_r2".to_string(),
+        name: format!("mcp/{slug}/read_resource"),
+        arguments_json: r#"{"uri": "file:///readme.txt"}"#.to_string(),
+        caller: None,
+    };
+    let read = registry
+        .execute_json(&read_call, ToolOutputFormat::Text, None, None, None, None)
+        .expect("read_resource executes");
+    assert!(
+        read.content.contains("hello from a resource"),
+        "read should return the resource text, got: {}",
+        read.content
+    );
+
+    drop(manager);
+    choreo_daemon::mcp::config::set_test_config_root(None);
+}
+
+#[test]
+#[ignore = "integration"]
+fn mcp_progress_streams_through_the_wrapper() {
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(120));
+        eprintln!("mcp_integration: test exceeded 120s; aborting");
+        std::process::abort();
+    });
+
+    let (config_dir, slug) =
+        write_single_server_config("prog", "modern-progress").expect("write config");
+    choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
+
+    let mut registry = choreo_daemon::tools::ToolRegistry::new();
+    let manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
+    let registry = Arc::new(registry);
+
+    let call = choreo_ai_protocols::ChatToolCall {
+        id: "call_p1".to_string(),
+        name: format!("mcp/{slug}/progress"),
+        arguments_json: "{}".to_string(),
+        caller: None,
+    };
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let output = registry
+        .execute_streaming_json(&call, ToolOutputFormat::Text, tx, None, None, None, None)
+        .expect("progress tool executes");
+
+    let chunks: Vec<String> = rx
+        .try_iter()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .collect();
+    assert!(
+        chunks.iter().any(|c| c.contains("working")),
+        "expected a streamed progress chunk, got: {chunks:?}"
+    );
+    assert!(
+        output.content.contains("progress done"),
+        "final output should carry the result, got: {}",
+        output.content
+    );
+
+    drop(manager);
+    choreo_daemon::mcp::config::set_test_config_root(None);
+}

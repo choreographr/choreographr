@@ -42,7 +42,7 @@ pub use config::{
 };
 pub use error::McpError;
 pub use protocol::{
-    CallToolResult, EMPTY_INPUT_SCHEMA, MAX_SCHEMA_BYTES, McpContent, McpTool,
+    CallToolResult, EMPTY_INPUT_SCHEMA, MAX_SCHEMA_BYTES, McpContent, McpResource, McpTool,
     normalize_input_schema,
 };
 pub use session::{McpServer, McpServerHandle};

@@ -38,6 +38,24 @@ pub struct McpTool {
     pub output_schema: Option<serde_json::Value>,
 }
 
+/// A resource advertised by an MCP server via `resources/list`.
+///
+/// Resources are not tools: the daemon exposes them to the model through
+/// generated wrapper tools (`read_resource`, `list_resources`) rather than one
+/// registry entry per resource, because the catalogue can be large and change
+/// while the daemon runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpResource {
+    /// The resource URI, passed verbatim to `resources/read`.
+    pub uri: String,
+    /// Human-readable name, when the server supplied one.
+    pub name: Option<String>,
+    /// Description, when the server supplied one.
+    pub description: Option<String>,
+    /// The resource MIME type, when the server supplied one.
+    pub mime_type: Option<String>,
+}
+
 /// The result of a `tools/call`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CallToolResult {

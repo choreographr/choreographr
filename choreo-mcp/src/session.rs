@@ -22,7 +22,7 @@
 
 use crate::config::McpServerConfig;
 use crate::error::McpError;
-use crate::protocol::{CallToolResult, McpTool};
+use crate::protocol::{CallToolResult, McpContent, McpResource, McpTool};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -77,6 +77,7 @@ impl McpServer {
             name: name.clone().into(),
             version: version.clone().into(),
             default_timeout: config.request_timeout(),
+            resources: engine.supports_resources(),
         };
 
         let factory = crate::engine::factory(config.clone());
@@ -135,6 +136,7 @@ pub struct McpServerHandle {
     name: Arc<str>,
     version: Arc<str>,
     default_timeout: Duration,
+    resources: bool,
 }
 
 impl McpServerHandle {
@@ -174,6 +176,27 @@ impl McpServerHandle {
         arguments: serde_json::Value,
         timeout: Option<Duration>,
     ) -> Result<CallToolResult, McpError> {
+        self.call_tool_streaming(session_id, name, arguments, timeout, None)
+    }
+
+    /// Like [`call_tool`](Self::call_tool), but forwards the server's progress
+    /// notifications to `chunk_tx` as rate-limited `ToolResultChunk` bytes.
+    ///
+    /// Used by the daemon's streaming tool path so a long-running MCP tool's
+    /// progress is visible live rather than only at completion. Progress is
+    /// best-effort: a full sink drops the chunk rather than blocking the call.
+    ///
+    /// # Errors
+    ///
+    /// As [`call_tool`](Self::call_tool).
+    pub fn call_tool_streaming(
+        &self,
+        session_id: u64,
+        name: &str,
+        arguments: serde_json::Value,
+        timeout: Option<Duration>,
+        chunk_tx: Option<crossbeam_channel::Sender<Vec<u8>>>,
+    ) -> Result<CallToolResult, McpError> {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let request = CallRequest {
             name: name.to_string(),
@@ -185,9 +208,47 @@ impl McpServerHandle {
                 session_id,
                 request,
                 reply: tx,
+                chunk_tx,
             })
             .map_err(|_| McpError::NotConnected)?;
         rx.recv().map_err(|_| McpError::NotConnected)?
+    }
+
+    /// List every resource the server advertises, following pagination cursors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::NotConnected`] when the dispatcher has exited, and
+    /// the transport/protocol errors surfaced by the engine.
+    pub fn list_resources(&self) -> Result<Vec<McpResource>, McpError> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.cmd_tx
+            .send(McpCommand::ListResources(tx))
+            .map_err(|_| McpError::NotConnected)?;
+        rx.recv().map_err(|_| McpError::NotConnected)?
+    }
+
+    /// Read one resource's contents by URI.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::NotConnected`] when the dispatcher has exited, and
+    /// the transport/protocol errors surfaced by the engine.
+    pub fn read_resource(&self, uri: &str) -> Result<Vec<McpContent>, McpError> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.cmd_tx
+            .send(McpCommand::ReadResource {
+                uri: uri.to_string(),
+                reply: tx,
+            })
+            .map_err(|_| McpError::NotConnected)?;
+        rx.recv().map_err(|_| McpError::NotConnected)?
+    }
+
+    /// Whether the server declared the `resources` capability.
+    #[must_use]
+    pub fn supports_resources(&self) -> bool {
+        self.resources
     }
 
     /// Cancel every in-flight call started by `session_id`.
@@ -223,6 +284,7 @@ impl McpServerHandle {
             name: name.into(),
             version: version.into(),
             default_timeout,
+            resources: false,
         }
     }
 }
@@ -234,11 +296,16 @@ pub(crate) struct CallRequest {
     pub(crate) timeout: Duration,
 }
 
-/// A tool invocation paired with its cancellation token, as seen by an
-/// [`McpEngine`].
+/// A tool invocation paired with its cancellation token and progress sink, as
+/// seen by an [`McpEngine`].
+///
+/// `chunk_tx` is the daemon's streaming-output channel when the caller wants
+/// live progress; the engine forwards rate-limited progress messages to it as
+/// `notifications/progress` arrive. `None` means the caller is not streaming.
 pub(crate) struct EngineCall {
     pub(crate) request: CallRequest,
     pub(crate) cancel: CancelToken,
+    pub(crate) chunk_tx: Option<crossbeam_channel::Sender<Vec<u8>>>,
 }
 
 /// The backend that executes MCP operations for one server.
@@ -255,6 +322,15 @@ pub(crate) trait McpEngine: Send + Sync + 'static {
 
     /// Call one tool, honouring the call's deadline and cancellation token.
     fn call_tool(&self, call: EngineCall) -> BoxFuture<'_, Result<CallToolResult, McpError>>;
+
+    /// List every advertised resource, following pagination cursors.
+    fn list_resources(&self) -> BoxFuture<'_, Result<Vec<McpResource>, McpError>>;
+
+    /// Read one resource's contents by URI.
+    fn read_resource(&self, uri: String) -> BoxFuture<'_, Result<Vec<McpContent>, McpError>>;
+
+    /// Whether the server declared the `resources` capability.
+    fn supports_resources(&self) -> bool;
 
     /// Close the connection. Called once on shutdown.
     fn shutdown(&self) -> BoxFuture<'_, ()>;
@@ -278,6 +354,14 @@ pub(crate) enum McpCommand {
         session_id: u64,
         request: CallRequest,
         reply: Sender<Result<CallToolResult, McpError>>,
+        chunk_tx: Option<crossbeam_channel::Sender<Vec<u8>>>,
+    },
+    /// List resources; the reply carries the result.
+    ListResources(Sender<Result<Vec<McpResource>, McpError>>),
+    /// Read one resource; the reply carries the result.
+    ReadResource {
+        uri: String,
+        reply: Sender<Result<Vec<McpContent>, McpError>>,
     },
     /// Cancel every in-flight call started by the session.
     CancelSession { session_id: u64 },
@@ -408,6 +492,7 @@ fn run_dispatcher(
                 session_id,
                 request,
                 reply,
+                chunk_tx,
             } => {
                 let call_id = next_call_id;
                 next_call_id = next_call_id.wrapping_add(1);
@@ -416,7 +501,13 @@ fn run_dispatcher(
                 let engine = Arc::clone(&engine);
                 let done_tx = done_tx.clone();
                 rt.spawn(async move {
-                    let result = engine.call_tool(EngineCall { request, cancel }).await;
+                    let result = engine
+                        .call_tool(EngineCall {
+                            request,
+                            cancel,
+                            chunk_tx,
+                        })
+                        .await;
                     let transport_failed = is_transport_error_ref(&result);
                     let _ = done_tx.send(Done {
                         call_id,
@@ -424,6 +515,26 @@ fn run_dispatcher(
                     });
                     let _ = reply.send(result);
                 });
+            }
+            McpCommand::ListResources(reply) => {
+                let mut result = rt.block_on(engine.list_resources());
+                if let Err(e) = &result
+                    && is_transport_error(e)
+                {
+                    policy.on_transport_failure(&factory, &mut engine);
+                    result = rt.block_on(engine.list_resources());
+                }
+                let _ = reply.send(result);
+            }
+            McpCommand::ReadResource { uri, reply } => {
+                let mut result = rt.block_on(engine.read_resource(uri.clone()));
+                if let Err(e) = &result
+                    && is_transport_error(e)
+                {
+                    policy.on_transport_failure(&factory, &mut engine);
+                    result = rt.block_on(engine.read_resource(uri));
+                }
+                let _ = reply.send(result);
             }
             McpCommand::CancelSession { session_id } => {
                 for (token, call_session) in inflight.values() {
@@ -571,7 +682,9 @@ mod tests {
         }
 
         fn call_tool(&self, call: EngineCall) -> BoxFuture<'_, Result<CallToolResult, McpError>> {
-            let EngineCall { request, cancel } = call;
+            let EngineCall {
+                request, cancel, ..
+            } = call;
             self.calls
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -591,6 +704,19 @@ mod tests {
                     Ok(result)
                 }
             })
+        }
+
+        fn list_resources(&self) -> BoxFuture<'_, Result<Vec<McpResource>, McpError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn read_resource(&self, uri: String) -> BoxFuture<'_, Result<Vec<McpContent>, McpError>> {
+            let _ = uri;
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn supports_resources(&self) -> bool {
+            false
         }
 
         fn shutdown(&self) -> BoxFuture<'_, ()> {
@@ -615,6 +741,7 @@ mod tests {
             name: "mock".into(),
             version: "0.0.1".into(),
             default_timeout: Duration::from_secs(5),
+            resources: false,
         };
         let factory_engine = Arc::clone(&engine);
         let factory: EngineFactory =

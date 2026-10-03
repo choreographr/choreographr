@@ -9,25 +9,27 @@
 
 use crate::config::{McpProtocolMode, McpServerConfig, McpTransport};
 use crate::error::McpError;
-use crate::protocol::{CallToolResult, McpContent, McpTool, normalize_input_schema};
+use crate::protocol::{CallToolResult, McpContent, McpResource, McpTool, normalize_input_schema};
 use crate::session::{BoxFuture, CallRequest, EngineCall, EngineFactory, McpEngine};
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientCapabilities,
-    ClientConfig, ClientRequest, ContentBlock, Implementation, ProtocolVersion, ResourceContents,
-    ServerPeerInfo, ServerResult,
+    ClientConfig, ClientRequest, ContentBlock, ElicitResult, ElicitationAction, Implementation,
+    InputRequest, InputRequests, InputResponses, ProgressNotificationParam, ProgressToken,
+    ProtocolVersion, ResourceContents, ServerPeerInfo, ServerResult,
 };
 use rmcp::service::{
-    ClientInitializeError, Peer, PeerRequestOptions, RoleClient, RunningService, ServiceError,
+    ClientInitializeError, MaybeSendFuture, NotificationContext, Peer, PeerRequestOptions,
+    RoleClient, RunningService, ServiceError,
 };
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransportConfig, StreamableHttpError,
 };
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
-use rmcp::{ClientLifecycleMode, serve_client_with_lifecycle};
+use rmcp::{ClientHandler, ClientLifecycleMode, serve_client_with_lifecycle};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The `clientInfo.name` this client advertises.
 const CLIENT_NAME: &str = "choreographr";
@@ -43,6 +45,53 @@ const MAX_SSE_EVENT_BYTES: usize = 16 * 1024 * 1024;
 /// connect has already failed, so it never adds latency to a healthy connect.
 const LEGACY_SSE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Upper bound on MRTR round-trips for a single `tools/call`.
+///
+/// A server may answer `tools/call` with an `input_required` result and expect
+/// the client to fulfil the named input requests and retry. This client cannot
+/// render an elicitation prompt yet, so it answers every request with a
+/// `decline` (the MRTR-legal "no") and retries once; the round cap bounds a
+/// peer that would otherwise keep asking.
+const MAX_MRTR_ROUNDS: usize = 3;
+
+/// Minimum spacing between forwarded progress chunks.
+///
+/// A chatty server can emit a progress notification per item; relaying every
+/// one would flood the chunk sink. Coalescing to at most one chunk per interval
+/// keeps the display live without the traffic.
+const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Buffer depth of the per-connection server-event broadcast.
+///
+/// Progress and list-change notifications are best-effort: a call that falls
+/// behind the buffer skips the missed events rather than stalling the reader.
+const SERVER_EVENT_BUFFER: usize = 64;
+
+/// A server-originated event the engine forwards to the rest of the client.
+///
+/// The engine's [`ClientHandler`] is the only place these are produced (rmcp
+/// delivers notifications to the handler, not to a request's caller); the
+/// broadcast carries them to the in-flight call tasks that care.
+#[derive(Debug, Clone)]
+pub(crate) enum ServerEvent {
+    /// A `notifications/progress` for the call owning `token`.
+    Progress {
+        /// Correlates the notification with the originating request.
+        token: ProgressToken,
+        /// The current progress value.
+        progress: f64,
+        /// The total, when the server knows it.
+        total: Option<f64>,
+        /// Optional human-readable progress message.
+        message: Option<String>,
+    },
+    /// The server's tool list changed (only delivered to a `subscriptions/listen`
+    /// stream, so the client must have opened one).
+    ToolListChanged,
+    /// The server's resource list changed.
+    ResourceListChanged,
+}
+
 /// The `rmcp`-backed engine for one connected server.
 pub(crate) struct RmcpEngine {
     /// The peer handle for request/response and notifications. Cloneable, so
@@ -51,11 +100,90 @@ pub(crate) struct RmcpEngine {
     /// The running service, kept alive so the connection stays open; closed
     /// exactly once on shutdown. This is a lifecycle handle (never touched per
     /// message), guarded only because `close` needs `&mut`.
-    running: tokio::sync::Mutex<Option<RunningService<RoleClient, ClientConfig>>>,
+    running: tokio::sync::Mutex<Option<RunningService<RoleClient, ServerHandler>>>,
+    /// Broadcast of server notifications for this connection. Every call task
+    /// subscribes to filter out the progress for its own request.
+    events: tokio::sync::broadcast::Sender<ServerEvent>,
     name: String,
     version: String,
     /// Per-server request timeout for listings (calls carry their own).
     timeout: Duration,
+    /// Whether the server declared the `resources` capability.
+    has_resources: bool,
+}
+
+/// The `ClientHandler` for one connection.
+///
+/// rmcp routes every server-to-client notification here rather than to the
+/// caller that issued the request, so this is where progress, logging, and
+/// list-change notifications are turned into a [`ServerEvent`] broadcast (or,
+/// for logging, a `tracing` event). The handler also carries the `clientInfo`
+/// and capability object advertised to the server.
+#[derive(Clone)]
+struct ServerHandler {
+    config: ClientConfig,
+    events: tokio::sync::broadcast::Sender<ServerEvent>,
+}
+
+impl ClientHandler for ServerHandler {
+    fn get_info(&self) -> ClientConfig {
+        self.config.clone()
+    }
+
+    fn on_progress(
+        &self,
+        params: ProgressNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + MaybeSendFuture + '_ {
+        let events = self.events.clone();
+        async move {
+            // Best-effort: a lagging subscriber is dropped, not blocked.
+            let _ = events.send(ServerEvent::Progress {
+                token: params.progress_token,
+                progress: params.progress,
+                total: params.total,
+                message: params.message,
+            });
+        }
+    }
+
+    fn on_tool_list_changed(
+        &self,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + MaybeSendFuture + '_ {
+        let events = self.events.clone();
+        async move {
+            let _ = events.send(ServerEvent::ToolListChanged);
+        }
+    }
+
+    fn on_resource_list_changed(
+        &self,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + MaybeSendFuture + '_ {
+        let events = self.events.clone();
+        async move {
+            let _ = events.send(ServerEvent::ResourceListChanged);
+        }
+    }
+
+    // Logging is deprecated by the specification (SEP-2577), but a server may
+    // still emit `notifications/message`, so it is forwarded to `tracing`
+    // rather than dropped. The deprecation note is the framework's; there is no
+    // replacement notification to consume instead.
+    #[expect(
+        deprecated,
+        reason = "rmcp flags the logging notification types as deprecated (SEP-2577); consuming the notification is still the only way to observe a server that sends one"
+    )]
+    async fn on_logging_message(
+        &self,
+        params: rmcp::model::LoggingMessageNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        let logger = params.logger.as_deref().unwrap_or("server");
+        let data = params.data;
+        tracing::info!(logger = %logger, level = ?params.level, "MCP server log: {data}");
+    }
 }
 
 /// Connect to the server described by `config`, returning a ready engine.
@@ -80,16 +208,23 @@ pub(crate) fn connect(config: &McpServerConfig) -> Result<Arc<dyn McpEngine>, Mc
     // The transport is built and the handshake driven on the sidecar runtime:
     // `tokio::process` needs a runtime context, and `rmcp`'s serving loop and
     // HTTP worker do too.
-    let running = crate::runtime::block_on(connect_transport(config))??;
+    // The per-connection event broadcast is created before the transport so
+    // the `ClientHandler` (built inside the handshake) can hold its sender; the
+    // engine keeps the same sender so call tasks can subscribe.
+    let (events, _rx) = tokio::sync::broadcast::channel(SERVER_EVENT_BUFFER);
+    let running = crate::runtime::block_on(connect_transport(config, &events))??;
 
     let peer = running.peer().clone();
     let (name, version) = server_identity(&running);
+    let has_resources = server_has_resources(&running);
     Ok(Arc::new(RmcpEngine {
         peer,
         running: tokio::sync::Mutex::new(Some(running)),
+        events,
         name,
         version,
         timeout,
+        has_resources,
     }))
 }
 
@@ -101,19 +236,20 @@ pub(crate) fn factory(config: McpServerConfig) -> EngineFactory {
 /// Establish the transport and drive the lifecycle handshake for `config`.
 async fn connect_transport(
     config: &McpServerConfig,
-) -> Result<RunningService<RoleClient, ClientConfig>, McpError> {
+    events: &tokio::sync::broadcast::Sender<ServerEvent>,
+) -> Result<RunningService<RoleClient, ServerHandler>, McpError> {
+    let handler = ServerHandler {
+        config: client_config(config.protocol),
+        events: events.clone(),
+    };
     match &config.transport {
         McpTransport::Stdio { .. } => {
             let transport = build_stdio_transport(config)?;
-            serve_client_with_lifecycle(
-                client_config(config.protocol),
-                transport,
-                lifecycle_for(config.protocol),
-            )
-            .await
-            .map_err(|e| McpError::InitializeFailed(e.to_string()))
+            serve_client_with_lifecycle(handler, transport, lifecycle_for(config.protocol))
+                .await
+                .map_err(|e| McpError::InitializeFailed(e.to_string()))
         }
-        McpTransport::Http { url, .. } => connect_http(config, url).await,
+        McpTransport::Http { url, .. } => connect_http(config, url, handler).await,
     }
 }
 
@@ -129,14 +265,15 @@ async fn connect_transport(
 async fn connect_http(
     config: &McpServerConfig,
     url: &str,
-) -> Result<RunningService<RoleClient, ClientConfig>, McpError> {
+    handler: ServerHandler,
+) -> Result<RunningService<RoleClient, ServerHandler>, McpError> {
     let client = http_client(config)?;
     let mut attempt = 0;
     loop {
         attempt += 1;
         let transport = build_http_transport(config, client.clone())?;
         match serve_client_with_lifecycle(
-            client_config(config.protocol),
+            handler.clone(),
             transport,
             lifecycle_for(config.protocol),
         )
@@ -395,12 +532,23 @@ fn lifecycle_for(mode: McpProtocolMode) -> ClientLifecycleMode {
 }
 
 /// Extract the server's self-reported name/version from the negotiated peer.
-fn server_identity(running: &RunningService<RoleClient, ClientConfig>) -> (String, String) {
+fn server_identity(running: &RunningService<RoleClient, ServerHandler>) -> (String, String) {
     let info: Option<Arc<ServerPeerInfo>> = running.peer_info();
     let implementation = info.as_ref().and_then(|info| info.server_info.as_ref());
     let name = implementation.map_or_else(|| "unknown".to_string(), |i| i.name.clone());
     let version = implementation.map_or_else(|| "0.0.0".to_string(), |i| i.version.clone());
     (name, version)
+}
+
+/// Whether the server declared the `resources` capability.
+///
+/// The daemon registers its `read_resource`/`list_resources` wrapper tools only
+/// for a server that advertises resources, so they are not offered to a model
+/// for a server that cannot serve them.
+fn server_has_resources(running: &RunningService<RoleClient, ServerHandler>) -> bool {
+    running
+        .peer_info()
+        .is_some_and(|info| info.capabilities.resources.is_some())
 }
 
 impl McpEngine for RmcpEngine {
@@ -420,7 +568,53 @@ impl McpEngine for RmcpEngine {
 
     fn call_tool(&self, call: EngineCall) -> BoxFuture<'_, Result<CallToolResult, McpError>> {
         let peer = self.peer.clone();
-        Box::pin(async move { call_tool_impl(&peer, call).await })
+        let events = self.events.clone();
+        Box::pin(async move { call_tool_impl(&peer, &events, call).await })
+    }
+
+    fn list_resources(&self) -> BoxFuture<'_, Result<Vec<McpResource>, McpError>> {
+        let peer = self.peer.clone();
+        let timeout = self.timeout;
+        Box::pin(async move {
+            match tokio::time::timeout(timeout, peer.list_all_resources()).await {
+                Ok(Ok(resources)) => {
+                    Ok(resources.into_iter().map(convert_listed_resource).collect())
+                }
+                Ok(Err(e)) => Err(map_service_error(e)),
+                Err(_) => Err(McpError::Timeout),
+            }
+        })
+    }
+
+    fn read_resource(&self, uri: String) -> BoxFuture<'_, Result<Vec<McpContent>, McpError>> {
+        let peer = self.peer.clone();
+        let timeout = self.timeout;
+        Box::pin(async move {
+            let params = rmcp::model::ReadResourceRequestParams::new(uri);
+            match tokio::time::timeout(timeout, peer.read_resource_once(params)).await {
+                Ok(Ok(rmcp::model::ReadResourceResponse::Complete(result))) => Ok(result
+                    .contents
+                    .into_iter()
+                    .map(convert_resource_contents)
+                    .collect()),
+                // MRTR on `resources/read` is not driven; report what was asked.
+                Ok(Ok(rmcp::model::ReadResourceResponse::InputRequired(_))) => {
+                    Err(McpError::ProtocolError(
+                        "resources/read requested client input, which this client cannot provide"
+                            .into(),
+                    ))
+                }
+                Ok(Ok(_)) => Err(McpError::ProtocolError(
+                    "resources/read returned an unsupported result type".into(),
+                )),
+                Ok(Err(e)) => Err(map_service_error(e)),
+                Err(_) => Err(McpError::Timeout),
+            }
+        })
+    }
+
+    fn supports_resources(&self) -> bool {
+        self.has_resources
     }
 
     fn shutdown(&self) -> BoxFuture<'_, ()> {
@@ -442,57 +636,198 @@ impl McpEngine for RmcpEngine {
     }
 }
 
-/// Drive one `tools/call`, honouring the deadline and the cancellation token.
+/// Drive one `tools/call`, honouring the deadline, the cancellation token, and
+/// the server's MRTR `input_required` responses.
+///
+/// A tool call can span several JSON-RPC round-trips when the server answers
+/// with an `input_required` result: this client cannot render an elicitation
+/// prompt, so it declines each requested input and retries the original call
+/// with the decline responses and the echoed `requestState`. The retry loop is
+/// bounded by [`MAX_MRTR_ROUNDS`]; a server that keeps asking is failed with a
+/// message naming the input it wanted rather than hanging.
+///
+/// Progress notifications for this call's `progressToken` are forwarded to the
+/// caller's chunk sink, rate-limited to [`PROGRESS_MIN_INTERVAL`].
 async fn call_tool_impl(
     peer: &Peer<RoleClient>,
+    events: &tokio::sync::broadcast::Sender<ServerEvent>,
     call: EngineCall,
 ) -> Result<CallToolResult, McpError> {
-    let EngineCall { request, cancel } = call;
+    let EngineCall {
+        request,
+        cancel,
+        chunk_tx,
+    } = call;
     let CallRequest {
         name,
         arguments,
         timeout,
     } = request;
 
-    let mut params = CallToolRequestParams::new(name);
-    if let serde_json::Value::Object(map) = arguments {
-        params.arguments = Some(map);
-    }
+    let mut input_responses: Option<InputResponses> = None;
+    let mut request_state: Option<String> = None;
+    let mut rounds = 0usize;
+    let mut last_progress: Option<Instant> = None;
 
-    // Request-scoped options: the deadline resets while progress notifications
-    // arrive (a long tool that reports progress is not killed mid-work).
-    let options = PeerRequestOptions::with_timeout(timeout).reset_timeout_on_progress();
-    let handle = peer
-        .send_cancellable_request(
-            ClientRequest::CallToolRequest(CallToolRequest::new(params)),
-            options,
-        )
-        .await
-        .map_err(map_service_error)?;
-    let request_id = handle.id.clone();
-
-    tokio::select! {
-        biased;
-        // Cancellation arm first: a session cancel stops the call the instant
-        // it is observed, and we tell the server to stop cooperatively.
-        () = cancel.cancelled() => {
-            let _ = peer
-                .notify_cancelled(CancelledNotificationParam::new(
-                    Some(request_id),
-                    Some("client cancelled".to_string()),
-                ))
-                .await;
-            Err(McpError::Cancelled)
+    loop {
+        let mut params = CallToolRequestParams::new(name.clone());
+        if let serde_json::Value::Object(map) = &arguments {
+            params.arguments = Some(map.clone());
         }
-        response = handle.await_response() => match response.map_err(map_service_error)? {
-            ServerResult::CallToolResult(result) => Ok(convert_call_result(result)),
-            // SEP-2322 `input_required` and the tasks extension are not yet
-            // driven here; surface what the server asked for instead of hanging.
-            other => Err(McpError::ProtocolError(format!(
-                "tools/call returned a result this client does not handle: {other:?}"
-            ))),
-        },
+        if let Some(responses) = input_responses.take() {
+            params = params.with_input_responses(responses);
+        }
+        if let Some(state) = request_state.take() {
+            params = params.with_request_state(state);
+        }
+
+        // Subscribe BEFORE sending: the broadcast drops a message when no
+        // receiver is attached, so a fast server's progress must find this
+        // receiver already live.
+        let mut events_rx = events.subscribe();
+
+        // Request-scoped options: the deadline resets while progress
+        // notifications arrive (a long tool that reports progress is not
+        // killed mid-work).
+        let options = PeerRequestOptions::with_timeout(timeout).reset_timeout_on_progress();
+        let handle = peer
+            .send_cancellable_request(
+                ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+                options,
+            )
+            .await
+            .map_err(map_service_error)?;
+        let request_id = handle.id.clone();
+        let progress_token = handle.progress_token.clone();
+
+        // A fatal transport error maps out of the loop; the response is the
+        // only thing that drives a retry.
+        let response_fut = handle.await_response();
+        tokio::pin!(response_fut);
+        let response = loop {
+            tokio::select! {
+                biased;
+                // Cancellation arm first: a session cancel stops the call the
+                // instant it is observed, and we tell the server to stop.
+                () = cancel.cancelled() => {
+                    let _ = peer
+                        .notify_cancelled(CancelledNotificationParam::new(
+                            Some(request_id.clone()),
+                            Some("client cancelled".to_string()),
+                        ))
+                        .await;
+                    return Err(McpError::Cancelled);
+                }
+                event = events_rx.recv() => {
+                    // Any event that is not this call's progress (or a lagged
+                    // receiver) is ignored; the loop re-selects.
+                    if let Ok(ServerEvent::Progress { token, progress, total, message }) = event
+                        && token == progress_token
+                    {
+                        forward_progress(chunk_tx.as_ref(), &mut last_progress, message.as_deref(), progress, total);
+                    }
+                }
+                response = &mut response_fut => break response,
+            }
+        };
+
+        match response.map_err(map_service_error)? {
+            ServerResult::CallToolResult(result) => return Ok(convert_call_result(result)),
+            ServerResult::InputRequiredResult(required) => {
+                rounds += 1;
+                if rounds >= MAX_MRTR_ROUNDS {
+                    return Err(McpError::ProtocolError(format!(
+                        "server kept requesting client input for tool {name:?} after {rounds} round(s); \
+                         this client cannot supply it"
+                    )));
+                }
+                input_responses = Some(decline_responses(required.input_requests.as_ref())?);
+                // Echo the opaque state verbatim; it is required on retry and
+                // must not be inspected.
+                request_state.clone_from(&required.request_state);
+            }
+            // The tasks extension is not driven; surface it rather than hang.
+            other => {
+                return Err(McpError::ProtocolError(format!(
+                    "tools/call returned a result this client does not handle: {other:?}"
+                )));
+            }
+        }
     }
+}
+
+/// Forward one progress notification to the caller's chunk sink, rate-limited.
+///
+/// A message is preferred; failing that a compact numeric indicator is emitted
+/// when the server knows the total. Sends are best-effort (`try_send`): a full
+/// or dropped sink never blocks the call.
+fn forward_progress(
+    chunk_tx: Option<&crossbeam_channel::Sender<Vec<u8>>>,
+    last_progress: &mut Option<Instant>,
+    message: Option<&str>,
+    progress: f64,
+    total: Option<f64>,
+) {
+    let Some(tx) = chunk_tx else {
+        return;
+    };
+    if let Some(last) = *last_progress
+        && last.elapsed() < PROGRESS_MIN_INTERVAL
+    {
+        return;
+    }
+    let text = match message.filter(|m| !m.is_empty()) {
+        Some(message) => format!("{message}\n"),
+        None => match total {
+            Some(total) if total > 0.0 => format!("[progress {progress:.0}/{total:.0}]\n"),
+            _ => return,
+        },
+    };
+    if tx.try_send(text.into_bytes()).is_ok() {
+        *last_progress = Some(Instant::now());
+    }
+}
+
+/// Build a decline response for every server input request in an
+/// `input_required` result.
+///
+/// Only elicitation and roots can be answered with a well-formed decline here;
+/// sampling (`sampling/createMessage`) would require this client to invoke a
+/// model, so its presence is reported as an unsupported protocol exchange
+/// rather than answered with fabricated content.
+fn decline_responses(input_requests: Option<&InputRequests>) -> Result<InputResponses, McpError> {
+    let mut responses = InputResponses::new();
+    let Some(requests) = input_requests else {
+        // A state-only `input_required` (load shedding) just needs the state
+        // echoed; an empty response map is a valid retry.
+        return Ok(responses);
+    };
+    for (key, request) in requests {
+        let value = match request {
+            InputRequest::Elicitation(_) => {
+                serde_json::to_value(ElicitResult::new(ElicitationAction::Decline))
+            }
+            // The roots result shape is `{"roots": []}`; built as a literal
+            // rather than through the (deprecated) rmcp type only to keep the
+            // decline here independent of that deprecation.
+            InputRequest::ListRoots(_) => Ok(serde_json::json!({ "roots": [] })),
+            InputRequest::CreateMessage(_) => {
+                return Err(McpError::ProtocolError(
+                    "server requested sampling (`sampling/createMessage`), which this client does \
+                     not advertise or serve"
+                        .into(),
+                ));
+            }
+            other => {
+                return Err(McpError::ProtocolError(format!(
+                    "server requested unsupported client input: {other:?}"
+                )));
+            }
+        }
+        .map_err(|e| McpError::ProtocolError(format!("failed to encode input response: {e}")))?;
+        responses.insert(key.clone(), value);
+    }
+    Ok(responses)
 }
 
 /// Map an `rmcp` service error onto this crate's error type.
@@ -529,6 +864,21 @@ fn convert_tool(tool: rmcp::model::Tool) -> Option<McpTool> {
         input_schema,
         output_schema,
     })
+}
+
+/// Convert a listed rmcp resource into this crate's value type.
+fn convert_listed_resource(resource: rmcp::model::Resource) -> McpResource {
+    McpResource {
+        uri: resource.uri,
+        name: Some(resource.name),
+        description: resource.description,
+        mime_type: resource.mime_type,
+    }
+}
+
+/// Convert one resource's contents from a `resources/read` result.
+fn convert_resource_contents(contents: ResourceContents) -> McpContent {
+    convert_resource(contents)
 }
 
 /// Convert an rmcp `tools/call` result into this crate's value type.
@@ -739,6 +1089,68 @@ mod tests {
 
         // A non-transport initialize error is never retryable.
         assert!(!retryable_connect(&ClientInitializeError::Cancelled));
+    }
+
+    #[test]
+    fn decline_responses_declines_elicitation() {
+        let elicitation = InputRequest::Elicitation(
+            serde_json::from_value(serde_json::json!({
+                "method": "elicitation/create",
+                "params": {
+                    "mode": "form",
+                    "message": "Which environment?",
+                    "requestedSchema": {"type": "object", "properties": {}}
+                }
+            }))
+            .expect("elicitation request decodes"),
+        );
+        let mut requests = InputRequests::new();
+        requests.insert("q1".to_string(), elicitation);
+        let responses = decline_responses(Some(&requests)).expect("declines encode");
+        assert_eq!(
+            responses.get("q1"),
+            Some(&serde_json::json!({"action": "decline"}))
+        );
+    }
+
+    #[test]
+    fn decline_responses_state_only_is_empty_map() {
+        let responses = decline_responses(None).expect("no requests is fine");
+        assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn forward_progress_rate_limits_and_formats() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut last = None;
+        forward_progress(Some(&tx), &mut last, Some("working"), 1.0, Some(2.0));
+        // A second message inside the interval is dropped.
+        forward_progress(Some(&tx), &mut last, Some("again"), 2.0, Some(2.0));
+        let got: Vec<String> = rx
+            .try_iter()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .collect();
+        assert_eq!(got.len(), 1, "rate-limited to one chunk: {got:?}");
+        assert!(got[0].contains("working"));
+    }
+
+    #[test]
+    fn forward_progress_numeric_fallback_and_no_sink() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut last = None;
+        // No message but a known total: a compact numeric indicator is emitted.
+        forward_progress(Some(&tx), &mut last, None, 1.0, Some(4.0));
+        let got: Vec<String> = rx
+            .try_iter()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .collect();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].contains("1/4"));
+
+        // No sink: nothing is sent and the rate-limit timestamp is untouched.
+        let mut untouched = None;
+        forward_progress(None, &mut untouched, Some("x"), 1.0, None);
+        assert!(untouched.is_none());
     }
 
     #[test]
