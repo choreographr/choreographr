@@ -1,7 +1,9 @@
 # Plan: MCP modernization — stateless protocol (2026-07-28) and a first-class client
 
-**Status:** proposed — design complete; nothing implemented (no source changes in this
-change).
+**Status:** **in progress — P0 and P1 implemented** (commits `ab3dc2e`
+"fix(choreo-mcp): harden the MCP client and drop the npx test dependency" and
+`976edf6` "feat(choreo-mcp): rebuild the MCP client on the official rmcp SDK");
+P2–P6 remain. See §1.2 for what landed.
 **Lifecycle:** this file is **deleted once the plan is fully implemented**. Nothing
 written during implementation may reference it — rustdoc, `ARCHITECTURE.md`,
 `README.md`, release notes, and commit messages must stand on their own, because a
@@ -11,9 +13,10 @@ reference to this plan would go stale the moment it is removed.
 `McpToolWrapper`), `choreo-tui` / `choreo-client-core` (later phases: `/mcp` control
 surface), root `Cargo.toml` + `Cargo.lock` (new dependencies).
 **Touches (when implemented):** `choreo-mcp` (rewritten around `rmcp`; new
-`runtime.rs` / `session.rs` / `auth.rs` / `config.rs` modules), `choreo-daemon`
-(`src/mcp/{mod,config,tool}.rs`, `src/daemon/open.rs`, `src/server/core.rs`,
-`src/sessions.rs` for cancel plumbing), `choreo-tui` (`/mcp` UI), `choreo-proto`
+`runtime.rs` / `session.rs` / `engine.rs` / `config.rs` modules landed in P1;
+`auth.rs` still to come), `choreo-daemon` (`src/mcp/{mod,config,tool}.rs` and
+`src/daemon.rs` cancel plumbing landed in P1; `src/daemon/open.rs`,
+`src/server/core.rs` unchanged), `choreo-tui` (`/mcp` UI, pending), `choreo-proto`
 (only if a new client message is added), the justfile (`doc_crates` stays current),
 `ARCHITECTURE.md`, `README.md`, `packaging/`.
 
@@ -23,10 +26,10 @@ surface), root `Cargo.toml` + `Cargo.lock` (new dependencies).
 > through `server/discover`, server-to-client interaction happens through
 > Multi Round-Trip Requests (MRTR) instead of server-initiated requests, and the
 > Streamable HTTP transport dropped sessions, the GET stream, and resumability.
-> Choreographr's client (`choreo-mcp`) still speaks the **2024-11-05** era: a
-> hard-coded handshake, stdio only, tools only, no pagination, no cancellation,
+> At plan time, Choreographr's client (`choreo-mcp`) spoke the **2024-11-05** era:
+> a hard-coded handshake, stdio only, tools only, no pagination, no cancellation,
 > no resources/prompts, no HTTP servers, no OAuth, no output-limit or restart
-> handling — and the daemon serializes every call to a server through one
+> handling — and the daemon serialized every call to a server through one
 > `Mutex<McpClient>`. The plan: replace the hand-rolled protocol engine with the
 > official Rust SDK **`rmcp` 3.5** behind a blocking facade (one sidecar tokio
 > runtime, one dispatcher thread per server — the same sanctioned pattern
@@ -38,6 +41,12 @@ surface), root `Cargo.toml` + `Cargo.lock` (new dependencies).
 > subscriptions-driven tool-list refresh, progress → streaming chunks,
 > cancellation, OAuth sign-in, tool-name hygiene, bounds, and the official
 > conformance suite in CI.
+>
+> **Update (2026-10-03):** P0 (hardening) and P1 (the `rmcp` engine swap) are
+> implemented — the client now negotiates the stateless and legacy eras on stdio
+> behind the dispatcher facade, with cancellation, restart, pagination, and the
+> content mapping in place. See §1.2 for the landed state and the deltas the plan
+> now tracks.
 
 ---
 
@@ -63,7 +72,11 @@ surface), root `Cargo.toml` + `Cargo.lock` (new dependencies).
 
 ## 1. Motivation & evidence
 
-### 1.1 What choreographr has today
+### 1.1 Starting point (before P0/P1)
+
+The table below describes the client as it stood when this plan was written; it is
+retained as the rationale for the phases. P0/P1 replaced most of it — §1.2 lists
+what landed.
 
 `choreo-mcp` is a library-only crate (1,330 lines including tests) consumed only by
 `choreo-daemon` behind the `mcp` cargo feature (off by default). Its whole surface is
@@ -84,15 +97,69 @@ a stdio child process speaking JSON-RPC 2.0:
 | Policy | `ToolPolicy::Mobile` never spawns MCP; feature `mcp` off by default; a plain build has a no-op stub | `daemon/open.rs`, `mcp/mod.rs` stub |
 | Tests | Two `#[ignore]` integration tests that `npx -y @modelcontextprotocol/server-everything` (Node + network required); unit tests cover serialization only | `choreo-mcp/tests/it/`, `choreo-daemon/tests/it/` |
 
-Doc comment in `choreo-mcp/src/lib.rs` claims the crate speaks "over a transport
-(stdio child process or HTTP)" — there is no HTTP path. Several declared error
-variants (`ToolNotFound`, `InvalidParams`) are never constructed.
+Doc comment in `choreo-mcp/src/lib.rs` claimed the crate spoke "over a transport
+(stdio child process or HTTP)" — there was no HTTP path. Several declared error
+variants (`ToolNotFound`, `InvalidParams`) were never constructed. Both were fixed
+in P0.
 
-### 1.2 The protocol delta
+### 1.2 Implementation progress (P0–P1)
+
+**P0** (`ab3dc2e`) landed the correctness and safety fixes against the then-current
+hand-rolled engine; **P1** (`976edf6`) replaced that engine with `rmcp` 3.5 behind
+the blocking dispatcher facade. Together they closed G1, G3–G7, G9, G11,
+G14–G17, G19–G20, and G22 (§4) and left G2 and G8–G10, G12, G13, G18, and G21
+for the later phases. What exists now:
+
+- `choreo-mcp` is six modules: `protocol` (daemon-facing value types, the
+  empty-schema fallback, `normalize_input_schema`), `config`
+  (`McpServerConfig`, `McpProtocolMode::{Auto,Legacy,Modern}`), `runtime`
+  (sidecar tokio runtime with `init`/`get`/`handle`/`block_on`), `session`
+  (per-server dispatcher thread and the `McpServer`/`McpServerHandle` blocking
+  facade), `engine` (the only `rmcp`-coupled module), `error`.
+- Protocol eras are negotiated per server: `auto` (default) probes
+  `server/discover` and falls back to `initialize` only on a legacy peer or a
+  timeout — never on a recognized modern rejection; `legacy` and `modern` pin one
+  era (`2026-07-28` is accepted as an alias for `modern`). Both eras are covered
+  by the integration suite, including the `auto` fallback.
+- Calls run concurrently per server (the dispatcher spawns each call onto the
+  sidecar runtime), are deadline-bounded (per-server `timeout`, `DEFAULT_TIMEOUT`
+  60 s; request-scoped progress resets the deadline), and are cancellable
+  end-to-end: the daemon's session-cancel path calls
+  `McpManager::cancel_session` (including for child sessions), the dispatcher
+  cancels the matching in-flight calls, and the engine sends
+  `notifications/cancelled` so the server can stop cooperatively.
+- A dead transport is rebuilt under a bounded restart policy: 3 attempts,
+  `500 ms · 2^(n-1)` backoff capped at 60 s, reset on success. Startup failures
+  are terminal for that server (it is dropped), so a bad config never retries in
+  a loop.
+- `tools/list` follows `nextCursor` (bounded by the server timeout); a tool's real
+  `outputSchema` is advertised; `structuredContent` lands in
+  `ToolOutput.result_json`; images attach through the daemon image pipeline;
+  audio/blob resources and resource links are described rather than dropped;
+  text is truncated at 256 KiB with an explicit marker; `isError` survives the
+  JSON, streaming, and postcard paths.
+- Startup is bounded by a 2 s budget for the whole batch (`STARTUP_BUDGET`); a
+  server that misses it is logged and skipped, so a hung server cannot stall
+  `DaemonState::open`.
+- The test suites are hermetic and fixture-driven (no Node/npx, no network):
+  `choreo-mcp`'s scripted stdio server covers both eras, `auto` fallback,
+  crash-on-call, garbage lines, oversized lines, a rejected `initialize`,
+  structured content, and cancellation; the daemon's suite shares that fixture
+  source via `include!`.
+
+Deltas the plan now tracks (detailed in §7): the stdio read path is rmcp's, whose
+`AsyncRwTransport` reads lines with no cap — the P0 8 MiB bound was lost in the
+engine swap and must be reinstated; there is no per-server concurrency cap yet;
+the config keys `cwd`/`exposure`/`disabledTools` and `${ENV}` expansion are not
+implemented; `auto_load` was removed (reported as an unknown key) rather than
+mapped to a deferred exposure; and elicitation/`input_required` results are
+refused with a clear error rather than driven (P4).
+
+### 1.3 The protocol delta
 
 The specification's revisions are `2024-11-05`, `2025-03-26`, `2025-06-18`,
-`2025-11-25`, and the current **`2026-07-28`**. Choreographr sits three revisions
-behind, which matters because:
+`2025-11-25`, and the current **`2026-07-28`**. At plan time Choreographr sat
+three revisions behind, which mattered because:
 
 - Modern servers (the 2026-07-28 era) **reject `initialize`** with
   `UnsupportedProtocolVersionError` (`-32022`) or method-not-found. A client that
@@ -108,7 +175,7 @@ behind, which matters because:
   cancellation, `subscriptions/listen`, tasks extension) is what makes an MCP
   client *usable* with real servers, not just with the `echo` reference server.
 
-### 1.3 Why now
+### 1.4 Why now
 
 Nothing is blocked on this (the feature is off by default and the current client
 works against legacy stdio servers), but every month of drift makes the eventual
@@ -332,32 +399,32 @@ are from source at the paths given.
 
 Severity: **S1** = broken/dead-end behavior a user can hit today; **S2** =
 missing capability that blocks real servers; **S3** = robustness/quality;
-**S4** = polish.
+**S4** = polish. Status is as of `976edf6` (P0–P1); evidence cites the pre-P0 tree.
 
-| # | Gap | Severity | Evidence |
-|---|---|---|---|
-| G1 | Cannot talk to 2026-07-28 (stateless-only) servers at all | S1 | `make_initialize_request` pins `2024-11-05` |
-| G2 | No HTTP transport; no remote servers, no OAuth | S1 | `transport.rs` is stdio-only |
-| G3 | Server crash is permanent for the daemon's lifetime | S1 | no restart anywhere in `mcp/` |
-| G4 | One `Mutex` per server serializes calls and blocks shutdown | S1 | `Arc<Mutex<McpClient>>`, `tool.rs` |
-| G5 | MCP images are never attached to the model (rendered as text) | S1 | `image_tx` ignored; `[Image: …]` placeholder |
-| G6 | `inputSchema` default is JSON `null` when a server omits the key; invalid per spec | S2 | `#[serde(default)] input_schema: Value` in `protocol.rs` |
-| G7 | `tools/list` ignores `nextCursor` → large servers lose tools silently | S2 | `client.rs::list_tools` |
-| G8 | No `subscriptions/listen`; new tools require a daemon restart | S2 | notifications discarded in `transport.rs` |
-| G9 | No `structuredContent`/`outputSchema` capture into `ToolOutput.result_json` | S2 | `tool.rs` mapping |
-| G10 | No resources, prompts | S2 | no protocol types |
-| G11 | No cancellation; a cancelled session leaves the MCP call running | S2 | `ctx.cancelled` never consulted |
-| G12 | No progress notifications; `supports_streaming_output` emits one final chunk | S2 | `execute_streaming_json` |
-| G13 | Unbounded stdout line + unbounded channels (memory DoS from a hostile server) | S2 | `transport.rs` |
-| G14 | No per-server timeouts in config; fixed 60 s | S3 | `client.rs` constants |
-| G15 | `auto_load` parsed but ignored | S3 | `config.rs` |
-| G16 | `output_schema()` hard-codes `{"type":"string"}` | S3 | `tool.rs` |
-| G17 | `isError` dropped on the postcard path; `describe_invocation_json` appends a stray period | S3 | `tool.rs` |
-| G18 | Tool names unsanitized (`mcp/<slug>/<tool>` may exceed provider name limits or contain bad chars) | S3 | `tool.rs::new` |
-| G19 | No startup budget: a hung server can hold up `DaemonState::open` | S3 | `open.rs` joins spawn threads |
-| G20 | Integration tests depend on Node/npx + network | S3 | `tests/it/*` |
-| G21 | No user surface: no `/mcp`, no status, no login/logout | S3 | nothing in `choreo-tui` |
-| G22 | `lib.rs` claims HTTP support that does not exist; unused error variants | S4 | `lib.rs`, `error.rs` |
+| # | Gap | Severity | Evidence | Status |
+|---|---|---|---|---|
+| G1 | Cannot talk to 2026-07-28 (stateless-only) servers at all | S1 | `make_initialize_request` pins `2024-11-05` | **Closed (P1)** — `auto`/`modern` negotiate `server/discover` via rmcp |
+| G2 | No HTTP transport; no remote servers, no OAuth | S1 | `transport.rs` is stdio-only | **Open (P2/P3)** |
+| G3 | Server crash is permanent for the daemon's lifetime | S1 | no restart anywhere in `mcp/` | **Closed (P1)** — bounded restart policy rebuilds a dead transport |
+| G4 | One `Mutex` per server serializes calls and blocks shutdown | S1 | `Arc<Mutex<McpClient>>`, `tool.rs` | **Closed (P1)** — per-server dispatcher, concurrent calls, bounded joins |
+| G5 | MCP images are never attached to the model (rendered as text) | S1 | `image_tx` ignored; `[Image: …]` placeholder | **Closed (P0)** — base64 decode + image pipeline; placeholder only without a sink/invalid |
+| G6 | `inputSchema` default is JSON `null` when a server omits the key; invalid per spec | S2 | `#[serde(default)] input_schema: Value` in `protocol.rs` | **Closed (P0/P1)** — `normalize_input_schema` + rmcp's object-shape enforcement |
+| G7 | `tools/list` ignores `nextCursor` → large servers lose tools silently | S2 | `client.rs::list_tools` | **Closed (P1)** — rmcp `list_all_tools` follows cursors |
+| G8 | No `subscriptions/listen`; new tools require a daemon restart | S2 | notifications discarded in `transport.rs` | **Open (P4)** |
+| G9 | No `structuredContent`/`outputSchema` capture into `ToolOutput.result_json` | S2 | `tool.rs` mapping | **Closed (P1)** — `result_json` set; real `outputSchema` advertised |
+| G10 | No resources, prompts | S2 | no protocol types | **Open (P4)** — content blocks convert; resource/prompt *tools* pending |
+| G11 | No cancellation; a cancelled session leaves the MCP call running | S2 | `ctx.cancelled` never consulted | **Closed (P1)** — cancel wired end-to-end incl. child sessions |
+| G12 | No progress notifications; `supports_streaming_output` emits one final chunk | S2 | `execute_streaming_json` | **Partial (P1/P4)** — progress resets the deadline; progress→chunks pending |
+| G13 | Unbounded stdout line + unbounded channels (memory DoS from a hostile server) | S2 | `transport.rs` | **Partial (P0→P1)** — P0 capped lines at 8 MiB; the rmcp swap reads uncapped; reinstatement in P6 |
+| G14 | No per-server timeouts in config; fixed 60 s | S3 | `client.rs` constants | **Closed (P0)** — `timeout` key + `DEFAULT_TIMEOUT` |
+| G15 | `auto_load` parsed but ignored | S3 | `config.rs` | **Closed (P0)** — key removed; unknown keys are logged |
+| G16 | `output_schema()` hard-codes `{"type":"string"}` | S3 | `tool.rs` | **Closed (P1)** — the server's real `outputSchema`, else `None` |
+| G17 | `isError` dropped on the postcard path; `describe_invocation_json` appends a stray period | S3 | `tool.rs` | **Closed (P0/P1)** — `is_error` on all paths; description returned verbatim |
+| G18 | Tool names unsanitized (`mcp/<slug>/<tool>` may exceed provider name limits or contain bad chars) | S3 | `tool.rs::new` | **Open (P5)** — name format unchanged |
+| G19 | No startup budget: a hung server can hold up `DaemonState::open` | S3 | `open.rs` joins spawn threads | **Closed (P1)** — 2 s batch budget, stragglers skipped |
+| G20 | Integration tests depend on Node/npx + network | S3 | `tests/it/*` | **Closed (P0)** — in-tree fixture server, shared via `include!` |
+| G21 | No user surface: no `/mcp`, no status, no login/logout | S3 | nothing in `choreo-tui` | **Open (P5)** |
+| G22 | `lib.rs` claims HTTP support that does not exist; unused error variants | S4 | `lib.rs`, `error.rs` | **Closed (P0)** |
 
 ---
 
@@ -387,11 +454,12 @@ in the survey (codex pins a git rev of it; goose uses the crates.io release).
 Codex's git pin exists for unreleased enterprise-auth work only; we do not need
 it.
 
-Feature set to enable: `client`, `transport-child-process`,
-`transport-streamable-http-client-reqwest`, `client-side-sse` (via the
-transport), `auth`, `elicitation`, `request-state`, `base64`, `schemars`;
-`default-features = false`. TLS rides reqwest → rustls, whose crates
-(`rustls`/`ring`/`webpki-roots`) are already in the lockfile.
+Feature set is enabled **per phase** with `default-features = false`. P1 enabled
+`client` + `transport-child-process` only (plus `process-wrap` for the process
+group). P2 adds `transport-streamable-http-client-reqwest` (TLS rides reqwest →
+rustls, whose crates are already in the lockfile); P3 adds `auth`; P4 adds
+`elicitation`/`request-state` only if the pipeline drives them. `tokio` and
+`process-wrap` were promoted to `[workspace.dependencies]` in P1.
 
 ### D2 — Keep the daemon thread-only: sidecar runtime + per-server dispatcher thread
 
@@ -427,12 +495,18 @@ plus `auto` as default).
 ### D4 — Config: extend `mcp_servers.json` in place; keep the path
 
 Same file, same directory (`<config>/choreographr/mcp_servers.json`), same
-`mcpServers` top level. New optional keys: `url`, `headers`, `oauth`, `timeout`,
-`cwd`, `exposure`, `protocol`, `disabledTools`, with `${VAR}` expansion in
-`env`/`headers` values. Existing keys keep their meaning. Unknown keys are
-reported and ignored (never fatal). `auto_load` is replaced by `exposure`
-(`direct` default here, `deferred`/`hidden` later); `auto_load: false` is honored
-as `exposure: "deferred"` for backwards compatibility.
+`mcpServers` top level. Landed in P0/P1: `timeout` (seconds; applied to the
+handshake, listing, and calls) and `protocol` (`auto`/`legacy`/`modern`, with
+`2026-07-28` and `initialize` as aliases; an unrecognized value warns and falls
+back to `auto`), plus unknown-key collection — every unrecognized key is logged
+and ignored, never fatal. `auto_load` was **removed** in P0 and is now reported
+like any other unknown key.
+
+Still to come: `url`, `headers`, `oauth` (P2/P3); `cwd`, `exposure`,
+`disabledTools`, and `${VAR}` expansion in `env`/`headers` values (P5). When
+`exposure` lands, a legacy `auto_load: false` can be mapped to
+`exposure: "deferred"`; there is no such mapping on purpose today, because
+deferred registration does not exist yet.
 
 ### D5 — Tool identity stays `mcp/<slug>/<tool>`
 
@@ -443,19 +517,33 @@ sanitization or truncation collides. Description prefix `[MCP <slug>] ` is kept
 (stable prompt text). `title`/`icons`/`annotations` are captured into group
 metadata for later UI use but never fed to the model as instructions (untrusted).
 
+Status: the name format and description prefix landed unchanged in P0/P1; the
+sanitizer and collision hash are still open (G18, P5).
+
 ### D6 — Concurrency, deadlines, cancellation
 
-- Per-server config `timeout` (seconds; default 60, progress resets the deadline
-  as pi does) and a global per-call ceiling.
-- `maxConcurrentCalls` per server (default 4; HTTP servers may run parallel,
-  stdio requests multiplex on rmcp).
+Landed in P1:
+
+- Per-server config `timeout` (seconds; default 60) bounds the handshake,
+  listing, and calls; a call's deadline is request-scoped and resets while
+  progress notifications arrive, so a long tool that reports progress is not
+  killed mid-work.
 - Cancellation: the daemon's session-cancel path calls
-  `McpManager::cancel_session(session_id)` (a channel send), the dispatcher
-  cancels the in-flight rmcp request (`notifications/cancelled` on stdio, stream
-  close on HTTP) and replies a typed `Cancelled` error. The call wrapper also
-  checks `ctx.cancelled` before starting (cheap, correct at the boundary).
-- Shutdown: `McpManager::shutdown_all` sends `Shutdown` commands and joins
-  dispatchers with a bounded wait; no MCP lock can block Ctrl-C.
+  `McpManager::cancel_session(session_id)` (a channel send, including for child
+  sessions), the dispatcher cancels the matching in-flight calls via a per-call
+  `CancelToken`, the engine sends `notifications/cancelled`, and the caller gets
+  a typed `Cancelled`. The call wrapper also checks `ctx.cancelled` before
+  starting.
+- Shutdown: `McpManager::shutdown_all` drops each `ServerSlot`; `McpServer`'s
+  `Drop` sends `Shutdown` and joins the dispatcher with a bounded wait, so no
+  MCP path can block Ctrl-C.
+
+Still to come:
+
+- `maxConcurrentCalls` per server is **not implemented** — the dispatcher spawns
+  every call with no cap. Re-add it with a bound in P6 (the request-scoped
+  timeout already keeps a single call from hanging forever, but a burst of calls
+  from many sessions is currently unbounded).
 
 ### D7 — Credentials
 
@@ -493,107 +581,114 @@ MCP content maps onto `ToolOutput` as follows:
 | `audio` | text descriptor `[Audio: <mime>, <bytes> — not attached]` |
 | `resource_link` | text line with URI/name; future: register as a session resource |
 | embedded `resource` | text content when inline; else descriptor |
-| `structuredContent` | `ToolOutput.result_json` (programmatic path) + a JSON text block for the model |
+| `structuredContent` | `ToolOutput.result_json` (programmatic path); not duplicated as a model-visible text block (the spec already tells servers to mirror it into a text block) |
 | `annotations` | metadata only; never model-visible as instructions |
 | `isError` | `ToolOutput.is_error` on every path (JSON, streaming, postcard) |
+
+Status: this mapping landed in P0/P1 (image attachment, audio/blob/resource-link
+descriptors, `result_json`, truncation); only the progress and logging
+notification paths remain (P4).
 
 ---
 
 ## 6. Target architecture
 
+As built by P1:
+
 ```
 choreo-daemon (thread-only)
-  └── mcp/  McpManager                      (config → servers, groups, status)
-        ├── config.rs   mcp_servers.json → Vec<McpServerConfig>   [parsed once, reloadable]
-        ├── tool.rs     McpToolWrapper: ToolDyn ≈ { name, group, schema, handle }
-        └── server.rs   ServerSlot { status, handle: McpServerHandle, restart_policy }
+  └── mcp/
+        ├── config.rs   mcp_servers.json → Vec<McpServerConfig>
+        ├── mod.rs      McpManager { servers: HashMap<slug, ServerSlot> },
+        │               ServerSlot { handle, server }, 2 s startup budget,
+        │               cancel_session(session_id) fan-out
+        └── tool.rs     McpToolWrapper: ToolDyn — name/group, schema,
+                        content mapping, image sink, 256 KiB truncation
 
 choreo-mcp (library; owns tokio + rmcp)
-  ├── runtime.rs    sidecar Runtime (init/get/block_on)            [choreo-content precedent]
-  ├── config.rs     McpServerConfig (stdio | http fields, protocol mode, timeouts, oauth)
-  ├── error.rs      McpError (spawn/connect/protocol/transport/auth/cancelled/timeout/…)
-  ├── auth.rs       credential store + rmcp OAuth glue            [P3]
-  └── session.rs    per-server dispatcher thread:
-        McpCommand::{Discover, ListTools, ListPrompts, ListResources, Call, Cancel, Shutdown}
-        ┌─────────────── dispatcher thread (current-thread tokio) ───────────────┐
-        │ RunningService<RoleClient> (rmcp)                                      │
-        │ cmd_rx.recv() → spawn(fut) on runtime → reply_tx.send(result)          │
-        │ notifications → SubscriptionEvent channel (call progress / list change)│
-        └────────────────────────────────────────────────────────────────────────┘
+  ├── runtime.rs    sidecar Runtime: init / get / handle / block_on
+  ├── config.rs     McpServerConfig + McpProtocolMode::{Auto,Legacy,Modern}
+  ├── protocol.rs   daemon-facing types + normalize_input_schema
+  ├── error.rs      McpError
+  ├── session.rs    per-server dispatcher thread:
+  │                   McpCommand::{ListTools, Call, CancelSession, Shutdown}
+  │                   McpServerHandle { list_tools, call_tool, cancel_session }
+  │                   in-flight registry (dispatcher-owned), CancelToken,
+  │                   RestartPolicy (3 attempts, backoff ≤ 60 s)
+  └── engine.rs     the only rmcp-coupled module:
+                      connect → TokioChildProcess (+ process-wrap group)
+                      list_all_tools (pagination), call_tool (deadline +
+                      cancel + notifications/cancelled), shutdown
 ```
 
 Data flow for one tool call:
 
 1. Session thread executes `mcp/<slug>/<tool>` → `McpToolWrapper::execute_json`.
-2. Wrapper sanitizes args (JSON string), sends `McpCommand::Call { tool, args,
-   deadline, reply_tx, cancel_token }` to the server's dispatcher.
-3. Dispatcher calls `peer.call_tool(...)` in a task; progress notifications are
-   forwarded to the wrapper's `output_tx` (as text chunks) via the subscription
-   event channel.
-4. Reply → content mapping (D10) → `ToolOutput`.
-5. Timeout/cancel: dispatcher cancels the rmcp request; wrapper returns a typed
-   error; nothing is left running.
+2. The wrapper checks the session's cancel flag, sends
+   `McpCommand::Call { session_id, request, reply }` over the dispatcher channel,
+   and blocks on the per-call reply channel.
+3. The dispatcher registers the call (`call_id` + `CancelToken`), spawns the
+   call task on the sidecar runtime, and keeps serving commands; the engine
+   sends the request with a deadline (`PeerRequestOptions::with_timeout(...)`
+   with `reset_timeout_on_progress`), racing the response against the token and
+   sending `notifications/cancelled` to the server when cancelled.
+4. Reply → content mapping (D10) → `ToolOutput`. A call that failed on the
+   transport sends a completion notice back; the dispatcher rebuilds the engine
+   under the restart policy before serving the next command.
+5. `CancelSession` walks the in-flight registry and cancels every call with the
+   matching session id; `Shutdown` closes the connection and exits the thread
+   (joined with a bounded wait from `McpServer::drop`).
 
-Lifecycle state machine per server: `disabled → connecting → ready → (needs_auth)
-→ failed → retrying → ready`, with a restart budget (3 attempts, exponential
-backoff to 60 s; a failed-connect cooldown so a bad server is not retried per
-call). `list_changed` notifications trigger `ListTools` refresh and a
-`ToolRegistry` group update (new tools registered, withdrawn ones dropped from
-the group but existing session group membership unchanged).
+Lifecycle per server: connect at startup under the 2 s batch budget (`ready`, or
+skipped with a log); at runtime a transport failure triggers a reconnect under
+the restart policy (attempts reset on success, never retried in a loop after the
+budget is spent); `McpManager::shutdown_all` drains the slots with bounded joins.
+Remaining lifecycle work (P4/P5): a `needs_auth` state and
+`subscriptions/listen`-driven tool-list refresh (new tools registered, withdrawn
+ones dropped from the group, session group membership unchanged).
 
 ## 7. Work breakdown
 
-Each phase is independently shippable and lands with tests + docs.
+Each phase is independently shippable and lands with tests + docs. **P0 and P1 are
+done**; the remaining phases are unchanged in scope except where noted below.
 
 ### P0 — Correctness and safety on the current engine (small, no new deps)
 
-- [ ] `inputSchema` fallback to `{"type":"object","additionalProperties":false}`;
-      reject non-object schemas; cap schema bytes.
-- [ ] Bounded stdout lines (8 MiB, codex's value) → close transport with a typed
-      error instead of allocating unboundedly.
-- [ ] Bounded channels: notification channel may drop (log at debug);
-      response channel stays unbounded per-response (bounded by `next_id`
-      discipline) or is bounded with backpressure.
-- [ ] `clientInfo.version` from `env!("CARGO_PKG_VERSION")`; protocol version
-      named constant.
-- [ ] `isError` on the postcard path; `describe_invocation_json` cleanup;
-      `output_schema()` → `None` when unknown.
-- [ ] Per-server `timeout` in config (seconds) applied to all three operations.
-- [ ] `auto_load` honored (deferred registration) or removed with a warning.
-- [ ] Image content attached via `image_tx` (base64 decode → existing image
-      pipeline), placeholder only when no sink exists.
-- [ ] Explicit `max response bytes` truncation marker for text content.
-- [ ] Fix the `lib.rs` HTTP claim; remove or use the dead error variants.
-- [ ] Replace the npx integration tests with an in-tree fixture server (see §8)
-      — unit + `#[ignore]` integration.
+**Done** — `ab3dc2e`. All items landed: camelCase wire parsing fixed (a tool's
+`inputSchema`, `isError`, and image `mimeType` were being read as snake_case and
+silently dropped); `normalize_input_schema` (missing/`null` → empty-object
+schema; non-object or > 256 KiB drops only that tool); 8 MiB stdout line cap;
+bounded notification channel; per-server `timeout`; `clientInfo.version` from the
+crate version; image attachment via the daemon pipeline; 256 KiB text truncation
+with a marker; `isError` on the postcard path; honest `output_schema`;
+`auto_load` removed (reported as an unknown key); `lib.rs`/dead-variant cleanup;
+and the hermetic in-tree fixture server replacing npx.
+
+One P0 guarantee was later superseded: the 8 MiB line cap lived in the
+hand-rolled transport, which P1 deleted. The bound must be reinstated against
+rmcp's transport — tracked in P6.
 
 ### P1 — `rmcp` engine behind the blocking facade (core swap)
 
-- [ ] Add `rmcp` 3.5 to `[workspace.dependencies]`; `choreo-mcp` enables the
-      feature set from D1 (`default-features = false`).
-- [ ] `runtime.rs`: sidecar init/get/block_on (copy the `choreo-content`
-      doc/error shape).
-- [ ] `session.rs`: dispatcher thread + command/reply channels + restart policy;
-      `McpServerHandle` (cloneable) replaces `Arc<Mutex<McpClient>>`.
-- [ ] `McpClient` public API evolves to `McpServer::connect(config) →
-      McpServerHandle`; `list_tools` with pagination; `call_tool` with deadline +
-      cancellation; typed errors mapped from rmcp.
-- [ ] `ClientLifecycleMode::Auto` wiring (preferred `[2026-07-28]`, legacy
-      `2025-11-25`), per-server `protocol` override.
-- [ ] Daemon: `McpManager` holds `ServerSlot`s; spawn in background with a
-      startup budget (do not block `open()` past `startup_timeout_ms`, default
-      2 s); `shutdown_all` sends commands and joins bounded.
-- [ ] Cancel plumbing: `McpManager::cancel_session` from the daemon's cancel path.
-- [ ] Unit tests: dispatcher protocol (mock engine), error mapping, config
-      parsing; no sleeps (channels/synchronization primitives only).
-- [ ] Integration tests: Rust fixture server speaking (a) 2026-07-28 discover,
-      (b) 2025-11-25 initialize, (c) a misbehaving server (garbage line, oversized
-      line, crash), (d) slow call for cancellation.
+**Done** — `976edf6`. `rmcp` 3.5 (workspace dep, `default-features = false`) with
+`client` + `transport-child-process`; `runtime.rs` sidecar (`init`/`get`/
+`handle`/`block_on`); `session.rs` dispatcher + `McpServer`/`McpServerHandle`
+facade replacing the `Mutex`; `engine.rs` as the only rmcp-coupled module;
+`ClientLifecycleMode::Auto` (preferred `[2026-07-28]`, legacy `2025-11-25`) with a
+per-server `protocol` override; `McpManager` server slots with a 2 s startup
+budget and bounded shutdown; `cancel_session` wired into the daemon's cancel
+path (including child sessions); mock-engine unit tests (wait-free) and the
+fixture-driven integration suite across both eras, `auto` fallback, crash,
+garbage, oversized, rejected `initialize`, structured content, and cancellation.
+
+Carried forward: the per-server concurrency cap (D6) and the bounded frame reader
+(P6).
 
 ### P2 — Streamable HTTP transport
 
 - [ ] Config: `url`, `headers`, `transport: "http" | "stdio" | "auto"`;
-      `${ENV}` expansion; TLS via rmcp/reqwest defaults.
+      `${ENV}` expansion; TLS via rmcp/reqwest defaults. Enable the rmcp
+      `transport-streamable-http-client-reqwest` feature (D1) at the same time.
 - [ ] Connect logic: modern POST probe; fall back per spec (recognized modern
       errors vs everything else); optional legacy SSE rejection with a clear
       error (we do not implement HTTP+SSE; it is deprecated).
@@ -618,24 +713,31 @@ Each phase is independently shippable and lands with tests + docs.
 
 ### P4 — Feature plumbing into the daemon
 
-- [ ] D10 content mapping, including `image_tx` and `result_json`.
+Content mapping (the first item below, D10) already landed in P0/P1; the rest
+remains.
+
+- [x] D10 content mapping, including `image_tx` and `result_json` — landed P0/P1.
 - [ ] `subscriptions/listen` per server when `listChanged` is declared; tool-list
       refresh updates the registry group in place.
 - [ ] Progress → `ToolResultChunk`s (rate-limited); logging notifications →
-      per-server log file + tracing.
-- [ ] MRTR loop for `input_required`: decline policy (D8) now; pluggable handler
-      later.
+      per-server log file + tracing (progress currently only resets the deadline).
+- [ ] MRTR loop for `input_required`: today the engine turns an
+      `input_required` result (and any other unhandled result type) into a clear
+      `ProtocolError` instead of hanging; the decline policy (D8) then the
+      pluggable handler land here.
 - [ ] Resource tools (per server, when `resources` capability declared):
       `mcp/<slug>/read_resource` (+ `list_resources`), paginated; prompts tools
       deferred.
-- [ ] `outputSchema` → `ToolDyn::output_schema()` (real schema) and
-      `structuredContent` → `result_json` so programmatic callers and the VM see
-      structured data.
-- [ ] Cancellation end-to-end test (cancel a session mid-call; assert the server
-      observed `notifications/cancelled` on stdio / stream close on HTTP).
+- [x] `outputSchema` → `ToolDyn::output_schema()` (real schema) and
+      `structuredContent` → `result_json` — landed P1.
+- [ ] Cancellation end-to-end test that also asserts the *server* observed
+      `notifications/cancelled` (the client-side cancellation test landed in P1).
 
 ### P5 — Configuration, UX, observability
 
+- [ ] Remaining config keys: `cwd`, `exposure`, `disabledTools`, and `${VAR}`
+      expansion in `env`/`headers` values.
+- [ ] Tool-name sanitization and collision hashing (G18, D5).
 - [ ] Config layers: user file + project file (`.choreographr/mcp_servers.json`),
       project overrides user per server (pi's merge rules).
 - [ ] `choreographr mcp add/remove/list/login/logout/reconnect` CLI + `/mcp` TUI
@@ -649,9 +751,17 @@ Each phase is independently shippable and lands with tests + docs.
 
 ### P6 — Bounds, conformance, hardening
 
+- [ ] Reinstate the bounded stdio frame reader: rmcp 3.5's `TokioChildProcess` →
+      `AsyncRwTransport` reads lines with no cap (`JsonRpcMessageCodec::new()`
+      defaults `max_length` to `usize::MAX`, and the transport does not expose a
+      limit). Options: wrap the child's stdout in a capped `AsyncRead` adapter and
+      build the transport with `AsyncRwTransport::new_client`, or use any
+      max-length hook rmcp grows; report the gap upstream. Until then the
+      `oversized` integration test passes because the fixture exits after writing,
+      not because the client bounds the line.
 - [ ] Caps: max tools per server (e.g. 1,024), max schema bytes/depth, max text
-      bytes returned to a model, max concurrent calls, max restarts, max
-      notification rate.
+      bytes returned to a model, **per-server concurrent calls (D6 — currently
+      unbounded)**, max restarts, max notification rate.
 - [ ] Adopt the official `@modelcontextprotocol/conformance` suite for the
       client, run in CI for the eras we support, with a committed baseline
       (script under `scripts/`, results under `choreo-mcp/tests/conformance/`).
@@ -666,27 +776,36 @@ Each phase is independently shippable and lands with tests + docs.
 Per AGENTS.md: unit tests live in `src/**/#[cfg(test)]` (no time-based waits);
 integration tests live in `tests/it/` (one binary per crate, `#[ignore]`).
 
-- **Fixture server.** A small Rust binary in `choreo-mcp/tests/fixtures/` (built
-  by the test harness or invoked via `env!("CARGO_BIN_EXE_…")`) that speaks
-  scripted scenarios: `discover`, `initialize`, `tools/list` (paged, with
-  `list_changed`, with bad schemas, with 2026-style `_meta` validation),
-  `tools/call` (text/image/audio/resource/structured/isError), slow call,
-  oversized line, crash-on-call, `notifications/progress`, and a `subscriptions/
-  listen` stream. Scenario selection via argv/env. This removes the Node/npx
-  dependency from CI.
-- **Unit tests** cover: config parsing/migration, name sanitization, content
-  mapping, error mapping, dispatcher state machine with a mock engine, backoff
-  math, deadline handling.
-- **Integration tests** cover: stdio against the fixture server per era; HTTP
-  against a local `tiny_http`-style fixture; cancellation; restart; shutdown
-  under load; the full `McpManager` → `ToolRegistry` path (the existing
-  `choreo-daemon/tests/it/mcp_integration.rs` grows these cases).
+- **Fixture server.** Landed in P0 and extended in P1: an in-tree Rust binary
+  (`choreo-mcp/tests/fixtures/fixture_server.rs`, spawned via
+  `env!("CARGO_BIN_EXE_mcp-fixture-server")`) speaking scripted scenarios through
+  a scenario argument. Covered today: modern `server/discover`, legacy
+  `initialize`, the `auto` fallback, a rejected `initialize`, crash-on-call,
+  garbage lines, an oversized line, the tool catalogue (echo/boom/image/
+  structured/slow) with a real `outputSchema`, and a slow call for cancellation.
+  The daemon suite re-uses the same source through an `include!` in
+  `choreo-daemon/tests/fixtures/mcp_fixture_server.rs`. No Node/npx, no network.
+  Still to add: `list_changed` + `subscriptions/listen`, `notifications/progress`,
+  paged `tools/list`, and bad-schema variants (P4/P6).
+- **Unit tests** cover: schema normalization, content mapping, name/desc
+  formatting, error mapping, the dispatcher protocol + cancellation + restart
+  backoff against a mock engine, config parsing (timeout/protocol/unknown keys),
+  and runtime init. All wait-free — the restart tests exercise the backoff math
+  without sleeping, and the cancellation test synchronizes over channels
+  (mock signals `started`, then the test cancels).
+- **Integration tests** cover: stdio against the fixture server per era, the
+  `auto` fallback, structured content, crash/garbage/oversized/no-init, and
+  cancellation; HTTP arrives in P2. The cancellation case waits for the fixture's
+  in-flight marker with a bounded 5 ms poll (integration-only; the unit-test
+  wait-free rule is intact), and the daemon case asserts the image sink path
+  end-to-end.
 - **Conformance** runs the official suite (P6) and diffs against a baseline.
 - **Manual interop matrix** (documented, run at release): current
   `@modelcontextprotocol/server-everything`, a filesystem server, a remote OAuth
   server (e.g. an MCP provider available to the project), and one legacy server.
-- **Determinism**: no `sleep`-based tests; deadlines exercised with short
-  injected timeouts through config, not wall-clock sleeps.
+- **Determinism**: unit tests use no `sleep`; deadlines and backoff are exercised
+  through injected values/config, not wall-clock waits. Integration tests keep
+the pre-existing 120 s watchdog and one bounded marker poll (above).
 
 ## 9. Security & trust model
 
@@ -766,17 +885,22 @@ TUI `/mcp` (status, sign-in, reconnect, enable/disable, exposure), a
   implemented, so a reference to it (`see docs/plans/mcp-modernization.md`) is a
   future broken link and stale context.
 
+Status: P0/P1 kept `ARCHITECTURE.md` (module tables, `mcp/` row, threading model,
+test-coverage rows) and `README.md` in step, and the tree contains no reference to
+this plan — verified at `976edf6`.
+
 ## 12. Risks & mitigations
 
 | Risk | Mitigation |
 |---|---|
-| Dependency weight (tokio/reqwest/hyper via rmcp) | `mcp` feature stays off by default; verify both `--no-default-features` and `--all-features` builds; static-musl release job with the feature enabled (P6). |
+| Dependency weight (tokio/reqwest/hyper via rmcp) | `mcp` feature stays off by default; verify both `--no-default-features` and `--all-features` builds; static-musl release job with the feature enabled (P6). P1 already scoped rmcp to `client` + `transport-child-process`, promoting `tokio`/`process-wrap` to workspace deps. |
+| rmcp's stdio transport buffers unbounded lines (`AsyncRwTransport` has no cap) | Reinstate a capped reader in P6 (custom transport over a bounded `AsyncRead` adapter, or an upstream rmcp hook); the `oversized` integration test currently passes on fixture exit, not a client-side bound. |
 | rmcp API churn (3.x is moving fast) | Pin `3.5`, upgrade deliberately; the blocking facade isolates the daemon from rmcp types (rmcp types do not cross the crate boundary). |
-| Sidecar runtime + threads complicate shutdown | Follow the `choreo-content` runtime pattern; dispatcher replies are bounded; `shutdown_all` joins with deadlines; add the "no MCP lock can wedge Ctrl-C" test. |
+| Sidecar runtime + threads complicate shutdown | Follow the `choreo-content` runtime pattern; dispatcher replies are bounded; `shutdown_all` joins with deadlines; add the "no MCP lock can wedge Ctrl-C" test. P1 landed the bounded joins; the Ctrl-C test is still to write. |
 | OAuth UX on headless devices (TUI over SSH, Termux) | Paste-the-redirected-URL fallback (pi's flow), device-code path only if a provider requires it; document. |
 | Tool-name collisions/limits change prompt text vs persisted sessions | Keep names stable; sanitize only what is invalid; hash only on collision; pin with tests. |
 | rmcp licenses/advisories | Apache-2.0; `cargo deny check` already gates the tree. |
-| Fixture server drifts from real servers | Keep the one `npx`-based interop test as an opt-in ignored test plus the official conformance suite. |
+| Fixture server drifts from real servers | Keep the `npx`-based interop test as an opt-in ignored test plus the official conformance suite. |
 
 ## 13. Out of scope / future work
 
@@ -801,25 +925,35 @@ TUI `/mcp` (status, sign-in, reconnect, enable/disable, exposure), a
    loopback browser? Follow the existing provider-OAuth plan
    (`docs/plans/provider-oauth.md`) precedent.
 4. Is the 2 s startup budget right, or should server availability be fully lazy
-   (tools appear when connected)? Leaning eager-with-budget + lazily updated
-   groups.
+   (tools appear when connected)? P1 shipped the 2 s batch budget (stragglers
+   skipped and logged); revisit if real configs routinely miss it.
 
 ## 15. Definition of done
+
+Progress (P0/P1): the stdio half of the first two bullets is done and tested; the
+rest of the list is the remaining work.
 
 - A 2026-07-28 server (`server/discover`, per-request `_meta`, `resultType`)
   and a 2024-11-05…2025-11-25 server both work, selectable per server, proven
   by integration tests and the official conformance suite baseline.
+  *(Stdio: met in P1 — both eras plus the `auto` fallback are covered by
+  integration tests; HTTP/OAuth arrive in P2/P3 and the conformance baseline in
+  P6.)*
 - Stdio and Streamable HTTP transports work; remote OAuth server sign-in works
-  end-to-end with refresh and logout.
+  end-to-end with refresh and logout. *(Stdio: met; HTTP/OAuth pending.)*
 - Tool calls: parallel per server, cancellable, deadline-bounded, restart on
   crash, progress-streamed, with images attached, structured content preserved,
-  and typed errors.
+  and typed errors. *(Met except progress streaming (P4) and the per-server
+  concurrency cap (P6).)*
 - Tool list changes propagate without a daemon restart; resources readable via
-  wrapper tools.
+  wrapper tools. *(Pending — P4.)*
 - Bounds (lines, tools, schemas, bytes, concurrency) enforced and tested.
-- `/mcp` + CLI surfaces report status and manage auth/reload.
+  *(Partial: schema and text caps done; the frame cap is missing (P6) and the
+  concurrency cap is pending.)*
+- `/mcp` + CLI surfaces report status and manage auth/reload. *(Pending — P3/P5.)*
 - `ARCHITECTURE.md`/`README.md`/rustdoc updated; `just pre-commit` green; release
-  notes written from the commit messages.
+  notes written from the commit messages. *(P0/P1 did exactly this, each commit
+  its own release note.)*
 - **This plan document is deleted.** No source file, doc, comment, or commit
   message in the tree references it (grep for `mcp-modernization` returns
   nothing).
