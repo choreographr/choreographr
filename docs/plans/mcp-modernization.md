@@ -1282,7 +1282,7 @@ are what remains.
       authenticated server; a server that requires OAuth fails with the P5
       actionable error, not a hang or a raw status string. No credential store,
       no sign-in flow (P3, post-ship) — `f037383`.
-- [ ] Tool calls: parallel per server, cancellable, deadline-bounded, restart
+- [x] Tool calls: parallel per server, cancellable, deadline-bounded, restart
       on crash, progress-streamed, with images attached, structured content
       preserved, and typed errors. *(Met.)*
 - [x] Resources readable via wrapper tools (`list_resources`/`read_resource`,
