@@ -754,11 +754,19 @@ removed 2024-11-05 HTTP+SSE transport is rejected with a typed
 HTTP fixture (JSON and SSE responses, generated-header validation, `auto`
 fallback, a retryable `503`, and the HTTP+SSE rejection).
 
-Residuals (not in P3/P4 scope unless noted):
+Residuals:
 
-- [ ] `Retry-After` is not honored — the retry policy is purely exponential.
+- [ ] `Retry-After` is not honored — **blocked upstream**: rmcp 3.5's
+      `StreamableHttpError` surfaces a non-2xx response as
+      `UnexpectedServerResponse(String)` only, with no headers, so the client
+      cannot read the header from the failed connect. Fixing it means rmcp grows
+      a structured response error, or the connect probe stops going through
+      rmcp's transport (which contradicts D1/D11); report it upstream. Impact is
+      low: the backoff is bounded and stops after 3 attempts.
 - [ ] No explicit idle-read timeout for a long-lived SSE response stream beyond
       the per-request deadline; verify when `subscriptions/listen` lands (P4).
+      rmcp exposes an `SseRetryPolicy` hook (`retry_config` on the transport
+      config) for exactly this layer — use it then.
 
 ### P3 — OAuth for remote servers
 
