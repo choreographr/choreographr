@@ -1013,8 +1013,19 @@ Post-ship (fast-follow, around P3):
       restarts, and max notification rate. (Schema- and text-byte caps already
       landed: 256 KiB each.)
 - [ ] Adopt the official `@modelcontextprotocol/conformance` suite for the
-      client, run in CI for the eras we support, with a committed baseline
-      (script under `scripts/`, results under `choreo-mcp/tests/conformance/`).
+      client (pin the version; 0.1.16 at time of writing). It supports the eras
+      directly: `--spec-version 2026-07-28` (stateless, per-request `_meta`)
+      and the legacy revisions (stateful `initialize`), plus frozen
+      `--requirements <revision>` sets. Deliverables: a small harness binary
+      that takes the server URL as `argv[1]` and reads
+      `MCP_CONFORMANCE_SCENARIO` / `MCP_CONFORMANCE_PROTOCOL_VERSION` (mapping
+      each scenario to our `McpServer`/`McpServerHandle` operations and
+      choosing the lifecycle by version), a `scripts/` runner that invokes the
+      pinned `npx` command per era, a committed `--expected-failures` YAML
+      baseline under `choreo-mcp/tests/conformance/` (the OAuth client
+      scenarios until P3, and any draft-only checks), and a CI job. The
+      baseline keeps CI green on known gaps while still failing on new
+      regressions and on stale entries.
 - [ ] Fuzz/config hardening: parse-time fuzzing for `mcp_servers.json` and the
       base64 header sentinel; property tests for the tool-name sanitizer.
 - [ ] Supply-chain: lockfile review, `cargo deny` stays green, note `rmcp` in
@@ -1098,7 +1109,9 @@ integration tests live in `tests/it/` (one binary per crate, `#[ignore]`).
   (above). The stdio cancellation case waits for the fixture's in-flight marker
   with a bounded 5 ms poll (integration-only; the unit-test wait-free rule is
   intact), and the daemon case asserts the image sink path end-to-end.
-- **Conformance** runs the official suite (P6) and diffs against a baseline.
+- **Conformance** runs the official client suite against a harness binary
+  (pinned version, one run per era via `--spec-version`), diffed against a
+  committed expected-failures baseline; OAuth suites are excluded until P3.
 - **Manual interop matrix** (documented, run at release): current
   `@modelcontextprotocol/server-everything`, a filesystem server, a remote OAuth
   server (e.g. an MCP provider available to the project), and one legacy server.
