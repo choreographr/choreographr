@@ -913,6 +913,19 @@ impl ToolRegistry {
         self.build_for_policy(ToolPolicy::Full)
     }
 
+    /// Wrap a built registry in the daemon's process-wide, swappable holder.
+    ///
+    /// The daemon shares one `Arc<ArcSwap<ToolRegistry>>` with every session
+    /// and request worker: readers load the current registry lock-free, and the
+    /// daemon command loop is the sole writer that replaces it wholesale when an
+    /// MCP server's tool list changes. Wrapping once at startup (rather than
+    /// cloning a bare `Arc`) is what lets a live list change reach in-flight
+    /// sessions without a restart.
+    #[must_use]
+    pub fn into_shared(self: Arc<Self>) -> Arc<arc_swap::ArcSwap<Self>> {
+        Arc::new(arc_swap::ArcSwap::from(self))
+    }
+
     /// Build a shared registry under a [`ToolPolicy`]. See [`build`] for the
     /// `Arc::new_cyclic` rationale; `Mobile` skips the RISC-V sandbox
     /// registration entirely (`run_series`/`load_tools`/`unload_tools` stay —

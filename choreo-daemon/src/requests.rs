@@ -507,9 +507,12 @@ pub(crate) fn run_agent_loop(
         // request with thinking enabled cannot be replayed with a 1-token cap).
         let thinking_enabled = thinking_effort != "off";
         crate::metrics::record_turn(model);
-        let tools = ctx
-            .tool_registry
-            .available_definitions(&session.config.active_tool_groups);
+        // Load the current tool catalogue once per iteration: the shared
+        // `ArcSwap` lets a list-changed rebuild swap in a new registry between
+        // turns, and this pull pins the definitions used for THIS turn (the
+        // whole turn is built against one consistent snapshot).
+        let tool_registry = ctx.tool_registry.load_full();
+        let tools = tool_registry.available_definitions(&session.config.active_tool_groups);
         if is_cancelled_once(cancel_rx) {
             // Relay the cancel so an armed warmer stops pinging promptly.
             relay_warm_cancel();
@@ -544,7 +547,7 @@ pub(crate) fn run_agent_loop(
                     context_config: &session.config.context_config,
                     skills,
                     loaded_skill_bodies: &session.loaded_skill_bodies,
-                    tool_registry: &ctx.tool_registry,
+                    tool_registry: &tool_registry,
                     pending_hints: &pending_hints,
                     session_title: session.config.title.as_deref(),
                 },
@@ -780,7 +783,7 @@ pub(crate) fn run_agent_loop(
                 let description_by_call: HashMap<String, String> = tool_use
                     .tool_calls
                     .iter()
-                    .map(|tc| (tc.id.clone(), ctx.tool_registry.describe_invocation(tc)))
+                    .map(|tc| (tc.id.clone(), tool_registry.describe_invocation(tc)))
                     .collect();
                 // Seed in call order by deriving the parallel slice from the
                 // map, so `describe_invocation` runs exactly once per call.
@@ -1106,7 +1109,7 @@ pub(crate) fn run_agent_loop(
                     };
 
                     let cmd_tx = ctx.cmd_tx.clone();
-                    let reg = Arc::clone(&ctx.tool_registry);
+                    let reg = Arc::clone(&tool_registry);
 
                     // Shared batch channel: every wait-loop thread delivers its
                     // final ToolHandle here the moment the tool completes
@@ -1382,7 +1385,7 @@ pub(crate) fn run_agent_loop(
                     apply_pending_config_change(
                         session,
                         change,
-                        ctx.tool_registry.protected_groups(),
+                        ctx.tool_registry.load().protected_groups(),
                     );
                 }
 

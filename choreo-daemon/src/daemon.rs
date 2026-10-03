@@ -5,6 +5,7 @@ use crate::catalog::{CatalogPaths, MaintenanceEvent, RefreshReport, RefreshReque
 use crate::db::{self, SessionRecord};
 use crate::mcp::McpManager;
 use crate::providers::{ImageProviderHandle, InferenceProvider};
+use arc_swap::ArcSwap;
 
 // Re-export the image-resolution error type next to the DaemonCommand that
 // carries it, so senders of `GetImageGenerationProvider` can name the reply
@@ -137,7 +138,18 @@ pub struct DaemonState {
     /// with no key had no signal that it should auto-bind.
     pub keystore_bound: bool,
     pub db: Arc<redb::Database>,
-    pub tool_registry: Arc<crate::tools::ToolRegistry>,
+    /// The daemon's live tool catalogue, shared with every session and request
+    /// worker as one `Arc<ArcSwap<…>>`. Readers load the current registry
+    /// lock-free; the command loop is the SOLE writer, replacing the whole
+    /// registry when an MCP server's tool list changes (`DaemonCommand::McpListChanged`)
+    /// so a live list change reaches in-flight sessions without a restart.
+    pub tool_registry: Arc<ArcSwap<crate::tools::ToolRegistry>>,
+    /// The tool policy the registry was built under. Kept so a list-changed
+    /// rebuild re-applies exactly the same registration filter.
+    pub tool_policy: crate::tools::ToolPolicy,
+    /// The platform-tool bridge the registry was built with (if any). Kept so a
+    /// rebuild re-registers the protected `ios` group identically.
+    pub platform_tool_bridge: Option<Arc<dyn crate::tools::ios_bridge::IosToolBridge>>,
     pub daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
     pub summary_subscribers: HashMap<u64, SubscriberSink>,
     /// Writer channel of EVERY connected client (both transports), registered
@@ -508,6 +520,14 @@ pub enum DaemonCommand {
         session_id: u64,
         request_id: u32,
     },
+    /// An MCP server reported a tool- or resource-list change on its
+    /// `subscriptions/listen` stream. The command loop (the sole writer of the
+    /// tool catalogue) rebuilds the registry from `McpManager` and swaps it in,
+    /// so the server's `mcp/<slug>` group is refreshed in place. The slug is
+    /// carried for logging only — the whole registry is rebuilt either way.
+    McpListChanged {
+        slug: String,
+    },
     /// Set the display title for a session, forwarded to the session's
     /// main loop for in-memory update, broadcast, and persistence.
     SetSessionTitle {
@@ -803,6 +823,7 @@ impl DaemonState {
                 session_id,
                 request_id,
             } => self.handle_cancel_request(session_id, request_id),
+            DaemonCommand::McpListChanged { slug } => self.handle_mcp_list_changed(&slug),
             DaemonCommand::SetSessionTitle { session_id, title } => {
                 self.handle_set_session_title(session_id, title);
             }
@@ -2013,6 +2034,31 @@ impl DaemonState {
         // dispatchers cancel their matching calls and tell the servers to stop
         // cooperatively. Best-effort and non-blocking.
         self.mcp_manager.cancel_session(session_id);
+    }
+
+    /// Rebuild and swap the tool catalogue after an MCP server reported a
+    /// list change.
+    ///
+    /// The daemon command loop is the SOLE writer of `tool_registry` (the
+    /// sanctioned `ArcSwap` single-writer rule): it reconstructs the whole
+    /// registry (core tools + platform bridge + the current MCP tools) and
+    /// stores it, so every session and request worker — which share the same
+    /// `Arc<ArcSwap<…>>` — observes the new catalogue on its next load, without
+    /// a daemon restart. A request already holding the previous registry keeps
+    /// using it safely; the swap is atomic and never tears a live load.
+    ///
+    /// The rebuild re-lists every connected server (`McpManager::register_all`),
+    /// which is a bounded blocking round-trip per server; it runs here because
+    /// the catalogue has a single writer, and a list change is a rare event.
+    fn handle_mcp_list_changed(&mut self, slug: &str) {
+        info!(server = %slug, "MCP list changed; rebuilding the tool catalogue");
+        let registry = open::build_tool_registry(
+            self.tool_policy,
+            self.platform_tool_bridge.as_ref(),
+            &self.mcp_manager,
+        );
+        self.tool_registry.store(registry);
+        info!(server = %slug, "MCP tool catalogue refreshed");
     }
 
     /// Force-close one session's provider sockets by shutting down its

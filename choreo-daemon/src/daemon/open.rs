@@ -52,6 +52,34 @@ pub struct OpenOptions {
     pub platform_tool_bridge: Option<Arc<dyn IosToolBridge>>,
 }
 
+/// Build the daemon's tool catalogue from its parts.
+///
+/// Used by every MCP list-change rebuild
+/// (`DaemonState::handle_mcp_list_changed`), applying the core-tool
+/// registration, the platform-bridge extension, and the current MCP dynamic
+/// groups by one code path so a refresh cannot drift from startup. Returns the
+/// bare `Arc<ToolRegistry>`; the caller stores it into the daemon's shared
+/// `ArcSwap` (the command loop is its sole writer).
+pub(crate) fn build_tool_registry(
+    policy: ToolPolicy,
+    bridge: Option<&Arc<dyn IosToolBridge>>,
+    mcp: &McpManager,
+) -> Arc<ToolRegistry> {
+    let mut registry = ToolRegistry::new_for_policy(policy);
+    // The bridge's presence is the gate for the protected `ios` group (not a
+    // `cfg`), so an embedder that supplied one gets it on every rebuild too.
+    if let Some(bridge) = bridge {
+        registry.register_platform_tools(Arc::clone(bridge));
+    }
+    // MCP servers only exist under the Full policy (registration-time filter);
+    // re-registering their dynamic groups keeps the `mcp/<slug>` catalogues
+    // current on a refresh.
+    if policy == ToolPolicy::Full {
+        mcp.register_all(&mut registry);
+    }
+    registry.build_for_policy(policy)
+}
+
 impl DaemonState {
     /// Open daemon state from explicit paths: database (with the same
     /// Windows-safe open → version → drop → backup → reopen → migrate
@@ -147,8 +175,8 @@ impl DaemonState {
         // and `build_for_policy` consumes the registry into the shared `Arc`
         // (its `Arc::new_cyclic` closure keeps the `protected_groups` field
         // alive — it moves with the value).
-        if let Some(bridge) = opts.platform_tool_bridge {
-            tool_registry.register_platform_tools(bridge);
+        if let Some(bridge) = &opts.platform_tool_bridge {
+            tool_registry.register_platform_tools(Arc::clone(bridge));
         }
         let mcp_manager = if opts.tool_policy == ToolPolicy::Full {
             McpManager::from_config(&mut tool_registry)
@@ -156,7 +184,12 @@ impl DaemonState {
             info!("tool policy Mobile: MCP servers not spawned");
             McpManager::empty()
         };
-        let tool_registry = tool_registry.build_for_policy(opts.tool_policy);
+        // Wrap once in the process-wide swappable holder: every session and
+        // request worker shares this `Arc<ArcSwap<…>>`, so a later MCP
+        // list-change rebuild reaches live sessions without a restart.
+        let tool_registry = tool_registry
+            .build_for_policy(opts.tool_policy)
+            .into_shared();
 
         // Authoritative keystore status source: is a binding present yet?
         // Read once at startup; `bind_keystore` flips it live (single writer
@@ -205,6 +238,8 @@ impl DaemonState {
             keystore_bound,
             db,
             tool_registry,
+            tool_policy: opts.tool_policy,
+            platform_tool_bridge: opts.platform_tool_bridge,
             summary_subscribers: HashMap::new(),
             client_writers: HashMap::new(),
             activity_subscribers: HashMap::new(),
@@ -260,7 +295,7 @@ mod tests {
         assert_eq!(state.next_session_id, 1);
         assert!(state.locked, "a fresh daemon starts locked");
         let active: HashSet<String> = ["shell".into()].into_iter().collect();
-        let defs = state.tool_registry.available_definitions(&active);
+        let defs = state.tool_registry.load().available_definitions(&active);
         assert!(
             defs.iter().any(|d| d.function.name == "sh"),
             "Full policy must register the shell tools"
@@ -286,11 +321,12 @@ mod tests {
 
         let all: HashSet<String> = state
             .tool_registry
+            .load()
             .group_names()
             .into_iter()
             .chain(["core".to_string()])
             .collect();
-        let defs = state.tool_registry.available_definitions(&all);
+        let defs = state.tool_registry.load().available_definitions(&all);
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         for absent in ["sh", "exec", "run_riscv"] {
             assert!(
@@ -325,7 +361,7 @@ mod tests {
 
         // Available WITHOUT "ios" in the caller-supplied active set.
         let active: HashSet<String> = HashSet::new();
-        let defs = state.tool_registry.available_definitions(&active);
+        let defs = state.tool_registry.load().available_definitions(&active);
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         for tool in IOS_TOOLS {
             assert!(names.contains(&tool), "missing {tool}: {names:?}");
@@ -334,11 +370,20 @@ mod tests {
         // "ios" is protected: excluded from the load/unload schema enum and
         // present in the protected set.
         assert!(
-            !state.tool_registry.group_names().iter().any(|g| g == "ios"),
+            !state
+                .tool_registry
+                .load()
+                .group_names()
+                .iter()
+                .any(|g| g == "ios"),
             "protected groups must not appear in group_names()"
         );
         assert!(
-            state.tool_registry.protected_groups().contains("ios"),
+            state
+                .tool_registry
+                .load()
+                .protected_groups()
+                .contains("ios"),
             "ios must be marked protected"
         );
         // Direct-only callers (exfiltration-chain mitigation) — checked on
@@ -346,6 +391,7 @@ mod tests {
         // tools, which keep their own caller policy).
         let resp_defs = state
             .tool_registry
+            .load()
             .available_definitions_for_responses(&active);
         for def in resp_defs
             .iter()

@@ -18,7 +18,9 @@ fn spawn_session(
     let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded();
     let (session_tx, session_rx) = crossbeam_channel::unbounded();
 
-    let tool_registry = choreo_daemon::tools::ToolRegistry::new().build();
+    let tool_registry = choreo_daemon::tools::ToolRegistry::new()
+        .build()
+        .into_shared();
     let cmd_tx = session_tx.clone();
 
     let handle = std::thread::spawn(move || {

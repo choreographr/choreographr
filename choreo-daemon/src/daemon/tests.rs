@@ -12,7 +12,7 @@ pub(super) fn make_daemon_state() -> (DaemonState, crossbeam_channel::Receiver<D
     let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
-    let tool_registry = crate::tools::ToolRegistry::new().build();
+    let tool_registry = crate::tools::ToolRegistry::new().build().into_shared();
     // The stays-alive detail: `add`/`save` later rewrite the accounts file
     // (tests seed accounts post-construction), so the directory holding it
     // must OUTLIVE the state. The state owns only the PATH (a `String`),
@@ -41,6 +41,8 @@ pub(super) fn make_daemon_state() -> (DaemonState, crossbeam_channel::Receiver<D
         keystore_bound: false,
         db,
         tool_registry,
+        tool_policy: crate::tools::ToolPolicy::Full,
+        platform_tool_bridge: None,
         daemon_tx,
         summary_subscribers: HashMap::new(),
         client_writers: HashMap::new(),
@@ -4012,4 +4014,29 @@ fn add_credential_on_bound_keystore_rejects_wrong_key_blob() {
     );
     assert!(db::get_all_credential_blobs(&state.db).unwrap().is_empty());
     assert!(state.locked);
+}
+
+/// An MCP list-changed event must rebuild and atomically swap the shared tool
+/// catalogue, so a live session (which shares the same `ArcSwap`) observes the
+/// refreshed registry on its next load. With no MCP servers configured the
+/// rebuild is a pure re-registration of the core tools, which is exactly what
+/// this asserts (the swap happened and the catalogue is still valid).
+#[test]
+fn mcp_list_changed_rebuilds_and_swaps_tool_registry() {
+    let (mut state, _rx) = make_daemon_state();
+    let before = Arc::as_ptr(&state.tool_registry.load_full());
+    state.handle_mcp_list_changed("test-server");
+    let after = Arc::as_ptr(&state.tool_registry.load_full());
+    assert_ne!(
+        before, after,
+        "the list-change handler must replace the shared registry"
+    );
+
+    // The rebuilt registry still carries the always-on core tools.
+    let active: HashSet<String> = ["core".into()].into_iter().collect();
+    let defs = state.tool_registry.load().available_definitions(&active);
+    assert!(
+        defs.iter().any(|d| d.function.name == "read_file"),
+        "the rebuilt registry must still register core tools"
+    );
 }

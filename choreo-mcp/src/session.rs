@@ -22,7 +22,7 @@
 
 use crate::config::McpServerConfig;
 use crate::error::McpError;
-use crate::protocol::{CallToolResult, McpContent, McpResource, McpTool};
+use crate::protocol::{CallToolResult, McpContent, McpListChange, McpResource, McpTool};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -51,12 +51,34 @@ pub struct McpServer {
 impl McpServer {
     /// Connect to the configured server and start its dispatcher thread.
     ///
+    /// A convenience wrapper over [`connect_with_list_changes`] for callers
+    /// that do not consume the server's list-changed events (tests, and any
+    /// embedder that only needs one-shot tool discovery).
+    ///
+    /// # Errors
+    ///
+    /// As [`connect_with_list_changes`].
+    ///
+    /// [`connect_with_list_changes`]: Self::connect_with_list_changes
+    pub fn connect(config: &McpServerConfig) -> Result<Self, McpError> {
+        Self::connect_with_list_changes(config, None)
+    }
+
+    /// Connect to the configured server and start its dispatcher thread,
+    /// forwarding the server's list-changed events to `list_changes`.
+    ///
     /// Performs the lifecycle handshake (legacy `initialize` or the stateless
     /// `server/discover` probe, per the config's
     /// [`McpProtocolMode`](crate::McpProtocolMode)) before returning, so a
     /// best-effort caller can fail fast; a caller unwilling to wait (the
     /// daemon's bounded startup) runs this on its own thread and detaches on
     /// timeout.
+    ///
+    /// When `list_changes` is `Some`, and the negotiated era is stateless and
+    /// the server advertises a list-changed capability, the connection opens a
+    /// `subscriptions/listen` stream on the sidecar runtime and forwards each
+    /// event as an [`McpListChange`]. The same sender is reused across
+    /// reconnects, so a rebuilt transport re-establishes its subscription.
     ///
     /// # Errors
     ///
@@ -65,9 +87,12 @@ impl McpServer {
     /// [`McpError::ProtocolError`] when the runtime is not initialized or the
     /// dispatcher thread cannot start, and transport/protocol errors surfaced
     /// by the handshake.
-    pub fn connect(config: &McpServerConfig) -> Result<Self, McpError> {
+    pub fn connect_with_list_changes(
+        config: &McpServerConfig,
+        list_changes: Option<crossbeam_channel::Sender<McpListChange>>,
+    ) -> Result<Self, McpError> {
         crate::runtime::init()?;
-        let engine = crate::engine::connect(config)?;
+        let engine = crate::engine::connect(config, list_changes.clone())?;
         let name = engine.name().to_string();
         let version = engine.version().to_string();
 
@@ -80,7 +105,7 @@ impl McpServer {
             resources: engine.supports_resources(),
         };
 
-        let factory = crate::engine::factory(config.clone());
+        let factory = crate::engine::factory(config.clone(), list_changes);
         let max_concurrent_calls = config.max_concurrent_calls();
         let join = std::thread::Builder::new()
             .name(format!("mcp-{}", config.slug))

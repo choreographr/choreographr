@@ -1139,7 +1139,7 @@ pub(crate) fn execute_tool_with_timeout(
     } = spawn_tool_execution(ToolExecutionSpec {
         tool_call,
         format,
-        registry: Arc::clone(&ctx.tool_registry),
+        registry: ctx.tool_registry.load_full(),
         x_credentials: x_credentials.cloned(),
         working_dir: working_dir.map(std::path::Path::to_path_buf),
         tool_ctx,

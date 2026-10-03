@@ -9,14 +9,18 @@
 
 use crate::config::{McpProtocolMode, McpServerConfig, McpTransport};
 use crate::error::McpError;
-use crate::protocol::{CallToolResult, McpContent, McpResource, McpTool, normalize_input_schema};
+use crate::protocol::{
+    CallToolResult, McpContent, McpListChange, McpListKind, McpResource, McpTool,
+    normalize_input_schema,
+};
 use crate::session::{BoxFuture, CallRequest, EngineCall, EngineFactory, McpEngine};
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientCapabilities,
     ClientConfig, ClientRequest, ContentBlock, ElicitResult, ElicitationAction, Implementation,
     InputRequest, InputRequests, InputResponses, ProgressNotificationParam, ProgressToken,
-    ProtocolVersion, ResourceContents, ServerPeerInfo, ServerResult,
+    ProtocolVersion, ResourceContents, ServerNotification, ServerPeerInfo, ServerResult,
+    SubscriptionFilter,
 };
 use rmcp::service::{
     ClientInitializeError, MaybeSendFuture, NotificationContext, Peer, PeerRequestOptions,
@@ -86,11 +90,6 @@ pub(crate) enum ServerEvent {
         /// Optional human-readable progress message.
         message: Option<String>,
     },
-    /// The server's tool list changed (only delivered to a `subscriptions/listen`
-    /// stream, so the client must have opened one).
-    ToolListChanged,
-    /// The server's resource list changed.
-    ResourceListChanged,
 }
 
 /// The `rmcp`-backed engine for one connected server.
@@ -148,25 +147,11 @@ impl ClientHandler for ServerHandler {
         }
     }
 
-    fn on_tool_list_changed(
-        &self,
-        _context: NotificationContext<RoleClient>,
-    ) -> impl Future<Output = ()> + MaybeSendFuture + '_ {
-        let events = self.events.clone();
-        async move {
-            let _ = events.send(ServerEvent::ToolListChanged);
-        }
-    }
-
-    fn on_resource_list_changed(
-        &self,
-        _context: NotificationContext<RoleClient>,
-    ) -> impl Future<Output = ()> + MaybeSendFuture + '_ {
-        let events = self.events.clone();
-        async move {
-            let _ = events.send(ServerEvent::ResourceListChanged);
-        }
-    }
+    // List-changed notifications are NOT handled here: the stateless era
+    // delivers them only on a `subscriptions/listen` stream, which rmcp routes
+    // to that stream's own receiver (see `spawn_list_change_listener`), not to
+    // the handler. An unsolicited list-changed from a legacy peer carries no
+    // actionable list to refresh, so it is intentionally ignored.
 
     // Logging is deprecated by the specification (SEP-2577), but a server may
     // still emit `notifications/message`, so it is forwarded to `tracing`
@@ -203,7 +188,10 @@ impl ClientHandler for ServerHandler {
 /// [`McpError::UnsupportedTransport`] when an HTTP endpoint speaks the removed
 /// HTTP+SSE transport, and [`McpError::ProtocolError`] when the sidecar runtime
 /// is not initialized or the HTTP config is invalid.
-pub(crate) fn connect(config: &McpServerConfig) -> Result<Arc<dyn McpEngine>, McpError> {
+pub(crate) fn connect(
+    config: &McpServerConfig,
+    list_changes: Option<crossbeam_channel::Sender<McpListChange>>,
+) -> Result<Arc<dyn McpEngine>, McpError> {
     let timeout = config.request_timeout();
 
     // The transport is built and the handshake driven on the sidecar runtime:
@@ -218,6 +206,15 @@ pub(crate) fn connect(config: &McpServerConfig) -> Result<Arc<dyn McpEngine>, Mc
     let peer = running.peer().clone();
     let (name, version) = server_identity(&running);
     let has_resources = server_has_resources(&running);
+
+    // Open the list-change subscription against the freshly negotiated peer,
+    // before the running service is moved into the engine. The subscription
+    // task owns its own `Peer` clone, so it is independent of the engine's
+    // lifecycle; a reconnect re-runs this and opens a fresh stream.
+    if let Some(sender) = list_changes {
+        spawn_list_change_listener(&peer, running.peer_info().as_deref(), &config.slug, sender);
+    }
+
     Ok(Arc::new(RmcpEngine {
         peer,
         running: tokio::sync::Mutex::new(Some(running)),
@@ -230,8 +227,123 @@ pub(crate) fn connect(config: &McpServerConfig) -> Result<Arc<dyn McpEngine>, Mc
 }
 
 /// Build the reconnect factory the dispatcher uses to rebuild a dead engine.
-pub(crate) fn factory(config: McpServerConfig) -> EngineFactory {
-    Box::new(move || connect(&config))
+///
+/// The factory carries the list-change sender so a rebuilt transport
+/// re-establishes its `subscriptions/listen` stream.
+pub(crate) fn factory(
+    config: McpServerConfig,
+    list_changes: Option<crossbeam_channel::Sender<McpListChange>>,
+) -> EngineFactory {
+    Box::new(move || connect(&config, list_changes.clone()))
+}
+
+/// Spawn the `subscriptions/listen` reader for a server that supports it.
+///
+/// The stateless era delivers list changes only on a `subscriptions/listen`
+/// stream, so a client that wants live tool catalogues must open one. The
+/// request does not exist before that era, so this is gated on the negotiated
+/// protocol version, and on the server actually advertising a list-changed
+/// capability (an empty filter would subscribe to nothing).
+fn spawn_list_change_listener(
+    peer: &Peer<RoleClient>,
+    peer_info: Option<&ServerPeerInfo>,
+    slug: &str,
+    sender: crossbeam_channel::Sender<McpListChange>,
+) {
+    let Some(info) = peer_info else {
+        return;
+    };
+    // `subscriptions/listen` exists only from the stateless era onward.
+    if info.protocol_version.has_initialize() {
+        return;
+    }
+    let filter = SubscriptionFilter::builder()
+        .tools_list_changed()
+        .resources_list_changed()
+        .build()
+        .supported_by(&info.capabilities);
+    if !filter_has_any(&filter) {
+        return;
+    }
+    let peer = peer.clone();
+    let slug = slug.to_string();
+    // A missing runtime disables the subscription rather than failing the
+    // connection: the server is still fully usable without live refresh.
+    let Ok(handle) = crate::runtime::handle() else {
+        tracing::warn!(
+            server = %slug,
+            "sidecar runtime unavailable; list-change subscription disabled"
+        );
+        return;
+    };
+    handle.spawn(async move {
+        listen_for_changes(peer, filter, slug, sender).await;
+    });
+}
+
+/// Whether a subscription filter opts in to at least one notification category.
+fn filter_has_any(filter: &SubscriptionFilter) -> bool {
+    filter.tools_list_changed == Some(true)
+        || filter.prompts_list_changed == Some(true)
+        || filter.resources_list_changed == Some(true)
+        || filter
+            .resource_subscriptions
+            .as_ref()
+            .is_some_and(|uris| !uris.is_empty())
+}
+
+/// Open one `subscriptions/listen` stream and forward each list-changed event.
+///
+/// Runs until the subscription ends or the transport closes; a reconnect
+/// re-spawns a fresh listener (see [`connect`]), so an ended stream is not
+/// retried here.
+async fn listen_for_changes(
+    peer: Peer<RoleClient>,
+    filter: SubscriptionFilter,
+    slug: String,
+    sender: crossbeam_channel::Sender<McpListChange>,
+) {
+    let mut subscription = match peer.listen(filter).await {
+        Ok(subscription) => subscription,
+        Err(e) => {
+            tracing::warn!(server = %slug, error = %e, "failed to open list-change subscription");
+            return;
+        }
+    };
+    tracing::debug!(server = %slug, "opened list-change subscription");
+    loop {
+        match subscription.next().await {
+            Ok(Some(ServerNotification::ToolListChangedNotification(_))) => {
+                let change = McpListChange {
+                    slug: slug.clone(),
+                    kind: McpListKind::Tools,
+                };
+                if sender.send(change).is_err() {
+                    // The daemon dropped its receiver (shutdown); stop reading.
+                    return;
+                }
+            }
+            Ok(Some(ServerNotification::ResourceListChangedNotification(_))) => {
+                let change = McpListChange {
+                    slug: slug.clone(),
+                    kind: McpListKind::Resources,
+                };
+                if sender.send(change).is_err() {
+                    return;
+                }
+            }
+            // Any other notification is outside the filter; ignore it.
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tracing::debug!(server = %slug, "list-change subscription ended");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(server = %slug, error = %e, "list-change subscription error");
+                return;
+            }
+        }
+    }
 }
 
 /// Establish the transport and drive the lifecycle handshake for `config`.
@@ -916,6 +1028,19 @@ fn convert_resource(contents: ResourceContents) -> McpContent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filter_has_any_detects_opted_in_categories() {
+        assert!(!filter_has_any(&SubscriptionFilter::default()));
+        assert!(filter_has_any(
+            &SubscriptionFilter::builder().tools_list_changed().build()
+        ));
+        assert!(filter_has_any(
+            &SubscriptionFilter::builder()
+                .resources_list_changed()
+                .build()
+        ));
+    }
 
     #[test]
     fn lifecycle_maps_modes() {

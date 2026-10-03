@@ -271,8 +271,11 @@ pub struct RequestContext {
     pub session_id: u64,
     /// Database handle for persisting state.
     pub db: Arc<redb::Database>,
-    /// Registry of available tools.
-    pub tool_registry: Arc<ToolRegistry>,
+    /// The daemon's live tool catalogue. Shared as the SAME
+    /// `Arc<ArcSwap<…>>` across every session and request worker, so a
+    /// list-changed rebuild on the command loop (the sole writer) is visible to
+    /// a live session on its next load — no restart, no session respawn.
+    pub tool_registry: Arc<arc_swap::ArcSwap<ToolRegistry>>,
     /// Channel to the daemon command loop.
     pub daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
     /// Daemon-wide cap on agent tool-loop iterations per request (0 = unlimited).
@@ -2336,7 +2339,7 @@ fn handle_load_tools(
     // registry before sending, so unknown names normally never reach the
     // handler.  Re-validate here so a directly-sent command can never
     // persist a typo'd group into the authoritative active set.
-    let known = ctx.tool_registry.known_group_names();
+    let known = ctx.tool_registry.load().known_group_names();
     if let Some(unknown) = crate::tools::unknown_group_names(groups, &known) {
         let _ = reply.send(Err(format!(
             "Unknown tool group(s): {}",
@@ -2371,7 +2374,7 @@ fn handle_unload_tools(
 
     // Defense-in-depth: reject unknown group names (same rationale as
     // handle_load_tools).  "core" is known and handled below as protected.
-    let known = ctx.tool_registry.known_group_names();
+    let known = ctx.tool_registry.load().known_group_names();
     if let Some(unknown) = crate::tools::unknown_group_names(groups, &known) {
         let _ = reply.send(Err(format!(
             "Unknown tool group(s): {}",
@@ -2386,7 +2389,7 @@ fn handle_unload_tools(
     let result = crate::tools::unload_tools::apply_unload_tools(
         &mut state.config.active_tool_groups,
         groups,
-        ctx.tool_registry.protected_groups(),
+        ctx.tool_registry.load().protected_groups(),
     );
 
     // Broadcast updated session state so the client picks up the new

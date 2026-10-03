@@ -58,7 +58,9 @@ pub fn test_daemon_state_with_limits(limits: LagLimits) -> DaemonState {
     let dir = tempfile::tempdir().expect("tempdir");
     let db =
         Arc::new(redb::Database::create(dir.path().join("state.redb")).expect("test database"));
-    let tool_registry = choreo_daemon::tools::ToolRegistry::new().build();
+    let tool_registry = choreo_daemon::tools::ToolRegistry::new()
+        .build()
+        .into_shared();
     let config_dir = tempfile::tempdir().expect("tempdir for config");
     let accounts_path = config_dir.path().join("accounts.toml");
     // The stays-alive detail: account seeding (add/save) later rewrites the
@@ -86,6 +88,8 @@ pub fn test_daemon_state_with_limits(limits: LagLimits) -> DaemonState {
         keystore_bound: false,
         db,
         tool_registry,
+        tool_policy: choreo_daemon::tools::ToolPolicy::Full,
+        platform_tool_bridge: None,
         daemon_tx,
         summary_subscribers: HashMap::new(),
         client_writers: HashMap::new(),

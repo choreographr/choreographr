@@ -5,7 +5,10 @@
 //! external MCP server over either the **stdio** transport (a child subprocess)
 //! or the **Streamable HTTP** transport (a remote POST endpoint), negotiates the
 //! protocol era (`server/discover` with an `initialize` fallback, or one pinned
-//! era), lists the server's tools, and invokes them on the model's behalf. The
+//! era), lists the server's tools, and invokes them on the model's behalf. When
+//! the negotiated era and the server's capabilities allow it, it also opens a
+//! `subscriptions/listen` stream and forwards each list-changed event as a
+//! [`McpListChange`] so the daemon can refresh its tool catalogue live. The
 //! daemon depends on it behind its `mcp` cargo feature (off by default) and
 //! registers thin `Tool` wrappers over [`McpServerHandle`].
 //!
@@ -45,8 +48,8 @@ pub use config::{
 };
 pub use error::McpError;
 pub use protocol::{
-    CallToolResult, EMPTY_INPUT_SCHEMA, MAX_SCHEMA_BYTES, McpContent, McpResource, McpTool,
-    normalize_input_schema,
+    CallToolResult, EMPTY_INPUT_SCHEMA, MAX_SCHEMA_BYTES, McpContent, McpListChange, McpListKind,
+    McpResource, McpTool, normalize_input_schema,
 };
 pub use session::{McpServer, McpServerHandle};
 pub use stdio::MAX_STDIO_FRAME_BYTES;

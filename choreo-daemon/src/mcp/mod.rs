@@ -11,7 +11,7 @@ pub mod tool;
 #[cfg(feature = "mcp")]
 use crate::tools::{ToolDyn, ToolRegistry};
 #[cfg(feature = "mcp")]
-use choreo_mcp::{McpServer, McpServerHandle};
+use choreo_mcp::{McpListChange, McpServer, McpServerHandle};
 #[cfg(feature = "mcp")]
 use std::collections::HashMap;
 #[cfg(feature = "mcp")]
@@ -48,6 +48,11 @@ struct ServerSlot {
 pub struct McpManager {
     /// One slot per server, keyed by server slug.
     servers: HashMap<String, ServerSlot>,
+    /// Receiver end of the shared list-changed channel every server's
+    /// `subscriptions/listen` stream feeds. The daemon takes it out (via
+    /// [`McpManager::take_list_change_rx`]) and pumps it into the command loop;
+    /// `None` once taken, or when no server could open a subscription.
+    list_change_rx: Option<crossbeam_channel::Receiver<McpListChange>>,
 }
 
 #[cfg(feature = "mcp")]
@@ -68,8 +73,16 @@ impl McpManager {
             }
         };
 
+        // One shared list-changed channel: every server's subscription task
+        // sends into this sender, and the daemon consumes the single receiver
+        // (see `take_list_change_rx`). Created even when no server supports
+        // subscriptions — the receiver is simply never taken, or the channel
+        // stays empty.
+        let (list_change_tx, list_change_rx) = crossbeam_channel::unbounded::<McpListChange>();
+
         let mut manager = Self {
             servers: HashMap::new(),
+            list_change_rx: Some(list_change_rx),
         };
 
         // Spawn all connect threads up front so they handshake in parallel.
@@ -83,8 +96,11 @@ impl McpManager {
                 target = cfg.transport.target(),
                 "spawning MCP server"
             );
-            let handle =
-                std::thread::spawn(move || McpServer::connect(&cfg).map_err(anyhow::Error::from));
+            let list_changes = Some(list_change_tx.clone());
+            let handle = std::thread::spawn(move || {
+                McpServer::connect_with_list_changes(&cfg, list_changes)
+                    .map_err(anyhow::Error::from)
+            });
             pending.push((slug, handle));
         }
 
@@ -111,6 +127,29 @@ impl McpManager {
         manager
     }
 
+    /// Take the shared list-changed receiver, if a server could have opened a
+    /// subscription. Called once by the daemon command-loop assembly, which
+    /// spawns a forwarder thread pumping it into [`DaemonCommand::McpListChanged`].
+    ///
+    /// [`DaemonCommand::McpListChanged`]: crate::daemon::DaemonCommand::McpListChanged
+    pub fn take_list_change_rx(&mut self) -> Option<crossbeam_channel::Receiver<McpListChange>> {
+        self.list_change_rx.take()
+    }
+
+    /// Re-register every connected server's tools into `registry`.
+    ///
+    /// Used when the daemon rebuilds its [`ToolRegistry`] after a list-changed
+    /// event: unlike startup (which drops a server whose listing fails), a
+    /// refresh names the failure and keeps the server connected, because a
+    /// transient listing error must not take a working server offline.
+    pub fn register_all(&self, registry: &mut ToolRegistry) {
+        for (slug, slot) in &self.servers {
+            if let Err(e) = Self::register_server_tools(slug, &slot.handle, registry) {
+                warn!(server = %slug, error = %e, "failed to list MCP tools during registry refresh");
+            }
+        }
+    }
+
     /// Discover a server's tools and register them (and the server) in the
     /// manager. A listing failure drops the server, which shuts it down.
     fn register_server(
@@ -120,53 +159,8 @@ impl McpManager {
         manager: &mut Self,
     ) {
         let handle = server.handle();
-        let server_name = server.name().to_string();
-
-        match handle.list_tools() {
-            Ok(tools) => {
-                registry.register_dynamic_group(
-                    format!("mcp/{slug}"),
-                    format!("MCP server: {server_name}"),
-                );
-                info!(
-                    server = %slug,
-                    name = %server_name,
-                    tool_count = tools.len(),
-                    "registered MCP server tools"
-                );
-                for mcp_tool in tools {
-                    let description = mcp_tool.description.unwrap_or_default();
-                    let wrapper = McpToolWrapper::new(
-                        slug,
-                        &mcp_tool.name,
-                        &description,
-                        mcp_tool.input_schema,
-                        mcp_tool.output_schema,
-                        handle.clone(),
-                    );
-                    // Own the strings BEFORE moving `wrapper` into the box: a
-                    // borrow extending into the call would conflict with the
-                    // move.
-                    let name = wrapper.name().to_string();
-                    let group = wrapper.group().to_string();
-                    registry.register_dynamic(name, &group, Box::new(wrapper));
-                }
-                // A server that declares the `resources` capability gets the
-                // catalogue tools; a server without it would only fail the
-                // call, so they are not offered.
-                if handle.supports_resources() {
-                    let group = format!("mcp/{slug}");
-                    let lister = McpListResourcesTool::new(slug, handle.clone());
-                    let reader = McpReadResourceTool::new(slug, handle.clone());
-                    for tool in [
-                        Box::new(lister) as Box<dyn ToolDyn>,
-                        Box::new(reader) as Box<dyn ToolDyn>,
-                    ] {
-                        let name = tool.name().to_string();
-                        registry.register_dynamic(name, &group, tool);
-                    }
-                    info!(server = %slug, "registered MCP resource tools");
-                }
+        match Self::register_server_tools(slug, &handle, registry) {
+            Ok(()) => {
                 manager
                     .servers
                     .insert(slug.to_string(), ServerSlot { handle, server });
@@ -176,6 +170,70 @@ impl McpManager {
                 // `server` is dropped here, shutting the connection down.
             }
         }
+    }
+
+    /// Register one server's advertised tools (and its catalogue group) into
+    /// `registry`.
+    ///
+    /// Shared by startup ([`register_server`](Self::register_server)) and a
+    /// post-list-change refresh ([`register_all`](Self::register_all)) so the
+    /// naming and resource-tool rules never drift. A server that declares the
+    /// `resources` capability additionally gets the `list_resources` /
+    /// `read_resource` catalogue tools; a server without it would only fail the
+    /// call, so they are not offered.
+    ///
+    /// # Errors
+    ///
+    /// Returns the listing error when `tools/list` fails.
+    fn register_server_tools(
+        slug: &str,
+        handle: &McpServerHandle,
+        registry: &mut ToolRegistry,
+    ) -> Result<(), choreo_mcp::McpError> {
+        let server_name = handle.name().to_string();
+        let tools = handle.list_tools()?;
+        registry
+            .register_dynamic_group(format!("mcp/{slug}"), format!("MCP server: {server_name}"));
+        info!(
+            server = %slug,
+            name = %server_name,
+            tool_count = tools.len(),
+            "registered MCP server tools"
+        );
+        for mcp_tool in tools {
+            let description = mcp_tool.description.unwrap_or_default();
+            let wrapper = McpToolWrapper::new(
+                slug,
+                &mcp_tool.name,
+                &description,
+                mcp_tool.input_schema,
+                mcp_tool.output_schema,
+                handle.clone(),
+            );
+            // Own the strings BEFORE moving `wrapper` into the box: a
+            // borrow extending into the call would conflict with the
+            // move.
+            let name = wrapper.name().to_string();
+            let group = wrapper.group().to_string();
+            registry.register_dynamic(name, &group, Box::new(wrapper));
+        }
+        // A server that declares the `resources` capability gets the
+        // catalogue tools; a server without it would only fail the call, so
+        // they are not offered.
+        if handle.supports_resources() {
+            let group = format!("mcp/{slug}");
+            let lister = McpListResourcesTool::new(slug, handle.clone());
+            let reader = McpReadResourceTool::new(slug, handle.clone());
+            for tool in [
+                Box::new(lister) as Box<dyn ToolDyn>,
+                Box::new(reader) as Box<dyn ToolDyn>,
+            ] {
+                let name = tool.name().to_string();
+                registry.register_dynamic(name, &group, tool);
+            }
+            info!(server = %slug, "registered MCP resource tools");
+        }
+        Ok(())
     }
 
     /// Shut down all MCP servers, joining each dispatcher with a bounded wait.
@@ -209,6 +267,7 @@ impl McpManager {
     pub fn empty() -> Self {
         Self {
             servers: HashMap::new(),
+            list_change_rx: None,
         }
     }
 
@@ -275,6 +334,9 @@ mod imp {
         pub fn from_config(_registry: &mut ToolRegistry) -> Self {
             Self
         }
+
+        /// Stub: no server has any tools to (re-)register.
+        pub fn register_all(&self, _registry: &mut ToolRegistry) {}
 
         /// Stub: there are no servers to shut down.
         pub fn shutdown_all(&mut self) {}

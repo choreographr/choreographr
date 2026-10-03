@@ -113,6 +113,36 @@ pub enum McpContent {
     },
 }
 
+/// Which advertised list changed on the server.
+///
+/// A `subscriptions/listen` stream opts in to one or more of these categories;
+/// each event the client observes is relabelled with this kind so the daemon
+/// knows what to refresh (its own tool catalogue, in either case).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpListKind {
+    /// `notifications/tools/list_changed`: the server's tool set changed.
+    Tools,
+    /// `notifications/resources/list_changed`: the server's resource set
+    /// changed.
+    Resources,
+}
+
+/// A list-changed event observed on a server's `subscriptions/listen` stream.
+///
+/// The client opens one subscription per server (when the negotiated protocol
+/// era and the server's advertised capabilities allow it) and forwards each
+/// event to the daemon, which rebuilds its tool catalogue so a live server can
+/// add or withdraw tools without a daemon restart. The slug names the
+/// originating server, since every server's subscription feeds one shared
+/// channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpListChange {
+    /// The server slug whose list changed.
+    pub slug: String,
+    /// Which list changed.
+    pub kind: McpListKind,
+}
+
 /// Parse [`EMPTY_INPUT_SCHEMA`] into a `Value`; infallible for this literal.
 #[must_use]
 pub fn empty_input_schema() -> serde_json::Value {

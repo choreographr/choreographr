@@ -1691,7 +1691,7 @@ fn finalize_and_broadcast_turn_strips_reasoning_artifact() {
         cmd_tx,
         session_id: 1,
         db,
-        tool_registry: ToolRegistry::new().build(),
+        tool_registry: ToolRegistry::new().build().into_shared(),
         daemon_tx,
         max_turns: 0,
         lag_limits: crate::broadcast::LagLimits::default(),
@@ -1756,7 +1756,7 @@ fn agent_loop_failure_marks_and_finalizes_turn() {
         cmd_tx,
         session_id: 1,
         db,
-        tool_registry: ToolRegistry::new().build(),
+        tool_registry: ToolRegistry::new().build().into_shared(),
         daemon_tx,
         max_turns: 0,
         lag_limits: crate::broadcast::LagLimits::default(),
@@ -1832,7 +1832,7 @@ fn agent_loop_recovers_from_truncated_tool_call() {
         cmd_tx,
         session_id: 1,
         db,
-        tool_registry: ToolRegistry::new().build(),
+        tool_registry: ToolRegistry::new().build().into_shared(),
         daemon_tx,
         max_turns: 0,
         lag_limits: crate::broadcast::LagLimits::default(),
@@ -1895,7 +1895,7 @@ fn agent_loop_gives_up_after_truncation_recovery_budget() {
         cmd_tx,
         session_id: 1,
         db,
-        tool_registry: ToolRegistry::new().build(),
+        tool_registry: ToolRegistry::new().build().into_shared(),
         daemon_tx,
         max_turns: 0,
         lag_limits: crate::broadcast::LagLimits::default(),
@@ -1948,7 +1948,7 @@ fn agent_loop_drops_response_id_chain_on_truncation_recovery() {
         cmd_tx,
         session_id: 1,
         db,
-        tool_registry: ToolRegistry::new().build(),
+        tool_registry: ToolRegistry::new().build().into_shared(),
         daemon_tx,
         max_turns: 0,
         lag_limits: crate::broadcast::LagLimits::default(),
@@ -2296,7 +2296,7 @@ fn run_exec_tool(
 
     let mut registry = ToolRegistry::new();
     registry.register(tool);
-    let registry = registry.build();
+    let registry = registry.build().into_shared();
 
     let tool_call = ChatToolCall {
         id: "call_test".into(),

@@ -113,6 +113,40 @@ fn spawn_power_event_forwarder(
         });
 }
 
+/// Dedicated forwarder thread for MCP list-changed events: blocks on the
+/// servers' shared list-change receiver (a dedicated thread blocking in
+/// `recv()` is fine — the house rule only forbids blocking the command loop)
+/// and translates each into a [`DaemonCommand::McpListChanged`]. The command
+/// loop then rebuilds the tool catalogue (single writer of the shared
+/// `ArcSwap`); this thread is transport only. Exits when every server's
+/// subscription sender drops (daemon shutdown) or the command channel closes.
+#[cfg(feature = "mcp")]
+fn spawn_mcp_list_change_forwarder(
+    state: &mut DaemonState,
+    daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
+) {
+    let Some(list_rx) = state.mcp_manager.take_list_change_rx() else {
+        return;
+    };
+    let spawned = thread::Builder::new()
+        .name("mcp-list-change".into())
+        .spawn(move || {
+            for change in &list_rx {
+                debug!(server = %change.slug, ?change.kind, "MCP list change received; forwarding to command loop");
+                if daemon_tx
+                    .send(DaemonCommand::McpListChanged { slug: change.slug })
+                    .is_err()
+                {
+                    info!("daemon command loop gone; stopping MCP list-change forwarder");
+                    break;
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        warn!(error = %e, "failed to spawn MCP list-change forwarder");
+    }
+}
+
 /// Assemble the transport-independent daemon core: command channel, ACL
 /// install + watcher, config watchers, catalog-maintenance thread, shutdown
 /// flag, connection counter, and the command-loop thread.
@@ -127,6 +161,16 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: CoreOptions) -> Daemon
     let mut state = state;
     let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
     state.daemon_tx = daemon_tx.clone();
+
+    // Pump the MCP servers' list-changed events into the command loop. The
+    // servers' `subscriptions/listen` streams feed one shared channel (see
+    // `McpManager::take_list_change_rx`); a dedicated forwarder thread
+    // translates each into a `DaemonCommand::McpListChanged`, keeping every
+    // external event source on the same forwarder-into-command-channel shape
+    // the config/ACL watchers and the power monitor use. Compiled out entirely
+    // without the `mcp` feature (no manager, no channel).
+    #[cfg(feature = "mcp")]
+    spawn_mcp_list_change_forwarder(&mut state, daemon_tx.clone());
 
     // Install the shared ACL into the state BEFORE the command loop takes
     // ownership: the command loop becomes its single WRITER (AclReload),

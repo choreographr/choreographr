@@ -21,6 +21,10 @@
 // - `crash-on-call` — the process exits the moment `tools/call` arrives.
 // - `garbage` — emits a non-JSON line before each real response.
 // - `oversized` — emits one line far larger than any sane frame.
+// - `modern-list-changed` — a 2026-07-28 server that declares
+//   `tools.listChanged` and, on `subscriptions/listen`, acknowledges the
+//   subscription and immediately emits a `notifications/tools/list_changed`
+//   (the subscription-to-daemon forwarding test).
 //
 // Tools:
 // - `slow` answers from a background thread so the read loop can observe a
@@ -143,6 +147,33 @@ fn main() {
                 );
             }
             "tools/call" => handle_call(&mut out, &id, &req, &scenario),
+            // `subscriptions/listen`: acknowledge, then emit one tools
+            // list-changed notification on the same subscription id. No result
+            // is sent — the request is long-lived, so the client reads the
+            // stream until it cancels. Only the list-changed scenario opens a
+            // stream; any other server answers method-not-found.
+            "subscriptions/listen" if scenario.contains("list-changed") => {
+                let sub_meta = serde_json::json!({
+                    "io.modelcontextprotocol/subscriptionId": id
+                });
+                let acknowledged = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/subscriptions/acknowledged",
+                    "params": {
+                        "_meta": sub_meta,
+                        "notifications": {"toolsListChanged": true}
+                    }
+                });
+                let _ = writeln!(out, "{acknowledged}");
+                let changed = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/tools/list_changed",
+                    "params": {
+                        "_meta": {"io.modelcontextprotocol/subscriptionId": id}
+                    }
+                });
+                let _ = writeln!(out, "{changed}");
+            }
             "resources/list" => respond_result(
                 &mut out,
                 &id,
@@ -180,12 +211,18 @@ fn main() {
 
 /// Server capabilities advertised for a scenario: the `resources` scenarios
 /// additionally declare the `resources` capability so the client registers its
-/// resource wrapper tools.
+/// resource wrapper tools, and the `modern-list-changed` scenario declares
+/// `tools.listChanged` so the client opens a `subscriptions/listen` stream.
 fn capabilities(scenario: &str) -> serde_json::Value {
-    if scenario.contains("resources") {
-        serde_json::json!({"tools": {}, "resources": {}})
+    let tools = if scenario.contains("list-changed") {
+        serde_json::json!({"listChanged": true})
     } else {
-        serde_json::json!({"tools": {}})
+        serde_json::json!({})
+    };
+    if scenario.contains("resources") {
+        serde_json::json!({"tools": tools, "resources": {}})
+    } else {
+        serde_json::json!({"tools": tools})
     }
 }
 

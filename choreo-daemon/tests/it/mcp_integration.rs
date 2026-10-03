@@ -244,6 +244,51 @@ fn mcp_resource_tools_are_registered_and_callable() {
 
 #[test]
 #[ignore = "integration"]
+fn mcp_list_change_is_forwarded_and_reregisters() {
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(120));
+        eprintln!("mcp_integration: test exceeded 120s; aborting");
+        std::process::abort();
+    });
+
+    // The fixture declares `tools.listChanged` and emits one tools list-changed
+    // notification right after acknowledging the subscription, so the manager's
+    // shared channel receives exactly one event.
+    let (config_dir, slug) =
+        write_single_server_config("lc", "modern-list-changed").expect("write config");
+    choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
+
+    let mut registry = choreo_daemon::tools::ToolRegistry::new();
+    let mut manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
+    let rx = manager
+        .take_list_change_rx()
+        .expect("a list-change channel is created for connected servers");
+
+    let change = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("expected a forwarded list change");
+    assert_eq!(change.slug, slug);
+    assert_eq!(change.kind, choreo_mcp::McpListKind::Tools);
+
+    // Rebuild into a fresh registry the way the daemon's list-change handler
+    // does, and confirm the server's catalogue is re-registered.
+    let mut rebuilt = choreo_daemon::tools::ToolRegistry::new();
+    manager.register_all(&mut rebuilt);
+    assert!(
+        rebuilt
+            .group_names()
+            .iter()
+            .any(|g| g == &format!("mcp/{slug}")),
+        "the refreshed registry must re-register the server's group: {:?}",
+        rebuilt.group_names()
+    );
+
+    drop(manager);
+    choreo_daemon::mcp::config::set_test_config_root(None);
+}
+
+#[test]
+#[ignore = "integration"]
 fn mcp_progress_streams_through_the_wrapper() {
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_secs(120));

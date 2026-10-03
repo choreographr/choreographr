@@ -1,11 +1,11 @@
 # Plan: MCP modernization — stateless protocol (2026-07-28) and a first-class client
 
-**Status:** **in progress — P0–P2 and most of P4 implemented; M1 (ship without
+**Status:** **in progress — P0–P2 and P4 implemented; M1 (ship without
 OAuth, `mcp` on by default) is the active goal.** Commits: `ab3dc2e` "fix: harden
 the MCP client and drop the npx test dependency", `976edf6` "feat: rebuild the
 MCP client on the official rmcp SDK", `9f6209a` "feat: add the MCP Streamable HTTP
 transport", `274f736` "feat: stream progress, drive MRTR, and expose resources".
-The one remaining P4 item is `subscriptions/listen` + the registry hot-swap (§7);
+P4's last item, `subscriptions/listen` + the registry hot-swap (§7), is now done;
 then P5 → P6. **OAuth (P3) is deferred to post-ship.** M1 flips `mcp` into the
 default feature set (D9). See §1.2 and §7.
 **Lifecycle:** this file is **deleted once the plan is fully implemented**. Nothing
@@ -188,10 +188,12 @@ the config keys `cwd`/`exposure`/`disabledTools` are not implemented; `auto_load
 was removed (reported as an unknown key) rather than mapped to a deferred
 exposure; `Retry-After` is not honored by the HTTP retry policy; OAuth is not
 implemented — deferred to post-ship (P3), with static tokens via config
-`headers` as the M1 credential path. The one P4 item not taken is
-`subscriptions/listen` + the registry hot-swap (§7): the registry refresh needs
-the daemon's shared `Arc<ToolRegistry>` rebuilt and swapped, which the P4 run
-deliberately left out rather than half-wire. M1 also flips the `mcp` feature
+`headers` as the M1 credential path. P4 is now complete: its last item,
+`subscriptions/listen` + the registry hot-swap (§7), landed — the client opens a
+subscription on a stateless server that declares list-changed and forwards each
+event to the daemon, which rebuilds its tool catalogue and swaps it into the
+shared `Arc<ArcSwap<ToolRegistry>>` so live sessions see the refreshed
+`mcp/<slug>` group without a restart. M1 also flips the `mcp` feature
 into the default set (D9).
 
 ### 1.3 The protocol delta
@@ -886,18 +888,24 @@ resources landed in `274f736`. One item remains.
       `structuredContent` → `result_json` — landed P1.
 - [x] Cancellation end-to-end test asserting the *server* observed
       `notifications/cancelled` — landed P4 (the fixture records it).
-- [ ] `subscriptions/listen` + registry refresh — the one remaining item,
-      deliberately not half-wired:
-  - [ ] Client wiring: open a `subscriptions/listen` stream when the server
-        declares list-changed (rmcp's peer listen API) and surface
-        `toolsListChanged` / `resourcesListChanged` events to the daemon.
-  - [ ] Registry hot-swap: rebuild the `ToolRegistry` on the daemon command loop
-        and swap the shared `Arc<ToolRegistry>` so a list change updates the
-        `mcp/<slug>` group in place. Today `DaemonState::tool_registry` is an
-        immutable `Arc` shared into every session, and the core-tool /
-        platform-bridge construction lives in startup (`daemon/open.rs`), so
-        this factors that construction into a rebuildable function first — a
-        daemon-lifecycle change, not a wrapper tweak.
+- [x] `subscriptions/listen` + registry refresh — landed. The client opens
+      a stream when the server declares list-changed and forwards each event to
+      the daemon, which rebuilds and swaps its shared tool catalogue:
+  - [x] Client wiring: the engine opens a `subscriptions/listen` stream
+        (rmcp's `Peer::listen`) when the negotiated era is stateless and the
+        server advertises a list-changed capability, and forwards each
+        `toolsListChanged` / `resourcesListChanged` as an `McpListChange` over
+        a crossbeam sink; a legacy peer, or one without the capability, opens
+        no stream.
+  - [x] Registry hot-swap: `McpManager` exposes the shared list-change
+        receiver; the daemon command-loop assembly spawns a forwarder thread
+        that turns each event into `DaemonCommand::McpListChanged`, and the
+        command loop rebuilds the whole catalogue (`build_tool_registry`,
+        which re-registers every server via `register_all`) and stows it into
+        the shared `Arc<ArcSwap<ToolRegistry>>` — so an already-running
+        session observes the refreshed `mcp/<slug>` group on its next request,
+        no restart and no session respawn. Every session and request worker
+        shares that one `ArcSwap` (single writer: the command loop).
 
 ### P5 — Configuration, UX, observability (M1)
 
@@ -988,8 +996,9 @@ integration tests live in `tests/it/` (one binary per crate, `#[ignore]`).
   The daemon suite re-uses the same source through an `include!` in
   `choreo-daemon/tests/fixtures/mcp_fixture_server.rs`. No Node/npx, no network.
   P4 added scenarios for progress, MRTR, resources, and a fixture-recorded
-  `notifications/cancelled`. Still to add: `subscriptions/listen` (and the
-  registry refresh), paged `tools/list`, and bad-schema variants (P4/P6).
+  `notifications/cancelled`, and a `modern-list-changed` server that opens a
+  `subscriptions/listen` stream. Still to add: paged `tools/list` and bad-schema
+  variants (P6).
 - **HTTP fixture.** `choreo-mcp/tests/it/mcp_http_integration.rs` (P2) drives a
   local `TcpListener` fixture: JSON and SSE responses, generated-header
   validation (`Mcp-Method`/`Mcp-Name`/`MCP-Protocol-Version` and custom
@@ -1118,7 +1127,7 @@ this plan — verified at `976edf6`.
 | Risk | Mitigation |
 |---|---|
 | Dependency weight is now paid by default builds (tokio/reqwest/rustls via rmcp, D9) | `rmcp` stays `default-features = false` with only the needed transports; the named feature remains the opt-out (`--no-default-features`; iOS keeps `default-features = false`); verify both `--no-default-features` and `--all-features` builds, and the static-musl release with defaults (P6). P1 scoped rmcp to `client` + `transport-child-process`; P2 added `transport-streamable-http-client-reqwest` and `reqwest` 0.13 (shared with rmcp and alloy — D11). |
-| Tool-list refresh needs the shared `Arc<ToolRegistry>` replaced | `DaemonState::tool_registry` is immutable and shared into every session; rebuild on the command loop with the core-tool/platform-bridge construction factored out of startup, swap once atomically, and let in-flight holders keep the old `Arc`. Sized as a daemon-lifecycle change — the remaining P4 item. |
+| Tool-list refresh needs the shared `Arc<ToolRegistry>` replaced | `DaemonState::tool_registry` is a process-wide `Arc<ArcSwap<ToolRegistry>>` shared into every session and request worker; the daemon command loop is its single writer, rebuilds it (`build_tool_registry`: core tools + platform bridge + `McpManager::register_all`) on an `McpListChanged` event, and stores it once atomically. Readers load lock-free, so in-flight holders keep the old `Arc` and every live session observes the refreshed catalogue on its next request — no restart. (The same single-writer `ArcSwap` exception as the provider catalog.) |
 | rmcp's stdio transport buffers unbounded lines (`AsyncRwTransport` has no cap) | Reinstate a capped reader in P6 (custom transport over a bounded `AsyncRead` adapter, or an upstream rmcp hook); the `oversized` integration test currently passes on fixture exit, not a client-side bound. (The HTTP path *is* bounded: SSE events are capped at 16 MiB.) |
 | Two `reqwest` majors in the lockfile (0.12.28 via `blitz-net`/`dioxus-native` → `choreo-gui`; 0.13.5 shared by `alloy` + `rmcp` + `choreo-mcp`) | The duplicate predates MCP and belongs to the GUI renderer; the MCP path shares one 0.13 build (D11). `deny.toml` keeps `multiple-versions = "warn"`. |
 | rmcp API churn (3.x is moving fast) | Pin `3.5`, upgrade deliberately; the blocking facade isolates the daemon from rmcp types (rmcp types do not cross the crate boundary). |
@@ -1180,8 +1189,8 @@ P0–P2 are done; the unchecked M1 items are what remains.
       (P6).)*
 - [x] Resources readable via wrapper tools (`list_resources`/`read_resource`,
       P4).
-- [ ] Tool and resource list changes propagate without a daemon restart
-      (`subscriptions/listen` + registry hot-swap — the one remaining P4 item).
+- [x] Tool and resource list changes propagate without a daemon restart
+      (`subscriptions/listen` + registry hot-swap — P4).
 - [ ] Bounds enforced and tested: schema/text caps (done), the stdio frame cap
       reinstated, and the per-server concurrency cap (P6).
 - [ ] Tool names sanitized and collision-proofed (P5).

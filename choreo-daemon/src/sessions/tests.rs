@@ -69,7 +69,7 @@ fn resolve_provider_rebuilds_lazily_after_client_drop() {
 
     let dir = tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("t.redb")).unwrap());
-    let tool_registry = ToolRegistry::new().build();
+    let tool_registry = ToolRegistry::new().build().into_shared();
     let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
     let (cmd_tx, _) = crossbeam_channel::unbounded();
     let ctx = RequestContext {
@@ -424,7 +424,7 @@ fn set_provider_slug_command_updates_and_clears_recorded_slug() {
         cmd_tx,
         session_id: 9,
         db,
-        tool_registry: ToolRegistry::new().build(),
+        tool_registry: ToolRegistry::new().build().into_shared(),
         daemon_tx,
         max_turns: 0,
         lag_limits: LagLimits::default(),
@@ -463,7 +463,7 @@ fn set_account_switches_slug_and_drops_stale_client_when_locked() {
         cmd_tx,
         session_id: 3,
         db,
-        tool_registry: ToolRegistry::new().build(),
+        tool_registry: ToolRegistry::new().build().into_shared(),
         daemon_tx,
         max_turns: 0,
         lag_limits: LagLimits::default(),
@@ -526,7 +526,7 @@ fn set_account_clears_slug_and_client_when_new_account_unknown() {
         cmd_tx,
         session_id: 4,
         db,
-        tool_registry: ToolRegistry::new().build(),
+        tool_registry: ToolRegistry::new().build().into_shared(),
         daemon_tx,
         max_turns: 0,
         lag_limits: LagLimits::default(),
@@ -596,7 +596,7 @@ fn session_record_carries_last_response_id_from_config() {
 fn broadcast_setup() -> (SessionState, RequestContext) {
     let dir = tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
-    let tool_registry = ToolRegistry::new().build();
+    let tool_registry = ToolRegistry::new().build().into_shared();
     let (daemon_tx, _) = crossbeam_channel::unbounded();
     let (cmd_tx, _) = crossbeam_channel::unbounded();
     let ctx = RequestContext {
@@ -1420,7 +1420,7 @@ fn sync_accumulated_usage_updates_config_and_broadcasts() {
     // receiver, but this test asserts the `UpdateMetadata` refresh lands.
     let dir = tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
-    let tool_registry = ToolRegistry::new().build();
+    let tool_registry = ToolRegistry::new().build().into_shared();
     let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
     let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
     let ctx = RequestContext {
@@ -1561,7 +1561,7 @@ fn sync_accumulated_usage_never_regresses_config() {
     // from an overlapping worker: a per-field max, never a blind assign.
     let dir = tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
-    let tool_registry = ToolRegistry::new().build();
+    let tool_registry = ToolRegistry::new().build().into_shared();
     let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded();
     let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
     let ctx = RequestContext {

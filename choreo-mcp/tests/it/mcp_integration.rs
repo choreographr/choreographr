@@ -11,7 +11,9 @@
 //! runs only unit tests; `cargo test-integration` runs these).
 
 use crate::common::watchdog;
-use choreo_mcp::{McpError, McpProtocolMode, McpServer, McpServerConfig, McpTransport};
+use choreo_mcp::{
+    McpError, McpListKind, McpProtocolMode, McpServer, McpServerConfig, McpTransport,
+};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -300,6 +302,54 @@ fn resources_are_listed_and_read() {
             |c| matches!(c, choreo_mcp::McpContent::Resource { text: Some(text), .. } if text.contains("hello from a resource"))
         ),
         "got: {contents:?}"
+    );
+}
+
+#[test]
+#[ignore = "integration: spawns the fixture subprocess per workspace test discipline"]
+fn list_changed_subscription_is_forwarded() {
+    watchdog();
+    // The modern-list-changed fixture declares `tools.listChanged` and emits
+    // one `notifications/tools/list_changed` right after acknowledging a
+    // `subscriptions/listen` stream, so a receiver proves the client opened the
+    // stream and relayed the event.
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let server = McpServer::connect_with_list_changes(
+        &fixture_config(Some("modern-list-changed"), McpProtocolMode::Modern),
+        Some(tx),
+    )
+    .expect("connect fixture");
+
+    let change = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("expected a forwarded list change");
+    assert_eq!(change.slug, "fixture");
+    assert_eq!(change.kind, McpListKind::Tools);
+
+    // A list change must not disturb the connection: the server still lists and
+    // calls tools afterwards.
+    let tools = server.handle().list_tools().expect("list tools");
+    assert!(tools.iter().any(|t| t.name == "echo"));
+}
+
+#[test]
+#[ignore = "integration: spawns the fixture subprocess per workspace test discipline"]
+fn no_subscription_without_list_changed_capability() {
+    watchdog();
+    // A modern server that does NOT declare a list-changed capability must not
+    // have a `subscriptions/listen` stream opened against it (the server here
+    // would answer method-not-found, so an opened stream would surface as a
+    // failed subscription rather than a silent channel). Nothing arrives within
+    // a short bound, which is the observable contract.
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let _server = McpServer::connect_with_list_changes(
+        &fixture_config(Some("modern"), McpProtocolMode::Modern),
+        Some(tx),
+    )
+    .expect("connect fixture");
+    assert!(
+        rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        "a server without a list-changed capability must not open a subscription"
     );
 }
 
