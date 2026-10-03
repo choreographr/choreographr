@@ -24,7 +24,7 @@ use crate::config::McpServerConfig;
 use crate::error::McpError;
 use crate::protocol::{CallToolResult, McpContent, McpResource, McpTool};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -81,9 +81,10 @@ impl McpServer {
         };
 
         let factory = crate::engine::factory(config.clone());
+        let max_concurrent_calls = config.max_concurrent_calls();
         let join = std::thread::Builder::new()
             .name(format!("mcp-{}", config.slug))
-            .spawn(move || run_dispatcher(engine, factory, &cmd_rx))
+            .spawn(move || run_dispatcher(engine, factory, &cmd_rx, max_concurrent_calls))
             .map_err(|e| McpError::SpawnFailed(format!("failed to start dispatcher: {e}")))?;
 
         tracing::info!(server = %config.slug, %name, %version, "MCP server connected");
@@ -365,6 +366,13 @@ pub(crate) enum McpCommand {
     },
     /// Cancel every in-flight call started by the session.
     CancelSession { session_id: u64 },
+    /// Report the dispatcher's in-flight/queued call counts.
+    ///
+    /// Test-only observability: the cap test needs to assert that an excess call
+    /// is queued rather than spawned, deterministically (no sleep-poll). The
+    /// production paths never construct it.
+    #[cfg(test)]
+    InflightStats(Sender<DispatcherStats>),
     /// Close the connection and exit the dispatcher.
     Shutdown,
 }
@@ -373,6 +381,88 @@ pub(crate) enum McpCommand {
 struct Done {
     call_id: u64,
     transport_failed: bool,
+}
+
+/// A tool invocation waiting for a free concurrency slot.
+///
+/// The dispatcher admits a call straight away when a slot is free, otherwise it
+/// parks the request here until an in-flight call completes. The queued entry
+/// carries everything the eventual spawn needs, plus its cancellation token so a
+/// session cancel can reach a call that has not started yet.
+struct QueuedCall {
+    call_id: u64,
+    session_id: u64,
+    request: CallRequest,
+    reply: Sender<Result<CallToolResult, McpError>>,
+    chunk_tx: Option<crossbeam_channel::Sender<Vec<u8>>>,
+    cancel: CancelToken,
+}
+
+/// Per-server accounting for the concurrent-call cap.
+///
+/// Kept as pure arithmetic (no channels, no threads) so the admission decision —
+/// admit up to `cap`, queue the rest, promote one per completion — is
+/// unit-testable without spawning anything. The dispatcher owns the single
+/// instance and the [`QueuedCall`] deque that mirrors `queued`.
+struct CallGate {
+    cap: usize,
+    active: usize,
+    queued: usize,
+}
+
+impl CallGate {
+    /// Build a gate with `cap` slots, clamped to at least one so a misconfigured
+    /// zero can never wedge the dispatcher.
+    fn new(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            active: 0,
+            queued: 0,
+        }
+    }
+
+    /// Admit a call: `true` when a slot is free (and is now taken), `false` when
+    /// the call must wait in the queue.
+    fn admit(&mut self) -> bool {
+        if self.active < self.cap {
+            self.active += 1;
+            true
+        } else {
+            self.queued += 1;
+            false
+        }
+    }
+
+    /// Whether a queued call can be promoted into a free slot.
+    fn has_capacity(&self) -> bool {
+        self.active < self.cap
+    }
+
+    /// Move one queued call into an active slot. Only call when
+    /// [`has_capacity`](Self::has_capacity) is true and the deque is non-empty.
+    fn promote(&mut self) {
+        debug_assert!(self.has_capacity() && self.queued > 0);
+        self.queued = self.queued.saturating_sub(1);
+        self.active += 1;
+    }
+
+    /// Record that an active call finished, freeing a slot.
+    fn complete(&mut self) {
+        self.active = self.active.saturating_sub(1);
+    }
+
+    /// Record that a queued call was abandoned without ever running.
+    fn abandon(&mut self) {
+        self.queued = self.queued.saturating_sub(1);
+    }
+}
+
+/// Test-only snapshot of the dispatcher's call accounting.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct DispatcherStats {
+    active: usize,
+    queued: usize,
 }
 
 /// Restart policy for a dispatcher whose engine's transport dies.
@@ -443,10 +533,16 @@ fn is_transport_error(error: &McpError) -> bool {
 }
 
 /// The dispatcher thread body: serve commands until shutdown or disconnect.
+///
+/// `max_concurrent_calls` bounds how many tool calls to this server run at once;
+/// calls beyond the cap wait in a queue and are started as slots free. Listings
+/// and resource reads run synchronously on this thread and so are naturally
+/// serialized and not subject to the cap.
 fn run_dispatcher(
     initial: Arc<dyn McpEngine>,
     factory: EngineFactory,
     cmd_rx: &Receiver<McpCommand>,
+    max_concurrent_calls: usize,
 ) {
     let rt = match crate::runtime::handle() {
         Ok(handle) => handle,
@@ -459,97 +555,267 @@ fn run_dispatcher(
     let mut engine = initial;
     let mut policy = RestartPolicy::default();
     let mut inflight: HashMap<u64, (CancelToken, u64)> = HashMap::new();
+    let mut queued: VecDeque<QueuedCall> = VecDeque::new();
+    let mut gate = CallGate::new(max_concurrent_calls);
     let mut next_call_id: u64 = 1;
 
     // Completion notices from spawned call tasks; drained between commands.
     let (done_tx, done_rx) = crossbeam_channel::unbounded::<Done>();
 
     loop {
+        // Drain completion notices before waiting: a finished call frees a slot
+        // and may have killed the transport (triggering a reconnect).
         while let Ok(done) = done_rx.try_recv() {
-            inflight.remove(&done.call_id);
-            if done.transport_failed {
-                policy.on_transport_failure(&factory, &mut engine);
-            }
+            apply_done(
+                &done,
+                &mut inflight,
+                &mut gate,
+                &mut policy,
+                &factory,
+                &mut engine,
+            );
         }
+        // Start queued calls into any slots the completions freed.
+        pump_queued(
+            &mut queued,
+            &mut gate,
+            &mut inflight,
+            &rt,
+            &engine,
+            &done_tx,
+        );
 
-        let Ok(cmd) = cmd_rx.recv() else {
-            tracing::debug!("MCP command channel closed; dispatcher exiting");
-            break;
-        };
-
-        match cmd {
-            McpCommand::ListTools(reply) => {
-                let mut result = rt.block_on(engine.list_tools());
-                if let Err(e) = &result
-                    && is_transport_error(e)
-                {
-                    policy.on_transport_failure(&factory, &mut engine);
-                    result = rt.block_on(engine.list_tools());
-                }
-                let _ = reply.send(result);
-            }
-            McpCommand::Call {
-                session_id,
-                request,
-                reply,
-                chunk_tx,
-            } => {
-                let call_id = next_call_id;
-                next_call_id = next_call_id.wrapping_add(1);
-                let cancel = CancelToken::new();
-                inflight.insert(call_id, (cancel.clone(), session_id));
-                let engine = Arc::clone(&engine);
-                let done_tx = done_tx.clone();
-                rt.spawn(async move {
-                    let result = engine
-                        .call_tool(EngineCall {
-                            request,
-                            cancel,
-                            chunk_tx,
-                        })
-                        .await;
-                    let transport_failed = is_transport_error_ref(&result);
-                    let _ = done_tx.send(Done {
-                        call_id,
-                        transport_failed,
-                    });
-                    let _ = reply.send(result);
-                });
-            }
-            McpCommand::ListResources(reply) => {
-                let mut result = rt.block_on(engine.list_resources());
-                if let Err(e) = &result
-                    && is_transport_error(e)
-                {
-                    policy.on_transport_failure(&factory, &mut engine);
-                    result = rt.block_on(engine.list_resources());
-                }
-                let _ = reply.send(result);
-            }
-            McpCommand::ReadResource { uri, reply } => {
-                let mut result = rt.block_on(engine.read_resource(uri.clone()));
-                if let Err(e) = &result
-                    && is_transport_error(e)
-                {
-                    policy.on_transport_failure(&factory, &mut engine);
-                    result = rt.block_on(engine.read_resource(uri));
-                }
-                let _ = reply.send(result);
-            }
-            McpCommand::CancelSession { session_id } => {
-                for (token, call_session) in inflight.values() {
-                    if *call_session == session_id {
-                        token.cancel();
+        // Wait for the next command or completion. Both are event sources, so no
+        // polling: a finished call wakes the loop to free its slot even when no
+        // command has arrived.
+        crossbeam_channel::select! {
+            recv(cmd_rx) -> msg => {
+                if let Ok(cmd) = msg {
+                    let keep_running = handle_command(
+                        cmd,
+                        &rt,
+                        &mut engine,
+                        &factory,
+                        &mut policy,
+                        &mut inflight,
+                        &mut queued,
+                        &mut gate,
+                        &done_tx,
+                        &mut next_call_id,
+                    );
+                    if !keep_running {
+                        break;
                     }
+                } else {
+                    tracing::debug!("MCP command channel closed; dispatcher exiting");
+                    break;
                 }
             }
-            McpCommand::Shutdown => {
-                rt.block_on(engine.shutdown());
-                break;
+            recv(done_rx) -> msg => {
+                if let Ok(done) = msg {
+                    apply_done(
+                        &done,
+                        &mut inflight,
+                        &mut gate,
+                        &mut policy,
+                        &factory,
+                        &mut engine,
+                    );
+                }
             }
         }
     }
     tracing::debug!("MCP dispatcher thread exiting");
+}
+
+/// Apply one completion notice: drop the call from the in-flight registry, free
+/// its slot, and rebuild the engine if the call died on the transport.
+fn apply_done(
+    done: &Done,
+    inflight: &mut HashMap<u64, (CancelToken, u64)>,
+    gate: &mut CallGate,
+    policy: &mut RestartPolicy,
+    factory: &EngineFactory,
+    engine: &mut Arc<dyn McpEngine>,
+) {
+    inflight.remove(&done.call_id);
+    gate.complete();
+    if done.transport_failed {
+        policy.on_transport_failure(factory, engine);
+    }
+}
+
+/// Start queued calls while the gate has free slots.
+///
+/// A promoted call is registered in `inflight` exactly like an immediately
+/// admitted one, so a later session cancel can still reach it.
+fn pump_queued(
+    queued: &mut VecDeque<QueuedCall>,
+    gate: &mut CallGate,
+    inflight: &mut HashMap<u64, (CancelToken, u64)>,
+    rt: &tokio::runtime::Handle,
+    engine: &Arc<dyn McpEngine>,
+    done_tx: &Sender<Done>,
+) {
+    while gate.has_capacity() {
+        let Some(call) = queued.pop_front() else {
+            break;
+        };
+        gate.promote();
+        inflight.insert(call.call_id, (call.cancel.clone(), call.session_id));
+        spawn_call(rt, engine, done_tx, call);
+    }
+}
+
+/// Spawn one call onto the sidecar runtime.
+///
+/// The task sends a [`Done`] notice (so the dispatcher frees the slot and can
+/// reconnect a dead transport) followed by the reply; both are best-effort — a
+/// dropped receiver means the caller already went away.
+fn spawn_call(
+    rt: &tokio::runtime::Handle,
+    engine: &Arc<dyn McpEngine>,
+    done_tx: &Sender<Done>,
+    call: QueuedCall,
+) {
+    let QueuedCall {
+        call_id,
+        request,
+        reply,
+        chunk_tx,
+        cancel,
+        ..
+    } = call;
+    let engine = Arc::clone(engine);
+    let done_tx = done_tx.clone();
+    rt.spawn(async move {
+        let result = engine
+            .call_tool(EngineCall {
+                request,
+                cancel,
+                chunk_tx,
+            })
+            .await;
+        let transport_failed = is_transport_error_ref(&result);
+        let _ = done_tx.send(Done {
+            call_id,
+            transport_failed,
+        });
+        let _ = reply.send(result);
+    });
+}
+
+/// Dispatch one command, returning `false` when the dispatcher should stop
+/// (i.e. the command was a shutdown). Split out of [`run_dispatcher`] so the
+/// (long) match does not have to be nested inside the `select!` arm.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the dispatcher's mutable state is all owned on the thread; bundling it into a struct would add indirection without clarifying anything"
+)]
+fn handle_command(
+    cmd: McpCommand,
+    rt: &tokio::runtime::Handle,
+    engine: &mut Arc<dyn McpEngine>,
+    factory: &EngineFactory,
+    policy: &mut RestartPolicy,
+    inflight: &mut HashMap<u64, (CancelToken, u64)>,
+    queued: &mut VecDeque<QueuedCall>,
+    gate: &mut CallGate,
+    done_tx: &Sender<Done>,
+    next_call_id: &mut u64,
+) -> bool {
+    match cmd {
+        McpCommand::ListTools(reply) => {
+            let mut result = rt.block_on(engine.list_tools());
+            if let Err(e) = &result
+                && is_transport_error(e)
+            {
+                policy.on_transport_failure(factory, engine);
+                result = rt.block_on(engine.list_tools());
+            }
+            let _ = reply.send(result);
+        }
+        McpCommand::Call {
+            session_id,
+            request,
+            reply,
+            chunk_tx,
+        } => {
+            let call_id = *next_call_id;
+            *next_call_id = next_call_id.wrapping_add(1);
+            let cancel = CancelToken::new();
+            let call = QueuedCall {
+                call_id,
+                session_id,
+                request,
+                reply,
+                chunk_tx,
+                cancel: cancel.clone(),
+            };
+            if gate.admit() {
+                inflight.insert(call_id, (cancel, session_id));
+                spawn_call(rt, engine, done_tx, call);
+            } else {
+                queued.push_back(call);
+            }
+        }
+        McpCommand::ListResources(reply) => {
+            let mut result = rt.block_on(engine.list_resources());
+            if let Err(e) = &result
+                && is_transport_error(e)
+            {
+                policy.on_transport_failure(factory, engine);
+                result = rt.block_on(engine.list_resources());
+            }
+            let _ = reply.send(result);
+        }
+        McpCommand::ReadResource { uri, reply } => {
+            let mut result = rt.block_on(engine.read_resource(uri.clone()));
+            if let Err(e) = &result
+                && is_transport_error(e)
+            {
+                policy.on_transport_failure(factory, engine);
+                result = rt.block_on(engine.read_resource(uri));
+            }
+            let _ = reply.send(result);
+        }
+        McpCommand::CancelSession { session_id } => {
+            for (token, call_session) in inflight.values() {
+                if *call_session == session_id {
+                    token.cancel();
+                }
+            }
+            // Cancel queued calls too, replying immediately and freeing their
+            // slots — a cancelled call must not linger behind the cap.
+            let mut index = 0;
+            while index < queued.len() {
+                if queued[index].session_id == session_id {
+                    if let Some(call) = queued.remove(index) {
+                        gate.abandon();
+                        call.cancel.cancel();
+                        let _ = call.reply.send(Err(McpError::Cancelled));
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        #[cfg(test)]
+        McpCommand::InflightStats(reply) => {
+            let _ = reply.send(DispatcherStats {
+                active: gate.active,
+                queued: gate.queued,
+            });
+        }
+        McpCommand::Shutdown => {
+            rt.block_on(engine.shutdown());
+            // Leaving returns `false`; `run_dispatcher` then drops `queued`,
+            // whose reply senders close, so a waiting caller observes
+            // `NotConnected` rather than blocking.
+            return false;
+        }
+    }
+    true
 }
 
 /// `is_transport_error` over a `Result` reference (used by spawned call tasks).
@@ -732,8 +998,17 @@ mod tests {
         }
     }
 
-    /// Spawn a dispatcher over `engine` with a factory that rebuilds it.
+    /// Spawn a dispatcher over `engine` with a factory that rebuilds it, using
+    /// the default concurrency cap.
     fn spawn(engine: Arc<MockEngine>) -> (McpServerHandle, std::thread::JoinHandle<()>) {
+        spawn_with_cap(engine, crate::DEFAULT_MAX_CONCURRENT_CALLS)
+    }
+
+    /// Spawn a dispatcher over `engine` with an explicit concurrency cap.
+    fn spawn_with_cap(
+        engine: Arc<MockEngine>,
+        cap: usize,
+    ) -> (McpServerHandle, std::thread::JoinHandle<()>) {
         crate::runtime::init().expect("runtime init");
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let handle = McpServerHandle {
@@ -747,9 +1022,18 @@ mod tests {
         let factory: EngineFactory =
             Box::new(move || Ok(Arc::clone(&factory_engine) as Arc<dyn McpEngine>));
         let join = std::thread::spawn(move || {
-            run_dispatcher(engine as Arc<dyn McpEngine>, factory, &cmd_rx);
+            run_dispatcher(engine as Arc<dyn McpEngine>, factory, &cmd_rx, cap);
         });
         (handle, join)
+    }
+
+    /// Test-only accessor for the dispatcher's call accounting.
+    impl McpServerHandle {
+        fn stats(&self) -> DispatcherStats {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let _ = self.cmd_tx.send(McpCommand::InflightStats(tx));
+            rx.recv().expect("dispatcher alive for a stats query")
+        }
     }
 
     fn tool(name: &str) -> McpTool {
@@ -863,6 +1147,107 @@ mod tests {
             .call_tool(0, "echo", serde_json::json!({}), None)
             .expect("call");
         assert_eq!(engine.call_count(), 1);
+        let _ = handle.cmd_tx.send(McpCommand::Shutdown);
+        join.join().expect("dispatcher joins");
+    }
+
+    #[test]
+    fn call_gate_admits_up_to_cap_then_queues() {
+        let mut gate = CallGate::new(2);
+        assert!(gate.admit(), "first call takes a slot");
+        assert!(gate.admit(), "second call takes the other slot");
+        assert!(!gate.admit(), "third call is queued");
+        assert!(!gate.admit(), "fourth call is queued too");
+        assert_eq!((gate.active, gate.queued), (2, 2));
+
+        // A completion frees a slot; exactly one queued call can then be
+        // promoted, and its queue depth drops by one.
+        gate.complete();
+        assert!(gate.has_capacity());
+        gate.promote();
+        assert_eq!((gate.active, gate.queued), (2, 1));
+        assert!(!gate.has_capacity());
+
+        // Abandoning a queued call (a session cancel) drops it from the queue.
+        gate.abandon();
+        assert_eq!((gate.active, gate.queued), (2, 0));
+    }
+
+    #[test]
+    fn call_gate_clamps_zero_cap_to_one() {
+        let mut gate = CallGate::new(0);
+        assert!(gate.admit());
+        assert!(!gate.admit());
+        assert_eq!((gate.active, gate.queued), (1, 1));
+    }
+
+    #[test]
+    fn concurrency_cap_queues_excess_calls() {
+        // A blocking mock: a call that is admitted parks until cancelled, so the
+        // slot it holds stays busy. With a cap of one, the second call must wait
+        // in the queue rather than reach the engine.
+        let (started_tx, started_rx) = crossbeam_channel::unbounded();
+        let engine = Arc::new(MockEngine::blocking(vec![], ok_result(), started_tx));
+        let (handle, join) = spawn_with_cap(engine, 1);
+
+        // First call: admitted immediately and reaches the engine.
+        let (tx1, rx1) = crossbeam_channel::bounded(1);
+        handle
+            .cmd_tx
+            .send(McpCommand::Call {
+                session_id: 1,
+                request: CallRequest {
+                    name: "slow".into(),
+                    arguments: serde_json::json!({}),
+                    timeout: Duration::from_secs(5),
+                },
+                reply: tx1,
+                chunk_tx: None,
+            })
+            .expect("send call 1");
+        started_rx.recv().expect("call 1 reached the engine");
+
+        // Second call: the only slot is taken, so it queues. Sending both
+        // commands and the stats query from this thread pins their order, so the
+        // counts are deterministic (no sleep-poll).
+        let (tx2, rx2) = crossbeam_channel::bounded(1);
+        handle
+            .cmd_tx
+            .send(McpCommand::Call {
+                session_id: 2,
+                request: CallRequest {
+                    name: "slow".into(),
+                    arguments: serde_json::json!({}),
+                    timeout: Duration::from_secs(5),
+                },
+                reply: tx2,
+                chunk_tx: None,
+            })
+            .expect("send call 2");
+        let stats = handle.stats();
+        assert_eq!(stats.active, 1, "one call in flight");
+        assert_eq!(stats.queued, 1, "the second call waits in the queue");
+
+        // Cancelling session 1 frees the slot; the queued call is promoted and
+        // reaches the engine.
+        handle.cancel_session(1);
+        assert!(
+            matches!(rx1.recv().expect("call 1 reply"), Err(McpError::Cancelled)),
+            "call 1 should be cancelled"
+        );
+        started_rx
+            .recv()
+            .expect("call 2 promoted and reaches the engine after a slot frees");
+        let stats = handle.stats();
+        assert_eq!(stats.active, 1);
+        assert_eq!(stats.queued, 0, "the queue drained once the slot freed");
+
+        handle.cancel_session(2);
+        assert!(
+            matches!(rx2.recv().expect("call 2 reply"), Err(McpError::Cancelled)),
+            "call 2 should be cancelled"
+        );
+
         let _ = handle.cmd_tx.send(McpCommand::Shutdown);
         join.join().expect("dispatcher joins");
     }

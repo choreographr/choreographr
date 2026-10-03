@@ -42,6 +42,11 @@ struct ServerEntry {
     /// `"modern"` (aliased by the explicit era string `"2026-07-28"`).
     #[serde(default)]
     protocol: Option<String>,
+    /// Optional cap on concurrent in-flight tool calls to this server
+    /// (`maxConcurrentCalls`; `max_concurrent_calls` is accepted as an alias).
+    /// When unset, the client's default applies.
+    #[serde(default, rename = "maxConcurrentCalls", alias = "max_concurrent_calls")]
+    max_concurrent_calls: Option<usize>,
     /// Any keys this client does not recognize. Collected so loading can
     /// report them (never fatal) — a typo'd or not-yet-supported key should
     /// surface in the log rather than being silently dropped.
@@ -155,6 +160,7 @@ fn resolve_entry(slug: &str, entry: &ServerEntry) -> Option<McpServerConfig> {
         enabled: entry.enabled,
         timeout: entry.timeout.map(Duration::from_secs),
         protocol: parse_protocol(entry.protocol.as_deref()),
+        max_concurrent_calls: entry.max_concurrent_calls,
     })
 }
 
@@ -331,6 +337,26 @@ mod tests {
         assert!(!entry.enabled);
         assert_eq!(entry.timeout, Some(30));
         assert!(entry.unknown.is_empty());
+    }
+
+    #[test]
+    fn server_entry_deserializes_max_concurrent_calls() {
+        // camelCase is the documented spelling; the snake_case alias is accepted
+        // for convenience.
+        let camel: ServerEntry = serde_json::from_value(serde_json::json!({
+            "command": "python",
+            "maxConcurrentCalls": 2
+        }))
+        .expect("entry with maxConcurrentCalls");
+        assert_eq!(camel.max_concurrent_calls, Some(2));
+        assert!(camel.unknown.is_empty(), "recognized key is not 'unknown'");
+
+        let snake: ServerEntry = serde_json::from_value(serde_json::json!({
+            "command": "python",
+            "max_concurrent_calls": 6
+        }))
+        .expect("entry with max_concurrent_calls alias");
+        assert_eq!(snake.max_concurrent_calls, Some(6));
     }
 
     #[test]

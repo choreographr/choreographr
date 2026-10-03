@@ -31,6 +31,7 @@ fn http_config(url: &str, protocol: McpProtocolMode) -> McpServerConfig {
         enabled: true,
         timeout: Some(Duration::from_secs(10)),
         protocol,
+        max_concurrent_calls: None,
     }
 }
 

@@ -32,6 +32,7 @@ fn fixture_config(scenario: Option<&str>, protocol: McpProtocolMode) -> McpServe
         enabled: true,
         timeout: Some(Duration::from_secs(10)),
         protocol,
+        max_concurrent_calls: None,
     }
 }
 

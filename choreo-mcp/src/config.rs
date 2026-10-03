@@ -14,6 +14,14 @@ use std::time::Duration;
 /// when the server config does not set one.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Default cap on concurrent in-flight tool calls to one server.
+///
+/// Without a bound, a burst of calls from many sessions could spawn an
+/// unbounded number of concurrent requests against one server; a small default
+/// keeps one server from being swamped while still allowing real parallelism.
+/// A server config may raise or lower it with `maxConcurrentCalls`.
+pub const DEFAULT_MAX_CONCURRENT_CALLS: usize = 4;
+
 /// Which MCP protocol era a client should establish with a server.
 ///
 /// The default is [`Self::Auto`], the spec-recommended behaviour: probe the
@@ -136,6 +144,10 @@ pub struct McpServerConfig {
     pub timeout: Option<Duration>,
     /// Which protocol era to negotiate.
     pub protocol: McpProtocolMode,
+    /// Optional cap on concurrent in-flight tool calls to this server. When
+    /// `None`, [`DEFAULT_MAX_CONCURRENT_CALLS`] is used. Values below 1 are
+    /// treated as 1 by [`max_concurrent_calls`](Self::max_concurrent_calls).
+    pub max_concurrent_calls: Option<usize>,
 }
 
 impl McpServerConfig {
@@ -143,6 +155,16 @@ impl McpServerConfig {
     #[must_use]
     pub fn request_timeout(&self) -> Duration {
         self.timeout.unwrap_or(DEFAULT_TIMEOUT)
+    }
+
+    /// The effective cap on concurrent in-flight tool calls (configured value
+    /// or [`DEFAULT_MAX_CONCURRENT_CALLS`]), clamped to at least 1 so a
+    /// misconfigured `0` can never deadlock the dispatcher.
+    #[must_use]
+    pub fn max_concurrent_calls(&self) -> usize {
+        self.max_concurrent_calls
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_CALLS)
+            .max(1)
     }
 }
 
@@ -161,6 +183,7 @@ mod tests {
             enabled: true,
             timeout,
             protocol: McpProtocolMode::Auto,
+            max_concurrent_calls: None,
         }
     }
 
@@ -227,5 +250,27 @@ mod tests {
     fn request_timeout_honors_config() {
         let cfg = config(Some(Duration::from_secs(5)));
         assert_eq!(cfg.request_timeout(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn max_concurrent_calls_defaults_when_unset() {
+        assert_eq!(
+            config(None).max_concurrent_calls(),
+            DEFAULT_MAX_CONCURRENT_CALLS
+        );
+    }
+
+    #[test]
+    fn max_concurrent_calls_honors_config() {
+        let mut cfg = config(None);
+        cfg.max_concurrent_calls = Some(8);
+        assert_eq!(cfg.max_concurrent_calls(), 8);
+    }
+
+    #[test]
+    fn max_concurrent_calls_clamps_zero_to_one() {
+        let mut cfg = config(None);
+        cfg.max_concurrent_calls = Some(0);
+        assert_eq!(cfg.max_concurrent_calls(), 1);
     }
 }

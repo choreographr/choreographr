@@ -19,8 +19,9 @@
 //! The split is deliberate: [`protocol`] owns the daemon-facing value types,
 //! [`config`] the per-server configuration (transport + protocol era), [`error`]
 //! the shared failure type, [`runtime`] the async sidecar, [`session`] the
-//! dispatcher + blocking facade, and the private `engine` / `retry` modules the
-//! `rmcp` plumbing and the HTTP connect-retry policy.
+//! dispatcher + blocking facade, and the private `engine` / `retry` / `stdio`
+//! modules the `rmcp` plumbing, the HTTP connect-retry policy, and the capped
+//! child-process transport.
 //!
 //! [Model Context Protocol]: https://modelcontextprotocol.io
 
@@ -36,9 +37,11 @@ pub mod protocol;
 mod retry;
 pub mod runtime;
 pub mod session;
+mod stdio;
 
 pub use config::{
-    DEFAULT_TIMEOUT, McpProtocolMode, McpServerConfig, McpTransport, McpTransportKind,
+    DEFAULT_MAX_CONCURRENT_CALLS, DEFAULT_TIMEOUT, McpProtocolMode, McpServerConfig, McpTransport,
+    McpTransportKind,
 };
 pub use error::McpError;
 pub use protocol::{
@@ -46,3 +49,4 @@ pub use protocol::{
     normalize_input_schema,
 };
 pub use session::{McpServer, McpServerHandle};
+pub use stdio::MAX_STDIO_FRAME_BYTES;

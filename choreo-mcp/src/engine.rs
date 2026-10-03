@@ -22,10 +22,10 @@ use rmcp::service::{
     ClientInitializeError, MaybeSendFuture, NotificationContext, Peer, PeerRequestOptions,
     RoleClient, RunningService, ServiceError,
 };
+use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransportConfig, StreamableHttpError,
 };
-use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{ClientHandler, ClientLifecycleMode, serve_client_with_lifecycle};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,8 +37,9 @@ const CLIENT_NAME: &str = "choreographr";
 /// Upper bound on a single SSE event accepted from a Streamable HTTP server.
 ///
 /// rmcp parses the event stream; this cap keeps a hostile or buggy server from
-/// feeding an unbounded event into memory (the stdio path has an analogous,
-/// separately-tracked bound).
+/// feeding an unbounded event into memory. The stdio path has the analogous
+/// [`MAX_STDIO_FRAME_BYTES`](crate::MAX_STDIO_FRAME_BYTES) bound, applied by the
+/// crate's own capped child-process transport.
 const MAX_SSE_EVENT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Deadline for the deprecated-transport probe that runs only after an HTTP
@@ -244,7 +245,7 @@ async fn connect_transport(
     };
     match &config.transport {
         McpTransport::Stdio { .. } => {
-            let transport = build_stdio_transport(config)?;
+            let transport = crate::stdio::StdioTransport::spawn(config)?;
             serve_client_with_lifecycle(handler, transport, lifecycle_for(config.protocol))
                 .await
                 .map_err(|e| McpError::InitializeFailed(e.to_string()))
@@ -319,33 +320,6 @@ fn http_client(config: &McpServerConfig) -> Result<reqwest::Client, McpError> {
         .connect_timeout(config.request_timeout())
         .build()
         .map_err(|e| McpError::InitializeFailed(format!("failed to build HTTP client: {e}")))
-}
-
-/// Spawn the server subprocess and wrap its stdio in an rmcp child transport.
-///
-/// On Unix the child is placed in its own process group so launcher chains
-/// (`npx` → `node`) are killed together on shutdown rather than orphaning the
-/// grandchild that holds the pipe.
-fn build_stdio_transport(config: &McpServerConfig) -> Result<TokioChildProcess, McpError> {
-    let McpTransport::Stdio {
-        command, args, env, ..
-    } = &config.transport
-    else {
-        return Err(McpError::ProtocolError(
-            "build_stdio_transport called for a non-stdio server".into(),
-        ));
-    };
-    let mut cmd = tokio::process::Command::new(command);
-    cmd.args(args);
-    // An explicit executable + args only — never a shell string — so config
-    // values cannot be reinterpreted as shell syntax.
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
-    let mut wrap = process_wrap::tokio::CommandWrap::from(cmd);
-    #[cfg(unix)]
-    wrap.wrap(process_wrap::tokio::ProcessGroup::leader());
-    TokioChildProcess::new(wrap).map_err(|e| McpError::SpawnFailed(e.to_string()))
 }
 
 /// Build the Streamable HTTP transport for `config` over `client`.
