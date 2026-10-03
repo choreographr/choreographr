@@ -15,13 +15,23 @@ rust-version.workspace = true
 # commands. Workspace policy: crossbeam, never std mpsc.
 crossbeam-channel.workspace = true
 # The official MCP Rust SDK, used only inside this crate. Default features are
-# off; we enable the client role plus the stdio child-process transport. The
-# daemon never sees an rmcp type (the blocking facade is fully typed on our own
-# `McpServer`/`McpServerHandle`/`McpTool`/`CallToolResult`).
-rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+# off; we enable the client role, the stdio child-process transport, and the
+# Streamable HTTP client transport (whose TLS rides the `reqwest` dependency
+# below). The daemon never sees an rmcp type (the blocking facade is fully typed
+# on our own `McpServer`/`McpServerHandle`/`McpTool`/`CallToolResult`).
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
 # Place the server child in its own process group on Unix so a launcher's
 # grandchild dies with it (the rmcp transport uses these wrappers' kill).
 process-wrap.workspace = true
+# HTTP client for the Streamable HTTP transport: choreo-mcp builds the client to
+# set the connect timeout and to run the deprecated HTTP+SSE pre-flight probe,
+# then hands it to rmcp's transport. Feature-unified with rmcp's own reqwest, so
+# enabling it adds no second copy to the build.
+reqwest.workspace = true
 # Sidecar async runtime. rmcp is async and the daemon is thread-only: this crate
 # owns one process-wide multi-thread runtime that drives the client futures, and
 # the daemon calls this crate's blocking `McpServer::*` methods. `sync` provides

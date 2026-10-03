@@ -10,7 +10,8 @@
 //! and are marked `#[ignore]` per the workspace test discipline (`cargo test`
 //! runs only unit tests; `cargo test-integration` runs these).
 
-use choreo_mcp::{McpError, McpProtocolMode, McpServer, McpServerConfig};
+use crate::common::watchdog;
+use choreo_mcp::{McpError, McpProtocolMode, McpServer, McpServerConfig, McpTransport};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -23,24 +24,15 @@ const FIXTURE_BIN: &str = env!("CARGO_BIN_EXE_mcp-fixture-server");
 fn fixture_config(scenario: Option<&str>, protocol: McpProtocolMode) -> McpServerConfig {
     McpServerConfig {
         slug: "fixture".to_string(),
-        command: FIXTURE_BIN.to_string(),
-        args: scenario.map_or_else(Vec::new, |s| vec![s.to_string()]),
-        env: HashMap::new(),
+        transport: McpTransport::Stdio {
+            command: FIXTURE_BIN.to_string(),
+            args: scenario.map_or_else(Vec::new, |s| vec![s.to_string()]),
+            env: HashMap::new(),
+        },
         enabled: true,
         timeout: Some(Duration::from_secs(10)),
         protocol,
     }
-}
-
-/// Watchdog: the stdlib test harness has no per-test timeout, so a regression
-/// that wedges connect/call/shutdown would hang CI. Abort if the body outlives
-/// its budget; the client's configured timeouts bound a healthy run far lower.
-fn watchdog() {
-    std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_secs(120));
-        eprintln!("mcp_integration: test exceeded 120s; aborting to avoid an indefinite hang");
-        std::process::abort();
-    });
 }
 
 #[test]
@@ -199,10 +191,12 @@ fn cancel_session_stops_inflight_call() {
 
     let mut config = fixture_config(Some("legacy"), McpProtocolMode::Legacy);
     config.timeout = Some(Duration::from_secs(60));
-    config.env.insert(
-        "MCP_FIXTURE_MARKER".to_string(),
-        marker.display().to_string(),
-    );
+    if let McpTransport::Stdio { env, .. } = &mut config.transport {
+        env.insert(
+            "MCP_FIXTURE_MARKER".to_string(),
+            marker.display().to_string(),
+        );
+    }
     let server = McpServer::connect(&config).expect("connect fixture");
     let handle = server.handle();
 

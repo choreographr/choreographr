@@ -63,6 +63,16 @@ pub enum McpError {
     /// has exited (e.g. after an explicit shutdown).
     #[error("MCP server dispatcher is not running")]
     NotConnected,
+
+    /// The configured endpoint speaks a transport this client does not
+    /// implement.
+    ///
+    /// The only such case today is the deprecated 2024-11-05 HTTP+SSE
+    /// transport (a single GET that returns an `endpoint` event), which the
+    /// spec removed; the message names it so a user knows to move the server to
+    /// Streamable HTTP rather than debugging an opaque connect failure.
+    #[error("unsupported MCP transport: {0}")]
+    UnsupportedTransport(String),
 }
 
 #[cfg(test)]
@@ -122,5 +132,11 @@ mod tests {
             McpError::NotConnected.to_string(),
             "MCP server dispatcher is not running"
         );
+    }
+
+    #[test]
+    fn error_unsupported_transport_display() {
+        let err = McpError::UnsupportedTransport("HTTP+SSE".into());
+        assert!(err.to_string().contains("HTTP+SSE"));
     }
 }

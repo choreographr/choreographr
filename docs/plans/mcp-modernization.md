@@ -1,9 +1,9 @@
 # Plan: MCP modernization — stateless protocol (2026-07-28) and a first-class client
 
-**Status:** **in progress — P0 and P1 implemented** (commits `ab3dc2e`
-"fix(choreo-mcp): harden the MCP client and drop the npx test dependency" and
-`976edf6` "feat(choreo-mcp): rebuild the MCP client on the official rmcp SDK");
-P2–P6 remain. See §1.2 for what landed.
+**Status:** **in progress — P0, P1, and P2 implemented** (commits `ab3dc2e`
+"fix(choreo-mcp): harden the MCP client and drop the npx test dependency",
+`976edf6` "feat(choreo-mcp): rebuild the MCP client on the official rmcp SDK",
+and the P2 Streamable HTTP commit). P3–P6 remain. See §1.2 for what landed.
 **Lifecycle:** this file is **deleted once the plan is fully implemented**. Nothing
 written during implementation may reference it — rustdoc, `ARCHITECTURE.md`,
 `README.md`, release notes, and commit messages must stand on their own, because a
@@ -404,7 +404,7 @@ missing capability that blocks real servers; **S3** = robustness/quality;
 | # | Gap | Severity | Evidence | Status |
 |---|---|---|---|---|
 | G1 | Cannot talk to 2026-07-28 (stateless-only) servers at all | S1 | `make_initialize_request` pins `2024-11-05` | **Closed (P1)** — `auto`/`modern` negotiate `server/discover` via rmcp |
-| G2 | No HTTP transport; no remote servers, no OAuth | S1 | `transport.rs` is stdio-only | **Open (P2/P3)** |
+| G2 | No HTTP transport; no remote servers, no OAuth | S1 | `transport.rs` is stdio-only | **Partial (P2)** — Streamable HTTP landed; OAuth is P3 |
 | G3 | Server crash is permanent for the daemon's lifetime | S1 | no restart anywhere in `mcp/` | **Closed (P1)** — bounded restart policy rebuilds a dead transport |
 | G4 | One `Mutex` per server serializes calls and blocks shutdown | S1 | `Arc<Mutex<McpClient>>`, `tool.rs` | **Closed (P1)** — per-server dispatcher, concurrent calls, bounded joins |
 | G5 | MCP images are never attached to the model (rendered as text) | S1 | `image_tx` ignored; `[Image: …]` placeholder | **Closed (P0)** — base64 decode + image pipeline; placeholder only without a sink/invalid |
@@ -686,17 +686,14 @@ Carried forward: the per-server concurrency cap (D6) and the bounded frame reade
 
 ### P2 — Streamable HTTP transport
 
-- [ ] Config: `url`, `headers`, `transport: "http" | "stdio" | "auto"`;
-      `${ENV}` expansion; TLS via rmcp/reqwest defaults. Enable the rmcp
-      `transport-streamable-http-client-reqwest` feature (D1) at the same time.
-- [ ] Connect logic: modern POST probe; fall back per spec (recognized modern
-      errors vs everything else); optional legacy SSE rejection with a clear
-      error (we do not implement HTTP+SSE; it is deprecated).
-- [ ] Retry policy: 408/429/5xx with capped exponential backoff and
-      `Retry-After`; no retry on 4xx protocol errors.
-- [ ] Timeouts: connect/read; SSE stream to final response.
-- [ ] Integration tests against a local HTTP fixture (JSON + SSE responses,
-      header validation, error taxonomy).
+**Done.** Config grew `url`, `headers`, and `transport: "http" | "stdio" |
+"auto"` (with `${ENV}` expansion in `env`/`headers` values); the engine connects
+over rmcp's `StreamableHttpClientTransport` (reqwest/rustls) and negotiates the
+same `Auto`/`modern`/`legacy` eras, with a bounded connect retry on
+`408`/`429`/`5xx` and a clear rejection of the removed 2024-11-05 HTTP+SSE
+transport. Hermetic integration tests drive a local `TcpListener` HTTP fixture
+(JSON + SSE responses, generated-header validation, `Auto` fallback, a
+retryable `503`, and the HTTP+SSE rejection).
 
 ### P3 — OAuth for remote servers
 

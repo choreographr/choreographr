@@ -77,7 +77,12 @@ impl McpManager {
             Vec::new();
         for cfg in configs {
             let slug = cfg.slug.clone();
-            info!(server = %slug, command = %cfg.command, "spawning MCP server");
+            info!(
+                server = %slug,
+                transport = cfg.transport.label(),
+                target = cfg.transport.target(),
+                "spawning MCP server"
+            );
             let handle =
                 std::thread::spawn(move || McpServer::connect(&cfg).map_err(anyhow::Error::from));
             pending.push((slug, handle));

@@ -14,4 +14,6 @@
 //! A former `tests/foo.rs` keeps its file-level `#![cfg(...)]` / `#![allow(...)]`
 //! inner attributes — inside a module they apply to that module.
 
+mod common;
+mod mcp_http_integration;
 mod mcp_integration;

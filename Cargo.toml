@@ -565,3 +565,13 @@ rmcp = { version = "3.5", default-features = false }
 # Already in the tree via rmcp's child-process transport; declared directly here
 # because choreo-mcp names `ProcessGroup` itself.
 process-wrap = { version = "10", features = ["tokio1"] }
+# HTTP client for the MCP Streamable HTTP transport. Declared directly (not only
+# transitively through rmcp's `transport-streamable-http-client-reqwest`) because
+# choreo-mcp builds the client itself to set the connect timeout and to run the
+# deprecated HTTP+SSE pre-flight probe. rustls keeps the TLS stack portable and
+# matches rmcp's own reqwest configuration, so the two share one compiled build.
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls",
+] }
