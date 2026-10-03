@@ -1,16 +1,14 @@
 # Plan: MCP modernization — stateless protocol (2026-07-28) and a first-class client
 
-**Status:** **in progress — P0–P2, P4, and P5 complete; the two P6 bounds (stdio
-frame cap, per-server concurrency cap) landed. M1 (ship without OAuth, `mcp` on
-by default) is the active goal.** Commits: `ab3dc2e` (hardening), `976edf6` (the
-rmcp engine swap), `9f6209a` (Streamable HTTP), `274f736`
-(progress/MRTR/resources), `1d7d239` (stdio frame cap + per-server concurrency
-cap), `15aa3ff` (`subscriptions/listen` + registry hot-swap), `f037383` (tool
-name hygiene, `cwd`/`disabledTools`, config layers, auth error, status API),
-`8d27006` (`/mcp` surface + `choreographr mcp` CLI), `a348c89` (per-server logs).
-Remaining M1 work: **the D9 default-feature flip** and **the rest of P6**
-(conformance suite, fuzz, supply-chain, release verification, security checklist).
-**OAuth (P3) is deferred to post-ship.** See §1.2 and §7.
+**Status:** **M1 implemented — `mcp` ships by default and P6 landed (commit
+`0a85184`), with one residual: the official conformance suite runs the legacy era
+(2025-11-25) in CI, and the 2026-07-28-era run is still to be wired and triaged.**
+Commits: `ab3dc2e` (hardening), `976edf6` (the rmcp engine swap), `9f6209a`
+(Streamable HTTP), `274f736` (progress/MRTR/resources), `1d7d239` (stdio frame cap
++ concurrency cap), `15aa3ff` (`subscriptions/listen` + registry hot-swap),
+`f037383`/`8d27006`/`a348c89` (P5: name hygiene, config, surfaces, logs),
+`0a85184` (D9 flip + P6 hardening). After the conformance residual, what remains
+is **post-ship**: OAuth (P3) and the fast-follows. See §1.2 and §7.
 **Lifecycle:** this file is **deleted once the plan is fully implemented**. Nothing
 written during implementation may reference it — rustdoc, `ARCHITECTURE.md`,
 `README.md`, release notes, and commit messages must stand on their own, because a
@@ -115,7 +113,7 @@ Doc comment in `choreo-mcp/src/lib.rs` claimed the crate spoke "over a transport
 variants (`ToolNotFound`, `InvalidParams`) were never constructed. Both were fixed
 in P0.
 
-### 1.2 Implementation progress (P0–P2, P4–P5, P6 bounds)
+### 1.2 Implementation progress (P0–P2, P4–P5, P6, D9)
 
 **P0** (`ab3dc2e`) landed the correctness and safety fixes against the then-current
 hand-rolled engine; **P1** (`976edf6`) replaced that engine with `rmcp` 3.5 behind
@@ -213,17 +211,34 @@ phases. What exists now:
   each server's state and tool count; and each stdio server's `stderr` is
   captured to a size-capped per-server log file.
 
+- D9 + P6 (`0a85184`): the `mcp` feature is in the default set at both layers
+  (the daemon's `default` and the root package's dependency), so a plain build
+  links `choreo-mcp`/`rmcp`/`reqwest` and the sidecar runtime — measured at
+  ~+11 MB (~+21.7%, 50.9 → 61.9 MB) on a local release build; the iOS embedded
+  daemon keeps `default-features = false`, and the daemon's `mcp` module still
+  degrades to the no-op stub. Every server-supplied bound is enforced: tool
+  schemas ≤ 256 KiB and ≤ 32 nesting levels (an over-bounds tool is dropped),
+  a catalogue capped at 1024 tools, an 8 MiB stdio frame cap, a bounded SSE
+  reconnect policy, rate-limited server logging notifications, and a per-server
+  `maxRestarts` (default 3; `0` disables reconnect). The official
+  `@modelcontextprotocol/conformance` client suite runs in CI
+  (`scripts/mcp-conformance.sh`, pinned 0.1.16, committed expected-failures
+  baseline covering OAuth/elicitation/SSE-retry) for the legacy era; a
+  "stubborn server" fixture proves `shutdown_all` stays bounded even when a
+  server ignores stdin EOF; and the config parser and tool-name sanitizer
+  gained fuzz-style property tests.
+
 Deltas the plan now tracks (detailed in §7): the config key `exposure` is not
 implemented (it defers with the deferred-tool-loading work); `auto_load` was
 removed (reported as an unknown key) rather than mapped to a deferred exposure;
 `Retry-After` is not honored by the HTTP retry policy (upstream-blocked, P2
 residuals); OAuth is not implemented — deferred to post-ship (P3), with static
-tokens via config `headers` as the M1 credential path; and M1 still has to flip
-the `mcp` feature into the default set (D9). P4's last item,
-`subscriptions/listen` + the registry hot-swap, landed in `15aa3ff`, the two
-P6 bounds in `1d7d239`, and P5 in `f037383`/`8d27006`/`a348c89`; the remaining
-P6 work is conformance, fuzzing, supply-chain, release verification, and the
-security checklist.
+tokens via config `headers` as the M1 credential path. The single M1 residual is
+the **2026-07-28-era conformance run**: the suite and the harness's version→
+lifecycle mapping support it, but CI currently runs only the script's default
+2025-11-25 era, and the modern-era scenario names/baseline still need triage.
+Everything else — D9, the P6 bounds and caps, fuzzing, supply-chain, security,
+and release verification — landed in `0a85184`.
 
 ### 1.3 The protocol delta
 
@@ -676,6 +691,13 @@ the static-musl build with it and records the size/build-time delta.
 
 `choreo-mcp` remains the only crate in the tree with MCP dependencies.
 
+Status: **landed in `0a85184`** — the flip is in place at both layers
+(`default = ["pdf", "mcp"]`; `features = ["pdf", "mcp"]` on the root's daemon
+dependency), the "off by default" statements in `ARCHITECTURE.md`, `README.md`,
+and both `Cargo.toml` comments are updated, and the measured release delta
+(~+11 MB, ~+21.7%) is recorded in `scripts/release.sh`. The release jobs gain MCP
+automatically (defaults still apply to their explicit `--features` lists).
+
 ### D10 — Content mapping
 
 MCP content maps onto `ToolOutput` as follows:
@@ -736,7 +758,7 @@ retry policy honors its exponential backoff only, not a `Retry-After` header
 
 ## 6. Target architecture
 
-As built through P5:
+As built through P6 (M1 complete):
 
 ```
 choreo-daemon (thread-only)
@@ -765,6 +787,7 @@ control plane:
 choreo-mcp (library; owns tokio + rmcp)
   ├── runtime.rs    sidecar Runtime: init / get / handle / block_on
   ├── config.rs     McpServerConfig + McpProtocolMode + maxConcurrentCalls
+  │                 + maxRestarts
   ├── naming.rs     sanitize_segment / build_tool_name (64-char cap,
   │                 collision hash) / group_name
   ├── protocol.rs   daemon-facing types, normalize_input_schema, McpListChange
@@ -822,14 +845,15 @@ The subscriptions-driven refresh landed (P4). Remaining lifecycle work: a
 ## 7. Work breakdown
 
 Each phase is independently shippable and lands with tests + docs. **P0–P2, P4,
-and P5 are done** (see §1.2); their sections come first for history. The
-remaining phases are listed in execution order — **P6** (M1), then the deferred
-**P3** (post-ship) — and keep their original P-numbers for continuity.
+and P5 are done** and **P6 + D9 landed in `0a85184`** (one conformance residual,
+see P6); their sections come first for history. After that residual the only
+remaining phase is the deferred **P3** (post-ship).
 
-### M1 — ship without OAuth (P5 done; P6 remains)
+### M1 — ship without OAuth (essentially complete; one conformance residual)
 
-MCP is shippable when P5 and P6 are complete (P4 and P5 are done). **OAuth is
-explicitly not part of M1** — it is P3, post-ship. Servers that need credentials
+MCP is shippable once the one conformance residual below is closed — everything
+else in M1 has landed. **OAuth is explicitly not part of M1** — it is P3,
+post-ship. Servers that need credentials
 are covered in the interim by the path that already works: a static token in
 `mcp_servers.json` headers, e.g. `"headers": {"Authorization": "Bearer ${DOCS_TOKEN}"}` (only
 `accept`, `mcp-session-id`, and `last-event-id` are reserved, and `${VAR}` is
@@ -838,13 +862,18 @@ with a clear, actionable error instead of a raw status string (`f037383`).
 
 M1 includes, at minimum:
 
-- **Default on**: the `mcp` feature moves into the default feature set (D9), so
-  a plain build has MCP — M1 is "MCP ships enabled", not "MCP compiles". Still
-  pending: the Cargo default-set flip plus the §11 doc/comment updates.
-- **P6**: the bounded stdio frame reader (the P1 regression) and the per-server
-  concurrency cap are **done** (`1d7d239`); remaining: the conformance baseline,
-  the lockfile/supply-chain check, the release verification with the default
-  feature set, and the §9 security checklist.
+- **Default on**: **done** (`0a85184`) — the `mcp` feature is in the daemon's
+  `default` and re-enabled on the root package's dependency; docs and feature
+  comments flipped; measured release delta ~+11 MB (~+21.7%).
+- **P6**: **done except one residual** — the caps (tool count 1024, schema
+  depth 32, `maxRestarts`, notification rate limit), the bounded SSE retry
+  policy, fuzz-style property tests, the stubborn-server shutdown test,
+  supply-chain (the gate is enforced by `pre-release` and the release CI, and
+  the dependency notes landed), the §9 security posture (recorded as the
+  "MCP client trust boundary" section in `ARCHITECTURE.md`), the release
+  verification (size delta recorded in `scripts/release.sh`), and the
+  conformance suite for the legacy era in CI with a committed baseline. The
+  residual: the **2026-07-28-era conformance run** (see P6).
 - **P5**: **complete** — tool-name sanitization, `cwd`/`disabledTools`, the
   `/mcp` status surface + `choreographr mcp` CLI + per-server logs +
   `session_inspect`, the auth-required error, config layers, and user docs
@@ -857,9 +886,11 @@ Explicitly deferred past M1 (not ship blockers): **OAuth (P3)**, `exposure` +
 [tool-search-driven deferred loading](#13-out-of-scope--future-work), `mcp
 reload`, and the MCP-server role (§13).
 
-The remaining M1 blocker is the P6 conformance baseline (and the supply-chain /
-release-verification passes) — the default-on flip makes those the last gate
-before shipping; P5's sanitization landed ahead of any trimming.
+The one remaining M1 item is the **2026-07-28-era conformance run** (see P6):
+the suite, the runner, the harness's version→lifecycle mapping, and the legacy
+run with its baseline all exist, so this is triage and wiring, not new feature
+work. Everything else — D9, the caps, fuzzing, supply-chain, security, and
+release verification — landed in `0a85184`.
 
 M1 shipping does **not** delete this plan: the Lifecycle rule ties deletion to
 full implementation, and P3 remains here for post-ship work.
@@ -1009,41 +1040,39 @@ Post-ship (fast-follow, around P3):
 - [x] Per-server concurrent calls — landed (`1d7d239`): `maxConcurrentCalls`
       (default 4, configurable, `0` clamped to 1), with a dispatcher-side queue
       and `select!` promotion.
-- [ ] Remaining caps: max tools per server (e.g. 1,024), schema depth, max
-      restarts, and max notification rate. (Schema- and text-byte caps already
-      landed: 256 KiB each.)
+- [x] Remaining caps — landed (`0a85184`): a 1024-tool catalogue cap, a
+      32-level schema-depth bound (256 KiB size bound already), a per-server
+      `maxRestarts` (default 3; `0` disables reconnect), and a rate limit on
+      server logging notifications.
 - [ ] Adopt the official `@modelcontextprotocol/conformance` suite for the
-      client (pin the version; 0.1.16 at time of writing). It supports the eras
-      directly: `--spec-version 2026-07-28` (stateless, per-request `_meta`)
-      and the legacy revisions (stateful `initialize`), plus frozen
-      `--requirements <revision>` sets. Deliverables: a small harness binary
-      that takes the server URL as `argv[1]` and reads
-      `MCP_CONFORMANCE_SCENARIO` / `MCP_CONFORMANCE_PROTOCOL_VERSION` (mapping
-      each scenario to our `McpServer`/`McpServerHandle` operations and
-      choosing the lifecycle by version), a `scripts/` runner that invokes the
-      pinned `npx` command per era, a committed `--expected-failures` YAML
-      baseline under `choreo-mcp/tests/conformance/` (the OAuth client
-      scenarios until P3, and any draft-only checks), and a CI job. The
-      baseline keeps CI green on known gaps while still failing on new
-      regressions and on stale entries.
-- [ ] Fuzz/config hardening: parse-time fuzzing for `mcp_servers.json` and the
-      base64 header sentinel; property tests for the tool-name sanitizer.
-- [ ] Supply-chain: lockfile review, `cargo deny` stays green, note `rmcp` in
-      the dependency policy docs.
-- [ ] Default-feature release verification: `mcp` is a default feature in M1
-      (D9), so the static-musl/release matrix must build with it — defaults
-      still apply to the explicit `--features` lists in `scripts/release.sh`,
-      so the builds gain MCP automatically; confirm the tarball builds, record
-      the size/build-time delta, and keep the opt-out paths documented (iOS
-      `default-features = false`; `--no-default-features` for embedders).
-      *(Requires the D9 flip first — the one M1 item outside this phase.)*
-- [ ] Security checklist from §9 executed and recorded in the PR.
-- [ ] Decide the SSE idle-timeout handling for long-lived streams (the P2
-      residual): set rmcp's `retry_config`/`SseRetryPolicy`, or record why the
-      per-request deadline suffices. This closes that residual.
-- [ ] Add the "no MCP path wedges shutdown" test held open in the risk table:
-      a fixture server that never exits while `shutdown_all` still returns
-      within its bounded wait.
+      client — **partially landed** (`0a85184`): `scripts/mcp-conformance.sh`
+      runs the pinned 0.1.16 client suite against the `mcp-conformance-client`
+      harness with the committed `expected-failures` baseline (OAuth,
+      elicitation, and SSE-retry scenarios baselined), wired into CI
+      (`.github/workflows/mcp-conformance.yml`) for the **legacy era
+      (2025-11-25)**; the harness already derives the stateless lifecycle from
+      `MCP_CONFORMANCE_PROTOCOL_VERSION`. **Residual: the 2026-07-28-era run** —
+      run `MCP_CONFORMANCE_SPEC_VERSION=2026-07-28 scripts/mcp-conformance.sh`,
+      extend the harness's scenario coverage to the modern-era scenario names,
+      triage the results, extend the baseline (or fix), and add the era to CI.
+- [x] Fuzz/config hardening — landed (`0a85184`): deterministic fuzz-style
+      property corpora for the `mcp_servers.json` parser and the tool-name
+      sanitizer (no external fuzz target).
+- [x] Supply-chain — `check-supply-chain` is part of `just pre-release` and the
+      release workflow, and the dependency notes (rmcp/process-wrap/reqwest)
+      landed in the Cargo comments and the ARCHITECTURE dependency table.
+- [x] Default-feature release verification — the measured delta is recorded in
+      `scripts/release.sh` (~+11 MB, ~+21.7%); release jobs gain MCP via their
+      defaults; the opt-out paths (iOS `default-features = false`;
+      `--no-default-features`) are documented.
+- [x] Security checklist from §9 — recorded as the "MCP client trust boundary"
+      section in `ARCHITECTURE.md`, covering all eight points.
+- [x] Decide the SSE idle-timeout handling — landed (`0a85184`): the SSE
+      reconnect policy is bounded at the transport (the crate default retries a
+      dropped stream forever).
+- [x] Add the "no MCP path wedges shutdown" test — landed (`0a85184`): the
+      stubborn-server fixture backs both a `choreo-mcp` and a daemon test
+      proving shutdown returns within its bounded wait.
 
 ### P3 — OAuth for remote servers (post-ship, deferred)
 
@@ -1109,9 +1138,11 @@ integration tests live in `tests/it/` (one binary per crate, `#[ignore]`).
   (above). The stdio cancellation case waits for the fixture's in-flight marker
   with a bounded 5 ms poll (integration-only; the unit-test wait-free rule is
   intact), and the daemon case asserts the image sink path end-to-end.
-- **Conformance** runs the official client suite against a harness binary
-  (pinned version, one run per era via `--spec-version`), diffed against a
-  committed expected-failures baseline; OAuth suites are excluded until P3.
+- **Conformance** runs the official client suite against the
+  `mcp-conformance-client` harness (`scripts/mcp-conformance.sh`, pinned 0.1.16)
+  with a committed expected-failures baseline, in CI for the legacy era
+  (2025-11-25); OAuth/elicitation/SSE-retry scenarios are baselined until P3.
+  The 2026-07-28-era run is the one open conformance residual (see P6).
 - **Manual interop matrix** (documented, run at release): current
   `@modelcontextprotocol/server-everything`, a filesystem server, a remote OAuth
   server (e.g. an MCP provider available to the project), and one legacy server.
@@ -1151,10 +1182,10 @@ the pre-existing 120 s watchdog and one bounded marker poll (above).
 ## 10. Configuration & control surface
 
 Target config shape (superset, all keys optional except command/url). Landed in
-P0–P5: `command`/`args`/`env`/`cwd`, `url`/`headers`, `transport`, `protocol`,
-`timeout`, `enabled`, `maxConcurrentCalls`, `disabledTools`, `${VAR}` expansion,
-and the project-config layer. Still pending: `exposure` (post-ship) and `oauth`
-(post-ship, with P3).
+P0–P6: `command`/`args`/`env`/`cwd`, `url`/`headers`, `transport`, `protocol`,
+`timeout`, `enabled`, `maxConcurrentCalls`, `maxRestarts`, `disabledTools`,
+`${VAR}` expansion, and the project-config layer. Still pending: `exposure`
+(post-ship) and `oauth` (post-ship, with P3).
 
 ```json
 {
@@ -1216,7 +1247,7 @@ are not offered (the TUI reports them as unsupported).
 
 Status: P0/P1 kept `ARCHITECTURE.md` (module tables, `mcp/` row, threading model,
 test-coverage rows) and `README.md` in step, and the tree contains no reference to
-this plan — verified at `a8917b3`. P4/P5/P6-bounds kept both in step too (the
+this plan — verified at `0a85184`. P4/P5/P6 kept both in step too (the
 `choreo-mcp` module table gained `naming.rs` and the auth/`cwd`/`disabledTools`
 notes, the `mcp/` row gained the config layers, name hygiene, status/reconnect,
 and per-server logs, and `README.md` gained the `mcp_servers.json` reference).
@@ -1226,15 +1257,15 @@ The feature-row flip (D9) still waits on the default-on change.
 
 | Risk | Mitigation |
 |---|---|
-| Dependency weight is now paid by default builds (tokio/reqwest/rustls via rmcp, D9) | `rmcp` stays `default-features = false` with only the needed transports; the named feature remains the opt-out (`--no-default-features`; iOS keeps `default-features = false`); verify both `--no-default-features` and `--all-features` builds, and the static-musl release with defaults (P6). P1 scoped rmcp to `client` + `transport-child-process`; P2 added `transport-streamable-http-client-reqwest` and `reqwest` 0.13 (shared with rmcp and alloy — D11). |
+| Dependency weight is paid by default builds (tokio/reqwest/rustls via rmcp, D9) | `rmcp` stays `default-features = false` with only the needed transports; the named feature remains the opt-out (`--no-default-features`; iOS keeps `default-features = false`). The cost is measured, not assumed: ~+11 MB (~+21.7%, 50.9 → 61.9 MB) on a local release build, recorded in `scripts/release.sh`. P1 scoped rmcp to `client` + `transport-child-process`; P2 added `transport-streamable-http-client-reqwest` and `reqwest` 0.13 (shared with rmcp and alloy — D11). |
 | Tool-list refresh needs the shared `Arc<ToolRegistry>` replaced | `DaemonState::tool_registry` is a process-wide `Arc<ArcSwap<ToolRegistry>>` shared into every session and request worker; the daemon command loop is its single writer, rebuilds it (`build_tool_registry`: core tools + platform bridge + `McpManager::register_all`) on an `McpListChanged` event, and stores it once atomically. Readers load lock-free, so in-flight holders keep the old `Arc` and every live session observes the refreshed catalogue on its next request — no restart. (The same single-writer `ArcSwap` exception as the provider catalog.) |
 | Two `reqwest` majors in the lockfile (0.12.28 via `blitz-net`/`dioxus-native` → `choreo-gui`; 0.13.5 shared by `alloy` + `rmcp` + `choreo-mcp`) | The duplicate predates MCP and belongs to the GUI renderer; the MCP path shares one 0.13 build (D11). `deny.toml` keeps `multiple-versions = "warn"`. |
 | rmcp API churn (3.x is moving fast) | Pin `3.5`, upgrade deliberately; the blocking facade isolates the daemon from rmcp types (rmcp types do not cross the crate boundary). |
-| Sidecar runtime + threads complicate shutdown | Follow the `choreo-content` runtime pattern; dispatcher replies are bounded; `shutdown_all` joins with deadlines; add the "no MCP lock can wedge Ctrl-C" test. P1 landed the bounded joins; the Ctrl-C test is still to write. |
+| Sidecar runtime + threads complicate shutdown | Follow the `choreo-content` runtime pattern; dispatcher replies are bounded; `shutdown_all` joins with deadlines. **Landed** (`0a85184`): a stubborn-server fixture (ignores stdin EOF) backs both a `choreo-mcp` and a daemon test proving shutdown returns within its bounded wait. |
 | (M1) Remote servers that require OAuth have no credential path until P3 | Document the static-token `headers` workaround (P5 docs); the P5 actionable `401`/`403` error names both options, so the failure explains itself. |
 | (Post-ship, P3) OAuth UX on headless devices (TUI over SSH, Termux) | Paste-the-redirected-URL fallback (pi's flow), device-code path only if a provider requires it; document. |
 | rmcp licenses/advisories | Apache-2.0; `cargo deny check` already gates the tree. |
-| Fixture server drifts from real servers | Keep the `npx`-based interop test as an opt-in ignored test plus the official conformance suite. |
+| Fixture server drifts from real servers | The in-tree fixtures plus the official client conformance suite in CI (pinned suite version; a bump is a deliberate change that re-triages the baseline). |
 
 ## 13. Out of scope / future work
 
@@ -1268,8 +1299,8 @@ The feature-row flip (D9) still waits on the default-on change.
 ## 15. Definition of done
 
 Two sets: **M1 — ship without OAuth** (the active goal) and **post-ship** (P3).
-P0–P2, P4, and P5 are complete and the P6 bounds landed; the unchecked M1 items
-are what remains.
+P0–P6 and D9 are complete; the one open M1 item is the 2026-07-28-era
+conformance run.
 
 ### M1 — ship without OAuth
 
@@ -1277,7 +1308,9 @@ are what remains.
       and a 2024-11-05…2025-11-25 server both work, selectable per server,
       covered by integration tests on **both** transports (P1 stdio, P2 HTTP).
 - [ ] The official conformance suite's client scenarios run green against the
-      supported eras, with a committed baseline (P6).
+      supported eras, with a committed baseline (P6). *(Legacy era
+      (2025-11-25) green in CI with a committed baseline; the 2026-07-28-era
+      run is the one open conformance residual — `0a85184`.)*
 - [x] Authentication without OAuth: a static token in `headers` reaches an
       authenticated server; a server that requires OAuth fails with the P5
       actionable error, not a hang or a raw status string. No credential store,
@@ -1289,20 +1322,22 @@ are what remains.
       P4).
 - [x] Tool and resource list changes propagate without a daemon restart
       (`subscriptions/listen` + registry hot-swap — P4).
-- [ ] Bounds enforced and tested: schema/text caps, the stdio frame cap, and
-      the per-server concurrency cap landed (`1d7d239`); remaining: max tool
-      count, schema depth, max restarts, and notification-rate caps (P6).
+- [x] Bounds enforced and tested: schema/text caps, the stdio frame cap, the
+      per-server concurrency cap, a 1024-tool catalogue cap, a 32-level schema
+      depth bound, a per-server `maxRestarts`, and a notification-rate limit
+      (`1d7d239`, `0a85184`).
 - [x] Tool names sanitized and collision-proofed (P5) — `f037383`.
 - [x] `/mcp` status surface + `mcp list/add/remove/reconnect` CLI, per-server
       logs, and a `session_inspect` section (P5) — `8d27006`, `a348c89`,
       `f037383`.
-- [ ] `mcp` is a default cargo feature: a plain build has MCP; the opt-out
-      paths (iOS embedded daemon, `--no-default-features`) stay documented
-      (D9).
-- [ ] Release artifacts verified with the default (MCP-on) feature set; the
-      static-musl build covers it and the size delta is recorded (P6).
-- [ ] `ARCHITECTURE.md`/`README.md`/rustdoc updated; `just pre-commit` green;
-      release notes written from the commit messages. *(P0–P2 did exactly this,
+- [x] `mcp` is a default cargo feature: a plain build has MCP; the opt-out
+      paths (iOS embedded daemon, `--no-default-features`) are documented
+      (D9, `0a85184`).
+- [x] Release artifacts verified with the default (MCP-on) feature set; the
+      static-musl build covers it and the size delta is recorded
+      (`0a85184`; ~+11 MB / ~+21.7%).
+- [x] `ARCHITECTURE.md`/`README.md`/rustdoc updated; `just pre-commit` green;
+      release notes written from the commit messages. *(P0–P6 did exactly this,
       each commit its own release note.)*
 
 ### Post-ship
