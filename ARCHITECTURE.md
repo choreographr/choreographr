@@ -55,8 +55,10 @@ Choreographr (workspace)
 ├── choreo-client-core     Shared client logic (parsing, images, history, credentials)
 ├── choreo-markdown        Markdown parser and HTML renderer (pulldown-cmark + ammonia),
 │                       plus a LaTeX math → Unicode pretty-printer (`render_math_pretty`)
-├── choreo-mcp             MCP (Model Context Protocol) client — spawns subprocess servers,
-│                       discovers tools, and dispatches tool calls over JSON-RPC stdio
+├── choreo-mcp             MCP (Model Context Protocol) client built on the official `rmcp`
+│                       SDK — spawns subprocess servers, negotiates the protocol era
+│                       (`server/discover` with an `initialize` fallback), lists paginated
+│                       tools, and dispatches cancellable calls behind a blocking facade
 │                       (linked only via the daemon's `mcp` feature, off by default)
 ├── choreo-ai-protocols    Provider protocols — OpenAI-compatible, Anthropic Messages, and
 │                       Google Gemini clients, the ProviderClient trait, and the provider
@@ -806,17 +808,24 @@ operator already trusts, or is confirmed by a human comparing fingerprints:
 
 ### `choreo-mcp` — MCP client (Model Context Protocol)
 
-Communicates with MCP server subprocesses over JSON-RPC 2.0 stdio transport.
-Used by `choreo-daemon` to spawn external MCP servers and register their tools
-(behind the daemon's `mcp` cargo feature, off by default — a plain build
-excludes the crate and the daemon's `mcp/` module compiles to a no-op stub).
+Communicates with MCP server subprocesses over the stdio transport of the
+**official `rmcp` SDK**. Used by `choreo-daemon` to spawn external MCP servers
+and register their tools (behind the daemon's `mcp` cargo feature, off by
+default — a plain build excludes the crate and the daemon's `mcp/` module
+compiles to a no-op stub). Because `rmcp` is async and the daemon is
+thread-only, the crate owns one process-wide sidecar tokio runtime (`runtime`)
+and one **dispatcher thread per server** (`session`); the daemon never sees an
+`rmcp` type — the boundary is typed on this crate's own `McpServer`,
+`McpServerHandle`, `McpTool`, and `CallToolResult`.
 
 | Module | Purpose |
 |---|---|
-| `client.rs` | `McpClient` — spawns a subprocess, performs the MCP initialize handshake, discovers tools (`list_tools`), and dispatches tool calls (`call_tool`). `inputSchema` is parsed in its camelCase wire form and normalized (a missing/`null` schema becomes an explicit empty-object schema; a non-object or oversized schema drops that tool, keeping the rest). Timeouts come from the per-server config (handshake, listing, call) with built-in defaults. |
-| `protocol.rs` | JSON-RPC 2.0 wire types (`JsonRpcRequest`, `JsonRpcResponse`) and MCP protocol types (`McpTool`, `CallToolResult`, `McpContent`), plus the named `PROTOCOL_VERSION` constant, the empty-input-schema fallback, and `normalize_input_schema`. All MCP payloads use the spec's camelCase wire names. |
-| `transport.rs` | `StdioTransport` — manages a subprocess stdin/stdout, routes incoming JSON-RPC lines to response/notification channels. Reads are bounded (an 8 MiB line cap yields a typed `LineTooLong` error and closes the transport instead of allocating unboundedly); the notification channel is bounded and drops (with a debug log) rather than blocking the reader, while the response channel stays unbounded. Every cross-thread wait is channel-driven, never a sleep-poll: `recv_response` blocks in `recv_deadline` on the response channel (an absolute deadline, so a mismatched response never extends the overall wait), and shutdown reaps the child via a `Child::wait()` thread and joins the stdout reader via a `JoinHandle` waiter thread, each signalling completion over a `bounded(1)` crossbeam channel the caller waits on with `recv_timeout`. The reader thread's stop hint is a single `Arc<AtomicBool>` (exception #1), set by `shutdown` and read between lines. |
-| `error.rs` | `McpError` enum — `SpawnFailed`, `InitializeFailed`, `JsonRpcError`, `ProtocolError`, `Timeout`, `Io`, `ServerShutdown`, `LineTooLong` |
+| `runtime.rs` | Sidecar tokio runtime (multi-thread, init/get/`block_on`/`handle`) — the same bridge pattern `choreo-content`/`choreo-blockchain` use for subxt. Blocking entry points run their client futures here; each dispatcher spawns in-flight call tasks onto it. |
+| `config.rs` | `McpServerConfig` (subprocess command/args/env, per-server timeout, `McpProtocolMode`) and `McpProtocolMode::{Auto,Legacy,Modern}`. `Auto` is the spec-standard probe (`server/discover`, falling back to `initialize` on a legacy peer or a timeout, never on a recognized modern rejection). |
+| `session.rs` | The per-server dispatcher thread and the blocking facade: `McpServer::connect` (handshake + dispatcher spawn), the cloneable `McpServerHandle` (`list_tools`/`call_tool`/`cancel_session`), the `McpEngine` backend trait (production `rmcp` engine, mock engine in tests), the `McpCommand` channel protocol, and the bounded restart policy. Calls no longer serialize behind a `Mutex`: the dispatcher spawns each call onto the runtime, so many calls run concurrently while it keeps draining commands (cancellation included) over crossbeam channels. The in-flight registry is owned solely by the dispatcher thread (no lock); the per-call cancellation token is the sanctioned cooperative flag (exception #1) that un-blocks a parked call. |
+| `engine.rs` | The only module that names an `rmcp` type. `connect` spawns the child (in its own process group on Unix via `process-wrap`) and drives the lifecycle handshake, then wraps the live `Peer`. `list_tools` follows `nextCursor` (bounded by the server timeout); `call_tool` honours the deadline (reset on progress) and cancellation, mapping `rmcp` service errors and content blocks onto the crate's own types. |
+| `protocol.rs` | The daemon-facing value types (`McpTool`, `CallToolResult`, `McpContent`), the empty-input-schema fallback, and `normalize_input_schema` (a missing/`null` schema becomes the empty-object schema; an over-cap schema drops that tool, keeping the rest). `rmcp` itself already rejects a non-object `inputSchema` at decode time. |
+| `error.rs` | `McpError` enum — `SpawnFailed`, `InitializeFailed`, `JsonRpcError`, `ProtocolError`, `Timeout`, `Io`, `ServerShutdown`, `Cancelled`, `NotConnected` |
 
 
 ### `choreo-sockreg` — Provider-socket registry + keepalive tuning
@@ -1143,7 +1152,7 @@ alloy/subxt clients, and the daemon calls their synchronous `execute_*` entry po
 | `tools/ios_bridge.rs` | iOS-native-tool C-ABI bridge — the Rust half of the choreo-daemon ↔ Swift host seam for the iOS tools (clipboard_write/clipboard_read/open_url/notify). Compiled UNCONDITIONALLY (the `powershell` precedent: modules compile everywhere, only registration is platform-gated). Owns the object-safe `IosToolBridge` trait, the `IosToolRequest`/`ToolBridgeReply` envelopes, serializable `ToolBridgeError` (BridgeUnavailable/Canceled/Timeout/Platform), the `IosToolPending` handle (deadline-bounded `wait` with cancellation polling and cancel-precedence over an already-arrived reply, plus best-effort `cancel()` via a `Box<dyn FnOnce()>` hook), named per-tool timeouts (1500/3000/5000 ms), and the scripted `MockBridge`. The concrete `SwiftIosToolBridge` lives in choreo-gui under `#[cfg(target_os = "ios")]` (that crate depends on choreo-daemon only for iOS); the Swift side is `ios/IosToolHost.swift` (main-queue-serialized handlers, exactly-once reply per request) — NOT compiled in CI; the zig path of `scripts/build-ios.sh` validates the Rust cfg(ios) code. BINDING reply-slot ownership contract (verbatim in the module header): each request boxes a one-shot crossbeam reply Sender as an opaque pointer passed through the C ABI; ownership transfers to Swift at dispatch; Rust NEVER frees the box; Swift guarantees exactly-once reply on its serial main queue; if Rust abandons (timeout/cancel) it drops the receiver and a late Swift reply sends into a disconnected channel (Err ignored) and then drops the slot — no UAF, no leak. THREADING: the bridge needs NO new sanctioned shared-state exception — every request carries its OWN boxed crossbeam one-shot reply Sender as the C-ABI context pointer (no state is shared between requests or threads; the only cross-thread path is the channel), so the AGENTS.md channel-only rule holds unmodified. |
 | `tools/vm.rs` | RISC-V sandbox: compiles Rust → ELF via rustc, executes in `ckb-vm` with custom syscall handler (`ChoreographrSyscall`) for tool dispatch. |
 | `tools/shell_util.rs` | Shared child-process spawning for the shell/exec tools (`spawn_with_watchdog` / `spawn_with_streaming`): env sanitization, output caps, the timeout watchdog, and process-tree isolation — process-group + pidfd kill on Unix, a Windows Job Object (`ChildJob`) with blocking reads bounded by job termination on Windows. All waits are channel-driven (`recv_timeout` on the watchdog and on every drain's completion channel — no polling), each bounded by a completion grace that detaches a wedged drain rather than hanging the tool; the `Arc<ChildJob>` shared by the watchdog and drain threads is the fifth sanctioned shared-state exception (AGENTS.md). `binary_exists` (the registration-time PATH probe for conditional tool registration) resolves Windows executables through PATHEXT extension candidates — a bare `nu` is really `nu.exe` — so Unix behavior is exact-name while Windows probes every PATHEXT entry. |
-| `mcp/` | `McpManager` — loads MCP server config from `mcp_servers.json` (recognized keys: `command`, `args`, `env`, `timeout`; unknown keys are logged and ignored), spawns subprocesses via `McpClient`, wraps discovered tools as `McpToolWrapper` (implements `ToolDyn`) and registers them in the `ToolRegistry` under a `mcp/<slug>` group. The wrapper maps MCP content onto `ToolOutput`: text is joined and truncated past a fixed byte budget (with an explicit marker), images are base64-decoded and routed through the daemon image pipeline to `image_tx` (a text placeholder is used only when there is no sink or the image is invalid), and `isError` rides `ToolOutput.is_error` on the JSON path and the domain `Err` on the postcard path. Compiled only with the `mcp` cargo feature (off by default); without it the module degrades to a no-op `McpManager` stub so call sites compile unchanged. |
+| `mcp/` | `McpManager` — loads MCP server config from `mcp_servers.json` (recognized keys: `command`, `args`, `env`, `timeout`, `protocol`; unknown keys are logged and ignored), connects servers via `McpServer::connect` in background threads bounded by a 2 s startup budget (a hung server cannot stall `DaemonState::open`), and wraps discovered tools as `McpToolWrapper` (implements `ToolDyn`) under a `mcp/<slug>` group. The wrapper maps MCP content onto `ToolOutput`: text is joined and truncated past a fixed byte budget (with an explicit marker), images are base64-decoded and routed through the daemon image pipeline to `image_tx` (a text placeholder is used only when there is no sink or the image is invalid), audio/blob resources/resource links are described rather than dropped, `structuredContent` becomes `ToolOutput.result_json`, and `isError` rides `ToolOutput.is_error` on the JSON path and the domain `Err` on the postcard path. Each call carries its session id so `McpManager::cancel_session` (driven from the daemon's session-cancel path) can stop that session's in-flight calls. Compiled only with the `mcp` cargo feature (off by default); without it the module degrades to a no-op `McpManager` stub so call sites compile unchanged. |
 
 ### Provider Architecture
 
@@ -3782,11 +3791,14 @@ counts survive the attach instead of regressing.
     the daemon's `InferenceProvider` is the thin dispatch/metrics facade.
 
 12. **OS threads with sidecar async runtime** — the daemon avoids async Rust everywhere except
-    where third-party libraries (alloy, subxt) require it. Both live in the `choreo-blockchain`
-    and `choreo-content` crates, which hold a global `OnceLock<tokio::runtime::Runtime>` as a
-    sidecar and run their clients via `block_on()`. The daemon links those crates only behind
-    the `blockchain` and `content` cargo features (both off by default) and calls their
-    synchronous `execute_*` entry points, so tokio is
+    where third-party libraries (alloy, subxt, rmcp) require it. These live in the
+    `choreo-blockchain`, `choreo-content`, and `choreo-mcp` crates, each of which holds a global
+    `OnceLock<tokio::runtime::Runtime>` as a sidecar and runs its clients via `block_on()`.
+    `choreo-mcp` additionally runs one blocking **dispatcher thread per MCP server** that spawns
+    its in-flight calls onto that sidecar, so calls to one server run concurrently and can be
+    cancelled while the dispatcher keeps serving commands. The daemon links those crates only
+    behind the `blockchain`, `content`, and `mcp` cargo features (all off by default) and calls
+    their synchronous entry points, so tokio is
     never a direct dependency of the daemon. Every call is additionally bounded by a 30s
     wall-clock `RPC_TIMEOUT` inside the crate: the daemon's own ~60s tool timeout can only
     *abandon* the blocked execution thread (a synchronous `block_on` cannot be interrupted),
@@ -4169,7 +4181,7 @@ tears every thread down before propagating.
 | Protocol | Framing, version handling, round-trip encode/decode | `choreo-proto/src/tests.rs` |
 | Client core | Shell parsing, markdown→HTML, image assembly, history | `choreo-client-core/src/tests.rs` |
 | Daemon | Request lifecycle, session CRUD, cancellation, tool calls, model listing | `choreo-daemon/src/tests.rs`, `choreo-daemon/tests/it/session_integration.rs`, `choreo-daemon/tests/it/lifecycle_integration.rs` |
-| MCP (choreo-mcp) | Server spawn, tool discovery, echo tool call/response, schema normalization, oversized-line rejection, image/error content, crash/no-init scenarios | `choreo-mcp/tests/it/mcp_integration.rs` (against the in-tree `tests/fixtures/fixture_server.rs`) |
+| MCP (choreo-mcp) | Server spawn, tool discovery, echo/error/structured/image calls, both protocol eras (`server/discover` + `Auto` fallback to `initialize`), schema normalization, cancellation, crash/no-init/garbage/oversized scenarios; the dispatcher protocol, error mapping, and config parsing are unit-tested against a mock engine (no sleeps) | `choreo-mcp/tests/it/mcp_integration.rs` (against the in-tree `tests/fixtures/fixture_server.rs`); dispatcher/config/engine unit tests in `src/` |
 | MCP (daemon) | McpManager + ToolRegistry integration, dynamic group registration, tool execution, image attachment via the sink | `choreo-daemon/tests/it/mcp_integration.rs` |
 | Providers (`choreo-ai-protocols`) | SSE parsing, HTTP request construction, chat completions + responses serialization, content-block deserialisation, config overrides, catalog lookups | `choreo-ai-protocols/src/openai/tests.rs`, `choreo-ai-protocols/src/openai/chat_completions.rs`, `choreo-ai-protocols/src/openai/config.rs`, `choreo-ai-protocols/src/anthropic/tests.rs`, `choreo-ai-protocols/src/google/tests.rs`, `choreo-ai-protocols/src/catalog/mod.rs` |
 | choreo-tui | SVG rasterization, Unicode width, app state | `choreo-tui/src/app_tests.rs`, `choreo-tui/src/lib_tests.rs` |
@@ -4383,9 +4395,10 @@ cargo run -p choreo-im -- telegram
 
 | Crate | Used by | Purpose |
 |---|---|---|
-| `tokio` | choreo-blockchain, choreo-content | Async runtime — the sidecar the blockchain and Coordination Platform tools run on (linked via the daemon's `blockchain` and `content` features respectively) |
+| `tokio` | choreo-blockchain, choreo-content, choreo-mcp | Async runtime — the sidecar the blockchain, Coordination Platform, and MCP clients run on (linked via the daemon's `blockchain`, `content`, and `mcp` features respectively) |
 | `alloy` | choreo-blockchain | EVM blockchain tools (behind the `blockchain` feature) |
 | `subxt` | choreo-blockchain | Substrate/Polkadot blockchain tools (behind the `blockchain` feature) |
+| `rmcp` + `process-wrap` | choreo-mcp | Official Model Context Protocol Rust SDK and its child-process wrappers — the MCP client protocol engine (behind the `mcp` feature; `process-wrap` places the server child in its own process group) |
 | `serde` + `rmp-serde` | proto, daemon | Wire protocol framing and DB value encoding (MessagePack, named mode) |
 | `structured-zstd` | daemon | Pure-Rust compression of `session_turns` DB values (a standard zstd frame around the MessagePack blob, level 6 — the tuned level maps onto C zstd numbering; see `db/codec.rs` `COMPRESSION_LEVEL`). Apache-2.0; no libzstd C build. |
 | `snow` | daemon, client-core, transport | Noise IK handshake and transport encryption |

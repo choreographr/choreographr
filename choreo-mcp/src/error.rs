@@ -1,20 +1,26 @@
-//! Error type shared across the MCP client, transport, and protocol layers.
+//! Error type shared across the MCP client, dispatcher, and engine layers.
 
 use std::io;
 
-/// Errors produced by the MCP client, transport, and protocol layers.
+/// Errors produced by the MCP client, its per-server dispatcher, and the
+/// `rmcp`-backed engine.
 ///
-/// The daemon maps this into its own `ToolExecError` at the boundary; the
-/// variants distinguish the failure stage (spawn, handshake, transport I/O,
-/// protocol framing, or a server-reported JSON-RPC error).
+/// The daemon maps this into its own `ToolExecError` at the boundary. The
+/// variants distinguish the failure stage (subprocess spawn, handshake, a
+/// server-reported JSON-RPC error, transport I/O, a deadline, or a client-side
+/// cancellation), so a caller can react — never crash — on any of them.
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
     /// The MCP server subprocess could not be spawned or its stdio captured.
     #[error("failed to spawn subprocess: {0}")]
     SpawnFailed(String),
 
-    /// The `initialize` handshake failed or returned a malformed response.
-    #[error("MCP initialize handshake failed: {0}")]
+    /// The lifecycle handshake failed or returned a malformed response.
+    ///
+    /// Covers both the legacy `initialize` handshake and the stateless
+    /// `server/discover` probe: whichever era was negotiated, a failure to
+    /// establish the connection surfaces here.
+    #[error("MCP handshake failed: {0}")]
     InitializeFailed(String),
 
     /// The server returned a JSON-RPC error response.
@@ -38,19 +44,25 @@ pub enum McpError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
 
-    /// The server or its reader thread shut down unexpectedly.
-    #[error("MCP server shut down unexpectedly")]
+    /// The server closed the connection or the transport died unexpectedly.
+    #[error("MCP server connection closed")]
     ServerShutdown,
 
-    /// A single stdout line from the server exceeded the configured cap.
+    /// The client cancelled the request before it completed.
     ///
-    /// Raised instead of buffering an unbounded line, so a hostile or broken
-    /// server cannot exhaust memory; the transport is closed once this fires.
-    #[error("MCP server output line exceeded {limit} bytes")]
-    LineTooLong {
-        /// The byte cap the line crossed.
-        limit: usize,
-    },
+    /// Raised when a session cancel stops an in-flight call; the dispatcher
+    /// also sends the server a best-effort `notifications/cancelled` so a
+    /// cooperative peer can stop work.
+    #[error("MCP request cancelled")]
+    Cancelled,
+
+    /// The per-server dispatcher is gone, so no command can be delivered.
+    ///
+    /// Distinct from [`Self::ServerShutdown`]: the connection may still be
+    /// alive, but the client-side worker thread that would carry the command
+    /// has exited (e.g. after an explicit shutdown).
+    #[error("MCP server dispatcher is not running")]
+    NotConnected,
 }
 
 #[cfg(test)]
@@ -60,15 +72,13 @@ mod tests {
     #[test]
     fn error_spawn_failed_display() {
         let err = McpError::SpawnFailed("binary not found".into());
-        let msg = err.to_string();
-        assert!(msg.contains("binary not found"));
+        assert!(err.to_string().contains("binary not found"));
     }
 
     #[test]
     fn error_initialize_failed_display() {
         let err = McpError::InitializeFailed("version mismatch".into());
-        let msg = err.to_string();
-        assert!(msg.contains("version mismatch"));
+        assert!(err.to_string().contains("version mismatch"));
     }
 
     #[test]
@@ -85,26 +95,32 @@ mod tests {
     #[test]
     fn error_protocol_error_display() {
         let err = McpError::ProtocolError("unexpected field".into());
-        let msg = err.to_string();
-        assert!(msg.contains("unexpected field"));
+        assert!(err.to_string().contains("unexpected field"));
     }
 
     #[test]
     fn error_timeout_display() {
-        let err = McpError::Timeout;
-        assert_eq!(err.to_string(), "tool call timed out");
+        assert_eq!(McpError::Timeout.to_string(), "tool call timed out");
     }
 
     #[test]
     fn error_server_shutdown_display() {
-        let err = McpError::ServerShutdown;
-        assert_eq!(err.to_string(), "MCP server shut down unexpectedly");
+        assert_eq!(
+            McpError::ServerShutdown.to_string(),
+            "MCP server connection closed"
+        );
     }
 
     #[test]
-    fn error_line_too_long_display() {
-        let err = McpError::LineTooLong { limit: 1024 };
-        let msg = err.to_string();
-        assert!(msg.contains("1024"), "message should name the cap: {msg}");
+    fn error_cancelled_display() {
+        assert_eq!(McpError::Cancelled.to_string(), "MCP request cancelled");
+    }
+
+    #[test]
+    fn error_not_connected_display() {
+        assert_eq!(
+            McpError::NotConnected.to_string(),
+            "MCP server dispatcher is not running"
+        );
     }
 }

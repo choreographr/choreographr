@@ -2008,6 +2008,11 @@ impl DaemonState {
         // distinct from suspend or organic IO errors) so the daemon log
         // stays greppable.
         self.force_close_session_sockets(session_id, "request cancelled");
+
+        // Stop any in-flight MCP tool call this session started: the MCP
+        // dispatchers cancel their matching calls and tell the servers to stop
+        // cooperatively. Best-effort and non-blocking.
+        self.mcp_manager.cancel_session(session_id);
     }
 
     /// Force-close one session's provider sockets by shutting down its
@@ -2057,6 +2062,8 @@ impl DaemonState {
                 // session (siblings elsewhere, unrelated sessions) keeps its
                 // sockets.
                 self.force_close_session_sockets(*child_id, "parent request cancelled");
+                // And stop each child's in-flight MCP call too.
+                self.mcp_manager.cancel_session(*child_id);
             }
         }
     }

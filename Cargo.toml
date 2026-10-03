@@ -549,3 +549,19 @@ notify = "8.2.0"
 # invisible format characters stays complete across Unicode releases without
 # a hand-maintained enumeration.
 unicode-general-category = "1.1"
+# Async runtime. Choreographr's daemon is thread-only; the only tokio use is the
+# sidecar runtime each async leaf crate owns to drive its async client (subxt in
+# choreo-content/choreo-blockchain, the official `rmcp` SDK in choreo-mcp).
+# Promoted to the workspace now that three members need it; consumers that need
+# extra features (e.g. choreo-mcp's `sync`/`macros`) add them at the member.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
+# Official Model Context Protocol Rust SDK, maintained by the MCP project. It is
+# the protocol engine behind `choreo-mcp` (feature `mcp`, off by default); the
+# daemon never sees rmcp types — they stay inside the crate. Default features
+# are off so a consumer enables exactly the transports it needs.
+rmcp = { version = "3.5", default-features = false }
+# Composable process wrappers, used by choreo-mcp to place an MCP server child
+# in its own process group (so a launcher's grandchild is killed with it).
+# Already in the tree via rmcp's child-process transport; declared directly here
+# because choreo-mcp names `ProcessGroup` itself.
+process-wrap = { version = "10", features = ["tokio1"] }

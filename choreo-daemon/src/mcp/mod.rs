@@ -1,4 +1,4 @@
-// Real implementation (spawn/handshake/discover/shutdown over stdio) is
+// Real implementation (connect/handshake/discover/shutdown over stdio) is
 // compiled only with the `mcp` feature. Without it, the module below degrades
 // to a no-op stub (see the `#[cfg(not(feature = "mcp"))]` block) so the
 // manager's call sites in cli.rs / daemon.rs / server/lifecycle.rs compile
@@ -11,92 +11,57 @@ pub mod tool;
 #[cfg(feature = "mcp")]
 use crate::tools::{ToolDyn, ToolRegistry};
 #[cfg(feature = "mcp")]
-use anyhow::{Context, Result};
-#[cfg(feature = "mcp")]
-use choreo_mcp::{McpClient, McpServerConfig};
+use choreo_mcp::{McpServer, McpServerHandle};
 #[cfg(feature = "mcp")]
 use std::collections::HashMap;
 #[cfg(feature = "mcp")]
-use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 #[cfg(feature = "mcp")]
 use tool::McpToolWrapper;
 #[cfg(feature = "mcp")]
 use tracing::{debug, error, info, warn};
 
-/// Manages all MCP server subprocesses and their registered tools.
+/// Default budget for connecting all MCP servers during `from_config`.
+///
+/// A hung server must never stall daemon startup: the manager gives the whole
+/// batch this long to connect, then registers whatever is ready and leaves the
+/// rest (their threads detach and the server is dropped, so nothing leaks).
+#[cfg(feature = "mcp")]
+const STARTUP_BUDGET: Duration = Duration::from_secs(2);
+
+/// One connected server: the live connection (owns the dispatcher thread) plus
+/// a cloneable handle shared with that server's tool wrappers.
+#[cfg(feature = "mcp")]
+struct ServerSlot {
+    handle: McpServerHandle,
+    /// Dropped on shutdown; its `Drop` sends the shutdown command and joins the
+    /// dispatcher with a bounded wait.
+    #[expect(
+        dead_code,
+        reason = "kept only for its Drop (bounded dispatcher shutdown)"
+    )]
+    server: McpServer,
+}
+
+/// Manages all MCP server connections and their registered tools.
 #[cfg(feature = "mcp")]
 pub struct McpManager {
-    /// MCP client per server, keyed by server slug. Arc<Mutex<>> so
-    /// `McpToolWrapper` instances can share the same client reference.
-    clients: HashMap<String, Arc<Mutex<McpClient>>>,
+    /// One slot per server, keyed by server slug.
+    servers: HashMap<String, ServerSlot>,
 }
 
 #[cfg(feature = "mcp")]
 impl McpManager {
-    /// Spawn a single MCP server subprocess and perform the initialize handshake.
-    fn spawn_server(cfg: &McpServerConfig) -> Result<McpClient> {
-        info!(
-            server = %cfg.slug,
-            command = %cfg.command,
-            "spawning MCP server"
-        );
-        McpClient::spawn(cfg).with_context(|| format!("failed to spawn MCP server '{}'", cfg.slug))
-    }
-
-    /// Discover tools from an MCP client and register them in the `ToolRegistry`.
-    fn register_server_tools(
-        slug: &str,
-        client: &mut McpClient,
-        registry: &mut ToolRegistry,
-        shared: &Arc<Mutex<McpClient>>,
-    ) {
-        match client.list_tools() {
-            Ok(tools) => {
-                registry.register_dynamic_group(
-                    format!("mcp/{slug}"),
-                    format!("MCP server: {}", client.server_name()),
-                );
-
-                info!(
-                    server = %slug,
-                    name = %client.server_name(),
-                    tool_count = tools.len(),
-                    "registered MCP server tools"
-                );
-
-                for mcp_tool in tools {
-                    let description = mcp_tool.description.unwrap_or_default();
-                    let wrapper = McpToolWrapper::new(
-                        slug,
-                        &mcp_tool.name,
-                        &description,
-                        mcp_tool.input_schema,
-                        Arc::clone(shared),
-                    );
-                    // Own the strings BEFORE moving `wrapper` into the box:
-                    // a borrow extending into the call would conflict with the
-                    // move (this path only builds under --all-features).
-                    let name = wrapper.name().to_string();
-                    let group = wrapper.group().to_string();
-                    registry.register_dynamic(name, &group, Box::new(wrapper));
-                }
-            }
-            Err(e) => {
-                error!(
-                    server = %slug,
-                    error = %e,
-                    "failed to list MCP tools, shutting down server"
-                );
-                // shared (Arc<Mutex<McpClient>>) is dropped here, killing the subprocess
-            }
-        }
-    }
-
-    /// Create a new `McpManager`, spawn all enabled servers, discover their
-    /// tools, and register them in the `ToolRegistry`.
+    /// Connect every enabled server, discover its tools, and register them in
+    /// the `ToolRegistry`.
+    ///
+    /// Servers connect in parallel on background threads; the whole batch is
+    /// bounded by [`STARTUP_BUDGET`] so a hung server cannot stall startup. A
+    /// server that is not ready in time is logged and skipped (its thread
+    /// detaches and its connection is dropped).
     pub fn from_config(registry: &mut ToolRegistry) -> Self {
         let configs = match config::load_mcp_config() {
-            Ok(c) => c,
+            Ok(configs) => configs,
             Err(e) => {
                 warn!("failed to load MCP config: {e}");
                 Vec::new()
@@ -104,48 +69,36 @@ impl McpManager {
         };
 
         let mut manager = Self {
-            clients: HashMap::new(),
+            servers: HashMap::new(),
         };
 
-        // Spawn all servers in parallel on background threads.
-        let mut handles: Vec<(String, std::thread::JoinHandle<anyhow::Result<McpClient>>)> =
+        // Spawn all connect threads up front so they handshake in parallel.
+        let mut pending: Vec<(String, std::thread::JoinHandle<anyhow::Result<McpServer>>)> =
             Vec::new();
-
-        for cfg in &configs {
+        for cfg in configs {
             let slug = cfg.slug.clone();
-            let cfg_clone = cfg.clone();
-            let handle = std::thread::spawn(move || Self::spawn_server(&cfg_clone));
-            handles.push((slug, handle));
+            info!(server = %slug, command = %cfg.command, "spawning MCP server");
+            let handle =
+                std::thread::spawn(move || McpServer::connect(&cfg).map_err(anyhow::Error::from));
+            pending.push((slug, handle));
         }
 
-        // Collect results and register each server's tools.
-        for (slug, handle) in handles {
-            match handle.join() {
-                Ok(Ok(client)) => {
-                    let shared = Arc::new(Mutex::new(client));
-                    let mut guard = match shared.lock() {
-                        Ok(g) => g,
-                        Err(e) => {
-                            error!(
-                                server = %slug,
-                                "MCP client lock poisoned: {e}"
-                            );
-                            continue;
-                        }
-                    };
-
-                    Self::register_server_tools(&slug, &mut guard, registry, &shared);
-
-                    // Drop the lock so the manager doesn't hold it while storing the Arc.
-                    drop(guard);
-
-                    manager.clients.insert(slug, shared);
+        let deadline = Instant::now() + STARTUP_BUDGET;
+        for (slug, handle) in pending {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match join_with_budget(handle, remaining) {
+                Some(Ok(server)) => {
+                    Self::register_server(&slug, server, registry, &mut manager);
                 }
-                Ok(Err(e)) => {
-                    error!(server = %slug, error = %e, "failed to spawn MCP server");
+                Some(Err(e)) => {
+                    error!(server = %slug, error = %e, "failed to connect MCP server");
                 }
-                Err(_) => {
-                    error!(server = %slug, "MCP server spawn thread panicked");
+                None => {
+                    warn!(
+                        server = %slug,
+                        budget_ms = STARTUP_BUDGET.as_millis(),
+                        "MCP server did not connect within the startup budget; skipping"
+                    );
                 }
             }
         }
@@ -153,44 +106,101 @@ impl McpManager {
         manager
     }
 
-    /// Shut down all MCP servers.
-    pub fn shutdown_all(&mut self) {
-        info!(count = self.clients.len(), "shutting down MCP servers");
-        for (slug, shared) in self.clients.drain() {
-            // Log per-server BEGIN and END: if a Ctrl+C wedge stops between
-            // the two, THIS server is the culprit — either its client mutex
-            // is held by a stuck tool call (blocked before the "done" line)
-            // or its transport shutdown hung (after it).
-            debug!(server = %slug, "waiting for MCP client lock + shutdown");
-            match shared.lock() {
-                Ok(mut client) => {
-                    debug!(server = %slug, "shutting down MCP server");
-                    client.shutdown();
-                }
-                Err(e) => {
-                    warn!(
-                        server = %slug,
-                        "MCP client lock poisoned during shutdown: {e}"
+    /// Discover a server's tools and register them (and the server) in the
+    /// manager. A listing failure drops the server, which shuts it down.
+    fn register_server(
+        slug: &str,
+        server: McpServer,
+        registry: &mut ToolRegistry,
+        manager: &mut Self,
+    ) {
+        let handle = server.handle();
+        let server_name = server.name().to_string();
+
+        match handle.list_tools() {
+            Ok(tools) => {
+                registry.register_dynamic_group(
+                    format!("mcp/{slug}"),
+                    format!("MCP server: {server_name}"),
+                );
+                info!(
+                    server = %slug,
+                    name = %server_name,
+                    tool_count = tools.len(),
+                    "registered MCP server tools"
+                );
+                for mcp_tool in tools {
+                    let description = mcp_tool.description.unwrap_or_default();
+                    let wrapper = McpToolWrapper::new(
+                        slug,
+                        &mcp_tool.name,
+                        &description,
+                        mcp_tool.input_schema,
+                        mcp_tool.output_schema,
+                        handle.clone(),
                     );
+                    // Own the strings BEFORE moving `wrapper` into the box: a
+                    // borrow extending into the call would conflict with the
+                    // move.
+                    let name = wrapper.name().to_string();
+                    let group = wrapper.group().to_string();
+                    registry.register_dynamic(name, &group, Box::new(wrapper));
                 }
+                manager
+                    .servers
+                    .insert(slug.to_string(), ServerSlot { handle, server });
             }
+            Err(e) => {
+                error!(server = %slug, error = %e, "failed to list MCP tools; dropping server");
+                // `server` is dropped here, shutting the connection down.
+            }
+        }
+    }
+
+    /// Shut down all MCP servers, joining each dispatcher with a bounded wait.
+    pub fn shutdown_all(&mut self) {
+        info!(count = self.servers.len(), "shutting down MCP servers");
+        for (slug, slot) in self.servers.drain() {
+            // Log per-server BEGIN/END: if a Ctrl+C wedge stops between the two,
+            // THIS server is the culprit.
+            debug!(server = %slug, "shutting down MCP server");
+            // Dropping the slot drops the `McpServer`, whose `Drop` sends the
+            // shutdown command and joins the dispatcher with a bounded wait.
+            drop(slot);
             debug!(server = %slug, "MCP server shut down");
         }
         info!("all MCP servers shut down");
+    }
+
+    /// Cancel every in-flight tool call started by `session_id`.
+    ///
+    /// Best-effort and non-blocking: the dispatcher for each server cancels the
+    /// matching calls (and tells the server to stop cooperatively). Called from
+    /// the daemon's session-cancel path.
+    pub fn cancel_session(&self, session_id: u64) {
+        for slot in self.servers.values() {
+            slot.handle.cancel_session(session_id);
+        }
     }
 
     /// Create an empty `McpManager` with no servers (for testing).
     #[must_use]
     pub fn empty() -> Self {
         Self {
-            clients: HashMap::new(),
+            servers: HashMap::new(),
         }
     }
 
-    /// Return a reference to the clients map (for testing/inspection).
+    /// Whether no servers are connected (for testing/inspection).
     #[must_use]
-    pub fn clients(&self) -> &HashMap<String, Arc<Mutex<McpClient>>> {
-        &self.clients
+    pub fn is_empty(&self) -> bool {
+        self.servers.is_empty()
+    }
+
+    /// The number of connected servers.
+    #[must_use]
+    pub fn server_count(&self) -> usize {
+        self.servers.len()
     }
 }
 
@@ -201,8 +211,34 @@ impl Drop for McpManager {
     }
 }
 
+/// Join a thread, giving up after `timeout` and returning `None` (leaving it
+/// detached) when it overruns.
+///
+/// The handle is moved into a waiter thread that joins and forwards the result
+/// over a crossbeam channel; this thread waits on that channel with
+/// `recv_timeout`, so a hung connect cannot stall the caller.
+#[cfg(feature = "mcp")]
+fn join_with_budget<T: Send + 'static>(
+    handle: std::thread::JoinHandle<T>,
+    timeout: Duration,
+) -> Option<T> {
+    let (done_tx, done_rx) = crossbeam_channel::bounded::<T>(1);
+    std::thread::spawn(move || {
+        if let Ok(value) = handle.join() {
+            let _ = done_tx.send(value);
+        }
+    });
+    match done_rx.recv_timeout(timeout) {
+        Ok(value) => Some(value),
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
+        // The waiter died (e.g. the connect thread panicked) — nothing to
+        // register.
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => None,
+    }
+}
+
 // Feature-off stub: mirrors the metrics-module stub convention. The manager
-// holds no clients (there is nothing to manage without the choreo-mcp
+// holds no servers (there is nothing to manage without the choreo-mcp
 // dependency), so construction, teardown, and Drop are all no-ops. The API
 // surface matches the real manager exactly — same method signatures — so
 // callers cannot tell the difference, and no call site needs feature cfgs.
@@ -222,11 +258,26 @@ mod imp {
         /// Stub: there are no servers to shut down.
         pub fn shutdown_all(&mut self) {}
 
+        /// Stub: no server has any in-flight call to cancel.
+        pub fn cancel_session(&self, _session_id: u64) {}
+
         /// Stub: creates an empty manager (same seam the real one exposes for
         /// tests).
         #[must_use]
         pub fn empty() -> Self {
             Self
+        }
+
+        /// Stub: there are never any servers.
+        #[must_use]
+        pub fn is_empty(&self) -> bool {
+            true
+        }
+
+        /// Stub: there are never any servers.
+        #[must_use]
+        pub fn server_count(&self) -> usize {
+            0
         }
     }
 }
@@ -240,22 +291,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_creates_manager_with_no_clients() {
+    fn empty_creates_manager_with_no_servers() {
         let manager = McpManager::empty();
-        assert!(manager.clients().is_empty());
+        assert!(manager.is_empty());
+        assert_eq!(manager.server_count(), 0);
     }
 
     #[test]
     fn shutdown_all_on_empty_is_noop() {
         let mut manager = McpManager::empty();
-        // Should not panic or error
         manager.shutdown_all();
-        assert!(manager.clients().is_empty());
+        assert!(manager.is_empty());
+    }
+
+    #[test]
+    fn cancel_session_on_empty_is_noop() {
+        let manager = McpManager::empty();
+        manager.cancel_session(7);
+        assert!(manager.is_empty());
     }
 
     #[test]
     fn drop_empty_manager_is_noop() {
-        // Just verify dropping an empty manager doesn't panic
         let manager = McpManager::empty();
         drop(manager);
     }
@@ -264,6 +321,6 @@ mod tests {
     fn from_config_with_no_file_creates_empty() {
         let mut registry = crate::tools::ToolRegistry::new();
         let manager = McpManager::from_config(&mut registry);
-        assert!(manager.clients().is_empty());
+        assert!(manager.is_empty());
     }
 }

@@ -1,27 +1,33 @@
 // A scripted MCP stdio server used as a test fixture.
 //
-// Implements just enough of the legacy (`2024-11-05`) JSON-RPC protocol for
-// the client integration tests: `initialize`, `tools/list`, and `tools/call`.
-// It is spawned as a subprocess by the test harness (see the two `tests/it`
-// suites), never linked in-process, so its behaviour can be scripted through
-// the scenario selector without affecting the client under test.
+// Implements enough of the protocol for the client integration tests: the
+// stateless `server/discover` handshake, the legacy `initialize` handshake,
+// `tools/list`, and `tools/call`. It is spawned as a subprocess by the test
+// harness (via `env!("CARGO_BIN_EXE_mcp-fixture-server")`), never linked
+// in-process, so its behaviour can be scripted through the scenario selector
+// without affecting the client under test.
 //
 // Scenario selection: the first CLI argument, or the `MCP_FIXTURE_SCENARIO`
-// environment variable. Unknown scenarios behave as `default`.
+// environment variable. Unknown scenarios behave as `legacy`.
 //
 // Scenarios:
-// - `default` — full tool set (`echo`, `boom`, `image`, `slow`, `big`, `bad`).
+// - `legacy` (default) — legacy `initialize` server; rejects `server/discover`.
+//   Full tool set (`echo`, `boom`, `image`, `structured`, `slow`).
+// - `modern` — 2026-07-28 stateless server; answers `server/discover`.
 // - `no-init` — the `initialize` handshake returns a JSON-RPC error.
 // - `crash-on-call` — the process exits the moment `tools/call` arrives.
 // - `garbage` — emits a non-JSON line before each real response.
+// - `oversized` — emits one line far larger than any sane frame.
+// - `slow` — the `slow` tool blocks, for the cancellation test.
+//
+// When `MCP_FIXTURE_MARKER` is set, the `slow` tool creates that file as soon
+// as a `tools/call` for it arrives, so the cancellation test can synchronise
+// without sleeping.
 
 use std::io::{BufRead, Write};
 
 /// A 1x1 opaque PNG (valid CRCs), base64-encoded, returned by the `image` tool.
 const PNG_1X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
-
-/// A line safely over the client's 8 MiB stdout cap, returned by the `big` tool.
-const OVERSIZED_FILLER_LEN: usize = 9 * 1024 * 1024;
 
 fn main() {
     let scenario = std::env::args()
@@ -57,7 +63,7 @@ fn main() {
         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
         // Simulate a crash: returning from `main` closes stdout, which the
-        // client observes as an abrupt server shutdown on the in-flight call.
+        // client observes as an abrupt shutdown on the in-flight call.
         if scenario == "crash-on-call" && method == "tools/call" {
             break;
         }
@@ -65,8 +71,33 @@ fn main() {
         if scenario == "garbage" {
             let _ = writeln!(out, "this is not json");
         }
+        if scenario == "oversized" && method == "tools/call" {
+            // A single line far larger than any sane frame, and not valid JSON:
+            // the client must not buffer it unboundedly nor treat it as a result.
+            let _ = writeln!(out, "{}", "x".repeat(9 * 1024 * 1024));
+            let _ = out.flush();
+            break;
+        }
 
         match method {
+            "server/discover" if scenario == "modern" => respond_result(
+                &mut out,
+                &id,
+                &serde_json::json!({
+                    "resultType": "complete",
+                    "supportedVersions": ["2026-07-28"],
+                    "capabilities": {"tools": {}},
+                    "ttlMs": 0,
+                    "cacheScope": "public",
+                    "_meta": {
+                        "io.modelcontextprotocol/serverInfo": {
+                            "name": "fixture",
+                            "version": "0.1.0"
+                        }
+                    }
+                }),
+            ),
+            "server/discover" => respond_error(&mut out, &id, -32601, "method not found"),
             "initialize" => {
                 if scenario == "no-init" {
                     respond_error(&mut out, &id, -32601, "method not found");
@@ -75,7 +106,7 @@ fn main() {
                         &mut out,
                         &id,
                         &serde_json::json!({
-                            "protocolVersion": "2024-11-05",
+                            "protocolVersion": "2025-11-25",
                             "capabilities": {"tools": {}},
                             "serverInfo": {"name": "fixture", "version": "0.1.0"},
                         }),
@@ -89,7 +120,7 @@ fn main() {
                     &serde_json::json!({ "tools": fixture_tools() }),
                 );
             }
-            "tools/call" => handle_call(&mut out, &id, &req),
+            "tools/call" => handle_call(&mut out, &id, &req, &scenario),
             _ => respond_error(&mut out, &id, -32601, "method not found"),
         }
         let _ = out.flush();
@@ -97,22 +128,30 @@ fn main() {
 }
 
 /// The tool catalogue the fixture advertises.
+///
+/// Every `inputSchema` is a JSON object (never `null`, never an array): rmcp
+/// enforces that shape at decode time, so a non-object schema would fail the
+/// whole listing rather than exercise the client's per-tool guard.
 fn fixture_tools() -> serde_json::Value {
     serde_json::json!([
         {"name": "echo", "description": "Echo a message back.",
          "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}}}},
         {"name": "boom", "description": "Always fails.", "inputSchema": {"type": "object"}},
         {"name": "image", "description": "Return a 1x1 PNG.", "inputSchema": {"type": "object"}},
-        {"name": "slow", "description": "Sleep then answer.", "inputSchema": {"type": "object"}},
-        {"name": "big", "description": "Answer with an oversized line.", "inputSchema": {"type": "object"}},
-        // A tool whose schema is not an object: the client must drop it while
-        // keeping the rest.
-        {"name": "bad", "description": "Malformed schema.", "inputSchema": ["not", "an", "object"]},
+        {"name": "structured", "description": "Return structured content.",
+         "inputSchema": {"type": "object"},
+         "outputSchema": {"type": "object", "properties": {"value": {"type": "number"}}}},
+        {"name": "slow", "description": "Block until cancelled.", "inputSchema": {"type": "object"}},
     ])
 }
 
 /// Answer a `tools/call` according to the requested tool name.
-fn handle_call(out: &mut impl Write, id: &serde_json::Value, req: &serde_json::Value) {
+fn handle_call(
+    out: &mut impl Write,
+    id: &serde_json::Value,
+    req: &serde_json::Value,
+    scenario: &str,
+) {
     let name = req
         .pointer("/params/name")
         .and_then(|n| n.as_str())
@@ -147,8 +186,24 @@ fn handle_call(out: &mut impl Write, id: &serde_json::Value, req: &serde_json::V
                 "isError": false,
             }),
         ),
+        "structured" => respond_result(
+            out,
+            id,
+            &serde_json::json!({
+                "content": [{"type": "text", "text": "{\"value\":42}"}],
+                "structuredContent": {"value": 42},
+                "isError": false,
+            }),
+        ),
         "slow" => {
-            std::thread::sleep(std::time::Duration::from_secs(5));
+            // Signal that the call is in flight (used by the cancellation test),
+            // then block well past any plausible test window.
+            if let Ok(marker) = std::env::var("MCP_FIXTURE_MARKER") {
+                let _ = std::fs::write(marker, b"started");
+            }
+            // A scenario-independent block: the client is expected to cancel
+            // long before this returns.
+            std::thread::sleep(std::time::Duration::from_secs(30));
             respond_result(
                 out,
                 id,
@@ -158,15 +213,10 @@ fn handle_call(out: &mut impl Write, id: &serde_json::Value, req: &serde_json::V
                 }),
             );
         }
-        "big" => respond_result(
-            out,
-            id,
-            &serde_json::json!({
-                "content": [{"type": "text", "text": "x".repeat(OVERSIZED_FILLER_LEN)}],
-                "isError": false,
-            }),
-        ),
-        _ => respond_error(out, id, -32602, "unknown tool"),
+        _ => {
+            let _ = scenario;
+            respond_error(out, id, -32602, "unknown tool");
+        }
     }
 }
 

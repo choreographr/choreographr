@@ -10,24 +10,39 @@ edition = "2024"
 rust-version.workspace = true
 
 [dependencies]
-# Cross-thread control-plane channels (the stdio transport's response /
-# notification / waiter channels). Workspace policy: crossbeam, never std mpsc.
+# Cross-thread control-plane channels: the per-server dispatcher's command and
+# reply channels, and the call-completion notifications it drains between
+# commands. Workspace policy: crossbeam, never std mpsc.
 crossbeam-channel.workspace = true
+# The official MCP Rust SDK, used only inside this crate. Default features are
+# off; we enable the client role plus the stdio child-process transport. The
+# daemon never sees an rmcp type (the blocking facade is fully typed on our own
+# `McpServer`/`McpServerHandle`/`McpTool`/`CallToolResult`).
+rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+# Place the server child in its own process group on Unix so a launcher's
+# grandchild dies with it (the rmcp transport uses these wrappers' kill).
+process-wrap.workspace = true
+# Sidecar async runtime. rmcp is async and the daemon is thread-only: this crate
+# owns one process-wide multi-thread runtime that drives the client futures, and
+# the daemon calls this crate's blocking `McpServer::*` methods. `sync` provides
+# the per-call cancellation primitive; `macros` the `select!` in the call task.
+tokio = { workspace = true, features = ["sync", "macros"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
-[target.'cfg(unix)'.dependencies]
-# Used only for killpg-style process-group cleanup of MCP server subprocesses.
-libc = "0.2"
-
-# Test fixture: a scripted legacy MCP stdio server that the integration suite
-# spawns as a subprocess (via `env!("CARGO_BIN_EXE_mcp-fixture-server")`),
-# removing the suite's dependency on Node/npx and the network.
+# Test fixture: a scripted MCP stdio server that the integration suite spawns as
+# a subprocess (via `env!("CARGO_BIN_EXE_mcp-fixture-server")`), removing the
+# suite's dependency on Node/npx and the network. It speaks both the legacy
+# `initialize` era and the stateless `server/discover` era per scenario.
 [[bin]]
 name = "mcp-fixture-server"
 path = "tests/fixtures/fixture_server.rs"
+
+[dev-dependencies]
+# Temporary directories for the cancellation test's in-flight marker file.
+tempfile.workspace = true
 
 # Workspace-wide lints (see [workspace.lints.clippy] in the root Cargo.toml).
 [lints]

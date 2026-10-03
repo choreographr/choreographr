@@ -5,11 +5,11 @@ use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use choreo_ai_protocols::openai::AllowedCaller;
 use choreo_keystore::ServiceCredential;
-use choreo_mcp::{CallToolResult, McpClient, McpContent};
+use choreo_mcp::{CallToolResult, McpContent, McpServerHandle};
 use crossbeam_channel;
 use serde_json::Value;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 
 /// Upper bound on the joined text an MCP result contributes to the model.
 ///
@@ -33,37 +33,39 @@ pub struct McpToolWrapper {
     description: String,
     /// Original input schema from the MCP server
     input_schema: Value,
+    /// The server's `outputSchema`, when it advertised one.
+    output_schema: Option<Value>,
     /// The original tool name as the MCP server knows it
     original_name: String,
-    /// Shared MCP client (one per server, shared across all tools from that server)
-    client: Arc<Mutex<McpClient>>,
+    /// Cloneable handle to the server's dispatcher (one per server, shared
+    /// across all tools from that server).
+    handle: McpServerHandle,
 }
 
 impl McpToolWrapper {
+    #[must_use]
     pub fn new(
         server_slug: &str,
         tool_name: &str,
         description: &str,
         input_schema: Value,
-        client: Arc<Mutex<McpClient>>,
+        output_schema: Option<Value>,
+        handle: McpServerHandle,
     ) -> Self {
         Self {
             name: format!("mcp/{server_slug}/{tool_name}"),
             group: format!("mcp/{server_slug}"),
             description: format!("[MCP {server_slug}] {description}"),
             input_schema,
+            output_schema,
             original_name: tool_name.to_string(),
-            client,
+            handle,
         }
     }
 
-    fn call_with_args(&self, args: Value) -> Result<CallToolResult> {
-        let mut client = self
-            .client
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        client
-            .call_tool(&self.original_name, Some(args), None)
+    fn call_with_args(&self, args: Value, session_id: u64) -> Result<CallToolResult> {
+        self.handle
+            .call_tool(session_id, &self.original_name, args, None)
             .with_context(|| format!("MCP tool call '{}' failed", self.original_name))
     }
 }
@@ -87,6 +89,18 @@ fn to_tool_error(e: &anyhow::Error) -> ToolError {
     ToolError::Other(format!("{e:#}"))
 }
 
+/// The session a call belongs to (0 when no context is available, e.g. a direct
+/// unit-test call): used so a later session cancel can stop the call.
+fn session_of(ctx: Option<&ToolContext>) -> u64 {
+    ctx.map_or(0, |ctx| ctx.session_id)
+}
+
+/// Whether the session has already been cancelled, checked at the call
+/// boundary so a cancelled session does not start a fresh MCP call.
+fn is_cancelled(ctx: Option<&ToolContext>) -> bool {
+    ctx.is_some_and(|ctx| ctx.cancelled.load(Ordering::Relaxed))
+}
+
 /// The mapped form of an MCP call result.
 struct MappedResult {
     /// Text blocks (and placeholders for content that has no textual form), in
@@ -97,6 +111,8 @@ struct MappedResult {
     images: Vec<PreparedImage>,
     /// Whether the server flagged the call as an error (`isError`).
     is_error: bool,
+    /// The server's `structuredContent`, preserved for the programmatic path.
+    structured: Option<Value>,
 }
 
 /// Map an MCP [`CallToolResult`] onto the daemon's tool-output shape.
@@ -104,7 +120,8 @@ struct MappedResult {
 /// When `attach_images` is true, `image` blocks are base64-decoded and routed
 /// to the daemon image pipeline; a decode or validation failure (or a caller
 /// with no image sink) degrades to a text placeholder instead of dropping the
-/// content silently.
+/// content silently. Content with no textual form (audio, blob resources,
+/// resource links) is described rather than dropped.
 fn map_mcp_result(result: &CallToolResult, attach_images: bool) -> MappedResult {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
@@ -112,22 +129,24 @@ fn map_mcp_result(result: &CallToolResult, attach_images: bool) -> MappedResult 
         match content {
             McpContent::Text { text } => text_parts.push(text.clone()),
             McpContent::Image { data, mime_type } => {
-                let mime = mime_type.clone().unwrap_or_else(|| "image/png".to_string());
-                let placeholder =
-                    format!("[Image: {} ({})]", mime, humfmt::bytes(data.len() as u64));
+                let placeholder = format!(
+                    "[Image: {} ({})]",
+                    mime_type,
+                    humfmt::bytes(data.len() as u64)
+                );
                 if attach_images {
                     let prepared =
                         BASE64
                             .decode(data)
                             .map_err(|e| e.to_string())
                             .and_then(|bytes| {
-                                prepare_image_from_bytes(&mime, &bytes)
+                                prepare_image_from_bytes(mime_type, &bytes)
                                     .map(|(m, w, h)| (m, bytes, w, h))
                                     .map_err(|e| e.to_string())
                             });
                     match prepared {
-                        Ok((mime_type, data, width, height)) => images.push(PreparedImage {
-                            mime_type,
+                        Ok((mime, data, width, height)) => images.push(PreparedImage {
+                            mime_type: mime,
                             data,
                             width,
                             height,
@@ -142,8 +161,25 @@ fn map_mcp_result(result: &CallToolResult, attach_images: bool) -> MappedResult 
                     text_parts.push(placeholder);
                 }
             }
-            McpContent::Resource { resource } => {
-                text_parts.push(format!("[Resource: {resource}]"));
+            McpContent::Audio { data, mime_type } => text_parts.push(format!(
+                "[Audio: {}, {} — not attached]",
+                mime_type,
+                humfmt::bytes(data.len() as u64)
+            )),
+            McpContent::Resource {
+                uri,
+                mime_type,
+                text,
+            } => match text {
+                Some(text) => text_parts.push(text.clone()),
+                None => text_parts.push(format!(
+                    "[Resource: {uri} ({})]",
+                    mime_type.as_deref().unwrap_or("unknown")
+                )),
+            },
+            McpContent::ResourceLink { uri, name, .. } => {
+                let label = name.as_deref().unwrap_or(uri);
+                text_parts.push(format!("[Resource link: {label} ({uri})]"));
             }
         }
     }
@@ -151,6 +187,7 @@ fn map_mcp_result(result: &CallToolResult, attach_images: bool) -> MappedResult 
         text_parts,
         images,
         is_error: result.is_error,
+        structured: result.structured_content.clone(),
     }
 }
 
@@ -174,7 +211,7 @@ fn join_text_parts(text_parts: &[String]) -> String {
 
 impl ToolDyn for McpToolWrapper {
     fn describe_invocation_json(&self, _args_json: &str) -> String {
-        self.description().to_string()
+        self.description.clone()
     }
     fn supports_streaming_output(&self) -> bool {
         true
@@ -197,10 +234,9 @@ impl ToolDyn for McpToolWrapper {
     }
 
     fn output_schema(&self) -> Option<Value> {
-        // We do not capture the server's `outputSchema`, so there is no real
-        // return schema to advertise; `None` is honest (a hard-coded
-        // `{"type":"string"}` would be wrong for any structured tool).
-        None
+        // The server's real `outputSchema`, when it advertised one; `None` is
+        // honest for a tool that returns free-form content.
+        self.output_schema.clone()
     }
 
     fn allowed_callers(&self) -> Vec<AllowedCaller> {
@@ -213,11 +249,16 @@ impl ToolDyn for McpToolWrapper {
         format: ToolOutputFormat,
         _x_credentials: Option<&ServiceCredential>,
         _working_dir: Option<&std::path::Path>,
-        _ctx: Option<&ToolContext>,
+        ctx: Option<&ToolContext>,
         image_tx: Option<mpsc::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError> {
+        if is_cancelled(ctx) {
+            return Ok(cancelled_output());
+        }
         let args = parse_json_args(args_json)?;
-        let result = self.call_with_args(args).map_err(|e| to_tool_error(&e))?;
+        let result = self
+            .call_with_args(args, session_of(ctx))
+            .map_err(|e| to_tool_error(&e))?;
         let mapped = map_mcp_result(&result, image_tx.is_some());
         // Images ride the dedicated sink so a vision-capable model receives
         // them as images, not as text; a caller without a sink got placeholders
@@ -234,6 +275,7 @@ impl ToolDyn for McpToolWrapper {
                 ToolOutputFormat::Json => serde_json::to_string(&content).unwrap_or(content),
             },
             is_error: mapped.is_error,
+            result_json: mapped.structured,
             invocation_description: String::new(),
             ..Default::default()
         })
@@ -244,8 +286,11 @@ impl ToolDyn for McpToolWrapper {
         args_bytes: &[u8],
         _x_credentials: Option<&ServiceCredential>,
         _working_dir: Option<&std::path::Path>,
-        _ctx: Option<&ToolContext>,
+        ctx: Option<&ToolContext>,
     ) -> Vec<u8> {
+        if is_cancelled(ctx) {
+            return encode_outer::<String, String>(&Ok(Err("MCP call cancelled".to_string())));
+        }
         let args = match parse_binary_args(args_bytes) {
             Ok(v) => v,
             Err(e) => return e,
@@ -253,7 +298,7 @@ impl ToolDyn for McpToolWrapper {
         // The postcard wire shape has no `is_error` bit, so a server-flagged
         // error is surfaced as the domain `Err` (the byte-level analogue of
         // `ToolOutput.is_error`) rather than being dropped.
-        let result: Result<String, String> = match self.call_with_args(args) {
+        let result: Result<String, String> = match self.call_with_args(args, session_of(ctx)) {
             Ok(call_result) => {
                 let mapped = map_mcp_result(&call_result, false);
                 let text = join_text_parts(&mapped.text_parts);
@@ -271,11 +316,16 @@ impl ToolDyn for McpToolWrapper {
         _x_credentials: Option<&ServiceCredential>,
         _working_dir: Option<&std::path::Path>,
         output_tx: crossbeam_channel::Sender<Vec<u8>>,
-        _ctx: Option<&ToolContext>,
+        ctx: Option<&ToolContext>,
         image_tx: Option<mpsc::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError> {
+        if is_cancelled(ctx) {
+            return Ok(cancelled_output());
+        }
         let args = parse_json_args(args_json)?;
-        let result = self.call_with_args(args).map_err(|e| to_tool_error(&e))?;
+        let result = self
+            .call_with_args(args, session_of(ctx))
+            .map_err(|e| to_tool_error(&e))?;
         let mapped = map_mcp_result(&result, image_tx.is_some());
         if let Some(tx) = &image_tx {
             for image in mapped.images {
@@ -283,7 +333,8 @@ impl ToolDyn for McpToolWrapper {
             }
         }
         let text_content = join_text_parts(&mapped.text_parts);
-        // Always stream text content for incremental display.
+        // Stream the text content for incremental display, then return it as
+        // the final output.
         let _ = output_tx.send(text_content.as_bytes().to_vec());
         Ok(ToolOutput {
             content: match format {
@@ -293,9 +344,20 @@ impl ToolDyn for McpToolWrapper {
                 }
             },
             is_error: mapped.is_error,
+            result_json: mapped.structured,
             invocation_description: String::new(),
             ..Default::default()
         })
+    }
+}
+
+/// The output returned when a session cancel is observed at the call boundary.
+fn cancelled_output() -> ToolOutput {
+    ToolOutput {
+        content: "MCP call cancelled".to_string(),
+        is_error: true,
+        invocation_description: String::new(),
+        ..Default::default()
     }
 }
 
@@ -308,14 +370,30 @@ fn mcp_result_to_string(result: &CallToolResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use choreo_mcp::McpTool;
 
-    // ── mcp_result_to_tool_output tests ──────────────────────────────
+    fn empty_result() -> CallToolResult {
+        CallToolResult {
+            content: vec![],
+            is_error: false,
+            structured_content: None,
+        }
+    }
+
+    fn text_result(text: &str) -> CallToolResult {
+        CallToolResult {
+            content: vec![McpContent::Text { text: text.into() }],
+            is_error: false,
+            structured_content: None,
+        }
+    }
 
     fn mcp_result_to_tool_output(result: &CallToolResult) -> ToolOutput {
         let mapped = map_mcp_result(result, false);
         ToolOutput {
             content: join_text_parts(&mapped.text_parts),
             is_error: mapped.is_error,
+            result_json: mapped.structured,
             invocation_description: String::new(),
             ..Default::default()
         }
@@ -323,13 +401,7 @@ mod tests {
 
     #[test]
     fn mcp_result_to_tool_output_text_only() {
-        let result = CallToolResult {
-            content: vec![McpContent::Text {
-                text: "hello world".into(),
-            }],
-            is_error: false,
-        };
-        let output = mcp_result_to_tool_output(&result);
+        let output = mcp_result_to_tool_output(&text_result("hello world"));
         assert!(!output.is_error);
         assert_eq!(output.content, "hello world");
     }
@@ -346,9 +418,9 @@ mod tests {
                 },
             ],
             is_error: false,
+            structured_content: None,
         };
-        let output = mcp_result_to_tool_output(&result);
-        assert_eq!(output.content, "line 1\nline 2");
+        assert_eq!(mcp_result_to_tool_output(&result).content, "line 1\nline 2");
     }
 
     #[test]
@@ -356,9 +428,10 @@ mod tests {
         let result = CallToolResult {
             content: vec![McpContent::Image {
                 data: "abc123".into(),
-                mime_type: Some("image/png".into()),
+                mime_type: "image/png".into(),
             }],
             is_error: false,
+            structured_content: None,
         };
         let output = mcp_result_to_tool_output(&result);
         assert!(output.content.contains("[Image:"));
@@ -366,28 +439,50 @@ mod tests {
     }
 
     #[test]
-    fn mcp_result_to_tool_output_image_no_mime_defaults_to_png() {
+    fn mcp_result_to_tool_output_with_audio() {
         let result = CallToolResult {
-            content: vec![McpContent::Image {
-                data: "data".into(),
-                mime_type: None,
+            content: vec![McpContent::Audio {
+                data: "abcd".into(),
+                mime_type: "audio/wav".into(),
             }],
             is_error: false,
+            structured_content: None,
         };
         let output = mcp_result_to_tool_output(&result);
-        assert!(output.content.contains("image/png"));
+        assert!(output.content.contains("[Audio:"));
+        assert!(output.content.contains("audio/wav"));
     }
 
     #[test]
-    fn mcp_result_to_tool_output_with_resource() {
+    fn mcp_result_to_tool_output_with_inline_resource() {
         let result = CallToolResult {
             content: vec![McpContent::Resource {
-                resource: serde_json::json!({"uri": "file:///tmp/test"}),
+                uri: "file:///tmp/a".into(),
+                mime_type: Some("text/plain".into()),
+                text: Some("body".into()),
             }],
             is_error: false,
+            structured_content: None,
         };
-        let output = mcp_result_to_tool_output(&result);
-        assert!(output.content.contains("[Resource:"));
+        assert_eq!(mcp_result_to_tool_output(&result).content, "body");
+    }
+
+    #[test]
+    fn mcp_result_to_tool_output_with_resource_link() {
+        let result = CallToolResult {
+            content: vec![McpContent::ResourceLink {
+                uri: "file:///tmp/a".into(),
+                name: Some("a".into()),
+                mime_type: None,
+            }],
+            is_error: false,
+            structured_content: None,
+        };
+        assert!(
+            mcp_result_to_tool_output(&result)
+                .content
+                .contains("Resource link")
+        );
     }
 
     #[test]
@@ -397,6 +492,7 @@ mod tests {
                 text: "error msg".into(),
             }],
             is_error: true,
+            structured_content: None,
         };
         let output = mcp_result_to_tool_output(&result);
         assert!(output.is_error);
@@ -404,27 +500,26 @@ mod tests {
     }
 
     #[test]
-    fn mcp_result_to_tool_output_empty_content() {
+    fn mcp_result_carries_structured_content() {
         let result = CallToolResult {
             content: vec![],
             is_error: false,
+            structured_content: Some(serde_json::json!({"value": 42})),
         };
         let output = mcp_result_to_tool_output(&result);
+        assert_eq!(output.result_json, Some(serde_json::json!({"value": 42})));
+    }
+
+    #[test]
+    fn mcp_result_to_tool_output_empty_content() {
+        let output = mcp_result_to_tool_output(&empty_result());
         assert!(!output.is_error);
         assert_eq!(output.content, "");
     }
 
-    // ── mcp_result_to_string tests ───────────────────────────────────
-
     #[test]
     fn mcp_result_to_string_text_only() {
-        let result = CallToolResult {
-            content: vec![McpContent::Text {
-                text: "hello".into(),
-            }],
-            is_error: false,
-        };
-        assert_eq!(mcp_result_to_string(&result), "hello");
+        assert_eq!(mcp_result_to_string(&text_result("hello")), "hello");
     }
 
     #[test]
@@ -435,6 +530,7 @@ mod tests {
                 McpContent::Text { text: "b".into() },
             ],
             is_error: false,
+            structured_content: None,
         };
         assert_eq!(mcp_result_to_string(&result), "a\nb");
     }
@@ -449,9 +545,10 @@ mod tests {
         let result = CallToolResult {
             content: vec![McpContent::Image {
                 data: PNG_1X1.into(),
-                mime_type: Some("image/png".into()),
+                mime_type: "image/png".into(),
             }],
             is_error: false,
+            structured_content: None,
         };
         let mapped = map_mcp_result(&result, true);
         assert_eq!(mapped.images.len(), 1, "valid image should be attached");
@@ -464,9 +561,10 @@ mod tests {
         let result = CallToolResult {
             content: vec![McpContent::Image {
                 data: "not-base64!!".into(),
-                mime_type: Some("image/png".into()),
+                mime_type: "image/png".into(),
             }],
             is_error: false,
+            structured_content: None,
         };
         let mapped = map_mcp_result(&result, true);
         assert_eq!(mapped.images.len(), 0, "invalid image must not attach");
@@ -479,9 +577,10 @@ mod tests {
         let result = CallToolResult {
             content: vec![McpContent::Image {
                 data: PNG_1X1.into(),
-                mime_type: Some("image/png".into()),
+                mime_type: "image/png".into(),
             }],
             is_error: false,
+            structured_content: None,
         };
         let mapped = map_mcp_result(&result, false);
         assert_eq!(mapped.images.len(), 0, "no sink means no image attaches");
@@ -502,6 +601,40 @@ mod tests {
         assert_eq!(join_text_parts(&["a".into(), "b".into()]), "a\nb");
     }
 
+    // ── describe / output schema ─────────────────────────────────────
+
+    /// A handle with no dispatcher behind it: the wrapper's metadata methods do
+    /// not call the server, so a disconnected handle is sufficient here.
+    fn unused_handle() -> McpServerHandle {
+        McpServerHandle::disconnected("fixture", "0.1.0", std::time::Duration::from_secs(5))
+    }
+
+    #[test]
+    fn wrapper_prefixes_name_and_description() {
+        let wrapper = McpToolWrapper::new(
+            "fixture",
+            "echo",
+            "Echo a message back.",
+            serde_json::json!({"type": "object"}),
+            Some(serde_json::json!({"type": "object"})),
+            unused_handle(),
+        );
+        assert_eq!(wrapper.name(), "mcp/fixture/echo");
+        assert_eq!(wrapper.group(), "mcp/fixture");
+        assert_eq!(wrapper.description(), "[MCP fixture] Echo a message back.");
+        assert_eq!(
+            wrapper.output_schema(),
+            Some(serde_json::json!({"type": "object"}))
+        );
+        // Sanity: the tool type still resolves.
+        let _ = McpTool {
+            name: "echo".into(),
+            description: None,
+            input_schema: serde_json::json!({}),
+            output_schema: None,
+        };
+    }
+
     // ── parse_json_args tests ────────────────────────────────────────
 
     #[test]
@@ -519,8 +652,13 @@ mod tests {
 
     #[test]
     fn parse_json_args_empty_object() {
-        let args = parse_json_args("{}").unwrap();
-        assert!(args.as_object().unwrap().is_empty());
+        assert!(
+            parse_json_args("{}")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

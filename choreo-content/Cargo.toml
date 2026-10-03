@@ -50,7 +50,7 @@ tungstenite.workspace = true
 ureq.workspace = true
 # Sidecar async runtime — the crate's ONLY tokio use is running subxt futures.
 # The daemon never touches tokio; it calls this crate's blocking `execute_*`.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
+tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true

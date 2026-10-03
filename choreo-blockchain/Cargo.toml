@@ -25,10 +25,9 @@ alloy = { version = "2.5", features = ["providers", "rpc-types-eth", "sol-types"
 # workspace because choreo-content (the always-on Coordination Platform tools)
 # uses the same client.
 subxt.workspace = true
-# Sidecar async runtime. This crate is the *only* place in the workspace that
-# depends on tokio: the daemon stays thread-only and calls into this crate's
-# blocking `execute_*` functions, which `block_on` here.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
+# Sidecar async runtime. The daemon stays thread-only and calls into this
+# crate's blocking `execute_*` functions, which `block_on` here.
+tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true

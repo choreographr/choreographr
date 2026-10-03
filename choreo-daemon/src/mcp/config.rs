@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use choreo_mcp::McpServerConfig;
+use choreo_mcp::{McpProtocolMode, McpServerConfig};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -24,6 +24,10 @@ struct ServerEntry {
     /// Optional per-server request timeout, in seconds.
     #[serde(default)]
     timeout: Option<u64>,
+    /// Optional protocol-era selector: `"auto"` (default), `"legacy"`, or
+    /// `"modern"` (aliased by the explicit era string `"2026-07-28"`).
+    #[serde(default)]
+    protocol: Option<String>,
     /// Any keys this client does not recognize. Collected so loading can
     /// report them (never fatal) — a typo'd or not-yet-supported key should
     /// surface in the log rather than being silently dropped.
@@ -33,6 +37,20 @@ struct ServerEntry {
 
 fn default_true() -> bool {
     true
+}
+
+/// Map the optional `protocol` config value onto a [`McpProtocolMode`].
+///
+/// An absent value or an unrecognized one defaults to `Auto` (with a warning
+/// for the unrecognized case) so a typo never makes a server unusable.
+fn parse_protocol(value: Option<&str>) -> McpProtocolMode {
+    match value {
+        None => McpProtocolMode::Auto,
+        Some(raw) => McpProtocolMode::parse(raw).unwrap_or_else(|| {
+            tracing::warn!(value = %raw, "unrecognized MCP protocol value; using 'auto'");
+            McpProtocolMode::Auto
+        }),
+    }
 }
 
 thread_local! {
@@ -108,6 +126,7 @@ pub fn load_mcp_config() -> Result<Vec<McpServerConfig>> {
                 env: entry.env,
                 enabled: entry.enabled,
                 timeout: entry.timeout.map(Duration::from_secs),
+                protocol: parse_protocol(entry.protocol.as_deref()),
             }
         })
         .collect();
@@ -149,6 +168,7 @@ mod tests {
         assert!(entry.env.is_empty());
         assert!(entry.enabled);
         assert!(entry.timeout.is_none());
+        assert!(entry.protocol.is_none());
         assert!(entry.unknown.is_empty());
     }
 
@@ -212,9 +232,19 @@ mod tests {
                 env: entry.env,
                 enabled: entry.enabled,
                 timeout: entry.timeout.map(Duration::from_secs),
+                protocol: parse_protocol(entry.protocol.as_deref()),
             })
             .collect();
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].slug, "enabled-server");
+    }
+
+    #[test]
+    fn parse_protocol_maps_values() {
+        assert_eq!(parse_protocol(None), McpProtocolMode::Auto);
+        assert_eq!(parse_protocol(Some("legacy")), McpProtocolMode::Legacy);
+        assert_eq!(parse_protocol(Some("modern")), McpProtocolMode::Modern);
+        // Unrecognized values fall back to the default rather than failing.
+        assert_eq!(parse_protocol(Some("bogus")), McpProtocolMode::Auto);
     }
 }
