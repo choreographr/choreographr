@@ -28,7 +28,7 @@ use std::pin::Pin;
 use std::process::Stdio;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::process::{ChildStdin, ChildStdout};
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 
 /// Maximum size, in bytes, of a single newline-delimited JSON frame read from a
 /// stdio server.
@@ -156,6 +156,7 @@ impl StdioTransport {
             args,
             env,
             cwd,
+            log_path,
         } = &config.transport
         else {
             return Err(McpError::ProtocolError(
@@ -177,8 +178,12 @@ impl StdioTransport {
             cmd.current_dir(dir);
         }
         // stdin/stdout are the JSON-RPC channel; stderr stays inherited so the
-        // server's own logging reaches the daemon's stderr.
+        // server's own logging reaches the daemon's stderr, unless a per-server
+        // log file is configured, in which case it is piped and captured below.
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
+        if log_path.is_some() {
+            cmd.stderr(Stdio::piped());
+        }
 
         let mut wrap = CommandWrap::from(cmd);
         #[cfg(unix)]
@@ -186,6 +191,14 @@ impl StdioTransport {
         let mut child = wrap
             .spawn()
             .map_err(|e| McpError::SpawnFailed(e.to_string()))?;
+
+        // With a per-server log configured, drain the child's stderr into it on
+        // the sidecar runtime. The task ends when the child closes stderr.
+        if let Some(path) = log_path
+            && let Some(stderr) = child.stderr().take()
+        {
+            spawn_stderr_logger(stderr, path.clone());
+        }
 
         let stdin = child
             .stdin()
@@ -234,6 +247,94 @@ impl Transport<RoleClient> for StdioTransport {
         let closed = self.inner.close().await;
         self.kill_child().await;
         closed
+    }
+}
+
+/// Maximum size of a per-server log file before it is truncated and restarted.
+///
+/// A server's own stderr can be arbitrarily chatty; capping the file keeps one
+/// verbose server from filling the disk. When the cap is reached the file is
+/// emptied and logging continues from the start (a simple single-file rotation —
+/// there is no history, just a bounded live log).
+pub(crate) const MAX_SERVER_LOG_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Bytes read from the child's stderr per drain iteration.
+const STDERR_CHUNK: usize = 8192;
+
+/// Capture a stdio server's `stderr` into `path`, size-capped.
+///
+/// Runs on the sidecar runtime; the task ends when the child closes its stderr
+/// (i.e. on exit), so it needs no explicit teardown. When the sidecar runtime is
+/// unavailable the stream is drained and discarded rather than left to block the
+/// child on a full pipe.
+fn spawn_stderr_logger(mut stderr: ChildStderr, path: std::path::PathBuf) {
+    let drain = async move {
+        // Truncate a pre-existing oversized file so a restart starts clean.
+        let mut written = match tokio::fs::metadata(&path).await {
+            Ok(meta) if meta.len() >= MAX_SERVER_LOG_BYTES => 0,
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
+        };
+        if written == 0 {
+            let _ = tokio::fs::write(&path, b"").await;
+        }
+        let open = || {
+            let path = path.clone();
+            async move {
+                tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .await
+                    .ok()
+            }
+        };
+        let mut file = open().await;
+        let mut buf = [0u8; STDERR_CHUNK];
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut stderr, &mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    // Rotate before writing when the cap is reached, so the file
+                    // never exceeds it by more than one chunk.
+                    if written >= MAX_SERVER_LOG_BYTES {
+                        let _ = tokio::fs::write(&path, b"").await;
+                        file = open().await;
+                        written = 0;
+                    }
+                    if let Some(file) = file.as_mut() {
+                        // The cap fits any platform's `usize`; the fallback
+                        // keeps the arithmetic total regardless.
+                        let remaining =
+                            usize::try_from(MAX_SERVER_LOG_BYTES - written).unwrap_or(usize::MAX);
+                        let take = n.min(remaining);
+                        let Some(chunk) = buf.get(..take) else {
+                            continue;
+                        };
+                        if tokio::io::AsyncWriteExt::write_all(file, chunk)
+                            .await
+                            .is_ok()
+                        {
+                            written += take as u64;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    match crate::runtime::handle() {
+        Ok(handle) => {
+            handle.spawn(drain);
+        }
+        Err(_) => {
+            // No current runtime (unreachable in practice — the transport is
+            // built inside `runtime::block_on`): run the drain on a short-lived
+            // thread so the child's stderr is still consumed.
+            std::thread::spawn(move || {
+                let _ = crate::runtime::block_on(drain);
+            });
+        }
     }
 }
 

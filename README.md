@@ -449,7 +449,7 @@ data model.
 | `choreo-image` | Leaf crate — the single raster decode path (EXIF orientation baked in) and HEIC/HEIF decode (with a pre-decode allocation guard), shared by the daemon and the TUI so the model and UI paths cannot drift |
 | `choreo-keystore` | X25519 + ECDH/AES-256-GCM crypto library for the per-daemon unlock-key keystore |
 | `choreo-transport` | Noise-IK encrypted transport over TCP |
-| `choreo-mcp` | MCP (Model Context Protocol) client built on the official `rmcp` SDK — connects over a stdio subprocess or a remote Streamable HTTP endpoint, negotiates the protocol era (`server/discover` with an `initialize` fallback), lists paginated tools, and dispatches cancellable, deadline-bounded, concurrency-capped calls behind a blocking facade (one dispatcher thread per server). Streams server progress notifications as live output, drives the MRTR `input_required` retry loop, exposes a server's resources (list/read) as wrapper tools when the capability is declared, and opens a `subscriptions/listen` stream so a server that changes its tool or resource list refreshes the daemon's catalogue live (no restart). Tool names are sanitized to the provider-safe alphabet and capped at 64 chars (with a stable hash suffix on collision), a server config can set a `cwd` and a `disabledTools` list, and a server that requires authorization fails with an actionable message naming the static-token and OAuth paths. The stdio read path is capped (a single oversized frame drops the connection instead of allocating without limit), and each server's in-flight calls are bounded by `maxConcurrentCalls` (default 4). Linked via the daemon's `mcp` feature (off by default); ships no binary (its only `[[bin]]` is a test fixture server) |
+| `choreo-mcp` | MCP (Model Context Protocol) client built on the official `rmcp` SDK — connects over a stdio subprocess or a remote Streamable HTTP endpoint, negotiates the protocol era (`server/discover` with an `initialize` fallback), lists paginated tools, and dispatches cancellable, deadline-bounded, concurrency-capped calls behind a blocking facade (one dispatcher thread per server). Streams server progress notifications as live output, drives the MRTR `input_required` retry loop, exposes a server's resources (list/read) as wrapper tools when the capability is declared, and opens a `subscriptions/listen` stream so a server that changes its tool or resource list refreshes the daemon's catalogue live (no restart). Tool names are sanitized to the provider-safe alphabet and capped at 64 chars (with a stable hash suffix on collision), a server config can set a `cwd`, a `disabledTools` list, and a per-server log file (`mcp-<slug>.log`), and a server that requires authorization fails with an actionable message naming the static-token and OAuth paths. The stdio read path is capped (a single oversized frame drops the connection instead of allocating without limit), and each server's in-flight calls are bounded by `maxConcurrentCalls` (default 4). Linked via the daemon's `mcp` feature (off by default); ships no binary (its only `[[bin]]` is a test fixture server) |
 | `choreo-acp` | ACP (Agent Communication Protocol) bridge — translates JSON-RPC 2.0 over stdin/stdout into `choreo-proto` messages so ACP-compatible editors can drive sessions |
 | `choreo-tui` | Full-screen terminal UI client (ratatui + crossterm) |
 | `choreo-gui` | Desktop/Android GUI client (Dioxus Native / Blitz renderer — no webview) |
@@ -811,6 +811,32 @@ a stdio server sets `command` (plus optional `args`/`env`/`cwd`) and a remote
 server sets `url` (plus optional `headers`). Discovered tools are exposed to
 the model under an `mcp/<slug>` group. A running daemon (built with the `mcp`
 feature) connects the enabled servers at startup and registers their tools.
+
+Per-server keys (all optional except `command`/`url`): `enabled`, `transport`
+(`auto`/`stdio`/`http`), `protocol` (`auto`/`legacy`/`modern`), `timeout`
+(seconds), `maxConcurrentCalls`, `disabledTools` (tool names to hide), and —
+for a stdio server — `cwd` (a leading `~` is expanded). `${VAR}` references in
+`env`/`headers` values are expanded from the environment. Each stdio server's
+`stderr` is captured into a per-server log file (`mcp-<slug>.log` under the
+log/state directory, capped at 2 MiB).
+
+A remote server that needs credentials uses a static token in `headers`:
+
+```json
+{
+  "mcpServers": {
+    "docs": {
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer ${DOCS_TOKEN}" }
+    }
+  }
+}
+```
+
+**OAuth is not yet supported.** A server that insists on an interactive OAuth
+sign-in and has no static token fails with a clear, actionable error naming both
+the static-token path above and the pending OAuth support, rather than a raw
+status string.
 
 Manage servers from the command line:
 

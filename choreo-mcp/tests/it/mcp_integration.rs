@@ -31,6 +31,7 @@ fn fixture_config(scenario: Option<&str>, protocol: McpProtocolMode) -> McpServe
             args: scenario.map_or_else(Vec::new, |s| vec![s.to_string()]),
             env: HashMap::new(),
             cwd: None,
+            log_path: None,
         },
         enabled: true,
         timeout: Some(Duration::from_secs(10)),

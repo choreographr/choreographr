@@ -36,7 +36,7 @@ reqwest.workspace = true
 # owns one process-wide multi-thread runtime that drives the client futures, and
 # the daemon calls this crate's blocking `McpServer::*` methods. `sync` provides
 # the per-call cancellation primitive; `macros` the `select!` in the call task.
-tokio = { workspace = true, features = ["sync", "macros"] }
+tokio = { workspace = true, features = ["sync", "macros", "fs", "io-util"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

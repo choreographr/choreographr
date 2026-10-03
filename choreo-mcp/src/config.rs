@@ -104,6 +104,11 @@ pub enum McpTransport {
         /// relative server bundle often expects to run from a specific
         /// directory; `None` inherits the daemon's own cwd.
         cwd: Option<String>,
+        /// Optional path of a per-server log file. When set, the child's
+        /// `stderr` is captured into this file (size-capped) instead of
+        /// inheriting the daemon's own stderr, so a chatty server's
+        /// diagnostics are isolated per server. `None` inherits stderr.
+        log_path: Option<std::path::PathBuf>,
     },
     /// Connect to a remote server over the Streamable HTTP transport.
     Http {
@@ -189,6 +194,7 @@ mod tests {
                 args: vec![],
                 env: HashMap::new(),
                 cwd: None,
+                log_path: None,
             },
             enabled: true,
             timeout,
@@ -241,6 +247,7 @@ mod tests {
             args: vec![],
             env: HashMap::new(),
             cwd: None,
+            log_path: None,
         };
         assert_eq!(stdio.label(), "stdio");
         assert_eq!(stdio.target(), "npx");

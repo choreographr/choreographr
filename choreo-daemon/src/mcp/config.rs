@@ -130,6 +130,7 @@ fn resolve_transport(slug: &str, entry: &ServerEntry) -> Option<McpTransport> {
                 args: entry.args.clone(),
                 env: expand_env_map(&entry.env),
                 cwd: entry.cwd.as_deref().map(expand_tilde),
+                log_path: server_log_path(slug),
             })
         }
         McpTransportKind::Http => {
@@ -171,6 +172,33 @@ fn resolve_entry(slug: &str, entry: &ServerEntry) -> Option<McpServerConfig> {
         max_concurrent_calls: entry.max_concurrent_calls,
         disabled_tools: entry.disabled_tools.clone(),
     })
+}
+
+/// The per-server log file path (`mcp-<slug>.log`) for a stdio server.
+///
+/// The child's `stderr` is captured here (size-capped) so each server's own
+/// diagnostics are isolated rather than mixed into the daemon's log. The slug is
+/// sanitized to filename-safe characters. `None` when no log directory is
+/// available (macOS/Windows with no `XDG_STATE_HOME`); the child then inherits
+/// the daemon's stderr.
+fn server_log_path(slug: &str) -> Option<PathBuf> {
+    choreo_shared::paths::log_file_default(&log_file_stem(slug))
+}
+
+/// The per-server log file stem (`mcp-<slug>`) with the slug sanitized to
+/// filename-safe characters.
+fn log_file_stem(slug: &str) -> String {
+    let safe: String = slug
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("mcp-{safe}")
 }
 
 /// Expand a leading `~` (or `~/`) in `path` to the user's home directory.
@@ -699,6 +727,13 @@ mod tests {
         // The user's `fs` survives; the project's `extra` is added.
         assert!(by_slug.contains_key("fs"));
         assert!(by_slug.contains_key("extra"));
+    }
+
+    #[test]
+    fn log_file_stem_sanitizes_the_slug() {
+        assert_eq!(log_file_stem("docs"), "mcp-docs");
+        assert_eq!(log_file_stem("my.server"), "mcp-my_server");
+        assert_eq!(log_file_stem("a/b"), "mcp-a_b");
     }
 
     #[test]
