@@ -779,6 +779,7 @@ const PARSER_COMMAND_NAMES: &[&str] = &[
     "lock",
     "acl",
     "refresh-models",
+    "mcp",
     "quit",
 ];
 

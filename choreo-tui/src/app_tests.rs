@@ -3,8 +3,8 @@ use crate::markdown_render::*;
 use crate::state::*;
 use crate::test_util::{make_session, test_app};
 use choreo_proto::{
-    AccountInfo, CatalogProvider, ClientMessage, DaemonMessage, ReasoningCapability, RefreshStatus,
-    SessionStatus, Turn,
+    AccountInfo, CatalogProvider, ClientMessage, DaemonMessage, McpServerStatus,
+    ReasoningCapability, RefreshStatus, SessionStatus, Turn,
 };
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
@@ -1135,6 +1135,131 @@ mod unsent_draft_tests {
         assert_eq!(
             app.error.as_deref(),
             Some("[daemon] refresh-models failed: network error")
+        );
+    }
+
+    // ── /mcp control surface ────────────────────────────────────────────
+
+    #[test]
+    fn mcp_requests_status_and_sends_message() {
+        // Bare `/mcp` echoes `> /mcp` and sends McpStatusRequest; the reply
+        // arrives asynchronously.
+        let mut app = test_app();
+        let (tx, rx) = crossbeam_channel::unbounded();
+
+        app.input.text = "/mcp".to_string();
+        app.input.cursor = app.input.text.len();
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("submit /mcp");
+
+        let msg = rx.recv().expect("McpStatusRequest sent");
+        assert_eq!(msg, ClientMessage::McpStatusRequest);
+        assert_eq!(app.status.as_deref(), Some("> /mcp"));
+    }
+
+    #[test]
+    fn mcp_reconnect_sends_message_with_slug() {
+        let mut app = test_app();
+        let (tx, rx) = crossbeam_channel::unbounded();
+
+        app.input.text = "/mcp reconnect docs".to_string();
+        app.input.cursor = app.input.text.len();
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("submit /mcp reconnect");
+
+        let msg = rx.recv().expect("McpReconnect sent");
+        assert_eq!(
+            msg,
+            ClientMessage::McpReconnect {
+                slug: "docs".to_string(),
+            }
+        );
+        assert_eq!(app.status.as_deref(), Some("reconnecting MCP server docs…"));
+    }
+
+    #[test]
+    fn mcp_status_reply_renders_one_server_per_line() {
+        let mut app = test_app();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+
+        handle_daemon_message(
+            DaemonMessage::McpStatus {
+                servers: vec![
+                    McpServerStatus {
+                        slug: "docs".to_string(),
+                        transport: "stdio".to_string(),
+                        target: "npx docs".to_string(),
+                        connected: true,
+                        tool_count: 4,
+                        server_name: Some("docs".to_string()),
+                        server_version: Some("1.0.0".to_string()),
+                        last_error: None,
+                    },
+                    McpServerStatus {
+                        slug: "fs".to_string(),
+                        transport: "http".to_string(),
+                        target: "https://example.com/mcp".to_string(),
+                        connected: false,
+                        tool_count: 0,
+                        server_name: None,
+                        server_version: None,
+                        last_error: Some("connect timed out".to_string()),
+                    },
+                ],
+            },
+            &mut app,
+            &tx,
+        )
+        .expect("handle McpStatus");
+
+        let status = app.status.expect("status set from McpStatus");
+        let lines: Vec<&str> = status.lines().collect();
+        assert_eq!(lines[0], "MCP servers (2)");
+        assert!(lines[1].contains("docs") && lines[1].contains("4 tool(s)"));
+        assert!(lines[2].contains("fs") && lines[2].contains("connect timed out"));
+    }
+
+    #[test]
+    fn mcp_status_reply_empty_lists_none_configured() {
+        let mut app = test_app();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+
+        handle_daemon_message(
+            DaemonMessage::McpStatus {
+                servers: Vec::new(),
+            },
+            &mut app,
+            &tx,
+        )
+        .expect("handle empty McpStatus");
+        assert_eq!(app.status.as_deref(), Some("no MCP servers configured"));
+    }
+
+    #[test]
+    fn mcp_reconnect_failed_sets_error() {
+        let mut app = test_app();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+
+        handle_daemon_message(
+            DaemonMessage::McpReconnectFailed {
+                slug: "docs".to_string(),
+                error: "connection refused".to_string(),
+            },
+            &mut app,
+            &tx,
+        )
+        .expect("handle McpReconnectFailed");
+        assert_eq!(
+            app.error.as_deref(),
+            Some("[daemon] mcp reconnect docs failed: connection refused")
         );
     }
 

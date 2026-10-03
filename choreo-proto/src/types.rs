@@ -690,6 +690,16 @@ pub enum ClientMessage {
         turn_id: u32,
         image_index: u32,
     },
+    /// Request the state of every configured MCP server. The daemon replies
+    /// with [`DaemonMessage::McpStatus`].
+    McpStatusRequest,
+    /// Reconnect one configured MCP server (rebuild its connection and refresh
+    /// the tool catalogue), identified by its slug. On success the daemon
+    /// replies with a refreshed [`DaemonMessage::McpStatus`]; on failure with
+    /// [`DaemonMessage::McpReconnectFailed`].
+    McpReconnect {
+        slug: String,
+    },
     SubscribeAllActivity,
     UnsubscribeAllActivity,
 }
@@ -730,6 +740,58 @@ pub enum RefreshStatus {
 pub struct CatalogProvider {
     pub slug: String,
     pub display_name: String,
+}
+
+/// The state of one configured MCP server, as carried in
+/// [`DaemonMessage::McpStatus`].
+///
+/// The same fields as the daemon's own status record
+/// (`choreo-daemon`'s `mcp::McpServerStatus`), so the daemon's connection
+/// handler converts one to the other field-for-field. Reports both connected
+/// servers (with their advertised name/version and tool count) and servers
+/// that failed or were skipped at startup (with the recorded `last_error`),
+/// so a client can show the whole configured set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerStatus {
+    /// The server's config key (its tool-name prefix, `mcp/<slug>`).
+    pub slug: String,
+    /// The resolved transport label (`"stdio"` / `"http"`).
+    pub transport: String,
+    /// The command (stdio) or URL (http) the transport targets.
+    pub target: String,
+    /// Whether the server is connected and its tools are registered.
+    pub connected: bool,
+    /// How many tools (excluding the resource catalogue tools) are registered.
+    pub tool_count: usize,
+    /// The server's self-reported name, once connected.
+    pub server_name: Option<String>,
+    /// The server's self-reported version, once connected.
+    pub server_version: Option<String>,
+    /// The last connect/refresh error, when the server is not connected (or a
+    /// refresh failed).
+    pub last_error: Option<String>,
+}
+
+impl McpServerStatus {
+    /// A one-line human-readable summary of this server's state, shared by
+    /// every front-end so the rendering cannot drift between them.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        if self.connected {
+            format!(
+                "{} [{} → {}] connected: {} tool(s)",
+                self.slug, self.transport, self.target, self.tool_count
+            )
+        } else {
+            format!(
+                "{} [{} → {}] not connected: {}",
+                self.slug,
+                self.transport,
+                self.target,
+                self.last_error.as_deref().unwrap_or("not connected")
+            )
+        }
+    }
 }
 
 /// Session-scoped events produced by the daemon for a specific session.
@@ -1134,6 +1196,18 @@ pub enum DaemonMessage {
         turn_id: u32,
         image_index: u32,
         data: Option<Vec<u8>>,
+    },
+    /// Reply to [`ClientMessage::McpStatusRequest`], and the success reply to
+    /// [`ClientMessage::McpReconnect`]: the current state of every configured
+    /// MCP server, in stable slug order.
+    McpStatus {
+        servers: Vec<McpServerStatus>,
+    },
+    /// Reply to [`ClientMessage::McpReconnect`] when the reconnect failed: the
+    /// slug it targeted and the failure reason.
+    McpReconnectFailed {
+        slug: String,
+        error: String,
     },
     ShuttingDown,
     /// Best-effort advisory, sent by the daemon immediately before it
@@ -2059,6 +2133,30 @@ mod tests {
                     turn_id: 1,
                     image_index: 0,
                     data: Some(vec![0u8; 4096]),
+                },
+            ),
+            (
+                "McpStatus",
+                DaemonMessage::McpStatus {
+                    servers: (0..12usize)
+                        .map(|i| McpServerStatus {
+                            slug: format!("server-{i}"),
+                            transport: "stdio".into(),
+                            target: format!("/usr/local/bin/mcp-server-{i} --flag"),
+                            connected: i % 2 == 0,
+                            tool_count: i,
+                            server_name: Some(format!("server-{i}-name")),
+                            server_version: Some("1.2.3".into()),
+                            last_error: (i % 2 == 1).then(|| "connect timed out".to_string()),
+                        })
+                        .collect(),
+                },
+            ),
+            (
+                "McpReconnectFailed",
+                DaemonMessage::McpReconnectFailed {
+                    slug: "docs".into(),
+                    error: "failed to list tools: connection refused".into(),
                 },
             ),
             ("ShuttingDown", DaemonMessage::ShuttingDown),

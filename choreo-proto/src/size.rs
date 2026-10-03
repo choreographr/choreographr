@@ -414,6 +414,28 @@ impl DaemonMessage {
             // only the (potentially large) byte payload is added on top. An
             // empty `data` / `None` counts as just the envelope.
             Self::Image { data, .. } => named_field_overhead(4) + data.as_ref().map_or(0, Vec::len),
+            // One `McpServerStatus` per configured server: 8 named fields plus
+            // the variable strings. The 200 B per-record allowance covers the
+            // map header, variant tag, eight field-name keys, and the
+            // `connected` bool / `tool_count` usize scalars; only the string
+            // payloads are added on top.
+            Self::McpStatus { servers } => {
+                named_field_overhead(1)
+                    + servers
+                        .iter()
+                        .map(|s| {
+                            200 + s.slug.len()
+                                + s.transport.len()
+                                + s.target.len()
+                                + option_str_len(s.server_name.as_ref())
+                                + option_str_len(s.server_version.as_ref())
+                                + option_str_len(s.last_error.as_ref())
+                        })
+                        .sum::<usize>()
+            }
+            Self::McpReconnectFailed { slug, error } => {
+                named_field_overhead(2) + slug.len() + error.len()
+            }
         }
     }
 }

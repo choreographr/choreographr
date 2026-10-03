@@ -72,7 +72,9 @@ pub use dispatch::{SessionStateData, ToolCallEvent, TurnEventHandler, dispatch_d
 pub use error::{ClientError, broken_pipe};
 pub use history::SessionView;
 pub use known_servers::{KnownServerEntry, KnownServers, known_servers_path};
-pub use shell::{Command, UnlockMethod, command_echo, is_valid_account_name, parse_input_line};
+pub use shell::{
+    Command, McpCommand, UnlockMethod, command_echo, is_valid_account_name, parse_input_line,
+};
 
 #[cfg(test)]
 mod tests;

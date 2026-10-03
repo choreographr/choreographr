@@ -15,7 +15,8 @@
 use crate::state::{App, Page};
 use crate::{Command, parse_input_line};
 use choreo_client_core::{
-    ClientError, broken_pipe, build_add_credential_message, command_echo, resolve_private_key,
+    ClientError, McpCommand, broken_pipe, build_add_credential_message, command_echo,
+    resolve_private_key,
 };
 use choreo_proto::ClientMessage;
 
@@ -446,6 +447,28 @@ pub(super) fn run_command(
             client_tx
                 .send(ClientMessage::RefreshModels { force })
                 .map_err(broken_pipe)?;
+        }
+        Command::Mcp(mcp) => {
+            if echo && let Some(text) = command_echo(&Command::Mcp(mcp.clone())) {
+                app.status = Some(text);
+            }
+            match mcp {
+                McpCommand::Status => {
+                    // The daemon replies asynchronously with McpStatus; the
+                    // reply handler renders the per-server lines.
+                    client_tx
+                        .send(ClientMessage::McpStatusRequest)
+                        .map_err(broken_pipe)?;
+                }
+                McpCommand::Reconnect { slug } => {
+                    // Immediate feedback; the reply is a refreshed McpStatus
+                    // (success) or McpReconnectFailed.
+                    app.status = Some(format!("reconnecting MCP server {slug}…"));
+                    client_tx
+                        .send(ClientMessage::McpReconnect { slug })
+                        .map_err(broken_pipe)?;
+                }
+            }
         }
         // Local-UI commands (the unified command model's non-daemon variants).
         Command::Quit => {

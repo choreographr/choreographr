@@ -90,6 +90,66 @@ fn refresh_messages_serde_round_trip() {
 }
 
 #[test]
+fn mcp_status_request_serde_round_trip() {
+    let message = ClientMessage::McpStatusRequest;
+    let frame = encode_frame(&message).expect("encode");
+    let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
+    assert_eq!(decoded, message);
+}
+
+#[test]
+fn mcp_reconnect_request_serde_round_trip() {
+    let message = ClientMessage::McpReconnect {
+        slug: "docs".to_string(),
+    };
+    let frame = encode_frame(&message).expect("encode");
+    let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
+    assert_eq!(decoded, message);
+}
+
+#[test]
+fn mcp_status_reply_serde_round_trip() {
+    let message = DaemonMessage::McpStatus {
+        servers: vec![
+            McpServerStatus {
+                slug: "docs".to_string(),
+                transport: "stdio".to_string(),
+                target: "npx -y @modelcontextprotocol/server-docs".to_string(),
+                connected: true,
+                tool_count: 4,
+                server_name: Some("docs-server".to_string()),
+                server_version: Some("1.0.0".to_string()),
+                last_error: None,
+            },
+            McpServerStatus {
+                slug: "fs".to_string(),
+                transport: "http".to_string(),
+                target: "https://example.com/mcp".to_string(),
+                connected: false,
+                tool_count: 0,
+                server_name: None,
+                server_version: None,
+                last_error: Some("connect timed out".to_string()),
+            },
+        ],
+    };
+    let frame = encode_frame(&message).expect("encode");
+    let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");
+    assert_eq!(decoded, message);
+}
+
+#[test]
+fn mcp_reconnect_failed_serde_round_trip() {
+    let message = DaemonMessage::McpReconnectFailed {
+        slug: "docs".to_string(),
+        error: "connection refused".to_string(),
+    };
+    let frame = encode_frame(&message).expect("encode");
+    let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");
+    assert_eq!(decoded, message);
+}
+
+#[test]
 fn decode_rejects_trailing_bytes() {
     let message = ClientMessage::Ping;
     let mut frame = encode_frame(&message).expect("encode");

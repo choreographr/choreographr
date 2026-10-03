@@ -105,6 +105,12 @@ static COMMAND_CATALOG: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
             group: CommandGroup::Security,
         },
         CommandSpec {
+            name: "mcp",
+            summary: "Show MCP server status, or reconnect one server",
+            arg_hint: Some("[reconnect <slug>]"),
+            group: CommandGroup::System,
+        },
+        CommandSpec {
             name: "model",
             summary: "Choose the session's model (opens the picker when omitted)",
             arg_hint: Some("[model]"),

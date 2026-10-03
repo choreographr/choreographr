@@ -588,6 +588,28 @@ pub(crate) fn handle_daemon_message(
             app.error = Some(format!("[daemon] refresh-models failed: {error}"));
             return Ok(());
         }
+        // ── S5: /mcp replies ────────────────────────────────────────────
+        // Bare `/mcp`'s status list AND a successful `/mcp reconnect` both
+        // arrive as McpStatus. Render one server per line; the status bar
+        // reserves the needed rows (status_error_height counts newlines), so
+        // the whole list is visible rather than wrapped to one line.
+        DaemonMessage::McpStatus { servers } => {
+            if servers.is_empty() {
+                app.status = Some("no MCP servers configured".to_string());
+            } else {
+                let mut lines = vec![format!("MCP servers ({})", servers.len())];
+                for server in servers {
+                    lines.push(server.summary());
+                }
+                app.status = Some(lines.join("\n"));
+            }
+            return Ok(());
+        }
+        DaemonMessage::McpReconnectFailed { slug, error } => {
+            tracing::warn!(%slug, %error, "mcp reconnect failed");
+            app.error = Some(format!("[daemon] mcp reconnect {slug} failed: {error}"));
+            return Ok(());
+        }
         DaemonMessage::CatalogUpdated { providers } => {
             // Replace the live provider list (the picker's source of truth)
             // and clamp the wizard selection if the list shrank. Only churn

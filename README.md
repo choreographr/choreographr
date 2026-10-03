@@ -801,6 +801,32 @@ API; set `programmatic_tool_calling = true` to override.
 Sessions can be created and browsed while the daemon is locked — credentials
 are only required when running prompts.
 
+### MCP servers
+
+MCP (Model Context Protocol) servers are configured in
+`$XDG_CONFIG_HOME/choreographr/mcp_servers.json` (a checkout may also carry a
+project file at `<root>/.choreographr/mcp_servers.json`, which overrides the
+user file per server slug). Each entry is a named server under `mcpServers`;
+a stdio server sets `command` (plus optional `args`/`env`/`cwd`) and a remote
+server sets `url` (plus optional `headers`). Discovered tools are exposed to
+the model under an `mcp/<slug>` group. A running daemon (built with the `mcp`
+feature) connects the enabled servers at startup and registers their tools.
+
+Manage servers from the command line:
+
+```
+choreographr mcp list                              # list configured servers (offline)
+choreographr mcp add docs --command npx --args -y @modelcontextprotocol/server-docs
+choreographr mcp remove docs
+choreographr mcp reconnect docs                    # rebuild one server on a running daemon
+```
+
+`list`/`add`/`remove` edit the user `mcp_servers.json` directly (no daemon
+needed; `add` refuses to overwrite an existing slug unless `--force`), while
+`reconnect` talks to a running daemon over its local socket. The in-TUI
+`/mcp` command shows the live state of every server (connected tool counts,
+or the last error) and `/mcp reconnect <slug>` does the same rebuild.
+
 ## Slash commands
 
 In `choreo-tui`:
@@ -818,6 +844,8 @@ runs the command**, and `Esc` discards the line without cancelling anything.
 - `/model` — open the model selector picker
 - `/model <name>` — set the session's model directly
 - `/refresh-models [--force]` — re-fetch the models.dev catalog (conditional GET against the cached etag; 304 → "models up to date"); `--force` bypasses the etag so the server must return a fresh catalog. Also re-reads the user overlay. The daemon fetches on a background thread and replies with provider/model counts; a burst of `/refresh-models` requests is coalesced into a single fetch (each requester's status reflects its own `--force` flag, and a 304 reply is ordered after any queued overlay reload so the counts are current).
+- `/mcp` — show the state of every configured MCP server (one line per server: slug, transport, target, connected state, tool count, or the last error). The configured set is the same `mcp_servers.json` the daemon loads. Offline management (add/remove/list) is done with the `choreographr mcp` CLI (see below)
+- `/mcp reconnect <slug>` — rebuild one server's connection on the running daemon and refresh its tools
 - `/new [title]` — create a new session and switch this client to it (the top-level shortcut for `/session new`)
 - `/session` — open the interactive session manager
 - `/session list` — list all sessions

@@ -1,6 +1,6 @@
 use crate::state::{AppState, UiEvent};
 use choreo_client_core::{
-    AutoBindAttempt, ClientError, Command, ConnectionMode, attempt_keystore_auto_bind,
+    AutoBindAttempt, ClientError, Command, ConnectionMode, McpCommand, attempt_keystore_auto_bind,
     build_add_credential_message, command_echo, dispatch_daemon_message, parse_input_line,
     record_unlock_key, resolve_private_key, run_daemon_connection_with_mode,
 };
@@ -157,6 +157,17 @@ pub(crate) fn handle_shell_command(
             });
             send_client_message(state, daemon_tx, ClientMessage::RefreshModels { force });
         }
+        Command::Mcp(mcp) => match mcp {
+            McpCommand::Status => {
+                send_client_message(state, daemon_tx, ClientMessage::McpStatusRequest);
+            }
+            McpCommand::Reconnect { slug } => {
+                state
+                    .status_texts
+                    .push(format!("reconnecting MCP server {slug}…"));
+                send_client_message(state, daemon_tx, ClientMessage::McpReconnect { slug });
+            }
+        },
         // TODO(task 3): the unified command model's local-UI variants
         // (open session manager / accounts / model picker, reasoning
         // cycle/list, quit) are not yet wired into the GUI event loop; a

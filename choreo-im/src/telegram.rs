@@ -9,7 +9,7 @@
 
 use ammonia::Builder as HtmlSanitizer;
 use choreo_client_core::{
-    Command, build_add_credential_message, parse_input_line, resolve_private_key,
+    Command, McpCommand, build_add_credential_message, parse_input_line, resolve_private_key,
 };
 use choreo_markdown::render_markdown_html;
 use choreo_proto::{ClientMessage, socket_path};
@@ -193,6 +193,17 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
             // the bridge like any other Send command.
             if let Err(e) = state.bridge_tx.send(ClientMessage::RefreshModels { force }) {
                 warn!("failed to send refresh-models to bridge: {e}");
+            }
+        }
+        Command::Mcp(mcp) => {
+            // The MCP control surface is client-agnostic: forward the status
+            // request or reconnect over the bridge like any other Send command.
+            let msg = match mcp {
+                McpCommand::Status => ClientMessage::McpStatusRequest,
+                McpCommand::Reconnect { slug } => ClientMessage::McpReconnect { slug },
+            };
+            if let Err(e) = state.bridge_tx.send(msg) {
+                warn!("failed to send mcp command to bridge: {e}");
             }
         }
         // The unified command model's local-UI variants are TUI concerns; the

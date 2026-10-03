@@ -589,6 +589,14 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             debug!("client {}: RefreshModels force={}", ctx.client_id, force);
             handle_refresh_models_sync(ctx, force);
         }
+        ClientMessage::McpStatusRequest => {
+            debug!("client {}: McpStatusRequest", ctx.client_id);
+            handle_mcp_status_sync(ctx);
+        }
+        ClientMessage::McpReconnect { slug } => {
+            debug!("client {}: McpReconnect slug={}", ctx.client_id, slug);
+            handle_mcp_reconnect_sync(ctx, slug);
+        }
         ClientMessage::DeleteSession { session_id } => {
             info!("client {}: DeleteSession id={}", ctx.client_id, session_id);
             handle_delete_session_sync(ctx, session_id);
@@ -1452,6 +1460,66 @@ fn handle_refresh_models_sync(ctx: &mut ClientCtx, force: bool) {
     }
 }
 
+/// Convert the daemon's MCP status record into the wire type sent to clients.
+///
+/// The two structs carry the same fields, so this is a field-for-field move;
+/// it exists as a named function so the conversion has one home and can be
+/// unit-tested against a status record.
+fn wire_mcp_status(status: crate::mcp::McpServerStatus) -> choreo_proto::McpServerStatus {
+    choreo_proto::McpServerStatus {
+        slug: status.slug,
+        transport: status.transport,
+        target: status.target,
+        connected: status.connected,
+        tool_count: status.tool_count,
+        server_name: status.server_name,
+        server_version: status.server_version,
+        last_error: status.last_error,
+    }
+}
+
+/// Handle a `ClientMessage::McpStatusRequest`: ask the daemon (the sole owner
+/// of the `McpManager`) for the state of every configured MCP server, convert
+/// each record to the wire type, and reply with [`DaemonMessage::McpStatus`].
+fn handle_mcp_status_sync(ctx: &mut ClientCtx) {
+    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::McpStatus { reply });
+    if let Ok(servers) = result {
+        let servers = servers.into_iter().map(wire_mcp_status).collect();
+        send_to_writer(ctx, &DaemonMessage::McpStatus { servers });
+    } else {
+        warn!("daemon disconnected while handling mcp status");
+    }
+}
+
+/// Handle a `ClientMessage::McpReconnect`: rebuild one MCP server's connection
+/// through the daemon (which also swaps the refreshed tool catalogue), then
+/// reply. Success is reported as a refreshed [`DaemonMessage::McpStatus`] —
+/// the same snapshot a status request would return, so the requester sees the
+/// server's new connected state and tool count — while a failure is a
+/// targeted [`DaemonMessage::McpReconnectFailed`]. Both requests block here
+/// until the daemon has a result, matching the `/mcp` request/reply contract.
+fn handle_mcp_reconnect_sync(ctx: &mut ClientCtx, slug: String) {
+    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::McpReconnect {
+        slug: slug.clone(),
+        reply,
+    });
+    match result {
+        Ok(Ok(())) => {
+            let status = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::McpStatus { reply });
+            if let Ok(servers) = status {
+                let servers = servers.into_iter().map(wire_mcp_status).collect();
+                send_to_writer(ctx, &DaemonMessage::McpStatus { servers });
+            } else {
+                warn!("daemon disconnected while reading mcp status after reconnect");
+            }
+        }
+        Ok(Err(e)) => {
+            send_to_writer(ctx, &DaemonMessage::McpReconnectFailed { slug, error: e });
+        }
+        Err(_) => warn!("daemon disconnected while handling mcp reconnect"),
+    }
+}
+
 fn handle_get_credential_sync(ctx: &mut ClientCtx, service: String) {
     let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::GetCredential {
         service: service.clone(),
@@ -2261,6 +2329,127 @@ mod tests {
         assert!(
             matches!(&msg, DaemonMessage::ModelsRefreshFailed { error } if error == "daemon is locked")
         );
+    }
+
+    // ── MCP status + reconnect handlers ──────────────────────────────
+
+    /// Build a `ClientCtx` over the given daemon sender plus a fresh writer
+    /// sink, returning the sink's receiver too. Shared by the MCP handler
+    /// tests so each one only supplies the fake daemon thread.
+    fn mcp_ctx<'a>(
+        daemon_tx: &'a crossbeam_channel::Sender<DaemonCommand>,
+        sink: &'a crate::broadcast::SubscriberSink,
+        global_lag: &'a AtomicUsize,
+        attached_session_id: &'a mut Option<u64>,
+        attached_session_tx: &'a mut Option<crossbeam_channel::Sender<SessionCommand>>,
+    ) -> ClientCtx<'a> {
+        ClientCtx {
+            writer: sink,
+            db: &TEST_DB,
+            global_lag,
+            daemon_tx,
+            attached_session_id,
+            attached_session_tx,
+            client_id: 0,
+            is_unix: true,
+        }
+    }
+
+    fn sample_mcp_status() -> crate::mcp::McpServerStatus {
+        crate::mcp::McpServerStatus {
+            slug: "docs".to_string(),
+            transport: "stdio".to_string(),
+            target: "npx docs-server".to_string(),
+            connected: true,
+            tool_count: 3,
+            server_name: Some("docs".to_string()),
+            server_version: Some("1.0.0".to_string()),
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn wire_mcp_status_moves_every_field() {
+        let wire = wire_mcp_status(sample_mcp_status());
+        assert_eq!(wire.slug, "docs");
+        assert_eq!(wire.transport, "stdio");
+        assert_eq!(wire.target, "npx docs-server");
+        assert!(wire.connected);
+        assert_eq!(wire.tool_count, 3);
+        assert_eq!(wire.server_name.as_deref(), Some("docs"));
+        assert_eq!(wire.server_version.as_deref(), Some("1.0.0"));
+        assert!(wire.last_error.is_none());
+    }
+
+    #[test]
+    fn handle_mcp_status_sync_ok() {
+        // The connection asks the daemon for the status list; the daemon
+        // replies with its records, which the connection converts to the wire
+        // type and routes to the client as McpStatus.
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = mcp_ctx(&daemon_tx, &sink, &global_lag, &mut none_id, &mut none_tx);
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::McpStatus { reply }) = daemon_rx.recv() {
+                let _ = reply.send(vec![sample_mcp_status()]);
+            }
+        });
+        handle_mcp_status_sync(&mut ctx);
+        let msg = writer_rx.recv().unwrap();
+        assert!(matches!(
+            &msg,
+            DaemonMessage::McpStatus { servers }
+                if servers.len() == 1 && servers[0].slug == "docs" && servers[0].connected
+        ));
+    }
+
+    #[test]
+    fn handle_mcp_reconnect_sync_ok_replies_refreshed_status() {
+        // A successful reconnect triggers a SECOND daemon round-trip (the
+        // status read) and replies with the refreshed McpStatus list.
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = mcp_ctx(&daemon_tx, &sink, &global_lag, &mut none_id, &mut none_tx);
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::McpReconnect { slug, reply }) = daemon_rx.recv() {
+                assert_eq!(slug, "docs");
+                let _ = reply.send(Ok(()));
+            }
+            if let Ok(DaemonCommand::McpStatus { reply }) = daemon_rx.recv() {
+                let _ = reply.send(vec![sample_mcp_status()]);
+            }
+        });
+        handle_mcp_reconnect_sync(&mut ctx, "docs".to_string());
+        let msg = writer_rx.recv().unwrap();
+        assert!(matches!(&msg, DaemonMessage::McpStatus { servers } if servers.len() == 1));
+    }
+
+    #[test]
+    fn handle_mcp_reconnect_sync_err_replies_failure() {
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = mcp_ctx(&daemon_tx, &sink, &global_lag, &mut none_id, &mut none_tx);
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::McpReconnect { reply, .. }) = daemon_rx.recv() {
+                let _ = reply.send(Err("connect timed out".into()));
+            }
+        });
+        handle_mcp_reconnect_sync(&mut ctx, "docs".to_string());
+        let msg = writer_rx.recv().unwrap();
+        assert!(matches!(
+            &msg,
+            DaemonMessage::McpReconnectFailed { slug, error }
+                if slug == "docs" && error == "connect timed out"
+        ));
     }
 
     #[test]
