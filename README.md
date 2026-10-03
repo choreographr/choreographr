@@ -449,7 +449,7 @@ data model.
 | `choreo-image` | Leaf crate — the single raster decode path (EXIF orientation baked in) and HEIC/HEIF decode (with a pre-decode allocation guard), shared by the daemon and the TUI so the model and UI paths cannot drift |
 | `choreo-keystore` | X25519 + ECDH/AES-256-GCM crypto library for the per-daemon unlock-key keystore |
 | `choreo-transport` | Noise-IK encrypted transport over TCP |
-| `choreo-mcp` | MCP (Model Context Protocol) client — spawns subprocess servers, discovers tools, dispatches calls over JSON-RPC stdio. Library-only, linked via the daemon's `mcp` feature (off by default) |
+| `choreo-mcp` | MCP (Model Context Protocol) client — spawns subprocess servers, discovers tools, dispatches calls over JSON-RPC stdio. Linked via the daemon's `mcp` feature (off by default); ships no binary (its only `[[bin]]` is a test fixture server) |
 | `choreo-acp` | ACP (Agent Communication Protocol) bridge — translates JSON-RPC 2.0 over stdin/stdout into `choreo-proto` messages so ACP-compatible editors can drive sessions |
 | `choreo-tui` | Full-screen terminal UI client (ratatui + crossterm) |
 | `choreo-gui` | Desktop/Android GUI client (Dioxus Native / Blitz renderer — no webview) |

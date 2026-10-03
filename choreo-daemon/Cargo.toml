@@ -187,3 +187,12 @@ uds_windows.workspace = true
 # Workspace-wide lints (see [workspace.lints.clippy] in the root Cargo.toml).
 [lints]
 workspace = true
+
+# Test fixture: the scripted MCP stdio server the MCP integration test spawns
+# as a subprocess. Only built with the `mcp` feature (the suite that uses it is
+# gated on the same feature), and its source is shared with `choreo-mcp` via a
+# single `include!` so the two copies cannot drift.
+[[bin]]
+name = "mcp-daemon-fixture-server"
+path = "tests/fixtures/mcp_fixture_server.rs"
+required-features = ["mcp"]

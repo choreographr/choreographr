@@ -1,11 +1,10 @@
 //! Model Context Protocol (MCP) client for Choreographr.
 //!
 //! This crate implements the client half of the [Model Context Protocol]: it
-//! speaks JSON-RPC 2.0 over a transport (stdio child process or HTTP) to an
-//! external MCP server, discovers the tools that server exposes, and invokes
-//! them on the model's behalf. The daemon depends on it behind its `mcp` cargo
-//! feature (off by default) and registers thin `Tool` wrappers over
-//! [`McpClient`].
+//! speaks JSON-RPC 2.0 over a stdio child process to an external MCP server,
+//! discovers the tools that server exposes, and invokes them on the model's
+//! behalf. The daemon depends on it behind its `mcp` cargo feature (off by
+//! default) and registers thin `Tool` wrappers over [`McpClient`].
 //!
 //! The split is deliberate: [`protocol`] owns the wire types, [`transport`] the
 //! byte-level framing and lifecycle of a connection, [`client`] the request /
@@ -25,4 +24,7 @@ pub mod transport;
 
 pub use client::{McpClient, McpServerConfig};
 pub use error::McpError;
-pub use protocol::{CallToolResult, McpContent, McpTool};
+pub use protocol::{
+    CallToolResult, EMPTY_INPUT_SCHEMA, MAX_SCHEMA_BYTES, McpContent, McpTool, PROTOCOL_VERSION,
+    normalize_input_schema,
+};

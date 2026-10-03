@@ -15,6 +15,74 @@ use std::thread;
 use std::time::Duration;
 use tracing::{debug, warn};
 
+/// Maximum length, in bytes, of a single newline-delimited stdout line from the
+/// server.
+///
+/// The reader buffers a line before parsing it; without a cap a hostile or
+/// buggy server could emit one unbounded line and exhaust the daemon's memory.
+/// A line that crosses this bound closes the transport with
+/// [`McpError::LineTooLong`].
+pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Capacity of the bounded notification channel.
+///
+/// Notifications are advisory (progress, log messages): a client that cannot
+/// keep up should drop the oldest rather than block the reader thread or grow
+/// without bound, so this channel is bounded and senders use `try_send`.
+const NOTIFICATION_CAPACITY: usize = 256;
+
+/// Response-channel id reserved to carry a transport-level failure to whichever
+/// request is currently waiting.
+///
+/// A real response id is a small monotonic counter (`next_id`), so the maximum
+/// `u64` can never collide with one; seeing it tells `recv_response` that the
+/// reader thread died mid-call and the paired error is the reason.
+const TRANSPORT_ERROR_ID: u64 = u64::MAX;
+
+/// The outcome of a single bounded line read.
+enum LineRead {
+    /// A complete line was read into the caller's buffer.
+    Line,
+    /// The stream ended with no more data.
+    Eof,
+    /// The line grew past [`MAX_LINE_BYTES`] before a newline was seen.
+    TooLong,
+}
+
+/// Read one newline-terminated line into `buf`, bounded by [`MAX_LINE_BYTES`].
+///
+/// Reads through `BufRead::fill_buf`/`consume` so a line longer than the cap is
+/// detected and reported without ever buffering the whole thing. On success the
+/// trailing newline is included in `buf`.
+fn read_line_bounded(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Result<LineRead> {
+    buf.clear();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(if buf.is_empty() {
+                LineRead::Eof
+            } else {
+                LineRead::Line
+            });
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            let take = pos + 1;
+            if buf.len() + take > MAX_LINE_BYTES {
+                return Ok(LineRead::TooLong);
+            }
+            buf.extend_from_slice(available.get(..take).unwrap_or(available));
+            reader.consume(take);
+            return Ok(LineRead::Line);
+        }
+        let take = available.len();
+        if buf.len() + take > MAX_LINE_BYTES {
+            return Ok(LineRead::TooLong);
+        }
+        buf.extend_from_slice(available);
+        reader.consume(take);
+    }
+}
+
 /// Manages a subprocess' stdio streams, routing stdout lines into typed
 /// channels for responses and notifications.
 pub struct StdioTransport {
@@ -90,25 +158,49 @@ impl StdioTransport {
         });
 
         let (response_tx, response_rx) = crossbeam_channel::unbounded();
-        let (notification_tx, notification_rx) = crossbeam_channel::unbounded();
+        let (notification_tx, notification_rx) = crossbeam_channel::bounded(NOTIFICATION_CAPACITY);
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
 
-        // Stdout reader — parse JSON-RPC lines
+        // Stdout reader — parse JSON-RPC lines. Lines are bounded so a single
+        // oversized line cannot exhaust memory; when one is seen the reader
+        // hands a typed error to the waiting request (via the transport-error
+        // sentinel) and stops.
         let reader_handle = thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
+            let mut reader = BufReader::new(stdout);
+            let mut line = Vec::new();
+            loop {
                 if shutdown_clone.load(Ordering::Relaxed) {
                     break;
                 }
-                let line = match line {
-                    Ok(l) => l,
-                    Err(e) => {
-                        warn!("MCP stdout read error: {e}");
+                match read_line_bounded(&mut reader, &mut line) {
+                    Ok(LineRead::Eof) => break,
+                    Ok(LineRead::Line) => {}
+                    Ok(LineRead::TooLong) => {
+                        warn!(
+                            limit = MAX_LINE_BYTES,
+                            "MCP stdout line exceeded cap; closing"
+                        );
+                        let _ = response_tx.send((
+                            TRANSPORT_ERROR_ID,
+                            Err(McpError::LineTooLong {
+                                limit: MAX_LINE_BYTES,
+                            }),
+                        ));
                         break;
                     }
+                    Err(e) => {
+                        warn!("MCP stdout read error: {e}");
+                        let _ = response_tx.send((TRANSPORT_ERROR_ID, Err(McpError::Io(e))));
+                        break;
+                    }
+                }
+                let trimmed = if let Ok(s) = std::str::from_utf8(&line) {
+                    s.trim()
+                } else {
+                    warn!("MCP stdout line was not valid UTF-8");
+                    continue;
                 };
-                let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
                 }
@@ -116,7 +208,12 @@ impl StdioTransport {
                 if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(trimmed) {
                     let _ = response_tx.send((resp.id, Ok(resp)));
                 } else if let Ok(notif) = serde_json::from_str::<JsonRpcNotification>(trimmed) {
-                    let _ = notification_tx.send(notif);
+                    // Advisory: drop with a debug line when the consumer is
+                    // behind rather than blocking the reader or growing
+                    // without bound.
+                    if notification_tx.try_send(notif).is_err() {
+                        debug!("MCP notification channel full; dropping notification");
+                    }
                 } else {
                     warn!(line = %trimmed, "unparseable MCP message");
                 }
@@ -199,7 +296,7 @@ impl StdioTransport {
         loop {
             match self.response_rx.recv_deadline(deadline) {
                 Ok((resp_id, resp)) => {
-                    if resp_id == id {
+                    if resp_id == id || resp_id == TRANSPORT_ERROR_ID {
                         return resp;
                     }
                     warn!(
@@ -353,7 +450,7 @@ mod tests {
             })),
             reader_handle: None,
             response_rx: crossbeam_channel::unbounded().1,
-            notification_rx: crossbeam_channel::unbounded().1,
+            notification_rx: crossbeam_channel::bounded(NOTIFICATION_CAPACITY).1,
             shutdown: Arc::new(AtomicBool::new(false)),
             child: None,
         };
@@ -405,5 +502,38 @@ mod tests {
         )
         .expect("wire should be UTF-8");
         assert!(wire.contains(r#""id":42"#), "request must keep id: {wire}");
+    }
+
+    #[test]
+    fn read_line_bounded_returns_line_with_newline() {
+        let mut reader = std::io::Cursor::new(b"hello\nworld\n".to_vec());
+        let mut buf = Vec::new();
+        assert!(matches!(
+            read_line_bounded(&mut reader, &mut buf).expect("read ok"),
+            LineRead::Line
+        ));
+        assert_eq!(buf, b"hello\n");
+        assert!(matches!(
+            read_line_bounded(&mut reader, &mut buf).expect("read ok"),
+            LineRead::Line
+        ));
+        assert_eq!(buf, b"world\n");
+        assert!(matches!(
+            read_line_bounded(&mut reader, &mut buf).expect("read ok"),
+            LineRead::Eof
+        ));
+    }
+
+    #[test]
+    fn read_line_bounded_flags_oversized_line() {
+        // A line one byte over the cap (and no newline anywhere) must be
+        // reported as too long without buffering it all.
+        let oversized = vec![b'x'; MAX_LINE_BYTES + 1];
+        let mut reader = std::io::Cursor::new(oversized);
+        let mut buf = Vec::new();
+        assert!(matches!(
+            read_line_bounded(&mut reader, &mut buf).expect("read ok"),
+            LineRead::TooLong
+        ));
     }
 }

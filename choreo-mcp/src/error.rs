@@ -42,13 +42,15 @@ pub enum McpError {
     #[error("MCP server shut down unexpectedly")]
     ServerShutdown,
 
-    /// The requested tool was not found on the server.
-    #[error("tool not found: {0}")]
-    ToolNotFound(String),
-
-    /// The tool arguments were invalid.
-    #[error("invalid params: {0}")]
-    InvalidParams(String),
+    /// A single stdout line from the server exceeded the configured cap.
+    ///
+    /// Raised instead of buffering an unbounded line, so a hostile or broken
+    /// server cannot exhaust memory; the transport is closed once this fires.
+    #[error("MCP server output line exceeded {limit} bytes")]
+    LineTooLong {
+        /// The byte cap the line crossed.
+        limit: usize,
+    },
 }
 
 #[cfg(test)]
@@ -100,16 +102,9 @@ mod tests {
     }
 
     #[test]
-    fn error_tool_not_found_display() {
-        let err = McpError::ToolNotFound("echo".into());
+    fn error_line_too_long_display() {
+        let err = McpError::LineTooLong { limit: 1024 };
         let msg = err.to_string();
-        assert!(msg.contains("echo"));
-    }
-
-    #[test]
-    fn error_invalid_params_display() {
-        let err = McpError::InvalidParams("missing name".into());
-        let msg = err.to_string();
-        assert!(msg.contains("missing name"));
+        assert!(msg.contains("1024"), "message should name the cap: {msg}");
     }
 }

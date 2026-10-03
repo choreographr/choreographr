@@ -22,6 +22,13 @@ tracing.workspace = true
 # Used only for killpg-style process-group cleanup of MCP server subprocesses.
 libc = "0.2"
 
+# Test fixture: a scripted legacy MCP stdio server that the integration suite
+# spawns as a subprocess (via `env!("CARGO_BIN_EXE_mcp-fixture-server")`),
+# removing the suite's dependency on Node/npx and the network.
+[[bin]]
+name = "mcp-fixture-server"
+path = "tests/fixtures/fixture_server.rs"
+
 # Workspace-wide lints (see [workspace.lints.clippy] in the root Cargo.toml).
 [lints]
 workspace = true

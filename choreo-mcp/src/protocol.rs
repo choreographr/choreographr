@@ -9,6 +9,30 @@
 use crate::McpError;
 use std::collections::HashMap;
 
+/// The MCP protocol revision this client negotiates in the `initialize`
+/// handshake.
+///
+/// Named once so the wire value and every log/assertion that references it
+/// cannot drift apart. The client speaks the `2024-11-05` era only; newer,
+/// stateless revisions replace the handshake entirely.
+pub const PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// The JSON Schema substituted for a tool whose `inputSchema` is missing or
+/// `null`.
+///
+/// The MCP spec forbids a `null` schema (a client that forwards one to a
+/// provider produces an invalid tool definition), so an absent schema is
+/// normalized to an explicit empty-object schema instead: it accepts exactly
+/// one argument shape — no arguments — and rejects everything else.
+pub const EMPTY_INPUT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false}"#;
+
+/// Upper bound on the size of a tool's `inputSchema` in bytes.
+///
+/// A hostile or buggy server can return an arbitrarily large schema; the
+/// client caps it so a single tool definition cannot balloon the memory used
+/// per server or the prompt sent to a model.
+pub const MAX_SCHEMA_BYTES: usize = 256 * 1024;
+
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 wire types
 // ---------------------------------------------------------------------------
@@ -145,14 +169,47 @@ pub struct ServerInfo {
 
 /// A tool advertised by an MCP server in a `tools/list` response.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct McpTool {
     /// The tool name used to invoke it via `tools/call`.
     pub name: String,
     /// Human-readable description, if the server supplied one.
     pub description: Option<String>,
-    /// JSON Schema for the tool's arguments (empty when the server omits it).
-    #[serde(default)]
+    /// JSON Schema for the tool's arguments.
+    ///
+    /// Defaults to [`EMPTY_INPUT_SCHEMA`] when the server omits the field, so
+    /// a downstream provider never receives a `null` schema. An explicit
+    /// `null` or non-object value is rejected later by
+    /// [`normalize_input_schema`].
+    #[serde(default = "empty_input_schema_value")]
     pub input_schema: serde_json::Value,
+}
+
+/// Parse [`EMPTY_INPUT_SCHEMA`] into a `Value`; infallible for this literal.
+fn empty_input_schema_value() -> serde_json::Value {
+    serde_json::from_str(EMPTY_INPUT_SCHEMA).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+/// Normalize a tool's raw `inputSchema` to a valid JSON Schema object.
+///
+/// Returns `None` when the schema is not an object (arrays, strings, numbers,
+/// booleans) or exceeds [`MAX_SCHEMA_BYTES`] — the caller drops such tools while
+/// keeping the rest, per the spec's "exclude the tool, keep the others" rule.
+/// A `null` schema is treated as absent and replaced with
+/// [`EMPTY_INPUT_SCHEMA`].
+#[must_use]
+pub fn normalize_input_schema(value: serde_json::Value) -> Option<serde_json::Value> {
+    match value {
+        serde_json::Value::Null => Some(empty_input_schema_value()),
+        serde_json::Value::Object(_) => {
+            // `to_string` of a `Value` is infallible in practice; treat the
+            // unlikely failure as "cannot bound the schema" and reject it so
+            // an unmeasurable schema never reaches the model.
+            let size = serde_json::to_string(&value).ok()?.len();
+            (size <= MAX_SCHEMA_BYTES).then_some(value)
+        }
+        _ => None,
+    }
 }
 
 /// Parameters for a `tools/call` request.
@@ -166,6 +223,7 @@ pub struct CallToolParams {
 
 /// The result of a `tools/call` request.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct CallToolResult {
     /// The content blocks the tool returned.
     pub content: Vec<McpContent>,
@@ -177,9 +235,10 @@ pub struct CallToolResult {
 /// A single content block in a [`CallToolResult`].
 ///
 /// Tagged by `type` on the wire, so each variant serializes with an explicit
-/// content-type discriminator.
+/// content-type discriminator; variant fields use the spec's camelCase form
+/// (e.g. an image's `mimeType`).
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
-#[serde(tag = "type")]
+#[serde(tag = "type", rename_all_fields = "camelCase")]
 pub enum McpContent {
     /// Plain text content.
     #[serde(rename = "text")]
@@ -220,7 +279,7 @@ pub fn make_initialize_request(id: RequestId) -> Result<JsonRpcRequest, McpError
         method: "initialize".into(),
         params: Some(
             serde_json::to_value(InitializeParams {
-                protocol_version: "2024-11-05".into(),
+                protocol_version: PROTOCOL_VERSION.into(),
                 capabilities: ClientCapabilities {
                     tools: Some(HashMap::from([(
                         "listChanged".into(),
@@ -231,7 +290,7 @@ pub fn make_initialize_request(id: RequestId) -> Result<JsonRpcRequest, McpError
                 },
                 client_info: ClientInfo {
                     name: "choreographr".into(),
-                    version: "0.1.0".into(),
+                    version: env!("CARGO_PKG_VERSION").into(),
                 },
             })
             .map_err(|e| McpError::ProtocolError(format!("serialize initialize params: {e}")))?,
@@ -437,5 +496,76 @@ mod tests {
         let json = serde_json::to_string(&params).unwrap();
         let parsed: CallToolParams = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.name, "echo");
+    }
+
+    #[test]
+    fn mcp_tool_missing_schema_defaults_to_empty_object() {
+        // A server that omits `inputSchema` must not yield a JSON `null`
+        // schema; it is normalized to the explicit empty-object fallback.
+        let json = r#"{"name": "noargs"}"#;
+        let tool: McpTool = serde_json::from_str(json).unwrap();
+        assert_eq!(tool.input_schema["type"], "object");
+        assert_eq!(tool.input_schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn normalize_input_schema_null_becomes_fallback() {
+        let normalized =
+            normalize_input_schema(serde_json::Value::Null).expect("null is normalized");
+        assert_eq!(normalized["type"], "object");
+        assert_eq!(normalized["additionalProperties"], false);
+    }
+
+    #[test]
+    fn normalize_input_schema_keeps_object() {
+        let schema = serde_json::json!({"type": "object", "properties": {}});
+        assert_eq!(normalize_input_schema(schema.clone()), Some(schema));
+    }
+
+    #[test]
+    fn normalize_input_schema_rejects_non_object() {
+        assert!(normalize_input_schema(serde_json::json!(["not", "a", "schema"])).is_none());
+        assert!(normalize_input_schema(serde_json::json!("string")).is_none());
+        assert!(normalize_input_schema(serde_json::json!(42)).is_none());
+    }
+
+    #[test]
+    fn normalize_input_schema_rejects_oversized() {
+        let filler = "x".repeat(MAX_SCHEMA_BYTES + 1);
+        let schema = serde_json::json!({ "type": "object", "description": filler });
+        assert!(normalize_input_schema(schema).is_none());
+    }
+
+    #[test]
+    fn initialize_request_version_is_named_constant() {
+        let req = make_initialize_request(1).expect("initialize request should succeed");
+        let params = req.params.expect("params present");
+        assert_eq!(params["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(params["clientInfo"]["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn mcp_tool_parses_camel_case_input_schema() {
+        // The wire field is `inputSchema`; without camelCase renaming the
+        // schema would be silently dropped and default to the empty object.
+        let json = r#"{"name":"t","inputSchema":{"type":"object","properties":{}}}"#;
+        let tool: McpTool = serde_json::from_str(json).unwrap();
+        assert_eq!(tool.input_schema["type"], "object");
+    }
+
+    #[test]
+    fn call_tool_result_parses_camel_case_is_error() {
+        let json = r#"{"content":[{"type":"text","text":"x"}],"isError":true}"#;
+        let parsed: CallToolResult = serde_json::from_str(json).unwrap();
+        assert!(parsed.is_error);
+    }
+
+    #[test]
+    fn image_content_parses_camel_case_mime_type() {
+        let json = r#"{"type":"image","data":"AAA","mimeType":"image/png"}"#;
+        let parsed: McpContent = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(parsed, McpContent::Image { ref mime_type, .. } if mime_type.as_deref() == Some("image/png"))
+        );
     }
 }

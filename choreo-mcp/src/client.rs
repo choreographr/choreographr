@@ -4,7 +4,7 @@
 use crate::error::McpError;
 use crate::protocol::{
     CallToolParams, CallToolResult, JsonRpcNotification, JsonRpcRequest, McpTool,
-    make_initialize_request,
+    make_initialize_request, normalize_input_schema,
 };
 use crate::transport::StdioTransport;
 use serde_json::Value;
@@ -15,10 +15,10 @@ use std::time::Duration;
 /// Default timeout for MCP tool calls.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Timeout for the initialize handshake.
+/// Default timeout for the initialize handshake.
 const INIT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Timeout for tools/list.
+/// Default timeout for tools/list.
 const LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Configuration for spawning an MCP server subprocess.
@@ -34,8 +34,17 @@ pub struct McpServerConfig {
     pub env: HashMap<String, String>,
     /// Whether this server is enabled for use.
     pub enabled: bool,
-    /// Whether its tools load automatically at startup or on explicit request.
-    pub auto_load: bool,
+    /// Optional per-server request timeout, applied to the handshake, tool
+    /// listing, and tool calls. When `None`, the built-in defaults are used.
+    pub timeout: Option<Duration>,
+}
+
+impl McpServerConfig {
+    /// Timeout for the `initialize` handshake: the configured value if set,
+    /// otherwise the built-in default.
+    fn init_timeout(&self) -> Duration {
+        self.timeout.unwrap_or(INIT_TIMEOUT)
+    }
 }
 
 /// A client connected to a single MCP server subprocess.
@@ -44,6 +53,9 @@ pub struct McpClient {
     next_id: AtomicU64,
     server_name: String,
     server_version: String,
+    /// Per-server default call timeout (from config), used when a call does not
+    /// pass its own.
+    timeout: Option<Duration>,
 }
 
 impl McpClient {
@@ -62,7 +74,7 @@ impl McpClient {
         let init_req = make_initialize_request(1)?;
         transport.send_request(&init_req)?;
 
-        let resp = transport.recv_response(1, INIT_TIMEOUT)?;
+        let resp = transport.recv_response(1, config.init_timeout())?;
 
         // Check for JSON-RPC error in response.
         if let Some(err) = resp.error {
@@ -116,6 +128,7 @@ impl McpClient {
             next_id: AtomicU64::new(3),
             server_name,
             server_version,
+            timeout: config.timeout,
         })
     }
 
@@ -136,7 +149,7 @@ impl McpClient {
             params: None,
         };
         self.transport.send_request(&req)?;
-        let resp = self.transport.recv_response(id, LIST_TOOLS_TIMEOUT)?;
+        let resp = self.transport.recv_response(id, self.list_timeout())?;
 
         if let Some(err) = resp.error {
             return Err(McpError::JsonRpcError {
@@ -153,7 +166,32 @@ impl McpClient {
             serde_json::from_value(result.get("tools").cloned().unwrap_or(Value::Array(vec![])))
                 .map_err(|e| McpError::ProtocolError(format!("invalid tools/list result: {e}")))?;
 
+        // Drop tools whose schema cannot be represented safely (non-object or
+        // over the size cap) rather than forwarding an invalid definition; a
+        // `null`/absent schema is normalized to the empty-object fallback. The
+        // spec's rule is to exclude the offending tool and keep the rest.
+        let tools = tools
+            .into_iter()
+            .filter_map(|mut tool| {
+                if let Some(schema) = normalize_input_schema(tool.input_schema) {
+                    tool.input_schema = schema;
+                    Some(tool)
+                } else {
+                    tracing::warn!(
+                        tool = %tool.name,
+                        "dropping MCP tool with invalid input schema"
+                    );
+                    None
+                }
+            })
+            .collect();
+
         Ok(tools)
+    }
+
+    /// The per-server `tools/list` timeout (configured value or default).
+    fn list_timeout(&self) -> Duration {
+        self.timeout.unwrap_or(LIST_TOOLS_TIMEOUT)
     }
 
     /// Call a tool on the server.
@@ -187,7 +225,7 @@ impl McpClient {
         self.transport.send_request(&req)?;
         let resp = self
             .transport
-            .recv_response(id, timeout.unwrap_or(DEFAULT_TIMEOUT))?;
+            .recv_response(id, timeout.or(self.timeout).unwrap_or(DEFAULT_TIMEOUT))?;
 
         if let Some(err) = resp.error {
             return Err(McpError::JsonRpcError {
@@ -240,11 +278,24 @@ mod tests {
             args: vec![],
             env: HashMap::new(),
             enabled: true,
-            auto_load: true,
+            timeout: None,
         };
         assert_eq!(config.slug, "test");
         assert_eq!(config.command, "echo");
         assert!(config.enabled);
-        assert!(config.auto_load);
+        assert_eq!(config.init_timeout(), INIT_TIMEOUT);
+    }
+
+    #[test]
+    fn configured_timeout_overrides_defaults() {
+        let config = McpServerConfig {
+            slug: "test".into(),
+            command: "echo".into(),
+            args: vec![],
+            env: HashMap::new(),
+            enabled: true,
+            timeout: Some(Duration::from_secs(5)),
+        };
+        assert_eq!(config.init_timeout(), Duration::from_secs(5));
     }
 }

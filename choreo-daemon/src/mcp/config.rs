@@ -3,6 +3,7 @@ use choreo_mcp::McpServerConfig;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Top-level structure matching the standard `mcp_servers.json` format.
 #[derive(Deserialize, Debug)]
@@ -20,8 +21,14 @@ struct ServerEntry {
     env: HashMap<String, String>,
     #[serde(default = "default_true")]
     enabled: bool,
-    #[serde(default = "default_true")]
-    auto_load: bool,
+    /// Optional per-server request timeout, in seconds.
+    #[serde(default)]
+    timeout: Option<u64>,
+    /// Any keys this client does not recognize. Collected so loading can
+    /// report them (never fatal) — a typo'd or not-yet-supported key should
+    /// surface in the log rather than being silently dropped.
+    #[serde(flatten)]
+    unknown: HashMap<String, serde_json::Value>,
 }
 
 fn default_true() -> bool {
@@ -84,13 +91,24 @@ pub fn load_mcp_config() -> Result<Vec<McpServerConfig>> {
         .mcp_servers
         .into_iter()
         .filter(|(_slug, entry)| entry.enabled)
-        .map(|(slug, entry)| McpServerConfig {
-            slug,
-            command: entry.command,
-            args: entry.args,
-            env: entry.env,
-            enabled: entry.enabled,
-            auto_load: entry.auto_load,
+        .map(|(slug, entry)| {
+            if !entry.unknown.is_empty() {
+                let mut keys: Vec<&String> = entry.unknown.keys().collect();
+                keys.sort();
+                tracing::warn!(
+                    server = %slug,
+                    keys = ?keys,
+                    "ignoring unrecognized MCP server config keys"
+                );
+            }
+            McpServerConfig {
+                slug,
+                command: entry.command,
+                args: entry.args,
+                env: entry.env,
+                enabled: entry.enabled,
+                timeout: entry.timeout.map(Duration::from_secs),
+            }
         })
         .collect();
 
@@ -130,7 +148,8 @@ mod tests {
         assert_eq!(entry.args, [] as [std::string::String; 0]);
         assert!(entry.env.is_empty());
         assert!(entry.enabled);
-        assert!(entry.auto_load);
+        assert!(entry.timeout.is_none());
+        assert!(entry.unknown.is_empty());
     }
 
     #[test]
@@ -140,7 +159,7 @@ mod tests {
             "args": ["-m", "server"],
             "env": {"KEY": "value"},
             "enabled": false,
-            "auto_load": false
+            "timeout": 30
         });
         let entry: ServerEntry = serde_json::from_value(json).expect("full server entry");
         assert_eq!(entry.command, "python");
@@ -150,7 +169,20 @@ mod tests {
             Some("value")
         );
         assert!(!entry.enabled);
-        assert!(!entry.auto_load);
+        assert_eq!(entry.timeout, Some(30));
+        assert!(entry.unknown.is_empty());
+    }
+
+    #[test]
+    fn server_entry_collects_unknown_keys() {
+        // `auto_load` was removed; a config still carrying it must load (not
+        // error) with the key reported rather than silently dropped.
+        let json = serde_json::json!({
+            "command": "echo",
+            "auto_load": false
+        });
+        let entry: ServerEntry = serde_json::from_value(json).expect("entry with unknown key");
+        assert!(entry.unknown.contains_key("auto_load"));
     }
 
     #[test]
@@ -179,7 +211,7 @@ mod tests {
                 args: entry.args,
                 env: entry.env,
                 enabled: entry.enabled,
-                auto_load: entry.auto_load,
+                timeout: entry.timeout.map(Duration::from_secs),
             })
             .collect();
         assert_eq!(configs.len(), 1);
