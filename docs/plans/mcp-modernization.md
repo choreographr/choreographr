@@ -2,6 +2,10 @@
 
 **Status:** proposed — design complete; nothing implemented (no source changes in this
 change).
+**Lifecycle:** this file is **deleted once the plan is fully implemented**. Nothing
+written during implementation may reference it — rustdoc, `ARCHITECTURE.md`,
+`README.md`, release notes, and commit messages must stand on their own, because a
+reference to this plan would go stale the moment it is removed.
 **Date:** 2026-10-03
 **Targets:** `choreo-mcp` (protocol engine), `choreo-daemon` (`src/mcp/` manager +
 `McpToolWrapper`), `choreo-tui` / `choreo-client-core` (later phases: `/mcp` control
@@ -757,6 +761,10 @@ TUI `/mcp` (status, sign-in, reconnect, enable/disable, exposure), a
 - Release note: one `feat(choreo-mcp):` commit (or a small series: `feat`,
   `fix`, `refactor`) with user-facing prose. `choreo-mcp` and `choreo-daemon`
   scopes preferred.
+- **No plan references.** Everything above must stand on its own: do not mention,
+  link, or paraphrase this plan in any of it. The plan is deleted once
+  implemented, so a reference to it (`see docs/plans/mcp-modernization.md`) is a
+  future broken link and stale context.
 
 ## 12. Risks & mitigations
 
@@ -812,3 +820,6 @@ TUI `/mcp` (status, sign-in, reconnect, enable/disable, exposure), a
 - `/mcp` + CLI surfaces report status and manage auth/reload.
 - `ARCHITECTURE.md`/`README.md`/rustdoc updated; `just pre-commit` green; release
   notes written from the commit messages.
+- **This plan document is deleted.** No source file, doc, comment, or commit
+  message in the tree references it (grep for `mcp-modernization` returns
+  nothing).
