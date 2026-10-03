@@ -8,9 +8,9 @@ rmcp engine swap), `9f6209a` (Streamable HTTP), `274f736`
 cap), `15aa3ff` (`subscriptions/listen` + registry hot-swap), `f037383` (tool
 name hygiene, `cwd`/`disabledTools`, config layers, auth error, status API),
 `8d27006` (`/mcp` surface + `choreographr mcp` CLI), `a348c89` (per-server logs).
-Remaining M1 work: **the rest of P6** (conformance suite, fuzz, supply-chain,
-default-feature release verification, security checklist). **OAuth (P3) is
-deferred to post-ship.** See §1.2 and §7.
+Remaining M1 work: **the D9 default-feature flip** and **the rest of P6**
+(conformance suite, fuzz, supply-chain, release verification, security checklist).
+**OAuth (P3) is deferred to post-ship.** See §1.2 and §7.
 **Lifecycle:** this file is **deleted once the plan is fully implemented**. Nothing
 written during implementation may reference it — rustdoc, `ARCHITECTURE.md`,
 `README.md`, release notes, and commit messages must stand on their own, because a
@@ -21,12 +21,14 @@ reference to this plan would go stale the moment it is removed.
 surface), root `Cargo.toml` + `Cargo.lock` (new dependencies; `mcp` moves into
 the default feature set for M1 — D9).
 **Touches (when implemented):** `choreo-mcp` (rewritten around `rmcp`; new
-`runtime.rs` / `session.rs` / `engine.rs` / `config.rs` modules landed in P1–P2;
-`auth.rs` and the OAuth glue are post-ship), `choreo-daemon`
-(`src/mcp/{mod,config,tool}.rs` and `src/daemon.rs` cancel plumbing landed in P1;
-`src/daemon/open.rs`, `src/server/core.rs` unchanged), `choreo-tui` (`/mcp`
-status in M1; sign-in post-ship), `choreo-proto` (only if a new client message is
-added), the justfile (`doc_crates` stays current), `ARCHITECTURE.md`, `README.md`,
+`runtime.rs` / `session.rs` / `engine.rs` / `config.rs` / `stdio.rs` / `naming.rs`
+modules landed through P5; `auth.rs` and the OAuth glue are post-ship),
+`choreo-daemon` (`src/mcp/{mod,config,tool}.rs` and `src/daemon.rs` cancel
+plumbing landed through P1–P5; `src/daemon/open.rs`, `src/server/core.rs` carry
+the registry swap; the CLI lives in `cli.rs`), `choreo-tui` (`/mcp` status +
+reconnect landed; sign-in post-ship), `choreo-proto` (the
+`McpStatusRequest`/`McpReconnect` client request and `McpStatus` reply landed in
+P5), the justfile (`doc_crates` stays current), `ARCHITECTURE.md`, `README.md`,
 `packaging/`.
 
 > **TL;DR.** The MCP specification's current revision is **2026-07-28**, a
@@ -51,11 +53,12 @@ added), the justfile (`doc_crates` stays current), `ARCHITECTURE.md`, `README.md
 > cancellation, OAuth sign-in, tool-name hygiene, bounds, and the official
 > conformance suite in CI.
 >
-> **Update (2026-10-03):** P0–P2 and P4 are implemented — the client negotiates
+> **Update (2026-10-03):** P0–P2 and P4–P5 are implemented — the client negotiates
 > the stateless and legacy eras on stdio **and** over Streamable HTTP behind the
 > dispatcher facade, with cancellation, restart, pagination, content mapping,
-> live tool-list refresh, bounds, and the remote-server config. The remaining
-> work is sequenced as **M1 (ship without OAuth)**: P5 → P6, then OAuth (P3)
+> live tool-list refresh, bounds, tool-name hygiene, config layers, a `/mcp`
+> status surface + `choreographr mcp` CLI, and per-server logs. The remaining
+> work is sequenced as **M1 (ship without OAuth)**: P6, then OAuth (P3)
 > post-ship. See §1.2 and §7.
 
 ---
@@ -112,7 +115,7 @@ Doc comment in `choreo-mcp/src/lib.rs` claimed the crate spoke "over a transport
 variants (`ToolNotFound`, `InvalidParams`) were never constructed. Both were fixed
 in P0.
 
-### 1.2 Implementation progress (P0–P2, P4, P6 bounds)
+### 1.2 Implementation progress (P0–P2, P4–P5, P6 bounds)
 
 **P0** (`ab3dc2e`) landed the correctness and safety fixes against the then-current
 hand-rolled engine; **P1** (`976edf6`) replaced that engine with `rmcp` 3.5 behind
@@ -733,18 +736,20 @@ retry policy honors its exponential backoff only, not a `Retry-After` header
 
 ## 6. Target architecture
 
-As built through P4 and the P6 bounds:
+As built through P5:
 
 ```
 choreo-daemon (thread-only)
   └── mcp/
-        ├── config.rs   mcp_servers.json → Vec<McpServerConfig>
+        ├── config.rs   mcp_servers.json (user + project layer) →
+        │               Vec<McpServerConfig> (cwd/disabledTools/log path)
         ├── mod.rs      McpManager { servers: HashMap<slug, ServerSlot> },
         │               ServerSlot { handle, server }, 2 s startup budget,
         │               cancel_session(session_id) fan-out, register_all +
-        │               take_list_change_rx (subscriptions)
-        └── tool.rs     McpToolWrapper: ToolDyn — name/group, schema,
-                        content mapping, image sink, resource tools,
+        │               take_list_change_rx (subscriptions), status() /
+        │               reconnect(slug), per-server stderr log capture
+        └── tool.rs     McpToolWrapper: ToolDyn — sanitized name/group,
+                        schema, content mapping, image sink, resource tools,
                         256 KiB truncation
 
 choreo-daemon catalog plane:
@@ -752,12 +757,20 @@ choreo-daemon catalog plane:
     → build_tool_registry (core tools + platform bridge + register_all)
     → Arc<ArcSwap<ToolRegistry>> store (single writer; readers load lock-free)
 
+control plane:
+  TUI `/mcp` + `/mcp reconnect <slug>`, `choreographr mcp list|add|remove|reconnect`
+    → ClientMessage::{McpStatusRequest, McpReconnect} (choreo-proto)
+    → McpManager::status / reconnect → DaemonMessage::{McpStatus, McpReconnectFailed}
+
 choreo-mcp (library; owns tokio + rmcp)
   ├── runtime.rs    sidecar Runtime: init / get / handle / block_on
   ├── config.rs     McpServerConfig + McpProtocolMode + maxConcurrentCalls
+  ├── naming.rs     sanitize_segment / build_tool_name (64-char cap,
+  │                 collision hash) / group_name
   ├── protocol.rs   daemon-facing types, normalize_input_schema, McpListChange
-  ├── error.rs      McpError
-  ├── stdio.rs      capped child transport: BoundedLineReader (8 MiB per frame)
+  ├── error.rs      McpError (incl. AuthRequired)
+  ├── stdio.rs      capped child transport: BoundedLineReader (8 MiB per frame);
+  │                 child stderr → per-server log file
   ├── session.rs    per-server dispatcher thread:
   │                   McpCommand::{ListTools, Call, CancelSession, Shutdown}
   │                   McpServerHandle { list_tools, call_tool,
@@ -769,7 +782,8 @@ choreo-mcp (library; owns tokio + rmcp)
                       connect → stdio (capped) | StreamableHttpClientTransport,
                       lifecycle (discover/initialize), list_all_tools,
                       call_tool (deadline + cancel + progress chunks + MRTR),
-                      resources, subscriptions/listen, ClientHandler
+                      resources, subscriptions/listen, ClientHandler,
+                      auth-required mapping
 ```
 
 Data flow for one tool call:
@@ -807,9 +821,9 @@ The subscriptions-driven refresh landed (P4). Remaining lifecycle work: a
 
 ## 7. Work breakdown
 
-Each phase is independently shippable and lands with tests + docs. **P0–P2 and
-P4 are done** (see §1.2); their sections come first for history. The remaining
-phases are listed in execution order — **P5 → P6** (M1), then the deferred
+Each phase is independently shippable and lands with tests + docs. **P0–P2, P4,
+and P5 are done** (see §1.2); their sections come first for history. The
+remaining phases are listed in execution order — **P6** (M1), then the deferred
 **P3** (post-ship) — and keep their original P-numbers for continuity.
 
 ### M1 — ship without OAuth (P5 done; P6 remains)
@@ -825,7 +839,8 @@ with a clear, actionable error instead of a raw status string (`f037383`).
 M1 includes, at minimum:
 
 - **Default on**: the `mcp` feature moves into the default feature set (D9), so
-  a plain build has MCP — M1 is "MCP ships enabled", not "MCP compiles".
+  a plain build has MCP — M1 is "MCP ships enabled", not "MCP compiles". Still
+  pending: the Cargo default-set flip plus the §11 doc/comment updates.
 - **P6**: the bounded stdio frame reader (the P1 regression) and the per-server
   concurrency cap are **done** (`1d7d239`); remaining: the conformance baseline,
   the lockfile/supply-chain check, the release verification with the default
@@ -1058,13 +1073,15 @@ integration tests live in `tests/it/` (one binary per crate, `#[ignore]`).
 - **Unit tests** cover: schema normalization, content mapping, name/desc
   formatting, error mapping, the dispatcher protocol + cancellation + restart
   backoff against a mock engine, config parsing (transport inference,
-  `${VAR}` expansion, timeout/protocol/`maxConcurrentCalls`/unknown keys), the
-  HTTP retry policy (status classification + capped backoff), the P4 progress
-  rate-limit and MRTR decline helpers, the `BoundedLineReader` frame cap, the
-  concurrency gate (admit/queue/promote, `0` clamp), and runtime init. All
-  wait-free — the restart tests exercise the backoff math without sleeping, and
-  the cancellation test synchronizes over channels (mock signals `started`,
-  then the test cancels).
+  `${VAR}` expansion, timeout/protocol/`maxConcurrentCalls`/unknown keys),
+  the HTTP retry policy (status classification + capped backoff), the P4
+  progress rate-limit and MRTR decline helpers, the `BoundedLineReader` frame
+  cap, the concurrency gate (admit/queue/promote, `0` clamp), P5's tool-name
+  sanitizer/collision/group-name cases, the config layers (project override,
+  `cwd`/`disabledTools`), log-stem sanitization, the `AuthRequired` mapping,
+  the TUI `/mcp` command parsing, and runtime init. All wait-free — the restart
+  tests exercise the backoff math without sleeping, and the cancellation test
+  synchronizes over channels (mock signals `started`, then the test cancels).
 - **Integration tests** cover: stdio against the fixture server per era, the
   `auto` fallback, structured content, crash/garbage/oversized/no-init,
   cancellation, P4's progress→chunk path (client and daemon), MRTR,
@@ -1127,6 +1144,7 @@ and the project-config layer. Still pending: `exposure` (post-ship) and `oauth`
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
       "env": { "TOKEN": "${FS_TOKEN}" },
       "cwd": "~/work",
+      "disabledTools": ["noisy_tool"],
       "protocol": "auto",
       "timeout": 60,
       "exposure": "direct",
@@ -1142,6 +1160,10 @@ and the project-config layer. Still pending: `exposure` (post-ship) and `oauth`
   }
 }
 ```
+
+Config layers: the user file at `<config>/choreographr/mcp_servers.json` and a
+project file at `<root>/.choreographr/mcp_servers.json`, which overrides the
+user file per server slug.
 
 Surfaces: M1 ships `choreographr mcp list|add|remove|reconnect` and the TUI
 `/mcp` status surface (server state, tool counts, last error, reconnect), a
@@ -1174,7 +1196,7 @@ are not offered (the TUI reports them as unsupported).
 
 Status: P0/P1 kept `ARCHITECTURE.md` (module tables, `mcp/` row, threading model,
 test-coverage rows) and `README.md` in step, and the tree contains no reference to
-this plan — verified at `15aa3ff`. P4/P5/P6-bounds kept both in step too (the
+this plan — verified at `a8917b3`. P4/P5/P6-bounds kept both in step too (the
 `choreo-mcp` module table gained `naming.rs` and the auth/`cwd`/`disabledTools`
 notes, the `mcp/` row gained the config layers, name hygiene, status/reconnect,
 and per-server logs, and `README.md` gained the `mcp_servers.json` reference).
@@ -1191,7 +1213,6 @@ The feature-row flip (D9) still waits on the default-on change.
 | Sidecar runtime + threads complicate shutdown | Follow the `choreo-content` runtime pattern; dispatcher replies are bounded; `shutdown_all` joins with deadlines; add the "no MCP lock can wedge Ctrl-C" test. P1 landed the bounded joins; the Ctrl-C test is still to write. |
 | (M1) Remote servers that require OAuth have no credential path until P3 | Document the static-token `headers` workaround (P5 docs); the P5 actionable `401`/`403` error names both options, so the failure explains itself. |
 | (Post-ship, P3) OAuth UX on headless devices (TUI over SSH, Termux) | Paste-the-redirected-URL fallback (pi's flow), device-code path only if a provider requires it; document. |
-| Tool-name collisions/limits change prompt text vs persisted sessions | Keep names stable; sanitize only what is invalid; hash only on collision; pin with tests. |
 | rmcp licenses/advisories | Apache-2.0; `cargo deny check` already gates the tree. |
 | Fixture server drifts from real servers | Keep the `npx`-based interop test as an opt-in ignored test plus the official conformance suite. |
 
@@ -1243,8 +1264,7 @@ are what remains.
       no sign-in flow (P3, post-ship) — `f037383`.
 - [ ] Tool calls: parallel per server, cancellable, deadline-bounded, restart
       on crash, progress-streamed, with images attached, structured content
-      preserved, and typed errors. *(Met except the per-server concurrency cap
-      (P6).)*
+      preserved, and typed errors. *(Met.)*
 - [x] Resources readable via wrapper tools (`list_resources`/`read_resource`,
       P4).
 - [x] Tool and resource list changes propagate without a daemon restart
