@@ -1025,7 +1025,14 @@ Post-ship (fast-follow, around P3):
       so the builds gain MCP automatically; confirm the tarball builds, record
       the size/build-time delta, and keep the opt-out paths documented (iOS
       `default-features = false`; `--no-default-features` for embedders).
+      *(Requires the D9 flip first — the one M1 item outside this phase.)*
 - [ ] Security checklist from §9 executed and recorded in the PR.
+- [ ] Decide the SSE idle-timeout handling for long-lived streams (the P2
+      residual): set rmcp's `retry_config`/`SseRetryPolicy`, or record why the
+      per-request deadline suffices. This closes that residual.
+- [ ] Add the "no MCP path wedges shutdown" test held open in the risk table:
+      a fixture server that never exits while `shutdown_all` still returns
+      within its bounded wait.
 
 ### P3 — OAuth for remote servers (post-ship, deferred)
 
