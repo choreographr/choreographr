@@ -803,6 +803,31 @@ blast radius is the servers actually edited, and a restart can interrupt an
 in-flight call only for a just-changed server. That is acceptable — but it is
 why the fingerprint gate and the malformed-file no-op matter.
 
+What already hot-reloads, and why MCP differs:
+
+- **Project context files / `AGENTS.md`** (the config-dir `AGENTS.md`,
+  `~/.agents/AGENTS.md`, `~/.claude/CLAUDE.md`, and the project chain of
+  `context_file_names` up to the git root): re-read on **every agent-loop
+  iteration** — `build_system_content` calls `discover_context` each turn and
+  fingerprints the result, so the session `context_cache` only skips
+  re-assembly. Edits land on the next turn, no watcher needed, and a newly
+  touched subdirectory's `AGENTS.md`/`CLAUDE.md` is injected as a hint as
+  tools reach it.
+- **Skills**: a session-scoped snapshot — lazily discovered once per session
+  and invalidated only by `set_working_dir`. The listing (name/description) is
+  frozen for the session, while `load_skill` reads the body fresh from disk at
+  call time. A skill *added* mid-session is therefore invisible until the
+  working directory changes or a new session starts (a deliberate "they don't
+  change during a session" assumption, not a watcher gap).
+- **`mcp_servers.json`** is different: its contents are **connection state**
+  (subprocesses, transports, a registered catalogue), which cannot be re-read
+  per request — hence explicit `mcp reload` plus this watcher decision.
+
+None of these is wired through `ConfigWatcher`; that transport exists for files
+whose consumers are long-lived threads (catalog, accounts, and now MCP). The
+skills snapshot asymmetry is recorded here for visibility; changing it is
+outside this plan.
+
 Follow-up item: land the watcher subscription (P5's post-ship list).
 
 ---
