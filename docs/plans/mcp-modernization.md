@@ -228,6 +228,14 @@ phases. What exists now:
   "stubborn server" fixture proves `shutdown_all` stays bounded even when a
   server ignores stdin EOF; and the config parser and tool-name sanitizer
   gained fuzz-style property tests.
+- Post-M1 fast-follow: `mcp reload` landed (`850cb4e`, protocol v9) — the daemon
+  re-reads the user+project config and reconciles the running server set
+  (connect added, disconnect removed, rebuild changed or previously-failed;
+  an unchanged server keeps its live connection), then rebuilds the catalogue.
+  Exposed as `ClientMessage::McpReload` ⇄ `DaemonMessage::McpReloaded` /
+  `McpReloadFailed`, `/mcp reload` in the TUI/GUI/IM, and
+  `choreographr mcp reload` over the running daemon's socket. A malformed
+  config is a hard error with no state change.
 
 Deltas the plan now tracks (detailed in §7): the config key `exposure` is not
 implemented (it defers with the deferred-tool-loading work); `auto_load` was
@@ -760,6 +768,43 @@ the `http` tool); this decision is scoped to the MCP transport. Not done: the
 retry policy honors its exponential backoff only, not a `Retry-After` header
 (see the P2 residuals).
 
+### D12 — `mcp_servers.json` joins the unified config watcher
+
+The daemon already hot-reloads config-dir files through ONE transport:
+`config_watch::ConfigWatcher` is a single `notify` watcher over
+`$XDG_CONFIG_HOME/choreographr` that fans normalized, per-basename events to
+consumers, built explicitly for "`models-overlay.toml`, `accounts.toml`, and
+future files". `mcp reload` (`850cb4e`) gave MCP the explicit command; the watcher
+is the "like other config" half, and it is a pattern-following addition, not a
+new mechanism.
+
+Decision: **yes — subscribe `mcp_servers.json` on the existing transport**,
+rather than leaving reload manual-only:
+
+- The consumer mirrors the overlay/accounts pattern: re-read the file,
+  fingerprint the raw contents to collapse editor save-event storms (the same
+  deterministic fingerprint-compare as `overlay_fingerprint_changed`, no
+  debounce timer), then forward the reload to the command loop (the single
+  writer). It reuses `McpManager::reload`'s reconcile, so an unchanged config
+  is a no-op and live connections are kept.
+- Failure policy: a malformed or half-written file logs a warning and keeps the
+  current server set — reload errors never mutate state. The explicit command
+  remains the path that reports errors to the user (`McpReloadFailed`).
+- Scope: the **user file only**. The project layer lives at `<base_dir or
+  cwd>/.choreographr/mcp_servers.json`, outside the watched directory
+  (`ConfigWatcher` is deliberately one-directory), so project edits use
+  `/mcp reload` explicitly until the transport grows a second directory.
+- Gating matches the existing watchers: the embedded daemon's
+  `config_watchers: false` path disables it wholesale (mobile-safe).
+
+Trade-off stated: an auto-reload can start (or restart) server subprocesses as a
+side effect of saving a file. Reconcile keeps unchanged servers live, so the
+blast radius is the servers actually edited, and a restart can interrupt an
+in-flight call only for a just-changed server. That is acceptable — but it is
+why the fingerprint gate and the malformed-file no-op matter.
+
+Follow-up item: land the watcher subscription (P5's post-ship list).
+
 ---
 
 ## 6. Target architecture
@@ -785,10 +830,12 @@ choreo-daemon catalog plane:
     → build_tool_registry (core tools + platform bridge + register_all)
     → Arc<ArcSwap<ToolRegistry>> store (single writer; readers load lock-free)
 
-control plane:
-  TUI `/mcp` + `/mcp reconnect <slug>`, `choreographr mcp list|add|remove|reconnect`
-    → ClientMessage::{McpStatusRequest, McpReconnect} (choreo-proto)
-    → McpManager::status / reconnect → DaemonMessage::{McpStatus, McpReconnectFailed}
+control plane (choreo-proto v9):
+  TUI `/mcp` + `/mcp reconnect <slug>` + `/mcp reload`,
+  `choreographr mcp list|add|remove|reconnect|reload`
+    → ClientMessage::{McpStatusRequest, McpReconnect, McpReload}
+    → McpManager::status / reconnect / reload
+    → DaemonMessage::{McpStatus, McpReconnectFailed, McpReloaded, McpReloadFailed}
 
 choreo-mcp (library; owns tokio + rmcp)
   ├── runtime.rs    sidecar Runtime: init / get / handle / block_on
@@ -1039,6 +1086,10 @@ Post-ship (fast-follow, around P3):
       reconciles the running server set (add/remove/restart), and rebuilds the
       catalogue; exposed as `ClientMessage::McpReload` ⇄ `DaemonMessage::McpReloaded`/
       `McpReloadFailed`, `/mcp reload` in the TUI, and `choreographr mcp reload`.
+- [ ] `mcp_servers.json` joins the unified config watcher for auto-reload (D12):
+      subscribe on `ConfigWatcher` alongside overlay/accounts, fingerprint-gate
+      the re-read, and forward the reload to the command loop; user file only
+      (the project layer stays on the explicit command).
 
 ### P6 — Bounds, conformance, hardening (M1)
 
@@ -1143,7 +1194,8 @@ integration tests live in `tests/it/` (one binary per crate, `#[ignore]`).
   cap, the concurrency gate (admit/queue/promote, `0` clamp), P5's tool-name
   sanitizer/collision/group-name cases, the config layers (project override,
   `cwd`/`disabledTools`), log-stem sanitization, the `AuthRequired` mapping,
-  the TUI `/mcp` command parsing, and runtime init. All wait-free — the restart
+  the TUI `/mcp` command parsing, the reload reconcile (no-config and
+  malformed-config cases), and runtime init. All wait-free — the restart
   tests exercise the backoff math without sleeping, and the cancellation test
   synchronizes over channels (mock signals `started`, then the test cancels).
 - **Integration tests** cover: stdio against the fixture server per era, the
@@ -1234,12 +1286,13 @@ Config layers: the user file at `<config>/choreographr/mcp_servers.json` and a
 project file at `<root>/.choreographr/mcp_servers.json`, which overrides the
 user file per server slug.
 
-Surfaces: M1 ships `choreographr mcp list|add|remove|reconnect` and the TUI
-`/mcp` status surface (server state, tool counts, last error, reconnect), a
-`session_inspect` section, and per-server log files. Sign-in (`login`/`logout`,
-auth state) arrives with P3 post-ship; `exposure` moves with its deferred-loading
-work; `enable`/`disable` from the surface need a runtime add/remove command and
-are not offered (the TUI reports them as unsupported).
+Surfaces: the CLI (`choreographr mcp list|add|remove|reconnect`) and the TUI
+`/mcp` status surface (server state, tool counts, last error, reconnect) ship in
+M1; `mcp reload` (CLI + `/mcp reload`) landed as a post-ship fast-follow
+(`850cb4e`). Sign-in (`login`/`logout`, auth state) arrives with P3 post-ship;
+`exposure` moves with its deferred-loading work; `enable`/`disable` from the
+surface need a runtime add/remove command and are not offered (the TUI reports
+them as unsupported).
 
 ## 11. Documentation deliverables
 
@@ -1265,7 +1318,7 @@ are not offered (the TUI reports them as unsupported).
 
 Status: P0/P1 kept `ARCHITECTURE.md` (module tables, `mcp/` row, threading model,
 test-coverage rows) and `README.md` in step, and the tree contains no reference to
-this plan — verified at `30999b0`. P4/P5/P6 kept both in step too (the
+this plan — verified at `850cb4e`. P4/P5/P6 kept both in step too (the
 `choreo-mcp` module table gained `naming.rs` and the auth/`cwd`/`disabledTools`
 notes, the `mcp/` row gained the config layers, name hygiene, status/reconnect,
 and per-server logs, and `README.md` gained the `mcp_servers.json` reference).
@@ -1313,6 +1366,9 @@ The feature-row flip (D9) still waits on the default-on change.
 4. Is the 2 s startup budget right, or should server availability be fully lazy
    (tools appear when connected)? P1 shipped the 2 s batch budget (stragglers
    skipped and logged); revisit if real configs routinely miss it.
+5. Should the config transport grow multi-directory support so the project-layer
+   `mcp_servers.json` auto-reloads too, or does the explicit `/mcp reload` stay
+   the answer there? D12 keeps the watcher scoped to the user file for now.
 
 ## 15. Definition of done
 
@@ -1362,6 +1418,8 @@ P0–P6 and D9 are complete.
 
 - [ ] Remote OAuth server sign-in works end-to-end with refresh and logout
       (P3).
+- [ ] The remaining fast-follows land: `exposure` + deferred tool search, and
+      the config-watcher auto-reload for `mcp_servers.json` (D12).
 - [ ] **This plan document is deleted** once everything above — including P3 —
       is implemented. No source file, doc, comment, or commit message in the
       tree references it (grep for `mcp-modernization` returns nothing).
