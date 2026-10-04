@@ -51,13 +51,13 @@ P5), the justfile (`doc_crates` stays current), `ARCHITECTURE.md`, `README.md`,
 > cancellation, OAuth sign-in, tool-name hygiene, bounds, and the official
 > conformance suite in CI.
 >
-> **Update (2026-10-03):** P0–P2 and P4–P5 are implemented — the client negotiates
+> **Update (2026-10-04):** P0–P6 and D9 are implemented — the client negotiates
 > the stateless and legacy eras on stdio **and** over Streamable HTTP behind the
 > dispatcher facade, with cancellation, restart, pagination, content mapping,
 > live tool-list refresh, bounds, tool-name hygiene, config layers, a `/mcp`
-> status surface + `choreographr mcp` CLI, and per-server logs. The remaining
-> work is sequenced as **M1 (ship without OAuth)**: P6, then OAuth (P3)
-> post-ship. See §1.2 and §7.
+> status surface + `choreographr mcp` CLI, per-server logs, and the official
+> conformance suite running both protocol eras in CI. **M1 is complete**; what
+> remains is **post-ship**: OAuth (P3) and the fast-follows. See §1.2 and §7.
 
 ---
 
@@ -675,8 +675,8 @@ re-enables it the way it already re-enables `pdf` (the root consumes
 `choreo-daemon` with `default-features = false`, so the workspace default alone
 would not reach the binary). Rationale: MCP is a core capability of the product,
 not an experiment — a feature that ships disabled is one nobody uses, and the
-remaining M1 work (bounds, name hygiene, status surface, conformance) exists
-precisely to make the default safe.
+M1 work that makes the default safe (bounds, name hygiene, status surface,
+conformance) landed alongside the flip in `0a85184`.
 
 Trade-offs accepted, with their mitigations:
 
@@ -1262,7 +1262,7 @@ are not offered (the TUI reports them as unsupported).
 
 Status: P0/P1 kept `ARCHITECTURE.md` (module tables, `mcp/` row, threading model,
 test-coverage rows) and `README.md` in step, and the tree contains no reference to
-this plan — verified at `0a85184`. P4/P5/P6 kept both in step too (the
+this plan — verified at `30999b0`. P4/P5/P6 kept both in step too (the
 `choreo-mcp` module table gained `naming.rs` and the auth/`cwd`/`disabledTools`
 notes, the `mcp/` row gained the config layers, name hygiene, status/reconnect,
 and per-server logs, and `README.md` gained the `mcp_servers.json` reference).
