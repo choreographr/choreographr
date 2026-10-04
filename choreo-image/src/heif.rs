@@ -327,10 +327,14 @@ fn parse_grid_payload(p: &[u8]) -> Option<GridGeometry> {
 }
 
 /// True when the declared geometry stays within the decompression-bomb guard:
-/// every single-item extent, every grid's declared output, and every grid's
-/// canvas (tile extent × rows/cols) are all within [`MAX_SOURCE_DIMENSION`]
-/// per side and within the pixel budget.
-pub(crate) fn geometry_within_limits(data: &[u8], max_side: u32, max_pixels: u64) -> bool {
+/// the largest single-item extent and the largest grid canvas (tile extent ×
+/// rows/cols) must not exceed the total-pixel budget `max_pixels`.
+///
+/// The guard bounds *area*, not a per-side dimension, so a tall or wide HEIC
+/// (a large single side, but few enough pixels) is admitted, while a container
+/// of any shape whose decoded canvas exceeds the budget is rejected — the same
+/// shape of bound the raster decoder applies to its declared size.
+pub(crate) fn geometry_within_limits(data: &[u8], max_pixels: u64) -> bool {
     let Some(geo) = heif_geometry(data) else {
         return false;
     };
@@ -345,7 +349,10 @@ pub(crate) fn geometry_within_limits(data: &[u8], max_side: u32, max_pixels: u64
         max_w = max_w.max(canvas_w).max(g.out_w);
         max_h = max_h.max(canvas_h).max(g.out_h);
     }
-    max_w <= max_side && max_h <= max_side && u64::from(max_w) * u64::from(max_h) <= max_pixels
+    // `max_w`/`max_h` are the extremes across every item; their product
+    // upper-bounds any single allocation the decoder makes. Computed in `u64`
+    // so the multiply cannot overflow two `u32` sides.
+    u64::from(max_w) * u64::from(max_h) <= max_pixels
 }
 
 /// Iterate sibling boxes in `bytes`, calling `f(box_type, content)` for each.

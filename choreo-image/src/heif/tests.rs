@@ -97,8 +97,6 @@ fn grid_payload(rows: u8, cols: u8, out_w: u16, out_h: u16) -> Vec<u8> {
 /// The pixel budget production uses (kept in lockstep with
 /// [`crate::MAX_DECODE_PIXELS`] so the guard test exercises the real wiring).
 const PIXEL_BUDGET: u64 = crate::MAX_DECODE_PIXELS;
-/// The per-side cap production uses.
-const MAX_SIDE: u32 = crate::MAX_SOURCE_DIMENSION;
 
 #[test]
 fn ispe_geometry_is_read_across_the_meta_fullbox_header() {
@@ -162,8 +160,9 @@ fn grid_canvas_is_bounded_from_grid_payload() {
     assert_eq!(geo.grids[0].out_w, 12000);
     assert_eq!(geo.grids[0].out_h, 9000);
     assert_eq!((geo.max_ispe_w, geo.max_ispe_h), (3000, 2000));
-    // Canvas 3000x5 x 2000x4 = 15000x8000 → rejected (side cap first).
-    assert!(!geometry_within_limits(&file, MAX_SIDE, PIXEL_BUDGET));
+    // Canvas 3000x5 x 2000x4 = 15000x8000 = 120M px → rejected (over the
+    // pixel budget).
+    assert!(!geometry_within_limits(&file, PIXEL_BUDGET));
 }
 
 #[test]
@@ -197,7 +196,7 @@ fn in_limits_grid_passes_the_guard() {
     assert_eq!(file.len(), off);
     file.extend_from_slice(&grid_payload);
 
-    assert!(geometry_within_limits(&file, MAX_SIDE, PIXEL_BUDGET));
+    assert!(geometry_within_limits(&file, PIXEL_BUDGET));
 }
 
 #[test]

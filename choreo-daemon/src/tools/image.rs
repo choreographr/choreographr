@@ -260,9 +260,10 @@ fn inspect_image_dimensions(mime_type: &str, data: &[u8]) -> io::Result<(u32, u3
         // BMP, TIFF, TGA, DDS, ICO, PNM, HDR, OpenEXR, Farbfeld, QOI) — plus
         // AVIF when the gated `avif` feature is on. `decode_raster_oriented`
         // sniffs the bytes (so the MIME is largely advisory) *and* applies the
-        // decompression-bomb `image::Limits` guard, so a hostile raster can't
-        // drive a huge allocation during the dimension probe either — not just
-        // the display decode.
+        // decompression-bomb guard (a total-pixel budget on the declared size,
+        // plus `image::Limits`), so a hostile raster can't drive a huge
+        // allocation during the dimension probe either — not just the display
+        // decode.
         "image/png"
         | "image/jpeg"
         | "image/webp"
@@ -429,16 +430,13 @@ mod tests {
 
     #[test]
     fn raster_dimension_probe_is_guard_limited() {
-        // A raster whose declared width is one pixel over the source cap must be
-        // rejected by the probe's decompression-bomb guard, not decoded. Encodes
-        // a real image so the rejection is attributable to `image::Limits` (the
-        // width cap) rather than to malformed bytes.
-        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::new(
-            choreo_image::MAX_SOURCE_DIMENSION + 1,
-            1,
-        ));
-        let mut png = Cursor::new(Vec::new());
-        img.write_to(&mut png, ImageFormat::Png).unwrap();
-        assert!(inspect_image_dimensions("image/png", &png.into_inner()).is_err());
+        // A raster declaring more pixels than the decompression-bomb budget is
+        // rejected by the probe's guard rather than decoded. The payload is a
+        // PNM (whose decoder enforces no `image::Limits` allocation limit), so
+        // the rejection is attributable to the total-pixel guard itself rather
+        // than to malformed bytes or a codec-local limit.
+        assert!(
+            inspect_image_dimensions("image/x-portable-pixmap", b"P6\n40000 40000\n255\n").is_err()
+        );
     }
 }

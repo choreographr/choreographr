@@ -653,7 +653,7 @@ rejected hostile input is observable without the crate owning any state:
 
 | Function | Purpose |
 |---|---|
-| `decode_raster_oriented` | `image`-crate raster decode with EXIF orientation baked in (JPEG/WebP/PNG-`eXIf`), in one pass, under a decompression-bomb `image::Limits` guard (`MAX_SOURCE_DIMENSION` x-side, `MAX_DECODE_ALLOC`). |
+| `decode_raster_oriented` | `image`-crate raster decode with EXIF orientation baked in (JPEG/WebP/PNG-`eXIf`), in one pass, under a decompression-bomb guard: a total-pixel budget (`MAX_DECODE_PIXELS`, checked against the image's declared size before any allocation) plus `image::Limits` (`MAX_SOURCE_DIMENSION` per-side sanity cap, `MAX_DECODE_ALLOC`) as defense-in-depth. |
 | `decode_heic` | Pure-Rust `heif-oxide` HEIC/HEIF decode. Applies the container's orientation, delivers display-ready sRGB, and runs a **pre-decode allocation guard** (see below) — a rejection is logged via `tracing`. |
 
 **HEIC decompression-bomb guard.** `heif-oxide` exposes no decoder limit and
@@ -666,10 +666,11 @@ frame size a single coded image or grid tile is decoded from — and every
 `grid` derived item's canvas, read from the grid item payload located via
 `iinf`/`iloc` (`rows`/`cols` × tile extent), which is the amplification
 vector a per-item cap alone does not close. Any container whose declared
-extent or canvas exceeds [`MAX_SOURCE_DIMENSION`] (or whose geometry cannot be
-proved — no `ispe`, an unlocatable/unsupported grid payload) is rejected
-before `heif-oxide` runs, the safe default. The box walk descends only into
-the `meta`/`iinf`/`iprp`/`ipco` containers and is careful about **full boxes**
+extent or canvas exceeds the total-pixel budget [`MAX_DECODE_PIXELS`] (or whose
+geometry cannot be proved — no `ispe`, an unlocatable/unsupported grid
+payload) is rejected before `heif-oxide` runs, the safe default. The box walk
+descends only into the `meta`/`iinf`/`iprp`/`ipco` containers and is careful
+about **full boxes**
 (`meta`/`iinf` carry a version/flags prefix + count), never descending into
 `mdat` raw media data, so arbitrary payload bytes cannot cause a false
 rejection.
