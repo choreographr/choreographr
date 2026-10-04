@@ -541,6 +541,14 @@ pub enum DaemonCommand {
         slug: String,
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     },
+    /// Re-read the MCP configuration from disk and reconcile the running
+    /// server set with it, then rebuild the tool catalogue — so a
+    /// `mcp_servers.json` edit is picked up without a daemon restart. Replies
+    /// with the reload outcome (a summary plus the refreshed status list),
+    /// targeted to the requesting connection.
+    McpReload {
+        reply: std::sync::mpsc::Sender<Result<crate::mcp::McpReloadOutcome, String>>,
+    },
     /// Set the display title for a session, forwarded to the session's
     /// main loop for in-memory update, broadcast, and persistence.
     SetSessionTitle {
@@ -842,6 +850,9 @@ impl DaemonState {
             }
             DaemonCommand::McpReconnect { slug, reply } => {
                 self.handle_mcp_reconnect(&slug, &reply);
+            }
+            DaemonCommand::McpReload { reply } => {
+                self.handle_mcp_reload(&reply);
             }
             DaemonCommand::SetSessionTitle { session_id, title } => {
                 self.handle_set_session_title(session_id, title);
@@ -2111,6 +2122,32 @@ impl DaemonState {
             }
             Err(e) => {
                 warn!(server = %slug, error = %e, "MCP reconnect failed");
+            }
+        }
+        let _ = reply.send(result);
+    }
+
+    /// Reload the MCP configuration and refresh the catalogue.
+    ///
+    /// The manager re-reads `mcp_servers.json` (user + project layers) and
+    /// reconciles the running servers with it — connecting added servers,
+    /// disconnecting removed ones, and rebuilding changed ones. On success the
+    /// whole catalogue is rebuilt (a reload can add, remove, or rename
+    /// servers' tools), and the outcome is reported back to the requester. On
+    /// a config read/parse failure nothing is changed and the error is
+    /// reported.
+    fn handle_mcp_reload(
+        &mut self,
+        reply: &std::sync::mpsc::Sender<Result<crate::mcp::McpReloadOutcome, String>>,
+    ) {
+        let result = self.mcp_manager.reload();
+        match &result {
+            Ok(outcome) => {
+                self.rebuild_tool_catalogue();
+                info!(summary = %outcome.summary, "MCP config reloaded; tool catalogue refreshed");
+            }
+            Err(e) => {
+                warn!(error = %e, "MCP config reload failed");
             }
         }
         let _ = reply.send(result);

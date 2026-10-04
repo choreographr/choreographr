@@ -377,6 +377,19 @@ fn dispatch_flat_message(msg: DaemonMessage, handler: &mut impl TurnEventHandler
         DaemonMessage::McpReconnectFailed { slug, error } => {
             handler.handle_error(format!("[daemon] mcp reconnect {slug} failed: {error}"));
         }
+        DaemonMessage::McpReloaded { summary, servers } => {
+            // The summary names what changed; the refreshed status list follows
+            // so the operator sees the post-reload state without a second
+            // `/mcp` request.
+            let mut lines = vec![format!("[daemon] {summary}")];
+            for s in &servers {
+                lines.push(format!("  {}", s.summary()));
+            }
+            handler.handle_status_text(lines.join("\n"));
+        }
+        DaemonMessage::McpReloadFailed { error } => {
+            handler.handle_error(format!("[daemon] mcp reload failed: {error}"));
+        }
         // On-demand displayed-image reply. The connection layer does NOT
         // intercept this (unlike `Sessions`, handled before the generic
         // dispatch), so it flows to the handler's `handle_image`, which fills

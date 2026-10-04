@@ -35,6 +35,13 @@ const STARTUP_BUDGET: Duration = Duration::from_secs(2);
 #[cfg(feature = "mcp")]
 const RECONNECT_BUDGET: Duration = Duration::from_secs(10);
 
+/// Per-server budget for a config reload (the `/mcp reload` action). Reload
+/// reconciles every configured server, so a (re)connect attempt gets the same
+/// generous per-server share as a manual reconnect; servers are attempted one
+/// at a time.
+#[cfg(feature = "mcp")]
+const RELOAD_BUDGET: Duration = Duration::from_secs(10);
+
 /// A read-only snapshot of one configured server's state, for the `/mcp`
 /// status surface and `session_inspect`.
 ///
@@ -83,6 +90,21 @@ impl McpServerStatus {
             )
         }
     }
+}
+
+/// The result of a successful MCP config reload, for the `/mcp reload`
+/// surface.
+///
+/// Defined unconditionally (outside the `mcp` feature gate) so the status-
+/// returning daemon command and its reply type compile no matter how the
+/// daemon is built; without the feature a reload never succeeds.
+#[derive(Debug, Clone)]
+pub struct McpReloadOutcome {
+    /// One-line human-readable summary of what changed, e.g.
+    /// `"MCP reload: 1 added, 0 removed, 1 restarted, 2 unchanged, 0 failed"`.
+    pub summary: String,
+    /// The refreshed state of every configured server, in stable slug order.
+    pub servers: Vec<McpServerStatus>,
 }
 
 /// One connected server: the live connection (owns the dispatcher thread) plus
@@ -461,29 +483,155 @@ impl McpManager {
         // down, so the fresh connect does not leave a stale connection behind.
         self.servers.remove(slug);
 
-        let list_changes = Some(self.list_change_tx.clone());
+        match Self::connect_slot(&self.list_change_tx, &config, RECONNECT_BUDGET) {
+            Ok(slot) => {
+                self.servers.insert(slug.to_string(), slot);
+                self.failures.remove(slug);
+                info!(server = %slug, "reconnected MCP server");
+                Ok(())
+            }
+            Err(msg) => {
+                self.failures.insert(slug.to_string(), msg.clone());
+                Err(msg)
+            }
+        }
+    }
+
+    /// Re-read the MCP configuration from disk and reconcile the running
+    /// server set with it, without restarting the daemon.
+    ///
+    /// The user and project `mcp_servers.json` files are re-read and resolved
+    /// exactly as at startup. Each configured slug is then handled by whether
+    /// it already exists and whether its resolved config changed:
+    ///
+    /// - a slug whose resolved config is identical to a currently connected
+    ///   server is left untouched (its connection and dispatcher stay live);
+    /// - a newly-added slug, a slug whose resolved config changed, or a slug
+    ///   that is configured but not connected (a prior connect failure) is
+    ///   (re)connected, replacing any stale connection;
+    /// - a slug that vanished from the config is disconnected (its slot's
+    ///   `Drop` shuts the dispatcher down with a bounded join).
+    ///
+    /// `self.configs`/`self.order` are replaced with the resolved set, so a
+    /// later [`status`](Self::status)/[`reconnect`](Self::reconnect) sees the
+    /// new configuration. The caller rebuilds the tool catalogue afterwards
+    /// (this does not touch a `ToolRegistry`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the config cannot be read or parsed. A
+    /// server that fails to (re)connect is recorded in `failures` and appears
+    /// in the outcome's status list, not as a hard error — the reload itself
+    /// completed.
+    pub fn reload(&mut self) -> Result<McpReloadOutcome, String> {
+        let mut configs: Vec<McpServerConfig> =
+            config::load_mcp_config().map_err(|e| format!("failed to load MCP config: {e}"))?;
+        // Deterministic order matches startup: a name collision resolves the
+        // same way across a reload as it did at boot.
+        configs.sort_by(|a, b| a.slug.cmp(&b.slug));
+        let new_order: Vec<String> = configs.iter().map(|c| c.slug.clone()).collect();
+        let new_configs: HashMap<String, McpServerConfig> = configs
+            .iter()
+            .map(|c| (c.slug.clone(), c.clone()))
+            .collect();
+
+        // Slugs that left the config: close their connection and forget any
+        // recorded failure. Done first so a slug reused across the reload (a
+        // removal plus an add in one edit) never aliases the old connection.
+        let removed: Vec<String> = self
+            .order
+            .iter()
+            .filter(|slug| !new_configs.contains_key(*slug))
+            .cloned()
+            .collect();
+        for slug in &removed {
+            self.servers.remove(slug);
+            self.failures.remove(slug);
+            info!(server = %slug, "MCP server removed by reload");
+        }
+
+        let mut added: Vec<String> = Vec::new();
+        let mut restarted: Vec<String> = Vec::new();
+        let mut unchanged: Vec<String> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+
+        for cfg in configs {
+            let slug = cfg.slug.clone();
+            let was_configured = self.configs.contains_key(&slug);
+            // An existing slot whose resolved config is unchanged is kept as
+            // is; every other case needs a fresh connection.
+            if self
+                .servers
+                .get(&slug)
+                .is_some_and(|slot| slot.config == cfg)
+            {
+                unchanged.push(slug);
+                continue;
+            }
+            if was_configured {
+                restarted.push(slug.clone());
+            } else {
+                added.push(slug.clone());
+            }
+            // Drop any stale connection before the fresh connect (bounded).
+            self.servers.remove(&slug);
+            match Self::connect_slot(&self.list_change_tx, &cfg, RELOAD_BUDGET) {
+                Ok(slot) => {
+                    self.failures.remove(&slug);
+                    self.servers.insert(slug, slot);
+                }
+                Err(e) => {
+                    warn!(server = %slug, error = %e, "MCP server failed to connect during reload");
+                    self.failures.insert(slug.clone(), e);
+                    failed.push(slug);
+                }
+            }
+        }
+
+        self.configs = new_configs;
+        self.order = new_order;
+
+        let summary = format!(
+            "MCP reload: {} added, {} removed, {} restarted, {} unchanged, {} failed",
+            added.len(),
+            removed.len(),
+            restarted.len(),
+            unchanged.len(),
+            failed.len()
+        );
+        info!(%summary, "reloaded MCP configuration");
+        Ok(McpReloadOutcome {
+            summary,
+            servers: self.status(),
+        })
+    }
+
+    /// Connect one server from its resolved config and return a ready slot,
+    /// bounding the whole connect (handshake, discovery, initial listing) by
+    /// `timeout`.
+    ///
+    /// Shared by a manual reconnect and a config reload so both take the same
+    /// path and neither can leave a half-connected server behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns the connect error (as text) when the connect fails, times out,
+    /// or the initial tool listing fails.
+    fn connect_slot(
+        list_change_tx: &crossbeam_channel::Sender<McpListChange>,
+        config: &McpServerConfig,
+        timeout: Duration,
+    ) -> Result<ServerSlot, String> {
+        let list_changes = Some(list_change_tx.clone());
         let cfg = config.clone();
         let handle = std::thread::spawn(move || {
             McpServer::connect_with_list_changes(&cfg, list_changes).map_err(anyhow::Error::from)
         });
-        let server = match join_with_budget(handle, RECONNECT_BUDGET) {
-            Some(Ok(server)) => server,
-            Some(Err(e)) => {
-                let msg = e.to_string();
-                self.failures.insert(slug.to_string(), msg.clone());
-                return Err(msg);
-            }
-            None => {
-                let msg = format!("reconnect timed out after {}s", RECONNECT_BUDGET.as_secs());
-                self.failures.insert(slug.to_string(), msg.clone());
-                return Err(msg);
-            }
-        };
-        let slot = Self::slot_from_server(server, config)?;
-        self.servers.insert(slug.to_string(), slot);
-        self.failures.remove(slug);
-        info!(server = %slug, "reconnected MCP server");
-        Ok(())
+        match join_with_budget(handle, timeout) {
+            Some(Ok(server)) => Self::slot_from_server(server, config.clone()),
+            Some(Err(e)) => Err(e.to_string()),
+            None => Err(format!("connect timed out after {}s", timeout.as_secs())),
+        }
     }
 
     /// Build a `ServerSlot` from a freshly connected `server`, listing its
@@ -606,7 +754,7 @@ fn join_with_budget<T: Send + 'static>(
 mod imp {
     use crate::tools::ToolRegistry;
 
-    use super::McpServerStatus;
+    use super::{McpReloadOutcome, McpServerStatus};
 
     /// No-op stand-in for the real `McpManager` (see the module-level cfg note).
     pub struct McpManager;
@@ -629,6 +777,11 @@ mod imp {
         /// Stub: there are no servers to reconnect.
         pub fn reconnect(&mut self, slug: &str) -> Result<(), String> {
             Err(format!("unknown MCP server {slug:?} (MCP is not built in)"))
+        }
+
+        /// Stub: there is no config to reload.
+        pub fn reload(&mut self) -> Result<McpReloadOutcome, String> {
+            Err("MCP is not built in".to_string())
         }
 
         /// Stub: there are never any servers, so no status rows.
@@ -707,6 +860,44 @@ mod tests {
         config::set_test_project_root(None);
         assert!(manager.is_empty());
         assert_eq!(manager.status().len(), 0);
+    }
+
+    #[test]
+    fn reload_with_no_config_reports_all_zero() {
+        // No servers are configured, so a reload reconciles nothing and still
+        // succeeds with an all-zero summary.
+        let dir = tempfile::tempdir().unwrap();
+        config::set_test_config_root(Some(dir.path().to_path_buf()));
+        config::set_test_project_root(Some(None));
+        let mut manager = McpManager::empty();
+        let outcome = manager.reload().expect("empty reload succeeds");
+        config::set_test_config_root(None);
+        config::set_test_project_root(None);
+        assert_eq!(
+            outcome.summary,
+            "MCP reload: 0 added, 0 removed, 0 restarted, 0 unchanged, 0 failed"
+        );
+        assert!(
+            outcome.servers.is_empty(),
+            "no servers -> empty status list"
+        );
+    }
+
+    #[test]
+    fn reload_with_malformed_config_is_a_hard_error() {
+        // A config file that exists but does not parse fails the reload
+        // outright (unlike startup, where a bad file degrades to no servers).
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_dir = dir.path().join("choreographr");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(cfg_dir.join("mcp_servers.json"), "{ not json").unwrap();
+        config::set_test_config_root(Some(dir.path().to_path_buf()));
+        config::set_test_project_root(Some(None));
+        let mut manager = McpManager::empty();
+        let err = manager.reload().expect_err("malformed config fails");
+        config::set_test_config_root(None);
+        config::set_test_project_root(None);
+        assert!(err.contains("failed to load MCP config"), "got: {err}");
     }
 
     #[test]

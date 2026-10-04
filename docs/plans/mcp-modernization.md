@@ -887,8 +887,8 @@ M1 includes, at minimum:
   the registry hot-swap (`15aa3ff`).
 
 Explicitly deferred past M1 (not ship blockers): **OAuth (P3)**, `exposure` +
-[tool-search-driven deferred loading](#13-out-of-scope--future-work), `mcp
-reload`, and the MCP-server role (§13).
+[tool-search-driven deferred loading](#13-out-of-scope--future-work), and the
+MCP-server role (§13). (`mcp reload` has since landed — see below.)
 
 M1 has no remaining items. The **2026-07-28-era conformance run** is closed
 (see P6): the harness now carries the modern-era scenario handling (a
@@ -1034,8 +1034,11 @@ Post-ship (fast-follow, around P3):
 
 - [ ] `exposure` + deferred exposure/tool search for servers with many tools
       (reuse `load_tools` groups; measure first — open question 1).
-- [ ] `mcp reload` (re-read config, add/remove/restart servers without a daemon
-      restart).
+- [x] `mcp reload` (re-read config, add/remove/restart servers without a daemon
+      restart) — landed: `McpManager::reload` re-reads the user+project config,
+      reconciles the running server set (add/remove/restart), and rebuilds the
+      catalogue; exposed as `ClientMessage::McpReload` ⇄ `DaemonMessage::McpReloaded`/
+      `McpReloadFailed`, `/mcp reload` in the TUI, and `choreographr mcp reload`.
 
 ### P6 — Bounds, conformance, hardening (M1)
 

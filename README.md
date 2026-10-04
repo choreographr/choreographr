@@ -849,13 +849,17 @@ choreographr mcp list                              # list configured servers (of
 choreographr mcp add docs --command npx --args -y @modelcontextprotocol/server-docs
 choreographr mcp remove docs
 choreographr mcp reconnect docs                    # rebuild one server on a running daemon
+choreographr mcp reload                            # re-read the config on a running daemon
 ```
 
 `list`/`add`/`remove` edit the user `mcp_servers.json` directly (no daemon
 needed; `add` refuses to overwrite an existing slug unless `--force`), while
-`reconnect` talks to a running daemon over its local socket. The in-TUI
+`reconnect`/`reload` talk to a running daemon over its local socket. The in-TUI
 `/mcp` command shows the live state of every server (connected tool counts,
-or the last error) and `/mcp reconnect <slug>` does the same rebuild.
+or the last error); `/mcp reconnect <slug>` rebuilds one server and `/mcp
+reload` re-reads the config and reconciles the whole set (connecting added
+servers, disconnecting removed ones, and rebuilding changed ones) without a
+daemon restart.
 
 ## Slash commands
 
@@ -876,6 +880,7 @@ runs the command**, and `Esc` discards the line without cancelling anything.
 - `/refresh-models [--force]` — re-fetch the models.dev catalog (conditional GET against the cached etag; 304 → "models up to date"); `--force` bypasses the etag so the server must return a fresh catalog. Also re-reads the user overlay. The daemon fetches on a background thread and replies with provider/model counts; a burst of `/refresh-models` requests is coalesced into a single fetch (each requester's status reflects its own `--force` flag, and a 304 reply is ordered after any queued overlay reload so the counts are current).
 - `/mcp` — show the state of every configured MCP server (one line per server: slug, transport, target, connected state, tool count, or the last error). The configured set is the same `mcp_servers.json` the daemon loads. Offline management (add/remove/list) is done with the `choreographr mcp` CLI (see below)
 - `/mcp reconnect <slug>` — rebuild one server's connection on the running daemon and refresh its tools
+- `/mcp reload` — re-read `mcp_servers.json` (user + project layers) on the running daemon and reconcile the server set with it — connect servers added to the config, disconnect removed ones, and rebuild changed ones — then refresh the tool catalogue, all without a daemon restart
 - `/new [title]` — create a new session and switch this client to it (the top-level shortcut for `/session new`)
 - `/session` — open the interactive session manager
 - `/session list` — list all sessions

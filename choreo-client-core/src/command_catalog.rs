@@ -106,8 +106,8 @@ static COMMAND_CATALOG: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
         },
         CommandSpec {
             name: "mcp",
-            summary: "Show MCP server status, or reconnect one server",
-            arg_hint: Some("[reconnect <slug>]"),
+            summary: "Show MCP server status, reload the config, or reconnect one server",
+            arg_hint: Some("[reload | reconnect <slug>]"),
             group: CommandGroup::System,
         },
         CommandSpec {

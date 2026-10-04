@@ -436,6 +436,24 @@ impl DaemonMessage {
             Self::McpReconnectFailed { slug, error } => {
                 named_field_overhead(2) + slug.len() + error.len()
             }
+            // Same per-server accounting as `McpStatus`, plus the one-line
+            // summary string.
+            Self::McpReloaded { summary, servers } => {
+                named_field_overhead(2)
+                    + summary.len()
+                    + servers
+                        .iter()
+                        .map(|s| {
+                            200 + s.slug.len()
+                                + s.transport.len()
+                                + s.target.len()
+                                + option_str_len(s.server_name.as_ref())
+                                + option_str_len(s.server_version.as_ref())
+                                + option_str_len(s.last_error.as_ref())
+                        })
+                        .sum::<usize>()
+            }
+            Self::McpReloadFailed { error } => named_field_overhead(1) + error.len(),
         }
     }
 }

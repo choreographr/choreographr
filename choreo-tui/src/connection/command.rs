@@ -468,6 +468,14 @@ pub(super) fn run_command(
                         .send(ClientMessage::McpReconnect { slug })
                         .map_err(broken_pipe)?;
                 }
+                McpCommand::Reload => {
+                    // Immediate feedback; the reply is McpReloaded (success) or
+                    // McpReloadFailed.
+                    app.status = Some("reloading MCP configuration…".to_string());
+                    client_tx
+                        .send(ClientMessage::McpReload)
+                        .map_err(broken_pipe)?;
+                }
             }
         }
         // Local-UI commands (the unified command model's non-daemon variants).

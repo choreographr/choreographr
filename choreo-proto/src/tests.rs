@@ -150,6 +150,35 @@ fn mcp_reconnect_failed_serde_round_trip() {
 }
 
 #[test]
+fn mcp_reload_request_serde_round_trip() {
+    let message = ClientMessage::McpReload;
+    let frame = encode_frame(&message).expect("encode");
+    let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
+    assert_eq!(decoded, message);
+}
+
+#[test]
+fn mcp_reloaded_reply_serde_round_trip() {
+    let message = DaemonMessage::McpReloaded {
+        summary: "MCP reload: 1 added, 0 removed, 1 restarted, 2 unchanged, 0 failed".to_string(),
+        servers: Vec::new(),
+    };
+    let frame = encode_frame(&message).expect("encode");
+    let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");
+    assert_eq!(decoded, message);
+}
+
+#[test]
+fn mcp_reload_failed_serde_round_trip() {
+    let message = DaemonMessage::McpReloadFailed {
+        error: "failed to parse mcp_servers.json".to_string(),
+    };
+    let frame = encode_frame(&message).expect("encode");
+    let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");
+    assert_eq!(decoded, message);
+}
+
+#[test]
 fn decode_rejects_trailing_bytes() {
     let message = ClientMessage::Ping;
     let mut frame = encode_frame(&message).expect("encode");
@@ -191,11 +220,11 @@ fn decode_tolerates_array_encoded_struct() {
     // Named mode writes structs as maps with field-name keys, but decode also
     // accepts the array (field-order) form — that is the compatibility
     // contract that keeps a future switch to compact mode backwards-readable.
-    // Hand-build `[8, [10, 20, 30]]`: version 8, then a `TokenUsage` struct
+    // Hand-build `[9, [10, 20, 30]]`: version 9, then a `TokenUsage` struct
     // serialized WITHOUT field names as a 3-element array.
     let blob = [
         0x92, // array of 2: (version, message)
-        0x08, // PROTOCOL_VERSION = 8
+        0x09, // PROTOCOL_VERSION = 9
         0x93, // array of 3: TokenUsage { input_tokens, output_tokens, total_tokens }
         0x0a, // input_tokens = 10
         0x14, // output_tokens = 20

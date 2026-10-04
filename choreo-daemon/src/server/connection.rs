@@ -597,6 +597,10 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             debug!("client {}: McpReconnect slug={}", ctx.client_id, slug);
             handle_mcp_reconnect_sync(ctx, slug);
         }
+        ClientMessage::McpReload => {
+            debug!("client {}: McpReload", ctx.client_id);
+            handle_mcp_reload_sync(ctx);
+        }
         ClientMessage::DeleteSession { session_id } => {
             info!("client {}: DeleteSession id={}", ctx.client_id, session_id);
             handle_delete_session_sync(ctx, session_id);
@@ -1517,6 +1521,32 @@ fn handle_mcp_reconnect_sync(ctx: &mut ClientCtx, slug: String) {
             send_to_writer(ctx, &DaemonMessage::McpReconnectFailed { slug, error: e });
         }
         Err(_) => warn!("daemon disconnected while handling mcp reconnect"),
+    }
+}
+
+/// Handle a `ClientMessage::McpReload`: ask the daemon (the sole owner of the
+/// `McpManager`) to re-read the MCP config and reconcile the running servers,
+/// which also swaps the refreshed tool catalogue, then reply. Success is
+/// reported as [`DaemonMessage::McpReloaded`] — the reload summary plus the
+/// refreshed status list — while a config read/parse failure is a
+/// [`DaemonMessage::McpReloadFailed`].
+fn handle_mcp_reload_sync(ctx: &mut ClientCtx) {
+    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::McpReload { reply });
+    match result {
+        Ok(Ok(outcome)) => {
+            let servers = outcome.servers.into_iter().map(wire_mcp_status).collect();
+            send_to_writer(
+                ctx,
+                &DaemonMessage::McpReloaded {
+                    summary: outcome.summary,
+                    servers,
+                },
+            );
+        }
+        Ok(Err(e)) => {
+            send_to_writer(ctx, &DaemonMessage::McpReloadFailed { error: e });
+        }
+        Err(_) => warn!("daemon disconnected while handling mcp reload"),
     }
 }
 
@@ -2449,6 +2479,54 @@ mod tests {
             &msg,
             DaemonMessage::McpReconnectFailed { slug, error }
                 if slug == "docs" && error == "connect timed out"
+        ));
+    }
+
+    #[test]
+    fn handle_mcp_reload_sync_ok_replies_summary_and_status() {
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = mcp_ctx(&daemon_tx, &sink, &global_lag, &mut none_id, &mut none_tx);
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::McpReload { reply }) = daemon_rx.recv() {
+                let _ = reply.send(Ok(crate::mcp::McpReloadOutcome {
+                    summary: "MCP reload: 1 added, 0 removed, 0 restarted, 0 unchanged, 0 failed"
+                        .to_string(),
+                    servers: vec![sample_mcp_status()],
+                }));
+            }
+        });
+        handle_mcp_reload_sync(&mut ctx);
+        let msg = writer_rx.recv().unwrap();
+        assert!(matches!(
+            &msg,
+            DaemonMessage::McpReloaded { summary, servers }
+                if summary.contains("1 added") && servers.len() == 1 && servers[0].slug == "docs"
+        ));
+    }
+
+    #[test]
+    fn handle_mcp_reload_sync_err_replies_failure() {
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = mcp_ctx(&daemon_tx, &sink, &global_lag, &mut none_id, &mut none_tx);
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::McpReload { reply }) = daemon_rx.recv() {
+                let _ = reply.send(Err("failed to parse mcp_servers.json".into()));
+            }
+        });
+        handle_mcp_reload_sync(&mut ctx);
+        let msg = writer_rx.recv().unwrap();
+        assert!(matches!(
+            &msg,
+            DaemonMessage::McpReloadFailed { error }
+                if error == "failed to parse mcp_servers.json"
         ));
     }
 

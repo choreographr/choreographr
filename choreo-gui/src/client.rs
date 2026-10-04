@@ -167,6 +167,12 @@ pub(crate) fn handle_shell_command(
                     .push(format!("reconnecting MCP server {slug}…"));
                 send_client_message(state, daemon_tx, ClientMessage::McpReconnect { slug });
             }
+            McpCommand::Reload => {
+                state
+                    .status_texts
+                    .push("reloading MCP configuration…".to_string());
+                send_client_message(state, daemon_tx, ClientMessage::McpReload);
+            }
         },
         // TODO(task 3): the unified command model's local-UI variants
         // (open session manager / accounts / model picker, reasoning

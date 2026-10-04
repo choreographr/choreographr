@@ -1264,6 +1264,78 @@ mod unsent_draft_tests {
     }
 
     #[test]
+    fn mcp_reload_sends_message() {
+        let mut app = test_app();
+        let (tx, rx) = crossbeam_channel::unbounded();
+
+        app.input.text = "/mcp reload".to_string();
+        app.input.cursor = app.input.text.len();
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("submit /mcp reload");
+
+        let msg = rx.recv().expect("McpReload sent");
+        assert_eq!(msg, ClientMessage::McpReload);
+        assert_eq!(app.status.as_deref(), Some("reloading MCP configuration…"));
+    }
+
+    #[test]
+    fn mcp_reloaded_renders_summary_and_servers() {
+        let mut app = test_app();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+
+        handle_daemon_message(
+            DaemonMessage::McpReloaded {
+                summary: "MCP reload: 1 added, 0 removed, 1 restarted, 0 unchanged, 0 failed"
+                    .to_string(),
+                servers: vec![McpServerStatus {
+                    slug: "docs".to_string(),
+                    transport: "stdio".to_string(),
+                    target: "npx docs".to_string(),
+                    connected: true,
+                    tool_count: 4,
+                    server_name: Some("docs".to_string()),
+                    server_version: Some("1.0.0".to_string()),
+                    last_error: None,
+                }],
+            },
+            &mut app,
+            &tx,
+        )
+        .expect("handle McpReloaded");
+
+        let status = app.status.expect("status set from McpReloaded");
+        let lines: Vec<&str> = status.lines().collect();
+        assert_eq!(
+            lines[0],
+            "MCP reload: 1 added, 0 removed, 1 restarted, 0 unchanged, 0 failed"
+        );
+        assert!(lines[1].contains("docs") && lines[1].contains("4 tool(s)"));
+    }
+
+    #[test]
+    fn mcp_reload_failed_sets_error() {
+        let mut app = test_app();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+
+        handle_daemon_message(
+            DaemonMessage::McpReloadFailed {
+                error: "failed to parse mcp_servers.json".to_string(),
+            },
+            &mut app,
+            &tx,
+        )
+        .expect("handle McpReloadFailed");
+        assert_eq!(
+            app.error.as_deref(),
+            Some("[daemon] mcp reload failed: failed to parse mcp_servers.json")
+        );
+    }
+
+    #[test]
     fn catalog_updated_replaces_provider_list_and_clamps_selection() {
         let mut app = test_app();
         let (tx, _rx) = crossbeam_channel::unbounded();

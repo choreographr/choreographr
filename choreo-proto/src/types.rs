@@ -700,6 +700,13 @@ pub enum ClientMessage {
     McpReconnect {
         slug: String,
     },
+    /// Reload the MCP server configuration from disk: re-read the user and
+    /// project `mcp_servers.json`, connect newly-added servers, disconnect
+    /// removed ones, and reconnect changed ones, rebuilding the tool
+    /// catalogue — without restarting the daemon. On success the daemon
+    /// replies with [`DaemonMessage::McpReloaded`]; when the config cannot be
+    /// read or parsed, with [`DaemonMessage::McpReloadFailed`].
+    McpReload,
     SubscribeAllActivity,
     UnsubscribeAllActivity,
 }
@@ -1207,6 +1214,18 @@ pub enum DaemonMessage {
     /// slug it targeted and the failure reason.
     McpReconnectFailed {
         slug: String,
+        error: String,
+    },
+    /// Reply to [`ClientMessage::McpReload`]: a one-line human-readable summary
+    /// of what the reload changed (added/removed/restarted/unchanged/failed
+    /// counts) plus the refreshed state of every configured server.
+    McpReloaded {
+        summary: String,
+        servers: Vec<McpServerStatus>,
+    },
+    /// Reply to [`ClientMessage::McpReload`] when the reload could not run at
+    /// all (the config file could not be read or parsed): the failure reason.
+    McpReloadFailed {
         error: String,
     },
     ShuttingDown,
@@ -2157,6 +2176,31 @@ mod tests {
                 DaemonMessage::McpReconnectFailed {
                     slug: "docs".into(),
                     error: "failed to list tools: connection refused".into(),
+                },
+            ),
+            (
+                "McpReloaded",
+                DaemonMessage::McpReloaded {
+                    summary: "MCP reload: 1 added, 0 removed, 1 restarted, 2 unchanged, 0 failed"
+                        .into(),
+                    servers: (0..12usize)
+                        .map(|i| McpServerStatus {
+                            slug: format!("server-{i}"),
+                            transport: "stdio".into(),
+                            target: format!("/usr/local/bin/mcp-server-{i} --flag"),
+                            connected: i % 2 == 0,
+                            tool_count: i,
+                            server_name: Some(format!("server-{i}-name")),
+                            server_version: Some("1.2.3".into()),
+                            last_error: (i % 2 == 1).then(|| "connect timed out".to_string()),
+                        })
+                        .collect(),
+                },
+            ),
+            (
+                "McpReloadFailed",
+                DaemonMessage::McpReloadFailed {
+                    error: "failed to parse /home/u/.config/choreographr/mcp_servers.json".into(),
                 },
             ),
             ("ShuttingDown", DaemonMessage::ShuttingDown),

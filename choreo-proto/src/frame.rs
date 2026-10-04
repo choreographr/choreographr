@@ -38,7 +38,10 @@ use std::io::Cursor;
 /// `ClientMessage::SetSessionPinned`/`SetSessionArchived` requests and the
 /// broadcast `SessionEvent::SessionFlagsChanged`, plus the
 /// `SessionSummary::pinned`/`archived_at` fields they surface.
-pub const PROTOCOL_VERSION: u8 = 8;
+/// 9 = live MCP config reload: the new `ClientMessage::McpReload` request and
+/// its `DaemonMessage::McpReloaded`/`McpReloadFailed` replies, so a running
+/// daemon can pick up `mcp_servers.json` edits without a restart.
+pub const PROTOCOL_VERSION: u8 = 9;
 /// Max serialised *payload* size, enforced identically on encode (before the
 /// 4-byte length prefix is added — [`encode_inner`]) and on decode
 /// (`read_payload`, which checks the length prefix before reading the body).

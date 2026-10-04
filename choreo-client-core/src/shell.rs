@@ -108,9 +108,10 @@ pub enum Command {
 /// The `/mcp` subcommand: the client-facing MCP server control surface.
 ///
 /// Bare `/mcp` reports the state of every configured server; a subcommand
-/// acts on one server by slug. The surface is deliberately request/reply —
-/// the front-end sends the request and renders the daemon's reply — so the
-/// variants here mirror the wire messages one-for-one.
+/// acts on one server by slug or reloads the whole set. The surface is
+/// deliberately request/reply — the front-end sends the request and renders
+/// the daemon's reply — so the variants here mirror the wire messages
+/// one-for-one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpCommand {
     /// `/mcp` — request and display the status of every configured server.
@@ -120,6 +121,9 @@ pub enum McpCommand {
         /// The server's config key (its tool-name prefix).
         slug: String,
     },
+    /// `/mcp reload` — re-read the config and reconcile the running servers
+    /// (add/remove/restart) without restarting the daemon.
+    Reload,
 }
 
 /// Returns `true` if `name` is a valid account name: non-empty and matching
@@ -299,10 +303,10 @@ fn parse_model_command(rest: &str) -> Option<Command> {
 }
 
 /// `/mcp` — the MCP server control surface. Bare `/mcp` requests the status
-/// list; `mcp reconnect <slug>` rebuilds one server. Enable/disable has no
-/// daemon command (a runtime add/remove would be needed), so those forms are
-/// deliberately not parsed and fall through to the unknown-command usage
-/// error.
+/// list; `mcp reconnect <slug>` rebuilds one server; `mcp reload` re-reads the
+/// config. Enable/disable has no daemon command (a runtime add/remove would be
+/// needed), so those forms are deliberately not parsed and fall through to the
+/// unknown-command usage error.
 fn parse_mcp_command(rest: &str) -> Option<Command> {
     if rest == "mcp" {
         return Some(Command::Mcp(McpCommand::Status));
@@ -316,8 +320,12 @@ fn parse_mcp_command(rest: &str) -> Option<Command> {
                 }),
                 _ => Command::UnknownCommand("usage: /mcp reconnect <slug>".to_string()),
             },
+            Some("reload") => match (parts.next(), parts.next()) {
+                (None, None) => Command::Mcp(McpCommand::Reload),
+                _ => Command::UnknownCommand("usage: /mcp reload".to_string()),
+            },
             other => Command::UnknownCommand(format!(
-                "usage: /mcp [reconnect <slug>] (got '{}')",
+                "usage: /mcp [reload | reconnect <slug>] (got '{}')",
                 other.unwrap_or("")
             )),
         });
@@ -625,6 +633,7 @@ pub fn command_echo(command: &Command) -> Option<String> {
         }
         Command::Mcp(McpCommand::Status) => Some("> /mcp".to_string()),
         Command::Mcp(McpCommand::Reconnect { slug }) => Some(format!("> /mcp reconnect {slug}")),
+        Command::Mcp(McpCommand::Reload) => Some("> /mcp reload".to_string()),
         _ => None,
     }
 }
@@ -710,6 +719,24 @@ mod tests {
     }
 
     #[test]
+    fn mcp_parses_reload() {
+        let mut id = 0;
+        assert_eq!(
+            parse_input_line("/mcp reload", &mut id),
+            Command::Mcp(McpCommand::Reload),
+        );
+    }
+
+    #[test]
+    fn mcp_reload_takes_no_argument() {
+        let mut id = 0;
+        assert!(matches!(
+            parse_input_line("/mcp reload docs", &mut id),
+            Command::UnknownCommand(_),
+        ));
+    }
+
+    #[test]
     fn mcp_rejects_unknown_subcommands() {
         let mut id = 0;
         // enable/disable have no daemon command, so they surface a usage error
@@ -734,6 +761,10 @@ mod tests {
             }))
             .as_deref(),
             Some("> /mcp reconnect docs"),
+        );
+        assert_eq!(
+            command_echo(&Command::Mcp(McpCommand::Reload)).as_deref(),
+            Some("> /mcp reload"),
         );
     }
 }

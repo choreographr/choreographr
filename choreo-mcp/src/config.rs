@@ -151,7 +151,13 @@ impl McpTransport {
 }
 
 /// Configuration for connecting to a single MCP server.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` compares the fully-resolved shape the engine consumes, so the
+/// daemon's config-reload path can tell a server whose effective configuration
+/// is unchanged (keep the live connection) from one whose resolved transport,
+/// timeout, protocol era, or tool filtering changed (rebuild it). It is not a
+/// comparison of the raw JSON entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpServerConfig {
     /// Stable identifier for this server, used as a tool-name prefix.
     pub slug: String,

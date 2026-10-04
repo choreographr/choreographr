@@ -108,8 +108,8 @@ enum Command {
         force: bool,
     },
     /// Manage MCP (Model Context Protocol) servers: list the configured set,
-    /// add or remove a server in the user config file, or reconnect a running
-    /// daemon's server over its local socket.
+    /// add or remove a server in the user config file, reconnect a running
+    /// daemon's server, or reload its configuration over its local socket.
     Mcp {
         #[command(subcommand)]
         command: McpCliCommand,
@@ -146,6 +146,10 @@ enum McpCliCommand {
         /// The server's slug.
         slug: String,
     },
+    /// Reload the MCP configuration on a running daemon over its local socket:
+    /// re-read the user and project config files, connect added servers,
+    /// disconnect removed ones, and reconnect changed ones — no restart.
+    Reload,
 }
 
 /// Enroll `pubkey_b64` into the ACL file at `path`. The testable core of the
@@ -383,56 +387,50 @@ fn print_mcp_list() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reconnect one MCP server on a running daemon over its local Unix socket.
+/// Send one MCP control request to a running daemon over its local Unix socket
+/// and drive the reply loop.
 ///
 /// A minimal one-shot client: the daemon's Unix transport takes framed
 /// `ClientMessage`s directly (no Noise handshake — that applies only to TCP),
-/// so this writes the request and reads until the matching reply. On success
-/// the daemon answers with a refreshed `McpStatus` list; on failure with
-/// `McpReconnectFailed`.
+/// so this writes the request and reads messages until `handle` recognises the
+/// reply and returns its outcome. Any message `handle` does not recognise (a
+/// status reply for another action, unrelated broadcast traffic) is skipped, so
+/// only the answer to *this* request ends the loop. `hint` is appended to the
+/// "is a daemon running?" error so each caller can name the matching
+/// connected-client escape hatch.
 ///
 /// # Errors
 ///
 /// Returns an error when the socket cannot be dialed, the request cannot be
-/// written, or the daemon replies with a reconnect failure (or the stream
-/// ends with no matching reply).
-fn mcp_reconnect_via_socket(slug: &str) -> anyhow::Result<()> {
-    use choreo_proto::{ClientMessage, DaemonMessage, connect_unix, read_message, write_message};
+/// written, or the stream ends with no matching reply. The reply's own outcome
+/// (a failure reply) is returned by `handle`.
+fn mcp_socket_request(
+    request: &choreo_proto::ClientMessage,
+    hint: &str,
+    handle: impl Fn(choreo_proto::DaemonMessage) -> Option<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    use choreo_proto::DaemonMessage;
     use std::io::{BufReader, BufWriter, Write};
 
     let path = choreo_proto::socket_path();
-    let stream = connect_unix(&path).with_context(|| {
-        format!(
-            "could not connect to a daemon at {path} (is one running?); \
-             use `/mcp reconnect {slug}` in a connected client instead"
-        )
+    let stream = choreo_proto::connect_unix(&path).with_context(|| {
+        format!("could not connect to a daemon at {path} (is one running?); {hint}")
     })?;
     let mut writer = BufWriter::new(stream.try_clone().context("failed to clone socket")?);
     let mut reader = BufReader::new(stream);
 
-    write_message(
-        &mut writer,
-        &ClientMessage::McpReconnect {
-            slug: slug.to_string(),
-        },
-    )
-    .context("failed to send reconnect request")?;
+    choreo_proto::write_message(&mut writer, request).context("failed to send request")?;
     writer.flush().context("failed to flush socket")?;
 
     loop {
-        match read_message::<_, DaemonMessage>(&mut reader) {
-            Ok(DaemonMessage::McpStatus { servers }) => {
-                for server in &servers {
-                    println!("{}", server.summary());
+        match choreo_proto::read_message::<_, DaemonMessage>(&mut reader) {
+            Ok(msg) => {
+                if let Some(outcome) = handle(msg) {
+                    return outcome;
                 }
-                return Ok(());
+                // Any other message is unrelated broadcast traffic; keep
+                // reading for the reply that answers our request.
             }
-            Ok(DaemonMessage::McpReconnectFailed { error, .. }) => {
-                anyhow::bail!("reconnect failed: {error}");
-            }
-            // Any other message is unrelated broadcast traffic; keep reading
-            // for the reply that answers our request.
-            Ok(_) => {}
             Err(e) => {
                 anyhow::bail!("daemon disconnected before replying: {e}");
             }
@@ -440,12 +438,72 @@ fn mcp_reconnect_via_socket(slug: &str) -> anyhow::Result<()> {
     }
 }
 
+/// Reconnect one MCP server on a running daemon over its local Unix socket.
+///
+/// On success the daemon answers with a refreshed `McpStatus` list; on failure
+/// with `McpReconnectFailed`.
+///
+/// # Errors
+///
+/// Propagates the socket error, or the daemon's reconnect failure.
+fn mcp_reconnect_via_socket(slug: &str) -> anyhow::Result<()> {
+    use choreo_proto::{ClientMessage, DaemonMessage};
+    let request = ClientMessage::McpReconnect {
+        slug: slug.to_string(),
+    };
+    mcp_socket_request(
+        &request,
+        &format!("use `/mcp reconnect {slug}` in a connected client instead"),
+        |msg| match msg {
+            DaemonMessage::McpStatus { servers } => {
+                for server in &servers {
+                    println!("{}", server.summary());
+                }
+                Some(Ok(()))
+            }
+            DaemonMessage::McpReconnectFailed { error, .. } => {
+                Some(Err(anyhow::anyhow!("reconnect failed: {error}")))
+            }
+            _ => None,
+        },
+    )
+}
+
+/// Reload the MCP configuration on a running daemon over its local Unix socket.
+///
+/// On success the daemon answers with a reload summary plus the refreshed
+/// status list; on a config read/parse failure with `McpReloadFailed`.
+///
+/// # Errors
+///
+/// Propagates the socket error, or the daemon's reload failure.
+fn mcp_reload_via_socket() -> anyhow::Result<()> {
+    use choreo_proto::{ClientMessage, DaemonMessage};
+    mcp_socket_request(
+        &ClientMessage::McpReload,
+        "use `/mcp reload` in a connected client instead",
+        |msg| match msg {
+            DaemonMessage::McpReloaded { summary, servers } => {
+                println!("{summary}");
+                for server in &servers {
+                    println!("{}", server.summary());
+                }
+                Some(Ok(()))
+            }
+            DaemonMessage::McpReloadFailed { error } => {
+                Some(Err(anyhow::anyhow!("reload failed: {error}")))
+            }
+            _ => None,
+        },
+    )
+}
+
 const DEFAULT_MAX_TURNS: u32 = 0;
 
 /// Dispatch an `mcp` subcommand to its implementation (see `McpCliCommand`).
 ///
 /// `list`/`add`/`remove` are offline file operations on the user config file;
-/// `reconnect` connects to a running daemon over its local socket.
+/// `reconnect`/`reload` connect to a running daemon over its local socket.
 ///
 /// # Errors
 ///
@@ -474,6 +532,7 @@ fn run_mcp_cli(command: &McpCliCommand) -> anyhow::Result<()> {
             }
         }
         McpCliCommand::Reconnect { slug } => mcp_reconnect_via_socket(slug),
+        McpCliCommand::Reload => mcp_reload_via_socket(),
     }
 }
 

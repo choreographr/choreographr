@@ -817,6 +817,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("none.json");
         let configs = load_from_paths(&missing, Some(&missing)).unwrap();
-        assert!(configs.is_empty());
+        assert!(configs.is_empty(), "missing files yield no configs");
     }
 }

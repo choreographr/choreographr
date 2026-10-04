@@ -197,10 +197,12 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
         }
         Command::Mcp(mcp) => {
             // The MCP control surface is client-agnostic: forward the status
-            // request or reconnect over the bridge like any other Send command.
+            // request, config reload, or reconnect over the bridge like any
+            // other Send command.
             let msg = match mcp {
                 McpCommand::Status => ClientMessage::McpStatusRequest,
                 McpCommand::Reconnect { slug } => ClientMessage::McpReconnect { slug },
+                McpCommand::Reload => ClientMessage::McpReload,
             };
             if let Err(e) = state.bridge_tx.send(msg) {
                 warn!("failed to send mcp command to bridge: {e}");

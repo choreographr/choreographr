@@ -610,6 +610,22 @@ pub(crate) fn handle_daemon_message(
             app.error = Some(format!("[daemon] mcp reconnect {slug} failed: {error}"));
             return Ok(());
         }
+        // A successful `/mcp reload` arrives as McpReloaded: the summary line
+        // plus the refreshed per-server list (rendered the same way McpStatus
+        // is — one server per line so the whole set is visible).
+        DaemonMessage::McpReloaded { summary, servers } => {
+            let mut lines = vec![summary.clone()];
+            for server in servers {
+                lines.push(server.summary());
+            }
+            app.status = Some(lines.join("\n"));
+            return Ok(());
+        }
+        DaemonMessage::McpReloadFailed { error } => {
+            tracing::warn!(%error, "mcp reload failed");
+            app.error = Some(format!("[daemon] mcp reload failed: {error}"));
+            return Ok(());
+        }
         DaemonMessage::CatalogUpdated { providers } => {
             // Replace the live provider list (the picker's source of truth)
             // and clamp the wizard selection if the list shrank. Only churn
