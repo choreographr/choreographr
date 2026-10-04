@@ -386,11 +386,13 @@ check-supply-chain:
 
 # MCP client conformance suite: build the `mcp-conformance-client` harness and
 # run the official `@modelcontextprotocol/conformance` client suite against it,
-# diffed against the committed expected-failures baseline. Requires Node.js
-# (npx) and network access, so it is a CI/release-time gate, not part of
-# `pre-commit`. See scripts/mcp-conformance.sh.
+# diffed against the committed expected-failures baseline. Runs both protocol
+# eras (the stateful 2025-11-25 wire and the stateless 2026-07-28 wire), matching
+# CI. Requires Node.js (npx) and network access, so it is a CI/release-time gate,
+# not part of `pre-commit`. See scripts/mcp-conformance.sh.
 mcp-conformance:
-    ./scripts/mcp-conformance.sh
+    MCP_CONFORMANCE_SPEC_VERSION=2025-11-25 ./scripts/mcp-conformance.sh
+    MCP_CONFORMANCE_SPEC_VERSION=2026-07-28 ./scripts/mcp-conformance.sh
 
 # Preview the release notes, generated from commit messages by git-cliff
 # (cliff.toml, via scripts/release-notes.sh). Defaults to the workspace version;

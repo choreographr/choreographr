@@ -1,6 +1,8 @@
 # Expected-failures baseline for the official MCP client conformance suite
 # (`@modelcontextprotocol/conformance`), consumed by `scripts/mcp-conformance.sh`
-# (and the `mcp-conformance` CI job).
+# (and the `mcp-conformance` CI job). It covers BOTH protocol eras the runner
+# exercises; an entry that applies to only one era is simply not run by the
+# other, which the suite tolerates.
 #
 # The suite already understands a baseline: a scenario listed here that FAILS is
 # accepted (exit 0), a scenario listed here that PASSES is a STALE entry and
@@ -10,11 +12,12 @@
 # corresponding feature lands is what makes CI re-enforce it.
 #
 # The suite is pinned to a specific version by the runner; these names are the
-# scenarios that version runs against our era, minus the ones we pass (the
-# `initialize` and `tools_call` core scenarios).
+# scenarios that version runs against our eras, minus the ones we pass.
 client:
   # OAuth flows (out of scope until the post-ship auth work). choreo-mcp has no
-  # OAuth provider today: remote servers use a static token in `headers`.
+  # OAuth provider today: a remote server that answers `401` fails with the
+  # actionable auth-required error, and these scenarios never get past it. The
+  # first group runs at both eras; the second is stateless-era-only.
   - auth/metadata-default
   - auth/metadata-var1
   - auth/metadata-var2
@@ -29,13 +32,21 @@ client:
   - auth/token-endpoint-auth-post
   - auth/token-endpoint-auth-none
   - auth/pre-registration
+  - auth/resource-mismatch
+  - auth/offline-access-scope
+  - auth/offline-access-not-supported
+  - auth/authorization-server-migration
+  - auth/iss-supported
+  - auth/iss-not-advertised
+  - auth/iss-supported-missing
+  - auth/iss-wrong-issuer
+  - auth/iss-unexpected
+  - auth/iss-normalized
+  - auth/metadata-issuer-mismatch
   # Elicitation. The client deliberately does NOT advertise the `elicitation`
   # capability (there is no prompt surface to honor it), and the spec forbids
   # advertising a capability that is not served, so a scenario that requires it
-  # cannot pass. Un-baseline when a UI surface lands.
+  # cannot pass. Un-baseline when a UI surface lands. Legacy era only (the
+  # stateless era drops server-initiated elicitation in favor of MRTR, which the
+  # client does drive).
   - elicitation-sep1034-client-defaults
-  # SSE-retry (SEP-1699): the legacy GET stream's `retry:`-field resumption.
-  # The client's HTTP transport reconnects its SSE streams with a bounded
-  # backoff (see `choreo-mcp`'s engine), but it does not consume the advisory
-  # `retry:` field nor drive the GET-stream resumption this scenario measures.
-  - sse-retry

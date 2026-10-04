@@ -6,6 +6,10 @@ name: MCP conformance
 # baseline. See scripts/mcp-conformance.sh (the single home of the pinned suite
 # version, the spec version, and the baseline path).
 #
+# Both supported protocol eras run as a matrix: the stateful 2025-11-25 wire and
+# the stateless 2026-07-28 wire. A scenario that applies to both is measured once
+# per era, so a pass on one says nothing about the other.
+#
 # The suite is an npm package (`npx`) and starts local HTTP scenario servers,
 # so the job needs Node.js and network access. It is scoped to the MCP crate and
 # the runner/baseline so unrelated changes do not pay for it.
@@ -26,9 +30,14 @@ on:
 
 jobs:
   client:
-    name: MCP client conformance
+    name: MCP client conformance (${{ matrix.spec }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      # Run every era even if one fails, so a single job shows the full matrix.
+      fail-fast: false
+      matrix:
+        spec: ['2025-11-25', '2026-07-28']
     steps:
       - uses: actions/checkout@v7
 
@@ -44,4 +53,6 @@ jobs:
           node-version: '20'
 
       - name: Run the client conformance suite
+        env:
+          MCP_CONFORMANCE_SPEC_VERSION: ${{ matrix.spec }}
         run: ./scripts/mcp-conformance.sh

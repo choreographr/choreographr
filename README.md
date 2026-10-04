@@ -1121,11 +1121,15 @@ to them is rejected by cargo (conflicting flags) — run
 The MCP client is additionally checked against the official
 `@modelcontextprotocol/conformance` **client** suite: `just mcp-conformance`
 (or `scripts/mcp-conformance.sh`) builds the `mcp-conformance-client` harness and
-runs the pinned suite against it, diffed against the committed expected-failures
-baseline at `choreo-mcp/tests/conformance/expected-failures.yml` (it needs
-Node.js and network access, so it is a CI/release-time gate, not part of
-`pre-commit`). A new regression fails the run; so does a baseline entry that has
-started passing, which is how the baseline shrinks as gaps are fixed.
+runs the pinned suite against it for **both protocol eras** — the stateful
+2025-11-25 wire and the stateless 2026-07-28 wire — diffed against the committed
+expected-failures baseline at
+`choreo-mcp/tests/conformance/expected-failures.yml` (it needs Node.js and
+network access, so it is a CI/release-time gate, not part of `pre-commit`). Every
+non-auth client scenario passes on both wires; the baseline records the OAuth
+scenarios (unimplemented until the post-ship auth work) and the un-advertised
+elicitation scenario. A new regression fails the run; so does a baseline entry
+that has started passing, which is how the baseline shrinks as gaps are fixed.
 
 ### justfile
 

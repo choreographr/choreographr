@@ -1,14 +1,14 @@
 # Plan: MCP modernization — stateless protocol (2026-07-28) and a first-class client
 
-**Status:** **M1 implemented — `mcp` ships by default and P6 landed (commit
-`0a85184`), with one residual: the official conformance suite runs the legacy era
-(2025-11-25) in CI, and the 2026-07-28-era run is still to be wired and triaged.**
+**Status:** **M1 implemented — `mcp` ships by default, P6 landed (commit
+`0a85184`), and the official conformance suite now runs both protocol eras
+(2025-11-25 and 2026-07-28) in CI with a committed baseline.**
 Commits: `ab3dc2e` (hardening), `976edf6` (the rmcp engine swap), `9f6209a`
 (Streamable HTTP), `274f736` (progress/MRTR/resources), `1d7d239` (stdio frame cap
 + concurrency cap), `15aa3ff` (`subscriptions/listen` + registry hot-swap),
 `f037383`/`8d27006`/`a348c89` (P5: name hygiene, config, surfaces, logs),
-`0a85184` (D9 flip + P6 hardening). After the conformance residual, what remains
-is **post-ship**: OAuth (P3) and the fast-follows. See §1.2 and §7.
+`0a85184` (D9 flip + P6 hardening), and the 2026-07-28-era conformance run. What
+remains is **post-ship**: OAuth (P3) and the fast-follows. See §1.2 and §7.
 **Lifecycle:** this file is **deleted once the plan is fully implemented**. Nothing
 written during implementation may reference it — rustdoc, `ARCHITECTURE.md`,
 `README.md`, release notes, and commit messages must stand on their own, because a
@@ -222,8 +222,9 @@ phases. What exists now:
   reconnect policy, rate-limited server logging notifications, and a per-server
   `maxRestarts` (default 3; `0` disables reconnect). The official
   `@modelcontextprotocol/conformance` client suite runs in CI
-  (`scripts/mcp-conformance.sh`, pinned 0.1.16, committed expected-failures
-  baseline covering OAuth/elicitation/SSE-retry) for the legacy era; a
+  (`scripts/mcp-conformance.sh`, pinned `0.2.0-alpha.12`, committed
+  expected-failures baseline) against **both** protocol eras — the stateful
+  2025-11-25 wire and the stateless 2026-07-28 wire — as a CI matrix; a
   "stubborn server" fixture proves `shutdown_all` stays bounded even when a
   server ignores stdin EOF; and the config parser and tool-name sanitizer
   gained fuzz-style property tests.
@@ -233,10 +234,15 @@ implemented (it defers with the deferred-tool-loading work); `auto_load` was
 removed (reported as an unknown key) rather than mapped to a deferred exposure;
 `Retry-After` is not honored by the HTTP retry policy (upstream-blocked, P2
 residuals); OAuth is not implemented — deferred to post-ship (P3), with static
-tokens via config `headers` as the M1 credential path. The single M1 residual is
-the **2026-07-28-era conformance run**: the suite and the harness's version→
-lifecycle mapping support it, but CI currently runs only the script's default
-2025-11-25 era, and the modern-era scenario names/baseline still need triage.
+tokens via config `headers` as the M1 credential path. The conformance suite
+runs both protocol eras in CI; every non-auth client scenario passes on both
+wires — the 2026-07-28 run additionally covers `server/discover`-era
+`request-metadata` (`_meta`), the SEP-2243 standard/custom header mirroring and
+malformed-tool rejection, SEP-2106 network-`ref` non-dereferencing and JSON
+Schema 2020-12 preservation, and the SEP-2322 MRTR request-state echo — and the
+baseline holds only the OAuth `auth/*` scenarios (plus, on the legacy wire, the
+un-advertised elicitation scenario). The suite was bumped from the 0.1 line to
+`0.2.0-alpha.12` because only the 0.2 line can express the 2026-07-28 era.
 Everything else — D9, the P6 bounds and caps, fuzzing, supply-chain, security,
 and release verification — landed in `0a85184`.
 
@@ -844,15 +850,14 @@ The subscriptions-driven refresh landed (P4). Remaining lifecycle work: a
 
 ## 7. Work breakdown
 
-Each phase is independently shippable and lands with tests + docs. **P0–P2, P4,
-and P5 are done** and **P6 + D9 landed in `0a85184`** (one conformance residual,
-see P6); their sections come first for history. After that residual the only
-remaining phase is the deferred **P3** (post-ship).
+Each phase is independently shippable and lands with tests + docs. **P0–P2 and
+P4–P6 are done** and **D9 landed in `0a85184`**; their sections come first for
+history. The only remaining phase is the deferred **P3** (post-ship).
 
-### M1 — ship without OAuth (essentially complete; one conformance residual)
+### M1 — ship without OAuth (complete)
 
-MCP is shippable once the one conformance residual below is closed — everything
-else in M1 has landed. **OAuth is explicitly not part of M1** — it is P3,
+MCP ships without OAuth: everything in M1 has landed. **OAuth is explicitly not
+part of M1** — it is P3,
 post-ship. Servers that need credentials
 are covered in the interim by the path that already works: a static token in
 `mcp_servers.json` headers, e.g. `"headers": {"Authorization": "Bearer ${DOCS_TOKEN}"}` (only
@@ -865,15 +870,14 @@ M1 includes, at minimum:
 - **Default on**: **done** (`0a85184`) — the `mcp` feature is in the daemon's
   `default` and re-enabled on the root package's dependency; docs and feature
   comments flipped; measured release delta ~+11 MB (~+21.7%).
-- **P6**: **done except one residual** — the caps (tool count 1024, schema
+- **P6**: **complete** — the caps (tool count 1024, schema
   depth 32, `maxRestarts`, notification rate limit), the bounded SSE retry
   policy, fuzz-style property tests, the stubborn-server shutdown test,
   supply-chain (the gate is enforced by `pre-release` and the release CI, and
   the dependency notes landed), the §9 security posture (recorded as the
   "MCP client trust boundary" section in `ARCHITECTURE.md`), the release
   verification (size delta recorded in `scripts/release.sh`), and the
-  conformance suite for the legacy era in CI with a committed baseline. The
-  residual: the **2026-07-28-era conformance run** (see P6).
+  conformance suite for **both protocol eras** in CI with a committed baseline.
 - **P5**: **complete** — tool-name sanitization, `cwd`/`disabledTools`, the
   `/mcp` status surface + `choreographr mcp` CLI + per-server logs +
   `session_inspect`, the auth-required error, config layers, and user docs
@@ -886,11 +890,15 @@ Explicitly deferred past M1 (not ship blockers): **OAuth (P3)**, `exposure` +
 [tool-search-driven deferred loading](#13-out-of-scope--future-work), `mcp
 reload`, and the MCP-server role (§13).
 
-The one remaining M1 item is the **2026-07-28-era conformance run** (see P6):
-the suite, the runner, the harness's version→lifecycle mapping, and the legacy
-run with its baseline all exist, so this is triage and wiring, not new feature
-work. Everything else — D9, the caps, fuzzing, supply-chain, security, and
-release verification — landed in `0a85184`.
+M1 has no remaining items. The **2026-07-28-era conformance run** is closed
+(see P6): the harness now carries the modern-era scenario handling (a
+`tools/list` plus per-tool exercise, the `MCP_CONFORMANCE_CONTEXT`
+scenario-supplied calls, and the JSON-Schema-preservation echo), and CI runs both
+protocol eras as a matrix against the committed baseline. Every non-auth client
+scenario passes on both wires; the baseline holds only the OAuth `auth/*`
+scenarios plus the legacy-wire elicitation scenario. Everything else — D9, the
+caps, fuzzing, supply-chain, security, and release verification — landed in
+`0a85184`.
 
 M1 shipping does **not** delete this plan: the Lifecycle rule ties deletion to
 full implementation, and P3 remains here for post-ship work.
@@ -1044,17 +1052,23 @@ Post-ship (fast-follow, around P3):
       32-level schema-depth bound (256 KiB size bound already), a per-server
       `maxRestarts` (default 3; `0` disables reconnect), and a rate limit on
       server logging notifications.
-- [ ] Adopt the official `@modelcontextprotocol/conformance` suite for the
-      client — **partially landed** (`0a85184`): `scripts/mcp-conformance.sh`
-      runs the pinned 0.1.16 client suite against the `mcp-conformance-client`
-      harness with the committed `expected-failures` baseline (OAuth,
-      elicitation, and SSE-retry scenarios baselined), wired into CI
-      (`.github/workflows/mcp-conformance.yml`) for the **legacy era
-      (2025-11-25)**; the harness already derives the stateless lifecycle from
-      `MCP_CONFORMANCE_PROTOCOL_VERSION`. **Residual: the 2026-07-28-era run** —
-      run `MCP_CONFORMANCE_SPEC_VERSION=2026-07-28 scripts/mcp-conformance.sh`,
-      extend the harness's scenario coverage to the modern-era scenario names,
-      triage the results, extend the baseline (or fix), and add the era to CI.
+- [x] Adopt the official `@modelcontextprotocol/conformance` suite for the
+      client — landed: `scripts/mcp-conformance.sh` runs the pinned
+      `0.2.0-alpha.12` client suite against the `mcp-conformance-client`
+      harness with the committed `expected-failures` baseline, wired into CI
+      (`.github/workflows/mcp-conformance.yml`) for **both protocol eras** —
+      the stateful 2025-11-25 wire and the stateless 2026-07-28 wire — as a
+      matrix. The harness derives the lifecycle from
+      `MCP_CONFORMANCE_PROTOCOL_VERSION`, issues the calls a scenario supplies
+      in `MCP_CONFORMANCE_CONTEXT`, and otherwise exercises the advertised
+      catalogue; every non-auth client scenario passes on both wires
+      (`request-metadata`, the SEP-2243 header mirroring and malformed-tool
+      rejection, SEP-2106 non-dereferencing and JSON Schema 2020-12
+      preservation, and the SEP-2322 MRTR request-state echo on the modern
+      wire; `sse-retry` now passes on the legacy wire too). The baseline holds
+      only the OAuth `auth/*` scenarios plus the legacy-wire elicitation
+      scenario. The suite moved from the 0.1 line to `0.2.0-alpha.12` because
+      only the 0.2 line can express the 2026-07-28 era.
 - [x] Fuzz/config hardening — landed (`0a85184`): deterministic fuzz-style
       property corpora for the `mcp_servers.json` parser and the tool-name
       sanitizer (no external fuzz target).
@@ -1139,10 +1153,11 @@ integration tests live in `tests/it/` (one binary per crate, `#[ignore]`).
   with a bounded 5 ms poll (integration-only; the unit-test wait-free rule is
   intact), and the daemon case asserts the image sink path end-to-end.
 - **Conformance** runs the official client suite against the
-  `mcp-conformance-client` harness (`scripts/mcp-conformance.sh`, pinned 0.1.16)
-  with a committed expected-failures baseline, in CI for the legacy era
-  (2025-11-25); OAuth/elicitation/SSE-retry scenarios are baselined until P3.
-  The 2026-07-28-era run is the one open conformance residual (see P6).
+  `mcp-conformance-client` harness (`scripts/mcp-conformance.sh`, pinned
+  `0.2.0-alpha.12`) with a committed expected-failures baseline, in CI for both
+  protocol eras (2025-11-25 and 2026-07-28) as a matrix; every non-auth client
+  scenario passes on both wires, and only the OAuth `auth/*` scenarios (plus the
+  legacy-wire elicitation scenario) are baselined until P3.
 - **Manual interop matrix** (documented, run at release): current
   `@modelcontextprotocol/server-everything`, a filesystem server, a remote OAuth
   server (e.g. an MCP provider available to the project), and one legacy server.
@@ -1299,18 +1314,18 @@ The feature-row flip (D9) still waits on the default-on change.
 ## 15. Definition of done
 
 Two sets: **M1 — ship without OAuth** (the active goal) and **post-ship** (P3).
-P0–P6 and D9 are complete; the one open M1 item is the 2026-07-28-era
-conformance run.
+P0–P6 and D9 are complete.
 
 ### M1 — ship without OAuth
 
 - [x] A 2026-07-28 server (`server/discover`, per-request `_meta`, `resultType`)
       and a 2024-11-05…2025-11-25 server both work, selectable per server,
       covered by integration tests on **both** transports (P1 stdio, P2 HTTP).
-- [ ] The official conformance suite's client scenarios run green against the
-      supported eras, with a committed baseline (P6). *(Legacy era
-      (2025-11-25) green in CI with a committed baseline; the 2026-07-28-era
-      run is the one open conformance residual — `0a85184`.)*
+- [x] The official conformance suite's client scenarios run green against the
+      supported eras, with a committed baseline (P6). *(Both the legacy
+      (2025-11-25) and 2026-07-28 eras run in CI as a matrix; every non-auth
+      client scenario passes on both wires, with only the OAuth scenarios
+      baselined.)*
 - [x] Authentication without OAuth: a static token in `headers` reaches an
       authenticated server; a server that requires OAuth fails with the P5
       actionable error, not a hang or a raw status string. No credential store,
