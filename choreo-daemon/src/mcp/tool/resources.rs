@@ -22,6 +22,12 @@ fn empty_object_schema() -> Value {
     serde_json::json!({"type": "object", "additionalProperties": false})
 }
 
+/// Description for the `list_resources` catalogue tool.
+pub(super) const LIST_RESOURCES_DESC: &str = "List the resources this server exposes.";
+
+/// Description for the `read_resource` catalogue tool.
+pub(super) const READ_RESOURCE_DESC: &str = "Read one resource by URI (see list_resources).";
+
 /// The argument schema for `read_resource`: a single required resource URI.
 fn read_resource_schema() -> Value {
     serde_json::json!({
@@ -54,11 +60,8 @@ impl McpListResourcesTool {
     /// Build the listing tool for one server.
     #[must_use]
     pub fn new(server_slug: &str, handle: McpServerHandle) -> Self {
-        let (name, group, description) = prefixed_identity(
-            server_slug,
-            "list_resources",
-            "List the resources this server exposes.",
-        );
+        let (name, group, description) =
+            prefixed_identity(server_slug, "list_resources", LIST_RESOURCES_DESC);
         Self::with_name(name, group, description, handle)
     }
 
@@ -191,11 +194,8 @@ impl McpReadResourceTool {
     /// Build the read tool for one server.
     #[must_use]
     pub fn new(server_slug: &str, handle: McpServerHandle) -> Self {
-        let (name, group, description) = prefixed_identity(
-            server_slug,
-            "read_resource",
-            "Read one resource by URI (see list_resources).",
-        );
+        let (name, group, description) =
+            prefixed_identity(server_slug, "read_resource", READ_RESOURCE_DESC);
         Self::with_name(name, group, description, handle)
     }
 

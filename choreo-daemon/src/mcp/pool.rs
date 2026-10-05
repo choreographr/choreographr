@@ -324,11 +324,7 @@ impl super::McpManager {
         config: McpServerConfig,
     ) -> ServerSlot {
         let handle = server.handle();
-        let disabled: HashSet<&str> = config.disabled_tools.iter().map(String::as_str).collect();
-        let tool_count = tools
-            .iter()
-            .filter(|t| !disabled.contains(t.name.as_str()))
-            .count();
+        let tool_count = Self::enabled_tool_count(tools, &config.disabled_tools);
         ServerSlot {
             handle,
             server,

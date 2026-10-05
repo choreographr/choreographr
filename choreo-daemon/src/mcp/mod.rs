@@ -1,8 +1,7 @@
 // Real implementation (connect/handshake/discover/shutdown over stdio) is
-// compiled only with the `mcp` feature. Without it, the module below degrades
-// to a no-op stub (see the `#[cfg(not(feature = "mcp"))]` block) so the
-// manager's call sites in cli.rs / daemon.rs / server/lifecycle.rs compile
-// unchanged in both configurations.
+// compiled only with the `mcp` feature. Without it, the module degrades to a
+// no-op stub (see `stub.rs`) so the manager's call sites in cli.rs / daemon.rs /
+// server/lifecycle.rs compile unchanged in both configurations.
 #[cfg(feature = "mcp")]
 pub mod config;
 #[cfg(feature = "mcp")]
@@ -14,16 +13,26 @@ pub mod trust;
 // The manager is split across cohesive child modules: `overlay` owns the
 // per-session overlay resolution plus the overlay value types and project-root
 // walk, `pool` owns the pool reconciliation (reconnect/reload) and the shared
-// slot connect helper. Their `impl McpManager` blocks reach the manager's
+// slot connect helper, `paths` the config-dir resolution and file names, and
+// `status` the daemon-facing status/report/outcome types. `stub` is the
+// feature-off stand-in. Their `impl McpManager` blocks reach the manager's
 // private fields as child modules; the items other modules use are re-exported
 // here so every `crate::mcp::…` path is unchanged.
-mod overlay;
-mod pool;
-
-pub use overlay::{ProjectToolSet, SessionMcpOverlay, project_root_for};
-
 #[cfg(feature = "mcp")]
-use crate::tools::ToolDyn;
+mod overlay;
+mod paths;
+mod pool;
+mod project;
+mod status;
+#[cfg(not(feature = "mcp"))]
+mod stub;
+
+pub use paths::{PROJECT_CONFIG_FILE, TRUST_FILE, config_dir, set_test_config_root, trust_path};
+pub use project::{ProjectToolSet, SessionMcpOverlay, project_root_for};
+pub use status::{McpReloadOutcome, McpServerStatus, McpStatusReport, McpTrustOutcome};
+#[cfg(not(feature = "mcp"))]
+pub use stub::McpManager;
+
 #[cfg(feature = "mcp")]
 use crate::tools::ToolRegistry;
 #[cfg(feature = "mcp")]
@@ -35,12 +44,11 @@ use std::collections::HashMap;
 #[cfg(feature = "mcp")]
 use std::collections::HashSet;
 #[cfg(feature = "mcp")]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(feature = "mcp")]
 use std::time::{Duration, Instant};
 #[cfg(feature = "mcp")]
-use tool::{McpListResourcesTool, McpReadResourceTool, McpToolWrapper};
+use tool::build_server_wrappers;
 #[cfg(feature = "mcp")]
 use tracing::{debug, error, info, warn};
 
@@ -54,58 +62,6 @@ type PendingConnect = (
     String,
     std::thread::JoinHandle<anyhow::Result<(McpServer, Vec<McpTool>)>>,
 );
-
-/// The project-tier MCP config file name (a checkout's own server set).
-///
-/// The MCP-ecosystem convention for a repository-local server declaration. The
-/// daemon-tier counterpart lives beside this crate's other config files
-/// (`<config>/choreographr/mcp.json`).
-pub const PROJECT_CONFIG_FILE: &str = ".mcp.json";
-
-/// The MCP trust-store file name (`<config>/choreographr/trust.toml`).
-pub const TRUST_FILE: &str = "trust.toml";
-
-thread_local! {
-    /// Test-only override for the base config directory. When set,
-    /// [`config_dir`] returns `<root>/choreographr` instead of the user's real
-    /// config dir.
-    ///
-    /// Deliberately NOT `#[cfg(test)]`-gated: integration tests in `tests/`
-    /// compile the crate without `cfg(test)`, so the hook must exist in normal
-    /// builds too (it is a no-op unless explicitly set).
-    static TEST_CONFIG_ROOT: std::cell::RefCell<Option<PathBuf>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Test-only override for the base config directory (see `TEST_CONFIG_ROOT`).
-///
-/// This is needed because `dirs::config_dir()` honors `XDG_CONFIG_HOME` only
-/// on Linux — on macOS it always returns `$HOME/Library/Application Support`,
-/// so an integration test cannot redirect the config path via environment
-/// variables.
-#[doc(hidden)]
-pub fn set_test_config_root(root: Option<PathBuf>) {
-    TEST_CONFIG_ROOT.with(|cell| cell.replace(root));
-}
-
-/// Resolve the choreographr config directory (`<config>/choreographr`).
-///
-/// # Errors
-///
-/// Returns an error when the config directory cannot be determined.
-pub fn config_dir() -> std::io::Result<PathBuf> {
-    if let Some(root) = TEST_CONFIG_ROOT.with(|cell| cell.borrow().clone()) {
-        return Ok(root.join("choreographr"));
-    }
-    choreo_shared::paths::config_dir()
-}
-
-/// The path of the MCP trust store (`<config>/choreographr/trust.toml`), or
-/// `None` when the config directory cannot be resolved.
-#[must_use]
-pub fn trust_path() -> Option<PathBuf> {
-    config_dir().ok().map(|d| d.join(TRUST_FILE))
-}
 
 /// Default budget for connecting all MCP servers during `from_config`.
 ///
@@ -141,122 +97,6 @@ const RELOAD_BUDGET: Duration = Duration::from_secs(10);
 /// normally milliseconds.
 #[cfg(feature = "mcp")]
 const CATALOGUE_REFRESH_BUDGET: Duration = Duration::from_secs(3);
-
-/// A read-only snapshot of one configured server's state, for the `/mcp`
-/// status surface and `session_inspect`.
-///
-/// Defined unconditionally (outside the `mcp` feature gate) so a status-returning
-/// daemon command and its callers compile no matter how the daemon is built;
-/// without the feature the list is simply always empty.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct McpServerStatus {
-    /// The server's config key (tool-name prefix).
-    pub slug: String,
-    /// The tier this server belongs to: `"daemon"` or `"project"`.
-    pub tier: String,
-    /// The resolved transport label (`"stdio"` / `"http"`).
-    pub transport: String,
-    /// The command (stdio) or URL (http) the transport targets.
-    pub target: String,
-    /// Whether the server is connected and its tools are registered.
-    pub connected: bool,
-    /// How many tools (excluding the resource catalogue tools) are registered.
-    pub tool_count: usize,
-    /// The server's self-reported name, once connected.
-    pub server_name: Option<String>,
-    /// The server's self-reported version, once connected.
-    pub server_version: Option<String>,
-    /// The last connect/refresh error, when the server is not connected (or a
-    /// refresh failed).
-    pub last_error: Option<String>,
-}
-
-impl McpServerStatus {
-    /// A one-line human-readable summary of this server's state.
-    #[must_use]
-    pub fn summary(&self) -> String {
-        if self.connected {
-            let name = self.server_name.as_deref().unwrap_or("unknown");
-            let version = self.server_version.as_deref().unwrap_or("?");
-            format!(
-                "{} [{} → {}] connected: {name} {version}, {} tool(s)",
-                self.slug, self.transport, self.target, self.tool_count
-            )
-        } else {
-            format!(
-                "{} [{} → {}] not connected: {}",
-                self.slug,
-                self.transport,
-                self.target,
-                self.last_error.as_deref().unwrap_or("not connected")
-            )
-        }
-    }
-}
-
-/// The result of a successful MCP config reload, for the `/mcp reload`
-/// surface.
-///
-/// Defined unconditionally (outside the `mcp` feature gate) so the status-
-/// returning daemon command and its reply type compile no matter how the
-/// daemon is built; without the feature a reload never succeeds.
-#[derive(Debug, Clone)]
-pub struct McpReloadOutcome {
-    /// One-line human-readable summary of what changed, e.g.
-    /// `"MCP reload: 1 added, 0 removed, 1 restarted, 2 unchanged, 0 failed"`.
-    pub summary: String,
-    /// The refreshed state of every configured server, in stable slug order.
-    pub servers: Vec<McpServerStatus>,
-    /// The sessions whose overlay referenced a daemon per-session
-    /// (`shared = false`) server that this reload changed or removed, in sorted
-    /// order. The command loop re-resolves exactly these overlays so they pick
-    /// up the new config (or drop the removed one). Daemon-internal bookkeeping:
-    /// not carried on the wire.
-    #[doc(hidden)]
-    pub affected_sessions: Vec<u64>,
-}
-
-/// A full MCP status report for one session: every visible server — daemon-tier
-/// plus (for an attached session) that session's own project servers — tagged
-/// by tier, plus the session's project-root trust context.
-#[derive(Debug, Clone)]
-pub struct McpStatusReport {
-    /// Every visible server, daemon-tier and project-tier, in stable order.
-    pub servers: Vec<McpServerStatus>,
-    /// The session's resolved project root, if any.
-    pub project_root: Option<PathBuf>,
-    /// Whether `project_root` (when present) is trusted.
-    pub project_trusted: bool,
-    /// Slugs declared by an UNTRUSTED `.mcp.json` — read so the operator can see
-    /// what is ignored, never spawned.
-    pub ignored_project_servers: Vec<String>,
-}
-
-impl McpStatusReport {
-    /// An empty report (no servers, no project context) — the stub baseline.
-    #[must_use]
-    pub fn empty() -> Self {
-        Self {
-            servers: Vec::new(),
-            project_root: None,
-            project_trusted: false,
-            ignored_project_servers: Vec::new(),
-        }
-    }
-}
-
-/// The outcome of a `/mcp trust` / `/mcp untrust` request: the resulting trust
-/// state of the target root (`None` when the active session has no resolvable
-/// project root) and a one-line human-readable summary.
-#[derive(Debug, Clone)]
-pub struct McpTrustOutcome {
-    /// The canonical project root the decision applied to, if any.
-    pub root: Option<PathBuf>,
-    /// Whether `root` is now trusted.
-    pub trusted: bool,
-    /// A one-line human-readable summary of what happened.
-    pub message: String,
-}
 
 /// One connected server: the live connection (owns the dispatcher thread) plus
 /// a cloneable handle shared with that server's tool wrappers.
@@ -449,23 +289,25 @@ impl McpManager {
             let Some(slot) = self.servers.get_mut(&slug) else {
                 continue;
             };
-            let tools = match slot
+            // Re-list the server, updating the cache; a listing that misses the
+            // deadline keeps the previous tool set. Register straight from the
+            // cache (no clone).
+            match slot
                 .handle
                 .list_tools_with_deadline(CATALOGUE_REFRESH_BUDGET)
             {
                 Ok(tools) => {
-                    slot.tools.clone_from(&tools);
-                    tools
+                    slot.tool_count = Self::enabled_tool_count(&tools, &slot.config.disabled_tools);
+                    slot.tools = tools;
                 }
                 Err(e) => {
                     warn!(server = %slug, error = %e, "MCP tool listing missed the catalogue-refresh budget; keeping the previous tool set");
-                    slot.tools.clone()
                 }
-            };
+            }
             Self::register_server_tools(
                 &slug,
                 &slot.handle,
-                tools,
+                &slot.tools,
                 &slot.config.disabled_tools,
                 &mut used,
                 registry,
@@ -507,16 +349,7 @@ impl McpManager {
                 // `/mcp` status surface reports the changed server's real tool
                 // count (the count excludes disabled tools, matching
                 // `slot_from_server`).
-                let disabled: HashSet<&str> = slot
-                    .config
-                    .disabled_tools
-                    .iter()
-                    .map(String::as_str)
-                    .collect();
-                slot.tool_count = tools
-                    .iter()
-                    .filter(|t| !disabled.contains(t.name.as_str()))
-                    .count();
+                slot.tool_count = Self::enabled_tool_count(&tools, &slot.config.disabled_tools);
                 slot.tools = tools;
             }
             Err(e) => {
@@ -545,7 +378,7 @@ impl McpManager {
             Self::register_server_tools(
                 slug,
                 &slot.handle,
-                slot.tools.clone(),
+                &slot.tools,
                 &slot.config.disabled_tools,
                 &mut used,
                 registry,
@@ -570,7 +403,7 @@ impl McpManager {
         let tool_count = Self::register_server_tools(
             slug,
             &handle,
-            tools.clone(),
+            &tools,
             &config.disabled_tools,
             used,
             registry,
@@ -590,63 +423,27 @@ impl McpManager {
     }
 
     /// Register one server's advertised `tools` (and its catalogue group) into
-    /// `registry`, returning the number of tools registered.
+    /// `registry`, returning the number of server tools registered (excluding
+    /// the resource-catalogue wrappers).
     ///
     /// The listing itself is done by the caller (inside its connect/refresh
-    /// budget), so this is pure registration: it cannot fail.
+    /// budget), so this is pure registration: it cannot fail. The wrapper
+    /// construction (names, disabled filter, resource-catalogue tools) is shared
+    /// with the per-session overlay via [`build_server_wrappers`].
     fn register_server_tools(
         slug: &str,
         handle: &McpServerHandle,
-        tools: Vec<McpTool>,
+        tools: &[McpTool],
         disabled: &[String],
         used: &mut HashSet<String>,
         registry: &mut ToolRegistry,
     ) -> usize {
+        let built = build_server_wrappers(slug, handle, tools, disabled, used);
         let server_name = handle.name().to_string();
-        let group = choreo_mcp::group_name(slug);
-        registry.register_dynamic_group(group.clone(), format!("MCP server: {server_name}"));
-        let disabled: HashSet<&str> = disabled.iter().map(String::as_str).collect();
-
-        if handle.supports_resources() {
-            for suffix in ["list_resources", "read_resource"] {
-                let name = Self::resolve_name(slug, suffix, used);
-                used.insert(name);
-            }
-        }
-
-        let mut count = 0usize;
-        for mcp_tool in tools {
-            if disabled.contains(mcp_tool.name.as_str()) {
-                debug!(server = %slug, tool = %mcp_tool.name, "MCP tool disabled by config");
-                continue;
-            }
-            let description = mcp_tool.description.unwrap_or_default();
-            let name = Self::resolve_name(slug, &mcp_tool.name, used);
-            used.insert(name.clone());
-            let wrapper = McpToolWrapper::with_name(
-                name.clone(),
-                group.clone(),
-                format!("[MCP {slug}] {description}"),
-                mcp_tool.name,
-                mcp_tool.input_schema,
-                mcp_tool.output_schema,
-                handle.clone(),
-            );
-            registry.register_dynamic(name, &group, Box::new(wrapper));
-            count += 1;
-        }
-
-        if handle.supports_resources() {
-            let lister = McpListResourcesTool::new(slug, handle.clone());
-            let reader = McpReadResourceTool::new(slug, handle.clone());
-            for tool in [
-                Box::new(lister) as Box<dyn ToolDyn>,
-                Box::new(reader) as Box<dyn ToolDyn>,
-            ] {
-                let name = tool.name().to_string();
-                registry.register_dynamic(name, &group, tool);
-            }
-            info!(server = %slug, "registered MCP resource tools");
+        registry.register_dynamic_group(built.group.clone(), format!("MCP server: {server_name}"));
+        let count = built.tool_count;
+        for (name, wrapper) in built.tools {
+            registry.register_dynamic(name, &built.group, wrapper);
         }
         info!(
             server = %slug,
@@ -657,14 +454,17 @@ impl McpManager {
         count
     }
 
-    /// Compute the provider-safe name for `tool` on `slug`, appending a hash
-    /// suffix when another server already claimed the sanitized name.
-    fn resolve_name(slug: &str, tool: &str, used: &HashSet<String>) -> String {
-        let base = choreo_mcp::build_tool_name(slug, tool);
-        if !used.contains(&base) {
-            return base;
-        }
-        choreo_mcp::build_tool_name_with_suffix(slug, tool, &format!("{slug}\u{0}{tool}"))
+    /// The number of `tools` not hidden by `disabled`.
+    ///
+    /// The per-server `/mcp` tool count excludes disabled tools, matching a
+    /// fresh connect ([`McpManager::slot_from_server`]). Used to keep a slot's
+    /// cached count in step after a re-list.
+    fn enabled_tool_count(tools: &[McpTool], disabled: &[String]) -> usize {
+        let disabled: HashSet<&str> = disabled.iter().map(String::as_str).collect();
+        tools
+            .iter()
+            .filter(|t| !disabled.contains(t.name.as_str()))
+            .count()
     }
 
     /// A snapshot of every daemon-tier SHARED server's state, in stable slug
@@ -900,119 +700,6 @@ fn join_with_budget<T: Send + 'static>(
     }
 }
 
-// Feature-off stub: mirrors the metrics-module stub convention. The manager
-// holds no servers (there is nothing to manage without the choreo-mcp
-// dependency), so construction, teardown, and Drop are all no-ops. The API
-// surface matches the real manager exactly — same method signatures — so
-// callers cannot tell the difference, and no call site needs feature cfgs.
-#[cfg(not(feature = "mcp"))]
-mod imp {
-    use crate::tools::ToolRegistry;
-
-    use super::{McpReloadOutcome, McpServerStatus, SessionMcpOverlay};
-
-    /// No-op stand-in for the real `McpManager` (see the module-level cfg note).
-    pub struct McpManager;
-
-    impl McpManager {
-        /// Stub: no MCP config is loaded and no servers are spawned.
-        pub fn from_config(_registry: &mut ToolRegistry) -> Self {
-            Self
-        }
-
-        /// Stub: no server has any tools to (re-)register.
-        pub fn register_all(&mut self, _registry: &mut ToolRegistry) {}
-
-        /// Stub: there are never any cached tools to register.
-        pub fn register_cached(&self, _registry: &mut ToolRegistry) {}
-
-        /// Stub: there is never a server to re-list.
-        pub fn refresh_server(&mut self, _slug: &str) {}
-
-        /// Stub: there are no servers to shut down.
-        pub fn shutdown_all(&mut self) {}
-
-        /// Stub: no server has any in-flight call to cancel.
-        pub fn cancel_session(&self, _session_id: u64) {}
-
-        /// Stub: no server has any in-flight call to cancel.
-        pub fn cancel_session_project(&self, _session_id: u64, _project_root: &std::path::Path) {}
-
-        /// Stub: no session ever holds a private MCP server.
-        #[must_use]
-        pub fn sessions_for_slug(&self, _slug: &str) -> std::collections::HashSet<u64> {
-            std::collections::HashSet::new()
-        }
-
-        /// Stub: there are no servers to reconnect.
-        pub fn reconnect(&mut self, slug: &str) -> Result<(), String> {
-            Err(format!("unknown MCP server {slug:?} (MCP is not built in)"))
-        }
-
-        /// Stub: there is no config to reload.
-        pub fn reload(&mut self) -> Result<McpReloadOutcome, String> {
-            Err("MCP is not built in".to_string())
-        }
-
-        /// Stub: no servers are ever ensured.
-        pub fn ensure_session(
-            &mut self,
-            _session_id: u64,
-            _project_root: Option<&std::path::Path>,
-            _trusted: bool,
-        ) -> SessionMcpOverlay {
-            SessionMcpOverlay::empty()
-        }
-
-        /// Stub: nothing to reload.
-        pub fn reload_session(
-            &mut self,
-            _session_id: u64,
-            _project_root: Option<&std::path::Path>,
-            _trusted: bool,
-        ) -> SessionMcpOverlay {
-            SessionMcpOverlay::empty()
-        }
-
-        /// Stub: nothing to release.
-        pub fn release_session(&mut self, _session_id: u64) {}
-
-        /// Stub: there is never any per-session project server.
-        #[must_use]
-        pub fn session_status(&self, _session_id: u64) -> Vec<McpServerStatus> {
-            Vec::new()
-        }
-
-        /// Stub: there are never any servers, so no status rows.
-        #[must_use]
-        pub fn status(&self) -> Vec<McpServerStatus> {
-            Vec::new()
-        }
-
-        /// Stub: creates an empty manager (same seam the real one exposes for
-        /// tests).
-        #[must_use]
-        pub fn empty() -> Self {
-            Self
-        }
-
-        /// Stub: there are never any servers.
-        #[must_use]
-        pub fn is_empty(&self) -> bool {
-            true
-        }
-
-        /// Stub: there are never any servers.
-        #[must_use]
-        pub fn server_count(&self) -> usize {
-            0
-        }
-    }
-}
-
-#[cfg(not(feature = "mcp"))]
-pub use imp::McpManager;
-
 #[cfg(test)]
 #[cfg(feature = "mcp")]
 mod tests {
@@ -1055,17 +742,6 @@ mod tests {
         config::set_test_config_root(None);
         assert!(manager.is_empty());
         assert_eq!(manager.status().len(), 0);
-    }
-
-    #[test]
-    fn resolve_name_disambiguates_a_collision() {
-        let mut used = HashSet::new();
-        let first = McpManager::resolve_name("s", "a.b", &used);
-        used.insert(first.clone());
-        let second = McpManager::resolve_name("s", "a_b", &used);
-        assert_ne!(first, second);
-        assert!(second.len() <= choreo_mcp::MAX_TOOL_NAME_LEN);
-        assert_eq!(second, McpManager::resolve_name("s", "a_b", &used));
     }
 
     /// A minimal daemon-tier entry with the given slug and pooling attribute.

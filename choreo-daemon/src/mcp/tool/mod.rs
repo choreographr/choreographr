@@ -8,6 +8,7 @@
 mod content;
 mod resources;
 
+use resources::{LIST_RESOURCES_DESC, READ_RESOURCE_DESC};
 pub use resources::{McpListResourcesTool, McpReadResourceTool};
 
 use crate::tools::context::ToolContext;
@@ -15,11 +16,13 @@ use crate::tools::{PreparedImage, ToolDyn, ToolError, ToolOutput, ToolOutputForm
 use anyhow::{Context, Result};
 use choreo_ai_protocols::openai::AllowedCaller;
 use choreo_keystore::ServiceCredential;
-use choreo_mcp::{CallToolResult, McpServerHandle};
+use choreo_mcp::{CallToolResult, McpServerHandle, McpTool};
 use content::{join_text_parts, map_mcp_result};
 use crossbeam_channel;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
+use tracing::{debug, info};
 
 /// Upper bound on the joined text an MCP result contributes to the model.
 ///
@@ -49,6 +52,111 @@ fn prefixed_identity(
         choreo_mcp::group_name(server_slug),
         format!("[MCP {server_slug}] {description}"),
     )
+}
+
+/// Resolve the provider-safe name for `tool` on `slug`, appending a hash suffix
+/// when another tool has already claimed the sanitized name.
+///
+/// Shared by the daemon-wide registration and the per-session overlay so their
+/// first-come-first-served disambiguation is identical.
+pub(super) fn resolve_name(slug: &str, tool: &str, used: &HashSet<String>) -> String {
+    let base = choreo_mcp::build_tool_name(slug, tool);
+    if !used.contains(&base) {
+        return base;
+    }
+    choreo_mcp::build_tool_name_with_suffix(slug, tool, &format!("{slug}\u{0}{tool}"))
+}
+
+/// The wrappers one server contributes to a catalogue, with their resolved
+/// names and the group they belong to.
+pub(super) struct ServerWrappers {
+    /// The `mcp/<slug>` group every wrapper belongs to.
+    pub(super) group: String,
+    /// The number of server TOOLS (excludes the resource-catalogue wrappers).
+    pub(super) tool_count: usize,
+    /// The wrappers in registration order (server tools first, then the
+    /// resource-catalogue tools), each paired with its resolved name.
+    pub(super) tools: Vec<(String, Box<dyn ToolDyn>)>,
+}
+
+/// Build the wrapper tools for one server's `tools`, resolving provider-safe
+/// names against the shared `used` set.
+///
+/// Both the daemon-wide registration ([`crate::mcp::McpManager`]) and the
+/// per-session overlay build through here, so their naming cannot drift. The
+/// resource-catalogue tools receive the SAME names reserved in `used` (the
+/// reservation is not discarded), which is what keeps a server tool named
+/// `list_resources`/`read_resource` — or a same-segment collision with another
+/// server — from colliding with the catalogue tools.
+pub(super) fn build_server_wrappers(
+    slug: &str,
+    handle: &McpServerHandle,
+    tools: &[McpTool],
+    disabled: &[String],
+    used: &mut HashSet<String>,
+) -> ServerWrappers {
+    let group = choreo_mcp::group_name(slug);
+    let disabled: HashSet<&str> = disabled.iter().map(String::as_str).collect();
+    let supports_resources = handle.supports_resources();
+
+    // Reserve the resource-catalogue names FIRST and keep them, so a server
+    // tool that sanitizes onto the same name takes the collision suffix and the
+    // catalogue tool is registered under the reserved (possibly suffixed) name
+    // rather than a recomputed base.
+    let resource_names = supports_resources.then(|| {
+        let list = resolve_name(slug, "list_resources", used);
+        used.insert(list.clone());
+        let read = resolve_name(slug, "read_resource", used);
+        used.insert(read.clone());
+        (list, read)
+    });
+
+    let mut wrappers: Vec<(String, Box<dyn ToolDyn>)> = Vec::new();
+    let mut tool_count = 0usize;
+    for mcp_tool in tools {
+        if disabled.contains(mcp_tool.name.as_str()) {
+            debug!(server = %slug, tool = %mcp_tool.name, "MCP tool disabled by config");
+            continue;
+        }
+        let description = mcp_tool.description.clone().unwrap_or_default();
+        let name = resolve_name(slug, &mcp_tool.name, used);
+        used.insert(name.clone());
+        let wrapper = McpToolWrapper::with_name(
+            name.clone(),
+            group.clone(),
+            format!("[MCP {slug}] {description}"),
+            mcp_tool.name.clone(),
+            mcp_tool.input_schema.clone(),
+            mcp_tool.output_schema.clone(),
+            handle.clone(),
+        );
+        wrappers.push((name, Box::new(wrapper)));
+        tool_count += 1;
+    }
+
+    if let Some((list_name, read_name)) = resource_names {
+        let lister = McpListResourcesTool::with_name(
+            list_name.clone(),
+            group.clone(),
+            format!("[MCP {slug}] {LIST_RESOURCES_DESC}"),
+            handle.clone(),
+        );
+        let reader = McpReadResourceTool::with_name(
+            read_name.clone(),
+            group.clone(),
+            format!("[MCP {slug}] {READ_RESOURCE_DESC}"),
+            handle.clone(),
+        );
+        wrappers.push((list_name, Box::new(lister)));
+        wrappers.push((read_name, Box::new(reader)));
+        info!(server = %slug, "registered MCP resource tools");
+    }
+
+    ServerWrappers {
+        group,
+        tool_count,
+        tools: wrappers,
+    }
 }
 
 /// Wraps an MCP server tool as a `ToolDyn` for Choreographr's tool registry.
@@ -321,11 +429,53 @@ fn cancelled_output() -> ToolOutput {
 mod tests {
     use super::*;
     use choreo_mcp::McpTool;
+    use std::collections::HashSet;
 
     /// A handle with no dispatcher behind it: the wrapper's metadata methods do
     /// not call the server, so a disconnected handle is sufficient here.
     fn unused_handle() -> McpServerHandle {
         McpServerHandle::disconnected("fixture", "0.1.0", std::time::Duration::from_secs(5))
+    }
+
+    #[test]
+    fn resolve_name_disambiguates_a_collision() {
+        // Two names that sanitize onto the same segment must be pulled apart by
+        // the hash suffix, and the result must stay within the provider cap.
+        let mut used = HashSet::new();
+        let first = resolve_name("s", "a.b", &used);
+        used.insert(first.clone());
+        let second = resolve_name("s", "a_b", &used);
+        assert_ne!(first, second);
+        assert!(second.len() <= choreo_mcp::MAX_TOOL_NAME_LEN);
+        assert_eq!(second, resolve_name("s", "a_b", &used));
+    }
+
+    #[test]
+    fn build_server_wrappers_reserves_catalogue_names_for_colliding_tools() {
+        // A server that advertises its OWN `list_resources` tool AND the
+        // `resources` capability: the catalogue tool must keep the reserved
+        // name while the server tool takes the collision suffix, so neither is
+        // registered under a name the other already claimed.
+        let handle = McpServerHandle::disconnected_with_resources("srv");
+        let tools = vec![McpTool {
+            name: "list_resources".into(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+        }];
+        let mut used = HashSet::new();
+        let built = build_server_wrappers("srv", &handle, &tools, &[], &mut used);
+        let names: Vec<&str> = built.tools.iter().map(|(n, _)| n.as_str()).collect();
+        // The catalogue tools keep the reserved names...
+        assert!(names.contains(&"mcp/srv/list_resources"), "{names:?}");
+        assert!(names.contains(&"mcp/srv/read_resource"), "{names:?}");
+        // ...and the server's own `list_resources` tool is disambiguated.
+        let server_tool = names
+            .iter()
+            .find(|n| n.starts_with("mcp/srv/list_resources-"))
+            .expect("the colliding server tool takes a hash suffix");
+        assert_ne!(*server_tool, "mcp/srv/list_resources");
+        assert_eq!(built.tool_count, 1, "only server tools count");
     }
 
     #[test]
