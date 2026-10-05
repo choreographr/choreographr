@@ -160,9 +160,10 @@ phases. What exists now:
   MCP headers are rejected), bounds SSE events at 16 MiB, retries a transient
   connect (`408`/`429`/`5xx`; 3 attempts, 500 ms·2^(n-1) capped at 60 s), and
   rejects a 2024-11-05 HTTP+SSE endpoint with a typed `UnsupportedTransport`.
-- Startup is bounded by a 2 s budget for the whole batch (`STARTUP_BUDGET`); a
-  server that misses it is logged and skipped, so a hung server cannot stall
-  `DaemonState::open`.
+- Startup is bounded by a 2 s budget for the whole batch (`STARTUP_BUDGET`); the
+  budget covers connect **and** the initial `tools/list`, so a server that
+  misses it — including one that handshakes fast but never answers the listing —
+  is logged and skipped, so a hung server cannot stall `DaemonState::open`.
 - The test suites are hermetic and fixture-driven (no Node/npx, no network):
   `choreo-mcp`'s scripted stdio server covers both eras, `auto` fallback,
   crash-on-call, garbage lines, oversized lines, a rejected `initialize`,

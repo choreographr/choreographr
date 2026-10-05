@@ -17,7 +17,7 @@ use crate::tools::ToolRegistry;
 use crate::tools::{ToolDyn, ToolError, ToolOutput, ToolOutputFormat};
 use choreo_ai_protocols::openai::ChatToolDefinition;
 #[cfg(feature = "mcp")]
-use choreo_mcp::{McpListChange, McpServer, McpServerConfig, McpServerHandle};
+use choreo_mcp::{McpListChange, McpServer, McpServerConfig, McpServerHandle, McpTool};
 #[cfg(feature = "mcp")]
 use config::McpEntry;
 #[cfg(feature = "mcp")]
@@ -31,6 +31,17 @@ use std::time::{Duration, Instant};
 use tool::{McpListResourcesTool, McpReadResourceTool, McpToolWrapper};
 #[cfg(feature = "mcp")]
 use tracing::{debug, error, info, warn};
+
+/// A background connect's join handle: the connected server plus its listed
+/// tools, or the connect/list error.
+///
+/// The listing runs inside the same bounded worker as the connect (see
+/// [`connect_and_list`]), so the caller's budget covers connect AND discovery.
+#[cfg(feature = "mcp")]
+type PendingConnect = (
+    String,
+    std::thread::JoinHandle<anyhow::Result<(McpServer, Vec<McpTool>)>>,
+);
 
 /// The project-tier MCP config file name (a checkout's own server set).
 ///
@@ -555,8 +566,9 @@ impl McpManager {
         };
 
         // Spawn only the shared servers up front so they handshake in parallel.
-        let mut pending: Vec<(String, std::thread::JoinHandle<anyhow::Result<McpServer>>)> =
-            Vec::new();
+        // Each worker connects AND performs the initial tool listing, so the
+        // startup budget below bounds discovery too, not just the handshake.
+        let mut pending: Vec<PendingConnect> = Vec::new();
         for cfg in configs {
             if !cfg.shared {
                 debug!(server = %cfg.config.slug, "daemon-tier server is not shared; deferred to per-session connect");
@@ -571,8 +583,7 @@ impl McpManager {
             );
             let list_changes = Some(list_change_tx.clone());
             let handle = std::thread::spawn(move || {
-                McpServer::connect_with_list_changes(&cfg.config, list_changes)
-                    .map_err(anyhow::Error::from)
+                connect_and_list(&cfg.config, list_changes).map_err(anyhow::Error::from)
             });
             pending.push((slug, handle));
         }
@@ -582,10 +593,15 @@ impl McpManager {
         for (slug, handle) in pending {
             let remaining = deadline.saturating_duration_since(Instant::now());
             match join_with_budget(handle, remaining) {
-                Some(Ok(server)) => {
-                    if let Err(e) =
-                        Self::register_server(&slug, server, &mut used, registry, &mut manager)
-                    {
+                Some(Ok((server, tools))) => {
+                    if let Err(e) = Self::register_server(
+                        &slug,
+                        server,
+                        tools,
+                        &mut used,
+                        registry,
+                        &mut manager,
+                    ) {
                         error!(server = %slug, error = %e, "failed to register MCP server");
                         manager.failures.insert(slug, e);
                     }
@@ -630,21 +646,28 @@ impl McpManager {
             let Some(slot) = self.servers.get(slug) else {
                 continue;
             };
-            if let Err(e) = Self::register_server_tools(
+            let tools = match slot.handle.list_tools() {
+                Ok(tools) => tools,
+                Err(e) => {
+                    warn!(server = %slug, error = %e, "failed to list MCP tools during registry refresh");
+                    continue;
+                }
+            };
+            Self::register_server_tools(
                 slug,
                 &slot.handle,
+                tools,
                 &slot.config.disabled_tools,
                 &mut used,
                 registry,
-            ) {
-                warn!(server = %slug, error = %e, "failed to list MCP tools during registry refresh");
-            }
+            );
         }
     }
 
     fn register_server(
         slug: &str,
         server: McpServer,
+        tools: Vec<McpTool>,
         used: &mut HashSet<String>,
         registry: &mut ToolRegistry,
         manager: &mut Self,
@@ -655,9 +678,14 @@ impl McpManager {
             .get(slug)
             .map(|e| e.config.clone())
             .ok_or_else(|| format!("no config for server {slug:?}"))?;
-        let tool_count =
-            Self::register_server_tools(slug, &handle, &config.disabled_tools, used, registry)
-                .map_err(|e| e.to_string())?;
+        let tool_count = Self::register_server_tools(
+            slug,
+            &handle,
+            tools,
+            &config.disabled_tools,
+            used,
+            registry,
+        );
         manager.servers.insert(
             slug.to_string(),
             ServerSlot {
@@ -671,17 +699,20 @@ impl McpManager {
         Ok(())
     }
 
-    /// Register one server's advertised tools (and its catalogue group) into
+    /// Register one server's advertised `tools` (and its catalogue group) into
     /// `registry`, returning the number of tools registered.
+    ///
+    /// The listing itself is done by the caller (inside its connect/refresh
+    /// budget), so this is pure registration: it cannot fail.
     fn register_server_tools(
         slug: &str,
         handle: &McpServerHandle,
+        tools: Vec<McpTool>,
         disabled: &[String],
         used: &mut HashSet<String>,
         registry: &mut ToolRegistry,
-    ) -> Result<usize, choreo_mcp::McpError> {
+    ) -> usize {
         let server_name = handle.name().to_string();
-        let tools = handle.list_tools()?;
         let group = choreo_mcp::group_name(slug);
         registry.register_dynamic_group(group.clone(), format!("MCP server: {server_name}"));
         let disabled: HashSet<&str> = disabled.iter().map(String::as_str).collect();
@@ -733,7 +764,7 @@ impl McpManager {
             tool_count = count,
             "registered MCP server tools"
         );
-        Ok(count)
+        count
     }
 
     /// Build the tool wrappers for one server WITHOUT registering them in a
@@ -1248,37 +1279,47 @@ impl McpManager {
     ) -> Option<ServerSlot> {
         let list_changes = Some(list_change_tx.clone());
         let cfg = config.clone();
+        // Connect AND list inside the worker, so `timeout` bounds discovery as
+        // well as the handshake: a server that handshakes fast but never answers
+        // `tools/list` is dropped at the budget instead of stalling the (reload
+        // or command-loop) caller for the per-server request timeout.
         let handle = std::thread::spawn(move || {
-            McpServer::connect_with_list_changes(&cfg, list_changes).map_err(anyhow::Error::from)
+            connect_and_list(&cfg, list_changes).map_err(anyhow::Error::from)
         });
         match join_with_budget(handle, timeout) {
-            Some(Ok(server)) => Self::slot_from_server(server, config.clone()),
+            Some(Ok((server, tools))) => {
+                Some(Self::slot_from_server(server, &tools, config.clone()))
+            }
             Some(Err(e)) => {
                 warn!(server = %config.slug, error = %e, "MCP server failed to connect");
                 None
             }
             None => {
-                warn!(server = %config.slug, "MCP server connect timed out");
+                warn!(server = %config.slug, "MCP server connect/discovery timed out");
                 None
             }
         }
     }
 
-    /// Build a `ServerSlot` from a freshly connected `server`.
-    fn slot_from_server(server: McpServer, config: McpServerConfig) -> Option<ServerSlot> {
+    /// Build a `ServerSlot` from a freshly connected `server` and its
+    /// already-listed `tools` (the listing happened inside the connect budget).
+    fn slot_from_server(
+        server: McpServer,
+        tools: &[McpTool],
+        config: McpServerConfig,
+    ) -> ServerSlot {
         let handle = server.handle();
-        let tools = handle.list_tools().ok()?;
         let disabled: HashSet<&str> = config.disabled_tools.iter().map(String::as_str).collect();
         let tool_count = tools
             .iter()
             .filter(|t| !disabled.contains(t.name.as_str()))
             .count();
-        Some(ServerSlot {
+        ServerSlot {
             handle,
             server,
             config,
             tool_count,
-        })
+        }
     }
 
     /// Shut down all MCP servers, joining each dispatcher with a bounded wait.
@@ -1350,6 +1391,22 @@ impl Drop for McpManager {
     fn drop(&mut self) {
         self.shutdown_all();
     }
+}
+
+/// Connect to a server and list its tools, both on the caller's worker thread.
+///
+/// Bundling the initial listing into the connect worker lets `join_with_budget`
+/// bound connect **and** discovery together: a server that handshakes quickly
+/// but never answers `tools/list` is dropped at the caller's budget rather than
+/// stalling it for the full per-server request timeout.
+#[cfg(feature = "mcp")]
+fn connect_and_list(
+    config: &McpServerConfig,
+    list_changes: Option<crossbeam_channel::Sender<McpListChange>>,
+) -> Result<(McpServer, Vec<McpTool>), choreo_mcp::McpError> {
+    let server = McpServer::connect_with_list_changes(config, list_changes)?;
+    let tools = server.handle().list_tools()?;
+    Ok((server, tools))
 }
 
 /// Join a thread, giving up after `timeout` and returning `None` (leaving it

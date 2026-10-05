@@ -289,6 +289,60 @@ fn mcp_list_change_is_forwarded_and_reregisters() {
 
 #[test]
 #[ignore = "integration"]
+fn mcp_startup_budget_bounds_slow_tool_listing() {
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(120));
+        eprintln!("mcp_integration: test exceeded 120s; aborting");
+        std::process::abort();
+    });
+
+    // The `slow-list` fixture handshakes promptly but never answers
+    // `tools/list`. The server's own request timeout is 60 s, so a caller that
+    // listed on its own thread (the pre-fix behaviour) would block for that
+    // long; the startup budget must bound connect AND discovery together.
+    let config_dir = tempfile::tempdir().expect("tempdir for config");
+    let config_path = config_dir.path().join("choreographr");
+    std::fs::create_dir_all(&config_path).expect("create config dir");
+    let mcp_config = serde_json::json!({
+        "mcpServers": {
+            "wedged": {
+                "command": FIXTURE_BIN,
+                "args": ["slow-list"],
+                "enabled": true,
+                "timeout": 60
+            }
+        }
+    });
+    std::fs::write(
+        config_path.join("mcp.json"),
+        serde_json::to_string_pretty(&mcp_config).expect("serialize config"),
+    )
+    .expect("write mcp.json");
+    choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
+
+    let mut registry = choreo_daemon::tools::ToolRegistry::new();
+    let start = std::time::Instant::now();
+    let manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
+    let elapsed = start.elapsed();
+
+    // The startup budget is 2 s; the request timeout is 60 s. Bound well below
+    // the latter so the assertion proves the budget did the work.
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "from_config must bound slow discovery by the startup budget, took {elapsed:?}"
+    );
+    assert_eq!(
+        manager.server_count(),
+        0,
+        "a server that never answers tools/list must be skipped, not registered"
+    );
+
+    drop(manager);
+    choreo_daemon::mcp::config::set_test_config_root(None);
+}
+
+#[test]
+#[ignore = "integration"]
 fn mcp_shutdown_all_is_bounded_with_a_stubborn_server() {
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_secs(120));

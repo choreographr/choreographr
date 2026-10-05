@@ -27,6 +27,9 @@
 //   `tools.listChanged` and, on `subscriptions/listen`, acknowledges the
 //   subscription and immediately emits a `notifications/tools/list_changed`
 //   (the subscription-to-daemon forwarding test).
+// - `slow-list` — handshakes promptly but never answers `tools/list` (it parks
+//   forever), so a caller's connect-and-discovery budget — not the per-server
+//   request timeout — is what bounds it.
 //
 // Tools:
 // - `slow` answers from a background thread so the read loop can observe a
@@ -153,6 +156,15 @@ fn main() {
                 }
             }
             "tools/list" => {
+                // A server that is alive but wedged on discovery: the handshake
+                // succeeded, yet the listing never arrives. Parking here (rather
+                // than responding) exercises the caller's connect-and-discovery
+                // budget; the client's process-group kill ends the child.
+                if scenario == "slow-list" {
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(3600));
+                    }
+                }
                 respond_result(
                     &mut out,
                     &id,
