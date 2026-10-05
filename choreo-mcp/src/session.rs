@@ -551,17 +551,15 @@ impl RestartPolicy {
     fn new(max_attempts: u32) -> Self {
         Self {
             max_attempts,
-            base_backoff: Duration::from_millis(500),
+            base_backoff: crate::retry::BASE_BACKOFF,
             failures: 0,
         }
     }
 
-    /// Backoff for the current failure count: `base * 2^(n-1)`, capped at 60 s.
+    /// Backoff for the current failure count: the shared exponential schedule
+    /// (`base · 2^(n-1)`) capped at [`crate::retry::MAX_BACKOFF`].
     fn backoff(&self) -> Duration {
-        let shift = self.failures.saturating_sub(1).min(7);
-        self.base_backoff
-            .saturating_mul(1u32 << shift)
-            .min(Duration::from_mins(1))
+        crate::retry::backoff(self.failures, self.base_backoff, crate::retry::MAX_BACKOFF)
     }
 
     /// Rebuild the engine after a transport failure, subject to the budget.

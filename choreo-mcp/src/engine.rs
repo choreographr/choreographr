@@ -502,7 +502,7 @@ async fn connect_http(
             Ok(running) => return Ok(running),
             Err(error) => {
                 if attempt < crate::retry::MAX_ATTEMPTS && retryable_connect(&error) {
-                    let backoff = crate::retry::backoff(attempt);
+                    let backoff = crate::retry::connect_backoff(attempt);
                     tracing::warn!(
                         url,
                         attempt,
@@ -624,10 +624,13 @@ impl SseRetryPolicy for BoundedSseRetry {
         if current_times >= self.max_attempts {
             return None;
         }
-        // `current_times` is bounded by `max_attempts` in practice, but clamp
-        // the shift so a hostile value cannot overflow the left shift.
-        let shift = u32::try_from(current_times).unwrap_or(u32::MAX).min(7);
-        Some(self.base.saturating_mul(1u32 << shift).min(self.ceiling))
+        // rmcp passes a 0-based attempt count; the shared formula is 1-based.
+        // A hostile value cannot overflow: `saturating_add` pins it and the
+        // shared shift clamp bounds the left shift.
+        let attempt = u32::try_from(current_times)
+            .unwrap_or(u32::MAX)
+            .saturating_add(1);
+        Some(crate::retry::backoff(attempt, self.base, self.ceiling))
     }
 }
 
@@ -652,15 +655,24 @@ fn retryable_connect(error: &ClientInitializeError) -> bool {
 
 /// Recover the HTTP status from a failed connect, if it carries one.
 ///
-/// Walks the transport error's source chain for rmcp's `StreamableHttpError`: a
-/// bare `reqwest::Error` carries a status directly, whereas a rejected POST
-/// surfaces the status inside rmcp's `"HTTP <status>: <body>"` message.
+/// Starts the shared source-chain walk at the transport error's root: a bare
+/// `reqwest::Error` carries a status directly, whereas a rejected POST surfaces
+/// the status inside rmcp's `"HTTP <status>: <body>"` message.
 fn connect_error_status(error: &ClientInitializeError) -> Option<u16> {
     let root: &dyn std::error::Error = match error {
         ClientInitializeError::TransportError { error, .. } => error.error.as_ref(),
         _ => return None,
     };
-    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(root);
+    status_from_chain(root)
+}
+
+/// Walk `root`'s `source()` chain looking for rmcp's `StreamableHttpError`,
+/// returning the HTTP status it carries, if any.
+///
+/// The one chain walk shared by the connect-time ([`connect_error_status`]) and
+/// service-time ([`service_error_status`]) status recovery.
+fn status_from_chain(root: &(dyn std::error::Error + 'static)) -> Option<u16> {
+    let mut current = Some(root);
     while let Some(err) = current {
         if let Some(http) = err.downcast_ref::<StreamableHttpError<reqwest::Error>>()
             && let Some(status) = http_error_status(http)
@@ -692,6 +704,13 @@ fn http_error_status(error: &StreamableHttpError<reqwest::Error>) -> Option<u16>
 /// A rejected POST that is not a JSON-RPC error is surfaced as
 /// `"HTTP <status>: <body>"`, where `<status>` is `reqwest::StatusCode`'s
 /// Display (`"503 Service Unavailable"`), so the code is the first token.
+///
+/// This depends on the exact message format of rmcp's
+/// `UnexpectedServerResponse` variant, so it is a BEST-EFFORT fallback only:
+/// whenever rmcp exposes the status structurally (a bare `reqwest::Error`, or
+/// its dedicated `AuthRequired`/`InsufficientScope` variants) the structural
+/// path in [`http_error_status`] is preferred, and this parser runs only for
+/// the one rejection shape rmcp does not model structurally.
 fn parse_http_status(message: &str) -> Option<u16> {
     message
         .strip_prefix("HTTP ")?
@@ -1134,16 +1153,7 @@ fn service_error_status(error: &ServiceError) -> Option<u16> {
         ServiceError::TransportSend(dynamic) => dynamic.error.as_ref(),
         _ => error,
     };
-    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(root);
-    while let Some(err) = current {
-        if let Some(http) = err.downcast_ref::<StreamableHttpError<reqwest::Error>>()
-            && let Some(status) = http_error_status(http)
-        {
-            return Some(status);
-        }
-        current = err.source();
-    }
-    None
+    status_from_chain(root)
 }
 
 /// The actionable guidance attached to an authorization-required error.

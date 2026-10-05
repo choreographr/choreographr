@@ -24,14 +24,23 @@ pub(crate) const BASE_BACKOFF: Duration = Duration::from_millis(500);
 /// Ceiling for the exponential backoff.
 pub(crate) const MAX_BACKOFF: Duration = Duration::from_mins(1);
 
-/// Backoff before retry number `attempt` (1-based): `base · 2^(attempt-1)`,
-/// capped at [`MAX_BACKOFF`].
+/// Exponential backoff before retry number `attempt` (1-based):
+/// `base · 2^(attempt-1)`, capped at `ceiling`.
 ///
-/// The shift is clamped so a hostile attempt count cannot overflow the left
-/// shift; the final `.min` makes the clamp exact.
-pub(crate) fn backoff(attempt: u32) -> Duration {
+/// The one shared formula behind every bounded-retry path in the crate (the
+/// connect probe, the dispatcher's restart policy, and the SSE stream
+/// reconnect). The shift is clamped so a hostile attempt count cannot overflow
+/// the left shift; the final `.min` makes the clamp exact.
+pub(crate) fn backoff(attempt: u32, base: Duration, ceiling: Duration) -> Duration {
     let shift = attempt.saturating_sub(1).min(7);
-    BASE_BACKOFF.saturating_mul(1u32 << shift).min(MAX_BACKOFF)
+    base.saturating_mul(1u32 << shift).min(ceiling)
+}
+
+/// Backoff before retry number `attempt` (1-based) under the fixed-default
+/// policy (base [`BASE_BACKOFF`], ceiling [`MAX_BACKOFF`]) the connect probe
+/// uses.
+pub(crate) fn connect_backoff(attempt: u32) -> Duration {
+    backoff(attempt, BASE_BACKOFF, MAX_BACKOFF)
 }
 
 /// Whether an HTTP status is worth retrying.
@@ -48,13 +57,26 @@ mod tests {
 
     #[test]
     fn backoff_grows_exponentially_then_caps() {
-        assert_eq!(backoff(1), Duration::from_millis(500));
-        assert_eq!(backoff(2), Duration::from_secs(1));
-        assert_eq!(backoff(3), Duration::from_secs(2));
-        assert_eq!(backoff(4), Duration::from_secs(4));
+        // The fixed-default connect policy is the general formula with the
+        // standard base and ceiling.
+        assert_eq!(connect_backoff(1), Duration::from_millis(500));
+        assert_eq!(connect_backoff(2), Duration::from_secs(1));
+        assert_eq!(connect_backoff(3), Duration::from_secs(2));
+        assert_eq!(connect_backoff(4), Duration::from_secs(4));
         // The clamp keeps an absurd attempt count from overflowing and pins to
         // the ceiling.
-        assert_eq!(backoff(64), MAX_BACKOFF);
+        assert_eq!(connect_backoff(64), MAX_BACKOFF);
+    }
+
+    #[test]
+    fn backoff_honours_a_custom_base_and_ceiling() {
+        // A caller-supplied policy scales from its own base and never exceeds
+        // its own ceiling.
+        let base = Duration::from_millis(100);
+        let ceiling = Duration::from_secs(1);
+        assert_eq!(backoff(1, base, ceiling), Duration::from_millis(100));
+        assert_eq!(backoff(2, base, ceiling), Duration::from_millis(200));
+        assert_eq!(backoff(64, base, ceiling), ceiling);
     }
 
     #[test]
