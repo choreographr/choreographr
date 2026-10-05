@@ -30,6 +30,9 @@
 // - `slow-list` — handshakes promptly but never answers `tools/list` (it parks
 //   forever), so a caller's connect-and-discovery budget — not the per-server
 //   request timeout — is what bounds it.
+// - `slow-list-after-first` — answers the FIRST `tools/list` promptly, then
+//   parks forever on every later one, so a catalogue refresh must bound its
+//   re-listing (and keep the server's previously-listed tools).
 //
 // Tools:
 // - `slow` answers from a background thread so the read loop can observe a
@@ -59,6 +62,9 @@ fn main() {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let mut line = String::new();
+    // How many `tools/list` requests have arrived; the `*-after-first`
+    // scenarios answer the first and park on the rest.
+    let mut tools_list_count: u32 = 0;
 
     loop {
         line.clear();
@@ -156,11 +162,17 @@ fn main() {
                 }
             }
             "tools/list" => {
+                tools_list_count += 1;
                 // A server that is alive but wedged on discovery: the handshake
                 // succeeded, yet the listing never arrives. Parking here (rather
-                // than responding) exercises the caller's connect-and-discovery
-                // budget; the client's process-group kill ends the child.
-                if scenario == "slow-list" {
+                // than responding) exercises the caller's budget; the client's
+                // process-group kill ends the child. The `*-after-first` variant
+                // answers the first listing so a later catalogue refresh is what
+                // gets bounded.
+                let after_first = scenario.contains("after-first");
+                let wedged =
+                    scenario.contains("slow-list") && (!after_first || tools_list_count > 1);
+                if wedged {
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(3600));
                     }

@@ -116,6 +116,20 @@ const RECONNECT_BUDGET: Duration = Duration::from_secs(10);
 #[cfg(feature = "mcp")]
 const RELOAD_BUDGET: Duration = Duration::from_secs(10);
 
+/// Budget for a synchronous tool-listing sweep the command loop performs when it
+/// refreshes the tool catalogue (a list-changed event, a reload, or a
+/// reconnect) or (re)resolves a session overlay.
+///
+/// Deliberately distinct from, and far shorter than, the per-server request
+/// timeout (60 s by default): these sweeps run on the command-loop thread, so a
+/// single slow server must not freeze every session and client behind it. A
+/// server that misses this deadline is skipped from that refresh with a warning
+/// and keeps its previous registration, rather than stalling the loop. A few
+/// seconds is ample for a healthy server, whose `tools/list` round-trip is
+/// normally milliseconds.
+#[cfg(feature = "mcp")]
+const CATALOGUE_REFRESH_BUDGET: Duration = Duration::from_secs(3);
+
 /// A read-only snapshot of one configured server's state, for the `/mcp`
 /// status surface and `session_inspect`.
 ///
@@ -485,6 +499,11 @@ struct ServerSlot {
     /// How many tools are registered for this server (excluding the resource
     /// catalogue tools).
     tool_count: usize,
+    /// The tools registered by the most recent successful listing. Kept so a
+    /// catalogue-refresh sweep that misses [`CATALOGUE_REFRESH_BUDGET`] can fall
+    /// back to the previous registration instead of dropping the server's tools
+    /// from the rebuilt catalogue.
+    tools: Vec<McpTool>,
 }
 
 /// A pooled, ref-counted project-shared server: one connection shared by every
@@ -640,21 +659,34 @@ impl McpManager {
     }
 
     /// Re-register every daemon-tier shared server's tools into `registry`.
-    pub fn register_all(&self, registry: &mut ToolRegistry) {
+    ///
+    /// Each server is listed with the short [`CATALOGUE_REFRESH_BUDGET`]
+    /// deadline, not the per-server request timeout: this sweep runs on the
+    /// command loop, and one slow server must not freeze every session. A server
+    /// that misses the deadline keeps its previously-listed tool set (so its
+    /// group does not blink out of the catalogue) and is re-listed on the next
+    /// refresh.
+    pub fn register_all(&mut self, registry: &mut ToolRegistry) {
         let mut used: HashSet<String> = HashSet::new();
-        for slug in &self.order {
-            let Some(slot) = self.servers.get(slug) else {
+        for slug in self.order.clone() {
+            let Some(slot) = self.servers.get_mut(&slug) else {
                 continue;
             };
-            let tools = match slot.handle.list_tools() {
-                Ok(tools) => tools,
+            let tools = match slot
+                .handle
+                .list_tools_with_deadline(CATALOGUE_REFRESH_BUDGET)
+            {
+                Ok(tools) => {
+                    slot.tools.clone_from(&tools);
+                    tools
+                }
                 Err(e) => {
-                    warn!(server = %slug, error = %e, "failed to list MCP tools during registry refresh");
-                    continue;
+                    warn!(server = %slug, error = %e, "MCP tool listing missed the catalogue-refresh budget; keeping the previous tool set");
+                    slot.tools.clone()
                 }
             };
             Self::register_server_tools(
-                slug,
+                &slug,
                 &slot.handle,
                 tools,
                 &slot.config.disabled_tools,
@@ -681,7 +713,7 @@ impl McpManager {
         let tool_count = Self::register_server_tools(
             slug,
             &handle,
-            tools,
+            tools.clone(),
             &config.disabled_tools,
             used,
             registry,
@@ -693,6 +725,7 @@ impl McpManager {
                 server,
                 config,
                 tool_count,
+                tools,
             },
         );
         manager.failures.remove(slug);
@@ -777,7 +810,7 @@ impl McpManager {
         out: &mut Vec<Box<dyn ToolDyn>>,
         groups: &mut HashSet<String>,
     ) -> Result<usize, choreo_mcp::McpError> {
-        let tools = handle.list_tools()?;
+        let tools = handle.list_tools_with_deadline(CATALOGUE_REFRESH_BUDGET)?;
         let group = choreo_mcp::group_name(slug);
         groups.insert(group.clone());
         let disabled: HashSet<&str> = disabled.iter().map(String::as_str).collect();
@@ -1319,6 +1352,7 @@ impl McpManager {
             server,
             config,
             tool_count,
+            tools: tools.to_vec(),
         }
     }
 
@@ -1450,7 +1484,7 @@ mod imp {
         }
 
         /// Stub: no server has any tools to (re-)register.
-        pub fn register_all(&self, _registry: &mut ToolRegistry) {}
+        pub fn register_all(&mut self, _registry: &mut ToolRegistry) {}
 
         /// Stub: there are no servers to shut down.
         pub fn shutdown_all(&mut self) {}

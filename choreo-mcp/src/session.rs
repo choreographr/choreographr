@@ -178,9 +178,30 @@ impl McpServerHandle {
     /// Returns [`McpError::NotConnected`] when the dispatcher has exited, and
     /// the handshake/transport/protocol errors surfaced by the engine.
     pub fn list_tools(&self) -> Result<Vec<McpTool>, McpError> {
+        self.list_tools_inner(None)
+    }
+
+    /// Like [`list_tools`](Self::list_tools), but bounding the listing by
+    /// `timeout` instead of the server's configured request timeout.
+    ///
+    /// Used by the daemon's catalogue-refresh sweeps, where one slow server
+    /// must not stall the command loop for the full per-server timeout. The
+    /// deadline is applied INSIDE the dispatcher (via the engine's listing
+    /// timeout), so a server that never answers `tools/list` is cancelled
+    /// rather than left busy.
+    ///
+    /// # Errors
+    ///
+    /// As [`list_tools`](Self::list_tools), plus [`McpError::Timeout`] when the
+    /// listing outlives `timeout`.
+    pub fn list_tools_with_deadline(&self, timeout: Duration) -> Result<Vec<McpTool>, McpError> {
+        self.list_tools_inner(Some(timeout))
+    }
+
+    fn list_tools_inner(&self, timeout: Option<Duration>) -> Result<Vec<McpTool>, McpError> {
         let (tx, rx) = crossbeam_channel::bounded(1);
         self.cmd_tx
-            .send(McpCommand::ListTools(tx))
+            .send(McpCommand::ListTools { timeout, reply: tx })
             .map_err(|_| McpError::NotConnected)?;
         rx.recv().map_err(|_| McpError::NotConnected)?
     }
@@ -347,9 +368,12 @@ pub(crate) struct EngineCall {
 /// so the dispatcher can `Arc`-share one engine across concurrently spawned
 /// call tasks.
 pub(crate) trait McpEngine: Send + Sync + 'static {
-    /// List every advertised tool (engine follows pagination, bounded by the
-    /// engine's own configured timeout).
-    fn list_tools(&self) -> BoxFuture<'_, Result<Vec<McpTool>, McpError>>;
+    /// List every advertised tool (engine follows pagination, bounded by
+    /// `timeout` when supplied, else the engine's own configured timeout).
+    fn list_tools(
+        &self,
+        timeout: Option<Duration>,
+    ) -> BoxFuture<'_, Result<Vec<McpTool>, McpError>>;
 
     /// Call one tool, honouring the call's deadline and cancellation token.
     fn call_tool(&self, call: EngineCall) -> BoxFuture<'_, Result<CallToolResult, McpError>>;
@@ -378,8 +402,13 @@ pub(crate) type EngineFactory = Box<dyn Fn() -> Result<Arc<dyn McpEngine>, McpEr
 
 /// Commands sent to a server's dispatcher thread.
 pub(crate) enum McpCommand {
-    /// List tools; the reply carries the result.
-    ListTools(Sender<Result<Vec<McpTool>, McpError>>),
+    /// List tools; the reply carries the result. `timeout` overrides the
+    /// engine's configured listing timeout for this request (a shorter
+    /// catalogue-refresh deadline), or is `None` to use the default.
+    ListTools {
+        timeout: Option<Duration>,
+        reply: Sender<Result<Vec<McpTool>, McpError>>,
+    },
     /// Call a tool; the reply carries the result.
     Call {
         session_id: u64,
@@ -790,13 +819,13 @@ fn handle_command(
     next_call_id: &mut u64,
 ) -> bool {
     match cmd {
-        McpCommand::ListTools(reply) => {
-            let mut result = rt.block_on(engine.list_tools());
+        McpCommand::ListTools { timeout, reply } => {
+            let mut result = rt.block_on(engine.list_tools(timeout));
             if let Err(e) = &result
                 && is_transport_error(e)
             {
                 policy.on_transport_failure(factory, engine);
-                result = rt.block_on(engine.list_tools());
+                result = rt.block_on(engine.list_tools(timeout));
             }
             let _ = reply.send(result);
         }
@@ -970,6 +999,9 @@ mod tests {
         tools: Vec<McpTool>,
         result: CallToolResult,
         calls: Mutex<Vec<String>>,
+        /// The `timeout` supplied to each `list_tools` call, in order (so a test
+        /// can assert the deadline plumbed through the dispatcher).
+        list_timeouts: Mutex<Vec<Option<Duration>>>,
         /// Signalled the instant a call reaches the mock, so a test can cancel
         /// deterministically after the call is registered (never by sleeping).
         started_tx: Sender<()>,
@@ -985,6 +1017,7 @@ mod tests {
                 tools,
                 result,
                 calls: Mutex::new(Vec::new()),
+                list_timeouts: Mutex::new(Vec::new()),
                 started_tx,
                 blocks: false,
             }
@@ -995,6 +1028,7 @@ mod tests {
                 tools,
                 result,
                 calls: Mutex::new(Vec::new()),
+                list_timeouts: Mutex::new(Vec::new()),
                 started_tx,
                 blocks: true,
             }
@@ -1005,10 +1039,23 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len()
         }
+        fn list_timeouts(&self) -> Vec<Option<Duration>> {
+            self.list_timeouts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
     }
 
     impl McpEngine for MockEngine {
-        fn list_tools(&self) -> BoxFuture<'_, Result<Vec<McpTool>, McpError>> {
+        fn list_tools(
+            &self,
+            timeout: Option<Duration>,
+        ) -> BoxFuture<'_, Result<Vec<McpTool>, McpError>> {
+            self.list_timeouts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(timeout);
             let tools = self.tools.clone();
             Box::pin(async move { Ok(tools) })
         }
@@ -1128,10 +1175,30 @@ mod tests {
     #[test]
     fn list_tools_round_trips() {
         let engine = Arc::new(MockEngine::new(vec![tool("echo")], ok_result()));
-        let (handle, join) = spawn(engine);
+        let (handle, join) = spawn(Arc::clone(&engine));
         let tools = handle.list_tools().expect("list tools");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "echo");
+        let _ = handle.cmd_tx.send(McpCommand::Shutdown);
+        join.join().expect("dispatcher joins");
+    }
+
+    #[test]
+    fn list_tools_with_deadline_forwards_the_timeout() {
+        // The catalogue-refresh path supplies a short deadline; the handle must
+        // plumb it through to the engine's listing (a bare `list_tools` uses the
+        // server's configured default, i.e. `None`).
+        let engine = Arc::new(MockEngine::new(vec![], ok_result()));
+        let (handle, join) = spawn(Arc::clone(&engine));
+        handle
+            .list_tools_with_deadline(Duration::from_secs(3))
+            .expect("bounded list");
+        handle.list_tools().expect("default list");
+        assert_eq!(
+            engine.list_timeouts(),
+            vec![Some(Duration::from_secs(3)), None],
+            "the deadline must reach the engine; a plain listing must not"
+        );
         let _ = handle.cmd_tx.send(McpCommand::Shutdown);
         join.join().expect("dispatcher joins");
     }

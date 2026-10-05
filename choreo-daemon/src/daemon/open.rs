@@ -63,7 +63,7 @@ pub struct OpenOptions {
 pub(crate) fn build_tool_registry(
     policy: ToolPolicy,
     bridge: Option<&Arc<dyn IosToolBridge>>,
-    mcp: &McpManager,
+    mcp: &mut McpManager,
 ) -> Arc<ToolRegistry> {
     let mut registry = ToolRegistry::new_for_policy(policy);
     // The bridge's presence is the gate for the protected `ios` group (not a

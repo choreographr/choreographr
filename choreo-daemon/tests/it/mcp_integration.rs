@@ -343,6 +343,55 @@ fn mcp_startup_budget_bounds_slow_tool_listing() {
 
 #[test]
 #[ignore = "integration"]
+fn mcp_catalogue_refresh_is_bounded_by_the_refresh_deadline() {
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(120));
+        eprintln!("mcp_integration: test exceeded 120s; aborting");
+        std::process::abort();
+    });
+
+    // The fixture answers the FIRST `tools/list` (so the server connects and
+    // registers normally) then parks on every later one. A catalogue refresh
+    // re-lists it on the command loop, so the short catalogue-refresh deadline
+    // must bound that re-listing rather than the server's 60 s request timeout.
+    let (config_dir, slug) = write_single_server_config("refresh", "modern-slow-list-after-first")
+        .expect("write config");
+    choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
+
+    let mut registry = choreo_daemon::tools::ToolRegistry::new();
+    let mut manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
+    assert_eq!(
+        manager.server_count(),
+        1,
+        "the server connects and lists once at startup"
+    );
+
+    let mut rebuilt = choreo_daemon::tools::ToolRegistry::new();
+    let start = std::time::Instant::now();
+    manager.register_all(&mut rebuilt);
+    let elapsed = start.elapsed();
+
+    // The refresh deadline is 3 s; the request timeout here is 10 s. Bound well
+    // below the latter so the assertion proves the deadline did the work.
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "register_all must bound a slow listing by the refresh deadline, took {elapsed:?}"
+    );
+    assert!(
+        rebuilt
+            .group_names()
+            .iter()
+            .any(|g| g == &format!("mcp/{slug}")),
+        "a server that misses the refresh deadline keeps its previous tools: {:?}",
+        rebuilt.group_names()
+    );
+
+    drop(manager);
+    choreo_daemon::mcp::config::set_test_config_root(None);
+}
+
+#[test]
+#[ignore = "integration"]
 fn mcp_shutdown_all_is_bounded_with_a_stubborn_server() {
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_secs(120));

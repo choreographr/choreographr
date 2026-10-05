@@ -806,9 +806,14 @@ fn server_has_resources(running: &RunningService<RoleClient, ServerHandler>) -> 
 }
 
 impl McpEngine for RmcpEngine {
-    fn list_tools(&self) -> BoxFuture<'_, Result<Vec<McpTool>, McpError>> {
+    fn list_tools(
+        &self,
+        timeout: Option<Duration>,
+    ) -> BoxFuture<'_, Result<Vec<McpTool>, McpError>> {
         let peer = self.peer.clone();
-        let timeout = self.timeout;
+        // A caller-supplied deadline (the daemon's catalogue-refresh budget)
+        // overrides the server's configured listing timeout for this request.
+        let timeout = timeout.unwrap_or(self.timeout);
         let slug = self.slug.clone();
         Box::pin(async move {
             // `list_all_tools` follows `nextCursor` to completion; the total is

@@ -2154,8 +2154,10 @@ impl DaemonState {
     /// using it safely; the swap is atomic and never tears a live load.
     ///
     /// The rebuild re-lists every connected server (`McpManager::register_all`),
-    /// which is a bounded blocking round-trip per server; it runs here because
-    /// the catalogue has a single writer, and a list change is a rare event.
+    /// each bounded by a short catalogue-refresh deadline (not the per-server
+    /// request timeout): it runs on the command loop because the catalogue has a
+    /// single writer, and a single slow server must not freeze every session. A
+    /// server that misses the deadline keeps its previous registration.
     fn handle_mcp_list_changed(&mut self, slug: &str) {
         info!(server = %slug, "MCP list changed; rebuilding the tool catalogue");
         self.rebuild_tool_catalogue();
@@ -2174,7 +2176,7 @@ impl DaemonState {
         let registry = open::build_tool_registry(
             self.tool_policy,
             self.platform_tool_bridge.as_ref(),
-            &self.mcp_manager,
+            &mut self.mcp_manager,
         );
         self.tool_registry.store(registry);
     }
