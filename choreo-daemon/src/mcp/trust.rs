@@ -114,10 +114,18 @@ impl McpTrustStore {
     /// Returns a message when the trust file cannot be written.
     pub fn trust(&mut self, root: &Path) -> Result<PathBuf, String> {
         let canonical = canonicalize_root(root);
-        if self.trusted.insert(canonical.clone()) {
-            self.save()?;
-            tracing::info!(root = %canonical.display(), "trusted project MCP root");
+        if self.trusted.contains(&canonical) {
+            return Ok(canonical);
         }
+        // Persist the PROSPECTIVE set first, committing to memory only once the
+        // write succeeds: a failed write must leave the store exactly as it
+        // was, never reporting a root as trusted that `trust.toml` does not
+        // actually record.
+        let mut prospective = self.trusted.clone();
+        prospective.insert(canonical.clone());
+        self.write_trust(&prospective)?;
+        self.trusted = prospective;
+        tracing::info!(root = %canonical.display(), "trusted project MCP root");
         Ok(canonical)
     }
 
@@ -129,20 +137,29 @@ impl McpTrustStore {
     /// Returns a message when the trust file cannot be written.
     pub fn untrust(&mut self, root: &Path) -> Result<PathBuf, String> {
         let canonical = canonicalize_root(root);
-        if self.trusted.remove(&canonical) {
-            self.save()?;
-            tracing::info!(root = %canonical.display(), "revoked trust for project MCP root");
+        if !self.trusted.contains(&canonical) {
+            return Ok(canonical);
         }
+        // Same write-first discipline as `trust`: revoke in memory only after
+        // the prospective set is durably on disk.
+        let mut prospective = self.trusted.clone();
+        prospective.remove(&canonical);
+        self.write_trust(&prospective)?;
+        self.trusted = prospective;
+        tracing::info!(root = %canonical.display(), "revoked trust for project MCP root");
         Ok(canonical)
     }
 
-    /// Write the trust file atomically with owner-only permissions (dir 0700,
-    /// file 0600). The write goes to a sibling temp file that is then renamed
-    /// over the target, so a reader never sees a partial file.
-    fn save(&self) -> Result<(), String> {
+    /// Write `trusted` to the trust file atomically with owner-only
+    /// permissions (dir 0700, file 0600). The write goes to a sibling temp
+    /// file that is then renamed over the target, so a reader never sees a
+    /// partial file.
+    ///
+    /// The set is passed in rather than read from `self` so callers can
+    /// persist a prospective set and only then adopt it in memory.
+    fn write_trust(&self, trusted: &BTreeSet<PathBuf>) -> Result<(), String> {
         let file = TrustFile {
-            trusted: self
-                .trusted
+            trusted: trusted
                 .iter()
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect(),
@@ -334,6 +351,31 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut store = McpTrustStore::load(dir.path().join("trust.toml"));
         store.untrust(Path::new("/never/trusted")).expect("noop");
+        assert_eq!(store.list(), [] as [PathBuf; 0]);
+    }
+
+    #[test]
+    fn failed_write_leaves_trust_set_unchanged() {
+        // Point the trust file at `<regular-file>/trust.toml`: the parent is an
+        // existing regular FILE, so `write_private_atomic`'s
+        // `create_dir_all(parent)` fails deterministically (no timing needed).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let not_a_dir = dir.path().join("not-a-dir");
+        std::fs::write(&not_a_dir, b"i am a file").unwrap();
+        let mut store = McpTrustStore::load(not_a_dir.join("trust.toml"));
+
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let result = store.trust(&root);
+        assert!(result.is_err(), "write into a file-as-parent must fail");
+        // The failed persist must not have mutated the in-memory set.
+        assert!(!store.is_trusted(&root));
+        assert_eq!(store.list(), [] as [PathBuf; 0]);
+
+        // Symmetric case: untrusting an absent root is a no-op even when the
+        // backing path is unwritable.
+        store.untrust(&root).expect("absent root is a no-op");
         assert_eq!(store.list(), [] as [PathBuf; 0]);
     }
 }
