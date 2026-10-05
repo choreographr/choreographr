@@ -13,11 +13,47 @@
 use crate::error::McpError;
 use crate::session::cancel::CancelToken;
 use crate::session::gate::{CallGate, QueuedCall};
-use crate::session::restart::{Reconnector, RestartPolicy, is_transport_error_ref};
+use crate::session::restart::{Reconnector, RestartPolicy, is_transport_error};
 use crate::session::{EngineCall, EngineFactory, McpCommand, McpEngine};
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+
+/// How a completed operation's result bears on the connection's health.
+///
+/// The dispatcher uses this to decide whether a notice should reset the restart
+/// budget. Only an exchange that actually reached the server — or whose failure
+/// is a settled answer a rebuild cannot change — proves the connection works;
+/// a deadline or a client-side cancel says nothing either way.
+pub(super) enum DoneOutcome {
+    /// The exchange reached the server or is a settled answer (an `Ok`, or a
+    /// JSON-RPC / protocol / auth-required error), so it proves the connection
+    /// is alive — it resets the restart budget.
+    Completed,
+    /// A transport-level failure: the reconnect trigger.
+    TransportFailed,
+    /// A non-transport failure that does NOT prove health (a deadline or a
+    /// client-side cancel).
+    Inconclusive,
+}
+
+/// Classify a completed operation's result into a [`DoneOutcome`].
+///
+/// A transport error is checked first, so the transport variants can never be
+/// mistaken for a settled `Err(_)`. [`McpError::Timeout`] and
+/// [`McpError::Cancelled`] are the only non-transport failures that leave the
+/// connection's health unproven: a deadline can fire while the transport is
+/// perfectly usable, and a client-side cancel never reached a verdict. Every
+/// other `Err` (a JSON-RPC error, a protocol error, a rejected auth) is a
+/// settled answer the live connection delivered, so it counts as `Completed`.
+pub(super) fn classify_outcome<T>(result: &Result<T, McpError>) -> DoneOutcome {
+    match result {
+        Ok(_) => DoneOutcome::Completed,
+        Err(e) if is_transport_error(e) => DoneOutcome::TransportFailed,
+        Err(McpError::Timeout | McpError::Cancelled) => DoneOutcome::Inconclusive,
+        Err(_) => DoneOutcome::Completed,
+    }
+}
 
 /// Completion notice a spawned task sends back to the dispatcher.
 ///
@@ -28,11 +64,13 @@ pub(super) struct Done {
     /// The in-flight call this notice retires, or `None` for a non-call
     /// operation (a listing or resource read) that holds no gate slot.
     pub(super) call_id: Option<u64>,
-    pub(super) transport_failed: bool,
-    /// The engine the operation ran against. Compared by identity so a failure
+    /// How the operation's result bears on the connection's health; decides
+    /// whether this notice resets the restart budget (see [`apply_completions`]).
+    pub(super) outcome: DoneOutcome,
+    /// The engine the operation ran against. Compared by identity so a notice
     /// that arrives after the engine has already been rebuilt (a straggler from
     /// an incident another notice already handled) frees its slot without
-    /// triggering a redundant reconnect.
+    /// affecting the current engine's budget.
     pub(super) engine: Arc<dyn McpEngine>,
 }
 
@@ -168,12 +206,16 @@ pub(super) fn run_dispatcher(
 /// worker), so `pump_queued` then starts queued calls against the rebuilt
 /// engine once it arrives. A notice whose request ran against an engine since
 /// replaced (compared by identity) only frees its slot — it is a straggler from
-/// an already-handled incident, not a new one.
+/// an already-handled incident, not a new one, and says nothing about the
+/// current engine's health.
 ///
-/// A notice that did NOT fail on the transport proves the connection is usable
-/// again, so it resets the restart budget (`record_success`); the budget is
-/// deliberately not reset by the reconnect itself (only a surviving request
-/// clears it), which bounds a server that reconnects and immediately dies.
+/// A notice from the CURRENT engine that genuinely COMPLETED its exchange (or
+/// whose failure is a settled answer) proves the connection is usable again, so
+/// it resets the restart budget (`record_success`); a notice that timed out or
+/// was cancelled client-side proves nothing, so it is neither a failure nor a
+/// success. The budget is deliberately not reset by the reconnect itself (only
+/// a surviving request clears it), which bounds a server that reconnects and
+/// immediately dies.
 pub(super) fn apply_completions(
     first: Option<Done>,
     done_rx: &Receiver<Done>,
@@ -185,19 +227,21 @@ pub(super) fn apply_completions(
     let mut transport_failed = false;
     for done in first.into_iter().chain(done_rx.try_iter()) {
         // A call notice retires its in-flight slot; a listing notice (`None`)
-        // holds no slot and only reports transport health.
+        // holds no slot and only reports transport health. This runs for EVERY
+        // notice, stragglers included, so their slots are always freed.
         if let Some(call_id) = done.call_id {
             inflight.remove(&call_id);
             gate.complete();
         }
-        if done.transport_failed {
-            // A straggler from an already-replaced engine is ignored, so it
-            // cannot charge the budget for an incident already handled.
-            if Arc::ptr_eq(&done.engine, engine) {
-                transport_failed = true;
-            }
-        } else {
-            reconnector.record_success();
+        // Only a notice from the CURRENT engine can speak to its health; a
+        // straggler from an already-replaced engine is otherwise ignored.
+        if !Arc::ptr_eq(&done.engine, engine) {
+            continue;
+        }
+        match done.outcome {
+            DoneOutcome::TransportFailed => transport_failed = true,
+            DoneOutcome::Completed => reconnector.record_success(),
+            DoneOutcome::Inconclusive => {}
         }
     }
     if transport_failed {
@@ -256,10 +300,10 @@ fn spawn_call(
                 chunk_tx,
             })
             .await;
-        let transport_failed = is_transport_error_ref(&result);
+        let outcome = classify_outcome(&result);
         let _ = done_tx.send(Done {
             call_id: Some(call_id),
-            transport_failed,
+            outcome,
             engine: Arc::clone(&engine),
         });
         let _ = reply.send(result);
@@ -270,11 +314,12 @@ fn spawn_call(
 ///
 /// A listing or resource read holds no call-gate slot, so its [`Done`] carries
 /// `call_id: None`; the dispatcher still folds it into the same coalesced
-/// transport-failure handling (and the success that resets the restart budget).
-fn report_offloaded(done_tx: &Sender<Done>, engine: &Arc<dyn McpEngine>, transport_failed: bool) {
+/// transport-failure handling (and the completed exchange that resets the
+/// restart budget).
+fn report_offloaded(done_tx: &Sender<Done>, engine: &Arc<dyn McpEngine>, outcome: DoneOutcome) {
     let _ = done_tx.send(Done {
         call_id: None,
-        transport_failed,
+        outcome,
         engine: Arc::clone(engine),
     });
 }
@@ -315,7 +360,7 @@ fn handle_command(
             let done_tx = done_tx.clone();
             rt.spawn(async move {
                 let result = engine.list_tools(timeout).await;
-                report_offloaded(&done_tx, &engine, is_transport_error_ref(&result));
+                report_offloaded(&done_tx, &engine, classify_outcome(&result));
                 let _ = reply.send(result);
             });
         }
@@ -356,7 +401,7 @@ fn handle_command(
             let done_tx = done_tx.clone();
             rt.spawn(async move {
                 let result = engine.list_resources().await;
-                report_offloaded(&done_tx, &engine, is_transport_error_ref(&result));
+                report_offloaded(&done_tx, &engine, classify_outcome(&result));
                 let _ = reply.send(result);
             });
         }
@@ -366,7 +411,7 @@ fn handle_command(
             let done_tx = done_tx.clone();
             rt.spawn(async move {
                 let result = engine.read_resource(uri).await;
-                report_offloaded(&done_tx, &engine, is_transport_error_ref(&result));
+                report_offloaded(&done_tx, &engine, classify_outcome(&result));
                 let _ = reply.send(result);
             });
         }

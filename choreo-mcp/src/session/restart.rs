@@ -52,11 +52,12 @@ impl RestartPolicy {
     /// backoff to wait before rebuilding.
     ///
     /// The failure count is NOT reset by a successful rebuild: it counts
-    /// consecutive transport-failure incidents since the last request that
-    /// SUCCEEDED (see [`record_success`](Self::record_success)). A server that
-    /// reconnects and then immediately dies again therefore still exhausts the
-    /// budget and is left alone, rather than being rebuilt forever. `None` means
-    /// the budget is spent (a `warn!` is logged) and no reconnect runs.
+    /// consecutive transport-failure incidents since the last exchange that
+    /// genuinely COMPLETED (see [`record_success`](Self::record_success)). A
+    /// server that reconnects and then immediately dies again therefore still
+    /// exhausts the budget and is left alone, rather than being rebuilt forever.
+    /// `None` means the budget is spent (a `warn!` is logged) and no reconnect
+    /// runs.
     pub(super) fn begin_attempt(&mut self) -> Option<Duration> {
         self.failures = self.failures.saturating_add(1);
         if self.failures > self.max_attempts {
@@ -69,14 +70,17 @@ impl RestartPolicy {
         Some(self.backoff())
     }
 
-    /// Record that a request completed cleanly, resetting the consecutive
+    /// Record that an exchange genuinely completed, resetting the consecutive
     /// transport-failure budget.
     ///
-    /// Called from the dispatcher when a call or listing returns without a
-    /// transport error: a healthy exchange proves the connection is usable, so
-    /// the restart budget starts fresh. This is what bounds a flapping server
-    /// that reconnects but never survives a request — the budget resets only on
-    /// a genuine success, never on the reconnect itself.
+    /// Called from the dispatcher when a call or listing from the CURRENT engine
+    /// reached the server or returned a settled answer (see `DoneOutcome`): the
+    /// connection is proven usable, so the restart budget starts fresh. A
+    /// deadline or a client-side cancel does NOT count — it leaves the
+    /// connection's health unproven — and neither does the reconnect itself.
+    /// This is what bounds a flapping server that reconnects but never survives
+    /// a request: the budget resets only on a genuine completion, never on the
+    /// rebuild.
     pub(super) fn record_success(&mut self) {
         self.failures = 0;
     }
@@ -141,7 +145,7 @@ impl Reconnector {
         &self.rx
     }
 
-    /// Reset the consecutive-failure budget on a clean completion.
+    /// Reset the consecutive-failure budget on a genuinely completed exchange.
     pub(super) fn record_success(&mut self) {
         self.policy.record_success();
     }
@@ -220,10 +224,4 @@ pub(super) fn is_transport_error(error: &McpError) -> bool {
             | McpError::Io(_)
             | McpError::NotConnected
     )
-}
-
-/// `is_transport_error` over a `Result` reference (used by spawned tasks that
-/// report a completion without consuming the result).
-pub(super) fn is_transport_error_ref<T>(result: &Result<T, McpError>) -> bool {
-    result.as_ref().err().is_some_and(is_transport_error)
 }

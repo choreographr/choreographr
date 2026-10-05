@@ -1,5 +1,7 @@
 use crate::session::cancel::CancelToken;
-use crate::session::dispatch::{DispatcherStats, Done, apply_completions, run_dispatcher};
+use crate::session::dispatch::{
+    DispatcherStats, Done, DoneOutcome, apply_completions, classify_outcome, run_dispatcher,
+};
 use crate::session::gate::CallGate;
 use crate::session::restart::{Reconnector, RestartPolicy};
 
@@ -368,7 +370,7 @@ fn batched_transport_failures_reconnect_once() {
         done_tx
             .send(Done {
                 call_id: Some(call_id),
-                transport_failed: true,
+                outcome: DoneOutcome::TransportFailed,
                 engine: Arc::clone(&engine),
             })
             .expect("send done");
@@ -417,7 +419,7 @@ fn straggler_failure_after_reconnect_does_not_reconnect_again() {
     done_tx
         .send(Done {
             call_id: Some(1),
-            transport_failed: true,
+            outcome: DoneOutcome::TransportFailed,
             engine: Arc::clone(&engine),
         })
         .expect("send done");
@@ -438,7 +440,7 @@ fn straggler_failure_after_reconnect_does_not_reconnect_again() {
     done_tx
         .send(Done {
             call_id: Some(2),
-            transport_failed: true,
+            outcome: DoneOutcome::TransportFailed,
             engine: Arc::clone(&engine),
         })
         .expect("send done");
@@ -492,7 +494,7 @@ fn restart_budget_is_not_reset_by_a_reconnect_alone() {
     done_tx
         .send(Done {
             call_id: Some(1),
-            transport_failed: true,
+            outcome: DoneOutcome::TransportFailed,
             engine: Arc::clone(&current),
         })
         .expect("send done");
@@ -514,7 +516,7 @@ fn restart_budget_is_not_reset_by_a_reconnect_alone() {
     done_tx
         .send(Done {
             call_id: Some(2),
-            transport_failed: true,
+            outcome: DoneOutcome::TransportFailed,
             engine: Arc::clone(&current),
         })
         .expect("send done");
@@ -558,13 +560,13 @@ fn clean_completion_resets_the_restart_budget() {
     let mut inflight = HashMap::new();
     let (done_tx, done_rx) = crossbeam_channel::unbounded();
 
-    // A clean completion (db not transport-failed) resets the budget...
+    // A clean completion (a genuinely completed exchange) resets the budget...
     assert!(gate.admit());
     inflight.insert(1, (CancelToken::new(), 7));
     done_tx
         .send(Done {
             call_id: Some(1),
-            transport_failed: false,
+            outcome: DoneOutcome::Completed,
             engine: Arc::clone(&current),
         })
         .expect("send done");
@@ -588,7 +590,7 @@ fn clean_completion_resets_the_restart_budget() {
     done_tx
         .send(Done {
             call_id: Some(2),
-            transport_failed: true,
+            outcome: DoneOutcome::TransportFailed,
             engine: Arc::clone(&current),
         })
         .expect("send done");
@@ -603,6 +605,148 @@ fn clean_completion_resets_the_restart_budget() {
     assert!(reconnector.is_in_flight());
     await_reconnect(&mut reconnector, &mut current);
     assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn timeout_completion_does_not_reset_the_restart_budget() {
+    // A deadline does NOT prove the connection is healthy: it can fire while the
+    // transport is perfectly usable, so a timeout completion must leave the
+    // consecutive-failure count untouched rather than resetting it.
+    let engine: Arc<dyn McpEngine> = Arc::new(MockEngine::new(vec![], ok_result()));
+    let current = Arc::clone(&engine);
+    let factory = counting_factory(Arc::new(AtomicUsize::new(0)));
+    // Seed a non-zero failure count directly so a spurious reset is observable.
+    let mut reconnector = Reconnector::new(
+        factory,
+        RestartPolicy {
+            max_attempts: 5,
+            base_backoff: Duration::ZERO,
+            failures: 2,
+        },
+    );
+    let mut gate = CallGate::new(4);
+    let mut inflight = HashMap::new();
+    let (done_tx, done_rx) = crossbeam_channel::unbounded();
+
+    assert!(gate.admit());
+    inflight.insert(1, (CancelToken::new(), 7));
+    done_tx
+        .send(Done {
+            call_id: Some(1),
+            outcome: classify_outcome(&Err::<(), _>(McpError::Timeout)),
+            engine: Arc::clone(&current),
+        })
+        .expect("send done");
+    apply_completions(
+        None,
+        &done_rx,
+        &mut inflight,
+        &mut gate,
+        &mut reconnector,
+        &current,
+    );
+
+    assert!(
+        inflight.is_empty(),
+        "the timed-out call still frees its slot"
+    );
+    assert_eq!(
+        reconnector.failures(),
+        2,
+        "a timeout does not prove health and must not reset the budget"
+    );
+}
+
+#[test]
+fn cancelled_completion_does_not_reset_the_restart_budget() {
+    // A client-side cancel never reached a verdict about the connection, so it
+    // must leave the consecutive-failure count untouched.
+    let engine: Arc<dyn McpEngine> = Arc::new(MockEngine::new(vec![], ok_result()));
+    let current = Arc::clone(&engine);
+    let factory = counting_factory(Arc::new(AtomicUsize::new(0)));
+    let mut reconnector = Reconnector::new(
+        factory,
+        RestartPolicy {
+            max_attempts: 5,
+            base_backoff: Duration::ZERO,
+            failures: 2,
+        },
+    );
+    let mut gate = CallGate::new(4);
+    let mut inflight = HashMap::new();
+    let (done_tx, done_rx) = crossbeam_channel::unbounded();
+
+    assert!(gate.admit());
+    inflight.insert(1, (CancelToken::new(), 7));
+    done_tx
+        .send(Done {
+            call_id: Some(1),
+            outcome: classify_outcome(&Err::<(), _>(McpError::Cancelled)),
+            engine: Arc::clone(&current),
+        })
+        .expect("send done");
+    apply_completions(
+        None,
+        &done_rx,
+        &mut inflight,
+        &mut gate,
+        &mut reconnector,
+        &current,
+    );
+
+    assert!(
+        inflight.is_empty(),
+        "the cancelled call still frees its slot"
+    );
+    assert_eq!(
+        reconnector.failures(),
+        2,
+        "a cancel does not prove health and must not reset the budget"
+    );
+}
+
+#[test]
+fn completed_exchange_resets_the_restart_budget() {
+    // An `Ok` result proves the connection works, so it must clear the
+    // consecutive-failure count.
+    let engine: Arc<dyn McpEngine> = Arc::new(MockEngine::new(vec![], ok_result()));
+    let current = Arc::clone(&engine);
+    let factory = counting_factory(Arc::new(AtomicUsize::new(0)));
+    let mut reconnector = Reconnector::new(
+        factory,
+        RestartPolicy {
+            max_attempts: 5,
+            base_backoff: Duration::ZERO,
+            failures: 2,
+        },
+    );
+    let mut gate = CallGate::new(4);
+    let mut inflight = HashMap::new();
+    let (done_tx, done_rx) = crossbeam_channel::unbounded();
+
+    assert!(gate.admit());
+    inflight.insert(1, (CancelToken::new(), 7));
+    done_tx
+        .send(Done {
+            call_id: Some(1),
+            outcome: classify_outcome(&Ok::<(), McpError>(())),
+            engine: Arc::clone(&current),
+        })
+        .expect("send done");
+    apply_completions(
+        None,
+        &done_rx,
+        &mut inflight,
+        &mut gate,
+        &mut reconnector,
+        &current,
+    );
+
+    assert_eq!(
+        reconnector.failures(),
+        0,
+        "a genuinely completed exchange resets the budget"
+    );
 }
 
 #[test]
