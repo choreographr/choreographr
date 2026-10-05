@@ -5,6 +5,7 @@ use crate::protocol::CallToolResult;
 use crate::session::CallRequest;
 use crate::session::cancel::CancelToken;
 use crossbeam_channel::Sender;
+use std::time::Instant;
 
 /// A tool invocation waiting for a free concurrency slot.
 ///
@@ -19,6 +20,15 @@ pub(super) struct QueuedCall {
     pub(super) reply: Sender<Result<CallToolResult, McpError>>,
     pub(super) chunk_tx: Option<crossbeam_channel::Sender<Vec<u8>>>,
     pub(super) cancel: CancelToken,
+    /// The wall-clock instant by which the whole call — queue wait plus
+    /// execution — must finish.
+    ///
+    /// A call's timeout bounds its ENTIRE lifetime, not just the run: it is set
+    /// once, from the caller's per-call timeout, when the command arrives. A
+    /// parked call that outlives it is reaped from the queue (or, if promoted at
+    /// the last instant, spawned with only the time remaining), so a caller can
+    /// never block forever behind a busy server.
+    pub(super) deadline: Instant,
 }
 
 /// Per-server accounting for the concurrent-call cap.

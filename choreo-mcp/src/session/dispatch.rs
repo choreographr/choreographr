@@ -1,23 +1,28 @@
 //! The dispatcher loop: serves one server's commands and owns the in-flight
 //! call registry.
 //!
-//! The loop drains completion notices, starts queued calls into any freed
-//! slots, then blocks on the next command, completion, or reconnect result. All
+//! The loop drains completion notices, reaps parked calls whose whole-call
+//! deadline has passed, starts queued calls into any freed slots, then blocks on
+//! the next command, completion, reconnect result, or queued-call deadline. All
 //! mutable state (the engine, the reconnector, the in-flight map, the queued
 //! deque, and the admission [`CallGate`]) lives on this thread — no lock. A
 //! transport failure starts a reconnect on a detached worker thread (see
 //! [`Reconnector`]) so this loop keeps serving commands — cancels and shutdown
 //! included — throughout the backoff and the rebuild; new calls are queued, not
-//! spawned against the dead engine, until the rebuild completes.
+//! spawned against the dead engine, until the rebuild completes. A call's
+//! per-call timeout bounds its WHOLE lifetime (queue wait plus execution), so a
+//! call parked behind a busy server is reaped once its deadline passes and the
+//! queue cannot grow without bound.
 
 use crate::error::McpError;
 use crate::session::cancel::CancelToken;
 use crate::session::gate::{CallGate, QueuedCall};
 use crate::session::restart::{Reconnector, RestartPolicy, is_transport_error};
-use crate::session::{EngineCall, EngineFactory, McpCommand, McpEngine};
+use crate::session::{CallRequest, EngineCall, EngineFactory, McpCommand, McpEngine};
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// How a completed operation's result bears on the connection's health.
 ///
@@ -77,11 +82,14 @@ pub(super) struct Done {
 /// The dispatcher thread body: serve commands until shutdown or disconnect.
 ///
 /// `max_concurrent_calls` bounds how many tool calls to this server run at once;
-/// calls beyond the cap wait in a queue and are started as slots free. Listings
-/// and resource reads are dispatched onto the runtime like calls but consume no
-/// concurrency slot, so they are not subject to the cap and cannot stall the
-/// dispatcher. `max_restarts` bounds how many times a dead transport is rebuilt
-/// in a row before the server is left alone.
+/// calls beyond the cap wait in a queue and are started as slots free. A queued
+/// call is bounded by its whole-call deadline — its per-call timeout measured
+/// from when the command arrived, not from when it starts — so a call that
+/// waits too long is reaped with a timeout reply rather than blocking forever
+/// behind a busy server. Listings and resource reads are dispatched onto the
+/// runtime like calls but consume no concurrency slot, so they are not subject
+/// to the cap and cannot stall the dispatcher. `max_restarts` bounds how many
+/// times a dead transport is rebuilt in a row before the server is left alone.
 pub(super) fn run_dispatcher(
     initial: Arc<dyn McpEngine>,
     factory: EngineFactory,
@@ -125,6 +133,11 @@ pub(super) fn run_dispatcher(
             &mut reconnector,
             &engine,
         );
+        // Reap parked calls whose whole-call deadline has passed BEFORE any
+        // promotion: an expired call must be dropped, never started into a slot
+        // that just freed. This is what bounds the queue's growth behind a
+        // wedged server, whose in-flight calls can hold every slot indefinitely.
+        expire_queued(&mut queued, &mut gate, Instant::now());
         // Start queued calls into any slots the completions freed — but only
         // when no reconnect is in flight, since promoting calls against a dead
         // engine would just fail them; they wait for the rebuilt engine.
@@ -138,10 +151,16 @@ pub(super) fn run_dispatcher(
                 &done_tx,
             );
         }
+        // Arm a fresh deadline timer from whatever is still queued, so the loop
+        // wakes exactly when the next call expires (or never, if none is). The
+        // timer is a per-iteration binding, so the `select!` arm always reads
+        // the timer that matches the queue as it stands now.
+        let queue_timer = arm_queue_timer(&queued);
 
-        // Wait for the next command, completion, or reconnect result. All are
-        // event sources, so no polling: a finished call wakes the loop to free
-        // its slot even when no command has arrived.
+        // Wait for the next command, completion, reconnect result, or queued-
+        // call deadline. All are event sources, so no polling: a finished call
+        // wakes the loop to free its slot even when no command has arrived, and
+        // the timer wakes it the instant a parked call's deadline passes.
         crossbeam_channel::select! {
             recv(cmd_rx) -> msg => {
                 if let Ok(cmd) = msg {
@@ -188,6 +207,10 @@ pub(super) fn run_dispatcher(
                     engine = fresh;
                 }
             }
+            // The earliest queued call's deadline timer fired; the next loop-
+            // top `expire_queued` does the reaping. This arm exists only to
+            // wake the loop — no work belongs here.
+            recv(queue_timer) -> _ => {}
         }
     }
     tracing::debug!("MCP dispatcher thread exiting");
@@ -271,12 +294,57 @@ fn pump_queued(
     }
 }
 
+/// Reap every parked call whose whole-call deadline has already passed.
+///
+/// A queued call's per-call timeout bounds its ENTIRE lifetime, so once its
+/// deadline is behind `now` it can never be run (a promotion would spend the
+/// caller's remaining budget on a call that must fail anyway). Dropping it here
+/// — with the same accounting as the `CancelSession` removal loop — is what
+/// keeps the queue bounded behind a busy or wedged server: the caller gets a
+/// timeout reply immediately instead of blocking forever.
+fn expire_queued(queued: &mut VecDeque<QueuedCall>, gate: &mut CallGate, now: Instant) {
+    let mut index = 0;
+    while index < queued.len() {
+        if queued[index].deadline <= now {
+            if let Some(call) = queued.remove(index) {
+                gate.abandon();
+                call.cancel.cancel();
+                let _ = call.reply.send(Err(McpError::Timeout));
+            }
+        } else {
+            index += 1;
+        }
+    }
+}
+
+/// Build the timer the dispatcher `select!`s on to reap queued calls.
+///
+/// The earliest deadline among the parked calls decides how long the timer
+/// waits — its `after(remaining)` fires exactly then, so there is no polling. An
+/// empty (or already-past) queue arms a `never()` channel that never fires, so
+/// the loop blocks only on real events.
+fn arm_queue_timer(queued: &VecDeque<QueuedCall>) -> crossbeam_channel::Receiver<Instant> {
+    match queued.iter().map(|c| c.deadline).min() {
+        Some(deadline) => {
+            crossbeam_channel::after(deadline.saturating_duration_since(Instant::now()))
+        }
+        None => crossbeam_channel::never(),
+    }
+}
+
 /// Spawn one call onto the sidecar runtime.
 ///
 /// The task sends a [`Done`] notice (so the dispatcher frees the slot and can
 /// reconnect a dead transport) followed by the reply; both are best-effort — a
 /// dropped receiver means the caller already went away.
-fn spawn_call(
+///
+/// The call's deadline bounds its WHOLE lifetime, so a call that spent time in
+/// the queue runs with only what remains. A call promoted at the last instant —
+/// or run while the queue timer and a completion race — may already be past its
+/// deadline: it must not touch the engine at all, so it is retired here with a
+/// timeout reply (`Inconclusive`, since a deadline proves nothing about the
+/// connection's health).
+pub(super) fn spawn_call(
     rt: &tokio::runtime::Handle,
     engine: &Arc<dyn McpEngine>,
     done_tx: &Sender<Done>,
@@ -288,8 +356,28 @@ fn spawn_call(
         reply,
         chunk_tx,
         cancel,
+        deadline,
         ..
     } = call;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        // Too late to run: fail without spawning, but still free the slot the
+        // caller's promotion took, exactly as a completed call would.
+        let _ = done_tx.send(Done {
+            call_id: Some(call_id),
+            outcome: DoneOutcome::Inconclusive,
+            engine: Arc::clone(engine),
+        });
+        let _ = reply.send(Err(McpError::Timeout));
+        return;
+    }
+    // The engine arms its own per-call deadline from this timeout, so passing
+    // the REMAINING time is what makes the deadline bound the whole call rather
+    // than restart at spawn.
+    let request = CallRequest {
+        timeout: remaining,
+        ..request
+    };
     let engine = Arc::clone(engine);
     let done_tx = done_tx.clone();
     rt.spawn(async move {
@@ -373,6 +461,12 @@ fn handle_command(
             let call_id = *next_call_id;
             *next_call_id = next_call_id.wrapping_add(1);
             let cancel = CancelToken::new();
+            // The per-call timeout bounds the WHOLE call — queue wait plus
+            // execution — so the deadline is fixed the instant the command
+            // arrives, before the call can park. Both the immediate-admit and
+            // the parked path carry the same instant: a call that waits behind
+            // a busy server gets only the time still remaining when it runs.
+            let deadline = Instant::now() + request.timeout;
             let call = QueuedCall {
                 call_id,
                 session_id,
@@ -380,6 +474,7 @@ fn handle_command(
                 reply,
                 chunk_tx,
                 cancel: cancel.clone(),
+                deadline,
             };
             if !reconnecting && gate.admit() {
                 inflight.insert(call_id, (cancel, session_id));

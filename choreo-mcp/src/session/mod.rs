@@ -27,7 +27,10 @@
 //! the dispatcher keeps serving commands — a session cancel still reaches
 //! in-flight calls, and shutdown still works — throughout the backoff and the
 //! rebuild; new calls arriving during a reconnect are queued rather than spawned
-//! against the dead engine, and are promoted once the rebuilt engine arrives.
+//! against the dead engine, and are promoted once the rebuilt engine arrives. A
+//! call's per-call timeout bounds its WHOLE lifetime (queue wait plus
+//! execution), so a call parked behind a busy server is reaped with a timeout
+//! reply once its deadline passes rather than blocking forever.
 //!
 //! The tree is split by concern: this module owns the blocking facade
 //! ([`McpServer`] / [`McpServerHandle`]), the channel protocol (`McpCommand`,
@@ -383,6 +386,11 @@ impl McpServerHandle {
 }
 
 /// A single tool invocation handed to the dispatcher.
+///
+/// `timeout` bounds the call's ENTIRE lifetime — its wait for a concurrency slot
+/// plus its execution — not just the run: the dispatcher fixes the call's
+/// deadline from it when the command arrives, so a call parked behind a busy
+/// server fails with [`McpError::Timeout`] rather than blocking forever.
 pub(crate) struct CallRequest {
     pub(crate) name: String,
     pub(crate) arguments: serde_json::Value,

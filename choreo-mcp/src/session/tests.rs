@@ -1,8 +1,9 @@
 use crate::session::cancel::CancelToken;
 use crate::session::dispatch::{
     DispatcherStats, Done, DoneOutcome, apply_completions, classify_outcome, run_dispatcher,
+    spawn_call,
 };
-use crate::session::gate::CallGate;
+use crate::session::gate::{CallGate, QueuedCall};
 use crate::session::restart::{Reconnector, RestartPolicy};
 
 use super::*;
@@ -10,6 +11,7 @@ use crate::protocol::CallToolResult;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 /// A scripted mock engine: `list_tools` returns a fixed vector; `call_tool`
 /// waits for the cancellation token or returns a fixed result, whichever
@@ -27,6 +29,10 @@ struct MockEngine {
     /// When true, `call_tool` blocks until cancelled and never returns the
     /// scripted result (the analogue of a long-running server tool).
     blocks: bool,
+    /// When true, only the FIRST `call_tool` blocks (until cancelled); every
+    /// later call returns the scripted result at once. Lets a test hold a slot
+    /// with one wedged call while a promoted call runs to completion.
+    block_first_only: bool,
 }
 
 impl MockEngine {
@@ -39,6 +45,7 @@ impl MockEngine {
             list_timeouts: Mutex::new(Vec::new()),
             started_tx,
             blocks: false,
+            block_first_only: false,
         }
     }
 
@@ -50,6 +57,21 @@ impl MockEngine {
             list_timeouts: Mutex::new(Vec::new()),
             started_tx,
             blocks: true,
+            block_first_only: false,
+        }
+    }
+
+    /// Like [`blocking`](Self::blocking) but only the first call parks; later
+    /// calls return the scripted result immediately.
+    fn blocking_first(tools: Vec<McpTool>, result: CallToolResult, started_tx: Sender<()>) -> Self {
+        Self {
+            tools,
+            result,
+            calls: Mutex::new(Vec::new()),
+            list_timeouts: Mutex::new(Vec::new()),
+            started_tx,
+            blocks: false,
+            block_first_only: true,
         }
     }
     fn call_count(&self) -> usize {
@@ -83,13 +105,20 @@ impl McpEngine for MockEngine {
         let EngineCall {
             request, cancel, ..
         } = call;
-        self.calls
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(request.name.clone());
+        // Record the call and learn its 0-based index synchronously, so the
+        // per-call block decision is deterministic (the future is polled later,
+        // on the runtime).
+        let index = {
+            let mut calls = self
+                .calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            calls.push(request.name.clone());
+            calls.len() - 1
+        };
         let started_tx = self.started_tx.clone();
         let result = self.result.clone();
-        let blocks = self.blocks;
+        let blocks = self.blocks || (self.block_first_only && index == 0);
         Box::pin(async move {
             // Signal that the call is in flight (and thus registered in the
             // dispatcher's in-flight map) before awaiting.
@@ -857,6 +886,144 @@ fn concurrency_cap_queues_excess_calls() {
         matches!(rx2.recv().expect("call 2 reply"), Err(McpError::Cancelled)),
         "call 2 should be cancelled"
     );
+
+    let _ = handle.cmd_tx.send(McpCommand::Shutdown);
+    join.join().expect("dispatcher joins");
+}
+
+/// Send one tool call through the dispatcher's command channel.
+fn send_call(
+    handle: &McpServerHandle,
+    session_id: u64,
+    name: &str,
+    timeout: Duration,
+) -> crossbeam_channel::Receiver<Result<CallToolResult, McpError>> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    handle
+        .cmd_tx
+        .send(McpCommand::Call {
+            session_id,
+            request: CallRequest {
+                name: name.into(),
+                arguments: serde_json::json!({}),
+                timeout,
+            },
+            reply: tx,
+            chunk_tx: None,
+        })
+        .expect("send call");
+    rx
+}
+
+#[test]
+fn expired_queued_call_times_out_and_never_runs() {
+    // A call's per-call timeout bounds its WHOLE lifetime. Here call 1 wedges
+    // and holds the only slot; call 2 (a zero timeout) is parked with a deadline
+    // already behind it, so the dispatcher must reap it with a timeout rather
+    // than let it block forever — and it must never reach the engine.
+    let (started_tx, started_rx) = crossbeam_channel::unbounded();
+    let engine = Arc::new(MockEngine::blocking(vec![], ok_result(), started_tx));
+    let (handle, join) = spawn_with_cap(Arc::clone(&engine), 1);
+
+    let _rx1 = send_call(&handle, 1, "slow", Duration::from_secs(5));
+    started_rx
+        .recv()
+        .expect("call 1 in flight and holding the slot");
+
+    let rx2 = send_call(&handle, 2, "queued", Duration::ZERO);
+    assert!(
+        matches!(rx2.recv().expect("call 2 reply"), Err(McpError::Timeout)),
+        "an expired parked call must reply with a timeout"
+    );
+    assert_eq!(
+        engine.call_count(),
+        1,
+        "the expired parked call must never reach the engine"
+    );
+
+    handle.cancel_session(1);
+    let _ = handle.cmd_tx.send(McpCommand::Shutdown);
+    join.join().expect("dispatcher joins");
+}
+
+#[test]
+fn expired_call_at_spawn_is_not_run() {
+    // The last-instant guard: a call promoted WITH no remaining time (its
+    // deadline already passed) must be failed without ever touching the engine,
+    // while still retiring the slot it took.
+    crate::runtime::init().expect("runtime init");
+    let rt = crate::runtime::handle().expect("runtime handle");
+    let mock = Arc::new(MockEngine::new(vec![], ok_result()));
+    let engine: Arc<dyn McpEngine> = Arc::clone(&mock) as Arc<dyn McpEngine>;
+    let (done_tx, done_rx) = crossbeam_channel::unbounded::<Done>();
+    let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+
+    let call = QueuedCall {
+        call_id: 7,
+        session_id: 1,
+        request: CallRequest {
+            name: "late".into(),
+            arguments: serde_json::json!({}),
+            timeout: Duration::from_secs(5),
+        },
+        reply: reply_tx,
+        chunk_tx: None,
+        cancel: CancelToken::new(),
+        deadline: Instant::now(), // already reached: no time remains
+    };
+    spawn_call(&rt, &engine, &done_tx, call);
+
+    assert!(
+        matches!(reply_rx.recv().expect("reply"), Err(McpError::Timeout)),
+        "a call past its deadline is failed, not run"
+    );
+    let done = done_rx.recv().expect("done notice retires the slot");
+    assert_eq!(done.call_id, Some(7));
+    assert!(
+        matches!(done.outcome, DoneOutcome::Inconclusive),
+        "a deadline proves nothing about the connection's health"
+    );
+    assert_eq!(
+        mock.call_count(),
+        0,
+        "an expired call must never reach the engine"
+    );
+}
+
+#[test]
+fn queued_call_promoted_before_deadline_runs() {
+    // A call that waits but is promoted BEFORE its deadline must still run and
+    // return its result — the deadline bounds the wait, it does not cancel a
+    // call that started in time.
+    let (started_tx, started_rx) = crossbeam_channel::unbounded();
+    let engine = Arc::new(MockEngine::blocking_first(vec![], ok_result(), started_tx));
+    let (handle, join) = spawn_with_cap(Arc::clone(&engine), 1);
+
+    let _rx1 = send_call(&handle, 1, "slow", Duration::from_secs(5));
+    started_rx
+        .recv()
+        .expect("call 1 in flight and holding the slot");
+    let rx2 = send_call(&handle, 2, "queued", Duration::from_secs(5));
+    let stats = handle.stats();
+    assert_eq!(
+        (stats.active, stats.queued),
+        (1, 1),
+        "call 2 waits in the queue"
+    );
+
+    // Free the slot: call 2 is promoted (well before its deadline), reaches the
+    // engine, and returns the scripted result.
+    handle.cancel_session(1);
+    started_rx
+        .recv()
+        .expect("call 2 promoted and reaches the engine");
+    let result = rx2.recv().expect("call 2 reply").expect("call 2 succeeds");
+    assert!(
+        !result.is_error,
+        "the promoted call returns its scripted result"
+    );
+    let stats = handle.stats();
+    assert_eq!(stats.queued, 0, "the queue drained once the slot freed");
 
     let _ = handle.cmd_tx.send(McpCommand::Shutdown);
     join.join().expect("dispatcher joins");
