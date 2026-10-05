@@ -40,7 +40,7 @@ use std::io::Cursor;
 /// `SessionSummary::pinned`/`archived_at` fields they surface.
 /// 9 = live MCP config reload: the new `ClientMessage::McpReload` request and
 /// its `DaemonMessage::McpReloaded`/`McpReloadFailed` replies, so a running
-/// daemon can pick up `mcp_servers.json` edits without a restart. The MCP
+/// daemon can pick up `mcp.json` edits without a restart. The MCP
 /// trust-query request/reply variants (`ClientMessage::McpTrust`/`McpUntrust`/
 /// `McpTrustList` and `DaemonMessage::McpTrustUpdated`/`McpTrustList`) were
 /// added to 9 this way, before any release carried 9.

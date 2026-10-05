@@ -1,7 +1,8 @@
 //! Per-server configuration, transport selection, and protocol-era negotiation.
 //!
 //! [`McpServerConfig`] is the fully-resolved shape the engine consumes: the
-//! daemon's loader reads `mcp_servers.json`, resolves the transport (stdio or
+//! daemon's loader reads the daemon-tier `mcp.json` (and a project's
+//! `.mcp.json`), resolves the transport (stdio or
 //! Streamable HTTP) and the protocol era, and hands the crate one config per
 //! server. Keeping the resolution out of the crate means the JSON-layer
 //! concerns (key inference, `${ENV}` expansion) live next to the file format,

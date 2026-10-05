@@ -56,6 +56,10 @@ struct NotificationLimiter {
     max: u32,
     /// Window length.
     window: Duration,
+    /// The shared counter, guarded by its own lock (the sanctioned shared-state
+    /// exception #9; see AGENTS.md): rmcp invokes the notification callbacks on
+    /// more than one task, so the budget must be shared. The lock guards only
+    /// these integers and is never held across an `await`.
     state: std::sync::Mutex<LimiterState>,
 }
 

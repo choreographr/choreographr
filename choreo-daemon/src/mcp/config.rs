@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Top-level structure matching the standard `mcp_servers.json` format.
+/// Top-level structure matching the standard MCP `mcpServers` config format.
 #[derive(Deserialize, Debug)]
 struct McpServersFile {
     #[serde(rename = "mcpServers")]

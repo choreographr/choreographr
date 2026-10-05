@@ -2265,7 +2265,7 @@ mod tests {
             (
                 "McpReloadFailed",
                 DaemonMessage::McpReloadFailed {
-                    error: "failed to parse /home/u/.config/choreographr/mcp_servers.json".into(),
+                    error: "failed to parse /home/u/.config/choreographr/mcp.json".into(),
                 },
             ),
             ("ShuttingDown", DaemonMessage::ShuttingDown),

@@ -2230,9 +2230,10 @@ impl DaemonState {
 
     /// Reload the MCP configuration and refresh the catalogue.
     ///
-    /// The manager re-reads `mcp_servers.json` (user + project layers) and
-    /// reconciles the running servers with it — connecting added servers,
-    /// disconnecting removed ones, and rebuilding changed ones. On success the
+    /// The manager re-reads the daemon-tier `mcp.json` and reconciles the
+    /// running servers with it — connecting added servers, disconnecting removed
+    /// ones, and rebuilding changed ones — then reconciles the active session's
+    /// project `.mcp.json` (when one is attached). On success the
     /// whole catalogue is rebuilt (a reload can add, remove, or rename
     /// servers' tools), and the outcome is reported back to the requester. On
     /// a config read/parse failure nothing is changed and the error is

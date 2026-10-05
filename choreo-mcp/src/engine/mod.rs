@@ -75,7 +75,8 @@ pub(crate) struct RmcpEngine {
     peer: Peer<RoleClient>,
     /// The running service, kept alive so the connection stays open; closed
     /// exactly once on shutdown. This is a lifecycle handle (never touched per
-    /// message), guarded only because `close` needs `&mut`.
+    /// message), guarded only because `close` needs `&mut`. This is the
+    /// sanctioned shared-state exception #8 (see AGENTS.md).
     running: tokio::sync::Mutex<Option<RunningService<RoleClient, ServerHandler>>>,
     /// Broadcast of server notifications for this connection. Every call task
     /// subscribes to filter out the progress for its own request.

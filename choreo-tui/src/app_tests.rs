@@ -1332,7 +1332,7 @@ mod unsent_draft_tests {
 
         handle_daemon_message(
             DaemonMessage::McpReloadFailed {
-                error: "failed to parse mcp_servers.json".to_string(),
+                error: "failed to parse mcp.json".to_string(),
             },
             &mut app,
             &tx,
@@ -1340,7 +1340,7 @@ mod unsent_draft_tests {
         .expect("handle McpReloadFailed");
         assert_eq!(
             app.error.as_deref(),
-            Some("[daemon] mcp reload failed: failed to parse mcp_servers.json")
+            Some("[daemon] mcp reload failed: failed to parse mcp.json")
         );
     }
 

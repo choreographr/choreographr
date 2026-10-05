@@ -147,8 +147,9 @@ enum McpCliCommand {
         slug: String,
     },
     /// Reload the MCP configuration on a running daemon over its local socket:
-    /// re-read the user and project config files, connect added servers,
-    /// disconnect removed ones, and reconnect changed ones — no restart.
+    /// re-read the daemon-tier `mcp.json` and the active session's project
+    /// `.mcp.json`, connect added servers, disconnect removed ones, and
+    /// reconnect changed ones — no restart.
     Reload,
 }
 
@@ -200,8 +201,9 @@ fn fingerprint_cli(path: Option<&str>) -> anyhow::Result<()> {
 // The `mcp list/add/remove` operations read and write the same
 // `{"mcpServers": { … }}` file the daemon's `mcp` module loads
 // (`mcp.json`), but do so DIRECTLY rather than through that module:
-// the module is compiled only behind the daemon's `mcp` cargo feature (off by
-// default), while this CLI group is always available. The path resolution and
+// the module is compiled only behind the daemon's `mcp` cargo feature (on by
+// default; an embedder opts out with `default-features = false`), while this
+// CLI group is always available. The path resolution and
 // file shape are kept identical so a server added here is picked up by a
 // feature-enabled daemon unchanged.
 
@@ -873,7 +875,7 @@ mod tests {
     #[test]
     fn mcp_add_creates_and_preserves_shape() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mcp_servers.json");
+        let path = dir.path().join("mcp.json");
 
         mcp_add_to(
             &path,
@@ -900,7 +902,7 @@ mod tests {
     #[test]
     fn mcp_add_refuses_existing_without_force() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mcp_servers.json");
+        let path = dir.path().join("mcp.json");
 
         mcp_add_to(&path, "docs", "first", &[], false).unwrap();
         // A second add without --force is refused, leaving the original.
@@ -923,7 +925,7 @@ mod tests {
     #[test]
     fn mcp_remove_reports_presence() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mcp_servers.json");
+        let path = dir.path().join("mcp.json");
 
         mcp_add_to(&path, "docs", "npx", &[], false).unwrap();
         assert!(mcp_remove_from(&path, "docs").unwrap());
