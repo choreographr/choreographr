@@ -206,6 +206,10 @@ impl super::McpManager {
                         .get(key)
                         .is_some_and(|slot| slot.config != entry.config)
                 });
+                // `self.configs` still holds the pre-reload set at this point, so
+                // it tells us whether this server was configured before this
+                // reload.
+                let was_configured = self.configs.contains_key(&slug);
                 if changed {
                     affected.extend(self.sessions_for_slug(&slug));
                     for key in stale {
@@ -216,8 +220,14 @@ impl super::McpManager {
                         "daemon per-session MCP server config changed; dropped stale per-session connections"
                     );
                     restarted.push(slug);
-                } else {
+                } else if was_configured {
                     unchanged.push(slug);
+                } else {
+                    // A newly-added daemon `shared = false` server has no stale
+                    // slot to drop and no live session holds it yet: it reaches
+                    // existing sessions on their next overlay re-resolve, not at
+                    // reload.
+                    added.push(slug);
                 }
                 continue;
             }

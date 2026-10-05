@@ -587,11 +587,18 @@ impl McpManager {
         choreo_mcp::build_tool_name_with_suffix(slug, tool, &format!("{slug}\u{0}{tool}"))
     }
 
-    /// A snapshot of every daemon-tier server's state, in stable slug order.
+    /// A snapshot of every daemon-tier SHARED server's state, in stable slug
+    /// order.
+    ///
+    /// Daemon-tier `shared = false` servers are per-session (they live in
+    /// `session_slots`, never in `servers`), so they are NOT reported here —
+    /// they would appear as a "not connected" duplicate of the per-session row
+    /// [`McpManager::session_status`] owns.
     #[must_use]
     pub fn status(&self) -> Vec<McpServerStatus> {
         self.order
             .iter()
+            .filter(|slug| self.configs.get(*slug).is_some_and(|e| e.shared))
             .map(|slug| self.daemon_status(slug))
             .collect()
     }
@@ -973,5 +980,51 @@ mod tests {
         assert_ne!(first, second);
         assert!(second.len() <= choreo_mcp::MAX_TOOL_NAME_LEN);
         assert_eq!(second, McpManager::resolve_name("s", "a_b", &used));
+    }
+
+    /// A minimal daemon-tier entry with the given slug and pooling attribute.
+    fn stdio_entry(slug: &str, shared: bool) -> McpEntry {
+        McpEntry {
+            config: McpServerConfig {
+                slug: slug.to_string(),
+                transport: choreo_mcp::McpTransport::Stdio {
+                    command: "true".to_string(),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                    cwd: None,
+                    log_path: None,
+                },
+                enabled: true,
+                timeout: None,
+                protocol: choreo_mcp::McpProtocolMode::Auto,
+                max_concurrent_calls: None,
+                max_restarts: None,
+                disabled_tools: Vec::new(),
+            },
+            shared,
+        }
+    }
+
+    #[test]
+    fn status_reports_only_shared_daemon_servers() {
+        let mut manager = McpManager::empty();
+        manager.order = vec!["shared-srv".to_string(), "per-session-srv".to_string()];
+        manager
+            .configs
+            .insert("shared-srv".to_string(), stdio_entry("shared-srv", true));
+        manager.configs.insert(
+            "per-session-srv".to_string(),
+            stdio_entry("per-session-srv", false),
+        );
+
+        let statuses = manager.status();
+        assert_eq!(
+            statuses.iter().map(|s| s.slug.as_str()).collect::<Vec<_>>(),
+            ["shared-srv"],
+            "a daemon `shared = false` server is not a daemon-tier status row"
+        );
+        assert!(!statuses[0].connected);
+        // The per-session row is owned by `session_status`, not `status`.
+        assert_eq!(manager.session_status(1), [] as [McpServerStatus; 0]);
     }
 }

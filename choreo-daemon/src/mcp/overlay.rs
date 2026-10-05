@@ -349,12 +349,7 @@ impl super::McpManager {
 
         // Daemon-tier per-session (shared=false) servers, unless a trusted
         // project overrides that slug.
-        let daemon_per_session: Vec<McpEntry> = self
-            .configs
-            .values()
-            .filter(|e| !e.shared && !project_slugs.contains(&e.config.slug))
-            .cloned()
-            .collect();
+        let daemon_per_session = self.daemon_per_session_entries(&project_slugs);
 
         // Track which project slugs the session references, for release.
         self.ensure_entries(
@@ -398,6 +393,26 @@ impl super::McpManager {
             ignored_project_servers: ignored,
             statuses,
         }
+    }
+
+    /// The daemon-tier `shared = false` entries a session's overlay should
+    /// connect, excluding any slug a trusted project overrides (its whole-entry
+    /// project config replaces the daemon server of the same name).
+    ///
+    /// Sorted by slug so the collision-suffix assignment for two daemon
+    /// per-session servers is deterministic across resolves (matching the
+    /// ordering the other registration paths use): `self.configs` is a `HashMap`,
+    /// whose iteration order is not stable, and tool names are resolved
+    /// first-come-first-served.
+    fn daemon_per_session_entries(&self, suppressed: &HashSet<String>) -> Vec<McpEntry> {
+        let mut entries: Vec<McpEntry> = self
+            .configs
+            .values()
+            .filter(|e| !e.shared && !suppressed.contains(&e.config.slug))
+            .cloned()
+            .collect();
+        entries.sort_by(|a, b| a.config.slug.cmp(&b.config.slug));
+        entries
     }
 
     /// Connect/ensure the slots for `entries`, appending their wrappers to
@@ -638,7 +653,65 @@ impl super::McpManager {
 #[cfg(test)]
 #[cfg(feature = "mcp")]
 mod tests {
+    use super::super::McpManager;
     use super::project_root_for;
+    use crate::mcp::config::McpEntry;
+    use choreo_mcp::McpServerConfig;
+    use std::collections::HashSet;
+
+    /// A minimal daemon-tier entry with the given slug and pooling attribute.
+    fn entry(slug: &str, shared: bool) -> McpEntry {
+        McpEntry {
+            config: McpServerConfig {
+                slug: slug.to_string(),
+                transport: choreo_mcp::McpTransport::Stdio {
+                    command: "true".to_string(),
+                    args: Vec::new(),
+                    env: std::collections::HashMap::new(),
+                    cwd: None,
+                    log_path: None,
+                },
+                enabled: true,
+                timeout: None,
+                protocol: choreo_mcp::McpProtocolMode::Auto,
+                max_concurrent_calls: None,
+                max_restarts: None,
+                disabled_tools: Vec::new(),
+            },
+            shared,
+        }
+    }
+
+    #[test]
+    fn daemon_per_session_entries_are_slug_sorted() {
+        let mut manager = McpManager::empty();
+        // Insert in an order that is NOT sorted, and with a mix of shared and
+        // per-session servers, so the filter and the sort are both exercised.
+        for (slug, shared) in [
+            ("gamma", false),
+            ("alpha", false),
+            ("shared", true),
+            ("beta", false),
+        ] {
+            manager
+                .configs
+                .insert(slug.to_string(), entry(slug, shared));
+        }
+
+        let entries = manager.daemon_per_session_entries(&HashSet::new());
+        let slugs: Vec<&str> = entries.iter().map(|e| e.config.slug.as_str()).collect();
+        assert_eq!(
+            slugs,
+            ["alpha", "beta", "gamma"],
+            "per-session slugs, sorted"
+        );
+
+        // A suppressed (project-overridden) slug is excluded.
+        let suppressed = HashSet::from(["beta".to_string()]);
+        let entries = manager.daemon_per_session_entries(&suppressed);
+        let slugs: Vec<&str> = entries.iter().map(|e| e.config.slug.as_str()).collect();
+        assert_eq!(slugs, ["alpha", "gamma"]);
+    }
 
     #[test]
     fn project_root_for_finds_nearest_dot_mcp_json() {

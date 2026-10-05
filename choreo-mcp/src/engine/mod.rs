@@ -83,7 +83,7 @@ pub(crate) struct RmcpEngine {
     running: tokio::sync::Mutex<Option<RunningService<RoleClient, ServerHandler>>>,
     /// Broadcast of server notifications for this connection. Every call task
     /// subscribes to filter out the progress for its own request.
-    events: tokio::sync::broadcast::Sender<handler::ServerEvent>,
+    events: tokio::sync::broadcast::Sender<transport::ServerEvent>,
     name: String,
     version: String,
     /// Per-server request timeout for listings (calls carry their own).
@@ -273,7 +273,7 @@ async fn listen_for_changes(
 /// Establish the transport and drive the lifecycle handshake for `config`.
 async fn connect_transport(
     config: &McpServerConfig,
-    events: &tokio::sync::broadcast::Sender<handler::ServerEvent>,
+    events: &tokio::sync::broadcast::Sender<transport::ServerEvent>,
 ) -> Result<RunningService<RoleClient, ServerHandler>, McpError> {
     let handler = ServerHandler::new(client_config(config.protocol));
     match &config.transport {
@@ -305,7 +305,7 @@ async fn connect_http(
     config: &McpServerConfig,
     url: &str,
     handler: ServerHandler,
-    events: tokio::sync::broadcast::Sender<handler::ServerEvent>,
+    events: tokio::sync::broadcast::Sender<transport::ServerEvent>,
 ) -> Result<RunningService<RoleClient, ServerHandler>, McpError> {
     let client = http_client(config)?;
     let mut attempt = 0;

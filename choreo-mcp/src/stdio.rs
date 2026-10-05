@@ -50,6 +50,8 @@ const READ_CHUNK: usize = 16 * 1024;
 /// A reader that fails once more than `limit` bytes have arrived without a
 /// newline.
 ///
+/// Content of exactly `limit` bytes (excluding the terminating newline) is
+/// accepted; only strictly more than `limit` bytes without a newline breaches.
 /// Once the limit is crossed it fails every subsequent read, so the framing
 /// layer above cannot recover by reading on: an oversized frame is a fatal
 /// protocol violation, not a hiccup.
@@ -84,15 +86,17 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedLineReader<R> {
             return Poll::Ready(Err(frame_too_large(this.limit)));
         }
 
-        // Never read past the remaining allowance for this frame: cap the read
-        // to `limit - since_newline` so the buffered line cannot exceed the
-        // limit before the error is raised.
+        // Allow one byte beyond the remaining allowance for this frame, so the
+        // terminating newline after a frame of EXACTLY `limit` content bytes
+        // can still be read: content of exactly `limit` bytes is legal, and only
+        // strictly more breaches. Reading that one extra byte reveals either the
+        // newline (frame legal, counter resets) or a non-newline (frame over the
+        // limit), which is checked below after the chunk is processed.
         let remaining = this.limit.saturating_sub(this.since_newline);
-        if remaining == 0 {
-            this.breached = true;
-            return Poll::Ready(Err(frame_too_large(this.limit)));
-        }
-        let allowance = buf.remaining().min(remaining).min(READ_CHUNK);
+        let allowance = buf
+            .remaining()
+            .min(remaining.saturating_add(1))
+            .min(READ_CHUNK);
 
         let mut scratch = [0u8; READ_CHUNK];
         let Some(scratch_slice) = scratch.get_mut(..allowance) else {
@@ -109,6 +113,13 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedLineReader<R> {
                 match filled.iter().rposition(|&byte| byte == b'\n') {
                     Some(last) => this.since_newline = filled.len() - last - 1,
                     None => this.since_newline += filled.len(),
+                }
+                // Content strictly greater than the limit breaches; exactly
+                // `limit` bytes is within budget. Set the flag before handing the
+                // bytes on so the offending frame is never surfaced.
+                if this.since_newline > this.limit {
+                    this.breached = true;
+                    return Poll::Ready(Err(frame_too_large(this.limit)));
                 }
                 buf.put_slice(filled);
                 Poll::Ready(Ok(()))
@@ -395,8 +406,9 @@ async fn drain_stderr_to_log<R: tokio::io::AsyncRead + Unpin>(
 /// Runs on the sidecar runtime (see [`drain_stderr_to_log`], which owns the
 /// drain/rotation logic); the task ends when the child closes its stderr
 /// (i.e. on exit), so it needs no explicit teardown. When the sidecar runtime is
-/// unavailable the stream is drained and discarded rather than left to block the
-/// child on a full pipe.
+/// unavailable it builds a short-lived current-thread runtime on a dedicated
+/// thread so the stream is still drained rather than left to block the child on
+/// a full pipe.
 fn spawn_stderr_logger(stderr: ChildStderr, path: std::path::PathBuf) {
     let drain = drain_stderr_to_log(stderr, path);
 
@@ -405,11 +417,21 @@ fn spawn_stderr_logger(stderr: ChildStderr, path: std::path::PathBuf) {
             handle.spawn(drain);
         }
         Err(_) => {
-            // No current runtime (unreachable in practice — the transport is
-            // built inside `runtime::block_on`): run the drain on a short-lived
-            // thread so the child's stderr is still consumed.
+            // No sidecar runtime (unreachable in practice — the transport is
+            // built inside `runtime::block_on`). Drive the drain on a
+            // short-lived thread with its OWN current-thread runtime: there is
+            // no runtime to run it on otherwise, and dropping `drain` unpolled
+            // would leave the child's stderr unconsumed (a full pipe can then
+            // block the child). Building the runtime here guarantees the drain
+            // actually runs.
             std::thread::spawn(move || {
-                let _ = crate::runtime::block_on(drain);
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                rt.block_on(drain);
             });
         }
     }
@@ -493,6 +515,37 @@ mod tests {
                 .expect("back-to-back frames each fit their own budget");
         });
         assert_eq!(out, input.into_bytes());
+    }
+
+    /// A frame whose content is EXACTLY `limit` bytes (excluding the newline) is
+    /// within budget: the reader must allow the terminating newline through
+    /// rather than breaching one byte early.
+    #[test]
+    fn frame_at_exactly_the_limit_is_accepted() {
+        let input = format!("{}\n", "z".repeat(64));
+        let mut reader = BoundedLineReader::new(input.as_bytes(), 64);
+        let mut out = Vec::new();
+        block_on(async {
+            reader
+                .read_to_end(&mut out)
+                .await
+                .expect("content of exactly the limit is accepted");
+        });
+        assert_eq!(out, input.into_bytes());
+    }
+
+    /// Content of `limit + 1` bytes without a newline is strictly over the
+    /// limit and must breach.
+    #[test]
+    fn frame_one_over_the_limit_is_rejected() {
+        let input = "z".repeat(65);
+        let mut reader = BoundedLineReader::new(input.as_bytes(), 64);
+        let err = block_on(async {
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).await
+        })
+        .expect_err("one byte over the limit breaches");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     /// The per-server stderr log is created owner-only (0600) on Unix: it may

@@ -7,7 +7,7 @@
 //! and forwarded to the caller's streaming sink.
 
 use super::convert::{convert_call_result, map_service_error};
-use super::handler::ServerEvent;
+use super::transport::ServerEvent;
 use crate::error::McpError;
 use crate::protocol::CallToolResult;
 use crate::session::{CallRequest, EngineCall};
@@ -82,8 +82,9 @@ pub(super) async fn call_tool_impl(
 
         // Subscribe BEFORE sending: the broadcast drops a message when no
         // receiver is attached, so a fast server's progress must find this
-        // receiver already live.
-        let mut events_rx = events.subscribe();
+        // receiver already live. Held as an `Option` so the select arm below
+        // can disable it once the broadcast closes (see `next_server_event`).
+        let mut events_rx = Some(events.subscribe());
 
         // Request-scoped options: the deadline resets while progress
         // notifications arrive (a long tool that reports progress is not
@@ -104,6 +105,7 @@ pub(super) async fn call_tool_impl(
         let response_fut = handle.await_response();
         tokio::pin!(response_fut);
         let response = loop {
+            let mut events_closed = false;
             tokio::select! {
                 biased;
                 // Cancellation arm first: a session cancel stops the call the
@@ -117,16 +119,31 @@ pub(super) async fn call_tool_impl(
                         .await;
                     return Err(McpError::Cancelled);
                 }
-                event = events_rx.recv() => {
-                    // Any event that is not this call's progress (or a lagged
-                    // receiver) is ignored; the loop re-selects.
-                    if let Ok(ServerEvent::Progress { token, progress, total, message }) = event
-                        && token == progress_token
-                    {
-                        forward_progress(chunk_tx.as_ref(), &mut last_progress, message.as_deref(), progress, total);
+                event = next_server_event(&mut events_rx) => {
+                    match event {
+                        // Any event that is not this call's progress is
+                        // ignored; the loop re-selects.
+                        Ok(ServerEvent::Progress { token, progress, total, message })
+                            if token == progress_token =>
+                        {
+                            forward_progress(chunk_tx.as_ref(), &mut last_progress, message.as_deref(), progress, total);
+                        }
+                        // A closed broadcast returns `Closed` immediately on
+                        // EVERY poll; since this arm is biased ahead of the
+                        // response arm, leaving it selectable would spin and
+                        // starve the response/cancel arms. Disable it below. A
+                        // `Lagged` receiver still recovers, so it is left
+                        // selectable.
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            events_closed = true;
+                        }
+                        _ => {}
                     }
                 }
                 response = &mut response_fut => break response,
+            }
+            if events_closed {
+                events_rx = None;
             }
         };
 
@@ -152,6 +169,26 @@ pub(super) async fn call_tool_impl(
                 )));
             }
         }
+    }
+}
+
+/// Await the next server event on `rx`, or pend forever once `rx` is `None`.
+///
+/// A closed broadcast receiver returns [`RecvError::Closed`] immediately on
+/// every poll. Because this is selected on as a biased-first arm, continuing to
+/// poll a closed receiver would spin and never let the response or cancellation
+/// arms win; the caller sets `rx` to `None` on the first `Closed` and this then
+/// awaits [`std::future::pending`] so the arm never resolves again. A `Lagged`
+/// receiver is deliberately NOT disabled — it recovers and resumes delivering
+/// the newest events.
+///
+/// [`RecvError::Closed`]: tokio::sync::broadcast::error::RecvError::Closed
+async fn next_server_event(
+    rx: &mut Option<tokio::sync::broadcast::Receiver<ServerEvent>>,
+) -> Result<ServerEvent, tokio::sync::broadcast::error::RecvError> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -259,6 +296,38 @@ mod tests {
     fn decline_responses_state_only_is_empty_map() {
         let responses = decline_responses(None).expect("no requests is fine");
         assert!(responses.is_empty());
+    }
+
+    /// A poll-once helper: whether `fut` is still pending after a single poll.
+    /// Deterministic (no timer), so it needs no wall-clock wait.
+    fn poll_is_pending<F: std::future::Future>(fut: F) -> bool {
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        matches!(std::pin::pin!(fut).poll(&mut cx), std::task::Poll::Pending)
+    }
+
+    #[test]
+    fn next_server_event_closes_then_pends() {
+        crate::runtime::init().expect("runtime init");
+        let (tx, rx) = tokio::sync::broadcast::channel::<ServerEvent>(1);
+        // Dropping the only sender closes the channel.
+        drop(tx);
+        let mut rx = Some(rx);
+
+        let first =
+            crate::runtime::block_on(next_server_event(&mut rx)).expect("runtime available");
+        assert!(
+            matches!(first, Err(tokio::sync::broadcast::error::RecvError::Closed)),
+            "a closed broadcast yields Closed"
+        );
+
+        // Once the caller has dropped it, the arm must pend rather than spin on
+        // the closed receiver.
+        rx = None;
+        assert!(
+            poll_is_pending(next_server_event(&mut rx)),
+            "a disabled receiver pends instead of returning Closed again"
+        );
     }
 
     #[test]

@@ -17,12 +17,32 @@
 //! response arm) always delivers the chunk. This covers both transports, since
 //! the wrapper is generic over the wrapped [`Transport`].
 
-use super::handler::ServerEvent;
 use rmcp::RoleClient;
-use rmcp::model::{JsonRpcMessage, JsonRpcNotification, ServerNotification};
+use rmcp::model::{JsonRpcMessage, JsonRpcNotification, ProgressToken, ServerNotification};
 use rmcp::service::{RxJsonRpcMessage, TxJsonRpcMessage};
 use rmcp::transport::Transport;
 use tokio::sync::broadcast;
+
+/// A server-originated event the engine forwards to the rest of the client.
+///
+/// Progress events are produced here, by the transport wrapper
+/// ([`ProgressForwarding`]), which forwards each `notifications/progress`
+/// inline as it is read; the per-connection broadcast carries them to the
+/// in-flight call tasks that care.
+#[derive(Debug, Clone)]
+pub(super) enum ServerEvent {
+    /// A `notifications/progress` for the call owning `token`.
+    Progress {
+        /// Correlates the notification with the originating request.
+        token: ProgressToken,
+        /// The current progress value.
+        progress: f64,
+        /// The total, when the server knows it.
+        total: Option<f64>,
+        /// Optional human-readable progress message.
+        message: Option<String>,
+    },
+}
 
 /// Wraps any client transport, forwarding progress notifications inline.
 ///

@@ -9,7 +9,7 @@
 //! at the transport boundary instead (see [`super::transport`]).
 
 use rmcp::ClientHandler;
-use rmcp::model::{ClientConfig, ProgressToken};
+use rmcp::model::ClientConfig;
 use rmcp::service::{NotificationContext, RoleClient};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,27 +23,6 @@ use std::time::{Duration, Instant};
 /// reported once the window rolls over. (`notifications/progress` has its own
 /// per-call throttle, [`PROGRESS_MIN_INTERVAL`](super::call::PROGRESS_MIN_INTERVAL).)
 const MAX_LOG_NOTIFICATIONS_PER_SECOND: u32 = 100;
-
-/// A server-originated event the engine forwards to the rest of the client.
-///
-/// Progress events are produced by the transport wrapper
-/// ([`super::transport::ProgressForwarding`]), which forwards each
-/// `notifications/progress` inline as it is read; the broadcast carries them to
-/// the in-flight call tasks that care.
-#[derive(Debug, Clone)]
-pub(super) enum ServerEvent {
-    /// A `notifications/progress` for the call owning `token`.
-    Progress {
-        /// Correlates the notification with the originating request.
-        token: ProgressToken,
-        /// The current progress value.
-        progress: f64,
-        /// The total, when the server knows it.
-        total: Option<f64>,
-        /// Optional human-readable progress message.
-        message: Option<String>,
-    },
-}
 
 /// A fixed-window rate limiter for server-originated notifications.
 ///
