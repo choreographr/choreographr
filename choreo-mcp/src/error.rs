@@ -48,6 +48,19 @@ pub enum McpError {
     #[error("MCP server connection closed")]
     ServerShutdown,
 
+    /// A send failed at the transport layer (a dropped connection, a refused
+    /// request) as distinct from a protocol-level error in the message payload.
+    ///
+    /// This is a reconnect trigger: a request or listing that fails this way
+    /// tells the dispatcher the connection is (or may be) dead, so the bounded
+    /// restart policy rebuilds it. A protocol error (a malformed payload, an
+    /// unexpected result type) is a settled answer and does not trigger a
+    /// rebuild. An HTTP authorization challenge is deliberately *not* mapped
+    /// here — it surfaces as [`Self::AuthRequired`], which is actionable rather
+    /// than transient.
+    #[error("MCP transport error: {0}")]
+    Transport(String),
+
     /// The client cancelled the request before it completed.
     ///
     /// Raised when a session cancel stops an in-flight call; the dispatcher
@@ -134,6 +147,12 @@ mod tests {
             McpError::ServerShutdown.to_string(),
             "MCP server connection closed"
         );
+    }
+
+    #[test]
+    fn error_transport_display() {
+        let err = McpError::Transport("connection reset by peer".into());
+        assert!(err.to_string().contains("connection reset by peer"));
     }
 
     #[test]

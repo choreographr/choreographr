@@ -128,6 +128,14 @@ fn convert_resource(contents: ResourceContents) -> McpContent {
 /// [`McpError::AuthRequired`] naming `slug`, so a mid-session authorization
 /// failure (not just a connect-time one) explains itself rather than appearing
 /// as an opaque transport error.
+///
+/// A send that fails at the transport layer becomes [`McpError::Transport`] —
+/// the reconnect trigger — rather than an opaque protocol error, so a dropped
+/// or refused connection reaches the dispatcher's restart policy instead of
+/// leaving it serving against a dead transport. The two exceptions are the
+/// settled answers: an authorization challenge is actionable, and a genuinely
+/// malformed exchange (an unexpected response type, an over-run MRTR loop) is a
+/// protocol error a rebuild cannot fix.
 pub(super) fn map_service_error(error: ServiceError, slug: &str) -> McpError {
     match error {
         ServiceError::McpError(data) => McpError::JsonRpcError {
@@ -137,32 +145,22 @@ pub(super) fn map_service_error(error: ServiceError, slug: &str) -> McpError {
         ServiceError::TransportClosed => McpError::ServerShutdown,
         ServiceError::Timeout { .. } => McpError::Timeout,
         ServiceError::Cancelled { .. } => McpError::Cancelled,
-        other => {
-            // A transport error may embed a rejected POST's status (or rmcp's
-            // dedicated auth variants); surface an authorization failure plainly
-            // when it does.
-            match service_error_status(&other) {
-                Some(status @ (401 | 403)) => McpError::AuthRequired {
-                    server: slug.to_string(),
-                    hint: auth_hint(status),
-                },
-                _ => McpError::ProtocolError(other.to_string()),
-            }
-        }
+        // A rejected send is a transport failure, not a protocol error: the
+        // connection is (or may be) dead, so it must reach the reconnect
+        // policy. rmcp delivers it as `TransportSend`, whose inner error is
+        // where an HTTP status lives — `TransportSend`'s boxed payload is not
+        // exposed through `source()`, so the walk starts there directly. An
+        // authorization challenge (HTTP 401/403) is surfaced as the actionable
+        // `AuthRequired`; any other send failure is a plain transport error.
+        ServiceError::TransportSend(dynamic) => match status_from_chain(dynamic.error.as_ref()) {
+            Some(status @ (401 | 403)) => McpError::AuthRequired {
+                server: slug.to_string(),
+                hint: auth_hint(status),
+            },
+            _ => McpError::Transport(dynamic.to_string()),
+        },
+        other => McpError::ProtocolError(other.to_string()),
     }
-}
-
-/// Recover an HTTP status from a service error by walking its source chain for
-/// rmcp's `StreamableHttpError`.
-fn service_error_status(error: &ServiceError) -> Option<u16> {
-    // `TransportSend`'s inner error is not exposed through `source()`, so the
-    // walk starts at the dynamic error's boxed payload, where the transport
-    // error actually lives.
-    let root: &(dyn std::error::Error + 'static) = match error {
-        ServiceError::TransportSend(dynamic) => dynamic.error.as_ref(),
-        _ => error,
-    };
-    status_from_chain(root)
 }
 
 /// The actionable guidance attached to an authorization-required error.
@@ -256,6 +254,25 @@ mod tests {
                 assert_eq!(server, "docs");
                 assert!(hint.contains("headers"), "{hint}");
             }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_error_maps_status_less_send_failure_to_transport() {
+        // A rejected send whose inner error carries no HTTP status (a dropped
+        // connection, not an HTTP response) must map to the reconnect-triggering
+        // `Transport`, not an opaque protocol error.
+        let inner = StreamableHttpError::<reqwest::Error>::UnexpectedServerResponse(
+            "connection reset by peer".into(),
+        );
+        let dynamic = DynamicTransportError::from_parts(
+            "test",
+            std::any::TypeId::of::<()>(),
+            Box::new(inner),
+        );
+        match map_service_error(ServiceError::TransportSend(dynamic), "docs") {
+            McpError::Transport(_) => {}
             other => panic!("unexpected: {other:?}"),
         }
     }

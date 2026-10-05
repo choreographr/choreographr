@@ -205,10 +205,20 @@ impl Reconnector {
 
 /// Whether an error indicates the transport (not the request) failed, which is
 /// the trigger for a reconnect.
+///
+/// The set is deliberately narrow: a request that failed because its payload was
+/// rejected or malformed is a settled answer a rebuild cannot fix, so it must
+/// *not* appear here. A send that failed at the transport layer
+/// ([`McpError::Transport`]), a closed connection, a dispatcher that has exited,
+/// and a raw I/O error all mean the connection is (or may be) unusable, so each
+/// is worth one bounded rebuild attempt.
 pub(super) fn is_transport_error(error: &McpError) -> bool {
     matches!(
         error,
-        McpError::ServerShutdown | McpError::Io(_) | McpError::NotConnected
+        McpError::ServerShutdown
+            | McpError::Transport(_)
+            | McpError::Io(_)
+            | McpError::NotConnected
     )
 }
 

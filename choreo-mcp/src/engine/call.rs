@@ -46,6 +46,14 @@ const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(100);
 ///
 /// Progress notifications for this call's `progressToken` are forwarded to the
 /// caller's chunk sink, rate-limited to [`PROGRESS_MIN_INTERVAL`].
+///
+/// The deadline resets while progress arrives (a long tool that reports
+/// progress is not killed mid-work), so a server that emits steady progress can
+/// hold this call — and the concurrency slot it occupies — open indefinitely.
+/// This is a deliberate trade-off: the slot is bounded by the server's
+/// `maxConcurrentCalls` (excess calls queue rather than accumulate), and a
+/// session cancel still stops the call, so the exposure is a busy server rather
+/// than an unbounded resource leak.
 pub(super) async fn call_tool_impl(
     peer: &Peer<RoleClient>,
     events: &tokio::sync::broadcast::Sender<ServerEvent>,
