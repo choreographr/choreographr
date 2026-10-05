@@ -33,7 +33,7 @@ pub(super) fn make_daemon_state() -> (DaemonState, crossbeam_channel::Receiver<D
         accounts: AccountManager::load(&accounts_path).unwrap(),
         daemon_registry: choreo_ai_protocols::SocketRegistry::default(),
         session_registries: HashMap::new(),
-        session_mcp_roots: HashMap::new(),
+        session_mcp_projects: HashMap::new(),
         credentials: HashMap::new(),
         x_credentials: None,
         // Test states start locked, matching the production daemon.
@@ -1885,8 +1885,8 @@ fn resolving_an_overlay_tracks_the_session_project_root() {
 
     state.resolve_and_push_session_overlay(1, false);
     assert_eq!(
-        state.session_mcp_roots.get(&1).cloned().flatten(),
-        Some(project.path().to_path_buf()),
+        state.session_mcp_projects.get(&1).cloned().map(|p| p.root),
+        Some(Some(project.path().to_path_buf())),
         "the resolved project root must be recorded for the session"
     );
 
@@ -1898,10 +1898,86 @@ fn resolving_an_overlay_tracks_the_session_project_root() {
     );
     state.resolve_and_push_session_overlay(1, true);
     assert_eq!(
-        state.session_mcp_roots.get(&1).cloned().flatten(),
-        None,
+        state.session_mcp_projects.get(&1).cloned().map(|p| p.root),
+        Some(None),
         "leaving the project must drop the recorded root"
     );
+}
+
+/// A trust flip on the SAME project root must RELEASE the session's stale MCP
+/// connections, not reuse them: an untrusted resolve had connected only the
+/// daemon-tier per-session servers, and re-using them on the untrusted→trusted
+/// transition would leave those connections live (suppressed from the overlay
+/// but never released). The reuse decision is the observable seam — it must be
+/// denied whenever the recorded trust differs from the freshly-resolved trust,
+/// even when the root is unchanged.
+#[test]
+fn trust_flip_on_the_same_root_forces_overlay_reload() {
+    let (mut state, _rx) = make_daemon_state();
+    let metadata = |working_dir: Option<String>| SessionMetadata {
+        title: None,
+        selected_model: None,
+        reasoning_effort: None,
+        parent_session_id: None,
+        working_dir,
+        created_at: 1000,
+        last_modified: 1000,
+        turn_count: 0,
+        status: SessionStatus::Inactive,
+        active_tool_groups: vec![],
+        account_name: None,
+        accumulated_usage: TokenUsage::default(),
+        context_window: None,
+        last_prompt_tokens: None,
+        pinned: false,
+        archived_at: None,
+    };
+
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project.path().join(".git")).unwrap();
+    std::fs::write(project.path().join(".mcp.json"), "{}").unwrap();
+    state.session_metadata.insert(
+        1,
+        metadata(Some(project.path().to_string_lossy().into_owned())),
+    );
+
+    // Resolve the project while it is UNTRUSTED: the resolve would have pooled
+    // the daemon-tier per-session servers under key `(1, None, _)`.
+    state.resolve_and_push_session_overlay(1, false);
+    let untrusted = state.session_mcp_projects.get(&1).cloned().unwrap();
+    assert_eq!(untrusted.root.as_deref(), Some(project.path()));
+    assert!(!untrusted.trusted, "a fresh trust store trusts nothing");
+
+    // Once the root is trusted, a same-root re-resolve that does NOT flip the
+    // trust state reuses the live connections.
+    let trusted_previous = SessionMcpProject {
+        root: untrusted.root.clone(),
+        trusted: true,
+    };
+    assert!(
+        DaemonState::session_overlay_reuse(&trusted_previous, Some(project.path()), true),
+        "an unchanged trusted project re-resolves without releasing"
+    );
+    // Now trust the root: the recorded trust differs from the fresh one, so a
+    // re-resolve of the SAME root must release + re-ensure rather than reuse.
+    state.mcp_trust.trust(project.path()).unwrap();
+    let (root, trusted) = state.session_project_root(1);
+    assert_eq!(
+        root.as_deref(),
+        Some(project.path()),
+        "same root after trusting"
+    );
+    assert!(trusted, "the root is now trusted");
+    assert!(
+        !DaemonState::session_overlay_reuse(&untrusted, root.as_deref(), trusted),
+        "a trust flip on the same root must NOT reuse the stale connections"
+    );
+
+    // The resolve records the new trust state for the next change.
+    state.resolve_and_push_session_overlay(1, false);
+    let after = state.session_mcp_projects.get(&1).cloned().unwrap();
+    assert_eq!(after.root.as_deref(), Some(project.path()));
+    assert!(after.trusted, "the trust flip must be recorded");
 }
 
 #[test]

@@ -83,6 +83,17 @@ pub struct ResolvedAccount {
     pub warm_policy: WarmPolicy,
 }
 
+/// A session's last-resolved MCP project: the project root its overlay was
+/// resolved for (`None` for no project tier) and whether that root was
+/// trusted at resolve time. Kept on the command loop so a working-directory
+/// change OR a trust flip can release exactly the connections the session is
+/// leaving, and so a trust change is never mistaken for an unchanged project.
+#[derive(Debug, Clone, Default)]
+pub struct SessionMcpProject {
+    pub root: Option<PathBuf>,
+    pub trusted: bool,
+}
+
 pub struct DaemonState {
     pub next_session_id: u64,
     pub max_turns: u32,
@@ -119,14 +130,14 @@ pub struct DaemonState {
     /// sessions' connections are untouched. Entries are created in
     /// `spawn_session` and dropped in `handle_session_exited`.
     pub session_registries: HashMap<u64, choreo_ai_protocols::SocketRegistry>,
-    /// Each live session's currently-resolved MCP project root (the root its
-    /// overlay was last resolved for), or `None` when it has no project tier.
-    /// Kept on the command loop so a working-directory change (or a trust flip)
+    /// Each live session's last-resolved MCP project (root + trust state).
+    /// Kept on the command loop so a working-directory change OR a trust flip
     /// that LEAVES a project can cancel that session's in-flight calls to
-    /// exactly THAT project's servers, leaving its daemon-tier calls running.
-    /// Entries are set in `resolve_and_push_session_overlay` and dropped in
-    /// `handle_session_exited`.
-    pub session_mcp_roots: HashMap<u64, Option<PathBuf>>,
+    /// exactly THAT project's servers, leaving its daemon-tier calls running,
+    /// and so a trust change is never mistaken for an unchanged project.
+    /// Entries are set in `resolve_and_push_session_overlay` /
+    /// `refresh_session_overlay` and dropped in `handle_session_exited`.
+    pub session_mcp_projects: HashMap<u64, SessionMcpProject>,
     pub credentials: HashMap<String, ServiceCredential>,
     pub x_credentials: Option<ServiceCredential>,
     /// Whether the credential keystore is currently locked (no decrypted
@@ -1781,7 +1792,7 @@ impl DaemonState {
         // Drop the session's registry clone: the thread is gone, nothing can
         // register or be cancelled through it anymore.
         self.session_registries.remove(&session_id);
-        self.session_mcp_roots.remove(&session_id);
+        self.session_mcp_projects.remove(&session_id);
 
         // Release the session's MCP pool references: decrement project-shared
         // ref-counts (dropping connections no session uses anymore) and drop
@@ -2325,6 +2336,22 @@ impl DaemonState {
         (root, trusted)
     }
 
+    /// Whether a session's overlay may REUSE its live connections: it must
+    /// still be in the same TRUSTED project it was last resolved for. A trust
+    /// flip in either direction (same root) must release instead, because an
+    /// untrusted resolve connected only the daemon-tier per-session servers,
+    /// so re-using them would leave those stale connections live rather than
+    /// releasing them.
+    fn session_overlay_reuse(
+        previous: &SessionMcpProject,
+        root: Option<&Path>,
+        trusted: bool,
+    ) -> bool {
+        let leaving = previous.root.as_deref() != root;
+        let trust_flip = previous.trusted != trusted;
+        trusted && !leaving && !trust_flip
+    }
+
     /// Resolve a session's MCP overlay and push it to the session thread (which
     /// stores it for the request/execution path). Returns the overlay so a
     /// caller that needs it (the ensure handler) can reply with it directly.
@@ -2336,38 +2363,45 @@ impl DaemonState {
         // The project this session's overlay was last resolved for, so a
         // working-directory change (or a trust flip) that LEAVES that project
         // can cancel exactly its servers' in-flight calls.
-        let previous_root = self.session_mcp_roots.get(&session_id).cloned().flatten();
+        let previous = self
+            .session_mcp_projects
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default();
         let (root, trusted) = self.session_project_root(session_id);
         // The change LEFT the previous project when the resolved root differs
         // (including entering or leaving the project tier entirely).
-        let leaving = previous_root.as_deref() != root.as_deref();
+        let leaving = previous.root != root;
         if cancel_inflight || leaving {
             // Stop the session's in-flight calls to the project it is leaving or
             // revoking — and ONLY those. Its daemon-tier calls keep running: a
             // working-directory change must not disturb an unrelated in-flight
             // call.
-            if let Some(old_root) = previous_root.as_deref() {
+            if let Some(old_root) = previous.root.as_deref() {
                 self.mcp_manager
                     .cancel_session_project(session_id, old_root);
             }
         }
-        // Reuse the live connections when the session stays in the same TRUSTED
-        // project (a same-project working-directory change, or a re-resolve
-        // triggered by something other than the project itself): `ensure_session`
-        // re-ensures, so pooled project-shared connections are reused rather
-        // than torn down and rebuilt. Every other case — leaving a project,
-        // entering one, an untrust flip, or a trusted→untrusted change — must
-        // release the session's current refs first, so those go through
-        // `reload_session` (release + ensure).
-        let overlay = if trusted && !leaving {
+        // Reuse the live connections only when the session stays in the same
+        // TRUSTED project: `ensure_session` re-ensures, so pooled project-shared
+        // connections are reused rather than torn down and rebuilt. Every other
+        // case — leaving or entering a project, or a trust flip in EITHER
+        // direction — must release the session's current refs first, so those go
+        // through `reload_session` (release + ensure). A trust flip of the same
+        // root is exactly such a case: the previous resolve had connected the
+        // daemon-tier per-session servers under a key the new resolve no longer
+        // wants, so re-using would leave them live instead of releasing them.
+        let overlay = if Self::session_overlay_reuse(&previous, root.as_deref(), trusted) {
             self.mcp_manager
                 .ensure_session(session_id, root.as_deref(), trusted)
         } else {
             self.mcp_manager
                 .reload_session(session_id, root.as_deref(), trusted)
         };
-        // Record the freshly-resolved root so the NEXT change knows what it left.
-        self.session_mcp_roots.insert(session_id, root);
+        // Record the freshly-resolved project + trust so the NEXT change knows
+        // what it left.
+        self.session_mcp_projects
+            .insert(session_id, SessionMcpProject { root, trusted });
         self.push_overlay_to_session(session_id, &overlay);
         overlay
     }
@@ -2387,7 +2421,8 @@ impl DaemonState {
         let overlay = self
             .mcp_manager
             .ensure_session(session_id, root.as_deref(), trusted);
-        self.session_mcp_roots.insert(session_id, root);
+        self.session_mcp_projects
+            .insert(session_id, SessionMcpProject { root, trusted });
         self.push_overlay_to_session(session_id, &overlay);
     }
 

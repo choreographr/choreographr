@@ -268,7 +268,7 @@ impl DaemonState {
             // Sessions create their OWN registries at spawn time.
             daemon_registry: choreo_ai_protocols::SocketRegistry::default(),
             session_registries: HashMap::new(),
-            session_mcp_roots: HashMap::new(),
+            session_mcp_projects: HashMap::new(),
             credentials: HashMap::new(),
             x_credentials: None,
             // The daemon starts locked: credentials are only decrypted into
