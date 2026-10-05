@@ -1948,6 +1948,25 @@ fn trust_flip_on_the_same_root_forces_overlay_reload() {
     assert_eq!(untrusted.root.as_deref(), Some(project.path()));
     assert!(!untrusted.trusted, "a fresh trust store trusts nothing");
 
+    // An unchanged UNTRUSTED project (same root, same trust) also REUSES: the
+    // server set it contributes is only the daemon per-session servers, which do
+    // not depend on the root, so re-resolving must not drop and reconnect them.
+    assert!(
+        DaemonState::session_overlay_reuse(&untrusted, Some(project.path()), false),
+        "an unchanged untrusted project re-resolves without releasing"
+    );
+
+    // A trust flip in EITHER direction on the same root must NOT reuse.
+    let revoked_previous = SessionMcpProject {
+        root: untrusted.root.clone(),
+        trusted: true,
+    };
+    assert!(!DaemonState::session_overlay_reuse(
+        &revoked_previous,
+        untrusted.root.as_deref(),
+        false
+    ));
+
     // Once the root is trusted, a same-root re-resolve that does NOT flip the
     // trust state reuses the live connections.
     let trusted_previous = SessionMcpProject {

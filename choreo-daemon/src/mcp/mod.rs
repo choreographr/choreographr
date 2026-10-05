@@ -13,7 +13,8 @@ pub mod trust;
 // The manager is split across cohesive child modules: `overlay` owns the
 // per-session overlay resolution plus the overlay value types and project-root
 // walk, `pool` owns the pool reconciliation (reconnect/reload) and the shared
-// slot connect helper, `paths` the config-dir resolution and file names, and
+// slot connect helper, `query` the `/mcp` status snapshots and the per-session
+// call cancellation, `paths` the config-dir resolution and file names, and
 // `status` the daemon-facing status/report/outcome types. `stub` is the
 // feature-off stand-in. Their `impl McpManager` blocks reach the manager's
 // private fields as child modules; the items other modules use are re-exported
@@ -23,6 +24,7 @@ mod overlay;
 mod paths;
 mod pool;
 mod project;
+mod query;
 mod status;
 #[cfg(not(feature = "mcp"))]
 mod stub;
@@ -44,7 +46,7 @@ use std::collections::HashMap;
 #[cfg(feature = "mcp")]
 use std::collections::HashSet;
 #[cfg(feature = "mcp")]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 #[cfg(feature = "mcp")]
 use std::time::{Duration, Instant};
 #[cfg(feature = "mcp")]
@@ -83,6 +85,32 @@ const RECONNECT_BUDGET: Duration = Duration::from_secs(10);
 /// at a time.
 #[cfg(feature = "mcp")]
 const RELOAD_BUDGET: Duration = Duration::from_secs(10);
+
+/// Aggregate budget for ONE [`McpManager::reload`] sweep, capping the WHOLE
+/// reconcile rather than each server.
+///
+/// `reload` (re)connects every added or changed server serially on the
+/// command-loop thread, each bounded by [`RELOAD_BUDGET`]; without an aggregate
+/// cap a config with many slow servers would stall the command loop for up to
+/// one budget PER server. This deadline bounds the total (both the `/mcp
+/// reload` path and the `mcp.json` watcher path run it), so a large or
+/// partially-unreachable server set cannot compound into an unbounded stall; a
+/// server reached after the deadline is recorded as failed for this sweep and
+/// retried on the next reload.
+#[cfg(feature = "mcp")]
+const RELOAD_TOTAL_BUDGET: Duration = Duration::from_secs(15);
+
+/// Aggregate budget for ONE [`McpManager::reconnect`] call, capping the WHOLE
+/// rebuild rather than each connection.
+///
+/// A slug can name a daemon shared server plus one project-shared and/or
+/// per-session connection per referencing project/session; each is rebuilt
+/// serially, bounded by [`RECONNECT_BUDGET`]. This deadline bounds the total so
+/// a slug referenced from many projects cannot stall the command loop (the
+/// `/mcp reconnect` path runs it) for one budget per connection; a connection
+/// reached after the deadline is reported as a failed reconnect.
+#[cfg(feature = "mcp")]
+const RECONNECT_TOTAL_BUDGET: Duration = Duration::from_secs(15);
 
 /// Budget for a synchronous tool-listing sweep the command loop performs when it
 /// refreshes the tool catalogue (a list-changed event, a reload, or a
@@ -311,6 +339,7 @@ impl McpManager {
             // Bound this server's re-list by the remaining share of the
             // aggregate budget; once it is spent, skip the re-list and keep the
             // server's CACHED tools so its group stays in the catalogue.
+            // Register straight from the cache (no clone).
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 warn!(
@@ -318,22 +347,7 @@ impl McpManager {
                     "catalogue-refresh budget exhausted; keeping the cached tool set"
                 );
             } else {
-                // Re-list the server, updating the cache; a listing that misses
-                // the deadline keeps the previous tool set. Register straight
-                // from the cache (no clone).
-                match slot
-                    .handle
-                    .list_tools_with_deadline(remaining.min(CATALOGUE_REFRESH_BUDGET))
-                {
-                    Ok(tools) => {
-                        slot.tool_count =
-                            Self::enabled_tool_count(&tools, &slot.config.disabled_tools);
-                        slot.tools = tools;
-                    }
-                    Err(e) => {
-                        warn!(server = %slug, error = %e, "MCP tool listing missed the catalogue-refresh budget; keeping the previous tool set");
-                    }
-                }
+                Self::relist_slot(slot, remaining.min(CATALOGUE_REFRESH_BUDGET));
             }
             Self::register_server_tools(
                 &slug,
@@ -371,20 +385,32 @@ impl McpManager {
             );
             return;
         };
-        match slot
-            .handle
-            .list_tools_with_deadline(CATALOGUE_REFRESH_BUDGET)
-        {
+        Self::relist_slot(slot, CATALOGUE_REFRESH_BUDGET);
+    }
+
+    /// Re-list one connected `slot`, bounded by `deadline`, refreshing its
+    /// cached tool set and enabled tool count.
+    ///
+    /// A listing that fails or misses `deadline` keeps the slot's previous tool
+    /// set with a warning, so the server's `mcp/<slug>` group never blinks out
+    /// of the catalogue; it is re-listed on the next refresh. Shared by the full
+    /// [`McpManager::register_all`] sweep and the single-server
+    /// [`McpManager::refresh_server`] path so the two cannot drift.
+    fn relist_slot(slot: &mut ServerSlot, deadline: Duration) {
+        match slot.handle.list_tools_with_deadline(deadline) {
             Ok(tools) => {
-                // Keep `tool_count` in step with the fresh listing so the
-                // `/mcp` status surface reports the changed server's real tool
-                // count (the count excludes disabled tools, matching
-                // `slot_from_server`).
+                // Keep `tool_count` in step with the fresh listing so the `/mcp`
+                // status surface reports the real tool count (the count excludes
+                // disabled tools, matching `slot_from_server`).
                 slot.tool_count = Self::enabled_tool_count(&tools, &slot.config.disabled_tools);
                 slot.tools = tools;
             }
             Err(e) => {
-                warn!(server = %slug, error = %e, "MCP tool listing missed the catalogue-refresh budget; keeping the previous tool set");
+                warn!(
+                    server = %slot.config.slug,
+                    error = %e,
+                    "MCP tool listing missed the catalogue-refresh budget; keeping the previous tool set"
+                );
             }
         }
     }
@@ -498,88 +524,6 @@ impl McpManager {
             .count()
     }
 
-    /// A snapshot of every daemon-tier SHARED server's state, in stable slug
-    /// order.
-    ///
-    /// Daemon-tier `shared = false` servers are per-session (they live in
-    /// `session_slots`, never in `servers`), so they are NOT reported here —
-    /// they would appear as a "not connected" duplicate of the per-session row
-    /// [`McpManager::session_status`] owns.
-    #[must_use]
-    pub fn status(&self) -> Vec<McpServerStatus> {
-        self.order
-            .iter()
-            .filter(|slug| self.configs.get(*slug).is_some_and(|e| e.shared))
-            .map(|slug| self.daemon_status(slug))
-            .collect()
-    }
-
-    fn daemon_status(&self, slug: &str) -> McpServerStatus {
-        let config = self.configs.get(slug).map(|e| &e.config);
-        let transport = config.map_or_else(String::new, |c| c.transport.label().to_string());
-        let target = config.map_or_else(String::new, |c| c.transport.target().to_string());
-        match self.servers.get(slug) {
-            Some(slot) => McpServerStatus {
-                slug: slug.to_string(),
-                tier: "daemon".to_string(),
-                transport,
-                target,
-                connected: true,
-                tool_count: slot.tool_count,
-                server_name: Some(slot.handle.name().to_string()),
-                server_version: Some(slot.handle.version().to_string()),
-                last_error: None,
-            },
-            None => McpServerStatus {
-                slug: slug.to_string(),
-                tier: "daemon".to_string(),
-                transport,
-                target,
-                connected: false,
-                tool_count: 0,
-                server_name: None,
-                server_version: None,
-                last_error: self.failures.get(slug).cloned(),
-            },
-        }
-    }
-
-    /// Statuses of a session's private (project + per-session) servers, in
-    /// stable `(tier, slug)` order.
-    #[must_use]
-    pub fn session_status(&self, session_id: u64) -> Vec<McpServerStatus> {
-        let mut out = Vec::new();
-        // Project-shared connections this session references.
-        for ((_, slug), shared) in &self.project_shared {
-            if shared.sessions.contains(&session_id) {
-                out.push(Self::slot_status(slug, "project", &shared.slot));
-            }
-        }
-        // Per-session connections.
-        for ((sid, root, slug), slot) in &self.session_slots {
-            if *sid == session_id {
-                let tier = if root.is_some() { "project" } else { "daemon" };
-                out.push(Self::slot_status(slug, tier, slot));
-            }
-        }
-        out.sort_by(|a, b| a.tier.cmp(&b.tier).then_with(|| a.slug.cmp(&b.slug)));
-        out
-    }
-
-    fn slot_status(slug: &str, tier: &str, slot: &ServerSlot) -> McpServerStatus {
-        McpServerStatus {
-            slug: slug.to_string(),
-            tier: tier.to_string(),
-            transport: slot.config.transport.label().to_string(),
-            target: slot.config.transport.target().to_string(),
-            connected: true,
-            tool_count: slot.tool_count,
-            server_name: Some(slot.handle.name().to_string()),
-            server_version: Some(slot.handle.version().to_string()),
-            last_error: None,
-        }
-    }
-
     /// Shut down all MCP servers, joining each dispatcher with a bounded wait.
     pub fn shutdown_all(&mut self) {
         let total = self.servers.len() + self.project_shared.len() + self.session_slots.len();
@@ -598,65 +542,6 @@ impl McpManager {
             drop(slot);
         }
         info!("all MCP servers shut down");
-    }
-
-    /// Cancel every in-flight tool call started by `session_id`.
-    pub fn cancel_session(&self, session_id: u64) {
-        for slot in self.servers.values() {
-            slot.handle.cancel_session(session_id);
-        }
-        for shared in self.project_shared.values() {
-            shared.slot.handle.cancel_session(session_id);
-        }
-        for ((sid, _, _), slot) in &self.session_slots {
-            if *sid == session_id {
-                slot.handle.cancel_session(session_id);
-            }
-        }
-    }
-
-    /// Cancel `session_id`'s in-flight tool calls to the servers of ONE project
-    /// root: its project-shared connections for that root plus its per-session
-    /// project connections under it.
-    ///
-    /// The session's daemon-tier calls (shared or per-session) are left running:
-    /// a working-directory change that leaves a project must not disturb an
-    /// unrelated in-flight call.
-    pub fn cancel_session_project(&self, session_id: u64, project_root: &Path) {
-        for ((root, _slug), shared) in &self.project_shared {
-            if root.as_path() == project_root && shared.sessions.contains(&session_id) {
-                shared.slot.handle.cancel_session(session_id);
-            }
-        }
-        for ((sid, root, _slug), slot) in &self.session_slots {
-            if *sid == session_id && root.as_deref() == Some(project_root) {
-                slot.handle.cancel_session(session_id);
-            }
-        }
-    }
-
-    /// The sessions that hold a project-tier or per-session server with `slug`
-    /// (project or daemon tier) — i.e. the sessions whose PRIVATE overlay
-    /// includes a server with that slug.
-    ///
-    /// A daemon-tier SHARED server with the same slug is NOT included: its tools
-    /// live in the daemon-wide catalogue, which the command loop refreshes
-    /// separately (`register_all`). Used to route a list change into exactly the
-    /// sessions whose overlay a project server's change affects.
-    #[must_use]
-    pub fn sessions_for_slug(&self, slug: &str) -> HashSet<u64> {
-        let mut out = HashSet::new();
-        for ((_root, s), shared) in &self.project_shared {
-            if s == slug {
-                out.extend(shared.sessions.iter().copied());
-            }
-        }
-        for (sid, _root, s) in self.session_slots.keys() {
-            if s == slug {
-                out.insert(*sid);
-            }
-        }
-        out
     }
 
     /// Create an empty `McpManager` with no servers (for testing).

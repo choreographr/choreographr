@@ -147,8 +147,7 @@ impl DaemonState {
                 // nudge — per-session project roots are unbounded, so they are
                 // never watched.
                 if let Some(session_id) = session_id {
-                    let overlay = self.resolve_and_push_session_overlay(session_id, false);
-                    let _ = overlay;
+                    let _ = self.resolve_and_push_session_overlay(session_id, false);
                 }
                 // Re-resolve the overlays that held a daemon per-session server
                 // this reload changed or removed, so they pick up the new
@@ -180,11 +179,21 @@ impl DaemonState {
     }
 
     /// Whether a session's overlay may REUSE its live connections: it must
-    /// still be in the same TRUSTED project it was last resolved for. A trust
-    /// flip in either direction (same root) must release instead, because an
-    /// untrusted resolve connected only the daemon-tier per-session servers,
-    /// so re-using them would leave those stale connections live rather than
-    /// releasing them.
+    /// still resolve to the same project root AND the same trust state it was
+    /// last resolved for.
+    ///
+    /// A resolved overlay's server set is determined by `(project_root,
+    /// trusted)`: a TRUSTED root contributes the project's servers plus the
+    /// daemon per-session servers, an UNTRUSTED (or absent) root contributes
+    /// only the daemon per-session servers — which do not depend on the root at
+    /// all. Reuse is therefore correct whenever neither the root nor the trust
+    /// state changed, INCLUDING the untrusted/absent case: reusing lets
+    /// `ensure_session` reuse the pooled daemon connections instead of dropping
+    /// and reconnecting them on every re-resolve.
+    ///
+    /// Leaving the root, or a trust flip in EITHER direction, must release
+    /// instead: a revocation that reused would leave the project's connections
+    /// live rather than releasing them.
     pub(super) fn session_overlay_reuse(
         previous: &SessionMcpProject,
         root: Option<&Path>,
@@ -192,7 +201,7 @@ impl DaemonState {
     ) -> bool {
         let leaving = previous.root.as_deref() != root;
         let trust_flip = previous.trusted != trusted;
-        trusted && !leaving && !trust_flip
+        !leaving && !trust_flip
     }
 
     /// Resolve a session's MCP overlay and push it to the session thread (which
@@ -418,16 +427,25 @@ impl DaemonState {
             .iter()
             .map(|p| crate::mcp::trust::canonicalize_root(p))
             .collect();
+        // A root that is no longer trusted is a REVOCATION: the sessions at it
+        // must have their in-flight calls to that project's servers cancelled,
+        // matching the command path (`/mcp untrust`). A root that became trusted
+        // is a grant and cancels nothing.
+        let revoked: std::collections::HashSet<PathBuf> = before
+            .iter()
+            .filter(|r| !after.contains(*r))
+            .map(|p| crate::mcp::trust::canonicalize_root(p))
+            .collect();
         let sessions: Vec<u64> = self.active_sessions.keys().copied().collect();
         let mut affected = 0usize;
         for session_id in sessions {
             let (root, _) = self.session_project_root(session_id);
-            let matches = root
-                .as_deref()
-                .is_some_and(|r| changed.contains(&crate::mcp::trust::canonicalize_root(r)));
+            let canonical = root.as_deref().map(crate::mcp::trust::canonicalize_root);
+            let matches = canonical.as_ref().is_some_and(|r| changed.contains(r));
             if matches {
                 affected += 1;
-                let _ = self.resolve_and_push_session_overlay(session_id, false);
+                let cancel = canonical.as_ref().is_some_and(|r| revoked.contains(r));
+                let _ = self.resolve_and_push_session_overlay(session_id, cancel);
             }
         }
         info!(

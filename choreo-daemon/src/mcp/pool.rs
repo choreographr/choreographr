@@ -12,8 +12,8 @@
 use super::config::{self, McpEntry};
 #[cfg(feature = "mcp")]
 use super::{
-    McpReloadOutcome, RECONNECT_BUDGET, RELOAD_BUDGET, ServerSlot, SharedSlot, connect_and_list,
-    join_with_budget,
+    McpReloadOutcome, RECONNECT_BUDGET, RECONNECT_TOTAL_BUDGET, RELOAD_BUDGET, RELOAD_TOTAL_BUDGET,
+    ServerSlot, SharedSlot, connect_and_list, join_with_budget,
 };
 #[cfg(feature = "mcp")]
 use choreo_mcp::{McpListChange, McpServer, McpServerConfig, McpTool};
@@ -22,7 +22,23 @@ use std::collections::{HashMap, HashSet};
 #[cfg(feature = "mcp")]
 use std::path::PathBuf;
 #[cfg(feature = "mcp")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// One live connection a reconnect can target, addressed by its pool key.
+///
+/// Lets [`super::McpManager::reconnect`] walk every connection a slug names — a
+/// daemon shared server, each project-shared connection, and each per-session
+/// slot — through one rebuild path, so the three categories cannot drift.
+#[cfg(feature = "mcp")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlotKey {
+    /// A daemon-tier shared connection, keyed by slug.
+    Daemon(String),
+    /// A project-shared connection, keyed by `(project_root, slug)`.
+    Project(PathBuf, String),
+    /// A per-session connection, keyed by `(session_id, root or None, slug)`.
+    Session(u64, Option<PathBuf>, String),
+}
 #[cfg(feature = "mcp")]
 use tracing::{info, warn};
 
@@ -35,102 +51,129 @@ impl super::McpManager {
     /// `shared = false` server has a per-session slot with `root = None`; a
     /// project `shared = false` server has one with `root = Some(..)`). Every
     /// matching connection is rebuilt in place: a failed rebuild is collected,
-    /// not fatal, so one bad connection does not skip the rest.
+    /// not fatal, so one bad connection does not skip the rest. The WHOLE walk
+    /// is bounded by [`RECONNECT_TOTAL_BUDGET`], so a slug referenced from many
+    /// projects cannot stall the command loop for one budget per connection.
+    ///
+    /// Each connection is rebuilt the SAME way — the replacement slot is built
+    /// first and swapped in only on success — so a transient connect failure
+    /// never discards a working connection.
     ///
     /// # Errors
     ///
     /// Returns a message when `slug` matches nothing, or when every matching
     /// connection failed to rebuild.
     pub fn reconnect(&mut self, slug: &str) -> Result<(), String> {
+        let keys = self.matching_slot_keys(slug);
+        if keys.is_empty() {
+            return Err(format!("unknown MCP server {slug:?}"));
+        }
+
+        let deadline = Instant::now() + RECONNECT_TOTAL_BUDGET;
         let mut reconnected = 0usize;
         let mut errors: Vec<String> = Vec::new();
-
-        // Daemon-tier shared server (at most one, keyed by slug).
-        if let Some(config) = self
-            .configs
-            .get(slug)
-            .filter(|e| e.shared)
-            .map(|e| e.config.clone())
-        {
-            self.servers.remove(slug);
-            if let Some(slot) = Self::connect_slot(&self.list_change_tx, &config, RECONNECT_BUDGET)
-            {
-                self.servers.insert(slug.to_string(), slot);
-                self.failures.remove(slug);
-                info!(server = %slug, "reconnected MCP server");
-                reconnected += 1;
-            } else {
-                let msg = format!("reconnect to {slug:?} failed");
-                self.failures.insert(slug.to_string(), msg.clone());
-                errors.push(msg);
+        for key in keys {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                errors.push(format!(
+                    "reconnect budget exhausted before rebuilding {key:?}"
+                ));
+                break;
             }
-        }
-
-        // Project-shared connections (best-effort, by slug). Rebuild EVERY
-        // match rather than bailing on the first failure, so a shared server
-        // referenced from several projects is fully refreshed.
-        let matching_shared: Vec<(PathBuf, String)> = self
-            .project_shared
-            .keys()
-            .filter(|(_, s)| s == slug)
-            .cloned()
-            .collect();
-        for key in matching_shared {
-            if let Some(shared) = self.project_shared.get(&key) {
-                let config = shared.slot.config.clone();
-                let sessions = shared.sessions.clone();
-                if let Some(slot) =
-                    Self::connect_slot(&self.list_change_tx, &config, RECONNECT_BUDGET)
-                {
-                    self.project_shared
-                        .insert(key.clone(), SharedSlot { slot, sessions });
-                    info!(server = %slug, root = %key.0.display(), "reconnected shared project MCP server");
+            match self.rebuild_slot(&key, remaining.min(RECONNECT_BUDGET)) {
+                Ok(()) => {
+                    info!(server = %slug, slot = ?key, "reconnected MCP server");
                     reconnected += 1;
-                } else {
-                    errors.push(format!(
-                        "reconnect to {slug:?} failed for project root {}",
-                        key.0.display()
-                    ));
                 }
-            }
-        }
-
-        // Per-session connections (daemon `shared = false`, and project
-        // `shared = false`), each rebuilt in place from its own config.
-        let matching_session: Vec<(u64, Option<PathBuf>, String)> = self
-            .session_slots
-            .keys()
-            .filter(|(_, _, s)| s == slug)
-            .cloned()
-            .collect();
-        for key in matching_session {
-            if let Some(slot) = self.session_slots.get(&key) {
-                let config = slot.config.clone();
-                if let Some(new_slot) =
-                    Self::connect_slot(&self.list_change_tx, &config, RECONNECT_BUDGET)
-                {
-                    self.session_slots.insert(key.clone(), new_slot);
-                    info!(
-                        server = %slug,
-                        session_id = key.0,
-                        root = ?key.1,
-                        "reconnected per-session MCP server"
-                    );
-                    reconnected += 1;
-                } else {
-                    errors.push(format!(
-                        "reconnect to {slug:?} failed for session {}",
-                        key.0
-                    ));
-                }
+                Err(e) => errors.push(e),
             }
         }
 
         if reconnected == 0 {
-            if errors.is_empty() {
-                return Err(format!("unknown MCP server {slug:?}"));
-            }
             return Err(errors.join("; "));
+        }
+        Ok(())
+    }
+
+    /// Every live connection `slug` names, in rebuild order (daemon shared
+    /// first, then project-shared, then per-session).
+    fn matching_slot_keys(&self, slug: &str) -> Vec<SlotKey> {
+        let mut keys = Vec::new();
+        // A daemon shared server is reconnectable even when it is not currently
+        // connected (a startup/reload failure leaves it out of `servers`), so
+        // this is keyed on the CONFIG, not on a live slot.
+        if self.configs.get(slug).is_some_and(|e| e.shared) {
+            keys.push(SlotKey::Daemon(slug.to_string()));
+        }
+        for (root, s) in self.project_shared.keys() {
+            if s == slug {
+                keys.push(SlotKey::Project(root.clone(), s.clone()));
+            }
+        }
+        for (sid, root, s) in self.session_slots.keys() {
+            if s == slug {
+                keys.push(SlotKey::Session(*sid, root.clone(), s.clone()));
+            }
+        }
+        keys
+    }
+
+    /// The resolved config backing `key`, cloned so the caller can rebuild
+    /// without holding a borrow of the manager.
+    fn slot_config(&self, key: &SlotKey) -> Option<McpServerConfig> {
+        match key {
+            SlotKey::Daemon(slug) => self.configs.get(slug).map(|e| e.config.clone()),
+            SlotKey::Project(root, slug) => self
+                .project_shared
+                .get(&(root.clone(), slug.clone()))
+                .map(|shared| shared.slot.config.clone()),
+            SlotKey::Session(id, root, slug) => self
+                .session_slots
+                .get(&(*id, root.clone(), slug.clone()))
+                .map(|slot| slot.config.clone()),
+        }
+    }
+
+    /// Rebuild the connection for `key` in place, replacing the slot only on
+    /// success so a failed rebuild never discards a working connection.
+    ///
+    /// `timeout` bounds the connect-and-discover worker.
+    fn rebuild_slot(&mut self, key: &SlotKey, timeout: Duration) -> Result<(), String> {
+        let config = self
+            .slot_config(key)
+            .ok_or_else(|| format!("no configuration for MCP slot {key:?}"))?;
+        let Some(slot) = Self::connect_slot(&self.list_change_tx, &config, timeout) else {
+            return Err(match key {
+                SlotKey::Daemon(_) => format!("reconnect to {:?} failed", config.slug),
+                SlotKey::Project(root, _) => format!(
+                    "reconnect to {:?} failed for project root {}",
+                    config.slug,
+                    root.display()
+                ),
+                SlotKey::Session(id, _, _) => {
+                    format!("reconnect to {:?} failed for session {id}", config.slug)
+                }
+            });
+        };
+        match key {
+            SlotKey::Daemon(slug) => {
+                self.failures.remove(slug);
+                self.servers.insert(slug.clone(), slot);
+            }
+            SlotKey::Project(root, slug) => {
+                // Preserve the existing ref-count set (a failed connect would
+                // have left it untouched; on success the new slot inherits it).
+                let sessions = self
+                    .project_shared
+                    .get(&(root.clone(), slug.clone()))
+                    .map_or_default(|shared| shared.sessions.clone());
+                self.project_shared
+                    .insert((root.clone(), slug.clone()), SharedSlot { slot, sessions });
+            }
+            SlotKey::Session(id, root, slug) => {
+                self.session_slots
+                    .insert((*id, root.clone(), slug.clone()), slot);
+            }
         }
         Ok(())
     }
@@ -186,6 +229,11 @@ impl super::McpManager {
         let mut restarted: Vec<String> = Vec::new();
         let mut unchanged: Vec<String> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
+
+        // One deadline for the WHOLE reload: each (re)connect gets the smaller
+        // of its per-server budget and the remaining share, so a config with
+        // many slow servers cannot stall the command loop indefinitely.
+        let deadline = Instant::now() + RELOAD_TOTAL_BUDGET;
 
         for entry in &entries {
             let slug = entry.config.slug.clone();
@@ -250,9 +298,18 @@ impl super::McpManager {
             // drop any (e.g. it was previously `shared = false`).
             affected.extend(self.drop_daemon_session_slots(&slug));
             self.servers.remove(&slug);
-            if let Some(slot) =
-                Self::connect_slot(&self.list_change_tx, &entry.config, RELOAD_BUDGET)
-            {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let slot = if remaining.is_zero() {
+                warn!(server = %slug, "MCP reload budget exhausted; skipping connect");
+                None
+            } else {
+                Self::connect_slot(
+                    &self.list_change_tx,
+                    &entry.config,
+                    remaining.min(RELOAD_BUDGET),
+                )
+            };
+            if let Some(slot) = slot {
                 self.failures.remove(&slug);
                 self.servers.insert(slug, slot);
             } else {
@@ -338,8 +395,63 @@ impl super::McpManager {
 #[cfg(test)]
 #[cfg(feature = "mcp")]
 mod tests {
-    use super::super::config;
+    use super::super::config::{self, McpEntry};
     use super::super::{McpManager, McpServerStatus};
+    use super::SlotKey;
+
+    /// A minimal entry with the given slug and pooling attribute.
+    fn entry(slug: &str, shared: bool) -> McpEntry {
+        McpEntry {
+            config: choreo_mcp::McpServerConfig {
+                slug: slug.to_string(),
+                transport: choreo_mcp::McpTransport::Stdio {
+                    command: "true".to_string(),
+                    args: Vec::new(),
+                    env: std::collections::HashMap::new(),
+                    cwd: None,
+                    log_path: None,
+                },
+                enabled: true,
+                timeout: None,
+                protocol: choreo_mcp::McpProtocolMode::Auto,
+                max_concurrent_calls: None,
+                max_restarts: None,
+                disabled_tools: Vec::new(),
+            },
+            shared,
+        }
+    }
+
+    /// A daemon-shared server is reconnectable from its CONFIG even with no live
+    /// slot (a failed startup must be retryable), while a per-session server is
+    /// reconnectable only where it is actually connected.
+    #[test]
+    fn matching_slot_keys_targets_shared_by_config() {
+        let mut manager = McpManager::empty();
+        manager
+            .configs
+            .insert("shared".to_string(), entry("shared", true));
+        manager
+            .configs
+            .insert("per".to_string(), entry("per", false));
+        assert_eq!(
+            manager.matching_slot_keys("shared"),
+            vec![SlotKey::Daemon("shared".to_string())]
+        );
+        assert!(
+            manager.matching_slot_keys("per").is_empty(),
+            "a per-session server with no live slot has nothing to reconnect"
+        );
+    }
+
+    #[test]
+    fn reconnect_unknown_slug_is_an_error() {
+        let mut manager = McpManager::empty();
+        let err = manager
+            .reconnect("nope")
+            .expect_err("an unknown slug must error");
+        assert!(err.contains("unknown MCP server"), "{err}");
+    }
 
     #[test]
     fn reload_with_no_config_reports_all_zero() {
