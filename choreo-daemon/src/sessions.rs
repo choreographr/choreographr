@@ -2377,7 +2377,8 @@ fn handle_set_working_dir(
     // working directory. `persist_session_metadata` queued the UpdateMetadata
     // that records the new directory FIRST, so the command loop sees the fresh
     // directory when it handles this. `cancel_inflight` stops the session's
-    // in-flight calls to the project it is leaving (A9).
+    // in-flight calls to the project it is leaving — and only those; its
+    // daemon-tier calls keep running.
     let _ = ctx.daemon_tx.send(DaemonCommand::McpEnsureSession {
         session_id: ctx.session_id,
         cancel_inflight: true,

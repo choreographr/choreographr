@@ -80,6 +80,7 @@ pub fn test_daemon_state_with_limits(limits: LagLimits) -> DaemonState {
         // sessions create their own registries at spawn time in unit tests.
         daemon_registry: choreo_ai_protocols::SocketRegistry::default(),
         session_registries: HashMap::new(),
+        session_mcp_roots: HashMap::new(),
         credentials: HashMap::new(),
         x_credentials: None,
         // Test daemons start locked, matching the production daemon.

@@ -1391,6 +1391,26 @@ impl McpManager {
         }
     }
 
+    /// Cancel `session_id`'s in-flight tool calls to the servers of ONE project
+    /// root: its project-shared connections for that root plus its per-session
+    /// project connections under it.
+    ///
+    /// The session's daemon-tier calls (shared or per-session) are left running:
+    /// a working-directory change that leaves a project must not disturb an
+    /// unrelated in-flight call.
+    pub fn cancel_session_project(&self, session_id: u64, project_root: &Path) {
+        for ((root, _slug), shared) in &self.project_shared {
+            if root.as_path() == project_root && shared.sessions.contains(&session_id) {
+                shared.slot.handle.cancel_session(session_id);
+            }
+        }
+        for ((sid, root, _slug), slot) in &self.session_slots {
+            if *sid == session_id && root.as_deref() == Some(project_root) {
+                slot.handle.cancel_session(session_id);
+            }
+        }
+    }
+
     /// Create an empty `McpManager` with no servers (for testing).
     #[must_use]
     pub fn empty() -> Self {
@@ -1491,6 +1511,9 @@ mod imp {
 
         /// Stub: no server has any in-flight call to cancel.
         pub fn cancel_session(&self, _session_id: u64) {}
+
+        /// Stub: no server has any in-flight call to cancel.
+        pub fn cancel_session_project(&self, _session_id: u64, _project_root: &std::path::Path) {}
 
         /// Stub: there are no servers to reconnect.
         pub fn reconnect(&mut self, slug: &str) -> Result<(), String> {

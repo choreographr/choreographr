@@ -119,6 +119,14 @@ pub struct DaemonState {
     /// sessions' connections are untouched. Entries are created in
     /// `spawn_session` and dropped in `handle_session_exited`.
     pub session_registries: HashMap<u64, choreo_ai_protocols::SocketRegistry>,
+    /// Each live session's currently-resolved MCP project root (the root its
+    /// overlay was last resolved for), or `None` when it has no project tier.
+    /// Kept on the command loop so a working-directory change (or a trust flip)
+    /// that LEAVES a project can cancel that session's in-flight calls to
+    /// exactly THAT project's servers, leaving its daemon-tier calls running.
+    /// Entries are set in `resolve_and_push_session_overlay` and dropped in
+    /// `handle_session_exited`.
+    pub session_mcp_roots: HashMap<u64, Option<PathBuf>>,
     pub credentials: HashMap<String, ServiceCredential>,
     pub x_credentials: Option<ServiceCredential>,
     /// Whether the credential keystore is currently locked (no decrypted
@@ -567,10 +575,12 @@ pub enum DaemonCommand {
     /// Resolve (or re-resolve) a session's MCP overlay: compute its project
     /// root from its working directory and the trust store, then ensure/release
     /// the project-shared and per-session servers. `cancel_inflight` is set
-    /// when the trigger is a working-directory change leaving a project, so the
-    /// session's in-flight calls to that project's servers are stopped (A9).
-    /// The command loop resolves the overlay and PUSHES it to the session via
-    /// [`SessionCommand::SetMcpOverlay`]; there is no reply (fire-and-forget).
+    /// when the trigger is a working-directory change leaving a project (or a
+    /// trust revocation), so the session's in-flight calls to that (old)
+    /// project's servers are stopped — and only those; its daemon-tier calls
+    /// keep running. The command loop resolves the overlay and PUSHES it to the
+    /// session via [`SessionCommand::SetMcpOverlay`]; there is no reply
+    /// (fire-and-forget).
     McpEnsureSession {
         session_id: u64,
         cancel_inflight: bool,
@@ -1761,6 +1771,7 @@ impl DaemonState {
         // Drop the session's registry clone: the thread is gone, nothing can
         // register or be cancelled through it anymore.
         self.session_registries.remove(&session_id);
+        self.session_mcp_roots.remove(&session_id);
 
         // Release the session's MCP pool references: decrement project-shared
         // ref-counts (dropping connections no session uses anymore) and drop
@@ -2263,17 +2274,26 @@ impl DaemonState {
         session_id: u64,
         cancel_inflight: bool,
     ) -> SessionMcpOverlay {
+        // The project this session's overlay was last resolved for, so a
+        // working-directory change (or a trust flip) that LEAVES that project
+        // can cancel exactly its servers' in-flight calls.
+        let previous_root = self.session_mcp_roots.get(&session_id).cloned().flatten();
         let (root, trusted) = self.session_project_root(session_id);
-        // A working-directory change that leaves a project stops that session's
-        // in-flight calls to its (old) project servers — a best-effort, broader
-        // cancel (it also stops any daemon-tier call in flight, which is
-        // harmless: the turn can simply retry).
         if cancel_inflight {
-            self.mcp_manager.cancel_session(session_id);
+            // Stop the session's in-flight calls to the project it is leaving or
+            // revoking — and ONLY those. Its daemon-tier calls keep running: a
+            // working-directory change must not disturb an unrelated in-flight
+            // call.
+            if let Some(old_root) = previous_root.as_deref() {
+                self.mcp_manager
+                    .cancel_session_project(session_id, old_root);
+            }
         }
         let overlay = self
             .mcp_manager
             .reload_session(session_id, root.as_deref(), trusted);
+        // Record the freshly-resolved root so the NEXT change knows what it left.
+        self.session_mcp_roots.insert(session_id, root);
         if let Some(entry) = self.active_sessions.get(&session_id)
             && entry
                 .cmd_tx

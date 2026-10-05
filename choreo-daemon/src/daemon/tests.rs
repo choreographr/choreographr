@@ -33,6 +33,7 @@ pub(super) fn make_daemon_state() -> (DaemonState, crossbeam_channel::Receiver<D
         accounts: AccountManager::load(&accounts_path).unwrap(),
         daemon_registry: choreo_ai_protocols::SocketRegistry::default(),
         session_registries: HashMap::new(),
+        session_mcp_roots: HashMap::new(),
         credentials: HashMap::new(),
         x_credentials: None,
         // Test states start locked, matching the production daemon.
@@ -1844,6 +1845,63 @@ fn handle_set_working_dir_forwards_to_session() {
 
     // Clean up the session thread.
     let _ = release_tx.send(());
+}
+
+/// The session's resolved MCP project root is tracked on the command loop, so a
+/// working-directory change that leaves a project can cancel exactly that
+/// project's in-flight calls (and, on the next resolve, knows what it left).
+#[test]
+fn resolving_an_overlay_tracks_the_session_project_root() {
+    let (mut state, _rx) = make_daemon_state();
+    let metadata = |working_dir: Option<String>| SessionMetadata {
+        title: None,
+        selected_model: None,
+        reasoning_effort: None,
+        parent_session_id: None,
+        working_dir,
+        created_at: 1000,
+        last_modified: 1000,
+        turn_count: 0,
+        status: SessionStatus::Inactive,
+        active_tool_groups: vec![],
+        account_name: None,
+        accumulated_usage: TokenUsage::default(),
+        context_window: None,
+        last_prompt_tokens: None,
+        pinned: false,
+        archived_at: None,
+    };
+
+    // A project root: a dir holding `.mcp.json` at the git root (no live MCP
+    // servers, so the cancel the leave-path issues is a no-op — this pins the
+    // root tracking the narrower cancel keys on).
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project.path().join(".git")).unwrap();
+    std::fs::write(project.path().join(".mcp.json"), "{}").unwrap();
+    state.session_metadata.insert(
+        1,
+        metadata(Some(project.path().to_string_lossy().into_owned())),
+    );
+
+    state.resolve_and_push_session_overlay(1, false);
+    assert_eq!(
+        state.session_mcp_roots.get(&1).cloned().flatten(),
+        Some(project.path().to_path_buf()),
+        "the resolved project root must be recorded for the session"
+    );
+
+    // Leaving the project (a dir with no `.mcp.json`) re-resolves to `None`.
+    let elsewhere = tempfile::tempdir().unwrap();
+    state.session_metadata.insert(
+        1,
+        metadata(Some(elsewhere.path().to_string_lossy().into_owned())),
+    );
+    state.resolve_and_push_session_overlay(1, true);
+    assert_eq!(
+        state.session_mcp_roots.get(&1).cloned().flatten(),
+        None,
+        "leaving the project must drop the recorded root"
+    );
 }
 
 #[test]
