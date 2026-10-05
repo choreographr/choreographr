@@ -325,29 +325,6 @@ impl ProjectToolSet {
             .collect()
     }
 
-    /// Like [`Self::definitions`] but carrying `output_schema`/`allowed_callers`
-    /// for the Responses API.
-    #[must_use]
-    pub fn definitions_for_responses(&self) -> Vec<ChatToolDefinition> {
-        self.tools
-            .iter()
-            .map(|t| {
-                let callers = t.allowed_callers();
-                ChatToolDefinition::function_with_options(
-                    t.name(),
-                    t.description(),
-                    t.schema(),
-                    t.output_schema(),
-                    if callers.is_empty() {
-                        None
-                    } else {
-                        Some(callers)
-                    },
-                )
-            })
-            .collect()
-    }
-
     /// Describe a call against a tool in this set, or `None` if unknown.
     #[must_use]
     pub fn describe_invocation_json(&self, name: &str, args_json: &str) -> Option<String> {

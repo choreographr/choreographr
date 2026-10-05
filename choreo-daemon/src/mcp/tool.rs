@@ -22,6 +22,24 @@ const MAX_OUTPUT_TEXT_BYTES: usize = 256 * 1024;
 /// [`MAX_OUTPUT_TEXT_BYTES`].
 const TRUNCATION_MARKER: &str = "\n… [output truncated]";
 
+/// The provider-safe `(name, group)` pair and `[MCP <slug>]`-prefixed
+/// description for one server tool.
+///
+/// Centralized so the naming, grouping, and prefixing convention is defined
+/// once and every wrapper constructor derives its three strings from it rather
+/// than re-assembling them.
+fn prefixed_identity(
+    server_slug: &str,
+    tool_name: &str,
+    description: &str,
+) -> (String, String, String) {
+    (
+        choreo_mcp::build_tool_name(server_slug, tool_name),
+        choreo_mcp::group_name(server_slug),
+        format!("[MCP {server_slug}] {description}"),
+    )
+}
+
 /// Wraps an MCP server tool as a `ToolDyn` for Choreographr's tool registry.
 pub struct McpToolWrapper {
     /// Full prefixed name: "mcp/<`server_slug`>/<`tool_name`>"
@@ -53,10 +71,11 @@ impl McpToolWrapper {
         output_schema: Option<Value>,
         handle: McpServerHandle,
     ) -> Self {
+        let (name, group, description) = prefixed_identity(server_slug, tool_name, description);
         Self::with_name(
-            choreo_mcp::build_tool_name(server_slug, tool_name),
-            choreo_mcp::group_name(server_slug),
-            format!("[MCP {server_slug}] {description}"),
+            name,
+            group,
+            description,
             tool_name.to_string(),
             input_schema,
             output_schema,
@@ -432,12 +451,12 @@ impl McpListResourcesTool {
     /// Build the listing tool for one server.
     #[must_use]
     pub fn new(server_slug: &str, handle: McpServerHandle) -> Self {
-        Self::with_name(
-            choreo_mcp::build_tool_name(server_slug, "list_resources"),
-            choreo_mcp::group_name(server_slug),
-            format!("[MCP {server_slug}] List the resources this server exposes."),
-            handle,
-        )
+        let (name, group, description) = prefixed_identity(
+            server_slug,
+            "list_resources",
+            "List the resources this server exposes.",
+        );
+        Self::with_name(name, group, description, handle)
     }
 
     /// Build the listing tool with an already-resolved name and group.
@@ -569,12 +588,12 @@ impl McpReadResourceTool {
     /// Build the read tool for one server.
     #[must_use]
     pub fn new(server_slug: &str, handle: McpServerHandle) -> Self {
-        Self::with_name(
-            choreo_mcp::build_tool_name(server_slug, "read_resource"),
-            choreo_mcp::group_name(server_slug),
-            format!("[MCP {server_slug}] Read one resource by URI (see list_resources)."),
-            handle,
-        )
+        let (name, group, description) = prefixed_identity(
+            server_slug,
+            "read_resource",
+            "Read one resource by URI (see list_resources).",
+        );
+        Self::with_name(name, group, description, handle)
     }
 
     /// Build the read tool with an already-resolved name and group.
