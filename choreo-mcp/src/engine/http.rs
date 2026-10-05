@@ -159,8 +159,8 @@ pub(super) fn connect_error_status(error: &ClientInitializeError) -> Option<u16>
 /// returning the HTTP status it carries, if any.
 ///
 /// The one chain walk shared by the connect-time ([`connect_error_status`]) and
-/// service-time ([`service_error_status`](super::convert::service_error_status))
-/// status recovery.
+/// service-time ([`map_service_error`](super::convert::map_service_error)) status
+/// recovery.
 pub(super) fn status_from_chain(root: &(dyn std::error::Error + 'static)) -> Option<u16> {
     let mut current = Some(root);
     while let Some(err) = current {

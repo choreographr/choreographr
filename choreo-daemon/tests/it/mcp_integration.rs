@@ -852,6 +852,67 @@ fn reload_drops_a_changed_daemon_per_session_slot() {
     choreo_daemon::mcp::config::set_test_config_root(None);
 }
 
+/// `/mcp reload` must move a daemon server flipped from `shared = true` to
+/// `shared = false` OUT of the shared pool. Leaving the stale daemon shared
+/// slot would keep it registering its tools under `mcp/<slug>` in the daemon
+/// catalogue while the per-session connection registers them again, yielding
+/// duplicate tool names.
+#[test]
+#[ignore = "integration"]
+fn reload_moves_a_shared_server_to_per_session() {
+    watchdog();
+
+    // Start as a daemon-tier SHARED server and connect it.
+    let config_dir = write_daemon_config(&serde_json::json!({ "flip": fixture_entry("modern") }))
+        .expect("write config");
+    choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
+
+    let mut registry = choreo_daemon::tools::ToolRegistry::new();
+    let mut manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
+    assert_eq!(
+        manager.server_count(),
+        1,
+        "the shared server must connect on startup"
+    );
+
+    // Flip it to per-session and reload.
+    let mut per_session = fixture_entry("modern");
+    per_session["shared"] = serde_json::json!(false);
+    std::fs::write(
+        config_dir.path().join("choreographr").join("mcp.json"),
+        serde_json::to_string_pretty(&serde_json::json!({ "mcpServers": { "flip": per_session } }))
+            .expect("serialize"),
+    )
+    .expect("rewrite mcp.json");
+
+    let outcome = manager.reload().expect("reload succeeds");
+    assert!(
+        outcome.summary.contains("1 restarted"),
+        "the flip must count as restarted: {}",
+        outcome.summary
+    );
+    assert_eq!(
+        manager.server_count(),
+        0,
+        "the stale shared slot must be dropped when the server becomes per-session"
+    );
+
+    // The next resolve connects it as a per-session server instead.
+    let overlay = manager.ensure_session(7, None, false);
+    assert!(
+        overlay.statuses.iter().any(|s| s.slug == "flip"),
+        "the server must reconnect per-session on the next resolve: {:?}",
+        overlay.statuses
+    );
+    assert!(
+        manager.session_status(7).iter().any(|s| s.slug == "flip"),
+        "the per-session connection must now be tracked"
+    );
+
+    drop(manager);
+    choreo_daemon::mcp::config::set_test_config_root(None);
+}
+
 /// A project server that fails to connect must NOT shadow the daemon-tier
 /// group of the same slug.
 #[test]

@@ -392,6 +392,23 @@ impl super::McpManager {
         Ok(built.tool_count)
     }
 
+    /// The `session_slots` keys naming a DAEMON-tier per-session connection
+    /// (`root = None`) for `slug`.
+    ///
+    /// A key with `root = Some(..)` is a PROJECT-tier per-session connection and
+    /// is reconciled by the overlay resolution, never by a daemon-tier reload;
+    /// only the daemon tier's keys are returned here.
+    pub(super) fn daemon_per_session_slot_keys(
+        &self,
+        slug: &str,
+    ) -> Vec<(u64, Option<PathBuf>, String)> {
+        self.session_slots
+            .keys()
+            .filter(|(_, root, s)| root.is_none() && s == slug)
+            .cloned()
+            .collect()
+    }
+
     /// Remove every daemon-tier per-session slot (`root = None`) for `slug`,
     /// returning the sessions that held them.
     ///
@@ -399,14 +416,8 @@ impl super::McpManager {
     /// exists; leaving it in `session_slots` would make `ensure_session_slot`
     /// return the old connection under the same key forever.
     pub(super) fn drop_daemon_session_slots(&mut self, slug: &str) -> HashSet<u64> {
-        let stale: Vec<(u64, Option<PathBuf>, String)> = self
-            .session_slots
-            .keys()
-            .filter(|(_, root, s)| root.is_none() && s == slug)
-            .cloned()
-            .collect();
         let mut sessions = HashSet::new();
-        for key in stale {
+        for key in self.daemon_per_session_slot_keys(slug) {
             if self.session_slots.remove(&key).is_some() {
                 sessions.insert(key.0);
             }

@@ -42,6 +42,28 @@ enum SlotKey {
 #[cfg(feature = "mcp")]
 use tracing::{info, warn};
 
+/// The classification of one daemon-tier entry reconciled by a reload, tallied
+/// into `McpReloadOutcome::summary`, plus the sessions a change reached.
+///
+/// Shared by the two per-entry reconcile paths (`reconcile_shared_entry` /
+/// `reconcile_per_session_entry`) so the summary and the re-resolve set are
+/// accumulated through one place and cannot drift between the tiers.
+#[cfg(feature = "mcp")]
+#[derive(Default)]
+struct ReloadTally {
+    /// Newly configured since the last reload.
+    added: Vec<String>,
+    /// Already configured and reconnected because the entry changed.
+    restarted: Vec<String>,
+    /// Already configured and left untouched.
+    unchanged: Vec<String>,
+    /// A shared (re)connect that failed; the slug stays in `failures`.
+    failed: Vec<String>,
+    /// The sessions whose overlay referenced a changed/removed daemon
+    /// per-session server, to be re-resolved.
+    affected: HashSet<u64>,
+}
+
 #[cfg(feature = "mcp")]
 impl super::McpManager {
     /// Rebuild the connection(s) to `slug`, re-registering their tools.
@@ -204,11 +226,12 @@ impl super::McpManager {
             .map(|c| (c.config.slug.clone(), c.clone()))
             .collect();
 
-        // The sessions whose overlay referenced a daemon per-session server
-        // this reload changed or removed; the daemon re-resolves exactly these
-        // so a `shared = false` config change (or removal) reaches the sessions
-        // that hold it.
-        let mut affected: HashSet<u64> = HashSet::new();
+        // The sessions whose overlay referenced a daemon per-session server this
+        // reload changed or removed; the daemon re-resolves exactly these so a
+        // `shared = false` config change (or removal) reaches the sessions that
+        // hold it. A SHARED server's change reaches every session through the
+        // daemon-wide catalogue swap, so it needs no per-session entry here.
+        let mut tally = ReloadTally::default();
 
         let removed: Vec<String> = self
             .order
@@ -218,17 +241,12 @@ impl super::McpManager {
             .collect();
         for slug in &removed {
             // Capture the referencing sessions BEFORE dropping anything.
-            affected.extend(self.sessions_for_slug(slug));
+            tally.affected.extend(self.sessions_for_slug(slug));
             self.servers.remove(slug);
             self.failures.remove(slug);
             self.drop_daemon_session_slots(slug);
             info!(server = %slug, "MCP server removed by reload");
         }
-
-        let mut added: Vec<String> = Vec::new();
-        let mut restarted: Vec<String> = Vec::new();
-        let mut unchanged: Vec<String> = Vec::new();
-        let mut failed: Vec<String> = Vec::new();
 
         // One deadline for the WHOLE reload: each (re)connect gets the smaller
         // of its per-server budget and the remaining share, so a config with
@@ -237,86 +255,16 @@ impl super::McpManager {
 
         for entry in &entries {
             let slug = entry.config.slug.clone();
-            if !entry.shared {
-                // Daemon-tier per-session server: not in `self.servers`; its
-                // connection lives in `session_slots` keyed with root `None`.
-                // A changed config must drop those stale slots — else
-                // `ensure_session_slot` returns the old connection under the
-                // same key and never picks up the new one.
-                let stale: Vec<(u64, Option<PathBuf>, String)> = self
-                    .session_slots
-                    .keys()
-                    .filter(|(_, root, s)| root.is_none() && s == &slug)
-                    .cloned()
-                    .collect();
-                let changed = stale.iter().any(|key| {
-                    self.session_slots
-                        .get(key)
-                        .is_some_and(|slot| slot.config != entry.config)
-                });
-                // `self.configs` still holds the pre-reload set at this point, so
-                // it tells us whether this server was configured before this
-                // reload.
-                let was_configured = self.configs.contains_key(&slug);
-                if changed {
-                    affected.extend(self.sessions_for_slug(&slug));
-                    for key in stale {
-                        self.session_slots.remove(&key);
-                    }
-                    info!(
-                        server = %slug,
-                        "daemon per-session MCP server config changed; dropped stale per-session connections"
-                    );
-                    restarted.push(slug);
-                } else if was_configured {
-                    unchanged.push(slug);
-                } else {
-                    // A newly-added daemon `shared = false` server has no stale
-                    // slot to drop and no live session holds it yet: it reaches
-                    // existing sessions on their next overlay re-resolve, not at
-                    // reload.
-                    added.push(slug);
-                }
-                continue;
-            }
-
+            // `self.configs` still holds the PRE-reload set here, so it tells us
+            // whether this slug was configured before this reload. Both reconcile
+            // paths are keyed on the shared-vs-per-session ATTRIBUTE of the NEW
+            // entry, so a slug that FLIPS tiers is reconciled by its new tier
+            // (which drops the old tier's connection).
             let was_configured = self.configs.contains_key(&slug);
-            if self
-                .servers
-                .get(&slug)
-                .is_some_and(|slot| slot.config == entry.config)
-            {
-                unchanged.push(slug);
-                continue;
-            }
-            if was_configured {
-                restarted.push(slug.clone());
+            if entry.shared {
+                self.reconcile_shared_entry(&slug, entry, was_configured, deadline, &mut tally);
             } else {
-                added.push(slug.clone());
-            }
-            // A shared server being (re)connected leaves no per-session slots:
-            // drop any (e.g. it was previously `shared = false`).
-            affected.extend(self.drop_daemon_session_slots(&slug));
-            self.servers.remove(&slug);
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let slot = if remaining.is_zero() {
-                warn!(server = %slug, "MCP reload budget exhausted; skipping connect");
-                None
-            } else {
-                Self::connect_slot(
-                    &self.list_change_tx,
-                    &entry.config,
-                    remaining.min(RELOAD_BUDGET),
-                )
-            };
-            if let Some(slot) = slot {
-                self.failures.remove(&slug);
-                self.servers.insert(slug, slot);
-            } else {
-                let e = format!("connect to {slug:?} failed");
-                warn!(server = %slug, error = %e, "MCP server failed to connect during reload");
-                self.failures.insert(slug.clone(), e);
-                failed.push(slug);
+                self.reconcile_per_session_entry(&slug, entry, was_configured, &mut tally);
             }
         }
 
@@ -325,21 +273,133 @@ impl super::McpManager {
 
         let summary = format!(
             "MCP reload: {} added, {} removed, {} restarted, {} unchanged, {} failed",
-            added.len(),
+            tally.added.len(),
             removed.len(),
-            restarted.len(),
-            unchanged.len(),
-            failed.len()
+            tally.restarted.len(),
+            tally.unchanged.len(),
+            tally.failed.len()
         );
         info!(%summary, "reloaded MCP configuration");
         // Deterministic order so the re-resolve sequence is reproducible.
-        let mut affected_sessions: Vec<u64> = affected.into_iter().collect();
+        let mut affected_sessions: Vec<u64> = tally.affected.into_iter().collect();
         affected_sessions.sort_unstable();
         Ok(McpReloadOutcome {
             summary,
             servers: self.status(),
             affected_sessions,
         })
+    }
+
+    /// Reconcile one daemon-tier SHARED entry, reconnecting it when the live
+    /// slot's resolved config differs and dropping any stale per-session slots
+    /// the slug may have held.
+    ///
+    /// A shared server's change is visible to every session through the daemon
+    /// catalogue rebuild the caller runs afterwards, so no session needs a
+    /// per-session re-resolve for it; `tally.affected` therefore only grows from
+    /// the stale per-session slots this drops (the `shared = false` -> `true`
+    /// flip). A (re)connect that fails is recorded in `failures` AND still
+    /// counted as added/restarted, matching the summary's intent (the entry IS
+    /// (re)configured; it just did not come up).
+    fn reconcile_shared_entry(
+        &mut self,
+        slug: &str,
+        entry: &McpEntry,
+        was_configured: bool,
+        deadline: Instant,
+        tally: &mut ReloadTally,
+    ) {
+        // An unchanged resolved config keeps the live connection untouched.
+        if self
+            .servers
+            .get(slug)
+            .is_some_and(|slot| slot.config == entry.config)
+        {
+            tally.unchanged.push(slug.to_string());
+            return;
+        }
+        if was_configured {
+            tally.restarted.push(slug.to_string());
+        } else {
+            tally.added.push(slug.to_string());
+        }
+        // A shared server being (re)connected leaves no per-session slots: drop
+        // any (e.g. it was previously `shared = false`).
+        tally.affected.extend(self.drop_daemon_session_slots(slug));
+        self.servers.remove(slug);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let slot = if remaining.is_zero() {
+            warn!(server = %slug, "MCP reload budget exhausted; skipping connect");
+            None
+        } else {
+            Self::connect_slot(
+                &self.list_change_tx,
+                &entry.config,
+                remaining.min(RELOAD_BUDGET),
+            )
+        };
+        if let Some(slot) = slot {
+            self.failures.remove(slug);
+            self.servers.insert(slug.to_string(), slot);
+        } else {
+            let e = format!("connect to {slug:?} failed");
+            warn!(server = %slug, error = %e, "MCP server failed to connect during reload");
+            self.failures.insert(slug.to_string(), e);
+            tally.failed.push(slug.to_string());
+        }
+    }
+
+    /// Reconcile one daemon-tier PER-SESSION (`shared = false`) entry, dropping
+    /// the stale connections a config change (or the shared -> per-session flip)
+    /// leaves behind so the next resolve reconnects with the new config.
+    ///
+    /// A daemon per-session server normally lives only in `session_slots`, but a
+    /// server FLIPPED from `shared = true` to `false` still has a stale DAEMON
+    /// slot in `servers`; that slot is dropped too — leaving it would keep the
+    /// server registering its tools under `mcp/<slug>` in the daemon catalogue
+    /// while the per-session connection registers them again in each session's
+    /// overlay, yielding duplicate tool names. Either kind of stale slot makes
+    /// the entry `restarted`; a genuinely unchanged per-session server whose
+    /// connection still matches is left untouched.
+    fn reconcile_per_session_entry(
+        &mut self,
+        slug: &str,
+        entry: &McpEntry,
+        was_configured: bool,
+        tally: &mut ReloadTally,
+    ) {
+        // Drop a stale daemon SHARED slot (the shared -> per-session flip); a
+        // per-session server's connection is NOT here, it is in `session_slots`.
+        let had_shared = self.servers.remove(slug).is_some();
+        if had_shared {
+            self.failures.remove(slug);
+        }
+        let stale = self.daemon_per_session_slot_keys(slug);
+        let changed = had_shared
+            || stale.iter().any(|key| {
+                self.session_slots
+                    .get(key)
+                    .is_some_and(|slot| slot.config != entry.config)
+            });
+        if changed {
+            // Capture the referencing sessions BEFORE dropping their slots.
+            tally.affected.extend(self.sessions_for_slug(slug));
+            for key in stale {
+                self.session_slots.remove(&key);
+            }
+            info!(
+                server = %slug,
+                "daemon per-session MCP server changed; dropped stale connections"
+            );
+            tally.restarted.push(slug.to_string());
+        } else if was_configured {
+            tally.unchanged.push(slug.to_string());
+        } else {
+            // A newly-added daemon `shared = false` server has no stale slot to
+            // drop and no live session holds it yet: it reaches existing sessions
+            // on their next overlay re-resolve, not at reload.
+            tally.added.push(slug.to_string());
+        }
     }
 
     /// Connect one server from its resolved config and return a ready slot,
