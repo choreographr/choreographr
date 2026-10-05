@@ -60,4 +60,4 @@ pub use protocol::{
     normalize_input_schema, normalize_output_schema,
 };
 pub use session::{McpServer, McpServerHandle};
-pub use stdio::MAX_STDIO_FRAME_BYTES;
+pub use stdio::{MAX_STDIO_FRAME_BYTES, sanitize_child_env};

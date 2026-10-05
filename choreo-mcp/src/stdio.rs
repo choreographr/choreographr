@@ -128,6 +128,42 @@ fn frame_too_large(limit: usize) -> io::Error {
     )
 }
 
+/// Environment variables stripped from an MCP stdio child before it is spawned.
+///
+/// An MCP server is an untrusted, operator-configured (and, for a project tier,
+/// checkout-provided) binary. These variables make the dynamic loader (`LD_*`,
+/// `DYLD_*`) or a language runtime (`PYTHONPATH`, `PERL5LIB`, `RUBYLIB`) load
+/// attacker-chosen code into the child — a code-injection vector. The daemon's
+/// shell tool already strips the same set (`choreo-daemon`'s
+/// `tools::shell_util::sanitize_env`); the MCP child inherits the daemon's whole
+/// environment, so it must be scrubbed the same way, or an operand secret in the
+/// daemon's environment (or a value an operator's profile set) leaks into a
+/// freshly downloaded server. Kept as a local copy so this crate does not depend
+/// on `choreo-daemon`; the two lists must stay in step.
+const INJECTION_ENV_VARS: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "LD_DEBUG",
+    "PYTHONPATH",
+    "PERL5LIB",
+    "RUBYLIB",
+    "DYLD_INSERT_LIBRARIES",
+];
+
+/// Strip the code-injection environment variables (see the module's
+/// `INJECTION_ENV_VARS`) from a child command, so it does not inherit them from
+/// the daemon.
+///
+/// Applied to the `std::process::Command` a `tokio::process::Command` wraps, so
+/// the daemon's whole environment — which may hold operator secrets — is not
+/// passed wholesale to an untrusted server binary.
+pub fn sanitize_child_env(cmd: &mut std::process::Command) {
+    for var in INJECTION_ENV_VARS {
+        cmd.env_remove(var);
+    }
+}
+
 /// A capped stdio transport plus the child process it owns.
 ///
 /// Owns the spawned child so it can be killed on `close` (and on `Drop`, so a
@@ -168,6 +204,12 @@ impl StdioTransport {
         cmd.args(args);
         // An explicit executable + args only — never a shell string — so config
         // values cannot be reinterpreted as shell syntax.
+        //
+        // Strip the daemon's code-injection environment from the child (it would
+        // otherwise inherit the daemon's whole environment), THEN apply the
+        // config's explicit additions, so a config value can still set any
+        // variable it names.
+        sanitize_child_env(cmd.as_std_mut());
         for (key, value) in env {
             cmd.env(key, value);
         }

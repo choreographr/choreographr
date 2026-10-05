@@ -15,5 +15,6 @@
 //! inner attributes — inside a module they apply to that module.
 
 mod common;
+mod env_sanitization;
 mod mcp_http_integration;
 mod mcp_integration;
