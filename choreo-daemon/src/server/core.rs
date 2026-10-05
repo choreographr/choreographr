@@ -167,7 +167,10 @@ fn spawn_mcp_list_change_forwarder(
             for change in &list_rx {
                 debug!(server = %change.slug, ?change.kind, "MCP list change received; forwarding to command loop");
                 if daemon_tx
-                    .send(DaemonCommand::McpListChanged { slug: change.slug })
+                    .send(DaemonCommand::McpListChanged {
+                        slug: change.slug,
+                        tools_changed: change.kind == choreo_mcp::McpListKind::Tools,
+                    })
                     .is_err()
                 {
                     info!("daemon command loop gone; stopping MCP list-change forwarder");

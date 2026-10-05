@@ -1905,7 +1905,7 @@ fn resolving_an_overlay_tracks_the_session_project_root() {
 }
 
 #[test]
-fn trust_set_changed_detects_only_real_differences() {
+fn trust_root_diff_detects_only_real_differences() {
     let a = PathBuf::from("/a");
     let b = PathBuf::from("/b");
     let one_a = vec![a.clone()];
@@ -1913,14 +1913,32 @@ fn trust_set_changed_detects_only_real_differences() {
     let two = vec![a.clone(), b.clone()];
     let two_reversed = vec![b, a];
     let empty: Vec<PathBuf> = Vec::new();
-    // Identical sets (in any order) are a no-op.
-    assert!(!DaemonState::trust_set_changed(&one_a, &one_a));
-    assert!(!DaemonState::trust_set_changed(&two, &two_reversed));
-    assert!(!DaemonState::trust_set_changed(&empty, &empty));
-    // A real change is detected.
-    assert!(DaemonState::trust_set_changed(&one_a, &one_b));
-    assert!(DaemonState::trust_set_changed(&one_a, &empty));
-    assert!(DaemonState::trust_set_changed(&empty, &one_a));
+    // Identical sets (in any order) yield no changed roots.
+    assert_eq!(
+        DaemonState::trust_root_diff(&one_a, &one_a),
+        [] as [PathBuf; 0]
+    );
+    assert_eq!(
+        DaemonState::trust_root_diff(&two, &two_reversed),
+        [] as [PathBuf; 0]
+    );
+    assert_eq!(
+        DaemonState::trust_root_diff(&empty, &empty),
+        [] as [PathBuf; 0]
+    );
+    // A real change yields the symmetric difference.
+    assert_eq!(
+        DaemonState::trust_root_diff(&one_a, &one_b),
+        vec![PathBuf::from("/a"), PathBuf::from("/b")]
+    );
+    assert_eq!(
+        DaemonState::trust_root_diff(&one_a, &empty),
+        vec![PathBuf::from("/a")]
+    );
+    assert_eq!(
+        DaemonState::trust_root_diff(&empty, &one_a),
+        vec![PathBuf::from("/a")]
+    );
 }
 
 #[test]
@@ -4103,7 +4121,7 @@ fn add_credential_on_bound_keystore_rejects_wrong_key_blob() {
 fn mcp_list_changed_rebuilds_and_swaps_tool_registry() {
     let (mut state, _rx) = make_daemon_state();
     let before = Arc::as_ptr(&state.tool_registry.load_full());
-    state.handle_mcp_list_changed("test-server");
+    state.handle_mcp_list_changed("test-server", true);
     let after = Arc::as_ptr(&state.tool_registry.load_full());
     assert_ne!(
         before, after,

@@ -539,9 +539,12 @@ pub enum DaemonCommand {
     /// `subscriptions/listen` stream. The command loop (the sole writer of the
     /// tool catalogue) rebuilds the registry from `McpManager` and swaps it in,
     /// so the server's `mcp/<slug>` group is refreshed in place. The slug is
-    /// carried for logging only — the whole registry is rebuilt either way.
+    /// carried for logging; `tools_changed` distinguishes a TOOLS list change
+    /// (which needs the catalogue rebuild) from a RESOURCES list change (which
+    /// does not — the resource catalogue is read on demand, never snapshotted).
     McpListChanged {
         slug: String,
+        tools_changed: bool,
     },
     /// Report the state of every MCP server visible to `session_id` (daemon
     /// tier plus, when attached, that session's own project servers), tagged by
@@ -903,7 +906,12 @@ impl DaemonState {
                 session_id,
                 request_id,
             } => self.handle_cancel_request(session_id, request_id),
-            DaemonCommand::McpListChanged { slug } => self.handle_mcp_list_changed(&slug),
+            DaemonCommand::McpListChanged {
+                slug,
+                tools_changed,
+            } => {
+                self.handle_mcp_list_changed(&slug, tools_changed);
+            }
             DaemonCommand::McpStatus { session_id, reply } => {
                 let _ = reply.send(self.handle_mcp_status(session_id));
             }
@@ -2181,8 +2189,15 @@ impl DaemonState {
     /// the daemon-tier rebuild. The sessions holding a private server with this
     /// slug therefore have their overlay re-resolved too (re-ensured, not
     /// released, so their connections are reused).
-    fn handle_mcp_list_changed(&mut self, slug: &str) {
-        info!(server = %slug, "MCP list changed; rebuilding the tool catalogue");
+    fn handle_mcp_list_changed(&mut self, slug: &str, tools_changed: bool) {
+        // A resources-only change needs no action: the resource catalogue is
+        // read live by the wrapper tools, so there is nothing cached to
+        // refresh. Only a TOOLS change can add or withdraw a registered tool.
+        if !tools_changed {
+            debug!(server = %slug, "MCP resource list changed; nothing to re-register");
+            return;
+        }
+        info!(server = %slug, "MCP tool list changed; rebuilding the tool catalogue");
         self.mcp_manager.refresh_server(slug);
         self.rebuild_tool_catalogue_cached();
         let affected = self.mcp_manager.sessions_for_slug(slug);
@@ -2506,28 +2521,52 @@ impl DaemonState {
     fn handle_mcp_trust_reload(&mut self) {
         let before = self.mcp_trust.list();
         self.mcp_trust = McpTrustStore::load(self.mcp_trust.path().to_path_buf());
-        if !Self::trust_set_changed(&before, &self.mcp_trust.list()) {
+        let after = self.mcp_trust.list();
+        let changed: Vec<PathBuf> = Self::trust_root_diff(&before, &after);
+        if changed.is_empty() {
             info!("MCP trust store reloaded (watch); trust set unchanged, no re-resolve");
             return;
         }
+        // Re-resolve only the sessions whose project root is one of the roots
+        // whose trust actually flipped: re-resolving can connect servers, so a
+        // change to one root must not disturb every unrelated session. Roots are
+        // canonicalized on both sides (the store holds canonical paths; a
+        // session's resolved root may be a symlinked spelling).
+        let changed: std::collections::HashSet<PathBuf> = changed
+            .iter()
+            .map(|p| crate::mcp::trust::canonicalize_root(p))
+            .collect();
         let sessions: Vec<u64> = self.active_sessions.keys().copied().collect();
+        let mut affected = 0usize;
+        for session_id in sessions {
+            let (root, _) = self.session_project_root(session_id);
+            let matches = root
+                .as_deref()
+                .is_some_and(|r| changed.contains(&crate::mcp::trust::canonicalize_root(r)));
+            if matches {
+                affected += 1;
+                let _ = self.resolve_and_push_session_overlay(session_id, false);
+            }
+        }
         info!(
-            sessions = sessions.len(),
+            changed_roots = changed.len(),
+            affected_sessions = affected,
             "MCP trust store reloaded (watch)"
         );
-        for session_id in sessions {
-            let _ = self.resolve_and_push_session_overlay(session_id, false);
-        }
     }
 
-    /// Whether two trust-root lists differ, order-insensitively. Used to gate
-    /// the trust-reload re-resolve on a real change.
-    fn trust_set_changed(before: &[PathBuf], after: &[PathBuf]) -> bool {
-        let mut before = before.to_vec();
-        let mut after = after.to_vec();
-        before.sort();
-        after.sort();
-        before != after
+    /// The roots whose trust differs between `before` and `after` (the
+    /// symmetric difference), order-insensitively. Used to scope the
+    /// trust-reload re-resolve to the sessions a real change can affect.
+    fn trust_root_diff(before: &[PathBuf], after: &[PathBuf]) -> Vec<PathBuf> {
+        let mut changed: Vec<PathBuf> = Vec::new();
+        for root in before.iter().chain(after.iter()) {
+            let in_both = before.contains(root) && after.contains(root);
+            if !in_both && !changed.contains(root) {
+                changed.push(root.clone());
+            }
+        }
+        changed
     }
 
     /// Force-close one session's provider sockets by shutting down its
