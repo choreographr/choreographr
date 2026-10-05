@@ -98,6 +98,19 @@ const RELOAD_BUDGET: Duration = Duration::from_secs(10);
 #[cfg(feature = "mcp")]
 const CATALOGUE_REFRESH_BUDGET: Duration = Duration::from_secs(3);
 
+/// Aggregate budget for ONE [`McpManager::register_all`] catalogue-refresh
+/// sweep, capping the WHOLE sweep rather than each server.
+///
+/// `register_all` re-lists every connected server serially on the command-loop
+/// thread, each bounded by [`CATALOGUE_REFRESH_BUDGET`]. A reload or reconnect
+/// over many servers would otherwise stall the loop for up to one budget PER
+/// server; this deadline bounds the total, so a large server set cannot
+/// compound into an unbounded command-loop stall. A server reached after the
+/// deadline is skipped for this sweep (keeping its cached tools) and re-listed
+/// on the next one.
+#[cfg(feature = "mcp")]
+const CATALOGUE_REFRESH_TOTAL_BUDGET: Duration = Duration::from_secs(10);
+
 /// One connected server: the live connection (owns the dispatcher thread) plus
 /// a cloneable handle shared with that server's tool wrappers.
 #[cfg(feature = "mcp")]
@@ -279,29 +292,47 @@ impl McpManager {
     ///
     /// Each server is listed with the short [`CATALOGUE_REFRESH_BUDGET`]
     /// deadline, not the per-server request timeout: this sweep runs on the
-    /// command loop, and one slow server must not freeze every session. A server
-    /// that misses the deadline keeps its previously-listed tool set (so its
-    /// group does not blink out of the catalogue) and is re-listed on the next
-    /// refresh.
+    /// command loop, and one slow server must not freeze every session. The
+    /// WHOLE sweep is additionally bounded by [`CATALOGUE_REFRESH_TOTAL_BUDGET`],
+    /// so a reload/reconnect over many servers cannot compound into an unbounded
+    /// command-loop stall. A server that misses either deadline keeps its
+    /// previously-listed tool set (so its group does not blink out of the
+    /// catalogue) and is re-listed on the next refresh.
     pub fn register_all(&mut self, registry: &mut ToolRegistry) {
         let mut used: HashSet<String> = HashSet::new();
+        // One deadline for the WHOLE sweep: each server is re-listed under the
+        // smaller remaining share, so the total cannot exceed the aggregate
+        // budget no matter how many servers are connected.
+        let deadline = Instant::now() + CATALOGUE_REFRESH_TOTAL_BUDGET;
         for slug in self.order.clone() {
             let Some(slot) = self.servers.get_mut(&slug) else {
                 continue;
             };
-            // Re-list the server, updating the cache; a listing that misses the
-            // deadline keeps the previous tool set. Register straight from the
-            // cache (no clone).
-            match slot
-                .handle
-                .list_tools_with_deadline(CATALOGUE_REFRESH_BUDGET)
-            {
-                Ok(tools) => {
-                    slot.tool_count = Self::enabled_tool_count(&tools, &slot.config.disabled_tools);
-                    slot.tools = tools;
-                }
-                Err(e) => {
-                    warn!(server = %slug, error = %e, "MCP tool listing missed the catalogue-refresh budget; keeping the previous tool set");
+            // Bound this server's re-list by the remaining share of the
+            // aggregate budget; once it is spent, skip the re-list and keep the
+            // server's CACHED tools so its group stays in the catalogue.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                warn!(
+                    server = %slug,
+                    "catalogue-refresh budget exhausted; keeping the cached tool set"
+                );
+            } else {
+                // Re-list the server, updating the cache; a listing that misses
+                // the deadline keeps the previous tool set. Register straight
+                // from the cache (no clone).
+                match slot
+                    .handle
+                    .list_tools_with_deadline(remaining.min(CATALOGUE_REFRESH_BUDGET))
+                {
+                    Ok(tools) => {
+                        slot.tool_count =
+                            Self::enabled_tool_count(&tools, &slot.config.disabled_tools);
+                        slot.tools = tools;
+                    }
+                    Err(e) => {
+                        warn!(server = %slug, error = %e, "MCP tool listing missed the catalogue-refresh budget; keeping the previous tool set");
+                    }
                 }
             }
             Self::register_server_tools(
