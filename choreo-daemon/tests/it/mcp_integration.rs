@@ -538,3 +538,265 @@ fn mcp_progress_streams_through_the_wrapper() {
     drop(manager);
     choreo_daemon::mcp::config::set_test_config_root(None);
 }
+
+/// Install the standard watchdog so a regression that hangs the MCP stack
+/// aborts rather than wedging CI forever (the stdlib harness has no per-test
+/// timeout).
+fn watchdog() {
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(120));
+        eprintln!("mcp_integration: test exceeded 120s; aborting to avoid an indefinite hang");
+        std::process::abort();
+    });
+}
+
+/// Write an `mcp.json` whose `mcpServers` map is `servers`, into a fresh
+/// config dir; returns the tempdir (kept alive by the caller).
+fn write_daemon_config(
+    servers: &serde_json::Value,
+) -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
+    let config_dir = tempfile::tempdir()?;
+    let config_path = config_dir.path().join("choreographr");
+    std::fs::create_dir_all(&config_path)?;
+    std::fs::write(
+        config_path.join("mcp.json"),
+        serde_json::to_string_pretty(&serde_json::json!({ "mcpServers": servers }))?,
+    )?;
+    Ok(config_dir)
+}
+
+/// A modern fixture server entry, with optional extra JSON keys merged in.
+fn fixture_entry(scenario: &str) -> serde_json::Value {
+    serde_json::json!({
+        "command": FIXTURE_BIN,
+        "args": [scenario],
+        "protocol": "modern",
+        "enabled": true,
+        "timeout": 10
+    })
+}
+
+/// A same-root re-resolve must REUSE the pooled project connection rather than
+/// reconnect it. The fixture appends its pid to `MCP_FIXTURE_CONNECT_LOG` on
+/// every startup, so counting the log lines proves how many connections were
+/// actually opened — no time-based wait needed.
+#[test]
+#[ignore = "integration"]
+fn same_root_re_resolve_reuses_connections() {
+    watchdog();
+
+    let project = tempfile::tempdir().expect("project dir");
+    let root = project.path();
+    let log_path = root.join("connects.log");
+    let mut server = fixture_entry("modern");
+    server["env"] = serde_json::json!({ "MCP_FIXTURE_CONNECT_LOG": log_path });
+    std::fs::write(
+        root.join(".mcp.json"),
+        serde_json::to_string(&serde_json::json!({ "mcpServers": { "proj": server } }))
+            .expect("serialize .mcp.json"),
+    )
+    .expect("write .mcp.json");
+
+    let mut manager = choreo_daemon::mcp::McpManager::empty();
+
+    let first = manager.ensure_session(7, Some(root), true);
+    assert!(
+        first.statuses.iter().any(|s| s.slug == "proj"),
+        "the project server must connect on the first resolve: {:?}",
+        first.statuses
+    );
+    // A second resolve for the SAME root re-ensures and reuses the connection.
+    let second = manager.ensure_session(7, Some(root), true);
+    assert!(
+        second.statuses.iter().any(|s| s.slug == "proj"),
+        "the reused server must still be present: {:?}",
+        second.statuses
+    );
+
+    let connections = std::fs::read_to_string(&log_path)
+        .expect("connect log")
+        .lines()
+        .count();
+    assert_eq!(
+        connections, 1,
+        "a same-root re-resolve must reuse the pooled connection, not reconnect (started {connections} servers)"
+    );
+
+    drop(manager);
+}
+
+/// An UNTRUSTED project `.mcp.json` is merely reported; its slugs must NOT
+/// suppress a daemon-tier `shared = false` server of the same name.
+#[test]
+#[ignore = "integration"]
+fn untrusted_project_does_not_suppress_daemon_per_session_server() {
+    watchdog();
+
+    let mut daemon_server = fixture_entry("modern");
+    daemon_server["shared"] = serde_json::json!(false);
+    let config_dir = write_daemon_config(&serde_json::json!({ "stateful": daemon_server }))
+        .expect("write config");
+    choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
+
+    // A project declaring the SAME slug, left untrusted.
+    let project = tempfile::tempdir().expect("project dir");
+    std::fs::write(
+        project.path().join(".mcp.json"),
+        serde_json::to_string(
+            &serde_json::json!({ "mcpServers": { "stateful": fixture_entry("modern") } }),
+        )
+        .expect("serialize"),
+    )
+    .expect("write .mcp.json");
+
+    let mut registry = choreo_daemon::tools::ToolRegistry::new();
+    let mut manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
+    let overlay = manager.ensure_session(7, Some(project.path()), false);
+
+    assert!(
+        overlay
+            .ignored_project_servers
+            .contains(&"stateful".to_string()),
+        "the untrusted project's slug must be reported as ignored: {:?}",
+        overlay.ignored_project_servers
+    );
+    assert!(
+        overlay
+            .statuses
+            .iter()
+            .any(|s| s.slug == "stateful" && s.tier == "daemon"),
+        "the daemon per-session server must still connect: {:?}",
+        overlay.statuses
+    );
+
+    drop(manager);
+    choreo_daemon::mcp::config::set_test_config_root(None);
+}
+
+/// `/mcp reconnect <slug>` must rebuild a per-session (`shared = false`)
+/// daemon-tier server's connection, not report it unknown.
+#[test]
+#[ignore = "integration"]
+fn reconnect_rebuilds_a_daemon_per_session_slot() {
+    watchdog();
+
+    let mut server = fixture_entry("modern");
+    server["shared"] = serde_json::json!(false);
+    let config_dir =
+        write_daemon_config(&serde_json::json!({ "stateful": server })).expect("write config");
+    choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
+
+    let mut registry = choreo_daemon::tools::ToolRegistry::new();
+    let mut manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
+    let overlay = manager.ensure_session(7, None, false);
+    assert!(
+        overlay.statuses.iter().any(|s| s.slug == "stateful"),
+        "the per-session server must connect first: {:?}",
+        overlay.statuses
+    );
+
+    manager
+        .reconnect("stateful")
+        .expect("reconnect must rebuild a per-session slot");
+    assert!(
+        manager
+            .session_status(7)
+            .iter()
+            .any(|s| s.slug == "stateful"),
+        "the reconnected per-session server must still be present"
+    );
+
+    drop(manager);
+    choreo_daemon::mcp::config::set_test_config_root(None);
+}
+
+/// `/mcp reload` must drop a daemon `shared = false` slot whose config changed,
+/// so the next resolve reconnects with the new config, and report the affected
+/// session.
+#[test]
+#[ignore = "integration"]
+fn reload_drops_a_changed_daemon_per_session_slot() {
+    watchdog();
+
+    let mut server = fixture_entry("modern");
+    server["shared"] = serde_json::json!(false);
+    let config_dir =
+        write_daemon_config(&serde_json::json!({ "stateful": server })).expect("write config");
+    choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
+
+    let mut registry = choreo_daemon::tools::ToolRegistry::new();
+    let mut manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
+    let overlay = manager.ensure_session(7, None, false);
+    assert!(
+        overlay.statuses.iter().any(|s| s.slug == "stateful"),
+        "the per-session server must connect first: {:?}",
+        overlay.statuses
+    );
+
+    // Rewrite the config with a changed value (the timeout).
+    let mut changed = fixture_entry("modern");
+    changed["shared"] = serde_json::json!(false);
+    changed["timeout"] = serde_json::json!(20);
+    std::fs::write(
+        config_dir.path().join("choreographr").join("mcp.json"),
+        serde_json::to_string_pretty(&serde_json::json!({ "mcpServers": { "stateful": changed } }))
+            .expect("serialize"),
+    )
+    .expect("rewrite mcp.json");
+
+    let outcome = manager.reload().expect("reload succeeds");
+    assert!(
+        outcome.summary.contains("1 restarted"),
+        "a changed per-session server must count as restarted: {}",
+        outcome.summary
+    );
+    assert!(
+        outcome.affected_sessions.contains(&7),
+        "the session that held the changed slot must be reported: {:?}",
+        outcome.affected_sessions
+    );
+    assert!(
+        manager.session_status(7).is_empty(),
+        "the stale per-session slot must be dropped by reload"
+    );
+
+    drop(manager);
+    choreo_daemon::mcp::config::set_test_config_root(None);
+}
+
+/// A project server that fails to connect must NOT shadow the daemon-tier
+/// group of the same slug.
+#[test]
+#[ignore = "integration"]
+fn failed_project_connect_does_not_shadow_daemon_group() {
+    watchdog();
+
+    // A daemon-tier shared server that connects, so `mcp/shared` exists.
+    let config_dir = write_daemon_config(&serde_json::json!({ "shared": fixture_entry("modern") }))
+        .expect("write config");
+    choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
+
+    // A project declaring the SAME slug with a command that cannot connect.
+    let project = tempfile::tempdir().expect("project dir");
+    std::fs::write(
+        project.path().join(".mcp.json"),
+        serde_json::to_string(&serde_json::json!({
+            "mcpServers": { "shared": { "command": "/nonexistent-mcp-fixture-binary", "enabled": true, "timeout": 5 } }
+        }))
+        .expect("serialize"),
+    )
+    .expect("write .mcp.json");
+
+    let mut registry = choreo_daemon::tools::ToolRegistry::new();
+    let mut manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
+    let overlay = manager.ensure_session(7, Some(project.path()), true);
+
+    assert!(
+        !overlay.shadowed_groups.contains("mcp/shared"),
+        "a failed project connect must not shadow the daemon group: {:?}",
+        overlay.shadowed_groups
+    );
+
+    drop(manager);
+    choreo_daemon::mcp::config::set_test_config_root(None);
+}

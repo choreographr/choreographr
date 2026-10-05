@@ -130,6 +130,21 @@ const RELOAD_BUDGET: Duration = Duration::from_secs(10);
 #[cfg(feature = "mcp")]
 const CATALOGUE_REFRESH_BUDGET: Duration = Duration::from_secs(3);
 
+/// Aggregate budget for the connect portion of ONE session's overlay
+/// resolution (see [`McpManager::ensure_session`]).
+///
+/// Unlike [`RELOAD_BUDGET`], which is per server, this bounds the WHOLE set of
+/// project/per-session servers a single resolve connects. `ensure_session` runs
+/// on the command-loop thread, so a project declaring several slow or
+/// unresponsive servers would otherwise stall every session and client behind
+/// it for one budget PER server. The budget matches the single-server reload
+/// budget, so one legitimately slow start (e.g. a cold `npx`) still connects in
+/// the common case, while a batch of them cannot compound into an unbounded
+/// stall; a server that misses the deadline is skipped from this resolve and
+/// retried on the next one.
+#[cfg(feature = "mcp")]
+const SESSION_CONNECT_BUDGET: Duration = Duration::from_secs(10);
+
 /// A read-only snapshot of one configured server's state, for the `/mcp`
 /// status surface and `session_inspect`.
 ///
@@ -195,6 +210,13 @@ pub struct McpReloadOutcome {
     pub summary: String,
     /// The refreshed state of every configured server, in stable slug order.
     pub servers: Vec<McpServerStatus>,
+    /// The sessions whose overlay referenced a daemon per-session
+    /// (`shared = false`) server that this reload changed or removed, in sorted
+    /// order. The command loop re-resolves exactly these overlays so they pick
+    /// up the new config (or drop the removed one). Daemon-internal bookkeeping:
+    /// not carried on the wire.
+    #[doc(hidden)]
+    pub affected_sessions: Vec<u64>,
 }
 
 /// A full MCP status report for one session: every visible server — daemon-tier
@@ -942,7 +964,16 @@ impl McpManager {
     /// `project_root`/`trusted` come from the daemon (the session's working
     /// directory walked up to a `.mcp.json` and checked against the trust
     /// store). An UNTRUSTED project root yields no project connections: the
-    /// declaration is read only to report the ignored slugs.
+    /// declaration is read only to report the ignored slugs, and — because the
+    /// project is not honoured — its slugs must NOT suppress a daemon-tier
+    /// per-session server of the same name.
+    ///
+    /// The connect portion of the whole resolve is bounded by
+    /// [`SESSION_CONNECT_BUDGET`], so a project whose servers are slow to start
+    /// cannot stall the command loop for one budget per server; a server that
+    /// misses the deadline is skipped from this resolve and retried on the
+    /// next. Connections already pooled for this session/server are reused and
+    /// consume no budget.
     pub fn ensure_session(
         &mut self,
         session_id: u64,
@@ -956,16 +987,17 @@ impl McpManager {
         let mut shadowed: HashSet<String> = HashSet::new();
         let mut ignored: Vec<String> = Vec::new();
 
-        // Resolve the project entries (first, so their slugs can suppress a
-        // same-slug daemon per-session server — the project override is
-        // whole-entry).
+        // Resolve the project entries. Their slugs suppress a same-slug daemon
+        // per-session server (the project override is whole-entry) — but ONLY
+        // for a TRUSTED project: an untrusted `.mcp.json` is merely reported,
+        // so its slugs must not suppress a daemon per-session server.
         let mut project_slugs: HashSet<String> = HashSet::new();
         let mut project_entries: Vec<McpEntry> = Vec::new();
         if let Some(root) = project_root {
             match config::load_project_config(root, trusted) {
                 Ok(Some(entries)) => {
-                    project_slugs.extend(entries.iter().map(|e| e.config.slug.clone()));
                     if trusted {
+                        project_slugs.extend(entries.iter().map(|e| e.config.slug.clone()));
                         project_entries = entries;
                     } else {
                         ignored = entries.iter().map(|e| e.config.slug.clone()).collect();
@@ -979,8 +1011,12 @@ impl McpManager {
             }
         }
 
-        // Daemon-tier per-session (shared=false) servers, unless the project
-        // overrides that slug.
+        // One connect deadline shared by every server this resolve ensures, so
+        // the aggregate is bounded (not one budget per server).
+        let deadline = Instant::now() + SESSION_CONNECT_BUDGET;
+
+        // Daemon-tier per-session (shared=false) servers, unless a trusted
+        // project overrides that slug.
         let daemon_per_session: Vec<McpEntry> = self
             .configs
             .values()
@@ -993,6 +1029,7 @@ impl McpManager {
             session_id,
             None,
             &daemon_per_session,
+            deadline,
             &mut used,
             &mut tools,
             &mut groups,
@@ -1001,18 +1038,23 @@ impl McpManager {
         if let Some(root) = project_root
             && trusted
         {
-            self.ensure_entries(
+            let connected = self.ensure_entries(
                 session_id,
                 Some(root),
                 &project_entries,
+                deadline,
                 &mut used,
                 &mut tools,
                 &mut groups,
                 &mut statuses,
             );
-            // Every project slug shadows the daemon-tier group of the same name.
-            for slug in &project_slugs {
-                shadowed.insert(choreo_mcp::group_name(slug));
+            // A project slug shadows the daemon-tier `mcp/<slug>` group of the
+            // same name ONLY when its server actually connected (its tools were
+            // built): a project entry that failed to connect, or was skipped on
+            // the connect deadline, must NOT remove the daemon-tier group from
+            // the catalogue.
+            for slug in connected {
+                shadowed.insert(choreo_mcp::group_name(&slug));
             }
         }
 
@@ -1027,27 +1069,44 @@ impl McpManager {
     }
 
     /// Connect/ensure the slots for `entries`, appending their wrappers to
-    /// `tools`. `root` is `None` for daemon-tier per-session servers.
+    /// `tools`. `root` is `None` for daemon-tier per-session servers. Returns
+    /// the slugs whose tools were built successfully — a server that failed to
+    /// connect/list, or that ran out of the shared `deadline`, is skipped and
+    /// does not appear.
     #[expect(clippy::too_many_arguments)]
     fn ensure_entries(
         &mut self,
         session_id: u64,
         root: Option<&Path>,
         entries: &[McpEntry],
+        deadline: Instant,
         used: &mut HashSet<String>,
         tools: &mut Vec<Box<dyn ToolDyn>>,
         groups: &mut HashSet<String>,
         statuses: &mut Vec<McpServerStatus>,
-    ) {
+    ) -> Vec<String> {
+        let mut connected: Vec<String> = Vec::new();
         for entry in entries {
             let slug = entry.config.slug.clone();
+            // Bound each connect by the remaining share of the overlay's total
+            // budget; once it is spent, defer the rest to the next resolve
+            // rather than stalling the command loop further.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                warn!(
+                    server = %slug,
+                    "MCP overlay connect budget exhausted; deferring remaining servers to the next resolve"
+                );
+                continue;
+            }
+            let timeout = remaining.min(RELOAD_BUDGET);
             let handle = if entry.shared {
                 let Some(root) = root else {
                     continue;
                 };
-                self.ensure_shared(session_id, root, &entry.config)
+                self.ensure_shared(session_id, root, &entry.config, timeout)
             } else {
-                self.ensure_session_slot(session_id, root, &entry.config)
+                self.ensure_session_slot(session_id, root, &entry.config, timeout)
             };
             let Some((handle, config)) = handle else {
                 continue;
@@ -1060,40 +1119,46 @@ impl McpManager {
                 tools,
                 groups,
             ) {
-                Ok(count) => statuses.push(McpServerStatus {
-                    slug,
-                    tier: if root.is_some() {
-                        "project".to_string()
-                    } else {
-                        "daemon".to_string()
-                    },
-                    transport: config.transport.label().to_string(),
-                    target: config.transport.target().to_string(),
-                    connected: true,
-                    tool_count: count,
-                    server_name: Some(handle.name().to_string()),
-                    server_version: Some(handle.version().to_string()),
-                    last_error: None,
-                }),
+                Ok(count) => {
+                    statuses.push(McpServerStatus {
+                        slug: slug.clone(),
+                        tier: if root.is_some() {
+                            "project".to_string()
+                        } else {
+                            "daemon".to_string()
+                        },
+                        transport: config.transport.label().to_string(),
+                        target: config.transport.target().to_string(),
+                        connected: true,
+                        tool_count: count,
+                        server_name: Some(handle.name().to_string()),
+                        server_version: Some(handle.version().to_string()),
+                        last_error: None,
+                    });
+                    connected.push(slug);
+                }
                 Err(e) => warn!(server = %slug, error = %e, "failed to list project MCP tools"),
             }
         }
+        connected
     }
 
     /// Ensure a project-shared connection for `(root, slug)`, adding the
-    /// session to its reference set. Returns the handle + config.
+    /// session to its reference set. Returns the handle + config. A new
+    /// connection is given at most `timeout`.
     fn ensure_shared(
         &mut self,
         session_id: u64,
         root: &Path,
         config: &McpServerConfig,
+        timeout: Duration,
     ) -> Option<(McpServerHandle, McpServerConfig)> {
         let key = (root.to_path_buf(), config.slug.clone());
         if let Some(shared) = self.project_shared.get_mut(&key) {
             shared.sessions.insert(session_id);
             return Some((shared.slot.handle.clone(), shared.slot.config.clone()));
         }
-        let slot = Self::connect_slot(&self.list_change_tx, config, RELOAD_BUDGET)?;
+        let slot = Self::connect_slot(&self.list_change_tx, config, timeout)?;
         let handle = slot.handle.clone();
         let cfg = slot.config.clone();
         self.project_shared.insert(
@@ -1107,18 +1172,20 @@ impl McpManager {
         Some((handle, cfg))
     }
 
-    /// Ensure a per-session connection for `(session_id, root, slug)`.
+    /// Ensure a per-session connection for `(session_id, root, slug)`. A new
+    /// connection is given at most `timeout`.
     fn ensure_session_slot(
         &mut self,
         session_id: u64,
         root: Option<&Path>,
         config: &McpServerConfig,
+        timeout: Duration,
     ) -> Option<(McpServerHandle, McpServerConfig)> {
         let key = (session_id, root.map(Path::to_path_buf), config.slug.clone());
         if let Some(slot) = self.session_slots.get(&key) {
             return Some((slot.handle.clone(), slot.config.clone()));
         }
-        let slot = Self::connect_slot(&self.list_change_tx, config, RELOAD_BUDGET)?;
+        let slot = Self::connect_slot(&self.list_change_tx, config, timeout)?;
         let handle = slot.handle.clone();
         let cfg = slot.config.clone();
         self.session_slots.insert(key, slot);
@@ -1163,40 +1230,54 @@ impl McpManager {
         self.ensure_session(session_id, project_root, trusted)
     }
 
-    /// Rebuild the connection to `slug`, re-registering its tools.
+    /// Rebuild the connection(s) to `slug`, re-registering their tools.
+    ///
+    /// A slug can name a daemon-tier shared server, one or more project-shared
+    /// connections, and/or one or more per-session connections (a daemon
+    /// `shared = false` server has a per-session slot with `root = None`; a
+    /// project `shared = false` server has one with `root = Some(..)`). Every
+    /// matching connection is rebuilt in place: a failed rebuild is collected,
+    /// not fatal, so one bad connection does not skip the rest.
     ///
     /// # Errors
     ///
-    /// Returns a message when `slug` is unknown or the (re)connect fails.
+    /// Returns a message when `slug` matches nothing, or when every matching
+    /// connection failed to rebuild.
     pub fn reconnect(&mut self, slug: &str) -> Result<(), String> {
-        // Daemon-tier shared server.
-        if let Some(entry) = self.configs.get(slug)
-            && entry.shared
+        let mut reconnected = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+
+        // Daemon-tier shared server (at most one, keyed by slug).
+        if let Some(config) = self
+            .configs
+            .get(slug)
+            .filter(|e| e.shared)
+            .map(|e| e.config.clone())
         {
-            let config = entry.config.clone();
             self.servers.remove(slug);
             if let Some(slot) = Self::connect_slot(&self.list_change_tx, &config, RECONNECT_BUDGET)
             {
                 self.servers.insert(slug.to_string(), slot);
                 self.failures.remove(slug);
                 info!(server = %slug, "reconnected MCP server");
-                return Ok(());
+                reconnected += 1;
+            } else {
+                let msg = format!("reconnect to {slug:?} failed");
+                self.failures.insert(slug.to_string(), msg.clone());
+                errors.push(msg);
             }
-            let msg = format!("reconnect to {slug:?} failed");
-            self.failures.insert(slug.to_string(), msg.clone());
-            return Err(msg);
         }
-        // A project-shared connection (best-effort, by slug).
-        let matching: Vec<(PathBuf, String)> = self
+
+        // Project-shared connections (best-effort, by slug). Rebuild EVERY
+        // match rather than bailing on the first failure, so a shared server
+        // referenced from several projects is fully refreshed.
+        let matching_shared: Vec<(PathBuf, String)> = self
             .project_shared
             .keys()
             .filter(|(_, s)| s == slug)
             .cloned()
             .collect();
-        if matching.is_empty() {
-            return Err(format!("unknown MCP server {slug:?}"));
-        }
-        for key in matching {
+        for key in matching_shared {
             if let Some(shared) = self.project_shared.get(&key) {
                 let config = shared.slot.config.clone();
                 let sessions = shared.sessions.clone();
@@ -1204,11 +1285,54 @@ impl McpManager {
                     Self::connect_slot(&self.list_change_tx, &config, RECONNECT_BUDGET)
                 {
                     self.project_shared
-                        .insert(key, SharedSlot { slot, sessions });
+                        .insert(key.clone(), SharedSlot { slot, sessions });
+                    info!(server = %slug, root = %key.0.display(), "reconnected shared project MCP server");
+                    reconnected += 1;
                 } else {
-                    return Err(format!("reconnect to {slug:?} failed"));
+                    errors.push(format!(
+                        "reconnect to {slug:?} failed for project root {}",
+                        key.0.display()
+                    ));
                 }
             }
+        }
+
+        // Per-session connections (daemon `shared = false`, and project
+        // `shared = false`), each rebuilt in place from its own config.
+        let matching_session: Vec<(u64, Option<PathBuf>, String)> = self
+            .session_slots
+            .keys()
+            .filter(|(_, _, s)| s == slug)
+            .cloned()
+            .collect();
+        for key in matching_session {
+            if let Some(slot) = self.session_slots.get(&key) {
+                let config = slot.config.clone();
+                if let Some(new_slot) =
+                    Self::connect_slot(&self.list_change_tx, &config, RECONNECT_BUDGET)
+                {
+                    self.session_slots.insert(key.clone(), new_slot);
+                    info!(
+                        server = %slug,
+                        session_id = key.0,
+                        root = ?key.1,
+                        "reconnected per-session MCP server"
+                    );
+                    reconnected += 1;
+                } else {
+                    errors.push(format!(
+                        "reconnect to {slug:?} failed for session {}",
+                        key.0
+                    ));
+                }
+            }
+        }
+
+        if reconnected == 0 {
+            if errors.is_empty() {
+                return Err(format!("unknown MCP server {slug:?}"));
+            }
+            return Err(errors.join("; "));
         }
         Ok(())
     }
@@ -1216,6 +1340,13 @@ impl McpManager {
     /// Re-read the daemon-tier `mcp.json` and reconcile the daemon-tier shared
     /// server set with it. Project-tier servers are reconciled per session
     /// (see [`McpManager::reload_session`]).
+    ///
+    /// Daemon-tier `shared = false` servers are per-session, so their
+    /// reconciliation drops the stale per-session connections of a server
+    /// whose config changed or that was removed (a stale slot would otherwise
+    /// be returned by `ensure_session_slot` forever); the sessions that held
+    /// them are reported in the outcome so the daemon re-resolves their
+    /// overlays.
     ///
     /// # Errors
     ///
@@ -1232,6 +1363,12 @@ impl McpManager {
             .map(|c| (c.config.slug.clone(), c.clone()))
             .collect();
 
+        // The sessions whose overlay referenced a daemon per-session server
+        // this reload changed or removed; the daemon re-resolves exactly these
+        // so a `shared = false` config change (or removal) reaches the sessions
+        // that hold it.
+        let mut affected: HashSet<u64> = HashSet::new();
+
         let removed: Vec<String> = self
             .order
             .iter()
@@ -1239,8 +1376,11 @@ impl McpManager {
             .cloned()
             .collect();
         for slug in &removed {
+            // Capture the referencing sessions BEFORE dropping anything.
+            affected.extend(self.sessions_for_slug(slug));
             self.servers.remove(slug);
             self.failures.remove(slug);
+            self.drop_daemon_session_slots(slug);
             info!(server = %slug, "MCP server removed by reload");
         }
 
@@ -1250,13 +1390,40 @@ impl McpManager {
         let mut failed: Vec<String> = Vec::new();
 
         for entry in &entries {
-            // `shared = false` daemon servers are per-session: they are not in
-            // `self.servers`, so there is nothing to (re)connect here.
+            let slug = entry.config.slug.clone();
             if !entry.shared {
-                unchanged.push(entry.config.slug.clone());
+                // Daemon-tier per-session server: not in `self.servers`; its
+                // connection lives in `session_slots` keyed with root `None`.
+                // A changed config must drop those stale slots — else
+                // `ensure_session_slot` returns the old connection under the
+                // same key and never picks up the new one.
+                let stale: Vec<(u64, Option<PathBuf>, String)> = self
+                    .session_slots
+                    .keys()
+                    .filter(|(_, root, s)| root.is_none() && s == &slug)
+                    .cloned()
+                    .collect();
+                let changed = stale.iter().any(|key| {
+                    self.session_slots
+                        .get(key)
+                        .is_some_and(|slot| slot.config != entry.config)
+                });
+                if changed {
+                    affected.extend(self.sessions_for_slug(&slug));
+                    for key in stale {
+                        self.session_slots.remove(&key);
+                    }
+                    info!(
+                        server = %slug,
+                        "daemon per-session MCP server config changed; dropped stale per-session connections"
+                    );
+                    restarted.push(slug);
+                } else {
+                    unchanged.push(slug);
+                }
                 continue;
             }
-            let slug = entry.config.slug.clone();
+
             let was_configured = self.configs.contains_key(&slug);
             if self
                 .servers
@@ -1271,6 +1438,9 @@ impl McpManager {
             } else {
                 added.push(slug.clone());
             }
+            // A shared server being (re)connected leaves no per-session slots:
+            // drop any (e.g. it was previously `shared = false`).
+            affected.extend(self.drop_daemon_session_slots(&slug));
             self.servers.remove(&slug);
             if let Some(slot) =
                 Self::connect_slot(&self.list_change_tx, &entry.config, RELOAD_BUDGET)
@@ -1297,10 +1467,36 @@ impl McpManager {
             failed.len()
         );
         info!(%summary, "reloaded MCP configuration");
+        // Deterministic order so the re-resolve sequence is reproducible.
+        let mut affected_sessions: Vec<u64> = affected.into_iter().collect();
+        affected_sessions.sort_unstable();
         Ok(McpReloadOutcome {
             summary,
             servers: self.status(),
+            affected_sessions,
         })
+    }
+
+    /// Remove every daemon-tier per-session slot (`root = None`) for `slug`,
+    /// returning the sessions that held them.
+    ///
+    /// A stale slot is one whose server's config changed or that no longer
+    /// exists; leaving it in `session_slots` would make `ensure_session_slot`
+    /// return the old connection under the same key forever.
+    fn drop_daemon_session_slots(&mut self, slug: &str) -> HashSet<u64> {
+        let stale: Vec<(u64, Option<PathBuf>, String)> = self
+            .session_slots
+            .keys()
+            .filter(|(_, root, s)| root.is_none() && s == slug)
+            .cloned()
+            .collect();
+        let mut sessions = HashSet::new();
+        for key in stale {
+            if self.session_slots.remove(&key).is_some() {
+                sessions.insert(key.0);
+            }
+        }
+        sessions
     }
 
     /// Connect one server from its resolved config and return a ready slot,

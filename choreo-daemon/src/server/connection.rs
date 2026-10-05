@@ -2601,6 +2601,7 @@ mod tests {
                     summary: "MCP reload: 1 added, 0 removed, 0 restarted, 0 unchanged, 0 failed"
                         .to_string(),
                     servers: vec![sample_mcp_status()],
+                    affected_sessions: Vec::new(),
                 }));
             }
         });

@@ -813,8 +813,10 @@ MCP (Model Context Protocol) servers are configured in **two tiers**:
   from a session's working directory to the git root (the first `.mcp.json`
   wins). Visible only to that session's project: a session sees the daemon-tier
   servers plus its own project's servers, and a project server of the same slug
-  replaces the daemon-tier one for that session. No project tier without a
-  working directory.
+  replaces the daemon-tier one for that session (only when that project server
+  actually connects; a project entry that fails to connect leaves the daemon-tier
+  server in place, and an UNTRUSTED project never suppresses a daemon-tier
+  `shared = false` server). No project tier without a working directory.
 
 A project's `.mcp.json` travels with a checkout you may not have written, so its
 servers (and any `${VAR}` expansion they request) are **gated behind trust**: it
@@ -875,9 +877,13 @@ needed; `add` refuses to overwrite an existing slug unless `--force`), while
 `reconnect`/`reload` talk to a running daemon over its local socket. The in-TUI
 `/mcp` command shows the live state of every server visible to the attached
 session (daemon + project tiers, tagged), plus the project-root trust state;
-`/mcp reconnect <slug>` rebuilds one server and `/mcp reload` reconciles the
-session's project `.mcp.json` (the daemon-tier `mcp.json` and `trust.toml`
-hot-reload via the config watcher) without a daemon restart.
+`/mcp reconnect <slug>` rebuilds every connection with that slug (a daemon
+shared server, a project-shared one, or a per-session `shared = false` server)
+and `/mcp reload` reconciles the session's project `.mcp.json` AND any changed
+or removed daemon per-session `shared = false` server (the daemon-tier `mcp.json`
+and `trust.toml` hot-reload via the config watcher) without a daemon restart. A
+working-directory change WITHIN the same trusted project reuses that project's
+live connections rather than reconnecting them (and cancels nothing).
 
 ## Slash commands
 
@@ -897,8 +903,8 @@ runs the command**, and `Esc` discards the line without cancelling anything.
 - `/model <name>` — set the session's model directly
 - `/refresh-models [--force]` — re-fetch the models.dev catalog (conditional GET against the cached etag; 304 → "models up to date"); `--force` bypasses the etag so the server must return a fresh catalog. Also re-reads the user overlay. The daemon fetches on a background thread and replies with provider/model counts; a burst of `/refresh-models` requests is coalesced into a single fetch (each requester's status reflects its own `--force` flag, and a 304 reply is ordered after any queued overlay reload so the counts are current).
 - `/mcp` — show the state of every MCP server visible to the attached session (daemon + project tiers, tagged by tier): slug, transport, target, connected state, tool count, or the last error — plus the session's project root, whether it is trusted, and any (untrusted) project servers being ignored. Offline management (add/remove/list) is done with the `choreographr mcp` CLI (see below)
-- `/mcp reconnect <slug>` — rebuild one server's connection on the running daemon and refresh its tools
-- `/mcp reload` — reconcile the ACTIVE session's project `.mcp.json` on the running daemon (the daemon-tier `mcp.json` and `trust.toml` hot-reload automatically) — connect added servers, disconnect removed ones, rebuild changed ones — then refresh the tool catalogue, all without a daemon restart
+- `/mcp reconnect <slug>` — rebuild every connection with that slug on the running daemon (a daemon shared server, a project-shared one, or a per-session `shared = false` server) and refresh its tools
+- `/mcp reload` — reconcile the ACTIVE session's project `.mcp.json` on the running daemon AND any changed or removed daemon per-session `shared = false` server (the daemon-tier `mcp.json` and `trust.toml` hot-reload automatically) — connect added servers, disconnect removed ones, rebuild changed ones, and re-resolve the affected sessions' overlays — then refresh the tool catalogue, all without a daemon restart
 - `/mcp trust` — trust the active session's project MCP root (the directory of its nearest `.mcp.json`); its servers are connected and their `${VAR}` values expanded
 - `/mcp untrust` — revoke trust for that root; its project servers stop (their connections are dropped)
 - `/mcp trust list` — list the trusted project roots

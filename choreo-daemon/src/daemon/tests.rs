@@ -1905,6 +1905,25 @@ fn resolving_an_overlay_tracks_the_session_project_root() {
 }
 
 #[test]
+fn trust_set_changed_detects_only_real_differences() {
+    let a = PathBuf::from("/a");
+    let b = PathBuf::from("/b");
+    let one_a = vec![a.clone()];
+    let one_b = vec![b.clone()];
+    let two = vec![a.clone(), b.clone()];
+    let two_reversed = vec![b, a];
+    let empty: Vec<PathBuf> = Vec::new();
+    // Identical sets (in any order) are a no-op.
+    assert!(!DaemonState::trust_set_changed(&one_a, &one_a));
+    assert!(!DaemonState::trust_set_changed(&two, &two_reversed));
+    assert!(!DaemonState::trust_set_changed(&empty, &empty));
+    // A real change is detected.
+    assert!(DaemonState::trust_set_changed(&one_a, &one_b));
+    assert!(DaemonState::trust_set_changed(&one_a, &empty));
+    assert!(DaemonState::trust_set_changed(&empty, &one_a));
+}
+
+#[test]
 fn handle_set_working_dir_nonexistent_session_replies_error() {
     let (mut state, _daemon_rx) = make_daemon_state();
     let (reply_tx, reply_rx) = mpsc::channel();

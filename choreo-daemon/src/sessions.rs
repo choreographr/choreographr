@@ -2376,12 +2376,13 @@ fn handle_set_working_dir(
     // Ask the daemon to re-resolve this session's MCP overlay for the new
     // working directory. `persist_session_metadata` queued the UpdateMetadata
     // that records the new directory FIRST, so the command loop sees the fresh
-    // directory when it handles this. `cancel_inflight` stops the session's
-    // in-flight calls to the project it is leaving — and only those; its
-    // daemon-tier calls keep running.
+    // directory when it handles this. `cancel_inflight` is left false: the
+    // command loop decides whether the change actually left the project (it
+    // compares the previous and new roots), so a same-project change neither
+    // cancels in-flight calls nor reconnects the project's servers.
     let _ = ctx.daemon_tx.send(DaemonCommand::McpEnsureSession {
         session_id: ctx.session_id,
-        cancel_inflight: true,
+        cancel_inflight: false,
     });
 
     let _ = reply.send(Ok(path.to_string_lossy().into_owned()));

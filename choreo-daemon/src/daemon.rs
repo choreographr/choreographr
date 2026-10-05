@@ -574,12 +574,14 @@ pub enum DaemonCommand {
     },
     /// Resolve (or re-resolve) a session's MCP overlay: compute its project
     /// root from its working directory and the trust store, then ensure/release
-    /// the project-shared and per-session servers. `cancel_inflight` is set
-    /// when the trigger is a working-directory change leaving a project (or a
-    /// trust revocation), so the session's in-flight calls to that (old)
-    /// project's servers are stopped — and only those; its daemon-tier calls
-    /// keep running. The command loop resolves the overlay and PUSHES it to the
-    /// session via [`SessionCommand::SetMcpOverlay`]; there is no reply
+    /// the project-shared and per-session servers. `cancel_inflight` requests
+    /// that the session's in-flight calls to its previously-resolved project be
+    /// stopped (a trust revocation passes `true`); the command loop ALSO
+    /// cancels when it detects the change actually left that project, so a
+    /// same-project working-directory change cancels nothing. A cancel is
+    /// scoped to the old project's servers only — the session's daemon-tier
+    /// calls keep running. The command loop resolves the overlay and PUSHES it
+    /// to the session via [`SessionCommand::SetMcpOverlay`]; there is no reply
     /// (fire-and-forget).
     McpEnsureSession {
         session_id: u64,
@@ -2253,6 +2255,12 @@ impl DaemonState {
                     let overlay = self.resolve_and_push_session_overlay(session_id, false);
                     let _ = overlay;
                 }
+                // Re-resolve the overlays that held a daemon per-session server
+                // this reload changed or removed, so they pick up the new
+                // config (the manager already dropped their stale slots).
+                for sid in &outcome.affected_sessions {
+                    self.refresh_session_overlay(*sid);
+                }
                 info!(summary = %outcome.summary, "MCP config reloaded; tool catalogue refreshed");
             }
             Err(e) => {
@@ -2289,7 +2297,10 @@ impl DaemonState {
         // can cancel exactly its servers' in-flight calls.
         let previous_root = self.session_mcp_roots.get(&session_id).cloned().flatten();
         let (root, trusted) = self.session_project_root(session_id);
-        if cancel_inflight {
+        // The change LEFT the previous project when the resolved root differs
+        // (including entering or leaving the project tier entirely).
+        let leaving = previous_root.as_deref() != root.as_deref();
+        if cancel_inflight || leaving {
             // Stop the session's in-flight calls to the project it is leaving or
             // revoking — and ONLY those. Its daemon-tier calls keep running: a
             // working-directory change must not disturb an unrelated in-flight
@@ -2299,9 +2310,21 @@ impl DaemonState {
                     .cancel_session_project(session_id, old_root);
             }
         }
-        let overlay = self
-            .mcp_manager
-            .reload_session(session_id, root.as_deref(), trusted);
+        // Reuse the live connections when the session stays in the same TRUSTED
+        // project (a same-project working-directory change, or a re-resolve
+        // triggered by something other than the project itself): `ensure_session`
+        // re-ensures, so pooled project-shared connections are reused rather
+        // than torn down and rebuilt. Every other case — leaving a project,
+        // entering one, an untrust flip, or a trusted→untrusted change — must
+        // release the session's current refs first, so those go through
+        // `reload_session` (release + ensure).
+        let overlay = if trusted && !leaving {
+            self.mcp_manager
+                .ensure_session(session_id, root.as_deref(), trusted)
+        } else {
+            self.mcp_manager
+                .reload_session(session_id, root.as_deref(), trusted)
+        };
         // Record the freshly-resolved root so the NEXT change knows what it left.
         self.session_mcp_roots.insert(session_id, root);
         self.push_overlay_to_session(session_id, &overlay);
@@ -2311,10 +2334,13 @@ impl DaemonState {
     /// Re-resolve ONE session's overlay WITHOUT releasing its existing
     /// connections, and push it to the session thread.
     ///
-    /// Used on an MCP list change: a project/per-session server that adds or
+    /// Used on an MCP list change (a project/per-session server that adds or
     /// withdraws a tool changes the session's private overlay, so re-ensuring
-    /// (rather than `reload_session`'s release-then-ensure) reuses its live
-    /// connections while re-listing their tools.
+    /// rather than `reload_session`'s release-then-ensure reuses its live
+    /// connections while re-listing their tools) and after a daemon-tier
+    /// reload that changed or removed a per-session server (whose stale slots
+    /// the manager already dropped, so the re-ensure reconnects them with the
+    /// new config).
     fn refresh_session_overlay(&mut self, session_id: u64) {
         let (root, trusted) = self.session_project_root(session_id);
         let overlay = self
@@ -2433,6 +2459,11 @@ impl DaemonState {
         match self.mcp_manager.reload() {
             Ok(outcome) => {
                 self.rebuild_tool_catalogue();
+                // Re-resolve the overlays that held a daemon per-session server
+                // this reload changed or removed.
+                for sid in &outcome.affected_sessions {
+                    self.refresh_session_overlay(*sid);
+                }
                 info!(summary = %outcome.summary, "MCP daemon-tier config reloaded (watch)");
             }
             Err(e) => warn!(error = %e, "MCP daemon-tier config reload failed"),
@@ -2442,8 +2473,17 @@ impl DaemonState {
     /// Handle a `trust.toml` watcher event: re-read the trust store and
     /// re-resolve every active session's overlay (a trust flip changes which
     /// project servers are spawned).
+    ///
+    /// A save that does not change the trust set is a no-op: re-resolving
+    /// every active session is expensive (it can connect servers), so it is
+    /// gated on the sorted root lists actually differing.
     fn handle_mcp_trust_reload(&mut self) {
+        let before = self.mcp_trust.list();
         self.mcp_trust = McpTrustStore::load(self.mcp_trust.path().to_path_buf());
+        if !Self::trust_set_changed(&before, &self.mcp_trust.list()) {
+            info!("MCP trust store reloaded (watch); trust set unchanged, no re-resolve");
+            return;
+        }
         let sessions: Vec<u64> = self.active_sessions.keys().copied().collect();
         info!(
             sessions = sessions.len(),
@@ -2452,6 +2492,16 @@ impl DaemonState {
         for session_id in sessions {
             let _ = self.resolve_and_push_session_overlay(session_id, false);
         }
+    }
+
+    /// Whether two trust-root lists differ, order-insensitively. Used to gate
+    /// the trust-reload re-resolve on a real change.
+    fn trust_set_changed(before: &[PathBuf], after: &[PathBuf]) -> bool {
+        let mut before = before.to_vec();
+        let mut after = after.to_vec();
+        before.sort();
+        after.sort();
+        before != after
     }
 
     /// Force-close one session's provider sockets by shutting down its

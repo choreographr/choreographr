@@ -57,6 +57,19 @@ fn main() {
         .or_else(|| std::env::var("MCP_FIXTURE_SCENARIO").ok())
         .unwrap_or_default();
 
+    // Test hook: when `MCP_FIXTURE_CONNECT_LOG` names a file, append this
+    // process id on startup. A connection test can then prove a slot was
+    // REUSED (one line) rather than reconnected (a second line) without any
+    // time-based wait. Append (never truncate) so repeat connects accumulate.
+    if let Ok(path) = std::env::var("MCP_FIXTURE_CONNECT_LOG")
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+    {
+        let _ = writeln!(file, "{}", std::process::id());
+    }
+
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
     let stdout = std::io::stdout();
