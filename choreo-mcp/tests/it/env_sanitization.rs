@@ -13,9 +13,11 @@ use crate::common;
 use std::io;
 use std::process::Command;
 
-/// A code-injection variable from the stripped set (`choreo_mcp::stdio`'s
-/// `INJECTION_ENV_VARS`). `PYTHONPATH` is chosen as the probe because it has no
-/// side effect on a shell, unlike `LD_PRELOAD`'s dynamic-loader involvement.
+/// A code-injection variable from the shared stripped set
+/// ([`choreo_sanitize::child_env::INJECTION_ENV_VARS`], applied by
+/// `choreo_mcp::sanitize_child_env`). `PYTHONPATH` is chosen as the probe
+/// because it has no side effect on a shell, unlike `LD_PRELOAD`'s
+/// dynamic-loader involvement.
 const PROBE_VAR: &str = "PYTHONPATH";
 
 /// Run `sh` with `cmd`'s settings and report whether the probe variable is set

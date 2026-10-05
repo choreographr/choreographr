@@ -128,40 +128,32 @@ fn frame_too_large(limit: usize) -> io::Error {
     )
 }
 
-/// Environment variables stripped from an MCP stdio child before it is spawned.
+/// Strip the code-injection environment variables from a child command, so an
+/// untrusted stdio server does not inherit them from the daemon.
 ///
 /// An MCP server is an untrusted, operator-configured (and, for a project tier,
-/// checkout-provided) binary. These variables make the dynamic loader (`LD_*`,
-/// `DYLD_*`) or a language runtime (`PYTHONPATH`, `PERL5LIB`, `RUBYLIB`) load
-/// attacker-chosen code into the child — a code-injection vector. The daemon's
-/// shell tool already strips the same set (`choreo-daemon`'s
-/// `tools::shell_util::sanitize_env`); the MCP child inherits the daemon's whole
-/// environment, so it must be scrubbed the same way, or an operand secret in the
-/// daemon's environment (or a value an operator's profile set) leaks into a
-/// freshly downloaded server. Kept as a local copy so this crate does not depend
-/// on `choreo-daemon`; the two lists must stay in step.
-const INJECTION_ENV_VARS: &[&str] = &[
-    "LD_PRELOAD",
-    "LD_LIBRARY_PATH",
-    "LD_AUDIT",
-    "LD_DEBUG",
-    "PYTHONPATH",
-    "PERL5LIB",
-    "RUBYLIB",
-    "DYLD_INSERT_LIBRARIES",
-];
-
-/// Strip the code-injection environment variables (see the module's
-/// `INJECTION_ENV_VARS`) from a child command, so it does not inherit them from
-/// the daemon.
+/// checkout-provided) binary. It is spawned with the daemon's whole environment
+/// minus the code-injection set — the canonical
+/// [`choreo_sanitize::child_env::INJECTION_ENV_VARS`], the same list the daemon's
+/// shell/exec tool strips. Those variables would let the dynamic loader or a
+/// language runtime pull attacker-chosen code into the child. Applied to the
+/// `std::process::Command` a `tokio::process::Command` wraps, before the config's
+/// explicit `env` additions, so a config value can still set a variable it names.
 ///
-/// Applied to the `std::process::Command` a `tokio::process::Command` wraps, so
-/// the daemon's whole environment — which may hold operator secrets — is not
-/// passed wholesale to an untrusted server binary.
+/// # Residual environment exposure
+///
+/// Removing the injection set is *not* a full environment scrub: every other
+/// variable the daemon process carries is still inherited by the child. A
+/// blanket `env_clear()` would be worse than the cure — real servers rely on
+/// inherited variables such as `PATH`, `HOME`, and `SSH_AUTH_SOCK` — so the
+/// remaining environment is passed through untouched. The consequence is
+/// explicit: **operators must not rely on the daemon's environment to carry
+/// secrets to an MCP server.** Anything a server needs must be set via the
+/// server's `env` in the MCP config, where the value (and any `${VAR}` expansion
+/// it names) is scoped to that one server rather than leaked to every spawned
+/// child.
 pub fn sanitize_child_env(cmd: &mut std::process::Command) {
-    for var in INJECTION_ENV_VARS {
-        cmd.env_remove(var);
-    }
+    choreo_sanitize::child_env::strip_injection_env(cmd);
 }
 
 /// A capped stdio transport plus the child process it owns.

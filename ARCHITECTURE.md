@@ -46,8 +46,9 @@ Choreographr (workspace)
 │                       and the filesystem-layout resolver (platform dirs +
 │                       the `--base-dir` instance-root override); no protocol
 │                       or transport logic
-├── choreo-sanitize        Leaf crate — shared Unicode "spoofing" predicates
-│                       and the tool-output byte budget + truncation marker
+├── choreo-sanitize        Leaf crate — shared Unicode "spoofing" predicates,
+│                       the tool-output byte budget + truncation marker, and
+│                       the child-process code-injection env set
 ├── choreo-image          Leaf crate — shared image decode (EXIF-orientation
 │                       baking, HEIC/HEIF with a pre-decode allocation guard)
 ├── choreo-keystore        X25519 + ECDH keypair crypto, encrypted storage primitives
@@ -135,10 +136,13 @@ Choreographr (workspace)
 (`choreo-markdown` is consumed by `choreo-client-core` and `choreo-tui`; it is omitted from the graph for brevity.)
 
 `choreo-sanitize` is a leaf crate (no workspace deps) consumed by
-`choreo-daemon`, `choreo-tui`, `choreo-client-core`, and `choreo-blockchain` —
-it owns the Unicode "spoofing" predicates and the shared tool-output byte
-budget / `...[truncated]` marker, so every sanitizer and streaming cap in the
-workspace agrees on the same policy and budget.
+`choreo-daemon`, `choreo-tui`, `choreo-client-core`, `choreo-blockchain`, and
+`choreo-mcp` —
+it owns the Unicode "spoofing" predicates, the shared tool-output byte
+budget / `...[truncated]` marker, and the canonical code-injection environment
+set stripped from every spawned child, so every sanitizer and streaming cap in
+the workspace agrees on the same policy and budget and the shell tool and MCP
+stdio child strip the same variables.
 
 `choreo-image` is a leaf crate (only `image` + `heif-oxide` + `tracing`)
 consumed by
@@ -613,7 +617,7 @@ foreign reader will ever touch the bytes.
 ### `choreo-sanitize` — Shared string-safety primitives
 
 An internal leaf crate (`publish = true`, no workspace deps beyond
-`unicode-general-category`) that is the single source of truth for two things
+`unicode-general-category`) that is the single source of truth for three things
 every consumer of tool output must agree on:
 
 - **The Unicode "spoofing" predicates.** [`is_unsafe_unicode`] (line/paragraph
@@ -633,11 +637,21 @@ every consumer of tool output must agree on:
   (`tools/mod.rs` re-exports them), the blockchain crate, and the client's
   live streaming cap (`history.rs`) all use these, so the final record, the
   streamed live view, and the client's live accumulation read identically.
+- **The child-process code-injection environment set.**
+  `child_env::INJECTION_ENV_VARS` is the canonical list of loader/runtime
+  variables (`LD_*`, `DYLD_*`, `PYTHONPATH`, `PERL5LIB`, `RUBYLIB`) removed from
+  every spawned child; `child_env::strip_injection_env` applies it. The daemon's
+  shell/exec tool (`tools/shell_util.rs::sanitize_env`) and the MCP stdio
+  transport (`choreo-mcp`'s `stdio.rs::sanitize_child_env`) both delegate to it,
+  so the two spawn paths cannot drift apart.
 
 Previously this logic was duplicated across `choreo-daemon`'s `tools/mod.rs`,
-`choreo-blockchain`'s `lib.rs`, `choreo-tui`'s `markdown_render/text.rs`, and
-`choreo-client-core`'s `history.rs`; consolidating it into one leaf crate means
-a policy or budget change (or a Unicode table bump) is applied everywhere at
+`choreo-blockchain`'s `lib.rs`, `choreo-tui`'s `markdown_render/text.rs`,
+`choreo-client-core`'s `history.rs`, and (for the injection set)
+`choreo-daemon`'s `tools/shell_util.rs` and `choreo-mcp`'s `stdio.rs`;
+consolidating it into one leaf crate means
+a policy or budget change (or a Unicode table bump, or an added injection
+variable) is applied everywhere at
 once, and the guard tests live next to the code they protect.
 
 

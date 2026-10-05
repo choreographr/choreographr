@@ -127,19 +127,12 @@ pub(crate) fn resolve_workdir(workdir: Option<&str>, working_dir: Option<&Path>)
 }
 
 /// Strip environment variables that could be used for code injection.
+///
+/// Delegates to the shared canonical list
+/// ([`choreo_sanitize::child_env::INJECTION_ENV_VARS`]) so the shell/exec tool
+/// and the MCP stdio child strip exactly the same set.
 pub(crate) fn sanitize_env(cmd: &mut Command) {
-    for var in &[
-        "LD_PRELOAD",
-        "LD_LIBRARY_PATH",
-        "LD_AUDIT",
-        "LD_DEBUG",
-        "PYTHONPATH",
-        "PERL5LIB",
-        "RUBYLIB",
-        "DYLD_INSERT_LIBRARIES",
-    ] {
-        cmd.env_remove(var);
-    }
+    choreo_sanitize::child_env::strip_injection_env(cmd);
 }
 
 /// Apply all child-process hardening (env sanitization + process-group

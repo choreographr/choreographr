@@ -10,6 +10,12 @@ edition = "2024"
 rust-version.workspace = true
 
 [dependencies]
+# The code-injection environment set shared with the daemon's shell tool: the
+# stdio child strips `choreo_sanitize::child_env::INJECTION_ENV_VARS`, the same
+# canonical list, so the two spawn paths cannot drift. `choreo-sanitize` is a
+# deliberately tiny leaf crate (only `unicode-general-category`), so this adds
+# no meaningful weight to this otherwise-light client crate.
+choreo-sanitize.workspace = true
 # Cross-thread control-plane channels: the per-server dispatcher's command and
 # reply channels, and the call-completion notifications it drains between
 # commands. Workspace policy: crossbeam, never std mpsc.

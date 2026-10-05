@@ -19,8 +19,14 @@
 //!   incrementally on streaming paths. Keeping the budget and its marker in
 //!   one place means the daemon's final record, the daemon's streamed live
 //!   view, and the client's live accumulation all read identically.
+//! - **The code-injection environment set** — [`child_env::INJECTION_ENV_VARS`],
+//!   the loader/runtime variables stripped from every spawned child process
+//!   ([`child_env::strip_injection_env`]). Sharing it here is what keeps the
+//!   daemon's shell/exec tool and the MCP stdio transport stripping the same
+//!   set instead of two hand-kept copies.
 //!
-//! Consumers: `choreo-daemon` (sanitizers + streaming caps), `choreo-tui`
+//! Consumers: `choreo-daemon` (sanitizers + streaming caps + shell/exec env
+//! stripping), `choreo-mcp` (stdio child env stripping), `choreo-tui`
 //! (terminal render filter), `choreo-blockchain` (node-output sanitizer),
 //! `choreo-client-core` (live streaming cap).
 
@@ -28,6 +34,8 @@
 // every public item carries docs, enforced as a hard error by clippy-strict's
 // `-D warnings`.
 #![warn(missing_docs)]
+
+pub mod child_env;
 
 use unicode_general_category::{GeneralCategory, get_general_category};
 

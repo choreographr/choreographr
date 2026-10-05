@@ -840,9 +840,13 @@ automatic reconnect), `disabledTools` (tool names to hide), `shared` (default
 uses it instead of one pooled connection), and — for a stdio
 server — `cwd` (a leading `~` is expanded). `${VAR}` references in
 `env`/`headers` values are expanded from the environment (a project's values
-are expanded only when its root is trusted). Each stdio server's
+are expanded only when its root is trusted). A stdio server inherits the
+daemon's environment with the code-injection variables (`LD_*`, `DYLD_*`,
+`PYTHONPATH`, `PERL5LIB`, `RUBYLIB`) stripped — so do not rely on the daemon's
+environment to carry secrets to a server; set what it needs via that server's
+`env`. Each stdio server's
 `stderr` is captured into a per-server log file (`mcp-<slug>.log` under the
-log/state directory, capped at 2 MiB).
+log/state directory, capped at 2 MiB, created owner-only on Unix).
 
 A remote server that needs credentials uses a static token in `headers`:
 
