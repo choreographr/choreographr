@@ -77,6 +77,29 @@ impl super::McpManager {
         project_root: Option<&Path>,
         trusted: bool,
     ) -> SessionMcpOverlay {
+        self.ensure_session_within(
+            session_id,
+            project_root,
+            trusted,
+            Instant::now() + SESSION_CONNECT_BUDGET,
+        )
+    }
+
+    /// Like [`ensure_session`](Self::ensure_session), but bounding the whole
+    /// resolve by an explicit `deadline` rather than a fresh per-resolve budget.
+    ///
+    /// The command loop's overlay re-resolve sweeps (a list change, a reload, and
+    /// a trust-watch reload) call this with a SHARED deadline, so re-resolving
+    /// many sessions cannot compound into one budget per session; a server
+    /// reached after the deadline is deferred to the next resolve.
+    /// [`SESSION_CONNECT_BUDGET`] is the budget a lone resolve gets.
+    pub fn ensure_session_within(
+        &mut self,
+        session_id: u64,
+        project_root: Option<&Path>,
+        trusted: bool,
+        deadline: Instant,
+    ) -> SessionMcpOverlay {
         let mut used: HashSet<String> = HashSet::new();
         let mut tools: Vec<Box<dyn ToolDyn>> = Vec::new();
         let mut groups: HashSet<String> = HashSet::new();
@@ -106,9 +129,9 @@ impl super::McpManager {
             }
         }
 
-        // One connect deadline shared by every server this resolve ensures, so
-        // the aggregate is bounded (not one budget per server).
-        let deadline = Instant::now() + SESSION_CONNECT_BUDGET;
+        // `deadline` (the caller's shared one, or a fresh per-resolve budget) is
+        // used by every server this resolve ensures, so the aggregate is bounded
+        // (not one budget per server).
 
         // Connect the project's servers FIRST, so we learn which slugs actually
         // connected before deciding what the daemon tier contributes: only a

@@ -14,7 +14,18 @@ use crate::mcp::trust::McpTrustStore;
 use crate::mcp::{McpReloadOutcome, McpStatusReport, McpTrustOutcome, SessionMcpOverlay};
 use crate::sessions::SessionCommand;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
+
+/// Aggregate budget for ONE overlay re-resolve sweep: the sessions re-resolved
+/// after a list change or a reload share one deadline, so re-resolving many
+/// sessions cannot stall the command loop for one connect budget per session.
+///
+/// A session reached after the deadline keeps its current overlay and is
+/// re-resolved on the next event. The connections already pooled for a session
+/// are reused, so the common case runs in microseconds and the deadline only
+/// bites when many sessions must each connect a fresh server.
+const OVERLAY_RERESOLVE_TOTAL_BUDGET: Duration = Duration::from_secs(10);
 
 impl DaemonState {
     /// Rebuild and swap the tool catalogue after an MCP server reported a
@@ -55,9 +66,7 @@ impl DaemonState {
         self.mcp_manager.refresh_server(slug);
         self.rebuild_tool_catalogue_cached();
         let affected = self.mcp_manager.sessions_for_slug(slug);
-        for session_id in affected {
-            self.refresh_session_overlay(session_id);
-        }
+        self.refresh_session_overlays(affected);
         info!(server = %slug, "MCP tool catalogue refreshed");
     }
 
@@ -152,9 +161,7 @@ impl DaemonState {
                 // Re-resolve the overlays that held a daemon per-session server
                 // this reload changed or removed, so they pick up the new
                 // config (the manager already dropped their stale slots).
-                for sid in &outcome.affected_sessions {
-                    self.refresh_session_overlay(*sid);
-                }
+                self.refresh_session_overlays(outcome.affected_sessions.iter().copied());
                 info!(summary = %outcome.summary, "MCP config reloaded; tool catalogue refreshed");
             }
             Err(e) => {
@@ -267,15 +274,34 @@ impl DaemonState {
     /// connections while re-listing their tools) and after a daemon-tier
     /// reload that changed or removed a per-session server (whose stale slots
     /// the manager already dropped, so the re-ensure reconnects them with the
-    /// new config).
-    pub(super) fn refresh_session_overlay(&mut self, session_id: u64) {
+    /// new config). The resolve is bounded by `deadline` (see
+    /// [`DaemonState::refresh_session_overlays`]).
+    pub(super) fn refresh_session_overlay(&mut self, session_id: u64, deadline: Instant) {
         let (root, trusted) = self.session_project_root(session_id);
-        let overlay = self
-            .mcp_manager
-            .ensure_session(session_id, root.as_deref(), trusted);
+        let overlay =
+            self.mcp_manager
+                .ensure_session_within(session_id, root.as_deref(), trusted, deadline);
         self.session_mcp_projects
             .insert(session_id, SessionMcpProject { root, trusted });
         self.push_overlay_to_session(session_id, &overlay);
+    }
+
+    /// Re-resolve each of `sessions`' overlays under ONE shared deadline.
+    ///
+    /// Bounds the WHOLE sweep (not each session) so re-resolving many sessions
+    /// cannot stall the command loop for one connect budget per session; a
+    /// session reached after the deadline keeps its current overlay and is
+    /// re-resolved on the next event. Sessions holding only reused (pooled)
+    /// connections — the common case — are fast and always fit.
+    pub(super) fn refresh_session_overlays(&mut self, sessions: impl IntoIterator<Item = u64>) {
+        let deadline = Instant::now() + OVERLAY_RERESOLVE_TOTAL_BUDGET;
+        for session_id in sessions {
+            if Instant::now() >= deadline {
+                warn!("MCP overlay re-resolve budget exhausted; deferring remaining sessions");
+                break;
+            }
+            self.refresh_session_overlay(session_id, deadline);
+        }
     }
 
     /// Push a resolved overlay to the session thread (which stores it for the
@@ -393,9 +419,7 @@ impl DaemonState {
                 self.rebuild_tool_catalogue();
                 // Re-resolve the overlays that held a daemon per-session server
                 // this reload changed or removed.
-                for sid in &outcome.affected_sessions {
-                    self.refresh_session_overlay(*sid);
-                }
+                self.refresh_session_overlays(outcome.affected_sessions.iter().copied());
                 info!(summary = %outcome.summary, "MCP daemon-tier config reloaded (watch)");
             }
             Err(e) => warn!(error = %e, "MCP daemon-tier config reload failed"),

@@ -62,6 +62,17 @@ impl McpManager {
         SessionMcpOverlay::empty()
     }
 
+    /// Stub: no servers are ever ensured, so the deadline is irrelevant.
+    pub fn ensure_session_within(
+        &mut self,
+        _session_id: u64,
+        _project_root: Option<&std::path::Path>,
+        _trusted: bool,
+        _deadline: std::time::Instant,
+    ) -> SessionMcpOverlay {
+        SessionMcpOverlay::empty()
+    }
+
     /// Stub: nothing to reload.
     pub fn reload_session(
         &mut self,
