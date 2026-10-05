@@ -113,6 +113,39 @@ fn spawn_power_event_forwarder(
         });
 }
 
+/// Dedicated forwarder for one config-dir file: blocks on the file's watcher
+/// receiver, re-reads it on every change, and forwards the reload command only
+/// when the content actually changed (a content fingerprint gate — a rewrite
+/// with identical bytes is a no-op). The `last` view is seeded from the file's
+/// current content at spawn, so the first genuine edit triggers exactly one
+/// reload. Exits when the daemon command channel closes.
+fn spawn_config_change_consumer(
+    daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
+    rx: crossbeam_channel::Receiver<crate::config_watch::ConfigChange>,
+    path: std::path::PathBuf,
+    name: &str,
+    make: fn() -> DaemonCommand,
+) {
+    let spawned = thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let mut last = std::fs::read(&path).ok();
+            for change in &rx {
+                let content = std::fs::read(&change.path).ok();
+                if content == last {
+                    continue;
+                }
+                last = content;
+                if daemon_tx.send(make()).is_err() {
+                    break;
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        warn!(error = %e, %name, "failed to spawn config-change consumer");
+    }
+}
+
 /// Dedicated forwarder thread for MCP list-changed events: blocks on the
 /// servers' shared list-change receiver (a dedicated thread blocking in
 /// `recv()` is fine — the house rule only forbids blocking the command loop)
@@ -226,15 +259,39 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: CoreOptions) -> Daemon
             crossbeam_channel::never()
         }
         Some(config_dir) => {
-            let mut config_watcher = crate::config_watch::ConfigWatcher::new(config_dir);
+            let mut config_watcher = crate::config_watch::ConfigWatcher::new(config_dir.clone());
             // The catalog maintenance thread reacts to overlay edits; the
             // accounts watcher reacts to accounts.toml edits. Each consumer
             // owns its reload policy (see `handle_accounts_reload` and the
             // maintenance loop's overlay arm).
             let overlay_rx = config_watcher.subscribe(crate::catalog::USER_OVERLAY_NAME);
             let accounts_rx = config_watcher.subscribe(crate::accounts::ACCOUNTS_TOML_NAME);
+            // The MCP trust store is always watched (it compiles without the
+            // `mcp` feature): an edit re-resolves every session's overlay. The
+            // daemon-tier `mcp.json` is watched only when the `mcp` feature is
+            // built in (there is no manager without it). Per-session PROJECT
+            // `.mcp.json` files are deliberately NOT watched — their roots are
+            // unbounded, so they reload via `/mcp reload`.
+            let trust_rx = config_watcher.subscribe(crate::mcp::TRUST_FILE);
+            #[cfg(feature = "mcp")]
+            let mcp_rx = config_watcher.subscribe(crate::mcp::config::DAEMON_CONFIG_FILE);
             config_watcher.spawn();
             crate::accounts::spawn_accounts_watcher(daemon_tx.clone(), accounts_rx);
+            spawn_config_change_consumer(
+                daemon_tx.clone(),
+                trust_rx,
+                config_dir.join(crate::mcp::TRUST_FILE),
+                "mcp-trust-watch",
+                || DaemonCommand::McpTrustReload,
+            );
+            #[cfg(feature = "mcp")]
+            spawn_config_change_consumer(
+                daemon_tx.clone(),
+                mcp_rx,
+                config_dir.join(crate::mcp::config::DAEMON_CONFIG_FILE),
+                "mcp-config-watch",
+                || DaemonCommand::McpTierReload,
+            );
             overlay_rx
         }
         None => {

@@ -122,7 +122,7 @@ enum McpCliCommand {
     /// List the configured MCP servers (user + project layers). Offline — no
     /// daemon connection; tool counts are unknown without one.
     List,
-    /// Add a server to the user config file (`mcp_servers.json`).
+    /// Add a server to the daemon-tier config file (`mcp.json`).
     Add {
         /// The server's slug (its config key and tool-name prefix).
         slug: String,
@@ -199,29 +199,28 @@ fn fingerprint_cli(path: Option<&str>) -> anyhow::Result<()> {
 //
 // The `mcp list/add/remove` operations read and write the same
 // `{"mcpServers": { … }}` file the daemon's `mcp` module loads
-// (`mcp_servers.json`), but do so DIRECTLY rather than through that module:
+// (`mcp.json`), but do so DIRECTLY rather than through that module:
 // the module is compiled only behind the daemon's `mcp` cargo feature (off by
 // default), while this CLI group is always available. The path resolution and
 // file shape are kept identical so a server added here is picked up by a
 // feature-enabled daemon unchanged.
 
-/// Resolve the path to the **user** `mcp_servers.json`.
+/// Resolve the path to the **daemon-tier** `mcp.json`.
 ///
 /// # Errors
 ///
 /// Returns an error when the user's config directory cannot be determined.
 fn user_mcp_config_path() -> anyhow::Result<PathBuf> {
-    choreo_shared::paths::config_file("mcp_servers.json")
-        .context("could not determine config directory")
+    choreo_shared::paths::config_file("mcp.json").context("could not determine config directory")
 }
 
-/// Resolve the path to the **project** `mcp_servers.json`, if one can be
-/// placed: `<root>/.choreographr/mcp_servers.json`, where `<root>` is the base
-/// dir when the daemon runs under `--base-dir` and the current directory
-/// otherwise. `None` when neither is resolvable.
+/// Resolve the **project-tier** `.mcp.json` for the current directory, if one
+/// can be placed: `<base_dir or cwd>/.mcp.json`. This is the offline CLI's
+/// best-effort notion of "the project file"; the daemon resolves a SESSION's
+/// project root by walking up from its working directory.
 fn project_mcp_config_path() -> Option<PathBuf> {
     let root = choreo_shared::paths::base_dir().or_else(|| std::env::current_dir().ok());
-    root.map(|root| root.join(".choreographr").join("mcp_servers.json"))
+    root.map(|root| root.join(".mcp.json"))
 }
 
 /// Read the `mcpServers` map from `path`, or an empty map when the file does
@@ -455,9 +454,9 @@ fn mcp_reconnect_via_socket(slug: &str) -> anyhow::Result<()> {
         &request,
         &format!("use `/mcp reconnect {slug}` in a connected client instead"),
         |msg| match msg {
-            DaemonMessage::McpStatus { servers } => {
+            DaemonMessage::McpStatus { servers, .. } => {
                 for server in &servers {
-                    println!("{}", server.summary());
+                    println!("[{}] {}", server.tier, server.summary());
                 }
                 Some(Ok(()))
             }

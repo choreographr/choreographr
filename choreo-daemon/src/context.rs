@@ -112,7 +112,7 @@ fn load_project_files(working_dir: &Path, files: &mut Vec<DiscoveredFile>, confi
     files.append(&mut found);
 }
 
-fn find_git_root(working_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn find_git_root(working_dir: &Path) -> Option<PathBuf> {
     let mut current = Some(working_dir.to_path_buf());
     while let Some(ref dir) = current {
         let git_path = dir.join(".git");

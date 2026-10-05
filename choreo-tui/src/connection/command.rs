@@ -476,6 +476,23 @@ pub(super) fn run_command(
                         .send(ClientMessage::McpReload)
                         .map_err(broken_pipe)?;
                 }
+                McpCommand::Trust => {
+                    app.status = Some("trusting project MCP root…".to_string());
+                    client_tx
+                        .send(ClientMessage::McpTrust)
+                        .map_err(broken_pipe)?;
+                }
+                McpCommand::Untrust => {
+                    app.status = Some("revoking project MCP trust…".to_string());
+                    client_tx
+                        .send(ClientMessage::McpUntrust)
+                        .map_err(broken_pipe)?;
+                }
+                McpCommand::TrustList => {
+                    client_tx
+                        .send(ClientMessage::McpTrustList)
+                        .map_err(broken_pipe)?;
+                }
             }
         }
         // Local-UI commands (the unified command model's non-daemon variants).

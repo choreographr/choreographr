@@ -3,6 +3,7 @@ use crate::cache_warm::WarmPolicy;
 use crate::context::{LoadedSkill, SkillMeta};
 use crate::daemon::{DaemonCommand, ResolvedAccount};
 use crate::db::{self, SessionRecord, write_session_retry, write_turn_retry};
+use crate::mcp::{ProjectToolSet, SessionMcpOverlay};
 use crate::providers::InferenceProvider;
 use crate::requests::run_agent_loop;
 use crate::tools::{ToolOutput, ToolRegistry};
@@ -155,6 +156,10 @@ pub fn join_session_shutdown_with_grace_for_test(
     )
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a control-plane channel message enum whose variants carry large payloads (`DaemonMessage` broadcasts, per-request snapshots) by nature; boxing every payload variant would churn every construction and match site for a human-rate channel where throughput is not the bottleneck"
+)]
 pub enum SessionCommand {
     RunInput {
         request_id: u32,
@@ -219,6 +224,13 @@ pub enum SessionCommand {
         path: PathBuf,
         reply: mpsc::Sender<Result<String, String>>,
     },
+    /// Replace the session's MCP overlay: its private project/per-session tool
+    /// wrappers plus the daemon-tier groups those project servers shadow. Pushed
+    /// by the daemon command loop after it (re)resolves the session's project.
+    /// Crucially NOT persisted into `active_tool_groups` — the overlay is
+    /// recomputed on every working-directory change, so a moved directory can
+    /// never strand a stale project group.
+    SetMcpOverlay(Box<SessionMcpOverlay>),
     /// Activate tool groups on the authoritative active-group set, then
     /// reply to the caller with a summary of what changed.
     LoadTools {
@@ -578,6 +590,13 @@ pub struct SessionSnapshot {
     pub loaded_skill_bodies: Vec<LoadedSkill>,
     pub context_cache: Option<(u64, Arc<String>)>,
     pub discovered_skills: Option<Vec<SkillMeta>>,
+    /// The session's private MCP tool set (see `SessionState::project_tools`),
+    /// carried across the worker snapshot so a request worker resolves and
+    /// executes project tools exactly as the main loop does.
+    pub project_tools: Arc<ProjectToolSet>,
+    /// The shadowed daemon-tier MCP groups (see
+    /// `SessionState::project_shadowed_groups`), carried across the snapshot.
+    pub project_shadowed_groups: HashSet<String>,
     /// The recorded provider slug (see `SessionState::provider_slug`) —
     /// restored so slug-keyed catalog lookups survive the worker swap.
     pub provider_slug: Option<String>,
@@ -649,6 +668,14 @@ pub struct SessionState {
     pub loaded_skill_bodies: Vec<LoadedSkill>,
     pub context_cache: Option<(u64, Arc<String>)>,
     pub discovered_skills: Option<Vec<SkillMeta>>,
+    /// This session's private MCP tool set (project servers plus any
+    /// `shared = false` per-session servers). Merged on top of the shared
+    /// registry's definitions and consulted first on the execution path.
+    pub project_tools: Arc<ProjectToolSet>,
+    /// The daemon-tier `mcp/<slug>` groups this session's project shadows
+    /// (removed from the shared registry's contribution to this session's tool
+    /// list — a project server replaces the daemon-tier one by group).
+    pub project_shadowed_groups: HashSet<String>,
 }
 
 /// The assistant response recorded onto a turn by the agent loop: display
@@ -738,6 +765,8 @@ impl SessionState {
             loaded_skill_bodies: self.loaded_skill_bodies.clone(),
             context_cache: self.context_cache.clone(),
             discovered_skills: self.discovered_skills.clone(),
+            project_tools: Arc::clone(&self.project_tools),
+            project_shadowed_groups: self.project_shadowed_groups.clone(),
             provider_slug: self.provider_slug.clone(),
             warm_policy: self.warm_policy,
         }
@@ -764,6 +793,8 @@ impl SessionState {
             loaded_skill_bodies: snapshot.loaded_skill_bodies,
             context_cache: snapshot.context_cache,
             discovered_skills: snapshot.discovered_skills,
+            project_tools: snapshot.project_tools,
+            project_shadowed_groups: snapshot.project_shadowed_groups,
         }
     }
 
@@ -1024,6 +1055,8 @@ impl SessionState {
             loaded_skill_bodies: Vec::new(),
             context_cache: None,
             discovered_skills: None,
+            project_tools: Arc::new(ProjectToolSet::empty()),
+            project_shadowed_groups: HashSet::new(),
         }
     }
 
@@ -1487,6 +1520,7 @@ fn process_command(
         SessionCommand::UnloadTools { groups, reply } => {
             handle_unload_tools(&groups, &reply, state, ctx)
         }
+        SessionCommand::SetMcpOverlay(overlay) => handle_set_mcp_overlay(*overlay, state, ctx),
         SessionCommand::SetAccount { name } => handle_set_account(name, state, ctx),
         SessionCommand::DropProvider => {
             // The daemon decided the cached client is stale (keystore locked,
@@ -2273,6 +2307,26 @@ fn handle_set_title(title: &str, state: &mut SessionState, ctx: &RequestContext)
     false
 }
 
+/// Apply a daemon-pushed MCP overlay: store the session's private project tool
+/// set and the daemon-tier groups it shadows. Never persisted — the overlay is
+/// recomputed by the daemon on every working-directory change.
+fn handle_set_mcp_overlay(
+    overlay: SessionMcpOverlay,
+    state: &mut SessionState,
+    ctx: &RequestContext,
+) -> bool {
+    debug!(
+        session_id = ctx.session_id,
+        tools = overlay.tools.len(),
+        shadowed = overlay.shadowed_groups.len(),
+        project_root = ?overlay.project_root,
+        "applied MCP overlay"
+    );
+    state.project_tools = overlay.tools;
+    state.project_shadowed_groups = overlay.shadowed_groups;
+    false
+}
+
 /// Set the session working directory, broadcasting the change to
 /// subscribers and notifying the daemon so session listings reflect it
 /// immediately.
@@ -2318,6 +2372,16 @@ fn handle_set_working_dir(
     );
 
     persist_session_metadata(state, ctx, "SetWorkingDir");
+
+    // Ask the daemon to re-resolve this session's MCP overlay for the new
+    // working directory. `persist_session_metadata` queued the UpdateMetadata
+    // that records the new directory FIRST, so the command loop sees the fresh
+    // directory when it handles this. `cancel_inflight` stops the session's
+    // in-flight calls to the project it is leaving (A9).
+    let _ = ctx.daemon_tx.send(DaemonCommand::McpEnsureSession {
+        session_id: ctx.session_id,
+        cancel_inflight: true,
+    });
 
     let _ = reply.send(Ok(path.to_string_lossy().into_owned()));
 

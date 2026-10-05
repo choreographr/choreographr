@@ -512,7 +512,16 @@ pub(crate) fn run_agent_loop(
         // turns, and this pull pins the definitions used for THIS turn (the
         // whole turn is built against one consistent snapshot).
         let tool_registry = ctx.tool_registry.load_full();
-        let tools = tool_registry.available_definitions(&session.config.active_tool_groups);
+        // Merge the shared registry's definitions (active ∪ protected, minus the
+        // daemon-tier `mcp/<slug>` groups the session's project servers shadow)
+        // with the session's own project tools. The project tools are pinned
+        // with the same registry snapshot for this turn, so the whole turn is
+        // built against one consistent tool list.
+        let mut tools = tool_registry.available_definitions_excluding(
+            &session.config.active_tool_groups,
+            &session.project_shadowed_groups,
+        );
+        tools.extend(session.project_tools.definitions());
         if is_cancelled_once(cancel_rx) {
             // Relay the cancel so an armed warmer stops pinging promptly.
             relay_warm_cancel();
@@ -783,7 +792,13 @@ pub(crate) fn run_agent_loop(
                 let description_by_call: HashMap<String, String> = tool_use
                     .tool_calls
                     .iter()
-                    .map(|tc| (tc.id.clone(), tool_registry.describe_invocation(tc)))
+                    .map(|tc| {
+                        let desc = session
+                            .project_tools
+                            .describe_invocation_json(&tc.name, &tc.arguments_json)
+                            .unwrap_or_else(|| tool_registry.describe_invocation(tc));
+                        (tc.id.clone(), desc)
+                    })
                     .collect();
                 // Seed in call order by deriving the parallel slice from the
                 // map, so `describe_invocation` runs exactly once per call.
@@ -976,6 +991,9 @@ pub(crate) fn run_agent_loop(
                     );
 
                     let turn_working_dir = session.config.working_dir.clone();
+                    // Clone the session's private MCP tool set out before the
+                    // mutable borrow of `session` in the params literal below.
+                    let session_tools = Arc::clone(&session.project_tools);
                     // TEMPORARY: pass the daemon's Substrate credential through
                     // the single `x_credentials` slot so the content write tools
                     // can build a ChainAccount. This single-slot reuse is a
@@ -991,6 +1009,7 @@ pub(crate) fn run_agent_loop(
                             request_id,
                             session_id: ctx.session_id,
                             session: &mut *session,
+                            session_tools,
                             cancel_rx,
                             ctx,
                             invocation_description: &invocation_description,
@@ -1110,6 +1129,10 @@ pub(crate) fn run_agent_loop(
 
                     let cmd_tx = ctx.cmd_tx.clone();
                     let reg = Arc::clone(&tool_registry);
+                    // The session's private MCP tools, cloned once per batch so
+                    // each dispatched call consults it before the shared
+                    // registry.
+                    let session_tools = Arc::clone(&session.project_tools);
 
                     // Shared batch channel: every wait-loop thread delivers its
                     // final ToolHandle here the moment the tool completes
@@ -1151,6 +1174,7 @@ pub(crate) fn run_agent_loop(
                             request_id,
                             session_id: ctx.session_id,
                             registry: Arc::clone(&reg),
+                            session_tools: Arc::clone(&session_tools),
                             cmd_tx: cmd_tx.clone(),
                             // TEMPORARY: clone the daemon's Substrate credential
                             // into the single `x_credentials` slot so the content

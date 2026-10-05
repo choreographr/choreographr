@@ -379,6 +379,10 @@ pub(crate) struct SpawnToolArgs {
     pub(crate) request_id: u32,
     pub(crate) session_id: u64,
     pub(crate) registry: Arc<ToolRegistry>,
+    /// The session's private MCP tool set, consulted BEFORE `registry` on the
+    /// execution path (a project server replaces a daemon-tier one). Empty when
+    /// the session has no project servers.
+    pub(crate) session_tools: Arc<crate::mcp::ProjectToolSet>,
     pub(crate) cmd_tx: crossbeam_channel::Sender<SessionCommand>,
     pub(crate) x_credentials: Option<ServiceCredential>,
     pub(crate) working_dir: Option<PathBuf>,
@@ -478,6 +482,8 @@ pub(crate) struct ToolExecutionSpec<'a> {
     pub(crate) tool_call: &'a ChatToolCall,
     pub(crate) format: ToolOutputFormat,
     pub(crate) registry: Arc<ToolRegistry>,
+    /// The session's private MCP tool set, consulted BEFORE `registry`.
+    pub(crate) session_tools: Arc<crate::mcp::ProjectToolSet>,
     pub(crate) x_credentials: Option<ServiceCredential>,
     pub(crate) working_dir: Option<PathBuf>,
     pub(crate) tool_ctx: ToolContext,
@@ -505,6 +511,7 @@ pub(crate) fn spawn_tool_execution(spec: ToolExecutionSpec<'_>) -> SpawnedToolEx
         tool_call,
         format,
         registry,
+        session_tools,
         x_credentials,
         working_dir,
         tool_ctx,
@@ -543,15 +550,29 @@ pub(crate) fn spawn_tool_execution(spec: ToolExecutionSpec<'_>) -> SpawnedToolEx
     // ── Execution thread ───────────────────────────────────────────
     let tc = tool_call.clone();
     thread::spawn(move || {
-        let result = registry.execute_streaming_json(
-            &tc,
-            format,
-            output_tx,
-            x_credentials.as_ref(),
-            working_dir.as_deref(),
-            Some(&tool_ctx),
-            Some(image_tx),
-        );
+        // The session's project tools win by name; a call the session does not
+        // hold falls through to the shared registry.
+        let result = session_tools
+            .execute_streaming_json(
+                &tc,
+                format,
+                output_tx.clone(),
+                x_credentials.as_ref(),
+                working_dir.as_deref(),
+                Some(&tool_ctx),
+                Some(image_tx.clone()),
+            )
+            .unwrap_or_else(|| {
+                registry.execute_streaming_json(
+                    &tc,
+                    format,
+                    output_tx,
+                    x_credentials.as_ref(),
+                    working_dir.as_deref(),
+                    Some(&tool_ctx),
+                    Some(image_tx),
+                )
+            });
         let _ = exec_tx.send(result);
     });
 
@@ -588,6 +609,7 @@ pub(crate) fn spawn_single_tool(args: SpawnToolArgs) -> crossbeam_channel::Sende
         request_id,
         session_id,
         registry,
+        session_tools,
         cmd_tx,
         x_credentials,
         working_dir,
@@ -627,6 +649,7 @@ pub(crate) fn spawn_single_tool(args: SpawnToolArgs) -> crossbeam_channel::Sende
         tool_call: &tool_call,
         format: ToolOutputFormat::Text,
         registry,
+        session_tools,
         x_credentials,
         working_dir,
         tool_ctx: ctx,
@@ -1064,6 +1087,8 @@ pub(crate) struct ExecuteToolParams<'a> {
     pub(crate) request_id: u32,
     pub(crate) session_id: u64,
     pub(crate) session: &'a mut SessionState,
+    /// The session's private MCP tool set (see `ToolExecutionSpec`).
+    pub(crate) session_tools: Arc<crate::mcp::ProjectToolSet>,
     pub(crate) cancel_rx: &'a crossbeam_channel::Receiver<()>,
     pub(crate) ctx: &'a RequestContext,
     pub(crate) invocation_description: &'a str,
@@ -1090,6 +1115,7 @@ pub(crate) fn execute_tool_with_timeout(
         request_id,
         session_id,
         session,
+        session_tools,
         cancel_rx,
         ctx,
         invocation_description,
@@ -1140,6 +1166,7 @@ pub(crate) fn execute_tool_with_timeout(
         tool_call,
         format,
         registry: ctx.tool_registry.load_full(),
+        session_tools,
         x_credentials: x_credentials.cloned(),
         working_dir: working_dir.map(std::path::Path::to_path_buf),
         tool_ctx,

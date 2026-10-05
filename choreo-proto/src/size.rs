@@ -414,17 +414,30 @@ impl DaemonMessage {
             // only the (potentially large) byte payload is added on top. An
             // empty `data` / `None` counts as just the envelope.
             Self::Image { data, .. } => named_field_overhead(4) + data.as_ref().map_or(0, Vec::len),
-            // One `McpServerStatus` per configured server: 8 named fields plus
-            // the variable strings. The 200 B per-record allowance covers the
-            // map header, variant tag, eight field-name keys, and the
+            // One `McpServerStatus` per configured server: 9 named fields plus
+            // the variable strings. The 220 B per-record allowance covers the
+            // map header, variant tag, nine field-name keys, and the
             // `connected` bool / `tool_count` usize scalars; only the string
-            // payloads are added on top.
-            Self::McpStatus { servers } => {
-                named_field_overhead(1)
+            // payloads are added on top. The envelope carries the project-root
+            // context: four named fields plus the root string and the ignored
+            // project slugs.
+            Self::McpStatus {
+                servers,
+                project_root,
+                ignored_project_servers,
+                ..
+            } => {
+                named_field_overhead(4)
+                    + option_str_len(project_root.as_ref())
+                    + ignored_project_servers
+                        .iter()
+                        .map(String::len)
+                        .sum::<usize>()
                     + servers
                         .iter()
                         .map(|s| {
-                            200 + s.slug.len()
+                            220 + s.slug.len()
+                                + s.tier.len()
                                 + s.transport.len()
                                 + s.target.len()
                                 + option_str_len(s.server_name.as_ref())
@@ -444,7 +457,8 @@ impl DaemonMessage {
                     + servers
                         .iter()
                         .map(|s| {
-                            200 + s.slug.len()
+                            220 + s.slug.len()
+                                + s.tier.len()
                                 + s.transport.len()
                                 + s.target.len()
                                 + option_str_len(s.server_name.as_ref())
@@ -454,6 +468,14 @@ impl DaemonMessage {
                         .sum::<usize>()
             }
             Self::McpReloadFailed { error } => named_field_overhead(1) + error.len(),
+            Self::McpTrustUpdated {
+                root,
+                trusted: _,
+                message,
+            } => named_field_overhead(3) + option_str_len(root.as_ref()) + message.len(),
+            Self::McpTrustList { roots } => {
+                named_field_overhead(1) + roots.iter().map(String::len).sum::<usize>()
+            }
         }
     }
 }

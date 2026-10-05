@@ -700,13 +700,27 @@ pub enum ClientMessage {
     McpReconnect {
         slug: String,
     },
-    /// Reload the MCP server configuration from disk: re-read the user and
-    /// project `mcp_servers.json`, connect newly-added servers, disconnect
-    /// removed ones, and reconnect changed ones, rebuilding the tool
+    /// Reload the MCP server configuration: reconcile the active session's
+    /// project `.mcp.json` (its daemon-tier `mcp.json` and `trust.toml` are
+    /// hot-reloaded by the daemon's config watcher), rebuilding the tool
     /// catalogue — without restarting the daemon. On success the daemon
     /// replies with [`DaemonMessage::McpReloaded`]; when the config cannot be
     /// read or parsed, with [`DaemonMessage::McpReloadFailed`].
     McpReload,
+    /// Trust the ACTIVE session's project MCP root: the directory containing
+    /// the nearest `.mcp.json` found by walking up from the session's working
+    /// directory to the git root. Trust is whole-project (one decision covers
+    /// every server that root's `.mcp.json` declares) and content-agnostic (a
+    /// root with no `.mcp.json` yet may be trusted). The daemon replies with
+    /// [`DaemonMessage::McpTrustUpdated`].
+    McpTrust,
+    /// Revoke trust for the ACTIVE session's project MCP root (the same root
+    /// [`ClientMessage::McpTrust`] would trust). Replies with
+    /// [`DaemonMessage::McpTrustUpdated`].
+    McpUntrust,
+    /// Request the list of currently trusted project MCP roots. Replies with
+    /// [`DaemonMessage::McpTrustList`].
+    McpTrustList,
     SubscribeAllActivity,
     UnsubscribeAllActivity,
 }
@@ -762,6 +776,9 @@ pub struct CatalogProvider {
 pub struct McpServerStatus {
     /// The server's config key (its tool-name prefix, `mcp/<slug>`).
     pub slug: String,
+    /// The configuration tier this server came from: `"daemon"` for the
+    /// daemon-wide `mcp.json`, `"project"` for a session's own `.mcp.json`.
+    pub tier: String,
     /// The resolved transport label (`"stdio"` / `"http"`).
     pub transport: String,
     /// The command (stdio) or URL (http) the transport targets.
@@ -1205,10 +1222,22 @@ pub enum DaemonMessage {
         data: Option<Vec<u8>>,
     },
     /// Reply to [`ClientMessage::McpStatusRequest`], and the success reply to
-    /// [`ClientMessage::McpReconnect`]: the current state of every configured
-    /// MCP server, in stable slug order.
+    /// [`ClientMessage::McpReconnect`]: the current state of every visible
+    /// MCP server (daemon-tier servers plus, for an attached session, that
+    /// session's own project servers), each tagged with its `tier`. Carries
+    /// the active session's project root and its trust state, plus the slugs
+    /// of any project servers that were read but ignored because the root is
+    /// untrusted.
     McpStatus {
         servers: Vec<McpServerStatus>,
+        /// The active session's project MCP root, when it has a working
+        /// directory that resolves to one.
+        project_root: Option<String>,
+        /// Whether `project_root` (when present) is trusted.
+        project_trusted: bool,
+        /// Slugs of project servers declared by an UNTRUSTED `.mcp.json` —
+        /// read so the operator can see what is being ignored, never spawned.
+        ignored_project_servers: Vec<String>,
     },
     /// Reply to [`ClientMessage::McpReconnect`] when the reconnect failed: the
     /// slug it targeted and the failure reason.
@@ -1227,6 +1256,20 @@ pub enum DaemonMessage {
     /// all (the config file could not be read or parsed): the failure reason.
     McpReloadFailed {
         error: String,
+    },
+    /// Reply to [`ClientMessage::McpTrust`] / [`ClientMessage::McpUntrust`]: the
+    /// resulting trust state of the target root (or `None` when the active
+    /// session has no resolvable project root) plus a one-line human-readable
+    /// summary of what happened.
+    McpTrustUpdated {
+        root: Option<String>,
+        trusted: bool,
+        message: String,
+    },
+    /// Reply to [`ClientMessage::McpTrustList`]: the trusted project MCP
+    /// roots, in stable (sorted) order.
+    McpTrustList {
+        roots: Vec<String>,
     },
     ShuttingDown,
     /// Best-effort advisory, sent by the daemon immediately before it
@@ -2160,6 +2203,7 @@ mod tests {
                     servers: (0..12usize)
                         .map(|i| McpServerStatus {
                             slug: format!("server-{i}"),
+                            tier: if i % 2 == 0 { "daemon" } else { "project" }.into(),
                             transport: "stdio".into(),
                             target: format!("/usr/local/bin/mcp-server-{i} --flag"),
                             connected: i % 2 == 0,
@@ -2169,6 +2213,26 @@ mod tests {
                             last_error: (i % 2 == 1).then(|| "connect timed out".to_string()),
                         })
                         .collect(),
+                    project_root: Some("/home/u/work/my-project".into()),
+                    project_trusted: true,
+                    ignored_project_servers: vec!["docs".into(), "notes".into()],
+                },
+            ),
+            (
+                "McpTrustUpdated",
+                DaemonMessage::McpTrustUpdated {
+                    root: Some("/home/u/work/my-project".into()),
+                    trusted: true,
+                    message: "trusted project MCP root /home/u/work/my-project".into(),
+                },
+            ),
+            (
+                "McpTrustList",
+                DaemonMessage::McpTrustList {
+                    roots: vec![
+                        "/home/u/work/my-project".into(),
+                        "/home/u/other-project".into(),
+                    ],
                 },
             ),
             (
@@ -2186,6 +2250,7 @@ mod tests {
                     servers: (0..12usize)
                         .map(|i| McpServerStatus {
                             slug: format!("server-{i}"),
+                            tier: if i % 2 == 0 { "daemon" } else { "project" }.into(),
                             transport: "stdio".into(),
                             target: format!("/usr/local/bin/mcp-server-{i} --flag"),
                             connected: i % 2 == 0,

@@ -105,6 +105,9 @@ pub fn test_daemon_state_with_limits(limits: LagLimits) -> DaemonState {
         model_cache: HashMap::new(),
         model_prefetch_in_flight: HashSet::new(),
         mcp_manager: choreo_daemon::mcp::McpManager::empty(),
+        mcp_trust: choreo_daemon::mcp::trust::McpTrustStore::load(
+            accounts_path.with_file_name("trust.toml"),
+        ),
         // The integration harness runs the real `run_server`, which spawns the
         // catalog-maintenance thread and fills this in; a dummy value here is
         // overwritten before any client connects.

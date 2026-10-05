@@ -121,9 +121,15 @@ pub enum McpCommand {
         /// The server's config key (its tool-name prefix).
         slug: String,
     },
-    /// `/mcp reload` — re-read the config and reconcile the running servers
+    /// `/mcp reload` — reconcile the active session's project `.mcp.json`
     /// (add/remove/restart) without restarting the daemon.
     Reload,
+    /// `/mcp trust` — trust the active session's project MCP root.
+    Trust,
+    /// `/mcp untrust` — revoke trust for the active session's project MCP root.
+    Untrust,
+    /// `/mcp trust list` — list the trusted project MCP roots.
+    TrustList,
 }
 
 /// Returns `true` if `name` is a valid account name: non-empty and matching
@@ -324,8 +330,17 @@ fn parse_mcp_command(rest: &str) -> Option<Command> {
                 (None, None) => Command::Mcp(McpCommand::Reload),
                 _ => Command::UnknownCommand("usage: /mcp reload".to_string()),
             },
+            Some("trust") => match (parts.next(), parts.next()) {
+                (None, None) => Command::Mcp(McpCommand::Trust),
+                (Some("list"), None) => Command::Mcp(McpCommand::TrustList),
+                _ => Command::UnknownCommand("usage: /mcp trust [list]".to_string()),
+            },
+            Some("untrust") => match (parts.next(), parts.next()) {
+                (None, None) => Command::Mcp(McpCommand::Untrust),
+                _ => Command::UnknownCommand("usage: /mcp untrust".to_string()),
+            },
             other => Command::UnknownCommand(format!(
-                "usage: /mcp [reload | reconnect <slug>] (got '{}')",
+                "usage: /mcp [reload | reconnect <slug> | trust [list] | untrust] (got '{}')",
                 other.unwrap_or("")
             )),
         });
@@ -634,6 +649,9 @@ pub fn command_echo(command: &Command) -> Option<String> {
         Command::Mcp(McpCommand::Status) => Some("> /mcp".to_string()),
         Command::Mcp(McpCommand::Reconnect { slug }) => Some(format!("> /mcp reconnect {slug}")),
         Command::Mcp(McpCommand::Reload) => Some("> /mcp reload".to_string()),
+        Command::Mcp(McpCommand::Trust) => Some("> /mcp trust".to_string()),
+        Command::Mcp(McpCommand::Untrust) => Some("> /mcp untrust".to_string()),
+        Command::Mcp(McpCommand::TrustList) => Some("> /mcp trust list".to_string()),
         _ => None,
     }
 }

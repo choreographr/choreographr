@@ -306,6 +306,27 @@ Consequences for choreographr: a session is not a connection. One long-lived
 child process per configured server is correct; the client must never treat
 "handshaken once" as a licence to skip per-request metadata.
 
+**Connection lifetime is separate from config/visibility scope.** The two axes
+are orthogonal:
+
+- **Connection lifetime.** An *unshared* (`shared: true`, the default) server has
+  one pooled connection per resolved config, shared across every session that
+  references it — a project's server is pooled by `(project_root, slug)` and a
+  daemon-tier server by `slug`. A session is never the connection lifetime
+  boundary, per the spec. The one explicit escape hatch is `shared: false`: a
+  stateful server that must not share state between sessions gets a private
+  connection *per session that uses it* — the modern-era way to scope state (the
+  old stdio ``as a conversation`` lifetime is still not restored).
+- **Config/visibility scope.** *Which* servers a session can see is a separate
+  question from how their connections are pooled: the daemon-tier `mcp.json` is
+  visible to every session; a session's own project `.mcp.json` (found by walking
+  up from its working directory) is visible only to that session, and never to
+  any other project's. A project server replaces a daemon-tier server of the same
+  slug *for that session only* (replace by group, not union).
+
+See §5 D13 for the settled design of the two-tier, per-session MCP config and
+the trust store that gates a project's servers.
+
 ### 2.2 Per-request metadata (`_meta`)
 
 Every client request **MUST** carry:
@@ -593,16 +614,19 @@ legacy servers that mis-handle pre-init traffic); `modern` refuses legacy server
 Config key: `"protocol": "auto" | "legacy" | "2026-07-28"` (maka-agent's shape,
 plus `auto` as default).
 
-### D4 — Config: extend `mcp_servers.json` in place; keep the path
+### D4 — Config: extend the MCP config in place
 
-Same file, same directory (`<config>/choreographr/mcp_servers.json`), same
-`mcpServers` top level. Landed: `timeout` and `protocol` (P0/P1); `url`,
+The same `mcpServers` top level, extended in place. D13 later renamed the
+daemon-tier file to `<config>/choreographr/mcp.json` and replaced the
+globally-scoped project overlay with a per-session `<PROJECT_ROOT>/.mcp.json`
+tier (gated by the trust store). Landed: `timeout` and `protocol` (P0/P1); `url`,
 `headers`, `transport` (`auto` infers HTTP from `url` and stdio from `command`;
 both or neither warns and skips the server) and `${VAR}` expansion in
 `env`/`headers` values (P2; an unset variable expands to empty with a warning);
-`cwd` and `disabledTools` (P5; a leading `~` in `cwd` is expanded); and a
-project-config layer that overlays the user file per server slug (P5).
-Unknown keys are collected, logged, and ignored — never fatal; `auto_load` was
+`cwd` and `disabledTools` (P5; a leading `~` in `cwd` is expanded); a per-server
+`shared` key (D13, default `true`, `false` = a private connection per session);
+and a per-session project tier (D13). Unknown keys are collected, logged, and
+ignored — never fatal; `auto_load` was
 removed in P0 and is now reported like any other unknown key.
 
 Still to come: `oauth` is post-ship (P3) and `exposure` moves with the
@@ -768,7 +792,7 @@ the `http` tool); this decision is scoped to the MCP transport. Not done: the
 retry policy honors its exponential backoff only, not a `Retry-After` header
 (see the P2 residuals).
 
-### D12 — `mcp_servers.json` joins the unified config watcher
+### D12 — the daemon-tier MCP config joins the unified config watcher
 
 The daemon already hot-reloads config-dir files through ONE transport:
 `config_watch::ConfigWatcher` is a single `notify` watcher over
@@ -790,10 +814,11 @@ rather than leaving reload manual-only:
 - Failure policy: a malformed or half-written file logs a warning and keeps the
   current server set — reload errors never mutate state. The explicit command
   remains the path that reports errors to the user (`McpReloadFailed`).
-- Scope: the **user file only**. The project layer lives at `<base_dir or
-  cwd>/.choreographr/mcp_servers.json`, outside the watched directory
-  (`ConfigWatcher` is deliberately one-directory), so project edits use
-  `/mcp reload` explicitly until the transport grows a second directory.
+- Scope: the **daemon-tier file only** (`<config>/choreographr/mcp.json`, the
+  rename of `mcp_servers.json` — see D13). The per-session project `.mcp.json`
+  lives outside the watched config directory (project roots are unbounded), so
+  project edits use `/mcp reload` explicitly. D13 also watches the trust store
+  `trust.toml` (same config dir) here.
 - Gating matches the existing watchers: the embedded daemon's
   `config_watchers: false` path disables it wholesale (mobile-safe).
 
@@ -829,6 +854,60 @@ skills snapshot asymmetry is recorded here for visibility; changing it is
 outside this plan.
 
 Follow-up item: land the watcher subscription (P5's post-ship list).
+
+### D13 — project-scoped MCP config, per-session visibility, and an MCP trust store
+
+Two-tier, per-session MCP configuration is the settled design (it supersedes the
+single-file overlay of D4/D12 for the project tier):
+
+- **Daemon tier:** `<config>/choreographr/mcp.json` (renamed from
+  `mcp_servers.json`; no release has shipped, so there is no legacy alias).
+  Visible to every session, trusted unconditionally (the user authored it), and
+  the only tier registered into the daemon-wide tool catalogue.
+- **Project tier:** `<PROJECT_ROOT>/.mcp.json`, where `PROJECT_ROOT` is found by
+  walking **up** from a session's working directory to the git root; the first
+  `.mcp.json` wins and its owning directory is the project's identity **and**
+  trust key. No project tier without a working directory.
+- **Visibility:** a session sees the daemon-tier servers ∪ its own project's
+  servers. A project server replaces a daemon-tier server of the same slug *for
+  that session only* (replace by group, not union); no other project's servers
+  are ever visible.
+- **Trust:** a project's `.mcp.json` travels with a checkout the user may not
+  have written, so its servers — and any `${VAR}`/header/env expansion they
+  request — are gated behind an explicit **whole-project** trust decision
+  (`/mcp trust`), keyed on the EXACT canonical project root (absolute + symlinks
+  resolved) with no ancestor inheritance. Trust is content-agnostic (a root with
+  no `.mcp.json` yet may be trusted) and whole-project (one decision authorizes
+  every server the root's file declares). An untrusted project's file is read so
+  `/mcp status` can report what is ignored, but is never spawned and never
+  expanded. The store is `<config>/choreographr/trust.toml` (TOML; the config
+  dir so the existing watcher can watch it by basename), written atomically with
+  owner-only permissions and read **fail-closed**.
+- **Pooling & lifetime:** connections are ref-counted. Project-shared servers
+  (default) are keyed by `(project_root, slug)`; daemon-tier shared servers by
+  `slug`; a per-session `shared: false` server gets a private connection per
+  session that uses it. A project's pool entries drop when the last session
+  referencing them leaves, and immediately on untrust or on a `set_working_dir`
+  that leaves the project (which also cancels that session's in-flight calls to
+  the old project's servers).
+- **Activation & overlay:** a session's daemon-tier AND own-project MCP groups
+  are active by default (no `load_tools` needed). Project groups are computed
+  per session and NEVER persisted into `active_tool_groups`; the shared registry
+  holds only core + daemon-tier shared servers + static groups, and each session
+  carries its own project tool wrappers. The request path merges the registry
+  definitions (active ∪ protected, minus every daemon-tier `mcp/<slug>` group the
+  session's project shadows) with the session's own project tools; the execution
+  path consults the session's project tools BEFORE the shared registry.
+- **Hot-reload:** `mcp.json` and `trust.toml` are watched via the existing
+  `ConfigWatcher` (config-dir basename subscriptions); consumers re-read +
+  fingerprint-gate and forward `McpServerTierReload` / `McpTrustReload`. The
+  project `.mcp.json` is NOT watched — `/mcp reload` reconciles the active
+  session's project file.
+- **Trust surface:** a TUI slash command (`/mcp trust`, `/mcp untrust`,
+  `/mcp trust list`) over new `ClientMessage`/`DaemonMessage` variants. No
+  per-server approve/reject and no separate credential approval (whole-project
+  trust covers both). `PROTOCOL_VERSION` is not bumped here — version bumps
+  happen at release time.
 
 ---
 
@@ -974,6 +1053,18 @@ caps, fuzzing, supply-chain, security, and release verification — landed in
 
 M1 shipping does **not** delete this plan: the Lifecycle rule ties deletion to
 full implementation, and P3 remains here for post-ship work.
+
+### M2 — two-tier per-session MCP config + trust store
+
+Implements D13. Splits MCP configuration into a daemon tier
+(`<config>/choreographr/mcp.json`) and a per-session project tier
+(`<PROJECT_ROOT>/.mcp.json`), gates the project tier behind a whole-project
+trust store (`<config>/choreographr/trust.toml`), adds the per-server `shared`
+key, ref-counts pooled connections, computes each session's project overlay
+(never persisted into `active_tool_groups`), and adds the `/mcp trust|
+untrust|trust list` slash command over new protocol messages (no
+`PROTOCOL_VERSION` bump). The daemon-tier file and the trust store hot-reload
+via the existing config watcher; the project file reloads via `/mcp reload`.
 
 ### P0 — Correctness and safety on the current engine (small, no new deps)
 
@@ -1381,19 +1472,24 @@ The feature-row flip (D9) still waits on the default-on change.
 1. Should `exposure: "deferred"` combine with an existing `load_tools`
    mechanism or introduce a `tool_search` tool (pi/goose style)? Decide in P5
    with data from real servers.
-2. Do we want the daemon to keep exactly one process per server even for many
-   sessions (jcode-style shared pool), or per-session processes for stateful
-   servers (`shared: false`)? Default stays one global process; add a per-server
-   `"shared": false` escape hatch if a stateful server needs it.
+2. *(Resolved by D13.)* The daemon keeps exactly one process per **resolved
+   config per project scope**: a daemon-tier server is pooled by `slug`, a
+   project's server by `(project_root, slug)`, and the pool ref-counts
+   referencing sessions. Visibility is project-scoped (a session sees only the
+   daemon tier plus its own project's servers). The per-server `shared: false`
+   escape hatch gives a stateful server a private connection per session that
+   uses it.
 3. *(Post-ship, P3)* Where does `mcp login` live for the GUI (embedded daemon) —
    GUI modal or loopback browser? Follow the existing provider-OAuth plan
    (`docs/plans/provider-oauth.md`) precedent.
 4. Is the 2 s startup budget right, or should server availability be fully lazy
    (tools appear when connected)? P1 shipped the 2 s batch budget (stragglers
    skipped and logged); revisit if real configs routinely miss it.
-5. Should the config transport grow multi-directory support so the project-layer
-   `mcp_servers.json` auto-reloads too, or does the explicit `/mcp reload` stay
-   the answer there? D12 keeps the watcher scoped to the user file for now.
+5. *(Resolved by D13.)* The config transport stays single-directory. The
+   daemon-tier `mcp.json` and the trust store `trust.toml` live in the config
+   dir and hot-reload via the existing watcher; the per-session project
+   `.mcp.json` is NOT watched (project roots are unbounded) and reloads via the
+   explicit `/mcp reload`.
 
 ## 15. Definition of done
 

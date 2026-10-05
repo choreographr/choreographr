@@ -23,10 +23,12 @@ daemon-core wiring); `ARCHITECTURE.md`/`README.md` for the documented behavior.
 > it into a single multi-root `WatchService` (one `notify` instance, per-root
 > recursive/non-recursive modes, **opportunistic** roots that are watched when they
 > appear rather than created, full-path subscriptions, a shared content-fingerprint
-> reload gate), then wire the three consumers that need it: MCP `mcp_servers.json`
-> (user + project layers), skills invalidation, and keep context files on their
-> deliberate per-iteration re-read. Behavior-preserving migration first; new
-> consumers second.
+> reload gate), then wire the consumers that need it: skills invalidation and
+> keep context files on their deliberate per-iteration re-read. Behavior-preserving
+> migration first; new consumers second. The MCP daemon-tier `mcp.json` and the
+> trust store `trust.toml` already hot-reload through the existing single-directory
+> transport; a session's project `.mcp.json` is deliberately NOT watched (project
+> roots are unbounded) and reloads via the explicit `/mcp reload`.
 
 ---
 
@@ -53,8 +55,9 @@ daemon-core wiring); `ARCHITECTURE.md`/`README.md` for the documented behavior.
 | `models-overlay.toml` (`config_dir`) | `ConfigWatcher` (config dir, non-recursive, basename) | catalog-maintenance thread; re-read + **content fingerprint** gate; forwards `DaemonCommand::CatalogBaseChanged` |
 | `accounts.toml` (`config_dir`) | same instance | `spawn_accounts_watcher` thread (drains bursts → one signal); forwards `DaemonCommand::AccountsReload`; **parse-compare** in the command loop |
 | `authorized_clients.toml` | **a second `ConfigWatcher` instance** on the file's own parent dir | `spawn_acl_watcher` thread; forwards `DaemonCommand::AclReload`; **parse-compare** inside `SharedAcl` (garbage/removed file keeps current keys) |
-| `mcp_servers.json` (user) | **not watched** | explicit reload only: `ClientMessage::McpReload` (commit `850cb4e`), `/mcp reload`, `choreographr mcp reload` |
-| `<base_dir or cwd>/.choreographr/mcp_servers.json` (project) | **not watched** and unreachable by the transport (one directory) | same explicit command |
+| `mcp.json` (daemon tier, `config_dir`) | `ConfigWatcher` (config dir, non-recursive, basename) | consumer thread; re-read + **content fingerprint** gate; forwards `DaemonCommand::McpTierReload`; explicit `ClientMessage::McpReload` / `/mcp reload` remains |
+| `trust.toml` (config_dir) | same instance | consumer thread; re-read + fingerprint gate; forwards `DaemonCommand::McpTrustReload` |
+| `<PROJECT_ROOT>/.mcp.json` (project) | **not watched** (project roots are unbounded) | explicit only: `ClientMessage::McpReload` / `/mcp reload` reconciles the ACTIVE session's project file |
 | skills `~/.agents/skills`, `<dir>/.agents/skills` chain | **not watched** | none: session-scoped snapshot (`SessionState.discovered_skills`), invalidated only by `set_working_dir`; `load_skill` reads the body fresh |
 | `AGENTS.md` / context files (config-dir, `~/.agents`, `~/.claude`, project chain) | **not watched, by design** | re-read + fingerprinted on **every agent-loop iteration** (`build_system_content` → `discover_context`); new subdirectories inject hints as tools touch them |
 | `config.toml` | not watched | loaded once at startup (max turns, cache-warming); changes need a restart |
@@ -78,11 +81,12 @@ delivery. What it cannot do:
 3. **Non-recursive only.** A nested layout (`<root>/.agents/skills/<skill>/SKILL.md`)
    cannot be watched; recursion is required for skill directories.
 4. **Roots must exist.** `spawn()` creates the directory (correct for the config
-   dir, wrong for `~/.agents` or a project's `.choreographr` — a daemon must not
-   create those as a side effect of watching).
+   dir, wrong for `~/.agents` — a daemon must not create those as a side effect
+   of watching).
 5. **No shared reload gate.** The overlay has a content-fingerprint gate; accounts
-   and ACL parse-compare; the MCP consumer would be a third variation of the same
-   "re-read, decide if it actually changed, then act" pattern.
+   and ACL parse-compare; the MCP config-dir consumers (and the trust store) are a
+   further variation of the same "re-read, decide if it actually changed, then
+   act" pattern.
 
 ## 2. What should hot-reload
 
@@ -91,8 +95,9 @@ The refactor settles every user-editable config file explicitly:
 | File | After this plan |
 |---|---|
 | `models-overlay.toml`, `accounts.toml`, `authorized_clients.toml` | Unchanged behavior; migrated onto the shared service (ACL's second instance retired). |
-| `mcp_servers.json` (user) | **Auto-reload** — the follow-up from the MCP reload work (`850cb4e`): subscribe the config-dir root; a change forwards the reload to the command loop; malformed files warn and keep the running set. |
-| `<base or cwd>/.choreographr/mcp_servers.json` (project) | **Auto-reload** — an opportunistic root (watched when present, never created). This closes the MCP follow-up's project-layer question. |
+| `mcp.json` (daemon tier) | Already auto-reloads (D13): subscribed on the config-dir root via the existing transport; a change forwards `McpTierReload` to the command loop; malformed files warn and keep the running set. Unchanged by this plan. |
+| `trust.toml` | Already auto-reloads (D13): subscribed on the config-dir root; a change forwards `McpTrustReload`, and the command loop re-resolves every active session. Unchanged by this plan. |
+| `<PROJECT_ROOT>/.mcp.json` (project) | **Explicit `/mcp reload` only.** Per-session project roots are unbounded, so the transport does not watch them; this is the deliberate trade (do NOT add an opportunistic per-project root). |
 | skills directories | **Invalidation, not injection**: a change clears each session's cached `discovered_skills`; the next request re-discovers. Global `~/.agents/skills` plus `<base or cwd>/.agents/skills` (both recursive, opportunistic). |
 | `AGENTS.md` / context files | **Deliberately not watched.** The per-iteration re-read is cheaper than watcher-driven invalidation for per-session working directories (which are unbounded) and already delivers edits on the next turn. Do not regress it. |
 | `config.toml` | **Not watched.** Startup-only by contract (bind addresses, thread counts, cache-warming defaults); changing it needs a restart. Revisit only if a hot-reloadable subset emerges. |
@@ -162,11 +167,14 @@ not a replacement.
 
 ### 3.3 Consumer wiring
 
-- **MCP**: subscribe the user file on the config-dir root and the project file on
-  the opportunistic `.choreographr` root. The consumer thread coalesces a burst
-  (drain, like the accounts watcher), then sends the reload request to the command
-  loop — reusing `McpManager::reload`'s reconcile, so an unchanged config is a
-  no-op and live connections are kept. A malformed config logs a warning and keeps
+- **MCP**: the daemon-tier `mcp.json` and the trust store `trust.toml` already
+  hot-reload via the existing single-directory transport (D13), so this plan does
+  NOT change them. The per-session project `.mcp.json` is NOT watched — project
+  roots are unbounded — and reloads via the explicit `/mcp reload`. The consumer
+  thread (for the two config-dir files) coalesces an event (drain), then sends the
+  reload request to the command loop — reusing `McpManager::reload`'s reconcile,
+  so an unchanged config is a no-op and live connections are kept. A malformed
+  config logs a warning and keeps
   the current server set (the explicit command remains the path that reports
   errors to the user). The current `DaemonCommand::McpReload { reply }` shape
   needs either a reply-less sibling variant or a consumer that drops/logs the
@@ -200,15 +208,19 @@ Each phase is independently shippable, lands with tests + docs, and keeps
   recursive nested event, root appearing after startup).
 - Update the `config_watch.rs` rustdoc and ARCHITECTURE's row.
 
-### P2 — MCP auto-reload (user + project)
+### P2 — MCP config-dir auto-reload (already landed; project file explicit)
 
-- Wire the MCP consumer per §3.3; add the reply-less reload path if needed.
-- Tests: edit the user file → a server is added/removed/restarted without a
-  restart; edit the project file → same; malformed file → running set unchanged;
-  save storm → one reload.
-- This completes the MCP configuration follow-up (the watcher subscription and the
-  project-layer question) — update the MCP plan's follow-up entry and open question
-  when this lands, and note it in the release-note commit.
+The daemon-tier `mcp.json` and `trust.toml` already hot-reload through the
+existing transport (D13), so no multi-root work is needed for them. A session's
+project `.mcp.json` is deliberately **not** watched (project roots are unbounded)
+and reloads via `/mcp reload` — this is the settled answer to the former
+"project-layer question," not a stopgap awaiting opportunistic roots.
+
+- Remaining follow-up (optional): fold the daemon-tier/trust consumers onto the
+  shared reload gate once §3.2 lands, behavior unchanged.
+- Tests: edit `mcp.json` → a shared server is added/removed/restarted without a
+  restart; edit `trust.toml` → sessions re-resolve; malformed file → running set
+  unchanged; save storm → one reload; `/mcp reload` → project file reconciled.
 
 ### P3 — Skills invalidation
 
@@ -240,9 +252,10 @@ noise).
   after startup; editor atomic-save (temp + rename) storms; the existing
   `config_watch.rs` and `acl_hot_reload.rs` suites stay green unmodified in P1
   (behavior parity), extended for new roots.
-- **Daemon end-to-end**: project `mcp_servers.json` edit adds a server without a
-  restart; skills change is visible on the next request; malformed configs keep
-  state.
+- **Daemon end-to-end**: a daemon-tier `mcp.json` or `trust.toml` edit is picked
+  up without a restart; `/mcp reload` reconciles the active session's project
+  `.mcp.json`; skills change is visible on the next request; malformed configs
+  keep state.
 - **Mobile**: verify the embedded daemon (iOS/Android) with `config_watchers: true`
   — notify's kqueue/inotify availability — and that the no-op path (flag false,
   unresolvable dir) degrades exactly as today.
@@ -251,10 +264,10 @@ noise).
 
 | Risk | Mitigation |
 |---|---|
-| Recursive watches on large trees (inotify watch count) | Scope strictly to `.agents/skills` and `.choreographr` — never project roots or home directories wholesale. |
+| Recursive watches on large trees (inotify watch count) | Scope strictly to `.agents/skills` and the config dir — never project roots or home directories wholesale. |
 | Editors' non-atomic saves firing bursts | `ContentGate` fingerprint gate + the existing per-consumer coalescing/parse-compare. |
 | Watching a root that appears later | Opportunistic roots retried on the re-arm cadence; debug-level while unarmed. |
-| `--base-dir` / test overrides changing paths | Resolve every root through `choreo_shared::paths` at wiring time; keep the existing test overrides and hermetic integration tests. |
+| `--base-dir` / test overrides changing paths | Resolve every root through `choreo_shared::paths` at wiring time; keep the existing test overrides (`set_test_config_root`) and hermetic integration tests. |
 | Skills invalidation racing an in-flight request | Generation counter (or next-request-boundary clear) so the merge-back cannot un-invalidate a fresh change. |
 | Behavior drift while migrating ACL | Keep `acl_hot_reload.rs` as an unmodified regression test through P1. |
 | macOS FSEvents extra events; Windows/mobile semantics | The existing integration tests already tolerate platform noise; reuse that harness for new roots. |
@@ -264,6 +277,8 @@ noise).
 - Watching `config.toml` (startup-only by contract).
 - Watching context files/`AGENTS.md` (the per-iteration re-read is the design).
 - Per-session project skill directories beyond `<base or cwd>` (open question 3).
+- Watching the per-session project `.mcp.json` (roots are unbounded; explicit
+  `/mcp reload` is the settled answer).
 - Watching the data directory or the catalog cache bin.
 - Any new user-facing watch-status UI.
 

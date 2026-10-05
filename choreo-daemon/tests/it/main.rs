@@ -39,6 +39,7 @@ mod image_gen_integration;
 mod lifecycle_integration;
 mod list_files_integration;
 mod mcp_integration;
+mod mcp_project_trust;
 mod metrics_integration;
 mod nu_tool_integration;
 mod pdf_tool_integration;

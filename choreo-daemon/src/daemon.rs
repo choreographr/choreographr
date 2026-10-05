@@ -3,7 +3,10 @@ use crate::broadcast::{LagLimits, SubscriberSink};
 use crate::cache_warm::{CacheWarmingConfig, WarmPolicy};
 use crate::catalog::{CatalogPaths, MaintenanceEvent, RefreshReport, RefreshRequester};
 use crate::db::{self, SessionRecord};
-use crate::mcp::McpManager;
+use crate::mcp::trust::McpTrustStore;
+use crate::mcp::{
+    McpManager, McpReloadOutcome, McpStatusReport, McpTrustOutcome, SessionMcpOverlay,
+};
 use crate::providers::{ImageProviderHandle, InferenceProvider};
 use arc_swap::ArcSwap;
 
@@ -27,7 +30,7 @@ use choreo_proto::{
 pub use keystore::KeystoreOpError;
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -189,6 +192,10 @@ pub struct DaemonState {
     /// they report back through the `daemon_tx` channel.
     pub model_prefetch_in_flight: HashSet<String>,
     pub mcp_manager: McpManager,
+    /// The MCP project-trust store (the set of project roots whose `.mcp.json`
+    /// the daemon honours). Owned by the command loop (its single writer); the
+    /// backing `trust.toml` is hot-reloaded via the config watcher.
+    pub mcp_trust: McpTrustStore,
     /// Sender to the ONE background catalog-maintenance thread (see
     /// `crate::catalog`). `None` until `run_server` spawns the thread — a
     /// unit-test `DaemonState` has no maintenance thread, and `/refresh-models`
@@ -528,11 +535,15 @@ pub enum DaemonCommand {
     McpListChanged {
         slug: String,
     },
-    /// Report the state of every configured MCP server (for the `/mcp` status
-    /// surface and `session_inspect`). Read-only; replies on a plain channel so
-    /// a blocked tool execution (or a connection handler) can wait for it.
+    /// Report the state of every MCP server visible to `session_id` (daemon
+    /// tier plus, when attached, that session's own project servers), tagged by
+    /// tier, plus the session's project-root trust context. Read-only; replies
+    /// on a plain channel so a blocked tool execution (or a connection
+    /// handler) can wait for it. `session_id: None` reports only the daemon
+    /// tier (the `session_inspect` diagnostic path).
     McpStatus {
-        reply: std::sync::mpsc::Sender<Vec<crate::mcp::McpServerStatus>>,
+        session_id: Option<u64>,
+        reply: std::sync::mpsc::Sender<McpStatusReport>,
     },
     /// Reconnect one MCP server (rebuild its connection), then rebuild the tool
     /// catalogue. Replies with the outcome, targeted to the requesting
@@ -541,14 +552,50 @@ pub enum DaemonCommand {
         slug: String,
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     },
-    /// Re-read the MCP configuration from disk and reconcile the running
-    /// server set with it, then rebuild the tool catalogue — so a
-    /// `mcp_servers.json` edit is picked up without a daemon restart. Replies
-    /// with the reload outcome (a summary plus the refreshed status list),
-    /// targeted to the requesting connection.
+    /// Reconcile the MCP configuration: re-read the daemon-tier `mcp.json`
+    /// (reconcile the shared servers) and, when `session_id` is `Some`, the
+    /// active session's project `.mcp.json` — then rebuild the tool catalogue
+    /// and push the refreshed overlay to the session. The daemon-tier `mcp.json`
+    /// and `trust.toml` are also hot-reloaded by the config watcher; this
+    /// command is the on-demand path (and the only one that reconciles a
+    /// session's project file). Replies with the reload outcome, targeted to
+    /// the requesting connection.
     McpReload {
-        reply: std::sync::mpsc::Sender<Result<crate::mcp::McpReloadOutcome, String>>,
+        session_id: Option<u64>,
+        reply: std::sync::mpsc::Sender<Result<McpReloadOutcome, String>>,
     },
+    /// Resolve (or re-resolve) a session's MCP overlay: compute its project
+    /// root from its working directory and the trust store, then ensure/release
+    /// the project-shared and per-session servers. `cancel_inflight` is set
+    /// when the trigger is a working-directory change leaving a project, so the
+    /// session's in-flight calls to that project's servers are stopped (A9).
+    /// The command loop resolves the overlay and PUSHES it to the session via
+    /// [`SessionCommand::SetMcpOverlay`]; there is no reply (fire-and-forget).
+    McpEnsureSession {
+        session_id: u64,
+        cancel_inflight: bool,
+    },
+    /// Set (`trusted = true`) or revoke (`trusted = false`) trust for the
+    /// active session's project root, then re-resolve the session's overlay.
+    /// Replies with the resulting trust state.
+    McpTrustSet {
+        session_id: u64,
+        trusted: bool,
+        reply: std::sync::mpsc::Sender<McpTrustOutcome>,
+    },
+    /// List the trusted project roots. Read-only.
+    McpTrustList {
+        reply: std::sync::mpsc::Sender<Vec<PathBuf>>,
+    },
+    /// The config watcher detected an `mcp.json` edit. The command loop (the
+    /// sole writer of the daemon-tier catalogue) re-reads and reconciles the
+    /// shared servers, then rebuilds the catalogue. Fire-and-forget.
+    McpTierReload,
+    /// The config watcher detected a `trust.toml` edit. The command loop is the
+    /// trust store's single writer: it re-reads the file and re-resolves every
+    /// active session's overlay (a trust flip changes which project servers are
+    /// spawned). Fire-and-forget.
+    McpTrustReload,
     /// Set the display title for a session, forwarded to the session's
     /// main loop for in-memory update, broadcast, and persistence.
     SetSessionTitle {
@@ -845,15 +892,34 @@ impl DaemonState {
                 request_id,
             } => self.handle_cancel_request(session_id, request_id),
             DaemonCommand::McpListChanged { slug } => self.handle_mcp_list_changed(&slug),
-            DaemonCommand::McpStatus { reply } => {
-                let _ = reply.send(self.mcp_manager.status());
+            DaemonCommand::McpStatus { session_id, reply } => {
+                let _ = reply.send(self.handle_mcp_status(session_id));
             }
             DaemonCommand::McpReconnect { slug, reply } => {
                 self.handle_mcp_reconnect(&slug, &reply);
             }
-            DaemonCommand::McpReload { reply } => {
-                self.handle_mcp_reload(&reply);
+            DaemonCommand::McpReload { session_id, reply } => {
+                self.handle_mcp_reload(session_id, &reply);
             }
+            DaemonCommand::McpEnsureSession {
+                session_id,
+                cancel_inflight,
+            } => {
+                let _ = self.resolve_and_push_session_overlay(session_id, cancel_inflight);
+            }
+            DaemonCommand::McpTrustSet {
+                session_id,
+                trusted,
+                reply,
+            } => {
+                let outcome = self.handle_mcp_trust_set(session_id, trusted);
+                let _ = reply.send(outcome);
+            }
+            DaemonCommand::McpTrustList { reply } => {
+                let _ = reply.send(self.mcp_trust.list());
+            }
+            DaemonCommand::McpTierReload => self.handle_mcp_tier_reload(),
+            DaemonCommand::McpTrustReload => self.handle_mcp_trust_reload(),
             DaemonCommand::SetSessionTitle { session_id, title } => {
                 self.handle_set_session_title(session_id, title);
             }
@@ -1002,6 +1068,11 @@ impl DaemonState {
             },
         );
         self.session_metadata.insert(session_id, metadata);
+        // Resolve the session's MCP overlay now that its working directory is
+        // indexed, and push it to the session thread. This runs before
+        // `session_tx` reaches the client, so the overlay is queued ahead of
+        // any first request and is in place before the session can run tools.
+        self.resolve_and_push_session_overlay(session_id, false);
         session_tx
     }
 
@@ -1691,6 +1762,11 @@ impl DaemonState {
         // register or be cancelled through it anymore.
         self.session_registries.remove(&session_id);
 
+        // Release the session's MCP pool references: decrement project-shared
+        // ref-counts (dropping connections no session uses anymore) and drop
+        // its per-session connections.
+        self.mcp_manager.release_session(session_id);
+
         // Remove the session entry so it is no longer treated as active.
         self.active_sessions.remove(&session_id);
 
@@ -2138,12 +2214,22 @@ impl DaemonState {
     /// reported.
     fn handle_mcp_reload(
         &mut self,
-        reply: &std::sync::mpsc::Sender<Result<crate::mcp::McpReloadOutcome, String>>,
+        session_id: Option<u64>,
+        reply: &std::sync::mpsc::Sender<Result<McpReloadOutcome, String>>,
     ) {
         let result = self.mcp_manager.reload();
         match &result {
             Ok(outcome) => {
                 self.rebuild_tool_catalogue();
+                // Reconcile the active session's project `.mcp.json` too (the
+                // daemon-tier `mcp.json` was just reloaded above; `trust.toml`
+                // is watcher-driven). Only the project file needs this explicit
+                // nudge — per-session project roots are unbounded, so they are
+                // never watched.
+                if let Some(session_id) = session_id {
+                    let overlay = self.resolve_and_push_session_overlay(session_id, false);
+                    let _ = overlay;
+                }
                 info!(summary = %outcome.summary, "MCP config reloaded; tool catalogue refreshed");
             }
             Err(e) => {
@@ -2151,6 +2237,166 @@ impl DaemonState {
             }
         }
         let _ = reply.send(result);
+    }
+
+    /// Compute the project root + trust state for a session from its recorded
+    /// working directory, returning `(root, trusted)`.
+    fn session_project_root(&self, session_id: u64) -> (Option<PathBuf>, bool) {
+        let root = self
+            .session_metadata
+            .get(&session_id)
+            .and_then(|m| m.working_dir.as_ref())
+            .and_then(|wd| crate::mcp::project_root_for(Path::new(wd)));
+        let trusted = root
+            .as_deref()
+            .is_some_and(|r| self.mcp_trust.is_trusted(r));
+        (root, trusted)
+    }
+
+    /// Resolve a session's MCP overlay and push it to the session thread (which
+    /// stores it for the request/execution path). Returns the overlay so a
+    /// caller that needs it (the ensure handler) can reply with it directly.
+    fn resolve_and_push_session_overlay(
+        &mut self,
+        session_id: u64,
+        cancel_inflight: bool,
+    ) -> SessionMcpOverlay {
+        let (root, trusted) = self.session_project_root(session_id);
+        // A working-directory change that leaves a project stops that session's
+        // in-flight calls to its (old) project servers — a best-effort, broader
+        // cancel (it also stops any daemon-tier call in flight, which is
+        // harmless: the turn can simply retry).
+        if cancel_inflight {
+            self.mcp_manager.cancel_session(session_id);
+        }
+        let overlay = self
+            .mcp_manager
+            .reload_session(session_id, root.as_deref(), trusted);
+        if let Some(entry) = self.active_sessions.get(&session_id)
+            && entry
+                .cmd_tx
+                .send(SessionCommand::SetMcpOverlay(Box::new(overlay.clone())))
+                .is_err()
+        {
+            warn!(session_id, "failed to push MCP overlay to session");
+        }
+        overlay
+    }
+
+    /// Build a full MCP status report for a session (or the daemon tier only
+    /// when `session_id` is `None`).
+    fn handle_mcp_status(&self, session_id: Option<u64>) -> McpStatusReport {
+        let mut servers = self.mcp_manager.status();
+        let mut report = McpStatusReport {
+            servers: Vec::new(),
+            project_root: None,
+            project_trusted: false,
+            ignored_project_servers: Vec::new(),
+        };
+        if let Some(session_id) = session_id {
+            servers.extend(self.mcp_manager.session_status(session_id));
+            let (root, trusted) = self.session_project_root(session_id);
+            if let Some(root) = root {
+                if !trusted {
+                    report.ignored_project_servers = Self::untrusted_project_slugs(root.as_path());
+                }
+                report.project_root = Some(root);
+                report.project_trusted = trusted;
+            }
+        }
+        report.servers = servers;
+        report
+    }
+
+    /// The slugs an untrusted project root's `.mcp.json` declares (read so
+    /// status can name what is being ignored; never spawned).
+    #[cfg(feature = "mcp")]
+    fn untrusted_project_slugs(root: &Path) -> Vec<String> {
+        match crate::mcp::config::load_project_config(root, false) {
+            Ok(Some(entries)) => {
+                let mut slugs: Vec<String> = entries.into_iter().map(|e| e.config.slug).collect();
+                slugs.sort();
+                slugs
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Without the `mcp` feature no project file is ever read, so nothing is
+    /// ever ignored.
+    #[cfg(not(feature = "mcp"))]
+    fn untrusted_project_slugs(_root: &Path) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Trust or untrust the active session's project root, then re-resolve the
+    /// session's overlay and reply with the outcome.
+    fn handle_mcp_trust_set(&mut self, session_id: u64, trusted: bool) -> McpTrustOutcome {
+        let (root, _) = self.session_project_root(session_id);
+        let Some(root) = root else {
+            return McpTrustOutcome {
+                root: None,
+                trusted: false,
+                message: "no project root for this session's working directory".to_string(),
+            };
+        };
+        let result = if trusted {
+            self.mcp_trust.trust(&root)
+        } else {
+            self.mcp_trust.untrust(&root)
+        };
+        match result {
+            Ok(canonical) => {
+                // A trust flip changes which project servers are spawned: push
+                // the fresh overlay to the session (releasing the old refs).
+                let _ = self.resolve_and_push_session_overlay(session_id, !trusted);
+                McpTrustOutcome {
+                    root: Some(canonical.clone()),
+                    trusted,
+                    message: format!(
+                        "{} project MCP root {}",
+                        if trusted {
+                            "trusted"
+                        } else {
+                            "revoked trust for"
+                        },
+                        canonical.display()
+                    ),
+                }
+            }
+            Err(e) => McpTrustOutcome {
+                root: Some(root),
+                trusted: false,
+                message: format!("failed to update trust: {e}"),
+            },
+        }
+    }
+
+    /// Handle a daemon-tier `mcp.json` watcher event: re-read and reconcile the
+    /// shared servers, then rebuild the catalogue.
+    fn handle_mcp_tier_reload(&mut self) {
+        match self.mcp_manager.reload() {
+            Ok(outcome) => {
+                self.rebuild_tool_catalogue();
+                info!(summary = %outcome.summary, "MCP daemon-tier config reloaded (watch)");
+            }
+            Err(e) => warn!(error = %e, "MCP daemon-tier config reload failed"),
+        }
+    }
+
+    /// Handle a `trust.toml` watcher event: re-read the trust store and
+    /// re-resolve every active session's overlay (a trust flip changes which
+    /// project servers are spawned).
+    fn handle_mcp_trust_reload(&mut self) {
+        self.mcp_trust = McpTrustStore::load(self.mcp_trust.path().to_path_buf());
+        let sessions: Vec<u64> = self.active_sessions.keys().copied().collect();
+        info!(
+            sessions = sessions.len(),
+            "MCP trust store reloaded (watch)"
+        );
+        for session_id in sessions {
+            let _ = self.resolve_and_push_session_overlay(session_id, false);
+        }
     }
 
     /// Force-close one session's provider sockets by shutting down its

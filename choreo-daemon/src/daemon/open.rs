@@ -252,6 +252,13 @@ impl DaemonState {
             model_cache: HashMap::new(),
             model_prefetch_in_flight: HashSet::new(),
             mcp_manager,
+            // The trust store is loaded fail-closed: a missing or malformed
+            // `trust.toml` yields an empty set. When no config dir is
+            // resolvable the path is empty and every read/write degrades
+            // gracefully (nothing is ever trusted).
+            mcp_trust: crate::mcp::trust::McpTrustStore::load(
+                crate::mcp::trust_path().unwrap_or_default(),
+            ),
             // Populated by `start_daemon_core`, which spawns the maintenance
             // thread (it needs the real command-loop channel).
             maintenance_tx: None,

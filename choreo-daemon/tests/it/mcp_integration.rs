@@ -36,7 +36,7 @@ fn mcp_fixture_tools_are_discovered_and_callable() {
         std::process::abort();
     });
 
-    // ── 1. Create a temporary config directory with mcp_servers.json ──
+    // ── 1. Create a temporary config directory with mcp.json ──
     let config_dir = tempfile::tempdir().expect("tempdir for config");
     let config_path = config_dir.path().join("choreographr");
     std::fs::create_dir_all(&config_path).expect("create Choreographr config dir");
@@ -52,10 +52,10 @@ fn mcp_fixture_tools_are_discovered_and_callable() {
     });
 
     std::fs::write(
-        config_path.join("mcp_servers.json"),
+        config_path.join("mcp.json"),
         serde_json::to_string_pretty(&mcp_config).expect("serialize mcp config"),
     )
-    .expect("write mcp_servers.json");
+    .expect("write mcp.json");
 
     // ── 2. Override the config dir so load_mcp_config finds our file ──
     // XDG_CONFIG_HOME cannot be used for this: `dirs::config_dir()` ignores it
@@ -152,7 +152,7 @@ fn mcp_fixture_tools_are_discovered_and_callable() {
     choreo_daemon::mcp::config::set_test_config_root(None);
 }
 
-/// Write an `mcp_servers.json` for a single server into a fresh config dir and
+/// Write an `mcp.json` for a single server into a fresh config dir and
 /// return the tempdir (kept alive by the caller) plus the server slug.
 fn write_single_server_config(
     slug: &str,
@@ -172,7 +172,7 @@ fn write_single_server_config(
     servers.insert(slug.to_string(), server);
     let mcp_config = serde_json::json!({ "mcpServers": servers });
     std::fs::write(
-        config_path.join("mcp_servers.json"),
+        config_path.join("mcp.json"),
         serde_json::to_string_pretty(&mcp_config)?,
     )?;
     Ok((config_dir, slug.to_string()))
@@ -314,10 +314,10 @@ fn mcp_shutdown_all_is_bounded_with_a_stubborn_server() {
         }
     });
     std::fs::write(
-        config_path.join("mcp_servers.json"),
+        config_path.join("mcp.json"),
         serde_json::to_string_pretty(&mcp_config).expect("serialize config"),
     )
-    .expect("write mcp_servers.json");
+    .expect("write mcp.json");
     choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
 
     let mut registry = choreo_daemon::tools::ToolRegistry::new();

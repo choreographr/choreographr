@@ -1195,6 +1195,7 @@ mod unsent_draft_tests {
                 servers: vec![
                     McpServerStatus {
                         slug: "docs".to_string(),
+                        tier: "daemon".to_string(),
                         transport: "stdio".to_string(),
                         target: "npx docs".to_string(),
                         connected: true,
@@ -1205,6 +1206,7 @@ mod unsent_draft_tests {
                     },
                     McpServerStatus {
                         slug: "fs".to_string(),
+                        tier: "project".to_string(),
                         transport: "http".to_string(),
                         target: "https://example.com/mcp".to_string(),
                         connected: false,
@@ -1214,6 +1216,9 @@ mod unsent_draft_tests {
                         last_error: Some("connect timed out".to_string()),
                     },
                 ],
+                project_root: None,
+                project_trusted: false,
+                ignored_project_servers: Vec::new(),
             },
             &mut app,
             &tx,
@@ -1235,6 +1240,9 @@ mod unsent_draft_tests {
         handle_daemon_message(
             DaemonMessage::McpStatus {
                 servers: Vec::new(),
+                project_root: None,
+                project_trusted: false,
+                ignored_project_servers: Vec::new(),
             },
             &mut app,
             &tx,
@@ -1293,6 +1301,7 @@ mod unsent_draft_tests {
                     .to_string(),
                 servers: vec![McpServerStatus {
                     slug: "docs".to_string(),
+                    tier: "daemon".to_string(),
                     transport: "stdio".to_string(),
                     target: "npx docs".to_string(),
                     connected: true,

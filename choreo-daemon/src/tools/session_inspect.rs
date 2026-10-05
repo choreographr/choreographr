@@ -517,20 +517,25 @@ fn mcp_section(ctx: &ToolContext) -> String {
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     if ctx
         .daemon_tx
-        .send(DaemonCommand::McpStatus { reply: reply_tx })
+        .send(DaemonCommand::McpStatus {
+            // No session scope: report only the daemon tier (this diagnostic
+            // runs from a tool thread that may not be the attached session).
+            session_id: None,
+            reply: reply_tx,
+        })
         .is_err()
     {
         return "  MCP: daemon command loop unavailable\n".to_string();
     }
-    let Ok(statuses) = reply_rx.recv_timeout(std::time::Duration::from_secs(2)) else {
+    let Ok(report) = reply_rx.recv_timeout(std::time::Duration::from_secs(2)) else {
         return "  MCP: status query timed out\n".to_string();
     };
-    if statuses.is_empty() {
+    if report.servers.is_empty() {
         return "  MCP: no servers configured\n".to_string();
     }
-    let mut out = format!("  MCP servers ({}):\n", statuses.len());
-    for status in statuses {
-        let _ = writeln!(out, "    {}", status.summary());
+    let mut out = format!("  MCP servers ({}):\n", report.servers.len());
+    for status in report.servers {
+        let _ = writeln!(out, "    [{}] {}", status.tier, status.summary());
     }
     out
 }

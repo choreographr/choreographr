@@ -113,6 +113,7 @@ fn mcp_status_reply_serde_round_trip() {
         servers: vec![
             McpServerStatus {
                 slug: "docs".to_string(),
+                tier: "daemon".to_string(),
                 transport: "stdio".to_string(),
                 target: "npx -y @modelcontextprotocol/server-docs".to_string(),
                 connected: true,
@@ -123,6 +124,7 @@ fn mcp_status_reply_serde_round_trip() {
             },
             McpServerStatus {
                 slug: "fs".to_string(),
+                tier: "project".to_string(),
                 transport: "http".to_string(),
                 target: "https://example.com/mcp".to_string(),
                 connected: false,
@@ -132,6 +134,9 @@ fn mcp_status_reply_serde_round_trip() {
                 last_error: Some("connect timed out".to_string()),
             },
         ],
+        project_root: Some("/home/u/proj".to_string()),
+        project_trusted: true,
+        ignored_project_servers: vec!["notes".to_string()],
     };
     let frame = encode_frame(&message).expect("encode");
     let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");
@@ -171,7 +176,53 @@ fn mcp_reloaded_reply_serde_round_trip() {
 #[test]
 fn mcp_reload_failed_serde_round_trip() {
     let message = DaemonMessage::McpReloadFailed {
-        error: "failed to parse mcp_servers.json".to_string(),
+        error: "failed to parse mcp.json".to_string(),
+    };
+    let frame = encode_frame(&message).expect("encode");
+    let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");
+    assert_eq!(decoded, message);
+}
+
+#[test]
+fn mcp_trust_request_serde_round_trip() {
+    let message = ClientMessage::McpTrust;
+    let frame = encode_frame(&message).expect("encode");
+    let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
+    assert_eq!(decoded, message);
+}
+
+#[test]
+fn mcp_untrust_request_serde_round_trip() {
+    let message = ClientMessage::McpUntrust;
+    let frame = encode_frame(&message).expect("encode");
+    let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
+    assert_eq!(decoded, message);
+}
+
+#[test]
+fn mcp_trust_list_request_serde_round_trip() {
+    let message = ClientMessage::McpTrustList;
+    let frame = encode_frame(&message).expect("encode");
+    let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
+    assert_eq!(decoded, message);
+}
+
+#[test]
+fn mcp_trust_updated_serde_round_trip() {
+    let message = DaemonMessage::McpTrustUpdated {
+        root: Some("/home/u/proj".to_string()),
+        trusted: true,
+        message: "trusted project MCP root /home/u/proj".to_string(),
+    };
+    let frame = encode_frame(&message).expect("encode");
+    let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");
+    assert_eq!(decoded, message);
+}
+
+#[test]
+fn mcp_trust_list_reply_serde_round_trip() {
+    let message = DaemonMessage::McpTrustList {
+        roots: vec!["/home/u/proj".to_string(), "/home/u/other".to_string()],
     };
     let frame = encode_frame(&message).expect("encode");
     let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");

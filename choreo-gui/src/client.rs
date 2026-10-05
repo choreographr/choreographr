@@ -173,6 +173,21 @@ pub(crate) fn handle_shell_command(
                     .push("reloading MCP configuration…".to_string());
                 send_client_message(state, daemon_tx, ClientMessage::McpReload);
             }
+            McpCommand::Trust => {
+                state
+                    .status_texts
+                    .push("trusting project MCP root…".to_string());
+                send_client_message(state, daemon_tx, ClientMessage::McpTrust);
+            }
+            McpCommand::Untrust => {
+                state
+                    .status_texts
+                    .push("revoking project MCP trust…".to_string());
+                send_client_message(state, daemon_tx, ClientMessage::McpUntrust);
+            }
+            McpCommand::TrustList => {
+                send_client_message(state, daemon_tx, ClientMessage::McpTrustList);
+            }
         },
         // TODO(task 3): the unified command model's local-UI variants
         // (open session manager / accounts / model picker, reasoning

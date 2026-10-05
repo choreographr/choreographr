@@ -1137,6 +1137,20 @@ impl ToolRegistry {
     /// those fields.
     #[must_use]
     pub fn available_definitions(&self, active: &HashSet<String>) -> Vec<ChatToolDefinition> {
+        self.available_definitions_excluding(active, &HashSet::new())
+    }
+
+    /// Like [`available_definitions`](Self::available_definitions) but drops
+    /// every tool whose group is in `excluded` — used by the request path to
+    /// remove the daemon-tier `mcp/<slug>` groups a session's project servers
+    /// shadow (a project server replaces the daemon-tier one BY GROUP, not by
+    /// union).
+    #[must_use]
+    pub fn available_definitions_excluding(
+        &self,
+        active: &HashSet<String>,
+        excluded: &HashSet<String>,
+    ) -> Vec<ChatToolDefinition> {
         self.tools
             .values()
             // Union the session's active set with the protected groups: the
@@ -1144,7 +1158,10 @@ impl ToolRegistry {
             // persisted sessions whose stored active set predates the group
             // (the group is unloadable, so "not listed" can only mean
             // "session is older than the group", never "user opted out").
-            .filter(|t| active.contains(t.group()) || self.protected_groups.contains(t.group()))
+            .filter(|t| {
+                (active.contains(t.group()) || self.protected_groups.contains(t.group()))
+                    && !excluded.contains(t.group())
+            })
             .map(|t| ChatToolDefinition::function(t.name(), t.description(), t.schema()))
             .collect()
     }

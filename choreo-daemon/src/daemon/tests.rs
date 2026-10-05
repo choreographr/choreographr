@@ -54,6 +54,7 @@ pub(super) fn make_daemon_state() -> (DaemonState, crossbeam_channel::Receiver<D
         model_cache: HashMap::new(),
         model_prefetch_in_flight: HashSet::new(),
         mcp_manager: crate::mcp::McpManager::empty(),
+        mcp_trust: crate::mcp::trust::McpTrustStore::load(config_dir.path().join("trust.toml")),
         maintenance_tx: None,
         acl: None,
         catalog_paths: CatalogPaths::default(),

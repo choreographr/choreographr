@@ -203,6 +203,9 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
                 McpCommand::Status => ClientMessage::McpStatusRequest,
                 McpCommand::Reconnect { slug } => ClientMessage::McpReconnect { slug },
                 McpCommand::Reload => ClientMessage::McpReload,
+                McpCommand::Trust => ClientMessage::McpTrust,
+                McpCommand::Untrust => ClientMessage::McpUntrust,
+                McpCommand::TrustList => ClientMessage::McpTrustList,
             };
             if let Err(e) = state.bridge_tx.send(msg) {
                 warn!("failed to send mcp command to bridge: {e}");

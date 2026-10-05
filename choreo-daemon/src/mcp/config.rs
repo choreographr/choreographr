@@ -42,6 +42,14 @@ struct ServerEntry {
     disabled_tools: Vec<String>,
     #[serde(default = "default_true")]
     enabled: bool,
+    /// Whether this server's connection may be pooled and shared across every
+    /// session that references it (`shared`, default `true`). `false` gives
+    /// the server a private connection per session that uses it — the escape
+    /// hatch for a stateful server whose state must not be shared between
+    /// sessions. This is a daemon-layer pooling attribute, not a wire/transport
+    /// concern (so it is not part of [`McpServerConfig`]).
+    #[serde(default = "default_true")]
+    shared: bool,
     /// Optional per-server request timeout, in seconds.
     #[serde(default)]
     timeout: Option<u64>,
@@ -90,7 +98,7 @@ fn parse_protocol(value: Option<&str>) -> McpProtocolMode {
 ///
 /// Returns `None` (with a logged reason) for an entry that cannot be resolved —
 /// an ambiguous or incomplete server — so the rest of the file still loads.
-fn resolve_transport(slug: &str, entry: &ServerEntry) -> Option<McpTransport> {
+fn resolve_transport(slug: &str, entry: &ServerEntry, expand_env: bool) -> Option<McpTransport> {
     let requested = match entry.transport.as_deref() {
         None => McpTransportKind::Auto,
         Some(raw) => McpTransportKind::parse(raw).unwrap_or_else(|| {
@@ -134,7 +142,7 @@ fn resolve_transport(slug: &str, entry: &ServerEntry) -> Option<McpTransport> {
             Some(McpTransport::Stdio {
                 command,
                 args: entry.args.clone(),
-                env: expand_env_map(&entry.env),
+                env: maybe_expand_env_map(&entry.env, expand_env),
                 cwd: entry.cwd.as_deref().map(expand_tilde),
                 log_path: server_log_path(slug),
             })
@@ -146,7 +154,7 @@ fn resolve_transport(slug: &str, entry: &ServerEntry) -> Option<McpTransport> {
             };
             Some(McpTransport::Http {
                 url,
-                headers: expand_env_map(&entry.headers),
+                headers: maybe_expand_env_map(&entry.headers, expand_env),
             })
         }
         // `Auto` is resolved to a concrete kind above.
@@ -154,8 +162,25 @@ fn resolve_transport(slug: &str, entry: &ServerEntry) -> Option<McpTransport> {
     }
 }
 
+/// A resolved daemon-layer MCP server: its client config plus the pooling
+/// attribute (`shared`) the daemon layers on top. `shared` is deliberately NOT
+/// part of [`McpServerConfig`] — it governs how the daemon pools the
+/// connection, not how the client speaks to the server.
+#[derive(Debug, Clone)]
+pub struct McpEntry {
+    /// The resolved client config.
+    pub config: McpServerConfig,
+    /// Whether the connection may be shared across sessions (default `true`).
+    pub shared: bool,
+}
+
 /// Resolve one entry into a config, or `None` when it is disabled or invalid.
-fn resolve_entry(slug: &str, entry: &ServerEntry) -> Option<McpServerConfig> {
+///
+/// `expand_env` gates `${VAR}` expansion in `env`/`headers` values: the
+/// daemon tier always expands; a project entry expands only when its project
+/// root is trusted (see [`crate::mcp::trust`]). An untrusted project entry is
+/// never resolved into a spawnable config this way.
+fn resolve_entry(slug: &str, entry: &ServerEntry, expand_env: bool) -> Option<McpEntry> {
     if !entry.enabled {
         return None;
     }
@@ -168,16 +193,19 @@ fn resolve_entry(slug: &str, entry: &ServerEntry) -> Option<McpServerConfig> {
             "ignoring unrecognized MCP server config keys"
         );
     }
-    let transport = resolve_transport(slug, entry)?;
-    Some(McpServerConfig {
-        slug: slug.to_string(),
-        transport,
-        enabled: entry.enabled,
-        timeout: entry.timeout.map(Duration::from_secs),
-        protocol: parse_protocol(entry.protocol.as_deref()),
-        max_concurrent_calls: entry.max_concurrent_calls,
-        max_restarts: entry.max_restarts,
-        disabled_tools: entry.disabled_tools.clone(),
+    let transport = resolve_transport(slug, entry, expand_env)?;
+    Some(McpEntry {
+        config: McpServerConfig {
+            slug: slug.to_string(),
+            transport,
+            enabled: entry.enabled,
+            timeout: entry.timeout.map(Duration::from_secs),
+            protocol: parse_protocol(entry.protocol.as_deref()),
+            max_concurrent_calls: entry.max_concurrent_calls,
+            max_restarts: entry.max_restarts,
+            disabled_tools: entry.disabled_tools.clone(),
+        },
+        shared: entry.shared,
     })
 }
 
@@ -236,6 +264,17 @@ fn expand_env_map(map: &HashMap<String, String>) -> HashMap<String, String> {
         .collect()
 }
 
+/// [`expand_env_map`] gated on `expand`: when `expand` is false the map is
+/// returned verbatim (a project entry whose root is UNTRUSTED must never have
+/// its secrets pulled from the environment).
+fn maybe_expand_env_map(map: &HashMap<String, String>, expand: bool) -> HashMap<String, String> {
+    if expand {
+        expand_env_map(map)
+    } else {
+        map.clone()
+    }
+}
+
 /// Expand `${VAR}` references in `value` from the environment.
 ///
 /// A reference to an unset variable expands to the empty string (with a
@@ -286,146 +325,88 @@ fn expand_env_with(value: &str, lookup: impl Fn(&str) -> Option<String>) -> Stri
     out
 }
 
-thread_local! {
-    /// Test-only override for the base config directory. When set,
-    /// `mcp_config_path()` returns `<root>/choreographr/mcp_servers.json`
-    /// instead of the user's real config dir.
-    ///
-    /// Deliberately NOT `#[cfg(test)]`-gated: integration tests in `tests/`
-    /// compile the crate without `cfg(test)`, so the hook must exist in
-    /// normal builds too (it is a no-op unless explicitly set).
-    static TEST_CONFIG_ROOT: std::cell::RefCell<Option<PathBuf>> =
-        const { std::cell::RefCell::new(None) };
-
-    /// Test-only override for the project config root. `Disabled` forces "no
-    /// project file"; `Path(root)` points the project file at
-    /// `<root>/.choreographr/mcp_servers.json`; `Unset` falls back to the base
-    /// dir / current dir.
-    static TEST_PROJECT_ROOT: std::cell::RefCell<ProjectRootOverride> =
-        const { std::cell::RefCell::new(ProjectRootOverride::Unset) };
-}
-
-/// Test-only override for the base config directory (see `TEST_CONFIG_ROOT`).
+/// The MCP server file name shared by both tiers.
 ///
-/// This is needed because `dirs::config_dir()` honors `XDG_CONFIG_HOME` only
-/// on Linux — on macOS it always returns `$HOME/Library/Application Support`,
-/// so an integration test cannot redirect the config path via environment
-/// variables.
+/// The daemon tier lives at `<config dir>/choreographr/mcp.json`; a project
+/// tier lives at `<project root>/.mcp.json` (a leading dot, the MCP-ecosystem
+/// convention). `mcpServers` is the MCP-standard key inside both.
+pub const DAEMON_CONFIG_FILE: &str = "mcp.json";
+
+/// Test-only override for the base config directory. Re-exported from the
+/// module root (which owns the thread-local) so the existing
+/// `mcp::config::set_test_config_root` call sites in `tests/` keep working.
 #[doc(hidden)]
 pub fn set_test_config_root(root: Option<PathBuf>) {
-    TEST_CONFIG_ROOT.with(|cell| cell.replace(root));
+    super::set_test_config_root(root);
 }
 
-/// Test-only override for the project config root (see `TEST_PROJECT_ROOT`).
-#[doc(hidden)]
-pub fn set_test_project_root(root: Option<Option<PathBuf>>) {
-    let override_value = match root {
-        None => ProjectRootOverride::Unset,
-        Some(None) => ProjectRootOverride::Disabled,
-        Some(Some(path)) => ProjectRootOverride::Path(path),
-    };
-    TEST_PROJECT_ROOT.with(|cell| cell.replace(override_value));
-}
-
-/// Resolve the path to the **user** `mcp_servers.json`.
+/// Resolve the path to the daemon-tier `mcp.json`.
 ///
 /// # Errors
 ///
-/// Returns an error when the user's config directory cannot be determined.
+/// Returns an error when the config directory cannot be determined.
 pub fn mcp_config_path() -> Result<PathBuf> {
-    if let Some(root) = TEST_CONFIG_ROOT.with(|cell| cell.borrow().clone()) {
-        return Ok(root.join("choreographr").join("mcp_servers.json"));
-    }
-    choreo_shared::paths::config_file("mcp_servers.json")
-        .context("could not determine config directory")
+    Ok(super::config_dir()?.join(DAEMON_CONFIG_FILE))
 }
 
-/// Resolve the path to the **project** `mcp_servers.json`, if one can be placed.
-///
-/// The project file lives at `<root>/.choreographr/mcp_servers.json`, where
-/// `<root>` is the base dir when the daemon runs under `--base-dir` and the
-/// process's current directory otherwise. A project file lets a checkout carry
-/// its own server set without editing the user config; its entries override the
-/// user file's per server slug. `None` when neither a base dir nor a current
-/// directory is resolvable (the project layer is then simply absent).
+/// The project-tier `.mcp.json` path for a resolved project root.
 #[must_use]
-pub fn project_config_path() -> Option<PathBuf> {
-    match TEST_PROJECT_ROOT.with(|cell| cell.borrow().clone()) {
-        ProjectRootOverride::Path(root) => {
-            return Some(root.join(".choreographr").join("mcp_servers.json"));
-        }
-        ProjectRootOverride::Disabled => return None,
-        ProjectRootOverride::Unset => {}
-    }
-    let root = choreo_shared::paths::base_dir().or_else(|| std::env::current_dir().ok());
-    root.map(|root| root.join(".choreographr").join("mcp_servers.json"))
+pub fn project_config_path(project_root: &std::path::Path) -> PathBuf {
+    project_root.join(super::PROJECT_CONFIG_FILE)
 }
 
-/// Test-only override for the project config root (see `TEST_PROJECT_ROOT`),
-/// distinguishing "unset" from "explicitly no project file".
-#[derive(Clone)]
-enum ProjectRootOverride {
-    /// No override: resolve from the base dir / current dir.
-    Unset,
-    /// The project layer is disabled.
-    Disabled,
-    /// The project file root is this directory.
-    Path(PathBuf),
-}
-
-/// Load MCP server configurations from the user file, overlaying the project
-/// file when present.
+/// Load the **daemon-tier** server set from `mcp.json`.
 ///
-/// Returns an empty Vec if neither file exists. Project entries replace user
-/// entries per server slug (a whole-entry override, so a project can point a
-/// server at a different command/URL entirely).
+/// Returns an empty Vec if the file does not exist. Daemon-tier entries are
+/// trusted unconditionally, so `${VAR}` expansion is always applied.
 ///
 /// # Errors
 ///
 /// Returns an error when a present file cannot be read or parsed.
-pub fn load_mcp_config() -> Result<Vec<McpServerConfig>> {
-    let user = mcp_config_path()?;
-    let project = project_config_path();
-    load_from_paths(&user, project.as_deref())
+pub fn load_daemon_config() -> Result<Vec<McpEntry>> {
+    let path = mcp_config_path()?;
+    Ok(read_entries_into(&path)?.map_or_else(Vec::new, |entries| resolve_entries(&entries, true)))
 }
 
-/// [`load_mcp_config`] parameterised on the two file paths, so the merge can be
-/// exercised without mutating the process environment or base dir.
+/// Load the **project-tier** server set from `<project_root>/.mcp.json`.
+///
+/// Returns `None` when the file does not exist. `expand` gates `${VAR}`
+/// expansion: only a TRUSTED project root expands. The caller decides whether
+/// to spawn the entries; an untrusted root's entries are read here (unexpanded)
+/// purely so status can report the slugs being ignored.
 ///
 /// # Errors
 ///
 /// Returns an error when a present file cannot be read or parsed.
-fn load_from_paths(
-    user: &std::path::Path,
-    project: Option<&std::path::Path>,
-) -> Result<Vec<McpServerConfig>> {
-    let mut entries: HashMap<String, ServerEntry> = HashMap::new();
-    read_servers_into(user, &mut entries)?;
-    if let Some(project) = project {
-        // Project entries extend and override the user's — re-keyed by slug, so
-        // a project's `docs` replaces the user's `docs` outright.
-        read_servers_into(project, &mut entries)?;
-    }
-    Ok(entries
-        .into_iter()
-        .filter_map(|(slug, entry)| resolve_entry(&slug, &entry))
-        .collect())
+pub fn load_project_config(
+    project_root: &std::path::Path,
+    expand: bool,
+) -> Result<Option<Vec<McpEntry>>> {
+    let path = project_config_path(project_root);
+    Ok(read_entries_into(&path)?.map(|entries| resolve_entries(&entries, expand)))
 }
 
-/// Parse one `mcp_servers.json` (if it exists) into `entries`, keyed by slug.
-fn read_servers_into(
-    path: &std::path::Path,
-    entries: &mut HashMap<String, ServerEntry>,
-) -> Result<()> {
+/// Resolve a parsed slug→entry map into a deterministic, slug-sorted list.
+fn resolve_entries(entries: &HashMap<String, ServerEntry>, expand: bool) -> Vec<McpEntry> {
+    let mut resolved: Vec<(String, McpEntry)> = entries
+        .iter()
+        .filter_map(|(slug, entry)| resolve_entry(slug, entry, expand).map(|e| (slug.clone(), e)))
+        .collect();
+    resolved.sort_by(|a, b| a.0.cmp(&b.0));
+    resolved.into_iter().map(|(_, e)| e).collect()
+}
+
+/// Parse one `mcp.json`/`.mcp.json` (if it exists) into `entries`, keyed by
+/// slug. `None` when the file is absent.
+fn read_entries_into(path: &std::path::Path) -> Result<Option<HashMap<String, ServerEntry>>> {
     if !path.exists() {
-        return Ok(());
+        return Ok(None);
     }
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     let parsed: McpServersFile = serde_json::from_str(&contents)
         .with_context(|| format!("failed to parse {}", path.display()))?;
-    entries.extend(parsed.mcp_servers);
-    Ok(())
+    Ok(Some(parsed.mcp_servers))
 }
 
 #[cfg(test)]
@@ -433,19 +414,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn load_mcp_config_file_not_found_returns_empty() {
-        // No mcp_servers.json exists in the test environment → returns empty Vec.
-        let configs = load_mcp_config().unwrap_or_else(|_| Vec::new());
-        // The file doesn't exist in CI so we expect empty.
-        // This test just verifies no panic on the happy path.
-        assert!(configs.is_empty() || !configs.is_empty());
+    fn load_daemon_config_missing_file_returns_empty() {
+        // Point the config root at a temp dir with no mcp.json so the real
+        // user config is never read.
+        let dir = tempfile::tempdir().unwrap();
+        set_test_config_root(Some(dir.path().to_path_buf()));
+        let configs = load_daemon_config().expect("load daemon config");
+        set_test_config_root(None);
+        assert!(configs.is_empty(), "no mcp.json yields no configs");
     }
 
     #[test]
     fn mcp_config_path_is_absolute() {
         let path = mcp_config_path().expect("should resolve config path");
         assert!(path.is_absolute());
-        assert!(path.ends_with("mcp_servers.json"));
+        assert!(path.ends_with("mcp.json"));
     }
 
     #[test]
@@ -461,6 +444,7 @@ mod tests {
         assert_eq!(entry.args, [] as [std::string::String; 0]);
         assert!(entry.env.is_empty());
         assert!(entry.enabled);
+        assert!(entry.shared, "shared defaults to true");
         assert!(entry.timeout.is_none());
         assert!(entry.protocol.is_none());
         assert!(entry.unknown.is_empty());
@@ -559,7 +543,7 @@ mod tests {
     #[test]
     fn auto_infers_stdio_from_command() {
         let entry = entry_from(serde_json::json!({"command": "npx"}));
-        match resolve_transport("s", &entry).expect("resolved") {
+        match resolve_transport("s", &entry, true).expect("resolved") {
             McpTransport::Stdio { command, .. } => assert_eq!(command, "npx"),
             other @ McpTransport::Http { .. } => panic!("expected stdio, got {other:?}"),
         }
@@ -568,7 +552,7 @@ mod tests {
     #[test]
     fn auto_infers_http_from_url() {
         let entry = entry_from(serde_json::json!({"url": "https://example.com/mcp"}));
-        match resolve_transport("s", &entry).expect("resolved") {
+        match resolve_transport("s", &entry, true).expect("resolved") {
             McpTransport::Http { url, .. } => assert_eq!(url, "https://example.com/mcp"),
             other @ McpTransport::Stdio { .. } => panic!("expected http, got {other:?}"),
         }
@@ -584,7 +568,7 @@ mod tests {
             "transport": "http"
         }));
         assert!(matches!(
-            resolve_transport("s", &entry),
+            resolve_transport("s", &entry, true),
             Some(McpTransport::Http { .. })
         ));
     }
@@ -595,13 +579,13 @@ mod tests {
             "command": "npx",
             "url": "https://example.com/mcp"
         }));
-        assert!(resolve_transport("s", &both).is_none());
+        assert!(resolve_transport("s", &both, true).is_none());
 
         let neither = entry_from(serde_json::json!({}));
-        assert!(resolve_transport("s", &neither).is_none());
+        assert!(resolve_transport("s", &neither, true).is_none());
 
         let http_without_url = entry_from(serde_json::json!({"transport": "http"}));
-        assert!(resolve_transport("s", &http_without_url).is_none());
+        assert!(resolve_transport("s", &http_without_url, true).is_none());
     }
 
     #[test]
@@ -613,13 +597,13 @@ mod tests {
             }
         });
         let parsed: McpServersFile = serde_json::from_value(json).unwrap();
-        let configs: Vec<McpServerConfig> = parsed
+        let configs: Vec<McpEntry> = parsed
             .mcp_servers
             .into_iter()
-            .filter_map(|(slug, entry)| resolve_entry(&slug, &entry))
+            .filter_map(|(slug, entry)| resolve_entry(&slug, &entry, true))
             .collect();
         assert_eq!(configs.len(), 1);
-        assert_eq!(configs[0].slug, "enabled-server");
+        assert_eq!(configs[0].config.slug, "enabled-server");
     }
 
     #[test]
@@ -691,7 +675,7 @@ mod tests {
     #[test]
     fn stdio_transport_carries_cwd() {
         let entry = entry_from(serde_json::json!({"command": "npx", "cwd": "/srv/mcp"}));
-        match resolve_transport("s", &entry).expect("resolved") {
+        match resolve_transport("s", &entry, true).expect("resolved") {
             McpTransport::Stdio { cwd, .. } => assert_eq!(cwd.as_deref(), Some("/srv/mcp")),
             other @ McpTransport::Http { .. } => panic!("expected stdio, got {other:?}"),
         }
@@ -715,43 +699,66 @@ mod tests {
             "command": "python",
             "disabledTools": ["a", "b"]
         }));
-        let config = resolve_entry("s", &entry).expect("resolved");
-        assert_eq!(config.disabled_tools, vec!["a", "b"]);
+        let config = resolve_entry("s", &entry, true).expect("resolved");
+        assert_eq!(config.config.disabled_tools, vec!["a", "b"]);
     }
 
     #[test]
-    fn project_layer_overrides_user_per_slug() {
+    fn project_load_reads_dot_mcp_json_and_gates_expansion() {
         let dir = tempfile::tempdir().unwrap();
-        let user = dir.path().join("user.json");
-        let project = dir.path().join("project.json");
+        // A project root with a `.mcp.json` whose env requests expansion.
         std::fs::write(
-            &user,
-            r#"{"mcpServers":{
-                "docs":{"url":"https://user.example/mcp"},
-                "fs":{"command":"user-fs"}
-            }}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            &project,
-            r#"{"mcpServers":{
-                "docs":{"url":"https://project.example/mcp"},
-                "extra":{"command":"project-extra"}
-            }}"#,
+            project_config_path(dir.path()),
+            r#"{"mcpServers":{"docs":{"url":"https://project.example/mcp","headers":{"Authorization":"Bearer ${MCP_TEST_TOKEN}"}}}}"#,
         )
         .unwrap();
 
-        let configs = load_from_paths(&user, Some(&project)).unwrap();
-        let by_slug: HashMap<&str, &McpServerConfig> =
-            configs.iter().map(|c| (c.slug.as_str(), c)).collect();
-        // The project's `docs` wins outright.
-        match &by_slug["docs"].transport {
-            McpTransport::Http { url, .. } => assert_eq!(url, "https://project.example/mcp"),
+        // Trusted: expansion happens (the unset var collapses to empty).
+        let trusted = load_project_config(dir.path(), true)
+            .expect("load project")
+            .expect("present");
+        assert_eq!(trusted.len(), 1);
+        match &trusted[0].config.transport {
+            McpTransport::Http { headers, .. } => {
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Bearer ")
+                );
+            }
             other @ McpTransport::Stdio { .. } => panic!("expected http, got {other:?}"),
         }
-        // The user's `fs` survives; the project's `extra` is added.
-        assert!(by_slug.contains_key("fs"));
-        assert!(by_slug.contains_key("extra"));
+
+        // Untrusted: the literal `${...}` is preserved (never expanded).
+        let untrusted = load_project_config(dir.path(), false)
+            .expect("load project")
+            .expect("present");
+        match &untrusted[0].config.transport {
+            McpTransport::Http { headers, .. } => {
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Bearer ${MCP_TEST_TOKEN}")
+                );
+            }
+            other @ McpTransport::Stdio { .. } => panic!("expected http, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_load_missing_file_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            load_project_config(dir.path(), true)
+                .expect("load")
+                .is_none(),
+            "a project root with no .mcp.json loads as None"
+        );
+    }
+
+    #[test]
+    fn shared_false_is_carried_through_resolution() {
+        let entry = entry_from(serde_json::json!({"command": "stateful", "shared": false}));
+        let resolved = resolve_entry("s", &entry, true).expect("resolved");
+        assert!(!resolved.shared);
     }
 
     #[test]
@@ -813,10 +820,9 @@ mod tests {
     }
 
     #[test]
-    fn load_from_paths_handles_missing_files() {
+    fn read_entries_missing_files_is_none() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("none.json");
-        let configs = load_from_paths(&missing, Some(&missing)).unwrap();
-        assert!(configs.is_empty(), "missing files yield no configs");
+        assert!(read_entries_into(&missing).unwrap().is_none());
     }
 }

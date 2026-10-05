@@ -654,7 +654,7 @@ longer carry their own `max_turns`.
 the platform defaults:
 
 ```text
-{base}/config/   config.toml, accounts.toml, mcp_servers.json,
+{base}/config/   config.toml, accounts.toml, mcp.json, trust.toml,
                  models-overlay.toml, authorized_clients.toml,
                  identity.pk, transport.sec/.pub, known_servers.toml
 {base}/data/     state.redb, catalog.bin
@@ -804,23 +804,41 @@ are only required when running prompts.
 
 ### MCP servers
 
-MCP (Model Context Protocol) servers are configured in
-`$XDG_CONFIG_HOME/choreographr/mcp_servers.json` (a checkout may also carry a
-project file at `<root>/.choreographr/mcp_servers.json`, which overrides the
-user file per server slug). Each entry is a named server under `mcpServers`;
-a stdio server sets `command` (plus optional `args`/`env`/`cwd`) and a remote
-server sets `url` (plus optional `headers`). Discovered tools are exposed to
-the model under an `mcp/<slug>` group. A running daemon (the `mcp` feature is
-on by default) connects the enabled servers at startup and registers their
-tools.
+MCP (Model Context Protocol) servers are configured in **two tiers**:
+
+- **Daemon tier** — `$XDG_CONFIG_HOME/choreographr/mcp.json`. Visible to every
+  session and trusted unconditionally (you wrote it). The daemon connects its
+  shared servers at startup and registers their tools.
+- **Project tier** — a `.mcp.json` at the **project root**, found by walking UP
+  from a session's working directory to the git root (the first `.mcp.json`
+  wins). Visible only to that session's project: a session sees the daemon-tier
+  servers plus its own project's servers, and a project server of the same slug
+  replaces the daemon-tier one for that session. No project tier without a
+  working directory.
+
+A project's `.mcp.json` travels with a checkout you may not have written, so its
+servers (and any `${VAR}` expansion they request) are **gated behind trust**: it
+is read so `/mcp status` can report what is ignored, but never spawned or
+expanded until you trust the root with `/mcp trust` (see the slash commands
+below). Trust is whole-project, keyed on the exact project root, and stored in
+`$XDG_CONFIG_HOME/choreographr/trust.toml`.
+
+Each entry is a named server under `mcpServers`; a stdio server sets `command`
+(plus optional `args`/`env`/`cwd`) and a remote server sets `url` (plus optional
+`headers`). Discovered tools are exposed to the model under an `mcp/<slug>`
+group. A running daemon (the `mcp` feature is on by default) connects the
+enabled servers at startup and registers their tools.
 
 Per-server keys (all optional except `command`/`url`): `enabled`, `transport`
 (`auto`/`stdio`/`http`), `protocol` (`auto`/`legacy`/`modern`), `timeout`
 (seconds), `maxConcurrentCalls`, `maxRestarts` (consecutive transport-rebuild
 attempts before the server is left alone until its next call; `0` disables
-automatic reconnect), `disabledTools` (tool names to hide), and — for a stdio
+automatic reconnect), `disabledTools` (tool names to hide), `shared` (default
+`true`; `false` gives a stateful server a private connection per session that
+uses it instead of one pooled connection), and — for a stdio
 server — `cwd` (a leading `~` is expanded). `${VAR}` references in
-`env`/`headers` values are expanded from the environment. Each stdio server's
+`env`/`headers` values are expanded from the environment (a project's values
+are expanded only when its root is trusted). Each stdio server's
 `stderr` is captured into a per-server log file (`mcp-<slug>.log` under the
 log/state directory, capped at 2 MiB).
 
@@ -852,14 +870,14 @@ choreographr mcp reconnect docs                    # rebuild one server on a run
 choreographr mcp reload                            # re-read the config on a running daemon
 ```
 
-`list`/`add`/`remove` edit the user `mcp_servers.json` directly (no daemon
+`list`/`add`/`remove` edit the daemon-tier `mcp.json` directly (no daemon
 needed; `add` refuses to overwrite an existing slug unless `--force`), while
 `reconnect`/`reload` talk to a running daemon over its local socket. The in-TUI
-`/mcp` command shows the live state of every server (connected tool counts,
-or the last error); `/mcp reconnect <slug>` rebuilds one server and `/mcp
-reload` re-reads the config and reconciles the whole set (connecting added
-servers, disconnecting removed ones, and rebuilding changed ones) without a
-daemon restart.
+`/mcp` command shows the live state of every server visible to the attached
+session (daemon + project tiers, tagged), plus the project-root trust state;
+`/mcp reconnect <slug>` rebuilds one server and `/mcp reload` reconciles the
+session's project `.mcp.json` (the daemon-tier `mcp.json` and `trust.toml`
+hot-reload via the config watcher) without a daemon restart.
 
 ## Slash commands
 
@@ -878,9 +896,12 @@ runs the command**, and `Esc` discards the line without cancelling anything.
 - `/model` — open the model selector picker
 - `/model <name>` — set the session's model directly
 - `/refresh-models [--force]` — re-fetch the models.dev catalog (conditional GET against the cached etag; 304 → "models up to date"); `--force` bypasses the etag so the server must return a fresh catalog. Also re-reads the user overlay. The daemon fetches on a background thread and replies with provider/model counts; a burst of `/refresh-models` requests is coalesced into a single fetch (each requester's status reflects its own `--force` flag, and a 304 reply is ordered after any queued overlay reload so the counts are current).
-- `/mcp` — show the state of every configured MCP server (one line per server: slug, transport, target, connected state, tool count, or the last error). The configured set is the same `mcp_servers.json` the daemon loads. Offline management (add/remove/list) is done with the `choreographr mcp` CLI (see below)
+- `/mcp` — show the state of every MCP server visible to the attached session (daemon + project tiers, tagged by tier): slug, transport, target, connected state, tool count, or the last error — plus the session's project root, whether it is trusted, and any (untrusted) project servers being ignored. Offline management (add/remove/list) is done with the `choreographr mcp` CLI (see below)
 - `/mcp reconnect <slug>` — rebuild one server's connection on the running daemon and refresh its tools
-- `/mcp reload` — re-read `mcp_servers.json` (user + project layers) on the running daemon and reconcile the server set with it — connect servers added to the config, disconnect removed ones, and rebuild changed ones — then refresh the tool catalogue, all without a daemon restart
+- `/mcp reload` — reconcile the ACTIVE session's project `.mcp.json` on the running daemon (the daemon-tier `mcp.json` and `trust.toml` hot-reload automatically) — connect added servers, disconnect removed ones, rebuild changed ones — then refresh the tool catalogue, all without a daemon restart
+- `/mcp trust` — trust the active session's project MCP root (the directory of its nearest `.mcp.json`); its servers are connected and their `${VAR}` values expanded
+- `/mcp untrust` — revoke trust for that root; its project servers stop (their connections are dropped)
+- `/mcp trust list` — list the trusted project roots
 - `/new [title]` — create a new session and switch this client to it (the top-level shortcut for `/session new`)
 - `/session` — open the interactive session manager
 - `/session list` — list all sessions

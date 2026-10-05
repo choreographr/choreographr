@@ -593,13 +593,55 @@ pub(crate) fn handle_daemon_message(
         // arrive as McpStatus. Render one server per line; the status bar
         // reserves the needed rows (status_error_height counts newlines), so
         // the whole list is visible rather than wrapped to one line.
-        DaemonMessage::McpStatus { servers } => {
+        DaemonMessage::McpStatus {
+            servers,
+            project_root,
+            project_trusted,
+            ignored_project_servers,
+        } => {
+            let mut lines = Vec::new();
             if servers.is_empty() {
-                app.status = Some("no MCP servers configured".to_string());
+                lines.push("no MCP servers configured".to_string());
             } else {
-                let mut lines = vec![format!("MCP servers ({})", servers.len())];
+                lines.push(format!("MCP servers ({})", servers.len()));
                 for server in servers {
-                    lines.push(server.summary());
+                    lines.push(format!("[{}] {}", server.tier, server.summary()));
+                }
+            }
+            if let Some(root) = project_root {
+                let state = if *project_trusted {
+                    "trusted"
+                } else {
+                    "UNTRUSTED (use /mcp trust)"
+                };
+                lines.push(format!("project root: {root} ({state})"));
+            }
+            if !ignored_project_servers.is_empty() {
+                lines.push(format!(
+                    "{} project server(s) ignored (untrusted): {}",
+                    ignored_project_servers.len(),
+                    ignored_project_servers.join(", ")
+                ));
+            }
+            app.status = Some(lines.join("\n"));
+            return Ok(());
+        }
+        DaemonMessage::McpTrustUpdated {
+            root: _,
+            trusted,
+            message,
+        } => {
+            let _ = trusted;
+            app.status = Some(message.clone());
+            return Ok(());
+        }
+        DaemonMessage::McpTrustList { roots } => {
+            if roots.is_empty() {
+                app.status = Some("no trusted project MCP roots".to_string());
+            } else {
+                let mut lines = vec![format!("trusted project MCP roots ({})", roots.len())];
+                for root in roots {
+                    lines.push(root.clone());
                 }
                 app.status = Some(lines.join("\n"));
             }

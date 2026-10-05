@@ -363,16 +363,37 @@ fn dispatch_flat_message(msg: DaemonMessage, handler: &mut impl TurnEventHandler
         DaemonMessage::AccountListFailed { error } => {
             handler.handle_error(format!("[daemon] failed to list accounts: {error}"));
         }
-        DaemonMessage::McpStatus { servers } => {
+        DaemonMessage::McpStatus {
+            servers,
+            project_root,
+            project_trusted,
+            ignored_project_servers,
+        } => {
+            let mut lines = Vec::new();
             if servers.is_empty() {
-                handler.handle_status_text("[daemon] no MCP servers configured".to_string());
+                lines.push("[daemon] no MCP servers configured".to_string());
             } else {
-                let mut lines = vec![format!("[daemon] MCP servers ({})", servers.len())];
+                lines.push(format!("[daemon] MCP servers ({})", servers.len()));
                 for s in &servers {
-                    lines.push(format!("  {}", s.summary()));
+                    lines.push(format!("  [{}] {}", s.tier, s.summary()));
                 }
-                handler.handle_status_text(lines.join("\n"));
             }
+            if let Some(root) = project_root {
+                let state = if project_trusted {
+                    "trusted"
+                } else {
+                    "UNTRUSTED (use /mcp trust)"
+                };
+                lines.push(format!("project root: {root} ({state})"));
+            }
+            if !ignored_project_servers.is_empty() {
+                lines.push(format!(
+                    "{} project server(s) ignored (untrusted): {}",
+                    ignored_project_servers.len(),
+                    ignored_project_servers.join(", ")
+                ));
+            }
+            handler.handle_status_text(lines.join("\n"));
         }
         DaemonMessage::McpReconnectFailed { slug, error } => {
             handler.handle_error(format!("[daemon] mcp reconnect {slug} failed: {error}"));
@@ -389,6 +410,28 @@ fn dispatch_flat_message(msg: DaemonMessage, handler: &mut impl TurnEventHandler
         }
         DaemonMessage::McpReloadFailed { error } => {
             handler.handle_error(format!("[daemon] mcp reload failed: {error}"));
+        }
+        DaemonMessage::McpTrustUpdated {
+            root,
+            trusted,
+            message,
+        } => {
+            let _ = (root, trusted);
+            handler.handle_status_text(format!("[daemon] {message}"));
+        }
+        DaemonMessage::McpTrustList { roots } => {
+            if roots.is_empty() {
+                handler.handle_status_text("[daemon] no trusted project MCP roots".to_string());
+            } else {
+                let mut lines = vec![format!(
+                    "[daemon] trusted project MCP roots ({})",
+                    roots.len()
+                )];
+                for root in roots {
+                    lines.push(format!("  {root}"));
+                }
+                handler.handle_status_text(lines.join("\n"));
+            }
         }
         // On-demand displayed-image reply. The connection layer does NOT
         // intercept this (unlike `Sessions`, handled before the generic

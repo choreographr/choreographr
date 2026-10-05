@@ -601,6 +601,18 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             debug!("client {}: McpReload", ctx.client_id);
             handle_mcp_reload_sync(ctx);
         }
+        ClientMessage::McpTrust => {
+            debug!("client {}: McpTrust", ctx.client_id);
+            handle_mcp_trust_sync(ctx, true);
+        }
+        ClientMessage::McpUntrust => {
+            debug!("client {}: McpUntrust", ctx.client_id);
+            handle_mcp_trust_sync(ctx, false);
+        }
+        ClientMessage::McpTrustList => {
+            debug!("client {}: McpTrustList", ctx.client_id);
+            handle_mcp_trust_list_sync(ctx);
+        }
         ClientMessage::DeleteSession { session_id } => {
             info!("client {}: DeleteSession id={}", ctx.client_id, session_id);
             handle_delete_session_sync(ctx, session_id);
@@ -1472,6 +1484,7 @@ fn handle_refresh_models_sync(ctx: &mut ClientCtx, force: bool) {
 fn wire_mcp_status(status: crate::mcp::McpServerStatus) -> choreo_proto::McpServerStatus {
     choreo_proto::McpServerStatus {
         slug: status.slug,
+        tier: status.tier,
         transport: status.transport,
         target: status.target,
         connected: status.connected,
@@ -1483,16 +1496,39 @@ fn wire_mcp_status(status: crate::mcp::McpServerStatus) -> choreo_proto::McpServ
 }
 
 /// Handle a `ClientMessage::McpStatusRequest`: ask the daemon (the sole owner
-/// of the `McpManager`) for the state of every configured MCP server, convert
-/// each record to the wire type, and reply with [`DaemonMessage::McpStatus`].
+/// of the `McpManager`) for every server visible to the ATTACHED session
+/// (daemon tier plus that session's project servers), convert each record to
+/// the wire type, and reply with [`DaemonMessage::McpStatus`] — including the
+/// session's project-root trust context.
 fn handle_mcp_status_sync(ctx: &mut ClientCtx) {
-    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::McpStatus { reply });
-    if let Ok(servers) = result {
-        let servers = servers.into_iter().map(wire_mcp_status).collect();
-        send_to_writer(ctx, &DaemonMessage::McpStatus { servers });
+    let session_id = *ctx.attached_session_id;
+    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::McpStatus {
+        session_id,
+        reply,
+    });
+    if let Ok(report) = result {
+        send_mcp_status(ctx, report);
     } else {
         warn!("daemon disconnected while handling mcp status");
     }
+}
+
+/// Send an [`McpStatusReport`](crate::mcp::McpStatusReport) as a wire
+/// [`DaemonMessage::McpStatus`], converting each server record and carrying the
+/// project-root trust context.
+fn send_mcp_status(ctx: &mut ClientCtx, report: crate::mcp::McpStatusReport) {
+    let servers = report.servers.into_iter().map(wire_mcp_status).collect();
+    send_to_writer(
+        ctx,
+        &DaemonMessage::McpStatus {
+            servers,
+            project_root: report
+                .project_root
+                .map(|p| p.to_string_lossy().into_owned()),
+            project_trusted: report.project_trusted,
+            ignored_project_servers: report.ignored_project_servers,
+        },
+    );
 }
 
 /// Handle a `ClientMessage::McpReconnect`: rebuild one MCP server's connection
@@ -1509,10 +1545,13 @@ fn handle_mcp_reconnect_sync(ctx: &mut ClientCtx, slug: String) {
     });
     match result {
         Ok(Ok(())) => {
-            let status = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::McpStatus { reply });
-            if let Ok(servers) = status {
-                let servers = servers.into_iter().map(wire_mcp_status).collect();
-                send_to_writer(ctx, &DaemonMessage::McpStatus { servers });
+            let session_id = *ctx.attached_session_id;
+            let status = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::McpStatus {
+                session_id,
+                reply,
+            });
+            if let Ok(report) = status {
+                send_mcp_status(ctx, report);
             } else {
                 warn!("daemon disconnected while reading mcp status after reconnect");
             }
@@ -1531,7 +1570,11 @@ fn handle_mcp_reconnect_sync(ctx: &mut ClientCtx, slug: String) {
 /// refreshed status list — while a config read/parse failure is a
 /// [`DaemonMessage::McpReloadFailed`].
 fn handle_mcp_reload_sync(ctx: &mut ClientCtx) {
-    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::McpReload { reply });
+    let session_id = *ctx.attached_session_id;
+    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::McpReload {
+        session_id,
+        reply,
+    });
     match result {
         Ok(Ok(outcome)) => {
             let servers = outcome.servers.into_iter().map(wire_mcp_status).collect();
@@ -1547,6 +1590,57 @@ fn handle_mcp_reload_sync(ctx: &mut ClientCtx) {
             send_to_writer(ctx, &DaemonMessage::McpReloadFailed { error: e });
         }
         Err(_) => warn!("daemon disconnected while handling mcp reload"),
+    }
+}
+
+/// Handle a `ClientMessage::McpTrust` / `McpUntrust`: set (or revoke) trust for
+/// the ATTACHED session's project root, then reply with the resulting state.
+fn handle_mcp_trust_sync(ctx: &mut ClientCtx, trusted: bool) {
+    let Some(session_id) = *ctx.attached_session_id else {
+        send_to_writer(
+            ctx,
+            &DaemonMessage::McpTrustUpdated {
+                root: None,
+                trusted: false,
+                message: "no session attached".to_string(),
+            },
+        );
+        return;
+    };
+    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::McpTrustSet {
+        session_id,
+        trusted,
+        reply,
+    });
+    if let Ok(outcome) = result {
+        send_to_writer(
+            ctx,
+            &DaemonMessage::McpTrustUpdated {
+                root: outcome.root.map(|p| p.to_string_lossy().into_owned()),
+                trusted: outcome.trusted,
+                message: outcome.message,
+            },
+        );
+    } else {
+        warn!("daemon disconnected while handling mcp trust");
+    }
+}
+
+/// Handle a `ClientMessage::McpTrustList`: reply with the trusted project roots.
+fn handle_mcp_trust_list_sync(ctx: &mut ClientCtx) {
+    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::McpTrustList { reply });
+    if let Ok(roots) = result {
+        send_to_writer(
+            ctx,
+            &DaemonMessage::McpTrustList {
+                roots: roots
+                    .into_iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
+            },
+        );
+    } else {
+        warn!("daemon disconnected while handling mcp trust list");
     }
 }
 
@@ -2385,9 +2479,19 @@ mod tests {
         }
     }
 
+    fn sample_mcp_report() -> crate::mcp::McpStatusReport {
+        crate::mcp::McpStatusReport {
+            servers: vec![sample_mcp_status()],
+            project_root: None,
+            project_trusted: false,
+            ignored_project_servers: Vec::new(),
+        }
+    }
+
     fn sample_mcp_status() -> crate::mcp::McpServerStatus {
         crate::mcp::McpServerStatus {
             slug: "docs".to_string(),
+            tier: "daemon".to_string(),
             transport: "stdio".to_string(),
             target: "npx docs-server".to_string(),
             connected: true,
@@ -2402,6 +2506,7 @@ mod tests {
     fn wire_mcp_status_moves_every_field() {
         let wire = wire_mcp_status(sample_mcp_status());
         assert_eq!(wire.slug, "docs");
+        assert_eq!(wire.tier, "daemon");
         assert_eq!(wire.transport, "stdio");
         assert_eq!(wire.target, "npx docs-server");
         assert!(wire.connected);
@@ -2423,15 +2528,15 @@ mod tests {
         let mut none_tx = None;
         let mut ctx = mcp_ctx(&daemon_tx, &sink, &global_lag, &mut none_id, &mut none_tx);
         std::thread::spawn(move || {
-            if let Ok(DaemonCommand::McpStatus { reply }) = daemon_rx.recv() {
-                let _ = reply.send(vec![sample_mcp_status()]);
+            if let Ok(DaemonCommand::McpStatus { reply, .. }) = daemon_rx.recv() {
+                let _ = reply.send(sample_mcp_report());
             }
         });
         handle_mcp_status_sync(&mut ctx);
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(
             &msg,
-            DaemonMessage::McpStatus { servers }
+            DaemonMessage::McpStatus { servers, .. }
                 if servers.len() == 1 && servers[0].slug == "docs" && servers[0].connected
         ));
     }
@@ -2451,13 +2556,13 @@ mod tests {
                 assert_eq!(slug, "docs");
                 let _ = reply.send(Ok(()));
             }
-            if let Ok(DaemonCommand::McpStatus { reply }) = daemon_rx.recv() {
-                let _ = reply.send(vec![sample_mcp_status()]);
+            if let Ok(DaemonCommand::McpStatus { reply, .. }) = daemon_rx.recv() {
+                let _ = reply.send(sample_mcp_report());
             }
         });
         handle_mcp_reconnect_sync(&mut ctx, "docs".to_string());
         let msg = writer_rx.recv().unwrap();
-        assert!(matches!(&msg, DaemonMessage::McpStatus { servers } if servers.len() == 1));
+        assert!(matches!(&msg, DaemonMessage::McpStatus { servers, .. } if servers.len() == 1));
     }
 
     #[test]
@@ -2491,7 +2596,7 @@ mod tests {
         let mut none_tx = None;
         let mut ctx = mcp_ctx(&daemon_tx, &sink, &global_lag, &mut none_id, &mut none_tx);
         std::thread::spawn(move || {
-            if let Ok(DaemonCommand::McpReload { reply }) = daemon_rx.recv() {
+            if let Ok(DaemonCommand::McpReload { reply, .. }) = daemon_rx.recv() {
                 let _ = reply.send(Ok(crate::mcp::McpReloadOutcome {
                     summary: "MCP reload: 1 added, 0 removed, 0 restarted, 0 unchanged, 0 failed"
                         .to_string(),
@@ -2517,8 +2622,8 @@ mod tests {
         let mut none_tx = None;
         let mut ctx = mcp_ctx(&daemon_tx, &sink, &global_lag, &mut none_id, &mut none_tx);
         std::thread::spawn(move || {
-            if let Ok(DaemonCommand::McpReload { reply }) = daemon_rx.recv() {
-                let _ = reply.send(Err("failed to parse mcp_servers.json".into()));
+            if let Ok(DaemonCommand::McpReload { reply, .. }) = daemon_rx.recv() {
+                let _ = reply.send(Err("failed to parse mcp.json".into()));
             }
         });
         handle_mcp_reload_sync(&mut ctx);
@@ -2526,7 +2631,7 @@ mod tests {
         assert!(matches!(
             &msg,
             DaemonMessage::McpReloadFailed { error }
-                if error == "failed to parse mcp_servers.json"
+                if error == "failed to parse mcp.json"
         ));
     }
 
