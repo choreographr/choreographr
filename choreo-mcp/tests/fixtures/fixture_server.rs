@@ -45,6 +45,12 @@
 // as a `tools/call` for it arrives; when `MCP_FIXTURE_CANCEL_MARKER` is set, a
 // received `notifications/cancelled` writes that file, so the cancellation
 // tests can synchronise without sleeping.
+//
+// When `MCP_FIXTURE_LIST_LOG` names a file, every `tools/list` request appends
+// one line before it is answered (or before parking, for the `*-slow-list`
+// variants). Counting the lines a server's own log file proves how many times
+// that server was re-listed — e.g. that a list change re-lists only the
+// CHANGED server — without any time-based wait.
 
 use std::io::{BufRead, Write};
 
@@ -176,6 +182,18 @@ fn main() {
             }
             "tools/list" => {
                 tools_list_count += 1;
+                // Record the listing attempt so a test can count how many times
+                // THIS server was re-listed (append, never truncate, so repeat
+                // listings accumulate). Written before the wedged park below so
+                // an attempt that never answers still shows up.
+                if let Ok(path) = std::env::var("MCP_FIXTURE_LIST_LOG")
+                    && let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                {
+                    let _ = writeln!(file, "{}", std::process::id());
+                }
                 // A server that is alive but wedged on discovery: the handshake
                 // succeeded, yet the listing never arrives. Parking here (rather
                 // than responding) exercises the caller's budget; the client's

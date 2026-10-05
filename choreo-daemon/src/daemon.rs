@@ -2166,11 +2166,15 @@ impl DaemonState {
     /// a daemon restart. A request already holding the previous registry keeps
     /// using it safely; the swap is atomic and never tears a live load.
     ///
-    /// The rebuild re-lists every connected server (`McpManager::register_all`),
-    /// each bounded by a short catalogue-refresh deadline (not the per-server
-    /// request timeout): it runs on the command loop because the catalogue has a
-    /// single writer, and a single slow server must not freeze every session. A
-    /// server that misses the deadline keeps its previous registration.
+    /// Only the server named by the event is re-listed
+    /// (`McpManager::refresh_server`, bounded by the short catalogue-refresh
+    /// deadline, not the per-server request timeout); every other server's
+    /// cached tool set is reused. The rebuilt catalogue is therefore identical
+    /// to a full sweep, but the command loop pays one round-trip per event
+    /// instead of one per connected server. This runs on the command loop
+    /// because the catalogue has a single writer, and a slow server must not
+    /// freeze every session (a server that misses the deadline keeps its
+    /// previous registration).
     ///
     /// A server can also be a session's PRIVATE project/per-session server,
     /// whose tools live only in that session's overlay and are NOT touched by
@@ -2179,7 +2183,8 @@ impl DaemonState {
     /// released, so their connections are reused).
     fn handle_mcp_list_changed(&mut self, slug: &str) {
         info!(server = %slug, "MCP list changed; rebuilding the tool catalogue");
-        self.rebuild_tool_catalogue();
+        self.mcp_manager.refresh_server(slug);
+        self.rebuild_tool_catalogue_cached();
         let affected = self.mcp_manager.sessions_for_slug(slug);
         for session_id in affected {
             self.refresh_session_overlay(session_id);
@@ -2187,19 +2192,39 @@ impl DaemonState {
         info!(server = %slug, "MCP tool catalogue refreshed");
     }
 
-    /// Rebuild the whole tool catalogue from the current `McpManager` and swap
-    /// it into the shared registry.
+    /// Rebuild the whole tool catalogue from the current `McpManager` —
+    /// re-listing every connected server — and swap it into the shared
+    /// registry.
     ///
     /// The command loop is the single writer of `tool_registry` (the sanctioned
-    /// `ArcSwap` rule); this is the one place the swap happens, so a list change
-    /// and a manual reconnect take the identical path. A request already holding
-    /// the previous registry keeps using it safely; the swap is atomic and never
-    /// tears a live load.
+    /// `ArcSwap` rule); this and [`DaemonState::rebuild_tool_catalogue_cached`]
+    /// are the two places the swap happens. This full sweep is the
+    /// reload/reconnect path, where the whole server set may have shifted (a
+    /// server added, removed, reconnected, or renamed) so every server must be
+    /// re-listed. A request already holding the previous registry keeps using
+    /// it safely; the swap is atomic and never tears a live load.
     fn rebuild_tool_catalogue(&mut self) {
         let registry = open::build_tool_registry(
             self.tool_policy,
             self.platform_tool_bridge.as_ref(),
             &mut self.mcp_manager,
+        );
+        self.tool_registry.store(registry);
+    }
+
+    /// Rebuild the whole tool catalogue from the current `McpManager`, reusing
+    /// every server's CACHED tool set, and swap it into the shared registry.
+    ///
+    /// The list-change path's counterpart to
+    /// [`DaemonState::rebuild_tool_catalogue`]: the caller re-listed exactly the
+    /// one changed server first (`McpManager::refresh_server`), so this rebuild
+    /// produces the identical catalogue without re-listing the unchanged
+    /// servers. The swap is atomic and never tears a live load.
+    fn rebuild_tool_catalogue_cached(&mut self) {
+        let registry = open::build_tool_registry_cached(
+            self.tool_policy,
+            self.platform_tool_bridge.as_ref(),
+            &self.mcp_manager,
         );
         self.tool_registry.store(registry);
     }

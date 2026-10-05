@@ -473,6 +473,86 @@ impl McpManager {
         }
     }
 
+    /// Re-list ONE daemon-tier shared server and update its cached tool set.
+    ///
+    /// A list-changed event names exactly one server, so re-listing only that
+    /// server keeps the catalogue rebuild off every other server's request
+    /// path: a full [`McpManager::register_all`] sweep would re-list all N
+    /// connected servers (each bounded by [`CATALOGUE_REFRESH_BUDGET`]), so a
+    /// single event could stall the command loop for up to N × the budget.
+    ///
+    /// The re-listing is bounded by the same short catalogue-refresh deadline
+    /// as `register_all` (not the per-server request timeout), and a server
+    /// that misses it — or fails to list — keeps its previous tool set with a
+    /// warning, so its group never blinks out of the catalogue; it is re-listed
+    /// on the next event or a full `register_all`.
+    ///
+    /// A no-op when `slug` is not a connected daemon shared server: a
+    /// per-session or project server's change is handled through its session
+    /// overlay, not the daemon-wide catalogue.
+    pub fn refresh_server(&mut self, slug: &str) {
+        let Some(slot) = self.servers.get_mut(slug) else {
+            debug!(
+                server = %slug,
+                "list change for a server outside the daemon catalogue; ignoring"
+            );
+            return;
+        };
+        match slot
+            .handle
+            .list_tools_with_deadline(CATALOGUE_REFRESH_BUDGET)
+        {
+            Ok(tools) => {
+                // Keep `tool_count` in step with the fresh listing so the
+                // `/mcp` status surface reports the changed server's real tool
+                // count (the count excludes disabled tools, matching
+                // `slot_from_server`).
+                let disabled: HashSet<&str> = slot
+                    .config
+                    .disabled_tools
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                slot.tool_count = tools
+                    .iter()
+                    .filter(|t| !disabled.contains(t.name.as_str()))
+                    .count();
+                slot.tools = tools;
+            }
+            Err(e) => {
+                warn!(server = %slug, error = %e, "MCP tool listing missed the catalogue-refresh budget; keeping the previous tool set");
+            }
+        }
+    }
+
+    /// Re-register every daemon-tier shared server's CACHED tool set into
+    /// `registry`, WITHOUT re-listing any of them.
+    ///
+    /// The catalogued counterpart of the re-list in
+    /// [`McpManager::refresh_server`]: after the one changed server has been
+    /// re-listed, this rebuilds the daemon-wide catalogue from every server's
+    /// cached `tools`. It walks `self.order` with a fresh `used` set exactly
+    /// like [`McpManager::register_all`], so the registered tool names and
+    /// groups are identical to a full sweep — tool naming depends only on
+    /// `self.order` and the tool lists, never on a live listing — while the
+    /// network round-trips are skipped.
+    pub fn register_cached(&self, registry: &mut ToolRegistry) {
+        let mut used: HashSet<String> = HashSet::new();
+        for slug in &self.order {
+            let Some(slot) = self.servers.get(slug) else {
+                continue;
+            };
+            Self::register_server_tools(
+                slug,
+                &slot.handle,
+                slot.tools.clone(),
+                &slot.config.disabled_tools,
+                &mut used,
+                registry,
+            );
+        }
+    }
+
     fn register_server(
         slug: &str,
         server: McpServer,
@@ -842,6 +922,12 @@ mod imp {
 
         /// Stub: no server has any tools to (re-)register.
         pub fn register_all(&mut self, _registry: &mut ToolRegistry) {}
+
+        /// Stub: there are never any cached tools to register.
+        pub fn register_cached(&self, _registry: &mut ToolRegistry) {}
+
+        /// Stub: there is never a server to re-list.
+        pub fn refresh_server(&mut self, _slug: &str) {}
 
         /// Stub: there are no servers to shut down.
         pub fn shutdown_all(&mut self) {}

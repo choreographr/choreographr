@@ -287,6 +287,94 @@ fn mcp_list_change_is_forwarded_and_reregisters() {
     choreo_daemon::mcp::config::set_test_config_root(None);
 }
 
+/// A list change must re-list ONLY the changed server: the daemon's handler
+/// calls `refresh_server(slug)` (one `tools/list`) and then rebuilds the
+/// catalogue from cache (`register_cached`), so the unchanged server's tools are
+/// reused without a second `tools/list`. Each fixture server appends one line to
+/// its own `MCP_FIXTURE_LIST_LOG` per listing, so the line counts prove how many
+/// times each was listed — no time-based wait.
+#[test]
+#[ignore = "integration"]
+fn mcp_list_change_only_relists_the_changed_server() {
+    watchdog();
+
+    // A per-run directory holds each server's listing log so the two are told
+    // apart by file, not by content.
+    let dir = tempfile::tempdir().expect("log dir");
+    let lc_log = dir.path().join("lc-lists.log");
+    let other_log = dir.path().join("other-lists.log");
+
+    // `lc` declares `tools.listChanged` (so it opens a subscription and the
+    // manager forwards exactly one event); `other` is an ordinary server that
+    // must not be re-listed by that event.
+    let mut lc = fixture_entry("modern-list-changed");
+    lc["env"] = serde_json::json!({ "MCP_FIXTURE_LIST_LOG": lc_log });
+    let mut other = fixture_entry("modern");
+    other["env"] = serde_json::json!({ "MCP_FIXTURE_LIST_LOG": other_log });
+
+    let config_dir = write_daemon_config(&serde_json::json!({ "lc": lc, "other": other }))
+        .expect("write config");
+    choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
+
+    let mut registry = choreo_daemon::tools::ToolRegistry::new();
+    let mut manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
+    let rx = manager
+        .take_list_change_rx()
+        .expect("a list-change channel is created for connected servers");
+
+    let change = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("expected a forwarded list change");
+    assert_eq!(change.slug, "lc");
+
+    // Both servers were listed exactly once by `from_config`'s connect sweep.
+    assert_eq!(
+        count_lines(&lc_log),
+        1,
+        "the changed server lists once at startup"
+    );
+    assert_eq!(
+        count_lines(&other_log),
+        1,
+        "the unchanged server lists once at startup"
+    );
+
+    // The daemon's list-change path: re-list only the changed server, then
+    // rebuild the catalogue from cache.
+    manager.refresh_server(&change.slug);
+    let mut rebuilt = choreo_daemon::tools::ToolRegistry::new();
+    manager.register_cached(&mut rebuilt);
+
+    assert_eq!(
+        count_lines(&lc_log),
+        2,
+        "the changed server must be re-listed by the refresh"
+    );
+    assert_eq!(
+        count_lines(&other_log),
+        1,
+        "an unchanged server must NOT be re-listed by the refresh"
+    );
+
+    // The cached rebuild re-registers BOTH groups, identically to a full sweep.
+    let groups = rebuilt.group_names();
+    for slug in ["lc", "other"] {
+        assert!(
+            groups.iter().any(|g| g == &format!("mcp/{slug}")),
+            "the cached rebuild must re-register mcp/{slug}: {groups:?}"
+        );
+    }
+
+    drop(manager);
+    choreo_daemon::mcp::config::set_test_config_root(None);
+}
+
+/// The number of lines in `path`, or 0 when it does not exist yet (a server
+/// that never listed leaves no file).
+fn count_lines(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path).map_or(0, |s| s.lines().count())
+}
+
 #[test]
 #[ignore = "integration"]
 fn mcp_startup_budget_bounds_slow_tool_listing() {

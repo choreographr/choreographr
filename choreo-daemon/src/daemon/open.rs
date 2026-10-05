@@ -52,32 +52,71 @@ pub struct OpenOptions {
     pub platform_tool_bridge: Option<Arc<dyn IosToolBridge>>,
 }
 
-/// Build the daemon's tool catalogue from its parts.
+/// Build the daemon's tool catalogue from its parts, re-listing every MCP
+/// server.
 ///
-/// Used by every MCP list-change rebuild
-/// (`DaemonState::handle_mcp_list_changed`), applying the core-tool
-/// registration, the platform-bridge extension, and the current MCP dynamic
-/// groups by one code path so a refresh cannot drift from startup. Returns the
-/// bare `Arc<ToolRegistry>`; the caller stores it into the daemon's shared
+/// Used by the reload/reconnect rebuilds
+/// (`DaemonState::handle_mcp_reload`, `handle_mcp_reconnect`,
+/// `handle_mcp_tier_reload`), applying the core-tool registration, the
+/// platform-bridge extension, and the current MCP dynamic groups by one code
+/// path so a refresh cannot drift from startup. Returns the bare
+/// `Arc<ToolRegistry>`; the caller stores it into the daemon's shared
 /// `ArcSwap` (the command loop is its sole writer).
 pub(crate) fn build_tool_registry(
     policy: ToolPolicy,
     bridge: Option<&Arc<dyn IosToolBridge>>,
     mcp: &mut McpManager,
 ) -> Arc<ToolRegistry> {
-    let mut registry = ToolRegistry::new_for_policy(policy);
-    // The bridge's presence is the gate for the protected `ios` group (not a
-    // `cfg`), so an embedder that supplied one gets it on every rebuild too.
-    if let Some(bridge) = bridge {
-        registry.register_platform_tools(Arc::clone(bridge));
-    }
+    let mut registry = base_registry(policy, bridge);
     // MCP servers only exist under the Full policy (registration-time filter);
-    // re-registering their dynamic groups keeps the `mcp/<slug>` catalogues
-    // current on a refresh.
+    // re-listing and re-registering their dynamic groups keeps the
+    // `mcp/<slug>` catalogues current on a refresh. This sweep re-lists every
+    // connected server, so it is the reload/reconnect path (a change to one
+    // server's config or connection can shift the whole set); a single server's
+    // list change uses [`build_tool_registry_cached`] instead.
     if policy == ToolPolicy::Full {
         mcp.register_all(&mut registry);
     }
     registry.build_for_policy(policy)
+}
+
+/// Build the daemon's tool catalogue from its parts, registering each MCP
+/// server's CACHED tools without re-listing.
+///
+/// The list-change counterpart of [`build_tool_registry`]: the caller has
+/// already re-listed the one server whose list changed (via
+/// [`McpManager::refresh_server`]), so every other server's tool set can be
+/// reused straight from its cache. The result is byte-for-byte the catalogue a
+/// full `build_tool_registry` would produce — the core tools, platform bridge,
+/// and MCP name resolution depend only on `self.order` and the tool lists, not
+/// on a live listing — but the command loop no longer pays a network round-trip
+/// per connected server on every event.
+pub(crate) fn build_tool_registry_cached(
+    policy: ToolPolicy,
+    bridge: Option<&Arc<dyn IosToolBridge>>,
+    mcp: &McpManager,
+) -> Arc<ToolRegistry> {
+    let mut registry = base_registry(policy, bridge);
+    if policy == ToolPolicy::Full {
+        mcp.register_cached(&mut registry);
+    }
+    registry.build_for_policy(policy)
+}
+
+/// Construct a policy-scoped registry with the always-on core tools and, when a
+/// bridge is supplied, the protected platform (`ios`) group.
+///
+/// The bridge's presence is the gate for the protected group (not a `cfg`), so
+/// an embedder that supplied one gets it on every rebuild too. The MCP dynamic
+/// groups are layered on by the callers (a live sweep in `build_tool_registry`,
+/// a cached one in `build_tool_registry_cached`), which keeps the shared
+/// core-plus-bridge setup in exactly one place.
+fn base_registry(policy: ToolPolicy, bridge: Option<&Arc<dyn IosToolBridge>>) -> ToolRegistry {
+    let mut registry = ToolRegistry::new_for_policy(policy);
+    if let Some(bridge) = bridge {
+        registry.register_platform_tools(Arc::clone(bridge));
+    }
+    registry
 }
 
 impl DaemonState {
