@@ -13,7 +13,9 @@
 //! - callers → dispatcher: a command (list / call / cancel / shutdown);
 //! - dispatcher → callers: a per-request reply channel;
 //! - call tasks → dispatcher: a completion notice (used to drop finished calls
-//!   from the in-flight registry and to trigger a restart on a dead transport).
+//!   from the in-flight registry and to trigger a restart on a dead transport —
+//!   a whole batch of calls lost on one transport is coalesced into a single
+//!   rebuild).
 //!
 //! The only shared-mutable state in the crate is the in-flight registry, and it
 //! is owned solely by the dispatcher thread (no lock); the per-call
@@ -409,6 +411,11 @@ pub(crate) enum McpCommand {
 struct Done {
     call_id: u64,
     transport_failed: bool,
+    /// The engine the call ran against. Compared by identity so a failure that
+    /// arrives after the engine has already been rebuilt (a straggler from an
+    /// incident another notice already handled) frees its slot without
+    /// triggering a redundant reconnect.
+    engine: Arc<dyn McpEngine>,
 }
 
 /// A tool invocation waiting for a free concurrency slot.
@@ -600,17 +607,18 @@ fn run_dispatcher(
 
     loop {
         // Drain completion notices before waiting: a finished call frees a slot
-        // and may have killed the transport (triggering a reconnect).
-        while let Ok(done) = done_rx.try_recv() {
-            apply_done(
-                &done,
-                &mut inflight,
-                &mut gate,
-                &mut policy,
-                &factory,
-                &mut engine,
-            );
-        }
+        // and, if it died on the transport, triggers a reconnect. The whole
+        // available batch is coalesced into at most ONE reconnect, so N calls
+        // lost on one dead transport cost one rebuild, not N.
+        apply_completions(
+            None,
+            &done_rx,
+            &mut inflight,
+            &mut gate,
+            &mut policy,
+            &factory,
+            &mut engine,
+        );
         // Start queued calls into any slots the completions freed.
         pump_queued(
             &mut queued,
@@ -649,8 +657,11 @@ fn run_dispatcher(
             }
             recv(done_rx) -> msg => {
                 if let Ok(done) = msg {
-                    apply_done(
-                        &done,
+                    // Fold this notice in with any siblings that completed in
+                    // the same incident, so the batch reconnects at most once.
+                    apply_completions(
+                        Some(done),
+                        &done_rx,
                         &mut inflight,
                         &mut gate,
                         &mut policy,
@@ -664,19 +675,36 @@ fn run_dispatcher(
     tracing::debug!("MCP dispatcher thread exiting");
 }
 
-/// Apply one completion notice: drop the call from the in-flight registry, free
-/// its slot, and rebuild the engine if the call died on the transport.
-fn apply_done(
-    done: &Done,
+/// Apply the completion notices currently available — `first`, when the caller
+/// already received one from the `select!`, plus everything else the channel
+/// holds — freeing each call's slot and rebuilding the engine AT MOST ONCE if
+/// any notice died on the transport.
+///
+/// One dead transport fails every in-flight call at once, each sending its own
+/// notice; rebuilding per notice would recreate the engine (with a backoff
+/// sleep) once per call for a single incident. The batch is coalesced: the
+/// reconnect happens once, after the whole batch is drained, so `pump_queued`
+/// then starts queued calls against the rebuilt engine. A notice whose call ran
+/// against an engine since replaced (compared by identity) only frees its slot —
+/// it is a straggler from an already-handled incident, not a new one.
+fn apply_completions(
+    first: Option<Done>,
+    done_rx: &Receiver<Done>,
     inflight: &mut HashMap<u64, (CancelToken, u64)>,
     gate: &mut CallGate,
     policy: &mut RestartPolicy,
     factory: &EngineFactory,
     engine: &mut Arc<dyn McpEngine>,
 ) {
-    inflight.remove(&done.call_id);
-    gate.complete();
-    if done.transport_failed {
+    let mut transport_failed = false;
+    for done in first.into_iter().chain(done_rx.try_iter()) {
+        inflight.remove(&done.call_id);
+        gate.complete();
+        if done.transport_failed && Arc::ptr_eq(&done.engine, &*engine) {
+            transport_failed = true;
+        }
+    }
+    if transport_failed {
         policy.on_transport_failure(factory, engine);
     }
 }
@@ -736,6 +764,7 @@ fn spawn_call(
         let _ = done_tx.send(Done {
             call_id,
             transport_failed,
+            engine: Arc::clone(&engine),
         });
         let _ = reply.send(result);
     });
@@ -932,6 +961,7 @@ mod tests {
     use super::*;
     use crate::protocol::CallToolResult;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
 
     /// A scripted mock engine: `list_tools` returns a fixed vector; `call_tool`
     /// waits for the cancellation token or returns a fixed result, whichever
@@ -1194,6 +1224,132 @@ mod tests {
         assert!(
             Arc::ptr_eq(&current, &engine),
             "no rebuild happens when max_restarts is 0"
+        );
+    }
+
+    /// A restart policy whose backoff is zeroed, so a successful reconnect is
+    /// wait-free (the production 500 ms base would otherwise be slept).
+    fn zero_backoff_policy() -> RestartPolicy {
+        RestartPolicy {
+            max_attempts: 5,
+            base_backoff: Duration::ZERO,
+            failures: 0,
+        }
+    }
+
+    /// A factory that rebuilds a fresh mock engine and counts its invocations.
+    fn counting_factory(counter: Arc<AtomicUsize>) -> EngineFactory {
+        Box::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(MockEngine::new(vec![], ok_result())) as Arc<dyn McpEngine>)
+        })
+    }
+
+    #[test]
+    fn batched_transport_failures_reconnect_once() {
+        // Two calls lost on the same transport: the drain batch must rebuild the
+        // engine exactly once, not once per notice.
+        let engine: Arc<dyn McpEngine> = Arc::new(MockEngine::new(vec![], ok_result()));
+        let mut current = Arc::clone(&engine);
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let factory = counting_factory(Arc::clone(&factory_calls));
+        let mut policy = zero_backoff_policy();
+        let mut gate = CallGate::new(4);
+        assert!(gate.admit() && gate.admit());
+        let mut inflight = HashMap::new();
+        inflight.insert(1, (CancelToken::new(), 7));
+        inflight.insert(2, (CancelToken::new(), 7));
+
+        let (done_tx, done_rx) = crossbeam_channel::unbounded();
+        for call_id in [1u64, 2] {
+            done_tx
+                .send(Done {
+                    call_id,
+                    transport_failed: true,
+                    engine: Arc::clone(&engine),
+                })
+                .expect("send done");
+        }
+
+        apply_completions(
+            None,
+            &done_rx,
+            &mut inflight,
+            &mut gate,
+            &mut policy,
+            &factory,
+            &mut current,
+        );
+
+        assert!(inflight.is_empty(), "every completed call is dropped");
+        assert_eq!(gate.active, 0, "every completed call frees its slot");
+        assert_eq!(
+            factory_calls.load(Ordering::SeqCst),
+            1,
+            "one dead transport must cost exactly one reconnect, not one per call"
+        );
+    }
+
+    #[test]
+    fn straggler_failure_after_reconnect_does_not_reconnect_again() {
+        // A call that ran against an engine since replaced by an earlier
+        // failure's reconnect is a straggler: it frees its slot but must not
+        // trigger a second reconnect for the same incident.
+        let engine: Arc<dyn McpEngine> = Arc::new(MockEngine::new(vec![], ok_result()));
+        let mut current = Arc::clone(&engine);
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let factory = counting_factory(Arc::clone(&factory_calls));
+        let mut policy = zero_backoff_policy();
+        let mut gate = CallGate::new(4);
+        let mut inflight = HashMap::new();
+        let (done_tx, done_rx) = crossbeam_channel::unbounded();
+
+        // First batch: one failure reconnects the engine (bumping its identity).
+        assert!(gate.admit());
+        inflight.insert(1, (CancelToken::new(), 7));
+        done_tx
+            .send(Done {
+                call_id: 1,
+                transport_failed: true,
+                engine: Arc::clone(&engine),
+            })
+            .expect("send done");
+        apply_completions(
+            None,
+            &done_rx,
+            &mut inflight,
+            &mut gate,
+            &mut policy,
+            &factory,
+            &mut current,
+        );
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+
+        // Second batch: a straggler carrying the OLD engine must not reconnect.
+        assert!(gate.admit());
+        inflight.insert(2, (CancelToken::new(), 7));
+        done_tx
+            .send(Done {
+                call_id: 2,
+                transport_failed: true,
+                engine: Arc::clone(&engine),
+            })
+            .expect("send done");
+        apply_completions(
+            None,
+            &done_rx,
+            &mut inflight,
+            &mut gate,
+            &mut policy,
+            &factory,
+            &mut current,
+        );
+
+        assert!(inflight.is_empty());
+        assert_eq!(
+            factory_calls.load(Ordering::SeqCst),
+            1,
+            "a straggler from an already-handled incident must not reconnect again"
         );
     }
 
