@@ -40,7 +40,16 @@ use std::io::Cursor;
 /// `SessionSummary::pinned`/`archived_at` fields they surface.
 /// 9 = live MCP config reload: the new `ClientMessage::McpReload` request and
 /// its `DaemonMessage::McpReloaded`/`McpReloadFailed` replies, so a running
-/// daemon can pick up `mcp_servers.json` edits without a restart.
+/// daemon can pick up `mcp_servers.json` edits without a restart. The MCP
+/// trust-query request/reply variants (`ClientMessage::McpTrust`/`McpUntrust`/
+/// `McpTrustList` and `DaemonMessage::McpTrustUpdated`/`McpTrustList`) were
+/// added to 9 this way, before any release carried 9.
+///
+/// Policy: variants may be added to the **current, unreleased** wire version
+/// without a bump. Mixed-version peers do not exist until a release ships, and
+/// the version gate rejects a mismatch either way, so an in-flight, unreleased
+/// version may be amended in place (exactly as the v4 shape was). A bump is
+/// required only once a version has shipped in a release.
 pub const PROTOCOL_VERSION: u8 = 9;
 /// Max serialised *payload* size, enforced identically on encode (before the
 /// 4-byte length prefix is added — [`encode_inner`]) and on decode
