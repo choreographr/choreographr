@@ -36,22 +36,14 @@ const MAX_OUTPUT_TEXT_BYTES: usize = 256 * 1024;
 /// [`MAX_OUTPUT_TEXT_BYTES`].
 const TRUNCATION_MARKER: &str = "\n… [output truncated]";
 
-/// The provider-safe `(name, group)` pair and `[MCP <slug>]`-prefixed
-/// description for one server tool.
+/// The `[MCP <slug>]`-prefixed description every wrapper carries.
 ///
-/// Centralized so the naming, grouping, and prefixing convention is defined
-/// once and every wrapper constructor derives its three strings from it rather
-/// than re-assembling them.
-fn prefixed_identity(
-    server_slug: &str,
-    tool_name: &str,
-    description: &str,
-) -> (String, String, String) {
-    (
-        choreo_mcp::build_tool_name(server_slug, tool_name),
-        choreo_mcp::group_name(server_slug),
-        format!("[MCP {server_slug}] {description}"),
-    )
+/// Centralized so the prefix convention is defined once. The tool name comes
+/// from the per-server collision resolution ([`resolve_name`]) and the group
+/// from [`choreo_mcp::group_name`]; only the description needs a shared helper
+/// here, so the two never drift from the production registration path.
+fn prefixed_description(server_slug: &str, description: &str) -> String {
+    format!("[MCP {server_slug}] {description}")
 }
 
 /// Resolve the provider-safe name for `tool` on `slug`, appending a hash suffix
@@ -124,7 +116,7 @@ pub(super) fn build_server_wrappers(
         let wrapper = McpToolWrapper::with_name(
             name.clone(),
             group.clone(),
-            format!("[MCP {slug}] {description}"),
+            prefixed_description(slug, &description),
             mcp_tool.name.clone(),
             mcp_tool.input_schema.clone(),
             mcp_tool.output_schema.clone(),
@@ -138,13 +130,13 @@ pub(super) fn build_server_wrappers(
         let lister = McpListResourcesTool::with_name(
             list_name.clone(),
             group.clone(),
-            format!("[MCP {slug}] {LIST_RESOURCES_DESC}"),
+            prefixed_description(slug, LIST_RESOURCES_DESC),
             handle.clone(),
         );
         let reader = McpReadResourceTool::with_name(
             read_name.clone(),
             group.clone(),
-            format!("[MCP {slug}] {READ_RESOURCE_DESC}"),
+            prefixed_description(slug, READ_RESOURCE_DESC),
             handle.clone(),
         );
         wrappers.push((list_name, Box::new(lister)));
@@ -179,29 +171,6 @@ pub struct McpToolWrapper {
 }
 
 impl McpToolWrapper {
-    /// Build a wrapper, deriving the provider-safe name and group from the
-    /// server slug and the server's own tool name.
-    #[must_use]
-    pub fn new(
-        server_slug: &str,
-        tool_name: &str,
-        description: &str,
-        input_schema: Value,
-        output_schema: Option<Value>,
-        handle: McpServerHandle,
-    ) -> Self {
-        let (name, group, description) = prefixed_identity(server_slug, tool_name, description);
-        Self::with_name(
-            name,
-            group,
-            description,
-            tool_name.to_string(),
-            input_schema,
-            output_schema,
-            handle,
-        )
-    }
-
     /// Build a wrapper with an already-resolved provider-safe `name` and
     /// catalogue `group` (used by the daemon when it must disambiguate a
     /// collision by appending a hash).
@@ -479,29 +448,25 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_prefixes_name_and_description() {
-        let wrapper = McpToolWrapper::new(
-            "fixture",
-            "echo",
-            "Echo a message back.",
-            serde_json::json!({"type": "object"}),
-            Some(serde_json::json!({"type": "object"})),
-            unused_handle(),
-        );
-        assert_eq!(wrapper.name(), "mcp/fixture/echo");
+    fn build_server_wrappers_prefixes_name_and_description() {
+        let tools = vec![McpTool {
+            name: "echo".into(),
+            description: Some("Echo a message back.".into()),
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: Some(serde_json::json!({"type": "object"})),
+        }];
+        let mut used = HashSet::new();
+        let built = build_server_wrappers("fixture", &unused_handle(), &tools, &[], &mut used);
+        assert_eq!(built.group, "mcp/fixture");
+        assert_eq!(built.tool_count, 1);
+        let (name, wrapper) = &built.tools[0];
+        assert_eq!(name, "mcp/fixture/echo");
         assert_eq!(wrapper.group(), "mcp/fixture");
         assert_eq!(wrapper.description(), "[MCP fixture] Echo a message back.");
         assert_eq!(
             wrapper.output_schema(),
             Some(serde_json::json!({"type": "object"}))
         );
-        // Sanity: the tool type still resolves.
-        let _ = McpTool {
-            name: "echo".into(),
-            description: None,
-            input_schema: serde_json::json!({}),
-            output_schema: None,
-        };
     }
 
     // ── parse_json_args tests ────────────────────────────────────────

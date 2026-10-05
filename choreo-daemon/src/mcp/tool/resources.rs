@@ -15,7 +15,7 @@ use crossbeam_channel;
 use serde_json::Value;
 
 use super::content::{join_text_parts, map_mcp_result};
-use super::{parse_json_args, prefixed_identity};
+use super::parse_json_args;
 
 /// The empty-argument schema shared by the resource-catalogue tools.
 fn empty_object_schema() -> Value {
@@ -57,14 +57,6 @@ pub struct McpListResourcesTool {
 }
 
 impl McpListResourcesTool {
-    /// Build the listing tool for one server.
-    #[must_use]
-    pub fn new(server_slug: &str, handle: McpServerHandle) -> Self {
-        let (name, group, description) =
-            prefixed_identity(server_slug, "list_resources", LIST_RESOURCES_DESC);
-        Self::with_name(name, group, description, handle)
-    }
-
     /// Build the listing tool with an already-resolved name and group.
     #[must_use]
     pub fn with_name(
@@ -191,14 +183,6 @@ pub struct McpReadResourceTool {
 }
 
 impl McpReadResourceTool {
-    /// Build the read tool for one server.
-    #[must_use]
-    pub fn new(server_slug: &str, handle: McpServerHandle) -> Self {
-        let (name, group, description) =
-            prefixed_identity(server_slug, "read_resource", READ_RESOURCE_DESC);
-        Self::with_name(name, group, description, handle)
-    }
-
     /// Build the read tool with an already-resolved name and group.
     #[must_use]
     pub fn with_name(
