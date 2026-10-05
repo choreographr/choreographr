@@ -62,6 +62,10 @@ struct BoundedLineReader<R> {
     since_newline: usize,
     /// Set once the limit is exceeded; every later read fails immediately.
     breached: bool,
+    /// Reusable read buffer, [`READ_CHUNK`] bytes long. Held across calls so a
+    /// read reuses the same storage instead of allocating and zeroing a fresh
+    /// buffer on every poll.
+    scratch: Vec<u8>,
 }
 
 impl<R> BoundedLineReader<R> {
@@ -71,6 +75,7 @@ impl<R> BoundedLineReader<R> {
             limit,
             since_newline: 0,
             breached: false,
+            scratch: vec![0u8; READ_CHUNK],
         }
     }
 }
@@ -98,8 +103,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedLineReader<R> {
             .min(remaining.saturating_add(1))
             .min(READ_CHUNK);
 
-        let mut scratch = [0u8; READ_CHUNK];
-        let Some(scratch_slice) = scratch.get_mut(..allowance) else {
+        let Some(scratch_slice) = this.scratch.get_mut(..allowance) else {
             // Unreachable: `allowance` is always at most `READ_CHUNK`, the
             // scratch length. Handled without a panic regardless.
             return Poll::Ready(Err(frame_too_large(this.limit)));

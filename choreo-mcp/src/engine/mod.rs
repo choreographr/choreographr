@@ -337,15 +337,9 @@ async fn connect_http(
                     tokio::time::sleep(backoff).await;
                     continue;
                 }
-                if looks_like_legacy_sse(&client, url).await {
-                    return Err(McpError::UnsupportedTransport(format!(
-                        "{url} answers GET with an SSE `endpoint` event, i.e. the \
-                         2024-11-05 HTTP+SSE transport, which was removed from the \
-                         specification; point the server at a Streamable HTTP endpoint"
-                    )));
-                }
-                // An authorization failure is surfaced before anything else: the
-                // legacy-SSE probe above only runs for a non-auth failure.
+                // An authorization failure is surfaced before anything else: it
+                // is a typed, actionable error, so it is checked ahead of the
+                // legacy-SSE probe and the generic fallback below.
                 if let Some(status) = connect_error_status(&error)
                     && matches!(status, 401 | 403)
                 {
@@ -353,6 +347,17 @@ async fn connect_http(
                         server: config.slug.clone(),
                         hint: auth_hint(status),
                     });
+                }
+                // The legacy-SSE probe runs only once the failure has not
+                // already produced the typed auth error above, so a deprecated
+                // endpoint is reported as an unsupported transport rather than
+                // masked by the generic fallback.
+                if looks_like_legacy_sse(&client, url).await {
+                    return Err(McpError::UnsupportedTransport(format!(
+                        "{url} answers GET with an SSE `endpoint` event, i.e. the \
+                         2024-11-05 HTTP+SSE transport, which was removed from the \
+                         specification; point the server at a Streamable HTTP endpoint"
+                    )));
                 }
                 return Err(McpError::InitializeFailed(error.to_string()));
             }

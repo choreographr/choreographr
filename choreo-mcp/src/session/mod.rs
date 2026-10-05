@@ -2,7 +2,7 @@
 //!
 //! One dispatcher (a plain OS thread) owns a single engine — the live
 //! connection to one server — and serves every caller through a command
-//! channel. Calls no longer serialize behind a per-server `Mutex`: the
+//! channel. Calls do not serialize behind a per-server `Mutex`: the
 //! dispatcher spawns each call onto the sidecar runtime, so many calls to one
 //! server run concurrently while the dispatcher keeps draining commands
 //! (cancellation included). Because the protocol is stateless, a crashed

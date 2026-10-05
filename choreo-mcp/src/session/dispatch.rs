@@ -277,9 +277,10 @@ fn handle_command(
             // dispatcher on it (as calls already do), so a slow `tools/list`
             // cannot stall this server's command processing. A transport
             // failure still reaches the reconnect logic through the slot-less
-            // `Done` the task reports; the old inline retry-on-failure is
-            // dropped because the caller keeps its previous catalogue on a
-            // failure and the NEXT listing runs against the rebuilt engine.
+            // `Done` the offloaded listing task reports; because the caller
+            // keeps its previous catalogue on a failure, the next listing
+            // simply runs against the rebuilt engine, so no inline retry
+            // belongs here.
             let engine = Arc::clone(engine);
             let done_tx = done_tx.clone();
             rt.spawn(async move {

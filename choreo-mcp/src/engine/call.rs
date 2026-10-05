@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 /// A server may answer `tools/call` with an `input_required` result and expect
 /// the client to fulfil the named input requests and retry. This client cannot
 /// render an elicitation prompt yet, so it answers every request with a
-/// `decline` (the MRTR-legal "no") and retries once; the round cap bounds a
-/// peer that would otherwise keep asking.
+/// `decline` (the MRTR-legal "no") and retries the original call; the round cap
+/// bounds a peer that would otherwise keep asking.
 const MAX_MRTR_ROUNDS: usize = 3;
 
 /// Minimum spacing between forwarded progress chunks.
