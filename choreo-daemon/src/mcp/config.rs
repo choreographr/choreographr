@@ -209,19 +209,21 @@ fn resolve_entry(slug: &str, entry: &ServerEntry, expand_env: bool) -> Option<Mc
     })
 }
 
-/// The per-server log file path (`mcp-<slug>.log`) for a stdio server.
+/// The per-server log file path (`mcp-<safe-slug>-<hash>.log`) for a stdio
+/// server.
 ///
 /// The child's `stderr` is captured here (size-capped) so each server's own
 /// diagnostics are isolated rather than mixed into the daemon's log. The slug is
-/// sanitized to filename-safe characters. `None` when no log directory is
-/// available (macOS/Windows with no `XDG_STATE_HOME`); the child then inherits
-/// the daemon's stderr.
+/// sanitized to filename-safe characters and disambiguated by a short hash.
+/// `None` when no log directory is available (macOS/Windows with no
+/// `XDG_STATE_HOME`); the child then inherits the daemon's stderr.
 fn server_log_path(slug: &str) -> Option<PathBuf> {
     choreo_shared::paths::log_file_default(&log_file_stem(slug))
 }
 
-/// The per-server log file stem (`mcp-<slug>`) with the slug sanitized to
-/// filename-safe characters.
+/// The per-server log file stem (`mcp-<safe-slug>-<hash>`): the slug sanitized
+/// to filename-safe characters, disambiguated by a stable short hash of the
+/// ORIGINAL slug.
 fn log_file_stem(slug: &str) -> String {
     let safe: String = slug
         .chars()
@@ -233,7 +235,11 @@ fn log_file_stem(slug: &str) -> String {
             }
         })
         .collect();
-    format!("mcp-{safe}")
+    // The sanitizer is many-to-one (`a.b` and `a_b` both become `a_b`), so two
+    // distinct servers could otherwise share — and race on — one log file. The
+    // stable FNV-1a short hash of the original slug keeps each server's stem
+    // unique while staying reproducible across runs and toolchains.
+    format!("mcp-{safe}-{}", choreo_mcp::short_hash(slug))
 }
 
 /// Expand a leading `~` (or `~/`) in `path` to the user's home directory.
@@ -814,9 +820,31 @@ mod tests {
 
     #[test]
     fn log_file_stem_sanitizes_the_slug() {
-        assert_eq!(log_file_stem("docs"), "mcp-docs");
-        assert_eq!(log_file_stem("my.server"), "mcp-my_server");
-        assert_eq!(log_file_stem("a/b"), "mcp-a_b");
+        // The sanitized slug is kept for readability, with the stable short
+        // hash appended. `docs` needs no sanitizing; `my.server` and `a/b` map
+        // their unsafe characters to `_`.
+        assert_eq!(
+            log_file_stem("docs"),
+            format!("mcp-docs-{}", choreo_mcp::short_hash("docs"))
+        );
+        assert_eq!(
+            log_file_stem("my.server"),
+            format!("mcp-my_server-{}", choreo_mcp::short_hash("my.server"))
+        );
+        assert_eq!(
+            log_file_stem("a/b"),
+            format!("mcp-a_b-{}", choreo_mcp::short_hash("a/b"))
+        );
+        // The stem is stable across calls (a reconnect writes the same file).
+        assert_eq!(log_file_stem("docs"), log_file_stem("docs"));
+        // Two slugs that sanitize to the SAME stem (`a.b` and `a_b`) must now
+        // produce DIFFERENT stems, so their servers never race on one log file.
+        assert_eq!(
+            log_file_stem("a.b").rsplit_once('-').map(|(stem, _)| stem),
+            log_file_stem("a_b").rsplit_once('-').map(|(stem, _)| stem),
+            "both slug spellings must sanitize to the same readable prefix"
+        );
+        assert_ne!(log_file_stem("a.b"), log_file_stem("a_b"));
     }
 
     #[test]
