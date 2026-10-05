@@ -98,7 +98,12 @@ fn parse_protocol(value: Option<&str>) -> McpProtocolMode {
 ///
 /// Returns `None` (with a logged reason) for an entry that cannot be resolved —
 /// an ambiguous or incomplete server — so the rest of the file still loads.
-fn resolve_transport(slug: &str, entry: &ServerEntry, expand_env: bool) -> Option<McpTransport> {
+fn resolve_transport(
+    identity: &str,
+    slug: &str,
+    entry: &ServerEntry,
+    expand_env: bool,
+) -> Option<McpTransport> {
     let requested = match entry.transport.as_deref() {
         None => McpTransportKind::Auto,
         Some(raw) => McpTransportKind::parse(raw).unwrap_or_else(|| {
@@ -144,7 +149,7 @@ fn resolve_transport(slug: &str, entry: &ServerEntry, expand_env: bool) -> Optio
                 args: entry.args.clone(),
                 env: maybe_expand_env_map(&entry.env, expand_env),
                 cwd: entry.cwd.as_deref().map(expand_tilde),
-                log_path: server_log_path(slug),
+                log_path: server_log_path(identity, slug),
             })
         }
         McpTransportKind::Http => {
@@ -180,7 +185,12 @@ pub struct McpEntry {
 /// daemon tier always expands; a project entry expands only when its project
 /// root is trusted (see [`crate::mcp::trust`]). An untrusted project entry is
 /// never resolved into a spawnable config this way.
-fn resolve_entry(slug: &str, entry: &ServerEntry, expand_env: bool) -> Option<McpEntry> {
+fn resolve_entry(
+    identity: &str,
+    slug: &str,
+    entry: &ServerEntry,
+    expand_env: bool,
+) -> Option<McpEntry> {
     if !entry.enabled {
         return None;
     }
@@ -193,7 +203,7 @@ fn resolve_entry(slug: &str, entry: &ServerEntry, expand_env: bool) -> Option<Mc
             "ignoring unrecognized MCP server config keys"
         );
     }
-    let transport = resolve_transport(slug, entry, expand_env)?;
+    let transport = resolve_transport(identity, slug, entry, expand_env)?;
     Some(McpEntry {
         config: McpServerConfig {
             slug: slug.to_string(),
@@ -214,17 +224,24 @@ fn resolve_entry(slug: &str, entry: &ServerEntry, expand_env: bool) -> Option<Mc
 ///
 /// The child's `stderr` is captured here (size-capped) so each server's own
 /// diagnostics are isolated rather than mixed into the daemon's log. The slug is
-/// sanitized to filename-safe characters and disambiguated by a short hash.
+/// sanitized to filename-safe characters and disambiguated by a short hash of
+/// the tier-scoped `identity` plus the slug.
 /// `None` when no log directory is available (macOS/Windows with no
 /// `XDG_STATE_HOME`); the child then inherits the daemon's stderr.
-fn server_log_path(slug: &str) -> Option<PathBuf> {
-    choreo_shared::paths::log_file_default(&log_file_stem(slug))
+fn server_log_path(identity: &str, slug: &str) -> Option<PathBuf> {
+    choreo_shared::paths::log_file_default(&log_file_stem(identity, slug))
 }
 
 /// The per-server log file stem (`mcp-<safe-slug>-<hash>`): the slug sanitized
 /// to filename-safe characters, disambiguated by a stable short hash of the
-/// ORIGINAL slug.
-fn log_file_stem(slug: &str) -> String {
+/// tier-scoped `identity` and the ORIGINAL slug.
+///
+/// `identity` scopes the log to the TIER that declared the server (the fixed
+/// `"daemon"` string for the daemon tier, the project root for a project tier),
+/// so two servers sharing one slug in different tiers — a daemon `docs` and a
+/// project `docs`, or two projects each with a `docs` — get DISTINCT log files
+/// rather than clobbering each other's.
+fn log_file_stem(identity: &str, slug: &str) -> String {
     let safe: String = slug
         .chars()
         .map(|c| {
@@ -237,9 +254,14 @@ fn log_file_stem(slug: &str) -> String {
         .collect();
     // The sanitizer is many-to-one (`a.b` and `a_b` both become `a_b`), so two
     // distinct servers could otherwise share — and race on — one log file. The
-    // stable FNV-1a short hash of the original slug keeps each server's stem
-    // unique while staying reproducible across runs and toolchains.
-    format!("mcp-{safe}-{}", choreo_mcp::short_hash(slug))
+    // stable FNV-1a short hash of identity+slug keeps each server's stem unique
+    // while staying reproducible across runs and toolchains. The `\0` separator
+    // between identity and slug ensures a slug like `a` with identity `bc`
+    // cannot collide with slug `ab` and identity `c`.
+    format!(
+        "mcp-{safe}-{}",
+        choreo_mcp::short_hash(&format!("{identity}\0{slug}"))
+    )
 }
 
 /// Expand a leading `~` (or `~/`) in `path` to the user's home directory.
@@ -338,6 +360,11 @@ fn expand_env_with(value: &str, lookup: impl Fn(&str) -> Option<String>) -> Stri
 /// convention). `mcpServers` is the MCP-standard key inside both.
 pub const DAEMON_CONFIG_FILE: &str = "mcp.json";
 
+/// The log identity for the daemon tier: a fixed string (not a path) so the
+/// daemon's own `mcp.json` servers log under a stable, project-independent
+/// scope. Project tiers use the project root as their identity instead.
+const DAEMON_LOG_IDENTITY: &str = "daemon";
+
 /// Test-only override for the base config directory. Re-exported from the
 /// module root (which owns the thread-local) so the existing
 /// `mcp::config::set_test_config_root` call sites in `tests/` keep working.
@@ -371,7 +398,9 @@ pub fn project_config_path(project_root: &std::path::Path) -> PathBuf {
 /// Returns an error when a present file cannot be read or parsed.
 pub fn load_daemon_config() -> Result<Vec<McpEntry>> {
     let path = mcp_config_path()?;
-    Ok(read_entries_into(&path)?.map_or_else(Vec::new, |entries| resolve_entries(&entries, true)))
+    Ok(read_entries_into(&path)?.map_or_else(Vec::new, |entries| {
+        resolve_entries(DAEMON_LOG_IDENTITY, &entries, true)
+    }))
 }
 
 /// Load the **project-tier** server set from `<project_root>/.mcp.json`.
@@ -389,14 +418,28 @@ pub fn load_project_config(
     expand: bool,
 ) -> Result<Option<Vec<McpEntry>>> {
     let path = project_config_path(project_root);
-    Ok(read_entries_into(&path)?.map(|entries| resolve_entries(&entries, expand)))
+    // The project root scopes this tier's log files: it is stable for a given
+    // project across loads, so a reconnecting project server reuses its log,
+    // while two projects (or a project and the daemon) with the same slug keep
+    // DISTINCT logs.
+    let identity = project_root.to_string_lossy();
+    Ok(read_entries_into(&path)?.map(|entries| resolve_entries(&identity, &entries, expand)))
 }
 
 /// Resolve a parsed slug→entry map into a deterministic, slug-sorted list.
-fn resolve_entries(entries: &HashMap<String, ServerEntry>, expand: bool) -> Vec<McpEntry> {
+///
+/// `identity` scopes the per-server log files to the tier this map came from
+/// (see [`log_file_stem`]).
+fn resolve_entries(
+    identity: &str,
+    entries: &HashMap<String, ServerEntry>,
+    expand: bool,
+) -> Vec<McpEntry> {
     let mut resolved: Vec<(String, McpEntry)> = entries
         .iter()
-        .filter_map(|(slug, entry)| resolve_entry(slug, entry, expand).map(|e| (slug.clone(), e)))
+        .filter_map(|(slug, entry)| {
+            resolve_entry(identity, slug, entry, expand).map(|e| (slug.clone(), e))
+        })
         .collect();
     resolved.sort_by(|a, b| a.0.cmp(&b.0));
     resolved.into_iter().map(|(_, e)| e).collect()
@@ -549,7 +592,7 @@ mod tests {
     #[test]
     fn auto_infers_stdio_from_command() {
         let entry = entry_from(serde_json::json!({"command": "npx"}));
-        match resolve_transport("s", &entry, true).expect("resolved") {
+        match resolve_transport("tier", "s", &entry, true).expect("resolved") {
             McpTransport::Stdio { command, .. } => assert_eq!(command, "npx"),
             other @ McpTransport::Http { .. } => panic!("expected stdio, got {other:?}"),
         }
@@ -558,7 +601,7 @@ mod tests {
     #[test]
     fn auto_infers_http_from_url() {
         let entry = entry_from(serde_json::json!({"url": "https://example.com/mcp"}));
-        match resolve_transport("s", &entry, true).expect("resolved") {
+        match resolve_transport("tier", "s", &entry, true).expect("resolved") {
             McpTransport::Http { url, .. } => assert_eq!(url, "https://example.com/mcp"),
             other @ McpTransport::Stdio { .. } => panic!("expected http, got {other:?}"),
         }
@@ -574,7 +617,7 @@ mod tests {
             "transport": "http"
         }));
         assert!(matches!(
-            resolve_transport("s", &entry, true),
+            resolve_transport("tier", "s", &entry, true),
             Some(McpTransport::Http { .. })
         ));
     }
@@ -585,13 +628,13 @@ mod tests {
             "command": "npx",
             "url": "https://example.com/mcp"
         }));
-        assert!(resolve_transport("s", &both, true).is_none());
+        assert!(resolve_transport("tier", "s", &both, true).is_none());
 
         let neither = entry_from(serde_json::json!({}));
-        assert!(resolve_transport("s", &neither, true).is_none());
+        assert!(resolve_transport("tier", "s", &neither, true).is_none());
 
         let http_without_url = entry_from(serde_json::json!({"transport": "http"}));
-        assert!(resolve_transport("s", &http_without_url, true).is_none());
+        assert!(resolve_transport("tier", "s", &http_without_url, true).is_none());
     }
 
     #[test]
@@ -606,7 +649,7 @@ mod tests {
         let configs: Vec<McpEntry> = parsed
             .mcp_servers
             .into_iter()
-            .filter_map(|(slug, entry)| resolve_entry(&slug, &entry, true))
+            .filter_map(|(slug, entry)| resolve_entry("tier", &slug, &entry, true))
             .collect();
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].config.slug, "enabled-server");
@@ -681,7 +724,7 @@ mod tests {
     #[test]
     fn stdio_transport_carries_cwd() {
         let entry = entry_from(serde_json::json!({"command": "npx", "cwd": "/srv/mcp"}));
-        match resolve_transport("s", &entry, true).expect("resolved") {
+        match resolve_transport("tier", "s", &entry, true).expect("resolved") {
             McpTransport::Stdio { cwd, .. } => assert_eq!(cwd.as_deref(), Some("/srv/mcp")),
             other @ McpTransport::Http { .. } => panic!("expected stdio, got {other:?}"),
         }
@@ -705,7 +748,7 @@ mod tests {
             "command": "python",
             "disabledTools": ["a", "b"]
         }));
-        let config = resolve_entry("s", &entry, true).expect("resolved");
+        let config = resolve_entry("tier", "s", &entry, true).expect("resolved");
         assert_eq!(config.config.disabled_tools, vec!["a", "b"]);
     }
 
@@ -763,7 +806,7 @@ mod tests {
     #[test]
     fn shared_false_is_carried_through_resolution() {
         let entry = entry_from(serde_json::json!({"command": "stateful", "shared": false}));
-        let resolved = resolve_entry("s", &entry, true).expect("resolved");
+        let resolved = resolve_entry("tier", "s", &entry, true).expect("resolved");
         assert!(!resolved.shared);
     }
 
@@ -824,27 +867,63 @@ mod tests {
         // hash appended. `docs` needs no sanitizing; `my.server` and `a/b` map
         // their unsafe characters to `_`.
         assert_eq!(
-            log_file_stem("docs"),
-            format!("mcp-docs-{}", choreo_mcp::short_hash("docs"))
+            log_file_stem("tier", "docs"),
+            format!("mcp-docs-{}", choreo_mcp::short_hash("tier\0docs"))
         );
         assert_eq!(
-            log_file_stem("my.server"),
-            format!("mcp-my_server-{}", choreo_mcp::short_hash("my.server"))
+            log_file_stem("tier", "my.server"),
+            format!(
+                "mcp-my_server-{}",
+                choreo_mcp::short_hash("tier\0my.server")
+            )
         );
         assert_eq!(
-            log_file_stem("a/b"),
-            format!("mcp-a_b-{}", choreo_mcp::short_hash("a/b"))
+            log_file_stem("tier", "a/b"),
+            format!("mcp-a_b-{}", choreo_mcp::short_hash("tier\0a/b"))
         );
         // The stem is stable across calls (a reconnect writes the same file).
-        assert_eq!(log_file_stem("docs"), log_file_stem("docs"));
+        assert_eq!(log_file_stem("tier", "docs"), log_file_stem("tier", "docs"));
         // Two slugs that sanitize to the SAME stem (`a.b` and `a_b`) must now
         // produce DIFFERENT stems, so their servers never race on one log file.
         assert_eq!(
-            log_file_stem("a.b").rsplit_once('-').map(|(stem, _)| stem),
-            log_file_stem("a_b").rsplit_once('-').map(|(stem, _)| stem),
+            log_file_stem("tier", "a.b")
+                .rsplit_once('-')
+                .map(|(stem, _)| stem),
+            log_file_stem("tier", "a_b")
+                .rsplit_once('-')
+                .map(|(stem, _)| stem),
             "both slug spellings must sanitize to the same readable prefix"
         );
-        assert_ne!(log_file_stem("a.b"), log_file_stem("a_b"));
+        assert_ne!(log_file_stem("tier", "a.b"), log_file_stem("tier", "a_b"));
+    }
+
+    #[test]
+    fn log_file_stem_is_keyed_by_tier_scoped_identity() {
+        // (a) A daemon-tier and a project-tier server with the SAME slug are
+        // distinct connections and must NOT share one log file.
+        let daemon = log_file_stem("daemon", "docs");
+        let project = log_file_stem("/home/me/proj", "docs");
+        assert_ne!(daemon, project);
+        // The readable sanitized-slug prefix is preserved in both.
+        for stem in [&daemon, &project] {
+            assert!(stem.starts_with("mcp-docs-"), "prefix kept: {stem}");
+        }
+
+        // (b) Two DIFFERENT project identities with the same slug must differ.
+        assert_ne!(
+            log_file_stem("/home/me/proj-a", "docs"),
+            log_file_stem("/home/me/proj-b", "docs")
+        );
+
+        // (c) The same (identity, slug) is stable across calls.
+        assert_eq!(
+            log_file_stem("/home/me/proj", "docs"),
+            log_file_stem("/home/me/proj", "docs")
+        );
+
+        // The `\0` separator prevents an identity/slug boundary collision:
+        // ("bc", "a") and ("c", "ab") must not hash to the same stem.
+        assert_ne!(log_file_stem("bc", "a"), log_file_stem("c", "ab"));
     }
 
     #[test]
