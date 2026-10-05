@@ -1411,6 +1411,30 @@ impl McpManager {
         }
     }
 
+    /// The sessions that hold a project-tier or per-session server with `slug`
+    /// (project or daemon tier) — i.e. the sessions whose PRIVATE overlay
+    /// includes a server with that slug.
+    ///
+    /// A daemon-tier SHARED server with the same slug is NOT included: its tools
+    /// live in the daemon-wide catalogue, which the command loop refreshes
+    /// separately (`register_all`). Used to route a list change into exactly the
+    /// sessions whose overlay a project server's change affects.
+    #[must_use]
+    pub fn sessions_for_slug(&self, slug: &str) -> HashSet<u64> {
+        let mut out = HashSet::new();
+        for ((_root, s), shared) in &self.project_shared {
+            if s == slug {
+                out.extend(shared.sessions.iter().copied());
+            }
+        }
+        for (sid, _root, s) in self.session_slots.keys() {
+            if s == slug {
+                out.insert(*sid);
+            }
+        }
+        out
+    }
+
     /// Create an empty `McpManager` with no servers (for testing).
     #[must_use]
     pub fn empty() -> Self {
@@ -1514,6 +1538,12 @@ mod imp {
 
         /// Stub: no server has any in-flight call to cancel.
         pub fn cancel_session_project(&self, _session_id: u64, _project_root: &std::path::Path) {}
+
+        /// Stub: no session ever holds a private MCP server.
+        #[must_use]
+        pub fn sessions_for_slug(&self, _slug: &str) -> std::collections::HashSet<u64> {
+            std::collections::HashSet::new()
+        }
 
         /// Stub: there are no servers to reconnect.
         pub fn reconnect(&mut self, slug: &str) -> Result<(), String> {

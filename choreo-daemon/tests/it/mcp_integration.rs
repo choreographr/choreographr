@@ -392,6 +392,57 @@ fn mcp_catalogue_refresh_is_bounded_by_the_refresh_deadline() {
 
 #[test]
 #[ignore = "integration"]
+fn project_server_slug_maps_to_its_referencing_sessions() {
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(120));
+        eprintln!("mcp_integration: test exceeded 120s; aborting");
+        std::process::abort();
+    });
+
+    // A project whose `.mcp.json` declares the fixture server, so the server is
+    // a session's PRIVATE project server (never in the daemon catalogue).
+    let project = tempfile::tempdir().expect("project dir");
+    let root = project.path();
+    let server = serde_json::json!({
+        "command": FIXTURE_BIN,
+        "args": ["modern"],
+        "protocol": "modern",
+        "enabled": true,
+        "timeout": 10
+    });
+    std::fs::write(
+        root.join(".mcp.json"),
+        serde_json::to_string(&serde_json::json!({ "mcpServers": { "proj": server } }))
+            .expect("serialize .mcp.json"),
+    )
+    .expect("write .mcp.json");
+
+    let mut manager = choreo_daemon::mcp::McpManager::empty();
+    assert!(
+        manager.sessions_for_slug("proj").is_empty(),
+        "no session references the project server yet"
+    );
+
+    // A session that resolves its overlay references the project server.
+    let _overlay = manager.ensure_session(7, Some(root), true);
+    assert!(
+        manager.sessions_for_slug("proj").contains(&7),
+        "a session holding the project server must be reported for its slug"
+    );
+
+    // Releasing the session drops it from the slug's referencing set (so a
+    // later list change no longer refreshes it).
+    manager.release_session(7);
+    assert!(
+        !manager.sessions_for_slug("proj").contains(&7),
+        "releasing the session must drop it from the slug's referencing set"
+    );
+
+    drop(manager);
+}
+
+#[test]
+#[ignore = "integration"]
 fn mcp_shutdown_all_is_bounded_with_a_stubborn_server() {
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_secs(120));

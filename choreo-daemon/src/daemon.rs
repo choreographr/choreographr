@@ -2169,9 +2169,19 @@ impl DaemonState {
     /// request timeout): it runs on the command loop because the catalogue has a
     /// single writer, and a single slow server must not freeze every session. A
     /// server that misses the deadline keeps its previous registration.
+    ///
+    /// A server can also be a session's PRIVATE project/per-session server,
+    /// whose tools live only in that session's overlay and are NOT touched by
+    /// the daemon-tier rebuild. The sessions holding a private server with this
+    /// slug therefore have their overlay re-resolved too (re-ensured, not
+    /// released, so their connections are reused).
     fn handle_mcp_list_changed(&mut self, slug: &str) {
         info!(server = %slug, "MCP list changed; rebuilding the tool catalogue");
         self.rebuild_tool_catalogue();
+        let affected = self.mcp_manager.sessions_for_slug(slug);
+        for session_id in affected {
+            self.refresh_session_overlay(session_id);
+        }
         info!(server = %slug, "MCP tool catalogue refreshed");
     }
 
@@ -2294,6 +2304,30 @@ impl DaemonState {
             .reload_session(session_id, root.as_deref(), trusted);
         // Record the freshly-resolved root so the NEXT change knows what it left.
         self.session_mcp_roots.insert(session_id, root);
+        self.push_overlay_to_session(session_id, &overlay);
+        overlay
+    }
+
+    /// Re-resolve ONE session's overlay WITHOUT releasing its existing
+    /// connections, and push it to the session thread.
+    ///
+    /// Used on an MCP list change: a project/per-session server that adds or
+    /// withdraws a tool changes the session's private overlay, so re-ensuring
+    /// (rather than `reload_session`'s release-then-ensure) reuses its live
+    /// connections while re-listing their tools.
+    fn refresh_session_overlay(&mut self, session_id: u64) {
+        let (root, trusted) = self.session_project_root(session_id);
+        let overlay = self
+            .mcp_manager
+            .ensure_session(session_id, root.as_deref(), trusted);
+        self.session_mcp_roots.insert(session_id, root);
+        self.push_overlay_to_session(session_id, &overlay);
+    }
+
+    /// Push a resolved overlay to the session thread (which stores it for the
+    /// request/execution path). Best-effort: a session with no live thread is
+    /// skipped with a warning.
+    fn push_overlay_to_session(&self, session_id: u64, overlay: &SessionMcpOverlay) {
         if let Some(entry) = self.active_sessions.get(&session_id)
             && entry
                 .cmd_tx
@@ -2302,7 +2336,6 @@ impl DaemonState {
         {
             warn!(session_id, "failed to push MCP overlay to session");
         }
-        overlay
     }
 
     /// Build a full MCP status report for a session (or the daemon tier only
