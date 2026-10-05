@@ -21,7 +21,7 @@ use crate::tools::{ToolDyn, ToolError, ToolOutput, ToolOutputFormat};
 use choreo_ai_protocols::openai::ChatToolDefinition;
 #[cfg(feature = "mcp")]
 use choreo_mcp::{McpServerConfig, McpServerHandle};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(feature = "mcp")]
@@ -60,6 +60,12 @@ const SESSION_CONNECT_BUDGET: Duration = Duration::from_secs(10);
 pub struct ProjectToolSet {
     /// The wrapped tools, in registration order.
     tools: Vec<Box<dyn ToolDyn>>,
+    /// `name -> index into tools`, so `has`/`describe_invocation_json`/`execute_*`
+    /// are O(1) rather than a linear scan. Names are unique within the set
+    /// (`resolve_name` dedupes against the resolve's shared `used` set), so each
+    /// tool appears exactly once; kept in lockstep with `tools`, which preserves
+    /// registration order for `definitions`.
+    index: HashMap<String, usize>,
     /// The `mcp/<slug>` groups these tools belong to — the groups whose
     /// daemon-tier counterparts the session must shadow.
     groups: HashSet<String>,
@@ -71,8 +77,36 @@ impl ProjectToolSet {
     pub fn empty() -> Self {
         Self {
             tools: Vec::new(),
+            index: HashMap::new(),
             groups: HashSet::new(),
         }
+    }
+
+    /// Build a set from a session's collected overlay tools, indexing every
+    /// tool by name for O(1) lookup. The `Vec` keeps registration order for
+    /// `definitions`; the index is derived from it so the two cannot drift.
+    /// Gated with the resolution methods that call it (only the `mcp` feature
+    /// builds a non-empty set).
+    #[cfg(feature = "mcp")]
+    fn new(tools: Vec<Box<dyn ToolDyn>>, groups: HashSet<String>) -> Self {
+        let index: HashMap<String, usize> = tools
+            .iter()
+            .enumerate()
+            .map(|(i, tool)| (tool.name().to_string(), i))
+            .collect();
+        Self {
+            tools,
+            index,
+            groups,
+        }
+    }
+
+    /// The tool named `name`, if the set holds one, via the name index.
+    fn find(&self, name: &str) -> Option<&dyn ToolDyn> {
+        // `index` is `name -> index into tools` and is built from the same
+        // `Vec`, so the lookup is total; `get` keeps it panic-free either way.
+        let index = *self.index.get(name)?;
+        self.tools.get(index).map(AsRef::as_ref)
     }
 
     /// Whether the set holds no tools.
@@ -96,7 +130,7 @@ impl ProjectToolSet {
     /// Whether a tool with `name` lives in this set.
     #[must_use]
     pub fn has(&self, name: &str) -> bool {
-        self.tools.iter().any(|t| t.name() == name)
+        self.index.contains_key(name)
     }
 
     /// A tool definition for every tool in the set (Text/JSON-compatible).
@@ -111,9 +145,7 @@ impl ProjectToolSet {
     /// Describe a call against a tool in this set, or `None` if unknown.
     #[must_use]
     pub fn describe_invocation_json(&self, name: &str, args_json: &str) -> Option<String> {
-        self.tools
-            .iter()
-            .find(|t| t.name() == name)
+        self.find(name)
             .map(|t| t.describe_invocation_json(args_json))
     }
 
@@ -129,19 +161,16 @@ impl ProjectToolSet {
         ctx: Option<&crate::tools::context::ToolContext>,
         image_tx: Option<crossbeam_channel::Sender<crate::tools::PreparedImage>>,
     ) -> Option<Result<ToolOutput, ToolError>> {
-        self.tools
-            .iter()
-            .find(|t| t.name() == tool_call.name)
-            .map(|t| {
-                t.execute_json(
-                    &tool_call.arguments_json,
-                    format,
-                    x_credentials,
-                    working_dir,
-                    ctx,
-                    image_tx,
-                )
-            })
+        self.find(&tool_call.name).map(|t| {
+            t.execute_json(
+                &tool_call.arguments_json,
+                format,
+                x_credentials,
+                working_dir,
+                ctx,
+                image_tx,
+            )
+        })
     }
 
     /// Execute a streaming JSON tool call against this set, or `None` when the
@@ -161,20 +190,17 @@ impl ProjectToolSet {
         ctx: Option<&crate::tools::context::ToolContext>,
         image_tx: Option<crossbeam_channel::Sender<crate::tools::PreparedImage>>,
     ) -> Option<Result<ToolOutput, ToolError>> {
-        self.tools
-            .iter()
-            .find(|t| t.name() == tool_call.name)
-            .map(|t| {
-                t.execute_streaming_json(
-                    &tool_call.arguments_json,
-                    format,
-                    x_credentials,
-                    working_dir,
-                    output_tx,
-                    ctx,
-                    image_tx,
-                )
-            })
+        self.find(&tool_call.name).map(|t| {
+            t.execute_streaming_json(
+                &tool_call.arguments_json,
+                format,
+                x_credentials,
+                working_dir,
+                output_tx,
+                ctx,
+                image_tx,
+            )
+        })
     }
 
     /// Execute a postcard tool call against this set, or `None` when the tool
@@ -188,9 +214,7 @@ impl ProjectToolSet {
         working_dir: Option<&Path>,
         ctx: Option<&crate::tools::context::ToolContext>,
     ) -> Option<Vec<u8>> {
-        self.tools
-            .iter()
-            .find(|t| t.name() == name)
+        self.find(name)
             .map(|t| t.execute_postcard(args_bytes, x_credentials, working_dir, ctx))
     }
 }
@@ -367,7 +391,7 @@ impl super::McpManager {
         }
 
         SessionMcpOverlay {
-            tools: Arc::new(ProjectToolSet { tools, groups }),
+            tools: Arc::new(ProjectToolSet::new(tools, groups)),
             shadowed_groups: shadowed,
             project_root: project_root.map(Path::to_path_buf),
             project_trusted: trusted,
