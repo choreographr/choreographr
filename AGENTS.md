@@ -111,9 +111,21 @@ Thread-to-thread messaging uses the **`crossbeam-channel`** leaf crate (not the 
 
 Apply it as follows:
 
-- **New code** — any crate: always `crossbeam_channel`.
+- **New code** — any crate: always `crossbeam_channel` for every **messaging**
+  channel. That means command/control channels, event/data channels, fan-outs, and
+  stream/drain channels — anything that carries more than a single message, that more
+  than one consumer might read, or that any code might later `select!` on or clone.
+  The workspace migrated its command channels to crossbeam for exactly this reason;
+  do not start a new messaging channel on `std::sync::mpsc`.
 - **Waits are event-driven**: use `select!`/`select_biased!`, a blocking `recv`, or `recv_deadline`. Bias the arm that must win deterministically: cancellation/stop arms go first so a cancel is observed the instant it is sent (see `recv_sse_event`, the concurrent tool collector, and the retry backoff). The one deliberate exception is a *drain-before-stop* wait — a thread whose job is to flush a queue of messages or output before it obeys a stop signal — which lists its data arm first so queued work is never dropped (the `choreo-client-core` daemon-connection writer and `choreo-daemon`'s tool-output forwarder do this, each with a comment). Never use `recv_timeout` as a poll interval paired with a flag check, and never a `sleep`-poll loop; a timer that *is* the event uses `crossbeam_channel::after(..)`. The one place a bounded-timeout poll of an exception-#1 flag is correct is a blocking OS call no channel can interrupt — the `tiny_http` metrics accept loop (`metrics.rs::serve_metrics`) is the sole instance.
-- **Retained std `mpsc`**: one-shot reply/flag channels and test scaffolding still use `std::sync::mpsc`. Migrate such a channel opportunistically — only when the change needs `select!`, a cloned receiver, or a select-with-timeout (or otherwise strains single-consumer semantics, e.g. a per-request reply that metrics/tracing might later tap). Do not migrate them for their own sake — that is churn with no behavioral payoff.
+- **`std::sync::mpsc` is reserved for one-shot reply/flag channels** (and test
+  scaffolding). A per-request reply — one request, one response, consumed once by one
+  thread, never selected on, never cloned — or a fire-once completion/stop flag, may
+  use `std::sync::mpsc`, new or existing. This is a deliberate exception, not legacy
+  debt: `std::sync::mpsc::Receiver` is neither `Clone` nor `Sync`, so its type is the
+  right compile-time marker for a channel that must have exactly one consumer. The
+  `DaemonCommand`/`SessionCommand` reply fields and `request_daemon` are the reference
+  pattern. When in doubt, use crossbeam.
 - **Async code**: keep the runtime's own channels (`futures_channel::mpsc` in `choreo-gui`, tokio channels in the daemon's sidecar runtime). Never call a blocking `recv()` (std or crossbeam) inside an async task — bridge across the async/thread boundary with the crossfire-style `From` conversions only if a measured need appears; the default is to keep blocking `recv()` on dedicated threads.
 
 ## Inline Comments
