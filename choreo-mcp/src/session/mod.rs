@@ -359,6 +359,20 @@ impl McpServerHandle {
             resources: false,
         }
     }
+
+    /// Like [`disconnected`](Self::disconnected), but reporting the `resources`
+    /// capability, so a caller can exercise the resource-catalogue wrapping
+    /// (names, reservation) without a live connection.
+    ///
+    /// Any command sent through it fails with [`McpError::NotConnected`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn disconnected_with_resources(name: &str) -> Self {
+        Self {
+            resources: true,
+            ..Self::disconnected(name, "0.0.0", Duration::from_secs(5))
+        }
+    }
 }
 
 /// A single tool invocation handed to the dispatcher.

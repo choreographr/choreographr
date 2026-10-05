@@ -348,7 +348,7 @@ fn batched_transport_failures_reconnect_once() {
     for call_id in [1u64, 2] {
         done_tx
             .send(Done {
-                call_id,
+                call_id: Some(call_id),
                 transport_failed: true,
                 engine: Arc::clone(&engine),
             })
@@ -393,7 +393,7 @@ fn straggler_failure_after_reconnect_does_not_reconnect_again() {
     inflight.insert(1, (CancelToken::new(), 7));
     done_tx
         .send(Done {
-            call_id: 1,
+            call_id: Some(1),
             transport_failed: true,
             engine: Arc::clone(&engine),
         })
@@ -414,7 +414,7 @@ fn straggler_failure_after_reconnect_does_not_reconnect_again() {
     inflight.insert(2, (CancelToken::new(), 7));
     done_tx
         .send(Done {
-            call_id: 2,
+            call_id: Some(2),
             transport_failed: true,
             engine: Arc::clone(&engine),
         })
@@ -435,6 +435,135 @@ fn straggler_failure_after_reconnect_does_not_reconnect_again() {
         1,
         "a straggler from an already-handled incident must not reconnect again"
     );
+}
+
+#[test]
+fn restart_budget_is_not_reset_by_a_reconnect_alone() {
+    // A reconnect alone must not clear the budget: a server that reconnects and
+    // then immediately dies again is left alone once the budget is spent, rather
+    // than rebuilt forever.
+    let engine: Arc<dyn McpEngine> = Arc::new(MockEngine::new(vec![], ok_result()));
+    let mut current = Arc::clone(&engine);
+    let factory_calls = Arc::new(AtomicUsize::new(0));
+    let factory = counting_factory(Arc::clone(&factory_calls));
+    // A budget of one attempt. After the first incident it is spent; because a
+    // reconnect does NOT reset it, the second incident must not reconnect again.
+    let mut policy = RestartPolicy {
+        max_attempts: 1,
+        base_backoff: Duration::ZERO,
+        failures: 0,
+    };
+    let mut gate = CallGate::new(4);
+    let mut inflight = HashMap::new();
+    let (done_tx, done_rx) = crossbeam_channel::unbounded();
+
+    // Incident 1 on the current engine: reconnect #1 (budget was 0).
+    assert!(gate.admit());
+    inflight.insert(1, (CancelToken::new(), 7));
+    done_tx
+        .send(Done {
+            call_id: Some(1),
+            transport_failed: true,
+            engine: Arc::clone(&current),
+        })
+        .expect("send done");
+    apply_completions(
+        None,
+        &done_rx,
+        &mut inflight,
+        &mut gate,
+        &mut policy,
+        &factory,
+        &mut current,
+    );
+    assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+
+    // Incident 2 on the REBUILT engine: the budget is already spent, so no
+    // second reconnect — a healthy reconnect did not clear the count.
+    assert!(gate.admit());
+    inflight.insert(2, (CancelToken::new(), 7));
+    done_tx
+        .send(Done {
+            call_id: Some(2),
+            transport_failed: true,
+            engine: Arc::clone(&current),
+        })
+        .expect("send done");
+    apply_completions(
+        None,
+        &done_rx,
+        &mut inflight,
+        &mut gate,
+        &mut policy,
+        &factory,
+        &mut current,
+    );
+    assert_eq!(
+        factory_calls.load(Ordering::SeqCst),
+        1,
+        "a reconnect must not reset the budget; the second incident is left alone"
+    );
+}
+
+#[test]
+fn clean_completion_resets_the_restart_budget() {
+    // A request that completes WITHOUT a transport error proves the connection
+    // is healthy, so it resets the budget and a following incident may reconnect
+    // again.
+    let engine: Arc<dyn McpEngine> = Arc::new(MockEngine::new(vec![], ok_result()));
+    let mut current = Arc::clone(&engine);
+    let factory_calls = Arc::new(AtomicUsize::new(0));
+    let factory = counting_factory(Arc::clone(&factory_calls));
+    let mut policy = RestartPolicy {
+        max_attempts: 1,
+        base_backoff: Duration::ZERO,
+        failures: 0,
+    };
+    let mut gate = CallGate::new(4);
+    let mut inflight = HashMap::new();
+    let (done_tx, done_rx) = crossbeam_channel::unbounded();
+
+    // A clean completion (db not transport-failed) resets the budget...
+    assert!(gate.admit());
+    inflight.insert(1, (CancelToken::new(), 7));
+    done_tx
+        .send(Done {
+            call_id: Some(1),
+            transport_failed: false,
+            engine: Arc::clone(&current),
+        })
+        .expect("send done");
+    apply_completions(
+        None,
+        &done_rx,
+        &mut inflight,
+        &mut gate,
+        &mut policy,
+        &factory,
+        &mut current,
+    );
+    assert_eq!(policy.failures, 0, "a clean completion resets the budget");
+
+    // ...so a following incident still reconnects within the budget.
+    assert!(gate.admit());
+    inflight.insert(2, (CancelToken::new(), 7));
+    done_tx
+        .send(Done {
+            call_id: Some(2),
+            transport_failed: true,
+            engine: Arc::clone(&current),
+        })
+        .expect("send done");
+    apply_completions(
+        None,
+        &done_rx,
+        &mut inflight,
+        &mut gate,
+        &mut policy,
+        &factory,
+        &mut current,
+    );
+    assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]

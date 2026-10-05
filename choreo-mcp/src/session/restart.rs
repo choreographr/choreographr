@@ -1,7 +1,6 @@
 //! Bounded transport-reconnect policy for a dispatcher whose engine dies.
 
 use crate::error::McpError;
-use crate::protocol::CallToolResult;
 use crate::session::{EngineFactory, McpEngine};
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,9 +40,13 @@ impl RestartPolicy {
 
     /// Rebuild the engine after a transport failure, subject to the budget.
     ///
-    /// Resets the failure count on success. The sleep is skipped entirely when
-    /// the backoff is zero, which is how the unit tests keep the restart path
-    /// free of any time-based wait.
+    /// The failure count is NOT reset by a successful rebuild: it counts
+    /// consecutive transport-failure incidents since the last request that
+    /// SUCCEEDED (see [`record_success`](Self::record_success)). A server that
+    /// reconnects and then immediately dies again therefore still exhausts the
+    /// budget and is left alone, rather than being rebuilt forever. The sleep
+    /// is skipped entirely when the backoff is zero, which is how the unit
+    /// tests keep the restart path free of any time-based wait.
     pub(super) fn on_transport_failure(
         &mut self,
         factory: &EngineFactory,
@@ -64,11 +67,22 @@ impl RestartPolicy {
         match factory() {
             Ok(fresh) => {
                 *engine = fresh;
-                self.failures = 0;
                 tracing::info!("MCP server reconnected after transport failure");
             }
             Err(e) => tracing::warn!(error = %e, "MCP reconnect failed"),
         }
+    }
+
+    /// Record that a request completed cleanly, resetting the consecutive
+    /// transport-failure budget.
+    ///
+    /// Called from the dispatcher when a call or listing returns without a
+    /// transport error: a healthy exchange proves the connection is usable, so
+    /// the restart budget starts fresh. This is what bounds a flapping server
+    /// that reconnects but never survives a request — the budget resets only on
+    /// a genuine success, never on the reconnect itself.
+    pub(super) fn record_success(&mut self) {
+        self.failures = 0;
     }
 }
 
@@ -81,7 +95,8 @@ pub(super) fn is_transport_error(error: &McpError) -> bool {
     )
 }
 
-/// `is_transport_error` over a `Result` reference (used by spawned call tasks).
-pub(super) fn is_transport_error_ref(result: &Result<CallToolResult, McpError>) -> bool {
+/// `is_transport_error` over a `Result` reference (used by spawned tasks that
+/// report a completion without consuming the result).
+pub(super) fn is_transport_error_ref<T>(result: &Result<T, McpError>) -> bool {
     result.as_ref().err().is_some_and(is_transport_error)
 }

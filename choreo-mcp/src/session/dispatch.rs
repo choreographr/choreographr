@@ -9,19 +9,25 @@
 use crate::error::McpError;
 use crate::session::cancel::CancelToken;
 use crate::session::gate::{CallGate, QueuedCall};
-use crate::session::restart::{RestartPolicy, is_transport_error, is_transport_error_ref};
+use crate::session::restart::{RestartPolicy, is_transport_error_ref};
 use crate::session::{EngineCall, EngineFactory, McpCommand, McpEngine};
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-/// Completion notice a spawned call task sends back to the dispatcher.
+/// Completion notice a spawned task sends back to the dispatcher.
+///
+/// A tool call and a listing/resource read both report here so the dispatcher
+/// can free a call's slot (when there is one) and reconnect a dead transport.
+/// Listings consume no concurrency slot, so their `call_id` is `None`.
 pub(super) struct Done {
-    pub(super) call_id: u64,
+    /// The in-flight call this notice retires, or `None` for a non-call
+    /// operation (a listing or resource read) that holds no gate slot.
+    pub(super) call_id: Option<u64>,
     pub(super) transport_failed: bool,
-    /// The engine the call ran against. Compared by identity so a failure that
-    /// arrives after the engine has already been rebuilt (a straggler from an
-    /// incident another notice already handled) frees its slot without
+    /// The engine the operation ran against. Compared by identity so a failure
+    /// that arrives after the engine has already been rebuilt (a straggler from
+    /// an incident another notice already handled) frees its slot without
     /// triggering a redundant reconnect.
     pub(super) engine: Arc<dyn McpEngine>,
 }
@@ -30,9 +36,10 @@ pub(super) struct Done {
 ///
 /// `max_concurrent_calls` bounds how many tool calls to this server run at once;
 /// calls beyond the cap wait in a queue and are started as slots free. Listings
-/// and resource reads run synchronously on this thread and so are naturally
-/// serialized and not subject to the cap. `max_restarts` bounds how many times
-/// a dead transport is rebuilt in a row before the server is left alone.
+/// and resource reads are dispatched onto the runtime like calls but consume no
+/// concurrency slot, so they are not subject to the cap and cannot stall the
+/// dispatcher. `max_restarts` bounds how many times a dead transport is rebuilt
+/// in a row before the server is left alone.
 pub(super) fn run_dispatcher(
     initial: Arc<dyn McpEngine>,
     factory: EngineFactory,
@@ -61,7 +68,7 @@ pub(super) fn run_dispatcher(
     loop {
         // Drain completion notices before waiting: a finished call frees a slot
         // and, if it died on the transport, triggers a reconnect. The whole
-        // available batch is coalesced into at most ONE reconnect, so N calls
+        // available batch is coalesced into at most ONE reconnect, so N requests
         // lost on one dead transport cost one rebuild, not N.
         apply_completions(
             None,
@@ -91,9 +98,7 @@ pub(super) fn run_dispatcher(
                     let keep_running = handle_command(
                         cmd,
                         &rt,
-                        &mut engine,
-                        &factory,
-                        &mut policy,
+                        &engine,
                         &mut inflight,
                         &mut queued,
                         &mut gate,
@@ -133,13 +138,18 @@ pub(super) fn run_dispatcher(
 /// holds — freeing each call's slot and rebuilding the engine AT MOST ONCE if
 /// any notice died on the transport.
 ///
-/// One dead transport fails every in-flight call at once, each sending its own
-/// notice; rebuilding per notice would recreate the engine (with a backoff
-/// sleep) once per call for a single incident. The batch is coalesced: the
+/// One dead transport fails every in-flight request at once, each sending its
+/// own notice; rebuilding per notice would recreate the engine (with a backoff
+/// sleep) once per request for a single incident. The batch is coalesced: the
 /// reconnect happens once, after the whole batch is drained, so `pump_queued`
-/// then starts queued calls against the rebuilt engine. A notice whose call ran
-/// against an engine since replaced (compared by identity) only frees its slot —
-/// it is a straggler from an already-handled incident, not a new one.
+/// then starts queued calls against the rebuilt engine. A notice whose request
+/// ran against an engine since replaced (compared by identity) only frees its
+/// slot — it is a straggler from an already-handled incident, not a new one.
+///
+/// A notice that did NOT fail on the transport proves the connection is usable
+/// again, so it resets the restart budget (`record_success`); the budget is
+/// deliberately not reset by the reconnect itself (only a surviving request
+/// clears it), which bounds a server that reconnects and immediately dies.
 pub(super) fn apply_completions(
     first: Option<Done>,
     done_rx: &Receiver<Done>,
@@ -151,10 +161,18 @@ pub(super) fn apply_completions(
 ) {
     let mut transport_failed = false;
     for done in first.into_iter().chain(done_rx.try_iter()) {
-        inflight.remove(&done.call_id);
-        gate.complete();
-        if done.transport_failed && Arc::ptr_eq(&done.engine, &*engine) {
-            transport_failed = true;
+        // A call notice retires its in-flight slot; a listing notice (`None`)
+        // holds no slot and only reports transport health.
+        if let Some(call_id) = done.call_id {
+            inflight.remove(&call_id);
+            gate.complete();
+        }
+        if done.transport_failed {
+            if Arc::ptr_eq(&done.engine, &*engine) {
+                transport_failed = true;
+            }
+        } else {
+            policy.record_success();
         }
     }
     if transport_failed {
@@ -215,11 +233,24 @@ fn spawn_call(
             .await;
         let transport_failed = is_transport_error_ref(&result);
         let _ = done_tx.send(Done {
-            call_id,
+            call_id: Some(call_id),
             transport_failed,
             engine: Arc::clone(&engine),
         });
         let _ = reply.send(result);
+    });
+}
+
+/// Report a non-call operation's completion to the dispatcher.
+///
+/// A listing or resource read holds no call-gate slot, so its [`Done`] carries
+/// `call_id: None`; the dispatcher still folds it into the same coalesced
+/// transport-failure handling (and the success that resets the restart budget).
+fn report_offloaded(done_tx: &Sender<Done>, engine: &Arc<dyn McpEngine>, transport_failed: bool) {
+    let _ = done_tx.send(Done {
+        call_id: None,
+        transport_failed,
+        engine: Arc::clone(engine),
     });
 }
 
@@ -233,9 +264,7 @@ fn spawn_call(
 fn handle_command(
     cmd: McpCommand,
     rt: &tokio::runtime::Handle,
-    engine: &mut Arc<dyn McpEngine>,
-    factory: &EngineFactory,
-    policy: &mut RestartPolicy,
+    engine: &Arc<dyn McpEngine>,
     inflight: &mut HashMap<u64, (CancelToken, u64)>,
     queued: &mut VecDeque<QueuedCall>,
     gate: &mut CallGate,
@@ -244,14 +273,20 @@ fn handle_command(
 ) -> bool {
     match cmd {
         McpCommand::ListTools { timeout, reply } => {
-            let mut result = rt.block_on(engine.list_tools(timeout));
-            if let Err(e) = &result
-                && is_transport_error(e)
-            {
-                policy.on_transport_failure(factory, engine);
-                result = rt.block_on(engine.list_tools(timeout));
-            }
-            let _ = reply.send(result);
+            // Dispatch the listing onto the runtime rather than blocking the
+            // dispatcher on it (as calls already do), so a slow `tools/list`
+            // cannot stall this server's command processing. A transport
+            // failure still reaches the reconnect logic through the slot-less
+            // `Done` the task reports; the old inline retry-on-failure is
+            // dropped because the caller keeps its previous catalogue on a
+            // failure and the NEXT listing runs against the rebuilt engine.
+            let engine = Arc::clone(engine);
+            let done_tx = done_tx.clone();
+            rt.spawn(async move {
+                let result = engine.list_tools(timeout).await;
+                report_offloaded(&done_tx, &engine, is_transport_error_ref(&result));
+                let _ = reply.send(result);
+            });
         }
         McpCommand::Call {
             session_id,
@@ -278,24 +313,24 @@ fn handle_command(
             }
         }
         McpCommand::ListResources(reply) => {
-            let mut result = rt.block_on(engine.list_resources());
-            if let Err(e) = &result
-                && is_transport_error(e)
-            {
-                policy.on_transport_failure(factory, engine);
-                result = rt.block_on(engine.list_resources());
-            }
-            let _ = reply.send(result);
+            // Off-thread for the same reason as `ListTools` above.
+            let engine = Arc::clone(engine);
+            let done_tx = done_tx.clone();
+            rt.spawn(async move {
+                let result = engine.list_resources().await;
+                report_offloaded(&done_tx, &engine, is_transport_error_ref(&result));
+                let _ = reply.send(result);
+            });
         }
         McpCommand::ReadResource { uri, reply } => {
-            let mut result = rt.block_on(engine.read_resource(uri.clone()));
-            if let Err(e) = &result
-                && is_transport_error(e)
-            {
-                policy.on_transport_failure(factory, engine);
-                result = rt.block_on(engine.read_resource(uri));
-            }
-            let _ = reply.send(result);
+            // Off-thread for the same reason as `ListTools` above.
+            let engine = Arc::clone(engine);
+            let done_tx = done_tx.clone();
+            rt.spawn(async move {
+                let result = engine.read_resource(uri).await;
+                report_offloaded(&done_tx, &engine, is_transport_error_ref(&result));
+                let _ = reply.send(result);
+            });
         }
         McpCommand::CancelSession { session_id } => {
             for (token, call_session) in inflight.values() {
