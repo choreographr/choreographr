@@ -10,14 +10,16 @@
 //! The tree is split by concern: this module owns the engine, its transport
 //! selection, and the [`McpEngine`] implementation; the `http` submodule owns
 //! the Streamable HTTP transport (client, connect retry, status recovery, and
-//! the legacy-SSE probe), `handler` the client handler, `convert` the value
-//! mapping onto the crate's own types, and `call` the `tools/call` path
-//! (deadline, cancellation, progress forwarding, and the MRTR loop).
+//! the legacy-SSE probe), `handler` the client handler, `transport` the
+//! inline progress-forwarding wrapper, `convert` the value mapping onto the
+//! crate's own types, and `call` the `tools/call` path (deadline, cancellation,
+//! progress forwarding, and the MRTR loop).
 
 mod call;
 mod convert;
 mod handler;
 mod http;
+mod transport;
 
 use self::call::call_tool_impl;
 use self::convert::{
@@ -28,6 +30,7 @@ use self::http::{
     build_http_transport, connect_error_status, http_client, looks_like_legacy_sse,
     retryable_connect,
 };
+use self::transport::ProgressForwarding;
 use crate::config::{McpProtocolMode, McpServerConfig, McpTransport};
 use crate::error::McpError;
 use crate::protocol::{
@@ -118,8 +121,8 @@ pub(crate) fn connect(
     // `tokio::process` needs a runtime context, and `rmcp`'s serving loop and
     // HTTP worker do too.
     // The per-connection event broadcast is created before the transport so
-    // the `ClientHandler` (built inside the handshake) can hold its sender; the
-    // engine keeps the same sender so call tasks can subscribe.
+    // the progress-forwarding transport wrapper can hold its sender; the engine
+    // keeps the same sender so call tasks can subscribe.
     let (events, _rx) = tokio::sync::broadcast::channel(SERVER_EVENT_BUFFER);
     let running = crate::runtime::block_on(connect_transport(config, &events))??;
 
@@ -272,15 +275,20 @@ async fn connect_transport(
     config: &McpServerConfig,
     events: &tokio::sync::broadcast::Sender<handler::ServerEvent>,
 ) -> Result<RunningService<RoleClient, ServerHandler>, McpError> {
-    let handler = ServerHandler::new(client_config(config.protocol), events.clone());
+    let handler = ServerHandler::new(client_config(config.protocol));
     match &config.transport {
         McpTransport::Stdio { .. } => {
-            let transport = crate::stdio::StdioTransport::spawn(config)?;
+            // Wrap the capped stdio transport so progress notifications are
+            // forwarded inline as they are read (see `transport.rs`).
+            let transport = ProgressForwarding::new(
+                crate::stdio::StdioTransport::spawn(config)?,
+                events.clone(),
+            );
             serve_client_with_lifecycle(handler, transport, lifecycle_for(config.protocol))
                 .await
                 .map_err(|e| McpError::InitializeFailed(e.to_string()))
         }
-        McpTransport::Http { url, .. } => connect_http(config, url, handler).await,
+        McpTransport::Http { url, .. } => connect_http(config, url, handler, events.clone()).await,
     }
 }
 
@@ -297,12 +305,18 @@ async fn connect_http(
     config: &McpServerConfig,
     url: &str,
     handler: ServerHandler,
+    events: tokio::sync::broadcast::Sender<handler::ServerEvent>,
 ) -> Result<RunningService<RoleClient, ServerHandler>, McpError> {
     let client = http_client(config)?;
     let mut attempt = 0;
     loop {
         attempt += 1;
-        let transport = build_http_transport(config, client.clone())?;
+        // Wrap each attempt's transport so a retry rebuilds the progress
+        // forwarding around the fresh connection.
+        let transport = ProgressForwarding::new(
+            build_http_transport(config, client.clone())?,
+            events.clone(),
+        );
         match serve_client_with_lifecycle(
             handler.clone(),
             transport,

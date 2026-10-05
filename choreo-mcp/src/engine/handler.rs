@@ -1,15 +1,16 @@
 //! The `rmcp` [`ClientHandler`] for one connection.
 //!
 //! rmcp routes every server-to-client notification to the handler rather than
-//! to the caller that issued the request, so this is where progress, logging,
-//! and (for the legacy era) list-change notifications are turned into a
-//! [`ServerEvent`] broadcast or a `tracing` event. The handler also carries the
-//! `clientInfo` and capability object advertised to the server, and the
-//! per-connection rate limiter that bounds logging notifications.
+//! to the caller that issued the request. This handler carries the `clientInfo`
+//! and capability object advertised to the server and forwards
+//! `notifications/message` to `tracing` under a per-connection rate limiter.
+//! Progress notifications are NOT handled here: their ordering relative to a
+//! `tools/call` response would otherwise be lossy, so they are forwarded inline
+//! at the transport boundary instead (see [`super::transport`]).
 
 use rmcp::ClientHandler;
-use rmcp::model::{ClientConfig, ProgressNotificationParam, ProgressToken};
-use rmcp::service::{MaybeSendFuture, NotificationContext, RoleClient};
+use rmcp::model::{ClientConfig, ProgressToken};
+use rmcp::service::{NotificationContext, RoleClient};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,11 +26,12 @@ const MAX_LOG_NOTIFICATIONS_PER_SECOND: u32 = 100;
 
 /// A server-originated event the engine forwards to the rest of the client.
 ///
-/// The engine's [`ClientHandler`] is the only place these are produced (rmcp
-/// delivers notifications to the handler, not to a request's caller); the
-/// broadcast carries them to the in-flight call tasks that care.
+/// Progress events are produced by the transport wrapper
+/// ([`super::transport::ProgressForwarding`]), which forwards each
+/// `notifications/progress` inline as it is read; the broadcast carries them to
+/// the in-flight call tasks that care.
 #[derive(Debug, Clone)]
-pub(crate) enum ServerEvent {
+pub(super) enum ServerEvent {
     /// A `notifications/progress` for the call owning `token`.
     Progress {
         /// Correlates the notification with the originating request.
@@ -126,31 +128,26 @@ impl NotificationLimiter {
 /// The `ClientHandler` for one connection.
 ///
 /// rmcp routes every server-to-client notification here rather than to the
-/// caller that issued the request, so this is where progress, logging, and
-/// list-change notifications are turned into a [`ServerEvent`] broadcast (or,
-/// for logging, a `tracing` event). The handler also carries the `clientInfo`
-/// and capability object advertised to the server.
+/// caller that issued the request. Logging (`notifications/message`) is turned
+/// into a `tracing` event under a per-connection rate limiter; the handler also
+/// carries the `clientInfo` and capability object advertised to the server.
+/// Progress is forwarded by the transport wrapper, not here (see the module
+/// docs).
 #[derive(Clone)]
 pub(super) struct ServerHandler {
     config: ClientConfig,
-    events: tokio::sync::broadcast::Sender<ServerEvent>,
     /// Per-connection rate limiter for logging notifications.
     limiter: Arc<NotificationLimiter>,
 }
 
 impl ServerHandler {
-    /// Build the handler for one connection, advertising `config` and
-    /// forwarding server notifications onto `events`.
+    /// Build the handler for one connection, advertising `config`.
     ///
     /// The logging rate limiter is created here so the per-connection budget is
     /// owned entirely by the handler.
-    pub(super) fn new(
-        config: ClientConfig,
-        events: tokio::sync::broadcast::Sender<ServerEvent>,
-    ) -> Self {
+    pub(super) fn new(config: ClientConfig) -> Self {
         Self {
             config,
-            events,
             limiter: Arc::new(NotificationLimiter::new(MAX_LOG_NOTIFICATIONS_PER_SECOND)),
         }
     }
@@ -161,22 +158,11 @@ impl ClientHandler for ServerHandler {
         self.config.clone()
     }
 
-    fn on_progress(
-        &self,
-        params: ProgressNotificationParam,
-        _context: NotificationContext<RoleClient>,
-    ) -> impl Future<Output = ()> + MaybeSendFuture + '_ {
-        let events = self.events.clone();
-        async move {
-            // Best-effort: a lagging subscriber is dropped, not blocked.
-            let _ = events.send(ServerEvent::Progress {
-                token: params.progress_token,
-                progress: params.progress,
-                total: params.total,
-                message: params.message,
-            });
-        }
-    }
+    // Progress notifications are NOT handled here: rmcp spawns a notification
+    // callback on a separate task while resolving a response inline, so a
+    // progress callback can lag the `tools/call` response it belongs to. They
+    // are forwarded inline at the transport boundary instead (see
+    // `super::transport`), which makes the ordering deterministic.
 
     // List-changed notifications are NOT handled here: the stateless era
     // delivers them only on a `subscriptions/listen` stream, which rmcp routes
