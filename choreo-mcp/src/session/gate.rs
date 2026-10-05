@@ -69,6 +69,16 @@ impl CallGate {
         self.active += 1;
     }
 
+    /// Record that a call was parked WITHOUT going through
+    /// [`admit`](Self::admit), used while a reconnect is in flight.
+    ///
+    /// The call is pushed to the dispatcher's queue so it can be promoted once
+    /// the rebuilt engine is ready. `admit` already increments `queued` when it
+    /// refuses, so this is called only when `admit` was skipped entirely.
+    pub(super) fn queue(&mut self) {
+        self.queued += 1;
+    }
+
     /// Record that an active call finished, freeing a slot.
     pub(super) fn complete(&mut self) {
         self.active = self.active.saturating_sub(1);

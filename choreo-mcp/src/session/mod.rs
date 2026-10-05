@@ -15,20 +15,27 @@
 //! - call tasks → dispatcher: a completion notice (used to drop finished calls
 //!   from the in-flight registry and to trigger a restart on a dead transport —
 //!   a whole batch of calls lost on one transport is coalesced into a single
-//!   rebuild).
+//!   rebuild);
+//! - reconnect worker → dispatcher: the rebuilt engine, so the blocking backoff
+//!   sleep and connect run on a detached worker thread and never wedge the
+//!   dispatcher.
 //!
 //! The only shared-mutable state in the crate is the in-flight registry, and it
 //! is owned solely by the dispatcher thread (no lock); the per-call
 //! cancellation token is the sanctioned "cooperative flag" used to un-block an
-//! in-flight request.
+//! in-flight request. A transport failure starts a reconnect off the loop, so
+//! the dispatcher keeps serving commands — a session cancel still reaches
+//! in-flight calls, and shutdown still works — throughout the backoff and the
+//! rebuild; new calls arriving during a reconnect are queued rather than spawned
+//! against the dead engine, and are promoted once the rebuilt engine arrives.
 //!
 //! The tree is split by concern: this module owns the blocking facade
 //! ([`McpServer`] / [`McpServerHandle`]), the channel protocol (`McpCommand`,
 //! `CallRequest`, `EngineCall`), and the `McpEngine` backend trait; `dispatch`
 //! the dispatcher loop and its call-slot accounting; `gate` the concurrent-call
-//! admission arithmetic; `restart` the bounded transport-reconnect policy;
-//! `cancel` the cooperative cancellation token; and `util` the bounded
-//! thread-join helper.
+//! admission arithmetic; `restart` the bounded transport-reconnect policy and
+//! the off-loop `Reconnector`; `cancel` the cooperative cancellation token; and
+//! `util` the bounded thread-join helper.
 
 mod cancel;
 mod dispatch;

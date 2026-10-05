@@ -1,7 +1,7 @@
 use crate::session::cancel::CancelToken;
 use crate::session::dispatch::{DispatcherStats, Done, apply_completions, run_dispatcher};
 use crate::session::gate::CallGate;
-use crate::session::restart::RestartPolicy;
+use crate::session::restart::{Reconnector, RestartPolicy};
 
 use super::*;
 use crate::protocol::CallToolResult;
@@ -298,16 +298,20 @@ fn restart_policy_backoff_is_capped() {
 #[test]
 fn restart_policy_zero_disables_reconnect() {
     // A `max_restarts` of 0 must leave the engine untouched: the very first
-    // failure already exceeds the budget, so the factory is never called.
-    let engine: Arc<dyn McpEngine> = Arc::new(MockEngine::new(vec![], ok_result()));
-    let mut current = Arc::clone(&engine);
-    let mut policy = RestartPolicy::new(0);
-    let factory: EngineFactory =
-        Box::new(|| Ok(Arc::new(MockEngine::new(vec![], ok_result())) as Arc<dyn McpEngine>));
-    policy.on_transport_failure(&factory, &mut current);
+    // failure already exceeds the budget, so no worker is ever spawned and the
+    // factory is never called.
+    let factory_calls = Arc::new(AtomicUsize::new(0));
+    let factory = counting_factory(Arc::clone(&factory_calls));
+    let mut reconnector = Reconnector::new(factory, RestartPolicy::new(0));
+    reconnector.note_failure();
     assert!(
-        Arc::ptr_eq(&current, &engine),
-        "no rebuild happens when max_restarts is 0"
+        !reconnector.is_in_flight(),
+        "no reconnect worker is spawned when max_restarts is 0"
+    );
+    assert_eq!(
+        factory_calls.load(Ordering::SeqCst),
+        0,
+        "the factory is never called when max_restarts is 0"
     );
 }
 
@@ -329,15 +333,30 @@ fn counting_factory(counter: Arc<AtomicUsize>) -> EngineFactory {
     })
 }
 
+/// Drive a reconnect to completion deterministically: block on the worker's
+/// result and swap in the fresh engine when it built one.
+///
+/// The worker always sends exactly one result, so a blocking `recv` is
+/// deterministic — never a `recv_timeout`/sleep poll (forbidden in unit tests).
+fn await_reconnect(reconnector: &mut Reconnector, current: &mut Arc<dyn McpEngine>) {
+    let result = reconnector
+        .receiver()
+        .recv()
+        .expect("reconnect worker always sends its result");
+    if let Some(fresh) = reconnector.take_result(result) {
+        *current = fresh;
+    }
+}
+
 #[test]
 fn batched_transport_failures_reconnect_once() {
-    // Two calls lost on the same transport: the drain batch must rebuild the
-    // engine exactly once, not once per notice.
+    // Two calls lost on the same transport: the drain batch must spawn exactly
+    // one reconnect worker, not one per notice.
     let engine: Arc<dyn McpEngine> = Arc::new(MockEngine::new(vec![], ok_result()));
     let mut current = Arc::clone(&engine);
     let factory_calls = Arc::new(AtomicUsize::new(0));
     let factory = counting_factory(Arc::clone(&factory_calls));
-    let mut policy = zero_backoff_policy();
+    let mut reconnector = Reconnector::new(factory, zero_backoff_policy());
     let mut gate = CallGate::new(4);
     assert!(gate.admit() && gate.admit());
     let mut inflight = HashMap::new();
@@ -360,13 +379,17 @@ fn batched_transport_failures_reconnect_once() {
         &done_rx,
         &mut inflight,
         &mut gate,
-        &mut policy,
-        &factory,
-        &mut current,
+        &mut reconnector,
+        &current,
     );
 
     assert!(inflight.is_empty(), "every completed call is dropped");
     assert_eq!(gate.active, 0, "every completed call frees its slot");
+    assert!(
+        reconnector.is_in_flight(),
+        "the batch starts exactly one reconnect worker"
+    );
+    await_reconnect(&mut reconnector, &mut current);
     assert_eq!(
         factory_calls.load(Ordering::SeqCst),
         1,
@@ -383,7 +406,7 @@ fn straggler_failure_after_reconnect_does_not_reconnect_again() {
     let mut current = Arc::clone(&engine);
     let factory_calls = Arc::new(AtomicUsize::new(0));
     let factory = counting_factory(Arc::clone(&factory_calls));
-    let mut policy = zero_backoff_policy();
+    let mut reconnector = Reconnector::new(factory, zero_backoff_policy());
     let mut gate = CallGate::new(4);
     let mut inflight = HashMap::new();
     let (done_tx, done_rx) = crossbeam_channel::unbounded();
@@ -403,10 +426,10 @@ fn straggler_failure_after_reconnect_does_not_reconnect_again() {
         &done_rx,
         &mut inflight,
         &mut gate,
-        &mut policy,
-        &factory,
-        &mut current,
+        &mut reconnector,
+        &current,
     );
+    await_reconnect(&mut reconnector, &mut current);
     assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
 
     // Second batch: a straggler carrying the OLD engine must not reconnect.
@@ -424,12 +447,15 @@ fn straggler_failure_after_reconnect_does_not_reconnect_again() {
         &done_rx,
         &mut inflight,
         &mut gate,
-        &mut policy,
-        &factory,
-        &mut current,
+        &mut reconnector,
+        &current,
     );
 
     assert!(inflight.is_empty());
+    assert!(
+        !reconnector.is_in_flight(),
+        "a straggler does not start a reconnect"
+    );
     assert_eq!(
         factory_calls.load(Ordering::SeqCst),
         1,
@@ -448,11 +474,14 @@ fn restart_budget_is_not_reset_by_a_reconnect_alone() {
     let factory = counting_factory(Arc::clone(&factory_calls));
     // A budget of one attempt. After the first incident it is spent; because a
     // reconnect does NOT reset it, the second incident must not reconnect again.
-    let mut policy = RestartPolicy {
-        max_attempts: 1,
-        base_backoff: Duration::ZERO,
-        failures: 0,
-    };
+    let mut reconnector = Reconnector::new(
+        factory,
+        RestartPolicy {
+            max_attempts: 1,
+            base_backoff: Duration::ZERO,
+            failures: 0,
+        },
+    );
     let mut gate = CallGate::new(4);
     let mut inflight = HashMap::new();
     let (done_tx, done_rx) = crossbeam_channel::unbounded();
@@ -472,10 +501,10 @@ fn restart_budget_is_not_reset_by_a_reconnect_alone() {
         &done_rx,
         &mut inflight,
         &mut gate,
-        &mut policy,
-        &factory,
-        &mut current,
+        &mut reconnector,
+        &current,
     );
+    await_reconnect(&mut reconnector, &mut current);
     assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
 
     // Incident 2 on the REBUILT engine: the budget is already spent, so no
@@ -494,9 +523,12 @@ fn restart_budget_is_not_reset_by_a_reconnect_alone() {
         &done_rx,
         &mut inflight,
         &mut gate,
-        &mut policy,
-        &factory,
-        &mut current,
+        &mut reconnector,
+        &current,
+    );
+    assert!(
+        !reconnector.is_in_flight(),
+        "the spent budget spawns no worker"
     );
     assert_eq!(
         factory_calls.load(Ordering::SeqCst),
@@ -514,11 +546,14 @@ fn clean_completion_resets_the_restart_budget() {
     let mut current = Arc::clone(&engine);
     let factory_calls = Arc::new(AtomicUsize::new(0));
     let factory = counting_factory(Arc::clone(&factory_calls));
-    let mut policy = RestartPolicy {
-        max_attempts: 1,
-        base_backoff: Duration::ZERO,
-        failures: 0,
-    };
+    let mut reconnector = Reconnector::new(
+        factory,
+        RestartPolicy {
+            max_attempts: 1,
+            base_backoff: Duration::ZERO,
+            failures: 0,
+        },
+    );
     let mut gate = CallGate::new(4);
     let mut inflight = HashMap::new();
     let (done_tx, done_rx) = crossbeam_channel::unbounded();
@@ -538,11 +573,14 @@ fn clean_completion_resets_the_restart_budget() {
         &done_rx,
         &mut inflight,
         &mut gate,
-        &mut policy,
-        &factory,
-        &mut current,
+        &mut reconnector,
+        &current,
     );
-    assert_eq!(policy.failures, 0, "a clean completion resets the budget");
+    assert_eq!(
+        reconnector.failures(),
+        0,
+        "a clean completion resets the budget"
+    );
 
     // ...so a following incident still reconnects within the budget.
     assert!(gate.admit());
@@ -559,10 +597,11 @@ fn clean_completion_resets_the_restart_budget() {
         &done_rx,
         &mut inflight,
         &mut gate,
-        &mut policy,
-        &factory,
-        &mut current,
+        &mut reconnector,
+        &current,
     );
+    assert!(reconnector.is_in_flight());
+    await_reconnect(&mut reconnector, &mut current);
     assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
 }
 

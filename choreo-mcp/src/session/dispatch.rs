@@ -2,14 +2,18 @@
 //! call registry.
 //!
 //! The loop drains completion notices, starts queued calls into any freed
-//! slots, then blocks on the next command or completion. All mutable state
-//! (the engine, the restart policy, the in-flight map, the queued deque, and
-//! the admission [`CallGate`]) lives on this thread — no lock.
+//! slots, then blocks on the next command, completion, or reconnect result. All
+//! mutable state (the engine, the reconnector, the in-flight map, the queued
+//! deque, and the admission [`CallGate`]) lives on this thread — no lock. A
+//! transport failure starts a reconnect on a detached worker thread (see
+//! [`Reconnector`]) so this loop keeps serving commands — cancels and shutdown
+//! included — throughout the backoff and the rebuild; new calls are queued, not
+//! spawned against the dead engine, until the rebuild completes.
 
 use crate::error::McpError;
 use crate::session::cancel::CancelToken;
 use crate::session::gate::{CallGate, QueuedCall};
-use crate::session::restart::{RestartPolicy, is_transport_error_ref};
+use crate::session::restart::{Reconnector, RestartPolicy, is_transport_error_ref};
 use crate::session::{EngineCall, EngineFactory, McpCommand, McpEngine};
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::{HashMap, VecDeque};
@@ -56,7 +60,7 @@ pub(super) fn run_dispatcher(
     };
 
     let mut engine = initial;
-    let mut policy = RestartPolicy::new(max_restarts);
+    let mut reconnector = Reconnector::new(factory, RestartPolicy::new(max_restarts));
     let mut inflight: HashMap<u64, (CancelToken, u64)> = HashMap::new();
     let mut queued: VecDeque<QueuedCall> = VecDeque::new();
     let mut gate = CallGate::new(max_concurrent_calls);
@@ -65,9 +69,14 @@ pub(super) fn run_dispatcher(
     // Completion notices from spawned call tasks; drained between commands.
     let (done_tx, done_rx) = crossbeam_channel::unbounded::<Done>();
 
+    // The reconnect worker's result channel, cloned out of the reconnector so
+    // the `select!` can observe a finished reconnect without borrowing the
+    // reconnector across an arm that mutates it (`Receiver` is `Clone`).
+    let reconnect_rx = reconnector.receiver().clone();
+
     loop {
         // Drain completion notices before waiting: a finished call frees a slot
-        // and, if it died on the transport, triggers a reconnect. The whole
+        // and, if it died on the transport, starts a reconnect. The whole
         // available batch is coalesced into at most ONE reconnect, so N requests
         // lost on one dead transport cost one rebuild, not N.
         apply_completions(
@@ -75,23 +84,26 @@ pub(super) fn run_dispatcher(
             &done_rx,
             &mut inflight,
             &mut gate,
-            &mut policy,
-            &factory,
-            &mut engine,
-        );
-        // Start queued calls into any slots the completions freed.
-        pump_queued(
-            &mut queued,
-            &mut gate,
-            &mut inflight,
-            &rt,
+            &mut reconnector,
             &engine,
-            &done_tx,
         );
+        // Start queued calls into any slots the completions freed — but only
+        // when no reconnect is in flight, since promoting calls against a dead
+        // engine would just fail them; they wait for the rebuilt engine.
+        if !reconnector.is_in_flight() {
+            pump_queued(
+                &mut queued,
+                &mut gate,
+                &mut inflight,
+                &rt,
+                &engine,
+                &done_tx,
+            );
+        }
 
-        // Wait for the next command or completion. Both are event sources, so no
-        // polling: a finished call wakes the loop to free its slot even when no
-        // command has arrived.
+        // Wait for the next command, completion, or reconnect result. All are
+        // event sources, so no polling: a finished call wakes the loop to free
+        // its slot even when no command has arrived.
         crossbeam_channel::select! {
             recv(cmd_rx) -> msg => {
                 if let Ok(cmd) = msg {
@@ -104,6 +116,7 @@ pub(super) fn run_dispatcher(
                         &mut gate,
                         &done_tx,
                         &mut next_call_id,
+                        reconnector.is_in_flight(),
                     );
                     if !keep_running {
                         break;
@@ -122,10 +135,19 @@ pub(super) fn run_dispatcher(
                         &done_rx,
                         &mut inflight,
                         &mut gate,
-                        &mut policy,
-                        &factory,
-                        &mut engine,
+                        &mut reconnector,
+                        &engine,
                     );
+                }
+            }
+            recv(reconnect_rx) -> msg => {
+                // The reconnect worker finished: adopt the rebuilt engine when
+                // it succeeded, leaving the old one in place on failure so a
+                // later incident retries within the budget.
+                if let Ok(result) = msg
+                    && let Some(fresh) = reconnector.take_result(result)
+                {
+                    engine = fresh;
                 }
             }
         }
@@ -135,16 +157,18 @@ pub(super) fn run_dispatcher(
 
 /// Apply the completion notices currently available — `first`, when the caller
 /// already received one from the `select!`, plus everything else the channel
-/// holds — freeing each call's slot and rebuilding the engine AT MOST ONCE if
-/// any notice died on the transport.
+/// holds — freeing each call's slot and reporting AT MOST ONE transport
+/// failure to the reconnector.
 ///
 /// One dead transport fails every in-flight request at once, each sending its
-/// own notice; rebuilding per notice would recreate the engine (with a backoff
-/// sleep) once per request for a single incident. The batch is coalesced: the
-/// reconnect happens once, after the whole batch is drained, so `pump_queued`
-/// then starts queued calls against the rebuilt engine. A notice whose request
-/// ran against an engine since replaced (compared by identity) only frees its
-/// slot — it is a straggler from an already-handled incident, not a new one.
+/// own notice; reporting each separately would charge the restart budget once
+/// per request for a single incident. The batch is coalesced: the single
+/// [`Reconnector::note_failure`] happens once, after the whole batch is drained
+/// (and, being idempotent while a reconnect is in flight, spawns only one
+/// worker), so `pump_queued` then starts queued calls against the rebuilt
+/// engine once it arrives. A notice whose request ran against an engine since
+/// replaced (compared by identity) only frees its slot — it is a straggler from
+/// an already-handled incident, not a new one.
 ///
 /// A notice that did NOT fail on the transport proves the connection is usable
 /// again, so it resets the restart budget (`record_success`); the budget is
@@ -155,9 +179,8 @@ pub(super) fn apply_completions(
     done_rx: &Receiver<Done>,
     inflight: &mut HashMap<u64, (CancelToken, u64)>,
     gate: &mut CallGate,
-    policy: &mut RestartPolicy,
-    factory: &EngineFactory,
-    engine: &mut Arc<dyn McpEngine>,
+    reconnector: &mut Reconnector,
+    engine: &Arc<dyn McpEngine>,
 ) {
     let mut transport_failed = false;
     for done in first.into_iter().chain(done_rx.try_iter()) {
@@ -168,15 +191,17 @@ pub(super) fn apply_completions(
             gate.complete();
         }
         if done.transport_failed {
-            if Arc::ptr_eq(&done.engine, &*engine) {
+            // A straggler from an already-replaced engine is ignored, so it
+            // cannot charge the budget for an incident already handled.
+            if Arc::ptr_eq(&done.engine, engine) {
                 transport_failed = true;
             }
         } else {
-            policy.record_success();
+            reconnector.record_success();
         }
     }
     if transport_failed {
-        policy.on_transport_failure(factory, engine);
+        reconnector.note_failure();
     }
 }
 
@@ -257,6 +282,10 @@ fn report_offloaded(done_tx: &Sender<Done>, engine: &Arc<dyn McpEngine>, transpo
 /// Dispatch one command, returning `false` when the dispatcher should stop
 /// (i.e. the command was a shutdown). Split out of [`run_dispatcher`] so the
 /// (long) match does not have to be nested inside the `select!` arm.
+///
+/// `reconnecting` is true while a transport rebuild is in flight; a new call is
+/// then parked (and accounted via [`CallGate::queue`]) rather than spawned
+/// against the dead engine, and is promoted once the rebuilt engine arrives.
 #[expect(
     clippy::too_many_arguments,
     reason = "the dispatcher's mutable state is all owned on the thread; bundling it into a struct would add indirection without clarifying anything"
@@ -270,6 +299,7 @@ fn handle_command(
     gate: &mut CallGate,
     done_tx: &Sender<Done>,
     next_call_id: &mut u64,
+    reconnecting: bool,
 ) -> bool {
     match cmd {
         McpCommand::ListTools { timeout, reply } => {
@@ -306,10 +336,17 @@ fn handle_command(
                 chunk_tx,
                 cancel: cancel.clone(),
             };
-            if gate.admit() {
+            if !reconnecting && gate.admit() {
                 inflight.insert(call_id, (cancel, session_id));
                 spawn_call(rt, engine, done_tx, call);
             } else {
+                // While a reconnect is in flight `admit` is skipped entirely, so
+                // the parked call must be accounted here; when not reconnecting
+                // `admit` already incremented `queued` by refusing, so counting
+                // it again would be wrong.
+                if reconnecting {
+                    gate.queue();
+                }
                 queued.push_back(call);
             }
         }
