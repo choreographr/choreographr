@@ -41,7 +41,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -464,8 +463,9 @@ pub(crate) struct SpawnedToolExecution {
     /// Send to stop the forwarding thread (also stops when the sender is
     /// dropped, e.g. by the serial path's drop guard).
     kill_tx: crossbeam_channel::Sender<()>,
-    /// The tool may emit one image here during execution.
-    image_rx: mpsc::Receiver<PreparedImage>,
+    /// Images the tool emits during execution (an MCP result can carry
+    /// several, so this is a multi-message stream, not a one-shot reply).
+    image_rx: crossbeam_channel::Receiver<PreparedImage>,
     /// Forwarding-thread handle, kept alive for this frame then detached
     /// (never joined) so the thread can finish a busy stream in the
     /// background after the caller stops waiting. Named without the
@@ -503,7 +503,7 @@ pub(crate) struct ToolExecutionSpec<'a> {
 /// blocks on `send` instead of buffering an unbounded number of chunks in
 /// memory (backpressure, matching the SSE reader's bounded channel).  The
 /// forwarder drains continuously and the session command channel it forwards
-/// into is unbounded (std `mpsc::Sender::send` never blocks), so this cannot
+/// into is unbounded (an unbounded `send` never blocks), so this cannot
 /// deadlock; when the forwarder exits it drops the receiver, failing any
 /// blocked `send`.
 pub(crate) fn spawn_tool_execution(spec: ToolExecutionSpec<'_>) -> SpawnedToolExecution {
@@ -530,8 +530,9 @@ pub(crate) fn spawn_tool_execution(spec: ToolExecutionSpec<'_>) -> SpawnedToolEx
     // waiting (also fires when the sender is dropped).
     let (kill_tx, kill_rx) = crossbeam_channel::unbounded::<()>();
 
-    // The tool may emit one image during execution.
-    let (image_tx, image_rx) = mpsc::channel::<PreparedImage>();
+    // Images the tool emits during execution — multi-message (an MCP result
+    // can carry several image blocks), so it lives on crossbeam.
+    let (image_tx, image_rx) = crossbeam_channel::unbounded::<PreparedImage>();
 
     // ── Forwarding thread ──────────────────────────────────────────
     //

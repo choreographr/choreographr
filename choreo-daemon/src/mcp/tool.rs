@@ -9,7 +9,6 @@ use choreo_mcp::{CallToolResult, McpContent, McpServerHandle};
 use crossbeam_channel;
 use serde_json::Value;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc;
 
 /// Upper bound on the joined text an MCP result contributes to the model.
 ///
@@ -281,7 +280,7 @@ impl ToolDyn for McpToolWrapper {
         _x_credentials: Option<&ServiceCredential>,
         _working_dir: Option<&std::path::Path>,
         ctx: Option<&ToolContext>,
-        image_tx: Option<mpsc::Sender<PreparedImage>>,
+        image_tx: Option<crossbeam_channel::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError> {
         if is_cancelled(ctx) {
             return Ok(cancelled_output());
@@ -349,7 +348,7 @@ impl ToolDyn for McpToolWrapper {
         _working_dir: Option<&std::path::Path>,
         output_tx: crossbeam_channel::Sender<Vec<u8>>,
         ctx: Option<&ToolContext>,
-        image_tx: Option<mpsc::Sender<PreparedImage>>,
+        image_tx: Option<crossbeam_channel::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError> {
         if is_cancelled(ctx) {
             return Ok(cancelled_output());
@@ -511,7 +510,7 @@ impl ToolDyn for McpListResourcesTool {
         _x_credentials: Option<&ServiceCredential>,
         _working_dir: Option<&std::path::Path>,
         _ctx: Option<&ToolContext>,
-        _image_tx: Option<mpsc::Sender<PreparedImage>>,
+        _image_tx: Option<crossbeam_channel::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError> {
         let listed = self
             .handle
@@ -551,7 +550,7 @@ impl ToolDyn for McpListResourcesTool {
         working_dir: Option<&std::path::Path>,
         _output_tx: crossbeam_channel::Sender<Vec<u8>>,
         ctx: Option<&ToolContext>,
-        image_tx: Option<mpsc::Sender<PreparedImage>>,
+        image_tx: Option<crossbeam_channel::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError> {
         // Not a streaming tool: the catalogue is one result.
         self.execute_json(args_json, format, x_credentials, working_dir, ctx, image_tx)
@@ -660,7 +659,7 @@ impl ToolDyn for McpReadResourceTool {
         _x_credentials: Option<&ServiceCredential>,
         _working_dir: Option<&std::path::Path>,
         _ctx: Option<&ToolContext>,
-        _image_tx: Option<mpsc::Sender<PreparedImage>>,
+        _image_tx: Option<crossbeam_channel::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError> {
         let args = parse_json_args(args_json)?;
         let uri = Self::uri_arg(&args)?;
@@ -698,7 +697,7 @@ impl ToolDyn for McpReadResourceTool {
         working_dir: Option<&std::path::Path>,
         _output_tx: crossbeam_channel::Sender<Vec<u8>>,
         ctx: Option<&ToolContext>,
-        image_tx: Option<mpsc::Sender<PreparedImage>>,
+        image_tx: Option<crossbeam_channel::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError> {
         // Not a streaming tool: a resource read is one result.
         self.execute_json(args_json, format, x_credentials, working_dir, ctx, image_tx)

@@ -123,7 +123,7 @@ fn mcp_fixture_tools_are_discovered_and_callable() {
         arguments_json: "{}".to_string(),
         caller: None,
     };
-    let (image_tx, image_rx) = std::sync::mpsc::channel();
+    let (image_tx, image_rx) = crossbeam_channel::unbounded();
     let image_output = registry
         .execute_json(
             &image_call,

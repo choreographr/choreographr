@@ -2347,8 +2347,10 @@ them directly, from generated JavaScript, or both.
 
 Tools that produce images (e.g. `display_image`) override `extract_image()` to return a
 `PreparedImage` from the typed return value. The conversion layer (see `ToolDyn` below)
-sends the image through an out-of-band `image_tx: Option<mpsc::Sender<PreparedImage>>`
-channel rather than embedding it in the response struct. The agent loop drains this
+sends the image through an out-of-band `image_tx: Option<crossbeam_channel::Sender<PreparedImage>>`
+channel rather than embedding it in the response struct — a tool can emit several
+images (an MCP result may carry multiple image blocks), so the sink is a
+multi-message channel. The agent loop drains this
 channel after execution to persist and broadcast the image.
 
 ### `ToolDyn` — type-erased dispatch trait
@@ -3439,8 +3441,9 @@ is set.
 
 ### Image flow (tool-triggered)
 
-Images are delivered out-of-band via a one-shot `mpsc` channel rather than embedded in
-`ToolOutput`:
+Images are delivered out-of-band via a crossbeam channel rather than embedded in
+`ToolOutput` (a tool can emit several — an MCP result may carry multiple image
+blocks):
 
 ```
 Model calls display_image tool

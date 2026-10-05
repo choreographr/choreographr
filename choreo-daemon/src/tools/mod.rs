@@ -15,7 +15,6 @@ use std::sync::Arc;
 
 use crate::tools::ios_bridge::IosToolBridge;
 use std::sync::OnceLock;
-use std::sync::mpsc;
 
 /// Helper: encode Result<Result<R, E>, `ToolError`> as postcard bytes.
 /// Used by `execute_postcard` to produce a single byte buffer containing
@@ -118,7 +117,7 @@ impl From<choreo_content::ContentError> for ToolExecError {
 /// faster than the forwarder can broadcast to subscribers blocks on `send`
 /// instead of buffering an unbounded number of chunks in memory. The
 /// forwarder drains continuously and the session command channel it forwards
-/// into is unbounded (std `mpsc::Sender::send` never blocks), so this cannot
+/// into is unbounded (an unbounded `send` never blocks), so this cannot
 /// deadlock; on kill the forwarder exits and drops the receiver, failing any
 /// blocked `send`. Matches the SSE reader's bounded-channel design
 /// (`SSE_CHANNEL_CAPACITY` in choreo-ai-protocols).
@@ -451,7 +450,7 @@ pub trait ToolDyn: Send + Sync {
         x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&std::path::Path>,
         ctx: Option<&context::ToolContext>,
-        image_tx: Option<mpsc::Sender<PreparedImage>>,
+        image_tx: Option<crossbeam_channel::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError>;
 
     #[expect(clippy::too_many_arguments)]
@@ -469,7 +468,7 @@ pub trait ToolDyn: Send + Sync {
         working_dir: Option<&std::path::Path>,
         output_tx: crossbeam_channel::Sender<Vec<u8>>,
         ctx: Option<&context::ToolContext>,
-        image_tx: Option<mpsc::Sender<PreparedImage>>,
+        image_tx: Option<crossbeam_channel::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError>;
 
     /// Postcard binary path — args from postcard, returns bytes encoding
@@ -523,7 +522,7 @@ impl<T: Tool + 'static> ToolDyn for T {
         x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&std::path::Path>,
         ctx: Option<&context::ToolContext>,
-        image_tx: Option<mpsc::Sender<PreparedImage>>,
+        image_tx: Option<crossbeam_channel::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError> {
         let args = serde_json::from_str::<T::Args>(args_json)?;
         let desc = T::describe_invocation(self, &args);
@@ -587,7 +586,7 @@ impl<T: Tool + 'static> ToolDyn for T {
         working_dir: Option<&std::path::Path>,
         output_tx: crossbeam_channel::Sender<Vec<u8>>,
         ctx: Option<&context::ToolContext>,
-        image_tx: Option<mpsc::Sender<PreparedImage>>,
+        image_tx: Option<crossbeam_channel::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError> {
         let args = serde_json::from_str::<T::Args>(args_json)?;
         let desc = T::describe_invocation(self, &args);
@@ -962,7 +961,7 @@ impl ToolRegistry {
         x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&std::path::Path>,
         ctx: Option<&context::ToolContext>,
-        image_tx: Option<mpsc::Sender<PreparedImage>>,
+        image_tx: Option<crossbeam_channel::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError> {
         match self.tools.get(tool_call.name.as_str()) {
             Some(tool) => tool.execute_json(
@@ -995,7 +994,7 @@ impl ToolRegistry {
         x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&std::path::Path>,
         ctx: Option<&context::ToolContext>,
-        image_tx: Option<mpsc::Sender<PreparedImage>>,
+        image_tx: Option<crossbeam_channel::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError> {
         match self.tools.get(tool_call.name.as_str()) {
             Some(tool) => tool.execute_streaming_json(

@@ -13,6 +13,7 @@ use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(test)]
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -140,7 +141,7 @@ fn push_client_thread(
 /// over the channel since the last drain, routing them through
 /// [`push_client_thread`].
 fn drain_tcp_handles(
-    rx: &mpsc::Receiver<thread::JoinHandle<()>>,
+    rx: &crossbeam_channel::Receiver<thread::JoinHandle<()>>,
     client_threads: &mut Vec<thread::JoinHandle<()>>,
 ) {
     while let Ok(handle) = rx.try_recv() {
@@ -317,13 +318,13 @@ pub fn run_server(
     // than inside the spawned thread — closes the same startup race as the
     // Unix path above.
     #[cfg(windows)]
-    let windows_signal_rx: Option<mpsc::Receiver<()>> = {
+    let windows_signal_rx: Option<crossbeam_channel::Receiver<()>> = {
         use signal_hook::consts::{SIGINT, SIGTERM};
-        let (sig_tx, sig_rx) = mpsc::channel::<()>();
+        let (sig_tx, sig_rx) = crossbeam_channel::unbounded::<()>();
         let int_tx = sig_tx.clone();
         let term_tx = sig_tx;
         // SAFETY: on Windows the registered action runs on the CRT's
-        // console-handler thread, where an mpsc send is safe (no POSIX
+        // console-handler thread, where a channel send is safe (no POSIX
         // async-signal restrictions apply); the senders are moved into the
         // registrations and outlive them.
         match unsafe {
@@ -469,7 +470,7 @@ pub fn run_server(
     // spawned inside the accept thread, so their JoinHandles are ferried back
     // over a channel.
     let mut client_threads: Vec<thread::JoinHandle<()>> = Vec::new();
-    let (tcp_client_tx, tcp_client_rx) = mpsc::channel::<thread::JoinHandle<()>>();
+    let (tcp_client_tx, tcp_client_rx) = crossbeam_channel::unbounded::<thread::JoinHandle<()>>();
 
     // Daemon-wide live-connection counter backing MAX_CONCURRENT_CONNECTIONS
     // (created in start_daemon_core — see DaemonCore::conn_count for why it

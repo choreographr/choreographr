@@ -25,7 +25,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc;
 #[cfg(feature = "mcp")]
 use std::time::{Duration, Instant};
 #[cfg(feature = "mcp")]
@@ -321,7 +320,7 @@ impl ProjectToolSet {
         x_credentials: Option<&choreo_keystore::ServiceCredential>,
         working_dir: Option<&Path>,
         ctx: Option<&crate::tools::context::ToolContext>,
-        image_tx: Option<mpsc::Sender<crate::tools::PreparedImage>>,
+        image_tx: Option<crossbeam_channel::Sender<crate::tools::PreparedImage>>,
     ) -> Option<Result<ToolOutput, ToolError>> {
         self.tools
             .iter()
@@ -353,7 +352,7 @@ impl ProjectToolSet {
         x_credentials: Option<&choreo_keystore::ServiceCredential>,
         working_dir: Option<&Path>,
         ctx: Option<&crate::tools::context::ToolContext>,
-        image_tx: Option<mpsc::Sender<crate::tools::PreparedImage>>,
+        image_tx: Option<crossbeam_channel::Sender<crate::tools::PreparedImage>>,
     ) -> Option<Result<ToolOutput, ToolError>> {
         self.tools
             .iter()
@@ -911,7 +910,7 @@ impl McpManager {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    warn!(root = %root.display(), error = %e, "failed to read project .mcp.json")
+                    warn!(root = %root.display(), error = %e, "failed to read project .mcp.json");
                 }
             }
         }

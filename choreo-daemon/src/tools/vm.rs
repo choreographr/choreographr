@@ -724,7 +724,7 @@ struct ChoreographrSyscall {
     registry: Arc<ToolRegistry>,
     x_credentials: Option<ServiceCredential>,
     working_dir: Option<PathBuf>,
-    output_tx: mpsc::Sender<Vec<u8>>,
+    output_tx: crossbeam_channel::Sender<Vec<u8>>,
     write_tx: Option<crossbeam_channel::Sender<Vec<u8>>>,
     ctx: Option<crate::tools::context::ToolContext>,
     /// Shared byte budget for guest WRITE output (accumulated and streamed
@@ -1219,7 +1219,7 @@ fn run_riscv_impl(
         return tool_err("memory_size cannot exceed 4MB (ckb-vm RISCV_MAX_MEMORY)");
     }
 
-    let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
+    let (output_tx, output_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
     // One-shot truncation signal from the guest-WRITE syscall: the runner
     // reads it after the machine exits to decide whether the finish footer
     // carries the `...[truncated]` marker (see the syscall struct docs).
@@ -1360,7 +1360,7 @@ fn run_riscv_impl(
 /// Drain all buffered VM output after the machine sender has been dropped.
 /// Uses a blocking `recv()` loop that terminates deterministically once the
 /// sender end is gone (the channel is disconnected).
-fn drain_vm_output(rx: &mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+fn drain_vm_output(rx: &crossbeam_channel::Receiver<Vec<u8>>) -> Vec<u8> {
     let mut out = Vec::new();
     while let Ok(chunk) = rx.recv() {
         out.extend_from_slice(&chunk);
@@ -1995,7 +1995,7 @@ mod tests {
             .store_bytes(addr, &chunk)
             .expect("store payload");
 
-        let (accum_tx, accum_rx) = mpsc::channel::<Vec<u8>>();
+        let (accum_tx, accum_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
         let (stream_tx, stream_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
         let (trunc_tx, trunc_rx) = mpsc::channel::<()>();
         let mut syscall = ChoreographrSyscall {
