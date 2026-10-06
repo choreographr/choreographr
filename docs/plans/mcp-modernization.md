@@ -237,6 +237,17 @@ phases. What exists now:
   `McpReloadFailed`, `/mcp reload` in the TUI/GUI/IM, and
   `choreographr mcp reload` over the running daemon's socket. A malformed
   config is a hard error with no state change.
+- Post-M1 provider hardening (`64e63c2`, `3e5237e`, `3272066`): MCP tool names
+  are provider-safe — built as `mcp__<slug>__<tool>`, joined with `__` rather
+  than a path-style `/`, which is outside a provider's function-name alphabet
+  and, as a single illegal name, rejected the entire tool list (`64e63c2`, D5);
+  every wrapper normalizes its server-supplied schema at construction — the
+  top-level `$schema`/`title` draft keys a provider refuses are stripped while
+  `$defs`/`$ref` are preserved — and bounds each description at 8 KiB
+  (`3e5237e`); and the turn's assembled tool list is preflight-validated against
+  the provider wire contract, so a definition the provider would reject is
+  dropped with a warning naming the session and the tool instead of invalidating
+  the whole request (`3272066`).
 
 Deltas the plan now tracks (detailed in §7): the config key `exposure` is not
 implemented (it defers with the deferred-tool-loading work); `auto_load` was
@@ -546,6 +557,7 @@ missing capability that blocks real servers; **S3** = robustness/quality;
 | G20 | Integration tests depend on Node/npx + network | S3 | `tests/it/*` | **Closed (P0)** — in-tree fixture server, shared via `include!` |
 | G21 | No user surface: no `/mcp`, no status, no login/logout | S3 | nothing in `choreo-tui` | **Closed (P5)** — `/mcp` status + `mcp reconnect <slug>` in the TUI and `choreographr mcp list/add/remove/reconnect` CLI (login/logout is P3) |
 | G22 | `lib.rs` claims HTTP support that does not exist; unused error variants | S4 | `lib.rs`, `error.rs` | **Closed (P0)** |
+| G23 | A single MCP tool definition a provider rejects (illegal function name, non-object `parameters`) invalidates the WHOLE turn — a bare, bodiless 400 names no offender, leaving nothing to diagnose | S1 | tools registered as `mcp/<slug>/<tool>`; schemas and descriptions forwarded verbatim | **Closed (post-M1)** — provider-safe `mcp__<slug>__<tool>` names (`64e63c2`), schema normalization + description bounding (`3e5237e`), and a preflight validator over the assembled turn tool list that drops only the offender (`3272066`) |
 
 ---
 
@@ -649,10 +661,13 @@ or truncation collides. Description prefix `[MCP <slug>] ` is kept (stable
 prompt text). `title`/`icons`/`annotations` are captured into group metadata
 for later UI use but never fed to the model as instructions (untrusted).
 
-Status: the `__`-joined name format and description prefix landed in P0/P1 (the
-separator was `/` until it was found to reject every request carrying an MCP
-tool); the sanitizer, 64-char cap, and collision hash landed in P5 (`f037383`,
-G18). `title`/`icons`/`annotations` capture is not yet implemented (post-ship
+Status: the description prefix `[MCP <slug>] ` landed in P0/P1. The `__`-joined
+provider name was re-confirmed in the post-M1 provider-hardening pass
+(`64e63c2`), which pins the whole built name (not just each segment) to the
+provider alphabet in a unit test: a path-style `/` is outside `[A-Za-z0-9_-]`,
+and a single illegal name rejects the entire tool list. The sanitizer, 64-char
+cap, and collision hash landed in P5 (`f037383`, G18).
+`title`/`icons`/`annotations` capture is not yet implemented (post-ship
 UI work).
 
 ### D6 — Concurrency, deadlines, cancellation
@@ -1213,6 +1228,29 @@ Post-ship (fast-follow, around P3):
       subscribe on `ConfigWatcher` alongside overlay/accounts, fingerprint-gate
       the re-read, and forward the reload to the command loop; user file only
       (the project layer stays on the explicit command).
+- [x] MCP tool names are provider-safe — `mcp__<slug>__<tool>`, joined with `__`
+      not a path-style `/` — landed (`64e63c2`); a unit test pins the whole built
+      name to the provider alphabet (D5).
+- [x] MCP tool schemas are normalized at wrapper construction (top-level
+      `$schema`/`title` stripped, `$defs`/`$ref` preserved) and each description
+      is bounded at 8 KiB — landed (`3e5237e`).
+- [x] The turn's assembled tool list is preflight-validated against the provider
+      wire contract; an invalid definition is dropped with a warning naming the
+      session and the tool rather than rejecting the whole request — landed
+      (`3272066`).
+- [ ] Turn-level rejection recovery: on a provider 4xx whose body *names* the
+      offending tool (e.g. OpenAI's `Invalid 'tools[N].function.name'`), parse
+      the tool, exclude it from that turn's tool list, and retry the turn once
+      (bounded), so one bad tool cannot brick a session. Deferred: it only fires
+      when the provider *names* the offender, so a gateway that answers with a
+      bare 400 and an empty body — the exact case the preflight validator now
+      prevents — gives it nothing to parse; reconsider only if a provider that
+      names offenders becomes a primary target.
+- [ ] Mediated egress for MCP servers (ironclaw-style): route a server's
+      outbound network through a single host-controlled egress seam so a server
+      cannot exfiltrate data or reach arbitrary hosts. Deferred: this is an
+      architectural project (a new host-mediated egress boundary), not a patch;
+      the residual risk and current mitigations are recorded in §9/§12/§13.
 
 ### P6 — Bounds, conformance, hardening (M1)
 
@@ -1351,7 +1389,11 @@ the pre-existing 120 s watchdog and one bounded marker poll (above).
    keep that) and are never executed.
 2. **Schema safety**: JSON Schema 2020-12; no network `$ref` dereferencing;
    depth/size/time bounds before validating; reject tools with invalid schemas
-   (exclude the tool, keep the rest — per spec).
+   (exclude the tool, keep the rest — per spec). MCP wrapper construction strips
+   only the top-level `$schema`/`title` draft keys a provider refuses (preserving
+   `$defs`/`$ref`) and bounds each description at 8 KiB (`3e5237e`), and the
+   agent loop preflights the assembled turn tool list so a single invalid
+   definition is dropped rather than rejecting the whole request (`3272066`).
 3. **Header discipline**: only `Mcp-Method`/`Mcp-Name`/`Mcp-Param-*` are
    generated, from the request body, with the spec's base64 sentinel; user
    `headers` are passed through but never echoed into logs unredacted; config
@@ -1366,7 +1408,14 @@ the pre-existing 120 s watchdog and one bounded marker poll (above).
    today. Note in docs; the sandboxed-execution story (`ToolPolicy::Mobile`
    exclusion, future OS sandboxing) applies. No auto-approval is added by this
    plan; tool invocation keeps the same broadcast/visibility semantics as every
-   other tool.
+   other tool. **Residual risk (network egress):** a stdio server has the
+   daemon's own network access too, so it can reach arbitrary hosts and
+   exfiltrate data. The mitigations in place — loader/runtime env-var stripping
+   for stdio children, the size-capped per-server stderr log, whole-project
+   trust gating, and (newly) schema normalization + description bounding + the
+   preflight validator — reduce but do not eliminate it. The structural fix is a
+   host-mediated egress boundary that routes every server-originated byte
+   through one controlled seam (ironclaw-style); it is deferred (§13).
 7. **Egress**: remote servers are contacted only when configured; no automatic
    discovery of servers from arbitrary content.
 8. **Secrets**: never logged; OAuth store 0600; tokens keyed by issuer; explicit
@@ -1460,6 +1509,7 @@ The feature-row flip (D9) still waits on the default-on change.
 | (Post-ship, P3) OAuth UX on headless devices (TUI over SSH, Termux) | Paste-the-redirected-URL fallback (pi's flow), device-code path only if a provider requires it; document. |
 | rmcp licenses/advisories | Apache-2.0; `cargo deny check` already gates the tree. |
 | Fixture server drifts from real servers | The in-tree fixtures plus the official client conformance suite in CI (pinned suite version; a bump is a deliberate change that re-triages the baseline). |
+| (Deferred) An MCP stdio server has the daemon user's full authority *and* the daemon's own network access, so it can exfiltrate data or reach arbitrary hosts | Mitigation today: loader/runtime env-var stripping for stdio children, the size-capped per-server stderr log, whole-project trust gating, and (post-M1) schema normalization + description bounding + the preflight validator. A host-mediated egress boundary (ironclaw-style) is the structural fix and is deferred — see §9/§13. |
 
 ## 13. Out of scope / future work
 
@@ -1472,6 +1522,18 @@ The feature-row flip (D9) still waits on the default-on change.
 - **MCP Apps / tasks extensions** — only if real servers demand them; rmcp
   already models tasks, so enabling is a small later step.
 - **Tool-search-driven deferred exposure** — measure server sizes first.
+- **Turn-level rejection recovery** — on a provider 4xx whose body *names* the
+  offending tool (e.g. OpenAI's `Invalid 'tools[N].function.name'`), drop that
+  tool from the turn's tool list and retry the turn once (bounded), so one bad
+  tool cannot brick a session. Deferred: it only fires when the provider *names*
+  the offender, so a gateway that answers with a bare 400 and an empty body —
+  the case the preflight validator now prevents — gives it nothing to parse;
+  reconsider only if a provider that names offenders becomes a primary target.
+- **Mediated egress for MCP servers (ironclaw-style)** — route a server's
+  outbound network through a single host-controlled egress seam so a server
+  cannot exfiltrate data or reach arbitrary hosts. Deferred as an architectural
+  project (a new host-mediated egress boundary, not a patch); the residual risk
+  and the mitigations that reduce (but do not eliminate) it are recorded in §9.
 - **Android/iOS sandboxing of MCP subprocesses** — mobile policy excludes MCP.
 
 ## 14. Open questions
@@ -1548,6 +1610,9 @@ P0–P6 and D9 are complete.
       (P3).
 - [ ] The remaining fast-follows land: `exposure` + deferred tool search, and
       the config-watcher auto-reload for `mcp_servers.json` (D12).
+- [ ] The two deferred robustness items land — or are reconfirmed deferred with
+      their rationale — turn-level rejection recovery and mediated egress for
+      MCP servers (§13).
 - [ ] **This plan document is deleted** once everything above — including P3 —
       is implemented. No source file, doc, comment, or commit message in the
       tree references it (grep for `mcp-modernization` returns nothing).
