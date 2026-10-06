@@ -80,7 +80,7 @@ fn mcp_fixture_tools_are_discovered_and_callable() {
     active.insert("mcp/fixture".to_string());
     active.insert("core".to_string());
     let defs = registry.available_definitions(&active);
-    let echo_name = "mcp/fixture/echo";
+    let echo_name = "mcp__fixture__echo";
     assert!(
         defs.iter().any(|d| d.function.name == echo_name),
         "expected tool '{echo_name}', got: {:?}",
@@ -107,7 +107,7 @@ fn mcp_fixture_tools_are_discovered_and_callable() {
     // ── 7. A server-flagged error surfaces as `is_error` ──
     let boom_call = choreo_ai_protocols::ChatToolCall {
         id: "call_2".to_string(),
-        name: "mcp/fixture/boom".to_string(),
+        name: "mcp__fixture__boom".to_string(),
         arguments_json: "{}".to_string(),
         caller: None,
     };
@@ -119,7 +119,7 @@ fn mcp_fixture_tools_are_discovered_and_callable() {
     // ── 8. Image content is attached via the image sink ──
     let image_call = choreo_ai_protocols::ChatToolCall {
         id: "call_3".to_string(),
-        name: "mcp/fixture/image".to_string(),
+        name: "mcp__fixture__image".to_string(),
         arguments_json: "{}".to_string(),
         caller: None,
     };
@@ -200,7 +200,7 @@ fn mcp_resource_tools_are_registered_and_callable() {
     active.insert("core".to_string());
     let defs = registry.available_definitions(&active);
     for expected in ["list_resources", "read_resource"] {
-        let name = format!("mcp/{slug}/{expected}");
+        let name = format!("mcp__{slug}__{expected}");
         assert!(
             defs.iter().any(|d| d.function.name == name),
             "expected resource tool '{name}', got: {:?}",
@@ -210,7 +210,7 @@ fn mcp_resource_tools_are_registered_and_callable() {
 
     let list_call = choreo_ai_protocols::ChatToolCall {
         id: "call_r1".to_string(),
-        name: format!("mcp/{slug}/list_resources"),
+        name: format!("mcp__{slug}__list_resources"),
         arguments_json: "{}".to_string(),
         caller: None,
     };
@@ -225,7 +225,7 @@ fn mcp_resource_tools_are_registered_and_callable() {
 
     let read_call = choreo_ai_protocols::ChatToolCall {
         id: "call_r2".to_string(),
-        name: format!("mcp/{slug}/read_resource"),
+        name: format!("mcp__{slug}__read_resource"),
         arguments_json: r#"{"uri": "file:///readme.txt"}"#.to_string(),
         caller: None,
     };
@@ -600,7 +600,7 @@ fn mcp_progress_streams_through_the_wrapper() {
 
     let call = choreo_ai_protocols::ChatToolCall {
         id: "call_p1".to_string(),
-        name: format!("mcp/{slug}/progress"),
+        name: format!("mcp__{slug}__progress"),
         arguments_json: "{}".to_string(),
         caller: None,
     };

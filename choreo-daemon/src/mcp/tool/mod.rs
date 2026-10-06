@@ -153,7 +153,7 @@ pub(super) fn build_server_wrappers(
 
 /// Wraps an MCP server tool as a `ToolDyn` for Choreographr's tool registry.
 pub struct McpToolWrapper {
-    /// Full prefixed name: "mcp/<`server_slug`>/<`tool_name`>"
+    /// Full prefixed name: "mcp__<`server_slug`>__<`tool_name`>"
     name: String,
     /// Tool group: "mcp/<`server_slug`>"
     group: String,
@@ -436,14 +436,14 @@ mod tests {
         let built = build_server_wrappers("srv", &handle, &tools, &[], &mut used);
         let names: Vec<&str> = built.tools.iter().map(|(n, _)| n.as_str()).collect();
         // The catalogue tools keep the reserved names...
-        assert!(names.contains(&"mcp/srv/list_resources"), "{names:?}");
-        assert!(names.contains(&"mcp/srv/read_resource"), "{names:?}");
+        assert!(names.contains(&"mcp__srv__list_resources"), "{names:?}");
+        assert!(names.contains(&"mcp__srv__read_resource"), "{names:?}");
         // ...and the server's own `list_resources` tool is disambiguated.
         let server_tool = names
             .iter()
-            .find(|n| n.starts_with("mcp/srv/list_resources-"))
+            .find(|n| n.starts_with("mcp__srv__list_resources-"))
             .expect("the colliding server tool takes a hash suffix");
-        assert_ne!(*server_tool, "mcp/srv/list_resources");
+        assert_ne!(*server_tool, "mcp__srv__list_resources");
         assert_eq!(built.tool_count, 1, "only server tools count");
     }
 
@@ -460,7 +460,7 @@ mod tests {
         assert_eq!(built.group, "mcp/fixture");
         assert_eq!(built.tool_count, 1);
         let (name, wrapper) = &built.tools[0];
-        assert_eq!(name, "mcp/fixture/echo");
+        assert_eq!(name, "mcp__fixture__echo");
         assert_eq!(wrapper.group(), "mcp/fixture");
         assert_eq!(wrapper.description(), "[MCP fixture] Echo a message back.");
         assert_eq!(

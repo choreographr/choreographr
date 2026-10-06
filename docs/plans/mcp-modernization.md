@@ -636,18 +636,24 @@ deferred-loading work. When
 `exposure: "deferred"`; there is no such mapping on purpose today, because
 deferred registration does not exist yet.
 
-### D5 — Tool identity stays `mcp/<slug>/<tool>`
+### D5 — Tool identity stays `mcp__<slug>__<tool>`
 
-Persisted sessions store group names; renaming would strand them. Rules:
-sanitize each segment to `[A-Za-z0-9_-]`, cap the full name at the provider limit
-(64 chars for OpenAI; use 64 as the safe ceiling), append `-<6-hex hash>` when
-sanitization or truncation collides. Description prefix `[MCP <slug>] ` is kept
-(stable prompt text). `title`/`icons`/`annotations` are captured into group
-metadata for later UI use but never fed to the model as instructions (untrusted).
+The provider function NAME is `mcp__<slug>__<tool>`; the internal catalogue GROUP
+stays `mcp/<slug>`. Persisted sessions store group names; the group naming is
+unchanged. The name segments are joined with `__`, not a path-style `/`: a
+provider accepts a function name drawn only from `[A-Za-z0-9_-]`, and a single
+illegal name (a `/`) rejects the entire tool list. Rules: sanitize each segment
+to `[A-Za-z0-9_-]`, cap the full name at the provider limit (64 chars for
+OpenAI; use 64 as the safe ceiling), append `-<6-hex hash>` when sanitization
+or truncation collides. Description prefix `[MCP <slug>] ` is kept (stable
+prompt text). `title`/`icons`/`annotations` are captured into group metadata
+for later UI use but never fed to the model as instructions (untrusted).
 
-Status: the name format and description prefix landed in P0/P1; the sanitizer,
-64-char cap, and collision hash landed in P5 (`f037383`, G18). `title`/`icons`/
-`annotations` capture is not yet implemented (post-ship UI work).
+Status: the `__`-joined name format and description prefix landed in P0/P1 (the
+separator was `/` until it was found to reject every request carrying an MCP
+tool); the sanitizer, 64-char cap, and collision hash landed in P5 (`f037383`,
+G18). `title`/`icons`/`annotations` capture is not yet implemented (post-ship
+UI work).
 
 ### D6 — Concurrency, deadlines, cancellation
 

@@ -8,12 +8,14 @@
 //! risks a rejected request (the whole tool list is invalid if one name is) or
 //! a name the model cannot reliably echo.
 //!
-//! The naming scheme keeps the stable `mcp/<slug>/<tool>` shape but sanitizes
-//! each *segment* to `[A-Za-z0-9_-]` and caps the whole name at the provider
-//! limit. When sanitization or truncation would make two distinct tools
-//! collide, the daemon appends a short hash of the original identity via
-//! [`build_tool_name_with_suffix`]; [`build_tool_name`] on its own is
-//! collision-free only for inputs that already sanitize distinctly.
+//! The naming scheme keeps the stable `mcp__<slug>__<tool>` shape (segments
+//! joined with the provider-safe `__`, never a path-style `/`, which the
+//! provider alphabet rejects), sanitizes each *segment* to `[A-Za-z0-9_-]`,
+//! and caps the whole name at the provider limit. When sanitization or
+//! truncation would make two distinct tools collide, the daemon appends a
+//! short hash of the original identity via [`build_tool_name_with_suffix`];
+//! [`build_tool_name`] on its own is collision-free only for inputs that
+//! already sanitize distinctly.
 //!
 //! The hash is a fixed FNV-1a over the identity, implemented here rather than
 //! pulled from `std` (`DefaultHasher`'s output is not guaranteed stable across
@@ -26,6 +28,16 @@ pub const MAX_TOOL_NAME_LEN: usize = 64;
 
 /// The namespace prefix every MCP tool name carries.
 pub const TOOL_NAME_PREFIX: &str = "mcp";
+
+/// The separator joining the `mcp` prefix, the slug, and the tool name.
+///
+/// A provider's function name may contain only `[A-Za-z0-9_-]`, so the
+/// segments are joined with `__` rather than a path-style `/`: a single `/`
+/// makes the whole tool list invalid (one bad name rejects every tool in the
+/// request). A slug or tool name containing `_` can still collapse two pairs
+/// onto one string; the caller's collision check resolves that with a hash
+/// suffix.
+const SEGMENT_SEPARATOR: &str = "__";
 
 /// Number of hex digits in a collision/truncation suffix.
 const SUFFIX_HEX_LEN: usize = 6;
@@ -54,13 +66,13 @@ pub fn sanitize_segment(segment: &str) -> String {
 /// Build the provider-safe tool name for `(slug, tool)`, capping it at
 /// [`MAX_TOOL_NAME_LEN`].
 ///
-/// The result is `mcp/<sanitized-slug>/<sanitized-tool>`. A name longer than
+/// The result is `mcp__<sanitized-slug>__<sanitized-tool>`. A name longer than
 /// the cap is shortened and given a hash suffix derived from the name itself,
 /// so a long tool name stays stable and distinct from its neighbours.
 #[must_use]
 pub fn build_tool_name(slug: &str, tool: &str) -> String {
     let base = format!(
-        "{TOOL_NAME_PREFIX}/{}/{}",
+        "{TOOL_NAME_PREFIX}{SEGMENT_SEPARATOR}{}{SEGMENT_SEPARATOR}{}",
         sanitize_segment(slug),
         sanitize_segment(tool)
     );
@@ -76,7 +88,7 @@ pub fn build_tool_name(slug: &str, tool: &str) -> String {
 #[must_use]
 pub fn build_tool_name_with_suffix(slug: &str, tool: &str, seed: &str) -> String {
     let base = format!(
-        "{TOOL_NAME_PREFIX}/{}/{}",
+        "{TOOL_NAME_PREFIX}{SEGMENT_SEPARATOR}{}{SEGMENT_SEPARATOR}{}",
         sanitize_segment(slug),
         sanitize_segment(tool)
     );
@@ -143,8 +155,22 @@ mod tests {
 
     #[test]
     fn build_tool_name_uses_stable_format() {
-        assert_eq!(build_tool_name("fixture", "echo"), "mcp/fixture/echo");
-        assert_eq!(build_tool_name("my.srv", "a.b"), "mcp/my_srv/a_b");
+        assert_eq!(build_tool_name("fixture", "echo"), "mcp__fixture__echo");
+        assert_eq!(build_tool_name("my.srv", "a.b"), "mcp__my_srv__a_b");
+    }
+
+    /// The WHOLE built name — not just each segment — must sit in the
+    /// provider's function-name alphabet. A `/` here is what a path-style join
+    /// would introduce, and one rejected name invalidates the entire tool list.
+    #[test]
+    fn build_tool_name_is_provider_safe() {
+        let name = build_tool_name("filesystem", "read_text_file");
+        assert_eq!(name, "mcp__filesystem__read_text_file");
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "name not provider-safe: {name}"
+        );
     }
 
     #[test]
@@ -152,7 +178,7 @@ mod tests {
         let long = "t".repeat(200);
         let name = build_tool_name("s", &long);
         assert!(name.len() <= MAX_TOOL_NAME_LEN, "name too long: {name}");
-        assert!(name.starts_with("mcp/s/"));
+        assert!(name.starts_with("mcp__s__"));
         // Deterministic and distinct from a different long tool.
         assert_eq!(name, build_tool_name("s", &long));
         assert_ne!(name, build_tool_name("s", &"u".repeat(200)));
@@ -204,9 +230,17 @@ mod tests {
             // One output character per input character (a multi-byte char maps
             // to a single '_').
             assert_eq!(out.chars().count(), input.chars().count());
-            // Deterministic, and a built name always respects the cap.
+            // Deterministic, and a built name always respects the cap AND the
+            // provider alphabet (a hostile slug/tool cannot smuggle a `/` in).
             assert_eq!(out, sanitize_segment(&input));
-            assert!(build_tool_name("slug", &input).len() <= MAX_TOOL_NAME_LEN);
+            let built = build_tool_name("slug", &input);
+            assert!(built.len() <= MAX_TOOL_NAME_LEN);
+            assert!(
+                built
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "built name not provider-safe for {input:?}: {built:?}"
+            );
         }
     }
 

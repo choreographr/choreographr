@@ -774,7 +774,7 @@ pub struct CatalogProvider {
 /// so a client can show the whole configured set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerStatus {
-    /// The server's config key (its tool-name prefix, `mcp/<slug>`).
+    /// The server's config key (its tool-name namespace, `mcp__<slug>__*`).
     pub slug: String,
     /// The configuration tier this server came from: `"daemon"` for the
     /// daemon-wide `mcp.json`, `"project"` for a session's own `.mcp.json`.

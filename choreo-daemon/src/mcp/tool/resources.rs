@@ -43,7 +43,7 @@ fn read_resource_schema() -> Value {
     })
 }
 
-/// Wrapper tool listing an MCP server's resources (`mcp/<slug>/list_resources`).
+/// Wrapper tool listing an MCP server's resources (`mcp__<slug>__list_resources`).
 ///
 /// Resources are exposed to the model as two catalogue tools rather than one
 /// registry entry per resource: the catalogue can be large and may change
@@ -174,7 +174,7 @@ impl ToolDyn for McpListResourcesTool {
     }
 }
 
-/// Wrapper tool reading one MCP resource (`mcp/<slug>/read_resource`).
+/// Wrapper tool reading one MCP resource (`mcp__<slug>__read_resource`).
 pub struct McpReadResourceTool {
     name: String,
     group: String,
