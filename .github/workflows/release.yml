@@ -57,6 +57,14 @@
 #                   artifacts had only ever been structurally inspected,
 #                   never run.
 #
+# Zig version pin: every job installs Zig via mlugg/setup-zig@v2 with an
+# explicit `version: 0.16.0`. zlob (a choreo-daemon dependency) compiles its
+# Zig source in build.rs on EVERY target and passes `--global-cache-dir`, a flag
+# that Zig 0.17.0's reworked build system removed — so the action's default
+# unpinned "latest" aborts zlob's build on every platform the moment a new Zig
+# lands (observed: 0.16.0 passed, 0.17.0 failed all jobs). Pin the last release
+# zlob accepts; bump it once zlob ships Zig 0.17 support.
+#
 # The windows-msvc build is TEMPORARILY excluded from the published release:
 # the job still runs (build + smoke tests + artifact upload) so the Windows
 # binary stays exercised on every tag, but the release job neither lists it in
@@ -132,6 +140,10 @@ jobs:
         with:
           tool: cargo-zigbuild
       - uses: mlugg/setup-zig@v2
+        with:
+          # Pin the last Zig release zlob 1.6.5 accepts: Zig 0.17.0 rejects the
+          # `--global-cache-dir` flag its build.rs passes (see the header note).
+          version: 0.16.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -220,6 +232,10 @@ jobs:
         with:
           tool: cargo-zigbuild
       - uses: mlugg/setup-zig@v2
+        with:
+          # Pin the last Zig release zlob 1.6.5 accepts: Zig 0.17.0 rejects the
+          # `--global-cache-dir` flag its build.rs passes (see the header note).
+          version: 0.16.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -281,6 +297,10 @@ jobs:
       # MacBook), and the android job because cargo-ndk does not satisfy
       # zlob's direct zig dependency.
       - uses: mlugg/setup-zig@v2
+        with:
+          # Pin the last Zig release zlob 1.6.5 accepts: Zig 0.17.0 rejects the
+          # `--global-cache-dir` flag its build.rs passes (see the header note).
+          version: 0.16.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -375,6 +395,10 @@ jobs:
       # zlob's build.rs needs `zig cc` on every target (host builds included,
       # see the macos job comment) — the Windows zip build is no exception.
       - uses: mlugg/setup-zig@v2
+        with:
+          # Pin the last Zig release zlob 1.6.5 accepts: Zig 0.17.0 rejects the
+          # `--global-cache-dir` flag its build.rs passes (see the header note).
+          version: 0.16.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -478,6 +502,10 @@ jobs:
       # through the NDK toolchain, so the preinstalled NDK alone doesn't
       # satisfy it.
       - uses: mlugg/setup-zig@v2
+        with:
+          # Pin the last Zig release zlob 1.6.5 accepts: Zig 0.17.0 rejects the
+          # `--global-cache-dir` flag its build.rs passes (see the header note).
+          version: 0.16.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -658,6 +686,10 @@ jobs:
           rustup target add --toolchain stable aarch64-apple-ios aarch64-apple-ios-sim
 
       - uses: mlugg/setup-zig@v2
+        with:
+          # Pin the last Zig release zlob 1.6.5 accepts: Zig 0.17.0 rejects the
+          # `--global-cache-dir` flag its build.rs passes (see the header note).
+          version: 0.16.0
         # The macOS aarch64 job above documents the same need: zlob (via
         # choreo-daemon) compiles its Zig source with `zig cc` in build.rs on
         # EVERY host — and since choreo-daemon entered the iOS build (step 5
