@@ -522,6 +522,21 @@ pub(crate) fn run_agent_loop(
             &session.project_shadowed_groups,
         );
         tools.extend(session.project_tools.definitions());
+        // Preflight the assembled list before it is sent. MCP names and schemas
+        // are sanitized at registration, so a definition a provider would reject
+        // (an illegal function name, or a non-object `parameters` schema) means a
+        // regression crept in. Such a tool invalidates the WHOLE request, and the
+        // provider may answer with a bare 400 naming no offending field — so drop
+        // the offender here (keeping the session usable) rather than dispatching a
+        // request the provider is guaranteed to reject.
+        let dropped_tools = crate::tools::retain_valid_tool_definitions(&mut tools);
+        if !dropped_tools.is_empty() {
+            warn!(
+                session_id = ctx.session_id,
+                dropped = ?dropped_tools,
+                "dropping provider-invalid tool definitions before send"
+            );
+        }
         if is_cancelled_once(cancel_rx) {
             // Relay the cancel so an armed warmer stops pinging promptly.
             relay_warm_cancel();
