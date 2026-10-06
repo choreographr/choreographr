@@ -74,8 +74,110 @@ fn resolve_refs(value: &mut serde_json::Value, defs: &serde_json::Map<String, se
     }
 }
 
+// Exercised only by the wire-contract unit tests today: `schema.rs` compiles
+// into BOTH a plain (non-test) lib build, where nothing calls these, AND the
+// test build, where the tests do. `dead_code` therefore fires in one build but
+// not the other — a shape `#[expect]` cannot satisfy (it would be unfulfilled
+// in the test build) — so it stays an `#[allow]` with its `allow_attributes`
+// exemption, the same idiom `choreo-ai-protocols`'s `ResponsesResponse` uses.
+#[allow(clippy::allow_attributes)]
+#[allow(dead_code)]
+pub(crate) const MAX_FUNCTION_NAME_LEN: usize = 64;
+
+/// Whether `name` is a provider-safe function name.
+///
+/// A provider accepts a function name of at most [`MAX_FUNCTION_NAME_LEN`]
+/// bytes drawn from `[A-Za-z0-9_-]`. One illegal name — e.g. a path-style `/`
+/// that a naive `mcp/<slug>/<tool>` join would smuggle in — rejects the entire
+/// request, so the request-assembly path drops any definition that fails this
+/// predicate rather than sending it.
+///
+/// Iterates bytes (ASCII classes only), so it needs no regex dependency and no
+/// Unicode handling.
+#[allow(clippy::allow_attributes)]
+#[allow(dead_code)]
+pub(crate) fn is_provider_safe_function_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_FUNCTION_NAME_LEN
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Whether `def` is a valid provider tool definition: a provider-safe function
+/// name and an object `parameters` schema.
+///
+/// The `parameters` field must be a JSON Schema *object* — a bare `null`, a
+/// string, or any non-object value is not a legal `parameters` schema and is
+/// rejected by the provider together with the rest of the list.
+#[allow(clippy::allow_attributes)]
+#[allow(dead_code)]
+pub(crate) fn is_valid_tool_definition(
+    def: &choreo_ai_protocols::openai::ChatToolDefinition,
+) -> bool {
+    is_provider_safe_function_name(&def.function.name) && def.function.parameters.is_object()
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_safe_function_name_accepts_provider_names() {
+        for name in [
+            "read_file",
+            "mcp__filesystem__read_text_file",
+            "a-b_c9",
+            "x",
+        ] {
+            assert!(
+                is_provider_safe_function_name(name),
+                "{name} should be accepted"
+            );
+        }
+        // Exactly at the cap is fine; one byte over is not.
+        assert!(is_provider_safe_function_name(
+            &"a".repeat(MAX_FUNCTION_NAME_LEN)
+        ));
+        assert!(!is_provider_safe_function_name(
+            &"a".repeat(MAX_FUNCTION_NAME_LEN + 1)
+        ));
+    }
+
+    #[test]
+    fn provider_safe_function_name_rejects_bad_names() {
+        // A path-style slash (the regression this guards), the empty name, and
+        // any character outside the provider alphabet.
+        assert!(!is_provider_safe_function_name(""));
+        assert!(!is_provider_safe_function_name("mcp/x/y"));
+        assert!(!is_provider_safe_function_name("has space"));
+        assert!(!is_provider_safe_function_name("has.dot"));
+    }
+
+    #[test]
+    fn valid_tool_definition_requires_safe_name_and_object_parameters() {
+        let ok = choreo_ai_protocols::openai::ChatToolDefinition::function(
+            "read_file",
+            "Read a file.",
+            serde_json::json!({ "type": "object" }),
+        );
+        assert!(is_valid_tool_definition(&ok));
+
+        let bad_name = choreo_ai_protocols::openai::ChatToolDefinition::function(
+            "bad/name",
+            "desc",
+            serde_json::json!({ "type": "object" }),
+        );
+        assert!(!is_valid_tool_definition(&bad_name));
+
+        // A non-object `parameters` (here a bare string) is not a legal schema.
+        let bad_params = choreo_ai_protocols::openai::ChatToolDefinition::function(
+            "ok_name",
+            "desc",
+            serde_json::json!("not-an-object"),
+        );
+        assert!(!is_valid_tool_definition(&bad_params));
+    }
     #[test]
     fn sanitize_schema_strips_metadata() {
         let input = serde_json::json!({

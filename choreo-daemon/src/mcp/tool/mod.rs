@@ -36,14 +36,70 @@ const MAX_OUTPUT_TEXT_BYTES: usize = 256 * 1024;
 /// [`MAX_OUTPUT_TEXT_BYTES`].
 const TRUNCATION_MARKER: &str = "\n… [output truncated]";
 
-/// The `[MCP <slug>]`-prefixed description every wrapper carries.
+/// Upper bound on an MCP tool's advertised description (the `[MCP <slug>]`
+/// prefixed string).
+///
+/// A server's description is untrusted free text and can be arbitrarily long;
+/// forwarding it verbatim lets a hostile or buggy server inflate every request
+/// that carries the tool. Capping it keeps one description from bloating the
+/// tool array, and truncation is explicit (a trailing marker names the cap) so
+/// the model can tell the text was cut rather than silently ending mid-sentence.
+const MAX_DESCRIPTION_BYTES: usize = 8 * 1024;
+
+/// The marker appended when a description is truncated at
+/// [`MAX_DESCRIPTION_BYTES`].
+const DESCRIPTION_TRUNCATION_MARKER: &str = "… [description truncated]";
+
+/// The `[MCP <slug>]`-prefixed description every wrapper carries, bounded at
+/// [`MAX_DESCRIPTION_BYTES`].
 ///
 /// Centralized so the prefix convention is defined once. The tool name comes
 /// from the per-server collision resolution ([`resolve_name`]) and the group
 /// from [`choreo_mcp::group_name`]; only the description needs a shared helper
-/// here, so the two never drift from the production registration path.
+/// here, so the two never drift from the production registration path. The
+/// final string (prefix included) is truncated with an explicit trailing marker
+/// — the same shape [`join_text_parts`](super::content::join_text_parts) applies
+/// to tool output — so a hostile server cannot inflate the request and the
+/// model can see the text was cut. Truncation backs off to a UTF-8 char
+/// boundary because the description is multi-byte untrusted text.
 fn prefixed_description(server_slug: &str, description: &str) -> String {
-    format!("[MCP {server_slug}] {description}")
+    let full = format!("[MCP {server_slug}] {description}");
+    if full.len() <= MAX_DESCRIPTION_BYTES {
+        return full;
+    }
+    let mut boundary = MAX_DESCRIPTION_BYTES.min(full.len());
+    while boundary > 0 && !full.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let mut truncated = full.get(..boundary).unwrap_or(&full).to_string();
+    truncated.push_str(DESCRIPTION_TRUNCATION_MARKER);
+    debug!(
+        server = %server_slug,
+        "MCP tool description truncated at {MAX_DESCRIPTION_BYTES} bytes"
+    );
+    truncated
+}
+
+/// Strip the draft meta-schema keys a provider rejects from an MCP tool schema.
+///
+/// A server's `inputSchema`/`outputSchema` may carry `$schema` (a draft locator
+/// such as `http://json-schema.org/draft-07/schema#`) and `title`. A provider
+/// that validates the tool schema against its own accepted dialect rejects the
+/// WHOLE request when one definition carries an unsupported key, so only these
+/// two TOP-LEVEL keys are removed.
+///
+/// This deliberately does NOT reuse [`crate::tools::sanitize_params_schema`]:
+/// that helper also strips `$defs` and resolves only TOP-LEVEL `$ref`s, so
+/// applying it to an arbitrary server schema would leave nested `$ref`s
+/// dangling (a regression). Here `$defs` and every `$ref` — nested included — are
+/// preserved intact so the schema stays self-consistent; only the two meta keys
+/// are removed.
+fn normalize_mcp_schema(mut value: Value) -> Value {
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("$schema");
+        obj.remove("title");
+    }
+    value
 }
 
 /// Resolve the provider-safe name for `tool` on `slug`, appending a hash suffix
@@ -157,11 +213,13 @@ pub struct McpToolWrapper {
     name: String,
     /// Tool group: "mcp/<`server_slug`>"
     group: String,
-    /// Description with server prefix
+    /// Description with server prefix, bounded at [`MAX_DESCRIPTION_BYTES`].
     description: String,
-    /// Original input schema from the MCP server
+    /// The server's input schema, normalized by [`normalize_mcp_schema`] (draft
+    /// `$schema`/`title` stripped, `$defs`/`$ref` preserved).
     input_schema: Value,
-    /// The server's `outputSchema`, when it advertised one.
+    /// The server's `outputSchema`, when it advertised one, normalized the same
+    /// way as [`Self::input_schema`].
     output_schema: Option<Value>,
     /// The original tool name as the MCP server knows it
     original_name: String,
@@ -174,6 +232,11 @@ impl McpToolWrapper {
     /// Build a wrapper with an already-resolved provider-safe `name` and
     /// catalogue `group` (used by the daemon when it must disambiguate a
     /// collision by appending a hash).
+    ///
+    /// The `input_schema`/`output_schema` are normalized by
+    /// [`normalize_mcp_schema`] at construction (draft `$schema`/`title`
+    /// stripped, `$defs`/`$ref` preserved) so a server-supplied schema can never
+    /// reach a provider carrying a meta key that would reject the whole request.
     #[must_use]
     pub fn with_name(
         name: String,
@@ -188,8 +251,8 @@ impl McpToolWrapper {
             name,
             group,
             description,
-            input_schema,
-            output_schema,
+            input_schema: normalize_mcp_schema(input_schema),
+            output_schema: output_schema.map(normalize_mcp_schema),
             original_name,
             handle,
         }
@@ -259,12 +322,15 @@ impl ToolDyn for McpToolWrapper {
     }
 
     fn schema(&self) -> Value {
+        // The server's input schema, normalized at construction (draft meta
+        // keys stripped, `$defs`/`$ref` preserved).
         self.input_schema.clone()
     }
 
     fn output_schema(&self) -> Option<Value> {
-        // The server's real `outputSchema`, when it advertised one; `None` is
-        // honest for a tool that returns free-form content.
+        // The server's real `outputSchema`, when it advertised one, normalized
+        // at construction; `None` is honest for a tool that returns free-form
+        // content.
         self.output_schema.clone()
     }
 
@@ -467,6 +533,75 @@ mod tests {
             wrapper.output_schema(),
             Some(serde_json::json!({"type": "object"}))
         );
+    }
+
+    #[test]
+    fn hostile_mcp_tool_definition_is_provider_valid() {
+        // A hostile server tool: a name carrying `/` and `.` (which a naive
+        // `mcp/<slug>/<tool>` join would forward verbatim), a description far
+        // over the cap, and a schema carrying draft metadata AND a nested
+        // `$ref`/`$defs` pair (the case `sanitize_params_schema` would break by
+        // stripping `$defs` and only resolving top-level refs).
+        use crate::tools::{is_provider_safe_function_name, is_valid_tool_definition};
+        use choreo_ai_protocols::openai::ChatToolDefinition;
+
+        let schema = serde_json::json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "title": "Hostile",
+            "$defs": { "Point": { "type": "object" } },
+            "type": "object",
+            "properties": { "p": { "$ref": "#/$defs/Point" } }
+        });
+        let tools = vec![McpTool {
+            name: "read/file.name".into(),
+            description: Some("x".repeat(MAX_DESCRIPTION_BYTES * 4)),
+            input_schema: schema.clone(),
+            output_schema: Some(schema),
+        }];
+        let mut used = HashSet::new();
+        let built = build_server_wrappers("hostile.srv", &unused_handle(), &tools, &[], &mut used);
+        let (name, wrapper) = &built.tools[0];
+
+        // The resolved function name — slug and tool segments sanitized onto
+        // the provider alphabet — is provider-safe.
+        assert!(
+            is_provider_safe_function_name(name),
+            "name not safe: {name}"
+        );
+
+        // The normalized schema dropped only the draft meta keys, preserving
+        // `$defs` and the nested `$ref` so the schema stays self-consistent.
+        let normalized = wrapper.schema();
+        assert!(
+            normalized.get("$schema").is_none(),
+            "$schema must be stripped"
+        );
+        assert!(normalized.get("title").is_none(), "title must be stripped");
+        assert!(normalized.get("$defs").is_some(), "$defs must be preserved");
+        assert_eq!(normalized["properties"]["p"]["$ref"], "#/$defs/Point");
+        let out = wrapper
+            .output_schema()
+            .expect("output schema was advertised");
+        assert!(out.get("$schema").is_none());
+        assert!(out.get("$defs").is_some());
+
+        // The description is bounded (cap plus the explicit trailing marker).
+        assert!(
+            wrapper.description().len()
+                <= MAX_DESCRIPTION_BYTES + DESCRIPTION_TRUNCATION_MARKER.len(),
+            "description not bounded: {} bytes",
+            wrapper.description().len()
+        );
+        assert!(
+            wrapper
+                .description()
+                .ends_with(DESCRIPTION_TRUNCATION_MARKER)
+        );
+
+        // The assembled provider definition is valid as a whole.
+        let def =
+            ChatToolDefinition::function(name.clone(), wrapper.description(), wrapper.schema());
+        assert!(is_valid_tool_definition(&def));
     }
 
     // ── parse_json_args tests ────────────────────────────────────────
