@@ -36,21 +36,23 @@ const MAX_OUTPUT_TEXT_BYTES: usize = 256 * 1024;
 /// [`MAX_OUTPUT_TEXT_BYTES`].
 const TRUNCATION_MARKER: &str = "\n… [output truncated]";
 
-/// Upper bound on an MCP tool's advertised description (the `[MCP <slug>]`
-/// prefixed string).
+/// Upper bound on the truncated body of an MCP tool's advertised description
+/// (the `[MCP <slug>]`-prefixed string).
 ///
 /// A server's description is untrusted free text and can be arbitrarily long;
 /// forwarding it verbatim lets a hostile or buggy server inflate every request
 /// that carries the tool. Capping it keeps one description from bloating the
 /// tool array, and truncation is explicit (a trailing marker names the cap) so
 /// the model can tell the text was cut rather than silently ending mid-sentence.
+/// The stored string is at most this many bytes, plus
+/// [`DESCRIPTION_TRUNCATION_MARKER`] when a truncation occurred.
 const MAX_DESCRIPTION_BYTES: usize = 8 * 1024;
 
 /// The marker appended when a description is truncated at
 /// [`MAX_DESCRIPTION_BYTES`].
 const DESCRIPTION_TRUNCATION_MARKER: &str = "… [description truncated]";
 
-/// The `[MCP <slug>]`-prefixed description every wrapper carries, bounded at
+/// The `[MCP <slug>]`-prefixed description every wrapper carries, truncated at
 /// [`MAX_DESCRIPTION_BYTES`].
 ///
 /// Centralized so the prefix convention is defined once. The tool name comes
@@ -58,7 +60,7 @@ const DESCRIPTION_TRUNCATION_MARKER: &str = "… [description truncated]";
 /// from [`choreo_mcp::group_name`]; only the description needs a shared helper
 /// here, so the two never drift from the production registration path. The
 /// final string (prefix included) is truncated with an explicit trailing marker
-/// — the same shape [`join_text_parts`](super::content::join_text_parts) applies
+/// — the same shape [`join_text_parts`] applies
 /// to tool output — so a hostile server cannot inflate the request and the
 /// model can see the text was cut. Truncation backs off to a UTF-8 char
 /// boundary because the description is multi-byte untrusted text.
@@ -94,6 +96,11 @@ fn prefixed_description(server_slug: &str, description: &str) -> String {
 /// dangling (a regression). Here `$defs` and every `$ref` — nested included — are
 /// preserved intact so the schema stays self-consistent; only the two meta keys
 /// are removed.
+///
+/// Residual assumption: `$defs`/`$ref` are kept on the premise the provider's
+/// schema dialect accepts them. The request-path preflight only checks that
+/// `parameters` is an object, so a server schema that leans on refs is forwarded
+/// as-is and relies on the provider tolerating them.
 fn normalize_mcp_schema(mut value: Value) -> Value {
     if let Some(obj) = value.as_object_mut() {
         obj.remove("$schema");
@@ -213,7 +220,8 @@ pub struct McpToolWrapper {
     name: String,
     /// Tool group: "mcp/<`server_slug`>"
     group: String,
-    /// Description with server prefix, bounded at [`MAX_DESCRIPTION_BYTES`].
+    /// Description with server prefix; beyond [`MAX_DESCRIPTION_BYTES`] it is
+    /// cut and a trailing [`DESCRIPTION_TRUNCATION_MARKER`] is appended.
     description: String,
     /// The server's input schema, normalized by [`normalize_mcp_schema`] (draft
     /// `$schema`/`title` stripped, `$defs`/`$ref` preserved).

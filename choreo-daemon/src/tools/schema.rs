@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 /// Strip `$schema`, `title`, and `$defs`/`$ref` patterns from a
 /// schemars-generated JSON Schema so it is compatible with providers
 /// that do not support JSON Schema Draft 2020-12 meta-schema features.
@@ -74,6 +76,12 @@ fn resolve_refs(value: &mut serde_json::Value, defs: &serde_json::Map<String, se
     }
 }
 
+/// The provider's function-name byte cap (`OpenAI`'s ceiling; Anthropic is more
+/// generous, so 64 is the safe common limit).
+///
+/// Kept numerically in step with `choreo_mcp::MAX_TOOL_NAME_LEN` — this module
+/// compiles with the `mcp` feature off, so it cannot reference that
+/// feature-gated constant and restates the same provider limit here.
 pub(crate) const MAX_FUNCTION_NAME_LEN: usize = 64;
 
 /// Whether `name` is a provider-safe function name.
@@ -109,6 +117,12 @@ pub(crate) fn is_valid_tool_definition(
 /// Retain only the provider-valid definitions in `defs`, returning the names of
 /// the dropped ones in encounter order.
 ///
+/// A definition is dropped when either it fails [`is_valid_tool_definition`] (an
+/// illegal function name, or a non-object `parameters` schema) OR its function
+/// name duplicates one already kept — a provider cannot disambiguate two tools
+/// of the same name, so the first occurrence wins and each later duplicate is
+/// dropped.
+///
 /// A tool whose name or `parameters` schema a provider would reject invalidates
 /// the WHOLE request — and the provider may answer with a bare, bodiless 400
 /// that names no offending field, leaving nothing to diagnose. MCP names and
@@ -120,11 +134,13 @@ pub(crate) fn retain_valid_tool_definitions(
     defs: &mut Vec<choreo_ai_protocols::openai::ChatToolDefinition>,
 ) -> Vec<String> {
     let mut dropped = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     defs.retain(|def| {
-        if is_valid_tool_definition(def) {
+        let name = &def.function.name;
+        if is_valid_tool_definition(def) && seen.insert(name.clone()) {
             true
         } else {
-            dropped.push(def.function.name.clone());
+            dropped.push(name.clone());
             false
         }
     });
@@ -227,6 +243,29 @@ mod tests {
         let dropped = retain_valid_tool_definitions(&mut defs);
         assert_eq!(dropped, Vec::<String>::new());
         assert_eq!(defs.len(), 1);
+    }
+
+    #[test]
+    fn retain_valid_tool_definitions_drops_duplicate_names_keeping_the_first() {
+        // Two valid definitions sharing one function name: the first is kept,
+        // the later duplicate dropped (a provider cannot disambiguate them).
+        let first = choreo_ai_protocols::openai::ChatToolDefinition::function(
+            "read_file",
+            "first",
+            serde_json::json!({ "type": "object" }),
+        );
+        let dup = choreo_ai_protocols::openai::ChatToolDefinition::function(
+            "read_file",
+            "second",
+            serde_json::json!({ "type": "object" }),
+        );
+        let mut defs = vec![first, dup];
+
+        let dropped = retain_valid_tool_definitions(&mut defs);
+
+        assert_eq!(dropped, vec!["read_file".to_string()]);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].function.description, "first");
     }
 
     #[test]

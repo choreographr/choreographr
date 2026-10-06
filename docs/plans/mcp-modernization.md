@@ -183,7 +183,7 @@ phases. What exists now:
   keeps asking fails cleanly instead of hanging. Resources are readable
   (`list_resources`/`read_resource`, paginated, behind a `supports_resources`
   capability flag), and a server that declares the capability gets
-  `mcp/<slug>/list_resources` and `mcp/<slug>/read_resource` catalogue tools.
+  `mcp__<slug>__list_resources` and `mcp__<slug>__read_resource` catalogue tools.
   Tests cover progress→chunk (client and daemon), MRTR, resources, and a
   fixture that records the server-observed `notifications/cancelled`. The
   subscription half landed in `15aa3ff`: a stateless server that declares
@@ -990,7 +990,7 @@ choreo-mcp (library; owns tokio + rmcp)
 
 Data flow for one tool call:
 
-1. Session thread executes `mcp/<slug>/<tool>` → `McpToolWrapper::execute_json`.
+1. Session thread executes `mcp__<slug>__<tool>` → `McpToolWrapper::execute_json`.
 2. The wrapper checks the session's cancel flag, sends
    `McpCommand::Call { session_id, request, reply }` over the dispatcher channel,
    and blocks on the per-call reply channel.

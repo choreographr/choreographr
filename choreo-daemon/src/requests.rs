@@ -528,13 +528,15 @@ pub(crate) fn run_agent_loop(
         // regression crept in. Such a tool invalidates the WHOLE request, and the
         // provider may answer with a bare 400 naming no offending field — so drop
         // the offender here (keeping the session usable) rather than dispatching a
-        // request the provider is guaranteed to reject.
+        // request the provider is guaranteed to reject. A function name already
+        // seen earlier in the list is dropped the same way, since a provider
+        // cannot disambiguate two tools of one name.
         let dropped_tools = crate::tools::retain_valid_tool_definitions(&mut tools);
         if !dropped_tools.is_empty() {
             warn!(
                 session_id = ctx.session_id,
                 dropped = ?dropped_tools,
-                "dropping provider-invalid tool definitions before send"
+                "dropping provider-invalid or duplicate tool definitions before send"
             );
         }
         if is_cancelled_once(cancel_rx) {
