@@ -998,3 +998,46 @@ fn code_box_copy_preserves_interior_blank_line() {
         "the interior blank line must survive the copy: {copied:?}"
     );
 }
+
+// ── table selection ─────────────────────────────────────────────────────
+
+#[test]
+fn table_selection_excludes_borders() {
+    // A normal selection over a table keeps the cell text and drops the `│`
+    // borders and the `─` frame rules.
+    let md = "| a | b |\n|---|---|\n| 1 | 2 |";
+    let mut app = app_with_turns(&[(0, md)], 30);
+    let (start, _) = locate(&app, "1");
+    let (_, end) = locate(&app, "2");
+    let copied = drag_and_finish(&mut app, start, end).expect("selection should extract");
+    assert!(
+        copied.contains('1') && copied.contains('2'),
+        "both cells are copied: {copied:?}"
+    );
+    assert!(!copied.contains('│'), "no cell border copied: {copied:?}");
+    assert!(!copied.contains('─'), "no frame rule copied: {copied:?}");
+}
+
+#[test]
+fn table_wrapped_cell_rejoins_to_original_text() {
+    // Dragging down a wrapped cell's column copies the cell's *original* text:
+    // the display's wrap rows are rejoined with the space the reflow consumed,
+    // not copied as separate lines.  (The neighbouring column's cell is swept
+    // in only where it shares a display row — plain line selection, not a cell
+    // rectangle — but a blank neighbour contributes no text.)
+    let md = "| Key | Value |\n|-----|-------|\n| k | alpha beta gamma delta epsilon |";
+    // Content width 31: the Value column shrinks and its cell wraps.
+    let mut app = test_app();
+    app.history_viewport.width = 40;
+    app.history_viewport.height = 40;
+    app.display_for(0).view.insert_or_replace(0, turn(md));
+    app.rebuild_height_prefix();
+    let (start, _) = locate(&app, "alpha");
+    let (_, end) = locate(&app, "epsilon");
+    let copied = drag_and_finish(&mut app, start, end).expect("selection should extract");
+    assert_eq!(
+        copied, "alpha beta gamma delta epsilon",
+        "the wrapped cell rejoins to its original text: {copied:?}"
+    );
+    assert!(!copied.contains('│'), "no cell border copied: {copied:?}");
+}

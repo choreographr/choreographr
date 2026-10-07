@@ -35,18 +35,45 @@ fn diff_gutter_has_no_chrome() {
 
 #[test]
 fn non_quote_non_box_rows_have_no_chrome() {
-    // Chrome is emitted only by the block-quote bar and the code box.  Every
-    // other markdown construct — headings, paragraphs (with emphasis, inline
-    // code, and a literal `│`), lists, tables, rules — must carry no chrome, so
-    // its content range is exactly what it was before chrome existed.
+    // Chrome is emitted only by the block-quote bar, the code box, and data
+    // tables.  Every other markdown construct — headings, paragraphs (with
+    // emphasis, inline code, and a literal `│`), lists, rules — must carry no
+    // chrome, so its content range is exactly what it was before chrome
+    // existed.  (Table rows are covered by `table_rows_carry_border_chrome`.)
     let md = "# Heading\n\nA paragraph with `code`, **bold**, a literal \u{2502} bar, and a\nsecond line.\n\n\
               - one\n- two\n\n\
-              | a | b |\n|---|---|\n| 1 | 2 |\n\n---\n";
+              ---\n";
     let (lines, _joins, chrome) = markdown_lines_joined(md, 60);
     assert_eq!(lines.len(), chrome.len(), "chrome must align with lines");
     for (i, c) in chrome.iter().enumerate() {
         assert!(c.is_empty(), "row {i} unexpectedly has chrome: {lines:#?}");
     }
+}
+
+#[test]
+fn table_rows_carry_border_chrome() {
+    // A data table records each `│` border column (and the whole of each
+    // frame/separator rule) as chrome, so the selection keeps the cell text and
+    // drops the frame.  The gaps between the border chrome runs are the cells.
+    let md = "| a | b |\n|---|---|\n| 1 | 2 |";
+    let (lines, _joins, chrome) = markdown_lines_joined(md, 60);
+    assert_eq!(lines.len(), chrome.len());
+    assert!(
+        chrome.iter().any(|c| !c.is_empty()),
+        "table rows must carry border chrome: {chrome:#?}"
+    );
+}
+
+#[test]
+fn wrapped_table_cell_joins_with_space() {
+    // A cell that wraps records a space-join on its continuation row, so a
+    // normal selection over the table rejoins the cell to its original text.
+    let md = "| Key | Value |\n|-----|-------|\n| k | alpha beta gamma delta epsilon |";
+    let (_lines, joins, _chrome) = markdown_lines_joined(md, 30);
+    assert!(
+        joins.contains(&LineJoin::Space),
+        "a wrapped table cell must record a space-join: {joins:?}"
+    );
 }
 
 #[test]

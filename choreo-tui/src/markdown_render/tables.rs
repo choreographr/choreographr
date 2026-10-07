@@ -82,26 +82,38 @@ pub(crate) fn render_table_lines(
     let mut lines = Vec::new();
     let mut joins = Vec::new();
     let mut chrome = Vec::new();
-    lines.push(table_border_line(
-        TABLE_BORDERS.top_left,
-        TABLE_BORDERS.top_mid,
-        TABLE_BORDERS.top_right,
-        &widths,
-        indent,
-    ));
-    joins.push(LineJoin::Break);
-    chrome.push(LineChrome::default());
+    push_rule_row(
+        &mut lines,
+        &mut joins,
+        &mut chrome,
+        table_border_line(
+            TABLE_BORDERS.top_left,
+            TABLE_BORDERS.top_mid,
+            TABLE_BORDERS.top_right,
+            &widths,
+            indent,
+        ),
+    );
     // The header row is the table's first row and the only one drawn bold —
     // the same emphasis nushell gives its column headers.
-    let (header_lines, header_joins, header_chrome) = table_rows.first().map_or_default(|row| {
-        render_table_row_wrapped(row, &widths, &header_alignment, indent, Modifier::BOLD)
-    });
-    lines.extend(header_lines);
-    joins.extend(header_joins);
-    chrome.extend(header_chrome);
-    lines.push(table_separator_line(&widths, indent));
-    joins.push(LineJoin::Break);
-    chrome.push(LineChrome::default());
+    if let Some(header_row) = table_rows.first() {
+        let (header_lines, header_joins, header_chrome) = render_table_row_wrapped(
+            header_row,
+            &widths,
+            &header_alignment,
+            indent,
+            Modifier::BOLD,
+        );
+        lines.extend(header_lines);
+        joins.extend(header_joins);
+        chrome.extend(header_chrome);
+    }
+    push_rule_row(
+        &mut lines,
+        &mut joins,
+        &mut chrome,
+        table_separator_line(&widths, indent),
+    );
     for (index, row) in table_rows.iter().enumerate().skip(1) {
         let (row_lines, row_joins, row_chrome) =
             render_table_row_wrapped(row, &widths, &header_alignment, indent, Modifier::empty());
@@ -111,21 +123,43 @@ pub(crate) fn render_table_lines(
         if index < table_rows.len() - 1 {
             // Inter-row junctions stay square: nushell's rounded preset
             // rounds only the outer corners, never the T-junctions.
-            lines.push(table_border_line('├', '┼', '┤', &widths, indent));
-            joins.push(LineJoin::Break);
-            chrome.push(LineChrome::default());
+            push_rule_row(
+                &mut lines,
+                &mut joins,
+                &mut chrome,
+                table_border_line('├', '┼', '┤', &widths, indent),
+            );
         }
     }
-    lines.push(table_border_line(
-        TABLE_BORDERS.bottom_left,
-        TABLE_BORDERS.bottom_mid,
-        TABLE_BORDERS.bottom_right,
-        &widths,
-        indent,
-    ));
-    joins.push(LineJoin::Break);
-    chrome.push(LineChrome::default());
+    push_rule_row(
+        &mut lines,
+        &mut joins,
+        &mut chrome,
+        table_border_line(
+            TABLE_BORDERS.bottom_left,
+            TABLE_BORDERS.bottom_mid,
+            TABLE_BORDERS.bottom_right,
+            &widths,
+            indent,
+        ),
+    );
     (lines, joins, chrome)
+}
+
+/// Push a table frame or inter-row separator rule: its whole span is
+/// non-selectable chrome, so a copy over it yields nothing, and it is a fresh
+/// line in the copy.
+fn push_rule_row(
+    lines: &mut Vec<Line<'static>>,
+    joins: &mut Vec<LineJoin>,
+    chrome: &mut Vec<LineChrome>,
+    line: Line<'static>,
+) {
+    let mut c = LineChrome::default();
+    c.push(0, line.width());
+    lines.push(line);
+    joins.push(LineJoin::Break);
+    chrome.push(c);
 }
 
 pub(crate) fn normalized_alignments(
@@ -222,16 +256,51 @@ pub(crate) fn render_table_row_wrapped(
     indent: usize,
     modifier: Modifier,
 ) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
-    let wrapped_cells: Vec<Vec<String>> = row
+    let wrapped_cells: Vec<Vec<(String, LineJoin)>> = row
         .iter()
         .zip(widths.iter())
         .map(|(cell, width)| wrap_cell_text(cell, *width))
         .collect();
     let row_height = wrapped_cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    // Row copy-joins: the first row is a fresh line, and each continuation
+    // joins as the wrap that produced it did — a word-boundary seam re-inserts
+    // the one separating space, a hard mid-word split joins directly, an
+    // embedded newline is a break.  When the cells on a line disagree, the
+    // strongest wins, so a hard split is never merged with a space.
+    let mut joins = Vec::with_capacity(row_height);
+    // The first row is always a fresh line; continuations default to a
+    // word-wrap seam (`Space`) and are upgraded below.
+    joins.push(LineJoin::Break);
+    joins.resize(row_height, LineJoin::Space);
+    for (line_index, row_join) in joins.iter_mut().enumerate().skip(1) {
+        for cell in &wrapped_cells {
+            if let Some((_, cell_join)) = cell.get(line_index) {
+                match cell_join {
+                    LineJoin::Break => {
+                        *row_join = LineJoin::Break;
+                        break;
+                    }
+                    LineJoin::Join => {
+                        if *row_join != LineJoin::Break {
+                            *row_join = LineJoin::Join;
+                        }
+                    }
+                    LineJoin::Space => {}
+                }
+            }
+        }
+    }
     let mut lines = Vec::with_capacity(row_height);
+    let mut chrome = Vec::with_capacity(row_height);
     for line_index in 0..row_height {
         let mut text = String::new();
+        // Track the row's display columns so each `│` border column is recorded
+        // as chrome: the selection keeps the cell text and drops the borders.
+        let mut col = 0usize;
+        let mut row_chrome = LineChrome::default();
         text.push('│');
+        row_chrome.push(indent + col, indent + col + 1);
+        col += 1;
         for column_index in 0..widths.len() {
             // `wrapped_cells`/`alignments` carry one entry per column of
             // `widths` (rows are normalized to the column count), so these
@@ -239,40 +308,50 @@ pub(crate) fn render_table_row_wrapped(
             let cell_line = wrapped_cells
                 .get(column_index)
                 .and_then(|cell| cell.get(line_index))
-                .map_or("", String::as_str);
+                .map_or("", |(text, _join)| text.as_str());
             let Some(cell_width) = widths.get(column_index) else {
                 continue;
             };
+            // One padding space, the aligned cell text, then one padding space
+            // and the cell's trailing border.
             text.push(' ');
-            text.push_str(&pad_aligned(
+            col += 1;
+            let padded = pad_aligned(
                 cell_line,
                 *cell_width,
                 alignments
                     .get(column_index)
                     .copied()
                     .unwrap_or(MarkdownAlignment::None),
-            ));
+            );
+            col += display_width(&padded);
+            text.push_str(&padded);
             text.push(' ');
+            col += 1;
             text.push('│');
+            row_chrome.push(indent + col, indent + col + 1);
+            col += 1;
         }
         lines.push(indented_styled_line(indent, text, modifier));
+        chrome.push(row_chrome);
     }
-    // Every table row (visual or wrapped) is a distinct line in the copy:
-    // the cell borders and padding are per-row rendering chrome that must
-    // not be re-glueed into a paragraph.
-    let joins = vec![LineJoin::Break; lines.len()];
-    // No renderer-emitted chrome yet (borders are still handled by the copy
-    // path); keep the buffer aligned with one default entry per row.
-    let chrome = vec![LineChrome::default(); lines.len()];
     (lines, joins, chrome)
 }
 
-pub(crate) fn wrap_cell_text(text: &str, width: usize) -> Vec<String> {
+/// Wrap one cell's text to `width`, returning each display line paired with
+/// the [`LineJoin`] describing how it glues to the line before it (so the copy
+/// can rejoin a wrapped cell to its original text): `Break` for the first line
+/// of a source segment, `Space` for a word-boundary wrap, `Join` for a hard
+/// mid-word split.
+pub(crate) fn wrap_cell_text(text: &str, width: usize) -> Vec<(String, LineJoin)> {
     let width = width.max(1);
-    let mut lines = Vec::new();
+    let mut lines: Vec<(String, LineJoin)> = Vec::new();
     for raw_line in text.split('\n') {
         let mut current = String::new();
         let mut current_width = 0;
+        // The join of the line currently being built; a fresh source segment
+        // is a break, a word-wrap seam becomes a space, a hard split joins.
+        let mut current_join = LineJoin::Break;
         for word in raw_line.split_whitespace() {
             let word_width = display_width(word);
             let separator_width = usize::from(!current.is_empty());
@@ -283,27 +362,37 @@ pub(crate) fn wrap_cell_text(text: &str, width: usize) -> Vec<String> {
                 }
                 current.push_str(word);
                 current_width += word_width;
-            } else if current.is_empty() {
-                lines.extend(split_word_to_width(word, width));
             } else {
-                lines.push(std::mem::take(&mut current));
-                current_width = 0;
+                // Flush the current line (the wrap is a word boundary → the
+                // copy re-inserts the separating space) before placing `word`.
+                if !current.is_empty() {
+                    lines.push((std::mem::take(&mut current), current_join));
+                    current_join = LineJoin::Space;
+                    current_width = 0;
+                }
                 if word_width <= width {
                     current.push_str(word);
                     current_width = word_width;
                 } else {
-                    lines.extend(split_word_to_width(word, width));
+                    // The word alone exceeds the width: hard-split it, its
+                    // chunks joined directly (no space exists in the source).
+                    for (chunk_index, chunk) in
+                        split_word_to_width(word, width).into_iter().enumerate()
+                    {
+                        if chunk_index > 0 {
+                            lines.push((std::mem::take(&mut current), current_join));
+                            current_join = LineJoin::Join;
+                        }
+                        current_width += display_width(&chunk);
+                        current.push_str(&chunk);
+                    }
                 }
             }
         }
-        if current.is_empty() {
-            lines.push(String::new());
-        } else {
-            lines.push(current);
-        }
+        lines.push((current, current_join));
     }
     if lines.is_empty() {
-        lines.push(String::new());
+        lines.push((String::new(), LineJoin::Break));
     }
     lines
 }
