@@ -287,6 +287,64 @@ fn send_to_writer(ctx: &ClientCtx, inner: &DaemonMessageType) {
     );
 }
 
+/// Owns the obligation to answer exactly one request.
+///
+/// [`send`](Self::send) consumes the handle; dropping an unused handle trips
+/// the debug guard, so a connection-thread handler cannot silently forget its
+/// reply — "exactly one reply" is enforced, not merely commented. One handle is
+/// minted per in-scope request from the acting connection's context (see
+/// [`ClientCtx::reply_handle`]) and passed by value to the handler that
+/// computes the reply inline.
+struct ReplyHandle<'a> {
+    /// The request id stamped onto the reply (echoed from the inbound frame).
+    id: u64,
+    /// The acting client's delivery sink. Owned (a cheap clone: a channel
+    /// sender plus its `Arc` byte counter) rather than borrowed from the
+    /// context, so the handle can be passed alongside `&mut ClientCtx` to a
+    /// handler.
+    sink: crate::broadcast::SubscriberSink,
+    /// Daemon-wide lag counter, borrowed from the connection; balanced by the
+    /// same enqueue-here / dequeue-in-the-writer-thread pairing as
+    /// [`send_to_writer`].
+    global: &'a AtomicUsize,
+    /// Whether the reply obligation has been met (sent) or deliberately
+    /// abandoned. `false` only on the drop-unanswered path the guard targets.
+    sent: bool,
+}
+
+impl ReplyHandle<'_> {
+    /// Answer the request: stamp `id` onto `inner` and enqueue the reply.
+    ///
+    /// Routes through `send_unchecked` (the no-threshold path) because a reply
+    /// is a request/response contract that must never be dropped for lag — the
+    /// same reasoning documented on [`send_to_writer`].
+    fn send(mut self, inner: DaemonMessageType) {
+        // Mark satisfied BEFORE the send so the guard is met even if the send
+        // path is unwound through: the enqueue on an unbounded channel cannot
+        // fail, but keeping the flag set first makes the invariant local.
+        self.sent = true;
+        self.sink
+            .send_unchecked(&DaemonMessage::reply(self.id, inner), self.global);
+    }
+
+    /// Relinquish the reply obligation WITHOUT sending.
+    ///
+    /// Reserved for the daemon-disconnected path: the command loop that would
+    /// have produced the reply is gone and the connection is being torn down,
+    /// so there is nobody left to answer. Marking the handle satisfied keeps
+    /// the drop guard meaningful — it must fire on a *forgotten* reply, never
+    /// on an impossible one.
+    fn abandon(mut self) {
+        self.sent = true;
+    }
+}
+
+impl Drop for ReplyHandle<'_> {
+    fn drop(&mut self) {
+        debug_assert!(self.sent, "request {} left unacknowledged", self.id);
+    }
+}
+
 /// Shared per-client context passed through the dispatch and handler functions.
 /// Bundles the channels and mutable per-connection state into one struct so
 /// the call sites don't pass 5–6 individual arguments to every function.
@@ -317,6 +375,23 @@ struct ClientCtx<'a> {
     /// `AclAdd` is refused on TCP because the approver for a trust decision
     /// must be at the machine, not on the network.
     is_unix: bool,
+}
+
+impl<'a> ClientCtx<'a> {
+    /// Mint the [`ReplyHandle`] for the request currently being dispatched.
+    ///
+    /// The sink clone is cheap (a channel `Sender` + an `Arc`), and the
+    /// returned handle borrows only `global_lag` (a `&'a AtomicUsize` copied
+    /// out of the context) — never `ctx` itself — so a dispatch arm or handler
+    /// can mint the handle and still pass `&mut ctx` alongside it.
+    fn reply_handle(&self) -> ReplyHandle<'a> {
+        ReplyHandle {
+            id: self.request_id,
+            sink: self.writer.clone(),
+            global: self.global_lag,
+            sent: false,
+        }
+    }
 }
 
 /// Clean up a client connection: detach from session, unregister the summary
@@ -356,6 +431,10 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
     // dispatch produces, and the payload is matched by value below.
     let ClientMessage { id, inner } = msg;
     ctx.request_id = id;
+    // The request's kind tag, computed before the payload is matched by value.
+    // The defensive wildcard arm (a future wire variant) needs it to build a
+    // typed `Failed` reply without re-deriving from the moved payload.
+    let kind = inner.kind();
     match inner {
         ClientMessageType::CreateSession {
             title,
@@ -366,6 +445,10 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             selected_model,
             reasoning_effort,
         } => {
+            // Mint the reply handle here and hand it to the handler by value:
+            // `handle_client_create_session` answers on THIS thread (it blocks
+            // on the daemon round-trip), so it owns the reply obligation.
+            let handle = ctx.reply_handle();
             if !handle_client_create_session(
                 title,
                 parent_session_id,
@@ -375,6 +458,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 selected_model,
                 reasoning_effort,
                 ctx,
+                handle,
             ) {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
@@ -383,7 +467,8 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             }
         }
         ClientMessageType::AttachSession { session_id } => {
-            if !handle_client_attach_session(session_id, ctx) {
+            let handle = ctx.reply_handle();
+            if !handle_client_attach_session(session_id, ctx, handle) {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
                     "daemon disconnected",
@@ -394,8 +479,13 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             debug!("client {}: ListSessions", ctx.client_id);
             let (reply, rx) = mpsc::channel();
             let _ = ctx.daemon_tx.send(DaemonCommand::ListSessions { reply });
-            if let Ok(sessions) = rx.recv() {
-                send_to_writer(ctx, &DaemonMessageType::Sessions { sessions });
+            let handle = ctx.reply_handle();
+            match rx.recv() {
+                Ok(sessions) => handle.send(DaemonMessageType::Sessions { sessions }),
+                // Daemon gone: the command loop that would have produced the
+                // list no longer exists, so the reply is impossible (not
+                // forgotten) and the connection is being torn down.
+                Err(_) => handle.abandon(),
             }
         }
         ClientMessageType::SubscribeSessionsSummary => {
@@ -483,7 +573,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
         }
         ClientMessageType::Ping => {
             debug!("client {}: Ping", ctx.client_id);
-            send_to_writer(ctx, &DaemonMessageType::Pong);
+            ctx.reply_handle().send(DaemonMessageType::Pong);
         }
         ClientMessageType::SetModel { model } => {
             info!(
@@ -533,27 +623,26 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             if let Some(tx) = ctx.attached_session_tx {
                 let (reply, rx) = mpsc::channel();
                 let _ = tx.send(SessionCommand::GetReasoningEffort { reply });
+                let handle = ctx.reply_handle();
                 if let Ok(effort) = rx.recv() {
                     // Session-scoped reply to the attached session: carry its
                     // real id (do NOT fall back to the None sentinel).
-                    send_to_writer(
-                        ctx,
-                        &DaemonMessageType::Session {
-                            session_id: *ctx.attached_session_id,
-                            event: SessionEvent::ReasoningEffortSet { effort },
-                        },
-                    );
+                    handle.send(DaemonMessageType::Session {
+                        session_id: *ctx.attached_session_id,
+                        event: SessionEvent::ReasoningEffortSet { effort },
+                    });
+                } else {
+                    // The session thread is gone; the connection is being
+                    // torn down, so the reply is impossible.
+                    handle.abandon();
                 }
             } else {
-                send_to_writer(
-                    ctx,
-                    &DaemonMessageType::Session {
-                        session_id: None,
-                        event: SessionEvent::ReasoningEffortSet {
-                            effort: "off".to_string(),
-                        },
+                ctx.reply_handle().send(DaemonMessageType::Session {
+                    session_id: None,
+                    event: SessionEvent::ReasoningEffortSet {
+                        effort: "off".to_string(),
                     },
-                );
+                });
             }
         }
         ClientMessageType::Unlock { private_key } => {
@@ -566,7 +655,8 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
         }
         ClientMessageType::Lock => {
             info!("client {}: Lock", ctx.client_id);
-            handle_lock_sync(ctx);
+            let handle = ctx.reply_handle();
+            handle_lock_sync(ctx, handle);
         }
         ClientMessageType::AddCredential {
             service,
@@ -584,15 +674,19 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 "client {}: RemoveCredential service={}",
                 ctx.client_id, service
             );
-            handle_remove_credential_sync(ctx, service);
+            let handle = ctx.reply_handle();
+            handle_remove_credential_sync(ctx, handle, service);
         }
         ClientMessageType::AclAdd { pubkey } => {
             info!("client {}: AclAdd (local={})", ctx.client_id, ctx.is_unix);
-            handle_acl_add_sync(ctx, &pubkey);
+            let handle = ctx.reply_handle();
+            handle_acl_add_sync(ctx, handle, &pubkey);
         }
         ClientMessageType::ListModels => {
             debug!("client {}: ListModels", ctx.client_id);
-            handle_list_models_sync(ctx, *ctx.attached_session_id);
+            let session_id = *ctx.attached_session_id;
+            let handle = ctx.reply_handle();
+            handle_list_models_sync(ctx, handle, session_id);
         }
         ClientMessageType::GetImage {
             session_id,
@@ -603,35 +697,43 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 "client {}: GetImage session={} turn={} key={:?}",
                 ctx.client_id, session_id, turn_id, key
             );
-            handle_client_get_image(session_id, turn_id, key, ctx);
+            let handle = ctx.reply_handle();
+            handle_client_get_image(session_id, turn_id, key, ctx, handle);
         }
         ClientMessageType::RefreshModels { force } => {
             debug!("client {}: RefreshModels force={}", ctx.client_id, force);
-            handle_refresh_models_sync(ctx, force);
+            let handle = ctx.reply_handle();
+            handle_refresh_models_sync(ctx, handle, force);
         }
         ClientMessageType::McpStatusRequest => {
             debug!("client {}: McpStatusRequest", ctx.client_id);
-            handle_mcp_status_sync(ctx);
+            let handle = ctx.reply_handle();
+            handle_mcp_status_sync(ctx, handle);
         }
         ClientMessageType::McpReconnect { slug } => {
             debug!("client {}: McpReconnect slug={}", ctx.client_id, slug);
-            handle_mcp_reconnect_sync(ctx, slug);
+            let handle = ctx.reply_handle();
+            handle_mcp_reconnect_sync(ctx, handle, slug);
         }
         ClientMessageType::McpReload => {
             debug!("client {}: McpReload", ctx.client_id);
-            handle_mcp_reload_sync(ctx);
+            let handle = ctx.reply_handle();
+            handle_mcp_reload_sync(ctx, handle);
         }
         ClientMessageType::McpTrust => {
             debug!("client {}: McpTrust", ctx.client_id);
-            handle_mcp_trust_sync(ctx, true);
+            let handle = ctx.reply_handle();
+            handle_mcp_trust_sync(ctx, handle, true);
         }
         ClientMessageType::McpUntrust => {
             debug!("client {}: McpUntrust", ctx.client_id);
-            handle_mcp_trust_sync(ctx, false);
+            let handle = ctx.reply_handle();
+            handle_mcp_trust_sync(ctx, handle, false);
         }
         ClientMessageType::McpTrustList => {
             debug!("client {}: McpTrustList", ctx.client_id);
-            handle_mcp_trust_list_sync(ctx);
+            let handle = ctx.reply_handle();
+            handle_mcp_trust_list_sync(ctx, handle);
         }
         ClientMessageType::DeleteSession { session_id } => {
             info!("client {}: DeleteSession id={}", ctx.client_id, session_id);
@@ -667,7 +769,8 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             );
         }
         ClientMessageType::GetCredential { service } => {
-            handle_get_credential_sync(ctx, service);
+            let handle = ctx.reply_handle();
+            handle_get_credential_sync(ctx, handle, service);
         }
         ClientMessageType::AddAccount {
             name,
@@ -679,6 +782,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             request_timeout_secs,
             total_timeout_secs,
         } => {
+            let handle = ctx.reply_handle();
             let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::AddAccountCmd {
                 name: name.clone(),
                 provider,
@@ -691,45 +795,35 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 reply,
             });
             match result {
-                Ok(Ok(())) => {
-                    send_to_writer(ctx, &DaemonMessageType::AccountAdded { name });
-                }
-                Ok(Err(e)) => {
-                    send_to_writer(ctx, &DaemonMessageType::AccountAddFailed { name, error: e });
-                }
-                Err(_) => warn!("daemon disconnected while handling add account"),
+                Ok(Ok(())) => handle.send(DaemonMessageType::AccountAdded { name }),
+                Ok(Err(e)) => handle.send(DaemonMessageType::AccountAddFailed { name, error: e }),
+                // Daemon gone: the reply is impossible, not forgotten.
+                Err(_) => handle.abandon(),
             }
         }
         ClientMessageType::RemoveAccount { name } => {
+            let handle = ctx.reply_handle();
             let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::RemoveAccountCmd {
                 name: name.clone(),
                 reply,
             });
             match result {
-                Ok(Ok(())) => {
-                    send_to_writer(ctx, &DaemonMessageType::AccountRemoved { name });
-                }
+                Ok(Ok(())) => handle.send(DaemonMessageType::AccountRemoved { name }),
                 Ok(Err(e)) => {
-                    send_to_writer(
-                        ctx,
-                        &DaemonMessageType::AccountRemoveFailed { name, error: e },
-                    );
+                    handle.send(DaemonMessageType::AccountRemoveFailed { name, error: e });
                 }
-                Err(_) => warn!("daemon disconnected while handling remove account"),
+                Err(_) => handle.abandon(),
             }
         }
         ClientMessageType::ListAccounts => {
+            let handle = ctx.reply_handle();
             let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::ListAccountsCmd {
                 reply,
             });
             match result {
-                Ok(Ok(accounts)) => {
-                    send_to_writer(ctx, &DaemonMessageType::Accounts { accounts });
-                }
-                Ok(Err(e)) => {
-                    send_to_writer(ctx, &DaemonMessageType::AccountListFailed { error: e });
-                }
-                Err(_) => warn!("daemon disconnected while handling list accounts"),
+                Ok(Ok(accounts)) => handle.send(DaemonMessageType::Accounts { accounts }),
+                Ok(Err(e)) => handle.send(DaemonMessageType::AccountListFailed { error: e }),
+                Err(_) => handle.abandon(),
             }
         }
         ClientMessageType::SetSessionAccount { name } => {
@@ -751,7 +845,17 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 });
         }
         _ => {
-            warn!("unhandled client message: {inner:?}");
+            // Defensive net for a request the dispatch does not (yet) answer —
+            // today only `GetSessionState`, which is defined on the wire but
+            // has no connection-thread handler. The variant set IS the wire
+            // contract, so this arm should not be reached in practice, but it
+            // must still REPLY rather than drop: an unanswered request strands
+            // the client's pending slot until its timeout.
+            warn!("unhandled client message (kind {kind:?})");
+            ctx.reply_handle().send(DaemonMessageType::Failed {
+                kind,
+                error: "unsupported request".into(),
+            });
         }
     }
     Ok(())
@@ -1181,7 +1285,7 @@ fn switch_attached_session(
 #[expect(clippy::too_many_arguments)]
 /// Handle a `CreateSession` client message. Returns false if the daemon
 /// disconnected, signaling `client_thread` to return.
-fn handle_client_create_session(
+fn handle_client_create_session<'a>(
     title: Option<String>,
     parent_session_id: Option<u64>,
     working_dir: Option<String>,
@@ -1189,7 +1293,8 @@ fn handle_client_create_session(
     account_name: Option<String>,
     selected_model: Option<String>,
     reasoning_effort: Option<String>,
-    ctx: &mut ClientCtx,
+    ctx: &mut ClientCtx<'a>,
+    handle: ReplyHandle<'a>,
 ) -> bool {
     info!("client {}: CreateSession", ctx.client_id);
     let cwd_str = working_dir.clone();
@@ -1223,41 +1328,45 @@ fn handle_client_create_session(
             // The daemon separately broadcasts `SessionCreated` to every
             // subscriber (see `DaemonState::handle_create_session`), where it
             // is notification-only and must not move a client's view.
-            send_to_writer(
-                ctx,
-                &DaemonMessageType::Session {
-                    session_id: Some(sid),
-                    event: SessionEvent::SessionCreatedForRequester {
-                        title,
-                        parent_session_id,
-                        working_dir: cwd_str,
-                        account_name,
-                        selected_model,
-                        reasoning_effort,
-                    },
+            handle.send(DaemonMessageType::Session {
+                session_id: Some(sid),
+                event: SessionEvent::SessionCreatedForRequester {
+                    title,
+                    parent_session_id,
+                    working_dir: cwd_str,
+                    account_name,
+                    selected_model,
+                    reasoning_effort,
                 },
-            );
+            });
         }
         Ok(Err(e)) => {
-            send_to_writer(
-                ctx,
-                &DaemonMessageType::Session {
-                    session_id: None,
-                    event: SessionEvent::SessionFailed {
-                        operation: "create_session".into(),
-                        error: e.to_string(),
-                    },
+            handle.send(DaemonMessageType::Session {
+                session_id: None,
+                event: SessionEvent::SessionFailed {
+                    operation: "create_session".into(),
+                    error: e.to_string(),
                 },
-            );
+            });
         }
-        Err(_) => return false,
+        Err(_) => {
+            // Daemon disconnected: release the obligation (the caller returns
+            // false and the connection is torn down) so the guard does not
+            // fire on an impossible reply.
+            handle.abandon();
+            return false;
+        }
     }
     true
 }
 
 /// Handle an `AttachSession` client message. Returns false if the daemon
 /// disconnected, signaling `client_thread` to return.
-fn handle_client_attach_session(session_id: u64, ctx: &mut ClientCtx) -> bool {
+fn handle_client_attach_session<'a>(
+    session_id: u64,
+    ctx: &mut ClientCtx<'a>,
+    handle: ReplyHandle<'a>,
+) -> bool {
     info!("client {}: AttachSession id={}", ctx.client_id, session_id);
     let (reply, rx) = mpsc::channel();
     let _ = ctx
@@ -1268,28 +1377,25 @@ fn handle_client_attach_session(session_id: u64, ctx: &mut ClientCtx) -> bool {
             // Send SessionAttached before SessionCommand::Attach so that
             // the TUI's attached_session_id is set before SessionState
             // arrives — otherwise SessionState is silently dropped.
-            send_to_writer(
-                ctx,
-                &DaemonMessageType::Session {
-                    session_id: Some(session_id),
-                    event: SessionEvent::SessionAttached,
-                },
-            );
+            handle.send(DaemonMessageType::Session {
+                session_id: Some(session_id),
+                event: SessionEvent::SessionAttached,
+            });
             switch_attached_session(session_id, session_tx, ctx);
         }
         Ok(Err(e)) => {
-            send_to_writer(
-                ctx,
-                &DaemonMessageType::Session {
-                    session_id: None,
-                    event: SessionEvent::SessionFailed {
-                        operation: "attach_session".into(),
-                        error: e.to_string(),
-                    },
+            handle.send(DaemonMessageType::Session {
+                session_id: None,
+                event: SessionEvent::SessionFailed {
+                    operation: "attach_session".into(),
+                    error: e.to_string(),
                 },
-            );
+            });
         }
-        Err(_) => return false,
+        Err(_) => {
+            handle.abandon();
+            return false;
+        }
     }
     true
 }
@@ -1391,38 +1497,32 @@ fn handle_bind_keystore_sync(ctx: &mut ClientCtx, key: Vec<u8>) {
 /// the acting client directly; the transition broadcast reaches it too (it
 /// is an activity subscriber), harmlessly idempotent — the TUI latches
 /// `keystore_locked` either way.
-fn handle_lock_sync(ctx: &mut ClientCtx) {
+fn handle_lock_sync<'a>(ctx: &mut ClientCtx<'a>, handle: ReplyHandle<'a>) {
     let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::Lock { reply });
     match result {
-        Ok(Ok(())) => {
-            send_to_writer(ctx, &DaemonMessageType::Locked);
-        }
-        Ok(Err(e)) => {
-            send_to_writer(ctx, &DaemonMessageType::LockedError { error: e });
-        }
-        Err(_) => warn!("daemon disconnected while handling lock"),
+        Ok(Ok(())) => handle.send(DaemonMessageType::Locked),
+        Ok(Err(e)) => handle.send(DaemonMessageType::LockedError { error: e }),
+        // Daemon gone: the reply is impossible, not forgotten.
+        Err(_) => handle.abandon(),
     }
 }
 
-fn handle_list_models_sync(ctx: &mut ClientCtx, attached_session_id: Option<u64>) {
+fn handle_list_models_sync<'a>(
+    ctx: &mut ClientCtx<'a>,
+    handle: ReplyHandle<'a>,
+    attached_session_id: Option<u64>,
+) {
     let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::ListModels {
         session_id: attached_session_id,
         reply,
     });
     match result {
-        Ok(Ok((models, selected_model))) => {
-            send_to_writer(
-                ctx,
-                &DaemonMessageType::Models {
-                    models,
-                    selected_model,
-                },
-            );
-        }
-        Ok(Err(e)) => {
-            send_to_writer(ctx, &DaemonMessageType::ModelsFailed { error: e });
-        }
-        Err(_) => warn!("daemon disconnected while handling list models"),
+        Ok(Ok((models, selected_model))) => handle.send(DaemonMessageType::Models {
+            models,
+            selected_model,
+        }),
+        Ok(Err(e)) => handle.send(DaemonMessageType::ModelsFailed { error: e }),
+        Err(_) => handle.abandon(),
     }
 }
 
@@ -1445,6 +1545,7 @@ fn handle_client_get_image(
     turn_id: u32,
     key: choreo_proto::ImageKey,
     ctx: &ClientCtx,
+    handle: ReplyHandle<'_>,
 ) {
     let data = if *ctx.attached_session_id == Some(session_id) {
         // `None` covers both "not found" and a redb read error; the client
@@ -1467,15 +1568,12 @@ fn handle_client_get_image(
     } else {
         None
     };
-    send_to_writer(
-        ctx,
-        &DaemonMessageType::Image {
-            session_id,
-            turn_id,
-            key,
-            data,
-        },
-    );
+    handle.send(DaemonMessageType::Image {
+        session_id,
+        turn_id,
+        key,
+        data,
+    });
 }
 
 /// Handle a `RefreshModels` client message: forward the request to the daemon
@@ -1483,26 +1581,19 @@ fn handle_client_get_image(
 /// connection), then route the reply back to the client. The request blocks
 /// here until the maintenance thread has a result, which is the request/
 /// response contract `/refresh-models` implies.
-fn handle_refresh_models_sync(ctx: &mut ClientCtx, force: bool) {
+fn handle_refresh_models_sync<'a>(ctx: &mut ClientCtx<'a>, handle: ReplyHandle<'a>, force: bool) {
     let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::RefreshModels {
         force,
         reply,
     });
     match result {
-        Ok(Ok(report)) => {
-            send_to_writer(
-                ctx,
-                &DaemonMessageType::ModelsRefreshed {
-                    providers: report.providers,
-                    models: report.models,
-                    status: report.status,
-                },
-            );
-        }
-        Ok(Err(e)) => {
-            send_to_writer(ctx, &DaemonMessageType::ModelsRefreshFailed { error: e });
-        }
-        Err(_) => warn!("daemon disconnected while handling refresh models"),
+        Ok(Ok(report)) => handle.send(DaemonMessageType::ModelsRefreshed {
+            providers: report.providers,
+            models: report.models,
+            status: report.status,
+        }),
+        Ok(Err(e)) => handle.send(DaemonMessageType::ModelsRefreshFailed { error: e }),
+        Err(_) => handle.abandon(),
     }
 }
 
@@ -1530,35 +1621,31 @@ fn wire_mcp_status(status: crate::mcp::McpServerStatus) -> choreo_proto::McpServ
 /// (daemon tier plus that session's project servers), convert each record to
 /// the wire type, and reply with [`DaemonMessageType::McpStatus`] — including the
 /// session's project-root trust context.
-fn handle_mcp_status_sync(ctx: &mut ClientCtx) {
+fn handle_mcp_status_sync<'a>(ctx: &mut ClientCtx<'a>, handle: ReplyHandle<'a>) {
     let session_id = *ctx.attached_session_id;
     let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::McpStatus {
         session_id,
         reply,
     });
-    if let Ok(report) = result {
-        send_mcp_status(ctx, report);
-    } else {
-        warn!("daemon disconnected while handling mcp status");
+    match result {
+        Ok(report) => send_mcp_status(handle, report),
+        Err(_) => handle.abandon(),
     }
 }
 
 /// Send an [`McpStatusReport`](crate::mcp::McpStatusReport) as a wire
 /// [`DaemonMessageType::McpStatus`], converting each server record and carrying the
 /// project-root trust context.
-fn send_mcp_status(ctx: &mut ClientCtx, report: crate::mcp::McpStatusReport) {
+fn send_mcp_status(handle: ReplyHandle<'_>, report: crate::mcp::McpStatusReport) {
     let servers = report.servers.into_iter().map(wire_mcp_status).collect();
-    send_to_writer(
-        ctx,
-        &DaemonMessageType::McpStatus {
-            servers,
-            project_root: report
-                .project_root
-                .map(|p| p.to_string_lossy().into_owned()),
-            project_trusted: report.project_trusted,
-            ignored_project_servers: report.ignored_project_servers,
-        },
-    );
+    handle.send(DaemonMessageType::McpStatus {
+        servers,
+        project_root: report
+            .project_root
+            .map(|p| p.to_string_lossy().into_owned()),
+        project_trusted: report.project_trusted,
+        ignored_project_servers: report.ignored_project_servers,
+    });
 }
 
 /// Handle a `ClientMessageType::McpReconnect`: rebuild one MCP server's connection
@@ -1568,7 +1655,7 @@ fn send_mcp_status(ctx: &mut ClientCtx, report: crate::mcp::McpStatusReport) {
 /// server's new connected state and tool count — while a failure is a
 /// targeted [`DaemonMessageType::McpReconnectFailed`]. Both requests block here
 /// until the daemon has a result, matching the `/mcp` request/reply contract.
-fn handle_mcp_reconnect_sync(ctx: &mut ClientCtx, slug: String) {
+fn handle_mcp_reconnect_sync<'a>(ctx: &mut ClientCtx<'a>, handle: ReplyHandle<'a>, slug: String) {
     let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::McpReconnect {
         slug: slug.clone(),
         reply,
@@ -1580,19 +1667,13 @@ fn handle_mcp_reconnect_sync(ctx: &mut ClientCtx, slug: String) {
                 session_id,
                 reply,
             });
-            if let Ok(report) = status {
-                send_mcp_status(ctx, report);
-            } else {
-                warn!("daemon disconnected while reading mcp status after reconnect");
+            match status {
+                Ok(report) => send_mcp_status(handle, report),
+                Err(_) => handle.abandon(),
             }
         }
-        Ok(Err(e)) => {
-            send_to_writer(
-                ctx,
-                &DaemonMessageType::McpReconnectFailed { slug, error: e },
-            );
-        }
-        Err(_) => warn!("daemon disconnected while handling mcp reconnect"),
+        Ok(Err(e)) => handle.send(DaemonMessageType::McpReconnectFailed { slug, error: e }),
+        Err(_) => handle.abandon(),
     }
 }
 
@@ -1602,7 +1683,7 @@ fn handle_mcp_reconnect_sync(ctx: &mut ClientCtx, slug: String) {
 /// reported as [`DaemonMessageType::McpReloaded`] — the reload summary plus the
 /// refreshed status list — while a config read/parse failure is a
 /// [`DaemonMessageType::McpReloadFailed`].
-fn handle_mcp_reload_sync(ctx: &mut ClientCtx) {
+fn handle_mcp_reload_sync<'a>(ctx: &mut ClientCtx<'a>, handle: ReplyHandle<'a>) {
     let session_id = *ctx.attached_session_id;
     let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::McpReload {
         session_id,
@@ -1611,33 +1692,25 @@ fn handle_mcp_reload_sync(ctx: &mut ClientCtx) {
     match result {
         Ok(Ok(outcome)) => {
             let servers = outcome.servers.into_iter().map(wire_mcp_status).collect();
-            send_to_writer(
-                ctx,
-                &DaemonMessageType::McpReloaded {
-                    summary: outcome.summary,
-                    servers,
-                },
-            );
+            handle.send(DaemonMessageType::McpReloaded {
+                summary: outcome.summary,
+                servers,
+            });
         }
-        Ok(Err(e)) => {
-            send_to_writer(ctx, &DaemonMessageType::McpReloadFailed { error: e });
-        }
-        Err(_) => warn!("daemon disconnected while handling mcp reload"),
+        Ok(Err(e)) => handle.send(DaemonMessageType::McpReloadFailed { error: e }),
+        Err(_) => handle.abandon(),
     }
 }
 
 /// Handle a `ClientMessageType::McpTrust` / `McpUntrust`: set (or revoke) trust for
 /// the ATTACHED session's project root, then reply with the resulting state.
-fn handle_mcp_trust_sync(ctx: &mut ClientCtx, trusted: bool) {
+fn handle_mcp_trust_sync<'a>(ctx: &mut ClientCtx<'a>, handle: ReplyHandle<'a>, trusted: bool) {
     let Some(session_id) = *ctx.attached_session_id else {
-        send_to_writer(
-            ctx,
-            &DaemonMessageType::McpTrustUpdated {
-                root: None,
-                trusted: false,
-                message: "no session attached".to_string(),
-            },
-        );
+        handle.send(DaemonMessageType::McpTrustUpdated {
+            root: None,
+            trusted: false,
+            message: "no session attached".to_string(),
+        });
         return;
     };
     let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::McpTrustSet {
@@ -1645,57 +1718,46 @@ fn handle_mcp_trust_sync(ctx: &mut ClientCtx, trusted: bool) {
         trusted,
         reply,
     });
-    if let Ok(outcome) = result {
-        send_to_writer(
-            ctx,
-            &DaemonMessageType::McpTrustUpdated {
-                root: outcome.root.map(|p| p.to_string_lossy().into_owned()),
-                trusted: outcome.trusted,
-                message: outcome.message,
-            },
-        );
-    } else {
-        warn!("daemon disconnected while handling mcp trust");
+    match result {
+        Ok(outcome) => handle.send(DaemonMessageType::McpTrustUpdated {
+            root: outcome.root.map(|p| p.to_string_lossy().into_owned()),
+            trusted: outcome.trusted,
+            message: outcome.message,
+        }),
+        Err(_) => handle.abandon(),
     }
 }
 
 /// Handle a `ClientMessageType::McpTrustList`: reply with the trusted project roots.
-fn handle_mcp_trust_list_sync(ctx: &mut ClientCtx) {
+fn handle_mcp_trust_list_sync<'a>(ctx: &mut ClientCtx<'a>, handle: ReplyHandle<'a>) {
     let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::McpTrustList { reply });
-    if let Ok(roots) = result {
-        send_to_writer(
-            ctx,
-            &DaemonMessageType::McpTrustList {
-                roots: roots
-                    .into_iter()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect(),
-            },
-        );
-    } else {
-        warn!("daemon disconnected while handling mcp trust list");
+    match result {
+        Ok(roots) => handle.send(DaemonMessageType::McpTrustList {
+            roots: roots
+                .into_iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+        }),
+        Err(_) => handle.abandon(),
     }
 }
 
-fn handle_get_credential_sync(ctx: &mut ClientCtx, service: String) {
+fn handle_get_credential_sync<'a>(
+    ctx: &mut ClientCtx<'a>,
+    handle: ReplyHandle<'a>,
+    service: String,
+) {
     let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::GetCredential {
         service: service.clone(),
         reply,
     });
     match result {
-        Ok(Some(key)) => {
-            send_to_writer(
-                ctx,
-                &DaemonMessageType::Credential {
-                    service,
-                    key: Some(key),
-                },
-            );
-        }
-        Ok(None) => {
-            send_to_writer(ctx, &DaemonMessageType::Credential { service, key: None });
-        }
-        Err(_) => warn!("daemon disconnected while handling get credential"),
+        Ok(Some(key)) => handle.send(DaemonMessageType::Credential {
+            service,
+            key: Some(key),
+        }),
+        Ok(None) => handle.send(DaemonMessageType::Credential { service, key: None }),
+        Err(_) => handle.abandon(),
     }
 }
 
@@ -1795,19 +1857,16 @@ fn handle_add_credential_sync(
 /// client gets its refusal without the command loop ever seeing the command.
 /// The trust approver must be at the machine (console or ssh) — an
 /// already-remote client must not be able to mint new trust.
-fn handle_acl_add_sync(ctx: &mut ClientCtx, pubkey: &str) {
+fn handle_acl_add_sync<'a>(ctx: &mut ClientCtx<'a>, handle: ReplyHandle<'a>, pubkey: &str) {
     if !ctx.is_unix {
         warn!(
             "client {}: AclAdd refused: remote connections cannot change the ACL",
             ctx.client_id
         );
-        send_to_writer(
-            ctx,
-            &DaemonMessageType::AclAddResult {
-                ok: false,
-                message: "ACL changes are only permitted from local connections".to_string(),
-            },
-        );
+        handle.send(DaemonMessageType::AclAddResult {
+            ok: false,
+            message: "ACL changes are only permitted from local connections".to_string(),
+        });
         return;
     }
     let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::AclAddCmd {
@@ -1815,44 +1874,31 @@ fn handle_acl_add_sync(ctx: &mut ClientCtx, pubkey: &str) {
         reply,
     });
     match result {
-        Ok(Ok(count)) => {
-            send_to_writer(
-                ctx,
-                &DaemonMessageType::AclAddResult {
-                    ok: true,
-                    message: format!("client key authorized ({count} client(s) now trusted)"),
-                },
-            );
-        }
-        Ok(Err(e)) => {
-            send_to_writer(
-                ctx,
-                &DaemonMessageType::AclAddResult {
-                    ok: false,
-                    message: e,
-                },
-            );
-        }
-        Err(_) => warn!("daemon disconnected while handling acl add"),
+        Ok(Ok(count)) => handle.send(DaemonMessageType::AclAddResult {
+            ok: true,
+            message: format!("client key authorized ({count} client(s) now trusted)"),
+        }),
+        Ok(Err(e)) => handle.send(DaemonMessageType::AclAddResult {
+            ok: false,
+            message: e,
+        }),
+        Err(_) => handle.abandon(),
     }
 }
 
-fn handle_remove_credential_sync(ctx: &mut ClientCtx, service: String) {
+fn handle_remove_credential_sync<'a>(
+    ctx: &mut ClientCtx<'a>,
+    handle: ReplyHandle<'a>,
+    service: String,
+) {
     let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::RemoveCredentialCmd {
         service: service.clone(),
         reply,
     });
     match result {
-        Ok(Ok(())) => {
-            send_to_writer(ctx, &DaemonMessageType::CredentialRemoved { service });
-        }
-        Ok(Err(e)) => {
-            send_to_writer(
-                ctx,
-                &DaemonMessageType::CredentialRemoveFailed { service, error: e },
-            );
-        }
-        Err(_) => warn!("daemon disconnected while handling remove credential"),
+        Ok(Ok(())) => handle.send(DaemonMessageType::CredentialRemoved { service }),
+        Ok(Err(e)) => handle.send(DaemonMessageType::CredentialRemoveFailed { service, error: e }),
+        Err(_) => handle.abandon(),
     }
 }
 
@@ -2202,6 +2248,90 @@ mod tests {
         );
     }
 
+    /// Drive the drop guard directly: a `ReplyHandle` that is never sent must
+    /// trip the debug assertion on drop, so a handler that forgets its reply
+    /// cannot pass silently in a debug build.
+    #[test]
+    #[should_panic(expected = "left unacknowledged")]
+    fn reply_handle_dropped_unanswered_trips_guard() {
+        let (sink, _rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
+        let handle = ReplyHandle {
+            id: 7,
+            sink,
+            global: &global_lag,
+            sent: false,
+        };
+        // Never sent: the guard must fire here.
+        drop(handle);
+    }
+
+    /// The companion positive case: `send` stamps the request id onto the
+    /// reply and balances the daemon-wide lag counter exactly as
+    /// `send_to_writer` does (the counter holds the enqueued bytes until the
+    /// writer thread's dequeue decrement, which does not run here).
+    #[test]
+    fn reply_handle_send_stamps_id_and_accounts_bytes() {
+        let (sink, rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
+        let handle = ReplyHandle {
+            id: 99,
+            sink,
+            global: &global_lag,
+            sent: false,
+        };
+        handle.send(DaemonMessageType::Pong);
+
+        let msg = rx.recv().unwrap();
+        assert_eq!(msg.id, Some(99), "the reply must carry the request id");
+        assert!(matches!(msg.inner, DaemonMessageType::Pong));
+        assert_eq!(
+            global_lag.load(Ordering::Relaxed),
+            DaemonMessage::reply(99, DaemonMessageType::Pong).approx_wire_size(),
+            "send must increment the daemon-wide lag counter for the enqueued reply"
+        );
+    }
+
+    /// The defensive wildcard must REPLY, not drop: `GetSessionState` is on the
+    /// wire but has no connection-thread handler, so it lands in the wildcard,
+    /// which answers a typed `Failed` naming the request's kind. This keeps the
+    /// client's pending slot resolvable instead of stranding it until timeout.
+    #[test]
+    fn dispatch_unhandled_request_replies_failed_with_kind() {
+        let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer: &sink,
+            db: &TEST_DB,
+            global_lag: &global_lag,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+            request_id: 0,
+            is_unix: true,
+        };
+
+        dispatch_client_message(
+            ClientMessage::request(11, ClientMessageType::GetSessionState { session_id: 1 }),
+            &mut ctx,
+        )
+        .unwrap();
+
+        let msg = writer_rx.recv().unwrap();
+        assert_eq!(msg.id, Some(11));
+        assert!(matches!(
+            &msg.inner,
+            DaemonMessageType::Failed {
+                kind: choreo_proto::MessageKind::GetSessionState,
+                error,
+            } if error == "unsupported request"
+        ));
+    }
+
     #[test]
     fn handle_acl_add_sync_refuses_remote_clients_without_dialing_daemon() {
         // A TCP client's AclAdd must be refused at the connection layer: the
@@ -2225,7 +2355,12 @@ mod tests {
             is_unix: false, // a TCP/Noise client
         };
 
-        handle_acl_add_sync(&mut ctx, "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=");
+        let handle = ctx.reply_handle();
+        handle_acl_add_sync(
+            &mut ctx,
+            handle,
+            "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+        );
 
         let msg = writer_rx.recv().unwrap();
         match msg.inner {
@@ -2381,7 +2516,8 @@ mod tests {
                 let _ = reply.send(Ok(()));
             }
         });
-        handle_lock_sync(&mut ctx);
+        let handle = ctx.reply_handle();
+        handle_lock_sync(&mut ctx, handle);
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(msg.inner, DaemonMessageType::Locked));
     }
@@ -2411,7 +2547,8 @@ mod tests {
                 let _ = reply.send(Err("cannot lock".into()));
             }
         });
-        handle_lock_sync(&mut ctx);
+        let handle = ctx.reply_handle();
+        handle_lock_sync(&mut ctx, handle);
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(msg.inner, DaemonMessageType::LockedError { .. }));
     }
@@ -2442,7 +2579,8 @@ mod tests {
                 )));
             }
         });
-        handle_list_models_sync(&mut ctx, None);
+        let handle = ctx.reply_handle();
+        handle_list_models_sync(&mut ctx, handle, None);
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(msg.inner, DaemonMessageType::Models { .. }));
     }
@@ -2478,7 +2616,8 @@ mod tests {
                 }));
             }
         });
-        handle_refresh_models_sync(&mut ctx, true);
+        let handle = ctx.reply_handle();
+        handle_refresh_models_sync(&mut ctx, handle, true);
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(
             &msg.inner,
@@ -2513,7 +2652,8 @@ mod tests {
                 let _ = reply.send(Err("daemon is locked".into()));
             }
         });
-        handle_refresh_models_sync(&mut ctx, false);
+        let handle = ctx.reply_handle();
+        handle_refresh_models_sync(&mut ctx, handle, false);
         let msg = writer_rx.recv().unwrap();
         assert!(
             matches!(&msg.inner, DaemonMessageType::ModelsRefreshFailed { error } if error == "daemon is locked")
@@ -2598,7 +2738,8 @@ mod tests {
                 let _ = reply.send(sample_mcp_report());
             }
         });
-        handle_mcp_status_sync(&mut ctx);
+        let handle = ctx.reply_handle();
+        handle_mcp_status_sync(&mut ctx, handle);
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(
             &msg.inner,
@@ -2626,7 +2767,8 @@ mod tests {
                 let _ = reply.send(sample_mcp_report());
             }
         });
-        handle_mcp_reconnect_sync(&mut ctx, "docs".to_string());
+        let handle = ctx.reply_handle();
+        handle_mcp_reconnect_sync(&mut ctx, handle, "docs".to_string());
         let msg = writer_rx.recv().unwrap();
         assert!(
             matches!(&msg.inner, DaemonMessageType::McpStatus { servers, .. } if servers.len() == 1)
@@ -2646,7 +2788,8 @@ mod tests {
                 let _ = reply.send(Err("connect timed out".into()));
             }
         });
-        handle_mcp_reconnect_sync(&mut ctx, "docs".to_string());
+        let handle = ctx.reply_handle();
+        handle_mcp_reconnect_sync(&mut ctx, handle, "docs".to_string());
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(
             &msg.inner,
@@ -2673,7 +2816,8 @@ mod tests {
                 }));
             }
         });
-        handle_mcp_reload_sync(&mut ctx);
+        let handle = ctx.reply_handle();
+        handle_mcp_reload_sync(&mut ctx, handle);
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(
             &msg.inner,
@@ -2695,7 +2839,8 @@ mod tests {
                 let _ = reply.send(Err("failed to parse mcp.json".into()));
             }
         });
-        handle_mcp_reload_sync(&mut ctx);
+        let handle = ctx.reply_handle();
+        handle_mcp_reload_sync(&mut ctx, handle);
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(
             &msg.inner,
@@ -2727,7 +2872,8 @@ mod tests {
                 let _ = reply.send(Err("daemon is locked".into()));
             }
         });
-        handle_list_models_sync(&mut ctx, None);
+        let handle = ctx.reply_handle();
+        handle_list_models_sync(&mut ctx, handle, None);
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(msg.inner, DaemonMessageType::ModelsFailed { .. }));
         if let DaemonMessageType::ModelsFailed { error } = &msg.inner {
@@ -2776,7 +2922,14 @@ mod tests {
         };
         crate::db::write_turn(&TEST_DB, 5, 2, &turn).unwrap();
 
-        handle_client_get_image(5, 2, choreo_proto::ImageKey::Displayed { index: 1 }, &ctx);
+        let handle = ctx.reply_handle();
+        handle_client_get_image(
+            5,
+            2,
+            choreo_proto::ImageKey::Displayed { index: 1 },
+            &ctx,
+            handle,
+        );
         let msg = writer_rx.recv().unwrap();
         match msg.inner {
             DaemonMessageType::Image {
@@ -2845,6 +2998,7 @@ mod tests {
         };
         crate::db::write_turn(&TEST_DB, 6, 1, &turn).unwrap();
 
+        let handle = ctx.reply_handle();
         handle_client_get_image(
             6,
             1,
@@ -2852,6 +3006,7 @@ mod tests {
                 call_id: "call_v".into(),
             },
             &ctx,
+            handle,
         );
         let msg = writer_rx.recv().unwrap();
         match msg.inner {
@@ -2898,7 +3053,14 @@ mod tests {
             request_id: 0,
             is_unix: true,
         };
-        handle_client_get_image(99, 0, choreo_proto::ImageKey::Displayed { index: 0 }, &ctx);
+        let handle = ctx.reply_handle();
+        handle_client_get_image(
+            99,
+            0,
+            choreo_proto::ImageKey::Displayed { index: 0 },
+            &ctx,
+            handle,
+        );
         let msg = writer_rx.recv().unwrap();
         match msg.inner {
             DaemonMessageType::Image {
@@ -2939,7 +3101,8 @@ mod tests {
                 let _ = reply.send(Some("sk-123".into()));
             }
         });
-        handle_get_credential_sync(&mut ctx, "openai".into());
+        let handle = ctx.reply_handle();
+        handle_get_credential_sync(&mut ctx, handle, "openai".into());
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(msg.inner, DaemonMessageType::Credential { .. }));
         if let DaemonMessageType::Credential { service, key } = &msg.inner {
@@ -2972,7 +3135,8 @@ mod tests {
                 let _ = reply.send(None);
             }
         });
-        handle_get_credential_sync(&mut ctx, "openai".into());
+        let handle = ctx.reply_handle();
+        handle_get_credential_sync(&mut ctx, handle, "openai".into());
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(msg.inner, DaemonMessageType::Credential { .. }));
         if let DaemonMessageType::Credential { service, key } = &msg.inner {
