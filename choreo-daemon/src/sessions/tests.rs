@@ -1,3 +1,4 @@
+use super::handlers::*;
 use super::*;
 use crate::broadcast::test_sink;
 use crate::tools::{ToolOutput, ToolRegistry};
