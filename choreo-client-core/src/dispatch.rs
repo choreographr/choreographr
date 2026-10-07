@@ -703,7 +703,12 @@ fn dispatch_session_event(
             call_id,
             data,
         } => {
-            handler.handle_tool_result_chunk(*session_id, *stream_id, call_id.clone(), data.clone())
+            handler.handle_tool_result_chunk(
+                *session_id,
+                *stream_id,
+                call_id.clone(),
+                data.clone(),
+            );
         }
         SessionEvent::Done {
             stream_id,
