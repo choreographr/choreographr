@@ -65,6 +65,30 @@ fn table_rows_carry_border_chrome() {
 }
 
 #[test]
+fn table_lines_carry_row_identity() {
+    // Each table line records its `TableRowId` on its chrome: the header is row
+    // 0, the body row is row 1, and the frame/separator rules carry the sentinel
+    // `RULE`, so the selection can group a table's wrapped lines back into rows
+    // and cells.
+    let md = "| a | b |\n|---|---|\n| 1 | 2 |";
+    let (_lines, _joins, chrome) = markdown_lines_joined(md, 60);
+    assert!(
+        chrome.iter().any(|c| c.table().is_some_and(|t| t.row == 0)),
+        "header row is row 0: {chrome:#?}"
+    );
+    assert!(
+        chrome.iter().any(|c| c.table().is_some_and(|t| t.row == 1)),
+        "body row is row 1: {chrome:#?}"
+    );
+    assert!(
+        chrome
+            .iter()
+            .any(|c| c.table().is_some_and(TableRowId::is_rule)),
+        "frame/separator rules carry the sentinel: {chrome:#?}"
+    );
+}
+
+#[test]
 fn wrapped_table_cell_joins_with_space() {
     // A cell that wraps records a space-join on its continuation row, so a
     // normal selection over the table rejoins the cell to its original text.

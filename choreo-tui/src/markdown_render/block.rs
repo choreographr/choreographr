@@ -616,8 +616,12 @@ pub(crate) fn render_markdown_block(
             header,
             rows,
         } => {
+            // Table id = the line index where the table begins: unique within
+            // the document buffer, so a contiguous run of table lines shares it.
+            // `u32` is ample for any real document; saturate defensively.
+            let table_id = u32::try_from(lines.len()).unwrap_or(u32::MAX);
             let (table_lines, table_joins, table_chrome) =
-                render_table_lines(alignments, header, rows, indent, width);
+                render_table_lines(alignments, header, rows, table_id, indent, width);
             lines.extend(table_lines);
             joins.extend(table_joins);
             chrome.extend(table_chrome);

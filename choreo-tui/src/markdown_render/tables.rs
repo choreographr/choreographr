@@ -3,7 +3,8 @@
 
 use super::{
     Line, LineChrome, LineJoin, MarkdownAlignment, MarkdownInline, Modifier, Span, Style,
-    display_width, indented_line, indented_styled_line, render_math_pretty, split_word_to_width,
+    TableRowId, display_width, indented_line, indented_styled_line, render_math_pretty,
+    split_word_to_width,
 };
 // ── Table rendering ───────────────────────────────────────────────────────
 
@@ -39,6 +40,7 @@ pub(crate) fn render_table_lines(
     alignments: &[MarkdownAlignment],
     header: &[Vec<MarkdownInline>],
     rows: &[Vec<Vec<MarkdownInline>>],
+    table_id: u32,
     indent: usize,
     width: usize,
 ) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
@@ -82,6 +84,13 @@ pub(crate) fn render_table_lines(
     let mut lines = Vec::new();
     let mut joins = Vec::new();
     let mut chrome = Vec::new();
+    // Every frame/separator rule is a table line with no cells: it carries the
+    // table id under the sentinel row so the selection tells it apart from a
+    // non-table line without mistaking it for a data row.
+    let rule_id = TableRowId {
+        table: table_id,
+        row: TableRowId::RULE,
+    };
     push_rule_row(
         &mut lines,
         &mut joins,
@@ -93,6 +102,7 @@ pub(crate) fn render_table_lines(
             &widths,
             indent,
         ),
+        rule_id,
     );
     // The header row is the table's first row and the only one drawn bold —
     // the same emphasis nushell gives its column headers.
@@ -103,6 +113,10 @@ pub(crate) fn render_table_lines(
             &header_alignment,
             indent,
             Modifier::BOLD,
+            TableRowId {
+                table: table_id,
+                row: 0,
+            },
         );
         lines.extend(header_lines);
         joins.extend(header_joins);
@@ -113,10 +127,23 @@ pub(crate) fn render_table_lines(
         &mut joins,
         &mut chrome,
         table_separator_line(&widths, indent),
+        rule_id,
     );
     for (index, row) in table_rows.iter().enumerate().skip(1) {
-        let (row_lines, row_joins, row_chrome) =
-            render_table_row_wrapped(row, &widths, &header_alignment, indent, Modifier::empty());
+        // Body row `index` (0 is the header) — `index` fits u16 for any real
+        // table; saturate defensively rather than panic.
+        let row_id = TableRowId {
+            table: table_id,
+            row: u16::try_from(index).unwrap_or(TableRowId::RULE.saturating_sub(1)),
+        };
+        let (row_lines, row_joins, row_chrome) = render_table_row_wrapped(
+            row,
+            &widths,
+            &header_alignment,
+            indent,
+            Modifier::empty(),
+            row_id,
+        );
         lines.extend(row_lines);
         joins.extend(row_joins);
         chrome.extend(row_chrome);
@@ -128,6 +155,7 @@ pub(crate) fn render_table_lines(
                 &mut joins,
                 &mut chrome,
                 table_border_line('├', '┼', '┤', &widths, indent),
+                rule_id,
             );
         }
     }
@@ -142,21 +170,25 @@ pub(crate) fn render_table_lines(
             &widths,
             indent,
         ),
+        rule_id,
     );
     (lines, joins, chrome)
 }
 
 /// Push a table frame or inter-row separator rule: its whole span is
 /// non-selectable chrome, so a copy over it yields nothing, and it is a fresh
-/// line in the copy.
+/// line in the copy.  It carries `rule_id` so the selection keeps recognising it
+/// as part of the same table.
 fn push_rule_row(
     lines: &mut Vec<Line<'static>>,
     joins: &mut Vec<LineJoin>,
     chrome: &mut Vec<LineChrome>,
     line: Line<'static>,
+    rule_id: TableRowId,
 ) {
     let mut c = LineChrome::default();
     c.push(0, line.width());
+    c.set_table(rule_id);
     lines.push(line);
     joins.push(LineJoin::Break);
     chrome.push(c);
@@ -255,6 +287,7 @@ pub(crate) fn render_table_row_wrapped(
     alignments: &[MarkdownAlignment],
     indent: usize,
     modifier: Modifier,
+    row_id: TableRowId,
 ) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
     let wrapped_cells: Vec<Vec<(String, LineJoin)>> = row
         .iter()
@@ -298,6 +331,7 @@ pub(crate) fn render_table_row_wrapped(
         // as chrome: the selection keeps the cell text and drops the borders.
         let mut col = 0usize;
         let mut row_chrome = LineChrome::default();
+        row_chrome.set_table(row_id);
         text.push('│');
         row_chrome.push(indent + col, indent + col + 1);
         col += 1;

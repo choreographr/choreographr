@@ -1004,15 +1004,15 @@ fn code_box_copy_preserves_interior_blank_line() {
 #[test]
 fn table_selection_excludes_borders() {
     // A normal selection over a table keeps the cell text and drops the `│`
-    // borders and the `─` frame rules.
+    // borders and the `─` frame rules, one cell per line.
     let md = "| a | b |\n|---|---|\n| 1 | 2 |";
     let mut app = app_with_turns(&[(0, md)], 30);
     let (start, _) = locate(&app, "1");
     let (_, end) = locate(&app, "2");
     let copied = drag_and_finish(&mut app, start, end).expect("selection should extract");
-    assert!(
-        copied.contains('1') && copied.contains('2'),
-        "both cells are copied: {copied:?}"
+    assert_eq!(
+        copied, "1\n\n2",
+        "cells copied on their own lines: {copied:?}"
     );
     assert!(!copied.contains('│'), "no cell border copied: {copied:?}");
     assert!(!copied.contains('─'), "no frame rule copied: {copied:?}");
@@ -1043,24 +1043,50 @@ fn table_wrapped_cell_rejoins_to_original_text() {
 }
 
 #[test]
-fn table_multi_column_wrapped_row_rejoins_onto_one_line() {
-    // A multi-column table row whose cells wrap across several display lines
-    // must copy as a single line (the display wraps are rejoined), not one line
-    // per display row.  Regression: selecting such a table copied its display
-    // rows verbatim (a newline per display row), which is what a user sees when
-    // a wrapped cell is only partially copied.
-    let md = "| Role | What it needs | Fits? |\n|---|---|---|\n| aaaa bbbb cccc dddd eeee ffff gggg | hhhh iiii jjjj kkkk llll mmmm nnnn | oooo pppp qqqq rrrr ssss tttt |";
+fn table_cells_are_copied_one_line_each_in_reading_order() {
+    // Selecting table content copies each cell's text (its wrapped display rows
+    // rejoined), one cell per line, cells separated by a blank line, in
+    // row-major order — the table structure dissolves instead of the wrapped
+    // rows spilling out line-by-line.
+    let md = "| aaaa bbbb cccc dddd | eeee ffff gggg hhhh |\n|---|---|\n| iiii jjjj kkkk llll | mmmm nnnn oooo pppp |";
+    // Content width 31: both columns shrink and their cells wrap.
     let mut app = test_app();
-    app.history_viewport.width = 70;
+    app.history_viewport.width = 40;
     app.history_viewport.height = 40;
     app.display_for(0).view.insert_or_replace(0, turn(md));
     app.rebuild_height_prefix();
-    let (start, _) = locate(&app, "aaaa");
-    let (_, end) = locate(&app, "tttt");
+    let (start, _) = locate(&app, "iiii");
+    let (_, end) = locate(&app, "pppp");
+    let copied = drag_and_finish(&mut app, start, end).expect("selection should extract");
+    assert_eq!(
+        copied, "iiii jjjj kkkk llll\n\nmmmm nnnn oooo pppp",
+        "each cell on its own line, blank-line separated: {copied:?}"
+    );
+    assert!(!copied.contains('│'), "no cell border copied: {copied:?}");
+}
+
+#[test]
+fn table_selected_with_surrounding_prose_copies_cells_per_line() {
+    // The common case: a drag that starts in the prose above a table and runs to
+    // its last row.  The prose is copied normally; the table's rows each become
+    // one blank-line-separated line per cell (the header is row 0, included
+    // because the rectangle covers it).
+    let md = "Intro paragraph before the table.\n\n| aaaa bbbb cccc dddd | eeee ffff gggg hhhh |\n|---|---|\n| iiii jjjj kkkk llll | mmmm nnnn oooo pppp |";
+    let mut app = test_app();
+    app.history_viewport.width = 40;
+    app.history_viewport.height = 40;
+    app.display_for(0).view.insert_or_replace(0, turn(md));
+    app.rebuild_height_prefix();
+    let (start, _) = locate(&app, "Intro");
+    let (_, end) = locate(&app, "pppp");
     let copied = drag_and_finish(&mut app, start, end).expect("selection should extract");
     assert!(
-        !copied.contains('\n'),
-        "a wrapped multi-column table row must rejoin onto one line: {copied:?}"
+        copied.starts_with("Intro paragraph before the table."),
+        "prose copied first: {copied:?}"
+    );
+    assert!(
+        copied.contains("iiii jjjj kkkk llll\n\nmmmm nnnn oooo pppp"),
+        "table cells copied one per line: {copied:?}"
     );
     assert!(!copied.contains('│'), "no cell border copied: {copied:?}");
 }

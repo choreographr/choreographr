@@ -33,6 +33,7 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::style::Color;
 use ratatui::text::{Line, Span};
 use smallvec::SmallVec;
+use std::collections::BTreeMap;
 use unicode_width::UnicodeWidthStr;
 
 /// Background color for the in-progress selection highlight.
@@ -344,6 +345,174 @@ struct ExtractedSlot {
     line_idx: usize,
 }
 
+/// Resolve a global content line to `(turn_idx, line_idx)` in the render cache,
+/// or `None` when it maps to no cached turn/line (past the end, cache drift).
+fn resolve_line(
+    display: &SessionDisplayState,
+    vp_width: usize,
+    content_line: usize,
+) -> Option<(usize, usize)> {
+    if content_line >= display.total_history_height() {
+        return None;
+    }
+    let turn_idx = display
+        .height_prefix
+        .partition_point(|&p| p <= content_line);
+    let turn_start = turn_idx
+        .checked_sub(1)
+        .and_then(|prev| display.height_prefix.get(prev))
+        .copied()
+        .unwrap_or(0);
+    let visual_row = content_line.saturating_sub(turn_start);
+    let rendered = cached_rendered_turn(display, turn_idx, vp_width)?;
+    let line_idx = rendered
+        .visual_offsets
+        .partition_point(|&o| o <= visual_row);
+    if line_idx >= rendered.lines.len() {
+        return None;
+    }
+    Some((turn_idx, line_idx))
+}
+
+/// The table a content line belongs to (its `table` id), or `None` when the
+/// line is not part of a table.  A table's data rows and its frame/separator
+/// rules all report the same id, so a contiguous run of them is one table.
+fn table_id_at(display: &SessionDisplayState, vp_width: usize, content_line: usize) -> Option<u32> {
+    let (turn_idx, line_idx) = resolve_line(display, vp_width, content_line)?;
+    let rendered = cached_rendered_turn(display, turn_idx, vp_width)?;
+    rendered
+        .chrome_ranges
+        .get(line_idx)
+        .and_then(LineChrome::table)
+        .map(|id| id.table)
+}
+
+/// The index of the cell whose column band contains `col` on a table line.
+/// A column landing on a `│` border (the boundary between two bands) belongs
+/// to the cell to its left; a column past the last band belongs to the last
+/// cell.  `None` when the line is not a table data row.
+fn cell_index_on_line(
+    display: &SessionDisplayState,
+    vp_width: usize,
+    content_line: usize,
+    col: usize,
+) -> Option<usize> {
+    let (turn_idx, line_idx) = resolve_line(display, vp_width, content_line)?;
+    let rendered = cached_rendered_turn(display, turn_idx, vp_width)?;
+    let chrome = rendered.chrome_ranges.get(line_idx)?;
+    if chrome.table()?.is_rule() {
+        return None;
+    }
+    let base = rendered.content_ranges.get(line_idx).copied().flatten()?;
+    let cells = selectable_intervals(base, chrome);
+    let mut best = None;
+    for (index, &(lo, hi)) in cells.iter().enumerate() {
+        if col >= lo && col < hi {
+            return Some(index);
+        }
+        if col >= hi {
+            best = Some(index);
+        }
+    }
+    best
+}
+
+/// Extract the text of one contiguous table run `[lo, hi)` covered by the
+/// selection: every covered cell's text (its wrapped display lines rejoined
+/// with the spaces the reflow consumed), one cell per line, cells separated by a
+/// blank line, in row-major order (each row's cells left-to-right, rows top to
+/// bottom).
+///
+/// The covered cell columns are the anchor's and head's cell indices (the full
+/// column range when an endpoint lies outside the table), applied to every
+/// covered row; the frame/separator rules carry no cells and are skipped.
+fn extract_table_run(
+    display: &SessionDisplayState,
+    vp_width: usize,
+    anchor: (usize, u16),
+    head: (usize, u16),
+    lo: usize,
+    hi: usize,
+) -> Option<String> {
+    // The selection's column range: the anchor's and head's cell indices,
+    // normalised left-to-right (`0` / `usize::MAX` = the outside-table end).
+    let a = cell_index_on_line(display, vp_width, anchor.0, anchor.1 as usize).unwrap_or(0);
+    let b = cell_index_on_line(display, vp_width, head.0, head.1 as usize).unwrap_or(usize::MAX);
+    let (cell_lo, cell_hi) = (a.min(b), a.max(b));
+    // Rows in visual order; each maps a cell index to its rejoin pieces (one
+    // piece per display line the cell has text on).
+    let mut rows: Vec<(u16, BTreeMap<usize, Vec<String>>)> = Vec::new();
+    for content_line in lo..hi {
+        let Some((turn_idx, line_idx)) = resolve_line(display, vp_width, content_line) else {
+            continue;
+        };
+        let Some(rendered) = cached_rendered_turn(display, turn_idx, vp_width) else {
+            continue;
+        };
+        let Some(chrome) = rendered.chrome_ranges.get(line_idx).cloned() else {
+            continue;
+        };
+        let Some(id) = chrome.table() else {
+            continue;
+        };
+        if id.is_rule() {
+            continue;
+        }
+        let Some(base) = rendered.content_ranges.get(line_idx).copied().flatten() else {
+            continue;
+        };
+        let Some(line) = rendered.lines.get(line_idx) else {
+            continue;
+        };
+        let cells = selectable_intervals(base, &chrome);
+        let Some(last) = cells.len().checked_sub(1) else {
+            continue;
+        };
+        let hi_idx = cell_hi.min(last);
+        if cell_lo > hi_idx {
+            continue;
+        }
+        let covered: Vec<(usize, String)> = (cell_lo..=hi_idx)
+            .filter_map(|idx| {
+                let (clo, chi) = *cells.get(idx)?;
+                Some((idx, slice_line_columns(line, clo, chi).trim().to_string()))
+            })
+            .collect();
+        match rows.last_mut() {
+            Some((row, map)) if *row == id.row => {
+                for (idx, piece) in covered {
+                    if !piece.is_empty() {
+                        map.entry(idx).or_default().push(piece);
+                    }
+                }
+            }
+            _ => {
+                let mut map: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+                for (idx, piece) in covered {
+                    if !piece.is_empty() {
+                        map.insert(idx, vec![piece]);
+                    }
+                }
+                rows.push((id.row, map));
+            }
+        }
+    }
+    // Rejoin each cell (word-wrap pieces re-insert the single separating space
+    // the wrapper consumed) and flatten row-major, one blank line between cells.
+    let mut out = String::new();
+    let mut first = true;
+    for (_row, map) in &rows {
+        for pieces in map.values() {
+            if !first {
+                out.push_str("\n\n");
+            }
+            first = false;
+            out.push_str(&pieces.join(" "));
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
 /// Extract the plain text covered by the active selection rectangle.
 ///
 /// Content lines are resolved one at a time through the height prefix + the
@@ -372,17 +541,46 @@ fn extract_selection_text(app: &App) -> Option<String> {
     // Iterate the selection's *content* lines directly — no screen mapping,
     // which is exactly why the selection survives scrolling (the endpoints
     // are content-anchored, so this is scroll-independent).
-    for content_line in start_line..=end_line {
-        let (col_lo, col_hi) = selection_bounds_for_line(anchor, head, content_line);
-        if let Some((text, join, turn_idx, line_idx)) =
-            text_and_join_for_content_line(display, vp_width, content_line, col_lo, col_hi)
-        {
-            slots.push(ExtractedSlot {
-                text,
-                join,
-                turn_idx,
-                line_idx,
-            });
+    let mut content_line = start_line;
+    while content_line <= end_line {
+        // A run of contiguous lines belonging to one table is copied
+        // cell-by-cell (one line per cell, blank-line separated) so a wrapped
+        // cell rejoins to its original text instead of spilling across display
+        // rows; every other line uses the ordinary per-line extraction.
+        if let Some(table) = table_id_at(display, vp_width, content_line) {
+            let mut run_end = content_line + 1;
+            while run_end <= end_line
+                && matches!(table_id_at(display, vp_width, run_end), Some(t) if t == table)
+            {
+                run_end += 1;
+            }
+            if let Some(text) =
+                extract_table_run(display, vp_width, anchor, head, content_line, run_end)
+            {
+                // A table run is its own slot; `usize::MAX` identity never
+                // matches a real line, so the assembly separates the run
+                // from its neighbours and never trims it as a wrap.
+                slots.push(ExtractedSlot {
+                    text,
+                    join: LineJoin::Break,
+                    turn_idx: usize::MAX,
+                    line_idx: usize::MAX,
+                });
+            }
+            content_line = run_end;
+        } else {
+            let (col_lo, col_hi) = selection_bounds_for_line(anchor, head, content_line);
+            if let Some((text, join, turn_idx, line_idx)) =
+                text_and_join_for_content_line(display, vp_width, content_line, col_lo, col_hi)
+            {
+                slots.push(ExtractedSlot {
+                    text,
+                    join,
+                    turn_idx,
+                    line_idx,
+                });
+            }
+            content_line += 1;
         }
     }
 

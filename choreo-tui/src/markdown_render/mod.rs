@@ -79,6 +79,33 @@ pub(crate) enum LineJoin {
     Join,
 }
 
+/// Identity of a rendered line as a row of a data table.
+///
+/// Emitted alongside a table row's chrome so the selection can group a table's
+/// wrapped display lines back into rows and cells (a cell's text is the rejoin
+/// of that cell across the row's display lines) without a separate per-line
+/// buffer.  A line with `None` is not part of any table; the frame/separator
+/// rules carry [`TableRowId::RULE`] as their row index so a contiguous run of
+/// table lines stays unambiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TableRowId {
+    /// Table ordinal within the rendered document.
+    pub table: u32,
+    /// Row index within the table, 0 = header; [`TableRowId::RULE`] marks a
+    /// frame/separator rule (no cells).
+    pub row: u16,
+}
+
+impl TableRowId {
+    /// Sentinel row index for a table's frame/separator rules.
+    pub(crate) const RULE: u16 = u16::MAX;
+
+    /// Whether this identity is a table rule row rather than a data row.
+    pub(crate) fn is_rule(self) -> bool {
+        self.row == Self::RULE
+    }
+}
+
 /// Display-column intervals of a rendered line that are **non-selectable
 /// chrome** (the value is relative to the line buffer its producer built).
 ///
@@ -86,9 +113,14 @@ pub(crate) enum LineJoin {
 /// these intervals per line as first-class, typed metadata so the
 /// selection/copy machinery can subtract them without re-scanning the
 /// finished [`Line`]'s spans for a magic `(content string, foreground
-/// colour)` pair.  A block-quote bar (`QUOTE_BAR`) and a fenced-code box's
-/// frame and padding (see `render_code_box`) are the producers today; table
-/// borders could adopt the same channel later.
+/// colour)` pair.  A block-quote bar (`QUOTE_BAR`), a fenced-code box's
+/// frame and padding (see `render_code_box`), and the `│` borders and frame of
+/// a data table are the producers today.
+///
+/// The record also carries the line's [`TableRowId`] (if any): it travels with
+/// the chrome through [`LineChrome::extend_shifted`] and the render cache, so
+/// the selection can regroup a table's wrapped rows into cells without a
+/// separate parallel buffer.
 ///
 /// Empty for the overwhelming majority of lines; a [`SmallVec`] keeps the
 /// common empty case allocation-free while still allowing more than one
@@ -97,7 +129,10 @@ pub(crate) enum LineJoin {
 /// of 2 holds both without a heap spill).  Each entry is `(lo, hi)` in display
 /// columns, half-open.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct LineChrome(SmallVec<[(u16, u16); 2]>);
+pub(crate) struct LineChrome {
+    intervals: SmallVec<[(u16, u16); 2]>,
+    table: Option<TableRowId>,
+}
 
 impl LineChrome {
     /// Record one chrome interval `[lo, hi)` in display columns.
@@ -110,32 +145,47 @@ impl LineChrome {
             u16::try_from(lo).is_ok() && u16::try_from(hi).is_ok(),
             "chrome column out of u16 range"
         );
-        self.0.push((
+        self.intervals.push((
             u16::try_from(lo).unwrap_or(u16::MAX),
             u16::try_from(hi).unwrap_or(u16::MAX),
         ));
     }
 
-    /// Append `other`'s intervals translated right by `by` columns.
+    /// Append `other`'s intervals translated right by `by` columns, and adopt
+    /// `other`'s table identity if this record has none.
     ///
     /// Used by the producers that prepend a prefix in front of already-built
     /// inner rows (the `List` marker, the `BlockQuote` bar, and the assembly
     /// layer's `"  ┃  "` gutter) to move the inner chrome into the emitted
-    /// row's column space, so nested chrome accumulates rather than being lost.
+    /// row's column space, so nested chrome accumulates rather than being lost
+    /// (and a table nested in a list/quote keeps its row identity).
     pub(crate) fn extend_shifted(&mut self, other: &LineChrome, by: usize) {
-        for &(lo, hi) in &other.0 {
+        for &(lo, hi) in &other.intervals {
             self.push(usize::from(lo) + by, usize::from(hi) + by);
+        }
+        if self.table.is_none() {
+            self.table = other.table;
         }
     }
 
     /// True when the line has no non-selectable chrome.
     pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.intervals.is_empty()
     }
 
     /// The recorded chrome intervals, in display columns.
     pub(crate) fn intervals(&self) -> &[(u16, u16)] {
-        &self.0
+        &self.intervals
+    }
+
+    /// The data-table row this line belongs to, if any.
+    pub(crate) fn table(&self) -> Option<TableRowId> {
+        self.table
+    }
+
+    /// Tag this record as part of `id`'s table row.
+    pub(crate) fn set_table(&mut self, id: TableRowId) {
+        self.table = Some(id);
     }
 }
 
