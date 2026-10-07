@@ -360,6 +360,101 @@ fn add_image_turn(session: &mut SessionState, user_text: &str, image_path: &str)
 }
 
 #[test]
+fn record_tool_completion_persists_vision_image_at_emit_time() {
+    // Persist-at-emit for a tool-result VISION image: completing a `read_image`
+    // call must write the `r{call_id}` attachment slot immediately — long before
+    // the turn is finalized — so an on-demand `GetImage` arriving with the
+    // mid-request (re)broadcast already resolves from the DB. This pins the one
+    // production call site (`record_tool_completion`) that the DB-level
+    // `write_attachment` unit test cannot cover.
+    let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
+    // Keep the receiver alive so the mid-completion broadcast `send` succeeds.
+    let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+    let ctx = RequestContext {
+        cmd_tx,
+        session_id: 1,
+        db: Arc::clone(&db),
+        tool_registry: ToolRegistry::new().build().into_shared(),
+        daemon_tx,
+        max_turns: 0,
+        lag_limits: crate::broadcast::LagLimits::default(),
+        global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        substrate_credential: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
+    };
+
+    // Seed a turn whose tool-result placeholder for `call_img` the completion
+    // path will fill (so `update_tool_result` matches the call id).
+    let mut session = SessionState::empty();
+    let (turn_id, _) = session.start_turn(Some("look at this".into()));
+    let calls = vec![AssistantToolCallRecord {
+        call_id: "call_img".into(),
+        name: "read_image".into(),
+        arguments_json: r#"{"path": "/tmp/x.png"}"#.into(),
+    }];
+    session.set_assistant_response(
+        turn_id,
+        AssistantResponse {
+            text: Some("Reading the image.".into()),
+            tool_calls: calls.clone(),
+            ..Default::default()
+        },
+    );
+    session.seed_tool_results(turn_id, &calls, &[String::new()]);
+
+    let tool_call = ChatToolCall {
+        id: "call_img".into(),
+        name: "read_image".into(),
+        arguments_json: r#"{"path": "/tmp/x.png"}"#.into(),
+        caller: None,
+    };
+    let mut output = ToolOutput {
+        content: "read image: (3x2, image/jpeg)".into(),
+        is_error: false,
+        invocation_description: "Reading `x.png`.".into(),
+        image_ref: Some(choreo_proto::ImageReference {
+            path: "/tmp/x.png".into(),
+            mime_type: "image/jpeg".into(),
+            width: 3,
+            height: 2,
+            data: vec![9, 8, 7],
+        }),
+        ..Default::default()
+    };
+    let mut tool_results: Vec<ToolResultItem> = Vec::new();
+    let mut known_hint_paths = Vec::new();
+    let mut pending_hints = Vec::new();
+
+    record_tool_completion(ToolCompletionParams {
+        request_id: 0,
+        session: &mut session,
+        tool_call: &tool_call,
+        output: &mut output,
+        image: None,
+        ctx: &ctx,
+        current_turn_id: turn_id,
+        tool_results: &mut tool_results,
+        known_hint_paths: &mut known_hint_paths,
+        pending_hints: &mut pending_hints,
+    });
+
+    // The `r{call_id}` slot was persisted at emit time (no `finalize_turn` ran),
+    // so it resolves by key exactly as a client's `GetImage` would.
+    let stored = crate::db::read_attachment(
+        &db,
+        1,
+        turn_id,
+        &choreo_proto::ImageKey::ToolResult {
+            call_id: "call_img".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(stored, Some(vec![9, 8, 7]));
+}
+
+#[test]
 fn builder_attaches_pixels_for_current_request_and_decays_older_turn() {
     // Two image-bearing turns; the request currently in flight starts at
     // turn 1. Turn 0 is history: on a VISION model with valid stored bytes

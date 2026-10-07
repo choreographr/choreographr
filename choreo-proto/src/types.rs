@@ -747,6 +747,15 @@ pub enum OutputStream {
 /// message and a tagged key rather than two parallel request/reply pairs. The
 /// variant names the slot kind; the `session_attachments` slot name itself
 /// (`d{index}` / `r{call_id}`) is an internal storage detail the wire never sees.
+///
+/// # Exhaustive by design
+///
+/// Deliberately NOT `#[non_exhaustive]`, matching [`DaemonMessage`]: the variant
+/// set IS the wire contract, and each variant maps to a DISTINCT storage slot
+/// (`d{index}` / `r{call_id}`) that every match site must know. Without the
+/// attribute, adding a variant points the compiler at each site that needs it —
+/// the daemon's key→slot mapping (`slot_for`), the client's key↔slot conversions,
+/// and the size gauge — instead of letting it silently fall through a wildcard.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ImageKey {
     /// A **displayed** image — the `index`-th entry of the turn's
@@ -2225,6 +2234,17 @@ mod tests {
                     session_id: 1,
                     turn_id: 1,
                     key: ImageKey::Displayed { index: 0 },
+                    data: Some(vec![0u8; 4096]),
+                },
+            ),
+            (
+                "Image (tool-result key)",
+                DaemonMessage::Image {
+                    session_id: 1,
+                    turn_id: 1,
+                    key: ImageKey::ToolResult {
+                        call_id: "call_0123456789abcdef0123456789abcdef".into(),
+                    },
                     data: Some(vec![0u8; 4096]),
                 },
             ),

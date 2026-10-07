@@ -1,10 +1,15 @@
-//! Displayed-image state and on-demand fetch plumbing.
+//! Turn-image state and on-demand fetch plumbing, covering BOTH kinds of turn
+//! image: DISPLAYED images (from `display_image`/`generate_image`/a
+//! `retrieve_webpage` screenshot) and tool-result VISION images (the normalized
+//! bytes a tool such as `read_image` fed to a vision model).
 //!
-//! Protocol v6 strips displayed-image bytes from turn snapshots (only metadata
-//! survives), so the TUI fetches each image's bytes lazily: the per-frame render
-//! path calls [`App::request_image_fetch`], the UI loop drains the queue with
+//! Turn snapshots strip image bytes (only metadata survives), so the TUI fetches
+//! each image's bytes lazily: the per-frame render path calls
+//! [`App::request_image_fetch`], the UI loop drains the queue with
 //! [`App::flush_image_fetches`], and the daemon's reply is applied by
-//! [`App::handle_image_reply`]. The encoded-bitmap jobs are handled separately by
+//! [`App::handle_image_reply`]. Both kinds are keyed by the same [`ImageSlot`]
+//! and served by one wire pair ([`ClientMessage::GetImage`] carrying an
+//! [`ImageKey`]). The encoded-bitmap jobs are handled separately by
 //! [`App::apply_image_result`]/[`App::submit_image_job`]. All of these are
 //! inherent `App` methods living in this sibling module; their fields stay on
 //! `App` in `state/mod.rs`.
@@ -12,7 +17,7 @@
 use super::App;
 use crate::RenderedImage;
 use crate::image_worker::{ImageId, ImageJob, ImageResult, next_job_id};
-use choreo_proto::{ClientMessage, ImageKey, ImageMetadata, Turn};
+use choreo_proto::{ClientMessage, ImageKey, ImageMetadata, ImageReference, Turn};
 use ratatui::layout::Size;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -67,6 +72,15 @@ impl ImageSlot {
 /// result order). The render path and the height accounting BOTH derive their
 /// image count and per-image identity from this one function, so the blocks they
 /// draw and the rows they reserve can never disagree.
+///
+/// Per-frame allocation: this builds a fresh `Vec` (and clones each tool-result
+/// `call_id`) on every call, and both the render loop and the height accounting
+/// call it once per turn per frame. That is accepted rather than cached —
+/// image-bearing turns are rare, so the cost is negligible beside the per-frame
+/// markdown render it accompanies. If a future workload ever makes it hot, the
+/// height path only needs the COUNT (it discards the identities), so it could
+/// use a plain `displayed_images.len() + <vision-slot count>` instead of
+/// materializing the list.
 pub(crate) fn turn_image_slots(turn: &Turn) -> Vec<ImageSlot> {
     let mut slots: Vec<ImageSlot> = (0..turn.displayed_images.len())
         .map(ImageSlot::Displayed)
@@ -79,10 +93,32 @@ pub(crate) fn turn_image_slots(turn: &Turn) -> Vec<ImageSlot> {
     slots
 }
 
+/// The placeholder [`ImageMetadata`] for a tool-result vision image, derived from
+/// the (byte-less, client-facing) [`ImageReference`]. `byte_len` is a POSITIVE
+/// marker: the client never receives the true length, and the reference's mere
+/// presence means "there is an image to fetch", so an otherwise empty
+/// placeholder is kept fetchable. The source path becomes `alt` so a placeholder
+/// can name the file. Shared by [`slot_source`] and [`App::sync_turn_images`] so
+/// the two can never derive different metadata for the same reference.
+fn vision_metadata(reference: &ImageReference) -> ImageMetadata {
+    ImageMetadata {
+        mime_type: reference.mime_type.clone(),
+        width: reference.width,
+        height: reference.height,
+        byte_len: if reference.data.is_empty() {
+            1
+        } else {
+            reference.data.len() as u64
+        },
+        alt: Some(reference.path.clone()),
+    }
+}
+
 /// The placeholder metadata and any inline bytes for a slot from the turn the
 /// client holds. Used to seed a [`RenderedImage`] lazily (e.g. the fullscreen
-/// path opening before `sync_turn_images` ran) — the metadata mirrors what
-/// [`App::sync_turn_images`] derives so the two can never disagree.
+/// path opening before `sync_turn_images` ran) — it derives a vision slot's
+/// metadata through the same [`vision_metadata`] helper [`App::sync_turn_images`]
+/// uses, so the two can never disagree.
 pub(crate) fn slot_source(turn: &Turn, slot: &ImageSlot) -> Option<(ImageMetadata, Vec<u8>)> {
     match slot {
         ImageSlot::Displayed(index) => turn
@@ -95,18 +131,7 @@ pub(crate) fn slot_source(turn: &Turn, slot: &ImageSlot) -> Option<(ImageMetadat
                 .iter()
                 .find(|tr| &tr.call_id == call_id)
                 .and_then(|tr| tr.image.as_ref())?;
-            let metadata = ImageMetadata {
-                mime_type: reference.mime_type.clone(),
-                width: reference.width,
-                height: reference.height,
-                byte_len: if reference.data.is_empty() {
-                    1
-                } else {
-                    reference.data.len() as u64
-                },
-                alt: Some(reference.path.clone()),
-            };
-            Some((metadata, reference.data.clone()))
+            Some((vision_metadata(reference), reference.data.clone()))
         }
     }
 }
@@ -172,30 +197,19 @@ impl App {
             );
         }
         // Tool-result vision images ride a byte-less `ImageReference` on the
-        // client view. Derive the placeholder metadata from it; `byte_len` is a
-        // POSITIVE marker (the reference's presence means "there is an image to
-        // fetch") because the client never receives the true length — a fetch
-        // fills in the bytes and, on a genuinely absent slot, latches
-        // `fetch_failed` rather than spinning.
+        // client view. Derive the placeholder metadata from it via the shared
+        // helper; `byte_len` is a POSITIVE marker (the reference's presence means
+        // "there is an image to fetch") because the client never receives the
+        // true length — a fetch fills in the bytes and, on a genuinely absent
+        // slot, latches `fetch_failed` rather than spinning.
         for tr in &turn.tool_results {
             let Some(reference) = &tr.image else {
                 continue;
             };
-            let metadata = ImageMetadata {
-                mime_type: reference.mime_type.clone(),
-                width: reference.width,
-                height: reference.height,
-                byte_len: if reference.data.is_empty() {
-                    1
-                } else {
-                    reference.data.len() as u64
-                },
-                alt: Some(reference.path.clone()),
-            };
             ensure_slot(
                 images,
                 ImageSlot::ToolResult(tr.call_id.clone()),
-                metadata,
+                vision_metadata(reference),
                 reference.data.clone(),
             );
         }

@@ -583,7 +583,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 "client {}: GetImage session={} turn={} key={:?}",
                 ctx.client_id, session_id, turn_id, key
             );
-            handle_client_get_image(session_id, turn_id, key.clone(), ctx);
+            handle_client_get_image(session_id, turn_id, key, ctx);
         }
         ClientMessage::RefreshModels { force } => {
             debug!("client {}: RefreshModels force={}", ctx.client_id, force);
