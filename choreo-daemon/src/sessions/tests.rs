@@ -4,7 +4,18 @@ use crate::broadcast::test_sink;
 use crate::tools::{ToolOutput, ToolRegistry};
 use choreo_proto::{MessageKind, SessionStatus};
 use std::collections::HashMap;
-use tempfile::tempdir;
+
+/// A fresh in-memory database fixture for the session tests. In-memory (no
+/// filesystem path) keeps these unit tests off the system boundary — they
+/// exercise the session state machine, not redb's on-disk format — and needs
+/// no `tempfile`.
+fn test_db() -> Arc<redb::Database> {
+    Arc::new(
+        redb::Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .expect("create in-memory test db"),
+    )
+}
 
 fn test_state() -> SessionState {
     let mut turns = BTreeMap::new();
@@ -71,8 +82,7 @@ fn test_state() -> SessionState {
 fn resolve_provider_rebuilds_lazily_after_client_drop() {
     use zeroize::Zeroizing;
 
-    let dir = tempdir().unwrap();
-    let db = Arc::new(redb::Database::create(dir.path().join("t.redb")).unwrap());
+    let db = test_db();
     let tool_registry = ToolRegistry::new().build().into_shared();
     let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
     let (cmd_tx, _) = crossbeam_channel::unbounded();
@@ -432,8 +442,7 @@ fn set_provider_slug_command_updates_and_clears_recorded_slug() {
     // The daemon's accounts-reload path pushes the account's (non-secret)
     // provider slug here; the handler records it, and `None` (account removed)
     // clears it so a stale slug can't keep feeding catalog lookups.
-    let dir = tempdir().unwrap();
-    let db = Arc::new(redb::Database::create(dir.path().join("t.redb")).unwrap());
+    let db = test_db();
     let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded();
     let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
     let ctx = RequestContext {
@@ -471,8 +480,7 @@ fn set_account_switches_slug_and_drops_stale_client_when_locked() {
     // account name.
     use choreo_ai_protocols::openai::{OpenAiClient, ServiceConfig};
 
-    let dir = tempdir().unwrap();
-    let db = Arc::new(redb::Database::create(dir.path().join("t.redb")).unwrap());
+    let db = test_db();
     let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
     let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
     let ctx = RequestContext {
@@ -534,8 +542,7 @@ fn set_account_clears_slug_and_client_when_new_account_unknown() {
     // old account's facts.
     use choreo_ai_protocols::openai::{OpenAiClient, ServiceConfig};
 
-    let dir = tempdir().unwrap();
-    let db = Arc::new(redb::Database::create(dir.path().join("t.redb")).unwrap());
+    let db = test_db();
     let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
     let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
     let ctx = RequestContext {
@@ -610,8 +617,7 @@ fn session_record_carries_last_response_id_from_config() {
 }
 
 fn broadcast_setup() -> (SessionState, RequestContext) {
-    let dir = tempdir().unwrap();
-    let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+    let db = test_db();
     let tool_registry = ToolRegistry::new().build().into_shared();
     let (daemon_tx, _) = crossbeam_channel::unbounded();
     let (cmd_tx, _) = crossbeam_channel::unbounded();
@@ -1435,8 +1441,7 @@ fn accumulated_usage_in_attach_snapshot() {
 fn sync_accumulated_usage_updates_config_and_broadcasts() {
     // A live daemon channel is required here: `broadcast_setup()` drops the
     // receiver, but this test asserts the `UpdateMetadata` refresh lands.
-    let dir = tempdir().unwrap();
-    let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+    let db = test_db();
     let tool_registry = ToolRegistry::new().build().into_shared();
     let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
     let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
@@ -1576,8 +1581,7 @@ fn attach_snapshot_carries_mid_turn_accumulated_usage() {
 fn sync_accumulated_usage_never_regresses_config() {
     // The config must be monotonic even if a sync arrives out of order or
     // from an overlapping worker: a per-field max, never a blind assign.
-    let dir = tempdir().unwrap();
-    let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+    let db = test_db();
     let tool_registry = ToolRegistry::new().build().into_shared();
     let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded();
     let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
