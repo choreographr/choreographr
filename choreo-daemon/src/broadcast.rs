@@ -59,7 +59,7 @@
 //! daemon-wide total (which bounds memory), and the writer thread mirrors the
 //! split on dequeue, so the counters stay balanced.
 
-use choreo_proto::{DaemonMessage, DaemonMessageType};
+use choreo_proto::{DaemonMessage, DaemonMessageType, MessageKind};
 use crossbeam_channel::Sender;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -237,6 +237,72 @@ pub(crate) fn fan_out_evicting(
         }
     });
     (evict_clients, evict_largest)
+}
+
+/// An OWNED obligation to answer one request, usable across a channel.
+///
+/// The connection thread mints one per request whose reply is produced OFF the
+/// connection thread — on a session thread or the daemon command loop —
+/// capturing the request id, its [`MessageKind`] tag, the acting client's
+/// delivery sink, and a clone of the daemon-wide lag counter. Because it OWNS
+/// all four it can travel over a `SessionCommand`/`DaemonCommand` channel; the
+/// connection thread's borrow-based `ReplyHandle` cannot cross a thread.
+///
+/// Sending routes through [`SubscriberSink::send_unchecked`] (the no-threshold
+/// path): a reply is a request/response contract that must never be dropped for
+/// lag, the same reasoning the connection thread's reply path documents.
+///
+/// `kind` is the request's [`MessageKind`] so the generic [`accept`](Self::accept)
+/// / [`fail`](Self::fail) acknowledgements can self-identify without the
+/// producer re-deriving it; commands that answer with a richer payload (the
+/// keystore replies) simply call [`send`](Self::send) directly.
+pub struct ReplyTarget {
+    /// The request id echoed onto every reply.
+    id: u64,
+    /// The request's kind tag (used by `accept`/`fail`).
+    kind: MessageKind,
+    /// The acting client's delivery sink (owns the byte counter).
+    sink: SubscriberSink,
+    /// The daemon-wide lag counter, cloned so the target owns it across threads.
+    global: Arc<AtomicUsize>,
+}
+
+impl ReplyTarget {
+    /// Build a reply target for request `id` of `kind`, delivering through
+    /// `sink` and accounting bytes into `global`.
+    #[must_use]
+    pub fn new(id: u64, kind: MessageKind, sink: SubscriberSink, global: Arc<AtomicUsize>) -> Self {
+        Self {
+            id,
+            kind,
+            sink,
+            global,
+        }
+    }
+
+    /// Answer the request with `inner`, stamped with the request id.
+    ///
+    /// Borrows (`&self`) rather than consuming: a request may legitimately
+    /// produce a short reply SEQUENCE (the `AddCredential` path sends `Unlocked`
+    /// then `CredentialAdded`), so the target must be reusable for the same id.
+    pub fn send(&self, inner: DaemonMessageType) {
+        self.sink
+            .send_unchecked(&DaemonMessage::reply(self.id, inner), &self.global);
+    }
+
+    /// Terminal success acknowledgement for a fire-and-confirm mutation:
+    /// `Accepted { kind }` for this request's kind.
+    pub fn accept(&self) {
+        self.send(DaemonMessageType::Accepted { kind: self.kind });
+    }
+
+    /// Terminal failure reply: `Failed { kind, error }` for this request's kind.
+    pub fn fail(&self, error: impl Into<String>) {
+        self.send(DaemonMessageType::Failed {
+            kind: self.kind,
+            error: error.into(),
+        });
+    }
 }
 
 /// Test helper: a fresh lossless delivery sink with its byte counter at

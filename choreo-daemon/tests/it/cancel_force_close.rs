@@ -339,6 +339,8 @@ fn mid_stream_cancel_finishes_promptly_via_registry_force_close() {
             } => finished = true,
             // The aborted turn's TurnAppended / Error events are expected.
             DaemonMessageType::Session { .. } => {}
+            // The `Cancel` request is acked with a no-arg `Accepted`.
+            DaemonMessageType::Accepted { .. } => {}
             other => panic!("unexpected message while cancelling: {other:?}"),
         }
     }

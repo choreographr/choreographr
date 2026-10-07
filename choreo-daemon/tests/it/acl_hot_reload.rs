@@ -254,6 +254,9 @@ fn acl_add_from_local_client_enrolls_new_tcp_client() {
                 break;
             }
             choreo_proto::DaemonMessageType::CatalogUpdated { .. } => {}
+            // The earlier SubscribeAllActivity request is acked with
+            // `Accepted`; treat it as informational.
+            choreo_proto::DaemonMessageType::Accepted { .. } => {}
             // The daemon pushes its current keystore status to every activity
             // subscriber on subscribe (like CatalogUpdated) and re-broadcasts
             // it on any keystore change, so an unsolicited `Keystore` can

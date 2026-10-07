@@ -13,14 +13,12 @@
 //! (credentials, accounts).
 use super::DaemonState;
 use crate::accounts::{AccountConfig, AccountManager};
-use crate::broadcast::SubscriberSink;
+use crate::broadcast::ReplyTarget;
 use crate::db;
 use choreo_keystore::ServiceCredential;
-use choreo_proto::{DaemonMessage, DaemonMessageType};
+use choreo_proto::DaemonMessageType;
 use std::collections::HashMap;
 use std::io;
-use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use zeroize::{Zeroize, Zeroizing};
@@ -45,65 +43,49 @@ pub enum KeystoreOpError {
 }
 
 impl DaemonState {
-    /// Enqueue a TARGETED reply directly into the acting client's writer
-    /// sink. This is the mechanism that makes the ORDERING INVARIANT real:
-    /// the connection thread learns of the reply via an mpsc handoff, which
-    /// does NOT order against a broadcast this thread makes to the same sink
-    /// — so the reply must be enqueued HERE, by this thread, into the same
-    /// FIFO queue the broadcast uses, BEFORE the broadcast.
-    fn send_targeted(
-        writer: Option<&SubscriberSink>,
-        global_lag: &Arc<AtomicUsize>,
-        inner: &DaemonMessageType,
+    /// Enqueue the TARGETED reply carried by `reply` (which owns the acting
+    /// client's sink, the request id, and the daemon-wide lag counter), then
+    /// ACK the command loop.
+    ///
+    /// This is the mechanism that makes the ORDERING INVARIANT real: the reply
+    /// is enqueued HERE, by this thread, into the client's FIFO writer queue
+    /// before any lock-state broadcast — so the broadcast can never overtake it
+    /// (the connection thread's mpsc handoff does NOT order against a broadcast
+    /// this thread makes to the same sink). A missing target (no acting client)
+    /// logs and drops the reply, but still ACKs so the caller never deadlocks.
+    fn send_targeted_ack(
+        reply: Option<ReplyTarget>,
+        inner: DaemonMessageType,
+        ack: &mpsc::Sender<()>,
     ) {
-        // P3: these command-loop replies carry no correlation id yet (the id
-        // is threaded from the connection thread to the command loop in P3),
-        // so for P1 they ride as broadcasts (`id: None`). Behavior is
-        // identical until a client resolves replies by id.
-        let framed = DaemonMessage::broadcast(inner.clone());
-        if let Some(w) = writer {
-            w.send_accounted(&framed, global_lag);
+        if let Some(target) = reply {
+            target.send(inner);
         } else {
             warn!(
                 ?inner,
-                "no client writer for targeted keystore reply; dropping reply"
+                "no reply target for targeted keystore reply; dropping reply"
             );
         }
-    }
-
-    /// [`Self::send_targeted`] + the command-loop ACK in one call — every
-    /// keystore handler replies targeted-then-acks, so the pair lives in a
-    /// single site (a handler that forgets the ACK deadlocks its caller).
-    fn send_targeted_ack(
-        writer: Option<&SubscriberSink>,
-        global_lag: &Arc<AtomicUsize>,
-        inner: &DaemonMessageType,
-        reply: &mpsc::Sender<()>,
-    ) {
-        Self::send_targeted(writer, global_lag, inner);
-        let _ = reply.send(());
+        let _ = ack.send(());
     }
 
     /// Enqueue the standard `CredentialAddFailed` targeted reply for the
     /// `save_credential` failure paths, then ACK the command loop. Every
     /// rejection path of `AddCredential` fails through this one method so
-    /// the ORDERING INVARIANT (reply enqueued by THIS thread, BEFORE any
-    /// lock-state broadcast) and the ACK cannot be dropped by a future edit.
+    /// the ORDERING INVARIANT cannot be dropped by a future edit.
     fn send_credential_add_failed(
-        &self,
         service: &str,
         error: String,
-        client_writer: Option<&SubscriberSink>,
-        reply: &mpsc::Sender<()>,
+        reply: Option<ReplyTarget>,
+        ack: &mpsc::Sender<()>,
     ) {
         Self::send_targeted_ack(
-            client_writer,
-            &self.global_lag,
-            &DaemonMessageType::CredentialAddFailed {
+            reply,
+            DaemonMessageType::CredentialAddFailed {
                 service: service.to_string(),
                 error,
             },
-            reply,
+            ack,
         );
     }
 
@@ -116,8 +98,8 @@ impl DaemonState {
     pub(super) fn handle_unlock(
         &mut self,
         private_key: Vec<u8>,
-        client_writer: Option<&SubscriberSink>,
-        reply: &mpsc::Sender<()>,
+        reply: Option<ReplyTarget>,
+        ack: &mpsc::Sender<()>,
     ) {
         info!("Unlock attempt");
         // Capture the pre-unlock lock state so the transition broadcast below
@@ -136,7 +118,7 @@ impl DaemonState {
             Ok(()) => DaemonMessageType::Unlocked,
             Err(e) => unlock_error_reply(e),
         };
-        Self::send_targeted_ack(client_writer, &self.global_lag, &reply_msg, reply);
+        Self::send_targeted_ack(reply, reply_msg, ack);
         // A successful unlock is a lock-state transition: fan it out to ALL
         // activity subscribers (the acting client already has its targeted
         // `Unlocked` queued; the duplicate is idempotent) so every connected
@@ -158,8 +140,8 @@ impl DaemonState {
     pub(super) fn handle_bind_keystore(
         &mut self,
         key: Vec<u8>,
-        client_writer: Option<&SubscriberSink>,
-        reply: &mpsc::Sender<()>,
+        reply: Option<ReplyTarget>,
+        ack: &mpsc::Sender<()>,
     ) {
         info!("BindKeystore attempt");
         let was_locked = self.locked;
@@ -176,7 +158,7 @@ impl DaemonState {
             Ok(()) => DaemonMessageType::Bound,
             Err(e) => unlock_error_reply(e),
         };
-        Self::send_targeted_ack(client_writer, &self.global_lag, &reply_msg, reply);
+        Self::send_targeted_ack(reply, reply_msg, ack);
         if result.is_ok() && was_locked {
             self.broadcast_keystore_state();
         }
@@ -241,8 +223,8 @@ impl DaemonState {
         service: String,
         encrypted_blob: &[u8],
         mut unlock_key: Vec<u8>,
-        client_writer: Option<&SubscriberSink>,
-        reply: &mpsc::Sender<()>,
+        reply: Option<ReplyTarget>,
+        ack: &mpsc::Sender<()>,
     ) {
         // Capture the pre-operations lock state so the implicit-unlock
         // transition broadcast below fires only on a REAL locked→unlocked
@@ -261,11 +243,11 @@ impl DaemonState {
             // The rejected bytes are still secret material — wipe them so
             // a failed add does not leave the key in a freed allocation.
             unlock_key.zeroize();
-            self.send_credential_add_failed(
+            Self::send_credential_add_failed(
                 &service,
                 "invalid unlock_key: expected exactly 32 bytes".to_string(),
-                client_writer,
                 reply,
+                ack,
             );
             return;
         });
@@ -291,7 +273,7 @@ impl DaemonState {
                     error: e,
                 },
             };
-            Self::send_targeted_ack(client_writer, &self.global_lag, &reply_msg, reply);
+            Self::send_targeted_ack(reply, reply_msg, ack);
             return;
         }
 
@@ -310,13 +292,13 @@ impl DaemonState {
                         "AddCredential: blob failed test-decrypt with the presented unlock key; \
                          rejecting without persisting"
                     );
-                    self.send_credential_add_failed(
+                    Self::send_credential_add_failed(
                         &service,
                         format!(
                             "credential blob failed to decrypt with the provided unlock key: {e}"
                         ),
-                        client_writer,
                         reply,
+                        ack,
                     );
                     return;
                 }
@@ -324,11 +306,11 @@ impl DaemonState {
         let cred: ServiceCredential = match postcard::from_bytes(&plaintext) {
             Ok(c) => c,
             Err(e) => {
-                self.send_credential_add_failed(
+                Self::send_credential_add_failed(
                     &service,
                     format!("credential payload is not a valid ServiceCredential: {e}"),
-                    client_writer,
                     reply,
+                    ack,
                 );
                 return;
             }
@@ -336,11 +318,11 @@ impl DaemonState {
 
         // Persist to DB only after both checks passed.
         if let Err(e) = db::set_credential_blob(&self.db, &service, encrypted_blob) {
-            self.send_credential_add_failed(
+            Self::send_credential_add_failed(
                 &service,
                 format!("failed to save credential: {e}"),
-                client_writer,
                 reply,
+                ack,
             );
             return;
         }
@@ -372,11 +354,11 @@ impl DaemonState {
                 error = %e,
                 "AddCredential: persisted credential but implicit unlock failed"
             );
-            self.send_credential_add_failed(
+            Self::send_credential_add_failed(
                 &service,
                 format!("credential saved but unlock failed: {e}"),
-                client_writer,
                 reply,
+                ack,
             );
             return;
         }
@@ -389,17 +371,13 @@ impl DaemonState {
         // (see handle_unlock) — the acting client keys its key-recording on
         // the CredentialAdded confirmation, so the broadcast must never
         // overtake it on the same writer queue.
-        Self::send_targeted_ack(
-            client_writer,
-            &self.global_lag,
-            &DaemonMessageType::Unlocked,
-            reply,
-        );
-        Self::send_targeted(
-            client_writer,
-            &self.global_lag,
-            &DaemonMessageType::CredentialAdded { service },
-        );
+        if let Some(target) = reply {
+            target.send(DaemonMessageType::Unlocked);
+            target.send(DaemonMessageType::CredentialAdded { service });
+        } else {
+            warn!("no reply target for targeted AddCredential replies; dropping replies");
+        }
+        let _ = ack.send(());
         // A valid AddCredential to a locked daemon IS a lock-state transition
         // (implicit unlock): fan out the newly-unlocked state to ALL activity
         // subscribers so every connected UI clears its lock banner.

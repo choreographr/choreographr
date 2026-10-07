@@ -1,7 +1,7 @@
 use super::*;
 use crate::broadcast::test_sink;
 use crate::tools::{ToolOutput, ToolRegistry};
-use choreo_proto::SessionStatus;
+use choreo_proto::{MessageKind, SessionStatus};
 use std::collections::HashMap;
 use tempfile::tempdir;
 
@@ -507,7 +507,7 @@ fn set_account_switches_slug_and_drops_stale_client_when_locked() {
     state.provider_slug = Some("openai".into());
     state.config.account_name = Some("old-account".into());
 
-    handle_set_account("new-account".into(), &mut state, &ctx);
+    handle_set_account("new-account".into(), None, &mut state, &ctx);
 
     assert!(
         state.provider.is_none(),
@@ -563,7 +563,7 @@ fn set_account_clears_slug_and_client_when_new_account_unknown() {
     state.provider_slug = Some("openai".into());
     state.config.account_name = Some("old-account".into());
 
-    handle_set_account("ghost-account".into(), &mut state, &ctx);
+    handle_set_account("ghost-account".into(), None, &mut state, &ctx);
 
     assert!(state.provider.is_none(), "stale client dropped");
     assert_eq!(state.provider_slug, None, "stale slug cleared");
@@ -836,7 +836,8 @@ fn set_working_dir_updates_config_and_broadcasts() {
     process_command(
         SessionCommand::SetWorkingDir {
             path: new_path.clone(),
-            reply: reply_tx,
+            tool_reply: reply_tx,
+            reply: None,
         },
         &mut state,
         &mut shutdown,
@@ -2077,7 +2078,12 @@ fn undo_clears_last_response_id_for_chain_invalidation() {
     let _ = state.start_turn(Some("user 2".into()));
 
     let mut shutdown = false;
-    process_command(SessionCommand::Undo, &mut state, &mut shutdown, &ctx);
+    process_command(
+        SessionCommand::Undo { reply: None },
+        &mut state,
+        &mut shutdown,
+        &ctx,
+    );
 
     assert_eq!(state.config.last_response_id, None);
     assert_eq!(state.config.last_response_id_producer, None);
@@ -2095,7 +2101,12 @@ fn undo_without_response_id_leaves_session_untouched() {
     let (mut state, ctx) = broadcast_setup();
     let _ = state.start_turn(Some("user 2".into()));
     let mut shutdown = false;
-    process_command(SessionCommand::Undo, &mut state, &mut shutdown, &ctx);
+    process_command(
+        SessionCommand::Undo { reply: None },
+        &mut state,
+        &mut shutdown,
+        &ctx,
+    );
     assert_eq!(state.config.last_response_id, None);
     assert_eq!(state.config.last_response_id_producer, None);
     // The most recent user turn was marked undone; the seeded turn 0 is
@@ -2125,7 +2136,12 @@ fn request_finished_after_in_flight_undo_preserves_chain_break_and_undone_turns(
 
     // 1. The undo lands while the request is in flight: it clears the
     //    chain id and marks the newest user subtree undone.
-    process_command(SessionCommand::Undo, &mut state, &mut shutdown, &ctx);
+    process_command(
+        SessionCommand::Undo { reply: None },
+        &mut state,
+        &mut shutdown,
+        &ctx,
+    );
     assert_eq!(state.config.last_response_id, None);
 
     // 2. The worker finishes; its snapshot predates the undo — the stale
@@ -2364,4 +2380,376 @@ fn default_active_tool_groups_feature_branches() {
             "content feature off but group in defaults: {groups:?}"
         );
     }
+}
+
+// ── Session-thread reply correlation ──────────────────────────────────────────
+
+/// Split every message a sink has delivered into id-stamped replies and
+/// `id: None` broadcasts.
+fn split_replies(
+    rx: &crossbeam_channel::Receiver<DaemonMessage>,
+) -> (Vec<DaemonMessage>, Vec<DaemonMessage>) {
+    rx.try_iter().partition(|m| m.id.is_some())
+}
+
+/// A [`ReplyTarget`] over `sink` for request `id`, sharing the context's
+/// daemon-wide lag counter exactly as the connection thread's mint does.
+fn target_for(
+    id: u64,
+    kind: MessageKind,
+    sink: &SubscriberSink,
+    ctx: &RequestContext,
+) -> ReplyTarget {
+    ReplyTarget::new(id, kind, sink.clone(), Arc::clone(&ctx.global_lag))
+}
+
+/// Assert exactly one id-stamped reply of the expected shape and return the
+/// accompanying `id: None` broadcasts for further inspection.
+fn one_reply(
+    rx: &crossbeam_channel::Receiver<DaemonMessage>,
+    id: u64,
+    expected: &DaemonMessageType,
+) -> Vec<DaemonMessage> {
+    let (replies, broadcasts) = split_replies(rx);
+    assert_eq!(replies.len(), 1, "exactly one id-stamped reply");
+    assert_eq!(
+        replies[0].id,
+        Some(id),
+        "the reply must carry the request id"
+    );
+    assert_eq!(&replies[0].inner, expected);
+    broadcasts
+}
+
+#[test]
+fn set_model_success_acks_accepted_and_broadcasts_model_selected() {
+    let (mut state, ctx) = broadcast_setup();
+    let (sink, rx) = test_sink();
+    state.subscribers.insert(10, sink.clone());
+    let target = target_for(7, MessageKind::SetModel, &sink, &ctx);
+
+    let _ = handle_set_model("gpt-4".into(), Some(target), &mut state, &ctx);
+
+    let broadcasts = one_reply(
+        &rx,
+        7,
+        &DaemonMessageType::Accepted {
+            kind: MessageKind::SetModel,
+        },
+    );
+    assert!(broadcasts.iter().any(|m| matches!(
+        &m.inner,
+        DaemonMessageType::Session {
+            event: SessionEvent::ModelSelected { .. },
+            ..
+        }
+    )));
+}
+
+#[test]
+fn set_reasoning_effort_success_acks_accepted_and_broadcasts_effort_set() {
+    let (mut state, ctx) = broadcast_setup();
+    let (sink, rx) = test_sink();
+    state.subscribers.insert(10, sink.clone());
+    let target = target_for(8, MessageKind::SetReasoningEffort, &sink, &ctx);
+
+    let _ = handle_set_reasoning_effort("high".into(), Some(target), &mut state, &ctx);
+
+    let broadcasts = one_reply(
+        &rx,
+        8,
+        &DaemonMessageType::Accepted {
+            kind: MessageKind::SetReasoningEffort,
+        },
+    );
+    assert!(broadcasts.iter().any(|m| matches!(
+        &m.inner,
+        DaemonMessageType::Session {
+            event: SessionEvent::ReasoningEffortSet { .. },
+            ..
+        }
+    )));
+}
+
+#[test]
+fn set_reasoning_effort_too_long_acks_failed_and_broadcasts_failure() {
+    let (mut state, ctx) = broadcast_setup();
+    let (sink, rx) = test_sink();
+    state.subscribers.insert(10, sink.clone());
+    let target = target_for(9, MessageKind::SetReasoningEffort, &sink, &ctx);
+
+    let _ = handle_set_reasoning_effort("x".repeat(65), Some(target), &mut state, &ctx);
+
+    let broadcasts = one_reply(
+        &rx,
+        9,
+        &DaemonMessageType::Failed {
+            kind: MessageKind::SetReasoningEffort,
+            error: "reasoning effort slug too long (65 bytes)".to_string(),
+        },
+    );
+    assert!(broadcasts.iter().any(|m| matches!(
+        &m.inner,
+        DaemonMessageType::Session {
+            event: SessionEvent::ReasoningEffortSetFailed { .. },
+            ..
+        }
+    )));
+}
+
+#[test]
+fn set_account_success_acks_accepted_and_broadcasts_account_set() {
+    let (mut state, ctx) = broadcast_setup();
+    let (sink, rx) = test_sink();
+    state.subscribers.insert(10, sink.clone());
+    let target = target_for(11, MessageKind::SetSessionAccount, &sink, &ctx);
+
+    let _ = handle_set_account("acct".into(), Some(target), &mut state, &ctx);
+
+    let broadcasts = one_reply(
+        &rx,
+        11,
+        &DaemonMessageType::Accepted {
+            kind: MessageKind::SetSessionAccount,
+        },
+    );
+    assert!(broadcasts.iter().any(|m| matches!(
+        &m.inner,
+        DaemonMessageType::Session {
+            event: SessionEvent::SessionAccountSet { .. },
+            ..
+        }
+    )));
+}
+
+#[test]
+fn undo_success_acks_accepted_and_broadcasts_turns_undone() {
+    let (mut state, ctx) = broadcast_setup();
+    let (sink, rx) = test_sink();
+    state.subscribers.insert(10, sink.clone());
+    let target = target_for(12, MessageKind::Undo, &sink, &ctx);
+
+    let _ = handle_undo(Some(target), &mut state, &ctx);
+
+    let broadcasts = one_reply(
+        &rx,
+        12,
+        &DaemonMessageType::Accepted {
+            kind: MessageKind::Undo,
+        },
+    );
+    assert!(broadcasts.iter().any(|m| matches!(
+        &m.inner,
+        DaemonMessageType::Session {
+            event: SessionEvent::TurnsUndone { .. },
+            ..
+        }
+    )));
+}
+
+#[test]
+fn undo_nothing_to_undo_acks_failed() {
+    let (mut state, ctx) = broadcast_setup();
+    state.turns.clear();
+    let (sink, rx) = test_sink();
+    state.subscribers.insert(10, sink.clone());
+    let target = target_for(13, MessageKind::Undo, &sink, &ctx);
+
+    let _ = handle_undo(Some(target), &mut state, &ctx);
+
+    one_reply(
+        &rx,
+        13,
+        &DaemonMessageType::Failed {
+            kind: MessageKind::Undo,
+            error: "nothing to undo".to_string(),
+        },
+    );
+}
+
+#[test]
+fn redo_nothing_to_redo_acks_failed() {
+    let (mut state, ctx) = broadcast_setup();
+    let (sink, rx) = test_sink();
+    state.subscribers.insert(10, sink.clone());
+    let target = target_for(14, MessageKind::Redo, &sink, &ctx);
+
+    let _ = handle_redo(Some(target), &mut state, &ctx);
+
+    one_reply(
+        &rx,
+        14,
+        &DaemonMessageType::Failed {
+            kind: MessageKind::Redo,
+            error: "nothing to redo".to_string(),
+        },
+    );
+}
+
+#[test]
+fn set_title_success_acks_accepted_and_broadcasts_title_set() {
+    let (mut state, ctx) = broadcast_setup();
+    let (sink, rx) = test_sink();
+    state.subscribers.insert(10, sink.clone());
+    // Title changes have no wire client message (the agent tool drives them), so
+    // there is no `MessageKind` variant for one; the filler kind exercises the
+    // generic ack path.
+    let target = target_for(15, MessageKind::CreateSession, &sink, &ctx);
+
+    let _ = handle_set_title("new title", Some(target), &mut state, &ctx);
+
+    let (replies, broadcasts) = split_replies(&rx);
+    assert_eq!(replies.len(), 1, "exactly one id-stamped reply");
+    assert_eq!(replies[0].id, Some(15));
+    assert!(matches!(
+        &replies[0].inner,
+        DaemonMessageType::Accepted { .. }
+    ));
+    assert!(broadcasts.iter().any(|m| matches!(
+        &m.inner,
+        DaemonMessageType::Session {
+            event: SessionEvent::SessionTitleSet { .. },
+            ..
+        }
+    )));
+}
+
+#[test]
+fn set_title_too_long_acks_failed() {
+    let (mut state, ctx) = broadcast_setup();
+    let (sink, rx) = test_sink();
+    state.subscribers.insert(10, sink.clone());
+    let target = target_for(16, MessageKind::CreateSession, &sink, &ctx);
+
+    let _ = handle_set_title(
+        &"x".repeat(MAX_TITLE_CHARS + 1),
+        Some(target),
+        &mut state,
+        &ctx,
+    );
+
+    let (replies, _broadcasts) = split_replies(&rx);
+    assert_eq!(replies.len(), 1, "exactly one id-stamped reply");
+    assert_eq!(replies[0].id, Some(16));
+    assert!(matches!(
+        &replies[0].inner,
+        DaemonMessageType::Failed { error, .. } if error == "title too long"
+    ));
+}
+
+#[test]
+fn set_working_dir_success_acks_accepted_and_broadcasts_workdir_set() {
+    let (mut state, ctx) = broadcast_setup();
+    let (sink, rx) = test_sink();
+    state.subscribers.insert(10, sink.clone());
+    // Same filler as `set_title` (no wire client message exists).
+    let target = target_for(17, MessageKind::CreateSession, &sink, &ctx);
+    let (tool_tx, _tool_rx) = mpsc::channel();
+
+    let _ = handle_set_working_dir(
+        &PathBuf::from("/tmp/new-wd"),
+        &tool_tx,
+        Some(target),
+        &mut state,
+        &ctx,
+    );
+
+    let (replies, broadcasts) = split_replies(&rx);
+    assert_eq!(replies.len(), 1, "exactly one id-stamped reply");
+    assert_eq!(replies[0].id, Some(17));
+    assert!(matches!(
+        &replies[0].inner,
+        DaemonMessageType::Accepted { .. }
+    ));
+    assert!(broadcasts.iter().any(|m| matches!(
+        &m.inner,
+        DaemonMessageType::Session {
+            event: SessionEvent::SessionWorkingDirSet { .. },
+            ..
+        }
+    )));
+}
+
+#[test]
+fn run_input_empty_acks_failed_and_broadcasts_stream_failure() {
+    let (mut state, ctx) = broadcast_setup();
+    let (sink, rx) = test_sink();
+    state.subscribers.insert(10, sink.clone());
+    let target = target_for(18, MessageKind::RunInput, &sink, &ctx);
+    let mut shutdown = false;
+
+    let _ = handle_run_input(5, b"", Some(target), &mut state, &mut shutdown, &ctx);
+
+    let broadcasts = one_reply(
+        &rx,
+        18,
+        &DaemonMessageType::Failed {
+            kind: MessageKind::RunInput,
+            error: "empty input".to_string(),
+        },
+    );
+    // The unchanged stream failure is still broadcast (`id: None`), for the
+    // requester and every other subscriber alike.
+    assert!(broadcasts.iter().any(|m| matches!(
+        &m.inner,
+        DaemonMessageType::Session {
+            event: SessionEvent::Started { stream_id: 5, .. },
+            ..
+        }
+    )));
+    assert!(broadcasts.iter().any(|m| matches!(
+        &m.inner,
+        DaemonMessageType::Session {
+            event: SessionEvent::Failed { stream_id: 5, .. },
+            ..
+        }
+    )));
+}
+
+#[test]
+fn run_input_accept_acks_targeted_started_and_broadcasts_started() {
+    use choreo_ai_protocols::openai::{OpenAiClient, ServiceConfig};
+
+    let (mut state, ctx) = broadcast_setup();
+    // A closed local endpoint: the spawned worker fails fast without touching
+    // the network. The acceptance reply the test asserts is produced
+    // SYNCHRONOUSLY before the worker is spawned, so the test never races it.
+    let client = OpenAiClient::new(
+        ServiceConfig {
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            ..ServiceConfig::default()
+        },
+        "k".into(),
+        &state.registry,
+    )
+    .expect("build a client against the dead endpoint");
+    state.provider = Some(InferenceProvider::from_openai(client));
+
+    let (sink, rx) = test_sink();
+    state.subscribers.insert(10, sink.clone());
+    let target = target_for(19, MessageKind::RunInput, &sink, &ctx);
+    let mut shutdown = false;
+
+    let _ = handle_run_input(5, b"hello", Some(target), &mut state, &mut shutdown, &ctx);
+
+    let broadcasts = one_reply(
+        &rx,
+        19,
+        &DaemonMessageType::Session {
+            session_id: Some(1),
+            event: SessionEvent::Started {
+                stream_id: 5,
+                turn_id: 1,
+                estimated_prompt_tokens: 0,
+            },
+        },
+    );
+    // The identical `Started` is broadcast (`id: None`) to every subscriber.
+    assert!(broadcasts.iter().any(|m| matches!(
+        &m.inner,
+        DaemonMessageType::Session {
+            event: SessionEvent::Started { stream_id: 5, .. },
+            ..
+        }
+    )));
 }

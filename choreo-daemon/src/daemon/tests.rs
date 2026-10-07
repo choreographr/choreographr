@@ -1773,7 +1773,7 @@ fn handle_set_session_title_forwards_to_session() {
     // The send is synchronous (handle_command sends on cmd_tx), so
     // try_recv is deterministic — no time-based wait needed.
     match cmd_rx.try_recv() {
-        Ok(SessionCommand::SetTitle { title }) => {
+        Ok(SessionCommand::SetTitle { title, .. }) => {
             assert_eq!(title, "new title");
         }
         Ok(_) => {
@@ -3990,6 +3990,19 @@ pub(super) fn test_pub(key: [u8; 32]) -> [u8; 32] {
     *x25519_dalek::PublicKey::from(&TestSecret::from(key)).as_bytes()
 }
 
+/// Build a [`crate::broadcast::ReplyTarget`] over `sink` for the keystore
+/// tests. The keystore replies carry their own payload (not
+/// `Accepted`/`Failed`), so the `kind` is a filler; a fresh lag counter keeps
+/// the byte-accounting self-contained.
+fn test_reply_target(sink: crate::broadcast::SubscriberSink) -> crate::broadcast::ReplyTarget {
+    crate::broadcast::ReplyTarget::new(
+        0,
+        choreo_proto::MessageKind::Unlock,
+        sink,
+        Arc::new(AtomicUsize::new(0)),
+    )
+}
+
 #[test]
 fn bind_keystore_adopts_on_unbound_and_runs_unlock_tail() {
     let (mut state, _rx) = make_daemon_state();
@@ -3999,16 +4012,20 @@ fn bind_keystore_adopts_on_unbound_and_runs_unlock_tail() {
     let (reply, reply_rx) = mpsc::channel();
     state.handle_command(DaemonCommand::BindKeystore {
         key: key.to_vec(),
-        client_writer: Some(writer),
-        reply,
+        reply: Some(test_reply_target(writer)),
+        ack: reply,
     });
 
     reply_rx.recv().unwrap();
-    // The targeted Bound confirmation reached the acting client's sink.
-    assert!(matches!(
-        writer_rx.recv().unwrap().inner,
-        DaemonMessageType::Bound
-    ));
+    // The targeted Bound confirmation reached the acting client's sink,
+    // stamped with the request id (the target's id).
+    let bound = writer_rx.recv().unwrap();
+    assert_eq!(
+        bound.id,
+        Some(0),
+        "the keystore reply carries the request id"
+    );
+    assert!(matches!(bound.inner, DaemonMessageType::Bound));
     // The binding was persisted (TOFU adopt happened here and ONLY here) and
     // the cached status flag was flipped so the daemon now reports `Unbound →
     // bound`.
@@ -4034,8 +4051,8 @@ fn bind_keystore_on_bound_keystore_rejects_wrong_key_without_overwrite() {
     let (reply, reply_rx) = mpsc::channel();
     state.handle_command(DaemonCommand::BindKeystore {
         key: key_a.to_vec(),
-        client_writer: Some(writer),
-        reply,
+        reply: Some(test_reply_target(writer)),
+        ack: reply,
     });
     reply_rx.recv().unwrap();
     assert!(matches!(
@@ -4046,8 +4063,8 @@ fn bind_keystore_on_bound_keystore_rejects_wrong_key_without_overwrite() {
     let (reply, reply_rx) = mpsc::channel();
     state.handle_command(DaemonCommand::BindKeystore {
         key: key_b.to_vec(),
-        client_writer: None, // no writer: the error is checked via state below
-        reply,
+        reply: None, // no writer: the error is checked via state below
+        ack: reply,
     });
     reply_rx.recv().unwrap();
     // The binding was NOT overwritten (the wrong-key bind was rejected).
@@ -4066,8 +4083,8 @@ fn unlock_on_unbound_keystore_is_refused_and_does_not_adopt() {
     let (reply, reply_rx) = mpsc::channel();
     state.handle_command(DaemonCommand::Unlock {
         private_key: key.to_vec(),
-        client_writer: Some(writer),
-        reply,
+        reply: Some(test_reply_target(writer)),
+        ack: reply,
     });
 
     reply_rx.recv().unwrap();
@@ -4092,8 +4109,8 @@ fn add_credential_on_unbound_keystore_is_refused_without_binding_or_persist() {
         service: "svc".to_string(),
         encrypted_blob: vec![1, 2, 3],
         unlock_key: key.to_vec(),
-        client_writer: Some(writer),
-        reply,
+        reply: Some(test_reply_target(writer)),
+        ack: reply,
     });
 
     reply_rx.recv().unwrap();
@@ -4123,8 +4140,8 @@ fn add_credential_verify_only_implicitly_unlocks_bound_keystore() {
     let (reply, reply_rx) = mpsc::channel();
     state.handle_command(DaemonCommand::BindKeystore {
         key: key.to_vec(),
-        client_writer: None,
-        reply,
+        reply: None,
+        ack: reply,
     });
     reply_rx.recv().unwrap();
     // The bind's implicit-unlock transition broadcast reached the subscriber.
@@ -4155,8 +4172,8 @@ fn add_credential_verify_only_implicitly_unlocks_bound_keystore() {
         service: "svc".to_string(),
         encrypted_blob: blob,
         unlock_key: key.to_vec(),
-        client_writer: Some(writer),
-        reply,
+        reply: Some(test_reply_target(writer)),
+        ack: reply,
     });
     reply_rx.recv().unwrap();
     // Targeted replies arrive in the daemon-mandated order: Unlocked then
@@ -4191,8 +4208,8 @@ fn add_credential_on_bound_keystore_rejects_wrong_key_blob() {
     let (reply, reply_rx) = mpsc::channel();
     state.handle_command(DaemonCommand::BindKeystore {
         key: key.to_vec(),
-        client_writer: None,
-        reply,
+        reply: None,
+        ack: reply,
     });
     reply_rx.recv().unwrap();
 
@@ -4209,8 +4226,8 @@ fn add_credential_on_bound_keystore_rejects_wrong_key_blob() {
         service: "svc".to_string(),
         encrypted_blob: vec![1, 2, 3],
         unlock_key: other.to_vec(),
-        client_writer: Some(writer),
-        reply,
+        reply: Some(test_reply_target(writer)),
+        ack: reply,
     });
     reply_rx.recv().unwrap();
     assert!(

@@ -1,8 +1,8 @@
 use crate::daemon::DaemonCommand;
 use crate::sessions::SessionCommand;
 use choreo_proto::{
-    ClientMessage, ClientMessageType, ContextConfig, DaemonMessage, DaemonMessageType, ProtoError,
-    SessionEvent, read_message, write_message,
+    ClientMessage, ClientMessageType, ContextConfig, DaemonMessage, DaemonMessageType, MessageKind,
+    ProtoError, SessionEvent, read_message, write_message,
 };
 use std::io::{self, BufReader, BufWriter, Write};
 use std::net::{Shutdown, TcpStream};
@@ -257,36 +257,6 @@ pub(crate) fn register_client_writer(
     (client_id, sink, writer_rx)
 }
 
-/// Send a reply to a client's writer channel.
-///
-/// Replies ride the same unbounded channel as broadcasts, so they MUST keep
-/// the lag counters consistent: `send_accounted` increments the daemon-wide
-/// counter (and the per-client counter, EXCEPT for a solicited `Image` reply —
-/// see [`crate::broadcast::counts_toward_client_lag`]) before the send, and the
-/// writer thread decrements the same counters on every dequeue; both self-
-/// correct if the receiver is gone. The lag limits are NOT enforced here: a
-/// reply is a request/response contract that must never be dropped (lossless
-/// for replies was already true — a blocking send never dropped, it just
-/// blocked; with an unbounded channel it can no longer block either). A
-/// dropped reply on a dead receiver is fine: the connection is being torn down
-/// anyway.
-///
-/// Most replies are small and infrequent next to broadcast streams, but a
-/// `GetImage` reply can be multi-megabyte — which is exactly why the PER-CLIENT
-/// eviction budget excludes it (the client solicited those bytes; counting
-/// them could evict it for simply scrolling images into view). The daemon-wide
-/// budget still bounds total memory across all replies.
-fn send_to_writer(ctx: &ClientCtx, inner: &DaemonMessageType) {
-    // The daemon owns no correlation state: it stamps the acting request's id
-    // (captured on `ctx` at dispatch entry) onto the reply and echoes it. A
-    // reply rides the same accounting path as a broadcast so the lag counters
-    // stay balanced (see the doc above).
-    ctx.writer.send_accounted(
-        &DaemonMessage::reply(ctx.request_id, inner.clone()),
-        ctx.global_lag,
-    );
-}
-
 /// Owns the obligation to answer exactly one request.
 ///
 /// [`send`](Self::send) consumes the handle; dropping an unused handle trips
@@ -295,6 +265,11 @@ fn send_to_writer(ctx: &ClientCtx, inner: &DaemonMessageType) {
 /// minted per in-scope request from the acting connection's context (see
 /// [`ClientCtx::reply_handle`]) and passed by value to the handler that
 /// computes the reply inline.
+///
+/// Handlers whose reply is produced OFF the connection thread (a session thread
+/// or the daemon command loop) mint an owned [`crate::broadcast::ReplyTarget`]
+/// instead (see [`ClientCtx::reply_target`]); this borrow-based handle can only
+/// answer on the connection thread.
 struct ReplyHandle<'a> {
     /// The request id stamped onto the reply (echoed from the inbound frame).
     id: u64,
@@ -304,8 +279,8 @@ struct ReplyHandle<'a> {
     /// handler.
     sink: crate::broadcast::SubscriberSink,
     /// Daemon-wide lag counter, borrowed from the connection; balanced by the
-    /// same enqueue-here / dequeue-in-the-writer-thread pairing as
-    /// [`send_to_writer`].
+    /// same enqueue-here / dequeue-in-the-writer-thread pairing every reply
+    /// path shares.
     global: &'a AtomicUsize,
     /// Whether the reply obligation has been met (sent) or deliberately
     /// abandoned. `false` only on the drop-unanswered path the guard targets.
@@ -316,8 +291,7 @@ impl ReplyHandle<'_> {
     /// Answer the request: stamp `id` onto `inner` and enqueue the reply.
     ///
     /// Routes through `send_unchecked` (the no-threshold path) because a reply
-    /// is a request/response contract that must never be dropped for lag — the
-    /// same reasoning documented on [`send_to_writer`].
+    /// is a request/response contract that must never be dropped for lag.
     fn send(mut self, inner: DaemonMessageType) {
         // Mark satisfied BEFORE the send so the guard is met even if the send
         // path is unwound through: the enqueue on an unbounded channel cannot
@@ -349,7 +323,7 @@ impl Drop for ReplyHandle<'_> {
 /// Bundles the channels and mutable per-connection state into one struct so
 /// the call sites don't pass 5–6 individual arguments to every function.
 struct ClientCtx<'a> {
-    /// This connection's delivery sink (see `send_to_writer`).
+    /// This connection's delivery sink.
     writer: &'a crate::broadcast::SubscriberSink,
     /// This connection's own redb handle, shared with every other connection
     /// (redb's `Database` is built for concurrent readers). Used to serve
@@ -358,17 +332,18 @@ struct ClientCtx<'a> {
     db: &'a redb::Database,
     /// Daemon-wide lag counter, shared by every connection; replies must
     /// increment it so the writer thread's per-dequeue decrement stays
-    /// balanced (see `send_to_writer`).
-    global_lag: &'a AtomicUsize,
+    /// balanced. Held as the `Arc` (not a `&AtomicUsize`) so a
+    /// [`crate::broadcast::ReplyTarget`] can clone it and cross to another
+    /// thread.
+    global_lag: &'a Arc<AtomicUsize>,
     daemon_tx: &'a crossbeam_channel::Sender<DaemonCommand>,
     attached_session_id: &'a mut Option<u64>,
     attached_session_tx: &'a mut Option<crossbeam_channel::Sender<SessionCommand>>,
     client_id: u64,
     /// The correlation id of the request currently being dispatched on this
-    /// connection — the value stamped onto every reply `send_to_writer`
-    /// produces. Set once at dispatch entry from the inbound
-    /// [`ClientMessage::id`]; a connection thread handles one request at a
-    /// time, so a single field is sufficient.
+    /// connection — the value stamped onto every reply. Set once at dispatch
+    /// entry from the inbound [`ClientMessage::id`]; a connection thread
+    /// handles one request at a time, so a single field is sufficient.
     request_id: u64,
     /// Whether this connection arrived over the local Unix socket (vs the
     /// TCP/Noise listener). Trust-boundary input for local-only commands:
@@ -381,9 +356,9 @@ impl<'a> ClientCtx<'a> {
     /// Mint the [`ReplyHandle`] for the request currently being dispatched.
     ///
     /// The sink clone is cheap (a channel `Sender` + an `Arc`), and the
-    /// returned handle borrows only `global_lag` (a `&'a AtomicUsize` copied
-    /// out of the context) — never `ctx` itself — so a dispatch arm or handler
-    /// can mint the handle and still pass `&mut ctx` alongside it.
+    /// returned handle borrows only `global_lag` — never `ctx` itself — so a
+    /// dispatch arm or handler can mint the handle and still pass `&mut ctx`
+    /// alongside it.
     fn reply_handle(&self) -> ReplyHandle<'a> {
         ReplyHandle {
             id: self.request_id,
@@ -391,6 +366,24 @@ impl<'a> ClientCtx<'a> {
             global: self.global_lag,
             sent: false,
         }
+    }
+
+    /// Mint an OWNED [`crate::broadcast::ReplyTarget`] for the request
+    /// currently being dispatched, tagged with its `kind`.
+    ///
+    /// Unlike [`reply_handle`](Self::reply_handle) the returned target OWNS
+    /// everything it needs (a sink clone and a clone of the `global_lag` `Arc`),
+    /// so it can travel over a `SessionCommand`/`DaemonCommand` channel to the
+    /// session thread or daemon command loop that will produce the reply. The
+    /// daemon owns no correlation state: the target echoes `request_id` and
+    /// nothing more.
+    fn reply_target(&self, kind: MessageKind) -> crate::broadcast::ReplyTarget {
+        crate::broadcast::ReplyTarget::new(
+            self.request_id,
+            kind,
+            self.writer.clone(),
+            Arc::clone(self.global_lag),
+        )
     }
 }
 
@@ -495,6 +488,10 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                     client_id: ctx.client_id,
                     writer: ctx.writer.clone(),
                 });
+            // No-arg ack: nothing is fire-and-forget. The register command is
+            // applied by the daemon command loop; this just confirms receipt.
+            ctx.reply_handle()
+                .send(DaemonMessageType::Accepted { kind });
         }
         ClientMessageType::UnsubscribeSessionsSummary => {
             let _ = ctx
@@ -502,27 +499,23 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 .send(DaemonCommand::UnregisterSummarySubscriber {
                     client_id: ctx.client_id,
                 });
+            ctx.reply_handle()
+                .send(DaemonMessageType::Accepted { kind });
         }
         ClientMessageType::RunInput { stream_id, input } => {
             debug!("client {}: RunInput id={}", ctx.client_id, stream_id);
-            if let Some(tx) = ctx.attached_session_tx {
-                let _ = tx.send(SessionCommand::RunInput { stream_id, input });
+            // Hand the reply obligation to the session thread: it sends the
+            // TARGETED acceptance reply (`Started` on accept, `Failed` on
+            // reject) plus the unchanged broadcast stream.
+            let target = ctx.reply_target(kind);
+            if let Some(tx) = ctx.attached_session_tx.as_ref() {
+                let _ = tx.send(SessionCommand::RunInput {
+                    stream_id,
+                    input,
+                    reply: Some(target),
+                });
             } else {
-                // This connection-level reply has no origin session, so the
-                // envelope carries `session_id: None` (used in every "no
-                // session attached" arm in this dispatch). The TUI resolves
-                // it as a connection-level failure via
-                // `App::resolve_daemon_session`.
-                send_to_writer(
-                    ctx,
-                    &DaemonMessageType::Session {
-                        session_id: None,
-                        event: SessionEvent::Failed {
-                            stream_id,
-                            error: "no session attached".to_string(),
-                        },
-                    },
-                );
+                target.fail("no session attached");
             }
         }
         ClientMessageType::Cancel { stream_id } => {
@@ -535,17 +528,31 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                     stream_id,
                 });
             }
+            // A no-arg ack so `Cancel` is not fire-and-forget: the request was
+            // received (the stream's own `Cancelled` broadcast is the outcome).
+            ctx.reply_handle()
+                .send(DaemonMessageType::Accepted { kind });
         }
         ClientMessageType::Undo => {
             debug!("client {}: Undo", ctx.client_id);
-            if let Some(tx) = ctx.attached_session_tx {
-                let _ = tx.send(SessionCommand::Undo);
+            let target = ctx.reply_target(kind);
+            if let Some(tx) = ctx.attached_session_tx.as_ref() {
+                let _ = tx.send(SessionCommand::Undo {
+                    reply: Some(target),
+                });
+            } else {
+                target.fail("no session attached");
             }
         }
         ClientMessageType::Redo => {
             debug!("client {}: Redo", ctx.client_id);
-            if let Some(tx) = ctx.attached_session_tx {
-                let _ = tx.send(SessionCommand::Redo);
+            let target = ctx.reply_target(kind);
+            if let Some(tx) = ctx.attached_session_tx.as_ref() {
+                let _ = tx.send(SessionCommand::Redo {
+                    reply: Some(target),
+                });
+            } else {
+                target.fail("no session attached");
             }
         }
         ClientMessageType::ContinueGeneration { stream_id } => {
@@ -553,22 +560,15 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 "client {}: ContinueGeneration id={}",
                 ctx.client_id, stream_id
             );
-            if let Some(tx) = ctx.attached_session_tx {
+            let target = ctx.reply_target(kind);
+            if let Some(tx) = ctx.attached_session_tx.as_ref() {
                 let _ = tx.send(SessionCommand::RunInput {
                     stream_id,
                     input: b"Continue.".to_vec(),
+                    reply: Some(target),
                 });
             } else {
-                send_to_writer(
-                    ctx,
-                    &DaemonMessageType::Session {
-                        session_id: None,
-                        event: SessionEvent::Failed {
-                            stream_id,
-                            error: "no session attached".to_string(),
-                        },
-                    },
-                );
+                target.fail("no session attached");
             }
         }
         ClientMessageType::Ping => {
@@ -582,19 +582,14 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 model,
                 ctx.attached_session_tx.is_some()
             );
-            if let Some(tx) = ctx.attached_session_tx {
-                let _ = tx.send(SessionCommand::SetModel { model });
+            let target = ctx.reply_target(kind);
+            if let Some(tx) = ctx.attached_session_tx.as_ref() {
+                let _ = tx.send(SessionCommand::SetModel {
+                    model,
+                    reply: Some(target),
+                });
             } else {
-                send_to_writer(
-                    ctx,
-                    &DaemonMessageType::Session {
-                        session_id: None,
-                        event: SessionEvent::ModelSelectionFailed {
-                            model,
-                            error: "no session attached".to_string(),
-                        },
-                    },
-                );
+                target.fail("no session attached");
             }
         }
         ClientMessageType::SetReasoningEffort { effort } => {
@@ -604,19 +599,14 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 effort,
                 ctx.attached_session_tx.is_some()
             );
-            if let Some(tx) = ctx.attached_session_tx {
-                let _ = tx.send(SessionCommand::SetReasoningEffort { effort });
+            let target = ctx.reply_target(kind);
+            if let Some(tx) = ctx.attached_session_tx.as_ref() {
+                let _ = tx.send(SessionCommand::SetReasoningEffort {
+                    effort,
+                    reply: Some(target),
+                });
             } else {
-                send_to_writer(
-                    ctx,
-                    &DaemonMessageType::Session {
-                        session_id: None,
-                        event: SessionEvent::ReasoningEffortSetFailed {
-                            effort,
-                            error: "no session attached".to_string(),
-                        },
-                    },
-                );
+                target.fail("no session attached");
             }
         }
         ClientMessageType::GetReasoningEffort => {
@@ -647,11 +637,11 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
         }
         ClientMessageType::Unlock { private_key } => {
             info!("client {}: Unlock", ctx.client_id);
-            handle_unlock_sync(ctx, private_key);
+            handle_unlock_sync(ctx, kind, private_key);
         }
         ClientMessageType::BindKeystore { key } => {
             info!("client {}: BindKeystore", ctx.client_id);
-            handle_bind_keystore_sync(ctx, key);
+            handle_bind_keystore_sync(ctx, kind, key);
         }
         ClientMessageType::Lock => {
             info!("client {}: Lock", ctx.client_id);
@@ -667,7 +657,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 "client {}: AddCredential service={}",
                 ctx.client_id, service
             );
-            handle_add_credential_sync(&mut *ctx, &service, encrypted_payload, unlock_key);
+            handle_add_credential_sync(&mut *ctx, kind, &service, encrypted_payload, unlock_key);
         }
         ClientMessageType::RemoveCredential { service } => {
             info!(
@@ -737,20 +727,16 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
         }
         ClientMessageType::DeleteSession { session_id } => {
             info!("client {}: DeleteSession id={}", ctx.client_id, session_id);
-            handle_delete_session_sync(ctx, session_id);
+            let handle = ctx.reply_handle();
+            handle_delete_session_sync(ctx, handle, session_id);
         }
         ClientMessageType::SetSessionPinned { session_id, pinned } => {
             info!(
                 "client {}: SetSessionPinned id={} pinned={}",
                 ctx.client_id, session_id, pinned
             );
-            handle_set_session_flags_sync(
-                ctx,
-                session_id,
-                Some(pinned),
-                None,
-                "set_session_pinned",
-            );
+            let handle = ctx.reply_handle();
+            handle_set_session_flags_sync(ctx, handle, session_id, Some(pinned), None, kind);
         }
         ClientMessageType::SetSessionArchived {
             session_id,
@@ -760,13 +746,8 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 "client {}: SetSessionArchived id={} archived={}",
                 ctx.client_id, session_id, archived
             );
-            handle_set_session_flags_sync(
-                ctx,
-                session_id,
-                None,
-                Some(archived),
-                "set_session_archived",
-            );
+            let handle = ctx.reply_handle();
+            handle_set_session_flags_sync(ctx, handle, session_id, None, Some(archived), kind);
         }
         ClientMessageType::GetCredential { service } => {
             let handle = ctx.reply_handle();
@@ -836,6 +817,8 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                     client_id: ctx.client_id,
                     writer: ctx.writer.clone(),
                 });
+            ctx.reply_handle()
+                .send(DaemonMessageType::Accepted { kind });
         }
         ClientMessageType::UnsubscribeAllActivity => {
             let _ = ctx
@@ -843,6 +826,8 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 .send(DaemonCommand::UnregisterActivitySubscriber {
                     client_id: ctx.client_id,
                 });
+            ctx.reply_handle()
+                .send(DaemonMessageType::Accepted { kind });
         }
         _ => {
             // Defensive net for a request the dispatch does not (yet) answer —
@@ -877,11 +862,11 @@ pub(crate) struct ClientConn {
     /// [`ClientCtx::db`]): on-demand image reads run here, on the connection
     /// thread, never as a command-loop round-trip.
     db: Arc<redb::Database>,
-    /// This connection's delivery sink (see `send_to_writer`).
+    /// This connection's delivery sink.
     writer: crate::broadcast::SubscriberSink,
     /// Daemon-wide lag counter, shared by every connection; kept so replies
     /// can increment it in balance with the writer thread's per-dequeue
-    /// decrement (see `send_to_writer`).
+    /// decrement.
     global_lag: Arc<AtomicUsize>,
     client_id: u64,
     /// Whether this connection arrived over the local Unix socket (vs the
@@ -911,7 +896,7 @@ pub(crate) struct ConnThreadArgs {
     /// This connection's own handle to the shared redb database (see
     /// [`ClientCtx::db`]).
     pub db: Arc<redb::Database>,
-    /// This connection's delivery sink (see `send_to_writer`).
+    /// This connection's delivery sink.
     pub writer: crate::broadcast::SubscriberSink,
     /// The receiver end of this connection's writer channel.
     pub writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
@@ -1401,45 +1386,40 @@ fn handle_client_attach_session<'a>(
 }
 
 /// Handle a `SetSessionAccount` client message: verify the account exists
-/// via the daemon, then set it on the attached session.
+/// via the daemon, then set it on the attached session. The account check runs
+/// HERE, on the connection thread, so the not-found and no-session cases reply
+/// `Failed { kind: SetSessionAccount }` directly; on success the session thread
+/// acks through the minted reply target.
 fn handle_client_set_session_account(name: String, ctx: &mut ClientCtx) {
-    if let Some(tx) = ctx.attached_session_tx.as_ref() {
-        // Verify the account exists before setting it.
-        let (reply, rx) = mpsc::channel();
-        let _ = ctx.daemon_tx.send(DaemonCommand::AccountExists {
-            name: name.clone(),
-            reply,
+    // Clone the session sender so the reply-target mint below can borrow `ctx`
+    // freely (an owned `Sender` avoids holding a borrow of `ctx` across it).
+    let Some(tx) = ctx.attached_session_tx.clone() else {
+        ctx.reply_handle().send(DaemonMessageType::Failed {
+            kind: MessageKind::SetSessionAccount,
+            error: "no session attached".into(),
         });
-        match rx.recv() {
-            Ok(true) => {
-                let _ = tx.send(SessionCommand::SetAccount { name });
-            }
-            _ => {
-                // Session-scoped reply to the attached session: carry its
-                // real id (do NOT fall back to the None sentinel).
-                send_to_writer(
-                    ctx,
-                    &DaemonMessageType::Session {
-                        session_id: *ctx.attached_session_id,
-                        event: SessionEvent::SessionFailed {
-                            operation: "set_account".into(),
-                            error: format!("account '{name}' not found"),
-                        },
-                    },
-                );
-            }
+        return;
+    };
+    // Verify the account exists before setting it.
+    let (reply, rx) = mpsc::channel();
+    let _ = ctx.daemon_tx.send(DaemonCommand::AccountExists {
+        name: name.clone(),
+        reply,
+    });
+    match rx.recv() {
+        Ok(true) => {
+            let target = ctx.reply_target(MessageKind::SetSessionAccount);
+            let _ = tx.send(SessionCommand::SetAccount {
+                name,
+                reply: Some(target),
+            });
         }
-    } else {
-        send_to_writer(
-            ctx,
-            &DaemonMessageType::Session {
-                session_id: None,
-                event: SessionEvent::SessionFailed {
-                    operation: "set_account".into(),
-                    error: "no session attached".to_string(),
-                },
-            },
-        );
+        _ => {
+            ctx.reply_handle().send(DaemonMessageType::Failed {
+                kind: MessageKind::SetSessionAccount,
+                error: format!("account '{name}' not found"),
+            });
+        }
     }
 }
 
@@ -1456,16 +1436,16 @@ fn request_daemon<R>(
     rx.recv()
 }
 
-fn handle_unlock_sync(ctx: &mut ClientCtx, private_key: Vec<u8>) {
+fn handle_unlock_sync(ctx: &mut ClientCtx, kind: MessageKind, private_key: Vec<u8>) {
     // The daemon command loop enqueues the targeted reply (Unlocked /
-    // KeystoreUnbound / LockedError) DIRECTLY into this client's writer sink
-    // BEFORE its lock-state broadcast — see ORDERING INVARIANT in
-    // `DaemonState::handle_unlock`. This thread only waits for the ack so a
-    // dropped daemon channel is reported.
-    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::Unlock {
+    // KeystoreUnbound / LockedError) through the minted reply target DIRECTLY
+    // onto this client's writer queue BEFORE its lock-state broadcast — see
+    // ORDERING INVARIANT in `DaemonState::handle_unlock`. This thread only waits
+    // for the ack so a dropped daemon channel is reported.
+    let result = request_daemon(ctx.daemon_tx, |ack| DaemonCommand::Unlock {
         private_key,
-        client_writer: Some(ctx.writer.clone()),
-        reply,
+        reply: Some(ctx.reply_target(kind)),
+        ack,
     });
     if result.is_err() {
         warn!("daemon disconnected while handling unlock");
@@ -1480,11 +1460,11 @@ fn handle_unlock_sync(ctx: &mut ClientCtx, private_key: Vec<u8>) {
 /// `handle_unlock`); on an already-bound keystore a wrong key is rejected
 /// with the existing wrong-key semantics (`LockedError`) — no unlock, no
 /// overwrite.
-fn handle_bind_keystore_sync(ctx: &mut ClientCtx, key: Vec<u8>) {
-    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::BindKeystore {
+fn handle_bind_keystore_sync(ctx: &mut ClientCtx, kind: MessageKind, key: Vec<u8>) {
+    let result = request_daemon(ctx.daemon_tx, |ack| DaemonCommand::BindKeystore {
         key,
-        client_writer: Some(ctx.writer.clone()),
-        reply,
+        reply: Some(ctx.reply_target(kind)),
+        ack,
     });
     if result.is_err() {
         warn!("daemon disconnected while handling bind keystore");
@@ -1761,45 +1741,47 @@ fn handle_get_credential_sync<'a>(
     }
 }
 
-fn handle_delete_session_sync(ctx: &mut ClientCtx, session_id: u64) {
+fn handle_delete_session_sync<'a>(
+    ctx: &mut ClientCtx<'a>,
+    handle: ReplyHandle<'a>,
+    session_id: u64,
+) {
     let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::DeleteSession {
         session_id,
         reply,
     });
     match result {
         Ok(Ok(())) => {
-            // The daemon broadcasts SessionDeleted to all summary
-            // subscribers (including this client when it's viewing
-            // the session list), so we don't duplicate it here.
+            // The daemon broadcasts `SessionDeleted` to all summary subscribers
+            // (this client included when it is viewing the session list); the
+            // broadcast is unchanged, and this targeted `Accepted` is the
+            // request's terminal reply.
+            handle.send(DaemonMessageType::Accepted {
+                kind: MessageKind::DeleteSession,
+            });
         }
-        Ok(Err(e)) => {
-            send_to_writer(
-                ctx,
-                &DaemonMessageType::Session {
-                    session_id: Some(session_id),
-                    event: SessionEvent::SessionDeleteFailed {
-                        error: e.to_string(),
-                    },
-                },
-            );
-        }
-        Err(_) => warn!("daemon disconnected while handling delete session"),
+        Ok(Err(e)) => handle.send(DaemonMessageType::Failed {
+            kind: MessageKind::DeleteSession,
+            error: e.to_string(),
+        }),
+        // Daemon gone: the reply is impossible, not forgotten.
+        Err(_) => handle.abandon(),
     }
 }
 
 /// Handle a `SetSessionPinned`/`SetSessionArchived` client message. On success
-/// NOTHING is sent to the client — the daemon's `SessionFlagsChanged` broadcast
-/// is the success signal (every subscriber, the requester included, receives
-/// it). On failure the error is a TARGETED reply to THIS connection only, so
-/// just the requester learns the operation failed (`operation` names which of
-/// the two messages it was). Follows the same shape as
+/// the requester gets a targeted `Accepted` IN ADDITION to the daemon's
+/// `SessionFlagsChanged` broadcast (which stays `id: None` and reaches every
+/// subscriber). On failure the requester gets a targeted `Failed { kind, error }`
+/// (`kind` names which of the two messages it was). Follows the same shape as
 /// [`handle_delete_session_sync`].
-fn handle_set_session_flags_sync(
-    ctx: &mut ClientCtx,
+fn handle_set_session_flags_sync<'a>(
+    ctx: &mut ClientCtx<'a>,
+    handle: ReplyHandle<'a>,
     session_id: u64,
     pinned: Option<bool>,
     archived: Option<bool>,
-    operation: &str,
+    kind: MessageKind,
 ) {
     let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::SetSessionFlags {
         session_id,
@@ -1808,28 +1790,18 @@ fn handle_set_session_flags_sync(
         reply,
     });
     match result {
-        Ok(Ok(())) => {
-            // Success: no targeted reply — the daemon broadcasts
-            // SessionFlagsChanged to every subscriber (this client included).
-        }
-        Ok(Err(e)) => {
-            send_to_writer(
-                ctx,
-                &DaemonMessageType::Session {
-                    session_id: Some(session_id),
-                    event: SessionEvent::SessionFailed {
-                        operation: operation.into(),
-                        error: e.to_string(),
-                    },
-                },
-            );
-        }
-        Err(_) => warn!("daemon disconnected while handling {operation}"),
+        Ok(Ok(())) => handle.send(DaemonMessageType::Accepted { kind }),
+        Ok(Err(e)) => handle.send(DaemonMessageType::Failed {
+            kind,
+            error: e.to_string(),
+        }),
+        Err(_) => handle.abandon(),
     }
 }
 
 fn handle_add_credential_sync(
     ctx: &mut ClientCtx,
+    kind: MessageKind,
     service: &str,
     encrypted_payload: Vec<u8>,
     // REQUIRED since the per-daemon keystore TOFU design (Task 1 made the
@@ -1837,15 +1809,16 @@ fn handle_add_credential_sync(
     unlock_key: Vec<u8>,
 ) {
     // The daemon command loop enqueues the targeted replies (Unlocked +
-    // CredentialAdded, or the failure variant) DIRECTLY into this client's
-    // writer sink BEFORE its lock-state broadcast — see ORDERING INVARIANT in
-    // `DaemonState::handle_unlock`. This thread only waits for the ack.
-    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::SaveCredential {
+    // CredentialAdded, or the failure variant) through the minted reply target
+    // DIRECTLY onto this client's writer queue BEFORE its lock-state broadcast —
+    // see ORDERING INVARIANT in `DaemonState::handle_unlock`. This thread only
+    // waits for the ack.
+    let result = request_daemon(ctx.daemon_tx, |ack| DaemonCommand::SaveCredential {
         service: service.to_string(),
         encrypted_blob: encrypted_payload,
         unlock_key,
-        client_writer: Some(ctx.writer.clone()),
-        reply,
+        reply: Some(ctx.reply_target(kind)),
+        ack,
     });
     if result.is_err() {
         warn!("daemon disconnected while handling add credential");
@@ -2267,9 +2240,9 @@ mod tests {
     }
 
     /// The companion positive case: `send` stamps the request id onto the
-    /// reply and balances the daemon-wide lag counter exactly as
-    /// `send_to_writer` does (the counter holds the enqueued bytes until the
-    /// writer thread's dequeue decrement, which does not run here).
+    /// reply and balances the daemon-wide lag counter (the counter holds the
+    /// enqueued bytes until the writer thread's dequeue decrement, which does
+    /// not run here).
     #[test]
     fn reply_handle_send_stamps_id_and_accounts_bytes() {
         let (sink, rx) = test_sink();
@@ -2398,23 +2371,17 @@ mod tests {
             is_unix: true,
         };
         // The daemon command loop now enqueues the targeted reply itself:
-        // the stub simulates that by sending Unlocked into the client_writer
-        // sink BEFORE the ack (the ORDERING INVARIANT shape).
-        let lag = Arc::clone(&global_lag);
+        // the stub simulates that by sending Unlocked through the reply target
+        // BEFORE the ack (the ORDERING INVARIANT shape).
         std::thread::spawn(move || {
-            if let Ok(DaemonCommand::Unlock {
-                client_writer,
-                reply,
-                ..
-            }) = daemon_rx.recv()
-            {
-                if let Some(w) = &client_writer {
-                    w.send_accounted(&DaemonMessage::broadcast(DaemonMessageType::Unlocked), &lag);
+            if let Ok(DaemonCommand::Unlock { reply, ack, .. }) = daemon_rx.recv() {
+                if let Some(target) = &reply {
+                    target.send(DaemonMessageType::Unlocked);
                 }
-                let _ = reply.send(());
+                let _ = ack.send(());
             }
         });
-        handle_unlock_sync(&mut ctx, vec![0u8; 32]);
+        handle_unlock_sync(&mut ctx, MessageKind::Unlock, vec![0u8; 32]);
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(msg.inner, DaemonMessageType::Unlocked));
     }
@@ -2439,26 +2406,17 @@ mod tests {
         };
         // The daemon command loop enqueues the targeted LockedError itself;
         // the stub simulates that (see the ordering-invariant note above).
-        let lag = Arc::clone(&global_lag);
         std::thread::spawn(move || {
-            if let Ok(DaemonCommand::Unlock {
-                client_writer,
-                reply,
-                ..
-            }) = daemon_rx.recv()
-            {
-                if let Some(w) = &client_writer {
-                    w.send_accounted(
-                        &DaemonMessage::broadcast(DaemonMessageType::LockedError {
-                            error: "wrong password".to_string(),
-                        }),
-                        &lag,
-                    );
+            if let Ok(DaemonCommand::Unlock { reply, ack, .. }) = daemon_rx.recv() {
+                if let Some(target) = &reply {
+                    target.send(DaemonMessageType::LockedError {
+                        error: "wrong password".to_string(),
+                    });
                 }
-                let _ = reply.send(());
+                let _ = ack.send(());
             }
         });
-        handle_unlock_sync(&mut ctx, vec![0u8; 32]);
+        handle_unlock_sync(&mut ctx, MessageKind::Unlock, vec![0u8; 32]);
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(msg.inner, DaemonMessageType::LockedError { .. }));
         if let DaemonMessageType::LockedError { error } = &msg.inner {
@@ -2485,7 +2443,7 @@ mod tests {
             is_unix: true,
         };
         drop(daemon_rx);
-        handle_unlock_sync(&mut ctx, vec![0u8; 32]);
+        handle_unlock_sync(&mut ctx, MessageKind::Unlock, vec![0u8; 32]);
         assert!(writer_rx.try_recv().is_err());
     }
 
@@ -2668,7 +2626,7 @@ mod tests {
     fn mcp_ctx<'a>(
         daemon_tx: &'a crossbeam_channel::Sender<DaemonCommand>,
         sink: &'a crate::broadcast::SubscriberSink,
-        global_lag: &'a AtomicUsize,
+        global_lag: &'a Arc<AtomicUsize>,
         attached_session_id: &'a mut Option<u64>,
         attached_session_tx: &'a mut Option<crossbeam_channel::Sender<SessionCommand>>,
     ) -> ClientCtx<'a> {
@@ -3217,7 +3175,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_delete_session_sync_success_no_message_sent() {
+    fn handle_delete_session_sync_success_sends_accepted() {
         let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
@@ -3239,13 +3197,22 @@ mod tests {
                 let _ = reply.send(Ok(()));
             }
         });
-        handle_delete_session_sync(&mut ctx, 42);
-        // On success, no message is sent to writer (broadcast handles it)
-        assert!(writer_rx.try_recv().is_err());
+        let handle = ctx.reply_handle();
+        handle_delete_session_sync(&mut ctx, handle, 42);
+        // A targeted `Accepted` is the request's terminal reply; the
+        // `SessionDeleted` fan-out is a separate (broadcast) message.
+        let msg = writer_rx.recv().unwrap();
+        assert_eq!(msg.id, Some(0), "the ack must carry the request id");
+        assert!(matches!(
+            msg.inner,
+            DaemonMessageType::Accepted {
+                kind: MessageKind::DeleteSession
+            }
+        ));
     }
 
     #[test]
-    fn handle_delete_session_sync_error() {
+    fn handle_delete_session_sync_error_sends_failed() {
         let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
@@ -3267,23 +3234,17 @@ mod tests {
                 let _ = reply.send(Err(io::Error::other("db error")));
             }
         });
-        handle_delete_session_sync(&mut ctx, 42);
+        let handle = ctx.reply_handle();
+        handle_delete_session_sync(&mut ctx, handle, 42);
         let msg = writer_rx.recv().unwrap();
+        assert_eq!(msg.id, Some(0));
         assert!(matches!(
-            msg.inner,
-            DaemonMessageType::Session {
-                event: SessionEvent::SessionDeleteFailed { .. },
-                ..
-            }
+            &msg.inner,
+            DaemonMessageType::Failed {
+                kind: MessageKind::DeleteSession,
+                error,
+            } if error == "db error"
         ));
-        if let DaemonMessageType::Session {
-            session_id: Some(session_id),
-            event: SessionEvent::SessionDeleteFailed { error },
-        } = &msg.inner
-        {
-            assert_eq!(*session_id, 42);
-            assert_eq!(error, "db error");
-        }
     }
 
     #[test]
@@ -3305,7 +3266,8 @@ mod tests {
             is_unix: true,
         };
         drop(daemon_rx);
-        handle_delete_session_sync(&mut ctx, 42);
+        let handle = ctx.reply_handle();
+        handle_delete_session_sync(&mut ctx, handle, 42);
         assert!(writer_rx.try_recv().is_err());
     }
 
@@ -3365,12 +3327,12 @@ mod tests {
 
         assert!(matches!(
             session_rx.try_recv().ok(),
-            Some(SessionCommand::Undo)
+            Some(SessionCommand::Undo { .. })
         ));
     }
 
     #[test]
-    fn dispatch_undo_when_not_attached_is_noop() {
+    fn dispatch_undo_when_not_attached_sends_failed() {
         let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
@@ -3391,8 +3353,16 @@ mod tests {
         dispatch_client_message(ClientMessage::request(0, ClientMessageType::Undo), &mut ctx)
             .unwrap();
 
-        // No message should appear on writer or session channels.
-        assert!(writer_rx.try_recv().is_err());
+        // No session attached: the requester still gets its terminal `Failed`.
+        let msg = writer_rx.recv().unwrap();
+        assert_eq!(msg.id, Some(0));
+        assert!(matches!(
+            &msg.inner,
+            DaemonMessageType::Failed {
+                kind: MessageKind::Undo,
+                error,
+            } if error == "no session attached"
+        ));
     }
 
     // ── Redo dispatch ────────────────────────────────────────────────────
@@ -3422,12 +3392,12 @@ mod tests {
 
         assert!(matches!(
             session_rx.try_recv().ok(),
-            Some(SessionCommand::Redo)
+            Some(SessionCommand::Redo { .. })
         ));
     }
 
     #[test]
-    fn dispatch_redo_when_not_attached_is_noop() {
+    fn dispatch_redo_when_not_attached_sends_failed() {
         let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
@@ -3448,7 +3418,15 @@ mod tests {
         dispatch_client_message(ClientMessage::request(0, ClientMessageType::Redo), &mut ctx)
             .unwrap();
 
-        assert!(writer_rx.try_recv().is_err());
+        let msg = writer_rx.recv().unwrap();
+        assert_eq!(msg.id, Some(0));
+        assert!(matches!(
+            &msg.inner,
+            DaemonMessageType::Failed {
+                kind: MessageKind::Redo,
+                error,
+            } if error == "no session attached"
+        ));
     }
 
     // ── ContinueGeneration dispatch ──────────────────────────────────────
@@ -3485,6 +3463,7 @@ mod tests {
             SessionCommand::RunInput {
                 stream_id: 7,
                 input,
+                ..
             } if input == b"Continue."
         ));
     }
@@ -3515,15 +3494,179 @@ mod tests {
         .unwrap();
 
         let msg = writer_rx.recv().expect("should receive Failed");
+        assert_eq!(msg.id, Some(0));
         assert!(matches!(
             &msg.inner,
-            DaemonMessageType::Session {
-                session_id: None,
-                event: SessionEvent::Failed {
-                    stream_id: 7,
-                    error,
-                },
+            DaemonMessageType::Failed {
+                kind: MessageKind::ContinueGeneration,
+                error,
             } if error == "no session attached"
+        ));
+    }
+
+    // ── No-arg acks (Cancel / subscribe / unsubscribe) ───────────────
+
+    #[test]
+    fn dispatch_subscribe_all_activity_acks_accepted() {
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer: &sink,
+            db: &TEST_DB,
+            global_lag: &global_lag,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+            request_id: 0,
+            is_unix: true,
+        };
+
+        dispatch_client_message(
+            ClientMessage::request(4, ClientMessageType::SubscribeAllActivity),
+            &mut ctx,
+        )
+        .unwrap();
+
+        let msg = writer_rx.recv().unwrap();
+        assert_eq!(msg.id, Some(4), "the ack must carry the request id");
+        assert!(matches!(
+            msg.inner,
+            DaemonMessageType::Accepted {
+                kind: MessageKind::SubscribeAllActivity
+            }
+        ));
+        // The registration command still reaches the daemon command loop.
+        assert!(matches!(
+            daemon_rx.try_recv().ok(),
+            Some(DaemonCommand::RegisterActivitySubscriber { .. })
+        ));
+    }
+
+    #[test]
+    fn dispatch_unsubscribe_all_activity_acks_accepted() {
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer: &sink,
+            db: &TEST_DB,
+            global_lag: &global_lag,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+            request_id: 0,
+            is_unix: true,
+        };
+
+        dispatch_client_message(
+            ClientMessage::request(5, ClientMessageType::UnsubscribeAllActivity),
+            &mut ctx,
+        )
+        .unwrap();
+
+        let msg = writer_rx.recv().unwrap();
+        assert_eq!(msg.id, Some(5));
+        assert!(matches!(
+            msg.inner,
+            DaemonMessageType::Accepted {
+                kind: MessageKind::UnsubscribeAllActivity
+            }
+        ));
+        assert!(matches!(
+            daemon_rx.try_recv().ok(),
+            Some(DaemonCommand::UnregisterActivitySubscriber { .. })
+        ));
+    }
+
+    #[test]
+    fn dispatch_cancel_acks_accepted() {
+        // Cancelling with no session attached still acks: the request was
+        // received, and the stream's own `Cancelled` broadcast is the outcome.
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer: &sink,
+            db: &TEST_DB,
+            global_lag: &global_lag,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+            request_id: 0,
+            is_unix: true,
+        };
+
+        dispatch_client_message(
+            ClientMessage::request(6, ClientMessageType::Cancel { stream_id: 1 }),
+            &mut ctx,
+        )
+        .unwrap();
+
+        let msg = writer_rx.recv().unwrap();
+        assert_eq!(msg.id, Some(6));
+        assert!(matches!(
+            msg.inner,
+            DaemonMessageType::Accepted {
+                kind: MessageKind::Cancel
+            }
+        ));
+        // No session attached: no cancel command is routed.
+        assert!(daemon_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn dispatch_set_session_pinned_success_acks_accepted() {
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer: &sink,
+            db: &TEST_DB,
+            global_lag: &global_lag,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+            request_id: 0,
+            is_unix: true,
+        };
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::SetSessionFlags { reply, .. }) = daemon_rx.recv() {
+                let _ = reply.send(Ok(()));
+            }
+        });
+
+        dispatch_client_message(
+            ClientMessage::request(
+                7,
+                ClientMessageType::SetSessionPinned {
+                    session_id: 1,
+                    pinned: true,
+                },
+            ),
+            &mut ctx,
+        )
+        .unwrap();
+
+        let msg = writer_rx.recv().unwrap();
+        assert_eq!(msg.id, Some(7));
+        assert!(matches!(
+            msg.inner,
+            DaemonMessageType::Accepted {
+                kind: MessageKind::SetSessionPinned
+            }
         ));
     }
 

@@ -1,5 +1,5 @@
 use crate::accounts::{AccountConfig, AccountManager, AccountOverrides};
-use crate::broadcast::{LagLimits, SubscriberSink};
+use crate::broadcast::{LagLimits, ReplyTarget, SubscriberSink};
 use crate::cache_warm::{CacheWarmingConfig, WarmPolicy};
 use crate::catalog::{CatalogPaths, MaintenanceEvent, RefreshReport, RefreshRequester};
 use crate::db::{self, SessionRecord};
@@ -276,14 +276,16 @@ pub enum DaemonCommand {
     },
     Unlock {
         private_key: Vec<u8>,
-        /// The acting client's writer sink, cloned from the connection. The
-        /// TARGETED reply is enqueued here directly by the daemon command
-        /// loop — before any lock-state broadcast — because routing the reply
-        /// through the connection thread's mpsc handoff does not order
-        /// against a broadcast enqueued by THIS thread into the same sink.
-        /// See ORDERING INVARIANT in `handle_unlock`.
-        client_writer: Option<SubscriberSink>,
-        reply: std::sync::mpsc::Sender<()>,
+        /// The acting client's reply target. The TARGETED reply is enqueued
+        /// through it DIRECTLY by the daemon command loop — before any
+        /// lock-state broadcast — because routing the reply through the
+        /// connection thread's mpsc handoff does not order against a broadcast
+        /// enqueued by THIS thread into the same sink. See ORDERING INVARIANT
+        /// in `handle_unlock`.
+        reply: Option<ReplyTarget>,
+        /// One-shot ACK back to the blocked connection thread; carries no data
+        /// (the reply rode `reply`), only "the command loop is done".
+        ack: std::sync::mpsc::Sender<()>,
     },
     /// Establish (TOFU-bind) the keystore binding. The ONLY path that can
     /// create the binding: on an unbound keystore the key is adopted (loud
@@ -292,9 +294,9 @@ pub enum DaemonCommand {
     /// mismatch is rejected without unlocking or overwriting.
     BindKeystore {
         key: Vec<u8>,
-        /// See `Unlock.client_writer` for why the targeted reply rides here.
-        client_writer: Option<SubscriberSink>,
-        reply: mpsc::Sender<()>,
+        /// See `Unlock.reply` for why the targeted reply rides here.
+        reply: Option<ReplyTarget>,
+        ack: mpsc::Sender<()>,
     },
     /// Lock the daemon's keystore: clear all decrypted in-memory credentials
     /// (and their cached providers) and flip `locked` back to `true`. The
@@ -316,9 +318,9 @@ pub enum DaemonCommand {
         /// it to test-decrypt + persist the blob, and then performs the
         /// implicit unlock (same tail as `Unlock`).
         unlock_key: Vec<u8>,
-        /// See `Unlock.client_writer` for why the targeted reply rides here.
-        client_writer: Option<SubscriberSink>,
-        reply: mpsc::Sender<()>,
+        /// See `Unlock.reply` for why the targeted replies ride here.
+        reply: Option<ReplyTarget>,
+        ack: mpsc::Sender<()>,
     },
     RemoveCredentialCmd {
         service: String,
@@ -771,28 +773,20 @@ impl DaemonState {
             }
             DaemonCommand::Unlock {
                 private_key,
-                client_writer,
                 reply,
-            } => self.handle_unlock(private_key, client_writer.as_ref(), &reply),
-            DaemonCommand::BindKeystore {
-                key,
-                client_writer,
-                reply,
-            } => self.handle_bind_keystore(key, client_writer.as_ref(), &reply),
+                ack,
+            } => self.handle_unlock(private_key, reply, &ack),
+            DaemonCommand::BindKeystore { key, reply, ack } => {
+                self.handle_bind_keystore(key, reply, &ack);
+            }
             DaemonCommand::Lock { reply } => self.handle_lock(&reply),
             DaemonCommand::SaveCredential {
                 service,
                 encrypted_blob,
                 unlock_key,
-                client_writer,
                 reply,
-            } => self.handle_save_credential(
-                service,
-                &encrypted_blob,
-                unlock_key,
-                client_writer.as_ref(),
-                &reply,
-            ),
+                ack,
+            } => self.handle_save_credential(service, &encrypted_blob, unlock_key, reply, &ack),
             DaemonCommand::RemoveCredentialCmd { service, reply } => {
                 self.handle_remove_credential(&service, &reply);
             }
@@ -2255,7 +2249,12 @@ impl DaemonState {
         debug!(session_id, title = %title, "forwarding title change to session");
         match self.active_sessions.get(&session_id) {
             Some(entry) => {
-                let _ = entry.cmd_tx.send(SessionCommand::SetTitle { title });
+                let _ = entry.cmd_tx.send(SessionCommand::SetTitle {
+                    title,
+                    // Tool-driven: the agent's `set_session_title` tool has no
+                    // client request id to ack.
+                    reply: None,
+                });
             }
             None => {
                 warn!(session_id, "cannot set title: session is not active");
@@ -2273,9 +2272,12 @@ impl DaemonState {
     ) {
         debug!(session_id, path = %path.display(), "forwarding working dir change to session");
         if let Some(entry) = self.active_sessions.get(&session_id) {
-            let _ = entry
-                .cmd_tx
-                .send(SessionCommand::SetWorkingDir { path, reply });
+            let _ = entry.cmd_tx.send(SessionCommand::SetWorkingDir {
+                path,
+                tool_reply: reply,
+                // Tool-driven (see handle_set_session_title's note).
+                reply: None,
+            });
         } else {
             warn!(session_id, "cannot set working dir: session is not active");
             // Reply immediately so the caller (a blocked tool execution)

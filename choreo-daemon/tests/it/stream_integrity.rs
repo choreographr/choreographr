@@ -311,12 +311,14 @@ fn streamed_answer_matches_final_turn_byte_for_byte() {
     session_tx
         .send(SessionCommand::SetModel {
             model: "mock-4o".to_string(),
+            reply: None,
         })
         .expect("set model");
     session_tx
         .send(SessionCommand::RunInput {
             stream_id: 1,
             input: b"hello".to_vec(),
+            reply: None,
         })
         .expect("run input");
 
@@ -378,12 +380,14 @@ fn tool_streaming_delivers_every_chunk_in_order() {
     session_tx
         .send(SessionCommand::SetModel {
             model: "mock-4o".to_string(),
+            reply: None,
         })
         .expect("set model");
     session_tx
         .send(SessionCommand::RunInput {
             stream_id: 1,
             input: b"run the tool".to_vec(),
+            reply: None,
         })
         .expect("run input");
 

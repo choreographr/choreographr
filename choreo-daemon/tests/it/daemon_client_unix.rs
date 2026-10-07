@@ -401,24 +401,26 @@ fn recv_until_not_catalog(client: &Client, what: &str) -> DaemonMessageType {
 }
 
 /// Drain the subscribe-time push (`CatalogUpdated` + lock state), tolerating
-/// extra async `CatalogUpdated` broadcasts racing with the drain.
+/// the subscribe's own `Accepted` ack and any extra async `CatalogUpdated`
+/// broadcasts racing with the drain.
 fn drain_subscribe_push(client: &Client) {
-    let first = client.recv();
-    assert!(
-        matches!(first, DaemonMessageType::CatalogUpdated { .. }),
-        "{first:?}"
-    );
-    let second = recv_until_not_catalog(client, "subscribe-time keystore state");
-    // A freshly spawned daemon has no binding → the push is `Unbound`.
-    assert!(
-        matches!(
-            second,
-            DaemonMessageType::Keystore {
-                state: choreo_proto::KeystoreState::Unbound
+    loop {
+        match client.recv() {
+            // The subscribe request is acked before the command loop pushes the
+            // current activity state; skip it.
+            DaemonMessageType::Accepted { .. } => {}
+            DaemonMessageType::CatalogUpdated { .. } => {}
+            // A freshly spawned daemon has no binding → the push is `Unbound`.
+            DaemonMessageType::Keystore { state } => {
+                assert!(
+                    matches!(state, choreo_proto::KeystoreState::Unbound),
+                    "{state:?}"
+                );
+                return;
             }
-        ),
-        "{second:?}"
-    );
+            other => panic!("unexpected subscribe-time push: {other:?}"),
+        }
+    }
 }
 
 /// `BindKeystore` on an unbound daemon adopts the key, replies the targeted

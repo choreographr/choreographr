@@ -78,6 +78,7 @@ fn session_starts_and_accepts_commands() {
     session_tx
         .send(SessionCommand::SetModel {
             model: "gpt-4".to_string(),
+            reply: None,
         })
         .unwrap();
 
@@ -149,7 +150,8 @@ fn session_config_tools_mutate_authoritative_state_and_persist() {
     session_tx
         .send(SessionCommand::SetWorkingDir {
             path: PathBuf::from("/tmp/new-wd"),
-            reply: wd_reply_tx,
+            tool_reply: wd_reply_tx,
+            reply: None,
         })
         .unwrap();
     match wd_reply_rx.recv().unwrap() {

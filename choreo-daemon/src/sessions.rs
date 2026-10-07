@@ -1,4 +1,4 @@
-use crate::broadcast::{LagLimits, SubscriberSink, fan_out_evicting};
+use crate::broadcast::{LagLimits, ReplyTarget, SubscriberSink, fan_out_evicting};
 use crate::cache_warm::WarmPolicy;
 use crate::context::{LoadedSkill, SkillMeta};
 use crate::daemon::{DaemonCommand, ResolvedAccount};
@@ -164,6 +164,13 @@ pub enum SessionCommand {
     RunInput {
         stream_id: u64,
         input: Vec<u8>,
+        /// The requester's reply target, when the run originated from a client
+        /// request (`RunInput`/`ContinueGeneration`). The session thread sends
+        /// the acceptance reply — a TARGETED `Started` on accept, a targeted
+        /// `Failed` on reject — in addition to the unchanged broadcast stream.
+        /// `None` for internally-requested runs (e.g. a child session's
+        /// implicit continue) that have no client awaiting a reply.
+        reply: Option<ReplyTarget>,
     },
     RunChildInput {
         stream_id: u64,
@@ -175,6 +182,10 @@ pub enum SessionCommand {
     },
     SetModel {
         model: String,
+        /// The requester's reply target: `Accepted` on success,
+        /// `Failed { kind: SetModel }` on rejection. The `ModelSelected` /
+        /// `ModelSelectionFailed` broadcasts still fire unchanged.
+        reply: Option<ReplyTarget>,
     },
     StatusChanged(SessionStatus),
     Attach {
@@ -215,6 +226,12 @@ pub enum SessionCommand {
     },
     SetTitle {
         title: String,
+        /// The requester's reply target. Title changes are driven by the agent's
+        /// `set_session_title` tool, which has no client request id, so this is
+        /// `None` there; the slot exists so a client-originated title request
+        /// can ack the same way as the other session mutations without another
+        /// cross-crate change.
+        reply: Option<ReplyTarget>,
     },
     /// Set the session working directory (authoritative state lives in the
     /// main loop, so this must be routed here rather than mutated on the
@@ -222,7 +239,13 @@ pub enum SessionCommand {
     /// the change has been broadcast and persisted.
     SetWorkingDir {
         path: PathBuf,
-        reply: mpsc::Sender<Result<String, String>>,
+        /// One-shot reply to the blocked `set_working_dir` tool caller (the
+        /// tool's synchronous round-trip), carrying the applied path or the
+        /// rejection reason.
+        tool_reply: mpsc::Sender<Result<String, String>>,
+        /// The client requester's reply target (see [`SessionCommand::SetTitle`]
+        /// for why this is `None` on the current tool-driven path).
+        reply: Option<ReplyTarget>,
     },
     /// Replace the session's MCP overlay: its private project/per-session tool
     /// wrappers plus the daemon-tier groups those project servers shadow. Pushed
@@ -245,6 +268,10 @@ pub enum SessionCommand {
     },
     SetAccount {
         name: String,
+        /// The requester's reply target: `Accepted` on success. The account's
+        /// existence is verified on the connection thread BEFORE this command
+        /// is sent, so the session thread only ever sees the success path.
+        reply: Option<ReplyTarget>,
     },
     /// Drop the session's cached provider client so it is rebuilt lazily on
     /// the next request. Sent by the daemon command loop when the keystore
@@ -264,12 +291,26 @@ pub enum SessionCommand {
     },
     SetReasoningEffort {
         effort: String,
+        /// The requester's reply target: `Accepted` on success,
+        /// `Failed { kind: SetReasoningEffort }` on rejection. The
+        /// `ReasoningEffortSet` / `ReasoningEffortSetFailed` broadcasts still
+        /// fire unchanged.
+        reply: Option<ReplyTarget>,
     },
     GetReasoningEffort {
         reply: mpsc::Sender<String>,
     },
-    Undo,
-    Redo,
+    Undo {
+        /// The requester's reply target: `Accepted` when turns were undone,
+        /// `Failed { kind: Undo, error: "nothing to undo" }` when there was
+        /// nothing to undo (closing the silent no-op gap).
+        reply: Option<ReplyTarget>,
+    },
+    Redo {
+        /// The requester's reply target: `Accepted` when turns were restored,
+        /// `Failed { kind: Redo, error: "nothing to redo" }` otherwise.
+        reply: Option<ReplyTarget>,
+    },
     Shutdown,
 }
 
@@ -1279,8 +1320,17 @@ fn fail_request(
     ctx: &RequestContext,
     session_id: u64,
     stream_id: u64,
+    reply: Option<ReplyTarget>,
     error: impl Into<String>,
 ) -> bool {
+    let error = error.into();
+    // Targeted acceptance-reply failure to the requester: the request's
+    // terminal reply (`id: Some`). Sent BEFORE the unchanged broadcast stream
+    // below — the two ride the same per-client writer queue, so the requester
+    // sees its rejection then the broadcast `Started`/`Failed` pair.
+    if let Some(target) = reply {
+        target.fail(error.clone());
+    }
     broadcast(
         subscribers,
         ctx,
@@ -1298,10 +1348,7 @@ fn fail_request(
         ctx,
         &DaemonMessageType::Session {
             session_id: Some(session_id),
-            event: SessionEvent::Failed {
-                stream_id,
-                error: error.into(),
-            },
+            event: SessionEvent::Failed { stream_id, error },
         },
     );
     false
@@ -1486,9 +1533,11 @@ fn process_command(
     ctx: &RequestContext,
 ) -> bool {
     match cmd {
-        SessionCommand::RunInput { stream_id, input } => {
-            handle_run_input(stream_id, &input, state, shutdown_requested, ctx)
-        }
+        SessionCommand::RunInput {
+            stream_id,
+            input,
+            reply,
+        } => handle_run_input(stream_id, &input, reply, state, shutdown_requested, ctx),
         SessionCommand::RunChildInput {
             stream_id,
             user_text,
@@ -1502,7 +1551,7 @@ fn process_command(
             ctx,
         ),
         SessionCommand::Cancel { stream_id } => handle_cancel(stream_id, state, ctx),
-        SessionCommand::SetModel { model } => handle_set_model(model, state, ctx),
+        SessionCommand::SetModel { model, reply } => handle_set_model(model, reply, state, ctx),
         SessionCommand::StatusChanged(new_status) => handle_status_changed(new_status, state, ctx),
         SessionCommand::Attach { client_id, tx } => handle_attach(client_id, tx, state, ctx),
         SessionCommand::Detach { client_id } => {
@@ -1521,10 +1570,12 @@ fn process_command(
             token_usage,
             last_prompt_tokens,
         } => handle_sync_accumulated_usage(token_usage, last_prompt_tokens, state, ctx),
-        SessionCommand::SetTitle { title } => handle_set_title(&title, state, ctx),
-        SessionCommand::SetWorkingDir { path, reply } => {
-            handle_set_working_dir(&path, &reply, state, ctx)
-        }
+        SessionCommand::SetTitle { title, reply } => handle_set_title(&title, reply, state, ctx),
+        SessionCommand::SetWorkingDir {
+            path,
+            tool_reply,
+            reply,
+        } => handle_set_working_dir(&path, &tool_reply, reply, state, ctx),
         SessionCommand::LoadTools { groups, reply } => {
             handle_load_tools(&groups, &reply, state, ctx)
         }
@@ -1532,7 +1583,7 @@ fn process_command(
             handle_unload_tools(&groups, &reply, state, ctx)
         }
         SessionCommand::SetMcpOverlay(overlay) => handle_set_mcp_overlay(*overlay, state, ctx),
-        SessionCommand::SetAccount { name } => handle_set_account(name, state, ctx),
+        SessionCommand::SetAccount { name, reply } => handle_set_account(name, reply, state, ctx),
         SessionCommand::DropProvider => {
             // The daemon decided the cached client is stale (keystore locked,
             // credential removed/changed, account reconfigured). Drop it so
@@ -1547,14 +1598,14 @@ fn process_command(
             false
         }
         SessionCommand::SetProviderSlug { slug } => handle_set_provider_slug(slug, state, ctx),
-        SessionCommand::SetReasoningEffort { effort } => {
-            handle_set_reasoning_effort(effort, state, ctx)
+        SessionCommand::SetReasoningEffort { effort, reply } => {
+            handle_set_reasoning_effort(effort, reply, state, ctx)
         }
         SessionCommand::GetReasoningEffort { reply } => {
             handle_get_reasoning_effort(&reply, state, ctx)
         }
-        SessionCommand::Undo => handle_undo(state, ctx),
-        SessionCommand::Redo => handle_redo(state, ctx),
+        SessionCommand::Undo { reply } => handle_undo(reply, state, ctx),
+        SessionCommand::Redo { reply } => handle_redo(reply, state, ctx),
         SessionCommand::Shutdown => handle_shutdown(state, shutdown_requested, ctx),
     }
 }
@@ -1565,6 +1616,7 @@ fn process_command(
 fn handle_run_input(
     stream_id: u64,
     input: &[u8],
+    reply: Option<ReplyTarget>,
     state: &mut SessionState,
     shutdown_requested: &mut bool,
     ctx: &RequestContext,
@@ -1583,6 +1635,7 @@ fn handle_run_input(
             ctx,
             ctx.session_id,
             stream_id,
+            reply,
             "empty input",
         );
     }
@@ -1593,7 +1646,14 @@ fn handle_run_input(
     let provider = match state.resolve_provider(ctx) {
         Ok(p) => p,
         Err(msg) => {
-            return fail_request(&mut state.subscribers, ctx, ctx.session_id, stream_id, msg);
+            return fail_request(
+                &mut state.subscribers,
+                ctx,
+                ctx.session_id,
+                stream_id,
+                reply,
+                msg,
+            );
         }
     };
     // Re-resolve context window now that a provider is available (e.g. the
@@ -1607,6 +1667,7 @@ fn handle_run_input(
                 ctx,
                 ctx.session_id,
                 stream_id,
+                reply,
                 "no model selected",
             );
         }
@@ -1617,6 +1678,7 @@ fn handle_run_input(
             ctx,
             ctx.session_id,
             stream_id,
+            reply,
             "session is shutting down",
         );
     }
@@ -1626,22 +1688,29 @@ fn handle_run_input(
             ctx,
             ctx.session_id,
             stream_id,
+            reply,
             "session already has an active request",
         );
     }
 
-    broadcast(
-        &mut state.subscribers,
-        ctx,
-        &DaemonMessageType::Session {
-            session_id: Some(ctx.session_id),
-            event: SessionEvent::Started {
-                stream_id,
-                turn_id: state.next_turn_id,
-                estimated_prompt_tokens: 0,
-            },
+    let started = DaemonMessageType::Session {
+        session_id: Some(ctx.session_id),
+        event: SessionEvent::Started {
+            stream_id,
+            turn_id: state.next_turn_id,
+            estimated_prompt_tokens: 0,
         },
-    );
+    };
+    // Acceptance reply (`id: Some`) to the requester, then the unchanged
+    // broadcast (`id: None`) to every subscriber. The requester receives BOTH
+    // `Started`s (targeted + broadcast); the client's `handle_started` is
+    // idempotent for a repeated (stream_id, turn_id), so the duplicate is
+    // harmless. Keeping the broadcast is what lets other attached clients
+    // follow the stream.
+    if let Some(target) = reply {
+        target.send(started.clone());
+    }
+    broadcast(&mut state.subscribers, ctx, &started);
     let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
     state.active_requests.insert(
         stream_id,
@@ -1781,7 +1850,12 @@ fn handle_cancel(stream_id: u64, state: &mut SessionState, ctx: &RequestContext)
 /// Set the model for this session and broadcast the change.
 /// Rejects invalid model names by broadcasting `ModelSelectionFailed`
 /// instead of mutating state.
-fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContext) -> bool {
+fn handle_set_model(
+    model: String,
+    reply: Option<ReplyTarget>,
+    state: &mut SessionState,
+    ctx: &RequestContext,
+) -> bool {
     info!("session {}: SetModel model={}", ctx.session_id, model);
 
     // Validate the model against the provider's model list before accepting it.
@@ -1790,6 +1864,11 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
             "session {}: model '{model}' rejected: {msg}",
             ctx.session_id
         );
+        // Targeted terminal failure to the requester, plus the unchanged
+        // broadcast (both fire; `id` distinguishes the reply from the fan-out).
+        if let Some(target) = reply {
+            target.fail(msg.clone());
+        }
         broadcast(
             &mut state.subscribers,
             ctx,
@@ -1867,6 +1946,11 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
         },
     );
     persist_session_metadata(state, ctx, "SetModel");
+    // Terminal success acknowledgement to the requester (`Accepted { SetModel }`),
+    // in addition to the `ModelSelected` broadcast above.
+    if let Some(target) = reply {
+        target.accept();
+    }
     false
 }
 
@@ -2278,7 +2362,12 @@ fn handle_sync_accumulated_usage(
 /// Set the session title, broadcasting the change to subscribers and
 /// notifying the daemon so session listings reflect the new title
 /// immediately.
-fn handle_set_title(title: &str, state: &mut SessionState, ctx: &RequestContext) -> bool {
+fn handle_set_title(
+    title: &str,
+    reply: Option<ReplyTarget>,
+    state: &mut SessionState,
+    ctx: &RequestContext,
+) -> bool {
     // Defense-in-depth: cap title length by grapheme clusters so
     // multi-byte scripts and composed emoji are treated as single
     // user-perceived characters.  The tool-level validation in
@@ -2292,6 +2381,11 @@ fn handle_set_title(title: &str, state: &mut SessionState, ctx: &RequestContext)
             max = MAX_TITLE_CHARS,
             "rejecting SetTitle: title too long (defense-in-depth)",
         );
+        // A client-originated title request (none today — the tool drives
+        // this) would learn of the rejection here.
+        if let Some(target) = reply {
+            target.fail("title too long");
+        }
         return false;
     }
 
@@ -2318,6 +2412,9 @@ fn handle_set_title(title: &str, state: &mut SessionState, ctx: &RequestContext)
 
     persist_session_metadata(state, ctx, "SetTitle");
 
+    if let Some(target) = reply {
+        target.accept();
+    }
     false
 }
 
@@ -2355,7 +2452,8 @@ fn handle_set_working_dir(
     // Borrowed only: the path is cloned into `state.config.working_dir` and
     // stringified for the reply below; the command variant still owns it.
     path: &Path,
-    reply: &mpsc::Sender<Result<String, String>>,
+    tool_reply: &mpsc::Sender<Result<String, String>>,
+    reply: Option<ReplyTarget>,
     state: &mut SessionState,
     ctx: &RequestContext,
 ) -> bool {
@@ -2399,8 +2497,11 @@ fn handle_set_working_dir(
         cancel_inflight: false,
     });
 
-    let _ = reply.send(Ok(path.to_string_lossy().into_owned()));
+    let _ = tool_reply.send(Ok(path.to_string_lossy().into_owned()));
 
+    if let Some(target) = reply {
+        target.accept();
+    }
     false
 }
 
@@ -2504,7 +2605,12 @@ fn handle_set_provider_slug(
 }
 
 /// Set the account for this session and try to resolve its provider.
-fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestContext) -> bool {
+fn handle_set_account(
+    name: String,
+    reply: Option<ReplyTarget>,
+    state: &mut SessionState,
+    ctx: &RequestContext,
+) -> bool {
     info!("session {}: SetAccount account={}", ctx.session_id, name);
     // Switching accounts must never leave the PREVIOUS account's client in
     // place: `resolve_provider` returns any cached client unconditionally, so a
@@ -2523,10 +2629,10 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
     // session-cancellable. If resolution fails (locked, no credential yet) the
     // provider stays None — the account name is still recorded and the next
     // request retries lazily (see `SessionState::resolve_provider`).
-    let (reply, rx) = crossbeam_channel::unbounded();
+    let (account_reply, rx) = crossbeam_channel::unbounded();
     let _ = ctx.daemon_tx.send(DaemonCommand::ResolveAccountCmd {
         account: name.clone(),
-        reply,
+        reply: account_reply,
     });
     let resolved = rx.recv().ok().flatten();
     // The provider slug and warm policy are NON-SECRET facts the daemon
@@ -2593,12 +2699,19 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
         },
     );
     persist_session_metadata(state, ctx, "SetAccount");
+    // The account's existence was verified on the connection thread before this
+    // command was sent, so reaching here is success: ack the requester in
+    // addition to the `SessionAccountSet` broadcast above.
+    if let Some(target) = reply {
+        target.accept();
+    }
     false
 }
 
 /// Set the reasoning effort for this session, validating against the model.
 fn handle_set_reasoning_effort(
     effort: String,
+    reply: Option<ReplyTarget>,
     state: &mut SessionState,
     ctx: &RequestContext,
 ) -> bool {
@@ -2606,6 +2719,9 @@ fn handle_set_reasoning_effort(
     if effort.len() > 64 {
         let msg = format!("reasoning effort slug too long ({} bytes)", effort.len());
         warn!(session_id = ctx.session_id, error = %msg, "reasoning effort rejected");
+        if let Some(target) = reply {
+            target.fail(msg.clone());
+        }
         broadcast(
             &mut state.subscribers,
             ctx,
@@ -2650,11 +2766,18 @@ fn handle_set_reasoning_effort(
                 event: SessionEvent::ReasoningEffortSet { effort },
             },
         );
+        // Terminal success ack in addition to the broadcast above.
+        if let Some(target) = reply {
+            target.accept();
+        }
         return false;
     }
     let model = state.config.selected_model.as_deref().unwrap_or("(none)");
     let msg = format!("model '{model}' does not support reasoning effort '{effort}'");
     warn!(session_id = ctx.session_id, error = %msg, "reasoning effort rejected");
+    if let Some(target) = reply {
+        target.fail(msg.clone());
+    }
     broadcast(
         &mut state.subscribers,
         ctx,
@@ -2684,12 +2807,18 @@ fn handle_get_reasoning_effort(
 
 /// Handle Undo: mark the most recent user turn's subtree as deleted.
 /// Uses a quick-reference `HashMap` to avoid an O(n) scan per ID.
-fn handle_undo(state: &mut SessionState, ctx: &RequestContext) -> bool {
+fn handle_undo(reply: Option<ReplyTarget>, state: &mut SessionState, ctx: &RequestContext) -> bool {
     let Some(turn_ids) = state.undo_turns() else {
         debug!(
             session_id = ctx.session_id,
             "undo requested but no user turn to undo",
         );
+        // An empty `/undo` is the silent-success gap this closes: the requester
+        // now gets an explicit `Failed { kind: Undo, error: "nothing to undo" }`
+        // instead of nothing at all.
+        if let Some(target) = reply {
+            target.fail("nothing to undo");
+        }
         return false;
     };
     info!(
@@ -2735,17 +2864,23 @@ fn handle_undo(state: &mut SessionState, ctx: &RequestContext) -> bool {
             event: SessionEvent::TurnsUndone { turn_ids },
         },
     );
+    if let Some(target) = reply {
+        target.accept();
+    }
     false
 }
 
 /// Reinstate the turns that were hidden by the preceding undo,
 /// persisting the restored state so it survives daemon restart.
-fn handle_redo(state: &mut SessionState, ctx: &RequestContext) -> bool {
+fn handle_redo(reply: Option<ReplyTarget>, state: &mut SessionState, ctx: &RequestContext) -> bool {
     let Some(turns) = state.redo_turns() else {
         debug!(
             session_id = ctx.session_id,
             "redo requested but nothing to redo (no prior undo, or new input after undo)",
         );
+        if let Some(target) = reply {
+            target.fail("nothing to redo");
+        }
         return false;
     };
     info!(
@@ -2771,6 +2906,9 @@ fn handle_redo(state: &mut SessionState, ctx: &RequestContext) -> bool {
             },
         },
     );
+    if let Some(target) = reply {
+        target.accept();
+    }
     false
 }
 

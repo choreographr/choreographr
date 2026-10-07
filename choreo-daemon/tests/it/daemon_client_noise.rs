@@ -409,11 +409,17 @@ fn noise_subscribe_receives_session_broadcasts() {
     // race to the daemon loop and session 1's broadcast would miss A
     // (zero subscribers at broadcast time) — flaking the test.
     client_a.send(ClientMessageType::ListSessions);
-    match client_a.recv() {
-        DaemonMessageType::Sessions { sessions } => {
-            assert_eq!(sessions, [] as [choreo_proto::SessionSummary; 0]);
+    // Skip the subscribe's own `Accepted` ack (enqueued before the
+    // ListSessions answer), then read the Sessions reply.
+    loop {
+        match client_a.recv() {
+            DaemonMessageType::Accepted { .. } => {}
+            DaemonMessageType::Sessions { sessions } => {
+                assert_eq!(sessions, [] as [choreo_proto::SessionSummary; 0]);
+                break;
+            }
+            other => panic!("expected empty Sessions, got {other:?}"),
         }
-        other => panic!("expected empty Sessions, got {other:?}"),
     }
 
     // B creates a session. An unsubscribed client must receive only the
