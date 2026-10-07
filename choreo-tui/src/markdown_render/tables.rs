@@ -13,13 +13,17 @@ use std::cell::Cell;
 thread_local! {
     /// Hands out each rendered data table a distinct ordinal.
     ///
-    /// Rendering is synchronous on the UI thread (the render cache is rebuilt
-    /// in place, never on a worker), so a per-thread counter is process-consistent
-    /// for the whole session.
+    /// Thread-local, not process-global: rendering runs synchronously on the
+    /// single UI thread (the render cache is rebuilt in place, never on a
+    /// worker), so a counter local to that thread is enough to keep ordinals
+    /// distinct for the whole session.  Were rendering ever moved onto a worker
+    /// thread, the switch would need a shared atomic instead, or ids could
+    /// collide across threads.
     static TABLE_ORDINAL: Cell<u32> = const { Cell::new(0) };
 }
 
-/// Allocate the next unique [`TableRowId::table`] ordinal.
+/// Allocate the next unique [`TableRowId::table`] ordinal for the current
+/// render thread.
 ///
 /// The id must be unique across the *whole* rendered session history, not just
 /// within one `markdown_lines_joined` buffer: the selection detects a table's
@@ -28,7 +32,8 @@ thread_local! {
 /// offset cannot guarantee that — it repeats across turns, and across the
 /// separate buffers a blockquote or list renders its nested blocks into — so a
 /// monotonically increasing counter that never hands out the same value twice
-/// is used instead.
+/// is used instead.  It is thread-local (see [`TABLE_ORDINAL`]): valid because
+/// every table in a session is rendered on the one UI thread.
 pub(crate) fn next_table_id() -> u32 {
     TABLE_ORDINAL.with(|cell| {
         let id = cell.get();
