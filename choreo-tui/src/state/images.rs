@@ -8,7 +8,7 @@
 //! [`App::request_image_fetch`], the UI loop drains the queue with
 //! [`App::flush_image_fetches`], and the daemon's reply is applied by
 //! [`App::handle_image_reply`]. Both kinds are keyed by the same [`ImageSlot`]
-//! and served by one wire pair ([`ClientMessage::GetImage`] carrying an
+//! and served by one wire pair ([`ClientMessageType::GetImage`] carrying an
 //! [`ImageKey`]). The encoded-bitmap jobs are handled separately by
 //! [`App::apply_image_result`]/[`App::submit_image_job`]. All of these are
 //! inherent `App` methods living in this sibling module; their fields stay on
@@ -17,7 +17,7 @@
 use super::App;
 use crate::RenderedImage;
 use crate::image_worker::{ImageId, ImageJob, ImageResult, next_job_id};
-use choreo_proto::{ClientMessage, ImageKey, ImageMetadata, ImageReference, Turn};
+use choreo_proto::{ClientMessageType, ImageKey, ImageMetadata, ImageReference, Turn};
 use ratatui::layout::Size;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use std::sync::Arc;
 /// Which image within a turn a [`RenderedImage`] slot addresses.
 ///
 /// A turn carries two kinds of images, both fetched on demand under one wire
-/// protocol ([`ClientMessage::GetImage`] with an [`ImageKey`]): DISPLAYED
+/// protocol ([`ClientMessageType::GetImage`] with an [`ImageKey`]): DISPLAYED
 /// images (produced by `display_image`/`generate_image`/a `retrieve_webpage`
 /// screenshot) addressed positionally within `turn.displayed_images`, and
 /// tool-result VISION images (the normalized bytes a tool such as `read_image`
@@ -42,7 +42,7 @@ pub(crate) enum ImageSlot {
 }
 
 impl ImageSlot {
-    /// The wire key this slot fetches under ([`ClientMessage::GetImage`]).
+    /// The wire key this slot fetches under ([`ClientMessageType::GetImage`]).
     fn to_key(&self) -> ImageKey {
         match self {
             // usize→u32: an image index is bounded far below u32 in practice;
@@ -269,10 +269,10 @@ impl App {
     /// next pass.
     pub(crate) fn flush_image_fetches(
         &mut self,
-        client_tx: &crossbeam_channel::Sender<ClientMessage>,
+        client_tx: &crossbeam_channel::Sender<ClientMessageType>,
     ) {
         for (session_id, turn_id, slot) in self.pending_image_fetch.drain(..) {
-            let _ = client_tx.send(ClientMessage::GetImage {
+            let _ = client_tx.send(ClientMessageType::GetImage {
                 session_id,
                 turn_id,
                 key: slot.to_key(),
@@ -280,7 +280,7 @@ impl App {
         }
     }
 
-    /// Apply a `DaemonMessage::Image` reply: store the fetched bytes (clearing
+    /// Apply a `DaemonMessageType::Image` reply: store the fetched bytes (clearing
     /// any decode-failure state so the next render submits an encoding job), or
     /// mark the image failed when the daemon had none (not found), so it is not
     /// re-requested every frame. A `fetch_failed` latch is not permanent: a
@@ -395,7 +395,7 @@ mod tests {
         // that actually has bytes (`byte_len > 0`) — never for one whose bytes
         // are already present, nor for a genuinely zero-byte image.
         let mut app = test_app();
-        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessageType>();
         let meta = |byte_len| choreo_proto::ImageMetadata {
             mime_type: "image/png".to_string(),
             width: 4,
@@ -445,10 +445,10 @@ mod tests {
         app.request_image_fetch(3, 9, ImageSlot::Displayed(1));
 
         app.flush_image_fetches(&tx);
-        let sent: Vec<ClientMessage> = rx.try_iter().collect();
+        let sent: Vec<ClientMessageType> = rx.try_iter().collect();
         assert_eq!(
             sent,
-            vec![ClientMessage::GetImage {
+            vec![ClientMessageType::GetImage {
                 session_id: 3,
                 turn_id: 9,
                 key: ImageKey::Displayed { index: 1 },
@@ -463,7 +463,7 @@ mod tests {
         // `ImageKey::ToolResult { call_id }` and store the reply in the same
         // `RenderedImage` map, keyed by the call id.
         let mut app = test_app();
-        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessageType>();
         let turn = Turn {
             created_at: choreo_proto::TimestampMs::now(),
             undone: false,
@@ -502,10 +502,10 @@ mod tests {
 
         app.request_image_fetch(2, 5, slot.clone());
         app.flush_image_fetches(&tx);
-        let sent: Vec<ClientMessage> = rx.try_iter().collect();
+        let sent: Vec<ClientMessageType> = rx.try_iter().collect();
         assert_eq!(
             sent,
-            vec![ClientMessage::GetImage {
+            vec![ClientMessageType::GetImage {
                 session_id: 2,
                 turn_id: 5,
                 key: ImageKey::ToolResult {

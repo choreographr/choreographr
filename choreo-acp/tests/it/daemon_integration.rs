@@ -4,7 +4,10 @@ use std::os::unix::net::UnixListener;
 use std::thread;
 
 use choreo_acp::daemon_client::{Event, spawn_daemon_io};
-use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent, read_message, write_message};
+use choreo_proto::{
+    ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent, read_message,
+    write_message,
+};
 
 /// Create a temporary directory and return a unique socket path within it.
 fn temp_socket_path() -> (std::path::PathBuf, std::path::PathBuf) {
@@ -42,39 +45,39 @@ fn daemon_io_send_and_receive() {
 
             // Read the first message from choreo-acp.
             let msg: ClientMessage = read_message(&mut reader).unwrap();
-            assert!(matches!(msg, ClientMessage::ListModels));
+            assert!(matches!(msg.inner, ClientMessageType::ListModels));
 
             // Respond with Models to confirm the handshake.
-            let response = DaemonMessage::Models {
+            let response = DaemonMessage::broadcast(DaemonMessageType::Models {
                 models: vec!["claude-4".into(), "gpt-5".into()],
                 selected_model: Some("claude-4".into()),
-            };
+            });
             write_message(&mut writer, &response).unwrap();
             writer.flush().unwrap();
 
-            // Read a second message and echo the request_id as OutputChunk.
+            // Read a second message and echo the stream_id as OutputChunk.
             let msg2: ClientMessage = read_message(&mut reader).unwrap();
-            let request_id = match &msg2 {
-                ClientMessage::RunInput { request_id, .. } => *request_id,
+            let stream_id = match &msg2.inner {
+                ClientMessageType::RunInput { stream_id, .. } => *stream_id,
                 _ => panic!("expected RunInput, got {msg2:?}"),
             };
 
-            let echo = DaemonMessage::Session {
+            let echo = DaemonMessage::broadcast(DaemonMessageType::Session {
                 session_id: None,
                 event: SessionEvent::OutputChunk {
-                    request_id,
+                    stream_id,
                     stream: choreo_proto::OutputStream::Answer,
                     data: b"echo".to_vec(),
                 },
-            };
+            });
             write_message(&mut writer, &echo).unwrap();
             writer.flush().unwrap();
 
             // Send Done to terminate the stream.
-            let done = DaemonMessage::Session {
+            let done = DaemonMessage::broadcast(DaemonMessageType::Session {
                 session_id: None,
                 event: SessionEvent::Done {
-                    request_id,
+                    stream_id,
                     token_usage: Some(choreo_proto::TokenUsage {
                         input_tokens: 5,
                         output_tokens: 3,
@@ -84,7 +87,7 @@ fn daemon_io_send_and_receive() {
                     }),
                     last_prompt_tokens: None,
                 },
-            };
+            });
             write_message(&mut writer, &done).unwrap();
             writer.flush().unwrap();
 
@@ -103,15 +106,22 @@ fn daemon_io_send_and_receive() {
     daemon_ready.recv().unwrap();
 
     // Send ListModels (this matches what dispatch_new_session does).
-    client.writer_tx.send(ClientMessage::ListModels).unwrap();
+    client
+        .writer_tx
+        .send(ClientMessageType::ListModels)
+        .unwrap();
 
     // Receive the Models response (deterministic: the fake daemon
     // sends synchronously before we reach this point).
     let models_event = event_rx.recv().unwrap();
     match models_event {
-        Event::DaemonMessage(DaemonMessage::Models {
-            models,
-            selected_model,
+        Event::DaemonMessage(DaemonMessage {
+            inner:
+                DaemonMessageType::Models {
+                    models,
+                    selected_model,
+                },
+            ..
         }) => {
             assert_eq!(models.len(), 2);
             assert_eq!(selected_model.as_deref(), Some("claude-4"));
@@ -122,8 +132,8 @@ fn daemon_io_send_and_receive() {
     // Send a RunInput to trigger an echoed response.
     client
         .writer_tx
-        .send(ClientMessage::RunInput {
-            request_id: 42,
+        .send(ClientMessageType::RunInput {
+            stream_id: 42,
             input: b"hello".to_vec(),
         })
         .unwrap();
@@ -131,17 +141,21 @@ fn daemon_io_send_and_receive() {
     // Receive the OutputChunk.
     let chunk_event = event_rx.recv().unwrap();
     match chunk_event {
-        Event::DaemonMessage(DaemonMessage::Session {
-            event:
-                SessionEvent::OutputChunk {
-                    request_id,
-                    stream,
-                    data,
+        Event::DaemonMessage(DaemonMessage {
+            inner:
+                DaemonMessageType::Session {
+                    event:
+                        SessionEvent::OutputChunk {
+                            stream_id,
+                            stream,
+                            data,
+                            ..
+                        },
                     ..
                 },
             ..
         }) => {
-            assert_eq!(request_id, 42);
+            assert_eq!(stream_id, 42);
             assert!(matches!(stream, choreo_proto::OutputStream::Answer));
             assert_eq!(data, b"echo");
         }
@@ -151,16 +165,20 @@ fn daemon_io_send_and_receive() {
     // Receive the Done.
     let done_event = event_rx.recv().unwrap();
     match done_event {
-        Event::DaemonMessage(DaemonMessage::Session {
-            event:
-                SessionEvent::Done {
-                    request_id,
-                    token_usage,
+        Event::DaemonMessage(DaemonMessage {
+            inner:
+                DaemonMessageType::Session {
+                    event:
+                        SessionEvent::Done {
+                            stream_id,
+                            token_usage,
+                            ..
+                        },
                     ..
                 },
             ..
         }) => {
-            assert_eq!(request_id, 42);
+            assert_eq!(stream_id, 42);
             let usage = token_usage.unwrap();
             assert_eq!(usage.input_tokens, 5);
             assert_eq!(usage.output_tokens, 3);

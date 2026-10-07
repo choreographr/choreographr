@@ -3,10 +3,10 @@
 //! The bridge talks to the Choreographr daemon over its Unix socket using the
 //! MessagePack-framed `choreo-proto` protocol. This module owns both I/O
 //! threads — one draining [`DaemonMessage`]s into the shared event channel and
-//! one consuming [`ClientMessage`]s from the event loop — plus the unified
+//! one consuming [`ClientMessageType`]s from the event loop — plus the unified
 //! [`Event`] type the main loop dispatches on.
 
-use choreo_proto::{ClientMessage, DaemonMessage, read_message, write_message};
+use choreo_proto::{ClientMessage, ClientMessageType, DaemonMessage, read_message, write_message};
 use crossbeam_channel::Sender;
 use std::io::{BufReader, BufWriter, Write};
 #[cfg(unix)]
@@ -56,12 +56,12 @@ pub enum Event {
 
 /// Handle to the daemon connection.
 ///
-/// `writer_tx` is used to send `ClientMessage` values to the daemon writer
+/// `writer_tx` is used to send `ClientMessageType` values to the daemon writer
 /// thread.  `join_handle` allows waiting for the daemon reader thread to
 /// finish during shutdown.
 pub struct DaemonClient {
-    /// Send `ClientMessage` frames to the daemon writer thread.
-    pub writer_tx: Sender<ClientMessage>,
+    /// Send `ClientMessageType` frames to the daemon writer thread.
+    pub writer_tx: Sender<ClientMessageType>,
     /// Join handle for the daemon reader thread.
     pub join_handle: thread::JoinHandle<()>,
 }
@@ -95,7 +95,7 @@ pub fn spawn_daemon_io(
     let mut writer_stream = BufWriter::new(stream);
 
     // Writer channel: the main loop sends ClientMessages here.
-    let (writer_tx, writer_rx): (Sender<ClientMessage>, _) = crossbeam_channel::unbounded();
+    let (writer_tx, writer_rx): (Sender<ClientMessageType>, _) = crossbeam_channel::unbounded();
 
     // ------------------------------------------------------------------
     // Writer thread
@@ -107,9 +107,16 @@ pub fn spawn_daemon_io(
         .name("daemon-writer".into())
         .spawn(move || {
             info!("daemon writer thread started");
+            // This writer thread is the ACP bridge's single send site: it owns
+            // the per-connection request-id counter and stamps every outbound
+            // frame (the ACP bridge ignores replies, but the id is mandatory on
+            // the wire).
+            let mut next_id: u64 = 0;
             for msg in writer_rx {
                 debug!(?msg, "sending message to daemon");
-                if let Err(e) = write_message(&mut writer_stream, &msg) {
+                let framed = ClientMessage::request(next_id, msg);
+                next_id = next_id.wrapping_add(1);
+                if let Err(e) = write_message(&mut writer_stream, &framed) {
                     error!(error = %e, "daemon writer error");
                     break;
                 }

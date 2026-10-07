@@ -2,20 +2,54 @@ use super::*;
 use std::collections::{BTreeMap, HashSet};
 use std::io::Cursor;
 
+/// A request envelope with an arbitrary correlation id — the round-trip tests
+/// only care that the id survives the codec.
+fn req(inner: ClientMessageType) -> ClientMessage {
+    ClientMessage::request(0, inner)
+}
+
 #[test]
 fn encode_decode_round_trip_client_message() {
-    let message = ClientMessage::RunInput {
-        request_id: 42,
+    let message = req(ClientMessageType::RunInput {
+        stream_id: 42,
         input: b"hello".to_vec(),
-    };
+    });
     let frame = encode_frame(&message).expect("encode");
     let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
     assert_eq!(decoded, message);
 }
 
 #[test]
+fn client_message_carries_its_id_round_trip() {
+    // The correlation id is part of the frame and must survive the codec
+    // byte-for-byte, since the daemon echoes it onto the reply.
+    let message = ClientMessage::request(0xDEAD_BEEF, ClientMessageType::Ping);
+    let frame = encode_frame(&message).expect("encode");
+    let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
+    assert_eq!(decoded.id, 0xDEAD_BEEF);
+    assert_eq!(decoded, message);
+}
+
+#[test]
+fn daemon_broadcast_omits_the_id_field() {
+    // A broadcast (`id: None`) must serialize WITHOUT the `id` key so the wire
+    // stays compact; `skip_serializing_if` is the contract.
+    let broadcast = DaemonMessage::broadcast(DaemonMessageType::Pong);
+    let value = serde_json::to_value(&broadcast).expect("serialize");
+    assert!(
+        value.get("id").is_none(),
+        "broadcast must omit the id field: {value}"
+    );
+
+    // A reply carries it.
+    let reply = DaemonMessage::reply(9, DaemonMessageType::Pong);
+    let value = serde_json::to_value(&reply).expect("serialize");
+    assert_eq!(value["id"], serde_json::json!(9));
+}
+
+#[test]
 fn undo_serde_round_trip() {
-    let message = ClientMessage::Undo;
+    let message = req(ClientMessageType::Undo);
     let frame = encode_frame(&message).expect("encode");
     let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
     assert_eq!(decoded, message);
@@ -23,7 +57,7 @@ fn undo_serde_round_trip() {
 
 #[test]
 fn redo_serde_round_trip() {
-    let message = ClientMessage::Redo;
+    let message = req(ClientMessageType::Redo);
     let frame = encode_frame(&message).expect("encode");
     let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
     assert_eq!(decoded, message);
@@ -31,7 +65,7 @@ fn redo_serde_round_trip() {
 
 #[test]
 fn continue_generation_serde_round_trip() {
-    let message = ClientMessage::ContinueGeneration { request_id: 7 };
+    let message = req(ClientMessageType::ContinueGeneration { stream_id: 7 });
     let frame = encode_frame(&message).expect("encode");
     let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
     assert_eq!(decoded, message);
@@ -40,7 +74,7 @@ fn continue_generation_serde_round_trip() {
 #[test]
 fn refresh_models_serde_round_trip() {
     for force in [false, true] {
-        let message = ClientMessage::RefreshModels { force };
+        let message = req(ClientMessageType::RefreshModels { force });
         let frame = encode_frame(&message).expect("encode");
         let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
         assert_eq!(decoded, message);
@@ -55,24 +89,30 @@ fn refresh_messages_serde_round_trip() {
         RefreshStatus::Updated,
         RefreshStatus::Forced,
     ] {
-        let message = DaemonMessage::ModelsRefreshed {
-            providers: 208,
-            models: 1234,
-            status,
-        };
+        let message = DaemonMessage::reply(
+            5,
+            DaemonMessageType::ModelsRefreshed {
+                providers: 208,
+                models: 1234,
+                status,
+            },
+        );
         let frame = encode_frame(&message).expect("encode");
         let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");
         assert_eq!(decoded, message);
     }
-    let failed = DaemonMessage::ModelsRefreshFailed {
-        error: "network error".to_string(),
-    };
+    let failed = DaemonMessage::reply(
+        6,
+        DaemonMessageType::ModelsRefreshFailed {
+            error: "network error".to_string(),
+        },
+    );
     let frame = encode_frame(&failed).expect("encode");
     let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");
     assert_eq!(decoded, failed);
 
     // CatalogUpdated carries the provider list (slugs + display names).
-    let updated = DaemonMessage::CatalogUpdated {
+    let updated = DaemonMessage::broadcast(DaemonMessageType::CatalogUpdated {
         providers: vec![
             CatalogProvider {
                 slug: "openai".to_string(),
@@ -83,7 +123,7 @@ fn refresh_messages_serde_round_trip() {
                 display_name: "Ollama (Local)".to_string(),
             },
         ],
-    };
+    });
     let frame = encode_frame(&updated).expect("encode");
     let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");
     assert_eq!(decoded, updated);
@@ -91,7 +131,7 @@ fn refresh_messages_serde_round_trip() {
 
 #[test]
 fn mcp_status_request_serde_round_trip() {
-    let message = ClientMessage::McpStatusRequest;
+    let message = req(ClientMessageType::McpStatusRequest);
     let frame = encode_frame(&message).expect("encode");
     let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
     assert_eq!(decoded, message);
@@ -99,9 +139,9 @@ fn mcp_status_request_serde_round_trip() {
 
 #[test]
 fn mcp_reconnect_request_serde_round_trip() {
-    let message = ClientMessage::McpReconnect {
+    let message = req(ClientMessageType::McpReconnect {
         slug: "docs".to_string(),
-    };
+    });
     let frame = encode_frame(&message).expect("encode");
     let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
     assert_eq!(decoded, message);
@@ -109,35 +149,38 @@ fn mcp_reconnect_request_serde_round_trip() {
 
 #[test]
 fn mcp_status_reply_serde_round_trip() {
-    let message = DaemonMessage::McpStatus {
-        servers: vec![
-            McpServerStatus {
-                slug: "docs".to_string(),
-                tier: "daemon".to_string(),
-                transport: "stdio".to_string(),
-                target: "npx -y @modelcontextprotocol/server-docs".to_string(),
-                connected: true,
-                tool_count: 4,
-                server_name: Some("docs-server".to_string()),
-                server_version: Some("1.0.0".to_string()),
-                last_error: None,
-            },
-            McpServerStatus {
-                slug: "fs".to_string(),
-                tier: "project".to_string(),
-                transport: "http".to_string(),
-                target: "https://example.com/mcp".to_string(),
-                connected: false,
-                tool_count: 0,
-                server_name: None,
-                server_version: None,
-                last_error: Some("connect timed out".to_string()),
-            },
-        ],
-        project_root: Some("/home/u/proj".to_string()),
-        project_trusted: true,
-        ignored_project_servers: vec!["notes".to_string()],
-    };
+    let message = DaemonMessage::reply(
+        3,
+        DaemonMessageType::McpStatus {
+            servers: vec![
+                McpServerStatus {
+                    slug: "docs".to_string(),
+                    tier: "daemon".to_string(),
+                    transport: "stdio".to_string(),
+                    target: "npx -y @modelcontextprotocol/server-docs".to_string(),
+                    connected: true,
+                    tool_count: 4,
+                    server_name: Some("docs-server".to_string()),
+                    server_version: Some("1.0.0".to_string()),
+                    last_error: None,
+                },
+                McpServerStatus {
+                    slug: "fs".to_string(),
+                    tier: "project".to_string(),
+                    transport: "http".to_string(),
+                    target: "https://example.com/mcp".to_string(),
+                    connected: false,
+                    tool_count: 0,
+                    server_name: None,
+                    server_version: None,
+                    last_error: Some("connect timed out".to_string()),
+                },
+            ],
+            project_root: Some("/home/u/proj".to_string()),
+            project_trusted: true,
+            ignored_project_servers: vec!["notes".to_string()],
+        },
+    );
     let frame = encode_frame(&message).expect("encode");
     let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");
     assert_eq!(decoded, message);
@@ -145,10 +188,13 @@ fn mcp_status_reply_serde_round_trip() {
 
 #[test]
 fn mcp_reconnect_failed_serde_round_trip() {
-    let message = DaemonMessage::McpReconnectFailed {
-        slug: "docs".to_string(),
-        error: "connection refused".to_string(),
-    };
+    let message = DaemonMessage::reply(
+        4,
+        DaemonMessageType::McpReconnectFailed {
+            slug: "docs".to_string(),
+            error: "connection refused".to_string(),
+        },
+    );
     let frame = encode_frame(&message).expect("encode");
     let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");
     assert_eq!(decoded, message);
@@ -156,7 +202,7 @@ fn mcp_reconnect_failed_serde_round_trip() {
 
 #[test]
 fn mcp_reload_request_serde_round_trip() {
-    let message = ClientMessage::McpReload;
+    let message = req(ClientMessageType::McpReload);
     let frame = encode_frame(&message).expect("encode");
     let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
     assert_eq!(decoded, message);
@@ -164,10 +210,14 @@ fn mcp_reload_request_serde_round_trip() {
 
 #[test]
 fn mcp_reloaded_reply_serde_round_trip() {
-    let message = DaemonMessage::McpReloaded {
-        summary: "MCP reload: 1 added, 0 removed, 1 restarted, 2 unchanged, 0 failed".to_string(),
-        servers: Vec::new(),
-    };
+    let message = DaemonMessage::reply(
+        8,
+        DaemonMessageType::McpReloaded {
+            summary: "MCP reload: 1 added, 0 removed, 1 restarted, 2 unchanged, 0 failed"
+                .to_string(),
+            servers: Vec::new(),
+        },
+    );
     let frame = encode_frame(&message).expect("encode");
     let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");
     assert_eq!(decoded, message);
@@ -175,9 +225,12 @@ fn mcp_reloaded_reply_serde_round_trip() {
 
 #[test]
 fn mcp_reload_failed_serde_round_trip() {
-    let message = DaemonMessage::McpReloadFailed {
-        error: "failed to parse mcp.json".to_string(),
-    };
+    let message = DaemonMessage::reply(
+        8,
+        DaemonMessageType::McpReloadFailed {
+            error: "failed to parse mcp.json".to_string(),
+        },
+    );
     let frame = encode_frame(&message).expect("encode");
     let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");
     assert_eq!(decoded, message);
@@ -185,7 +238,7 @@ fn mcp_reload_failed_serde_round_trip() {
 
 #[test]
 fn mcp_trust_request_serde_round_trip() {
-    let message = ClientMessage::McpTrust;
+    let message = req(ClientMessageType::McpTrust);
     let frame = encode_frame(&message).expect("encode");
     let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
     assert_eq!(decoded, message);
@@ -193,7 +246,7 @@ fn mcp_trust_request_serde_round_trip() {
 
 #[test]
 fn mcp_untrust_request_serde_round_trip() {
-    let message = ClientMessage::McpUntrust;
+    let message = req(ClientMessageType::McpUntrust);
     let frame = encode_frame(&message).expect("encode");
     let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
     assert_eq!(decoded, message);
@@ -201,7 +254,7 @@ fn mcp_untrust_request_serde_round_trip() {
 
 #[test]
 fn mcp_trust_list_request_serde_round_trip() {
-    let message = ClientMessage::McpTrustList;
+    let message = req(ClientMessageType::McpTrustList);
     let frame = encode_frame(&message).expect("encode");
     let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
     assert_eq!(decoded, message);
@@ -209,11 +262,14 @@ fn mcp_trust_list_request_serde_round_trip() {
 
 #[test]
 fn mcp_trust_updated_serde_round_trip() {
-    let message = DaemonMessage::McpTrustUpdated {
-        root: Some("/home/u/proj".to_string()),
-        trusted: true,
-        message: "trusted project MCP root /home/u/proj".to_string(),
-    };
+    let message = DaemonMessage::reply(
+        9,
+        DaemonMessageType::McpTrustUpdated {
+            root: Some("/home/u/proj".to_string()),
+            trusted: true,
+            message: "trusted project MCP root /home/u/proj".to_string(),
+        },
+    );
     let frame = encode_frame(&message).expect("encode");
     let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");
     assert_eq!(decoded, message);
@@ -221,17 +277,39 @@ fn mcp_trust_updated_serde_round_trip() {
 
 #[test]
 fn mcp_trust_list_reply_serde_round_trip() {
-    let message = DaemonMessage::McpTrustList {
-        roots: vec!["/home/u/proj".to_string(), "/home/u/other".to_string()],
-    };
+    let message = DaemonMessage::reply(
+        9,
+        DaemonMessageType::McpTrustList {
+            roots: vec!["/home/u/proj".to_string(), "/home/u/other".to_string()],
+        },
+    );
     let frame = encode_frame(&message).expect("encode");
     let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");
     assert_eq!(decoded, message);
 }
 
 #[test]
+fn accepted_and_failed_round_trip() {
+    // The two new terminal-acknowledgement replies (carrying a `MessageKind`).
+    for inner in [
+        DaemonMessageType::Accepted {
+            kind: MessageKind::SetSessionPinned,
+        },
+        DaemonMessageType::Failed {
+            kind: MessageKind::RunInput,
+            error: "no session attached".to_string(),
+        },
+    ] {
+        let message = DaemonMessage::reply(11, inner);
+        let frame = encode_frame(&message).expect("encode");
+        let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");
+        assert_eq!(decoded, message);
+    }
+}
+
+#[test]
 fn decode_rejects_trailing_bytes() {
-    let message = ClientMessage::Ping;
+    let message = req(ClientMessageType::Ping);
     let mut frame = encode_frame(&message).expect("encode");
     frame.extend_from_slice(&[1, 2, 3]);
     let err = decode_frame::<ClientMessage>(&frame[4..]).expect_err("should fail");
@@ -242,8 +320,8 @@ fn decode_rejects_trailing_bytes() {
 fn decode_rejects_wrong_version() {
     // Encode with the *current* named-MessagePack semantics but one version
     // ahead — what a newer peer would send. Must be rejected up front.
-    let payload =
-        rmp_serde::to_vec_named(&(PROTOCOL_VERSION + 1, ClientMessage::Ping)).expect("encode");
+    let payload = rmp_serde::to_vec_named(&(PROTOCOL_VERSION + 1, req(ClientMessageType::Ping)))
+        .expect("encode");
     let err = decode_frame::<ClientMessage>(&payload).expect_err("should fail");
     assert!(matches!(err, ProtoError::UnsupportedVersion { .. }));
 }
@@ -295,7 +373,7 @@ fn decode_tolerates_array_encoded_struct() {
 
 #[test]
 fn sync_read_write_round_trip() {
-    let expected = DaemonMessage::Pong;
+    let expected = DaemonMessage::broadcast(DaemonMessageType::Pong);
 
     let frame = encode_frame(&expected).expect("encode");
     let mut cursor = Cursor::new(&frame[..]);
@@ -367,9 +445,9 @@ fn encode_rejects_oversized_message() {
     // whereas `Vec<u8>` is encoded as an msgpack *array* of one u8 per element
     // — a 64 MiB byte vector costs ~64M `serialize_u8` calls (~5s unoptimized)
     // for byte-for-byte the same FrameTooLarge outcome.
-    let message = DaemonMessage::ModelsRefreshFailed {
+    let message = DaemonMessage::broadcast(DaemonMessageType::ModelsRefreshFailed {
         error: "x".repeat(MAX_FRAME_SIZE),
-    };
+    });
     let err = encode_frame(&message).expect_err("should fail");
     assert!(matches!(err, ProtoError::FrameTooLarge));
 }
@@ -533,38 +611,39 @@ fn session_summary_tolerates_missing_and_unknown_fields() {
 fn done_tolerates_missing_optional_fields() {
     // `token_usage` on the session-scoped `Done` event is optional: a payload
     // that omits it (and the `#[serde(default)]` `last_prompt_tokens`) must
-    // parse and default to None. The wire shape is now the v4 envelope —
-    // `DaemonMessage::Session { session_id, event: SessionEvent::Done }` — so
-    // the fixture nests the event inside the envelope.
-    let json = r#"{"Session":{"session_id":1,"event":{"Done":{"request_id":42}}}}"#;
+    // parse and default to None. The wire shape is the correlation envelope —
+    // `DaemonMessage { id, inner: DaemonMessageType::Session { session_id,
+    // event: SessionEvent::Done } }` — so the fixture nests the event inside
+    // the envelope.
+    let json = r#"{"id":1,"inner":{"Session":{"session_id":1,"event":{"Done":{"stream_id":42}}}}}"#;
     let msg: DaemonMessage = serde_json::from_str(json).unwrap();
-    match msg {
-        DaemonMessage::Session {
+    match msg.inner {
+        DaemonMessageType::Session {
             session_id,
             event:
                 SessionEvent::Done {
-                    request_id,
+                    stream_id,
                     token_usage,
                     ..
                 },
         } => {
             assert_eq!(session_id, Some(1));
-            assert_eq!(request_id, 42);
+            assert_eq!(stream_id, 42);
             assert_eq!(token_usage, None);
         }
         _ => panic!("expected Session(Done)"),
     }
 
-    // The same shape must round-trip through the actual v4 frame codec too
+    // The same shape must round-trip through the actual frame codec too
     // (the version gate stays consistent because all constants are local).
-    let msg = DaemonMessage::Session {
+    let msg = DaemonMessage::broadcast(DaemonMessageType::Session {
         session_id: Some(1),
         event: SessionEvent::Done {
-            request_id: 42,
+            stream_id: 42,
             token_usage: None,
             last_prompt_tokens: None,
         },
-    };
+    });
     let frame = encode_frame(&msg).expect("encode");
     let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
     assert_eq!(decoded, msg);
@@ -572,26 +651,26 @@ fn done_tolerates_missing_optional_fields() {
 
 #[test]
 fn daemon_message_done_without_usage() {
-    let msg = DaemonMessage::Session {
+    let msg = DaemonMessage::broadcast(DaemonMessageType::Session {
         session_id: Some(1),
         event: SessionEvent::Done {
-            request_id: 7,
+            stream_id: 7,
             token_usage: None,
             last_prompt_tokens: None,
         },
-    };
-    match msg {
-        DaemonMessage::Session {
+    });
+    match msg.inner {
+        DaemonMessageType::Session {
             session_id,
             event:
                 SessionEvent::Done {
-                    request_id,
+                    stream_id,
                     token_usage,
                     ..
                 },
         } => {
             assert_eq!(session_id, Some(1));
-            assert_eq!(request_id, 7);
+            assert_eq!(stream_id, 7);
             assert_eq!(token_usage, None);
         }
         _ => panic!("expected Session(Done)"),
@@ -606,28 +685,28 @@ fn daemon_message_done_with_usage_round_trip() {
         total_tokens: 150,
         ..Default::default()
     };
-    let msg = DaemonMessage::Session {
+    let msg = DaemonMessage::broadcast(DaemonMessageType::Session {
         session_id: Some(1),
         event: SessionEvent::Done {
-            request_id: 3,
+            stream_id: 3,
             token_usage: Some(usage),
             last_prompt_tokens: None,
         },
-    };
+    });
     let frame = encode_frame(&msg).expect("encode");
     let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
-    match decoded {
-        DaemonMessage::Session {
+    match decoded.inner {
+        DaemonMessageType::Session {
             session_id,
             event:
                 SessionEvent::Done {
-                    request_id,
+                    stream_id,
                     token_usage,
                     ..
                 },
         } => {
             assert_eq!(session_id, Some(1));
-            assert_eq!(request_id, 3);
+            assert_eq!(stream_id, 3);
             assert_eq!(token_usage, Some(usage));
         }
         _ => panic!("expected Session(Done)"),
@@ -743,7 +822,7 @@ fn session_summary_some_token_usage_round_trip() {
 
 #[test]
 fn session_state_none_optionals_round_trip() {
-    let state = DaemonMessage::Session {
+    let state = DaemonMessage::broadcast(DaemonMessageType::Session {
         session_id: Some(1),
         event: SessionEvent::SessionState {
             title: None,
@@ -759,7 +838,7 @@ fn session_state_none_optionals_round_trip() {
             reasoning_effort: None,
             reasoning_capability: None,
         },
-    };
+    });
     let frame = encode_frame(&state).expect("encode");
     let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
     assert_eq!(decoded, state);
@@ -786,9 +865,12 @@ fn sessions_with_none_optionals_round_trip() {
         pinned: false,
         archived_at: None,
     };
-    let msg = DaemonMessage::Sessions {
-        sessions: vec![summary.clone(), summary],
-    };
+    let msg = DaemonMessage::reply(
+        2,
+        DaemonMessageType::Sessions {
+            sessions: vec![summary.clone(), summary],
+        },
+    );
     let frame = encode_frame(&msg).expect("encode");
     let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
     assert_eq!(decoded, msg);
@@ -852,13 +934,13 @@ fn turn_appended_serde_round_trip() {
         reasoning_artifact: None,
         reasoning_producer: None,
     };
-    let msg = DaemonMessage::Session {
+    let msg = DaemonMessage::broadcast(DaemonMessageType::Session {
         session_id: Some(1),
         event: SessionEvent::TurnAppended {
             turn_id: 1,
             turn: turn.clone(),
         },
-    };
+    });
     let frame = encode_frame(&msg).expect("encode");
     let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
     assert_eq!(decoded, msg);
@@ -867,13 +949,15 @@ fn turn_appended_serde_round_trip() {
 #[test]
 fn evicted_serde_round_trip() {
     // Evicted is a unit variant (best-effort lag-eviction advisory): it must
-    // round-trip through the wire format. Origin-session attribution for the
-    // activity-broadcast dedup is now carried explicitly on the broadcast
-    // command, not derived from the message, so no session_id assertion here.
-    let msg = DaemonMessage::Evicted;
+    // round-trip through the wire format as a broadcast. Origin-session
+    // attribution for the activity-broadcast dedup is now carried explicitly
+    // on the broadcast command, not derived from the message, so no session_id
+    // assertion here.
+    let msg = DaemonMessage::broadcast(DaemonMessageType::Evicted);
     let frame = encode_frame(&msg).expect("encode");
-    let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
-    assert_eq!(decoded, DaemonMessage::Evicted);
+    let decoded = decode_frame::<DaemonMessage>(&frame[4..]).expect("decode");
+    assert_eq!(decoded, msg);
+    assert_eq!(decoded.id, None);
 }
 
 // ── approx_wire_size tests ─────────────────────────────────────
@@ -882,13 +966,13 @@ fn evicted_serde_round_trip() {
 fn approx_wire_size_scales_with_payload() {
     // A variant carrying a 100-byte String must estimate at least 100 bytes:
     // the string payload itself dominates the serialized size.
-    let msg = DaemonMessage::Session {
+    let msg = DaemonMessage::broadcast(DaemonMessageType::Session {
         session_id: Some(1),
         event: SessionEvent::Failed {
-            request_id: 1,
+            stream_id: 1,
             error: "x".repeat(100),
         },
-    };
+    });
     assert!(msg.approx_wire_size() >= 100);
 
     // A turn-bearing variant must track the turn's own estimate (a 100-byte
@@ -909,19 +993,19 @@ fn approx_wire_size_scales_with_payload() {
     };
     let turn_size = turn.approx_size();
     assert!(turn_size >= 100);
-    let msg = DaemonMessage::Session {
+    let msg = DaemonMessage::broadcast(DaemonMessageType::Session {
         session_id: Some(1),
         event: SessionEvent::TurnAppended {
             turn_id: 1,
             turn: turn.clone(),
         },
-    };
+    });
     assert!(msg.approx_wire_size() >= turn_size);
     // A second copy of the same turn must not change the estimate.
-    let msg2 = DaemonMessage::Session {
+    let msg2 = DaemonMessage::broadcast(DaemonMessageType::Session {
         session_id: Some(1),
         event: SessionEvent::TurnAppended { turn_id: 1, turn },
-    };
+    });
     assert_eq!(msg.approx_wire_size(), msg2.approx_wire_size());
 }
 
@@ -929,10 +1013,20 @@ fn approx_wire_size_scales_with_payload() {
 fn approx_wire_size_empty_variants_are_small_positive() {
     // Empty/unit variants must still report a small positive fixed envelope,
     // so lag accounting never sees a zero-byte message.
-    assert!(DaemonMessage::Pong.approx_wire_size() > 0);
-    assert!(DaemonMessage::Pong.approx_wire_size() < 128);
-    assert!(DaemonMessage::Evicted.approx_wire_size() > 0);
-    assert!(DaemonMessage::Evicted.approx_wire_size() < 128);
+    assert!(DaemonMessage::broadcast(DaemonMessageType::Pong).approx_wire_size() > 0);
+    assert!(DaemonMessage::broadcast(DaemonMessageType::Pong).approx_wire_size() < 256);
+    assert!(DaemonMessage::broadcast(DaemonMessageType::Evicted).approx_wire_size() > 0);
+    assert!(DaemonMessage::broadcast(DaemonMessageType::Evicted).approx_wire_size() < 256);
+}
+
+#[test]
+fn approx_wire_size_reply_is_at_least_broadcast() {
+    // A reply carries the extra `id` field on the wire, so its estimate must
+    // never be smaller than the same payload sent as a broadcast.
+    let payload = DaemonMessageType::Pong;
+    let broadcast = DaemonMessage::broadcast(payload.clone());
+    let reply = DaemonMessage::reply(12_345, payload);
+    assert!(reply.approx_wire_size() >= broadcast.approx_wire_size());
 }
 
 // ── InferenceError metric_label tests ─────────────────────────

@@ -38,7 +38,7 @@ use choreo_client_core::error::ClientError;
 use choreo_client_core::run_daemon_connection;
 use choreo_client_core::run_daemon_tcp_connection;
 use choreo_client_core::run_daemon_tcp_connection_xx_first_contact;
-use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent};
+use choreo_proto::{ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent};
 use choreo_transport::key::{ensure_transport_keypair, set_test_config_root};
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -84,7 +84,7 @@ const LARGE_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 /// test can join it with a bounded `recv_timeout` instead of a blocking
 /// `thread::join`.
 struct NoiseClient {
-    from_ui: crossbeam_channel::Sender<ClientMessage>,
+    from_ui: crossbeam_channel::Sender<ClientMessageType>,
     rx: mpsc::Receiver<DaemonMessage>,
     shutdown_tx: crossbeam_channel::Sender<()>,
     result_rx: mpsc::Receiver<Result<(), ClientError>>,
@@ -103,7 +103,7 @@ impl NoiseClient {
     /// the thread's result is sent; if the thread panics first, the
     /// thread-local dies with the thread and leaks nothing.
     fn connect(addr: &str, server_pk: &[u8; 32], key_dir: PathBuf) -> Self {
-        let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
+        let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessageType>();
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
         let (tx, rx) = mpsc::channel::<DaemonMessage>();
         let (result_tx, result_rx) = mpsc::channel::<Result<(), ClientError>>();
@@ -131,21 +131,22 @@ impl NoiseClient {
         }
     }
 
-    fn send(&self, msg: ClientMessage) {
+    fn send(&self, msg: ClientMessageType) {
         self.from_ui.send(msg).expect("send to daemon");
     }
 
-    fn recv(&self) -> DaemonMessage {
+    fn recv(&self) -> DaemonMessageType {
         self.recv_within(TIMEOUT)
     }
 
     /// Like [`Self::recv`] but with an explicit bound. Used by the large-message
     /// tests, whose replies take materially longer to arrive under load (see
     /// [`LARGE_MESSAGE_TIMEOUT`]).
-    fn recv_within(&self, timeout: Duration) -> DaemonMessage {
+    fn recv_within(&self, timeout: Duration) -> DaemonMessageType {
         self.rx
             .recv_timeout(timeout)
             .unwrap_or_else(|e| panic!("timed out waiting for daemon message: {e:?}"))
+            .inner
     }
 
     /// Bounded join: signals shutdown (severs the socket), waits up to
@@ -176,8 +177,8 @@ impl NoiseClient {
 /// The `CreateSession` request used throughout: every optional field unset, so
 /// the tests exercise the default session-creation path (mirrors the Unix
 /// test file's helper).
-fn create_session() -> ClientMessage {
-    ClientMessage::CreateSession {
+fn create_session() -> ClientMessageType {
+    ClientMessageType::CreateSession {
         title: None,
         parent_session_id: None,
         working_dir: None,
@@ -220,8 +221,8 @@ fn noise_ping_pong_over_tcp() {
     // + ACL + `tcp_client_thread` on one side, real client
     // `run_daemon_tcp_connection` on the other, one encrypted round trip
     // through the Noise transport state.
-    client.send(ClientMessage::Ping);
-    assert_eq!(client.recv(), DaemonMessage::Pong);
+    client.send(ClientMessageType::Ping);
+    assert_eq!(client.recv(), DaemonMessageType::Pong);
 
     // Graceful shutdown: SIGINT makes the daemon notify every connected
     // Noise client and close the connection, so the reader must exit
@@ -242,9 +243,9 @@ fn noise_list_sessions_round_trip() {
     );
 
     // Fresh daemon: the session list starts empty.
-    client.send(ClientMessage::ListSessions);
+    client.send(ClientMessageType::ListSessions);
     match client.recv() {
-        DaemonMessage::Sessions { sessions } => {
+        DaemonMessageType::Sessions { sessions } => {
             assert_eq!(sessions, [] as [choreo_proto::SessionSummary; 0]);
         }
         other => panic!("expected empty Sessions, got {other:?}"),
@@ -253,7 +254,7 @@ fn noise_list_sessions_round_trip() {
     // Create a session with all optional fields unset.
     client.send(create_session());
     match client.recv() {
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionCreatedForRequester { .. },
         } => assert_eq!(session_id, 1),
@@ -270,9 +271,9 @@ fn noise_list_sessions_round_trip() {
     // broadcast arrives between the create reply and the list reply — the
     // next message is exactly the Sessions reply. This is the regression pin
     // for the removed TCP auto-registration.
-    client.send(ClientMessage::ListSessions);
+    client.send(ClientMessageType::ListSessions);
     match client.recv() {
-        DaemonMessage::Sessions { sessions } => {
+        DaemonMessageType::Sessions { sessions } => {
             assert_eq!(sessions.len(), 1);
             assert_eq!(sessions[0].session_id, 1);
         }
@@ -299,7 +300,7 @@ fn noise_and_unix_share_daemon_state() {
     // Minimal inline Unix client: spawn `run_daemon_connection` in a
     // thread. Only send + recv + join are needed here — the full Client
     // helper lives in daemon_client_unix.rs.
-    let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
+    let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessageType>();
     let (tx, rx) = mpsc::channel::<DaemonMessage>();
     let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
     let socket = daemon.socket_str();
@@ -315,21 +316,24 @@ fn noise_and_unix_share_daemon_state() {
     });
 
     // Both connections are live on their own transports.
-    noise_client.send(ClientMessage::Ping);
-    assert_eq!(noise_client.recv(), DaemonMessage::Pong);
-    from_ui.send(ClientMessage::Ping).expect("send to daemon");
+    noise_client.send(ClientMessageType::Ping);
+    assert_eq!(noise_client.recv(), DaemonMessageType::Pong);
+    from_ui
+        .send(ClientMessageType::Ping)
+        .expect("send to daemon");
     match rx
         .recv_timeout(TIMEOUT)
         .unwrap_or_else(|e| panic!("timed out waiting for Unix daemon message: {e:?}"))
+        .inner
     {
-        DaemonMessage::Pong => {}
+        DaemonMessageType::Pong => {}
         other => panic!("expected Pong on Unix connection, got {other:?}"),
     }
 
     // The Noise client creates a session...
     noise_client.send(create_session());
     match noise_client.recv() {
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionCreatedForRequester { .. },
         } => assert_eq!(session_id, 1),
@@ -345,13 +349,14 @@ fn noise_and_unix_share_daemon_state() {
     // auto-registered), so no broadcast lands on the Unix channel before its
     // reply — the next message must be exactly the Sessions reply.
     from_ui
-        .send(ClientMessage::ListSessions)
+        .send(ClientMessageType::ListSessions)
         .expect("send to daemon");
     match rx
         .recv_timeout(TIMEOUT)
         .unwrap_or_else(|e| panic!("timed out waiting for Unix daemon message: {e:?}"))
+        .inner
     {
-        DaemonMessage::Sessions { sessions } => {
+        DaemonMessageType::Sessions { sessions } => {
             assert_eq!(sessions.len(), 1);
             assert_eq!(sessions[0].session_id, 1);
         }
@@ -395,7 +400,7 @@ fn noise_subscribe_receives_session_broadcasts() {
     );
 
     // A opts in to summary broadcasts; B never sends the message.
-    client_a.send(ClientMessage::SubscribeSessionsSummary);
+    client_a.send(ClientMessageType::SubscribeSessionsSummary);
 
     // Synchronize: A's connection thread forwards SubscribeSessionsSummary
     // and ListSessions to the daemon command loop in order, so when A
@@ -403,9 +408,9 @@ fn noise_subscribe_receives_session_broadcasts() {
     // processed. Without this barrier, B's CreateSession below could win the
     // race to the daemon loop and session 1's broadcast would miss A
     // (zero subscribers at broadcast time) — flaking the test.
-    client_a.send(ClientMessage::ListSessions);
+    client_a.send(ClientMessageType::ListSessions);
     match client_a.recv() {
-        DaemonMessage::Sessions { sessions } => {
+        DaemonMessageType::Sessions { sessions } => {
             assert_eq!(sessions, [] as [choreo_proto::SessionSummary; 0]);
         }
         other => panic!("expected empty Sessions, got {other:?}"),
@@ -420,7 +425,7 @@ fn noise_subscribe_receives_session_broadcasts() {
     // exact-one-message assert below is the pin.)
     client_b.send(create_session());
     match client_b.recv() {
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionCreatedForRequester { .. },
         } => assert_eq!(session_id, 1),
@@ -436,14 +441,14 @@ fn noise_subscribe_receives_session_broadcasts() {
     let mut saw_status = false;
     for _ in 0..2 {
         match client_a.recv() {
-            DaemonMessage::Session {
+            DaemonMessageType::Session {
                 session_id: Some(session_id),
                 event: SessionEvent::SessionCreated { .. },
             } => {
                 assert_eq!(session_id, 1);
                 saw_created = true;
             }
-            DaemonMessage::Session {
+            DaemonMessageType::Session {
                 session_id: Some(session_id),
                 event: SessionEvent::SessionStatusChanged { .. },
             } => {
@@ -474,21 +479,21 @@ fn noise_subscribe_receives_session_broadcasts() {
     let mut status_2 = 0;
     for _ in 0..3 {
         match client_a.recv() {
-            DaemonMessage::Session {
+            DaemonMessageType::Session {
                 session_id: Some(session_id),
                 event: SessionEvent::SessionCreatedForRequester { .. },
             } => {
                 assert_eq!(session_id, 2);
                 requester_2 += 1;
             }
-            DaemonMessage::Session {
+            DaemonMessageType::Session {
                 session_id: Some(session_id),
                 event: SessionEvent::SessionCreated { .. },
             } => {
                 assert_eq!(session_id, 2);
                 created_2 += 1;
             }
-            DaemonMessage::Session {
+            DaemonMessageType::Session {
                 session_id: Some(session_id),
                 event: SessionEvent::SessionStatusChanged { .. },
             } => {
@@ -502,8 +507,8 @@ fn noise_subscribe_receives_session_broadcasts() {
     assert_eq!(created_2, 1, "broadcast SessionCreated");
     assert_eq!(status_2, 1, "broadcast SessionStatusChanged");
 
-    client_b.send(ClientMessage::Ping);
-    assert_eq!(client_b.recv(), DaemonMessage::Pong);
+    client_b.send(ClientMessageType::Ping);
+    assert_eq!(client_b.recv(), DaemonMessageType::Pong);
 
     daemon.shutdown();
     client_a.finish().expect("clean close after shutdown");
@@ -578,15 +583,15 @@ fn noise_shutdown_notifies_client() {
     );
 
     // Prove the encrypted channel is live before shutting the daemon down.
-    client.send(ClientMessage::Ping);
-    assert_eq!(client.recv(), DaemonMessage::Pong);
+    client.send(ClientMessageType::Ping);
+    assert_eq!(client.recv(), DaemonMessageType::Pong);
 
     // SIGINT: the shutdown path writes ShuttingDown to every connected
     // Noise client THROUGH the encrypted channel (the Task-2 fix), then
     // closes the connection. Asserting the notification here is what pins
     // that fix — TCP clients previously got only a bare EOF.
     daemon.shutdown();
-    assert_eq!(client.recv(), DaemonMessage::ShuttingDown);
+    assert_eq!(client.recv(), DaemonMessageType::ShuttingDown);
 
     // The EOF that follows the notification must be a clean close — Ok(()),
     // not an I/O error.
@@ -626,11 +631,11 @@ fn noise_large_message_through_daemon() {
     // BIND first: the daemon's keystore starts unbound and AddCredential is
     // verify-only, so the fresh daemon must be bound (the ONLY adopt path)
     // before any credential can be added.
-    client.send(ClientMessage::BindKeystore {
+    client.send(ClientMessageType::BindKeystore {
         key: unlock_key.to_vec(),
     });
     match client.recv() {
-        DaemonMessage::Bound => {}
+        DaemonMessageType::Bound => {}
         other => panic!("expected Bound, got {other:?}"),
     }
     // (No lock-state broadcast is expected here: this Noise client is not an
@@ -645,7 +650,7 @@ fn noise_large_message_through_daemon() {
     plaintext.resize(1024 * 1024, 0x42);
     let blob = choreo_keystore::crypto::encrypt_with_public_key(derived_pub.as_bytes(), &plaintext)
         .expect("test blob must encrypt");
-    client.send(ClientMessage::AddCredential {
+    client.send(ClientMessageType::AddCredential {
         service: "big-blob".into(),
         encrypted_payload: blob,
         unlock_key: unlock_key.to_vec(),
@@ -654,11 +659,11 @@ fn noise_large_message_through_daemon() {
         // A successful AddCredential now implicitly unlocks the keystore, so
         // the daemon emits `Unlocked` before `CredentialAdded` (mirroring a
         // successful `Unlock`).
-        DaemonMessage::Unlocked => {}
+        DaemonMessageType::Unlocked => {}
         other => panic!("expected Unlocked, got {other:?}"),
     }
     match client.recv_within(LARGE_MESSAGE_TIMEOUT) {
-        DaemonMessage::CredentialAdded { service } => assert_eq!(service, "big-blob"),
+        DaemonMessageType::CredentialAdded { service } => assert_eq!(service, "big-blob"),
         other => panic!("expected CredentialAdded, got {other:?}"),
     }
 
@@ -691,7 +696,7 @@ fn noise_large_message_daemon_to_client() {
 
     let big_title = "x".repeat(8 * 1024);
     for i in 0..SESSIONS {
-        client.send(ClientMessage::CreateSession {
+        client.send(ClientMessageType::CreateSession {
             title: Some(big_title.clone()),
             parent_session_id: None,
             working_dir: None,
@@ -701,7 +706,7 @@ fn noise_large_message_daemon_to_client() {
             reasoning_effort: None,
         });
         match client.recv() {
-            DaemonMessage::Session {
+            DaemonMessageType::Session {
                 session_id: Some(session_id),
                 event: SessionEvent::SessionCreatedForRequester { .. },
             } => {
@@ -715,9 +720,9 @@ fn noise_large_message_daemon_to_client() {
     // message is exactly the Sessions reply — and it must be intact after
     // reassembly. Bound by [`LARGE_MESSAGE_TIMEOUT`]: the aggregated reply is
     // itself a multi-fragment (>64 KiB) reassembly.
-    client.send(ClientMessage::ListSessions);
+    client.send(ClientMessageType::ListSessions);
     match client.recv_within(LARGE_MESSAGE_TIMEOUT) {
-        DaemonMessage::Sessions { sessions } => {
+        DaemonMessageType::Sessions { sessions } => {
             assert_eq!(sessions.len(), SESSIONS);
             for s in &sessions {
                 assert_eq!(s.title.as_deref(), Some(big_title.as_str()));
@@ -755,7 +760,7 @@ fn connect_xx(
     confirm: bool,
     learned_tx: mpsc::Sender<[u8; 32]>,
 ) -> NoiseClient {
-    let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
+    let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessageType>();
     let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
     let (tx, rx) = mpsc::channel::<DaemonMessage>();
     let (result_tx, result_rx) = mpsc::channel::<Result<(), ClientError>>();
@@ -817,8 +822,8 @@ fn noise_xx_first_contact_full_path() {
     );
 
     // After confirmation the encrypted channel must work end to end.
-    client.send(ClientMessage::Ping);
-    assert_eq!(client.recv(), DaemonMessage::Pong);
+    client.send(ClientMessageType::Ping);
+    assert_eq!(client.recv(), DaemonMessageType::Pong);
 
     daemon.shutdown();
     client.finish().expect("clean close after shutdown");
@@ -876,7 +881,7 @@ fn noise_xx_first_contact_reject_closes_without_traffic() {
     // could ever reach the daemon. (A SendError here is the pin: pre-gate,
     // the writer thread would be draining this channel and the send would
     // succeed — which is exactly the leak the gate exists to prevent.)
-    let send_result = from_ui.send(ClientMessage::Ping);
+    let send_result = from_ui.send(ClientMessageType::Ping);
     assert!(
         send_result.is_err(),
         "after refusal no message path to the daemon may exist"
@@ -926,8 +931,8 @@ fn noise_unknown_preamble_is_rejected() {
         &daemon.server_pk,
         key_dir.path().to_path_buf(),
     );
-    client.send(ClientMessage::Ping);
-    assert_eq!(client.recv(), DaemonMessage::Pong);
+    client.send(ClientMessageType::Ping);
+    assert_eq!(client.recv(), DaemonMessageType::Pong);
 
     daemon.shutdown();
     client.finish().expect("clean close after shutdown");

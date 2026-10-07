@@ -57,11 +57,11 @@ fn spawn_subsession_happy_path() {
                 // ── Receive and verify RunChildInput with user_text ──
                 match child_rx.recv().unwrap() {
                     SessionCommand::RunChildInput {
-                        request_id,
+                        stream_id,
                         user_text,
                         reply,
                     } => {
-                        assert_eq!(request_id, 1);
+                        assert_eq!(stream_id, 1);
                         assert_eq!(user_text.as_deref(), Some("work on this task"));
                         reply
                             .send(Ok(ChildResult {

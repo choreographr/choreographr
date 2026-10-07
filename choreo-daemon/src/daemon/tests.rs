@@ -365,7 +365,10 @@ fn handle_evict_client_removes_from_maps_and_sends_advisory() {
     assert!(!state.activity_subscribers.contains_key(&7));
     assert!(!state.client_subscribed_sessions.contains_key(&7));
     // The best-effort advisory was enqueued before the sink was dropped.
-    assert_eq!(rx.recv().unwrap(), DaemonMessage::Evicted);
+    assert_eq!(
+        rx.recv().unwrap(),
+        DaemonMessage::broadcast(DaemonMessageType::Evicted)
+    );
 }
 
 #[test]
@@ -614,8 +617,8 @@ fn handle_set_session_flags_applies_persists_and_broadcasts() {
     assert_eq!(persisted.archived_at, stamped);
 
     // The broadcast carried the post-change flag state.
-    let broadcast = rx.try_iter().find_map(|m| match m {
-        DaemonMessage::Session {
+    let broadcast = rx.try_iter().find_map(|m| match m.inner {
+        DaemonMessageType::Session {
             session_id: Some(1),
             event:
                 SessionEvent::SessionFlagsChanged {
@@ -899,8 +902,8 @@ fn handle_broadcast_session_status() {
     });
     let msg = rx.recv().unwrap();
     assert!(matches!(
-        msg,
-        DaemonMessage::Session {
+        msg.inner,
+        DaemonMessageType::Session {
             session_id: Some(42),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inference,
@@ -1007,8 +1010,8 @@ fn handle_broadcast_session_status_dedups_against_session_and_activity_subscribe
     // Client 3 (summary-only) must receive it — exactly once.
     let msg = rx3.recv().unwrap();
     assert!(matches!(
-        msg,
-        DaemonMessage::Session {
+        msg.inner,
+        DaemonMessageType::Session {
             session_id: Some(42),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inference,
@@ -1470,13 +1473,13 @@ fn broadcast_sends_to_subscriber() {
     let (mut state, _rx) = make_daemon_state();
     let (tx, rx) = test_sink();
     state.summary_subscribers.insert(1, tx);
-    let msg = DaemonMessage::Session {
+    let msg = DaemonMessageType::Session {
         session_id: Some(42),
         event: SessionEvent::SessionDeleted,
     };
     state.broadcast(&msg.clone());
     let received = rx.recv().unwrap();
-    assert_eq!(received, msg);
+    assert_eq!(received, DaemonMessage::broadcast(msg));
     // Subscriber should still be registered
     assert!(state.summary_subscribers.contains_key(&1));
 }
@@ -1487,7 +1490,7 @@ fn broadcast_removes_disconnected_subscriber() {
     let (tx, rx) = test_sink();
     state.summary_subscribers.insert(1, tx);
     drop(rx); // Disconnect the receiver
-    state.broadcast(&DaemonMessage::Session {
+    state.broadcast(&DaemonMessageType::Session {
         session_id: Some(42),
         event: SessionEvent::SessionDeleted,
     });
@@ -1510,14 +1513,14 @@ fn broadcast_enqueues_losslessly_and_evicts_over_lag_client() {
     state.summary_subscribers.insert(7, sink.clone());
     state.client_writers.insert(7, sink);
 
-    let msg = DaemonMessage::Session {
+    let msg = DaemonMessageType::Session {
         session_id: Some(42),
         event: SessionEvent::SessionDeleted,
     };
     state.broadcast(&msg.clone());
 
     // Lossless: the crossing message is still delivered, never dropped.
-    assert_eq!(rx.recv().unwrap(), msg);
+    assert_eq!(rx.recv().unwrap(), DaemonMessage::broadcast(msg));
     // …but the client is evicted for lag, from every map.
     assert!(
         !state.summary_subscribers.contains_key(&7),
@@ -1568,19 +1571,19 @@ fn broadcast_lifecycle_delivers_to_summary_and_activity_exactly_once_per_client(
     drain_send_on_subscribe(&rx2);
     drain_send_on_subscribe(&rx3);
 
-    let msg = DaemonMessage::Session {
+    let msg = DaemonMessageType::Session {
         session_id: Some(42),
         event: SessionEvent::SessionDeleted,
     };
     state.broadcast(&msg.clone());
 
     // Summary-only client: delivered via the summary fan-out.
-    assert_eq!(rx1.recv().unwrap(), msg);
+    assert_eq!(rx1.recv().unwrap(), DaemonMessage::broadcast(msg.clone()));
     // Activity-only client: delivered via the activity fan-out (the gap this
     // pin closes — it previously received nothing).
-    assert_eq!(rx2.recv().unwrap(), msg);
+    assert_eq!(rx2.recv().unwrap(), DaemonMessage::broadcast(msg.clone()));
     // Both-bus client: exactly one copy (summary skipped them).
-    assert_eq!(rx3.recv().unwrap(), msg);
+    assert_eq!(rx3.recv().unwrap(), DaemonMessage::broadcast(msg));
     assert!(
         rx3.try_recv().is_err(),
         "a summary+activity client must receive the lifecycle event exactly once"
@@ -2149,11 +2152,11 @@ fn handle_unload_tools_nonexistent_session_replies_error() {
 fn drain_send_on_subscribe(rx: &crossbeam_channel::Receiver<DaemonMessage>) {
     let msg = rx.recv().unwrap();
     assert!(
-        matches!(&msg, DaemonMessage::CatalogUpdated { providers } if !providers.is_empty()),
+        matches!(&msg.inner, DaemonMessageType::CatalogUpdated { providers } if !providers.is_empty()),
         "expected the send-on-subscribe CatalogUpdated, got {msg:?}",
     );
-    match rx.recv().unwrap() {
-        DaemonMessage::Keystore { .. } => {}
+    match rx.recv().unwrap().inner {
+        DaemonMessageType::Keystore { .. } => {}
         other => panic!("expected the send-on-subscribe keystore state, got {other:?}"),
     }
 }
@@ -2213,8 +2216,8 @@ fn handle_acl_add_enrolls_key_updates_file_and_broadcasts() {
     assert!(file.contains(&acl_b64(&ACL_KEY_B)), "new key written");
     assert!(state.acl.as_ref().unwrap().contains(&ACL_KEY_B));
 
-    match writer_rx.recv().unwrap() {
-        DaemonMessage::AclUpdated { clients } => assert_eq!(clients, 2),
+    match writer_rx.recv().unwrap().inner {
+        DaemonMessageType::AclUpdated { clients } => assert_eq!(clients, 2),
         other => panic!("expected AclUpdated broadcast, got {other:?}"),
     }
 }
@@ -2294,8 +2297,8 @@ fn handle_accounts_reload_applies_external_change_and_broadcasts() {
 
     assert!(state.accounts.contains("alpha"));
     assert!(state.accounts.contains("beta"));
-    match writer_rx.recv().unwrap() {
-        DaemonMessage::Accounts { accounts } => {
+    match writer_rx.recv().unwrap().inner {
+        DaemonMessageType::Accounts { accounts } => {
             let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
             assert!(names.contains(&"alpha"), "broadcast carries alpha");
             assert!(names.contains(&"beta"), "broadcast carries beta");
@@ -2742,21 +2745,21 @@ fn handle_broadcast_activity_sends_to_subscriber() {
     });
     drain_send_on_subscribe(&rx);
 
-    let msg = DaemonMessage::Session {
+    let msg = DaemonMessageType::Session {
         session_id: Some(1),
         event: SessionEvent::OutputChunk {
-            request_id: 5,
+            stream_id: 5,
             stream: choreo_proto::OutputStream::Answer,
             data: b"hello".to_vec(),
         },
     };
     state.handle_command(DaemonCommand::BroadcastActivity {
         session_id: Some(1),
-        msg: msg.clone(),
+        msg: DaemonMessage::broadcast(msg.clone()),
     });
 
     let received = rx.recv().unwrap();
-    assert_eq!(received, msg);
+    assert_eq!(received, DaemonMessage::broadcast(msg));
     // Subscriber should still be registered
     assert!(state.activity_subscribers.contains_key(&10));
 }
@@ -2782,10 +2785,10 @@ fn handle_broadcast_activity_skips_dedup_for_session_subscriber() {
 
     // Broadcast a message FROM session 1 — should be SKIPPED for client 10
     // because they're already a direct subscriber of session 1.
-    let msg = DaemonMessage::Session {
+    let msg = DaemonMessageType::Session {
         session_id: Some(1),
         event: SessionEvent::OutputChunk {
-            request_id: 5,
+            stream_id: 5,
             stream: choreo_proto::OutputStream::Answer,
             data: b"hello".to_vec(),
         },
@@ -2794,7 +2797,7 @@ fn handle_broadcast_activity_skips_dedup_for_session_subscriber() {
     // the message — so this session-1 message is suppressed for client 10.
     state.handle_command(DaemonCommand::BroadcastActivity {
         session_id: Some(1),
-        msg,
+        msg: DaemonMessage::broadcast(msg),
     });
 
     // The client should NOT have received the message (it was suppressed
@@ -2826,21 +2829,21 @@ fn handle_broadcast_activity_no_dedup_for_different_session() {
 
     // Broadcast a message FROM session 2 — client 10 is NOT a subscriber
     // of session 2, so the message should be delivered.
-    let msg = DaemonMessage::Session {
+    let msg = DaemonMessageType::Session {
         session_id: Some(2),
         event: SessionEvent::OutputChunk {
-            request_id: 5,
+            stream_id: 5,
             stream: choreo_proto::OutputStream::Answer,
             data: b"hello".to_vec(),
         },
     };
     state.handle_command(DaemonCommand::BroadcastActivity {
         session_id: Some(2),
-        msg: msg.clone(),
+        msg: DaemonMessage::broadcast(msg.clone()),
     });
 
     let received = rx.recv().unwrap();
-    assert_eq!(received, msg);
+    assert_eq!(received, DaemonMessage::broadcast(msg));
 }
 
 #[test]
@@ -2858,17 +2861,17 @@ fn handle_broadcast_activity_sends_when_no_session_id() {
     });
     drain_send_on_subscribe(&rx);
 
-    let msg = DaemonMessage::Models {
+    let msg = DaemonMessageType::Models {
         models: vec!["gpt-4".into()],
         selected_model: Some("gpt-4".into()),
     };
     state.handle_command(DaemonCommand::BroadcastActivity {
         session_id: None,
-        msg: msg.clone(),
+        msg: DaemonMessage::broadcast(msg.clone()),
     });
 
     let received = rx.recv().unwrap();
-    assert_eq!(received, msg);
+    assert_eq!(received, DaemonMessage::broadcast(msg));
 }
 
 #[test]
@@ -2887,7 +2890,7 @@ fn handle_broadcast_activity_removes_disconnected_subscriber() {
     drop(rx);
 
     // Broadcast should detect the dead subscriber and remove it
-    let msg = DaemonMessage::Session {
+    let msg = DaemonMessageType::Session {
         session_id: Some(1),
         event: SessionEvent::SessionStatusChanged {
             status: SessionStatus::Inactive,
@@ -2896,7 +2899,7 @@ fn handle_broadcast_activity_removes_disconnected_subscriber() {
     };
     state.handle_command(DaemonCommand::BroadcastActivity {
         session_id: Some(1),
-        msg,
+        msg: DaemonMessage::broadcast(msg),
     });
 
     // Dead subscriber should be removed
@@ -2930,21 +2933,21 @@ fn handle_broadcast_activity_evicts_over_lag_subscriber() {
     drain_send_on_subscribe(&rx);
 
     // The message crosses the tiny cap (OutputChunk payload ~70 bytes).
-    let broadcast = DaemonMessage::Session {
+    let broadcast = DaemonMessageType::Session {
         session_id: Some(7),
         event: SessionEvent::OutputChunk {
-            request_id: 99,
+            stream_id: 99,
             stream: choreo_proto::OutputStream::Answer,
             data: b"hello".to_vec(),
         },
     };
     state.handle_command(DaemonCommand::BroadcastActivity {
         session_id: Some(7),
-        msg: broadcast.clone(),
+        msg: DaemonMessage::broadcast(broadcast.clone()),
     });
 
     // Lossless: the crossing message was delivered, not dropped.
-    assert_eq!(rx.recv().unwrap(), broadcast);
+    assert_eq!(rx.recv().unwrap(), DaemonMessage::broadcast(broadcast));
     // …and the subscriber is evicted from every map.
     assert!(
         !state.activity_subscribers.contains_key(&10),
@@ -2980,17 +2983,17 @@ fn handle_broadcast_activity_handles_multiple_clients() {
         session_id: 1,
     });
 
-    let msg = DaemonMessage::Session {
+    let msg = DaemonMessageType::Session {
         session_id: Some(1),
         event: SessionEvent::OutputChunk {
-            request_id: 5,
+            stream_id: 5,
             stream: choreo_proto::OutputStream::Answer,
             data: b"data".to_vec(),
         },
     };
     state.handle_command(DaemonCommand::BroadcastActivity {
         session_id: Some(1),
-        msg: msg.clone(),
+        msg: DaemonMessage::broadcast(msg.clone()),
     });
 
     // Client 10 (session subscriber) should be skipped
@@ -3000,7 +3003,7 @@ fn handle_broadcast_activity_handles_multiple_clients() {
     );
     // Client 20 (activity only) should receive the message
     let received = rx2.recv().unwrap();
-    assert_eq!(received, msg);
+    assert_eq!(received, DaemonMessage::broadcast(msg));
 }
 
 // ── Explicit-origin broadcast dedup tests ─────────────────────────
@@ -3031,10 +3034,10 @@ fn handle_broadcast_activity_dedup_keyed_on_command_origin_not_message_shape() {
     // `Sessions` has no session_id inside its payload: the Some(42) origin
     // below exists ONLY on the command, so a delivery (or suppression)
     // proves the filter reads the provenance field, not the message shape.
-    let msg = DaemonMessage::Sessions { sessions: vec![] };
+    let msg = DaemonMessageType::Sessions { sessions: vec![] };
     state.handle_command(DaemonCommand::BroadcastActivity {
         session_id: Some(42),
-        msg,
+        msg: DaemonMessage::broadcast(msg),
     });
 
     // Suppressed: the client received nothing through the activity path
@@ -3057,41 +3060,41 @@ fn broadcast_origin_contract_requires_agreeing_provenance() {
     assert!(
         super::subscriber_handlers::violates_broadcast_origin_contract(
             Some(42),
-            &DaemonMessage::Sessions { sessions: vec![] },
+            &DaemonMessage::broadcast(DaemonMessageType::Sessions { sessions: vec![] }),
         )
     );
     assert!(
         super::subscriber_handlers::violates_broadcast_origin_contract(
             Some(42),
-            &DaemonMessage::CatalogUpdated { providers: vec![] },
+            &DaemonMessage::broadcast(DaemonMessageType::CatalogUpdated { providers: vec![] }),
         )
     );
 
     // A session-scoped message whose origin matches the test command origin
     // (42) — the per-session bus carries it, so a `Some(42)` command origin
     // can legitimately suppress it for session-42 subscribers.
-    let session_msg = DaemonMessage::Session {
+    let session_msg = DaemonMessage::broadcast(DaemonMessageType::Session {
         session_id: Some(42),
         event: SessionEvent::OutputChunk {
-            request_id: 1,
+            stream_id: 1,
             stream: choreo_proto::OutputStream::Answer,
             data: vec![],
         },
-    };
+    });
 
     // A `Some` command origin whose `Session` envelope carries a DIFFERENT
     // session: the dedup suppresses the command-origin's subscribers rather
     // than the envelope's real origin's — the real origin's direct
-    // subscribers miss the event, the command origin's receive a foreign
+    // subscribers miss the event), the command origin's receive a foreign
     // session's event.
-    let other_session_msg = DaemonMessage::Session {
+    let other_session_msg = DaemonMessage::broadcast(DaemonMessageType::Session {
         session_id: Some(7),
         event: SessionEvent::OutputChunk {
-            request_id: 1,
+            stream_id: 1,
             stream: choreo_proto::OutputStream::Answer,
             data: vec![],
         },
-    };
+    });
     assert!(
         super::subscriber_handlers::violates_broadcast_origin_contract(
             Some(42),
@@ -3104,17 +3107,17 @@ fn broadcast_origin_contract_requires_agreeing_provenance() {
     assert!(
         super::subscriber_handlers::violates_broadcast_origin_contract(
             Some(42),
-            &DaemonMessage::Session {
+            &DaemonMessage::broadcast(DaemonMessageType::Session {
                 session_id: None,
                 event: SessionEvent::Failed {
-                    request_id: 1,
+                    stream_id: 1,
                     error: "no session attached".into(),
                 },
-            },
+            }),
         )
     );
 
-    // A `None` command origin on a session-scoped envelope: no dedup runs, so
+    // A `None` command origin on a session-scoped envelope: no dedup runs), so
     // the envelope origin's direct subscribers receive the event TWICE (here
     // and on the per-session bus).
     assert!(super::subscriber_handlers::violates_broadcast_origin_contract(None, &session_msg,));
@@ -3134,7 +3137,7 @@ fn broadcast_origin_contract_requires_agreeing_provenance() {
     assert!(
         !super::subscriber_handlers::violates_broadcast_origin_contract(
             None,
-            &DaemonMessage::CatalogUpdated { providers: vec![] },
+            &DaemonMessage::broadcast(DaemonMessageType::CatalogUpdated { providers: vec![] }),
         )
     );
 
@@ -3143,13 +3146,13 @@ fn broadcast_origin_contract_requires_agreeing_provenance() {
     assert!(
         !super::subscriber_handlers::violates_broadcast_origin_contract(
             None,
-            &DaemonMessage::Session {
+            &DaemonMessage::broadcast(DaemonMessageType::Session {
                 session_id: None,
                 event: SessionEvent::Failed {
-                    request_id: 1,
+                    stream_id: 1,
                     error: "no session attached".into(),
                 },
-            },
+            }),
         )
     );
 }
@@ -3294,8 +3297,8 @@ fn catalog_base_changed_swaps_broadcasts_and_replies() {
     // Activity subscribers got the CatalogUpdated broadcast.
     let broadcast = writer_rx.recv().unwrap();
     assert!(matches!(
-        &broadcast,
-        DaemonMessage::CatalogUpdated { providers } if providers.iter().any(|p| p.slug == "tiny-test")
+        &broadcast.inner,
+        DaemonMessageType::CatalogUpdated { providers } if providers.iter().any(|p| p.slug == "tiny-test")
     ));
     // The requester got a RefreshReport with the merged counts. The
     // merged catalog is tiny-test + the bundled overlay's wholesale
@@ -3439,8 +3442,8 @@ fn activity_subscriber_gets_current_provider_list_on_register() {
     state.handle_register_activity_subscriber(1, &writer_tx);
 
     let msg = writer_rx.recv().unwrap();
-    match &msg {
-        DaemonMessage::CatalogUpdated { providers } => {
+    match &msg.inner {
+        DaemonMessageType::CatalogUpdated { providers } => {
             assert_ne!(
                 providers.as_slice(),
                 [] as [choreo_proto::CatalogProvider; 0]
@@ -3466,9 +3469,12 @@ fn activity_subscriber_gets_current_lock_state_on_register() {
     // Fresh state: no binding yet → the subscribe push is `Unbound`.
     state.handle_register_activity_subscriber(1, &writer_tx);
     let msg = writer_rx.recv().unwrap(); // CatalogUpdated
-    assert!(matches!(&msg, DaemonMessage::CatalogUpdated { .. }));
-    match writer_rx.recv().unwrap() {
-        DaemonMessage::Keystore { state } => {
+    assert!(matches!(
+        &msg.inner,
+        DaemonMessageType::CatalogUpdated { .. }
+    ));
+    match writer_rx.recv().unwrap().inner {
+        DaemonMessageType::Keystore { state } => {
             assert_eq!(state, choreo_proto::KeystoreState::Unbound);
         }
         other => panic!("expected subscribe-time Unbound, got {other:?}"),
@@ -3480,8 +3486,8 @@ fn activity_subscriber_gets_current_lock_state_on_register() {
     let (writer_tx2, writer_rx2) = test_sink();
     state.handle_register_activity_subscriber(2, &writer_tx2);
     let _ = writer_rx2.recv().unwrap(); // CatalogUpdated
-    match writer_rx2.recv().unwrap() {
-        DaemonMessage::Keystore { state } => {
+    match writer_rx2.recv().unwrap().inner {
+        DaemonMessageType::Keystore { state } => {
             assert_eq!(state, choreo_proto::KeystoreState::Unlocked);
         }
         other => panic!("expected subscribe-time Unlocked, got {other:?}"),
@@ -3515,14 +3521,14 @@ fn broadcast_keystore_state_sends_current_state_to_all_activity_subscribers() {
     state.locked = false;
     state.broadcast_keystore_state();
     assert!(matches!(
-        rx_a.recv().unwrap(),
-        DaemonMessage::Keystore {
+        rx_a.recv().unwrap().inner,
+        DaemonMessageType::Keystore {
             state: choreo_proto::KeystoreState::Unlocked
         }
     ));
     assert!(matches!(
-        rx_b.recv().unwrap(),
-        DaemonMessage::Keystore {
+        rx_b.recv().unwrap().inner,
+        DaemonMessageType::Keystore {
             state: choreo_proto::KeystoreState::Unlocked
         }
     ));
@@ -3530,14 +3536,14 @@ fn broadcast_keystore_state_sends_current_state_to_all_activity_subscribers() {
     state.locked = true;
     state.broadcast_keystore_state();
     assert!(matches!(
-        rx_a.recv().unwrap(),
-        DaemonMessage::Keystore {
+        rx_a.recv().unwrap().inner,
+        DaemonMessageType::Keystore {
             state: choreo_proto::KeystoreState::Locked
         }
     ));
     assert!(matches!(
-        rx_b.recv().unwrap(),
-        DaemonMessage::Keystore {
+        rx_b.recv().unwrap().inner,
+        DaemonMessageType::Keystore {
             state: choreo_proto::KeystoreState::Locked
         }
     ));
@@ -3585,8 +3591,8 @@ fn handle_lock_clears_credentials_latches_locked_and_broadcasts() {
     );
     drop(release);
     // The transition was broadcast to every activity subscriber.
-    match writer_rx.recv().unwrap() {
-        DaemonMessage::Keystore {
+    match writer_rx.recv().unwrap().inner {
+        DaemonMessageType::Keystore {
             state: choreo_proto::KeystoreState::Locked,
         } => {}
         other => panic!("expected Locked transition broadcast, got {other:?}"),
@@ -3999,7 +4005,10 @@ fn bind_keystore_adopts_on_unbound_and_runs_unlock_tail() {
 
     reply_rx.recv().unwrap();
     // The targeted Bound confirmation reached the acting client's sink.
-    assert!(matches!(writer_rx.recv().unwrap(), DaemonMessage::Bound));
+    assert!(matches!(
+        writer_rx.recv().unwrap().inner,
+        DaemonMessageType::Bound
+    ));
     // The binding was persisted (TOFU adopt happened here and ONLY here) and
     // the cached status flag was flipped so the daemon now reports `Unbound →
     // bound`.
@@ -4029,7 +4038,10 @@ fn bind_keystore_on_bound_keystore_rejects_wrong_key_without_overwrite() {
         reply,
     });
     reply_rx.recv().unwrap();
-    assert!(matches!(writer_rx.recv().unwrap(), DaemonMessage::Bound));
+    assert!(matches!(
+        writer_rx.recv().unwrap().inner,
+        DaemonMessageType::Bound
+    ));
 
     let (reply, reply_rx) = mpsc::channel();
     state.handle_command(DaemonCommand::BindKeystore {
@@ -4061,8 +4073,8 @@ fn unlock_on_unbound_keystore_is_refused_and_does_not_adopt() {
     reply_rx.recv().unwrap();
     // The distinct Unbound reply (NOT a wrong-key LockedError): verify-only.
     assert!(matches!(
-        writer_rx.recv().unwrap(),
-        DaemonMessage::KeystoreUnbound { .. }
+        writer_rx.recv().unwrap().inner,
+        DaemonMessageType::KeystoreUnbound { .. }
     ));
     // No binding was created, and the unlock tail never ran.
     assert_eq!(db::get_keystore_binding(&state.db).unwrap(), None);
@@ -4087,8 +4099,8 @@ fn add_credential_on_unbound_keystore_is_refused_without_binding_or_persist() {
     reply_rx.recv().unwrap();
     // The distinct Unbound reply (verify-only — no adoption).
     assert!(matches!(
-        writer_rx.recv().unwrap(),
-        DaemonMessage::KeystoreUnbound { .. }
+        writer_rx.recv().unwrap().inner,
+        DaemonMessageType::KeystoreUnbound { .. }
     ));
     // Nothing was adopted and nothing was persisted.
     assert_eq!(db::get_keystore_binding(&state.db).unwrap(), None);
@@ -4117,8 +4129,8 @@ fn add_credential_verify_only_implicitly_unlocks_bound_keystore() {
     reply_rx.recv().unwrap();
     // The bind's implicit-unlock transition broadcast reached the subscriber.
     assert!(matches!(
-        sub_rx.recv().unwrap(),
-        DaemonMessage::Keystore {
+        sub_rx.recv().unwrap().inner,
+        DaemonMessageType::Keystore {
             state: choreo_proto::KeystoreState::Unlocked
         }
     ));
@@ -4149,10 +4161,13 @@ fn add_credential_verify_only_implicitly_unlocks_bound_keystore() {
     reply_rx.recv().unwrap();
     // Targeted replies arrive in the daemon-mandated order: Unlocked then
     // CredentialAdded, BEFORE the transition broadcast (asserted below).
-    assert!(matches!(writer_rx.recv().unwrap(), DaemonMessage::Unlocked));
     assert!(matches!(
-        writer_rx.recv().unwrap(),
-        DaemonMessage::CredentialAdded { .. }
+        writer_rx.recv().unwrap().inner,
+        DaemonMessageType::Unlocked
+    ));
+    assert!(matches!(
+        writer_rx.recv().unwrap().inner,
+        DaemonMessageType::CredentialAdded { .. }
     ));
     assert!(!state.locked, "valid AddCredential implicitly unlocks");
     assert!(matches!(
@@ -4161,8 +4176,8 @@ fn add_credential_verify_only_implicitly_unlocks_bound_keystore() {
     ));
     // The implicit-unlock transition was broadcast to the activity subscriber.
     assert!(matches!(
-        sub_rx.recv().unwrap(),
-        DaemonMessage::Keystore {
+        sub_rx.recv().unwrap().inner,
+        DaemonMessageType::Keystore {
             state: choreo_proto::KeystoreState::Unlocked
         }
     ));
@@ -4199,8 +4214,8 @@ fn add_credential_on_bound_keystore_rejects_wrong_key_blob() {
     });
     reply_rx.recv().unwrap();
     assert!(
-        matches!(&writer_rx.recv().unwrap(),
-            DaemonMessage::CredentialAddFailed { error, .. } if error.contains("does not match")),
+        matches!(&writer_rx.recv().unwrap().inner,
+            DaemonMessageType::CredentialAddFailed { error, .. } if error.contains("does not match")),
         "mismatched key must be rejected with CredentialAddFailed"
     );
     assert!(db::get_all_credential_blobs(&state.db).unwrap().is_empty());

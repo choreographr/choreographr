@@ -25,7 +25,7 @@ pub struct AcpSession {
     pub acp_id: String,
     /// Active prompt request ID, if any.  The ACP spec forbids concurrent
     /// prompts on a single session, so this acts as a guard.
-    pub active_request: Option<u32>,
+    pub active_request: Option<u64>,
     /// Currently selected model for this session.
     pub model: Option<String>,
     /// Reasoning effort setting.
@@ -52,8 +52,8 @@ pub struct SessionManager {
     /// Daemon numeric session ID → ACP session ID.
     by_daemon_id: HashMap<u64, String>,
     /// Monotonically increasing request ID counter.  Each outgoing
-    /// `ClientMessage` that expects a streaming response gets a unique ID.
-    next_request_id: u32,
+    /// `ClientMessageType` that expects a streaming response gets a unique ID.
+    next_request_id: u64,
 }
 
 impl Default for SessionManager {
@@ -142,7 +142,7 @@ impl SessionManager {
     /// Allocate the next monotonically-increasing request ID.  Wraps on
     /// overflow (`u32::MAX` → 0) since request IDs only need to be unique
     /// per-daemon-connection-lifetime.
-    pub fn next_request_id(&mut self) -> u32 {
+    pub fn next_request_id(&mut self) -> u64 {
         let id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
         id
@@ -157,7 +157,7 @@ impl SessionManager {
     /// Returns [`AcpError::SessionNotFound`] when the ACP session ID is
     /// unknown, and [`AcpError::SessionBusy`] when the session already has
     /// an active prompt; the prompt guard is only set on success.
-    pub fn try_begin_prompt(&mut self, acp_id: &str, request_id: u32) -> Result<(), AcpError> {
+    pub fn try_begin_prompt(&mut self, acp_id: &str, stream_id: u64) -> Result<(), AcpError> {
         let session = self
             .sessions
             .get_mut(acp_id)
@@ -168,17 +168,17 @@ impl SessionManager {
             return Err(AcpError::SessionBusy(acp_id.to_string()));
         }
 
-        session.active_request = Some(request_id);
-        debug!(acp_id, request_id, "prompt started");
+        session.active_request = Some(stream_id);
+        debug!(acp_id, stream_id, "prompt started");
         Ok(())
     }
 
     /// End the active prompt for the given session (clears the guard).
     pub fn end_prompt(&mut self, acp_id: &str) {
         if let Some(session) = self.sessions.get_mut(acp_id)
-            && let Some(request_id) = session.active_request.take()
+            && let Some(stream_id) = session.active_request.take()
         {
-            debug!(acp_id, request_id, "prompt ended");
+            debug!(acp_id, stream_id, "prompt ended");
         }
     }
 
@@ -290,10 +290,10 @@ mod tests {
     #[test]
     fn next_request_id_wraps() {
         let mut mgr = SessionManager::new();
-        mgr.next_request_id = u32::MAX;
+        mgr.next_request_id = u64::MAX;
         let id1 = mgr.next_request_id();
         let id2 = mgr.next_request_id();
-        assert_eq!(id1, u32::MAX);
+        assert_eq!(id1, u64::MAX);
         assert_eq!(id2, 0);
     }
 }

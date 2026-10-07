@@ -1,5 +1,5 @@
 use super::*;
-use choreo_proto::ClientMessage;
+use choreo_proto::ClientMessageType;
 
 #[test]
 fn parses_empty_line() {
@@ -13,7 +13,7 @@ fn parses_ping() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/ping", &mut next),
-        Command::Send(ClientMessage::Ping)
+        Command::Send(ClientMessageType::Ping)
     );
     assert_eq!(next, 3);
 }
@@ -23,7 +23,7 @@ fn parses_cancel() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/cancel 42", &mut next),
-        Command::Send(ClientMessage::Cancel { request_id: 42 })
+        Command::Send(ClientMessageType::Cancel { stream_id: 42 })
     );
     assert_eq!(next, 3);
 }
@@ -99,7 +99,7 @@ fn model_set() {
     let mut next = 10;
     assert_eq!(
         parse_input_line("/model gpt-5.4-nano", &mut next),
-        Command::Send(ClientMessage::SetModel {
+        Command::Send(ClientMessageType::SetModel {
             model: "gpt-5.4-nano".to_string(),
         })
     );
@@ -132,7 +132,7 @@ fn session_info_parses_id() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/session info 7", &mut next),
-        Command::Send(ClientMessage::GetSessionState { session_id: 7 })
+        Command::Send(ClientMessageType::GetSessionState { session_id: 7 })
     );
     assert_eq!(next, 3);
 }
@@ -152,7 +152,7 @@ fn session_list() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/session list", &mut next),
-        Command::Send(ClientMessage::ListSessions)
+        Command::Send(ClientMessageType::ListSessions)
     );
     assert_eq!(next, 3);
 }
@@ -162,7 +162,7 @@ fn session_new_with_title() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/session new my title", &mut next),
-        Command::Send(ClientMessage::CreateSession {
+        Command::Send(ClientMessageType::CreateSession {
             title: Some("my title".to_string()),
             parent_session_id: None,
             working_dir: None,
@@ -180,7 +180,7 @@ fn session_new_without_title() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/session new", &mut next),
-        Command::Send(ClientMessage::CreateSession {
+        Command::Send(ClientMessageType::CreateSession {
             title: None,
             parent_session_id: None,
             working_dir: None,
@@ -198,7 +198,7 @@ fn session_switch() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/session switch 5", &mut next),
-        Command::Send(ClientMessage::AttachSession { session_id: 5 })
+        Command::Send(ClientMessageType::AttachSession { session_id: 5 })
     );
     assert_eq!(next, 3);
 }
@@ -209,7 +209,7 @@ fn new_without_title() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/new", &mut next),
-        Command::Send(ClientMessage::CreateSession {
+        Command::Send(ClientMessageType::CreateSession {
             title: None,
             parent_session_id: None,
             working_dir: None,
@@ -227,7 +227,7 @@ fn new_with_title() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/new my title", &mut next),
-        Command::Send(ClientMessage::CreateSession {
+        Command::Send(ClientMessageType::CreateSession {
             title: Some("my title".to_string()),
             parent_session_id: None,
             working_dir: None,
@@ -480,8 +480,8 @@ fn parses_run_input_and_increments_request_id() {
     let mut next = 10;
     assert_eq!(
         parse_input_line("hello world", &mut next),
-        Command::Send(ClientMessage::RunInput {
-            request_id: 10,
+        Command::Send(ClientMessageType::RunInput {
+            stream_id: 10,
             input: b"hello world".to_vec(),
         })
     );
@@ -495,7 +495,7 @@ fn account_list() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/account list", &mut next),
-        Command::Send(ClientMessage::ListAccounts)
+        Command::Send(ClientMessageType::ListAccounts)
     );
     assert_eq!(next, 3);
 }
@@ -515,7 +515,7 @@ fn account_remove() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/account remove my-provider", &mut next),
-        Command::Send(ClientMessage::RemoveAccount {
+        Command::Send(ClientMessageType::RemoveAccount {
             name: "my-provider".to_string()
         })
     );
@@ -537,7 +537,7 @@ fn account_set_valid_name() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/account my-account", &mut next),
-        Command::Send(ClientMessage::SetSessionAccount {
+        Command::Send(ClientMessageType::SetSessionAccount {
             name: "my-account".to_string()
         })
     );
@@ -571,7 +571,7 @@ fn reasoning_set_off() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/reasoning off", &mut next),
-        Command::Send(ClientMessage::SetReasoningEffort {
+        Command::Send(ClientMessageType::SetReasoningEffort {
             effort: "off".to_string()
         })
     );
@@ -583,7 +583,7 @@ fn reasoning_set_low() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/reasoning low", &mut next),
-        Command::Send(ClientMessage::SetReasoningEffort {
+        Command::Send(ClientMessageType::SetReasoningEffort {
             effort: "low".to_string()
         })
     );
@@ -595,7 +595,7 @@ fn reasoning_set_medium() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/reasoning medium", &mut next),
-        Command::Send(ClientMessage::SetReasoningEffort {
+        Command::Send(ClientMessageType::SetReasoningEffort {
             effort: "medium".to_string()
         })
     );
@@ -607,7 +607,7 @@ fn reasoning_set_high() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/reasoning high", &mut next),
-        Command::Send(ClientMessage::SetReasoningEffort {
+        Command::Send(ClientMessageType::SetReasoningEffort {
             effort: "high".to_string()
         })
     );
@@ -619,7 +619,7 @@ fn reasoning_set_none_alias() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/reasoning none", &mut next),
-        Command::Send(ClientMessage::SetReasoningEffort {
+        Command::Send(ClientMessageType::SetReasoningEffort {
             effort: "off".to_string()
         })
     );
@@ -631,7 +631,7 @@ fn reasoning_set_disabled_alias() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/reasoning disabled", &mut next),
-        Command::Send(ClientMessage::SetReasoningEffort {
+        Command::Send(ClientMessageType::SetReasoningEffort {
             effort: "off".to_string()
         })
     );
@@ -643,7 +643,7 @@ fn reasoning_set_med_alias() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/reasoning med", &mut next),
-        Command::Send(ClientMessage::SetReasoningEffort {
+        Command::Send(ClientMessageType::SetReasoningEffort {
             effort: "medium".to_string()
         })
     );
@@ -655,7 +655,7 @@ fn reasoning_set_on() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/reasoning on", &mut next),
-        Command::Send(ClientMessage::SetReasoningEffort {
+        Command::Send(ClientMessageType::SetReasoningEffort {
             effort: "on".to_string()
         })
     );
@@ -667,7 +667,7 @@ fn reasoning_unknown_slug_passes_through() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/reasoning turbo", &mut next),
-        Command::Send(ClientMessage::SetReasoningEffort {
+        Command::Send(ClientMessageType::SetReasoningEffort {
             effort: "turbo".to_string()
         })
     );
@@ -679,7 +679,7 @@ fn reasoning_max_slug_passes_through() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/reasoning max", &mut next),
-        Command::Send(ClientMessage::SetReasoningEffort {
+        Command::Send(ClientMessageType::SetReasoningEffort {
             effort: "max".to_string()
         })
     );

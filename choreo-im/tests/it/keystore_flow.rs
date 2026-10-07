@@ -21,7 +21,9 @@
 )]
 use choreo_client_core::KnownServers;
 use choreo_im::establish_keystore;
-use choreo_proto::{ClientMessage, DaemonMessage, read_message, write_message};
+use choreo_proto::{
+    ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, read_message, write_message,
+};
 use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 
@@ -72,8 +74,8 @@ fn socket_pair() -> (SocketHalves, SocketHalves) {
 /// Read one client message, asserting it is a `BindKeystore`, and return the
 /// presented key.
 fn expect_bind(client: &mut BufReader<UnixStream>) -> Vec<u8> {
-    match read_message::<_, ClientMessage>(client).unwrap() {
-        ClientMessage::BindKeystore { key } => key,
+    match read_message::<_, ClientMessage>(client).unwrap().inner {
+        ClientMessageType::BindKeystore { key } => key,
         other => panic!("expected BindKeystore, got {other:?}"),
     }
 }
@@ -102,7 +104,11 @@ fn unbound_daemon_auto_binds() {
         Some(key.try_into().unwrap())
     );
 
-    write_message(&mut d_writer, &DaemonMessage::Bound).unwrap();
+    write_message(
+        &mut d_writer,
+        &DaemonMessage::broadcast(DaemonMessageType::Bound),
+    )
+    .unwrap();
     flush(&mut d_writer);
 
     handle.join().unwrap().unwrap();
@@ -125,16 +131,19 @@ fn stored_key_unlock_then_auto_bind_mints_fresh_key() {
     let handle = run_client(_dir.path().to_path_buf(), reader, writer);
 
     // Stored key path: an Unlock arrives first.
-    match read_message::<_, ClientMessage>(&mut d_reader).unwrap() {
-        ClientMessage::Unlock { private_key } => assert_eq!(private_key, stored_key.to_vec()),
+    match read_message::<_, ClientMessage>(&mut d_reader)
+        .unwrap()
+        .inner
+    {
+        ClientMessageType::Unlock { private_key } => assert_eq!(private_key, stored_key.to_vec()),
         other => panic!("expected Unlock, got {other:?}"),
     }
     // Stored verify key can never create a binding → daemon answers unbound.
     write_message(
         &mut d_writer,
-        &DaemonMessage::KeystoreUnbound {
+        &DaemonMessage::broadcast(DaemonMessageType::KeystoreUnbound {
             error: "no binding".to_string(),
-        },
+        }),
     )
     .unwrap();
     flush(&mut d_writer);
@@ -149,7 +158,11 @@ fn stored_key_unlock_then_auto_bind_mints_fresh_key() {
         Some(bind_key.try_into().unwrap())
     );
 
-    write_message(&mut d_writer, &DaemonMessage::Bound).unwrap();
+    write_message(
+        &mut d_writer,
+        &DaemonMessage::broadcast(DaemonMessageType::Bound),
+    )
+    .unwrap();
     flush(&mut d_writer);
 
     handle.join().unwrap().unwrap();
@@ -169,9 +182,9 @@ fn probe_against_bound_daemon_falls_through() {
     expect_bind(&mut d_reader);
     write_message(
         &mut d_writer,
-        &DaemonMessage::LockedError {
+        &DaemonMessage::broadcast(DaemonMessageType::LockedError {
             error: "already bound".to_string(),
-        },
+        }),
     )
     .unwrap();
     flush(&mut d_writer);
@@ -195,14 +208,16 @@ fn unlock_rejected_yields_repair_guidance() {
     let handle = run_client(_dir.path().to_path_buf(), reader, writer);
 
     assert!(matches!(
-        read_message::<_, ClientMessage>(&mut d_reader).unwrap(),
-        ClientMessage::Unlock { .. }
+        read_message::<_, ClientMessage>(&mut d_reader)
+            .unwrap()
+            .inner,
+        ClientMessageType::Unlock { .. }
     ));
     write_message(
         &mut d_writer,
-        &DaemonMessage::LockedError {
+        &DaemonMessage::broadcast(DaemonMessageType::LockedError {
             error: "wrong key".to_string(),
-        },
+        }),
     )
     .unwrap();
     flush(&mut d_writer);
@@ -224,9 +239,9 @@ fn bind_rejected_against_unbound_daemon_is_err() {
     expect_bind(&mut d_reader);
     write_message(
         &mut d_writer,
-        &DaemonMessage::KeystoreUnbound {
+        &DaemonMessage::broadcast(DaemonMessageType::KeystoreUnbound {
             error: "still unbound".to_string(),
-        },
+        }),
     )
     .unwrap();
     flush(&mut d_writer);

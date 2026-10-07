@@ -124,7 +124,7 @@ pub struct IosToolRequest {
     /// Monotonically increasing per-bridge id; echoed by
     /// `choreo_ios_tool_cancel` for Swift-side best-effort cancel and useful
     /// for correlating traces across the boundary.
-    pub request_id: u64,
+    pub stream_id: u64,
     /// Tool name (`&'static str` at the call sites — the `Tool` trait's
     /// `name()` — carried as `String` so the envelope is owned/serializable).
     pub name: String,
@@ -139,16 +139,16 @@ pub type ToolBridgeReply = Result<serde_json::Value, ToolBridgeError>;
 /// Swift-side cancel), the reply channel (for a blocking `wait`), and
 /// `cancel()`.
 // No derived Debug: the boxed cancel hook is not Debug, and a manual impl
-// would gain nothing (the interesting fields are `request_id` + the reply
+// would gain nothing (the interesting fields are `stream_id` + the reply
 // channel, which callers log directly).
 pub struct IosToolPending {
     /// Assigned by the bridge at dispatch time (see the id counter per impl).
-    pub request_id: u64,
+    pub stream_id: u64,
     /// One-shot reply channel: exactly one value ever arrives, or the sender
     /// is dropped and `wait` reports [`ToolBridgeError::BridgeUnavailable`].
     pub reply_rx: Receiver<ToolBridgeReply>,
     /// Best-effort cancel hook, supplied by the concrete bridge at dispatch:
-    /// for the Swift bridge it calls `choreo_ios_tool_cancel(request_id)`;
+    /// for the Swift bridge it calls `choreo_ios_tool_cancel(stream_id)`;
     /// for [`MockBridge`] it just records the cancel. `Option` because a
     /// bridge may have no cancel path (e.g. the request already completed).
     cancel: Option<Box<dyn FnOnce() + Send>>,
@@ -160,12 +160,12 @@ impl IosToolPending {
     /// inaccessible afterwards (cancel is exclusively via `cancel(self)`).
     #[must_use]
     pub fn new(
-        request_id: u64,
+        stream_id: u64,
         reply_rx: Receiver<ToolBridgeReply>,
         cancel: Box<dyn FnOnce() + Send>,
     ) -> Self {
         Self {
-            request_id,
+            stream_id,
             reply_rx,
             cancel: Some(cancel),
         }
@@ -334,9 +334,9 @@ impl MockBridge {
 
 impl IosToolBridge for MockBridge {
     fn dispatch(&self, request: IosToolRequest) -> Result<IosToolPending, ToolBridgeError> {
-        let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let stream_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request = IosToolRequest {
-            request_id,
+            stream_id,
             ..request
         };
         self.dispatched
@@ -360,7 +360,7 @@ impl IosToolBridge for MockBridge {
             MockResponse::DropSender => { /* tx drops disconnected → BridgeUnavailable */ }
         }
         Ok(IosToolPending::new(
-            request_id,
+            stream_id,
             rx,
             Box::new({
                 // Cloned Arc, not a borrow: the closure outlives this
@@ -370,7 +370,7 @@ impl IosToolBridge for MockBridge {
                     cancels
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(request_id);
+                        .push(stream_id);
                 }
             }),
         ))
@@ -389,7 +389,7 @@ mod tests {
 
     fn request() -> IosToolRequest {
         IosToolRequest {
-            request_id: 0, // reassigned by dispatch
+            stream_id: 0, // reassigned by dispatch
             name: "clipboard_write".to_string(),
             args_json: r#"{"text":"hello"}"#.to_string(),
         }
@@ -426,16 +426,16 @@ mod tests {
         let m = mock();
         m.script(MockResponse::Reply(Ok(serde_json::json!({"ok": true}))));
         let pending = m.dispatch(request()).unwrap();
-        assert_eq!(pending.request_id, 0);
+        assert_eq!(pending.stream_id, 0);
         let value = pending.wait(CLIPBOARD_TIMEOUT, &|| false).unwrap();
         assert_eq!(value, serde_json::json!({"ok": true}));
         let dispatched = m.dispatched();
         assert_eq!(dispatched.len(), 1);
         assert_eq!(dispatched[0].name, "clipboard_write");
-        assert_eq!(dispatched[0].request_id, 0);
+        assert_eq!(dispatched[0].stream_id, 0);
         // Ids increase across dispatches.
         let p2 = m.dispatch(request()).unwrap();
-        assert_eq!(p2.request_id, 1);
+        assert_eq!(p2.stream_id, 1);
     }
 
     #[test]
@@ -515,7 +515,7 @@ mod tests {
     fn cancel_hook_records_request_id() {
         let m = mock();
         let pending = m.dispatch(request()).unwrap();
-        let id = pending.request_id;
+        let id = pending.stream_id;
         pending.cancel();
         assert_eq!(m.cancels(), vec![id]);
     }

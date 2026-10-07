@@ -1,5 +1,7 @@
 use choreo_daemon::run_server;
-use choreo_proto::{ClientMessage, DaemonMessage, read_message, write_message};
+use choreo_proto::{
+    ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, read_message, write_message,
+};
 use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::thread;
@@ -72,11 +74,15 @@ fn server_accepts_ping_and_shuts_down_on_signal() {
     let mut reader = BufReader::new(client.try_clone().expect("clone for reader"));
     let mut writer = BufWriter::new(client);
 
-    write_message(&mut writer, &ClientMessage::Ping).expect("write Ping");
+    write_message(
+        &mut writer,
+        &ClientMessage::request(0, ClientMessageType::Ping),
+    )
+    .expect("write Ping");
     writer.flush().expect("flush Ping");
 
     let response: DaemonMessage = read_message(&mut reader).expect("read response");
-    assert_eq!(response, DaemonMessage::Pong);
+    assert_eq!(response.inner, DaemonMessageType::Pong);
 
     // Trigger graceful shutdown by sending SIGINT.
     // The signal handler thread sets the shutdown flag and self-connects

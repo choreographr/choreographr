@@ -1,16 +1,16 @@
 use crate::client::run_client;
 use crate::state::UiEvent;
-use choreo_proto::ClientMessage;
+use choreo_proto::ClientMessageType;
 use dioxus::prelude::*;
 use futures_channel::mpsc::{self, UnboundedReceiver};
 
 type DaemonConnection = (
-    Signal<Option<crossbeam_channel::Sender<ClientMessage>>>,
+    Signal<Option<crossbeam_channel::Sender<ClientMessageType>>>,
     Signal<Option<UnboundedReceiver<UiEvent>>>,
 );
 
 pub(crate) fn use_daemon_connection() -> DaemonConnection {
-    let mut daemon_tx = use_signal(|| None::<crossbeam_channel::Sender<ClientMessage>>);
+    let mut daemon_tx = use_signal(|| None::<crossbeam_channel::Sender<ClientMessageType>>);
     let mut events_rx = use_signal(|| None::<UnboundedReceiver<UiEvent>>);
 
     // Read the global connection mode set from CLI args in main().
@@ -25,9 +25,9 @@ pub(crate) fn use_daemon_connection() -> DaemonConnection {
     // so these queue in the unbounded channel — there is no handshake window
     // to race, same as the socket transports.
     use_hook(move || {
-        let (client_tx, client_rx) = crossbeam_channel::unbounded::<ClientMessage>();
+        let (client_tx, client_rx) = crossbeam_channel::unbounded::<ClientMessageType>();
         let (ui_tx, ui_rx) = mpsc::unbounded::<UiEvent>();
-        if let Err(e) = client_tx.send(ClientMessage::ListSessions) {
+        if let Err(e) = client_tx.send(ClientMessageType::ListSessions) {
             tracing::error!("failed to send ListSessions: {e}");
         }
         // The GUI keeps its session list live via daemon push broadcasts
@@ -35,7 +35,7 @@ pub(crate) fn use_daemon_connection() -> DaemonConnection {
         // no longer auto-registers TCP clients as summary subscribers, so the
         // GUI must opt in explicitly at connect — same as the TUI does on the
         // Unix path.
-        if let Err(e) = client_tx.send(ClientMessage::SubscribeSessionsSummary) {
+        if let Err(e) = client_tx.send(ClientMessageType::SubscribeSessionsSummary) {
             tracing::error!("failed to send SubscribeSessionsSummary: {e}");
         }
         // Connect-time keystore bootstrap (mirrors choreo-im's
@@ -51,7 +51,7 @@ pub(crate) fn use_daemon_connection() -> DaemonConnection {
         let keystore_addr = crate::client::connection_addr();
         match choreo_client_core::try_auto_unlock_key(&keystore_addr) {
             Some(private_key) => {
-                if let Err(e) = client_tx.send(ClientMessage::Unlock { private_key }) {
+                if let Err(e) = client_tx.send(ClientMessageType::Unlock { private_key }) {
                     tracing::error!("failed to send Unlock: {e}");
                 }
             }

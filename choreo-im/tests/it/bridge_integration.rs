@@ -10,8 +10,8 @@
 )]
 use choreo_im::bridge::{BridgeEvent, DaemonBridge};
 use choreo_proto::{
-    ClientMessage, DaemonMessage, OutputStream, SessionEvent, SessionStatus, SessionSummary,
-    read_message, write_message,
+    ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, OutputStream, SessionEvent,
+    SessionStatus, SessionSummary, read_message, write_message,
 };
 use std::io::{BufReader, BufWriter};
 use std::os::unix::net::UnixStream;
@@ -47,15 +47,18 @@ fn summary(session_id: u64, parent_session_id: Option<u64>) -> SessionSummary {
     }
 }
 
-/// The bridge now sends `ClientMessage::SubscribeSessionsSummary` and then
-/// `ClientMessage::ListSessions` at startup (to pick a session to attach).
+/// The bridge now sends `ClientMessageType::SubscribeSessionsSummary` and then
+/// `ClientMessageType::ListSessions` at startup (to pick a session to attach).
 /// Tests that read the bridge's outgoing wire must consume that two-message
 /// handshake before their own messages.
 fn consume_startup_handshake(reader: &mut BufReader<UnixStream>) {
     let first = read_message::<_, ClientMessage>(reader).unwrap();
-    assert!(matches!(first, ClientMessage::SubscribeSessionsSummary));
+    assert!(matches!(
+        first.inner,
+        ClientMessageType::SubscribeSessionsSummary
+    ));
     let second = read_message::<_, ClientMessage>(reader).unwrap();
-    assert!(matches!(second, ClientMessage::ListSessions));
+    assert!(matches!(second.inner, ClientMessageType::ListSessions));
 }
 
 #[ignore = "integration"]
@@ -64,13 +67,17 @@ fn bridge_ping_pong() {
     let (bridge, mut daemon_reader, mut daemon_writer) = connected_bridge();
     let (tx, rx) = bridge.into_parts();
 
-    tx.send(ClientMessage::Ping).unwrap();
+    tx.send(ClientMessageType::Ping).unwrap();
 
     consume_startup_handshake(&mut daemon_reader);
     let msg = read_message::<_, ClientMessage>(&mut daemon_reader).unwrap();
-    assert!(matches!(msg, ClientMessage::Ping));
+    assert!(matches!(msg.inner, ClientMessageType::Ping));
 
-    write_message(&mut daemon_writer, &DaemonMessage::Pong).unwrap();
+    write_message(
+        &mut daemon_writer,
+        &DaemonMessage::broadcast(DaemonMessageType::Pong),
+    )
+    .unwrap();
     use std::io::Write;
     let _ = daemon_writer.flush();
 
@@ -84,16 +91,20 @@ fn bridge_unlock_locked() {
     let (bridge, mut daemon_reader, mut daemon_writer) = connected_bridge();
     let (tx, rx) = bridge.into_parts();
 
-    tx.send(ClientMessage::Unlock {
+    tx.send(ClientMessageType::Unlock {
         private_key: vec![0u8; 32],
     })
     .unwrap();
 
     consume_startup_handshake(&mut daemon_reader);
     let msg = read_message::<_, ClientMessage>(&mut daemon_reader).unwrap();
-    assert!(matches!(msg, ClientMessage::Unlock { .. }));
+    assert!(matches!(msg.inner, ClientMessageType::Unlock { .. }));
 
-    write_message(&mut daemon_writer, &DaemonMessage::Unlocked).unwrap();
+    write_message(
+        &mut daemon_writer,
+        &DaemonMessage::broadcast(DaemonMessageType::Unlocked),
+    )
+    .unwrap();
     use std::io::Write;
     let _ = daemon_writer.flush();
 
@@ -109,40 +120,40 @@ fn bridge_text_streaming() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::Session {
+        &DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::OutputChunk {
-                request_id: 1,
+                stream_id: 1,
                 stream: OutputStream::Answer,
                 data: b"hello ".to_vec(),
             },
-        },
+        }),
     )
     .unwrap();
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::Session {
+        &DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::OutputChunk {
-                request_id: 1,
+                stream_id: 1,
                 stream: OutputStream::Answer,
                 data: b"world".to_vec(),
             },
-        },
+        }),
     )
     .unwrap();
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::Session {
+        &DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::Done {
-                request_id: 1,
+                stream_id: 1,
                 token_usage: None,
                 last_prompt_tokens: None,
             },
-        },
+        }),
     )
     .unwrap();
     use std::io::Write;
@@ -160,16 +171,16 @@ fn bridge_tool_call_events() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::Session {
+        &DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::ToolCallStarted {
-                request_id: 1,
+                stream_id: 1,
                 call_id: "call_1".into(),
                 tool_name: "read_file".into(),
                 arguments_json: r#"{"path":"/tmp"}"#.into(),
                 invocation_description: String::new(),
             },
-        },
+        }),
     )
     .unwrap();
     use std::io::Write;
@@ -183,26 +194,26 @@ fn bridge_tool_call_events() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::Session {
+        &DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::ToolResultChunk {
-                request_id: 1,
+                stream_id: 1,
                 call_id: "call_1".into(),
                 data: b"file contents".to_vec(),
             },
-        },
+        }),
     )
     .unwrap();
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::Session {
+        &DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::ToolCallFinished {
-                request_id: 1,
+                stream_id: 1,
                 call_id: "call_1".into(),
                 tool_name: "read_file".into(),
             },
-        },
+        }),
     )
     .unwrap();
     let _ = daemon_writer.flush();
@@ -222,15 +233,15 @@ fn bridge_tool_call_failed() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::Session {
+        &DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::ToolCallFailed {
-                request_id: 1,
+                stream_id: 1,
                 call_id: "call_1".into(),
                 tool_name: "read_file".into(),
                 error: "permission denied".into(),
             },
-        },
+        }),
     )
     .unwrap();
     use std::io::Write;
@@ -274,10 +285,10 @@ fn bridge_turn_images() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::Session {
+        &DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::TurnAppended { turn_id: 1, turn },
-        },
+        }),
     )
     .unwrap();
     use std::io::Write;
@@ -301,9 +312,9 @@ fn bridge_attaches_on_sessions_reply() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::Sessions {
+        &DaemonMessage::broadcast(DaemonMessageType::Sessions {
             sessions: vec![summary(5, Some(9)), summary(42, None)],
-        },
+        }),
     )
     .unwrap();
     use std::io::Write;
@@ -312,7 +323,10 @@ fn bridge_attaches_on_sessions_reply() {
     // The bridge must attach to the first TOP-LEVEL session (42), not the
     // sub-session listed first.
     let msg = read_message::<_, ClientMessage>(&mut daemon_reader).unwrap();
-    assert_eq!(msg, ClientMessage::AttachSession { session_id: 42 });
+    assert_eq!(
+        msg.inner,
+        ClientMessageType::AttachSession { session_id: 42 }
+    );
 }
 
 #[ignore = "integration"]
@@ -329,7 +343,7 @@ fn bridge_attaches_on_session_created_after_empty_list() {
     // Empty list: nothing to attach to yet.
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::Sessions { sessions: vec![] },
+        &DaemonMessage::broadcast(DaemonMessageType::Sessions { sessions: vec![] }),
     )
     .unwrap();
     use std::io::Write;
@@ -338,7 +352,7 @@ fn bridge_attaches_on_session_created_after_empty_list() {
     // A top-level session is created afterwards.
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::Session {
+        &DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(7),
             event: SessionEvent::SessionCreated {
                 title: None,
@@ -348,13 +362,16 @@ fn bridge_attaches_on_session_created_after_empty_list() {
                 selected_model: None,
                 reasoning_effort: None,
             },
-        },
+        }),
     )
     .unwrap();
     let _ = daemon_writer.flush();
 
     let msg = read_message::<_, ClientMessage>(&mut daemon_reader).unwrap();
-    assert_eq!(msg, ClientMessage::AttachSession { session_id: 7 });
+    assert_eq!(
+        msg.inner,
+        ClientMessageType::AttachSession { session_id: 7 }
+    );
 }
 
 #[ignore = "integration"]
@@ -365,13 +382,13 @@ fn bridge_error_variants() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::Session {
+        &DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::Failed {
-                request_id: 1,
+                stream_id: 1,
                 error: "something went wrong".into(),
             },
-        },
+        }),
     )
     .unwrap();
     use std::io::Write;
@@ -382,9 +399,9 @@ fn bridge_error_variants() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::LockedError {
+        &DaemonMessage::broadcast(DaemonMessageType::LockedError {
             error: "already locked".into(),
-        },
+        }),
     )
     .unwrap();
     let _ = daemon_writer.flush();
@@ -401,10 +418,10 @@ fn bridge_models() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::Models {
+        &DaemonMessage::broadcast(DaemonMessageType::Models {
             models: vec!["gpt-4".into()],
             selected_model: Some("gpt-4".into()),
-        },
+        }),
     )
     .unwrap();
     use std::io::Write;
@@ -421,13 +438,13 @@ fn bridge_models() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::Session {
+        &DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::ModelSelected {
                 model: "claude".into(),
                 reasoning_capability: None,
             },
-        },
+        }),
     )
     .unwrap();
     let _ = daemon_writer.flush();
@@ -444,23 +461,23 @@ fn bridge_cancelled_clears_buffer() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::Session {
+        &DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::OutputChunk {
-                request_id: 42,
+                stream_id: 42,
                 stream: OutputStream::Answer,
                 data: b"buffered data".to_vec(),
             },
-        },
+        }),
     )
     .unwrap();
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::Session {
+        &DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
-            event: SessionEvent::Cancelled { request_id: 42 },
-        },
+            event: SessionEvent::Cancelled { stream_id: 42 },
+        }),
     )
     .unwrap();
     use std::io::Write;

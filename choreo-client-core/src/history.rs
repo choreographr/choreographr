@@ -2,7 +2,7 @@
 //!
 //! [`SessionView`] holds the turn history a front-end renders and routes the
 //! daemon's streaming events (`OutputChunk`, tool-result chunks, …) into the
-//! right turn. It owns the `turn_id → Turn` and `request_id → turn_id`
+//! right turn. It owns the `turn_id → Turn` and `stream_id → turn_id`
 //! mappings plus a bounded stash of tool-call descriptions, so the TUI/GUI
 //! need not track that correlation themselves.
 
@@ -57,15 +57,15 @@ fn push_capped(content: &mut String, data: &str) {
 
 /// Client-side view of a session's turn history.
 ///
-/// Maps `turn_id → Turn` (ordered) and `request_id → turn_id` for
+/// Maps `turn_id → Turn` (ordered) and `stream_id → turn_id` for
 /// routing streaming chunks during an active agent loop.
 #[derive(Debug, Clone)]
 pub struct SessionView {
     /// `turn_id` → Turn. Ordered by key (monotonically assigned by daemon).
     pub turns: BTreeMap<u32, Turn>,
-    /// `request_id` → `turn_id` for streaming chunk routing.
+    /// `stream_id` → `turn_id` for streaming chunk routing.
     /// Inserted on `Started`, removed on `Done`/`Failed`/`Cancelled`.
-    pub request_to_turn: HashMap<u32, u32>,
+    pub request_to_turn: HashMap<u64, u32>,
     /// `call_id` → invocation description for tool calls whose start event
     /// (`ToolCallStarted`) arrived before their first streaming chunk created
     /// a stub result.  The description rides on the start event (never on a
@@ -128,23 +128,23 @@ impl SessionView {
         self.turns.get_mut(&turn_id)
     }
 
-    /// The turn currently associated with the streaming `request_id`, if any.
+    /// The turn currently associated with the streaming `stream_id`, if any.
     #[must_use]
-    pub fn request_turn(&self, request_id: u32) -> Option<&Turn> {
-        let turn_id = self.request_to_turn.get(&request_id)?;
+    pub fn request_turn(&self, stream_id: u64) -> Option<&Turn> {
+        let turn_id = self.request_to_turn.get(&stream_id)?;
         self.turns.get(turn_id)
     }
 
-    /// The turn associated with `request_id`, mutable, if any.
-    pub fn request_turn_mut(&mut self, request_id: u32) -> Option<&mut Turn> {
-        let turn_id = self.request_to_turn.get(&request_id)?;
+    /// The turn associated with `stream_id`, mutable, if any.
+    pub fn request_turn_mut(&mut self, stream_id: u64) -> Option<&mut Turn> {
+        let turn_id = self.request_to_turn.get(&stream_id)?;
         self.turns.get_mut(turn_id)
     }
 
     /// Route streaming output to the current turn for this request.
-    pub fn stream_chunk(&mut self, request_id: u32, stream: &OutputStream, data: &str) {
-        let Some(&turn_id) = self.request_to_turn.get(&request_id) else {
-            tracing::warn!(%request_id, "stream_chunk: unknown request");
+    pub fn stream_chunk(&mut self, stream_id: u64, stream: &OutputStream, data: &str) {
+        let Some(&turn_id) = self.request_to_turn.get(&stream_id) else {
+            tracing::warn!(%stream_id, "stream_chunk: unknown request");
             return;
         };
         let Some(turn) = self.turns.get_mut(&turn_id) else {
@@ -178,14 +178,14 @@ impl SessionView {
     /// Route a tool call start notification.
     pub fn tool_call_started(
         &mut self,
-        request_id: u32,
+        stream_id: u64,
         call_id: String,
         name: String,
         args: String,
         invocation_description: &str,
     ) {
-        let Some(&turn_id) = self.request_to_turn.get(&request_id) else {
-            tracing::warn!(%request_id, "tool_call_started: unknown request");
+        let Some(&turn_id) = self.request_to_turn.get(&stream_id) else {
+            tracing::warn!(%stream_id, "tool_call_started: unknown request");
             return;
         };
         let Some(turn) = self.turns.get_mut(&turn_id) else {
@@ -230,9 +230,9 @@ impl SessionView {
 
     /// Route a tool result chunk — appends to the matching `ToolResultRecord`.
     /// Creates a stub record if the `ToolCallStarted` event hasn't arrived yet.
-    pub fn tool_result_chunk(&mut self, request_id: u32, call_id: &str, data: &str) {
-        let Some(&turn_id) = self.request_to_turn.get(&request_id) else {
-            tracing::warn!(%request_id, "tool_result_chunk: unknown request");
+    pub fn tool_result_chunk(&mut self, stream_id: u64, call_id: &str, data: &str) {
+        let Some(&turn_id) = self.request_to_turn.get(&stream_id) else {
+            tracing::warn!(%stream_id, "tool_result_chunk: unknown request");
             return;
         };
         let Some(turn) = self.turns.get_mut(&turn_id) else {

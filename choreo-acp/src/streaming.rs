@@ -9,7 +9,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use choreo_proto::{DaemonMessage, SessionEvent};
+use choreo_proto::{DaemonMessage, DaemonMessageType, SessionEvent};
 
 use crate::acp_jsonrpc::{ContentBlock, SessionUpdateParams, SessionUpdateVariant};
 
@@ -42,7 +42,7 @@ pub fn translate_message(
     // envelope (the origin `session_id` lives on the envelope, not on the
     // event). Unwrap it once; non-session messages — plain replies, control
     // messages — produce no ACP events here.
-    let DaemonMessage::Session { event, .. } = msg else {
+    let DaemonMessageType::Session { event, .. } = &msg.inner else {
         return None;
     };
     match event {
@@ -52,7 +52,7 @@ pub fn translate_message(
         // text content for the ACP protocol.
         // ------------------------------------------------------------------
         SessionEvent::OutputChunk {
-            request_id: _,
+            stream_id: _,
             stream: _,
             data,
             ..
@@ -73,7 +73,7 @@ pub fn translate_message(
         // and the call arguments as content.
         // ------------------------------------------------------------------
         SessionEvent::ToolCallStarted {
-            request_id: _,
+            stream_id: _,
             call_id,
             tool_name,
             arguments_json,
@@ -101,7 +101,7 @@ pub fn translate_message(
         // carries the opaque byte data that we surface as text.
         // ------------------------------------------------------------------
         SessionEvent::ToolResultChunk {
-            request_id: _,
+            stream_id: _,
             call_id,
             data,
             ..
@@ -121,7 +121,7 @@ pub fn translate_message(
         // Tool call finished → mark the tool call as "completed".
         // ------------------------------------------------------------------
         SessionEvent::ToolCallFinished {
-            request_id: _,
+            stream_id: _,
             call_id,
             ..
         } => Some(vec![SessionUpdateParams {
@@ -137,7 +137,7 @@ pub fn translate_message(
         // Tool call failed → mark the tool call as "failed" with the error.
         // ------------------------------------------------------------------
         SessionEvent::ToolCallFailed {
-            request_id: _,
+            stream_id: _,
             call_id,
             tool_name: _,
             error,
@@ -158,7 +158,7 @@ pub fn translate_message(
         // by a status update signalling completion.
         // ------------------------------------------------------------------
         SessionEvent::Done {
-            request_id: _,
+            stream_id: _,
             token_usage,
             ..
         } => {
@@ -241,68 +241,68 @@ mod tests {
     // -- Helpers to build daemon messages for testing -- //
 
     fn output_chunk(stream: choreo_proto::OutputStream, data: &str) -> DaemonMessage {
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::OutputChunk {
-                request_id: 1,
+                stream_id: 1,
                 stream,
                 data: data.as_bytes().to_vec(),
             },
-        }
+        })
     }
 
     fn tool_call_started(call_id: &str, tool_name: &str, args: &str) -> DaemonMessage {
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::ToolCallStarted {
-                request_id: 1,
+                stream_id: 1,
                 call_id: call_id.into(),
                 tool_name: tool_name.into(),
                 arguments_json: args.into(),
                 invocation_description: String::new(),
             },
-        }
+        })
     }
 
     fn tool_result_chunk(call_id: &str, data: &str) -> DaemonMessage {
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::ToolResultChunk {
-                request_id: 1,
+                stream_id: 1,
                 call_id: call_id.into(),
                 data: data.as_bytes().to_vec(),
             },
-        }
+        })
     }
 
     fn tool_call_finished(call_id: &str, tool_name: &str) -> DaemonMessage {
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::ToolCallFinished {
-                request_id: 1,
+                stream_id: 1,
                 call_id: call_id.into(),
                 tool_name: tool_name.into(),
             },
-        }
+        })
     }
 
     fn tool_call_failed(call_id: &str, tool_name: &str, error: &str) -> DaemonMessage {
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::ToolCallFailed {
-                request_id: 1,
+                stream_id: 1,
                 call_id: call_id.into(),
                 tool_name: tool_name.into(),
                 error: error.into(),
             },
-        }
+        })
     }
 
     fn done() -> DaemonMessage {
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::Done {
-                request_id: 1,
+                stream_id: 1,
                 token_usage: Some(choreo_proto::TokenUsage {
                     input_tokens: 10,
                     output_tokens: 20,
@@ -312,17 +312,17 @@ mod tests {
                 }),
                 last_prompt_tokens: None,
             },
-        }
+        })
     }
 
     fn failed() -> DaemonMessage {
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::Failed {
-                request_id: 1,
+                stream_id: 1,
                 error: "model refused".into(),
             },
-        }
+        })
     }
 
     // -- Tests -- //
@@ -469,14 +469,14 @@ mod tests {
 
     #[test]
     fn done_without_token_usage_omits_usage_update() {
-        let msg = DaemonMessage::Session {
+        let msg = DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::Done {
-                request_id: 1,
+                stream_id: 1,
                 token_usage: None,
                 last_prompt_tokens: None,
             },
-        };
+        });
         let result = translate_message(&msg, &sess()).unwrap();
         // Only the status update should be present.
         assert_eq!(result.len(), 1);
@@ -501,7 +501,7 @@ mod tests {
     #[test]
     fn non_streaming_message_returns_none() {
         let msgs = [
-            DaemonMessage::Session {
+            DaemonMessage::broadcast(DaemonMessageType::Session {
                 session_id: Some(1),
                 event: SessionEvent::SessionCreated {
                     title: None,
@@ -511,12 +511,12 @@ mod tests {
                     selected_model: None,
                     reasoning_effort: None,
                 },
-            },
-            DaemonMessage::Sessions { sessions: vec![] },
-            DaemonMessage::Models {
+            }),
+            DaemonMessage::broadcast(DaemonMessageType::Sessions { sessions: vec![] }),
+            DaemonMessage::broadcast(DaemonMessageType::Models {
                 models: vec![],
                 selected_model: None,
-            },
+            }),
         ];
         for msg in &msgs {
             assert!(

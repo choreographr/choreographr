@@ -12,8 +12,8 @@ use crate::selection::TextSelection;
 use choreo_client_core::dispatch::{SessionStateData, ToolCallEvent};
 use choreo_client_core::{ClientError, SessionView, TurnEventHandler, broken_pipe};
 use choreo_proto::{
-    AccountInfo, ClientMessage, OutputStream, ReasoningCapability, SessionStatus, SessionSummary,
-    TokenUsage, ToolResultRecord, Turn, socket_path,
+    AccountInfo, ClientMessageType, OutputStream, ReasoningCapability, SessionStatus,
+    SessionSummary, TokenUsage, ToolResultRecord, Turn, socket_path,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::Line;
@@ -307,7 +307,7 @@ pub(crate) struct SessionDisplayState {
     /// Incremental assistant-response render cache for the streaming fast path,
     /// keyed to [`Self::streaming_turn_index`] (see [`StreamingResponseCache`]).
     pub(crate) streaming_response: Option<StreamingResponseCache>,
-    pub(crate) active: HashSet<u32>,
+    pub(crate) active: HashSet<u64>,
     pub(crate) live_input_estimate: u32,
     pub(crate) live_output_tokens: u32,
     pub(crate) progress_dirty: bool,
@@ -376,14 +376,14 @@ impl Default for SessionDisplayState {
 
 pub(crate) struct App {
     pub(crate) input: InputBuffer,
-    pub(crate) next_request_id: u32,
+    pub(crate) next_request_id: u64,
     pub(crate) rendered_images: HashMap<u64, HashMap<u32, HashMap<ImageSlot, RenderedImage>>>,
     pub(crate) pending_job_idx: HashMap<ImageId, (u64, u32, ImageSlot)>,
     /// Images the render path wants fetched on demand (both displayed images and
     /// tool-result vision images have their bytes stripped from turn snapshots).
     /// Queued here — deduped via the per-image `fetching` flag — because the
     /// render path has no client sender; the UI loop drains this each iteration
-    /// and sends `ClientMessage::GetImage`.
+    /// and sends `ClientMessageType::GetImage`.
     pub(crate) pending_image_fetch: Vec<(u64, u32, ImageSlot)>,
     pub(crate) history_viewport: HistoryViewport,
     pub(crate) should_quit: bool,
@@ -1181,7 +1181,7 @@ impl App {
         account_name: Option<String>,
         selected_model: Option<String>,
         reasoning_effort: Option<String>,
-        client_tx: &crossbeam_channel::Sender<ClientMessage>,
+        client_tx: &crossbeam_channel::Sender<ClientMessageType>,
     ) -> Result<(), ClientError> {
         // Agent-spawned sub-sessions (parent_session_id = Some) are transient
         // tool artifacts, not sessions the user opened.  Navigating to one
@@ -1230,7 +1230,7 @@ impl App {
         // create from ANY page funnels through this handler.
         if self.page != Page::SessionManager {
             client_tx
-                .send(ClientMessage::ListSessions)
+                .send(ClientMessageType::ListSessions)
                 .map_err(broken_pipe)?;
         }
         // Shared attach sequence (also used by the Session Manager's Enter):
@@ -1261,7 +1261,7 @@ impl App {
         &mut self,
         session_id: u64,
         parent_session_id: Option<u64>,
-        client_tx: &crossbeam_channel::Sender<ClientMessage>,
+        client_tx: &crossbeam_channel::Sender<ClientMessageType>,
     ) {
         tracing::debug!(
             session_id,
@@ -1272,7 +1272,7 @@ impl App {
             // Best-effort refresh: a broken channel means the whole connection
             // is tearing down, and the reply renders into the session list
             // (never the status line), so there is nothing to propagate.
-            let _ = client_tx.send(ClientMessage::ListSessions);
+            let _ = client_tx.send(ClientMessageType::ListSessions);
         }
     }
 
@@ -1555,13 +1555,13 @@ impl App {
     pub(crate) fn attach_to_session(
         &mut self,
         session_id: u64,
-        client_tx: &crossbeam_channel::Sender<ClientMessage>,
+        client_tx: &crossbeam_channel::Sender<ClientMessageType>,
     ) -> Result<(), ClientError> {
         client_tx
-            .send(ClientMessage::UnsubscribeSessionsSummary)
+            .send(ClientMessageType::UnsubscribeSessionsSummary)
             .map_err(broken_pipe)?;
         client_tx
-            .send(ClientMessage::AttachSession { session_id })
+            .send(ClientMessageType::AttachSession { session_id })
             .map_err(broken_pipe)?;
         // Discard a command line BEFORE the input hand-off below: it is not a
         // prompt, so it must be dropped (not stashed as the outgoing session's
@@ -1600,7 +1600,7 @@ impl App {
         &mut self,
         finished_session_id: u64,
         parent_id: u64,
-        client_tx: &crossbeam_channel::Sender<ClientMessage>,
+        client_tx: &crossbeam_channel::Sender<ClientMessageType>,
     ) -> Result<(), ClientError> {
         // Titles come from the summary list — the same source that told us
         // the sub-session's parent — falling back to "untitled" exactly like
@@ -1632,7 +1632,7 @@ impl App {
     pub(crate) fn handle_sessions(
         &mut self,
         sessions: &[SessionSummary],
-        client_tx: &crossbeam_channel::Sender<ClientMessage>,
+        client_tx: &crossbeam_channel::Sender<ClientMessageType>,
     ) -> Result<(), ClientError> {
         self.session_mgr.set_sessions(sessions.to_vec());
         if self.page == Page::Chat {
@@ -1691,7 +1691,7 @@ impl App {
                     self.reset_for_session_switch(first.session_id);
                     self.attached_session_id = Some(first.session_id);
                     client_tx
-                        .send(ClientMessage::AttachSession {
+                        .send(ClientMessageType::AttachSession {
                             session_id: first.session_id,
                         })
                         .map_err(broken_pipe)?;
@@ -1708,7 +1708,7 @@ impl App {
                     // later (e.g. via `set_working_dir` or when attaching a
                     // session that already has one).
                     client_tx
-                        .send(ClientMessage::CreateSession {
+                        .send(ClientMessageType::CreateSession {
                             title: Some("default".to_string()),
                             parent_session_id: None,
                             working_dir: None,
@@ -2098,9 +2098,9 @@ impl SessionDisplayState {
         self.mark_content_changed();
     }
 
-    pub(crate) fn resolve_streaming_turn_index(&mut self, request_id: u32) {
+    pub(crate) fn resolve_streaming_turn_index(&mut self, stream_id: u64) {
         if self.streaming_turn_index.is_none()
-            && let Some(&turn_id) = self.view.request_to_turn.get(&request_id)
+            && let Some(&turn_id) = self.view.request_to_turn.get(&stream_id)
         {
             self.streaming_turn_index = self.visible_turn_ids.iter().position(|id| *id == turn_id);
         }
@@ -2496,20 +2496,20 @@ impl TurnEventHandler for App {
     fn handle_request_stream(
         &mut self,
         session_id: u64,
-        request_id: u32,
+        stream_id: u64,
         stream: OutputStream,
         data: Cow<'_, str>,
     ) {
         let display = self.display_for(session_id);
         // Detect the first Answer chunk for this request: the turn has no
         // response text yet, so this chunk begins the response phase.
-        let turn_id = display.view.request_to_turn.get(&request_id).copied();
+        let turn_id = display.view.request_to_turn.get(&stream_id).copied();
         let first_answer = matches!(stream, OutputStream::Answer)
             && turn_id
                 .and_then(|id| display.view.turns.get(&id))
                 .is_some_and(|t| t.assistant_text.is_none());
 
-        display.view.stream_chunk(request_id, &stream, &data);
+        display.view.stream_chunk(stream_id, &stream, &data);
 
         // The appended chunk changed the turn's rendered content: bump its
         // version so any rebuild (e.g. one triggered by an interleaved
@@ -2527,21 +2527,21 @@ impl TurnEventHandler for App {
             display.reasoning_override.remove(&turn_id);
         }
 
-        display.resolve_streaming_turn_index(request_id);
+        display.resolve_streaming_turn_index(stream_id);
         display.mark_streaming_changed();
     }
 
     fn handle_started(
         &mut self,
         session_id: u64,
-        request_id: u32,
+        stream_id: u64,
         turn_id: u32,
         estimated_prompt_tokens: u32,
     ) {
-        tracing::trace!(%request_id, %turn_id, %estimated_prompt_tokens, "handle_started");
+        tracing::trace!(%stream_id, %turn_id, %estimated_prompt_tokens, "handle_started");
         let display = self.display_for(session_id);
-        display.view.request_to_turn.insert(request_id, turn_id);
-        display.active.insert(request_id);
+        display.view.request_to_turn.insert(stream_id, turn_id);
+        display.active.insert(stream_id);
         display.live_input_estimate = estimated_prompt_tokens;
         display.live_output_tokens = 0;
         display.streaming_turn_index = display
@@ -2553,11 +2553,11 @@ impl TurnEventHandler for App {
     fn handle_done(
         &mut self,
         session_id: u64,
-        request_id: u32,
+        stream_id: u64,
         token_usage: Option<TokenUsage>,
         last_prompt_tokens: Option<u32>,
     ) {
-        tracing::trace!(%request_id, "handle_done");
+        tracing::trace!(%stream_id, "handle_done");
         // Done always arrives with `Some` (the session task knows its id), but
         // resolve defensively anyway so this choke point can never write to an
         // unintended display if a connection-level path is ever added.
@@ -2570,11 +2570,11 @@ impl TurnEventHandler for App {
         // the map would keep them — clear for this turn so the map stays
         // bounded by in-flight calls even when the terminal broadcast is
         // lost.  (Looked up before `request_to_turn` is removed.)
-        if let Some(&turn_id) = display.view.request_to_turn.get(&request_id) {
+        if let Some(&turn_id) = display.view.request_to_turn.get(&stream_id) {
             display.view.clear_tool_call_descriptions(turn_id);
         }
-        display.view.request_to_turn.remove(&request_id);
-        display.active.remove(&request_id);
+        display.view.request_to_turn.remove(&stream_id);
+        display.active.remove(&stream_id);
         if let Some(usage) = token_usage {
             display.token_usage = Some(usage);
             if last_prompt_tokens.is_none() {
@@ -2593,8 +2593,8 @@ impl TurnEventHandler for App {
         display.mark_content_changed();
     }
 
-    fn handle_failed(&mut self, session_id: Option<u64>, request_id: u32, error: String) {
-        tracing::trace!(%request_id, %error, "handle_failed");
+    fn handle_failed(&mut self, session_id: Option<u64>, stream_id: u64, error: String) {
+        tracing::trace!(%stream_id, %error, "handle_failed");
         // A connection-level failure (e.g. "no session attached" from
         // RunInput/SetModel/SetReasoningEffort) arrives with `session_id:
         // None` — no origin session — meaning "the attached session".  Resolve
@@ -2602,7 +2602,7 @@ impl TurnEventHandler for App {
         // to rather than a phantom display.
         let is_connection_level = session_id.is_none();
         let Some(session_id) = self.resolve_daemon_session(session_id) else {
-            tracing::debug!(%request_id, %error, "dropping failure: no attached session to route the connection-level failure to");
+            tracing::debug!(%stream_id, %error, "dropping failure: no attached session to route the connection-level failure to");
             // No display to update, but a connection-level rejection (e.g.
             // "no session attached") is exactly what the user needs to see
             // on the status line.
@@ -2629,17 +2629,17 @@ impl TurnEventHandler for App {
         // won't clean the description map — clear it here (before the
         // request→turn mapping is removed) to keep the map bounded by
         // in-flight calls even on the failure path.
-        if let Some(&turn_id) = display.view.request_to_turn.get(&request_id) {
+        if let Some(&turn_id) = display.view.request_to_turn.get(&stream_id) {
             display.view.clear_tool_call_descriptions(turn_id);
         }
-        display.view.request_to_turn.remove(&request_id);
-        display.active.remove(&request_id);
+        display.view.request_to_turn.remove(&stream_id);
+        display.active.remove(&stream_id);
         display.streaming_turn_index = None;
         display.streaming_response = None;
         display.mark_content_changed();
     }
 
-    fn handle_tool_call_event(&mut self, session_id: u64, request_id: u32, event: ToolCallEvent) {
+    fn handle_tool_call_event(&mut self, session_id: u64, stream_id: u64, event: ToolCallEvent) {
         let display = self.display_for(session_id);
         match event {
             ToolCallEvent::Started {
@@ -2652,9 +2652,9 @@ impl TurnEventHandler for App {
                 // can target the right turn (the start event may backfill the
                 // stub's name/description — both visible in the rendered
                 // header).
-                let turn_id = display.view.request_to_turn.get(&request_id).copied();
+                let turn_id = display.view.request_to_turn.get(&stream_id).copied();
                 display.view.tool_call_started(
-                    request_id,
+                    stream_id,
                     call_id,
                     tool_name,
                     arguments_json,
@@ -2663,7 +2663,7 @@ impl TurnEventHandler for App {
                 if let Some(turn_id) = turn_id {
                     display.bump_turn_version(turn_id);
                 }
-                display.resolve_streaming_turn_index(request_id);
+                display.resolve_streaming_turn_index(stream_id);
                 display.mark_streaming_changed();
             }
             ToolCallEvent::Finished { .. } => {}
@@ -2674,7 +2674,7 @@ impl TurnEventHandler for App {
     fn handle_tool_result_chunk(
         &mut self,
         session_id: u64,
-        request_id: u32,
+        stream_id: u64,
         call_id: String,
         data: Vec<u8>,
     ) {
@@ -2684,12 +2684,12 @@ impl TurnEventHandler for App {
         // live); bump the turn's content version so a rebuild between chunks
         // recomputes instead of reusing the pre-chunk cached lines — the
         // core fix for "scrollbar moves but results stay stuck".
-        let turn_id = display.view.request_to_turn.get(&request_id).copied();
-        display.view.tool_result_chunk(request_id, &call_id, &text);
+        let turn_id = display.view.request_to_turn.get(&stream_id).copied();
+        display.view.tool_result_chunk(stream_id, &call_id, &text);
         if let Some(turn_id) = turn_id {
             display.bump_turn_version(turn_id);
         }
-        display.resolve_streaming_turn_index(request_id);
+        display.resolve_streaming_turn_index(stream_id);
         display.mark_streaming_changed();
     }
 

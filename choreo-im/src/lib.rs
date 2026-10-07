@@ -24,7 +24,10 @@
 #![warn(missing_docs)]
 
 use anyhow::{Context, bail};
-use choreo_proto::{ClientMessage, DaemonMessage, read_message, socket_path, write_message};
+use choreo_proto::{
+    ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, read_message, socket_path,
+    write_message,
+};
 use choreo_shared::clap_styles;
 use choreo_shared::logging::{LoggingConfig, Verbosity};
 use clap::Parser;
@@ -108,23 +111,26 @@ pub fn main() -> anyhow::Result<()> {
     info!(%platform, "requesting credential from daemon");
     write_message(
         &mut writer,
-        &ClientMessage::GetCredential {
-            service: platform.clone(),
-        },
+        &ClientMessage::request(
+            0,
+            ClientMessageType::GetCredential {
+                service: platform.clone(),
+            },
+        ),
     )
     .context("failed to send credential request")?;
     writer
         .flush()
         .context("failed to flush credential request")?;
-    match read_message::<_, DaemonMessage>(&mut reader) {
-        Ok(DaemonMessage::Credential {
+    match read_message::<_, DaemonMessage>(&mut reader).map(|m| m.inner) {
+        Ok(DaemonMessageType::Credential {
             key: Some(bot_token),
             ..
         }) => {
             info!(%platform, "got credential, starting platform bridge");
             run_platform(&platform, bot_token, reader, writer).context("platform bridge failed")?;
         }
-        Ok(DaemonMessage::Credential { key: None, .. }) => {
+        Ok(DaemonMessageType::Credential { key: None, .. }) => {
             bail!(
                 "daemon keystore is locked (or unbound with no client key), or no '{platform}' \
                  credential found — unlock it via the TUI (/unlock); a fresh (unbound) daemon \
@@ -197,33 +203,37 @@ pub fn establish_keystore<R: std::io::Read, W: std::io::Write>(
     // recording cannot clobber a key that does not resolve anyway.
     if let Some(private_key) = choreo_client_core::try_auto_unlock_key(addr) {
         info!("unlocking daemon with stored unlock key");
-        write_message(writer, &ClientMessage::Unlock { private_key })
-            .context("failed to send unlock message")?;
+        write_message(
+            writer,
+            &ClientMessage::request(0, ClientMessageType::Unlock { private_key }),
+        )
+        .context("failed to send unlock message")?;
         writer.flush().context("failed to flush unlock message")?;
-        match read_message::<_, DaemonMessage>(&mut *reader) {
-            Ok(DaemonMessage::Unlocked) => {
+        match read_message::<_, DaemonMessage>(&mut *reader).map(|m| m.inner) {
+            Ok(DaemonMessageType::Unlocked) => {
                 info!("daemon unlocked");
             }
-            Ok(DaemonMessage::KeystoreUnbound { error }) => {
+            Ok(DaemonMessageType::KeystoreUnbound { error }) => {
                 // Unbound daemon: the stored key was a verify attempt that
                 // cannot succeed. Mint a fresh binding key and send it.
                 info!(%error, "daemon keystore unbound — auto-binding with a fresh key");
                 let (_key, bind_msg) = choreo_client_core::bind_fresh_daemon(addr)
                     .context("failed to mint and record a fresh bind key")?;
-                write_message(writer, &bind_msg).context("failed to send bind message")?;
+                write_message(writer, &ClientMessage::request(0, bind_msg))
+                    .context("failed to send bind message")?;
                 writer.flush().context("failed to flush bind message")?;
-                match read_message::<_, DaemonMessage>(&mut *reader) {
+                match read_message::<_, DaemonMessage>(&mut *reader).map(|m| m.inner) {
                     // `Bound` is the unlock confirmation for a bind (the
                     // daemon ran the shared unlock tail after adopting the
                     // key) — accept it exactly like `Unlocked`.
-                    Ok(DaemonMessage::Bound) => {
+                    Ok(DaemonMessageType::Bound) => {
                         info!("daemon keystore bound and unlocked");
                     }
-                    Ok(DaemonMessage::KeystoreUnbound { error: bind_err }) => {
+                    Ok(DaemonMessageType::KeystoreUnbound { error: bind_err }) => {
                         error!(%bind_err, "bind failed: keystore still unbound");
                         bail!("bind failed: {bind_err}");
                     }
-                    Ok(DaemonMessage::LockedError { error: bind_err }) => {
+                    Ok(DaemonMessageType::LockedError { error: bind_err }) => {
                         error!(%bind_err, "bind failed");
                         bail!("bind failed: {bind_err}");
                     }
@@ -237,7 +247,7 @@ pub fn establish_keystore<R: std::io::Read, W: std::io::Write>(
                     }
                 }
             }
-            Ok(DaemonMessage::LockedError { error: unlock_err }) => {
+            Ok(DaemonMessageType::LockedError { error: unlock_err }) => {
                 error!(%unlock_err, "unlock failed");
                 bail!(
                     "unlock failed: {unlock_err} — the daemon is bound to a key this client \
@@ -261,16 +271,17 @@ pub fn establish_keystore<R: std::io::Read, W: std::io::Write>(
         let (_key, bind_msg) = choreo_client_core::bind_fresh_daemon(addr)
             .context("failed to mint and record a fresh bind key")?;
         info!("no stored unlock key — probing daemon with a fresh bind");
-        write_message(writer, &bind_msg).context("failed to send bind message")?;
+        write_message(writer, &ClientMessage::request(0, bind_msg))
+            .context("failed to send bind message")?;
         writer.flush().context("failed to flush bind message")?;
-        match read_message::<_, DaemonMessage>(&mut *reader) {
-            Ok(DaemonMessage::Bound) => {
+        match read_message::<_, DaemonMessage>(&mut *reader).map(|m| m.inner) {
+            Ok(DaemonMessageType::Bound) => {
                 info!("daemon keystore bound and unlocked");
             }
-            Ok(DaemonMessage::LockedError { error }) => {
+            Ok(DaemonMessageType::LockedError { error }) => {
                 info!(%error, "daemon is bound to a key this client does not hold");
             }
-            Ok(DaemonMessage::KeystoreUnbound { error }) => {
+            Ok(DaemonMessageType::KeystoreUnbound { error }) => {
                 error!(%error, "bind rejected against an unbound keystore");
                 bail!("bind failed: {error}");
             }

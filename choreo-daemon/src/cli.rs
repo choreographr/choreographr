@@ -448,21 +448,24 @@ fn mcp_socket_request(
 ///
 /// Propagates the socket error, or the daemon's reconnect failure.
 fn mcp_reconnect_via_socket(slug: &str) -> anyhow::Result<()> {
-    use choreo_proto::{ClientMessage, DaemonMessage};
-    let request = ClientMessage::McpReconnect {
-        slug: slug.to_string(),
-    };
+    use choreo_proto::{ClientMessage, ClientMessageType, DaemonMessageType};
+    let request = ClientMessage::request(
+        0,
+        ClientMessageType::McpReconnect {
+            slug: slug.to_string(),
+        },
+    );
     mcp_socket_request(
         &request,
         &format!("use `/mcp reconnect {slug}` in a connected client instead"),
-        |msg| match msg {
-            DaemonMessage::McpStatus { servers, .. } => {
+        |msg| match msg.inner {
+            DaemonMessageType::McpStatus { servers, .. } => {
                 for server in &servers {
                     println!("[{}] {}", server.tier, server.summary());
                 }
                 Some(Ok(()))
             }
-            DaemonMessage::McpReconnectFailed { error, .. } => {
+            DaemonMessageType::McpReconnectFailed { error, .. } => {
                 Some(Err(anyhow::anyhow!("reconnect failed: {error}")))
             }
             _ => None,
@@ -479,19 +482,19 @@ fn mcp_reconnect_via_socket(slug: &str) -> anyhow::Result<()> {
 ///
 /// Propagates the socket error, or the daemon's reload failure.
 fn mcp_reload_via_socket() -> anyhow::Result<()> {
-    use choreo_proto::{ClientMessage, DaemonMessage};
+    use choreo_proto::{ClientMessage, ClientMessageType, DaemonMessageType};
     mcp_socket_request(
-        &ClientMessage::McpReload,
+        &ClientMessage::request(0, ClientMessageType::McpReload),
         "use `/mcp reload` in a connected client instead",
-        |msg| match msg {
-            DaemonMessage::McpReloaded { summary, servers } => {
+        |msg| match msg.inner {
+            DaemonMessageType::McpReloaded { summary, servers } => {
                 println!("{summary}");
                 for server in &servers {
                     println!("{}", server.summary());
                 }
                 Some(Ok(()))
             }
-            DaemonMessage::McpReloadFailed { error } => {
+            DaemonMessageType::McpReloadFailed { error } => {
                 Some(Err(anyhow::anyhow!("reload failed: {error}")))
             }
             _ => None,

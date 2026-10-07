@@ -1,7 +1,7 @@
 use crate::connection::handle_terminal_event;
 use crate::state::*;
 use crate::test_util::{add_user_text, test_app};
-use choreo_proto::{ClientMessage, Turn};
+use choreo_proto::{ClientMessageType, Turn};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -765,7 +765,7 @@ fn cursor_down_from_wrapped_line() {
 fn navigate_history_up_down_with_multi_line() {
     let mut app = test_app();
     // Insert a turn with user_text so history exists
-    let id = app.next_request_id;
+    let id = u32::try_from(app.next_request_id).unwrap();
     app.display_for(0).view.insert_or_replace(
         id,
         choreo_proto::Turn {
@@ -803,7 +803,7 @@ fn navigate_history_up_adjusts_scroll_offset_for_long_entry() {
         .map(|i| format!("line {i}\n"))
         .collect::<Vec<_>>()
         .concat();
-    let id = app.next_request_id;
+    let id = u32::try_from(app.next_request_id).unwrap();
     app.display_for(0).view.insert_or_replace(
         id,
         choreo_proto::Turn {
@@ -2345,7 +2345,7 @@ fn scroll_mouse_outside_history_box_does_not_update_accumulator() {
 /// Send a left-click at terminal (column, row) through the event pipeline.
 fn click_input(
     app: &mut App,
-    tx: &crossbeam_channel::Sender<ClientMessage>,
+    tx: &crossbeam_channel::Sender<ClientMessageType>,
     column: u16,
     row: u16,
 ) {
@@ -2756,7 +2756,7 @@ fn alt_shift_m_opens_selector_like_alt_m() {
         "alt+shift+m opens the selector"
     );
     let msg = rx.recv().expect("sent message");
-    assert_eq!(msg, ClientMessage::ListModels);
+    assert_eq!(msg, ClientMessageType::ListModels);
 }
 
 #[test]

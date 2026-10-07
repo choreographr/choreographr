@@ -10,8 +10,8 @@
 //! knows nothing about how they are rendered.
 
 use choreo_proto::{
-    ClientMessage, DaemonMessage, ImageKey, OutputStream, SessionEvent, SessionSummary, Turn,
-    write_message,
+    ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, ImageKey, OutputStream,
+    SessionEvent, SessionSummary, Turn, write_message,
 };
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
@@ -64,14 +64,14 @@ impl StreamBuffer {
 }
 
 /// Handle onto the spawned daemon bridge: a channel for sending
-/// [`ClientMessage`]s to the daemon and one for receiving [`BridgeEvent`]s from
+/// [`ClientMessageType`]s to the daemon and one for receiving [`BridgeEvent`]s from
 /// it.
 ///
 /// Created by [`DaemonBridge::spawn`] and split into its two halves with
 /// [`DaemonBridge::into_parts`], so a platform layer can hand the send and
 /// receive halves to different threads.
 pub struct DaemonBridge {
-    client_tx: Sender<ClientMessage>,
+    client_tx: Sender<ClientMessageType>,
     event_rx: Receiver<BridgeEvent>,
 }
 
@@ -144,7 +144,7 @@ impl DaemonBridge {
     /// crossbeam channels, so a send never blocks on a busy peer.
     #[must_use]
     pub fn spawn(reader: BufReader<UnixStream>, writer: BufWriter<UnixStream>) -> Self {
-        let (client_tx, client_rx) = crossbeam_channel::unbounded::<ClientMessage>();
+        let (client_tx, client_rx) = crossbeam_channel::unbounded::<ClientMessageType>();
         let (event_tx, event_rx) = crossbeam_channel::unbounded::<BridgeEvent>();
         let writer_event_tx = event_tx.clone();
 
@@ -155,9 +155,15 @@ impl DaemonBridge {
         std::thread::spawn(move || {
             let mut writer = writer;
             let client_rx = client_rx;
+            // The bridge writer thread is its single send site: it stamps a
+            // per-connection request id onto every outbound frame (the IM
+            // bridge ignores replies).
+            let mut next_id: u64 = 0;
             while let Ok(msg) = client_rx.recv() {
-                debug!(?msg, "sending message to daemon");
-                if let Err(e) = write_message(&mut writer, &msg) {
+                let framed = ClientMessage::request(next_id, msg);
+                next_id = next_id.wrapping_add(1);
+                debug!(?framed, "sending message to daemon");
+                if let Err(e) = write_message(&mut writer, &framed) {
                     error!(%e, "write error, bridge writer shutting down");
                     if let Err(send_err) =
                         writer_event_tx.send(BridgeEvent::Error(format!("write error: {e}")))
@@ -182,8 +188,8 @@ impl DaemonBridge {
         let image_event_tx = event_tx.clone();
         std::thread::spawn(move || {
             let mut reader = reader;
-            let mut buffers: HashMap<u32, StreamBuffer> = HashMap::new();
-            let mut tool_buffers: HashMap<u32, String> = HashMap::new();
+            let mut buffers: HashMap<u64, StreamBuffer> = HashMap::new();
+            let mut tool_buffers: HashMap<u64, String> = HashMap::new();
             // Attach-once latch. The daemon only serves `GetImage` for — and
             // only delivers session-scoped events (`TurnAppended`, …) to
             // subscribers of — the session a connection is ATTACHED to. So the
@@ -212,16 +218,16 @@ impl DaemonBridge {
                 if !attached && let Some(session_id) = attach_target(&msg) {
                     attached = true;
                     info!(session_id, "bridge attaching to session");
-                    let _ = reader_client_tx.send(ClientMessage::AttachSession { session_id });
+                    let _ = reader_client_tx.send(ClientMessageType::AttachSession { session_id });
                 }
                 // Live turns carry displayed images, but only their metadata:
                 // request each image's bytes and emit them when the matching
                 // `Image` reply arrives.
-                if let DaemonMessage::Session {
+                if let DaemonMessageType::Session {
                     session_id,
                     event: SessionEvent::TurnAppended { turn_id, turn, .. },
                     ..
-                } = &msg
+                } = &msg.inner
                 {
                     let (events, requests) =
                         collect_turn_images(session_id.unwrap_or_default(), *turn_id, turn);
@@ -233,9 +239,9 @@ impl DaemonBridge {
                     }
                 }
                 // The on-demand reply: forward the fetched bytes.
-                if let DaemonMessage::Image {
+                if let DaemonMessageType::Image {
                     data: Some(bytes), ..
-                } = &msg
+                } = &msg.inner
                 {
                     let _ = image_event_tx.send(BridgeEvent::Image {
                         _mime: String::new(),
@@ -264,10 +270,10 @@ impl DaemonBridge {
         // Best-effort: `client_tx` outlives the writer thread as long as the
         // bridge is alive, so a send can only fail if the writer already
         // exited (daemon gone), in which case no attach would help anyway.
-        if let Err(e) = client_tx.send(ClientMessage::SubscribeSessionsSummary) {
+        if let Err(e) = client_tx.send(ClientMessageType::SubscribeSessionsSummary) {
             warn!("failed to subscribe to session summaries at bridge startup: {e}");
         }
-        if let Err(e) = client_tx.send(ClientMessage::ListSessions) {
+        if let Err(e) = client_tx.send(ClientMessageType::ListSessions) {
             warn!("failed to request session list at bridge startup: {e}");
         }
 
@@ -280,7 +286,7 @@ impl DaemonBridge {
     /// Split the handle into its send and receive halves, for handing to
     /// separate threads.
     #[must_use]
-    pub fn into_parts(self) -> (Sender<ClientMessage>, Receiver<BridgeEvent>) {
+    pub fn into_parts(self) -> (Sender<ClientMessageType>, Receiver<BridgeEvent>) {
         (self.client_tx, self.event_rx)
     }
 }
@@ -290,7 +296,7 @@ impl DaemonBridge {
 ///
 /// Protocol v6 strips displayed-image bytes from `TurnAppended`, leaving only
 /// metadata — so an image with `byte_len > 0` but empty `data` must be
-/// requested with `ClientMessage::GetImage` (keyed by session, turn, and the
+/// requested with `ClientMessageType::GetImage` (keyed by session, turn, and the
 /// image's index within the turn). An image that still carries bytes inline
 /// (an older daemon) is forwarded immediately, and a genuinely zero-byte image
 /// has nothing to send. Pure and side-effect free so the policy is unit-tested
@@ -299,7 +305,7 @@ fn collect_turn_images(
     session_id: u64,
     turn_id: u32,
     turn: &Turn,
-) -> (Vec<BridgeEvent>, Vec<ClientMessage>) {
+) -> (Vec<BridgeEvent>, Vec<ClientMessageType>) {
     let mut events = Vec::new();
     let mut requests = Vec::new();
     for (idx, record) in turn.displayed_images.iter().enumerate() {
@@ -309,7 +315,7 @@ fn collect_turn_images(
                 data: record.data.clone(),
             });
         } else if record.metadata.byte_len > 0 {
-            requests.push(ClientMessage::GetImage {
+            requests.push(ClientMessageType::GetImage {
                 session_id,
                 turn_id,
                 key: ImageKey::Displayed {
@@ -330,9 +336,9 @@ fn collect_turn_images(
 /// that started before any session existed — sub-sessions are never a root
 /// attach target. Pure so the policy is unit-tested without a live socket.
 fn attach_target(msg: &DaemonMessage) -> Option<u64> {
-    match msg {
-        DaemonMessage::Sessions { sessions } => session_to_attach(sessions),
-        DaemonMessage::Session {
+    match &msg.inner {
+        DaemonMessageType::Sessions { sessions } => session_to_attach(sessions),
+        DaemonMessageType::Session {
             session_id: Some(session_id),
             event:
                 SessionEvent::SessionCreated {
@@ -361,14 +367,14 @@ fn session_to_attach(sessions: &[SessionSummary]) -> Option<u64> {
 
 fn daemon_to_bridge_events(
     msg: DaemonMessage,
-    buffers: &mut HashMap<u32, StreamBuffer>,
-    tool_buffers: &mut HashMap<u32, String>,
+    buffers: &mut HashMap<u64, StreamBuffer>,
+    tool_buffers: &mut HashMap<u64, String>,
 ) -> Option<BridgeEvent> {
-    match msg {
-        DaemonMessage::Session {
+    match msg.inner {
+        DaemonMessageType::Session {
             event:
                 SessionEvent::OutputChunk {
-                    request_id,
+                    stream_id,
                     stream,
                     data,
                     ..
@@ -376,15 +382,15 @@ fn daemon_to_bridge_events(
             ..
         } => {
             let text = String::from_utf8_lossy(&data);
-            let entry = buffers.entry(request_id).or_insert_with(StreamBuffer::new);
+            let entry = buffers.entry(stream_id).or_insert_with(StreamBuffer::new);
             entry.append(&stream, &text);
             None
         }
-        DaemonMessage::Session {
-            event: SessionEvent::Done { request_id, .. },
+        DaemonMessageType::Session {
+            event: SessionEvent::Done { stream_id, .. },
             ..
         } => {
-            if let Some(entry) = buffers.remove(&request_id) {
+            if let Some(entry) = buffers.remove(&stream_id) {
                 let text = entry.flatten();
                 if !text.is_empty() {
                     return Some(BridgeEvent::Text(text));
@@ -392,24 +398,24 @@ fn daemon_to_bridge_events(
             }
             None
         }
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             event: SessionEvent::Failed {
-                request_id, error, ..
+                stream_id, error, ..
             },
             ..
         } => {
-            buffers.remove(&request_id);
+            buffers.remove(&stream_id);
             Some(BridgeEvent::Error(error))
         }
-        DaemonMessage::Session {
-            event: SessionEvent::Cancelled { request_id, .. },
+        DaemonMessageType::Session {
+            event: SessionEvent::Cancelled { stream_id, .. },
             ..
         } => {
-            buffers.remove(&request_id);
-            tool_buffers.remove(&request_id);
+            buffers.remove(&stream_id);
+            tool_buffers.remove(&stream_id);
             Some(BridgeEvent::Error("cancelled".into()))
         }
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             event:
                 SessionEvent::ToolCallStarted {
                     tool_name: name,
@@ -421,32 +427,32 @@ fn daemon_to_bridge_events(
             name,
             arguments_json,
         }),
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             event:
                 SessionEvent::ToolCallFinished {
-                    request_id,
+                    stream_id,
                     tool_name: name,
                     ..
                 },
             ..
         } => {
-            let output = tool_buffers.remove(&request_id).unwrap_or_default();
+            let output = tool_buffers.remove(&stream_id).unwrap_or_default();
             Some(BridgeEvent::ToolCallFinished { name, output })
         }
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             event:
                 SessionEvent::ToolCallFailed {
-                    request_id,
+                    stream_id,
                     tool_name: name,
                     error,
                     ..
                 },
             ..
         } => {
-            tool_buffers.remove(&request_id);
+            tool_buffers.remove(&stream_id);
             Some(BridgeEvent::ToolCallFailed { name, error })
         }
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             event:
                 SessionEvent::TurnAppended { .. }
                 | SessionEvent::TurnsUndone { .. }
@@ -457,40 +463,40 @@ fn daemon_to_bridge_events(
             // TurnsUndone/TurnsRedone don't carry image data.
             None
         }
-        DaemonMessage::Models {
+        DaemonMessageType::Models {
             models,
             selected_model: selected,
             ..
         } => Some(BridgeEvent::Models { models, selected }),
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             event: SessionEvent::ModelSelected { model, .. },
             ..
         } => Some(BridgeEvent::ModelSelected(model)),
-        DaemonMessage::Unlocked => Some(BridgeEvent::Unlocked),
-        DaemonMessage::Locked => Some(BridgeEvent::Locked),
-        DaemonMessage::Pong => Some(BridgeEvent::Pong),
-        DaemonMessage::Session {
+        DaemonMessageType::Unlocked => Some(BridgeEvent::Unlocked),
+        DaemonMessageType::Locked => Some(BridgeEvent::Locked),
+        DaemonMessageType::Pong => Some(BridgeEvent::Pong),
+        DaemonMessageType::Session {
             event: SessionEvent::SessionFailed { error, .. },
             ..
         }
-        | DaemonMessage::LockedError { error }
-        | DaemonMessage::ModelsFailed { error }
-        | DaemonMessage::Session {
+        | DaemonMessageType::LockedError { error }
+        | DaemonMessageType::ModelsFailed { error }
+        | DaemonMessageType::Session {
             event: SessionEvent::ModelSelectionFailed { error, .. },
             ..
         } => Some(BridgeEvent::Error(error)),
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             event: SessionEvent::Started { .. },
             ..
         } => {
             debug!("bridge ignoring Started event");
             None
         }
-        DaemonMessage::ShuttingDown => {
+        DaemonMessageType::ShuttingDown => {
             info!("daemon shutting down");
             None
         }
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             event:
                 SessionEvent::SessionCreated { .. }
                 | SessionEvent::SessionCreatedForRequester { .. }
@@ -515,29 +521,28 @@ fn daemon_to_bridge_events(
             );
             None
         }
-        DaemonMessage::Sessions { .. } => {
+        DaemonMessageType::Sessions { .. } => {
             // The `ListSessions` reply is consumed by the reader callback (to
             // choose the session to attach to); the event channel has nothing
             // to render. Expected startup traffic, so no warning.
             None
         }
-        DaemonMessage::CredentialAdded { .. }
-        | DaemonMessage::CredentialAddFailed { .. }
-        | DaemonMessage::CredentialRemoved { .. }
-        | DaemonMessage::CredentialRemoveFailed { .. }
-        | DaemonMessage::Credential { .. } => {
+        DaemonMessageType::CredentialAdded { .. }
+        | DaemonMessageType::CredentialAddFailed { .. }
+        | DaemonMessageType::CredentialRemoved { .. }
+        | DaemonMessageType::CredentialRemoveFailed { .. }
+        | DaemonMessageType::Credential { .. } => {
             warn!(?msg, "unhandled daemon message variant in bridge");
             None
         }
-        DaemonMessage::Session {
-            event:
-                SessionEvent::ToolResultChunk {
-                    request_id, data, ..
-                },
+        DaemonMessageType::Session {
+            event: SessionEvent::ToolResultChunk {
+                stream_id, data, ..
+            },
             ..
         } => {
             if let Ok(text) = String::from_utf8(data) {
-                tool_buffers.entry(request_id).or_default().push_str(&text);
+                tool_buffers.entry(stream_id).or_default().push_str(&text);
             }
             None
         }
@@ -600,12 +605,16 @@ mod tests {
         // decision without a live daemon.
         let sessions = vec![summary(5, Some(9)), summary(7, None)];
         let msg = session_to_attach(&sessions)
-            .map(|session_id| ClientMessage::AttachSession { session_id });
-        assert_eq!(msg, Some(ClientMessage::AttachSession { session_id: 7 }));
+            .map(|session_id| ClientMessageType::AttachSession { session_id });
+        assert_eq!(
+            msg,
+            Some(ClientMessageType::AttachSession { session_id: 7 })
+        );
 
         // Empty list attaches to nothing.
         assert_eq!(
-            session_to_attach(&[]).map(|session_id| ClientMessage::AttachSession { session_id }),
+            session_to_attach(&[])
+                .map(|session_id| ClientMessageType::AttachSession { session_id }),
             None
         );
     }
@@ -613,7 +622,7 @@ mod tests {
     /// A `SessionCreated` envelope for `id` (only the fields `attach_target`
     /// consults matter; the rest are filler).
     fn session_created(id: u64, parent_session_id: Option<u64>) -> DaemonMessage {
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(id),
             event: SessionEvent::SessionCreated {
                 title: None,
@@ -623,7 +632,7 @@ mod tests {
                 selected_model: None,
                 reasoning_effort: None,
             },
-        }
+        })
     }
 
     #[test]
@@ -631,12 +640,16 @@ mod tests {
         // A `ListSessions` reply is delegated to `session_to_attach`.
         let sessions = vec![summary(5, Some(9)), summary(7, None)];
         assert_eq!(
-            attach_target(&DaemonMessage::Sessions { sessions }),
+            attach_target(&DaemonMessage::broadcast(DaemonMessageType::Sessions {
+                sessions
+            })),
             Some(7)
         );
         // An empty list has nothing to attach to.
         assert_eq!(
-            attach_target(&DaemonMessage::Sessions { sessions: vec![] }),
+            attach_target(&DaemonMessage::broadcast(DaemonMessageType::Sessions {
+                sessions: vec![]
+            })),
             None
         );
 
@@ -647,7 +660,10 @@ mod tests {
         assert_eq!(attach_target(&session_created(11, Some(7))), None);
 
         // Unrelated messages carry nothing attachable.
-        assert_eq!(attach_target(&DaemonMessage::Pong), None);
+        assert_eq!(
+            attach_target(&DaemonMessage::broadcast(DaemonMessageType::Pong)),
+            None
+        );
     }
 
     #[test]
@@ -656,42 +672,42 @@ mod tests {
         let mut tool_buffers = HashMap::new();
 
         let events1 = daemon_to_bridge_events(
-            DaemonMessage::Session {
+            DaemonMessage::broadcast(DaemonMessageType::Session {
                 session_id: None,
                 event: SessionEvent::OutputChunk {
-                    request_id: 1,
+                    stream_id: 1,
                     stream: OutputStream::Answer,
                     data: b"hello ".to_vec(),
                 },
-            },
+            }),
             &mut buffers,
             &mut tool_buffers,
         );
         assert!(events1.is_none());
 
         let events2 = daemon_to_bridge_events(
-            DaemonMessage::Session {
+            DaemonMessage::broadcast(DaemonMessageType::Session {
                 session_id: None,
                 event: SessionEvent::OutputChunk {
-                    request_id: 1,
+                    stream_id: 1,
                     stream: OutputStream::Answer,
                     data: b"world".to_vec(),
                 },
-            },
+            }),
             &mut buffers,
             &mut tool_buffers,
         );
         assert!(events2.is_none());
 
         let events3 = daemon_to_bridge_events(
-            DaemonMessage::Session {
+            DaemonMessage::broadcast(DaemonMessageType::Session {
                 session_id: None,
                 event: SessionEvent::Done {
-                    request_id: 1,
+                    stream_id: 1,
                     token_usage: None,
                     last_prompt_tokens: None,
                 },
-            },
+            }),
             &mut buffers,
             &mut tool_buffers,
         );
@@ -708,14 +724,14 @@ mod tests {
         let mut tool_buffers = HashMap::new();
 
         let events = daemon_to_bridge_events(
-            DaemonMessage::Session {
+            DaemonMessage::broadcast(DaemonMessageType::Session {
                 session_id: None,
                 event: SessionEvent::Done {
-                    request_id: 999,
+                    stream_id: 999,
                     token_usage: None,
                     last_prompt_tokens: None,
                 },
-            },
+            }),
             &mut buffers,
             &mut tool_buffers,
         );
@@ -728,26 +744,26 @@ mod tests {
         let mut tool_buffers = HashMap::new();
 
         daemon_to_bridge_events(
-            DaemonMessage::Session {
+            DaemonMessage::broadcast(DaemonMessageType::Session {
                 session_id: None,
                 event: SessionEvent::OutputChunk {
-                    request_id: 1,
+                    stream_id: 1,
                     stream: OutputStream::Answer,
                     data: b"data".to_vec(),
                 },
-            },
+            }),
             &mut buffers,
             &mut tool_buffers,
         );
 
         let events = daemon_to_bridge_events(
-            DaemonMessage::Session {
+            DaemonMessage::broadcast(DaemonMessageType::Session {
                 session_id: None,
                 event: SessionEvent::Failed {
-                    request_id: 1,
+                    stream_id: 1,
                     error: "oops".into(),
                 },
-            },
+            }),
             &mut buffers,
             &mut tool_buffers,
         );
@@ -755,14 +771,14 @@ mod tests {
         assert!(matches!(events.as_ref().unwrap(), BridgeEvent::Error(msg) if msg == "oops"));
 
         let events2 = daemon_to_bridge_events(
-            DaemonMessage::Session {
+            DaemonMessage::broadcast(DaemonMessageType::Session {
                 session_id: None,
                 event: SessionEvent::Done {
-                    request_id: 1,
+                    stream_id: 1,
                     token_usage: None,
                     last_prompt_tokens: None,
                 },
-            },
+            }),
             &mut buffers,
             &mut tool_buffers,
         );
@@ -775,23 +791,23 @@ mod tests {
         let mut tool_buffers = HashMap::new();
 
         daemon_to_bridge_events(
-            DaemonMessage::Session {
+            DaemonMessage::broadcast(DaemonMessageType::Session {
                 session_id: None,
                 event: SessionEvent::OutputChunk {
-                    request_id: 2,
+                    stream_id: 2,
                     stream: OutputStream::Answer,
                     data: b"data".to_vec(),
                 },
-            },
+            }),
             &mut buffers,
             &mut tool_buffers,
         );
 
         let events = daemon_to_bridge_events(
-            DaemonMessage::Session {
+            DaemonMessage::broadcast(DaemonMessageType::Session {
                 session_id: None,
-                event: SessionEvent::Cancelled { request_id: 2 },
-            },
+                event: SessionEvent::Cancelled { stream_id: 2 },
+            }),
             &mut buffers,
             &mut tool_buffers,
         );
@@ -799,14 +815,14 @@ mod tests {
         assert!(matches!(events.as_ref().unwrap(), BridgeEvent::Error(msg) if msg == "cancelled"));
 
         let events2 = daemon_to_bridge_events(
-            DaemonMessage::Session {
+            DaemonMessage::broadcast(DaemonMessageType::Session {
                 session_id: None,
                 event: SessionEvent::Done {
-                    request_id: 2,
+                    stream_id: 2,
                     token_usage: None,
                     last_prompt_tokens: None,
                 },
-            },
+            }),
             &mut buffers,
             &mut tool_buffers,
         );
@@ -819,16 +835,16 @@ mod tests {
         let mut tool_buffers = HashMap::new();
 
         let events = daemon_to_bridge_events(
-            DaemonMessage::Session {
+            DaemonMessage::broadcast(DaemonMessageType::Session {
                 session_id: None,
                 event: SessionEvent::ToolCallStarted {
-                    request_id: 1,
+                    stream_id: 1,
                     call_id: "call_1".into(),
                     tool_name: "read".into(),
                     arguments_json: r#"{"path":"/tmp"}"#.into(),
                     invocation_description: String::new(),
                 },
-            },
+            }),
             &mut buffers,
             &mut tool_buffers,
         );
@@ -852,27 +868,27 @@ mod tests {
 
         // First send a chunk so the buffer has content
         daemon_to_bridge_events(
-            DaemonMessage::Session {
+            DaemonMessage::broadcast(DaemonMessageType::Session {
                 session_id: None,
                 event: SessionEvent::ToolResultChunk {
-                    request_id: 1,
+                    stream_id: 1,
                     call_id: "call_1".into(),
                     data: b"file contents".to_vec(),
                 },
-            },
+            }),
             &mut buffers,
             &mut tool_buffers,
         );
 
         let events = daemon_to_bridge_events(
-            DaemonMessage::Session {
+            DaemonMessage::broadcast(DaemonMessageType::Session {
                 session_id: None,
                 event: SessionEvent::ToolCallFinished {
-                    request_id: 1,
+                    stream_id: 1,
                     call_id: "call_1".into(),
                     tool_name: "read".into(),
                 },
-            },
+            }),
             &mut buffers,
             &mut tool_buffers,
         );
@@ -892,15 +908,15 @@ mod tests {
         let mut tool_buffers = HashMap::new();
 
         let events = daemon_to_bridge_events(
-            DaemonMessage::Session {
+            DaemonMessage::broadcast(DaemonMessageType::Session {
                 session_id: None,
                 event: SessionEvent::ToolCallFailed {
-                    request_id: 1,
+                    stream_id: 1,
                     call_id: "call_1".into(),
                     tool_name: "read".into(),
                     error: "permission denied".into(),
                 },
-            },
+            }),
             &mut buffers,
             &mut tool_buffers,
         );
@@ -961,7 +977,7 @@ mod tests {
         assert!(matches!(&events[0], BridgeEvent::Image { data, .. } if data == b"AAAA"));
         assert_eq!(
             requests,
-            vec![ClientMessage::GetImage {
+            vec![ClientMessageType::GetImage {
                 session_id: 7,
                 turn_id: 3,
                 key: ImageKey::Displayed { index: 1 },
@@ -979,7 +995,7 @@ mod tests {
         let mut tool_buffers = HashMap::new();
 
         let events = daemon_to_bridge_events(
-            DaemonMessage::Session {
+            DaemonMessage::broadcast(DaemonMessageType::Session {
                 session_id: None,
                 event: SessionEvent::TurnAppended {
                     turn_id: 1,
@@ -1008,7 +1024,7 @@ mod tests {
                         reasoning_producer: None,
                     },
                 },
-            },
+            }),
             &mut buffers,
             &mut tool_buffers,
         );
@@ -1023,10 +1039,10 @@ mod tests {
         let mut tool_buffers = HashMap::new();
 
         let events = daemon_to_bridge_events(
-            DaemonMessage::Models {
+            DaemonMessage::broadcast(DaemonMessageType::Models {
                 models: vec!["gpt-4".into(), "claude".into()],
                 selected_model: Some("claude".into()),
-            },
+            }),
             &mut buffers,
             &mut tool_buffers,
         );
@@ -1046,9 +1062,9 @@ mod tests {
         let mut tool_buffers = HashMap::new();
 
         let events = daemon_to_bridge_events(
-            DaemonMessage::ModelsFailed {
+            DaemonMessage::broadcast(DaemonMessageType::ModelsFailed {
                 error: "network error".into(),
-            },
+            }),
             &mut buffers,
             &mut tool_buffers,
         );
@@ -1064,7 +1080,11 @@ mod tests {
         let mut buffers = HashMap::new();
         let mut tool_buffers = HashMap::new();
 
-        let events = daemon_to_bridge_events(DaemonMessage::Pong, &mut buffers, &mut tool_buffers);
+        let events = daemon_to_bridge_events(
+            DaemonMessage::broadcast(DaemonMessageType::Pong),
+            &mut buffers,
+            &mut tool_buffers,
+        );
         assert!(events.is_some());
         assert!(matches!(events.as_ref().unwrap(), BridgeEvent::Pong));
     }
@@ -1075,17 +1095,17 @@ mod tests {
         let mut tool_buffers = HashMap::new();
 
         let cases = vec![
-            DaemonMessage::Session {
+            DaemonMessageType::Session {
                 session_id: None,
                 event: SessionEvent::SessionFailed {
                     operation: "attach".into(),
                     error: "session error".into(),
                 },
             },
-            DaemonMessage::LockedError {
+            DaemonMessageType::LockedError {
                 error: "already locked".into(),
             },
-            DaemonMessage::Session {
+            DaemonMessageType::Session {
                 session_id: None,
                 event: SessionEvent::ModelSelectionFailed {
                     model: "gpt-4".into(),
@@ -1095,7 +1115,11 @@ mod tests {
         ];
 
         for msg in cases {
-            let events = daemon_to_bridge_events(msg, &mut buffers, &mut tool_buffers);
+            let events = daemon_to_bridge_events(
+                DaemonMessage::broadcast(msg),
+                &mut buffers,
+                &mut tool_buffers,
+            );
             assert!(events.is_some());
             assert!(matches!(events.as_ref().unwrap(), BridgeEvent::Error(_)));
         }

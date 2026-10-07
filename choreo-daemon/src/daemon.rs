@@ -22,8 +22,8 @@ use choreo_ai_protocols::{
 use choreo_keystore::ServiceCredential;
 use choreo_power_events::SuspendEvent;
 use choreo_proto::{
-    AccountInfo, CatalogProvider, ContextConfig, DaemonMessage, RefreshStatus, SessionEvent,
-    SessionStatus, SessionSummary, TimestampMs, TokenUsage,
+    AccountInfo, CatalogProvider, ContextConfig, DaemonMessage, DaemonMessageType, RefreshStatus,
+    SessionEvent, SessionStatus, SessionSummary, TimestampMs, TokenUsage,
 };
 pub use keystore::KeystoreOpError;
 use std::collections::{HashMap, HashSet};
@@ -443,7 +443,7 @@ pub enum DaemonCommand {
     /// Disconnect the currently most-lagging client (see
     /// `broadcast::EnqueueOutcome::GlobalOverBudget`).
     EvictLargestLagging,
-    /// Deliver `DaemonMessage::ShuttingDown` to every connected client via its
+    /// Deliver `DaemonMessageType::ShuttingDown` to every connected client via its
     /// writer channel; each connection's writer thread then closes its own
     /// socket, so clients observe the notification before EOF.
     BroadcastShuttingDown,
@@ -543,7 +543,7 @@ pub enum DaemonCommand {
     /// directly so that leaf sessions never generate unnecessary messages.
     CancelRequest {
         session_id: u64,
-        request_id: u32,
+        stream_id: u64,
     },
     /// An MCP server reported a tool- or resource-list change on its
     /// `subscriptions/listen` stream. The command loop (the sole writer of the
@@ -914,8 +914,8 @@ impl DaemonState {
             } => self.handle_validate_model(session_id, &model, &reply),
             DaemonCommand::CancelRequest {
                 session_id,
-                request_id,
-            } => self.handle_cancel_request(session_id, request_id),
+                stream_id,
+            } => self.handle_cancel_request(session_id, stream_id),
             DaemonCommand::McpListChanged {
                 slug,
                 tools_changed,
@@ -1510,7 +1510,7 @@ impl DaemonState {
         // that lets the CREATING client attach is `SessionCreatedForRequester`,
         // built and sent in the connection thread (`handle_client_create_session`)
         // — see the split documented on `SessionEvent`.
-        let created_msg = DaemonMessage::Session {
+        let created_msg = DaemonMessageType::Session {
             session_id: Some(sid),
             event: SessionEvent::SessionCreated {
                 title,
@@ -1521,7 +1521,7 @@ impl DaemonState {
                 reasoning_effort: reasoning_effort_clone,
             },
         };
-        let status_msg = DaemonMessage::Session {
+        let status_msg = DaemonMessageType::Session {
             session_id: Some(sid),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inactive,
@@ -1703,7 +1703,7 @@ impl DaemonState {
             meta.pinned = pinned;
             meta.archived_at = archived_at;
         }
-        self.broadcast(&DaemonMessage::Session {
+        self.broadcast(&DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionFlagsChanged {
                 pinned,
@@ -1827,7 +1827,7 @@ impl DaemonState {
         // shutting-down thread must not emit a ghost "sleeping" status for a
         // session the user removed.
         if self.session_metadata.contains_key(&session_id) {
-            let msg = DaemonMessage::Session {
+            let msg = DaemonMessageType::Session {
                 session_id: Some(session_id),
                 event: SessionEvent::SessionStatusChanged {
                     status: SessionStatus::Sleeping,
@@ -1977,7 +1977,10 @@ impl DaemonState {
         // Broadcast the new provider list to all activity subscribers so the
         // TUI's provider picker tracks the live catalog.
         let providers = catalog_provider_pairs();
-        self.handle_broadcast_activity(None, &DaemonMessage::CatalogUpdated { providers });
+        self.handle_broadcast_activity(
+            None,
+            &DaemonMessage::broadcast(DaemonMessageType::CatalogUpdated { providers }),
+        );
 
         let models: usize = effective.iter().map(|e| e.models.len()).sum();
         info!(providers = effective.len(), models, "catalog updated",);
@@ -2141,12 +2144,12 @@ impl DaemonState {
     /// to the target session and then propagates cancellation to any child
     /// sub-sessions directly — avoiding a round-trip message from the session
     /// thread back to the daemon.
-    fn handle_cancel_request(&mut self, session_id: u64, request_id: u32) {
-        debug!("CancelRequest: session={session_id} request={request_id}");
+    fn handle_cancel_request(&mut self, session_id: u64, stream_id: u64) {
+        debug!("CancelRequest: session={session_id} request={stream_id}");
 
         // Forward the cancel to the session thread.
         if let Some(entry) = self.active_sessions.get(&session_id) {
-            let _ = entry.cmd_tx.send(SessionCommand::Cancel { request_id });
+            let _ = entry.cmd_tx.send(SessionCommand::Cancel { stream_id });
         }
 
         // Propagate to children — this runs here in the daemon so that
@@ -2209,7 +2212,7 @@ impl DaemonState {
                 if entry
                     .cmd_tx
                     .send(SessionCommand::Cancel {
-                        request_id: CANCEL_ALL,
+                        stream_id: CANCEL_ALL,
                     })
                     .is_err()
                 {
@@ -2235,7 +2238,7 @@ impl DaemonState {
         if entry
             .cmd_tx
             .send(SessionCommand::Cancel {
-                request_id: CANCEL_ALL,
+                stream_id: CANCEL_ALL,
             })
             .is_err()
         {
@@ -2384,7 +2387,7 @@ impl DaemonState {
             warn!(session_id, error = %e, "failed to clear stale session-deletion tombstone");
         }
         self.session_metadata.remove(&session_id);
-        self.broadcast(&DaemonMessage::Session {
+        self.broadcast(&DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionDeleted,
         });
@@ -2438,7 +2441,7 @@ impl DaemonState {
             if entry
                 .cmd_tx
                 .send(SessionCommand::Cancel {
-                    request_id: CANCEL_ALL,
+                    stream_id: CANCEL_ALL,
                 })
                 .is_err()
             {
@@ -2467,7 +2470,7 @@ impl DaemonState {
         // unattachable (deleted marker), even while its record is still being
         // cleaned up in the background.
         self.session_metadata.remove(&session_id);
-        self.broadcast(&DaemonMessage::Session {
+        self.broadcast(&DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionDeleted,
         });
@@ -2602,9 +2605,9 @@ impl DaemonState {
             // connected client learns the new trust total.
             self.handle_broadcast_activity(
                 None,
-                &DaemonMessage::AclUpdated {
+                &DaemonMessage::broadcast(DaemonMessageType::AclUpdated {
                     clients: *count as u64,
-                },
+                }),
             );
         }
         let _ = reply.send(result);
@@ -2762,7 +2765,10 @@ impl DaemonState {
         // provenance — a flat, non-session message — so no origin-contract
         // dedup runs). Clients can refresh their account pickers live.
         let accounts = self.account_infos();
-        self.handle_broadcast_activity(None, &DaemonMessage::Accounts { accounts });
+        self.handle_broadcast_activity(
+            None,
+            &DaemonMessage::broadcast(DaemonMessageType::Accounts { accounts }),
+        );
     }
 
     /// Resolve the cache-warming policy for a session's account: the daemon's

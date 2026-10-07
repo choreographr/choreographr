@@ -4,7 +4,9 @@ use choreo_client_core::{
     build_add_credential_message, command_echo, dispatch_daemon_message, parse_input_line,
     record_unlock_key, resolve_private_key, run_daemon_connection_with_mode,
 };
-use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent, socket_path};
+use choreo_proto::{
+    ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent, socket_path,
+};
 use dioxus::prelude::*;
 use futures_channel::mpsc::UnboundedSender;
 use zeroize::Zeroize;
@@ -14,7 +16,7 @@ use zeroize::Zeroize;
 #[expect(clippy::needless_pass_by_value)]
 pub(crate) fn run_client(
     mode: ConnectionMode,
-    client_rx: crossbeam_channel::Receiver<ClientMessage>,
+    client_rx: crossbeam_channel::Receiver<ClientMessageType>,
     ui_tx: UnboundedSender<UiEvent>,
 ) -> Result<(), ClientError> {
     let result = run_daemon_connection_with_mode(
@@ -37,7 +39,7 @@ pub(crate) fn run_client(
 
 pub(crate) fn submit_input(
     state: &mut Signal<AppState>,
-    daemon_tx: Option<crossbeam_channel::Sender<ClientMessage>>,
+    daemon_tx: Option<crossbeam_channel::Sender<ClientMessageType>>,
 ) {
     let line = state.read().input.trim().to_string();
     state.write().input.clear();
@@ -70,7 +72,7 @@ pub(crate) fn connection_addr() -> String {
 
 pub(crate) fn handle_shell_command(
     state: &mut AppState,
-    daemon_tx: Option<crossbeam_channel::Sender<ClientMessage>>,
+    daemon_tx: Option<crossbeam_channel::Sender<ClientMessageType>>,
     command: Command,
 ) {
     match command {
@@ -85,7 +87,7 @@ pub(crate) fn handle_shell_command(
                 // Hold the key until the daemon confirms the unlock, then
                 // record it per-daemon (see [`record_pending_unlock_key`]).
                 state.pending_unlock_key = Some(private_key.clone());
-                send_client_message(state, daemon_tx, ClientMessage::Unlock { private_key });
+                send_client_message(state, daemon_tx, ClientMessageType::Unlock { private_key });
             }
             Err(e) => {
                 state.status_texts.push(format!("[error] {e}"));
@@ -112,39 +114,39 @@ pub(crate) fn handle_shell_command(
         Command::AclAdd { pubkey } => {
             // The daemon enforces local-only; forward like any other command
             // and surface the refusal if this GUI connection is remote.
-            send_client_message(state, daemon_tx, ClientMessage::AclAdd { pubkey });
+            send_client_message(state, daemon_tx, ClientMessageType::AclAdd { pubkey });
         }
         Command::RemoveCredential { service } => {
             send_client_message(
                 state,
                 daemon_tx,
-                ClientMessage::RemoveCredential { service },
+                ClientMessageType::RemoveCredential { service },
             );
         }
         Command::Undo => {
-            send_client_message(state, daemon_tx, ClientMessage::Undo);
+            send_client_message(state, daemon_tx, ClientMessageType::Undo);
         }
         Command::Redo => {
-            send_client_message(state, daemon_tx, ClientMessage::Redo);
+            send_client_message(state, daemon_tx, ClientMessageType::Redo);
         }
         Command::Continue => {
             if state.attached_session_id.is_some() {
-                let request_id = state.next_request_id;
+                let stream_id = state.next_request_id;
                 state.next_request_id = state.next_request_id.wrapping_add(1);
                 send_client_message(
                     state,
                     daemon_tx,
-                    ClientMessage::ContinueGeneration { request_id },
+                    ClientMessageType::ContinueGeneration { stream_id },
                 );
             } else {
                 state.status_texts.push("no session attached".to_string());
             }
         }
         Command::Stop => {
-            // Send Cancel with request_id 0 (CANCEL_ALL sentinel) to stop
+            // Send Cancel with stream_id 0 (CANCEL_ALL sentinel) to stop
             // whatever request is currently active on the attached session.
             if state.attached_session_id.is_some() {
-                send_client_message(state, daemon_tx, ClientMessage::Cancel { request_id: 0 });
+                send_client_message(state, daemon_tx, ClientMessageType::Cancel { stream_id: 0 });
             } else {
                 state.status_texts.push("no session attached".to_string());
             }
@@ -155,38 +157,38 @@ pub(crate) fn handle_shell_command(
             } else {
                 "refreshing models…".to_string()
             });
-            send_client_message(state, daemon_tx, ClientMessage::RefreshModels { force });
+            send_client_message(state, daemon_tx, ClientMessageType::RefreshModels { force });
         }
         Command::Mcp(mcp) => match mcp {
             McpCommand::Status => {
-                send_client_message(state, daemon_tx, ClientMessage::McpStatusRequest);
+                send_client_message(state, daemon_tx, ClientMessageType::McpStatusRequest);
             }
             McpCommand::Reconnect { slug } => {
                 state
                     .status_texts
                     .push(format!("reconnecting MCP server {slug}…"));
-                send_client_message(state, daemon_tx, ClientMessage::McpReconnect { slug });
+                send_client_message(state, daemon_tx, ClientMessageType::McpReconnect { slug });
             }
             McpCommand::Reload => {
                 state
                     .status_texts
                     .push("reloading MCP configuration…".to_string());
-                send_client_message(state, daemon_tx, ClientMessage::McpReload);
+                send_client_message(state, daemon_tx, ClientMessageType::McpReload);
             }
             McpCommand::Trust => {
                 state
                     .status_texts
                     .push("trusting project MCP root…".to_string());
-                send_client_message(state, daemon_tx, ClientMessage::McpTrust);
+                send_client_message(state, daemon_tx, ClientMessageType::McpTrust);
             }
             McpCommand::Untrust => {
                 state
                     .status_texts
                     .push("revoking project MCP trust…".to_string());
-                send_client_message(state, daemon_tx, ClientMessage::McpUntrust);
+                send_client_message(state, daemon_tx, ClientMessageType::McpUntrust);
             }
             McpCommand::TrustList => {
-                send_client_message(state, daemon_tx, ClientMessage::McpTrustList);
+                send_client_message(state, daemon_tx, ClientMessageType::McpTrustList);
             }
         },
         // TODO(task 3): the unified command model's local-UI variants
@@ -204,8 +206,8 @@ pub(crate) fn handle_shell_command(
 
 pub(crate) fn send_client_message(
     state: &mut AppState,
-    daemon_tx: Option<crossbeam_channel::Sender<ClientMessage>>,
-    message: ClientMessage,
+    daemon_tx: Option<crossbeam_channel::Sender<ClientMessageType>>,
+    message: ClientMessageType,
 ) {
     let Some(sender) = daemon_tx else {
         state
@@ -232,11 +234,11 @@ pub(crate) fn send_client_message(
 /// this function.
 fn handle_session_message(
     state: &mut AppState,
-    daemon_tx: Option<&crossbeam_channel::Sender<ClientMessage>>,
+    daemon_tx: Option<&crossbeam_channel::Sender<ClientMessageType>>,
     message: &DaemonMessage,
 ) -> bool {
-    match message {
-        DaemonMessage::Session {
+    match &message.inner {
+        DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionCreatedForRequester { .. } | SessionEvent::SessionAttached,
         } => {
@@ -249,7 +251,7 @@ fn handle_session_message(
             state.attached_session_id = Some(*session_id);
             false
         }
-        DaemonMessage::Sessions { sessions } => {
+        DaemonMessageType::Sessions { sessions } => {
             if sessions.is_empty() {
                 state.status_texts.push("[daemon] no sessions".to_string());
             } else {
@@ -274,12 +276,12 @@ fn handle_session_message(
                 && let Some(sender) = daemon_tx
             {
                 if let Some(first) = sessions.first() {
-                    if let Err(e) = sender.send(ClientMessage::AttachSession {
+                    if let Err(e) = sender.send(ClientMessageType::AttachSession {
                         session_id: first.session_id,
                     }) {
                         tracing::error!("failed to send AttachSession: {e}");
                     }
-                } else if let Err(e) = sender.send(ClientMessage::CreateSession {
+                } else if let Err(e) = sender.send(ClientMessageType::CreateSession {
                     title: Some("default".to_string()),
                     parent_session_id: None,
                     working_dir: None,
@@ -306,7 +308,7 @@ fn handle_session_message(
 /// (the callers surface their own reconnect-to-retry message then).
 fn trigger_keystore_auto_bind(
     state: &mut AppState,
-    daemon_tx: Option<crossbeam_channel::Sender<ClientMessage>>,
+    daemon_tx: Option<crossbeam_channel::Sender<ClientMessageType>>,
 ) -> bool {
     match attempt_keystore_auto_bind(&mut state.keystore_auto_bind, &connection_addr()) {
         AutoBindAttempt::Bind { key, msg } => {
@@ -332,7 +334,7 @@ fn trigger_keystore_auto_bind(
 pub(crate) fn apply_daemon_message(
     state: &mut AppState,
     message: DaemonMessage,
-    daemon_tx: Option<crossbeam_channel::Sender<ClientMessage>>,
+    daemon_tx: Option<crossbeam_channel::Sender<ClientMessageType>>,
 ) {
     if handle_session_message(state, daemon_tx.as_ref(), &message) {
         return;
@@ -341,14 +343,16 @@ pub(crate) fn apply_daemon_message(
     // Unlock/AddCredential outcome (per-daemon keystore): resolve what the
     // daemon did with the pending key — the key carried by the most recent
     // `Unlock`/`AddCredential` — and reconcile the client-side record with it.
-    match &message {
+    match &message.inner {
         // CONFIRMED success (explicit Unlock, an AddCredential that
         // implicitly unlocked, or our auto-bind of an unbound daemon).
         // Record the pending key per-daemon NOW — the whole point of the
         // per-daemon keystore design is that a key is only trusted/recorded
         // after the daemon accepts it (TOFU adopt, or a binding match). A
         // rejected key never reaches here.
-        DaemonMessage::Unlocked | DaemonMessage::Bound | DaemonMessage::CredentialAdded { .. } => {
+        DaemonMessageType::Unlocked
+        | DaemonMessageType::Bound
+        | DaemonMessageType::CredentialAdded { .. } => {
             if let Some(key) = state.pending_unlock_key.take()
                 && let Err(e) = record_unlock_key(&connection_addr(), &key)
             {
@@ -365,7 +369,7 @@ pub(crate) fn apply_daemon_message(
         // message; the daemon replies `Bound`, which the arm above treats
         // exactly like `Unlocked`. A second `KeystoreUnbound` after the bind
         // was sent is surfaced as an error, never a re-bind (bind-loop guard).
-        DaemonMessage::KeystoreUnbound { .. } => {
+        DaemonMessageType::KeystoreUnbound { .. } => {
             // The stale verify key belongs to THIS frontend's pending-key
             // lifecycle: drop it (zeroized) BEFORE the shared state machine
             // runs, so the minted bind key can be held pending afterwards.
@@ -389,7 +393,7 @@ pub(crate) fn apply_daemon_message(
         // the all-activity bus, so this normally only reaches it if it ever
         // opts in; it is handled here for correctness and forward-compat. The
         // GUI's connect-time bootstrap (hooks.rs) drives the bind today.
-        DaemonMessage::Keystore { state: ks } => match ks {
+        DaemonMessageType::Keystore { state: ks } => match ks {
             choreo_proto::KeystoreState::Unbound => {
                 if !state.keystore_auto_bind.attempted() {
                     // Discard any pending verify key; the minted bind key then
@@ -419,7 +423,7 @@ pub(crate) fn apply_daemon_message(
         // error), and the keystore binding is TOFU-immortal so a confirmed
         // record can never be wrong. Manual re-pair (`remove(addr)`) is the
         // recovery path for a genuinely wrong key.
-        DaemonMessage::LockedError { .. } | DaemonMessage::CredentialAddFailed { .. } => {
+        DaemonMessageType::LockedError { .. } | DaemonMessageType::CredentialAddFailed { .. } => {
             if let Some(mut key) = state.pending_unlock_key.take() {
                 key.zeroize();
                 tracing::info!(

@@ -353,7 +353,7 @@ fn session_state_message_strips_artifacts_from_turns() {
         },
     );
 
-    let DaemonMessage::Session {
+    let DaemonMessageType::Session {
         event: SessionEvent::SessionState { turns, .. },
         ..
     } = state.session_state_message(7)
@@ -385,7 +385,7 @@ fn slug_keyed_catalog_facts_resolve_without_a_live_provider() {
     // recorded slug. Precedence: the provider's own client-config override
     // when a client exists, else the catalog; the reasoning capability always
     // resolves from the slug.
-    use choreo_proto::{DaemonMessage, SessionEvent};
+    use choreo_proto::SessionEvent;
 
     // Sanity: the bundled catalog pins a known window for this model.
     assert_eq!(
@@ -407,7 +407,7 @@ fn slug_keyed_catalog_facts_resolve_without_a_live_provider() {
     // ...and the attach snapshot reports the model's reasoning capability,
     // so Alt+R never shows "reasoning capability not yet available" on a
     // locked daemon.
-    let DaemonMessage::Session {
+    let DaemonMessageType::Session {
         event:
             SessionEvent::SessionState {
                 reasoning_capability,
@@ -706,10 +706,10 @@ fn broadcast_delivers_message_to_all_subscribers() {
 
     let mut shutdown = false;
     process_command(
-        SessionCommand::Broadcast(DaemonMessage::Session {
+        SessionCommand::Broadcast(DaemonMessageType::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::Done {
-                request_id: 5,
+                stream_id: 5,
                 token_usage: None,
                 last_prompt_tokens: None,
             },
@@ -720,22 +720,22 @@ fn broadcast_delivers_message_to_all_subscribers() {
     );
 
     assert_eq!(
-        rx1.recv().unwrap(),
-        DaemonMessage::Session {
+        rx1.recv().unwrap().inner,
+        DaemonMessageType::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::Done {
-                request_id: 5,
+                stream_id: 5,
                 token_usage: None,
                 last_prompt_tokens: None,
             },
         }
     );
     assert_eq!(
-        rx2.recv().unwrap(),
-        DaemonMessage::Session {
+        rx2.recv().unwrap().inner,
+        DaemonMessageType::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::Done {
-                request_id: 5,
+                stream_id: 5,
                 token_usage: None,
                 last_prompt_tokens: None,
             },
@@ -749,10 +749,10 @@ fn broadcast_with_no_subscribers_does_not_panic() {
     let (mut state, ctx) = broadcast_setup();
     let mut shutdown = false;
     process_command(
-        SessionCommand::Broadcast(DaemonMessage::Session {
+        SessionCommand::Broadcast(DaemonMessageType::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::Done {
-                request_id: 0,
+                stream_id: 0,
                 token_usage: None,
                 last_prompt_tokens: None,
             },
@@ -773,7 +773,7 @@ fn broadcast_handles_disconnected_subscriber_gracefully() {
 
     let mut shutdown = false;
     process_command(
-        SessionCommand::Broadcast(DaemonMessage::Pong),
+        SessionCommand::Broadcast(DaemonMessageType::Pong),
         &mut state,
         &mut shutdown,
         &ctx,
@@ -796,10 +796,10 @@ fn broadcast_enqueues_losslessly_and_signals_eviction() {
     state.subscribers.insert(10, tx);
 
     // A message large enough to cross the tiny per-client cap.
-    let broadcast = DaemonMessage::Session {
+    let broadcast = DaemonMessageType::Session {
         session_id: Some(ctx.session_id),
         event: SessionEvent::Failed {
-            request_id: 5,
+            stream_id: 5,
             error: "x".repeat(100),
         },
     };
@@ -812,7 +812,7 @@ fn broadcast_enqueues_losslessly_and_signals_eviction() {
     );
 
     // Lossless: the crossing message was delivered, not dropped.
-    assert_eq!(rx.recv().unwrap(), broadcast);
+    assert_eq!(rx.recv().unwrap().inner, broadcast);
     // The subscriber stays in the map (eviction happens daemon-side via
     // the EvictClient signal + the daemon's handle_evict_client).
     assert!(state.subscribers.contains_key(&10));
@@ -850,8 +850,8 @@ fn set_working_dir_updates_config_and_broadcasts() {
     );
     assert!(!shutdown);
     // Subscribers should receive the SessionWorkingDirSet broadcast.
-    match rx.recv().unwrap() {
-        DaemonMessage::Session {
+    match rx.recv().unwrap().inner {
+        DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionWorkingDirSet { path },
         } => {
@@ -1041,7 +1041,7 @@ fn cancel_sends_through_channel() {
 
     let mut shutdown = false;
     process_command(
-        SessionCommand::Cancel { request_id: 1 },
+        SessionCommand::Cancel { stream_id: 1 },
         &mut state,
         &mut shutdown,
         &ctx,
@@ -1414,8 +1414,8 @@ fn accumulated_usage_in_attach_snapshot() {
     );
 
     let msg = sub_rx.recv().unwrap();
-    match msg {
-        DaemonMessage::Session {
+    match msg.inner {
+        DaemonMessageType::Session {
             event: SessionEvent::SessionState { token_usage, .. },
             ..
         } => {
@@ -1481,8 +1481,8 @@ fn sync_accumulated_usage_updates_config_and_broadcasts() {
 
     // ...and the update is broadcast from the authoritative state.
     let msg = sub_rx.recv().unwrap();
-    match msg {
-        DaemonMessage::Session {
+    match msg.inner {
+        DaemonMessageType::Session {
             session_id: Some(session_id),
             event:
                 SessionEvent::TokenUsageUpdate {
@@ -1555,8 +1555,8 @@ fn attach_snapshot_carries_mid_turn_accumulated_usage() {
     );
 
     let msg = sub_rx.recv().unwrap();
-    match msg {
-        DaemonMessage::Session {
+    match msg.inner {
+        DaemonMessageType::Session {
             event: SessionEvent::SessionState { token_usage, .. },
             ..
         } => {
@@ -1667,24 +1667,24 @@ fn attach_with_active_requests_sends_started_to_new_subscriber() {
     );
 
     // Expect Start messages for each active request, in insertion order.
-    match sub_rx.recv().unwrap() {
-        DaemonMessage::Session {
+    match sub_rx.recv().unwrap().inner {
+        DaemonMessageType::Session {
             session_id: Some(1),
             event:
                 SessionEvent::Started {
-                    request_id: 10,
+                    stream_id: 10,
                     turn_id: 3,
                     estimated_prompt_tokens: 0,
                 },
         } => {}
         other => panic!("expected Started(10, turn=3), got {other:?}"),
     }
-    match sub_rx.recv().unwrap() {
-        DaemonMessage::Session {
+    match sub_rx.recv().unwrap().inner {
+        DaemonMessageType::Session {
             session_id: Some(1),
             event:
                 SessionEvent::Started {
-                    request_id: 20,
+                    stream_id: 20,
                     turn_id: 7,
                     estimated_prompt_tokens: 0,
                 },
@@ -1693,8 +1693,8 @@ fn attach_with_active_requests_sends_started_to_new_subscriber() {
     }
 
     // Followed by SessionState.
-    match sub_rx.recv().unwrap() {
-        DaemonMessage::Session {
+    match sub_rx.recv().unwrap().inner {
+        DaemonMessageType::Session {
             event: SessionEvent::SessionState { .. },
             ..
         } => {}
@@ -1722,8 +1722,8 @@ fn attach_without_active_requests_does_not_send_started() {
     );
 
     // Only SessionState — no Started messages.
-    match sub_rx.recv().unwrap() {
-        DaemonMessage::Session {
+    match sub_rx.recv().unwrap().inner {
+        DaemonMessageType::Session {
             event: SessionEvent::SessionState { .. },
             ..
         } => {}
@@ -2146,7 +2146,7 @@ fn request_finished_after_in_flight_undo_preserves_chain_break_and_undone_turns(
 
     process_command(
         SessionCommand::RequestFinished {
-            request_id: 1,
+            stream_id: 1,
             snapshot,
         },
         &mut state,
@@ -2190,7 +2190,7 @@ fn request_finished_without_undo_restores_chain_id() {
     let mut shutdown = false;
     process_command(
         SessionCommand::RequestFinished {
-            request_id: 1,
+            stream_id: 1,
             snapshot,
         },
         &mut state,

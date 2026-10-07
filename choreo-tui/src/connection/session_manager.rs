@@ -1,12 +1,12 @@
 use crate::state::{App, Page, SessionManagerView, session_list_click_index};
 use choreo_client_core::{ClientError, broken_pipe};
-use choreo_proto::ClientMessage;
+use choreo_proto::ClientMessageType;
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseEvent};
 
 pub(super) fn handle_session_manager_event(
     event: &Event,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
 ) -> Result<(), ClientError> {
     match app.session_mgr.view {
         SessionManagerView::List | SessionManagerView::Archived => {
@@ -19,7 +19,7 @@ pub(super) fn handle_session_manager_event(
 fn handle_session_list_event(
     event: &Event,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
 ) -> Result<(), ClientError> {
     match *event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -33,7 +33,7 @@ fn handle_session_list_event(
 fn handle_session_detail_event(
     event: &Event,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
 ) -> Result<(), ClientError> {
     match *event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -46,7 +46,7 @@ fn handle_session_detail_event(
 fn handle_session_list_key(
     key: crossterm::event::KeyEvent,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
 ) -> Result<(), ClientError> {
     // Ignore Ctrl/Alt chords: every action here is a BARE-letter key, and a
     // modifier combination must never fire one.  Without this, `Ctrl+A` (which
@@ -62,7 +62,7 @@ fn handle_session_list_key(
             KeyCode::Char('y' | 'Y') => {
                 if let Some((session_id, _title)) = app.session_mgr.confirm_delete.take() {
                     client_tx
-                        .send(ClientMessage::DeleteSession { session_id })
+                        .send(ClientMessageType::DeleteSession { session_id })
                         .map_err(broken_pipe)?;
                 }
             }
@@ -112,7 +112,7 @@ fn handle_session_list_key(
                 let session_id = session.session_id;
                 let pinned = !session.pinned;
                 client_tx
-                    .send(ClientMessage::SetSessionPinned { session_id, pinned })
+                    .send(ClientMessageType::SetSessionPinned { session_id, pinned })
                     .map_err(broken_pipe)?;
             }
         }
@@ -125,7 +125,7 @@ fn handle_session_list_key(
                 let session_id = session.session_id;
                 let archived = matches!(app.session_mgr.view, SessionManagerView::List);
                 client_tx
-                    .send(ClientMessage::SetSessionArchived {
+                    .send(ClientMessageType::SetSessionArchived {
                         session_id,
                         archived,
                     })
@@ -135,7 +135,7 @@ fn handle_session_list_key(
         KeyCode::Char('n') => {
             tracing::info!("[choreo-tui] pressing n on session list -> CreateSession");
             client_tx
-                .send(ClientMessage::CreateSession {
+                .send(ClientMessageType::CreateSession {
                     title: None,
                     parent_session_id: None,
                     // Inherit fields from the currently attached session.
@@ -164,7 +164,7 @@ fn handle_session_list_key(
         }
         KeyCode::Esc | KeyCode::Char('q') => {
             app.set_page(Page::Chat);
-            let _ = client_tx.send(ClientMessage::UnsubscribeSessionsSummary);
+            let _ = client_tx.send(ClientMessageType::UnsubscribeSessionsSummary);
         }
         _ => {}
     }
@@ -180,7 +180,7 @@ fn handle_session_list_key(
 fn handle_session_list_mouse(
     mouse: MouseEvent,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
 ) -> Result<(), ClientError> {
     super::handle_full_page_list_mouse(
         app,
@@ -226,7 +226,7 @@ fn handle_session_list_mouse(
 fn handle_session_detail_key(
     key: crossterm::event::KeyEvent,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
 ) -> Result<(), ClientError> {
     // Ignore Ctrl/Alt chords (the detail view's keys are bare letters); see
     // `handle_session_list_key`.  See `super::is_modifier_chord`.

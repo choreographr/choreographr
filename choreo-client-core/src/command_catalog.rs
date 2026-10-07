@@ -1,6 +1,6 @@
 //! Metadata catalog for the unified command model.
 //!
-//! Every command the client understands — whether it ships a [`ClientMessage`]
+//! Every command the client understands — whether it ships a [`ClientMessageType`]
 //! to the daemon or drives local UI — is described here exactly once. The
 //! catalog is the single source of truth for command discovery and
 //! descriptions (e.g. the TUI command palette); the parser in [`crate::shell`]
@@ -10,7 +10,7 @@
 //! parse arm is required to extend). A catalog entry with no parse arm fails
 //! the suite; a parse arm is caught once it is named in that list.
 //!
-//! [`ClientMessage`]: choreo_proto::ClientMessage
+//! [`ClientMessageType`]: choreo_proto::ClientMessageType
 
 use std::sync::LazyLock;
 

@@ -10,9 +10,9 @@ use crate::tools::{ToolOutput, ToolRegistry};
 use choreo_ai_protocols::model_reasoning_capability;
 use choreo_keystore::ServiceCredential;
 use choreo_proto::{
-    AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, ImageReference,
-    ReasoningArtifact, ReasoningProducer, SessionEvent, SessionStatus, SessionSummary, TimestampMs,
-    TokenUsage, ToolResultRecord, Turn,
+    AssistantToolCallRecord, ContextConfig, DaemonMessage, DaemonMessageType, DisplayedImageRecord,
+    ImageReference, ReasoningArtifact, ReasoningProducer, SessionEvent, SessionStatus,
+    SessionSummary, TimestampMs, TokenUsage, ToolResultRecord, Turn,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
@@ -22,9 +22,9 @@ use std::sync::{Arc, mpsc};
 use tracing::{debug, error, info, trace, warn};
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Sentinel `request_id` meaning "cancel whatever is currently active, regardless of its ID".
+/// Sentinel `stream_id` meaning "cancel whatever is currently active, regardless of its ID".
 /// Used in child-session cancellation where we don't know the child's active request ID.
-pub(crate) const CANCEL_ALL: u32 = 0;
+pub(crate) const CANCEL_ALL: u64 = 0;
 
 /// Maximum length of a session title in grapheme clusters (user-perceived
 /// characters), not bytes or Unicode scalar values.  Titles are user-facing
@@ -162,16 +162,16 @@ pub fn join_session_shutdown_with_grace_for_test(
 )]
 pub enum SessionCommand {
     RunInput {
-        request_id: u32,
+        stream_id: u64,
         input: Vec<u8>,
     },
     RunChildInput {
-        request_id: u32,
+        stream_id: u64,
         user_text: Option<String>,
         reply: std::sync::mpsc::Sender<io::Result<ChildResult>>,
     },
     Cancel {
-        request_id: u32,
+        stream_id: u64,
     },
     SetModel {
         model: String,
@@ -195,13 +195,13 @@ pub enum SessionCommand {
         reply: std::sync::mpsc::Sender<SessionSummary>,
     },
     RequestFinished {
-        request_id: u32,
+        stream_id: u64,
         snapshot: SessionSnapshot,
     },
     /// Route a daemon message through the main session thread's subscriber
     /// map so that workers always broadcast to the live subscriber set
     /// rather than a stale clone of it.
-    Broadcast(DaemonMessage),
+    Broadcast(DaemonMessageType),
     /// Mid-turn token-usage sync from the request worker.  The worker owns
     /// the live accumulation (its private session clone), so the main
     /// thread's `config.accumulated_usage` would otherwise stay at the
@@ -632,7 +632,7 @@ pub struct SessionState {
     last_undo_turn_ids: Option<Vec<u32>>,
     pub turns: BTreeMap<u32, Turn>,
     subscribers: HashMap<u64, SubscriberSink>,
-    pub(crate) active_requests: BTreeMap<u32, ActiveRequest>,
+    pub(crate) active_requests: BTreeMap<u64, ActiveRequest>,
     pub provider: Option<InferenceProvider>,
     /// The account's **provider slug** (catalog key, e.g. "opencode-go"),
     /// recorded as soon as the account config resolves — at spawn time (the
@@ -750,7 +750,7 @@ impl SessionState {
             broadcast(
                 &mut self.subscribers,
                 ctx,
-                &DaemonMessage::Session {
+                &DaemonMessageType::Session {
                     session_id: Some(ctx.session_id),
                     event: SessionEvent::ContextWindowResolved { context_window: cw },
                 },
@@ -801,7 +801,7 @@ impl SessionState {
     /// Build a [`SessionEvent::SessionState`] snapshot of the current session
     /// for broadcasting to connected clients.  Centralises the field mapping
     /// so that every broadcast site stays consistent when new fields are added.
-    pub(crate) fn session_state_message(&self, session_id: u64) -> DaemonMessage {
+    pub(crate) fn session_state_message(&self, session_id: u64) -> DaemonMessageType {
         let reasoning_capability = self.config.selected_model.as_ref().and_then(|model| {
             // Slug-keyed lookup (not the provider instance): the capability is
             // a static catalog fact and must be reported even while the
@@ -810,7 +810,7 @@ impl SessionState {
             let slug = self.effective_provider_slug()?;
             Some(model_reasoning_capability(slug, model))
         });
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionState {
                 title: self.config.title.clone(),
@@ -1153,7 +1153,7 @@ impl SessionState {
 /// request from them), the vision image **bytes** in `ToolResultRecord.image`
 /// (the request builder reads them from the authoritative daemon-side
 /// `SessionState`/DB), and `DisplayedImageRecord.data` (the bytes live in the
-/// DB; clients fetch them on demand via `ClientMessage::GetImage`).
+/// DB; clients fetch them on demand via `ClientMessageType::GetImage`).
 ///
 /// Image **metadata** stays on the client view for BOTH kinds: each
 /// `DisplayedImageRecord` keeps its `metadata` (dimensions, mime, `byte_len`,
@@ -1212,7 +1212,7 @@ pub(crate) fn turn_for_client(turn: &Turn) -> Turn {
             })
             .collect(),
         // Displayed-image bytes are fetched on demand
-        // (ClientMessage::GetImage); the metadata (with `byte_len`) stays so
+        // (ClientMessageType::GetImage); the metadata (with `byte_len`) stays so
         // the client can size the placeholder and knows whether there is
         // anything to fetch.
         displayed_images: turn
@@ -1233,8 +1233,11 @@ pub(crate) fn turn_for_client(turn: &Turn) -> Turn {
 fn broadcast(
     subscribers: &mut HashMap<u64, SubscriberSink>,
     ctx: &RequestContext,
-    message: &DaemonMessage,
+    message: &DaemonMessageType,
 ) {
+    // Wrap the payload as a broadcast (`id: None`): session events fan out to
+    // EVERY subscriber (and the all-activity bus), not to a single requester.
+    let framed = DaemonMessage::broadcast(message.clone());
     // Forward to daemon-level activity subscribers so clients subscribed
     // to all session activity (e.g. the TUI after SubscribeAllActivity)
     // receive every session-scoped event without having to attach to every
@@ -1242,12 +1245,9 @@ fn broadcast(
     // origin is carried explicitly on the command for the daemon's
     // duplicate-suppression (it no longer re-derives the origin from the
     // message shape).
-    // `msg` is taken by reference so the (potentially large) payload can be
-    // reused by the caller after fanning it out — the daemon-level forward
-    // below clones it anyway.
     let _ = ctx.daemon_tx.send(DaemonCommand::BroadcastActivity {
         session_id: Some(ctx.session_id),
-        msg: message.clone(),
+        msg: framed.clone(),
     });
 
     // Lossless + lag-eviction via the ONE shared policy — the same
@@ -1261,7 +1261,7 @@ fn broadcast(
     // daemon tears the connection down.
     let (evict_clients, evict_largest) = fan_out_evicting(
         subscribers,
-        message,
+        &framed,
         &ctx.lag_limits,
         &ctx.global_lag,
         |_| false, // session subscribers are never duplicate-suppressed
@@ -1278,16 +1278,16 @@ fn fail_request(
     subscribers: &mut HashMap<u64, SubscriberSink>,
     ctx: &RequestContext,
     session_id: u64,
-    request_id: u32,
+    stream_id: u64,
     error: impl Into<String>,
 ) -> bool {
     broadcast(
         subscribers,
         ctx,
-        &DaemonMessage::Session {
+        &DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::Started {
-                request_id,
+                stream_id,
                 turn_id: 0,
                 estimated_prompt_tokens: 0,
             },
@@ -1296,10 +1296,10 @@ fn fail_request(
     broadcast(
         subscribers,
         ctx,
-        &DaemonMessage::Session {
+        &DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::Failed {
-                request_id,
+                stream_id,
                 error: error.into(),
             },
         },
@@ -1486,22 +1486,22 @@ fn process_command(
     ctx: &RequestContext,
 ) -> bool {
     match cmd {
-        SessionCommand::RunInput { request_id, input } => {
-            handle_run_input(request_id, &input, state, shutdown_requested, ctx)
+        SessionCommand::RunInput { stream_id, input } => {
+            handle_run_input(stream_id, &input, state, shutdown_requested, ctx)
         }
         SessionCommand::RunChildInput {
-            request_id,
+            stream_id,
             user_text,
             reply,
         } => handle_run_child_input(
-            request_id,
+            stream_id,
             user_text.as_deref(),
             reply,
             state,
             shutdown_requested,
             ctx,
         ),
-        SessionCommand::Cancel { request_id } => handle_cancel(request_id, state, ctx),
+        SessionCommand::Cancel { stream_id } => handle_cancel(stream_id, state, ctx),
         SessionCommand::SetModel { model } => handle_set_model(model, state, ctx),
         SessionCommand::StatusChanged(new_status) => handle_status_changed(new_status, state, ctx),
         SessionCommand::Attach { client_id, tx } => handle_attach(client_id, tx, state, ctx),
@@ -1513,9 +1513,9 @@ fn process_command(
         }
         SessionCommand::GetSummary { reply } => handle_get_summary(&reply, state, ctx),
         SessionCommand::RequestFinished {
-            request_id,
+            stream_id,
             snapshot,
-        } => handle_request_finished(request_id, snapshot, state, *shutdown_requested, ctx),
+        } => handle_request_finished(stream_id, snapshot, state, *shutdown_requested, ctx),
         SessionCommand::Broadcast(message) => handle_broadcast(&message, state, ctx),
         SessionCommand::SyncAccumulatedUsage {
             token_usage,
@@ -1563,13 +1563,13 @@ fn process_command(
 
 /// Process a user input: validate, resolve provider, spawn a request worker.
 fn handle_run_input(
-    request_id: u32,
+    stream_id: u64,
     input: &[u8],
     state: &mut SessionState,
     shutdown_requested: &mut bool,
     ctx: &RequestContext,
 ) -> bool {
-    debug!("session {}: RunInput id={}", ctx.session_id, request_id);
+    debug!("session {}: RunInput id={}", ctx.session_id, stream_id);
     let text = String::from_utf8_lossy(input).trim().to_string();
     info!(
         session_id = ctx.session_id,
@@ -1582,7 +1582,7 @@ fn handle_run_input(
             &mut state.subscribers,
             ctx,
             ctx.session_id,
-            request_id,
+            stream_id,
             "empty input",
         );
     }
@@ -1593,7 +1593,7 @@ fn handle_run_input(
     let provider = match state.resolve_provider(ctx) {
         Ok(p) => p,
         Err(msg) => {
-            return fail_request(&mut state.subscribers, ctx, ctx.session_id, request_id, msg);
+            return fail_request(&mut state.subscribers, ctx, ctx.session_id, stream_id, msg);
         }
     };
     // Re-resolve context window now that a provider is available (e.g. the
@@ -1606,7 +1606,7 @@ fn handle_run_input(
                 &mut state.subscribers,
                 ctx,
                 ctx.session_id,
-                request_id,
+                stream_id,
                 "no model selected",
             );
         }
@@ -1616,7 +1616,7 @@ fn handle_run_input(
             &mut state.subscribers,
             ctx,
             ctx.session_id,
-            request_id,
+            stream_id,
             "session is shutting down",
         );
     }
@@ -1625,7 +1625,7 @@ fn handle_run_input(
             &mut state.subscribers,
             ctx,
             ctx.session_id,
-            request_id,
+            stream_id,
             "session already has an active request",
         );
     }
@@ -1633,10 +1633,10 @@ fn handle_run_input(
     broadcast(
         &mut state.subscribers,
         ctx,
-        &DaemonMessage::Session {
+        &DaemonMessageType::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::Started {
-                request_id,
+                stream_id,
                 turn_id: state.next_turn_id,
                 estimated_prompt_tokens: 0,
             },
@@ -1644,7 +1644,7 @@ fn handle_run_input(
     );
     let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
     state.active_requests.insert(
-        request_id,
+        stream_id,
         ActiveRequest {
             cancel_tx,
             turn_id: state.next_turn_id,
@@ -1659,7 +1659,7 @@ fn handle_run_input(
     let user_text = Some(text);
     std::thread::spawn(move || {
         run_request_worker(RequestWorkerArgs {
-            request_id,
+            stream_id,
             client: &provider,
             session: &mut worker_session,
             model: &model,
@@ -1678,7 +1678,7 @@ fn handle_run_input(
 /// command only triggers the agent loop on whatever turns are already
 /// queued. The response is delivered through the `reply` channel.
 fn handle_run_child_input(
-    request_id: u32,
+    stream_id: u64,
     // Borrowed only: the text is cloned when injected into the worker's
     // user turn; the command variant still owns it.
     user_text: Option<&str>,
@@ -1711,10 +1711,10 @@ fn handle_run_child_input(
     broadcast(
         &mut state.subscribers,
         ctx,
-        &DaemonMessage::Session {
+        &DaemonMessageType::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::Started {
-                request_id,
+                stream_id,
                 turn_id: state.next_turn_id,
                 estimated_prompt_tokens: 0,
             },
@@ -1722,7 +1722,7 @@ fn handle_run_child_input(
     );
     let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
     state.active_requests.insert(
-        request_id,
+        stream_id,
         ActiveRequest {
             cancel_tx,
             turn_id: state.next_turn_id,
@@ -1733,7 +1733,7 @@ fn handle_run_child_input(
     let provider = provider.clone();
     std::thread::spawn(move || {
         run_request_worker(RequestWorkerArgs {
-            request_id,
+            stream_id,
             client: &provider,
             session: &mut worker_session,
             model: &model,
@@ -1752,15 +1752,15 @@ fn handle_run_child_input(
 /// additional messages back to the daemon.
 /// Cancel one or all active requests.
 ///
-/// When `request_id` is `0` (the `CANCEL_ALL` sentinel), every active
+/// When `stream_id` is `0` (the `CANCEL_ALL` sentinel), every active
 /// request is cancelled — this is used by child-session cancellation
 /// where the parent doesn't know the child's specific request ID.
 /// Otherwise only the matching request is cancelled.
-fn handle_cancel(request_id: u32, state: &mut SessionState, ctx: &RequestContext) -> bool {
-    let targets: Vec<u32> = if request_id == 0 {
+fn handle_cancel(stream_id: u64, state: &mut SessionState, ctx: &RequestContext) -> bool {
+    let targets: Vec<u64> = if stream_id == 0 {
         state.active_requests.keys().copied().collect()
     } else {
-        vec![request_id]
+        vec![stream_id]
     };
     for rid in targets {
         if let Some(active) = state.active_requests.get(&rid) {
@@ -1768,9 +1768,9 @@ fn handle_cancel(request_id: u32, state: &mut SessionState, ctx: &RequestContext
             broadcast(
                 &mut state.subscribers,
                 ctx,
-                &DaemonMessage::Session {
+                &DaemonMessageType::Session {
                     session_id: Some(ctx.session_id),
-                    event: SessionEvent::Cancelled { request_id: rid },
+                    event: SessionEvent::Cancelled { stream_id: rid },
                 },
             );
         }
@@ -1793,7 +1793,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
         broadcast(
             &mut state.subscribers,
             ctx,
-            &DaemonMessage::Session {
+            &DaemonMessageType::Session {
                 session_id: Some(ctx.session_id),
                 event: SessionEvent::ModelSelectionFailed { model, error: msg },
             },
@@ -1815,7 +1815,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
         broadcast(
             &mut state.subscribers,
             ctx,
-            &DaemonMessage::Session {
+            &DaemonMessageType::Session {
                 session_id: Some(ctx.session_id),
                 event: SessionEvent::ContextWindowResolved { context_window: cw },
             },
@@ -1842,7 +1842,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
         broadcast(
             &mut state.subscribers,
             ctx,
-            &DaemonMessage::Session {
+            &DaemonMessageType::Session {
                 session_id: Some(ctx.session_id),
                 event: SessionEvent::ReasoningEffortSet {
                     effort: "off".to_string(),
@@ -1858,7 +1858,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
     broadcast(
         &mut state.subscribers,
         ctx,
-        &DaemonMessage::Session {
+        &DaemonMessageType::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::ModelSelected {
                 model: model.clone(),
@@ -1926,7 +1926,7 @@ fn handle_status_changed(
     broadcast(
         &mut state.subscribers,
         ctx,
-        &DaemonMessage::Session {
+        &DaemonMessageType::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::SessionStatusChanged {
                 status: new_status.clone(),
@@ -1945,7 +1945,7 @@ fn handle_status_changed(
 ///
 /// If the session has active requests when the client attaches (i.e. the new
 /// client is joining mid-stream), synthetic `Started` messages are sent first
-/// so the client can populate its `request_id → turn_id` mapping and route
+/// so the client can populate its `stream_id → turn_id` mapping and route
 /// subsequent streaming chunks (`OutputChunk`, `ToolResultChunk`, etc.) to
 /// the correct turn — without this, those chunks would be silently dropped.
 fn handle_attach(
@@ -1984,16 +1984,16 @@ fn handle_attach(
     if !state.active_requests.is_empty()
         && let Some(tx) = state.subscribers.get(&client_id)
     {
-        for (&request_id, active) in &state.active_requests {
+        for (&stream_id, active) in &state.active_requests {
             tx.send_unchecked(
-                &DaemonMessage::Session {
+                &DaemonMessage::broadcast(DaemonMessageType::Session {
                     session_id: Some(ctx.session_id),
                     event: SessionEvent::Started {
-                        request_id,
+                        stream_id,
                         turn_id: active.turn_id,
                         estimated_prompt_tokens: 0,
                     },
-                },
+                }),
                 &ctx.global_lag,
             );
         }
@@ -2005,7 +2005,9 @@ fn handle_attach(
     // drop it on a full 128-slot buffer).
     let snapshot = state.session_state_message(ctx.session_id);
     if let Some(tx) = state.subscribers.get(&client_id) {
-        tx.send_unchecked(&snapshot, &ctx.global_lag);
+        // Unsolicited push of the attach snapshot to this one client; P1
+        // rides it as a broadcast (`id: None`).
+        tx.send_unchecked(&DaemonMessage::broadcast(snapshot), &ctx.global_lag);
     }
     false
 }
@@ -2093,7 +2095,7 @@ fn handle_get_summary(
 
 /// Apply the worker's snapshot (config only) and merge turn state.
 fn handle_request_finished(
-    request_id: u32,
+    stream_id: u64,
     mut snapshot: SessionSnapshot,
     state: &mut SessionState,
     shutdown_requested: bool,
@@ -2118,7 +2120,7 @@ fn handle_request_finished(
     if undo_during_request {
         debug!(
             session_id = ctx.session_id,
-            request_id,
+            stream_id,
             "undo landed while request was in flight; dropping stale response-id chain from worker snapshot",
         );
         snapshot.config.last_response_id = None;
@@ -2185,7 +2187,7 @@ fn handle_request_finished(
         state.next_turn_id = state.next_turn_id.max(max_id + 1);
     }
 
-    state.active_requests.remove(&request_id);
+    state.active_requests.remove(&stream_id);
     state.config.status = SessionStatus::Inactive;
     let _ = ctx.daemon_tx.send(DaemonCommand::UpdateMetadata {
         session_id: ctx.session_id,
@@ -2194,7 +2196,7 @@ fn handle_request_finished(
     broadcast(
         &mut state.subscribers,
         ctx,
-        &DaemonMessage::Session {
+        &DaemonMessageType::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inactive,
@@ -2211,10 +2213,11 @@ fn handle_request_finished(
 
 /// Broadcast a message through the live subscriber map.
 fn handle_broadcast(
-    // Borrowed only: the message is forwarded by reference into
-    // `broadcast` (which clones it for the daemon-level activity fan-out);
-    // the command variant still owns the payload.
-    message: &DaemonMessage,
+    // Borrowed only: the payload is forwarded by reference into
+    // `broadcast` (which wraps it as a broadcast for the daemon-level
+    // activity fan-out and the per-session fan-out); the command variant
+    // still owns the payload.
+    message: &DaemonMessageType,
     state: &mut SessionState,
     ctx: &RequestContext,
 ) -> bool {
@@ -2254,7 +2257,7 @@ fn handle_sync_accumulated_usage(
     broadcast(
         &mut state.subscribers,
         ctx,
-        &DaemonMessage::Session {
+        &DaemonMessageType::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::TokenUsageUpdate {
                 token_usage: state.config.accumulated_usage,
@@ -2305,7 +2308,7 @@ fn handle_set_title(title: &str, state: &mut SessionState, ctx: &RequestContext)
     broadcast(
         &mut state.subscribers,
         ctx,
-        &DaemonMessage::Session {
+        &DaemonMessageType::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::SessionTitleSet {
                 title: title.to_owned(),
@@ -2374,7 +2377,7 @@ fn handle_set_working_dir(
     broadcast(
         &mut state.subscribers,
         ctx,
-        &DaemonMessage::Session {
+        &DaemonMessageType::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::SessionWorkingDirSet {
                 path: Some(path.to_string_lossy().into_owned()),
@@ -2568,7 +2571,7 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
             broadcast(
                 &mut state.subscribers,
                 ctx,
-                &DaemonMessage::Session {
+                &DaemonMessageType::Session {
                     session_id: Some(ctx.session_id),
                     event: SessionEvent::ContextWindowResolved { context_window: cw },
                 },
@@ -2584,7 +2587,7 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
     broadcast(
         &mut state.subscribers,
         ctx,
-        &DaemonMessage::Session {
+        &DaemonMessageType::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::SessionAccountSet { account: name },
         },
@@ -2606,7 +2609,7 @@ fn handle_set_reasoning_effort(
         broadcast(
             &mut state.subscribers,
             ctx,
-            &DaemonMessage::Session {
+            &DaemonMessageType::Session {
                 session_id: Some(ctx.session_id),
                 event: SessionEvent::ReasoningEffortSetFailed { effort, error: msg },
             },
@@ -2642,7 +2645,7 @@ fn handle_set_reasoning_effort(
         broadcast(
             &mut state.subscribers,
             ctx,
-            &DaemonMessage::Session {
+            &DaemonMessageType::Session {
                 session_id: Some(ctx.session_id),
                 event: SessionEvent::ReasoningEffortSet { effort },
             },
@@ -2655,7 +2658,7 @@ fn handle_set_reasoning_effort(
     broadcast(
         &mut state.subscribers,
         ctx,
-        &DaemonMessage::Session {
+        &DaemonMessageType::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::ReasoningEffortSetFailed { effort, error: msg },
         },
@@ -2727,7 +2730,7 @@ fn handle_undo(state: &mut SessionState, ctx: &RequestContext) -> bool {
     broadcast(
         &mut state.subscribers,
         ctx,
-        &DaemonMessage::Session {
+        &DaemonMessageType::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::TurnsUndone { turn_ids },
         },
@@ -2758,7 +2761,7 @@ fn handle_redo(state: &mut SessionState, ctx: &RequestContext) -> bool {
     broadcast(
         &mut state.subscribers,
         ctx,
-        &DaemonMessage::Session {
+        &DaemonMessageType::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::TurnsRedone {
                 turns: turns
@@ -2778,14 +2781,14 @@ fn handle_shutdown(
     ctx: &RequestContext,
 ) -> bool {
     *shutdown_requested = true;
-    for (&request_id, active) in &state.active_requests {
+    for (&stream_id, active) in &state.active_requests {
         let _ = active.cancel_tx.send(());
         broadcast(
             &mut state.subscribers,
             ctx,
-            &DaemonMessage::Session {
+            &DaemonMessageType::Session {
                 session_id: Some(ctx.session_id),
-                event: SessionEvent::Cancelled { request_id },
+                event: SessionEvent::Cancelled { stream_id },
             },
         );
     }
@@ -2796,7 +2799,7 @@ fn handle_shutdown(
 /// one value instead of eight positional arguments (and the
 /// `too_many_arguments` lint needs no suppression).
 struct RequestWorkerArgs<'a> {
-    request_id: u32,
+    stream_id: u64,
     // Borrowed only: `run_agent_loop` also takes the client by reference;
     // the worker thread outlives the call via its own clones of `ctx` and
     // `model` at the spawn site.
@@ -2811,7 +2814,7 @@ struct RequestWorkerArgs<'a> {
 
 fn run_request_worker(args: RequestWorkerArgs<'_>) {
     let RequestWorkerArgs {
-        request_id,
+        stream_id,
         client,
         session,
         model,
@@ -2826,9 +2829,7 @@ fn run_request_worker(args: RequestWorkerArgs<'_>) {
     let request_start = std::time::Instant::now();
     let initial_snapshot = session.snapshot();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_agent_loop(
-            client, session, model, request_id, cancel_rx, ctx, user_text,
-        )
+        run_agent_loop(client, session, model, stream_id, cancel_rx, ctx, user_text)
     }));
 
     let (outcome, snapshot) = match result {
@@ -2851,14 +2852,14 @@ fn run_request_worker(args: RequestWorkerArgs<'_>) {
 
     match &outcome {
         RequestOutcome::Done => {
-            info!(session_id = ctx.session_id, request_id, "request completed");
+            info!(session_id = ctx.session_id, stream_id, "request completed");
             // Route through the main session thread so detach is respected.
             // Include the worker's accumulated token usage so subscribers
             // (e.g. the TUI) can show per-request token counts.
             let usage = &session.config.accumulated_usage;
             debug!(
                 session_id = ctx.session_id,
-                request_id,
+                stream_id,
                 input_tokens = usage.input_tokens,
                 output_tokens = usage.output_tokens,
                 total_tokens = usage.total_tokens,
@@ -2866,30 +2867,30 @@ fn run_request_worker(args: RequestWorkerArgs<'_>) {
             );
             let _ = ctx
                 .cmd_tx
-                .send(SessionCommand::Broadcast(DaemonMessage::Session {
+                .send(SessionCommand::Broadcast(DaemonMessageType::Session {
                     session_id: Some(ctx.session_id),
                     event: SessionEvent::Done {
-                        request_id,
+                        stream_id,
                         token_usage: Some(*usage),
                         last_prompt_tokens: session.config.last_prompt_tokens,
                     },
                 }));
         }
         RequestOutcome::Failed(error) => {
-            info!(session_id = ctx.session_id, request_id, error = %error, "request failed");
+            info!(session_id = ctx.session_id, stream_id, error = %error, "request failed");
             // Route through the main session thread so detach is respected.
             let _ = ctx
                 .cmd_tx
-                .send(SessionCommand::Broadcast(DaemonMessage::Session {
+                .send(SessionCommand::Broadcast(DaemonMessageType::Session {
                     session_id: Some(ctx.session_id),
                     event: SessionEvent::Failed {
-                        request_id,
+                        stream_id,
                         error: error.to_string(),
                     },
                 }));
         }
         RequestOutcome::Cancelled => {
-            info!(session_id = ctx.session_id, request_id, "request cancelled");
+            info!(session_id = ctx.session_id, stream_id, "request cancelled");
         }
     }
 
@@ -2920,7 +2921,7 @@ fn run_request_worker(args: RequestWorkerArgs<'_>) {
     }
 
     let _ = ctx.cmd_tx.send(SessionCommand::RequestFinished {
-        request_id,
+        stream_id,
         snapshot,
     });
 }

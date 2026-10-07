@@ -2,7 +2,8 @@ use crate::connection::{handle_daemon_message, handle_terminal_event};
 use crate::state::*;
 use crate::test_util::{add_user_text, make_session, test_app};
 use choreo_proto::{
-    ClientMessage, DaemonMessage, ReasoningCapability, SessionEvent, SessionStatus, TokenUsage,
+    ClientMessageType, DaemonMessage, DaemonMessageType, ReasoningCapability, SessionEvent,
+    SessionStatus, TokenUsage,
 };
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
@@ -18,7 +19,7 @@ fn daemon_message_session_state_updates_progress_for_attached_session() {
     app.attached_session_id = Some(7);
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(7),
             event: SessionEvent::SessionState {
                 title: None,
@@ -40,7 +41,7 @@ fn daemon_message_session_state_updates_progress_for_attached_session() {
                 reasoning_capability: None,
                 status: SessionStatus::Inactive,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -71,7 +72,7 @@ fn daemon_message_session_state_sets_tool_groups() {
     app.attached_session_id = Some(7);
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(7),
             event: SessionEvent::SessionState {
                 title: None,
@@ -87,7 +88,7 @@ fn daemon_message_session_state_sets_tool_groups() {
                 reasoning_capability: None,
                 status: SessionStatus::Inactive,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -103,7 +104,7 @@ fn daemon_message_session_state_ignores_wrong_session() {
     app.attached_session_id = Some(7);
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(99), // different from attached_session_id
             event: SessionEvent::SessionState {
                 title: None,
@@ -125,7 +126,7 @@ fn daemon_message_session_state_ignores_wrong_session() {
                 reasoning_capability: None,
                 status: SessionStatus::Inactive,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -169,10 +170,10 @@ fn daemon_message_done_with_token_usage_updates_progress() {
     app.attached_session_id = Some(42);
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(42),
             event: SessionEvent::Done {
-                request_id: 1,
+                stream_id: 1,
                 token_usage: Some(TokenUsage {
                     input_tokens: 5,
                     output_tokens: 10,
@@ -182,7 +183,7 @@ fn daemon_message_done_with_token_usage_updates_progress() {
                 }),
                 last_prompt_tokens: Some(5),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -209,14 +210,14 @@ fn daemon_message_done_without_token_usage_does_not_change_progress() {
     // `Done` is a requires-origin event (the daemon always carries the real
     // session id in `Some`), so the fixture uses a nonzero id.
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(42),
             event: SessionEvent::Done {
-                request_id: 1,
+                stream_id: 1,
                 token_usage: None,
                 last_prompt_tokens: None,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -244,13 +245,13 @@ fn live_output_token_count_from_background_session_does_not_pollute_status_bar()
     // Session 7 (background, streamed via SubscribeAllActivity) reports its
     // live output-token count while the user keeps looking at session 0.
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(7),
             event: SessionEvent::LiveOutputTokenCount {
-                request_id: 50,
+                stream_id: 50,
                 output_tokens: 99,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -290,13 +291,13 @@ fn live_output_token_count_updates_own_session_after_switch() {
     });
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(7),
             event: SessionEvent::LiveOutputTokenCount {
-                request_id: 50,
+                stream_id: 50,
                 output_tokens: 42,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -337,7 +338,7 @@ fn session_state_snapshot_does_not_regress_fresher_token_usage() {
     // can lag the worker's live total for a mid-turn session — it must not
     // regress the status bar's token readout.
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(7),
             event: SessionEvent::SessionState {
                 title: None,
@@ -359,7 +360,7 @@ fn session_state_snapshot_does_not_regress_fresher_token_usage() {
                 reasoning_capability: None,
                 status: SessionStatus::Inactive,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -395,7 +396,7 @@ fn session_state_snapshot_with_newer_larger_usage_updates_display() {
     });
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(7),
             event: SessionEvent::SessionState {
                 title: None,
@@ -417,7 +418,7 @@ fn session_state_snapshot_with_newer_larger_usage_updates_display() {
                 reasoning_capability: None,
                 status: SessionStatus::Inactive,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -451,7 +452,7 @@ fn session_state_snapshot_does_not_regress_fresher_last_prompt_tokens() {
     app.display_for(7).last_prompt_tokens = Some(5000);
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(7),
             event: SessionEvent::SessionState {
                 title: None,
@@ -467,7 +468,7 @@ fn session_state_snapshot_does_not_regress_fresher_last_prompt_tokens() {
                 reasoning_capability: None,
                 status: SessionStatus::Inactive,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -491,7 +492,7 @@ fn session_state_snapshot_fills_missing_last_prompt_tokens() {
     assert!(app.display_for(7).last_prompt_tokens.is_none());
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(7),
             event: SessionEvent::SessionState {
                 title: None,
@@ -507,7 +508,7 @@ fn session_state_snapshot_fills_missing_last_prompt_tokens() {
                 reasoning_capability: None,
                 status: SessionStatus::Inactive,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -539,7 +540,7 @@ fn enter_continue_when_attached_sends_continue_generation() {
     assert_eq!(app.status.as_deref(), Some("> continue"));
     assert!(app.display_for(0).active.contains(&1));
     let msg = rx.recv().expect("should send ContinueGeneration");
-    assert_eq!(msg, ClientMessage::ContinueGeneration { request_id: 1 });
+    assert_eq!(msg, ClientMessageType::ContinueGeneration { stream_id: 1 });
 }
 
 #[test]
@@ -604,7 +605,7 @@ fn enter_stop_when_attached_sends_cancel_all() {
 
     assert_eq!(app.status.as_deref(), Some("> stop"));
     let msg = rx.recv().expect("should send Cancel");
-    assert_eq!(msg, ClientMessage::Cancel { request_id: 0 });
+    assert_eq!(msg, ClientMessageType::Cancel { stream_id: 0 });
 }
 
 #[test]
@@ -639,7 +640,7 @@ fn enter_undo_sends_undo() {
 
     assert_eq!(app.status.as_deref(), Some("> undo"));
     let msg = rx.recv().expect("should send Undo");
-    assert_eq!(msg, ClientMessage::Undo);
+    assert_eq!(msg, ClientMessageType::Undo);
 }
 
 #[test]
@@ -657,7 +658,7 @@ fn enter_redo_sends_redo() {
 
     assert_eq!(app.status.as_deref(), Some("> redo"));
     let msg = rx.recv().expect("should send Redo");
-    assert_eq!(msg, ClientMessage::Redo);
+    assert_eq!(msg, ClientMessageType::Redo);
 }
 
 #[test]
@@ -768,7 +769,7 @@ fn ctrl_r_cycles_through_valid_slugs() {
     let msg = rx.recv().expect("SetReasoningEffort 1");
     assert_eq!(
         msg,
-        ClientMessage::SetReasoningEffort {
+        ClientMessageType::SetReasoningEffort {
             effort: "low".to_string()
         }
     );
@@ -787,7 +788,7 @@ fn ctrl_r_cycles_through_valid_slugs() {
     let msg = rx.recv().expect("SetReasoningEffort 2");
     assert_eq!(
         msg,
-        ClientMessage::SetReasoningEffort {
+        ClientMessageType::SetReasoningEffort {
             effort: "medium".to_string()
         }
     );
@@ -803,7 +804,7 @@ fn ctrl_r_cycles_through_valid_slugs() {
     let msg = rx.recv().expect("SetReasoningEffort 3");
     assert_eq!(
         msg,
-        ClientMessage::SetReasoningEffort {
+        ClientMessageType::SetReasoningEffort {
             effort: "high".to_string()
         }
     );
@@ -819,7 +820,7 @@ fn ctrl_r_cycles_through_valid_slugs() {
     let msg = rx.recv().expect("SetReasoningEffort 4");
     assert_eq!(
         msg,
-        ClientMessage::SetReasoningEffort {
+        ClientMessageType::SetReasoningEffort {
             effort: "off".to_string()
         }
     );
@@ -901,7 +902,7 @@ fn ctrl_r_google_off_on() {
     let msg = rx.recv().expect("SetReasoningEffort 1");
     assert_eq!(
         msg,
-        ClientMessage::SetReasoningEffort {
+        ClientMessageType::SetReasoningEffort {
             effort: "on".to_string()
         }
     );
@@ -917,7 +918,7 @@ fn ctrl_r_google_off_on() {
     let msg = rx.recv().expect("SetReasoningEffort 2");
     assert_eq!(
         msg,
-        ClientMessage::SetReasoningEffort {
+        ClientMessageType::SetReasoningEffort {
             effort: "off".to_string()
         }
     );
@@ -931,12 +932,12 @@ fn reasoning_effort_set_updates_session_state() {
     app.attached_session_id = Some(42);
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::ReasoningEffortSet {
                 effort: "high".to_string(),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -972,12 +973,12 @@ fn reasoning_effort_set_for_background_session_does_not_touch_attached_display()
     // display — writing it to the active display would let a background
     // session's settings bleed into the status bar of the session being viewed.
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(99),
             event: SessionEvent::ReasoningEffortSet {
                 effort: "high".to_string(),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1009,13 +1010,13 @@ fn model_selected_for_background_session_does_not_touch_attached_display() {
     // A background session (99) changes its model.  The active display must
     // not show the background session's model in its status bar.
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(99),
             event: SessionEvent::ModelSelected {
                 model: "gpt-other".to_string(),
                 reasoning_capability: None,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1045,13 +1046,13 @@ fn model_selected_for_attached_session_updates_display_and_summary() {
         .set_sessions(vec![make_session(42, "a", "gpt-old", 0)]);
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(42),
             event: SessionEvent::ModelSelected {
                 model: "gpt-new".to_string(),
                 reasoning_capability: None,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1083,12 +1084,12 @@ fn reasoning_effort_set_for_attached_session_updates_display_and_summary() {
         .set_sessions(vec![make_session(42, "a", "m", 0)]);
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(42),
             event: SessionEvent::ReasoningEffortSet {
                 effort: "high".to_string(),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1118,12 +1119,12 @@ fn session_account_set_for_background_session_does_not_touch_attached_display() 
     // A background session (99) changes its account — the viewed session's
     // identity fields (account, provider slug) must not change.
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(99),
             event: SessionEvent::SessionAccountSet {
                 account: "bg-account".to_string(),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1151,13 +1152,13 @@ fn reasoning_effort_set_failed_for_background_session_does_not_touch_attached_di
     // A background session's rejection must not flip the viewed session's
     // reasoning-effort display back to "off".
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(99),
             event: SessionEvent::ReasoningEffortSetFailed {
                 effort: "high".to_string(),
                 error: "model does not support reasoning".to_string(),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1209,13 +1210,13 @@ fn session_flags_changed_updates_list_and_archived_split() {
 
     // The daemon broadcasts a pin for session 1.
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(1),
             event: SessionEvent::SessionFlagsChanged {
                 pinned: true,
                 archived_at: None,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1226,13 +1227,13 @@ fn session_flags_changed_updates_list_and_archived_split() {
 
     // The daemon broadcasts an archive for session 2.
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(2),
             event: SessionEvent::SessionFlagsChanged {
                 pinned: false,
                 archived_at: Some(1_705_314_000_500),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1266,13 +1267,13 @@ fn session_failed_for_pin_and_archive_sets_page_error() {
     assert!(app.session_mgr.error.is_none());
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(1),
             event: SessionEvent::SessionFailed {
                 operation: "set_session_pinned".into(),
                 error: "boom".into(),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1284,13 +1285,13 @@ fn session_failed_for_pin_and_archive_sets_page_error() {
 
     app.session_mgr.error = None;
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(1),
             event: SessionEvent::SessionFailed {
                 operation: "set_session_archived".into(),
                 error: "nope".into(),
             },
-        },
+        }),
         &mut app,
         &tx,
     )

@@ -3,8 +3,8 @@ use crate::markdown_render::*;
 use crate::state::*;
 use crate::test_util::{make_session, test_app};
 use choreo_proto::{
-    AccountInfo, CatalogProvider, ClientMessage, DaemonMessage, McpServerStatus,
-    ReasoningCapability, RefreshStatus, SessionStatus, Turn,
+    AccountInfo, CatalogProvider, ClientMessageType, DaemonMessage, DaemonMessageType,
+    McpServerStatus, ReasoningCapability, RefreshStatus, SessionStatus, Turn,
 };
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
@@ -120,8 +120,8 @@ fn terminal_event_submits_run_input() {
     let message = rx.recv().expect("sent message");
     assert_eq!(
         message,
-        ClientMessage::RunInput {
-            request_id: 1,
+        ClientMessageType::RunInput {
+            stream_id: 1,
             input: b"hello".to_vec(),
         }
     );
@@ -169,7 +169,7 @@ fn submitting_prompt_while_locked_is_rejected_with_feedback() {
 // available so the user can still e.g. `/cancel`.
 
 /// Drive a bare Enter keypress through the full terminal-event pipeline.
-fn press_enter(app: &mut App, tx: &crossbeam_channel::Sender<ClientMessage>) {
+fn press_enter(app: &mut App, tx: &crossbeam_channel::Sender<ClientMessageType>) {
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         app,
@@ -236,8 +236,8 @@ fn submitting_prompt_while_idle_is_sent() {
     assert!(app.input.is_empty());
     assert_eq!(
         rx.recv().expect("sent message"),
-        ClientMessage::RunInput {
-            request_id: 1,
+        ClientMessageType::RunInput {
+            stream_id: 1,
             input: b"hello".to_vec(),
         }
     );
@@ -278,7 +278,7 @@ fn slash_command_is_accepted_while_busy() {
 
     assert_eq!(
         rx.recv().expect("sent message"),
-        ClientMessage::Ping,
+        ClientMessageType::Ping,
         "slash-commands must bypass the idle guard"
     );
 }
@@ -300,7 +300,7 @@ fn empty_submission_while_busy_is_a_noop() {
 }
 
 /// Drive an Alt+Enter keypress through the full terminal-event pipeline.
-fn press_alt_enter(app: &mut App, tx: &crossbeam_channel::Sender<ClientMessage>) {
+fn press_alt_enter(app: &mut App, tx: &crossbeam_channel::Sender<ClientMessageType>) {
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
         app,
@@ -360,7 +360,7 @@ fn alt_enter_while_idle_is_sent() {
 
     assert!(matches!(
         rx.recv().expect("sent message"),
-        ClientMessage::ContinueGeneration { .. }
+        ClientMessageType::ContinueGeneration { .. }
     ));
     assert!(app.status.is_none(), "no status message on success");
 }
@@ -581,7 +581,7 @@ fn chat_alt_a_enters_ai_providers() {
 
     assert_eq!(app.page, Page::AIProviders);
     let msg = rx.recv().expect("sent message");
-    assert_eq!(msg, ClientMessage::ListAccounts);
+    assert_eq!(msg, ClientMessageType::ListAccounts);
 }
 
 #[test]
@@ -597,7 +597,7 @@ fn chat_alt_up_sends_undo() {
     .expect("handle alt+up");
 
     let msg = rx.recv().expect("sent message");
-    assert_eq!(msg, ClientMessage::Undo);
+    assert_eq!(msg, ClientMessageType::Undo);
 }
 
 #[test]
@@ -613,7 +613,7 @@ fn chat_alt_down_sends_redo() {
     .expect("handle alt+down");
 
     let msg = rx.recv().expect("sent message");
-    assert_eq!(msg, ClientMessage::Redo);
+    assert_eq!(msg, ClientMessageType::Redo);
 }
 
 #[test]
@@ -630,7 +630,7 @@ fn chat_esc_stops_active_session() {
     .expect("handle esc");
 
     let msg = rx.recv().expect("sent message");
-    assert_eq!(msg, ClientMessage::Cancel { request_id: 0 });
+    assert_eq!(msg, ClientMessageType::Cancel { stream_id: 0 });
     assert!(app.status.is_none(), "no status message on success");
 }
 
@@ -667,13 +667,11 @@ fn chat_alt_enter_continues_generation() {
     let msg = rx.recv().expect("sent message");
     assert_eq!(
         msg,
-        ClientMessage::ContinueGeneration {
-            request_id: next_id
-        }
+        ClientMessageType::ContinueGeneration { stream_id: next_id }
     );
     assert!(
         app.display_for(0).active.contains(&next_id),
-        "request_id should be in active set"
+        "stream_id should be in active set"
     );
     assert_eq!(
         app.next_request_id,
@@ -1063,7 +1061,7 @@ mod unsent_draft_tests {
         .expect("submit refresh-models");
 
         let msg = rx.recv().expect("RefreshModels sent");
-        assert_eq!(msg, ClientMessage::RefreshModels { force: true });
+        assert_eq!(msg, ClientMessageType::RefreshModels { force: true });
         assert_eq!(
             app.status.as_deref(),
             Some("refreshing models… (forced)"),
@@ -1077,11 +1075,11 @@ mod unsent_draft_tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
 
         handle_daemon_message(
-            DaemonMessage::ModelsRefreshed {
+            DaemonMessage::broadcast(DaemonMessageType::ModelsRefreshed {
                 providers: 208,
                 models: 1234,
                 status: RefreshStatus::Updated,
-            },
+            }),
             &mut app,
             &tx,
         )
@@ -1092,11 +1090,11 @@ mod unsent_draft_tests {
         );
 
         handle_daemon_message(
-            DaemonMessage::ModelsRefreshed {
+            DaemonMessage::broadcast(DaemonMessageType::ModelsRefreshed {
                 providers: 208,
                 models: 1234,
                 status: RefreshStatus::UpToDate,
-            },
+            }),
             &mut app,
             &tx,
         )
@@ -1107,11 +1105,11 @@ mod unsent_draft_tests {
         );
 
         handle_daemon_message(
-            DaemonMessage::ModelsRefreshed {
+            DaemonMessage::broadcast(DaemonMessageType::ModelsRefreshed {
                 providers: 208,
                 models: 1234,
                 status: RefreshStatus::Forced,
-            },
+            }),
             &mut app,
             &tx,
         )
@@ -1125,9 +1123,9 @@ mod unsent_draft_tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
 
         handle_daemon_message(
-            DaemonMessage::ModelsRefreshFailed {
+            DaemonMessage::broadcast(DaemonMessageType::ModelsRefreshFailed {
                 error: "network error".to_string(),
-            },
+            }),
             &mut app,
             &tx,
         )
@@ -1157,7 +1155,7 @@ mod unsent_draft_tests {
         .expect("submit /mcp");
 
         let msg = rx.recv().expect("McpStatusRequest sent");
-        assert_eq!(msg, ClientMessage::McpStatusRequest);
+        assert_eq!(msg, ClientMessageType::McpStatusRequest);
         assert_eq!(app.status.as_deref(), Some("> /mcp"));
     }
 
@@ -1178,7 +1176,7 @@ mod unsent_draft_tests {
         let msg = rx.recv().expect("McpReconnect sent");
         assert_eq!(
             msg,
-            ClientMessage::McpReconnect {
+            ClientMessageType::McpReconnect {
                 slug: "docs".to_string(),
             }
         );
@@ -1191,7 +1189,7 @@ mod unsent_draft_tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
 
         handle_daemon_message(
-            DaemonMessage::McpStatus {
+            DaemonMessage::broadcast(DaemonMessageType::McpStatus {
                 servers: vec![
                     McpServerStatus {
                         slug: "docs".to_string(),
@@ -1219,7 +1217,7 @@ mod unsent_draft_tests {
                 project_root: None,
                 project_trusted: false,
                 ignored_project_servers: Vec::new(),
-            },
+            }),
             &mut app,
             &tx,
         )
@@ -1238,12 +1236,12 @@ mod unsent_draft_tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
 
         handle_daemon_message(
-            DaemonMessage::McpStatus {
+            DaemonMessage::broadcast(DaemonMessageType::McpStatus {
                 servers: Vec::new(),
                 project_root: None,
                 project_trusted: false,
                 ignored_project_servers: Vec::new(),
-            },
+            }),
             &mut app,
             &tx,
         )
@@ -1257,10 +1255,10 @@ mod unsent_draft_tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
 
         handle_daemon_message(
-            DaemonMessage::McpReconnectFailed {
+            DaemonMessage::broadcast(DaemonMessageType::McpReconnectFailed {
                 slug: "docs".to_string(),
                 error: "connection refused".to_string(),
-            },
+            }),
             &mut app,
             &tx,
         )
@@ -1286,7 +1284,7 @@ mod unsent_draft_tests {
         .expect("submit /mcp reload");
 
         let msg = rx.recv().expect("McpReload sent");
-        assert_eq!(msg, ClientMessage::McpReload);
+        assert_eq!(msg, ClientMessageType::McpReload);
         assert_eq!(app.status.as_deref(), Some("reloading MCP configuration…"));
     }
 
@@ -1296,7 +1294,7 @@ mod unsent_draft_tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
 
         handle_daemon_message(
-            DaemonMessage::McpReloaded {
+            DaemonMessage::broadcast(DaemonMessageType::McpReloaded {
                 summary: "MCP reload: 1 added, 0 removed, 1 restarted, 0 unchanged, 0 failed"
                     .to_string(),
                 servers: vec![McpServerStatus {
@@ -1310,7 +1308,7 @@ mod unsent_draft_tests {
                     server_version: Some("1.0.0".to_string()),
                     last_error: None,
                 }],
-            },
+            }),
             &mut app,
             &tx,
         )
@@ -1331,9 +1329,9 @@ mod unsent_draft_tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
 
         handle_daemon_message(
-            DaemonMessage::McpReloadFailed {
+            DaemonMessage::broadcast(DaemonMessageType::McpReloadFailed {
                 error: "failed to parse mcp.json".to_string(),
-            },
+            }),
             &mut app,
             &tx,
         )
@@ -1357,7 +1355,7 @@ mod unsent_draft_tests {
 
         // A catalog update with a small list replaces it and clamps.
         handle_daemon_message(
-            DaemonMessage::CatalogUpdated {
+            DaemonMessage::broadcast(DaemonMessageType::CatalogUpdated {
                 providers: vec![
                     CatalogProvider {
                         slug: "openai".into(),
@@ -1368,7 +1366,7 @@ mod unsent_draft_tests {
                         display_name: "Anthropic".into(),
                     },
                 ],
-            },
+            }),
             &mut app,
             &tx,
         )
@@ -1401,8 +1399,12 @@ mod unsent_draft_tests {
                 display_name: p.display_name.clone(),
             })
             .collect();
-        handle_daemon_message(DaemonMessage::CatalogUpdated { providers }, &mut app, &tx)
-            .expect("handle CatalogUpdated");
+        handle_daemon_message(
+            DaemonMessage::broadcast(DaemonMessageType::CatalogUpdated { providers }),
+            &mut app,
+            &tx,
+        )
+        .expect("handle CatalogUpdated");
 
         assert_eq!(app.status.as_deref(), Some("busy"), "status preserved");
         assert_eq!(app.providers.len(), 208);
@@ -1578,10 +1580,10 @@ mod unsent_draft_tests {
         app.ai_providers.credential.open("my-account".to_string());
 
         handle_daemon_message(
-            DaemonMessage::AccountAddFailed {
+            DaemonMessage::broadcast(DaemonMessageType::AccountAddFailed {
                 name: "my-account".to_string(),
                 error: "duplicate slug".to_string(),
-            },
+            }),
             &mut app,
             &tx,
         )
@@ -1610,10 +1612,10 @@ mod unsent_draft_tests {
         app.ai_providers.credential.input.cursor = 4;
 
         handle_daemon_message(
-            DaemonMessage::AccountAddFailed {
+            DaemonMessage::broadcast(DaemonMessageType::AccountAddFailed {
                 name: "my-account".to_string(),
                 error: "duplicate slug".to_string(),
-            },
+            }),
             &mut app,
             &tx,
         )
@@ -1644,7 +1646,12 @@ mod unsent_draft_tests {
         let mut app = test_app();
         let (tx, _rx) = crossbeam_channel::unbounded();
 
-        handle_daemon_message(DaemonMessage::Evicted, &mut app, &tx).expect("handle Evicted");
+        handle_daemon_message(
+            DaemonMessage::broadcast(DaemonMessageType::Evicted),
+            &mut app,
+            &tx,
+        )
+        .expect("handle Evicted");
 
         assert!(app.should_quit, "eviction must terminate the TUI");
         let msg = app.quit_message.as_deref().expect("quit message set");
@@ -1659,8 +1666,12 @@ mod unsent_draft_tests {
         let mut app = test_app();
         let (tx, _rx) = crossbeam_channel::unbounded();
 
-        handle_daemon_message(DaemonMessage::ShuttingDown, &mut app, &tx)
-            .expect("handle ShuttingDown");
+        handle_daemon_message(
+            DaemonMessage::broadcast(DaemonMessageType::ShuttingDown),
+            &mut app,
+            &tx,
+        )
+        .expect("handle ShuttingDown");
 
         assert!(app.should_quit, "server shutdown must terminate the TUI");
         let msg = app.quit_message.as_deref().expect("quit message set");
@@ -1678,7 +1689,7 @@ mod unsent_draft_tests {
 // drive the full terminal-event pipeline to pin the end-to-end behavior.
 
 /// Send one unmodified key through the full terminal-event pipeline.
-fn press(app: &mut App, tx: &crossbeam_channel::Sender<ClientMessage>, code: KeyCode) {
+fn press(app: &mut App, tx: &crossbeam_channel::Sender<ClientMessageType>, code: KeyCode) {
     handle_terminal_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), app, tx)
         .expect("handle key");
 }
@@ -1771,7 +1782,10 @@ fn palette_enter_runs_the_command_and_clears_the_line() {
         app.model_selector.is_open(),
         "Enter runs `/model`, opening the model selector"
     );
-    assert_eq!(rx.recv().expect("ListModels"), ClientMessage::ListModels);
+    assert_eq!(
+        rx.recv().expect("ListModels"),
+        ClientMessageType::ListModels
+    );
     assert!(
         !app.command_palette_active(),
         "running a command clears the line"
@@ -1805,7 +1819,10 @@ fn palette_shift_enter_runs_the_command_without_a_newline() {
         app.model_selector.is_open(),
         "Shift+Enter runs the command like Enter"
     );
-    assert_eq!(rx.recv().expect("ListModels"), ClientMessage::ListModels);
+    assert_eq!(
+        rx.recv().expect("ListModels"),
+        ClientMessageType::ListModels
+    );
     assert!(
         !app.command_palette_active(),
         "running the command clears the line"
@@ -1852,11 +1869,11 @@ fn palette_enter_on_empty_line_runs_the_highlighted_command() {
     );
     assert_eq!(
         rx.recv().expect("ListSessions"),
-        ClientMessage::ListSessions
+        ClientMessageType::ListSessions
     );
     assert_eq!(
         rx.recv().expect("SubscribeSessionsSummary"),
-        ClientMessage::SubscribeSessionsSummary
+        ClientMessageType::SubscribeSessionsSummary
     );
     assert!(
         !app.command_palette_active(),
@@ -1883,7 +1900,10 @@ fn palette_enter_on_a_partial_token_runs_the_highlighted_command() {
         app.model_selector.is_open(),
         "Enter ran the highlighted `/model`"
     );
-    assert_eq!(rx.recv().expect("ListModels"), ClientMessage::ListModels);
+    assert_eq!(
+        rx.recv().expect("ListModels"),
+        ClientMessageType::ListModels
+    );
     assert!(
         !app.command_palette_active(),
         "running a command clears the line"
@@ -1911,7 +1931,10 @@ fn palette_enter_runs_the_row_the_arrows_selected() {
         app.model_selector.is_open(),
         "Enter ran the arrow-selected `/model`"
     );
-    assert_eq!(rx.recv().expect("ListModels"), ClientMessage::ListModels);
+    assert_eq!(
+        rx.recv().expect("ListModels"),
+        ClientMessageType::ListModels
+    );
     assert!(!app.command_palette_active());
 }
 
@@ -2042,7 +2065,10 @@ fn literal_slash_command_line_runs() {
     press(&mut app, &tx, KeyCode::Enter);
 
     assert!(app.model_selector.is_open(), "`/model` opens the selector");
-    assert_eq!(rx.recv().expect("ListModels"), ClientMessage::ListModels);
+    assert_eq!(
+        rx.recv().expect("ListModels"),
+        ClientMessageType::ListModels
+    );
     assert!(!app.command_palette_active());
 }
 
@@ -2091,7 +2117,7 @@ fn alt_r_cycles_reasoning_effort() {
     assert_eq!(app.status.as_deref(), Some("reasoning: low"));
     assert_eq!(
         rx.recv().expect("sent message"),
-        ClientMessage::SetReasoningEffort {
+        ClientMessageType::SetReasoningEffort {
             effort: "low".to_string()
         }
     );
@@ -2112,11 +2138,11 @@ fn alt_s_opens_session_manager() {
     assert_eq!(app.page, Page::SessionManager);
     assert_eq!(
         rx.recv().expect("ListSessions"),
-        ClientMessage::ListSessions
+        ClientMessageType::ListSessions
     );
     assert_eq!(
         rx.recv().expect("SubscribeSessionsSummary"),
-        ClientMessage::SubscribeSessionsSummary
+        ClientMessageType::SubscribeSessionsSummary
     );
     // A bare keypress must not echo a `> /session` status.
     assert!(app.status.is_none());
@@ -2135,7 +2161,10 @@ fn alt_m_opens_selector_and_requests_models() {
     .expect("alt+m");
 
     assert!(app.model_selector.is_open());
-    assert_eq!(rx.recv().expect("ListModels"), ClientMessage::ListModels);
+    assert_eq!(
+        rx.recv().expect("ListModels"),
+        ClientMessageType::ListModels
+    );
     assert!(app.status.is_none(), "a bare keypress must not echo");
 }
 

@@ -40,7 +40,10 @@ use choreo_ai_protocols::test_utils::MockProvider;
 use choreo_daemon::broadcast::{LagLimits, SubscriberSink};
 use choreo_daemon::providers::InferenceProvider;
 use choreo_daemon::{RequestContext, SessionCommand, session_main};
-use choreo_proto::{ClientMessage, DaemonMessage, OutputStream, SessionEvent, Turn};
+use choreo_proto::{
+    ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, OutputStream, SessionEvent,
+    Turn,
+};
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -209,8 +212,8 @@ fn collect_answer_until_done(rx: &crossbeam_channel::Receiver<DaemonMessage>) ->
     let mut bytes = Vec::new();
     let mut final_turn = None;
     loop {
-        match recv_msg(rx) {
-            DaemonMessage::Session {
+        match recv_msg(rx).inner {
+            DaemonMessageType::Session {
                 event:
                     SessionEvent::OutputChunk {
                         stream: OutputStream::Answer,
@@ -219,19 +222,19 @@ fn collect_answer_until_done(rx: &crossbeam_channel::Receiver<DaemonMessage>) ->
                     },
                 ..
             } => bytes.extend_from_slice(&data),
-            DaemonMessage::Session {
+            DaemonMessageType::Session {
                 event: SessionEvent::OutputChunk { .. },
                 ..
             } => {
                 // Reasoning deltas are not part of assistant_text; skip them.
             }
-            DaemonMessage::Session {
+            DaemonMessageType::Session {
                 event: SessionEvent::TurnAppended { turn, .. },
                 ..
             } if turn.assistant_text.is_some() => {
                 final_turn = Some(turn);
             }
-            DaemonMessage::Session {
+            DaemonMessageType::Session {
                 event: SessionEvent::Done { .. },
                 ..
             } => break,
@@ -251,21 +254,21 @@ fn collect_tool_chunks_until_done(
     let mut bytes = Vec::new();
     let mut tool_turn = None;
     loop {
-        match recv_msg(rx) {
-            DaemonMessage::Session {
+        match recv_msg(rx).inner {
+            DaemonMessageType::Session {
                 event: SessionEvent::ToolResultChunk { call_id, data, .. },
                 ..
             } => {
                 assert_eq!(call_id, "call_1", "only the scripted sh call streams");
                 bytes.extend_from_slice(&data);
             }
-            DaemonMessage::Session {
+            DaemonMessageType::Session {
                 event: SessionEvent::TurnAppended { turn, .. },
                 ..
             } if !turn.tool_results.is_empty() => {
                 tool_turn = Some(turn);
             }
-            DaemonMessage::Session {
+            DaemonMessageType::Session {
                 event: SessionEvent::Done { .. },
                 ..
             } => break,
@@ -312,7 +315,7 @@ fn streamed_answer_matches_final_turn_byte_for_byte() {
         .expect("set model");
     session_tx
         .send(SessionCommand::RunInput {
-            request_id: 1,
+            stream_id: 1,
             input: b"hello".to_vec(),
         })
         .expect("run input");
@@ -379,7 +382,7 @@ fn tool_streaming_delivers_every_chunk_in_order() {
         .expect("set model");
     session_tx
         .send(SessionCommand::RunInput {
-            request_id: 1,
+            stream_id: 1,
             input: b"run the tool".to_vec(),
         })
         .expect("run input");
@@ -479,34 +482,40 @@ fn evicts_client_that_stops_reading() {
     // streaming request.
     write_message(
         &mut stream,
-        &ClientMessage::CreateSession {
-            title: None,
-            parent_session_id: None,
-            working_dir: None,
-            context_config: None,
-            account_name: Some("mock-account".to_string()),
-            selected_model: Some("mock-4o".to_string()),
-            reasoning_effort: None,
-        },
+        &ClientMessage::request(
+            0,
+            ClientMessageType::CreateSession {
+                title: None,
+                parent_session_id: None,
+                working_dir: None,
+                context_config: None,
+                account_name: Some("mock-account".to_string()),
+                selected_model: Some("mock-4o".to_string()),
+                reasoning_effort: None,
+            },
+        ),
     );
-    let session_id = match read_message::<_, DaemonMessage>(&mut stream) {
-        DaemonMessage::Session {
+    let session_id = match read_message::<_, DaemonMessage>(&mut stream).inner {
+        DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionCreatedForRequester { .. },
         } => session_id,
         other => panic!("expected SessionCreatedForRequester, got {other:?}"),
     };
 
-    write_message(&mut stream, &ClientMessage::AttachSession { session_id });
-    match read_message::<_, DaemonMessage>(&mut stream) {
-        DaemonMessage::Session {
+    write_message(
+        &mut stream,
+        &ClientMessage::request(0, ClientMessageType::AttachSession { session_id }),
+    );
+    match read_message::<_, DaemonMessage>(&mut stream).inner {
+        DaemonMessageType::Session {
             session_id: Some(sid),
             event: SessionEvent::SessionAttached,
         } => assert_eq!(sid, session_id),
         other => panic!("expected SessionAttached, got {other:?}"),
     }
-    match read_message::<_, DaemonMessage>(&mut stream) {
-        DaemonMessage::Session {
+    match read_message::<_, DaemonMessage>(&mut stream).inner {
+        DaemonMessageType::Session {
             event: SessionEvent::SessionState { .. },
             ..
         } => {}
@@ -517,10 +526,13 @@ fn evicts_client_that_stops_reading() {
     // broadcast + a couple of OutputChunks), then STOP reading entirely.
     write_message(
         &mut stream,
-        &ClientMessage::RunInput {
-            request_id: 1,
-            input: b"stream a lot".to_vec(),
-        },
+        &ClientMessage::request(
+            0,
+            ClientMessageType::RunInput {
+                stream_id: 1,
+                input: b"stream a lot".to_vec(),
+            },
+        ),
     );
     let mut chunks_seen = 0u32;
     let start_deadline = Instant::now() + TIMEOUT;
@@ -529,22 +541,22 @@ fn evicts_client_that_stops_reading() {
             Instant::now() < start_deadline,
             "timed out waiting for the stream to start"
         );
-        match read_message::<_, DaemonMessage>(&mut stream) {
-            DaemonMessage::Session {
+        match read_message::<_, DaemonMessage>(&mut stream).inner {
+            DaemonMessageType::Session {
                 event: SessionEvent::Started { .. },
                 ..
             } => {}
-            DaemonMessage::Session {
+            DaemonMessageType::Session {
                 event: SessionEvent::OutputChunk { .. },
                 ..
             } => chunks_seen += 1,
-            DaemonMessage::Evicted => {
+            DaemonMessageType::Evicted => {
                 panic!("client was evicted before it deliberately stopped reading")
             }
             // The seed/status/token messages that precede the first answer
             // chunk are expected noise on the wire — only Started,
             // OutputChunk, and Evicted are load-bearing here.
-            DaemonMessage::Session { .. } => {}
+            DaemonMessageType::Session { .. } => {}
             other => panic!("unexpected message while the stream started: {other:?}"),
         }
     }
@@ -561,9 +573,12 @@ fn evicts_client_that_stops_reading() {
     client2
         .set_read_timeout(Some(READ_TIMEOUT))
         .expect("read timeout");
-    write_message(&mut client2, &ClientMessage::Ping);
-    match read_message::<_, DaemonMessage>(&mut client2) {
-        DaemonMessage::Pong => {}
+    write_message(
+        &mut client2,
+        &ClientMessage::request(0, ClientMessageType::Ping),
+    );
+    match read_message::<_, DaemonMessage>(&mut client2).inner {
+        DaemonMessageType::Pong => {}
         other => panic!("expected Pong from the healthy daemon, got {other:?}"),
     }
 

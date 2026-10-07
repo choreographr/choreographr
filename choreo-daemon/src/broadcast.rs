@@ -59,7 +59,7 @@
 //! daemon-wide total (which bounds memory), and the writer thread mirrors the
 //! split on dequeue, so the counters stay balanced.
 
-use choreo_proto::DaemonMessage;
+use choreo_proto::{DaemonMessage, DaemonMessageType};
 use crossbeam_channel::Sender;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -273,7 +273,7 @@ pub enum EnqueueOutcome {
 /// Broadcast/streaming messages and ordinary replies count: a client whose
 /// backlog of UNSOLICITED traffic grows past the cap is genuinely lagging and
 /// is the one eviction sheds. The one exception is a large, SOLICITED `Image`
-/// reply (the answer to `ClientMessage::GetImage`): the client asked for
+/// reply (the answer to `ClientMessageType::GetImage`): the client asked for
 /// exactly those bytes, so their size is not evidence that it cannot keep up —
 /// a single image can approach `MAX_FRAME_SIZE` (64 MiB, equal to the default
 /// per-client cap), so counting it could evict a client merely for scrolling
@@ -288,7 +288,7 @@ pub enum EnqueueOutcome {
 /// writer's mirror follows automatically).
 #[must_use]
 pub(crate) fn counts_toward_client_lag(msg: &DaemonMessage) -> bool {
-    !matches!(msg, DaemonMessage::Image { .. })
+    !matches!(msg.inner, DaemonMessageType::Image { .. })
 }
 
 /// Lag thresholds. Default = 64 MiB per client, 512 MiB daemon-wide.
@@ -315,13 +315,13 @@ mod tests {
     use choreo_proto::SessionStatus;
 
     fn status_msg(session_id: u64) -> DaemonMessage {
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inactive,
                 last_modified: 0,
             },
-        }
+        })
     }
 
     /// Tiny, injectable limits so a test can cross a cap with a handful of
@@ -367,19 +367,22 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
         let sink = SubscriberSink::new(tx);
         let global = AtomicUsize::new(0);
-        // per_client_cap = 200: the ~180-byte `Session`-wrapped status
-        // message fits, a ~276-byte wrapped `Failed` payload message crosses
-        // it (both estimates include the v4 envelope overhead).
+        // per_client_cap = 256: the ~228-byte `Session`-wrapped status
+        // message (the `{ id, inner }` envelope adds the correlation-id
+        // overhead) fits, a ~324-byte wrapped `Failed` payload message crosses
+        // it (both estimates include the frame/envelope overhead).
         let limits = LagLimits {
-            per_client_cap: 200,
+            per_client_cap: 256,
             global_budget: usize::MAX, // isolate the per-client threshold
         };
-        let payload_msg = || DaemonMessage::Session {
-            session_id: Some(1),
-            event: SessionEvent::Failed {
-                request_id: 1,
-                error: "x".repeat(100),
-            },
+        let payload_msg = || {
+            DaemonMessage::broadcast(DaemonMessageType::Session {
+                session_id: Some(1),
+                event: SessionEvent::Failed {
+                    stream_id: 1,
+                    error: "x".repeat(100),
+                },
+            })
         };
 
         // First: well under the cap → Delivered.
@@ -412,11 +415,11 @@ mod tests {
         let sink = SubscriberSink::new(tx);
         let global = AtomicUsize::new(0);
         // Global budget tiny; per-client cap huge so only the global fires.
-        // budget = 200: the ~180-byte `Session`-wrapped status message fits,
-        // the ~376-byte wrapped `Failed` payload pushes the total over.
+        // budget = 256: the ~228-byte `Session`-wrapped status message fits,
+        // the ~424-byte wrapped `Failed` payload pushes the total over.
         let limits = LagLimits {
             per_client_cap: usize::MAX,
-            global_budget: 200,
+            global_budget: 256,
         };
 
         // One status message (~small) stays under the global budget.
@@ -427,13 +430,13 @@ mod tests {
         ));
 
         // A big message pushes the daemon-wide total over the budget.
-        let m2 = DaemonMessage::Session {
+        let m2 = DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(1),
             event: SessionEvent::Failed {
-                request_id: 2,
+                stream_id: 2,
                 error: "y".repeat(200),
             },
-        };
+        });
         let outcome = sink.enqueue(&m2, &limits, &global);
         assert!(
             matches!(outcome, EnqueueOutcome::GlobalOverBudget),
@@ -515,20 +518,20 @@ mod tests {
         };
 
         // Two messages of known size: Failed with 100-byte and 50-byte errors.
-        let m1 = DaemonMessage::Session {
+        let m1 = DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(1),
             event: SessionEvent::Failed {
-                request_id: 1,
+                stream_id: 1,
                 error: "a".repeat(100),
             },
-        };
-        let m2 = DaemonMessage::Session {
+        });
+        let m2 = DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(2),
             event: SessionEvent::Failed {
-                request_id: 2,
+                stream_id: 2,
                 error: "b".repeat(50),
             },
-        };
+        });
         let s1 = m1.approx_wire_size();
         let s2 = m2.approx_wire_size();
 
@@ -595,12 +598,15 @@ mod tests {
         };
 
         // A multi-KiB Image reply: the per-client counter must stay at zero...
-        let image = DaemonMessage::Image {
-            session_id: 1,
-            turn_id: 1,
-            key: choreo_proto::ImageKey::Displayed { index: 0 },
-            data: Some(vec![0u8; 4096]),
-        };
+        let image = DaemonMessage::reply(
+            0,
+            DaemonMessageType::Image {
+                session_id: 1,
+                turn_id: 1,
+                key: choreo_proto::ImageKey::Displayed { index: 0 },
+                data: Some(vec![0u8; 4096]),
+            },
+        );
         assert!(sink.send_accounted(&image, &global).is_some());
         assert_eq!(
             sink.bytes_in_flight.load(Ordering::Relaxed),

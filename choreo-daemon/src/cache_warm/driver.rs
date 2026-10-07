@@ -33,7 +33,7 @@ pub struct WarmRequest {
     /// Gateway routing identity (opencode sticky routing) the real turn used.
     pub session_id: String,
     /// The per-turn request id the real turn used.
-    pub request_id: String,
+    pub stream_id: String,
     /// The per-call output cap the ping sends. Anthropic supports `max_tokens:
     /// 0` — the documented cache pre-warm, which writes the cache and bills no
     /// output tokens; every other protocol needs at least one output token, so
@@ -247,7 +247,7 @@ pub(super) fn ping_request<'a>(
         tool_results: &[],
         programmatic_tool_calling: false,
         session_id: request.session_id.clone(),
-        request_id: request.request_id.clone(),
+        request_id: request.stream_id.clone(),
         max_output_tokens_override: Some(request.max_output_tokens),
         no_retry: true,
     }

@@ -40,7 +40,7 @@ pub struct EmbeddedOptions {}
 /// * `client_tx` — send `ClientMessage`s INTO the daemon (values, no codec).
 /// * `daemon_rx` — receive `DaemonMessage`s FROM the daemon (values). The
 ///   receiver ends with `Err`/`None` when the link is dropped, the daemon
-///   shuts down (after a `DaemonMessage::ShuttingDown` value), or this client
+///   shuts down (after a `DaemonMessageType::ShuttingDown` value), or this client
 ///   is evicted (after an `Evicted` value) — notify-before-close, delivered
 ///   by the same single-writer contract the socket transports use.
 pub struct EmbeddedLink {
@@ -248,7 +248,7 @@ impl EmbeddedDaemon {
     /// shutdown, minus the sockets:
     ///
     /// 1. `BroadcastShuttingDown` — every connected client's writer thread
-    ///    delivers `DaemonMessage::ShuttingDown` as a VALUE, then closes its
+    ///    delivers `DaemonMessageType::ShuttingDown` as a VALUE, then closes its
     ///    channel, so the GUI observes the notification before the close;
     /// 2. `Shutdown` — the command loop drains sessions and MCP;
     /// 3. drop the command channel and join the command-loop thread;

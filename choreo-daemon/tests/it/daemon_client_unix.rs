@@ -26,7 +26,7 @@
 )]
 use choreo_client_core::error::ClientError;
 use choreo_client_core::run_daemon_connection;
-use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent};
+use choreo_proto::{ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent};
 use std::io::{self, Read};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
@@ -47,7 +47,7 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// thread blocks in the reader loop and forwards every decoded
 /// `DaemonMessage` into `rx`.
 struct Client {
-    from_ui: crossbeam_channel::Sender<ClientMessage>,
+    from_ui: crossbeam_channel::Sender<ClientMessageType>,
     rx: mpsc::Receiver<DaemonMessage>,
     /// Sender half of `run_daemon_connection`'s optional shutdown channel.
     /// Sending on it makes the connection's shutdown thread call
@@ -59,7 +59,7 @@ struct Client {
 
 impl Client {
     fn connect(socket: &str) -> Self {
-        let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
+        let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessageType>();
         // The shutdown channel is wired for every client even though most
         // tests never use it: `disconnect()` needs it, and an unused one is
         // inert (its thread just blocks on `recv` until the test process
@@ -85,14 +85,15 @@ impl Client {
         }
     }
 
-    fn send(&self, msg: ClientMessage) {
+    fn send(&self, msg: ClientMessageType) {
         self.from_ui.send(msg).expect("send to daemon");
     }
 
-    fn recv(&self) -> DaemonMessage {
+    fn recv(&self) -> DaemonMessageType {
         self.rx
             .recv_timeout(TIMEOUT)
             .unwrap_or_else(|e| panic!("timed out waiting for daemon message: {e:?}"))
+            .inner
     }
 
     fn assert_closed_ok(self) {
@@ -134,8 +135,8 @@ impl Client {
 
 /// The `CreateSession` request used throughout: every optional field unset, so
 /// the tests exercise the default session-creation path.
-fn create_session() -> ClientMessage {
-    ClientMessage::CreateSession {
+fn create_session() -> ClientMessageType {
+    ClientMessageType::CreateSession {
         title: None,
         parent_session_id: None,
         working_dir: None,
@@ -155,8 +156,8 @@ fn unix_ping_pong_round_trip() {
     // One round trip through the real wire path: the client writer thread
     // puts Ping on the socket, the daemon's `client_thread` replies Pong,
     // and the reader loop delivers it to the handler channel.
-    client.send(ClientMessage::Ping);
-    assert_eq!(client.recv(), DaemonMessage::Pong);
+    client.send(ClientMessageType::Ping);
+    assert_eq!(client.recv(), DaemonMessageType::Pong);
 
     // Graceful shutdown: SIGINT makes the daemon notify every connected
     // Unix client and close the connection, so the reader must exit cleanly
@@ -172,9 +173,9 @@ fn unix_list_sessions_round_trip() {
     let client = Client::connect(&daemon.socket_str());
 
     // Fresh daemon: the session list starts empty.
-    client.send(ClientMessage::ListSessions);
+    client.send(ClientMessageType::ListSessions);
     match client.recv() {
-        DaemonMessage::Sessions { sessions } => {
+        DaemonMessageType::Sessions { sessions } => {
             assert_eq!(sessions, [] as [choreo_proto::SessionSummary; 0]);
         }
         other => panic!("expected empty Sessions, got {other:?}"),
@@ -183,7 +184,7 @@ fn unix_list_sessions_round_trip() {
     // Create a session with all optional fields unset.
     client.send(create_session());
     match client.recv() {
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionCreatedForRequester { .. },
         } => assert_eq!(session_id, 1),
@@ -193,9 +194,9 @@ fn unix_list_sessions_round_trip() {
     // The new session is now visible to ListSessions — exactly one entry,
     // carrying the id the daemon assigned at creation. This proves the
     // create path updated the same daemon-side store the list reads from.
-    client.send(ClientMessage::ListSessions);
+    client.send(ClientMessageType::ListSessions);
     match client.recv() {
-        DaemonMessage::Sessions { sessions } => {
+        DaemonMessageType::Sessions { sessions } => {
             assert_eq!(sessions.len(), 1);
             assert_eq!(sessions[0].session_id, 1);
         }
@@ -214,7 +215,7 @@ fn unix_create_session_then_attach() {
 
     client.send(create_session());
     match client.recv() {
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionCreatedForRequester { .. },
         } => assert_eq!(session_id, 1),
@@ -226,16 +227,16 @@ fn unix_create_session_then_attach() {
     // TUI sets its `attached_session_id` on SessionAttached and silently
     // drops SessionState messages for sessions it is not attached to. The
     // ordering is load-bearing, so assert it strictly in order.
-    client.send(ClientMessage::AttachSession { session_id: 1 });
+    client.send(ClientMessageType::AttachSession { session_id: 1 });
     match client.recv() {
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionAttached,
         } => assert_eq!(session_id, 1),
         other => panic!("expected SessionAttached, got {other:?}"),
     }
     match client.recv() {
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionState { .. },
         } => assert_eq!(session_id, 1),
@@ -253,13 +254,13 @@ fn unix_shutdown_notifies_client() {
     let client = Client::connect(&daemon.socket_str());
 
     // Prove the connection is live before shutting the daemon down.
-    client.send(ClientMessage::Ping);
-    assert_eq!(client.recv(), DaemonMessage::Pong);
+    client.send(ClientMessageType::Ping);
+    assert_eq!(client.recv(), DaemonMessageType::Pong);
 
     // SIGINT: the server's shutdown path writes ShuttingDown to every
     // connected Unix client, then closes the connection.
     daemon.shutdown();
-    assert_eq!(client.recv(), DaemonMessage::ShuttingDown);
+    assert_eq!(client.recv(), DaemonMessageType::ShuttingDown);
 
     // The reader must exit cleanly on the EOF that follows the notification
     // — a clean close (Ok(())), not an I/O error.
@@ -275,15 +276,15 @@ fn unix_two_clients_isolated_and_shared_state() {
 
     // Both connections are live and independent: each Ping gets its own
     // Pong on the right connection.
-    client_a.send(ClientMessage::Ping);
-    assert_eq!(client_a.recv(), DaemonMessage::Pong);
-    client_b.send(ClientMessage::Ping);
-    assert_eq!(client_b.recv(), DaemonMessage::Pong);
+    client_a.send(ClientMessageType::Ping);
+    assert_eq!(client_a.recv(), DaemonMessageType::Pong);
+    client_b.send(ClientMessageType::Ping);
+    assert_eq!(client_b.recv(), DaemonMessageType::Pong);
 
     // A creates a session...
     client_a.send(create_session());
     match client_a.recv() {
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionCreatedForRequester { .. },
         } => assert_eq!(session_id, 1),
@@ -292,9 +293,9 @@ fn unix_two_clients_isolated_and_shared_state() {
 
     // ...and B sees it: daemon state is shared across connections even
     // though the connections themselves are independent.
-    client_b.send(ClientMessage::ListSessions);
+    client_b.send(ClientMessageType::ListSessions);
     match client_b.recv() {
-        DaemonMessage::Sessions { sessions } => {
+        DaemonMessageType::Sessions { sessions } => {
             assert_eq!(sessions.len(), 1);
             assert_eq!(sessions[0].session_id, 1);
         }
@@ -309,8 +310,8 @@ fn unix_two_clients_isolated_and_shared_state() {
     client_a.disconnect();
 
     // The daemon keeps serving remaining clients after a disconnect.
-    client_b.send(ClientMessage::Ping);
-    assert_eq!(client_b.recv(), DaemonMessage::Pong);
+    client_b.send(ClientMessageType::Ping);
+    assert_eq!(client_b.recv(), DaemonMessageType::Pong);
 
     daemon.shutdown();
     client_b.assert_closed_ok();
@@ -389,10 +390,10 @@ fn unix_connection_cap_rejects_over_limit_with_eof() {
 /// them; only messages produced by the request under test carry ordering
 /// guarantees (per-client sink FIFO). Panics with the offending message if
 /// anything other than `CatalogUpdated` fails `keep`.
-fn recv_until_not_catalog(client: &Client, what: &str) -> DaemonMessage {
+fn recv_until_not_catalog(client: &Client, what: &str) -> DaemonMessageType {
     loop {
         let msg = client.recv();
-        if !matches!(msg, DaemonMessage::CatalogUpdated { .. }) {
+        if !matches!(msg, DaemonMessageType::CatalogUpdated { .. }) {
             return msg;
         }
         tracing::debug!(what, "skipping interleaved async CatalogUpdated broadcast");
@@ -404,7 +405,7 @@ fn recv_until_not_catalog(client: &Client, what: &str) -> DaemonMessage {
 fn drain_subscribe_push(client: &Client) {
     let first = client.recv();
     assert!(
-        matches!(first, DaemonMessage::CatalogUpdated { .. }),
+        matches!(first, DaemonMessageType::CatalogUpdated { .. }),
         "{first:?}"
     );
     let second = recv_until_not_catalog(client, "subscribe-time keystore state");
@@ -412,7 +413,7 @@ fn drain_subscribe_push(client: &Client) {
     assert!(
         matches!(
             second,
-            DaemonMessage::Keystore {
+            DaemonMessageType::Keystore {
                 state: choreo_proto::KeystoreState::Unbound
             }
         ),
@@ -428,13 +429,13 @@ fn drain_subscribe_push(client: &Client) {
 fn unix_bind_keystore_adopts_and_replies_bound() {
     let mut daemon = common::SpawnedDaemon::start(&[]);
     let client = Client::connect(&daemon.socket_str());
-    client.send(ClientMessage::SubscribeAllActivity);
+    client.send(ClientMessageType::SubscribeAllActivity);
     drain_subscribe_push(&client);
 
     let key: [u8; 32] = std::array::from_fn(|i| (i * 11) as u8);
-    client.send(ClientMessage::BindKeystore { key: key.to_vec() });
+    client.send(ClientMessageType::BindKeystore { key: key.to_vec() });
     match recv_until_not_catalog(&client, "bind reply") {
-        DaemonMessage::Bound => {}
+        DaemonMessageType::Bound => {}
         other => panic!("expected Bound, got {other:?}"),
     }
     // The bind's implicit unlock transition broadcast follows the targeted
@@ -443,7 +444,7 @@ fn unix_bind_keystore_adopts_and_replies_bound() {
     // are skipped, but the RELATIVE order of Bound before Unlocked is still
     // asserted strictly (FIFO per-client sink).
     match recv_until_not_catalog(&client, "Unlocked broadcast") {
-        DaemonMessage::Keystore {
+        DaemonMessageType::Keystore {
             state: choreo_proto::KeystoreState::Unlocked,
         } => {}
         other => panic!("expected Unlocked broadcast after Bound, got {other:?}"),
@@ -451,9 +452,9 @@ fn unix_bind_keystore_adopts_and_replies_bound() {
 
     // The binding is real: a second bind with a DIFFERENT key is rejected
     // with the wrong-key semantics (no overwrite).
-    client.send(ClientMessage::BindKeystore { key: vec![9u8; 32] });
+    client.send(ClientMessageType::BindKeystore { key: vec![9u8; 32] });
     match recv_until_not_catalog(&client, "wrong-key rejection") {
-        DaemonMessage::LockedError { error } => {
+        DaemonMessageType::LockedError { error } => {
             assert!(error.contains("already bound"), "got: {error}");
         }
         other => panic!("expected LockedError rejection, got {other:?}"),
@@ -473,11 +474,11 @@ fn unix_unlock_on_unbound_keystore_is_refused_without_adopting() {
     let client = Client::connect(&daemon.socket_str());
 
     let key: [u8; 32] = std::array::from_fn(|i| (i * 13) as u8);
-    client.send(ClientMessage::Unlock {
+    client.send(ClientMessageType::Unlock {
         private_key: key.to_vec(),
     });
     match client.recv() {
-        DaemonMessage::KeystoreUnbound { error } => {
+        DaemonMessageType::KeystoreUnbound { error } => {
             assert!(
                 error.contains("not initialized"),
                 "the error must guide the client to auto-bind, got: {error}"
@@ -495,13 +496,13 @@ fn unix_unlock_on_unbound_keystore_is_refused_without_adopting() {
             .unwrap(),
     )
     .unwrap();
-    client.send(ClientMessage::AddCredential {
+    client.send(ClientMessageType::AddCredential {
         service: "svc".into(),
         encrypted_payload: blob,
         unlock_key: key.to_vec(),
     });
     match client.recv() {
-        DaemonMessage::KeystoreUnbound { .. } => {}
+        DaemonMessageType::KeystoreUnbound { .. } => {}
         other => panic!("expected KeystoreUnbound, got {other:?}"),
     }
 
@@ -521,22 +522,22 @@ fn unix_targeted_reply_precedes_lock_state_broadcast() {
     let client = Client::connect(&daemon.socket_str());
     // Become an activity subscriber so the transition broadcast is routed to
     // this same client's socket.
-    client.send(ClientMessage::SubscribeAllActivity);
+    client.send(ClientMessageType::SubscribeAllActivity);
     drain_subscribe_push(&client);
 
     let key: [u8; 32] = std::array::from_fn(|i| (i * 17) as u8);
-    client.send(ClientMessage::BindKeystore { key: key.to_vec() });
+    client.send(ClientMessageType::BindKeystore { key: key.to_vec() });
     // STRICT order (modulo skipped async CatalogUpdated broadcasts): the
     // targeted Bound confirmation first, the Unlocked broadcast second. If the
     // broadcast ever overtook the reply, the client keying on "first
     // Unlocked-style message" would mis-attribute the key.
     assert!(matches!(
         recv_until_not_catalog(&client, "bind reply"),
-        DaemonMessage::Bound
+        DaemonMessageType::Bound
     ));
     assert!(matches!(
         recv_until_not_catalog(&client, "Unlocked broadcast"),
-        DaemonMessage::Keystore {
+        DaemonMessageType::Keystore {
             state: choreo_proto::KeystoreState::Unlocked
         }
     ));
@@ -550,27 +551,27 @@ fn unix_targeted_reply_precedes_lock_state_broadcast() {
     // key-carrying ops — Unlock/Bind/AddCredential — which `handle_unlock`/
     // `handle_bind_keystore` satisfy by enqueuing the targeted reply before the
     // transition broadcast.)
-    client.send(ClientMessage::Lock);
+    client.send(ClientMessageType::Lock);
     assert!(matches!(
         recv_until_not_catalog(&client, "Locked broadcast"),
-        DaemonMessage::Keystore {
+        DaemonMessageType::Keystore {
             state: choreo_proto::KeystoreState::Locked
         }
     ));
     assert!(matches!(
         recv_until_not_catalog(&client, "lock reply"),
-        DaemonMessage::Locked
+        DaemonMessageType::Locked
     ));
-    client.send(ClientMessage::Unlock {
+    client.send(ClientMessageType::Unlock {
         private_key: key.to_vec(),
     });
     assert!(matches!(
         recv_until_not_catalog(&client, "unlock reply"),
-        DaemonMessage::Unlocked
+        DaemonMessageType::Unlocked
     ));
     assert!(matches!(
         recv_until_not_catalog(&client, "Unlocked broadcast"),
-        DaemonMessage::Keystore {
+        DaemonMessageType::Keystore {
             state: choreo_proto::KeystoreState::Unlocked
         }
     ));

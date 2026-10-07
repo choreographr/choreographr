@@ -11,7 +11,8 @@
 //! rather than being silently swallowed.
 
 use choreo_proto::{
-    DaemonMessage, OutputStream, ReasoningCapability, SessionEvent, SessionStatus, TokenUsage, Turn,
+    DaemonMessage, DaemonMessageType, OutputStream, ReasoningCapability, SessionEvent,
+    SessionStatus, TokenUsage, Turn,
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -96,21 +97,21 @@ pub trait TurnEventHandler {
     fn handle_turns_undone(&mut self, session_id: u64, turn_ids: &[u32]);
     /// The given turns were redone (keyed by turn id, in turn order).
     fn handle_turns_redone(&mut self, session_id: u64, turns: BTreeMap<u32, Turn>);
-    /// A chunk of streamed output (`stream`) arrived for `request_id`,
+    /// A chunk of streamed output (`stream`) arrived for `stream_id`,
     /// carrying `data` (lossily converted to UTF-8).
     fn handle_request_stream(
         &mut self,
         session_id: u64,
-        request_id: u32,
+        stream_id: u64,
         stream: OutputStream,
         data: Cow<'_, str>,
     );
-    /// A request started on `request_id`, producing turn `turn_id` with the
+    /// A request started on `stream_id`, producing turn `turn_id` with the
     /// given estimated prompt-token count.
     fn handle_started(
         &mut self,
         session_id: u64,
-        request_id: u32,
+        stream_id: u64,
         turn_id: u32,
         estimated_prompt_tokens: u32,
     );
@@ -119,20 +120,20 @@ pub trait TurnEventHandler {
     fn handle_done(
         &mut self,
         session_id: u64,
-        request_id: u32,
+        stream_id: u64,
         token_usage: Option<TokenUsage>,
         last_prompt_tokens: Option<u32>,
     );
     /// A request failed or was cancelled. `session_id` is `None` for
     /// connection-level failures with no originating session.
-    fn handle_failed(&mut self, session_id: Option<u64>, request_id: u32, error: String);
-    /// A tool-call lifecycle event occurred for `request_id`.
-    fn handle_tool_call_event(&mut self, session_id: u64, request_id: u32, event: ToolCallEvent);
-    /// A chunk of raw tool-result bytes arrived for `call_id` on `request_id`.
+    fn handle_failed(&mut self, session_id: Option<u64>, stream_id: u64, error: String);
+    /// A tool-call lifecycle event occurred for `stream_id`.
+    fn handle_tool_call_event(&mut self, session_id: u64, stream_id: u64, event: ToolCallEvent);
+    /// A chunk of raw tool-result bytes arrived for `call_id` on `stream_id`.
     fn handle_tool_result_chunk(
         &mut self,
         session_id: u64,
-        request_id: u32,
+        stream_id: u64,
         call_id: String,
         data: Vec<u8>,
     );
@@ -172,7 +173,7 @@ pub trait TurnEventHandler {
         last_prompt_tokens: Option<u32>,
     );
     /// A previously-requested turn attachment arrived (the reply to
-    /// `ClientMessage::GetImage`). `data: Some(bytes)` carries the image; `None`
+    /// `ClientMessageType::GetImage`). `data: Some(bytes)` carries the image; `None`
     /// means it was not found (deleted/evicted session or turn, or a stale
     /// key). `key` echoes the request so a client with several fetches in flight
     /// can route the reply to the right slot. Only clients that render image
@@ -202,7 +203,7 @@ pub trait TurnEventHandler {
 
 /// Dispatch a [`DaemonMessage`] to the [`TurnEventHandler`], splitting the
 /// two v4 families before any per-arm work:
-/// - [`DaemonMessage::Session`] — a session-scoped [`SessionEvent`] wrapped in
+/// - [`DaemonMessageType::Session`] — a session-scoped [`SessionEvent`] wrapped in
 ///   the envelope that hoists the origin session id. `dispatch_session_event`
 ///   resolves that origin exactly once (the reference is destructured in its
 ///   value position there, so every arm below reads a single `session_id`)
@@ -214,8 +215,11 @@ pub trait TurnEventHandler {
 ///   `dispatch_flat_message`.
 pub fn dispatch_daemon_message(msg: DaemonMessage, handler: &mut impl TurnEventHandler) {
     debug!("dispatching daemon message: {msg:?}");
-    match msg {
-        DaemonMessage::Session { session_id, event } => {
+    // The correlation id rides the envelope (`msg.id`); for P1 the client does
+    // not yet resolve pending slots by it, so dispatch keys purely on the
+    // payload. The session-event / flat split is on the inner payload.
+    match msg.inner {
+        DaemonMessageType::Session { session_id, event } => {
             // The session-event dispatch keeps borrowing its inputs: the
             // envelope is owned now, so `.as_ref()` / `&event` hand it the
             // exact `&u64` / `&SessionEvent` it always took — no clone, and no
@@ -237,18 +241,18 @@ pub fn dispatch_daemon_message(msg: DaemonMessage, handler: &mut impl TurnEventH
 /// compile time instead of being silently swallowed by a wildcard arm
 /// (matching the same rule `dispatch_session_event` applies to its
 /// `SessionEvent` match).
-fn dispatch_flat_message(msg: DaemonMessage, handler: &mut impl TurnEventHandler) {
+fn dispatch_flat_message(msg: DaemonMessageType, handler: &mut impl TurnEventHandler) {
     match msg {
-        DaemonMessage::Sessions { .. } => {
+        DaemonMessageType::Sessions { .. } => {
             // Handled upstream by the caller before dispatch.
         }
-        DaemonMessage::Pong => {
+        DaemonMessageType::Pong => {
             handler.handle_status_text("[daemon] pong".to_string());
         }
-        DaemonMessage::ShuttingDown => {
+        DaemonMessageType::ShuttingDown => {
             handler.handle_status_text("[daemon] shutting down".to_string());
         }
-        DaemonMessage::Models {
+        DaemonMessageType::Models {
             models,
             selected_model,
         } => {
@@ -267,21 +271,21 @@ fn dispatch_flat_message(msg: DaemonMessage, handler: &mut impl TurnEventHandler
                 handler.handle_status_text(lines.join("\n"));
             }
         }
-        DaemonMessage::ModelsFailed { error } => {
+        DaemonMessageType::ModelsFailed { error } => {
             handler.handle_error(format!("[daemon] models failed: {error}"));
         }
-        DaemonMessage::Unlocked => {
+        DaemonMessageType::Unlocked => {
             handler.handle_status_text(
                 "[daemon] keystore unlocked, credentials available".to_string(),
             );
         }
-        DaemonMessage::Locked => {
+        DaemonMessageType::Locked => {
             handler.handle_status_text("[daemon] keystore locked, credentials cleared".to_string());
         }
         // Authoritative keystore status push (subscribe-time + transitions).
         // `Unbound` is the first-run signal from which the frontends trigger
         // their auto-bind; the status text here is informational.
-        DaemonMessage::Keystore { state } => {
+        DaemonMessageType::Keystore { state } => {
             let text = match state {
                 choreo_proto::KeystoreState::Unbound => {
                     "[daemon] keystore not initialized — a binding will be created automatically"
@@ -295,63 +299,63 @@ fn dispatch_flat_message(msg: DaemonMessage, handler: &mut impl TurnEventHandler
             };
             handler.handle_status_text(text.to_string());
         }
-        DaemonMessage::LockedError { error } => {
+        DaemonMessageType::LockedError { error } => {
             handler.handle_error(format!("[daemon] locked: {error}"));
         }
         // Targeted reply to a successful BindKeystore: the binding was
         // created and the daemon unlocked. Text only — the caller that SENT
         // the bind records the key on this confirmation.
-        DaemonMessage::Bound => {
+        DaemonMessageType::Bound => {
             handler.handle_status_text("[daemon] keystore bound and unlocked".to_string());
         }
         // Verify-only operation against an unbound keystore: distinct from
         // LockedError so callers can distinguish "never bound — auto-bind
         // with a fresh key" from "bound but wrong key".
-        DaemonMessage::KeystoreUnbound { error } => {
+        DaemonMessageType::KeystoreUnbound { error } => {
             handler.handle_error(format!("[daemon] {error}"));
         }
-        DaemonMessage::CredentialAdded { service } => {
+        DaemonMessageType::CredentialAdded { service } => {
             handler.handle_status_text(format!("[daemon] credential added: {service}"));
         }
-        DaemonMessage::CredentialAddFailed { service, error } => {
+        DaemonMessageType::CredentialAddFailed { service, error } => {
             handler.handle_error(format!(
                 "[daemon] credential add failed ({service}): {error}"
             ));
         }
-        DaemonMessage::CredentialRemoved { service } => {
+        DaemonMessageType::CredentialRemoved { service } => {
             handler.handle_status_text(format!("[daemon] credential removed: {service}"));
         }
-        DaemonMessage::CredentialRemoveFailed { service, error } => {
+        DaemonMessageType::CredentialRemoveFailed { service, error } => {
             handler.handle_error(format!(
                 "[daemon] credential remove failed ({service}): {error}"
             ));
         }
-        DaemonMessage::AclAddResult { ok, message } => {
+        DaemonMessageType::AclAddResult { ok, message } => {
             if ok {
                 handler.handle_status_text(format!("[daemon] {message}"));
             } else {
                 handler.handle_error(format!("[daemon] acl add failed: {message}"));
             }
         }
-        DaemonMessage::AclUpdated { clients } => {
+        DaemonMessageType::AclUpdated { clients } => {
             handler.handle_status_text(format!(
                 "[daemon] ACL updated — {clients} authorized client(s)"
             ));
         }
-        DaemonMessage::Credential { .. } => {}
-        DaemonMessage::AccountAdded { name } => {
+        DaemonMessageType::Credential { .. } => {}
+        DaemonMessageType::AccountAdded { name } => {
             handler.handle_status_text(format!("[daemon] account added: {name}"));
         }
-        DaemonMessage::AccountAddFailed { name, error } => {
+        DaemonMessageType::AccountAddFailed { name, error } => {
             handler.handle_error(format!("[daemon] failed to add account {name}: {error}"));
         }
-        DaemonMessage::AccountRemoved { name } => {
+        DaemonMessageType::AccountRemoved { name } => {
             handler.handle_status_text(format!("[daemon] account removed: {name}"));
         }
-        DaemonMessage::AccountRemoveFailed { name, error } => {
+        DaemonMessageType::AccountRemoveFailed { name, error } => {
             handler.handle_error(format!("[daemon] failed to remove account {name}: {error}"));
         }
-        DaemonMessage::Accounts { accounts } => {
+        DaemonMessageType::Accounts { accounts } => {
             if accounts.is_empty() {
                 handler.handle_status_text("[daemon] no accounts configured".to_string());
             } else {
@@ -362,10 +366,10 @@ fn dispatch_flat_message(msg: DaemonMessage, handler: &mut impl TurnEventHandler
                 handler.handle_status_text(lines.join("\n"));
             }
         }
-        DaemonMessage::AccountListFailed { error } => {
+        DaemonMessageType::AccountListFailed { error } => {
             handler.handle_error(format!("[daemon] failed to list accounts: {error}"));
         }
-        DaemonMessage::McpStatus {
+        DaemonMessageType::McpStatus {
             servers,
             project_root,
             project_trusted,
@@ -397,10 +401,10 @@ fn dispatch_flat_message(msg: DaemonMessage, handler: &mut impl TurnEventHandler
             }
             handler.handle_status_text(lines.join("\n"));
         }
-        DaemonMessage::McpReconnectFailed { slug, error } => {
+        DaemonMessageType::McpReconnectFailed { slug, error } => {
             handler.handle_error(format!("[daemon] mcp reconnect {slug} failed: {error}"));
         }
-        DaemonMessage::McpReloaded { summary, servers } => {
+        DaemonMessageType::McpReloaded { summary, servers } => {
             // The summary names what changed; the refreshed status list follows
             // so the operator sees the post-reload state without a second
             // `/mcp` request.
@@ -410,10 +414,10 @@ fn dispatch_flat_message(msg: DaemonMessage, handler: &mut impl TurnEventHandler
             }
             handler.handle_status_text(lines.join("\n"));
         }
-        DaemonMessage::McpReloadFailed { error } => {
+        DaemonMessageType::McpReloadFailed { error } => {
             handler.handle_error(format!("[daemon] mcp reload failed: {error}"));
         }
-        DaemonMessage::McpTrustUpdated {
+        DaemonMessageType::McpTrustUpdated {
             root,
             trusted,
             message,
@@ -421,7 +425,7 @@ fn dispatch_flat_message(msg: DaemonMessage, handler: &mut impl TurnEventHandler
             let _ = (root, trusted);
             handler.handle_status_text(format!("[daemon] {message}"));
         }
-        DaemonMessage::McpTrustList { roots } => {
+        DaemonMessageType::McpTrustList { roots } => {
             if roots.is_empty() {
                 handler.handle_status_text("[daemon] no trusted project MCP roots".to_string());
             } else {
@@ -440,7 +444,7 @@ fn dispatch_flat_message(msg: DaemonMessage, handler: &mut impl TurnEventHandler
         // `Sessions`, handled before the generic dispatch), so it flows to the
         // handler's `handle_image`, which fills the matching placeholder (data)
         // or marks the fetch failed (None).
-        DaemonMessage::Image {
+        DaemonMessageType::Image {
             session_id,
             turn_id,
             key,
@@ -461,12 +465,17 @@ fn dispatch_flat_message(msg: DaemonMessage, handler: &mut impl TurnEventHandler
         //   disconnect and the connection layer shows it.
         // The `@` binding keeps the whole owned envelope available for the
         // debug line even though the arm matches several variants by shape.
-        msg @ (DaemonMessage::ModelsRefreshed { .. }
-        | DaemonMessage::ModelsRefreshFailed { .. }
-        | DaemonMessage::CatalogUpdated { .. }
-        | DaemonMessage::Evicted) => {
+        msg @ (DaemonMessageType::ModelsRefreshed { .. }
+        | DaemonMessageType::ModelsRefreshFailed { .. }
+        | DaemonMessageType::CatalogUpdated { .. }
+        | DaemonMessageType::Evicted) => {
             debug!("flat daemon message has no generic-dispatch text: {msg:?}");
         }
+        // Terminal acknowledgement replies to the client's own requests. P1
+        // records nothing here (the correlation table that turns these into
+        // "request resolved" feedback is P4); the payloads carry no state of
+        // their own, so there is nothing to apply yet.
+        DaemonMessageType::Accepted { .. } | DaemonMessageType::Failed { .. } => {}
         // A `Session` envelope here is a routing bug — `dispatch_daemon_message`
         // splits the two families before calling this function, so only
         // non-session messages can reach it at runtime. The arm is still
@@ -476,7 +485,7 @@ fn dispatch_flat_message(msg: DaemonMessage, handler: &mut impl TurnEventHandler
         // compile. That also makes the arm the tripwire: if a future refactor
         // ever routes an envelope here, it fails loudly instead of silently
         // dropping the event.
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             session_id, event, ..
         } => {
             warn!(
@@ -487,7 +496,7 @@ fn dispatch_flat_message(msg: DaemonMessage, handler: &mut impl TurnEventHandler
     }
 }
 
-/// Dispatch the inner [`SessionEvent`] of a [`DaemonMessage::Session`]
+/// Dispatch the inner [`SessionEvent`] of a [`DaemonMessageType::Session`]
 /// envelope to the handler, resolving the origin session id exactly once on
 /// the envelope.
 ///
@@ -524,14 +533,14 @@ fn dispatch_session_event(
     // with a warn instead of reaching its handler. New None-capable events
     // touch BOTH sites; new requires-origin events touch only the lower match.
     match event {
-        SessionEvent::Failed { request_id, error } => {
+        SessionEvent::Failed { stream_id, error } => {
             // `session_id` is `Option<&u64>` here, so `copied()` yields the
             // `Option<u64>` the handler wants.
-            handler.handle_failed(session_id.copied(), *request_id, error.clone());
+            handler.handle_failed(session_id.copied(), *stream_id, error.clone());
             return;
         }
-        SessionEvent::Cancelled { request_id } => {
-            handler.handle_failed(session_id.copied(), *request_id, "cancelled".to_string());
+        SessionEvent::Cancelled { stream_id } => {
+            handler.handle_failed(session_id.copied(), *stream_id, "cancelled".to_string());
             return;
         }
         SessionEvent::ModelSelectionFailed { model, error } => {
@@ -633,29 +642,29 @@ fn dispatch_session_event(
             handler.handle_turns_redone(*session_id, turns.clone());
         }
         SessionEvent::Started {
-            request_id,
+            stream_id,
             turn_id,
             estimated_prompt_tokens,
-        } => handler.handle_started(*session_id, *request_id, *turn_id, *estimated_prompt_tokens),
+        } => handler.handle_started(*session_id, *stream_id, *turn_id, *estimated_prompt_tokens),
         SessionEvent::OutputChunk {
-            request_id,
+            stream_id,
             stream,
             data,
         } => handler.handle_request_stream(
             *session_id,
-            *request_id,
+            *stream_id,
             stream.clone(),
             String::from_utf8_lossy(data),
         ),
         SessionEvent::ToolCallStarted {
-            request_id,
+            stream_id,
             call_id,
             tool_name,
             arguments_json,
             invocation_description,
         } => handler.handle_tool_call_event(
             *session_id,
-            *request_id,
+            *stream_id,
             ToolCallEvent::Started {
                 call_id: call_id.clone(),
                 tool_name: tool_name.clone(),
@@ -664,25 +673,25 @@ fn dispatch_session_event(
             },
         ),
         SessionEvent::ToolCallFinished {
-            request_id,
+            stream_id,
             call_id,
             tool_name,
         } => handler.handle_tool_call_event(
             *session_id,
-            *request_id,
+            *stream_id,
             ToolCallEvent::Finished {
                 call_id: call_id.clone(),
                 tool_name: tool_name.clone(),
             },
         ),
         SessionEvent::ToolCallFailed {
-            request_id,
+            stream_id,
             call_id,
             tool_name,
             error,
         } => handler.handle_tool_call_event(
             *session_id,
-            *request_id,
+            *stream_id,
             ToolCallEvent::Failed {
                 call_id: call_id.clone(),
                 tool_name: tool_name.clone(),
@@ -690,20 +699,17 @@ fn dispatch_session_event(
             },
         ),
         SessionEvent::ToolResultChunk {
-            request_id,
+            stream_id,
             call_id,
             data,
-        } => handler.handle_tool_result_chunk(
-            *session_id,
-            *request_id,
-            call_id.clone(),
-            data.clone(),
-        ),
+        } => {
+            handler.handle_tool_result_chunk(*session_id, *stream_id, call_id.clone(), data.clone())
+        }
         SessionEvent::Done {
-            request_id,
+            stream_id,
             token_usage,
             last_prompt_tokens,
-        } => handler.handle_done(*session_id, *request_id, *token_usage, *last_prompt_tokens),
+        } => handler.handle_done(*session_id, *stream_id, *token_usage, *last_prompt_tokens),
         SessionEvent::SessionStatusChanged {
             status,
             last_modified,

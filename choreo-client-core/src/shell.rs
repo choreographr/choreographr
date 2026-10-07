@@ -2,13 +2,13 @@
 //!
 //! [`parse_input_line`] turns a line typed into a TUI input box into a
 //! [`Command`]: a slash-prefixed command becomes a structured variant
-//! (either a [`ClientMessage`] to send or a local-UI action), while a plain
+//! (either a [`ClientMessageType`] to send or a local-UI action), while a plain
 //! line becomes a `RunInput` message carrying a fresh request id. It is pure
 //! syntax — decoding and validation of keys and credentials happen where
 //! those values are owned — so the same parser drives every front-end, and
 //! [`command_echo`] renders the canonical transcript form of a parsed command.
 
-use choreo_proto::ClientMessage;
+use choreo_proto::ClientMessageType;
 use tracing::debug;
 
 const INVALID_ACCOUNT_NAME: &str =
@@ -34,7 +34,7 @@ pub enum UnlockMethod {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Send this pre-built message to the daemon verbatim.
-    Send(ClientMessage),
+    Send(ClientMessageType),
     /// Unlock the daemon keystore, by the given [`UnlockMethod`].
     Unlock {
         /// Where the unlock key comes from (stored/legacy, or a supplied key).
@@ -169,7 +169,7 @@ fn validate_pubkey_b64(b64: &str) -> Result<(), String> {
 /// session's defaults and the daemon applies its own, keeping `/new` and
 /// `/session new` byte-for-byte identical on the wire.
 fn create_session(title: Option<String>) -> Command {
-    Command::Send(ClientMessage::CreateSession {
+    Command::Send(ClientMessageType::CreateSession {
         title,
         parent_session_id: None,
         working_dir: None,
@@ -209,13 +209,13 @@ fn parse_session_subcommand(rest: &str) -> Option<Command> {
         let sub = sub.trim();
         if let Some(session_id) = sub.strip_prefix("switch ") {
             return Some(match session_id.trim().parse::<u64>() {
-                Ok(id) => Command::Send(ClientMessage::AttachSession { session_id: id }),
+                Ok(id) => Command::Send(ClientMessageType::AttachSession { session_id: id }),
                 Err(_) => Command::UnknownCommand("usage: /session switch <id>".to_string()),
             });
         }
         if let Some(session_id) = sub.strip_prefix("info ") {
             return Some(match session_id.trim().parse::<u64>() {
-                Ok(id) => Command::Send(ClientMessage::GetSessionState { session_id: id }),
+                Ok(id) => Command::Send(ClientMessageType::GetSessionState { session_id: id }),
                 Err(_) => Command::UnknownCommand("usage: /session info <id>".to_string()),
             });
         }
@@ -226,7 +226,7 @@ fn parse_session_subcommand(rest: &str) -> Option<Command> {
             return Some(create_session(None));
         }
         if sub == "list" {
-            return Some(Command::Send(ClientMessage::ListSessions));
+            return Some(Command::Send(ClientMessageType::ListSessions));
         }
         return Some(Command::UnknownCommand(
             "session subcommands: list, new [title], switch <id>, info <id>".to_string(),
@@ -254,7 +254,7 @@ fn parse_account_subcommand(rest: &str) -> Option<Command> {
         // args was checked non-empty above, so first() is always Some; the
         // catch-all arm treats the None case identically anyway.
         return Some(match parts.first().copied() {
-            Some("list") => Command::Send(ClientMessage::ListAccounts),
+            Some("list") => Command::Send(ClientMessageType::ListAccounts),
             Some("remove") => {
                 let name = args
                     .trim_start()
@@ -266,7 +266,7 @@ fn parse_account_subcommand(rest: &str) -> Option<Command> {
                 } else if !is_valid_account_name(name) {
                     Command::UnknownCommand(INVALID_ACCOUNT_NAME.to_string())
                 } else {
-                    Command::Send(ClientMessage::RemoveAccount {
+                    Command::Send(ClientMessageType::RemoveAccount {
                         name: name.to_string(),
                     })
                 }
@@ -274,7 +274,7 @@ fn parse_account_subcommand(rest: &str) -> Option<Command> {
             _ => {
                 let name = args.to_string();
                 if is_valid_account_name(&name) {
-                    Command::Send(ClientMessage::SetSessionAccount { name })
+                    Command::Send(ClientMessageType::SetSessionAccount { name })
                 } else {
                     Command::UnknownCommand(INVALID_ACCOUNT_NAME.to_string())
                 }
@@ -300,7 +300,7 @@ fn parse_model_command(rest: &str) -> Option<Command> {
     if let Some(model) = rest.strip_prefix("model ") {
         let model = model.trim();
         if !model.is_empty() {
-            return Some(Command::Send(ClientMessage::SetModel {
+            return Some(Command::Send(ClientMessageType::SetModel {
                 model: model.to_string(),
             }));
         }
@@ -350,13 +350,13 @@ fn parse_mcp_command(rest: &str) -> Option<Command> {
 
 /// Parse a line of user input into a [`Command`].
 ///
-/// A plain (non-slash) non-empty line becomes a `ClientMessage::RunInput` and
+/// A plain (non-slash) non-empty line becomes a `ClientMessageType::RunInput` and
 /// consumes `next_request_id`, which is then incremented — the caller owns
 /// the id counter, so successive prompts get distinct request ids that route
 /// the daemon's streaming replies. Slash commands (`/name …`) never touch the
 /// counter; unknown ones come back as [`Command::UnknownCommand`].
 #[must_use]
-pub fn parse_input_line(line: &str, next_request_id: &mut u32) -> Command {
+pub fn parse_input_line(line: &str, next_request_id: &mut u64) -> Command {
     let line = line.trim();
     if line.is_empty() {
         return Command::Empty;
@@ -368,10 +368,10 @@ pub fn parse_input_line(line: &str, next_request_id: &mut u32) -> Command {
         return cmd;
     }
 
-    let request_id = *next_request_id;
+    let stream_id = *next_request_id;
     *next_request_id = next_request_id.wrapping_add(1);
-    Command::Send(ClientMessage::RunInput {
-        request_id,
+    Command::Send(ClientMessageType::RunInput {
+        stream_id,
         input: line.as_bytes().to_vec(),
     })
 }
@@ -397,14 +397,14 @@ fn parse_command(rest: &str) -> Command {
     }
 
     if let Some(arg) = rest.strip_prefix("cancel ") {
-        return match arg.trim().parse::<u32>() {
-            Ok(request_id) => Command::Send(ClientMessage::Cancel { request_id }),
+        return match arg.trim().parse::<u64>() {
+            Ok(stream_id) => Command::Send(ClientMessageType::Cancel { stream_id }),
             Err(_) => Command::InvalidCancel(arg.trim().to_string()),
         };
     }
 
     if rest == "ping" {
-        return Command::Send(ClientMessage::Ping);
+        return Command::Send(ClientMessageType::Ping);
     }
 
     if rest == "quit" {
@@ -553,7 +553,7 @@ fn parse_command(rest: &str) -> Command {
     }
 
     if rest == "lock" {
-        return Command::Send(ClientMessage::Lock);
+        return Command::Send(ClientMessageType::Lock);
     }
 
     // /refresh-models [--force]: refresh the models.dev catalog. Kept as a
@@ -605,7 +605,7 @@ fn parse_command(rest: &str) -> Command {
             // capability set and rejects unsupported values.
             other => other,
         };
-        return Command::Send(ClientMessage::SetReasoningEffort {
+        return Command::Send(ClientMessageType::SetReasoningEffort {
             effort: effort.to_string(),
         });
     }
@@ -624,16 +624,16 @@ fn parse_command(rest: &str) -> Command {
 pub fn command_echo(command: &Command) -> Option<String> {
     match command {
         Command::Send(message) => match message {
-            ClientMessage::RunInput { .. } => None,
-            ClientMessage::SetModel { model } => Some(format!("> set model: {model}")),
-            ClientMessage::SetReasoningEffort { effort } => {
+            ClientMessageType::RunInput { .. } => None,
+            ClientMessageType::SetModel { model } => Some(format!("> set model: {model}")),
+            ClientMessageType::SetReasoningEffort { effort } => {
                 Some(format!("> set reasoning effort: {effort}"))
             }
-            ClientMessage::GetReasoningEffort => Some("> get reasoning effort".to_string()),
+            ClientMessageType::GetReasoningEffort => Some("> get reasoning effort".to_string()),
             _ => None,
         },
         // Non-Send shell commands: echo the raw line so the user can see
-        // what they typed even though no ClientMessage is sent.
+        // what they typed even though no ClientMessageType is sent.
         Command::Unlock { .. } => Some("> /unlock".to_string()),
         Command::AddCredential { service, .. } => Some(format!("> /add-key {service}")),
         Command::RemoveCredential { service } => Some(format!("> /remove-key {service}")),

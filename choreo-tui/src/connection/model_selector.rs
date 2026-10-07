@@ -1,6 +1,6 @@
 use crate::state::{App, apply_selector_left_click};
 use choreo_client_core::{ClientError, broken_pipe};
-use choreo_proto::ClientMessage;
+use choreo_proto::ClientMessageType;
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 
 /// Handle events while the model selector overlay is open (Chat page).
@@ -15,7 +15,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind
 pub(super) fn handle_model_selector_event(
     event: &Event,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
 ) -> Result<(), ClientError> {
     match *event {
         Event::Key(key) => {
@@ -35,7 +35,7 @@ pub(super) fn handle_model_selector_event(
                 if let Some(model) = app.model_selector.submit() {
                     tracing::info!(%model, "model selector: selecting model");
                     client_tx
-                        .send(ClientMessage::SetModel { model })
+                        .send(ClientMessageType::SetModel { model })
                         .map_err(broken_pipe)?;
                 }
                 return Ok(());
@@ -107,7 +107,7 @@ pub(super) fn handle_model_selector_event(
                         if let Some(model) = app.model_selector.submit() {
                             tracing::info!(%model, "model selector: selecting model");
                             client_tx
-                                .send(ClientMessage::SetModel { model })
+                                .send(ClientMessageType::SetModel { model })
                                 .map_err(broken_pipe)?;
                         }
                     }

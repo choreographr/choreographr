@@ -1,7 +1,7 @@
 //! In-flight request tracking for the single-threaded event loop.
 //!
 //! ACP requests are asynchronous on the wire: the loop sends a
-//! [`ClientMessage`](choreo_proto::ClientMessage) to the daemon and must later
+//! [`ClientMessageType`](choreo_proto::ClientMessageType) to the daemon and must later
 //! match the daemon's reply back to the original JSON-RPC id. [`PendingRequests`]
 //! holds that bookkeeping — synchronous replies keyed by [`PendingKind`],
 //! streaming prompts keyed by session id, and the [`ModelsPending`] slot that
@@ -25,7 +25,7 @@ pub enum PendingKind {
     SetReasoningEffort,
 }
 
-/// A pending synchronous request — the event loop sent a `ClientMessage`
+/// A pending synchronous request — the event loop sent a `ClientMessageType`
 /// and is waiting for the matching `DaemonMessage` before it can write the
 /// JSON-RPC response to the editor.
 #[derive(Debug)]
@@ -42,7 +42,7 @@ pub struct ActivePrompt {
     /// The JSON-RPC id of the editor's `session/prompt` request.
     pub jsonrpc_id: u64,
     /// The daemon-assigned request id this prompt's stream is tagged with.
-    pub daemon_request_id: u32,
+    pub daemon_request_id: u64,
     /// The ACP session id the prompt belongs to.
     pub session_acp_id: String,
 }
@@ -178,10 +178,10 @@ impl PendingRequests {
     }
 
     /// Find an active prompt by daemon request ID.  This is needed because
-    /// streaming `DaemonMessage` values carry `request_id` but not the
+    /// streaming `DaemonMessage` values carry `stream_id` but not the
     /// session ID, and we need to map back to the ACP session.
     #[must_use]
-    pub fn find_by_request_id(&self, daemon_request_id: u32) -> Option<&ActivePrompt> {
+    pub fn find_by_request_id(&self, daemon_request_id: u64) -> Option<&ActivePrompt> {
         self.prompts
             .values()
             .find(|p| p.daemon_request_id == daemon_request_id)

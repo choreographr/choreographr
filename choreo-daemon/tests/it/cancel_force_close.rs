@@ -7,7 +7,7 @@
 //! the cooperative cancel flag alone cannot interrupt (channels cannot reach
 //! into a syscall).
 //!
-//! The client sends `ClientMessage::Cancel`. The daemon command loop's
+//! The client sends `ClientMessageType::Cancel`. The daemon command loop's
 //! `handle_cancel_request` (the site where the cancel is DECIDED) calls
 //! `SocketRegistry::shutdown_all()` on the ONE daemon-wide registry, which
 //! shuts down the registered provider socket and makes the blocked read
@@ -22,7 +22,9 @@
 // allow-*-in-tests config only recognizes #[test]-annotated functions —
 // helper fns in this file need this file-level allowance.
 #![expect(clippy::expect_used)]
-use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent, SessionStatus};
+use choreo_proto::{
+    ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent, SessionStatus,
+};
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -188,24 +190,30 @@ fn mid_stream_cancel_finishes_promptly_via_registry_force_close() {
 
     write_message(
         &mut stream,
-        &ClientMessage::CreateSession {
-            title: None,
-            parent_session_id: None,
-            working_dir: None,
-            context_config: None,
-            account_name: Some("mock-account".to_string()),
-            selected_model: Some("mock-4o".to_string()),
-            reasoning_effort: None,
-        },
+        &ClientMessage::request(
+            0,
+            ClientMessageType::CreateSession {
+                title: None,
+                parent_session_id: None,
+                working_dir: None,
+                context_config: None,
+                account_name: Some("mock-account".to_string()),
+                selected_model: Some("mock-4o".to_string()),
+                reasoning_effort: None,
+            },
+        ),
     );
-    let session_id = match read_message::<_, DaemonMessage>(&mut stream) {
-        DaemonMessage::Session {
+    let session_id = match read_message::<_, DaemonMessage>(&mut stream).inner {
+        DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionCreatedForRequester { .. },
         } => session_id,
         other => panic!("expected SessionCreatedForRequester, got {other:?}"),
     };
-    write_message(&mut stream, &ClientMessage::AttachSession { session_id });
+    write_message(
+        &mut stream,
+        &ClientMessage::request(0, ClientMessageType::AttachSession { session_id }),
+    );
     // Drain the attach acks (SessionAttached + SessionState).
     for _ in 0..2 {
         read_message::<_, DaemonMessage>(&mut stream);
@@ -219,10 +227,13 @@ fn mid_stream_cancel_finishes_promptly_via_registry_force_close() {
     // `Started` event plus the stalling server's contract are the wedge.
     write_message(
         &mut stream,
-        &ClientMessage::RunInput {
-            request_id: 1,
-            input: b"hello".to_vec(),
-        },
+        &ClientMessage::request(
+            0,
+            ClientMessageType::RunInput {
+                stream_id: 1,
+                input: b"hello".to_vec(),
+            },
+        ),
     );
     let t0 = Instant::now();
     let start_deadline = t0 + Duration::from_secs(10);
@@ -232,13 +243,13 @@ fn mid_stream_cancel_finishes_promptly_via_registry_force_close() {
             Instant::now() < start_deadline,
             "timed out waiting for the request to start"
         );
-        match read_message::<_, DaemonMessage>(&mut stream) {
-            DaemonMessage::Session {
+        match read_message::<_, DaemonMessage>(&mut stream).inner {
+            DaemonMessageType::Session {
                 event: SessionEvent::Started { .. },
                 ..
             } => in_flight += 1,
             // Status/usage/seed noise on the way to the first chunk.
-            DaemonMessage::Session { .. } => {}
+            DaemonMessageType::Session { .. } => {}
             other => panic!("unexpected message during stream start: {other:?}"),
         }
     }
@@ -253,7 +264,10 @@ fn mid_stream_cancel_finishes_promptly_via_registry_force_close() {
     // unblocks NOW. Assert the turn aborts promptly: a `Done` (and the
     // session leaving `Inference`) arrives within DONE_TIMEOUT — not after
     // the 30 s request timeout.
-    write_message(&mut stream, &ClientMessage::Cancel { request_id: 1 });
+    write_message(
+        &mut stream,
+        &ClientMessage::request(0, ClientMessageType::Cancel { stream_id: 1 }),
+    );
     let deadline = t0 + Duration::from_secs(10) + DONE_TIMEOUT;
     // Drop the read timeout for this phase so a message slightly later
     // than expected surfaces as a deadline assert, not a 30 s protocol
@@ -296,8 +310,8 @@ fn mid_stream_cancel_finishes_promptly_via_registry_force_close() {
                 Err(e) => panic!("read protocol message: {e}"),
             }
         };
-        match msg {
-            DaemonMessage::Session {
+        match msg.inner {
+            DaemonMessageType::Session {
                 event: SessionEvent::SessionStatusChanged { status, .. },
                 ..
             } => {
@@ -305,11 +319,11 @@ fn mid_stream_cancel_finishes_promptly_via_registry_force_close() {
                     left_inference = true;
                 }
             }
-            DaemonMessage::Session {
+            DaemonMessageType::Session {
                 event: SessionEvent::Done { .. },
                 ..
             }
-            | DaemonMessage::Session {
+            | DaemonMessageType::Session {
                 event: SessionEvent::Failed { .. },
                 ..
             } => finished = true,
@@ -319,12 +333,12 @@ fn mid_stream_cancel_finishes_promptly_via_registry_force_close() {
             // error, so the daemon emits `Cancelled` + the cancelled turn —
             // and deliberately NO `Failed`. That is an equally prompt
             // completion, so accept it as `finished` too.
-            DaemonMessage::Session {
-                event: SessionEvent::Cancelled { request_id: 1 },
+            DaemonMessageType::Session {
+                event: SessionEvent::Cancelled { stream_id: 1 },
                 ..
             } => finished = true,
             // The aborted turn's TurnAppended / Error events are expected.
-            DaemonMessage::Session { .. } => {}
+            DaemonMessageType::Session { .. } => {}
             other => panic!("unexpected message while cancelling: {other:?}"),
         }
     }

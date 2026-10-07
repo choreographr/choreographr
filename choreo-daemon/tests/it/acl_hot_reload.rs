@@ -36,7 +36,7 @@ const RELOAD_DEADLINE: Duration = Duration::from_secs(10);
 /// to what this test needs. The keypair override must be re-installed inside
 /// the connection thread (thread-local) — see the doc comment there.
 struct Client {
-    from_ui: crossbeam_channel::Sender<choreo_proto::ClientMessage>,
+    from_ui: crossbeam_channel::Sender<choreo_proto::ClientMessageType>,
     rx: mpsc::Receiver<choreo_proto::DaemonMessage>,
     result_rx: mpsc::Receiver<Result<(), ClientError>>,
 }
@@ -75,8 +75,8 @@ impl Client {
     /// costs milliseconds, not a full Pong timeout; a live client waits for
     /// the Pong instead (its connection result only arrives at teardown).
     fn is_alive(&mut self) -> bool {
-        use choreo_proto::{ClientMessage, DaemonMessage};
-        if self.from_ui.send(ClientMessage::Ping).is_err() {
+        use choreo_proto::{ClientMessageType, DaemonMessageType};
+        if self.from_ui.send(ClientMessageType::Ping).is_err() {
             return false;
         }
         // Short bounded peek for a handshake rejection...
@@ -84,7 +84,7 @@ impl Client {
             return result.is_ok();
         }
         // ...otherwise the connection is (still) up: expect the Pong.
-        matches!(self.rx.recv_timeout(TIMEOUT), Ok(DaemonMessage::Pong))
+        matches!(self.rx.recv_timeout(TIMEOUT), Ok(m) if m.inner == DaemonMessageType::Pong)
     }
 }
 
@@ -155,11 +155,11 @@ fn acl_edit_authorizes_new_client_without_restart() {
     // Prove the channel is live, then clean shutdown.
     client_b
         .from_ui
-        .send(choreo_proto::ClientMessage::Ping)
+        .send(choreo_proto::ClientMessageType::Ping)
         .expect("send over hot-authorized connection");
     assert_eq!(
-        client_b.rx.recv_timeout(TIMEOUT).expect("Pong"),
-        choreo_proto::DaemonMessage::Pong
+        client_b.rx.recv_timeout(TIMEOUT).expect("Pong").inner,
+        choreo_proto::DaemonMessageType::Pong
     );
     drop(client_b);
 
@@ -215,7 +215,7 @@ fn acl_add_from_local_client_enrolls_new_tcp_client() {
     // Subscribe to activity broadcasts, exactly like the real TUI does at
     // startup — that is the channel the AclUpdated control broadcast rides.
     from_ui
-        .send(choreo_proto::ClientMessage::SubscribeAllActivity)
+        .send(choreo_proto::ClientMessageType::SubscribeAllActivity)
         .expect("subscribe to activity");
 
     let pubkey_b64 = base64::engine::general_purpose::STANDARD.encode(client_pk_b);
@@ -234,7 +234,7 @@ fn acl_add_from_local_client_enrolls_new_tcp_client() {
 
     // Enroll client B via the LOCAL connection.
     from_ui
-        .send(choreo_proto::ClientMessage::AclAdd {
+        .send(choreo_proto::ClientMessageType::AclAdd {
             pubkey: pubkey_b64.clone(),
         })
         .expect("send AclAdd");
@@ -244,21 +244,21 @@ fn acl_add_from_local_client_enrolls_new_tcp_client() {
     // fact; the direct reply is what ends the wait.
     let mut enrolled = false;
     loop {
-        match rx.recv_timeout(TIMEOUT).expect("AclAdd reply") {
-            choreo_proto::DaemonMessage::AclUpdated { clients } => {
+        match rx.recv_timeout(TIMEOUT).expect("AclAdd reply").inner {
+            choreo_proto::DaemonMessageType::AclUpdated { clients } => {
                 assert_eq!(clients, 2, "the broadcast carries the new total");
                 enrolled = true;
             }
-            choreo_proto::DaemonMessage::AclAddResult { ok, message: _ } => {
+            choreo_proto::DaemonMessageType::AclAddResult { ok, message: _ } => {
                 assert!(ok, "/acl add from a local client must succeed");
                 break;
             }
-            choreo_proto::DaemonMessage::CatalogUpdated { .. } => {}
+            choreo_proto::DaemonMessageType::CatalogUpdated { .. } => {}
             // The daemon pushes its current keystore status to every activity
             // subscriber on subscribe (like CatalogUpdated) and re-broadcasts
             // it on any keystore change, so an unsolicited `Keystore` can
             // arrive mid-wait — treat it as informational and keep going.
-            choreo_proto::DaemonMessage::Keystore { .. } => {}
+            choreo_proto::DaemonMessageType::Keystore { .. } => {}
             other => panic!("expected AclAddResult, got {other:?}"),
         }
     }
@@ -283,11 +283,11 @@ fn acl_add_from_local_client_enrolls_new_tcp_client() {
     let client_b = connected.expect("the enrolled client must connect without a daemon restart");
     client_b
         .from_ui
-        .send(choreo_proto::ClientMessage::Ping)
+        .send(choreo_proto::ClientMessageType::Ping)
         .expect("send over enrolled connection");
     assert_eq!(
-        client_b.rx.recv_timeout(TIMEOUT).expect("Pong"),
-        choreo_proto::DaemonMessage::Pong
+        client_b.rx.recv_timeout(TIMEOUT).expect("Pong").inner,
+        choreo_proto::DaemonMessageType::Pong
     );
     drop(client_b);
 

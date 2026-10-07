@@ -10,19 +10,19 @@ use crate::render::render_turn;
 #[cfg(target_os = "ios")]
 use crate::settings;
 use crate::state::AppState;
-use choreo_proto::ClientMessage;
+use choreo_proto::ClientMessageType;
 use dioxus::prelude::*;
 
 #[component]
 pub(crate) fn Toolbar(
     state: Signal<AppState>,
-    tx: Signal<Option<crossbeam_channel::Sender<ClientMessage>>>,
+    tx: Signal<Option<crossbeam_channel::Sender<ClientMessageType>>>,
 ) -> Element {
     let on_ping = {
         let t = tx;
         move |_| {
             let daemon_tx = t.read().clone();
-            send_client_message(&mut state.write(), daemon_tx, ClientMessage::Ping);
+            send_client_message(&mut state.write(), daemon_tx, ClientMessageType::Ping);
         }
     };
 
@@ -30,7 +30,7 @@ pub(crate) fn Toolbar(
         let t = tx;
         move |_| {
             let daemon_tx = t.read().clone();
-            send_client_message(&mut state.write(), daemon_tx, ClientMessage::ListModels);
+            send_client_message(&mut state.write(), daemon_tx, ClientMessageType::ListModels);
         }
     };
 
@@ -45,15 +45,15 @@ pub(crate) fn Toolbar(
                     .push("[client] enter a request id to cancel".to_string());
                 return;
             }
-            match request_id_text.parse::<u32>() {
-                Ok(request_id) => {
+            match request_id_text.parse::<u64>() {
+                Ok(stream_id) => {
                     // Single write scope for the success path.
                     let mut guard = state.write();
                     let daemon_tx = t.read().clone();
                     send_client_message(
                         &mut guard,
                         daemon_tx,
-                        ClientMessage::Cancel { request_id },
+                        ClientMessageType::Cancel { stream_id },
                     );
                     guard.pending_cancel.clear();
                 }
@@ -162,7 +162,7 @@ pub(crate) fn HistoryList(state: Signal<AppState>) -> Element {
 #[component]
 pub(crate) fn Composer(
     state: Signal<AppState>,
-    tx: Signal<Option<crossbeam_channel::Sender<ClientMessage>>>,
+    tx: Signal<Option<crossbeam_channel::Sender<ClientMessageType>>>,
 ) -> Element {
     let on_submit = {
         let t = tx;

@@ -36,19 +36,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // `choreo_ios_tool_reply`. Plain comments: rustdoc does not document extern
 // blocks, so `///` here would warn as unused doc comments.
 unsafe extern "C" {
-    // NOTE: `request_id` is a documented addition to the subsession
+    // NOTE: `stream_id` is a documented addition to the subsession
     // contract's four-argument signature — without it
-    // `choreo_ios_tool_cancel(request_id)` has no way to identify the
+    // `choreo_ios_tool_cancel(stream_id)` has no way to identify the
     // request, making the best-effort cancel path unimplementable (see the
     // report / IosToolHost.swift's matching NOTE).
     fn choreo_ios_tool_request(
-        request_id: u64,
+        stream_id: u64,
         name: *const c_char,
         args_json: *const c_char,
         reply_ctx: *mut c_void,
         reply_cb: extern "C" fn(*mut c_void, i32, *const c_char),
     );
-    fn choreo_ios_tool_cancel(request_id: u64);
+    fn choreo_ios_tool_cancel(stream_id: u64);
 }
 
 /// The reply callback handed to Swift. Exported so Swift could call it
@@ -132,7 +132,7 @@ impl SwiftIosToolBridge {
 
 impl IosToolBridge for SwiftIosToolBridge {
     fn dispatch(&self, request: IosToolRequest) -> Result<IosToolPending, ToolBridgeError> {
-        let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let stream_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         // One-shot bounded(1) reply channel: exactly one value ever arrives
         // (Swift's exactly-once guarantee), so capacity 1 can never block a
         // late send either — and a dropped receiver is the abandonment path.
@@ -160,13 +160,13 @@ impl IosToolBridge for SwiftIosToolBridge {
                 return Err(ToolBridgeError::Platform("args contained NUL".into()));
             }
         };
-        tracing::debug!(request_id, name = %request.name, "ios bridge: dispatching to Swift host");
+        tracing::debug!(stream_id, name = %request.name, "ios bridge: dispatching to Swift host");
         // SAFETY: both CStrings outlive the call; the call only enqueues and
         // returns (Swift-side contract); reply_ctx ownership transfers to
         // Swift exactly here — never freed by Rust again.
         unsafe {
             choreo_ios_tool_request(
-                request_id,
+                stream_id,
                 name.as_ptr(),
                 args.as_ptr(),
                 reply_ctx,
@@ -174,13 +174,13 @@ impl IosToolBridge for SwiftIosToolBridge {
             );
         }
         Ok(IosToolPending::new(
-            request_id,
+            stream_id,
             rx,
             // Best-effort Swift-side cancel: echoes the id so the host can
             // drop a still-queued request. The caller's flag stays
             // authoritative for `wait`.
             Box::new(move || {
-                unsafe { choreo_ios_tool_cancel(request_id) };
+                unsafe { choreo_ios_tool_cancel(stream_id) };
             }),
         ))
     }

@@ -3,8 +3,8 @@ use crate::state::*;
 use crate::test_util::{make_session, test_app};
 use choreo_client_core::TurnEventHandler;
 use choreo_proto::{
-    ClientMessage, DaemonMessage, DisplayedImageRecord, ImageMetadata, SessionEvent, SessionStatus,
-    TokenUsage, Turn,
+    ClientMessageType, DaemonMessage, DaemonMessageType, DisplayedImageRecord, ImageMetadata,
+    SessionEvent, SessionStatus, TokenUsage, Turn,
 };
 use crossterm::event::Event;
 
@@ -223,9 +223,9 @@ mod session_manager_key_tests {
         assert_eq!(app.page, Page::Chat);
         assert_eq!(app.attached_session_id, Some(1));
         let msg = rx.recv().expect("sent message (unsub)");
-        assert_eq!(msg, ClientMessage::UnsubscribeSessionsSummary);
+        assert_eq!(msg, ClientMessageType::UnsubscribeSessionsSummary);
         let msg = rx.recv().expect("sent message");
-        assert_eq!(msg, ClientMessage::AttachSession { session_id: 1 });
+        assert_eq!(msg, ClientMessageType::AttachSession { session_id: 1 });
     }
 
     #[test]
@@ -283,9 +283,9 @@ mod session_manager_key_tests {
 
         assert_eq!(app.page, Page::SessionManager);
         let msg = rx.recv().expect("sent message");
-        assert_eq!(msg, ClientMessage::ListSessions);
+        assert_eq!(msg, ClientMessageType::ListSessions);
         let msg = rx.recv().expect("sent message");
-        assert_eq!(msg, ClientMessage::SubscribeSessionsSummary);
+        assert_eq!(msg, ClientMessageType::SubscribeSessionsSummary);
     }
 
     #[test]
@@ -393,7 +393,7 @@ mod session_manager_key_tests {
 
     #[test]
     fn session_manager_p_sends_toggled_pin() {
-        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessageType>();
         let mut app = make_sm_app();
         // The highlighted session (1) starts un-pinned.
         assert_eq!(app.session_mgr.sessions[0].session_id, 1);
@@ -406,7 +406,7 @@ mod session_manager_key_tests {
         .expect("handle p");
         assert_eq!(
             rx.recv().expect("sent message"),
-            ClientMessage::SetSessionPinned {
+            ClientMessageType::SetSessionPinned {
                 session_id: 1,
                 pinned: true,
             }
@@ -422,7 +422,7 @@ mod session_manager_key_tests {
         .expect("handle p");
         assert_eq!(
             rx.recv().expect("sent message"),
-            ClientMessage::SetSessionPinned {
+            ClientMessageType::SetSessionPinned {
                 session_id: 1,
                 pinned: false,
             }
@@ -431,7 +431,7 @@ mod session_manager_key_tests {
 
     #[test]
     fn session_manager_a_archives_on_list_and_unarchives_on_archived() {
-        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessageType>();
         let mut app = make_sm_app();
 
         handle_terminal_event(
@@ -442,7 +442,7 @@ mod session_manager_key_tests {
         .expect("handle a");
         assert_eq!(
             rx.recv().expect("sent message"),
-            ClientMessage::SetSessionArchived {
+            ClientMessageType::SetSessionArchived {
                 session_id: 1,
                 archived: true,
             }
@@ -463,7 +463,7 @@ mod session_manager_key_tests {
         .expect("handle a");
         assert_eq!(
             rx.recv().expect("sent message"),
-            ClientMessage::SetSessionArchived {
+            ClientMessageType::SetSessionArchived {
                 session_id: 1,
                 archived: false,
             }
@@ -504,15 +504,15 @@ mod session_manager_key_tests {
         assert_eq!(app.page, Page::Chat);
         assert_eq!(app.attached_session_id, Some(1));
         let msg = rx.recv().expect("sent message (unsub)");
-        assert_eq!(msg, ClientMessage::UnsubscribeSessionsSummary);
+        assert_eq!(msg, ClientMessageType::UnsubscribeSessionsSummary);
         let msg = rx.recv().expect("sent message");
-        assert_eq!(msg, ClientMessage::AttachSession { session_id: 1 });
+        assert_eq!(msg, ClientMessageType::AttachSession { session_id: 1 });
     }
 
     #[test]
     fn session_manager_n_sends_create_session() {
         let mut app = make_sm_app();
-        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessageType>();
 
         handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
@@ -524,7 +524,7 @@ mod session_manager_key_tests {
         let msg = rx.recv().expect("sent message");
         assert_eq!(
             msg,
-            ClientMessage::CreateSession {
+            ClientMessageType::CreateSession {
                 title: None,
                 parent_session_id: None,
                 working_dir: None,
@@ -568,9 +568,9 @@ mod session_manager_key_tests {
         );
         assert_eq!(app.attached_session_id, Some(2));
         let msg = rx.recv().expect("sent message (unsub)");
-        assert_eq!(msg, ClientMessage::UnsubscribeSessionsSummary);
+        assert_eq!(msg, ClientMessageType::UnsubscribeSessionsSummary);
         let msg = rx.recv().expect("sent message");
-        assert_eq!(msg, ClientMessage::AttachSession { session_id: 2 });
+        assert_eq!(msg, ClientMessageType::AttachSession { session_id: 2 });
     }
 
     #[test]
@@ -983,7 +983,7 @@ fn handle_session_state_keeps_accumulated_live_turn_over_snapshot_placeholder() 
     snapshot_turns.insert(5, placeholder_turn("user q"));
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(7),
             event: SessionEvent::SessionState {
                 title: None,
@@ -999,7 +999,7 @@ fn handle_session_state_keeps_accumulated_live_turn_over_snapshot_placeholder() 
                 reasoning_capability: None,
                 status: SessionStatus::Inactive,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1056,10 +1056,10 @@ fn done_for_background_session_does_not_pollute_attached_display() {
     }
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(7),
             event: SessionEvent::Done {
-                request_id: 50,
+                stream_id: 50,
                 token_usage: Some(TokenUsage {
                     input_tokens: 99,
                     output_tokens: 99,
@@ -1069,7 +1069,7 @@ fn done_for_background_session_does_not_pollute_attached_display() {
                 }),
                 last_prompt_tokens: Some(99),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1198,13 +1198,13 @@ fn model_selected_for_background_session_does_not_write_global_status() {
     // A background session (99) changes its model.  Its per-session display
     // is updated, but the global status/error line must stay untouched.
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(99),
             event: SessionEvent::ModelSelected {
                 model: "gpt-other".to_string(),
                 reasoning_capability: None,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1235,13 +1235,13 @@ fn model_selected_for_attached_session_writes_status_feedback() {
     // The user's own `/model` command must still print its confirmation via
     // the generic dispatch fall-through.
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(42),
             event: SessionEvent::ModelSelected {
                 model: "gpt-new".to_string(),
                 reasoning_capability: None,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1267,12 +1267,12 @@ fn reasoning_effort_set_for_background_session_does_not_write_global_status() {
     assert!(app.status.is_none() && app.error.is_none());
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(99),
             event: SessionEvent::ReasoningEffortSet {
                 effort: "high".to_string(),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1294,12 +1294,12 @@ fn reasoning_effort_set_for_attached_session_writes_status_feedback() {
     app.active_session_id = Some(42);
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(42),
             event: SessionEvent::ReasoningEffortSet {
                 effort: "high".to_string(),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1325,12 +1325,12 @@ fn session_account_set_for_background_session_does_not_write_global_status() {
     assert!(app.status.is_none() && app.error.is_none());
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(99),
             event: SessionEvent::SessionAccountSet {
                 account: "bg-account".to_string(),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1352,12 +1352,12 @@ fn session_account_set_for_attached_session_writes_status_feedback() {
     app.active_session_id = Some(42);
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(42),
             event: SessionEvent::SessionAccountSet {
                 account: "main".to_string(),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1382,13 +1382,13 @@ fn reasoning_effort_set_failed_for_background_session_does_not_write_global_stat
     // A background session's rejection previously leaked through BOTH the
     // explicit `app.status` write and the generic dispatch's `app.error`.
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(99),
             event: SessionEvent::ReasoningEffortSetFailed {
                 effort: "high".to_string(),
                 error: "model does not support reasoning".to_string(),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1415,13 +1415,13 @@ fn reasoning_effort_set_failed_for_attached_session_writes_status_and_error() {
     // The user's own `/reasoning` command failed — the rejection notice stays
     // on the status line and the generic dispatch records the error.
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(42),
             event: SessionEvent::ReasoningEffortSetFailed {
                 effort: "high".to_string(),
                 error: "model does not support reasoning".to_string(),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1459,12 +1459,12 @@ fn reasoning_effort_set_connection_level_writes_status_feedback_for_attached_ses
     // attached session.  It must be treated as the user's own feedback, not
     // swallowed as background noise.
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::ReasoningEffortSet {
                 effort: "high".to_string(),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1499,13 +1499,13 @@ fn reasoning_effort_set_failed_connection_level_writes_status_and_error() {
     // connection-level rejections ("no session attached").  The user must see
     // the rejection of their own /reasoning command.
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::ReasoningEffortSetFailed {
                 effort: "high".to_string(),
                 error: "no session attached".to_string(),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1535,13 +1535,13 @@ fn model_selection_failed_for_background_session_does_not_write_global_error() {
     assert!(app.status.is_none() && app.error.is_none());
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(99),
             event: SessionEvent::ModelSelectionFailed {
                 model: "gpt-other".to_string(),
                 error: "model not found".to_string(),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1564,13 +1564,13 @@ fn model_selection_failed_for_attached_session_writes_global_error() {
     // The user's own /model command failed — the rejection must still be
     // surfaced via the generic dispatch's error write.
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(42),
             event: SessionEvent::ModelSelectionFailed {
                 model: "gpt-x".to_string(),
                 error: "model not found".to_string(),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1593,13 +1593,13 @@ fn model_selection_failed_connection_level_writes_global_error() {
     // No session attached at the daemon connection level — the `None` reply
     // must keep its error feedback, not be swallowed as background noise.
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: None,
             event: SessionEvent::ModelSelectionFailed {
                 model: "gpt-x".to_string(),
                 error: "no session attached".to_string(),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1624,7 +1624,7 @@ fn session_created_for_sub_session_does_not_hijack_chat_view() {
     // spawn_subsession makes the daemon broadcast SessionCreated with
     // parent_session_id = Some(parent).  The TUI must not switch to it.
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(99),
             event: SessionEvent::SessionCreated {
                 parent_session_id: Some(42),
@@ -1634,7 +1634,7 @@ fn session_created_for_sub_session_does_not_hijack_chat_view() {
                 selected_model: None,
                 reasoning_effort: None,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1655,17 +1655,17 @@ fn session_created_for_sub_session_does_not_hijack_chat_view() {
     // Chat page renders `Sessions` replies into the status line — no
     // unsolicited list refresh either (it would rewrite the status line and
     // reflow the viewed viewport).
-    let msgs: Vec<ClientMessage> = rx.try_iter().collect();
+    let msgs: Vec<ClientMessageType> = rx.try_iter().collect();
     assert!(
-        !msgs
-            .iter()
-            .any(|m| matches!(m, ClientMessage::AttachSession { session_id } if *session_id == 99)),
+        !msgs.iter().any(
+            |m| matches!(m, ClientMessageType::AttachSession { session_id } if *session_id == 99)
+        ),
         "sub-session creation must not auto-attach"
     );
     assert!(
         !msgs
             .iter()
-            .any(|m| matches!(m, ClientMessage::ListSessions)),
+            .any(|m| matches!(m, ClientMessageType::ListSessions)),
         "on the Chat page a sub-session creation must not refresh the session list — \
          the Sessions reply would rewrite the status line"
     );
@@ -1680,7 +1680,7 @@ fn session_created_for_sub_session_on_session_manager_refreshes_list() {
     app.page = Page::SessionManager;
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(99),
             event: SessionEvent::SessionCreated {
                 parent_session_id: Some(42),
@@ -1690,7 +1690,7 @@ fn session_created_for_sub_session_on_session_manager_refreshes_list() {
                 selected_model: None,
                 reasoning_effort: None,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1700,16 +1700,16 @@ fn session_created_for_sub_session_on_session_manager_refreshes_list() {
     // renders into the session list, not the status line.
     assert_eq!(app.attached_session_id, Some(42));
     assert_eq!(app.active_session_id, Some(42));
-    let msgs: Vec<ClientMessage> = rx.try_iter().collect();
+    let msgs: Vec<ClientMessageType> = rx.try_iter().collect();
     assert!(
-        !msgs
-            .iter()
-            .any(|m| matches!(m, ClientMessage::AttachSession { session_id } if *session_id == 99)),
+        !msgs.iter().any(
+            |m| matches!(m, ClientMessageType::AttachSession { session_id } if *session_id == 99)
+        ),
         "sub-session creation must not auto-attach"
     );
     assert!(
         msgs.iter()
-            .any(|m| matches!(m, ClientMessage::ListSessions)),
+            .any(|m| matches!(m, ClientMessageType::ListSessions)),
         "on the Session Manager page the list must refresh so the sub-session is visible"
     );
 }
@@ -1725,7 +1725,7 @@ fn session_created_for_user_session_attaches_on_chat_page() {
     // (`SessionCreatedForRequester`, parent_session_id = None) keeps the old
     // behavior: switch the view and attach.
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(99),
             event: SessionEvent::SessionCreatedForRequester {
                 parent_session_id: None,
@@ -1735,7 +1735,7 @@ fn session_created_for_user_session_attaches_on_chat_page() {
                 selected_model: Some("gpt-new".to_string()),
                 reasoning_effort: Some("off".to_string()),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1749,15 +1749,16 @@ fn session_created_for_user_session_attaches_on_chat_page() {
         app.display_for(99).selected_model.as_deref(),
         Some("gpt-new")
     );
-    let msgs: Vec<ClientMessage> = rx.try_iter().collect();
+    let msgs: Vec<ClientMessageType> = rx.try_iter().collect();
     assert!(
-        msgs.iter()
-            .any(|m| matches!(m, ClientMessage::AttachSession { session_id } if *session_id == 99)),
+        msgs.iter().any(
+            |m| matches!(m, ClientMessageType::AttachSession { session_id } if *session_id == 99)
+        ),
         "a user-created session must still auto-attach on the Chat page"
     );
     assert!(
         msgs.iter()
-            .any(|m| matches!(m, ClientMessage::ListSessions))
+            .any(|m| matches!(m, ClientMessageType::ListSessions))
     );
 }
 
@@ -1773,7 +1774,7 @@ fn session_created_for_user_session_on_session_manager_navigates() {
     app.page = Page::SessionManager;
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(99),
             event: SessionEvent::SessionCreatedForRequester {
                 parent_session_id: None,
@@ -1783,7 +1784,7 @@ fn session_created_for_user_session_on_session_manager_navigates() {
                 selected_model: Some("gpt-new".to_string()),
                 reasoning_effort: Some("off".to_string()),
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1797,15 +1798,16 @@ fn session_created_for_user_session_on_session_manager_navigates() {
     assert_eq!(app.attached_session_id, Some(99));
     assert_eq!(app.active_session_id, Some(99));
     assert_eq!(app.display_for(99).account_name.as_deref(), Some("acct"));
-    let msgs: Vec<ClientMessage> = rx.try_iter().collect();
+    let msgs: Vec<ClientMessageType> = rx.try_iter().collect();
     assert!(
-        msgs.iter()
-            .any(|m| matches!(m, ClientMessage::AttachSession { session_id } if *session_id == 99)),
+        msgs.iter().any(
+            |m| matches!(m, ClientMessageType::AttachSession { session_id } if *session_id == 99)
+        ),
         "the creator must attach to the new session"
     );
     assert!(
         msgs.iter()
-            .any(|m| matches!(m, ClientMessage::UnsubscribeSessionsSummary)),
+            .any(|m| matches!(m, ClientMessageType::UnsubscribeSessionsSummary)),
         "leaving the Session Manager must drop its summary subscription"
     );
     // Exactly-once refresh: the direct reply must NOT also fetch the list from
@@ -1814,7 +1816,7 @@ fn session_created_for_user_session_on_session_manager_navigates() {
     assert!(
         !msgs
             .iter()
-            .any(|m| matches!(m, ClientMessage::ListSessions)),
+            .any(|m| matches!(m, ClientMessageType::ListSessions)),
         "a create from the Session Manager must not send a second ListSessions"
     );
 }
@@ -1832,7 +1834,7 @@ fn session_created_broadcast_does_not_attach_on_chat_page() {
     app.active_session_id = Some(42);
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(99),
             event: SessionEvent::SessionCreated {
                 parent_session_id: None,
@@ -1842,7 +1844,7 @@ fn session_created_broadcast_does_not_attach_on_chat_page() {
                 selected_model: Some("gpt-new".to_string()),
                 reasoning_effort: None,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1854,17 +1856,17 @@ fn session_created_broadcast_does_not_attach_on_chat_page() {
         "another client's creation must not change the attached session"
     );
     assert_eq!(app.active_session_id, Some(42));
-    let msgs: Vec<ClientMessage> = rx.try_iter().collect();
+    let msgs: Vec<ClientMessageType> = rx.try_iter().collect();
     assert!(
         !msgs
             .iter()
-            .any(|m| matches!(m, ClientMessage::AttachSession { .. })),
+            .any(|m| matches!(m, ClientMessageType::AttachSession { .. })),
         "a broadcast create must not auto-attach"
     );
     assert!(
         !msgs
             .iter()
-            .any(|m| matches!(m, ClientMessage::ListSessions)),
+            .any(|m| matches!(m, ClientMessageType::ListSessions)),
         "on the Chat page a broadcast create must not refresh the list — \
          the Sessions reply would rewrite the status line"
     );
@@ -1879,7 +1881,7 @@ fn session_created_broadcast_on_session_manager_refreshes_list_only() {
     app.page = Page::SessionManager;
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(99),
             event: SessionEvent::SessionCreated {
                 parent_session_id: None,
@@ -1889,7 +1891,7 @@ fn session_created_broadcast_on_session_manager_refreshes_list_only() {
                 selected_model: None,
                 reasoning_effort: None,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -1897,16 +1899,16 @@ fn session_created_broadcast_on_session_manager_refreshes_list_only() {
 
     assert_eq!(app.attached_session_id, Some(42));
     assert_eq!(app.active_session_id, Some(42));
-    let msgs: Vec<ClientMessage> = rx.try_iter().collect();
+    let msgs: Vec<ClientMessageType> = rx.try_iter().collect();
     assert!(
         !msgs
             .iter()
-            .any(|m| matches!(m, ClientMessage::AttachSession { .. })),
+            .any(|m| matches!(m, ClientMessageType::AttachSession { .. })),
         "a broadcast create must not auto-attach"
     );
     assert!(
         msgs.iter()
-            .any(|m| matches!(m, ClientMessage::ListSessions)),
+            .any(|m| matches!(m, ClientMessageType::ListSessions)),
         "on the Session Manager page the list must refresh so the new session is visible"
     );
 }
@@ -2006,13 +2008,13 @@ fn subsession_finish_switches_back_to_parent_with_notification() {
     ]);
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(99),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inactive,
                 last_modified: 1_705_315_000_000,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -2023,17 +2025,17 @@ fn subsession_finish_switches_back_to_parent_with_notification() {
     assert_eq!(app.active_session_id, Some(42));
     // The daemon was asked to attach to the parent, mirroring the Session
     // Manager Enter path (summary unsubscription first, then attach).
-    let msgs: Vec<ClientMessage> = rx.try_iter().collect();
+    let msgs: Vec<ClientMessageType> = rx.try_iter().collect();
     assert!(
         msgs.iter().any(|m| matches!(
             m,
-            ClientMessage::AttachSession { session_id } if *session_id == 42
+            ClientMessageType::AttachSession { session_id } if *session_id == 42
         )),
         "must attach to the parent session"
     );
     assert!(
         msgs.iter()
-            .any(|m| matches!(m, ClientMessage::UnsubscribeSessionsSummary)),
+            .any(|m| matches!(m, ClientMessageType::UnsubscribeSessionsSummary)),
         "must unsubscribe from the sessions summary like other attach paths"
     );
     // The notification names both sessions.
@@ -2063,13 +2065,13 @@ fn subsession_finish_does_not_fire_on_duplicate_idle_broadcast() {
     app.handle_session_status_changed(99, &SessionStatus::Inactive, 1_705_315_000_000);
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(99),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inactive,
                 last_modified: 1_705_315_000_000,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -2093,13 +2095,13 @@ fn top_level_session_finish_does_not_switch() {
         .set_sessions(vec![make_session(42, "my session", "m1", 3)]);
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(42),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inactive,
                 last_modified: 1_705_315_000_000,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -2125,13 +2127,13 @@ fn subsession_finish_with_missing_parent_does_not_switch() {
         .set_sessions(vec![make_subsession(99, "orphan task", 42)]);
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(99),
             event: SessionEvent::SessionStatusChanged {
                 status: SessionStatus::Inactive,
                 last_modified: 1_705_315_000_000,
             },
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -2184,10 +2186,10 @@ fn session_attached_does_not_regress_accumulated_live_state() {
     }
 
     handle_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(42),
             event: SessionEvent::SessionAttached,
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -2239,7 +2241,7 @@ fn handle_sessions_auto_attach_prefers_top_level_session() {
     // The auto-attach must pick the top-level session, not the sub-session
     // that happens to be the most recently modified.
     let msg = rx.recv().expect("auto-attach message");
-    assert_eq!(msg, ClientMessage::AttachSession { session_id: 3 });
+    assert_eq!(msg, ClientMessageType::AttachSession { session_id: 3 });
     assert_eq!(app.attached_session_id, Some(3));
     assert_eq!(app.active_session_id, Some(3));
 
@@ -2267,7 +2269,7 @@ fn handle_sessions_auto_attach_falls_back_to_child_when_no_top_level() {
 
     // With no top-level session at all, fall back to the most recent session.
     let msg = rx.recv().expect("auto-attach message");
-    assert_eq!(msg, ClientMessage::AttachSession { session_id: 7 });
+    assert_eq!(msg, ClientMessageType::AttachSession { session_id: 7 });
 }
 
 #[test]
@@ -2286,7 +2288,7 @@ fn handle_sessions_empty_creates_default_session_without_working_dir() {
     let msg = rx.recv().expect("CreateSession message");
     assert_eq!(
         msg,
-        ClientMessage::CreateSession {
+        ClientMessageType::CreateSession {
             title: Some("default".into()),
             parent_session_id: None,
             working_dir: None,
@@ -2318,7 +2320,7 @@ fn handle_sessions_auto_attach_skips_archived_sessions() {
         .expect("handle_sessions should succeed");
 
     let msg = rx.recv().expect("auto-attach message");
-    assert_eq!(msg, ClientMessage::AttachSession { session_id: 3 });
+    assert_eq!(msg, ClientMessageType::AttachSession { session_id: 3 });
     assert_eq!(app.attached_session_id, Some(3));
 }
 
@@ -2338,6 +2340,6 @@ fn handle_sessions_only_archived_creates_default_instead_of_attaching() {
         .expect("handle_sessions should succeed");
 
     let msg = rx.recv().expect("CreateSession message");
-    assert!(matches!(msg, ClientMessage::CreateSession { .. }));
+    assert!(matches!(msg, ClientMessageType::CreateSession { .. }));
     assert_eq!(app.attached_session_id, None);
 }

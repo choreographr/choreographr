@@ -20,7 +20,7 @@ use choreo_ai_protocols::{
 };
 use choreo_ai_protocols::{ProviderProtocol, lookup_provider, model_cost, prompt_cache_ttl};
 use choreo_proto::{
-    AssistantToolCallRecord, DaemonMessage, OutputStream, ReasoningProducer, SessionEvent,
+    AssistantToolCallRecord, DaemonMessageType, OutputStream, ReasoningProducer, SessionEvent,
     SessionStatus,
 };
 
@@ -395,7 +395,7 @@ pub(crate) fn run_agent_loop(
     client: &InferenceProvider,
     session: &mut SessionState,
     model: &str,
-    request_id: u32,
+    stream_id: u64,
     cancel_rx: &crossbeam_channel::Receiver<()>,
     ctx: &RequestContext,
     user_text: Option<&str>,
@@ -600,10 +600,10 @@ pub(crate) fn run_agent_loop(
 
         let _ = ctx
             .cmd_tx
-            .send(SessionCommand::Broadcast(DaemonMessage::Session {
+            .send(SessionCommand::Broadcast(DaemonMessageType::Session {
                 session_id: Some(ctx.session_id),
                 event: SessionEvent::Started {
-                    request_id,
+                    stream_id,
                     turn_id: current_turn_id,
                     estimated_prompt_tokens,
                 },
@@ -631,7 +631,7 @@ pub(crate) fn run_agent_loop(
         // keys its sticky provider tracker on the session id). Owned locals,
         // so the borrowed fields outlive the provider call below.
         let oc_session_id = ctx.session_id.to_string();
-        let oc_request_id = request_id.to_string();
+        let oc_request_id = stream_id.to_string();
 
         match client.chat_completion_turn_streaming(
             ChatTurnRequest {
@@ -660,27 +660,27 @@ pub(crate) fn run_agent_loop(
                                 output_token_count += n as u32;
                             }
                         }
-                        let _ =
-                            ctx.cmd_tx
-                                .send(SessionCommand::Broadcast(DaemonMessage::Session {
-                                    session_id: Some(ctx.session_id),
-                                    event: SessionEvent::OutputChunk {
-                                        request_id,
-                                        stream: OutputStream::Answer,
-                                        data: text.into_bytes(),
-                                    },
-                                }));
+                        let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
+                            DaemonMessageType::Session {
+                                session_id: Some(ctx.session_id),
+                                event: SessionEvent::OutputChunk {
+                                    stream_id,
+                                    stream: OutputStream::Answer,
+                                    data: text.into_bytes(),
+                                },
+                            },
+                        ));
                         // Let the UI update its live token display on every
                         // chunk so the count feels responsive.
-                        let _ =
-                            ctx.cmd_tx
-                                .send(SessionCommand::Broadcast(DaemonMessage::Session {
-                                    session_id: Some(ctx.session_id),
-                                    event: SessionEvent::LiveOutputTokenCount {
-                                        request_id,
-                                        output_tokens: output_token_count,
-                                    },
-                                }));
+                        let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
+                            DaemonMessageType::Session {
+                                session_id: Some(ctx.session_id),
+                                event: SessionEvent::LiveOutputTokenCount {
+                                    stream_id,
+                                    output_tokens: output_token_count,
+                                },
+                            },
+                        ));
                     }
                     StreamEvent::Reasoning(text) => {
                         if let Some(enc) = &encoding {
@@ -691,25 +691,25 @@ pub(crate) fn run_agent_loop(
                                 output_token_count += n as u32;
                             }
                         }
-                        let _ =
-                            ctx.cmd_tx
-                                .send(SessionCommand::Broadcast(DaemonMessage::Session {
-                                    session_id: Some(ctx.session_id),
-                                    event: SessionEvent::OutputChunk {
-                                        request_id,
-                                        stream: OutputStream::Reasoning,
-                                        data: text.into_bytes(),
-                                    },
-                                }));
-                        let _ =
-                            ctx.cmd_tx
-                                .send(SessionCommand::Broadcast(DaemonMessage::Session {
-                                    session_id: Some(ctx.session_id),
-                                    event: SessionEvent::LiveOutputTokenCount {
-                                        request_id,
-                                        output_tokens: output_token_count,
-                                    },
-                                }));
+                        let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
+                            DaemonMessageType::Session {
+                                session_id: Some(ctx.session_id),
+                                event: SessionEvent::OutputChunk {
+                                    stream_id,
+                                    stream: OutputStream::Reasoning,
+                                    data: text.into_bytes(),
+                                },
+                            },
+                        ));
+                        let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
+                            DaemonMessageType::Session {
+                                session_id: Some(ctx.session_id),
+                                event: SessionEvent::LiveOutputTokenCount {
+                                    stream_id,
+                                    output_tokens: output_token_count,
+                                },
+                            },
+                        ));
                     }
                     // `StreamEvent` is #[non_exhaustive] — a future event kind
                     // this loop doesn't forward should be ignored, not crash
@@ -895,7 +895,7 @@ pub(crate) fn run_agent_loop(
                         tools: tools.clone(),
                         facts,
                         session_id: ctx.session_id.to_string(),
-                        request_id: request_id.to_string(),
+                        stream_id: stream_id.to_string(),
                         // Anthropic accepts `max_tokens: 0` as its documented
                         // cache pre-warm (writes the cache, bills no output) —
                         // hence the inverted flag; every other protocol needs at
@@ -965,10 +965,10 @@ pub(crate) fn run_agent_loop(
 
                     if let Err(e) =
                         ctx.cmd_tx
-                            .send(SessionCommand::Broadcast(DaemonMessage::Session {
+                            .send(SessionCommand::Broadcast(DaemonMessageType::Session {
                                 session_id: Some(ctx.session_id),
                                 event: SessionEvent::ToolCallStarted {
-                                    request_id,
+                                    stream_id,
                                     call_id: tool_call.id.clone(),
                                     tool_name: tool_call.name.clone(),
                                     arguments_json: tool_call.arguments_json.clone(),
@@ -976,7 +976,7 @@ pub(crate) fn run_agent_loop(
                                 },
                             }))
                     {
-                        warn!(%request_id, call_id = %tool_call.id, error = %e, "failed to broadcast ToolCallStarted");
+                        warn!(%stream_id, call_id = %tool_call.id, error = %e, "failed to broadcast ToolCallStarted");
                     }
 
                     let tool_timeout =
@@ -1023,7 +1023,7 @@ pub(crate) fn run_agent_loop(
                             x_credentials: ctx.substrate_credential.as_ref(),
                             working_dir: turn_working_dir.as_deref(),
                             timeout_dur: tool_timeout,
-                            request_id,
+                            stream_id,
                             session_id: ctx.session_id,
                             session: &mut *session,
                             session_tools,
@@ -1042,7 +1042,7 @@ pub(crate) fn run_agent_loop(
                     }
 
                     record_tool_completion(ToolCompletionParams {
-                        request_id,
+                        stream_id,
                         session: &mut *session,
                         tool_call: &tool_call,
                         output: &mut output,
@@ -1089,10 +1089,10 @@ pub(crate) fn run_agent_loop(
                             description_by_call.get(&tc.id).cloned().unwrap_or_default();
                         if let Err(e) =
                             ctx.cmd_tx
-                                .send(SessionCommand::Broadcast(DaemonMessage::Session {
+                                .send(SessionCommand::Broadcast(DaemonMessageType::Session {
                                     session_id: Some(ctx.session_id),
                                     event: SessionEvent::ToolCallStarted {
-                                        request_id,
+                                        stream_id,
                                         call_id: tc.id.clone(),
                                         tool_name: tc.name.clone(),
                                         arguments_json: tc.arguments_json.clone(),
@@ -1100,7 +1100,7 @@ pub(crate) fn run_agent_loop(
                                     },
                                 }))
                         {
-                            warn!(%request_id, call_id = %tc.id, error = %e, "failed to broadcast ToolCallStarted");
+                            warn!(%stream_id, call_id = %tc.id, error = %e, "failed to broadcast ToolCallStarted");
                         }
                     }
 
@@ -1188,7 +1188,7 @@ pub(crate) fn run_agent_loop(
                         let kill_tx = spawn_single_tool(SpawnToolArgs {
                             tool_call,
                             timeout,
-                            request_id,
+                            stream_id,
                             session_id: ctx.session_id,
                             registry: Arc::clone(&reg),
                             session_tools: Arc::clone(&session_tools),
@@ -1247,7 +1247,7 @@ pub(crate) fn run_agent_loop(
                             );
 
                             record_tool_completion(ToolCompletionParams {
-                                request_id,
+                                stream_id,
                                 session: &mut *session,
                                 tool_call: &tool_call,
                                 output: &mut output,
@@ -1348,7 +1348,7 @@ pub(crate) fn run_agent_loop(
                                 } else {
                                     warn!(
                                         session_id = ctx.session_id,
-                                        request_id,
+                                        stream_id,
                                         delivered = delivered.len(),
                                         expected = batch_size,
                                         "concurrent tool batch ended early after cancel; synthesizing missing tool results",
@@ -1375,7 +1375,7 @@ pub(crate) fn run_agent_loop(
                                 // records a result for every call.
                                 warn!(
                                     session_id = ctx.session_id,
-                                    request_id,
+                                    stream_id,
                                     delivered = delivered.len(),
                                     expected = batch_size,
                                     "concurrent tool batch ended early; synthesizing missing tool results",
@@ -1489,7 +1489,7 @@ pub(crate) fn run_agent_loop(
                     };
                     tracing::warn!(
                         session_id = ctx.session_id,
-                        request_id,
+                        stream_id,
                         recovery = truncation_recoveries,
                         max_recoveries = MAX_TRUNCATION_RECOVERIES,
                         tools = %names,
@@ -1531,7 +1531,7 @@ pub(crate) fn run_agent_loop(
                     if truncation_recoveries >= MAX_TRUNCATION_RECOVERIES {
                         tracing::warn!(
                             session_id = ctx.session_id,
-                            request_id,
+                            stream_id,
                             recovery = truncation_recoveries,
                             "output-token truncation persisted after the recovery budget; \
                              ending the request",

@@ -1,7 +1,7 @@
 use crate::connection::{handle_daemon_message, handle_terminal_event};
 use crate::state::*;
 use crate::test_util::test_app;
-use choreo_proto::{AccountInfo, ClientMessage, DaemonMessage};
+use choreo_proto::{AccountInfo, ClientMessageType, DaemonMessage, DaemonMessageType};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -15,7 +15,7 @@ fn send_mouse(
     kind: MouseEventKind,
     column: u16,
     row: u16,
-    tx: &crossbeam_channel::Sender<ClientMessage>,
+    tx: &crossbeam_channel::Sender<ClientMessageType>,
 ) {
     handle_terminal_event(
         Event::Mouse(MouseEvent {
@@ -63,7 +63,7 @@ fn ai_providers_enter_selects_account_and_returns_to_chat() {
     let msg = rx.recv().expect("sent message");
     assert_eq!(
         msg,
-        ClientMessage::SetSessionAccount {
+        ClientMessageType::SetSessionAccount {
             name: "personal-account".to_string(),
         }
     );
@@ -137,7 +137,7 @@ fn ai_providers_list_click_selects_account_and_returns_to_chat() {
     let msg = rx.recv().expect("sent message");
     assert_eq!(
         msg,
-        ClientMessage::SetSessionAccount {
+        ClientMessageType::SetSessionAccount {
             name: "personal-account".to_string(),
         }
     );
@@ -312,7 +312,7 @@ fn setup_providers_new_account(app: &mut App) {
 /// returning nothing.  `provider` is matched by slug.
 fn advance_to_slug_phase(
     app: &mut App,
-    tx: &crossbeam_channel::Sender<ClientMessage>,
+    tx: &crossbeam_channel::Sender<ClientMessageType>,
     provider: &str,
 ) {
     setup_providers_new_account(app);
@@ -789,7 +789,7 @@ fn ai_providers_new_account_submit_creates_account_and_redirects_to_credential()
     let msg = rx.recv().expect("AddAccount message");
     assert_eq!(
         msg,
-        ClientMessage::AddAccount {
+        ClientMessageType::AddAccount {
             name: "my-account".to_string(),
             provider: "openai".to_string(),
             base_url: None,
@@ -878,22 +878,22 @@ fn ai_providers_credential_added_refreshes_account_list() {
     // — otherwise `has_credential` stays stale (no) until the user leaves
     // and re-enters the page.
     handle_daemon_message(
-        DaemonMessage::CredentialAdded {
+        DaemonMessage::broadcast(DaemonMessageType::CredentialAdded {
             service: "my-account".to_string(),
-        },
+        }),
         &mut app,
         &tx,
     )
     .expect("handle CredentialAdded");
 
     let msg = rx.recv().expect("ListAccounts sent after credential added");
-    assert_eq!(msg, ClientMessage::ListAccounts);
+    assert_eq!(msg, ClientMessageType::ListAccounts);
 
     // Removal refreshes the list the same way.
     handle_daemon_message(
-        DaemonMessage::CredentialRemoved {
+        DaemonMessage::broadcast(DaemonMessageType::CredentialRemoved {
             service: "my-account".to_string(),
-        },
+        }),
         &mut app,
         &tx,
     )
@@ -902,7 +902,7 @@ fn ai_providers_credential_added_refreshes_account_list() {
     let msg = rx
         .recv()
         .expect("ListAccounts sent after credential removed");
-    assert_eq!(msg, ClientMessage::ListAccounts);
+    assert_eq!(msg, ClientMessageType::ListAccounts);
 }
 
 // ── New-account wizard mouse support ──────────────────────

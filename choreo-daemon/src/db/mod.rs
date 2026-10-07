@@ -1447,7 +1447,7 @@ mod tests {
     #[test]
     fn read_attachment_returns_bytes_by_key_or_none() {
         // On-demand fetch reads a single attachment by (session, turn, key) —
-        // the exact key `ClientMessage::GetImage` carries, resolved to its
+        // the exact key `ClientMessageType::GetImage` carries, resolved to its
         // `d{index}` / `r{call_id}` slot by the shared reader. A missing
         // table/slot is `None`, never an error.
         let dir = tempfile::tempdir().unwrap();

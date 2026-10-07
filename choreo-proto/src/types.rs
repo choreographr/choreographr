@@ -1,3 +1,36 @@
+//! The wire protocol types: the two message envelopes and every payload they
+//! carry.
+//!
+//! # The uniform correlation frame
+//!
+//! Both directions use one shaped envelope. A [`ClientMessage`] is
+//! `{ id: u64, inner: ClientMessageType }`; a [`DaemonMessage`] is
+//! `{ id: Option<u64>, inner: DaemonMessageType }`. A client allocates `id` as a
+//! monotonic per-connection counter and the daemon MUST answer every request
+//! with exactly one `DaemonMessage { id: Some(the same id), .. }` — the terminal
+//! reply, success or failure. A broadcast is `DaemonMessage { id: None, .. }` and
+//! never resolves a request.
+//!
+//! # Two orthogonal axes
+//!
+//! The **reply axis** (`id`) is per-connection and one-shot: one request, one
+//! reply. The **stream axis** (`stream_id`, carried in the payload by the
+//! streaming requests and their [`SessionEvent`]s) is per-session and many-shot:
+//! a single `RunInput`/`ContinueGeneration` fans many events out to EVERY
+//! session subscriber, including mid-stream joiners. They are never merged,
+//! because two clients each use their own request id 0, while a stream needs an
+//! id unique across a namespace all subscribers share.
+//!
+//! # Reply/broadcast overlap
+//!
+//! Reply-ness is a property of the SEND, not the payload type. The same `inner`
+//! (e.g. `SessionState`, `ReasoningEffortSet`) may be emitted with `id: Some`
+//! (a reply) or `id: None` (a broadcast); a client applies the payload's state
+//! effect either way and resolves a pending slot only when `id` is `Some`. A
+//! variant is split into a dedicated type only when the reply carries
+//! requester-relative intent no broadcast may carry (the
+//! `SessionCreatedForRequester` precedent).
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tracing::warn;
@@ -329,7 +362,7 @@ pub struct ToolResultRecord {
 /// directly, is persisted in the `session_attachments` DB table at write time
 /// (kept out of the zstd turn blob) and re-attached on read, and is emptied on
 /// the client-facing view by `turn_for_client` (the client fetches the bytes
-/// with `ClientMessage::GetImage` under `ImageKey::ToolResult { call_id }`).
+/// with `ClientMessageType::GetImage` under `ImageKey::ToolResult { call_id }`).
 /// `#[serde(default)]` keeps old persisted records backward compatible — they
 /// deserialize with an empty `data`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -542,9 +575,47 @@ impl SessionSummary {
     }
 }
 
+/// A client→server wire frame: a per-connection correlation `id` plus the
+/// request payload in [`ClientMessageType`].
+///
+/// `id` is allocated by the client as a monotonic per-connection counter
+/// (starting at 0, never reused for the connection's life), and the daemon
+/// MUST answer with exactly one `DaemonMessage { id: Some(self.id), .. }` —
+/// the terminal reply, success or failure. There is no sentinel and no
+/// uncorrelated send.
+///
+/// The reply `id` and the stream `stream_id` are two ORTHOGONAL axes and are
+/// never merged: `id` is per-connection and one-shot (exactly one reply per
+/// request), while `stream_id` is per-session and drives the many streaming
+/// events a single `RunInput`/`ContinueGeneration` fans out to every session
+/// subscriber. Two clients may each use their own request id 0, but a stream
+/// fanned to all subscribers needs an id unique in a namespace they share —
+/// which is why the two cannot be the same key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClientMessage {
+    /// The per-connection request id the daemon echoes onto its reply.
+    pub id: u64,
+    /// The request payload.
+    pub inner: ClientMessageType,
+}
+
+impl ClientMessage {
+    /// Build a request frame: `inner` tagged with correlation `id`.
+    #[must_use]
+    pub fn request(id: u64, inner: ClientMessageType) -> Self {
+        Self { id, inner }
+    }
+}
+
+/// The request payloads carried inside a [`ClientMessage`].
+///
+/// The variants are exactly the former `ClientMessage` variants, unchanged;
+/// only the envelope around them moved to the [`ClientMessage`] struct's
+/// `inner` field. Every variant is a correlated request that receives exactly
+/// one terminal reply.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum ClientMessage {
+pub enum ClientMessageType {
     CreateSession {
         title: Option<String>,
         parent_session_id: Option<u64>,
@@ -564,11 +635,11 @@ pub enum ClientMessage {
         session_id: u64,
     },
     RunInput {
-        request_id: u32,
+        stream_id: u64,
         input: Vec<u8>,
     },
     Cancel {
-        request_id: u32,
+        stream_id: u64,
     },
     Ping,
     GetCredential {
@@ -578,7 +649,7 @@ pub enum ClientMessage {
     /// Ask the daemon to refresh the models.dev catalog from upstream: a
     /// conditional GET against the cached etag, then a catalog swap when the
     /// remote changed. `force` bypasses the etag (`Cache-Control: no-cache`).
-    /// The daemon replies with `DaemonMessage::ModelsRefreshed` (or
+    /// The daemon replies with `DaemonMessageType::ModelsRefreshed` (or
     /// `ModelsRefreshFailed`).
     RefreshModels {
         force: bool,
@@ -595,7 +666,7 @@ pub enum ClientMessage {
     /// the binding: on an unbound keystore the daemon adopts the key (loud
     /// `KEYSTORE BOUND` log), runs the shared unlock tail (same code path as
     /// `AddCredential`'s implicit unlock), and replies
-    /// [`DaemonMessage::Bound`]. On an ALREADY-bound keystore the key is
+    /// [`DaemonMessageType::Bound`]. On an ALREADY-bound keystore the key is
     /// verified against the binding — a mismatch is rejected with the usual
     /// wrong-key semantics (no unlock, no overwrite). Unlock and `AddCredential`
     /// are strictly VERIFY-ONLY and cannot create a binding.
@@ -643,7 +714,7 @@ pub enum ClientMessage {
     /// Set (or clear) the session's `archived` state. Archiving stamps the
     /// current time into the summary's `archived_at`; unarchiving clears it.
     /// Same daemon-authoritative update/broadcast contract as
-    /// [`ClientMessage::SetSessionPinned`].
+    /// [`ClientMessageType::SetSessionPinned`].
     SetSessionArchived {
         session_id: u64,
         archived: bool,
@@ -674,7 +745,7 @@ pub enum ClientMessage {
     /// Create a new turn with the text "Continue." and run the agent loop.
     /// Semantically distinct from `RunInput` — the daemon controls the prompt text.
     ContinueGeneration {
-        request_id: u32,
+        stream_id: u64,
     },
     /// Request the raw bytes of one turn attachment in `session_id` — either a
     /// displayed image or a tool-result vision image — selected by [`ImageKey`].
@@ -685,7 +756,7 @@ pub enum ClientMessage {
     /// byte-less `ImageReference` (path + mime + dimensions). A long session's
     /// history therefore ships no image bytes up front; the client fetches each
     /// image on demand — typically when it scrolls into view — and the daemon
-    /// replies with a targeted [`DaemonMessage::Image`].
+    /// replies with a targeted [`DaemonMessageType::Image`].
     ///
     /// The bytes are served from the daemon's durable `session_attachments`
     /// store, keyed exactly like the wire request: (`session_id`, `turn_id`,
@@ -700,12 +771,12 @@ pub enum ClientMessage {
         key: ImageKey,
     },
     /// Request the state of every configured MCP server. The daemon replies
-    /// with [`DaemonMessage::McpStatus`].
+    /// with [`DaemonMessageType::McpStatus`].
     McpStatusRequest,
     /// Reconnect one configured MCP server (rebuild its connection and refresh
     /// the tool catalogue), identified by its slug. On success the daemon
-    /// replies with a refreshed [`DaemonMessage::McpStatus`]; on failure with
-    /// [`DaemonMessage::McpReconnectFailed`].
+    /// replies with a refreshed [`DaemonMessageType::McpStatus`]; on failure with
+    /// [`DaemonMessageType::McpReconnectFailed`].
     McpReconnect {
         slug: String,
     },
@@ -713,27 +784,132 @@ pub enum ClientMessage {
     /// project `.mcp.json` (its daemon-tier `mcp.json` and `trust.toml` are
     /// hot-reloaded by the daemon's config watcher), rebuilding the tool
     /// catalogue — without restarting the daemon. On success the daemon
-    /// replies with [`DaemonMessage::McpReloaded`]; when the config cannot be
-    /// read or parsed, with [`DaemonMessage::McpReloadFailed`].
+    /// replies with [`DaemonMessageType::McpReloaded`]; when the config cannot be
+    /// read or parsed, with [`DaemonMessageType::McpReloadFailed`].
     McpReload,
     /// Trust the ACTIVE session's project MCP root: the directory containing
     /// the nearest `.mcp.json` found by walking up from the session's working
     /// directory to the git root. Trust is whole-project (one decision covers
     /// every server that root's `.mcp.json` declares) and content-agnostic (a
     /// root with no `.mcp.json` yet may be trusted). The daemon replies with
-    /// [`DaemonMessage::McpTrustUpdated`].
+    /// [`DaemonMessageType::McpTrustUpdated`].
     McpTrust,
     /// Revoke trust for the ACTIVE session's project MCP root (the same root
-    /// [`ClientMessage::McpTrust`] would trust). Replies with
-    /// [`DaemonMessage::McpTrustUpdated`].
+    /// [`ClientMessageType::McpTrust`] would trust). Replies with
+    /// [`DaemonMessageType::McpTrustUpdated`].
     McpUntrust,
     /// Request the list of currently trusted project MCP roots. Replies with
-    /// [`DaemonMessage::McpTrustList`].
+    /// [`DaemonMessageType::McpTrustList`].
     McpTrustList,
     SubscribeAllActivity,
     UnsubscribeAllActivity,
 }
 
+/// A coarse tag naming a request kind, one variant per [`ClientMessageType`].
+///
+/// The daemon surfaces it in [`DaemonMessageType::Accepted`] /
+/// [`DaemonMessageType::Failed`] and clients use it as the log/timeout key, so
+/// every request/reply exchange self-identifies without the receiver having to
+/// reconstruct which request a bare success reply answered. It is `Copy`
+/// because it is a pure tag carried by value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MessageKind {
+    CreateSession,
+    ListSessions,
+    SubscribeSessionsSummary,
+    UnsubscribeSessionsSummary,
+    AttachSession,
+    GetSessionState,
+    RunInput,
+    Cancel,
+    Ping,
+    GetCredential,
+    ListModels,
+    RefreshModels,
+    SetModel,
+    Unlock,
+    Lock,
+    BindKeystore,
+    AddCredential,
+    RemoveCredential,
+    AclAdd,
+    DeleteSession,
+    SetSessionPinned,
+    SetSessionArchived,
+    AddAccount,
+    RemoveAccount,
+    ListAccounts,
+    SetSessionAccount,
+    SetReasoningEffort,
+    GetReasoningEffort,
+    Undo,
+    Redo,
+    ContinueGeneration,
+    GetImage,
+    McpStatusRequest,
+    McpReconnect,
+    McpReload,
+    McpTrust,
+    McpUntrust,
+    McpTrustList,
+    SubscribeAllActivity,
+    UnsubscribeAllActivity,
+}
+
+impl ClientMessageType {
+    /// The [`MessageKind`] tag naming this request's kind.
+    #[must_use]
+    pub fn kind(&self) -> MessageKind {
+        MessageKind::from(self)
+    }
+}
+
+impl From<&ClientMessageType> for MessageKind {
+    fn from(message: &ClientMessageType) -> Self {
+        match message {
+            ClientMessageType::CreateSession { .. } => Self::CreateSession,
+            ClientMessageType::ListSessions => Self::ListSessions,
+            ClientMessageType::SubscribeSessionsSummary => Self::SubscribeSessionsSummary,
+            ClientMessageType::UnsubscribeSessionsSummary => Self::UnsubscribeSessionsSummary,
+            ClientMessageType::AttachSession { .. } => Self::AttachSession,
+            ClientMessageType::GetSessionState { .. } => Self::GetSessionState,
+            ClientMessageType::RunInput { .. } => Self::RunInput,
+            ClientMessageType::Cancel { .. } => Self::Cancel,
+            ClientMessageType::Ping => Self::Ping,
+            ClientMessageType::GetCredential { .. } => Self::GetCredential,
+            ClientMessageType::ListModels => Self::ListModels,
+            ClientMessageType::RefreshModels { .. } => Self::RefreshModels,
+            ClientMessageType::SetModel { .. } => Self::SetModel,
+            ClientMessageType::Unlock { .. } => Self::Unlock,
+            ClientMessageType::Lock => Self::Lock,
+            ClientMessageType::BindKeystore { .. } => Self::BindKeystore,
+            ClientMessageType::AddCredential { .. } => Self::AddCredential,
+            ClientMessageType::RemoveCredential { .. } => Self::RemoveCredential,
+            ClientMessageType::AclAdd { .. } => Self::AclAdd,
+            ClientMessageType::DeleteSession { .. } => Self::DeleteSession,
+            ClientMessageType::SetSessionPinned { .. } => Self::SetSessionPinned,
+            ClientMessageType::SetSessionArchived { .. } => Self::SetSessionArchived,
+            ClientMessageType::AddAccount { .. } => Self::AddAccount,
+            ClientMessageType::RemoveAccount { .. } => Self::RemoveAccount,
+            ClientMessageType::ListAccounts => Self::ListAccounts,
+            ClientMessageType::SetSessionAccount { .. } => Self::SetSessionAccount,
+            ClientMessageType::SetReasoningEffort { .. } => Self::SetReasoningEffort,
+            ClientMessageType::GetReasoningEffort => Self::GetReasoningEffort,
+            ClientMessageType::Undo => Self::Undo,
+            ClientMessageType::Redo => Self::Redo,
+            ClientMessageType::ContinueGeneration { .. } => Self::ContinueGeneration,
+            ClientMessageType::GetImage { .. } => Self::GetImage,
+            ClientMessageType::McpStatusRequest => Self::McpStatusRequest,
+            ClientMessageType::McpReconnect { .. } => Self::McpReconnect,
+            ClientMessageType::McpReload => Self::McpReload,
+            ClientMessageType::McpTrust => Self::McpTrust,
+            ClientMessageType::McpUntrust => Self::McpUntrust,
+            ClientMessageType::McpTrustList => Self::McpTrustList,
+            ClientMessageType::SubscribeAllActivity => Self::SubscribeAllActivity,
+            ClientMessageType::UnsubscribeAllActivity => Self::UnsubscribeAllActivity,
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum OutputStream {
@@ -741,7 +917,7 @@ pub enum OutputStream {
     Reasoning,
 }
 
-/// Which turn attachment a [`ClientMessage::GetImage`] / [`DaemonMessage::Image`]
+/// Which turn attachment a [`ClientMessageType::GetImage`] / [`DaemonMessageType::Image`]
 /// addresses. The two attachments are TURN-SCOPED and share one durable byte
 /// store (`session_attachments`), so the fetch protocol addresses them with one
 /// message and a tagged key rather than two parallel request/reply pairs. The
@@ -781,8 +957,8 @@ pub struct ImageMetadata {
     pub alt: Option<String>,
 }
 
-/// Outcome of a `ClientMessage::RefreshModels` request, reported in
-/// `DaemonMessage::ModelsRefreshed`.
+/// Outcome of a `ClientMessageType::RefreshModels` request, reported in
+/// `DaemonMessageType::ModelsRefreshed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RefreshStatus {
@@ -794,7 +970,7 @@ pub enum RefreshStatus {
     Forced,
 }
 
-/// One provider in a `DaemonMessage::CatalogUpdated` broadcast: the slug the
+/// One provider in a `DaemonMessageType::CatalogUpdated` broadcast: the slug the
 /// daemon's catalog is keyed by, plus the human-readable display name. A
 /// plain wire pair — the TUI maps it into its own `ProviderInfo`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -804,7 +980,7 @@ pub struct CatalogProvider {
 }
 
 /// The state of one configured MCP server, as carried in
-/// [`DaemonMessage::McpStatus`].
+/// [`DaemonMessageType::McpStatus`].
 ///
 /// The same fields as the daemon's own status record
 /// (`choreo-daemon`'s `mcp::McpServerStatus`), so the daemon's connection
@@ -862,7 +1038,7 @@ impl McpServerStatus {
 ///
 /// These 31 events used to be `DaemonMessage` variants that each carried
 /// their own `session_id` field. They now live inside
-/// [`DaemonMessage::Session`], whose envelope supplies the origin session
+/// [`DaemonMessageType::Session`], whose envelope supplies the origin session
 /// for every session-scoped event: `session_id: Some(id)`, present on the
 /// wire as `Some(id)`, so every event has an origin session **by
 /// construction** — it can never be forgotten, mismatched, or duplicated.
@@ -882,7 +1058,7 @@ pub enum SessionEvent {
         selected_model: Option<String>,
         reasoning_effort: Option<String>,
     },
-    /// Direct reply to the creating connection's [`ClientMessage::CreateSession`].
+    /// Direct reply to the creating connection's [`ClientMessageType::CreateSession`].
     ///
     /// Unlike [`SessionEvent::SessionCreated`] — which is BROADCAST to every
     /// subscriber as a notification — this variant is sent ONLY to the client
@@ -950,12 +1126,12 @@ pub enum SessionEvent {
         error: String,
     },
     Started {
-        request_id: u32,
+        stream_id: u64,
         turn_id: u32,
         estimated_prompt_tokens: u32,
     },
     ToolCallStarted {
-        request_id: u32,
+        stream_id: u64,
         call_id: String,
         tool_name: String,
         arguments_json: String,
@@ -966,17 +1142,17 @@ pub enum SessionEvent {
         invocation_description: String,
     },
     ToolCallFinished {
-        request_id: u32,
+        stream_id: u64,
         call_id: String,
         tool_name: String,
     },
     ToolResultChunk {
-        request_id: u32,
+        stream_id: u64,
         call_id: String,
         data: Vec<u8>,
     },
     ToolCallFailed {
-        request_id: u32,
+        stream_id: u64,
         call_id: String,
         tool_name: String,
         error: String,
@@ -988,16 +1164,16 @@ pub enum SessionEvent {
     /// Cumulative output-token estimate for the current turn, updated as
     /// each stream chunk arrives.  Used by the TUI for live token display.
     LiveOutputTokenCount {
-        request_id: u32,
+        stream_id: u64,
         output_tokens: u32,
     },
     OutputChunk {
-        request_id: u32,
+        stream_id: u64,
         stream: OutputStream,
         data: Vec<u8>,
     },
     Done {
-        request_id: u32,
+        stream_id: u64,
         /// Token usage for the completed request, if reported by the provider.
         token_usage: Option<TokenUsage>,
         /// The `prompt_tokens` from the most recent API response (the actual
@@ -1006,11 +1182,11 @@ pub enum SessionEvent {
         last_prompt_tokens: Option<u32>,
     },
     Failed {
-        request_id: u32,
+        stream_id: u64,
         error: String,
     },
     Cancelled {
-        request_id: u32,
+        stream_id: u64,
     },
     ModelSelected {
         model: String,
@@ -1064,7 +1240,7 @@ pub enum SessionEvent {
     },
 }
 
-/// Authoritative daemon keystore STATUS (see [`DaemonMessage::Keystore`]).
+/// Authoritative daemon keystore STATUS (see [`DaemonMessageType::Keystore`]).
 ///
 /// Three states, because "unbound" is a distinct fact from "locked": a fresh
 /// daemon has no binding at all and a client must BIND it (auto-bind with a
@@ -1075,11 +1251,11 @@ pub enum SessionEvent {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum KeystoreState {
     /// No binding exists yet — a fresh daemon. A client mints a bind key and
-    /// sends [`ClientMessage::BindKeystore`]; the frontends do this
+    /// sends [`ClientMessageType::BindKeystore`]; the frontends do this
     /// automatically, once per connection, when they observe this state.
     Unbound,
     /// A binding exists, but no cleartext credentials are in memory. A client
-    /// unlocks by presenting the bound key via [`ClientMessage::Unlock`].
+    /// unlocks by presenting the bound key via [`ClientMessageType::Unlock`].
     Locked,
     /// A binding exists and the credentials are decrypted in memory.
     Unlocked,
@@ -1088,7 +1264,7 @@ pub enum KeystoreState {
 /// Messages sent from the daemon to a client.
 ///
 /// Split into two families:
-/// - [`DaemonMessage::Session`] carries a session-scoped [`SessionEvent`]
+/// - [`DaemonMessageType::Session`] carries a session-scoped [`SessionEvent`]
 ///   wrapped in an envelope that supplies the origin session — always
 ///   `session_id: Some(id)` for session-scoped events, present on the wire
 ///   as `Some(id)` — by construction. These events are delivered to
@@ -1111,9 +1287,55 @@ pub enum KeystoreState {
 // same as removing one — and without the attribute every consumer match must
 // enumerate the whole set, so the compiler points at every site that needs
 // revisiting when that happens.)
+///
+/// A daemon→client wire frame: an optional correlation `id` plus the payload
+/// in [`DaemonMessageType`].
+///
+/// `id: Some(n)` is the targeted terminal reply to the client request `n`
+/// (exactly one such reply per request, success or failure); `id: None` is a
+/// broadcast, which never resolves a request. Reply-ness is a property of the
+/// SEND, not the payload type: the same `inner` (e.g. `SessionState`,
+/// `ReasoningEffortSet`) may be emitted with `id: Some` (a reply) or `id: None`
+/// (a broadcast). A client always applies the payload's state effect, and
+/// ADDITIONALLY resolves a pending request slot iff `id` is `Some`. A variant
+/// is split into a separate type only when the reply carries requester-
+/// relative intent that no broadcast may carry (the
+/// `SessionCreatedForRequester` precedent).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonMessage {
+    /// The request id this frame answers, or `None` for a broadcast. Absent
+    /// from the wire when `None` (`skip_serializing_if`), so broadcasts stay
+    /// compact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
+    /// The payload.
+    pub inner: DaemonMessageType,
+}
+
+impl DaemonMessage {
+    /// Build a targeted reply to request `id`.
+    #[must_use]
+    pub fn reply(id: u64, inner: DaemonMessageType) -> Self {
+        Self {
+            id: Some(id),
+            inner,
+        }
+    }
+
+    /// Build a broadcast (carries no correlation id and resolves no request).
+    #[must_use]
+    pub fn broadcast(inner: DaemonMessageType) -> Self {
+        Self { id: None, inner }
+    }
+}
+
+/// The payloads carried inside a [`DaemonMessage`].
+///
+/// The variants are exactly the former `DaemonMessage` variants, unchanged;
+/// only the envelope around them moved to the [`DaemonMessage`] struct.
 #[expect(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum DaemonMessage {
+pub enum DaemonMessageType {
     /// Single home for all session-scoped events. The envelope supplies the
     /// origin `session_id` that used to ride on each of the 31 moved
     /// variants, so every inner [`SessionEvent`] has an origin session **by
@@ -1136,15 +1358,15 @@ pub enum DaemonMessage {
     ModelsFailed {
         error: String,
     },
-    /// Targeted reply to [`ClientMessage::Unlock`]: the presented key matched
+    /// Targeted reply to [`ClientMessageType::Unlock`]: the presented key matched
     /// the binding and the daemon decrypted its credentials. This is an
     /// OPERATION OUTCOME; the current keystore *status* is pushed separately
-    /// as [`DaemonMessage::Keystore`].
+    /// as [`DaemonMessageType::Keystore`].
     Unlocked,
-    /// Targeted reply to [`ClientMessage::Lock`]: the daemon wiped its
+    /// Targeted reply to [`ClientMessageType::Lock`]: the daemon wiped its
     /// in-memory credentials and re-latched the locked state. An OPERATION
     /// OUTCOME; the current keystore *status* is pushed separately as
-    /// [`DaemonMessage::Keystore`].
+    /// [`DaemonMessageType::Keystore`].
     Locked,
     /// The daemon's authoritative keystore STATUS. Pushed to a client the
     /// moment it registers as an ACTIVITY subscriber and broadcast to every
@@ -1161,9 +1383,9 @@ pub enum DaemonMessage {
     LockedError {
         error: String,
     },
-    /// Targeted reply to [`ClientMessage::BindKeystore`] when an unbound
+    /// Targeted reply to [`ClientMessageType::BindKeystore`] when an unbound
     /// keystore adopted the presented key and the implicit unlock succeeded.
-    /// Distinct from [`DaemonMessage::Unlocked`] so the client can tell "I just
+    /// Distinct from [`DaemonMessageType::Unlocked`] so the client can tell "I just
     /// created this binding" from "I verified an existing one". Ordering
     /// contract: the daemon serializes this targeted reply to the acting
     /// client's socket BEFORE the lock-state transition broadcast, so the
@@ -1172,7 +1394,7 @@ pub enum DaemonMessage {
     Bound,
     /// Error reply for `Unlock` / `AddCredential` / `BindKeystore` against a daemon
     /// whose keystore has NO binding yet. Deliberately distinct from
-    /// [`DaemonMessage::LockedError`] (which means "bound but wrong key") so
+    /// [`DaemonMessageType::LockedError`] (which means "bound but wrong key") so
     /// the client knows this daemon has never been bound and can AUTO-BIND it
     /// with a freshly generated key instead of replaying a stored key that
     /// can never match a nonexistent binding.
@@ -1193,7 +1415,7 @@ pub enum DaemonMessage {
         service: String,
         error: String,
     },
-    /// Reply to [`ClientMessage::AclAdd`]: `ok` false carries the failure
+    /// Reply to [`ClientMessageType::AclAdd`]: `ok` false carries the failure
     /// reason in `message` (rejected transport, bad key, I/O error); `ok`
     /// true carries the new total of authorized clients.
     AclAddResult {
@@ -1230,14 +1452,14 @@ pub enum DaemonMessage {
     AccountListFailed {
         error: String,
     },
-    /// Reply to `ClientMessage::RefreshModels`. `status` distinguishes
+    /// Reply to `ClientMessageType::RefreshModels`. `status` distinguishes
     /// "nothing changed" (304) from a real swap (200), and a forced swap.
     ModelsRefreshed {
         providers: usize,
         models: usize,
         status: RefreshStatus,
     },
-    /// Reply to `ClientMessage::RefreshModels` when the fetch/merge failed.
+    /// Reply to `ClientMessageType::RefreshModels` when the fetch/merge failed.
     ModelsRefreshFailed {
         error: String,
     },
@@ -1247,7 +1469,7 @@ pub enum DaemonMessage {
     CatalogUpdated {
         providers: Vec<CatalogProvider>,
     },
-    /// Targeted reply to [`ClientMessage::GetImage`]: the raw bytes of the
+    /// Targeted reply to [`ClientMessageType::GetImage`]: the raw bytes of the
     /// requested attachment (displayed image or tool-result vision image), or
     /// `None` when it is not found (the session or turn was deleted, the
     /// attachment was evicted, or the key is stale). `Some(vec![])` is a
@@ -1261,8 +1483,8 @@ pub enum DaemonMessage {
         key: ImageKey,
         data: Option<Vec<u8>>,
     },
-    /// Reply to [`ClientMessage::McpStatusRequest`], and the success reply to
-    /// [`ClientMessage::McpReconnect`]: the current state of every visible
+    /// Reply to [`ClientMessageType::McpStatusRequest`], and the success reply to
+    /// [`ClientMessageType::McpReconnect`]: the current state of every visible
     /// MCP server (daemon-tier servers plus, for an attached session, that
     /// session's own project servers), each tagged with its `tier`. Carries
     /// the active session's project root and its trust state, plus the slugs
@@ -1279,25 +1501,25 @@ pub enum DaemonMessage {
         /// read so the operator can see what is being ignored, never spawned.
         ignored_project_servers: Vec<String>,
     },
-    /// Reply to [`ClientMessage::McpReconnect`] when the reconnect failed: the
+    /// Reply to [`ClientMessageType::McpReconnect`] when the reconnect failed: the
     /// slug it targeted and the failure reason.
     McpReconnectFailed {
         slug: String,
         error: String,
     },
-    /// Reply to [`ClientMessage::McpReload`]: a one-line human-readable summary
+    /// Reply to [`ClientMessageType::McpReload`]: a one-line human-readable summary
     /// of what the reload changed (added/removed/restarted/unchanged/failed
     /// counts) plus the refreshed state of every configured server.
     McpReloaded {
         summary: String,
         servers: Vec<McpServerStatus>,
     },
-    /// Reply to [`ClientMessage::McpReload`] when the reload could not run at
+    /// Reply to [`ClientMessageType::McpReload`] when the reload could not run at
     /// all (the config file could not be read or parsed): the failure reason.
     McpReloadFailed {
         error: String,
     },
-    /// Reply to [`ClientMessage::McpTrust`] / [`ClientMessage::McpUntrust`]: the
+    /// Reply to [`ClientMessageType::McpTrust`] / [`ClientMessageType::McpUntrust`]: the
     /// resulting trust state of the target root (or `None` when the active
     /// session has no resolvable project root) plus a one-line human-readable
     /// summary of what happened.
@@ -1306,7 +1528,7 @@ pub enum DaemonMessage {
         trusted: bool,
         message: String,
     },
-    /// Reply to [`ClientMessage::McpTrustList`]: the trusted project MCP
+    /// Reply to [`ClientMessageType::McpTrustList`]: the trusted project MCP
     /// roots, in stable (sorted) order.
     McpTrustList {
         roots: Vec<String>,
@@ -1319,6 +1541,22 @@ pub enum DaemonMessage {
     /// daemon may drop the connection before this message is flushed, so
     /// clients must not treat its absence as meaningful.
     Evicted,
+    /// Terminal success reply to a request whose outcome is otherwise silent
+    /// (a fire-and-confirm mutation: pinned/archived flags, title/working-dir,
+    /// undo/redo, subscriptions, …): the request was accepted and applied. The
+    /// request's own outcome broadcast (if any) still rides `id: None`; this
+    /// acknowledgement exists so every request has exactly one targeted reply.
+    Accepted {
+        kind: MessageKind,
+    },
+    /// Terminal failure reply to any request that could not be honoured, tagged
+    /// with the request's [`MessageKind`] and a human-readable reason. This is
+    /// the uniform failure channel: a request that used to fall through a
+    /// dispatch wildcard now has somewhere concrete to report why.
+    Failed {
+        kind: MessageKind,
+        error: String,
+    },
 }
 
 #[cfg(test)]
@@ -1542,11 +1780,14 @@ mod tests {
         // cannot do anything useful without the key. Pin both wire formats
         // and assert the key survives byte-for-byte so a future serde change
         // cannot silently make it optional or drop it.
-        let msg = ClientMessage::AddCredential {
-            service: "openai".to_string(),
-            encrypted_payload: vec![1u8, 2, 3, 4, 5],
-            unlock_key: vec![9u8; 32],
-        };
+        let msg = ClientMessage::request(
+            7,
+            ClientMessageType::AddCredential {
+                service: "openai".to_string(),
+                encrypted_payload: vec![1u8, 2, 3, 4, 5],
+                unlock_key: vec![9u8; 32],
+            },
+        );
 
         let bytes = rmp_serde::to_vec_named(&msg).expect("encode");
         let decoded: ClientMessage = rmp_serde::from_slice(&bytes).expect("decode");
@@ -1565,9 +1806,12 @@ mod tests {
         // field). Pin the rejection so the requirement is enforced on the
         // wire, not just in the type system.
         let bytes = rmp_serde::to_vec_named(&serde_json::json!({
-            "AddCredential": {
-                "service": "openai",
-                "encrypted_payload": [1, 2, 3]
+            "id": 0,
+            "inner": {
+                "AddCredential": {
+                    "service": "openai",
+                    "encrypted_payload": [1, 2, 3]
+                }
             }
         }))
         .expect("encode legacy-shaped payload");
@@ -1728,10 +1972,10 @@ mod tests {
         bare_artifact_turn.reasoning_artifact = Some(ReasoningArtifact::ResponsesItems(
             b"[{\"type\":\"reasoning\",\"id\":\"re_1\"}]".to_vec(),
         ));
-        let samples: Vec<(&str, DaemonMessage)> = vec![
+        let samples: Vec<(&str, DaemonMessageType)> = vec![
             (
                 "SessionCreated",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::SessionCreated {
                         title: Some("t".into()),
@@ -1745,7 +1989,7 @@ mod tests {
             ),
             (
                 "SessionCreatedForRequester",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::SessionCreatedForRequester {
                         title: Some("t".into()),
@@ -1759,20 +2003,20 @@ mod tests {
             ),
             (
                 "Sessions",
-                DaemonMessage::Sessions {
+                DaemonMessageType::Sessions {
                     sessions: (0..20).map(summary).collect(),
                 },
             ),
             (
                 "SessionAttached",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::SessionAttached,
                 },
             ),
             (
                 "SessionFlagsChanged",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::SessionFlagsChanged {
                         pinned: true,
@@ -1782,7 +2026,7 @@ mod tests {
             ),
             (
                 "SessionState",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::SessionState {
                         title: Some("t".into()),
@@ -1817,7 +2061,7 @@ mod tests {
             ),
             (
                 "TurnAppended",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::TurnAppended {
                         turn_id: 1,
@@ -1827,7 +2071,7 @@ mod tests {
             ),
             (
                 "TurnAppendedBareArtifact",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::TurnAppended {
                         turn_id: 2,
@@ -1837,7 +2081,7 @@ mod tests {
             ),
             (
                 "SessionStatusChanged",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::SessionStatusChanged {
                         status: SessionStatus::ToolCall("sh".into()),
@@ -1847,7 +2091,7 @@ mod tests {
             ),
             (
                 "SessionFailed",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::SessionFailed {
                         operation: "create_session".into(),
@@ -1857,10 +2101,10 @@ mod tests {
             ),
             (
                 "Started",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::Started {
-                        request_id: 1,
+                        stream_id: 1,
                         turn_id: 1,
                         estimated_prompt_tokens: 100,
                     },
@@ -1868,10 +2112,10 @@ mod tests {
             ),
             (
                 "ToolCallStarted",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::ToolCallStarted {
-                        request_id: 1,
+                        stream_id: 1,
                         call_id: "call_1".into(),
                         tool_name: "sh".into(),
                         arguments_json: r#"{"command":"echo hi"}"#.into(),
@@ -1881,10 +2125,10 @@ mod tests {
             ),
             (
                 "ToolCallFinished",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::ToolCallFinished {
-                        request_id: 1,
+                        stream_id: 1,
                         call_id: "call_1".into(),
                         tool_name: "sh".into(),
                     },
@@ -1892,10 +2136,10 @@ mod tests {
             ),
             (
                 "ToolResultChunk",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::ToolResultChunk {
-                        request_id: 1,
+                        stream_id: 1,
                         call_id: "call_1".into(),
                         data: vec![b'x'; 100],
                     },
@@ -1903,10 +2147,10 @@ mod tests {
             ),
             (
                 "ToolCallFailed",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::ToolCallFailed {
-                        request_id: 1,
+                        stream_id: 1,
                         call_id: "call_1".into(),
                         tool_name: "sh".into(),
                         error: "command not found".into(),
@@ -1915,7 +2159,7 @@ mod tests {
             ),
             (
                 "TokenUsageUpdate",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::TokenUsageUpdate {
                         token_usage: TokenUsage {
@@ -1930,20 +2174,20 @@ mod tests {
             ),
             (
                 "LiveOutputTokenCount",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::LiveOutputTokenCount {
-                        request_id: 1,
+                        stream_id: 1,
                         output_tokens: 42,
                     },
                 },
             ),
             (
                 "OutputChunk",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::OutputChunk {
-                        request_id: 1,
+                        stream_id: 1,
                         stream: OutputStream::Answer,
                         data: vec![b'x'; 100],
                     },
@@ -1951,10 +2195,10 @@ mod tests {
             ),
             (
                 "Done",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::Done {
-                        request_id: 1,
+                        stream_id: 1,
                         token_usage: Some(TokenUsage {
                             input_tokens: 100,
                             output_tokens: 50,
@@ -1967,38 +2211,38 @@ mod tests {
             ),
             (
                 "Failed",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::Failed {
-                        request_id: 1,
+                        stream_id: 1,
                         error: "x".repeat(100),
                     },
                 },
             ),
             (
                 "Cancelled",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
-                    event: SessionEvent::Cancelled { request_id: 1 },
+                    event: SessionEvent::Cancelled { stream_id: 1 },
                 },
             ),
-            ("Pong", DaemonMessage::Pong),
+            ("Pong", DaemonMessageType::Pong),
             (
                 "Models",
-                DaemonMessage::Models {
+                DaemonMessageType::Models {
                     models: vec!["gpt-4".into(), "gpt-4o".into(), "gpt-5.6".into()],
                     selected_model: Some("gpt-5.6".into()),
                 },
             ),
             (
                 "ModelsFailed",
-                DaemonMessage::ModelsFailed {
+                DaemonMessageType::ModelsFailed {
                     error: "failed to list models".into(),
                 },
             ),
             (
                 "ModelsRefreshed",
-                DaemonMessage::ModelsRefreshed {
+                DaemonMessageType::ModelsRefreshed {
                     providers: 208,
                     models: 1234,
                     status: RefreshStatus::Updated,
@@ -2006,13 +2250,13 @@ mod tests {
             ),
             (
                 "ModelsRefreshFailed",
-                DaemonMessage::ModelsRefreshFailed {
+                DaemonMessageType::ModelsRefreshFailed {
                     error: "network error".into(),
                 },
             ),
             (
                 "CatalogUpdated",
-                DaemonMessage::CatalogUpdated {
+                DaemonMessageType::CatalogUpdated {
                     providers: (0..208)
                         .map(|i| CatalogProvider {
                             slug: format!("provider-slug-{i}"),
@@ -2023,7 +2267,7 @@ mod tests {
             ),
             (
                 "ModelSelected",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::ModelSelected {
                         model: "gpt-5.6".into(),
@@ -2040,7 +2284,7 @@ mod tests {
             ),
             (
                 "ModelSelectionFailed",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::ModelSelectionFailed {
                         model: "gpt-5.6".into(),
@@ -2048,56 +2292,56 @@ mod tests {
                     },
                 },
             ),
-            ("Unlocked", DaemonMessage::Unlocked),
-            ("Locked", DaemonMessage::Locked),
+            ("Unlocked", DaemonMessageType::Unlocked),
+            ("Locked", DaemonMessageType::Locked),
             (
                 "Keystore",
-                DaemonMessage::Keystore {
+                DaemonMessageType::Keystore {
                     state: KeystoreState::Unbound,
                 },
             ),
             (
                 "LockedError",
-                DaemonMessage::LockedError {
+                DaemonMessageType::LockedError {
                     error: "wrong password".into(),
                 },
             ),
             (
                 "CredentialAdded",
-                DaemonMessage::CredentialAdded {
+                DaemonMessageType::CredentialAdded {
                     service: "openai".into(),
                 },
             ),
             (
                 "CredentialAddFailed",
-                DaemonMessage::CredentialAddFailed {
+                DaemonMessageType::CredentialAddFailed {
                     service: "openai".into(),
                     error: "already exists".into(),
                 },
             ),
             (
                 "CredentialRemoved",
-                DaemonMessage::CredentialRemoved {
+                DaemonMessageType::CredentialRemoved {
                     service: "openai".into(),
                 },
             ),
             (
                 "CredentialRemoveFailed",
-                DaemonMessage::CredentialRemoveFailed {
+                DaemonMessageType::CredentialRemoveFailed {
                     service: "openai".into(),
                     error: "not found".into(),
                 },
             ),
             (
                 "SessionDeleted",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::SessionDeleted,
                 },
             ),
             (
                 "SessionDeleteFailed",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::SessionDeleteFailed {
                         error: "db error".into(),
@@ -2106,7 +2350,7 @@ mod tests {
             ),
             (
                 "TurnsUndone",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::TurnsUndone {
                         turn_ids: vec![1, 2, 3, 4, 5],
@@ -2115,7 +2359,7 @@ mod tests {
             ),
             (
                 "TurnsRedone",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::TurnsRedone {
                         turns: std::collections::BTreeMap::from([(1, dense_turn), (2, one_turn)]),
@@ -2124,40 +2368,40 @@ mod tests {
             ),
             (
                 "Credential",
-                DaemonMessage::Credential {
+                DaemonMessageType::Credential {
                     service: "openai".into(),
                     key: Some("sk-123".into()),
                 },
             ),
             (
                 "AccountAdded",
-                DaemonMessage::AccountAdded {
+                DaemonMessageType::AccountAdded {
                     name: "default".into(),
                 },
             ),
             (
                 "AccountAddFailed",
-                DaemonMessage::AccountAddFailed {
+                DaemonMessageType::AccountAddFailed {
                     name: "default".into(),
                     error: "invalid provider".into(),
                 },
             ),
             (
                 "AccountRemoved",
-                DaemonMessage::AccountRemoved {
+                DaemonMessageType::AccountRemoved {
                     name: "default".into(),
                 },
             ),
             (
                 "AccountRemoveFailed",
-                DaemonMessage::AccountRemoveFailed {
+                DaemonMessageType::AccountRemoveFailed {
                     name: "default".into(),
                     error: "not found".into(),
                 },
             ),
             (
                 "Accounts",
-                DaemonMessage::Accounts {
+                DaemonMessageType::Accounts {
                     accounts: (0..10)
                         .map(|i| AccountInfo {
                             name: format!("account-{i}"),
@@ -2169,13 +2413,13 @@ mod tests {
             ),
             (
                 "AccountListFailed",
-                DaemonMessage::AccountListFailed {
+                DaemonMessageType::AccountListFailed {
                     error: "failed to list accounts".into(),
                 },
             ),
             (
                 "SessionAccountSet",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::SessionAccountSet {
                         account: "default".into(),
@@ -2184,7 +2428,7 @@ mod tests {
             ),
             (
                 "ContextWindowResolved",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::ContextWindowResolved {
                         context_window: 128_000,
@@ -2193,7 +2437,7 @@ mod tests {
             ),
             (
                 "SessionWorkingDirSet",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::SessionWorkingDirSet {
                         path: Some("/tmp".into()),
@@ -2202,7 +2446,7 @@ mod tests {
             ),
             (
                 "SessionTitleSet",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::SessionTitleSet {
                         title: "hello".into(),
@@ -2211,7 +2455,7 @@ mod tests {
             ),
             (
                 "ReasoningEffortSet",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::ReasoningEffortSet {
                         effort: "high".into(),
@@ -2220,7 +2464,7 @@ mod tests {
             ),
             (
                 "ReasoningEffortSetFailed",
-                DaemonMessage::Session {
+                DaemonMessageType::Session {
                     session_id: Some(1),
                     event: SessionEvent::ReasoningEffortSetFailed {
                         effort: "high".into(),
@@ -2230,7 +2474,7 @@ mod tests {
             ),
             (
                 "Image",
-                DaemonMessage::Image {
+                DaemonMessageType::Image {
                     session_id: 1,
                     turn_id: 1,
                     key: ImageKey::Displayed { index: 0 },
@@ -2239,7 +2483,7 @@ mod tests {
             ),
             (
                 "Image (tool-result key)",
-                DaemonMessage::Image {
+                DaemonMessageType::Image {
                     session_id: 1,
                     turn_id: 1,
                     key: ImageKey::ToolResult {
@@ -2250,7 +2494,7 @@ mod tests {
             ),
             (
                 "McpStatus",
-                DaemonMessage::McpStatus {
+                DaemonMessageType::McpStatus {
                     servers: (0..12usize)
                         .map(|i| McpServerStatus {
                             slug: format!("server-{i}"),
@@ -2271,7 +2515,7 @@ mod tests {
             ),
             (
                 "McpTrustUpdated",
-                DaemonMessage::McpTrustUpdated {
+                DaemonMessageType::McpTrustUpdated {
                     root: Some("/home/u/work/my-project".into()),
                     trusted: true,
                     message: "trusted project MCP root /home/u/work/my-project".into(),
@@ -2279,7 +2523,7 @@ mod tests {
             ),
             (
                 "McpTrustList",
-                DaemonMessage::McpTrustList {
+                DaemonMessageType::McpTrustList {
                     roots: vec![
                         "/home/u/work/my-project".into(),
                         "/home/u/other-project".into(),
@@ -2288,14 +2532,14 @@ mod tests {
             ),
             (
                 "McpReconnectFailed",
-                DaemonMessage::McpReconnectFailed {
+                DaemonMessageType::McpReconnectFailed {
                     slug: "docs".into(),
                     error: "failed to list tools: connection refused".into(),
                 },
             ),
             (
                 "McpReloaded",
-                DaemonMessage::McpReloaded {
+                DaemonMessageType::McpReloaded {
                     summary: "MCP reload: 1 added, 0 removed, 1 restarted, 2 unchanged, 0 failed"
                         .into(),
                     servers: (0..12usize)
@@ -2315,17 +2559,20 @@ mod tests {
             ),
             (
                 "McpReloadFailed",
-                DaemonMessage::McpReloadFailed {
+                DaemonMessageType::McpReloadFailed {
                     error: "failed to parse /home/u/.config/choreographr/mcp.json".into(),
                 },
             ),
-            ("ShuttingDown", DaemonMessage::ShuttingDown),
-            ("Evicted", DaemonMessage::Evicted),
+            ("ShuttingDown", DaemonMessageType::ShuttingDown),
+            ("Evicted", DaemonMessageType::Evicted),
         ];
 
         let mut checked = 0usize;
-        for (name, msg) in &samples {
-            let frame = crate::encode_frame(msg).expect("encode");
+        for (name, inner) in &samples {
+            // Every broadcast rides `id: None`; the estimate must cover the
+            // broadcast frame (the id field is absent on the wire).
+            let msg = DaemonMessage::broadcast(inner.clone());
+            let frame = crate::encode_frame(&msg).expect("encode");
             // The 4-byte BE length prefix precedes the payload; the estimate
             // must cover the payload itself.
             let payload = frame.len() - 4;
@@ -2337,6 +2584,78 @@ mod tests {
             );
             checked += 1;
         }
-        assert_eq!(checked, samples.len(), "every sample must be checked");
+        // Id-BEARING frames: a targeted reply carries the extra `id` field on
+        // the wire, so the estimate must cover that too (the envelope
+        // allowance, not the per-variant payload, absorbs it). Include the new
+        // terminal-acknowledgement variants.
+        let replies: Vec<(&str, DaemonMessage)> = vec![
+            (
+                "SessionsReply",
+                DaemonMessage::reply(
+                    42,
+                    DaemonMessageType::Sessions {
+                        sessions: (0..20).map(summary).collect(),
+                    },
+                ),
+            ),
+            (
+                "SessionStateReply",
+                DaemonMessage::reply(
+                    7,
+                    DaemonMessageType::Session {
+                        session_id: Some(1),
+                        event: SessionEvent::SessionState {
+                            title: Some("t".into()),
+                            selected_model: Some("gpt-5.6".into()),
+                            parent_session_id: None,
+                            working_dir: Some("/tmp".into()),
+                            turns: BTreeMap::new(),
+                            active_tool_groups: vec!["core".into()],
+                            token_usage: None,
+                            context_window: None,
+                            last_prompt_tokens: None,
+                            status: SessionStatus::Inactive,
+                            reasoning_effort: None,
+                            reasoning_capability: None,
+                        },
+                    },
+                ),
+            ),
+            (
+                "Accepted",
+                DaemonMessage::reply(
+                    9,
+                    DaemonMessageType::Accepted {
+                        kind: MessageKind::SetSessionPinned,
+                    },
+                ),
+            ),
+            (
+                "Failed",
+                DaemonMessage::reply(
+                    11,
+                    DaemonMessageType::Failed {
+                        kind: MessageKind::RunInput,
+                        error: "session not attached".into(),
+                    },
+                ),
+            ),
+        ];
+        for (name, msg) in &replies {
+            let frame = crate::encode_frame(msg).expect("encode");
+            let payload = frame.len() - 4;
+            let est = msg.approx_wire_size();
+            assert!(
+                est >= payload,
+                "approx_wire_size ({est}) UNDER-estimates the {payload}-byte encoded payload by {} for {name} (reply): {msg:?}",
+                payload - est
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked,
+            samples.len() + replies.len(),
+            "every sample must be checked"
+        );
     }
 }

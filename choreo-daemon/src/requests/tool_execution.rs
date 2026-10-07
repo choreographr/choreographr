@@ -7,7 +7,9 @@ use crate::tools::{
 };
 use choreo_ai_protocols::{ChatToolCall, ToolResultItem};
 use choreo_keystore::ServiceCredential;
-use choreo_proto::{DaemonMessage, DisplayedImageRecord, ImageMetadata, SessionEvent, TokenUsage};
+use choreo_proto::{
+    DaemonMessageType, DisplayedImageRecord, ImageMetadata, SessionEvent, TokenUsage,
+};
 
 /// Extra time added on top of a tool's requested `timeout` when raising the
 /// outer deadline: the inner watchdog kills the child at exactly the
@@ -54,7 +56,7 @@ pub(crate) fn broadcast_turn_appended(
     turn_id: u32,
 ) {
     if let Some(turn) = session.turns.get(&turn_id)
-        && let Err(e) = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::Session {
+        && let Err(e) = cmd_tx.send(SessionCommand::Broadcast(DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::TurnAppended {
                 turn_id,
@@ -161,7 +163,7 @@ pub(crate) fn emit_image(
 pub(crate) fn spawn_forwarding_thread(
     cmd_tx: crossbeam_channel::Sender<SessionCommand>,
     session_id: u64,
-    request_id: u32,
+    stream_id: u64,
     call_id: String,
     output_rx: crossbeam_channel::Receiver<Vec<u8>>,
     kill_rx: crossbeam_channel::Receiver<()>,
@@ -172,10 +174,10 @@ pub(crate) fn spawn_forwarding_thread(
                 recv(output_rx) -> msg => match msg {
                     Ok(data) => {
                         if cmd_tx
-                            .send(SessionCommand::Broadcast(DaemonMessage::Session {
+                            .send(SessionCommand::Broadcast(DaemonMessageType::Session {
                                 session_id: Some(session_id),
                                 event: SessionEvent::ToolResultChunk {
-                                    request_id,
+                                    stream_id,
                                     call_id: call_id.clone(),
                                     data,
                                 },
@@ -212,10 +214,10 @@ pub(crate) fn spawn_forwarding_thread(
                                 };
                                 if cmd_tx
                                     .send(SessionCommand::Broadcast(
-                                        DaemonMessage::Session {
+                                        DaemonMessageType::Session {
                                             session_id: Some(session_id),
                                             event: SessionEvent::ToolResultChunk {
-                                                request_id,
+                                                stream_id,
                                                 call_id: call_id.clone(),
                                                 data,
                                             },
@@ -381,7 +383,7 @@ pub(crate) struct ToolHandle {
 pub(crate) struct SpawnToolArgs {
     pub(crate) tool_call: ChatToolCall,
     pub(crate) timeout: Option<Duration>,
-    pub(crate) request_id: u32,
+    pub(crate) stream_id: u64,
     pub(crate) session_id: u64,
     pub(crate) registry: Arc<ToolRegistry>,
     /// The session's private MCP tool set, consulted BEFORE `registry` on the
@@ -495,7 +497,7 @@ pub(crate) struct ToolExecutionSpec<'a> {
     pub(crate) tool_ctx: ToolContext,
     pub(crate) cmd_tx: crossbeam_channel::Sender<SessionCommand>,
     pub(crate) session_id: u64,
-    pub(crate) request_id: u32,
+    pub(crate) stream_id: u64,
 }
 
 /// Spawn the forwarding thread and the tool execution thread for one call,
@@ -523,7 +525,7 @@ pub(crate) fn spawn_tool_execution(spec: ToolExecutionSpec<'_>) -> SpawnedToolEx
         tool_ctx,
         cmd_tx,
         session_id,
-        request_id,
+        stream_id,
     } = spec;
     // The execution thread delivers its final result here.
     let (exec_tx, exec_rx) = crossbeam_channel::unbounded::<Result<ToolOutput, ToolError>>();
@@ -548,7 +550,7 @@ pub(crate) fn spawn_tool_execution(spec: ToolExecutionSpec<'_>) -> SpawnedToolEx
     let forwarder = spawn_forwarding_thread(
         cmd_tx,
         session_id,
-        request_id,
+        stream_id,
         tool_call.id.clone(),
         output_rx,
         kill_rx,
@@ -613,7 +615,7 @@ pub(crate) fn spawn_single_tool(args: SpawnToolArgs) -> crossbeam_channel::Sende
     let SpawnToolArgs {
         tool_call,
         timeout,
-        request_id,
+        stream_id,
         session_id,
         registry,
         session_tools,
@@ -662,7 +664,7 @@ pub(crate) fn spawn_single_tool(args: SpawnToolArgs) -> crossbeam_channel::Sende
         tool_ctx: ctx,
         cmd_tx,
         session_id,
-        request_id,
+        stream_id,
     });
 
     // ── Wait loop ──────────────────────────────────────────────────
@@ -824,7 +826,7 @@ pub(crate) fn finalize_and_broadcast_turn(
     if let Some(turn) = session.turns.get(&current_turn_id) {
         let _ = ctx
             .cmd_tx
-            .send(SessionCommand::Broadcast(DaemonMessage::Session {
+            .send(SessionCommand::Broadcast(DaemonMessageType::Session {
                 session_id: Some(ctx.session_id),
                 event: SessionEvent::TurnAppended {
                     turn_id: current_turn_id,
@@ -836,7 +838,7 @@ pub(crate) fn finalize_and_broadcast_turn(
 }
 
 pub(crate) fn finish_tool_call(
-    request_id: u32,
+    stream_id: u64,
     session: &mut SessionState,
     tool_call: &ChatToolCall,
     output: &mut ToolOutput,
@@ -854,27 +856,27 @@ pub(crate) fn finish_tool_call(
     broadcast_turn_appended(&ctx.cmd_tx, session, ctx.session_id, turn_id);
 
     let event = if is_error {
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::ToolCallFailed {
-                request_id,
+                stream_id,
                 call_id: tool_call.id.clone(),
                 tool_name: tool_call.name.clone(),
                 error: content,
             },
         }
     } else {
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             session_id: Some(ctx.session_id),
             event: SessionEvent::ToolCallFinished {
-                request_id,
+                stream_id,
                 call_id: tool_call.id.clone(),
                 tool_name: tool_call.name.clone(),
             },
         }
     };
     if let Err(e) = ctx.cmd_tx.send(SessionCommand::Broadcast(event)) {
-        warn!(%request_id, error = %e, "failed to broadcast tool call finished/failed event");
+        warn!(%stream_id, error = %e, "failed to broadcast tool call finished/failed event");
     }
 }
 
@@ -882,7 +884,7 @@ pub(crate) fn finish_tool_call(
 /// value instead of ten positional arguments (and the `too_many_arguments`
 /// lint needs no suppression).
 pub(crate) struct ToolCompletionParams<'a> {
-    pub(crate) request_id: u32,
+    pub(crate) stream_id: u64,
     pub(crate) session: &'a mut SessionState,
     pub(crate) tool_call: &'a ChatToolCall,
     pub(crate) output: &'a mut ToolOutput,
@@ -902,7 +904,7 @@ pub(crate) struct ToolCompletionParams<'a> {
 /// and collect the output for the provider's next request.
 pub(crate) fn record_tool_completion(params: ToolCompletionParams<'_>) {
     let ToolCompletionParams {
-        request_id,
+        stream_id,
         session,
         tool_call,
         output,
@@ -961,7 +963,7 @@ pub(crate) fn record_tool_completion(params: ToolCompletionParams<'_>) {
         warn!(turn_id = current_turn_id, error = %e, "failed to persist tool-result vision image at emit time");
     }
 
-    finish_tool_call(request_id, session, tool_call, output, ctx, current_turn_id);
+    finish_tool_call(stream_id, session, tool_call, output, ctx, current_turn_id);
     collect_tool_result(CollectToolResultParams {
         tool_results,
         session,
@@ -1112,7 +1114,7 @@ pub(crate) struct ExecuteToolParams<'a> {
     pub(crate) x_credentials: Option<&'a ServiceCredential>,
     pub(crate) working_dir: Option<&'a Path>,
     pub(crate) timeout_dur: Duration,
-    pub(crate) request_id: u32,
+    pub(crate) stream_id: u64,
     pub(crate) session_id: u64,
     pub(crate) session: &'a mut SessionState,
     /// The session's private MCP tool set (see `ToolExecutionSpec`).
@@ -1140,7 +1142,7 @@ pub(crate) fn execute_tool_with_timeout(
         x_credentials,
         working_dir,
         timeout_dur,
-        request_id,
+        stream_id,
         session_id,
         session,
         session_tools,
@@ -1200,7 +1202,7 @@ pub(crate) fn execute_tool_with_timeout(
         tool_ctx,
         cmd_tx: ctx.cmd_tx.clone(),
         session_id,
-        request_id,
+        stream_id,
     });
 
     let _kill_guard = KillGuard(kill_tx);

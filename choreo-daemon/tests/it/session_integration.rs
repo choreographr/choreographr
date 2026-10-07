@@ -1,6 +1,6 @@
 use choreo_daemon::broadcast::{LagLimits, SubscriberSink};
 use choreo_daemon::{RequestContext, SessionCommand, db, session_main};
-use choreo_proto::{DaemonMessage, SessionEvent};
+use choreo_proto::{DaemonMessage, DaemonMessageType, SessionEvent};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -68,8 +68,8 @@ fn session_starts_and_accepts_commands() {
 
     let msg = writer_rx.recv().unwrap();
     assert!(matches!(
-        msg,
-        DaemonMessage::Session {
+        msg.inner,
+        DaemonMessageType::Session {
             event: SessionEvent::SessionState { .. },
             ..
         }
@@ -113,9 +113,9 @@ fn session_cancel_nonexistent_request_does_not_panic() {
     let db = Arc::new(common::test_db());
     let (session_tx, handle) = spawn_session(db, 1);
 
-    // Cancel on a request_id that doesn't exist should not panic or hang.
+    // Cancel on a stream_id that doesn't exist should not panic or hang.
     session_tx
-        .send(SessionCommand::Cancel { request_id: 999 })
+        .send(SessionCommand::Cancel { stream_id: 999 })
         .unwrap();
 
     // Session should still be functional afterwards.

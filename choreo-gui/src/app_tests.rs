@@ -2,8 +2,8 @@ use super::*;
 use crate::client::handle_shell_command;
 use choreo_client_core::{Command, dispatch_daemon_message};
 use choreo_proto::{
-    ClientMessage, DaemonMessage, DisplayedImageRecord, ImageMetadata, OutputStream, SessionEvent,
-    TimestampMs, TokenUsage, Turn,
+    ClientMessageType, DaemonMessage, DaemonMessageType, DisplayedImageRecord, ImageMetadata,
+    OutputStream, SessionEvent, TimestampMs, TokenUsage, Turn,
 };
 
 #[test]
@@ -12,14 +12,14 @@ fn app_state_stream_updates_history() {
 
     // Simulate a Started message to set up request-to-turn mapping.
     dispatch_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(1),
             event: SessionEvent::Started {
-                request_id: 7,
+                stream_id: 7,
                 turn_id: 1,
                 estimated_prompt_tokens: 0,
             },
-        },
+        }),
         &mut state,
     );
 
@@ -44,38 +44,38 @@ fn app_state_stream_updates_history() {
     );
 
     dispatch_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(1),
             event: SessionEvent::OutputChunk {
-                request_id: 7,
+                stream_id: 7,
                 stream: OutputStream::Reasoning,
                 data: b"thinking".to_vec(),
             },
-        },
+        }),
         &mut state,
     );
 
     dispatch_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(1),
             event: SessionEvent::OutputChunk {
-                request_id: 7,
+                stream_id: 7,
                 stream: OutputStream::Answer,
                 data: b"hello".to_vec(),
             },
-        },
+        }),
         &mut state,
     );
 
     dispatch_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(1),
             event: SessionEvent::OutputChunk {
-                request_id: 7,
+                stream_id: 7,
                 stream: OutputStream::Answer,
                 data: b" world".to_vec(),
             },
-        },
+        }),
         &mut state,
     );
 
@@ -134,10 +134,10 @@ fn apply_daemon_turn_appended_with_image() {
     };
 
     dispatch_daemon_message(
-        DaemonMessage::Session {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(1),
             event: SessionEvent::TurnAppended { turn_id: 1, turn },
-        },
+        }),
         &mut state,
     );
 
@@ -164,7 +164,7 @@ fn handle_continue_when_attached_sends_continue_generation() {
 
     assert_eq!(state.next_request_id, 6);
     let msg = rx.recv().expect("should send ContinueGeneration");
-    assert_eq!(msg, ClientMessage::ContinueGeneration { request_id: 5 });
+    assert_eq!(msg, ClientMessageType::ContinueGeneration { stream_id: 5 });
 }
 
 #[test]
@@ -191,7 +191,7 @@ fn handle_stop_when_attached_sends_cancel_all() {
     handle_shell_command(&mut state, Some(tx), Command::Stop);
 
     let msg = rx.recv().expect("should send Cancel");
-    assert_eq!(msg, ClientMessage::Cancel { request_id: 0 });
+    assert_eq!(msg, ClientMessageType::Cancel { stream_id: 0 });
 }
 
 #[test]
@@ -217,7 +217,7 @@ fn handle_undo_sends_undo_message() {
     handle_shell_command(&mut state, Some(tx), Command::Undo);
 
     let msg = rx.recv().expect("should send Undo");
-    assert_eq!(msg, ClientMessage::Undo);
+    assert_eq!(msg, ClientMessageType::Undo);
 }
 
 #[test]
@@ -228,7 +228,7 @@ fn handle_redo_sends_redo_message() {
     handle_shell_command(&mut state, Some(tx), Command::Redo);
 
     let msg = rx.recv().expect("should send Redo");
-    assert_eq!(msg, ClientMessage::Redo);
+    assert_eq!(msg, ClientMessageType::Redo);
 }
 
 // ── Keystore bind/unlock flow ─────────────────────────────────────
@@ -240,7 +240,11 @@ fn bound_message_records_the_pending_key() {
     state.pending_unlock_key = Some(vec![3u8; 32]);
     let (tx, rx) = crossbeam_channel::unbounded();
 
-    apply_daemon_message(&mut state, DaemonMessage::Bound, Some(tx));
+    apply_daemon_message(
+        &mut state,
+        DaemonMessage::broadcast(DaemonMessageType::Bound),
+        Some(tx),
+    );
 
     assert!(state.pending_unlock_key.is_none(), "pending key consumed");
     let store = choreo_client_core::KnownServers::load().unwrap();
@@ -263,9 +267,9 @@ fn keystore_unbound_auto_binds_once() {
 
     apply_daemon_message(
         &mut state,
-        DaemonMessage::KeystoreUnbound {
+        DaemonMessage::broadcast(DaemonMessageType::KeystoreUnbound {
             error: "no binding".into(),
-        },
+        }),
         Some(tx.clone()),
     );
     assert!(state.keystore_auto_bind.attempted(), "bind attempt latched");
@@ -273,7 +277,7 @@ fn keystore_unbound_auto_binds_once() {
         state.pending_unlock_key.is_some(),
         "minted key held pending"
     );
-    let ClientMessage::BindKeystore { key } = rx.recv().expect("bind sent") else {
+    let ClientMessageType::BindKeystore { key } = rx.recv().expect("bind sent") else {
         panic!("auto-bind must send BindKeystore");
     };
     let store = choreo_client_core::KnownServers::load().unwrap();
@@ -287,9 +291,9 @@ fn keystore_unbound_auto_binds_once() {
     // A second KeystoreUnbound must NOT re-bind.
     apply_daemon_message(
         &mut state,
-        DaemonMessage::KeystoreUnbound {
+        DaemonMessage::broadcast(DaemonMessageType::KeystoreUnbound {
             error: "still unbound".into(),
-        },
+        }),
         Some(tx),
     );
     assert!(rx.try_recv().is_err(), "no second bind attempt");
@@ -312,24 +316,24 @@ fn keystore_unbound_status_push_auto_binds() {
 
     apply_daemon_message(
         &mut state,
-        DaemonMessage::Keystore {
+        DaemonMessage::broadcast(DaemonMessageType::Keystore {
             state: choreo_proto::KeystoreState::Unbound,
-        },
+        }),
         Some(tx.clone()),
     );
     assert!(state.keystore_auto_bind.attempted());
     assert!(state.pending_unlock_key.is_some());
     assert!(matches!(
         rx.recv().expect("bind sent"),
-        ClientMessage::BindKeystore { .. }
+        ClientMessageType::BindKeystore { .. }
     ));
 
     // A duplicate unbound push is inert: no re-bind.
     apply_daemon_message(
         &mut state,
-        DaemonMessage::Keystore {
+        DaemonMessage::broadcast(DaemonMessageType::Keystore {
             state: choreo_proto::KeystoreState::Unbound,
-        },
+        }),
         Some(tx),
     );
     assert!(rx.try_recv().is_err(), "no second bind attempt");

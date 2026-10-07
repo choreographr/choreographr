@@ -18,7 +18,7 @@ use choreo_client_core::{
     ClientError, McpCommand, broken_pipe, build_add_credential_message, command_echo,
     resolve_private_key,
 };
-use choreo_proto::ClientMessage;
+use choreo_proto::ClientMessageType;
 
 /// Send a `ContinueGeneration` for the attached session — the shared body of
 /// the two new-turn triggers that map to it, Alt+Enter and `/continue`.
@@ -37,7 +37,7 @@ use choreo_proto::ClientMessage;
 /// broken client channel is an error, so callers can `?` this directly.
 fn send_continue_generation(
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
     echo: bool,
 ) -> Result<(), ClientError> {
     if app.attached_session_id.is_none() {
@@ -57,16 +57,16 @@ fn send_continue_generation(
     if echo && let Some(text) = command_echo(&Command::Continue) {
         app.status = Some(text);
     }
-    let request_id = app.next_request_id;
+    let stream_id = app.next_request_id;
     app.next_request_id = app.next_request_id.wrapping_add(1);
     // The guard above already checked `attached_session_id`, but the display
     // entry may not exist yet — track the in-flight request only when there is
     // a display to hold it, never panic on a missing one.
     if let Some(display) = app.active_display() {
-        display.active.insert(request_id);
+        display.active.insert(stream_id);
     }
     client_tx
-        .send(ClientMessage::ContinueGeneration { request_id })
+        .send(ClientMessageType::ContinueGeneration { stream_id })
         .map_err(broken_pipe)?;
     app.scroll_to(0);
     Ok(())
@@ -81,13 +81,13 @@ fn send_continue_generation(
 /// the selector closes.
 fn open_model_selector(
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
 ) -> Result<(), ClientError> {
     tracing::debug!("[choreo-tui] opening model selector");
     app.text_selection = None;
     app.model_selector.open();
     client_tx
-        .send(ClientMessage::ListModels)
+        .send(ClientMessageType::ListModels)
         .map_err(broken_pipe)?;
     Ok(())
 }
@@ -96,7 +96,7 @@ fn open_model_selector(
 /// — the shared body of the `Alt+S` shortcut and the bare `/session` command.
 fn open_session_manager(
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
 ) -> Result<(), ClientError> {
     tracing::debug!("[choreo-tui] navigating to session manager");
     // Record the viewed session so the ListSessions reply lands the highlight
@@ -106,10 +106,10 @@ fn open_session_manager(
     }
     app.set_page(Page::SessionManager);
     client_tx
-        .send(ClientMessage::ListSessions)
+        .send(ClientMessageType::ListSessions)
         .map_err(broken_pipe)?;
     client_tx
-        .send(ClientMessage::SubscribeSessionsSummary)
+        .send(ClientMessageType::SubscribeSessionsSummary)
         .map_err(broken_pipe)?;
     Ok(())
 }
@@ -118,12 +118,12 @@ fn open_session_manager(
 /// shortcut and the bare `/account` command.
 fn open_accounts_page(
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
 ) -> Result<(), ClientError> {
     tracing::debug!("[choreo-tui] navigating to AI provider accounts");
     app.set_page(Page::AIProviders);
     client_tx
-        .send(ClientMessage::ListAccounts)
+        .send(ClientMessageType::ListAccounts)
         .map_err(broken_pipe)?;
     Ok(())
 }
@@ -138,7 +138,7 @@ fn open_accounts_page(
 /// model selected) versus "no model selected".
 fn cycle_reasoning(
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
 ) -> Result<(), ClientError> {
     let Some(display) = app.active_display_ref() else {
         // No session attached — there is no display whose capability could be
@@ -177,7 +177,7 @@ fn cycle_reasoning(
                     "cycling reasoning effort",
                 );
                 client_tx
-                    .send(ClientMessage::SetReasoningEffort { effort: next })
+                    .send(ClientMessageType::SetReasoningEffort { effort: next })
                     .map_err(broken_pipe)?;
             } else {
                 // `cycle_from` only returns None for an empty level set, which
@@ -261,7 +261,7 @@ pub(super) fn run_command(
     command: Command,
     echo: bool,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
 ) -> Result<(), ClientError> {
     match command {
         Command::Empty => {}
@@ -274,7 +274,7 @@ pub(super) fn run_command(
             // model's capability set does not include.  This provides faster
             // feedback than waiting for the daemon to reply with
             // ReasoningEffortSetFailed.
-            if let ClientMessage::SetReasoningEffort { ref effort } = message
+            if let ClientMessageType::SetReasoningEffort { ref effort } = message
                 && effort != "off"
             {
                 let valid = app
@@ -292,7 +292,7 @@ pub(super) fn run_command(
                 }
             }
             let message = match message {
-                ClientMessage::CreateSession {
+                ClientMessageType::CreateSession {
                     title,
                     parent_session_id,
                     working_dir,
@@ -300,7 +300,7 @@ pub(super) fn run_command(
                     account_name,
                     selected_model,
                     reasoning_effort,
-                } => ClientMessage::CreateSession {
+                } => ClientMessageType::CreateSession {
                     title,
                     parent_session_id,
                     // Inherit fields from the currently attached session when
@@ -326,13 +326,13 @@ pub(super) fn run_command(
             if echo && let Some(text) = command_echo(&Command::Send(message.clone())) {
                 app.status = Some(text);
             }
-            if let ClientMessage::RunInput { request_id, .. } = &message {
+            if let ClientMessageType::RunInput { stream_id, .. } = &message {
                 app.error = None;
                 // The active display tracks in-flight request ids for the
                 // spinner; with no session active there is nothing to track, so
                 // skip instead of panicking.
                 if let Some(display) = app.active_display() {
-                    display.active.insert(*request_id);
+                    display.active.insert(*stream_id);
                 }
             }
             client_tx.send(message).map_err(broken_pipe)?;
@@ -347,7 +347,7 @@ pub(super) fn run_command(
                     // Hold the key until the daemon CONFIRMS the unlock, then
                     // record it per-daemon.
                     app.pending_unlock_key = Some(private_key.clone());
-                    let _ = client_tx.send(ClientMessage::Unlock { private_key });
+                    let _ = client_tx.send(ClientMessageType::Unlock { private_key });
                 }
                 Err(e) => {
                     tracing::warn!("[choreo-tui] unlock failed: {e}");
@@ -390,7 +390,7 @@ pub(super) fn run_command(
             {
                 app.status = Some(text);
             }
-            let _ = client_tx.send(ClientMessage::AclAdd {
+            let _ = client_tx.send(ClientMessageType::AclAdd {
                 pubkey: pubkey.clone(),
             });
         }
@@ -402,7 +402,7 @@ pub(super) fn run_command(
             {
                 app.status = Some(text);
             }
-            let _ = client_tx.send(ClientMessage::RemoveCredential {
+            let _ = client_tx.send(ClientMessageType::RemoveCredential {
                 service: service.clone(),
             });
         }
@@ -410,13 +410,13 @@ pub(super) fn run_command(
             if echo && let Some(text) = command_echo(&Command::Undo) {
                 app.status = Some(text);
             }
-            let _ = client_tx.send(ClientMessage::Undo);
+            let _ = client_tx.send(ClientMessageType::Undo);
         }
         Command::Redo => {
             if echo && let Some(text) = command_echo(&Command::Redo) {
                 app.status = Some(text);
             }
-            let _ = client_tx.send(ClientMessage::Redo);
+            let _ = client_tx.send(ClientMessageType::Redo);
         }
         Command::Continue => {
             // `/continue` (or Alt+Enter) — same guard, same
@@ -428,12 +428,12 @@ pub(super) fn run_command(
             if echo && let Some(text) = command_echo(&Command::Stop) {
                 app.status = Some(text);
             }
-            // Send Cancel with request_id 0 (the CANCEL_ALL sentinel) to stop
+            // Send Cancel with stream_id 0 (the CANCEL_ALL sentinel) to stop
             // whatever request is currently active on the attached session and
             // all its children.
             if app.attached_session_id.is_some() {
                 client_tx
-                    .send(ClientMessage::Cancel { request_id: 0 })
+                    .send(ClientMessageType::Cancel { stream_id: 0 })
                     .map_err(broken_pipe)?;
             } else {
                 app.status = Some("no session attached".to_string());
@@ -445,7 +445,7 @@ pub(super) fn run_command(
             let suffix = if force { " (forced)" } else { "" };
             app.status = Some(format!("refreshing models…{suffix}"));
             client_tx
-                .send(ClientMessage::RefreshModels { force })
+                .send(ClientMessageType::RefreshModels { force })
                 .map_err(broken_pipe)?;
         }
         Command::Mcp(mcp) => {
@@ -457,7 +457,7 @@ pub(super) fn run_command(
                     // The daemon replies asynchronously with McpStatus; the
                     // reply handler renders the per-server lines.
                     client_tx
-                        .send(ClientMessage::McpStatusRequest)
+                        .send(ClientMessageType::McpStatusRequest)
                         .map_err(broken_pipe)?;
                 }
                 McpCommand::Reconnect { slug } => {
@@ -465,7 +465,7 @@ pub(super) fn run_command(
                     // (success) or McpReconnectFailed.
                     app.status = Some(format!("reconnecting MCP server {slug}…"));
                     client_tx
-                        .send(ClientMessage::McpReconnect { slug })
+                        .send(ClientMessageType::McpReconnect { slug })
                         .map_err(broken_pipe)?;
                 }
                 McpCommand::Reload => {
@@ -473,24 +473,24 @@ pub(super) fn run_command(
                     // McpReloadFailed.
                     app.status = Some("reloading MCP configuration…".to_string());
                     client_tx
-                        .send(ClientMessage::McpReload)
+                        .send(ClientMessageType::McpReload)
                         .map_err(broken_pipe)?;
                 }
                 McpCommand::Trust => {
                     app.status = Some("trusting project MCP root…".to_string());
                     client_tx
-                        .send(ClientMessage::McpTrust)
+                        .send(ClientMessageType::McpTrust)
                         .map_err(broken_pipe)?;
                 }
                 McpCommand::Untrust => {
                     app.status = Some("revoking project MCP trust…".to_string());
                     client_tx
-                        .send(ClientMessage::McpUntrust)
+                        .send(ClientMessageType::McpUntrust)
                         .map_err(broken_pipe)?;
                 }
                 McpCommand::TrustList => {
                     client_tx
-                        .send(ClientMessage::McpTrustList)
+                        .send(ClientMessageType::McpTrustList)
                         .map_err(broken_pipe)?;
                 }
             }
@@ -535,7 +535,7 @@ pub(super) fn run_named(
     name: &str,
     echo: bool,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
 ) -> Result<(), ClientError> {
     let command = parse_input_line(&format!("/{name}"), &mut app.next_request_id);
     run_command(command, echo, app, client_tx)

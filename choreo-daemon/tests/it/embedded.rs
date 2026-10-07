@@ -14,7 +14,7 @@
 #![expect(clippy::unwrap_used)]
 use choreo_daemon::daemon::OpenOptions;
 use choreo_daemon::{DaemonState, EmbeddedOptions, ToolPolicy, spawn_embedded};
-use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent};
+use choreo_proto::{ClientMessage, ClientMessageType, DaemonMessageType, SessionEvent};
 
 /// Open a `DaemonState` rooted in `dir` (temp sandbox: explicit paths, no env
 /// overrides) with the unrestricted tool policy.
@@ -40,26 +40,29 @@ fn open_state(dir: &tempfile::TempDir) -> DaemonState {
 /// directly, via the same single-writer channel broadcasts ride on).
 fn create_session(link: &choreo_daemon::EmbeddedLink) -> u64 {
     link.client_tx
-        .send(ClientMessage::CreateSession {
-            title: Some("embedded test".to_string()),
-            parent_session_id: None,
-            working_dir: None,
-            context_config: None,
-            account_name: None,
-            selected_model: None,
-            reasoning_effort: None,
-        })
+        .send(ClientMessage::request(
+            0,
+            ClientMessageType::CreateSession {
+                title: Some("embedded test".to_string()),
+                parent_session_id: None,
+                working_dir: None,
+                context_config: None,
+                account_name: None,
+                selected_model: None,
+                reasoning_effort: None,
+            },
+        ))
         .unwrap();
     loop {
         // Session-status broadcasts and other traffic are expected here;
         // keep waiting for the connection-level creation reply. The reply to
         // OUR CreateSession is `SessionCreatedForRequester`; the broadcast
         // `SessionCreated` (if this link is subscribed) is also acceptable.
-        if let DaemonMessage::Session {
+        if let DaemonMessageType::Session {
             session_id: Some(sid),
             event:
                 SessionEvent::SessionCreatedForRequester { .. } | SessionEvent::SessionCreated { .. },
-        } = link.daemon_rx.recv().unwrap()
+        } = link.daemon_rx.recv().unwrap().inner
         {
             return sid;
         }
@@ -81,9 +84,11 @@ fn embedded_transport_round_trips_values() {
     assert!(sid > 0);
 
     // A request/response round trip over the SAME value channel.
-    link.client_tx.send(ClientMessage::ListSessions).unwrap();
+    link.client_tx
+        .send(ClientMessage::request(0, ClientMessageType::ListSessions))
+        .unwrap();
     let saw_list = loop {
-        if let DaemonMessage::Sessions { sessions } = link.daemon_rx.recv().unwrap() {
+        if let DaemonMessageType::Sessions { sessions } = link.daemon_rx.recv().unwrap().inner {
             break sessions;
         }
     };
@@ -94,13 +99,16 @@ fn embedded_transport_round_trips_values() {
 
     // The session state must be observable too: attach and read it back.
     link.client_tx
-        .send(ClientMessage::AttachSession { session_id: sid })
+        .send(ClientMessage::request(
+            0,
+            ClientMessageType::AttachSession { session_id: sid },
+        ))
         .unwrap();
     loop {
-        if let DaemonMessage::Session {
+        if let DaemonMessageType::Session {
             session_id: Some(id),
             event: SessionEvent::SessionAttached,
-        } = link.daemon_rx.recv().unwrap()
+        } = link.daemon_rx.recv().unwrap().inner
         {
             assert_eq!(id, sid);
             break;
@@ -111,10 +119,13 @@ fn embedded_transport_round_trips_values() {
     // the daemon must stay healthy — a second link answers a Ping.
     drop(link);
     let link2 = daemon.connect().unwrap();
-    link2.client_tx.send(ClientMessage::Ping).unwrap();
+    link2
+        .client_tx
+        .send(ClientMessage::request(0, ClientMessageType::Ping))
+        .unwrap();
     assert!(matches!(
-        link2.daemon_rx.recv().unwrap(),
-        DaemonMessage::Pong
+        link2.daemon_rx.recv().unwrap().inner,
+        DaemonMessageType::Pong
     ));
 
     // Drop link2 BEFORE shutting down: a still-open connection thread is
@@ -127,7 +138,7 @@ fn embedded_transport_round_trips_values() {
     daemon.shutdown();
 }
 
-/// The shutdown contract: the GUI receives `DaemonMessage::ShuttingDown` as
+/// The shutdown contract: the GUI receives `DaemonMessageType::ShuttingDown` as
 /// a VALUE, and only THEN does the channel close (the next recv returns
 /// Err/None) — notify-before-close with no bytes involved.
 #[test]
@@ -138,10 +149,12 @@ fn shutdown_delivers_shutting_down_before_channel_close() {
     let link = daemon.connect().unwrap();
 
     // Sanity: the link is live before the drain.
-    link.client_tx.send(ClientMessage::Ping).unwrap();
+    link.client_tx
+        .send(ClientMessage::request(0, ClientMessageType::Ping))
+        .unwrap();
     assert!(matches!(
-        link.daemon_rx.recv().unwrap(),
-        DaemonMessage::Pong
+        link.daemon_rx.recv().unwrap().inner,
+        DaemonMessageType::Pong
     ));
 
     // Drain the daemon on a separate thread: the GUI-side observations below
@@ -155,7 +168,10 @@ fn shutdown_delivers_shutting_down_before_channel_close() {
     // value first, then the EOF (blocking recvs — both are deterministic:
     // the writer thread closes the channel right after the flush).
     assert!(
-        matches!(link.daemon_rx.recv().unwrap(), DaemonMessage::ShuttingDown),
+        matches!(
+            link.daemon_rx.recv().unwrap().inner,
+            DaemonMessageType::ShuttingDown
+        ),
         "ShuttingDown must arrive as a value before the channel closes"
     );
     assert!(

@@ -28,7 +28,7 @@ use std::thread;
 use std::time::Duration;
 
 use choreo_client_core::{ConnectionMode, probe_server_key, run_daemon_connection_with_mode};
-use choreo_proto::{ClientMessage, DaemonMessage};
+use choreo_proto::{ClientMessageType, DaemonMessage, DaemonMessageType};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 /// A server keypair: raw secret + public bytes, generated from the workspace
@@ -108,7 +108,7 @@ fn spawn_connection_thread(
     roots: &TestRoots,
     mode: ConnectionMode,
     handle_daemon_message: impl FnMut(DaemonMessage) + Send + 'static,
-    to_daemon: crossbeam_channel::Receiver<ClientMessage>,
+    to_daemon: crossbeam_channel::Receiver<ClientMessageType>,
 ) -> thread::JoinHandle<Result<(), choreo_client_core::ClientError>> {
     let transport_dir = roots.transport_dir.clone();
     let keystore_dir = roots.keystore_dir.clone();
@@ -277,13 +277,13 @@ fn pinned_mode_connects_and_round_trips() {
             })
             .expect("IK responder");
         let msg = server_stream.recv_client_message().expect("recv Ping");
-        assert_eq!(msg, ClientMessage::Ping);
+        assert_eq!(msg.inner, ClientMessageType::Ping);
         server_stream
-            .send_daemon_message(&DaemonMessage::Pong)
+            .send_daemon_message(&DaemonMessage::broadcast(DaemonMessageType::Pong))
             .expect("send Pong");
     });
 
-    let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
+    let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessageType>();
     let (tx, rx) = mpsc::channel::<DaemonMessage>();
     let handle = spawn_connection_thread(
         &roots,
@@ -294,10 +294,10 @@ fn pinned_mode_connects_and_round_trips() {
         to_daemon,
     );
 
-    from_ui.send(ClientMessage::Ping).expect("send Ping");
+    from_ui.send(ClientMessageType::Ping).expect("send Ping");
     assert_eq!(
         rx.recv_timeout(Duration::from_secs(5)).expect("Pong"),
-        DaemonMessage::Pong,
+        DaemonMessage::broadcast(DaemonMessageType::Pong),
         "pinned-mode connection must carry encrypted traffic"
     );
 
@@ -340,7 +340,7 @@ fn pinned_mode_key_change_fails_loud() {
         });
     });
 
-    let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
+    let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessageType>();
     let (tx, _rx) = mpsc::channel::<DaemonMessage>();
     let result = spawn_connection_thread(
         &roots,
@@ -382,7 +382,7 @@ fn pinned_mode_without_pin_errors() {
     // No pin written — deliberately. (The bound listener only proves the
     // client COULD have dialed: the error must come from the store check.)
 
-    let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
+    let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessageType>();
     let (tx, _rx) = mpsc::channel::<DaemonMessage>();
     let result = spawn_connection_thread(
         &roots,

@@ -1,4 +1,4 @@
-use choreo_proto::ClientMessage;
+use choreo_proto::ClientMessageType;
 use choreo_tui::{Command, parse_input_line};
 
 // Ignored by default: part of the #[ignore] integration suite, exercised via
@@ -14,7 +14,7 @@ fn shell_parser_handles_full_command_flow() {
     );
     assert_eq!(
         parse_input_line("/ping", &mut next_request_id),
-        Command::Send(ClientMessage::Ping)
+        Command::Send(ClientMessageType::Ping)
     );
     // `/models` was removed from the unified command model: it is no longer a
     // known command (the bare `/model` opens the selector instead).
@@ -29,20 +29,20 @@ fn shell_parser_handles_full_command_flow() {
     );
     assert_eq!(
         parse_input_line("/model gpt-5.4-nano", &mut next_request_id),
-        Command::Send(ClientMessage::SetModel {
+        Command::Send(ClientMessageType::SetModel {
             model: "gpt-5.4-nano".to_string(),
         })
     );
     assert_eq!(
         parse_input_line("run this", &mut next_request_id),
-        Command::Send(ClientMessage::RunInput {
-            request_id: 1,
+        Command::Send(ClientMessageType::RunInput {
+            stream_id: 1,
             input: b"run this".to_vec(),
         })
     );
     assert_eq!(
         parse_input_line("/cancel 1", &mut next_request_id),
-        Command::Send(ClientMessage::Cancel { request_id: 1 })
+        Command::Send(ClientMessageType::Cancel { stream_id: 1 })
     );
     assert_eq!(
         parse_input_line("/cancel nope", &mut next_request_id),

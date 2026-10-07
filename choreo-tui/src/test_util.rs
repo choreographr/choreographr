@@ -25,7 +25,7 @@ pub fn test_app() -> App {
 /// Add a `UserText` turn to the session, mimicking what the daemon sends after
 /// processing a `RunInput`.
 pub fn add_user_text(app: &mut App, content: &str) {
-    let turn_id = app.next_request_id;
+    let turn_id = u32::try_from(app.next_request_id).unwrap();
     app.next_request_id += 1;
     let turn = Turn {
         created_at: choreo_proto::TimestampMs::now(),

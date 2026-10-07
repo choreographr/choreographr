@@ -428,7 +428,7 @@ fn record_tool_completion_persists_vision_image_at_emit_time() {
     let mut pending_hints = Vec::new();
 
     record_tool_completion(ToolCompletionParams {
-        request_id: 0,
+        stream_id: 0,
         session: &mut session,
         tool_call: &tool_call,
         output: &mut output,
@@ -1691,7 +1691,7 @@ fn broadcast_turn_appended_sends_when_turn_exists() {
     broadcast_turn_appended(&tx, &session, 0, turn_id);
 
     match rx.try_recv() {
-        Ok(SessionCommand::Broadcast(DaemonMessage::Session {
+        Ok(SessionCommand::Broadcast(DaemonMessageType::Session {
             event: SessionEvent::TurnAppended { turn_id: id, .. },
             ..
         })) => {
@@ -1750,7 +1750,7 @@ fn broadcast_turn_appended_strips_reasoning_artifact() {
     broadcast_turn_appended(&tx, &session, 0, turn_id);
 
     match rx.try_recv() {
-        Ok(SessionCommand::Broadcast(DaemonMessage::Session {
+        Ok(SessionCommand::Broadcast(DaemonMessageType::Session {
             event: SessionEvent::TurnAppended {
                 turn_id: id, turn, ..
             },
@@ -1816,7 +1816,7 @@ fn finalize_and_broadcast_turn_strips_reasoning_artifact() {
     finalize_and_broadcast_turn(&mut session, &ctx, turn_id).unwrap();
 
     match cmd_rx.try_recv() {
-        Ok(SessionCommand::Broadcast(DaemonMessage::Session {
+        Ok(SessionCommand::Broadcast(DaemonMessageType::Session {
             event: SessionEvent::TurnAppended { turn, .. },
             ..
         })) => {
@@ -1896,7 +1896,7 @@ fn agent_loop_failure_marks_and_finalizes_turn() {
     // that an error-bearing TurnAppended arrived.
     let mut saw_error_appended = false;
     while let Ok(msg) = cmd_rx.try_recv() {
-        if let SessionCommand::Broadcast(DaemonMessage::Session {
+        if let SessionCommand::Broadcast(DaemonMessageType::Session {
             event: SessionEvent::TurnAppended { turn, .. },
             ..
         }) = msg
@@ -2417,7 +2417,7 @@ fn run_exec_tool(
         x_credentials: None,
         working_dir: None,
         timeout_dur,
-        request_id: 1,
+        stream_id: 1,
         session_id: 1,
         session: &mut session,
         session_tools: Arc::new(crate::mcp::ProjectToolSet::empty()),
@@ -2657,7 +2657,7 @@ fn execute_tool_forwards_streaming_output() {
     // rides on ToolCallStarted + the seeded placeholder); the only chunk
     // is the tool's own payload from execute_streaming.
     match cmd_rx.recv() {
-        Ok(SessionCommand::Broadcast(DaemonMessage::Session {
+        Ok(SessionCommand::Broadcast(DaemonMessageType::Session {
             event: SessionEvent::ToolResultChunk { data, .. },
             ..
         })) => {
@@ -2693,7 +2693,7 @@ fn forwarding_thread_drains_queued_output_before_kill() {
     kill_tx.send(()).expect("send kill");
 
     match cmd_rx.recv() {
-        Ok(SessionCommand::Broadcast(DaemonMessage::Session {
+        Ok(SessionCommand::Broadcast(DaemonMessageType::Session {
             event: SessionEvent::ToolResultChunk { data, .. },
             ..
         })) => {
@@ -2721,7 +2721,7 @@ fn forwarding_thread_exits_when_output_disconnects() {
     drop(output_tx);
 
     match cmd_rx.recv() {
-        Ok(SessionCommand::Broadcast(DaemonMessage::Session {
+        Ok(SessionCommand::Broadcast(DaemonMessageType::Session {
             event: SessionEvent::ToolResultChunk { data, .. },
             ..
         })) => {
@@ -2779,7 +2779,7 @@ fn forwarding_thread_honors_kill_while_output_is_still_alive() {
     // The first queued chunk is forwarded (FIFO) before the kill is
     // honored; the rest of the kill-time burst may be drained too.
     match cmd_rx.recv() {
-        Ok(SessionCommand::Broadcast(DaemonMessage::Session {
+        Ok(SessionCommand::Broadcast(DaemonMessageType::Session {
             event: SessionEvent::ToolResultChunk { data, .. },
             ..
         })) => {
@@ -2969,7 +2969,7 @@ fn run_spawn_single_tool(
     let _kill_tx = spawn_single_tool(SpawnToolArgs {
         tool_call,
         timeout,
-        request_id: 1,
+        stream_id: 1,
         session_id: 1,
         registry,
         session_tools: Arc::new(crate::mcp::ProjectToolSet::empty()),
@@ -3065,7 +3065,7 @@ fn concurrent_tools_deliver_in_completion_order() {
     let _slow_kill = spawn_single_tool(SpawnToolArgs {
         tool_call: slow_call,
         timeout: Some(Duration::from_secs(5)),
-        request_id: 1,
+        stream_id: 1,
         session_id: 1,
         registry: Arc::clone(&registry),
         session_tools: Arc::new(crate::mcp::ProjectToolSet::empty()),
@@ -3080,7 +3080,7 @@ fn concurrent_tools_deliver_in_completion_order() {
     let _fast_kill = spawn_single_tool(SpawnToolArgs {
         tool_call: fast_call,
         timeout: Some(Duration::from_secs(60)),
-        request_id: 1,
+        stream_id: 1,
         session_id: 1,
         registry,
         session_tools: Arc::new(crate::mcp::ProjectToolSet::empty()),
@@ -3141,7 +3141,7 @@ fn wait_loop_honors_kill_while_tool_is_still_running() {
     let kill_tx = spawn_single_tool(SpawnToolArgs {
         tool_call,
         timeout: None, // unbounded — the kill is the only wakeup
-        request_id: 1,
+        stream_id: 1,
         session_id: 1,
         registry,
         session_tools: Arc::new(crate::mcp::ProjectToolSet::empty()),

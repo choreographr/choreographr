@@ -16,7 +16,7 @@ use crate::accounts::{AccountConfig, AccountManager};
 use crate::broadcast::SubscriberSink;
 use crate::db;
 use choreo_keystore::ServiceCredential;
-use choreo_proto::DaemonMessage;
+use choreo_proto::{DaemonMessage, DaemonMessageType};
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
@@ -27,7 +27,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 /// Failure of a keystore unlock/bind/add-credential operation, with the
 /// UNBOUND case carried structurally so the connection layer can answer with
-/// the distinct `DaemonMessage::KeystoreUnbound` (guiding the client to
+/// the distinct `DaemonMessageType::KeystoreUnbound` (guiding the client to
 /// auto-bind) instead of the generic wrong-key `LockedError`. Kept as an enum
 /// rather than a string sentinel because string matching on error text is how
 /// such distinctions silently rot.
@@ -54,13 +54,18 @@ impl DaemonState {
     fn send_targeted(
         writer: Option<&SubscriberSink>,
         global_lag: &Arc<AtomicUsize>,
-        msg: &DaemonMessage,
+        inner: &DaemonMessageType,
     ) {
+        // P3: these command-loop replies carry no correlation id yet (the id
+        // is threaded from the connection thread to the command loop in P3),
+        // so for P1 they ride as broadcasts (`id: None`). Behavior is
+        // identical until a client resolves replies by id.
+        let framed = DaemonMessage::broadcast(inner.clone());
         if let Some(w) = writer {
-            w.send_accounted(msg, global_lag);
+            w.send_accounted(&framed, global_lag);
         } else {
             warn!(
-                ?msg,
+                ?inner,
                 "no client writer for targeted keystore reply; dropping reply"
             );
         }
@@ -72,10 +77,10 @@ impl DaemonState {
     fn send_targeted_ack(
         writer: Option<&SubscriberSink>,
         global_lag: &Arc<AtomicUsize>,
-        msg: &DaemonMessage,
+        inner: &DaemonMessageType,
         reply: &mpsc::Sender<()>,
     ) {
-        Self::send_targeted(writer, global_lag, msg);
+        Self::send_targeted(writer, global_lag, inner);
         let _ = reply.send(());
     }
 
@@ -94,7 +99,7 @@ impl DaemonState {
         Self::send_targeted_ack(
             client_writer,
             &self.global_lag,
-            &DaemonMessage::CredentialAddFailed {
+            &DaemonMessageType::CredentialAddFailed {
                 service: service.to_string(),
                 error,
             },
@@ -128,7 +133,7 @@ impl DaemonState {
         // travel in the SAME per-client FIFO writer queue, and the reply is
         // enqueued first HERE, so the broadcast can never overtake it.
         let reply_msg = match &result {
-            Ok(()) => DaemonMessage::Unlocked,
+            Ok(()) => DaemonMessageType::Unlocked,
             Err(e) => unlock_error_reply(e),
         };
         Self::send_targeted_ack(client_writer, &self.global_lag, &reply_msg, reply);
@@ -144,7 +149,7 @@ impl DaemonState {
     }
 
     /// Establish (TOFU-bind) the keystore binding — the ONLY path that can
-    /// create it (`ClientMessage::BindKeystore`). On an unbound keystore the
+    /// create it (`ClientMessageType::BindKeystore`). On an unbound keystore the
     /// presented key is ADOPTED (loud `KEYSTORE BOUND` log) and the shared
     /// unlock tail runs (bulk decrypt is a no-op on a fresh keystore, loads
     /// accounts, sets locked=false); on an already-bound keystore the key is
@@ -168,7 +173,7 @@ impl DaemonState {
         // path. The arm is left to the shared helper rather than spelled out
         // as a match arm that advertises a behavior that cannot happen.
         let reply_msg = match &result {
-            Ok(()) => DaemonMessage::Bound,
+            Ok(()) => DaemonMessageType::Bound,
             Err(e) => unlock_error_reply(e),
         };
         Self::send_targeted_ack(client_writer, &self.global_lag, &reply_msg, reply);
@@ -278,10 +283,10 @@ impl DaemonState {
             // reply is enqueued by THIS thread before anything else touches
             // the client's writer queue.
             let reply_msg = match e {
-                KeystoreOpError::Unbound => DaemonMessage::KeystoreUnbound {
+                KeystoreOpError::Unbound => DaemonMessageType::KeystoreUnbound {
                     error: KeystoreOpError::Unbound.to_string(),
                 },
-                KeystoreOpError::Other(e) => DaemonMessage::CredentialAddFailed {
+                KeystoreOpError::Other(e) => DaemonMessageType::CredentialAddFailed {
                     service: service.clone(),
                     error: e,
                 },
@@ -387,13 +392,13 @@ impl DaemonState {
         Self::send_targeted_ack(
             client_writer,
             &self.global_lag,
-            &DaemonMessage::Unlocked,
+            &DaemonMessageType::Unlocked,
             reply,
         );
         Self::send_targeted(
             client_writer,
             &self.global_lag,
-            &DaemonMessage::CredentialAdded { service },
+            &DaemonMessageType::CredentialAdded { service },
         );
         // A valid AddCredential to a locked daemon IS a lock-state transition
         // (implicit unlock): fan out the newly-unlocked state to ALL activity
@@ -475,12 +480,12 @@ fn zeroized_key_or_wipe(key: &mut Vec<u8>) -> Result<Zeroizing<[u8; 32]>, Keysto
 /// The three call sites (unlock, bind, save-credential) used to each spell
 /// this match out — one shared mapping so the `Unbound` → `KeystoreUnbound`
 /// guidance text and the wrong-key → error-message shape cannot drift.
-fn unlock_error_reply(e: &KeystoreOpError) -> DaemonMessage {
+fn unlock_error_reply(e: &KeystoreOpError) -> DaemonMessageType {
     match e {
-        KeystoreOpError::Unbound => DaemonMessage::KeystoreUnbound {
+        KeystoreOpError::Unbound => DaemonMessageType::KeystoreUnbound {
             error: KeystoreOpError::Unbound.to_string(),
         },
-        KeystoreOpError::Other(e) => DaemonMessage::LockedError { error: e.clone() },
+        KeystoreOpError::Other(e) => DaemonMessageType::LockedError { error: e.clone() },
     }
 }
 

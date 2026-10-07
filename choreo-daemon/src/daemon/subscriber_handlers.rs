@@ -20,7 +20,7 @@ use super::{
     SubscriberSink, catalog_provider_pairs, debug, info, warn,
 };
 use crate::broadcast::fan_out_evicting;
-use choreo_proto::KeystoreState;
+use choreo_proto::{DaemonMessageType, KeystoreState};
 
 /// True when a [`DaemonCommand::BroadcastActivity`] command's provenance and
 /// its message's origin disagree — a dedup-contract violation.
@@ -54,9 +54,9 @@ pub(super) fn violates_broadcast_origin_contract(
     session_id: Option<u64>,
     msg: &DaemonMessage,
 ) -> bool {
-    match msg {
+    match &msg.inner {
         // The envelope carries its own origin — it must match the command's.
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             session_id: envelope_id,
             ..
         } => match (session_id, envelope_id) {
@@ -95,13 +95,16 @@ impl DaemonState {
     /// two fan-outs run on the daemon command thread in the order written
     /// here, so the summary skip always observes the same membership the
     /// activity fan-out just served.
-    pub(super) fn broadcast(&mut self, msg: &DaemonMessage) {
+    pub(super) fn broadcast(&mut self, inner: &DaemonMessageType) {
+        // Wrap the payload as a broadcast (`id: None`): summary + activity
+        // fan-outs deliver process-wide notifications, never a targeted reply.
+        let msg = DaemonMessage::broadcast(inner.clone());
         // Lifecycle events ride the activity bus too — an all-activity
         // subscriber must see sessions appear and disappear even though it
         // never joined the session-list bus.
         let (evict_activity, evict_activity_largest) = fan_out_evicting(
             &mut self.activity_subscribers,
-            msg,
+            &msg,
             &self.lag_limits,
             &self.global_lag,
             |_| false, // lifecycle events have no per-session dedup here
@@ -110,7 +113,7 @@ impl DaemonState {
 
         let (evict_clients, evict_largest) = fan_out_evicting(
             &mut self.summary_subscribers,
-            msg,
+            &msg,
             &self.lag_limits,
             &self.global_lag,
             |client_id| {
@@ -197,13 +200,13 @@ impl DaemonState {
             // below anyway, so a default timestamp is harmless.
             None => 0,
         };
-        let msg = DaemonMessage::Session {
+        let msg = DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionStatusChanged {
                 status,
                 last_modified,
             },
-        };
+        });
         // A deleted session's still-shutting-down thread must not emit ghost
         // status events for a session the user removed; the index is empty
         // for deleted sessions, so use its presence as the "session exists"
@@ -255,7 +258,7 @@ impl DaemonState {
         // ignored because a fresh subscription cannot be over the lag cap.
         let providers = catalog_provider_pairs();
         let _ = writer.enqueue(
-            &DaemonMessage::CatalogUpdated { providers },
+            &DaemonMessage::broadcast(DaemonMessageType::CatalogUpdated { providers }),
             &self.lag_limits,
             &self.global_lag,
         );
@@ -301,7 +304,9 @@ impl DaemonState {
         } else {
             KeystoreState::Unlocked
         };
-        DaemonMessage::Keystore { state }
+        // A broadcast (`id: None`): the keystore status push is unsolicited,
+        // not a reply to any request.
+        DaemonMessage::broadcast(DaemonMessageType::Keystore { state })
     }
 
     /// Broadcast the daemon's CURRENT keystore status to every activity
@@ -368,7 +373,10 @@ impl DaemonState {
         // borrowed; the borrow ends here, before the map mutations below
         // (the daemon command loop is single-threaded, so reordering the
         // advisory ahead of the removals is unobservable).
-        let _ = sink.send_unchecked(&DaemonMessage::Evicted, &self.global_lag);
+        let _ = sink.send_unchecked(
+            &DaemonMessage::broadcast(DaemonMessageType::Evicted),
+            &self.global_lag,
+        );
         self.summary_subscribers.remove(&client_id);
         self.activity_subscribers.remove(&client_id);
         // Promptly remove this client from every session's subscriber map
@@ -406,7 +414,7 @@ impl DaemonState {
         }
     }
 
-    /// Deliver `DaemonMessage::ShuttingDown` to every connected client via its
+    /// Deliver `DaemonMessageType::ShuttingDown` to every connected client via its
     /// writer channel; each connection's writer thread then closes its own
     /// socket, so clients observe the notification before EOF.
     ///
@@ -424,7 +432,10 @@ impl DaemonState {
             // notification), so the notification must be counted like every
             // other message; `send_unchecked` self-corrects when the
             // receiver is gone.
-            if sink.send_unchecked(&DaemonMessage::ShuttingDown, &self.global_lag) {
+            if sink.send_unchecked(
+                &DaemonMessage::broadcast(DaemonMessageType::ShuttingDown),
+                &self.global_lag,
+            ) {
                 true
             } else {
                 warn!("removing disconnected client {client_id} during shutdown");

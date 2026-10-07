@@ -73,7 +73,7 @@ pub struct RenderedImage {
     /// Job ID of a currently-pending encoding request, or `None` when
     /// no encoding is in flight (idle or cached).
     pub pending_job: Option<ImageId>,
-    /// True while an on-demand `ClientMessage::GetImage` for this image is in
+    /// True while an on-demand `ClientMessageType::GetImage` for this image is in
     /// flight (bytes stripped from the turn snapshot, protocol v6). Dedupes
     /// the fetch so the per-frame render path cannot re-request the same image
     /// while a reply is pending.

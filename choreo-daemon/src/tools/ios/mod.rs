@@ -86,12 +86,12 @@ pub(crate) fn run_bridge_tool<T: serde::Serialize>(
     let pending = bridge
         .dispatch(IosToolRequest {
             // Reassigned by the bridge; zero here is only the pre-assign value.
-            request_id: 0,
+            stream_id: 0,
             name: tool_name.to_string(),
             args_json,
         })
         .map_err(|e| bridge_err_to_tool_err(tool_name, e))?;
-    let request_id = pending.request_id;
+    let stream_id = pending.stream_id;
 
     // The cancellation predicate reads the context's cooperative flag — the
     // sanctioned shared-state exception. With no context (tests) nothing
@@ -106,7 +106,7 @@ pub(crate) fn run_bridge_tool<T: serde::Serialize>(
     let reply = pending.wait(timeout, &is_canceled);
     match reply {
         Ok(value) => {
-            tracing::debug!(tool = tool_name, request_id, "ios tool reply received");
+            tracing::debug!(tool = tool_name, stream_id, "ios tool reply received");
             Ok(value)
         }
         Err(e) => {
@@ -117,9 +117,9 @@ pub(crate) fn run_bridge_tool<T: serde::Serialize>(
                 // dropping it afterwards disconnects the reply channel, which
                 // is the documented abandonment path.
                 pending.cancel();
-                tracing::info!(tool = tool_name, request_id, "ios tool canceled");
+                tracing::info!(tool = tool_name, stream_id, "ios tool canceled");
             } else {
-                tracing::warn!(tool = tool_name, request_id, error = %e, "ios tool failed");
+                tracing::warn!(tool = tool_name, stream_id, error = %e, "ios tool failed");
             }
             Err(bridge_err_to_tool_err(tool_name, e))
         }

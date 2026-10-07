@@ -39,7 +39,7 @@ The client can either run on the same computer as the server agent (via local so
 
 Client/server communication is encoded in [MessagePack](https://msgpack.org/) in *named* mode — a self-describing, compact binary format with broad language support (struct field names and enum variant names travel on the wire, so the format is evolution-safe for future mobile/web/third-party clients). [Postcard](https://postcard.jamesmunns.com/) remains only on internal Rust-only channels: the RISC-V VM↔host protocol and encrypted credential storage.
 
-Delivery is **lossless**: the daemon never drops a broadcast message. Each connected client gets an unbounded queue drained by its own writer thread, so a slow client can never stall a session or the daemon loop — memory is bounded instead by **lag-based eviction** (per-client 64 MiB cap, 512 MiB daemon-wide). A client that falls too far behind receives a best-effort `Evicted` advisory and is disconnected; it reconciles on reconnect via the attach/snapshot path. Final turns ride a single `TurnAppended` delivery — a `SessionEvent` wrapped in the `DaemonMessage::Session { session_id: Option<u64>, event }` envelope (protocol v4) — so the live stream and the recorded turn can never diverge.
+Delivery is **lossless**: the daemon never drops a broadcast message. Each connected client gets an unbounded queue drained by its own writer thread, so a slow client can never stall a session or the daemon loop — memory is bounded instead by **lag-based eviction** (per-client 64 MiB cap, 512 MiB daemon-wide). A client that falls too far behind receives a best-effort `Evicted` advisory and is disconnected; it reconciles on reconnect via the attach/snapshot path. Final turns ride a single `TurnAppended` delivery — a `SessionEvent` wrapped in the `DaemonMessageType::Session { session_id: Option<u64>, event }` envelope (protocol v4) — so the live stream and the recorded turn can never diverge.
 
 Currently the primary client is **`choreo-tui`** - a fullscreen terminal UI.
 
@@ -960,19 +960,19 @@ shutdown.
 ## Security model
 
 The daemon starts **locked**. It publishes its authoritative keystore status
-on the wire (`DaemonMessage::Keystore { state }`, with `Unbound`/`Locked`/
+on the wire (`DaemonMessageType::Keystore { state }`, with `Unbound`/`Locked`/
 `Unlocked`) to each client at subscribe time and on every transition. When a
 client connects and the daemon's keystore has NO binding yet (the `Unbound`
 status), the client AUTO-BINDS it once per connection: it mints a
 fresh 32-byte key with its CSPRNG, records it into `known_servers.toml`
 (pre-send — an unbound daemon adopts whatever key arrives first, so the record
 matches the binding even if the confirmation is lost), and sends
-`ClientMessage::BindKeystore`; the daemon adopts the key (loud `KEYSTORE
+`ClientMessageType::BindKeystore`; the daemon adopts the key (loud `KEYSTORE
 BOUND` log), replies `Bound`, and is unlocked. There is no `/bind-key`
 command — binding is never user-triggered. Once bound, clients resolve their
 per-daemon unlock key (the stored per-daemon key, else the legacy raw
 `identity.pk` file, which is copied into the store on first use) and send it
-via `ClientMessage::Unlock`. Unlock and `AddCredential` are strictly
+via `ClientMessageType::Unlock`. Unlock and `AddCredential` are strictly
 VERIFY-ONLY — they verify against the binding (`KeystoreUnbound` means
 "no binding yet"; `LockedError` means "bound but wrong key") and never create
 one — and the daemon decrypts all stored credential blobs into memory on a
@@ -995,7 +995,7 @@ binding; the next connect auto-binds a fresh key.
   locked state.
 - **Keystore status is broadcast to every client.** The daemon tracks its
   authoritative keystore status (`Unbound` — no binding yet; `Locked` — bound
-  but no cleartext in memory; `Unlocked`) and pushes `DaemonMessage::Keystore
+  but no cleartext in memory; `Unlocked`) and pushes `DaemonMessageType::Keystore
   { state }` to each freshly-connecting client at subscribe time and to all
   activity subscribers on every transition. `Unbound` is what lets a first-run
   client auto-bind; `Locked`/`Unlocked` drive the banner. The TUI latches this

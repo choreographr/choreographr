@@ -3,7 +3,7 @@
 //! [`run_event_loop`] owns the bridge's control flow: it pulls [`Event`]s off
 //! the shared channel, applies the `initialize` handshake gate, and routes each
 //! editor request/notification to a per-method handler that sends the matching
-//! [`ClientMessage`] to the daemon. Incoming
+//! [`ClientMessageType`] to the daemon. Incoming
 //! [`DaemonMessage`]s are split into streaming turn events (translated into
 //! `session/update` notifications via [`streaming`]) and
 //! synchronous replies (matched against [`PendingRequests`] to complete the
@@ -13,7 +13,7 @@ use crossbeam_channel::{Receiver, Sender};
 use std::io::{BufWriter, Write};
 use tracing::{debug, error, info, warn};
 
-use choreo_proto::{ClientMessage, DaemonMessage, SessionEvent};
+use choreo_proto::{ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent};
 
 use crate::acp_jsonrpc::{
     self, AgentCapabilities, AgentInfo, ConfigOptionValue, ContentBlock, InitializeResult,
@@ -53,7 +53,7 @@ const DISCONNECT_ERR_MSG: &str = "Daemon disconnected";
 /// dropped their event senders.
 pub fn run_event_loop(
     event_rx: &Receiver<Event>,
-    daemon_writer: Sender<ClientMessage>,
+    daemon_writer: Sender<ClientMessageType>,
 ) -> Result<(), AcpError> {
     let mut sessions = SessionManager::new();
     let mut pending = PendingRequests::new();
@@ -174,7 +174,7 @@ fn handle_request(
     req: &acp_jsonrpc::JsonRpcRequest,
     sessions: &mut SessionManager,
     pending: &mut PendingRequests,
-    daemon_writer: &Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessageType>,
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
     match req.method.as_str() {
@@ -199,7 +199,7 @@ fn handle_request(
 fn handle_notification(
     notif: &acp_jsonrpc::JsonRpcNotification,
     pending: &mut PendingRequests,
-    daemon_writer: &Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessageType>,
 ) -> Result<(), AcpError> {
     if notif.method.as_str() == "session/cancel" {
         dispatch_cancel(notif, pending, daemon_writer)
@@ -262,7 +262,7 @@ fn handle_initialize(
 fn dispatch_new_session(
     req: &acp_jsonrpc::JsonRpcRequest,
     pending: &mut PendingRequests,
-    daemon_writer: &Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessageType>,
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
     info!("dispatching session/new (id={})", req.id);
@@ -283,7 +283,7 @@ fn dispatch_new_session(
                 .map(String::from)
         });
 
-    send_to_daemon(daemon_writer, ClientMessage::ListModels)?;
+    send_to_daemon(daemon_writer, ClientMessageType::ListModels)?;
     pending.set_models_pending(ModelsPending::CreateSession {
         jsonrpc_id: req.id,
         account_name,
@@ -295,10 +295,10 @@ fn continue_new_session_after_models(
     jsonrpc_id: u64,
     account_name: Option<String>,
     pending: &mut PendingRequests,
-    daemon_writer: &Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessageType>,
 ) -> Result<(), AcpError> {
     info!(jsonrpc_id, "continuing session/new after ListModels");
-    let msg = ClientMessage::CreateSession {
+    let msg = ClientMessageType::CreateSession {
         title: None,
         parent_session_id: None,
         working_dir: None,
@@ -342,11 +342,11 @@ fn dispatch_load_session(
 
 fn dispatch_list_sessions(
     req: &acp_jsonrpc::JsonRpcRequest,
-    daemon_writer: &Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessageType>,
     pending: &mut PendingRequests,
 ) -> Result<(), AcpError> {
     info!("dispatching session/list (id={})", req.id);
-    send_to_daemon(daemon_writer, ClientMessage::ListSessions)?;
+    send_to_daemon(daemon_writer, ClientMessageType::ListSessions)?;
     pending.insert_sync(PendingKind::ListSessions, req.id);
     Ok(())
 }
@@ -354,7 +354,7 @@ fn dispatch_list_sessions(
 fn dispatch_delete_session(
     req: &acp_jsonrpc::JsonRpcRequest,
     sessions: &mut SessionManager,
-    daemon_writer: &Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessageType>,
     pending: &mut PendingRequests,
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
@@ -377,7 +377,7 @@ fn dispatch_delete_session(
 
     send_to_daemon(
         daemon_writer,
-        ClientMessage::DeleteSession {
+        ClientMessageType::DeleteSession {
             session_id: daemon_id,
         },
     )?;
@@ -419,7 +419,7 @@ fn dispatch_close_session(
 fn dispatch_set_config_option(
     req: &acp_jsonrpc::JsonRpcRequest,
     sessions: &mut SessionManager,
-    daemon_writer: &Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessageType>,
     pending: &mut PendingRequests,
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
@@ -453,7 +453,7 @@ fn dispatch_set_config_option(
 fn handle_set_model(
     req: &acp_jsonrpc::JsonRpcRequest,
     config_req: &acp_jsonrpc::SetConfigOptionRequest,
-    daemon_writer: &Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessageType>,
     pending: &mut PendingRequests,
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
@@ -465,7 +465,7 @@ fn handle_set_model(
     };
     send_to_daemon(
         daemon_writer,
-        ClientMessage::SetModel {
+        ClientMessageType::SetModel {
             model: model.clone(),
         },
     )?;
@@ -479,7 +479,7 @@ fn handle_set_model(
 fn handle_set_reasoning_effort(
     req: &acp_jsonrpc::JsonRpcRequest,
     config_req: &acp_jsonrpc::SetConfigOptionRequest,
-    daemon_writer: &Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessageType>,
     pending: &mut PendingRequests,
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
@@ -502,7 +502,10 @@ fn handle_set_reasoning_effort(
             return respond_err(req.id, -32602, "Reasoning effort must be a string", out);
         }
     };
-    send_to_daemon(daemon_writer, ClientMessage::SetReasoningEffort { effort })?;
+    send_to_daemon(
+        daemon_writer,
+        ClientMessageType::SetReasoningEffort { effort },
+    )?;
     pending.insert_sync(PendingKind::SetReasoningEffort, req.id);
     // State is updated when the daemon confirms (via ReasoningEffortSet).
     pending.store_pending_session(
@@ -530,7 +533,7 @@ fn dispatch_prompt(
     req: &acp_jsonrpc::JsonRpcRequest,
     sessions: &mut SessionManager,
     pending: &mut PendingRequests,
-    daemon_writer: &Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessageType>,
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
     info!("dispatching session/prompt (id={})", req.id);
@@ -558,15 +561,15 @@ fn dispatch_prompt(
 
     send_to_daemon(
         daemon_writer,
-        ClientMessage::AttachSession {
+        ClientMessageType::AttachSession {
             session_id: daemon_id,
         },
     )?;
 
     send_to_daemon(
         daemon_writer,
-        ClientMessage::RunInput {
-            request_id: daemon_request_id,
+        ClientMessageType::RunInput {
+            stream_id: daemon_request_id,
             input: input.into_bytes(),
         },
     )?;
@@ -586,7 +589,7 @@ fn dispatch_prompt(
 fn dispatch_cancel(
     notif: &acp_jsonrpc::JsonRpcNotification,
     pending: &mut PendingRequests,
-    daemon_writer: &Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessageType>,
 ) -> Result<(), AcpError> {
     let acp_id = parse_params::<acp_jsonrpc::CancelNotification>(notif.params.as_ref())
         .map_or_default(|r| r.session_id);
@@ -603,8 +606,8 @@ fn dispatch_cancel(
     );
     send_to_daemon(
         daemon_writer,
-        ClientMessage::Cancel {
-            request_id: prompt.daemon_request_id,
+        ClientMessageType::Cancel {
+            stream_id: prompt.daemon_request_id,
         },
     )?;
     Ok(())
@@ -618,11 +621,11 @@ fn handle_daemon_message(
     msg: &DaemonMessage,
     sessions: &mut SessionManager,
     pending: &mut PendingRequests,
-    daemon_writer: &Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessageType>,
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
-    match msg {
-        DaemonMessage::Session {
+    match &msg.inner {
+        DaemonMessageType::Session {
             event:
                 SessionEvent::OutputChunk { .. }
                 | SessionEvent::ToolCallStarted { .. }
@@ -648,30 +651,30 @@ fn handle_streaming_message(
     sessions: &mut SessionManager,
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
-    // All streaming messages carry request_id — extract it from whichever
-    // SessionEvent variant arrived. The `DaemonMessage::Session` envelope
+    // All streaming messages carry stream_id — extract it from whichever
+    // SessionEvent variant arrived. The `DaemonMessageType::Session` envelope
     // wraps every session-scoped event, so the alternation lives on the
     // inner `event` field of one envelope arm.
-    let request_id = match msg {
-        DaemonMessage::Session {
+    let stream_id = match &msg.inner {
+        DaemonMessageType::Session {
             event:
-                SessionEvent::OutputChunk { request_id, .. }
-                | SessionEvent::ToolCallStarted { request_id, .. }
-                | SessionEvent::ToolResultChunk { request_id, .. }
-                | SessionEvent::ToolCallFinished { request_id, .. }
-                | SessionEvent::ToolCallFailed { request_id, .. }
-                | SessionEvent::Done { request_id, .. }
-                | SessionEvent::Failed { request_id, .. }
-                | SessionEvent::Cancelled { request_id, .. },
+                SessionEvent::OutputChunk { stream_id, .. }
+                | SessionEvent::ToolCallStarted { stream_id, .. }
+                | SessionEvent::ToolResultChunk { stream_id, .. }
+                | SessionEvent::ToolCallFinished { stream_id, .. }
+                | SessionEvent::ToolCallFailed { stream_id, .. }
+                | SessionEvent::Done { stream_id, .. }
+                | SessionEvent::Failed { stream_id, .. }
+                | SessionEvent::Cancelled { stream_id, .. },
             ..
-        } => *request_id,
+        } => *stream_id,
         _ => return Ok(()),
     };
 
-    // Find the matching prompt.  If this request_id doesn't belong to any
+    // Find the matching prompt.  If this stream_id doesn't belong to any
     // active prompt, the message is stale (e.g. from a prior connection)
     // and can be safely ignored.
-    let Some(prompt) = pending.find_by_request_id(request_id) else {
+    let Some(prompt) = pending.find_by_request_id(stream_id) else {
         return Ok(());
     };
     let jsonrpc_id = prompt.jsonrpc_id;
@@ -692,7 +695,7 @@ fn handle_streaming_message(
     // state.  Non-terminal (mid-stream) messages stop here.  All terminal
     // states are session-scoped events, so unwrap the envelope once and
     // dispatch on the inner event.
-    let DaemonMessage::Session { event, .. } = msg else {
+    let DaemonMessageType::Session { event, .. } = &msg.inner else {
         return Ok(());
     };
     match event {
@@ -782,13 +785,13 @@ fn handle_sync_message(
     msg: &DaemonMessage,
     sessions: &mut SessionManager,
     pending: &mut PendingRequests,
-    daemon_writer: &Sender<ClientMessage>,
+    daemon_writer: &Sender<ClientMessageType>,
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
     debug!("handling sync daemon message");
 
-    match msg {
-        DaemonMessage::Models {
+    match &msg.inner {
+        DaemonMessageType::Models {
             models: _models,
             selected_model,
         } => match pending.take_models_pending() {
@@ -820,7 +823,7 @@ fn handle_sync_message(
             }
         },
 
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionCreatedForRequester { .. },
             ..
@@ -832,7 +835,7 @@ fn handle_sync_message(
                 let acp_id = sessions.create(*session_id);
                 send_to_daemon(
                     daemon_writer,
-                    ClientMessage::AttachSession {
+                    ClientMessageType::AttachSession {
                         session_id: *session_id,
                     },
                 )?;
@@ -849,7 +852,7 @@ fn handle_sync_message(
             }
         }
 
-        DaemonMessage::Sessions {
+        DaemonMessageType::Sessions {
             sessions: session_list,
         } => {
             if let Some(entry) = pending.take_sync(&PendingKind::ListSessions) {
@@ -876,7 +879,7 @@ fn handle_sync_message(
             }
         }
 
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionDeleted,
             ..
@@ -891,7 +894,7 @@ fn handle_sync_message(
             }
         }
 
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             session_id: Some(session_id),
             event: SessionEvent::SessionDeleteFailed { error },
             ..
@@ -906,12 +909,12 @@ fn handle_sync_message(
         // ModelSelected is a no-op here because the SetModel sync entry
         // is consumed in the Models handler (which carries selected_model
         // for updating session state).  See the Models arm above.
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             event: SessionEvent::ModelSelected { .. },
             ..
         } => {}
 
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             event: SessionEvent::ModelSelectionFailed { error, .. },
             ..
         } => {
@@ -921,7 +924,7 @@ fn handle_sync_message(
             }
         }
 
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             event: SessionEvent::ReasoningEffortSet { effort, .. },
             ..
         } => {
@@ -936,7 +939,7 @@ fn handle_sync_message(
             }
         }
 
-        DaemonMessage::Session {
+        DaemonMessageType::Session {
             event: SessionEvent::ReasoningEffortSetFailed { error, .. },
             ..
         } => {
@@ -958,7 +961,10 @@ fn handle_sync_message(
 // Low-level I/O helpers
 // ---------------------------------------------------------------------------
 
-fn send_to_daemon(writer: &Sender<ClientMessage>, msg: ClientMessage) -> Result<(), AcpError> {
+fn send_to_daemon(
+    writer: &Sender<ClientMessageType>,
+    msg: ClientMessageType,
+) -> Result<(), AcpError> {
     writer.send(msg).map_err(|_| {
         error!("daemon writer channel closed");
         AcpError::TransportDisconnected

@@ -19,8 +19,8 @@
 //! any under-estimate, so a drift surfaces as a test failure.
 
 use crate::{
-    DaemonMessage, ImageKey, OutputStream, ReasoningArtifact, ReasoningCapability, SessionEvent,
-    SessionStatus, Turn,
+    DaemonMessage, DaemonMessageType, ImageKey, OutputStream, ReasoningArtifact,
+    ReasoningCapability, SessionEvent, SessionStatus, Turn,
 };
 
 impl Turn {
@@ -315,177 +315,206 @@ impl DaemonMessage {
     /// which encodes every `DaemonMessage` variant with realistic payloads and
     /// asserts the estimate covers the actual bytes.
     pub fn approx_wire_size(&self) -> usize {
+        // Fixed envelope overhead for the `{ id, inner }` frame: the two
+        // named-mode map keys (`id`, `inner`) plus the `Option<u64>` id (absent
+        // on a broadcast via `skip_serializing_if`, up to ~9 bytes when
+        // present). A generous fixed value here keeps the whole estimate
+        // conservative regardless of which arms below add payload bytes.
+        const ID_ENVELOPE: usize = 48;
         // Fixed envelope overhead for FIELDLESS variants (Pong, Evicted, …):
         // just the variant tag, so this generous fixed value is a comfortable
         // over-estimate. Struct variants get their per-field named-mode key
         // overhead from `named_field_overhead` instead.
         const OVERHEAD: usize = 96;
-        match self {
-            // Session-scoped events ride the `Session` envelope: fixed
-            // 2-field envelope overhead (variant tag + map header + the
-            // `session_id`/`event` field keys) plus the inner event's own
-            // per-field estimate. The `Option<u64>` `session_id` payload
-            // (1 byte for nil, up to ~9 for `Some(u64)`) is comfortably
-            // covered by the fixed 88-byte envelope allowance (40 + 2×24),
-            // so both encodings fit without per-arm accounting.
-            Self::Session { event, .. } => named_field_overhead(2) + session_event_size(event),
-            Self::Sessions { sessions } => {
-                named_field_overhead(1)
-                    + sessions
-                        .iter()
-                        .map(|s| {
-                            // 17-field SessionSummary (`pinned` + `archived_at`
-                            // added): named-mode keys + tags + status string (the
-                            // variable-size status payload is not otherwise
-                            // counted).
-                            named_field_overhead(17)
-                                + option_str_len(s.title.as_ref())
-                                + option_str_len(s.selected_model.as_ref())
-                                + option_str_len(s.reasoning_effort.as_ref())
-                                + option_str_len(s.working_dir.as_ref())
-                                + option_str_len(s.account_name.as_ref())
-                                + s.active_tool_groups.iter().map(String::len).sum::<usize>()
-                                + session_status_size(&s.status)
-                        })
-                        .sum::<usize>()
+        ID_ENVELOPE
+            + match &self.inner {
+                // Session-scoped events ride the `Session` envelope: fixed
+                // 2-field envelope overhead (variant tag + map header + the
+                // `session_id`/`event` field keys) plus the inner event's own
+                // per-field estimate. The `Option<u64>` `session_id` payload
+                // (1 byte for nil, up to ~9 for `Some(u64)`) is comfortably
+                // covered by the fixed 88-byte envelope allowance (40 + 2×24),
+                // so both encodings fit without per-arm accounting.
+                DaemonMessageType::Session { event, .. } => {
+                    named_field_overhead(2) + session_event_size(event)
+                }
+                DaemonMessageType::Sessions { sessions } => {
+                    named_field_overhead(1)
+                        + sessions
+                            .iter()
+                            .map(|s| {
+                                // 17-field SessionSummary (`pinned` + `archived_at`
+                                // added): named-mode keys + tags + status string (the
+                                // variable-size status payload is not otherwise
+                                // counted).
+                                named_field_overhead(17)
+                                    + option_str_len(s.title.as_ref())
+                                    + option_str_len(s.selected_model.as_ref())
+                                    + option_str_len(s.reasoning_effort.as_ref())
+                                    + option_str_len(s.working_dir.as_ref())
+                                    + option_str_len(s.account_name.as_ref())
+                                    + s.active_tool_groups.iter().map(String::len).sum::<usize>()
+                                    + session_status_size(&s.status)
+                            })
+                            .sum::<usize>()
+                }
+                DaemonMessageType::Pong => OVERHEAD,
+                DaemonMessageType::Models {
+                    models,
+                    selected_model,
+                } => {
+                    named_field_overhead(2)
+                        + models.iter().map(String::len).sum::<usize>()
+                        + option_str_len(selected_model.as_ref())
+                }
+                DaemonMessageType::ModelsFailed { error } => named_field_overhead(1) + error.len(),
+                DaemonMessageType::Unlocked
+                | DaemonMessageType::Locked
+                | DaemonMessageType::Bound
+                | DaemonMessageType::ShuttingDown
+                | DaemonMessageType::Evicted => OVERHEAD,
+                // `state` is a small (1–2 byte) enum, but its named-mode encoding
+                // includes the variant-name string; one field's allowance covers
+                // the key + tag + name comfortably.
+                DaemonMessageType::Keystore { .. } => named_field_overhead(1),
+                DaemonMessageType::LockedError { error }
+                | DaemonMessageType::KeystoreUnbound { error } => {
+                    named_field_overhead(1) + error.len()
+                }
+                DaemonMessageType::CredentialAdded { service } => {
+                    named_field_overhead(1) + service.len()
+                }
+                DaemonMessageType::CredentialAddFailed { service, error } => {
+                    named_field_overhead(2) + service.len() + error.len()
+                }
+                DaemonMessageType::CredentialRemoved { service } => {
+                    named_field_overhead(1) + service.len()
+                }
+                DaemonMessageType::CredentialRemoveFailed { service, error } => {
+                    named_field_overhead(2) + service.len() + error.len()
+                }
+                DaemonMessageType::AclAddResult { ok: _, message } => {
+                    named_field_overhead(2) + message.len()
+                }
+                DaemonMessageType::AclUpdated { .. } => named_field_overhead(1),
+                DaemonMessageType::Credential { service, key } => {
+                    named_field_overhead(2) + service.len() + option_str_len(key.as_ref())
+                }
+                DaemonMessageType::AccountAdded { name } => named_field_overhead(1) + name.len(),
+                DaemonMessageType::AccountAddFailed { name, error } => {
+                    named_field_overhead(2) + name.len() + error.len()
+                }
+                DaemonMessageType::AccountRemoved { name } => named_field_overhead(1) + name.len(),
+                DaemonMessageType::AccountRemoveFailed { name, error } => {
+                    named_field_overhead(2) + name.len() + error.len()
+                }
+                DaemonMessageType::Accounts { accounts } => {
+                    named_field_overhead(1)
+                        + accounts
+                            .iter()
+                            .map(|a| 48 + a.name.len() + a.provider.len())
+                            .sum::<usize>()
+                }
+                DaemonMessageType::AccountListFailed { error } => {
+                    named_field_overhead(1) + error.len()
+                }
+                // providers/models are usize COUNTS (fixed-size scalars), covered
+                // by the per-field allowance.
+                DaemonMessageType::ModelsRefreshed { .. } => named_field_overhead(3),
+                DaemonMessageType::ModelsRefreshFailed { error } => {
+                    named_field_overhead(1) + error.len()
+                }
+                DaemonMessageType::CatalogUpdated { providers } => {
+                    named_field_overhead(1)
+                        + providers
+                            .iter()
+                            .map(|p| 32 + p.slug.len() + p.display_name.len())
+                            .sum::<usize>()
+                }
+                // Targeted image reply: 4 fields (session_id, turn_id, key, data);
+                // the scalars fit the per-field allowance and only the (potentially
+                // large) byte payload is added on top. An empty `data` / `None`
+                // counts as just the envelope. The `key` adds a variable `call_id`
+                // string for the tool-result variant (the fixed 4-field allowance
+                // covers the enum tag and field names); under-counting it would let
+                // a lagging client escape eviction, so it is added explicitly.
+                DaemonMessageType::Image { key, data, .. } => {
+                    named_field_overhead(4)
+                        + data.as_ref().map_or(0, Vec::len)
+                        + match key {
+                            ImageKey::Displayed { .. } => 0,
+                            ImageKey::ToolResult { call_id } => call_id.len(),
+                        }
+                }
+                // One `McpServerStatus` per configured server: 9 named fields plus
+                // the variable strings. The 220 B per-record allowance covers the
+                // map header, variant tag, nine field-name keys, and the
+                // `connected` bool / `tool_count` usize scalars; only the string
+                // payloads are added on top. The envelope carries the project-root
+                // context: four named fields plus the root string and the ignored
+                // project slugs.
+                DaemonMessageType::McpStatus {
+                    servers,
+                    project_root,
+                    ignored_project_servers,
+                    ..
+                } => {
+                    named_field_overhead(4)
+                        + option_str_len(project_root.as_ref())
+                        + ignored_project_servers
+                            .iter()
+                            .map(String::len)
+                            .sum::<usize>()
+                        + servers
+                            .iter()
+                            .map(|s| {
+                                220 + s.slug.len()
+                                    + s.tier.len()
+                                    + s.transport.len()
+                                    + s.target.len()
+                                    + option_str_len(s.server_name.as_ref())
+                                    + option_str_len(s.server_version.as_ref())
+                                    + option_str_len(s.last_error.as_ref())
+                            })
+                            .sum::<usize>()
+                }
+                DaemonMessageType::McpReconnectFailed { slug, error } => {
+                    named_field_overhead(2) + slug.len() + error.len()
+                }
+                // Same per-server accounting as `McpStatus`, plus the one-line
+                // summary string.
+                DaemonMessageType::McpReloaded { summary, servers } => {
+                    named_field_overhead(2)
+                        + summary.len()
+                        + servers
+                            .iter()
+                            .map(|s| {
+                                220 + s.slug.len()
+                                    + s.tier.len()
+                                    + s.transport.len()
+                                    + s.target.len()
+                                    + option_str_len(s.server_name.as_ref())
+                                    + option_str_len(s.server_version.as_ref())
+                                    + option_str_len(s.last_error.as_ref())
+                            })
+                            .sum::<usize>()
+                }
+                DaemonMessageType::McpReloadFailed { error } => {
+                    named_field_overhead(1) + error.len()
+                }
+                DaemonMessageType::McpTrustUpdated {
+                    root,
+                    trusted: _,
+                    message,
+                } => named_field_overhead(3) + option_str_len(root.as_ref()) + message.len(),
+                DaemonMessageType::McpTrustList { roots } => {
+                    named_field_overhead(1) + roots.iter().map(String::len).sum::<usize>()
+                }
+                // Terminal acknowledgement replies: `Accepted` carries only the
+                // `MessageKind` tag (fixed-size, covered by the per-field
+                // allowance); `Failed` adds the error string.
+                DaemonMessageType::Accepted { .. } => named_field_overhead(1),
+                DaemonMessageType::Failed { error, .. } => named_field_overhead(2) + error.len(),
             }
-            Self::Pong => OVERHEAD,
-            Self::Models {
-                models,
-                selected_model,
-            } => {
-                named_field_overhead(2)
-                    + models.iter().map(String::len).sum::<usize>()
-                    + option_str_len(selected_model.as_ref())
-            }
-            Self::ModelsFailed { error } => named_field_overhead(1) + error.len(),
-            Self::Unlocked | Self::Locked | Self::Bound | Self::ShuttingDown | Self::Evicted => {
-                OVERHEAD
-            }
-            // `state` is a small (1–2 byte) enum, but its named-mode encoding
-            // includes the variant-name string; one field's allowance covers
-            // the key + tag + name comfortably.
-            Self::Keystore { .. } => named_field_overhead(1),
-            Self::LockedError { error } | Self::KeystoreUnbound { error } => {
-                named_field_overhead(1) + error.len()
-            }
-            Self::CredentialAdded { service } => named_field_overhead(1) + service.len(),
-            Self::CredentialAddFailed { service, error } => {
-                named_field_overhead(2) + service.len() + error.len()
-            }
-            Self::CredentialRemoved { service } => named_field_overhead(1) + service.len(),
-            Self::CredentialRemoveFailed { service, error } => {
-                named_field_overhead(2) + service.len() + error.len()
-            }
-            Self::AclAddResult { ok: _, message } => named_field_overhead(2) + message.len(),
-            Self::AclUpdated { .. } => named_field_overhead(1),
-            Self::Credential { service, key } => {
-                named_field_overhead(2) + service.len() + option_str_len(key.as_ref())
-            }
-            Self::AccountAdded { name } => named_field_overhead(1) + name.len(),
-            Self::AccountAddFailed { name, error } => {
-                named_field_overhead(2) + name.len() + error.len()
-            }
-            Self::AccountRemoved { name } => named_field_overhead(1) + name.len(),
-            Self::AccountRemoveFailed { name, error } => {
-                named_field_overhead(2) + name.len() + error.len()
-            }
-            Self::Accounts { accounts } => {
-                named_field_overhead(1)
-                    + accounts
-                        .iter()
-                        .map(|a| 48 + a.name.len() + a.provider.len())
-                        .sum::<usize>()
-            }
-            Self::AccountListFailed { error } => named_field_overhead(1) + error.len(),
-            // providers/models are usize COUNTS (fixed-size scalars), covered
-            // by the per-field allowance.
-            Self::ModelsRefreshed { .. } => named_field_overhead(3),
-            Self::ModelsRefreshFailed { error } => named_field_overhead(1) + error.len(),
-            Self::CatalogUpdated { providers } => {
-                named_field_overhead(1)
-                    + providers
-                        .iter()
-                        .map(|p| 32 + p.slug.len() + p.display_name.len())
-                        .sum::<usize>()
-            }
-            // Targeted image reply: 4 fields (session_id, turn_id, key, data);
-            // the scalars fit the per-field allowance and only the (potentially
-            // large) byte payload is added on top. An empty `data` / `None`
-            // counts as just the envelope. The `key` adds a variable `call_id`
-            // string for the tool-result variant (the fixed 4-field allowance
-            // covers the enum tag and field names); under-counting it would let
-            // a lagging client escape eviction, so it is added explicitly.
-            Self::Image { key, data, .. } => {
-                named_field_overhead(4)
-                    + data.as_ref().map_or(0, Vec::len)
-                    + match key {
-                        ImageKey::Displayed { .. } => 0,
-                        ImageKey::ToolResult { call_id } => call_id.len(),
-                    }
-            }
-            // One `McpServerStatus` per configured server: 9 named fields plus
-            // the variable strings. The 220 B per-record allowance covers the
-            // map header, variant tag, nine field-name keys, and the
-            // `connected` bool / `tool_count` usize scalars; only the string
-            // payloads are added on top. The envelope carries the project-root
-            // context: four named fields plus the root string and the ignored
-            // project slugs.
-            Self::McpStatus {
-                servers,
-                project_root,
-                ignored_project_servers,
-                ..
-            } => {
-                named_field_overhead(4)
-                    + option_str_len(project_root.as_ref())
-                    + ignored_project_servers
-                        .iter()
-                        .map(String::len)
-                        .sum::<usize>()
-                    + servers
-                        .iter()
-                        .map(|s| {
-                            220 + s.slug.len()
-                                + s.tier.len()
-                                + s.transport.len()
-                                + s.target.len()
-                                + option_str_len(s.server_name.as_ref())
-                                + option_str_len(s.server_version.as_ref())
-                                + option_str_len(s.last_error.as_ref())
-                        })
-                        .sum::<usize>()
-            }
-            Self::McpReconnectFailed { slug, error } => {
-                named_field_overhead(2) + slug.len() + error.len()
-            }
-            // Same per-server accounting as `McpStatus`, plus the one-line
-            // summary string.
-            Self::McpReloaded { summary, servers } => {
-                named_field_overhead(2)
-                    + summary.len()
-                    + servers
-                        .iter()
-                        .map(|s| {
-                            220 + s.slug.len()
-                                + s.tier.len()
-                                + s.transport.len()
-                                + s.target.len()
-                                + option_str_len(s.server_name.as_ref())
-                                + option_str_len(s.server_version.as_ref())
-                                + option_str_len(s.last_error.as_ref())
-                        })
-                        .sum::<usize>()
-            }
-            Self::McpReloadFailed { error } => named_field_overhead(1) + error.len(),
-            Self::McpTrustUpdated {
-                root,
-                trusted: _,
-                message,
-            } => named_field_overhead(3) + option_str_len(root.as_ref()) + message.len(),
-            Self::McpTrustList { roots } => {
-                named_field_overhead(1) + roots.iter().map(String::len).sum::<usize>()
-            }
-        }
     }
 }

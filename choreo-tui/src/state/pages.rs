@@ -574,7 +574,7 @@ pub(crate) enum PolkadotImportStep {
 /// account password; on the final step the TUI reads the file, decrypts it
 /// with `choreo_keystore::substrate::import_from_json` and sends the
 /// resulting Substrate credential over the same encrypted
-/// `ClientMessage::AddCredential` path the API-key modal uses.
+/// `ClientMessageType::AddCredential` path the API-key modal uses.
 pub(crate) struct PolkadotImportState {
     pub(crate) open: bool,
     pub(crate) step: PolkadotImportStep,
@@ -739,7 +739,7 @@ pub(crate) struct Marker {
 /// State for the model-selector popup (Chat page, Alt+M).
 ///
 /// The selector lists the models available on the attached session's account
-/// (fetched from the daemon via `ClientMessage::ListModels`) and lets the user
+/// (fetched from the daemon via `ClientMessageType::ListModels`) and lets the user
 /// pick one with the keyboard.  The filter is a plain case-insensitive
 /// substring match over model IDs — no fuzzy matching.  The currently active
 /// model is highlighted with a `●` marker so the user can see where they are
@@ -793,7 +793,7 @@ impl ModelSelectorState {
 
     /// Open the selector and request a fresh model list.
     ///
-    /// The caller is responsible for sending `ClientMessage::ListModels`;
+    /// The caller is responsible for sending `ClientMessageType::ListModels`;
     /// `loading` stays true until `apply_models` or `apply_error` arrives.
     /// The previous filter/focus is discarded so each opening starts clean.
     pub(crate) fn open(&mut self) {

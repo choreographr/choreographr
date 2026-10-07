@@ -1,7 +1,7 @@
 //! Connect-time keystore handshake and credential-message building.
 //!
 //! A daemon's credential keystore is TOFU: it adopts a key only through
-//! `ClientMessage::BindKeystore`, and `Unlock`/`AddCredential` are verify-only
+//! `ClientMessageType::BindKeystore`, and `Unlock`/`AddCredential` are verify-only
 //! against that adopted key. This module owns the client half of that design —
 //! resolving the unlock key already associated with an address
 //! ([`resolve_private_key`], [`try_auto_unlock_key`]), minting and
@@ -13,7 +13,7 @@
 
 use base64::Engine as _;
 use choreo_keystore::ServiceCredential;
-use choreo_proto::ClientMessage;
+use choreo_proto::ClientMessageType;
 use tracing::{debug, info, warn};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
@@ -276,7 +276,7 @@ fn resolve_keystore_key(addr: &str) -> Result<[u8; 32], ClientError> {
 /// daemon adopts whatever key arrives first, so if the confirmation is lost
 /// the recorded key still matches the binding, and there is nothing to
 /// overwrite. The returned `(key, message)` pair is sent as-is; the caller
-/// MUST confirm on the targeted `DaemonMessage::Bound` reply via
+/// MUST confirm on the targeted `DaemonMessageType::Bound` reply via
 /// [`record_unlock_key`] (a no-op-safe re-record of the already-persisted
 /// key) to keep the pending-flow contract uniform.
 ///
@@ -289,7 +289,7 @@ fn resolve_keystore_key(addr: &str) -> Result<[u8; 32], ClientError> {
 ///
 /// Returns [`ClientError::Io`] if the fresh bind key cannot be recorded
 /// into the store pre-send (the bind is then REFUSED, per the doc above).
-pub fn bind_fresh_daemon(addr: &str) -> Result<([u8; 32], ClientMessage), ClientError> {
+pub fn bind_fresh_daemon(addr: &str) -> Result<([u8; 32], ClientMessageType), ClientError> {
     // CSPRNG via rand's thread-local generator: the binding key is the root
     // of the daemon's credential confidentiality, so it must never be
     // predictable or reused.
@@ -301,7 +301,7 @@ pub fn bind_fresh_daemon(addr: &str) -> Result<([u8; 32], ClientMessage), Client
     // Pre-send record is MANDATORY here (not best-effort): see doc above.
     KnownServers::load()?.set_unlock_key(addr, &fresh)?;
     debug!(addr, "recorded fresh bind key into known_servers pre-send");
-    let msg = ClientMessage::BindKeystore {
+    let msg = ClientMessageType::BindKeystore {
         key: fresh.to_vec(),
     };
     Ok((fresh, msg))
@@ -326,7 +326,7 @@ pub fn build_add_credential_message(
     service: String,
     credential_type: String,
     fields: Vec<String>,
-) -> Result<(ClientMessage, Vec<u8>), ClientError> {
+) -> Result<(ClientMessageType, Vec<u8>), ClientError> {
     debug!(
         addr,
         service, credential_type, "building add credential message"
@@ -408,7 +408,7 @@ impl KeystoreAutoBind {
     pub fn on_unbound(
         &mut self,
         addr: &str,
-    ) -> Result<Option<([u8; 32], ClientMessage)>, ClientError> {
+    ) -> Result<Option<([u8; 32], ClientMessageType)>, ClientError> {
         if self.attempted {
             // Bind-loop guard: never re-mint against a daemon that is still
             // unbound after one bind. Re-minting could overwrite a binding
@@ -439,7 +439,7 @@ impl KeystoreAutoBind {
 pub enum AutoBindAttempt {
     /// A fresh bind key was minted and recorded into `known_servers` PRE-SEND.
     /// The caller MUST send `msg` and hold `key` in its pending-key lifecycle
-    /// for the targeted `DaemonMessage::Bound` confirmation (`record_unlock_key`
+    /// for the targeted `DaemonMessageType::Bound` confirmation (`record_unlock_key`
     /// re-records the already-persisted key, so the confirm is a no-op-safe
     /// uniform path).
     Bind {
@@ -447,7 +447,7 @@ pub enum AutoBindAttempt {
         /// before the message is sent.
         key: [u8; 32],
         /// The `BindKeystore` message carrying that same key.
-        msg: ClientMessage,
+        msg: ClientMessageType,
     },
     /// Bind-loop guard: a `BindKeystore` was already minted on this
     /// connection. The caller must NOT re-mint; it surfaces its own
@@ -518,7 +518,7 @@ pub fn build_add_credential_from_credential(
     addr: &str,
     service: String,
     credential: ServiceCredential,
-) -> Result<(ClientMessage, Vec<u8>), ClientError> {
+) -> Result<(ClientMessageType, Vec<u8>), ClientError> {
     debug!(
         addr,
         service, "building add credential message from parsed credential"
@@ -538,7 +538,7 @@ pub fn build_add_credential_from_credential(
     // own stored copy, so this closes the remaining gap on the send path).
     plaintext.zeroize();
 
-    let msg = ClientMessage::AddCredential {
+    let msg = ClientMessageType::AddCredential {
         service,
         encrypted_payload,
         unlock_key: unlock_key.to_vec(),
@@ -762,9 +762,9 @@ mod tests {
 
     /// A helper to pull the key back out of the built message (tests may
     /// unwrap; production code may not).
-    fn msg_unlock_key(msg: &ClientMessage) -> Vec<u8> {
+    fn msg_unlock_key(msg: &ClientMessageType) -> Vec<u8> {
         match msg {
-            ClientMessage::AddCredential { unlock_key, .. } => unlock_key.clone(),
+            ClientMessageType::AddCredential { unlock_key, .. } => unlock_key.clone(),
             other => panic!("expected AddCredential, got {other:?}"),
         }
     }
@@ -842,7 +842,7 @@ mod tests {
             build_add_credential_message("d:1", "svc".into(), "api_key".into(), vec!["k".into()])
                 .unwrap();
         assert_eq!(key, stored.to_vec());
-        let ClientMessage::AddCredential {
+        let ClientMessageType::AddCredential {
             service,
             encrypted_payload,
             ..
@@ -880,7 +880,7 @@ mod tests {
         assert_ne!(key, stored, "bind must NEVER reuse a stored key");
         assert_ne!(key, legacy_sk, "bind must NEVER reuse the legacy key");
         match &msg {
-            ClientMessage::BindKeystore { key: wire_key } => {
+            ClientMessageType::BindKeystore { key: wire_key } => {
                 assert_eq!(wire_key, &key.to_vec(), "message carries the minted key");
             }
             other => panic!("expected BindKeystore, got {other:?}"),
@@ -989,7 +989,7 @@ mod tests {
 
         // The minted key is recorded into known_servers PRE-SEND, and the
         // returned message carries exactly that key.
-        let ClientMessage::BindKeystore { key: sent } = msg else {
+        let ClientMessageType::BindKeystore { key: sent } = msg else {
             panic!("auto-bind must produce BindKeystore");
         };
         assert_eq!(sent, key.to_vec());
@@ -1055,7 +1055,7 @@ mod tests {
         let first = attempt_keystore_auto_bind(&mut bind, "attempt-test:1");
         let AutoBindAttempt::Bind {
             key,
-            msg: ClientMessage::BindKeystore { key: wire_key },
+            msg: ClientMessageType::BindKeystore { key: wire_key },
         } = &first
         else {
             panic!("first attempt must bind, got {first:?}");

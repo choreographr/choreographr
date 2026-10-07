@@ -35,7 +35,7 @@
 //! The bridge is three threads joined by one crossbeam event channel: the
 //! stdin reader and the daemon reader each send [`Event`](daemon_client::Event)
 //! values into it, and the main thread runs the event loop over the single
-//! receiver. A separate daemon writer thread consumes `ClientMessage`s sent
+//! receiver. A separate daemon writer thread consumes `ClientMessageType`s sent
 //! over its own channel. The event loop is single-threaded and all I/O is
 //! blocking, so the per-loop state ([`sessions::SessionManager`],
 //! [`pending::PendingRequests`]) needs no locking.

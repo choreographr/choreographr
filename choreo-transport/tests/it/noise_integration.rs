@@ -1,4 +1,4 @@
-use choreo_proto::{ClientMessage, DaemonMessage};
+use choreo_proto::{ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType};
 use choreo_transport::error::TransportError;
 use choreo_transport::handshake::{
     handshake_initiator, handshake_initiator_xx, handshake_responder,
@@ -158,21 +158,23 @@ fn noise_encrypted_message_round_trip() {
             let msg = server
                 .recv_client_message()
                 .map_err(|e| format!("recv ping failed: {e:?}"))?;
-            if msg != ClientMessage::Ping {
+            if msg.inner != ClientMessageType::Ping {
                 return Err(format!("expected Ping, got {msg:?}"));
             }
             server
-                .send_daemon_message(&DaemonMessage::Pong)
+                .send_daemon_message(&DaemonMessage::broadcast(DaemonMessageType::Pong))
                 .map_err(|e| format!("send pong failed: {e:?}"))?;
 
             let msg2 = server
                 .recv_client_message()
                 .map_err(|e| format!("recv list failed: {e:?}"))?;
-            if msg2 != ClientMessage::ListSessions {
+            if msg2.inner != ClientMessageType::ListSessions {
                 return Err(format!("expected ListSessions, got {msg2:?}"));
             }
             server
-                .send_daemon_message(&DaemonMessage::Sessions { sessions: vec![] })
+                .send_daemon_message(&DaemonMessage::broadcast(DaemonMessageType::Sessions {
+                    sessions: vec![],
+                }))
                 .map_err(|e| format!("send sessions failed: {e:?}"))?;
             Ok(())
         })();
@@ -184,20 +186,23 @@ fn noise_encrypted_message_round_trip() {
 
     // First round trip: Ping -> Pong.
     client
-        .send_client_message(&ClientMessage::Ping)
+        .send_client_message(&ClientMessage::request(0, ClientMessageType::Ping))
         .expect("client send ping");
     let reply = client.recv_daemon_message().expect("client recv pong");
-    assert_eq!(reply, DaemonMessage::Pong);
+    assert_eq!(reply, DaemonMessage::broadcast(DaemonMessageType::Pong));
 
     // Second round trip: ListSessions -> Sessions. Each encrypted message
     // advances the nonce on both sides of the shared TransportState; a
     // second successful round trip proves the transport keeps working
     // across nonce advancement rather than being a one-shot.
     client
-        .send_client_message(&ClientMessage::ListSessions)
+        .send_client_message(&ClientMessage::request(0, ClientMessageType::ListSessions))
         .expect("client send list");
     let reply2 = client.recv_daemon_message().expect("client recv sessions");
-    assert_eq!(reply2, DaemonMessage::Sessions { sessions: vec![] });
+    assert_eq!(
+        reply2,
+        DaemonMessage::broadcast(DaemonMessageType::Sessions { sessions: vec![] })
+    );
 
     let server_result = rx.recv().expect("recv server result");
     assert!(
@@ -1109,18 +1114,21 @@ fn noise_xx_handshake_round_trip() {
         .expect("server handshake");
     // Prove the data plane over the XX transport: one encrypted round trip.
     client
-        .send_client_message(&ClientMessage::Ping)
+        .send_client_message(&ClientMessage::request(0, ClientMessageType::Ping))
         .expect("send Ping over XX transport");
     assert_eq!(
-        server.recv_client_message().expect("recv from XX client"),
-        ClientMessage::Ping
+        server
+            .recv_client_message()
+            .expect("recv from XX client")
+            .inner,
+        ClientMessageType::Ping
     );
     server
-        .send_daemon_message(&DaemonMessage::Pong)
+        .send_daemon_message(&DaemonMessage::broadcast(DaemonMessageType::Pong))
         .expect("send Pong over XX transport");
     assert_eq!(
         client.recv_daemon_message().expect("recv Pong"),
-        DaemonMessage::Pong
+        DaemonMessage::broadcast(DaemonMessageType::Pong)
     );
 }
 

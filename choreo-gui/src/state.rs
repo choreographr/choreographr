@@ -17,7 +17,7 @@ pub(crate) enum UiEvent {
 #[derive(Debug, Clone)]
 pub(crate) struct AppState {
     pub(crate) input: String,
-    pub(crate) next_request_id: u32,
+    pub(crate) next_request_id: u64,
     pub(crate) session_view: SessionView,
     pub(crate) status_texts: Vec<String>,
     pub(crate) pending_cancel: String,
@@ -82,60 +82,58 @@ impl TurnEventHandler for AppState {
     fn handle_request_stream(
         &mut self,
         _session_id: u64,
-        request_id: u32,
+        stream_id: u64,
         stream: OutputStream,
         data: Cow<'_, str>,
     ) {
-        trace!(%request_id, ?stream, len = %data.len(), "handle_request_stream");
-        self.session_view.stream_chunk(request_id, &stream, &data);
+        trace!(%stream_id, ?stream, len = %data.len(), "handle_request_stream");
+        self.session_view.stream_chunk(stream_id, &stream, &data);
     }
 
     fn handle_started(
         &mut self,
         _session_id: u64,
-        request_id: u32,
+        stream_id: u64,
         turn_id: u32,
         _estimated_prompt_tokens: u32,
     ) {
-        debug!(%request_id, %turn_id, "stream started");
-        self.session_view
-            .request_to_turn
-            .insert(request_id, turn_id);
+        debug!(%stream_id, %turn_id, "stream started");
+        self.session_view.request_to_turn.insert(stream_id, turn_id);
     }
 
     fn handle_done(
         &mut self,
         _session_id: u64,
-        request_id: u32,
+        stream_id: u64,
         _token_usage: Option<TokenUsage>,
         _last_prompt_tokens: Option<u32>,
     ) {
-        trace!(%request_id, "handle_done");
+        trace!(%stream_id, "handle_done");
         // The final TurnAppended usually cleaned description entries via
         // `insert_or_replace`; clear for this turn anyway (before the
         // request→turn mapping is removed) so a dropped final broadcast
         // can't leak them.
-        if let Some(&turn_id) = self.session_view.request_to_turn.get(&request_id) {
+        if let Some(&turn_id) = self.session_view.request_to_turn.get(&stream_id) {
             self.session_view.clear_tool_call_descriptions(turn_id);
         }
-        self.session_view.request_to_turn.remove(&request_id);
+        self.session_view.request_to_turn.remove(&stream_id);
     }
 
-    fn handle_failed(&mut self, _session_id: Option<u64>, request_id: u32, error: String) {
-        trace!(%request_id, %error, "handle_failed");
+    fn handle_failed(&mut self, _session_id: Option<u64>, stream_id: u64, error: String) {
+        trace!(%stream_id, %error, "handle_failed");
         // A failed request never re-broadcasts its turn, so `insert_or_replace`
         // won't clean the description map — clear it here (before the
         // request→turn mapping is removed) to keep the map bounded by
         // in-flight calls even on the failure path.
-        if let Some(&turn_id) = self.session_view.request_to_turn.get(&request_id) {
+        if let Some(&turn_id) = self.session_view.request_to_turn.get(&stream_id) {
             self.session_view.clear_tool_call_descriptions(turn_id);
         }
-        self.session_view.request_to_turn.remove(&request_id);
+        self.session_view.request_to_turn.remove(&stream_id);
         self.status_texts.push(format!("[error] {error}"));
     }
 
-    fn handle_tool_call_event(&mut self, _session_id: u64, request_id: u32, event: ToolCallEvent) {
-        trace!(%request_id, ?event, "handle_tool_call_event");
+    fn handle_tool_call_event(&mut self, _session_id: u64, stream_id: u64, event: ToolCallEvent) {
+        trace!(%stream_id, ?event, "handle_tool_call_event");
         match event {
             ToolCallEvent::Started {
                 call_id,
@@ -144,7 +142,7 @@ impl TurnEventHandler for AppState {
                 invocation_description,
             } => {
                 self.session_view.tool_call_started(
-                    request_id,
+                    stream_id,
                     call_id,
                     tool_name,
                     arguments_json,
@@ -158,18 +156,18 @@ impl TurnEventHandler for AppState {
     fn handle_tool_result_chunk(
         &mut self,
         _session_id: u64,
-        request_id: u32,
+        stream_id: u64,
         call_id: String,
         data: Vec<u8>,
     ) {
-        trace!(%request_id, %call_id, len = %data.len(), "handle_tool_result_chunk");
+        trace!(%stream_id, %call_id, len = %data.len(), "handle_tool_result_chunk");
         match String::from_utf8(data) {
             Ok(text) => {
                 self.session_view
-                    .tool_result_chunk(request_id, &call_id, &text);
+                    .tool_result_chunk(stream_id, &call_id, &text);
             }
             Err(e) => {
-                warn!(%request_id, %call_id, error = %e, "non-UTF-8 tool result chunk");
+                warn!(%stream_id, %call_id, error = %e, "non-UTF-8 tool result chunk");
             }
         }
     }

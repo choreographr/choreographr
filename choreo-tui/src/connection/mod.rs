@@ -7,7 +7,7 @@ use choreo_client_core::{
     ClientError, ConnectionMode, run_daemon_connection_with_autostart,
     run_daemon_connection_with_mode,
 };
-use choreo_proto::ClientMessage;
+use choreo_proto::ClientMessageType;
 use crossbeam_channel as channel;
 use crossbeam_channel::select;
 use crossterm::event::{
@@ -69,7 +69,7 @@ pub(crate) use daemon::handle_daemon_message;
 #[cfg(test)]
 use crate::selection;
 #[cfg(test)]
-use choreo_proto::DaemonMessage;
+use choreo_proto::{DaemonMessage, DaemonMessageType};
 
 /// Keyboard enhancements requested from the terminal via the kitty keyboard
 /// protocol (`CSI > flags u`), pushed at startup and re-pushed after resume.
@@ -187,7 +187,7 @@ fn notify_disconnected(rx: &channel::Receiver<()>) -> bool {
 pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     tracing::info!("[choreo-tui] run_app starting");
 
-    let (client_tx, client_rx) = crossbeam_channel::unbounded::<ClientMessage>();
+    let (client_tx, client_rx) = crossbeam_channel::unbounded::<ClientMessageType>();
     // The address that keys this daemon's unlock key in known_servers: the
     // actual dial address for TCP, the unix socket path otherwise. Derived
     // up front (by reference) because `mode` is moved into the connection
@@ -575,7 +575,7 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     if let Some(private_key) = choreo_client_core::try_auto_unlock_key(&app.connection_addr) {
         tracing::info!("[choreo-tui] auto-unlocking daemon on connect");
         app.pending_unlock_key = Some(private_key.clone());
-        let _ = client_tx.send(ClientMessage::Unlock { private_key });
+        let _ = client_tx.send(ClientMessageType::Unlock { private_key });
     } else {
         tracing::info!("[choreo-tui] no unlock key available — awaiting keystore status");
         // Startup feedback while the daemon's authoritative keystore status
@@ -593,13 +593,13 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     }
 
     client_tx
-        .send(ClientMessage::ListSessions)
+        .send(ClientMessageType::ListSessions)
         .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
     client_tx
-        .send(ClientMessage::ListAccounts)
+        .send(ClientMessageType::ListAccounts)
         .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
     client_tx
-        .send(ClientMessage::SubscribeAllActivity)
+        .send(ClientMessageType::SubscribeAllActivity)
         .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
     let result = run_ui_loop(
         &mut terminal,
@@ -674,7 +674,7 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
 fn run_ui_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
     ui_rx: &channel::Receiver<UiEvent>,
     image_result_rx: &channel::Receiver<ImageResult>,
     terminal_rx: &channel::Receiver<Event>,
@@ -943,7 +943,7 @@ fn shift_char(c: char) -> char {
 pub(crate) fn handle_terminal_event(
     event: Event,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
 ) -> Result<(), ClientError> {
     // Normalise kitty-protocol SHIFT reporting before anything else so the
     // paste guard and all page handlers see legacy-equivalent events.
@@ -1116,7 +1116,7 @@ fn paste_into_text_state(state: &mut impl tui_prompts::State, data: &str) {
 fn handle_fullscreen_event(
     event: &Event,
     app: &mut App,
-    _client_tx: &crossbeam_channel::Sender<ClientMessage>,
+    _client_tx: &crossbeam_channel::Sender<ClientMessageType>,
 ) {
     let Event::Key(key) = event else {
         return;
@@ -1137,7 +1137,7 @@ fn handle_fullscreen_event(
 fn handle_ui_event(
     event: UiEvent,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessage>,
+    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
 ) -> Result<bool, ClientError> {
     match event {
         UiEvent::Daemon(message) => {
@@ -2092,9 +2092,11 @@ mod tests {
         assert_eq!(app.status.as_deref(), Some("daemon started"));
 
         handle_ui_event(
-            UiEvent::Daemon(Box::new(DaemonMessage::AccountListFailed {
-                error: "boom".to_string(),
-            })),
+            UiEvent::Daemon(Box::new(DaemonMessage::broadcast(
+                DaemonMessageType::AccountListFailed {
+                    error: "boom".to_string(),
+                },
+            ))),
             &mut app,
             &tx,
         )
@@ -2117,9 +2119,11 @@ mod tests {
         app.status_is_transient = false;
 
         handle_ui_event(
-            UiEvent::Daemon(Box::new(DaemonMessage::AccountListFailed {
-                error: "boom".to_string(),
-            })),
+            UiEvent::Daemon(Box::new(DaemonMessage::broadcast(
+                DaemonMessageType::AccountListFailed {
+                    error: "boom".to_string(),
+                },
+            ))),
             &mut app,
             &tx,
         )
@@ -2135,8 +2139,12 @@ mod tests {
         // generic "connection closed" text.
         let mut app = test_app();
         let (tx, _rx) = crossbeam_channel::unbounded();
-        handle_daemon_message(DaemonMessage::ShuttingDown, &mut app, &tx)
-            .expect("handle ShuttingDown");
+        handle_daemon_message(
+            DaemonMessage::broadcast(DaemonMessageType::ShuttingDown),
+            &mut app,
+            &tx,
+        )
+        .expect("handle ShuttingDown");
 
         handle_ui_event(UiEvent::ReaderClosed, &mut app, &tx).expect("handle ReaderClosed");
 

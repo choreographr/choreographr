@@ -491,7 +491,7 @@ fn warm_request() -> WarmRequest {
         tools: Vec::new(),
         facts: facts(),
         session_id: "42".into(),
-        request_id: "7".into(),
+        stream_id: "7".into(),
         max_output_tokens: 1,
     }
 }

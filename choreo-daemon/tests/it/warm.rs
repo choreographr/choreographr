@@ -36,7 +36,7 @@ use choreo_daemon::broadcast::{LagLimits, SubscriberSink};
 use choreo_daemon::cache_warm::{CacheWarmingMode, MeterKind, WarmPolicy};
 use choreo_daemon::providers::InferenceProvider;
 use choreo_daemon::{RequestContext, SessionCommand, session_main};
-use choreo_proto::{DaemonMessage, OutputStream, SessionEvent};
+use choreo_proto::{DaemonMessage, DaemonMessageType, OutputStream, SessionEvent};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -223,8 +223,8 @@ fn drain_until_done(rx: &crossbeam_channel::Receiver<DaemonMessage>) -> (Vec<u8>
         let msg = rx
             .recv_timeout(TIMEOUT)
             .unwrap_or_else(|e| panic!("timed out waiting for daemon message: {e:?}"));
-        match msg {
-            DaemonMessage::Session {
+        match msg.inner {
+            DaemonMessageType::Session {
                 event:
                     SessionEvent::OutputChunk {
                         stream: OutputStream::Answer,
@@ -233,7 +233,7 @@ fn drain_until_done(rx: &crossbeam_channel::Receiver<DaemonMessage>) -> (Vec<u8>
                     },
                 ..
             } => answer.extend_from_slice(&data),
-            DaemonMessage::Session {
+            DaemonMessageType::Session {
                 event: SessionEvent::TurnAppended { turn, .. },
                 ..
             } => {
@@ -244,7 +244,7 @@ fn drain_until_done(rx: &crossbeam_channel::Receiver<DaemonMessage>) -> (Vec<u8>
                     transcript.push_str(&result.content);
                 }
             }
-            DaemonMessage::Session {
+            DaemonMessageType::Session {
                 event: SessionEvent::Done { .. },
                 ..
             } => break,
@@ -301,7 +301,7 @@ fn warm_ping_fires_during_a_tool_run_and_stays_out_of_context() {
         .expect("set model");
     session_tx
         .send(SessionCommand::RunInput {
-            request_id: 1,
+            stream_id: 1,
             input: b"run the tool".to_vec(),
         })
         .expect("run input");
@@ -380,7 +380,7 @@ fn requests_metered_account_never_pings() {
         .expect("set model");
     session_tx
         .send(SessionCommand::RunInput {
-            request_id: 1,
+            stream_id: 1,
             input: b"run the tool".to_vec(),
         })
         .expect("run input");

@@ -13,7 +13,8 @@
 
 use crate::error::ClientError;
 use choreo_proto::{
-    ClientMessage, DaemonMessage, ProtoError, UnixStream, connect_unix, read_message, write_message,
+    ClientMessage, ClientMessageType, DaemonMessage, ProtoError, UnixStream, connect_unix,
+    read_message, write_message,
 };
 use choreo_transport::error::TransportError;
 use choreo_transport::handshake::{
@@ -88,7 +89,7 @@ pub fn run_daemon_reader<R: BufRead>(
 pub fn run_daemon_connection(
     socket_path: &str,
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: CrossbeamReceiver<choreo_proto::ClientMessage>,
+    from_ui: CrossbeamReceiver<ClientMessageType>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     info!("connecting to daemon at {socket_path}");
@@ -123,7 +124,7 @@ pub fn run_daemon_connection_with_autostart(
     socket_path: &str,
     ensure_daemon: &mut dyn FnMut() -> Result<(), ClientError>,
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: CrossbeamReceiver<choreo_proto::ClientMessage>,
+    from_ui: CrossbeamReceiver<ClientMessageType>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     info!("connecting to daemon at {socket_path}");
@@ -148,7 +149,7 @@ pub fn run_daemon_connection_with_autostart(
 fn pump_connection(
     stream: UnixStream,
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: CrossbeamReceiver<choreo_proto::ClientMessage>,
+    from_ui: CrossbeamReceiver<ClientMessageType>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     let reader = BufReader::new(stream.try_clone()?);
@@ -159,7 +160,12 @@ fn pump_connection(
     // the reader sends at most one stop signal, so capacity 1 never blocks it.
     let (writer_shutdown_tx, writer_shutdown_rx) = crossbeam_channel::bounded::<()>(1);
 
+    // This writer thread is the client's SINGLE send site: it owns the
+    // per-connection request-id counter and stamps every outbound frame. The
+    // counter starts at 0 and increments per send, never reused for the
+    // connection's life (the daemon echoes the id onto the matching reply).
     let writer_handle = thread::spawn(move || {
+        let mut next_id: u64 = 0;
         loop {
             // Event-driven wait: block until EITHER a UI message arrives OR the
             // reader signals shutdown — no polling.  The message arm is FIRST
@@ -168,8 +174,10 @@ fn pump_connection(
             // matching the previous drain-then-stop behaviour exactly.
             crossbeam_channel::select_biased! {
                 recv(from_ui) -> msg => match msg {
-                    Ok(msg) => {
-                        if let Err(e) = write_message(&mut writer, &msg) {
+                    Ok(inner) => {
+                        let framed = ClientMessage::request(next_id, inner);
+                        next_id = next_id.wrapping_add(1);
+                        if let Err(e) = write_message(&mut writer, &framed) {
                             warn!("writer thread write error: {e}");
                             break;
                         }
@@ -291,7 +299,7 @@ pub fn run_daemon_tcp_connection(
     addr: &str,
     server_pk: &[u8; 32],
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: CrossbeamReceiver<ClientMessage>,
+    from_ui: CrossbeamReceiver<ClientMessageType>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     info!("connecting to daemon at {addr}");
@@ -351,7 +359,7 @@ fn ik_handshake_and_serve(
     client_sk: &[u8; 32],
     server_pk: &[u8; 32],
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: CrossbeamReceiver<ClientMessage>,
+    from_ui: CrossbeamReceiver<ClientMessageType>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     let noise = ik_handshake_raw(tcp, client_sk, server_pk).map_err(|e| {
@@ -392,7 +400,7 @@ fn ik_handshake_and_serve(
 pub fn run_daemon_tcp_connection_xx_first_contact(
     addr: &str,
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: CrossbeamReceiver<ClientMessage>,
+    from_ui: CrossbeamReceiver<ClientMessageType>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
     on_first_contact: impl FnOnce([u8; 32]) -> bool,
 ) -> Result<(), ClientError> {
@@ -442,7 +450,7 @@ pub fn run_daemon_tcp_connection_xx_first_contact(
 fn serve_noise_connection(
     mut noise: choreo_transport::noise::NoiseStream,
     mut handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: CrossbeamReceiver<ClientMessage>,
+    from_ui: CrossbeamReceiver<ClientMessageType>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     // Channel to signal the writer thread to stop when the reader finishes.
@@ -455,12 +463,17 @@ fn serve_noise_connection(
     // message arm is FIRST (biased) so queued UI messages are drained before a
     // simultaneous stop is honoured; no socket-level timeout is set.
     let mut writer = noise.try_clone().map_err(ClientError::Io)?;
+    // The noise writer thread is this connection's single send site: it owns
+    // the per-connection request-id counter and stamps every outbound frame.
     let writer_handle = thread::spawn(move || {
+        let mut next_id: u64 = 0;
         loop {
             crossbeam_channel::select_biased! {
                 recv(from_ui) -> msg => match msg {
-                    Ok(msg) => {
-                        if let Err(e) = writer.send_client_message(&msg) {
+                    Ok(inner) => {
+                        let framed = ClientMessage::request(next_id, inner);
+                        next_id = next_id.wrapping_add(1);
+                        if let Err(e) = writer.send_client_message(&framed) {
                             warn!("writer thread error: {e}");
                             break;
                         }
@@ -673,7 +686,7 @@ pub fn verify_daemon_authorization(addr: &str, server_pk: &[u8; 32]) -> Result<(
 pub fn run_daemon_tcp_connection_pinned(
     addr: &str,
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: CrossbeamReceiver<ClientMessage>,
+    from_ui: CrossbeamReceiver<ClientMessageType>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     let known = crate::known_servers::KnownServers::load()?;
@@ -764,7 +777,7 @@ fn run_daemon_connection_in_process(
     daemon_tx: CrossbeamSender<ClientMessage>,
     daemon_rx: CrossbeamReceiver<DaemonMessage>,
     mut handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: CrossbeamReceiver<ClientMessage>,
+    from_ui: CrossbeamReceiver<ClientMessageType>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) {
     info!("serving in-process (embedded daemon) connection");
@@ -782,12 +795,18 @@ fn run_daemon_connection_in_process(
     // write, and a failed send (all daemon-side receivers dropped) is the
     // broken-pipe analogue.  The message arm is FIRST (biased) so queued UI
     // messages are drained before a simultaneous stop is honoured.
+    // The in-process writer thread is this connection's single send site: it
+    // owns the per-connection request-id counter and stamps every outbound
+    // frame before forwarding it into the embedded daemon's channel.
     let writer_handle = thread::spawn(move || {
+        let mut next_id: u64 = 0;
         loop {
             crossbeam_channel::select_biased! {
                 recv(from_ui) -> msg => match msg {
-                    Ok(msg) => {
-                        if daemon_tx.send(msg).is_err() {
+                    Ok(inner) => {
+                        let framed = ClientMessage::request(next_id, inner);
+                        next_id = next_id.wrapping_add(1);
+                        if daemon_tx.send(framed).is_err() {
                             warn!(
                                 "writer thread: daemon receiver gone (embedded connection closed)"
                             );
@@ -845,7 +864,7 @@ fn run_daemon_connection_in_process(
 pub fn run_daemon_connection_with_mode(
     mode: ConnectionMode,
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: CrossbeamReceiver<ClientMessage>,
+    from_ui: CrossbeamReceiver<ClientMessageType>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     match mode {
@@ -881,6 +900,7 @@ pub fn run_daemon_connection_with_mode(
 #[cfg(test)]
 mod in_process_tests {
     use super::*;
+    use choreo_proto::DaemonMessageType;
     use choreo_proto::SessionSummary;
 
     /// Bare in-process link — two crossbeam channels, NO real daemon. The
@@ -891,14 +911,14 @@ mod in_process_tests {
     /// real embedded daemon signals disconnect.
     fn make_link() -> (
         ConnectionMode,
-        CrossbeamSender<ClientMessage>,
-        CrossbeamReceiver<ClientMessage>,
+        CrossbeamSender<ClientMessageType>,
+        CrossbeamReceiver<ClientMessageType>,
         crossbeam_channel::Receiver<ClientMessage>,
         crossbeam_channel::Sender<DaemonMessage>,
     ) {
         let (client_tx, client_rx) = crossbeam_channel::unbounded::<ClientMessage>();
         let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonMessage>();
-        let (from_ui_tx, from_ui_rx) = crossbeam_channel::unbounded::<ClientMessage>();
+        let (from_ui_tx, from_ui_rx) = crossbeam_channel::unbounded::<ClientMessageType>();
         let mode = ConnectionMode::InProcess {
             daemon_tx: client_tx,
             daemon_rx,
@@ -911,7 +931,7 @@ mod in_process_tests {
     /// receiver of every `DaemonMessage` it handled, in order.
     fn spawn_connection(
         mode: ConnectionMode,
-        from_ui: CrossbeamReceiver<ClientMessage>,
+        from_ui: CrossbeamReceiver<ClientMessageType>,
         handle: impl FnMut(DaemonMessage) + Send + 'static,
     ) -> thread::JoinHandle<(
         Result<(), ClientError>,
@@ -944,13 +964,20 @@ mod in_process_tests {
         let (mode, from_ui_tx, from_ui_rx, client_rx, daemon_tx) = make_link();
         thread::spawn(move || {
             for msg in client_rx {
-                let reply = match msg {
-                    ClientMessage::Ping => DaemonMessage::Pong,
-                    ClientMessage::ListModels => DaemonMessage::Models {
-                        models: vec!["m1".to_string()],
-                        selected_model: None,
-                    },
-                    ClientMessage::Lock => DaemonMessage::Locked,
+                let reply = match &msg.inner {
+                    ClientMessageType::Ping => {
+                        DaemonMessage::reply(msg.id, DaemonMessageType::Pong)
+                    }
+                    ClientMessageType::ListModels => DaemonMessage::reply(
+                        msg.id,
+                        DaemonMessageType::Models {
+                            models: vec!["m1".to_string()],
+                            selected_model: None,
+                        },
+                    ),
+                    ClientMessageType::Lock => {
+                        DaemonMessage::reply(msg.id, DaemonMessageType::Locked)
+                    }
                     _ => continue,
                 };
                 if daemon_tx.send(reply).is_err() {
@@ -962,9 +989,9 @@ mod in_process_tests {
         });
 
         let requests = [
-            ClientMessage::Ping,
-            ClientMessage::ListModels,
-            ClientMessage::Lock,
+            ClientMessageType::Ping,
+            ClientMessageType::ListModels,
+            ClientMessageType::Lock,
         ];
         for request in &requests {
             from_ui_tx.send(request.clone()).expect("from_ui open");
@@ -979,17 +1006,22 @@ mod in_process_tests {
             .expect("join");
         result.expect("in-process connection must end cleanly on channel close");
 
-        // Every reply arrived, in order, before the clean EOF.
+        // Every reply arrived, in order, before the clean EOF. The writer
+        // stamped each outbound frame with a fresh per-connection id (0, 1, 2),
+        // and the fake daemon echoed it back.
         let replies: Vec<DaemonMessage> = seen_rx.into_iter().collect();
         assert_eq!(
             replies,
             vec![
-                DaemonMessage::Pong,
-                DaemonMessage::Models {
-                    models: vec!["m1".to_string()],
-                    selected_model: None,
-                },
-                DaemonMessage::Locked,
+                DaemonMessage::reply(0, DaemonMessageType::Pong),
+                DaemonMessage::reply(
+                    1,
+                    DaemonMessageType::Models {
+                        models: vec!["m1".to_string()],
+                        selected_model: None,
+                    },
+                ),
+                DaemonMessage::reply(2, DaemonMessageType::Locked),
             ]
         );
     }
@@ -1003,36 +1035,41 @@ mod in_process_tests {
         thread::spawn(move || {
             let mut pings = 0usize;
             for msg in client_rx {
-                if matches!(msg, ClientMessage::Ping) {
+                if matches!(msg.inner, ClientMessageType::Ping) {
                     pings += 1;
-                    let _ = daemon_tx.send(DaemonMessage::Sessions {
-                        sessions: vec![SessionSummary {
-                            session_id: pings as u64,
-                            title: None,
-                            selected_model: None,
-                            parent_session_id: None,
-                            working_dir: None,
-                            created_at: 0,
-                            last_modified: 0,
-                            turn_count: 0,
-                            status: choreo_proto::SessionStatus::Inactive,
-                            active_tool_groups: vec![],
-                            account_name: None,
-                            reasoning_effort: None,
-                            token_usage: None,
-                            context_window: None,
-                            last_prompt_tokens: None,
-                            pinned: false,
-                            archived_at: None,
-                        }],
-                    });
+                    let _ = daemon_tx.send(DaemonMessage::reply(
+                        msg.id,
+                        DaemonMessageType::Sessions {
+                            sessions: vec![SessionSummary {
+                                session_id: pings as u64,
+                                title: None,
+                                selected_model: None,
+                                parent_session_id: None,
+                                working_dir: None,
+                                created_at: 0,
+                                last_modified: 0,
+                                turn_count: 0,
+                                status: choreo_proto::SessionStatus::Inactive,
+                                active_tool_groups: vec![],
+                                account_name: None,
+                                reasoning_effort: None,
+                                token_usage: None,
+                                context_window: None,
+                                last_prompt_tokens: None,
+                                pinned: false,
+                                archived_at: None,
+                            }],
+                        },
+                    ));
                 }
             }
         });
 
         // Multiple messages through the writer while it is alive.
         for _ in 0..5 {
-            from_ui_tx.send(ClientMessage::Ping).expect("from_ui open");
+            from_ui_tx
+                .send(ClientMessageType::Ping)
+                .expect("from_ui open");
         }
         drop(from_ui_tx);
 
@@ -1042,8 +1079,8 @@ mod in_process_tests {
         result.expect("clean end after from_ui close");
         let replies: Vec<u64> = seen_rx
             .into_iter()
-            .map(|m| match m {
-                DaemonMessage::Sessions { sessions } => sessions[0].session_id,
+            .map(|m| match m.inner {
+                DaemonMessageType::Sessions { sessions } => sessions[0].session_id,
                 other => panic!("unexpected message: {other:?}"),
             })
             .collect();
@@ -1065,24 +1102,29 @@ mod in_process_tests {
             // channel-close EOF. `client_rx` is dropped un-received — the
             // daemon may vanish while client messages are still in flight.
             let _ = client_rx;
-            let _ = daemon_tx.send(DaemonMessage::ShuttingDown);
+            let _ = daemon_tx.send(DaemonMessage::broadcast(DaemonMessageType::ShuttingDown));
             drop(daemon_tx);
         });
 
         // The UI sender stays OPEN for the whole test: the connection must
         // still end because the daemon side is gone.
-        from_ui_tx.send(ClientMessage::Ping).expect("from_ui open");
+        from_ui_tx
+            .send(ClientMessageType::Ping)
+            .expect("from_ui open");
 
         let (result, seen_rx) = spawn_connection(mode, from_ui_rx, |_| {})
             .join()
             .expect("join");
         result.expect("daemon-side close must be a clean EOF");
         let replies: Vec<DaemonMessage> = seen_rx.into_iter().collect();
-        assert_eq!(replies, vec![DaemonMessage::ShuttingDown]);
+        assert_eq!(
+            replies,
+            vec![DaemonMessage::broadcast(DaemonMessageType::ShuttingDown)]
+        );
         // The pump must NOT have closed `from_ui` itself (it only ever
         // drains it): a late send is delivered into the channel — it simply
         // has no consumer. It must not panic or error.
-        let _ = from_ui_tx.send(ClientMessage::Ping);
+        let _ = from_ui_tx.send(ClientMessageType::Ping);
     }
 
     /// The optional external shutdown channel stops the writer even when its
@@ -1175,7 +1217,7 @@ mod in_process_tests {
             hook_calls += 1;
             Err(ClientError::DaemonStart("test: no daemon".to_string()))
         };
-        let (from_ui_tx, from_ui_rx) = crossbeam_channel::unbounded::<ClientMessage>();
+        let (from_ui_tx, from_ui_rx) = crossbeam_channel::unbounded::<ClientMessageType>();
         drop(from_ui_tx); // the pump's writer thread ends immediately
 
         let error = run_daemon_connection_with_autostart(

@@ -5,7 +5,7 @@
 //! it). A project's `.mcp.json` travels with a checkout the user may not have
 //! written, so its servers — and, critically, any `${VAR}` expansion their
 //! `env`/`headers` request — are gated behind an explicit whole-project trust
-//! decision ([`ClientMessage::McpTrust`](choreo_proto::ClientMessage::McpTrust)).
+//! decision ([`ClientMessageType::McpTrust`](choreo_proto::ClientMessageType::McpTrust)).
 //!
 //! Trust is keyed by the EXACT canonical project root (see
 //! [`crate::mcp::project_root_for`]) with NO ancestor inheritance: trusting

@@ -12,7 +12,7 @@ use choreo_client_core::{
     Command, McpCommand, build_add_credential_message, parse_input_line, resolve_private_key,
 };
 use choreo_markdown::render_markdown_html;
-use choreo_proto::{ClientMessage, socket_path};
+use choreo_proto::{ClientMessageType, socket_path};
 use crossbeam_channel::{Receiver, Sender};
 use std::cell::Cell;
 use tracing::{debug, error, info, warn};
@@ -22,7 +22,7 @@ use crate::tg_api::Bot;
 
 /// Run the Telegram bridge until the process exits.
 ///
-/// Consumes the bridge's halves: `bridge_tx` carries [`ClientMessage`]s to the
+/// Consumes the bridge's halves: `bridge_tx` carries [`ClientMessageType`]s to the
 /// daemon and `bridge_rx` yields the [`BridgeEvent`]s to render. `admin_ids` is
 /// the set of Telegram user ids allowed to drive the daemon. Blocks forever in
 /// the poll loop — an update-fetch error is logged and retried after a short
@@ -30,7 +30,7 @@ use crate::tg_api::Bot;
 pub fn run(
     bot_token: &str,
     admin_ids: Vec<i64>,
-    bridge_tx: Sender<ClientMessage>,
+    bridge_tx: Sender<ClientMessageType>,
     bridge_rx: Receiver<BridgeEvent>,
 ) {
     let bot = Bot::new(bot_token);
@@ -59,7 +59,7 @@ pub fn run(
     let state = TelegramState {
         bridge_tx,
         admin_ids,
-        request_id: Cell::new(0),
+        stream_id: Cell::new(0),
         chat_id_tx,
     };
 
@@ -87,9 +87,9 @@ pub fn run(
 }
 
 struct TelegramState {
-    bridge_tx: Sender<ClientMessage>,
+    bridge_tx: Sender<ClientMessageType>,
     admin_ids: Vec<i64>,
-    request_id: Cell<u32>,
+    stream_id: Cell<u64>,
     chat_id_tx: Sender<i64>,
 }
 
@@ -119,13 +119,13 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
 
     let _ = state.chat_id_tx.send(chat_id_val);
 
-    let mut request_id = state.request_id.get();
-    let command = parse_input_line(text, &mut request_id);
-    state.request_id.set(request_id);
+    let mut stream_id = state.stream_id.get();
+    let command = parse_input_line(text, &mut stream_id);
+    state.stream_id.set(stream_id);
 
     match command {
         Command::Send(client_msg) => {
-            if let ClientMessage::RunInput { input, .. } = &client_msg {
+            if let ClientMessageType::RunInput { input, .. } = &client_msg {
                 let echo = format!("> {}", String::from_utf8_lossy(input));
                 if let Err(e) = bot.send_message(chat_id_val, &echo, None) {
                     warn!("failed to send echo to telegram: {e}");
@@ -144,7 +144,10 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
         }
         Command::Unlock { method } => match resolve_private_key(&method, &socket_path()) {
             Ok(private_key) => {
-                if let Err(e) = state.bridge_tx.send(ClientMessage::Unlock { private_key }) {
+                if let Err(e) = state
+                    .bridge_tx
+                    .send(ClientMessageType::Unlock { private_key })
+                {
                     warn!("failed to send unlock to bridge: {e}");
                 }
             }
@@ -169,7 +172,7 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
         Command::RemoveCredential { service } => {
             if let Err(e) = state
                 .bridge_tx
-                .send(ClientMessage::RemoveCredential { service })
+                .send(ClientMessageType::RemoveCredential { service })
             {
                 warn!("failed to send remove credential to bridge: {e}");
             }
@@ -191,7 +194,10 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
         Command::RefreshModels { force } => {
             // The daemon refresh is client-agnostic: forward the request over
             // the bridge like any other Send command.
-            if let Err(e) = state.bridge_tx.send(ClientMessage::RefreshModels { force }) {
+            if let Err(e) = state
+                .bridge_tx
+                .send(ClientMessageType::RefreshModels { force })
+            {
                 warn!("failed to send refresh-models to bridge: {e}");
             }
         }
@@ -200,12 +206,12 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
             // request, config reload, or reconnect over the bridge like any
             // other Send command.
             let msg = match mcp {
-                McpCommand::Status => ClientMessage::McpStatusRequest,
-                McpCommand::Reconnect { slug } => ClientMessage::McpReconnect { slug },
-                McpCommand::Reload => ClientMessage::McpReload,
-                McpCommand::Trust => ClientMessage::McpTrust,
-                McpCommand::Untrust => ClientMessage::McpUntrust,
-                McpCommand::TrustList => ClientMessage::McpTrustList,
+                McpCommand::Status => ClientMessageType::McpStatusRequest,
+                McpCommand::Reconnect { slug } => ClientMessageType::McpReconnect { slug },
+                McpCommand::Reload => ClientMessageType::McpReload,
+                McpCommand::Trust => ClientMessageType::McpTrust,
+                McpCommand::Untrust => ClientMessageType::McpUntrust,
+                McpCommand::TrustList => ClientMessageType::McpTrustList,
             };
             if let Err(e) = state.bridge_tx.send(msg) {
                 warn!("failed to send mcp command to bridge: {e}");
