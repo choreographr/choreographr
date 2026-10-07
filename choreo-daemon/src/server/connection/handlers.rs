@@ -403,7 +403,7 @@ pub(super) fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -
             );
         }
         ClientMessageType::SetSessionAccount { name } => {
-            handle_client_set_session_account(name, ctx);
+            handle_client_set_session_account(name, kind, ctx);
         }
         ClientMessageType::SubscribeAllActivity => {
             let _ = ctx
@@ -423,12 +423,13 @@ pub(super) fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -
             ctx.ack(kind);
         }
         _ => {
-            // Defensive net for a request the dispatch does not (yet) answer —
-            // today only `GetSessionState`, which is defined on the wire but
-            // has no connection-thread handler. The variant set IS the wire
-            // contract, so this arm should not be reached in practice, but it
-            // must still REPLY rather than drop: an unanswered request strands
-            // the client's pending slot until its timeout.
+            // `ClientMessageType` is `#[non_exhaustive]`, so this arm is
+            // REQUIRED for the match to compile — it is the escape hatch for a
+            // wire variant a newer client sends that this build does not know,
+            // not dead code. It must still REPLY rather than drop: an
+            // unanswered request would strand the client's pending slot until
+            // its timeout, so an unrecognized request is answered with a
+            // terminal `Failed`.
             warn!("unhandled client message (kind {kind:?})");
             ctx.reply_handle().send(DaemonMessageType::Failed {
                 kind,
@@ -563,7 +564,11 @@ pub(super) fn handle_client_attach_session(
 /// a targeted session-scoped `SessionFailed { operation: "set_account" }`
 /// directly (the shape every front-end already renders); on success the
 /// session thread acks through the minted reply target.
-pub(super) fn handle_client_set_session_account(name: String, ctx: &mut ClientCtx) {
+pub(super) fn handle_client_set_session_account(
+    name: String,
+    kind: MessageKind,
+    ctx: &mut ClientCtx,
+) {
     // Clone the session sender so the reply-target mint below can borrow `ctx`
     // freely (an owned `Sender` avoids holding a borrow of `ctx` across it).
     let Some(tx) = ctx.attached_session_tx.clone() else {
@@ -584,7 +589,7 @@ pub(super) fn handle_client_set_session_account(name: String, ctx: &mut ClientCt
     });
     match rx.recv() {
         Ok(true) => {
-            let target = ctx.reply_target(MessageKind::SetSessionAccount);
+            let target = ctx.reply_target(kind);
             let _ = tx.send(SessionCommand::SetAccount {
                 name,
                 reply: Some(target),
