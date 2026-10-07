@@ -1,7 +1,10 @@
 use super::*;
-use crate::state::find_turn_at_row;
+use crate::markdown_render::LineChrome;
+use crate::state::{App, find_turn_at_row};
 use crate::test_util::test_app;
 use choreo_proto::{ToolResultRecord, Turn};
+use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 /// Build a turn with a single assistant text line (and no user text) so
 /// the rendered layout is exactly one line per turn — the easiest canvas
@@ -538,16 +541,17 @@ fn row_highlighted(app: &mut App, screen_row: u16) -> bool {
                 .unwrap_or(0),
         )
     };
-    let mut lines = cached_lines.to_vec();
-    apply_selection_to_lines(
-        app,
+    // The whole-selection table highlight is built once per frame in
+    // production; the test builds it once and threads it in identically.
+    let table = table_highlight(app);
+    let turn = TurnSlice {
         turn_start,
-        &offsets,
-        &content_ranges,
-        &chrome_ranges,
-        0,
-        &mut lines,
-    );
+        text_offsets: &offsets,
+        content_ranges: &content_ranges,
+        chrome_ranges: &chrome_ranges,
+    };
+    let mut lines = cached_lines.to_vec();
+    apply_selection_to_lines(app, &table, &turn, 0, &mut lines);
     let line_idx = offsets
         .partition_point(|&o| o <= visual_row)
         .min(lines.len().saturating_sub(1));
@@ -657,15 +661,14 @@ fn apply_selection_to_lines_short_history_styles_visible_rows() {
         )
     };
     let mut lines = cached_lines.to_vec();
-    apply_selection_to_lines(
-        &app,
+    let table = table_highlight(&app);
+    let turn = TurnSlice {
         turn_start,
-        &offsets,
-        &content_ranges,
-        &chrome_ranges,
-        0,
-        &mut lines,
-    );
+        text_offsets: &offsets,
+        content_ranges: &content_ranges,
+        chrome_ranges: &chrome_ranges,
+    };
+    apply_selection_to_lines(&app, &table, &turn, 0, &mut lines);
     assert!(
         lines
             .iter()
@@ -1100,15 +1103,14 @@ fn selected_highlight_text(app: &App) -> String {
         .and_then(Option::as_ref)
         .expect("render cache");
     let mut lines = cached.rendered.lines.to_vec();
-    apply_selection_to_lines(
-        app,
-        0,
-        &cached.rendered.visual_offsets,
-        &cached.rendered.content_ranges,
-        &cached.rendered.chrome_ranges,
-        0,
-        &mut lines,
-    );
+    let table = table_highlight(app);
+    let turn = TurnSlice {
+        turn_start: 0,
+        text_offsets: &cached.rendered.visual_offsets,
+        content_ranges: &cached.rendered.content_ranges,
+        chrome_ranges: &cached.rendered.chrome_ranges,
+    };
+    apply_selection_to_lines(app, &table, &turn, 0, &mut lines);
     let mut out = String::new();
     for line in &lines {
         for span in &line.spans {
@@ -1164,5 +1166,34 @@ fn table_reading_order_fill_highlights_selected_cells() {
         selected, "cdef ghij klmn opqr st",
         "only the copied text is highlighted: {selected:?}"
     );
+    app.text_selection = None;
+}
+
+#[test]
+fn table_zwj_emoji_highlight_matches_copy() {
+    // A ZWJ emoji family in a table cell: the highlighted extent and the
+    // copied text must agree.  The trim used to measure columns by summing
+    // each char's width, while the copy and the highlight are grapheme-cluster
+    // based — for a ZWJ family the char-width sum (2 per person glyph) drifts
+    // well past the cluster's 2 columns, so the highlight spilled into the
+    // cell padding while the copy kept only the emoji.  Pinning highlight ==
+    // copy for a ZWJ cell is the invariant `selection.rs` depends on.
+    let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+    let md = format!("| x |\n|---|\n| {family} |");
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 40;
+    app.display_for(0).view.insert_or_replace(0, turn(&md));
+    app.rebuild_height_prefix();
+    let (start, end) = locate(&app, family);
+    start_selection(&mut app, start.0, start.1);
+    update_selection(&mut app, end.0, end.1);
+    let copied = extract_selection_text(&app).expect("selection should extract");
+    let highlighted = selected_highlight_text(&app);
+    assert_eq!(
+        highlighted, copied,
+        "the highlighted extent must equal the copied text"
+    );
+    assert_eq!(copied, family, "only the emoji is copied: {copied:?}");
     app.text_selection = None;
 }

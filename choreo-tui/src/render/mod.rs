@@ -540,6 +540,13 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let visible_turn_ids: Vec<u32> = app.display_for(session_id).visible_turn_ids.clone();
     let len = visible_turn_ids.len();
 
+    // Build the whole-selection table highlight ONCE per frame, before the
+    // visible-turn loop: it scans the selection's content lines (viewport-
+    // independent), so recomputing it inside the loop would cost
+    // O(visible_turns × selection_span) for nothing.  Empty when no selection
+    // is active.
+    let table_highlight = selection::table_highlight(app);
+
     // Iterate visible turns from newest to oldest.  clipped_area consumes
     // rows_to_skip from the bottom (newest end) so that turns fully below
     // the viewport are skipped before any content is rendered.
@@ -686,10 +693,13 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 .unwrap_or(0);
             selection::apply_selection_to_lines(
                 app,
-                turn_start,
-                &text_offsets[..],
-                &content_ranges[..],
-                &chrome_ranges[..],
+                &table_highlight,
+                &selection::TurnSlice {
+                    turn_start,
+                    text_offsets: &text_offsets[..],
+                    content_ranges: &content_ranges[..],
+                    chrome_ranges: &chrome_ranges[..],
+                },
                 line_start,
                 &mut visible_lines,
             );
