@@ -9,7 +9,6 @@ use choreo_proto::{
     ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, KeystoreState, MessageKind,
     RefreshStatus, SessionEvent,
 };
-use zeroize::Zeroize;
 
 /// Whether a resolved pending slot names a `ListModels` request — i.e. the
 /// reply answers THIS client's model-list request (the only requester of
@@ -949,18 +948,22 @@ fn record_confirmed_unlock_key(app: &mut App, resolved: Option<&Pending>) {
 /// a genuinely wrong one. Takes the key out of the resolved slot so an
 /// in-process reply cannot linger after the rejection.
 fn discard_rejected_unlock_key(app: &mut App, resolved: &mut Option<Pending>) {
-    let Some(Pending {
-        context: PendingContext::UnlockKey(mut key),
-        ..
-    }) = resolved.take()
-    else {
+    // Take the slot out so it is dropped HERE; `PendingContext::drop` zeroizes
+    // the held UnlockKey, so the secret is wiped on the rejection path exactly
+    // as it is on every other exit path (resolve, timeout, connection reset). A
+    // reply whose slot carried no key (or no slot at all) has nothing to
+    // discard.
+    let Some(pending) = resolved.take() else {
         return;
     };
-    key.zeroize();
+    if !matches!(pending.context, PendingContext::UnlockKey(..)) {
+        return;
+    }
     tracing::info!(
         addr = %app.connection_addr,
         "daemon rejected the presented unlock key; the known_servers record is kept"
     );
+    // `pending` drops here, zeroizing the key via its `Drop` impl.
 }
 
 #[cfg(test)]

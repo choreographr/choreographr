@@ -28,6 +28,7 @@ use crossbeam_channel::Sender;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tracing::warn;
+use zeroize::Zeroize;
 
 /// The per-kind reply budget: how long a request may stay in flight before its
 /// slot is considered timed out.
@@ -60,8 +61,10 @@ pub enum PendingContext {
     /// No extra context — the reply's payload is self-sufficient.
     None,
     /// The unlock/bind key presented in this request, held until the daemon's
-    /// terminal reply either confirms it (record it per-daemon) or rejects it
-    /// (drop it, zeroized). Secret material — never logged.
+    /// terminal reply either confirms it (record it per-daemon) or rejects it.
+    /// Secret material — never logged, and wiped on drop (see the `Drop` impl,
+    /// so a freed allocation never retains it on any exit path: resolve,
+    /// timeout, `clear()`, or connection reset).
     UnlockKey(Vec<u8>),
     /// A turn-attachment fetch ([`ClientMessageType::GetImage`]): the
     /// (session, turn, key) the reply's bytes belong to, so a fetch can be
@@ -84,6 +87,20 @@ impl PendingContext {
         match self {
             PendingContext::UnlockKey(key) => Some(key),
             _ => None,
+        }
+    }
+}
+
+impl Drop for PendingContext {
+    /// Zeroize the presented unlock/bind key when the slot is dropped, so the
+    /// secret is never left in a freed heap allocation. This runs on EVERY exit
+    /// path a slot can take — resolve, per-kind timeout, `clear()` on connection
+    /// reset, or the front-end dropping the resolved slot itself — which is what
+    /// makes the `UnlockKey` contract hold without every caller remembering to
+    /// wipe it. The other variants carry no secret material.
+    fn drop(&mut self) {
+        if let PendingContext::UnlockKey(key) = self {
+            key.zeroize();
         }
     }
 }
