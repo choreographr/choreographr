@@ -1041,3 +1041,26 @@ fn table_wrapped_cell_rejoins_to_original_text() {
     );
     assert!(!copied.contains('│'), "no cell border copied: {copied:?}");
 }
+
+#[test]
+fn table_multi_column_wrapped_row_rejoins_onto_one_line() {
+    // A multi-column table row whose cells wrap across several display lines
+    // must copy as a single line (the display wraps are rejoined), not one line
+    // per display row.  Regression: selecting such a table copied its display
+    // rows verbatim (a newline per display row), which is what a user sees when
+    // a wrapped cell is only partially copied.
+    let md = "| Role | What it needs | Fits? |\n|---|---|---|\n| aaaa bbbb cccc dddd eeee ffff gggg | hhhh iiii jjjj kkkk llll mmmm nnnn | oooo pppp qqqq rrrr ssss tttt |";
+    let mut app = test_app();
+    app.history_viewport.width = 70;
+    app.history_viewport.height = 40;
+    app.display_for(0).view.insert_or_replace(0, turn(md));
+    app.rebuild_height_prefix();
+    let (start, _) = locate(&app, "aaaa");
+    let (_, end) = locate(&app, "tttt");
+    let copied = drag_and_finish(&mut app, start, end).expect("selection should extract");
+    assert!(
+        !copied.contains('\n'),
+        "a wrapped multi-column table row must rejoin onto one line: {copied:?}"
+    );
+    assert!(!copied.contains('│'), "no cell border copied: {copied:?}");
+}
