@@ -48,7 +48,9 @@ mod streaming;
 // re-exported here so `crate::state::X` references (in this crate and in
 // `app_tests.rs`/`render_tests.rs`) keep resolving exactly as before.
 pub(crate) use command_palette::*;
-pub(crate) use images::{ImageJobRequest, ImageSlot, slot_source, turn_image_slots};
+pub(crate) use images::{
+    ImageJobRequest, ImageSlot, slot_source, turn_image_count, turn_image_slots,
+};
 pub(crate) use input::*;
 pub(crate) use keymap::*;
 pub(crate) use layout::*;
@@ -75,6 +77,53 @@ pub(crate) const INPUT_PAD: u16 = 2;
 /// width: terminal width minus the horizontal padding on both sides.
 pub(crate) fn input_inner_width(term_width: u16) -> usize {
     term_width.saturating_sub(INPUT_PAD * 2) as usize
+}
+
+/// What a recomputed history viewport implies for the per-session render caches
+/// and the in-progress selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewportChange {
+    /// Nothing that affects the rendered content changed.  The history viewport
+    /// height can still shrink or grow (the status/error line appeared or
+    /// disappeared, the help overlay toggled, the input box grew) but no line
+    /// re-wraps, so the render caches and the selection must be left alone.
+    None,
+    /// The rendered width changed, so every line re-wraps: the width-keyed
+    /// render caches are stale and the selection's stored column anchors no
+    /// longer point at the same text.
+    Rewrap,
+    /// Only the height changed — a real vertical resize, or the chrome (the
+    /// status/error line, the help overlay, the input box) growing or shrinking.
+    /// Nothing re-wraps, so the caches and the selection stay valid, but the
+    /// heights must be recomputed because the image-block height the height
+    /// prefix reserves derives from the viewport height.  That recompute is a
+    /// cache-hit rebuild, so it is cheap enough to run for every chrome change.
+    HeightsOnly,
+}
+
+/// Classify a history-viewport change into the invalidation it warrants.
+///
+/// Pure (no terminal access) so the policy — and its full case matrix — is
+/// unit-testable.  Only the rendered WIDTH decides a re-wrap: nothing about
+/// wrapping reads the height.  Any height change recomputes the height model,
+/// because the image-block height the prefix reserves derives from the viewport
+/// height — and that recompute is a cache-hit rebuild (no re-render), so it is
+/// cheap enough to run even when a status line merely appears or disappears.
+/// See [`App::update_viewport_from_terminal_size`] for why wiping the render
+/// cache on a chrome height change was the bug.
+fn classify_viewport_change(
+    old_width: u16,
+    new_width: u16,
+    old_height: u16,
+    new_height: u16,
+) -> ViewportChange {
+    if old_width != new_width {
+        ViewportChange::Rewrap
+    } else if old_height != new_height {
+        ViewportChange::HeightsOnly
+    } else {
+        ViewportChange::None
+    }
 }
 
 /// The two-line keyboard-shortcut help overlay (toggled with `Alt+H`).
@@ -854,25 +903,50 @@ impl App {
             width: new_width,
             height: new_height,
         });
-        if old_width != new_width || old_height != self.history_viewport.height {
-            // A selection is stored as (content line, viewport column); a
-            // terminal resize re-wraps every line, so a stored column no
-            // longer points at the same text (and the anchor is deliberately
-            // never re-resolved — only the head follows the cursor).  Drop
-            // the gesture like suspend/page-switch do.
-            self.text_selection = None;
-            for display in self.session_displays.values_mut() {
-                display.render_cache.fill(None);
-                display.markers_dirty = true;
-                if old_width != new_width {
-                    tracing::debug!(
-                        "width changed ({} → {}), clearing content_dirty",
-                        old_width,
-                        new_width,
-                    );
+        // Classify the viewport change and invalidate only what it warrants.  A
+        // width change re-wraps every line, so the render caches and the
+        // selection's column anchors go.  A height change — a real vertical
+        // resize, OR the chrome (the status/error line, the help overlay, the
+        // input box) growing or shrinking — re-wraps nothing, so the caches and
+        // the selection survive; only the HEIGHTS are recomputed, because the
+        // image-block height the prefix reserves derives from the viewport
+        // height.  The old code cleared every session's render cache on any
+        // height change, which forced a full O(session) re-render the instant
+        // any status line was set or cleared (the input delay a large session
+        // showed right after a copy and on the next keystroke); the height
+        // recompute is now a cache-hit rebuild, so it is cheap enough to run for
+        // every chrome change.
+        match classify_viewport_change(old_width, new_width, old_height, new_height) {
+            ViewportChange::Rewrap => {
+                // The width changed, so every line re-wraps: the width-keyed
+                // render caches are stale and the selection's stored column
+                // anchors no longer point at the same text (the anchor is
+                // deliberately never re-resolved — only the head follows the
+                // cursor).  Drop the gesture like suspend/page-switch do, and
+                // clear every session's cache so the next frame re-renders at
+                // the new width.
+                tracing::debug!(
+                    old_width,
+                    new_width,
+                    "history width changed; invalidating render caches"
+                );
+                self.text_selection = None;
+                for display in self.session_displays.values_mut() {
+                    display.render_cache.fill(None);
+                    display.markers_dirty = true;
                     display.content_dirty = false;
                 }
             }
+            ViewportChange::HeightsOnly => {
+                // A real vertical resize: nothing re-wraps, so the caches and
+                // the selection stay valid, but the image-block height the
+                // prefix reserves derives from the viewport height, so recompute
+                // the heights (a cache-hit rebuild — no re-render).
+                for display in self.session_displays.values_mut() {
+                    display.markers_dirty = true;
+                }
+            }
+            ViewportChange::None => {}
         }
         // Session-manager list rows: full height minus the status bar (1),
         // the bordered list block (2), and the table header (1).  Must stay
@@ -1977,9 +2051,10 @@ impl SessionDisplayState {
             let mut total_img_height: usize = 0;
             // Every image slot the turn exposes (displayed + tool-result vision)
             // reserves one block, in the SAME order the render loop draws them
-            // (both derive the list from `turn_image_slots`), so a click's
-            // `image_ranges` index maps onto that slot list exactly.
-            for _ in &turn_image_slots(turn) {
+            // (the height path uses `turn_image_count`, the render loop
+            // `turn_image_slots`, and both walk the same source order), so a
+            // click's `image_ranges` index maps onto that slot list exactly.
+            for _ in 0..turn_image_count(turn) {
                 let start = text_height + total_img_height;
                 image_ranges.push((start, start + fallback_img_height));
                 total_img_height += fallback_img_height;
@@ -5532,6 +5607,60 @@ mod tests {
         }
     }
 
+    /// A minimal render-cache entry, so the resize tests below can assert
+    /// whether a viewport change preserved or wiped the cache.
+    fn dummy_cache_entry() -> RenderedCache {
+        RenderedCache {
+            key: RenderCacheKey {
+                turn_id: 0,
+                width: 0,
+                viewport_width: 0,
+                reasoning_expanded: false,
+                tool_results_collapsed: vec![],
+                content_version: 0,
+            },
+            rendered: RenderedTurn {
+                lines: Arc::from(Vec::<Line<'static>>::new()),
+                height: 0,
+                visual_offsets: Arc::from([]),
+                joins: Arc::from([]),
+                content_ranges: Arc::from([]),
+                chrome_ranges: Arc::from([]),
+                reasoning_header_idx: None,
+                tool_result_header_idxs: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn classify_viewport_change_matrix() {
+        // A width change re-wraps every line: invalidate caches + selection.
+        assert_eq!(
+            classify_viewport_change(80, 79, 30, 30),
+            ViewportChange::Rewrap
+        );
+        assert_eq!(
+            classify_viewport_change(80, 79, 30, 25),
+            ViewportChange::Rewrap
+        );
+        // Width unchanged + ANY height change → recompute the heights only
+        // (nothing re-wraps).  This covers both a real vertical resize and the
+        // status/help/input chrome growing or shrinking.
+        assert_eq!(
+            classify_viewport_change(79, 79, 30, 25),
+            ViewportChange::HeightsOnly
+        );
+        assert_eq!(
+            classify_viewport_change(79, 79, 25, 30),
+            ViewportChange::HeightsOnly
+        );
+        // Nothing changed → nothing.
+        assert_eq!(
+            classify_viewport_change(79, 79, 30, 30),
+            ViewportChange::None
+        );
+    }
+
     #[test]
     fn width_change_clears_content_dirty() {
         let mut app = test_app();
@@ -5546,26 +5675,7 @@ mod tests {
             let display = app.active_display().unwrap();
             display.content_dirty = true;
             display.markers_dirty = true;
-            display.render_cache = vec![Some(RenderedCache {
-                key: RenderCacheKey {
-                    turn_id: 0,
-                    width: 0,
-                    viewport_width: 0,
-                    reasoning_expanded: false,
-                    tool_results_collapsed: vec![],
-                    content_version: 0,
-                },
-                rendered: RenderedTurn {
-                    lines: Arc::from(Vec::<Line<'static>>::new()),
-                    height: 0,
-                    visual_offsets: Arc::from([]),
-                    joins: Arc::from([]),
-                    content_ranges: Arc::from([]),
-                    chrome_ranges: Arc::from([]),
-                    reasoning_header_idx: None,
-                    tool_result_header_idxs: vec![],
-                },
-            })];
+            display.render_cache = vec![Some(dummy_cache_entry())];
         }
 
         app.update_viewport_from_terminal_size();
@@ -5584,7 +5694,15 @@ mod tests {
     }
 
     #[test]
-    fn height_only_change_does_not_clear_content_dirty() {
+    fn height_only_change_recomputes_heights_without_wiping_cache() {
+        // A height-only change — a real vertical resize, or the chrome
+        // (status/error line, help overlay, input box) growing or shrinking —
+        // re-wraps nothing, so it must NOT wipe the render cache: doing that
+        // forced a full O(session) re-render, the input delay a large session
+        // showed right after a copy set the status and on the next keystroke
+        // that cleared it.  It DOES mark the heights dirty, because the
+        // image-block height the prefix reserves derives from the viewport
+        // height; that rebuild is a cache hit.
         let mut app = test_app();
 
         app.history_viewport.width = 79;
@@ -5596,40 +5714,24 @@ mod tests {
         {
             let display = app.active_display().unwrap();
             display.content_dirty = true;
-            display.markers_dirty = true;
-            display.render_cache = vec![Some(RenderedCache {
-                key: RenderCacheKey {
-                    turn_id: 0,
-                    width: 0,
-                    viewport_width: 0,
-                    reasoning_expanded: false,
-                    tool_results_collapsed: vec![],
-                    content_version: 0,
-                },
-                rendered: RenderedTurn {
-                    lines: Arc::from(Vec::<Line<'static>>::new()),
-                    height: 0,
-                    visual_offsets: Arc::from([]),
-                    joins: Arc::from([]),
-                    content_ranges: Arc::from([]),
-                    chrome_ranges: Arc::from([]),
-                    reasoning_header_idx: None,
-                    tool_result_header_idxs: vec![],
-                },
-            })];
+            display.markers_dirty = false;
+            display.render_cache = vec![Some(dummy_cache_entry())];
         }
 
         app.update_viewport_from_terminal_size();
 
         let display = app.active_display_ref().unwrap();
         assert!(
-            display.content_dirty,
-            "content_dirty should NOT be cleared on height-only change"
+            display.markers_dirty,
+            "a height change must recompute the heights (image blocks depend on the viewport height)"
         );
-        assert!(display.markers_dirty, "markers_dirty should remain true");
         assert!(
-            display.render_cache.iter().all(Option::is_none),
-            "render_cache should be cleared"
+            display.render_cache.iter().all(Option::is_some),
+            "a height change must NOT wipe the render cache (nothing re-wraps)"
+        );
+        assert!(
+            display.content_dirty,
+            "content_dirty must be untouched by a height-only change"
         );
     }
 

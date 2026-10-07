@@ -77,13 +77,11 @@ impl ImageSlot {
 /// draw and the rows they reserve can never disagree.
 ///
 /// Per-frame allocation: this builds a fresh `Vec` (and clones each tool-result
-/// `call_id`) on every call, and both the render loop and the height accounting
-/// call it once per turn per frame. That is accepted rather than cached —
-/// image-bearing turns are rare, so the cost is negligible beside the per-frame
-/// markdown render it accompanies. If a future workload ever makes it hot, the
-/// height path only needs the COUNT (it discards the identities), so it could
-/// use a plain `displayed_images.len() + <vision-slot count>` instead of
-/// materializing the list.
+/// `call_id`) on every call.  The RENDER loop needs the identities and calls it
+/// once per visible turn per frame; the HEIGHT accounting only needs the count
+/// and uses [`turn_image_count`] instead, so a height rebuild (which runs on
+/// every viewport-height change — a real resize, or a status/help/input row
+/// appearing) allocates nothing per turn.
 pub(crate) fn turn_image_slots(turn: &Turn) -> Vec<ImageSlot> {
     let mut slots: Vec<ImageSlot> = (0..turn.displayed_images.len())
         .map(ImageSlot::Displayed)
@@ -94,6 +92,22 @@ pub(crate) fn turn_image_slots(turn: &Turn) -> Vec<ImageSlot> {
         }
     }
     slots
+}
+
+/// The number of image blocks a turn exposes — the count [`turn_image_slots`]
+/// yields, without materializing the list or cloning any `call_id`.
+///
+/// The height accounting reserves one block per image and never needs the
+/// identities, so it uses this.  It walks the same source order as
+/// [`turn_image_slots`] (displayed images then tool-result vision images), so the
+/// two can never disagree on the count.
+pub(crate) fn turn_image_count(turn: &Turn) -> usize {
+    turn.displayed_images.len()
+        + turn
+            .tool_results
+            .iter()
+            .filter(|tr| tr.image.is_some())
+            .count()
 }
 
 /// The placeholder [`ImageMetadata`] for a tool-result vision image, derived from
@@ -474,6 +488,73 @@ mod tests {
                 turn_id: 9,
                 key: ImageKey::Displayed { index: 1 },
             }]
+        );
+    }
+
+    #[test]
+    fn turn_image_count_matches_slots_len() {
+        // The height path reserves one block per image from `turn_image_count`;
+        // the render path walks the identities from `turn_image_slots`.  Both
+        // must agree on the count for a turn mixing displayed images and
+        // tool-result vision images (and a tool result with no image, which is
+        // not counted).
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![
+                choreo_proto::ToolResultRecord {
+                    call_id: "call_a".into(),
+                    name: "read_image".into(),
+                    content: "image".into(),
+                    is_error: false,
+                    invocation_description: "read_image".into(),
+                    image: Some(choreo_proto::ImageReference {
+                        path: "/tmp/a.png".into(),
+                        mime_type: "image/png".into(),
+                        width: 8,
+                        height: 6,
+                        data: Vec::new(),
+                    }),
+                },
+                // No image → must not be counted.
+                choreo_proto::ToolResultRecord {
+                    call_id: "call_b".into(),
+                    name: "read_file".into(),
+                    content: "text".into(),
+                    is_error: false,
+                    invocation_description: "read_file".into(),
+                    image: None,
+                },
+            ],
+            displayed_images: vec![choreo_proto::DisplayedImageRecord {
+                metadata: choreo_proto::ImageMetadata {
+                    mime_type: "image/png".to_string(),
+                    width: 4,
+                    height: 4,
+                    byte_len: 4,
+                    alt: None,
+                },
+                data: b"AAAA".to_vec(),
+                tool_call_id: None,
+            }],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        assert_eq!(
+            turn_image_count(&turn),
+            2,
+            "one displayed + one vision image"
+        );
+        assert_eq!(
+            turn_image_count(&turn),
+            turn_image_slots(&turn).len(),
+            "the count must match the slot list the render path walks"
         );
     }
 
