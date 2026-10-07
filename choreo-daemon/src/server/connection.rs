@@ -1384,15 +1384,19 @@ fn handle_client_attach_session<'a>(
 /// Handle a `SetSessionAccount` client message: verify the account exists
 /// via the daemon, then set it on the attached session. The account check runs
 /// HERE, on the connection thread, so the not-found and no-session cases reply
-/// `Failed { kind: SetSessionAccount }` directly; on success the session thread
-/// acks through the minted reply target.
+/// a targeted session-scoped `SessionFailed { operation: "set_account" }`
+/// directly (the shape every front-end already renders); on success the
+/// session thread acks through the minted reply target.
 fn handle_client_set_session_account(name: String, ctx: &mut ClientCtx) {
     // Clone the session sender so the reply-target mint below can borrow `ctx`
     // freely (an owned `Sender` avoids holding a borrow of `ctx` across it).
     let Some(tx) = ctx.attached_session_tx.clone() else {
-        ctx.reply_handle().send(DaemonMessageType::Failed {
-            kind: MessageKind::SetSessionAccount,
-            error: "no session attached".into(),
+        ctx.reply_handle().send(DaemonMessageType::Session {
+            session_id: None,
+            event: SessionEvent::SessionFailed {
+                operation: "set_account".into(),
+                error: "no session attached".into(),
+            },
         });
         return;
     };
@@ -1411,9 +1415,12 @@ fn handle_client_set_session_account(name: String, ctx: &mut ClientCtx) {
             });
         }
         _ => {
-            ctx.reply_handle().send(DaemonMessageType::Failed {
-                kind: MessageKind::SetSessionAccount,
-                error: format!("account '{name}' not found"),
+            ctx.reply_handle().send(DaemonMessageType::Session {
+                session_id: *ctx.attached_session_id,
+                event: SessionEvent::SessionFailed {
+                    operation: "set_account".into(),
+                    error: format!("account '{name}' not found"),
+                },
             });
         }
     }
@@ -1756,9 +1763,17 @@ fn handle_delete_session_sync<'a>(
                 kind: MessageKind::DeleteSession,
             });
         }
-        Ok(Err(e)) => handle.send(DaemonMessageType::Failed {
-            kind: MessageKind::DeleteSession,
-            error: e.to_string(),
+        // A delete failure is session-scoped and richer than a bare
+        // `Failed`: carrying the `SessionDeleteFailed` event keeps the origin
+        // session (which the ACP keys its pending delete on) and lets every
+        // front-end reuse its existing session-scoped failure handling. The
+        // reply still carries the correlation id (reply-ness is a property of
+        // the send, not of the payload type).
+        Ok(Err(e)) => handle.send(DaemonMessageType::Session {
+            session_id: Some(session_id),
+            event: SessionEvent::SessionDeleteFailed {
+                error: e.to_string(),
+            },
         }),
         // Daemon gone: the reply is impossible, not forgotten.
         Err(_) => handle.abandon(),
@@ -1768,8 +1783,10 @@ fn handle_delete_session_sync<'a>(
 /// Handle a `SetSessionPinned`/`SetSessionArchived` client message. On success
 /// the requester gets a targeted `Accepted` IN ADDITION to the daemon's
 /// `SessionFlagsChanged` broadcast (which stays `id: None` and reaches every
-/// subscriber). On failure the requester gets a targeted `Failed { kind, error }`
-/// (`kind` names which of the two messages it was). Follows the same shape as
+/// subscriber). On failure the requester gets a targeted session-scoped
+/// `SessionFailed { operation, error }` (the operation names which of the two
+/// messages it was) — the same event shape every front-end already renders, so
+/// a pin/archive failure is never silently dropped. Follows the same shape as
 /// [`handle_delete_session_sync`].
 fn handle_set_session_flags_sync<'a>(
     ctx: &mut ClientCtx<'a>,
@@ -1787,11 +1804,25 @@ fn handle_set_session_flags_sync<'a>(
     });
     match result {
         Ok(Ok(())) => handle.send(DaemonMessageType::Accepted { kind }),
-        Ok(Err(e)) => handle.send(DaemonMessageType::Failed {
-            kind,
-            error: e.to_string(),
+        Ok(Err(e)) => handle.send(DaemonMessageType::Session {
+            session_id: Some(session_id),
+            event: SessionEvent::SessionFailed {
+                operation: operation_for_kind(kind).to_string(),
+                error: e.to_string(),
+            },
         }),
         Err(_) => handle.abandon(),
+    }
+}
+
+/// The operation label a session-scoped [`SessionEvent::SessionFailed`] carries
+/// for the flag mutations, so a front-end can name the failed command (and the
+/// session-manager page can surface it inline).
+fn operation_for_kind(kind: MessageKind) -> &'static str {
+    match kind {
+        MessageKind::SetSessionPinned => "set_session_pinned",
+        MessageKind::SetSessionArchived => "set_session_archived",
+        _ => "session mutation",
     }
 }
 
@@ -3208,7 +3239,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_delete_session_sync_error_sends_failed() {
+    fn handle_delete_session_sync_error_sends_session_delete_failed() {
         let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
         let (sink, writer_rx) = test_sink();
         let global_lag = Arc::new(AtomicUsize::new(0));
@@ -3234,11 +3265,13 @@ mod tests {
         handle_delete_session_sync(&mut ctx, handle, 42);
         let msg = writer_rx.recv().unwrap();
         assert_eq!(msg.id, Some(0));
+        // The failure reply is the session-scoped `SessionDeleteFailed` (with
+        // the origin session preserved), still carrying the correlation id.
         assert!(matches!(
             &msg.inner,
-            DaemonMessageType::Failed {
-                kind: MessageKind::DeleteSession,
-                error,
+            DaemonMessageType::Session {
+                session_id: Some(42),
+                event: SessionEvent::SessionDeleteFailed { error },
             } if error == "db error"
         ));
     }
@@ -3659,6 +3692,56 @@ mod tests {
             DaemonMessageType::Accepted {
                 kind: MessageKind::SetSessionPinned
             }
+        ));
+    }
+
+    #[test]
+    fn dispatch_set_session_pinned_failure_sends_session_failed() {
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer: &sink,
+            db: &TEST_DB,
+            global_lag: &global_lag,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+            request_id: 0,
+            is_unix: true,
+        };
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::SetSessionFlags { reply, .. }) = daemon_rx.recv() {
+                let _ = reply.send(Err(io::Error::other("db error")));
+            }
+        });
+
+        dispatch_client_message(
+            ClientMessage::request(
+                8,
+                ClientMessageType::SetSessionPinned {
+                    session_id: 1,
+                    pinned: true,
+                },
+            ),
+            &mut ctx,
+        )
+        .unwrap();
+
+        // The failure reply is the session-scoped `SessionFailed` (which every
+        // front-end renders) carrying the operation label, still correlated by
+        // the request id.
+        let msg = writer_rx.recv().unwrap();
+        assert_eq!(msg.id, Some(8));
+        assert!(matches!(
+            &msg.inner,
+            DaemonMessageType::Session {
+                session_id: Some(1),
+                event: SessionEvent::SessionFailed { operation, error },
+            } if operation == "set_session_pinned" && error == "db error"
         ));
     }
 

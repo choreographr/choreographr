@@ -832,32 +832,19 @@ fn handle_sync_message(
     debug!("handling sync daemon message");
 
     match &msg.inner {
-        DaemonMessageType::Models {
-            models: _models,
-            selected_model,
-        } => match pending.take_models_pending() {
-            Some(ModelsPending::CreateSession {
+        DaemonMessageType::Models { .. } => {
+            // The only `Models` the bridge solicits is the `session/new`
+            // handshake's `ListModels`, so complete an outstanding `session/new`
+            // when one is pending. Model *changes* complete on the
+            // `ModelSelected` broadcast below, not here.
+            if let Some(ModelsPending::CreateSession {
                 jsonrpc_id,
                 account_name,
-            }) => {
+            }) = pending.take_models_pending()
+            {
                 continue_new_session_after_models(jsonrpc_id, account_name, pending, daemon)?;
             }
-            None => {
-                // SetModel produces a ModelSelected + Models broadcast.
-                // The SetModel sync entry is consumed here (not ModelSelected)
-                // because Models carries selected_model which we need to
-                // update the session state.
-                if let Some(entry) = pending.take_sync(&PendingKind::SetModel) {
-                    // Daemon confirmed the model — apply it to the session now.
-                    if let Some(session_id) = pending.take_pending_session(&PendingKind::SetModel)
-                        && let Some(s) = sessions.get_mut(&session_id)
-                    {
-                        s.model.clone_from(selected_model);
-                    }
-                    respond(entry.jsonrpc_id, serde_json::json!({}), out)?;
-                }
-            }
-        },
+        }
 
         DaemonMessageType::Session {
             session_id: Some(session_id),
@@ -939,13 +926,24 @@ fn handle_sync_message(
             }
         }
 
-        // ModelSelected is a no-op here because the SetModel sync entry
-        // is consumed in the Models handler (which carries selected_model
-        // for updating session state).  See the Models arm above.
+        // `ModelSelected` is the SET-MODEL SUCCESS signal: the daemon confirmed
+        // the change and broadcasts the new model to every subscriber. Complete
+        // the editor's pending config request and apply the model to the session
+        // state here. (The daemon no longer sends a `Models` reply for a model
+        // change — only the `session/new` handshake consumes `Models`.)
         DaemonMessageType::Session {
-            event: SessionEvent::ModelSelected { .. },
+            event: SessionEvent::ModelSelected { model, .. },
             ..
-        } => {}
+        } => {
+            if let Some(entry) = pending.take_sync(&PendingKind::SetModel) {
+                if let Some(session_id) = pending.take_pending_session(&PendingKind::SetModel)
+                    && let Some(s) = sessions.get_mut(&session_id)
+                {
+                    s.model = Some(model.clone());
+                }
+                respond(entry.jsonrpc_id, serde_json::json!({}), out)?;
+            }
+        }
 
         DaemonMessageType::Session {
             event: SessionEvent::ModelSelectionFailed { error, .. },

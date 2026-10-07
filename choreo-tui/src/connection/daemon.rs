@@ -846,11 +846,12 @@ pub(crate) fn handle_daemon_message(
         } => {
             // Per-session `pinned`/`archived_at` flag change. The daemon
             // broadcasts the post-change state to every client — the
-            // requesting client included — as the SUCCESS SIGNAL for a
-            // `SetSessionPinned`/`SetSessionArchived` (there is no targeted
-            // reply; a failure arrives as `SessionFailed`). Applying it here,
-            // rather than optimistically on the keypress, is what keeps the
-            // TUI's list in agreement with the daemon.
+            // requesting client included — and this broadcast is the STATE
+            // update, not the acknowledgement. The requester's terminal ack is
+            // a separate targeted reply (`Accepted` on success, a `SessionFailed`
+            // event on failure). Applying the broadcast here, rather than
+            // optimistically on the keypress, is what keeps the TUI's list in
+            // agreement with the daemon.
             match session_id {
                 Some(session_id) => {
                     app.handle_session_flags_changed(*session_id, *pinned, *archived_at);
@@ -979,6 +980,49 @@ mod tests {
     fn app_defaults_to_keystore_locked() {
         // Safest default: assume locked until the daemon reports otherwise.
         assert!(App::new().keystore_locked);
+    }
+
+    #[test]
+    fn failed_reply_surfaces_an_error_line() {
+        // A terminal `Failed` reply (the request's one id-bearing reply, for a
+        // request with no richer session-scoped failure shape — e.g. an empty
+        // `/undo`) must reach the user as an error, not be silently dropped.
+        // The correlation id rides the envelope; the payload becomes the error.
+        let mut app = test_app();
+        dispatch(
+            DaemonMessage::reply(
+                1,
+                DaemonMessageType::Failed {
+                    kind: MessageKind::Undo,
+                    error: "nothing to undo".into(),
+                },
+            ),
+            &mut app,
+        );
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|e| e.contains("nothing to undo")),
+            "a Failed reply must set the error line, got {:?}",
+            app.error
+        );
+    }
+
+    #[test]
+    fn accepted_reply_is_a_silent_success() {
+        // `Accepted` carries no state of its own (the mutation's broadcast is
+        // the state), so it must not write an error or a status line.
+        let mut app = test_app();
+        dispatch(
+            DaemonMessage::reply(
+                2,
+                DaemonMessageType::Accepted {
+                    kind: MessageKind::SetSessionPinned,
+                },
+            ),
+            &mut app,
+        );
+        assert!(app.error.is_none(), "Accepted must not surface an error");
     }
 
     #[test]

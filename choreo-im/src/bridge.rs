@@ -511,9 +511,18 @@ fn daemon_to_bridge_events(
         | DaemonMessageType::LockedError { error }
         | DaemonMessageType::ModelsFailed { error }
         | DaemonMessageType::Session {
+            event: SessionEvent::SessionDeleteFailed { error },
+            ..
+        }
+        | DaemonMessageType::Session {
             event: SessionEvent::ModelSelectionFailed { error, .. },
             ..
-        } => Some(BridgeEvent::Error(error)),
+        }
+        | DaemonMessageType::Failed { error, .. } => Some(BridgeEvent::Error(error)),
+        // Terminal success acks of fire-and-confirm mutations: the mutation's
+        // own state broadcast (if any) carries the outcome, so the ack renders
+        // nothing.
+        DaemonMessageType::Accepted { .. } => None,
         DaemonMessageType::Session {
             event: SessionEvent::Started { .. },
             ..
@@ -533,7 +542,6 @@ fn daemon_to_bridge_events(
                 | SessionEvent::SessionState { .. }
                 | SessionEvent::SessionStatusChanged { .. }
                 | SessionEvent::SessionDeleted
-                | SessionEvent::SessionDeleteFailed { .. }
                 | SessionEvent::ContextWindowResolved { .. }
                 | SessionEvent::LiveOutputTokenCount { .. }
                 | SessionEvent::TokenUsageUpdate { .. },

@@ -2102,8 +2102,8 @@ fn handle_attach(
     // drop it on a full 128-slot buffer).
     let snapshot = state.session_state_message(ctx.session_id);
     if let Some(tx) = state.subscribers.get(&client_id) {
-        // Unsolicited push of the attach snapshot to this one client; P1
-        // rides it as a broadcast (`id: None`).
+        // Unsolicited push of the attach snapshot to this one client; it rides
+        // the wire as a broadcast (`id: None`) since it answers no request.
         tx.send_unchecked(&DaemonMessage::broadcast(snapshot), &ctx.global_lag);
     }
     false

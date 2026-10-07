@@ -215,9 +215,10 @@ pub trait TurnEventHandler {
 ///   `dispatch_flat_message`.
 pub fn dispatch_daemon_message(msg: DaemonMessage, handler: &mut impl TurnEventHandler) {
     debug!("dispatching daemon message: {msg:?}");
-    // The correlation id rides the envelope (`msg.id`); for P1 the client does
-    // not yet resolve pending slots by it, so dispatch keys purely on the
-    // payload. The session-event / flat split is on the inner payload.
+    // The correlation id rides the envelope (`msg.id`); the front-end resolves
+    // the matching pending slot before calling this (it owns the
+    // `PendingReplies` table), so dispatch keys purely on the payload. The
+    // session-event / flat split is on the inner payload.
     match msg.inner {
         DaemonMessageType::Session { session_id, event } => {
             // The session-event dispatch keeps borrowing its inputs: the
@@ -471,11 +472,19 @@ fn dispatch_flat_message(msg: DaemonMessageType, handler: &mut impl TurnEventHan
         | DaemonMessageType::Evicted) => {
             debug!("flat daemon message has no generic-dispatch text: {msg:?}");
         }
-        // Terminal acknowledgement replies to the client's own requests. P1
-        // records nothing here (the correlation table that turns these into
-        // "request resolved" feedback is P4); the payloads carry no state of
-        // their own, so there is nothing to apply yet.
-        DaemonMessageType::Accepted { .. } | DaemonMessageType::Failed { .. } => {}
+        // Terminal acknowledgement replies to the client's own requests.
+        // `Accepted` is a silent success: the request's own outcome broadcast
+        // (if any) carries the state, and the correlation table has already
+        // resolved the pending slot. `Failed` is the terminal failure for a
+        // request whose failure has no richer, session-scoped shape; surface it
+        // as an error line so an otherwise-silent mutation (an empty
+        // `/undo`, an unsupported request) is never swallowed.
+        DaemonMessageType::Accepted { kind } => {
+            debug!(?kind, "request accepted");
+        }
+        DaemonMessageType::Failed { kind, error } => {
+            handler.handle_error(format!("[daemon] {kind:?} failed: {error}"));
+        }
         // A `Session` envelope here is a routing bug — `dispatch_daemon_message`
         // splits the two families before calling this function, so only
         // non-session messages can reach it at runtime. The arm is still

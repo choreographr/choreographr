@@ -719,16 +719,18 @@ pub enum ClientMessageType {
     /// Set (or clear) the session's `pinned` flag. The daemon is the
     /// authority: it updates its metadata index, persists the flag via a
     /// read-modify-write that touches ONLY the two flag columns, and
-    /// broadcasts [`SessionEvent::SessionFlagsChanged`]. There is NO targeted
-    /// success reply — the broadcast is the success signal — but a failure
-    /// is reported to the requesting connection only.
+    /// broadcasts [`SessionEvent::SessionFlagsChanged`] to every subscriber
+    /// (the requesting connection included) — that broadcast is the state
+    /// update, not the acknowledgement. The requester ALSO gets exactly one
+    /// targeted terminal reply: a [`DaemonMessageType::Accepted`] on success,
+    /// or a session-scoped [`SessionEvent::SessionFailed`] on failure.
     SetSessionPinned {
         session_id: u64,
         pinned: bool,
     },
     /// Set (or clear) the session's `archived` state. Archiving stamps the
     /// current time into the summary's `archived_at`; unarchiving clears it.
-    /// Same daemon-authoritative update/broadcast contract as
+    /// Same daemon-authoritative update/broadcast/ack contract as
     /// [`ClientMessageType::SetSessionPinned`].
     SetSessionArchived {
         session_id: u64,
@@ -1220,9 +1222,10 @@ pub enum SessionEvent {
     /// lifecycle fan-out that reaches both activity and summary subscribers),
     /// NOT a targeted reply: the daemon command loop owns the flags, updates
     /// its metadata index, persists them, and emits this once for every client
-    /// — the requesting client included — in place of a per-request
-    /// acknowledgement. It carries the full post-change flag state so a
-    /// subscriber can update its view directly.
+    /// — the requesting client included. The requester's terminal
+    /// acknowledgement is a SEPARATE targeted reply: `Accepted { kind }` on
+    /// success, `SessionFailed` on failure. It carries the full post-change
+    /// flag state so a subscriber can update its view directly.
     SessionFlagsChanged {
         pinned: bool,
         archived_at: Option<i64>,
