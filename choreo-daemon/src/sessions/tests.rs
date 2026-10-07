@@ -238,13 +238,16 @@ fn turn_for_client_strips_artifact_and_producer() {
 }
 
 #[test]
-fn turn_for_client_strips_all_image_bytes_keeps_display_metadata() {
+fn turn_for_client_strips_all_image_bytes_keeps_metadata() {
     // The client-facing copy must carry NO image bytes: the request builder
-    // reads `ToolResultRecord.image` from the authoritative daemon-side turn,
-    // and displayed-image bytes are fetched on demand via `GetImage`, so the
-    // client clone strips both. The displayed image's METADATA (dimensions,
-    // mime, byte_len, alt) survives so the client can size the placeholder and
-    // knows there is something to fetch.
+    // reads the vision bytes in `ToolResultRecord.image` from the
+    // authoritative daemon-side turn, and both attachment kinds' bytes are
+    // fetched on demand via `GetImage`, so the client clone strips every byte
+    // payload. The METADATA survives for both: the displayed image keeps its
+    // `ImageMetadata` (dimensions, mime, byte_len, alt) and the vision image
+    // keeps its `ImageReference` with `data` emptied (path, mime, dimensions)
+    // — so the client can size the placeholder and knows there is something to
+    // fetch under the corresponding [`ImageKey`].
     let authoritative = Turn {
         created_at: TimestampMs::now(),
         undone: false,
@@ -291,8 +294,17 @@ fn turn_for_client_strips_all_image_bytes_keeps_display_metadata() {
 
     let client = turn_for_client(&authoritative);
 
-    // Vision image bytes are stripped (daemon/model-only)…
-    assert_eq!(client.tool_results[0].image, None);
+    // The vision image's BYTES are stripped (daemon/model-only)…
+    let client_ref = client.tool_results[0]
+        .image
+        .as_ref()
+        .expect("client view keeps the vision reference metadata");
+    assert_eq!(client_ref.data, [] as [u8; 0]);
+    // …but its metadata survives so the client knows an image exists and how to
+    // size it, and can fetch the bytes under `ImageKey::ToolResult { call_id }`.
+    assert_eq!(client_ref.path, "/tmp/a.png");
+    assert_eq!(client_ref.mime_type, "image/png");
+    assert_eq!((client_ref.width, client_ref.height), (2, 2));
     // …and the displayed-image bytes are stripped too (fetched on demand)…
     assert_eq!(client.displayed_images[0].data, [] as [u8; 0]);
     // …but the display image's metadata survives so the client can lay out a

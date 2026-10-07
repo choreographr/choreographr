@@ -12,7 +12,7 @@ pub use io::{
 };
 pub use types::{
     AccountInfo, AssistantToolCallRecord, CatalogProvider, ChatReasoningField, ClientMessage,
-    ContextConfig, DaemonMessage, DiscardedToolCall, DisplayedImageRecord, ImageMetadata,
+    ContextConfig, DaemonMessage, DiscardedToolCall, DisplayedImageRecord, ImageKey, ImageMetadata,
     ImageReference, InferenceError, KeystoreState, McpServerStatus, OutputStream,
     ReasoningArtifact, ReasoningCapability, ReasoningProducer, RefreshStatus, SessionEvent,
     SessionStatus, SessionSummary, TimestampMs, TokenUsage, ToolResultRecord, Turn,

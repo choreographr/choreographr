@@ -1166,7 +1166,7 @@ fn handle_turn_appended_with_displayed_image_populates_rendered_images() {
 
     let images = app.rendered_images.get(&0).and_then(|m| m.get(&1)).unwrap();
     assert_eq!(images.len(), 1);
-    let img = images.get(&0).unwrap();
+    let img = images.get(&crate::state::ImageSlot::Displayed(0)).unwrap();
     assert_eq!(img.metadata.mime_type, "image/png");
     assert_eq!(img.metadata.width, 640);
     assert_eq!(img.metadata.height, 480);

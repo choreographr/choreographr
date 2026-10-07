@@ -19,7 +19,7 @@
 //! any under-estimate, so a drift surfaces as a test failure.
 
 use crate::{
-    DaemonMessage, OutputStream, ReasoningArtifact, ReasoningCapability, SessionEvent,
+    DaemonMessage, ImageKey, OutputStream, ReasoningArtifact, ReasoningCapability, SessionEvent,
     SessionStatus, Turn,
 };
 
@@ -409,11 +409,21 @@ impl DaemonMessage {
                         .map(|p| 32 + p.slug.len() + p.display_name.len())
                         .sum::<usize>()
             }
-            // Targeted image reply: 4 fields (session_id, turn_id,
-            // image_index, data); the scalars fit the per-field allowance and
-            // only the (potentially large) byte payload is added on top. An
-            // empty `data` / `None` counts as just the envelope.
-            Self::Image { data, .. } => named_field_overhead(4) + data.as_ref().map_or(0, Vec::len),
+            // Targeted image reply: 4 fields (session_id, turn_id, key, data);
+            // the scalars fit the per-field allowance and only the (potentially
+            // large) byte payload is added on top. An empty `data` / `None`
+            // counts as just the envelope. The `key` adds a variable `call_id`
+            // string for the tool-result variant (the fixed 4-field allowance
+            // covers the enum tag and field names); under-counting it would let
+            // a lagging client escape eviction, so it is added explicitly.
+            Self::Image { key, data, .. } => {
+                named_field_overhead(4)
+                    + data.as_ref().map_or(0, Vec::len)
+                    + match key {
+                        ImageKey::Displayed { .. } => 0,
+                        ImageKey::ToolResult { call_id } => call_id.len(),
+                    }
+            }
             // One `McpServerStatus` per configured server: 9 named fields plus
             // the variable strings. The 220 B per-record allowance covers the
             // map header, variant tag, nine field-name keys, and the

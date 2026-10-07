@@ -18,7 +18,7 @@ use codec::{ZSTD_FRAME_MAGIC, zstd_encode};
 // naming, and every attachment read/write/delete, so this file keeps the
 // schema, the turn/session plumbing, and the migrations.
 mod attachments;
-pub use attachments::{read_display_image, write_display_image_attachment};
+pub use attachments::{read_attachment, write_attachment};
 // The session-record and turn CRUD lives in its own module: the session
 // record, its deletion tombstones, and the turn read/write/retry wrappers are
 // one cohesive unit, so this file keeps the schema, tables, migrations, and the
@@ -1214,8 +1214,8 @@ mod tests {
     // (and its import) moved to the `sessions` submodule.
     use super::codec::zstd_decode;
     use choreo_proto::{
-        ContextConfig, DisplayedImageRecord, ImageMetadata, ImageReference, ReasoningProducer,
-        ToolResultRecord, Turn,
+        ContextConfig, DisplayedImageRecord, ImageKey, ImageMetadata, ImageReference,
+        ReasoningProducer, ToolResultRecord, Turn,
     };
 
     /// Read the current `next_session_id` from the DB and atomically
@@ -1445,16 +1445,20 @@ mod tests {
     }
 
     #[test]
-    fn read_display_image_returns_bytes_by_index_or_none() {
-        // On-demand fetch (protocol v6) reads a single display-image attachment
-        // by (session, turn, index) — the exact key `ClientMessage::GetImage`
-        // carries. A missing table/slot is `None`, never an error.
+    fn read_attachment_returns_bytes_by_key_or_none() {
+        // On-demand fetch reads a single attachment by (session, turn, key) —
+        // the exact key `ClientMessage::GetImage` carries, resolved to its
+        // `d{index}` / `r{call_id}` slot by the shared reader. A missing
+        // table/slot is `None`, never an error.
         let dir = tempfile::tempdir().unwrap();
         let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
         let id = 7u64;
 
         // Fresh DB: no attachments table yet → not found, not an error.
-        assert_eq!(read_display_image(&db, id, 0, 0).unwrap(), None);
+        assert_eq!(
+            read_attachment(&db, id, 0, &ImageKey::Displayed { index: 0 }).unwrap(),
+            None
+        );
 
         let mut turn = dummy_turn();
         turn.displayed_images = vec![
@@ -1481,25 +1485,76 @@ mod tests {
                 tool_call_id: None,
             },
         ];
+        // A tool-result vision image rides the same turn under `r{call_id}`,
+        // addressed by `ImageKey::ToolResult` — proving one reader serves both
+        // attachment kinds.
+        turn.tool_results = vec![ToolResultRecord {
+            call_id: "call_v".into(),
+            name: "read_image".into(),
+            content: "image".into(),
+            is_error: false,
+            invocation_description: "read_image".into(),
+            image: Some(ImageReference {
+                path: "/tmp/a.png".into(),
+                mime_type: "image/png".into(),
+                width: 1,
+                height: 1,
+                data: b"VVVV".to_vec(),
+            }),
+        }];
         write_turn(&db, id, 3, &turn).unwrap();
 
         // Each display index resolves to its own `d{i}` slot.
         assert_eq!(
-            read_display_image(&db, id, 3, 0).unwrap(),
+            read_attachment(&db, id, 3, &ImageKey::Displayed { index: 0 }).unwrap(),
             Some(b"AAAA".to_vec())
         );
         assert_eq!(
-            read_display_image(&db, id, 3, 1).unwrap(),
+            read_attachment(&db, id, 3, &ImageKey::Displayed { index: 1 }).unwrap(),
             Some(b"BBBB".to_vec())
         );
-        // Missing index, missing turn, missing session → None.
-        assert_eq!(read_display_image(&db, id, 3, 2).unwrap(), None);
-        assert_eq!(read_display_image(&db, id, 99, 0).unwrap(), None);
-        assert_eq!(read_display_image(&db, 999, 3, 0).unwrap(), None);
+        // The tool-result vision image resolves by call id.
+        assert_eq!(
+            read_attachment(
+                &db,
+                id,
+                3,
+                &ImageKey::ToolResult {
+                    call_id: "call_v".into()
+                }
+            )
+            .unwrap(),
+            Some(b"VVVV".to_vec())
+        );
+        // Missing index, missing call id, missing turn, missing session → None.
+        assert_eq!(
+            read_attachment(&db, id, 3, &ImageKey::Displayed { index: 2 }).unwrap(),
+            None
+        );
+        assert_eq!(
+            read_attachment(
+                &db,
+                id,
+                3,
+                &ImageKey::ToolResult {
+                    call_id: "nope".into()
+                }
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            read_attachment(&db, id, 99, &ImageKey::Displayed { index: 0 }).unwrap(),
+            None
+        );
+        assert_eq!(
+            read_attachment(&db, 999, 3, &ImageKey::Displayed { index: 0 }).unwrap(),
+            None
+        );
     }
 
     #[test]
-    fn write_display_image_attachment_inserts_one_slot_without_touching_others() {
+    fn write_attachment_inserts_one_slot_without_touching_others() {
         // The emit-time persist path: writing ONE display-image slot must not
         // disturb the turn's other attachment slots (unlike write_turn, which
         // clears and rewrites the whole turn). This is the O(1) write that
@@ -1553,21 +1608,34 @@ mod tests {
 
         // Emit-time single-slot write for a THIRD image (index 2) — the shape
         // emit_image produces after appending the image to the turn.
-        write_display_image_attachment(&db, id, 0, 2, b"CCCC").unwrap();
+        write_attachment(&db, id, 0, &ImageKey::Displayed { index: 2 }, b"CCCC").unwrap();
 
         // All three display slots resolve, and the pre-existing vision slot is
         // left untouched by the single-slot write.
         assert_eq!(
-            read_display_image(&db, id, 0, 0).unwrap(),
+            read_attachment(&db, id, 0, &ImageKey::Displayed { index: 0 }).unwrap(),
             Some(b"AAAA".to_vec())
         );
         assert_eq!(
-            read_display_image(&db, id, 0, 1).unwrap(),
+            read_attachment(&db, id, 0, &ImageKey::Displayed { index: 1 }).unwrap(),
             Some(b"BBBB".to_vec())
         );
         assert_eq!(
-            read_display_image(&db, id, 0, 2).unwrap(),
+            read_attachment(&db, id, 0, &ImageKey::Displayed { index: 2 }).unwrap(),
             Some(b"CCCC".to_vec())
+        );
+        // ...and the tool-result vision slot reads back through the same reader.
+        assert_eq!(
+            read_attachment(
+                &db,
+                id,
+                0,
+                &ImageKey::ToolResult {
+                    call_id: "call_v".into()
+                }
+            )
+            .unwrap(),
+            Some(b"VVVV".to_vec())
         );
         {
             let read_txn = db.begin_read().unwrap();
@@ -1584,8 +1652,11 @@ mod tests {
         }
 
         // Empty data writes NOTHING — no row is created (mirrors write_turn).
-        write_display_image_attachment(&db, id, 0, 9, b"").unwrap();
-        assert_eq!(read_display_image(&db, id, 0, 9).unwrap(), None);
+        write_attachment(&db, id, 0, &ImageKey::Displayed { index: 9 }, b"").unwrap();
+        assert_eq!(
+            read_attachment(&db, id, 0, &ImageKey::Displayed { index: 9 }).unwrap(),
+            None
+        );
         {
             let read_txn = db.begin_read().unwrap();
             let table = read_txn.open_table(SESSION_ATTACHMENTS).unwrap();

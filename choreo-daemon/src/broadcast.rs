@@ -598,7 +598,7 @@ mod tests {
         let image = DaemonMessage::Image {
             session_id: 1,
             turn_id: 1,
-            image_index: 0,
+            key: choreo_proto::ImageKey::Displayed { index: 0 },
             data: Some(vec![0u8; 4096]),
         };
         assert!(sink.send_accounted(&image, &global).is_some());

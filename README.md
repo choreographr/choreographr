@@ -507,13 +507,15 @@ or re-normalization. Each provider's wire format is supported (OpenAI chat
 `image_url`, Responses `input_image`, Anthropic `image`, Google `inline_data`),
 and a **vision gate** (`supports_vision` from the models.dev catalog, overridable
 via the overlay) ensures images are never sent to a text-only model — they
-degrade to a text placeholder instead. Vision bytes are daemon/model-only: they
-never reach clients. `display_image`, `generate_image`, and `retrieve_webpage`
-screenshots instead land in `Turn::displayed_images` and persist in the same
-`session_attachments` table; those images are delivered to clients **on demand**
-— a session snapshot carries only the image metadata, and the client fetches an
-image's bytes when it is about to render it (the TUI when it scrolls into view)
-via a `GetImage` request the daemon answers from the DB.
+degrade to a text placeholder instead. The vision image's bytes never ride the
+session snapshots: a snapshot carries only the reference metadata (path, mime,
+dimensions) and the client fetches the bytes **on demand** when it renders the
+image. `display_image`, `generate_image`, and `retrieve_webpage` screenshots land
+in `Turn::displayed_images` and persist in the same `session_attachments` table;
+both kinds are delivered to clients on demand through one `GetImage` request the
+daemon answers from the DB (the TUI fetches when it scrolls the image into view).
+This lets the TUI show the user the exact normalized image the model saw — even
+after the model-side decay gate stops re-attaching it to later requests.
 Vision support is per-model: pick a vision-capable model (e.g.
 `deepseek-v4-flash-vision-exp`) and call `read_image` with a path.
 

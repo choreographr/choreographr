@@ -380,7 +380,7 @@ pub(super) fn handle_chat_event(
                         } else if let Some(layout) = app
                             .active_display_ref()
                             .and_then(|d| d.turn_layouts.get(turn_idx))
-                            && let Some(img_idx) = layout
+                            && let Some(range_idx) = layout
                                 .image_ranges
                                 .iter()
                                 .position(|&(start, end)| offset >= start && offset < end)
@@ -389,8 +389,21 @@ pub(super) fn handle_chat_event(
                                 .and_then(|d| d.visible_turn_ids.get(turn_idx))
                                 .copied()
                             && let Some(session_id) = app.active_session_id
+                            // The clicked block's position maps onto the turn's
+                            // image slots in the SAME order the render/height
+                            // paths draw them (`turn_image_slots`), so a
+                            // displayed image and a tool-result vision image
+                            // open fullscreen identically.
+                            && let Some(slot) = app
+                                .active_display_ref()
+                                .and_then(|d| d.view.turns.get(&turn_id))
+                                .and_then(|turn| {
+                                    crate::state::turn_image_slots(turn)
+                                        .get(range_idx)
+                                        .cloned()
+                                })
                         {
-                            app.fullscreen_image_target = Some((session_id, turn_id, img_idx));
+                            app.fullscreen_image_target = Some((session_id, turn_id, slot));
                         } else {
                             // Plain-text click: arm a potential text selection
                             // at the click point.  It only becomes real

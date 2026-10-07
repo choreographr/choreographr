@@ -3,8 +3,8 @@ use crate::markdown_render::{display_width, reasoning_expanded_default, render_t
 use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
 use crate::selection;
 use crate::state::{
-    App, HELP_LINE1, HELP_LINE2, INPUT_PAD, Page, RenderCacheKey, cached_or_compute_lines,
-    cached_visual_lines, input_inner_width,
+    App, HELP_LINE1, HELP_LINE2, INPUT_PAD, ImageSlot, Page, RenderCacheKey,
+    cached_or_compute_lines, cached_visual_lines, input_inner_width, slot_source, turn_image_slots,
 };
 use choreo_proto::{SessionStatus, TokenUsage};
 use ratatui::{
@@ -108,13 +108,13 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
-/// Look up the fullscreen image by (`turn_id`, `img_idx`) and render it.
+/// Look up the fullscreen image by (`turn_id`, [`ImageSlot`]) and render it.
 pub(crate) fn render_fullscreen_only(frame: &mut Frame<'_>, app: &mut App) -> bool {
-    let Some((session_id, turn_id, img_idx)) = app.fullscreen_image_target else {
+    let Some((session_id, turn_id, slot)) = app.fullscreen_image_target.clone() else {
         return false;
     };
     // De Morgan: the guard reads clearer as a single negation of "there is a
-    // rendered image for this turn OR the turn still has displayable images".
+    // rendered image for this turn OR the turn still exposes image slots".
     let has_image = app
         .rendered_images
         .get(&session_id)
@@ -124,12 +124,12 @@ pub(crate) fn render_fullscreen_only(frame: &mut Frame<'_>, app: &mut App) -> bo
             .view
             .turns
             .get(&turn_id)
-            .is_some_and(|t| !t.displayed_images.is_empty());
+            .is_some_and(|t| !turn_image_slots(t).is_empty());
     if !has_image {
         app.fullscreen_image_target = None;
         return false;
     }
-    render_fullscreen_image(frame, session_id, turn_id, img_idx, app);
+    render_fullscreen_image(frame, session_id, turn_id, slot, app);
     true
 }
 
@@ -145,7 +145,7 @@ fn render_fullscreen_image(
     frame: &mut Frame<'_>,
     session_id: u64,
     turn_id: u32,
-    img_idx: usize,
+    slot: ImageSlot,
     app: &mut App,
 ) {
     let area = frame.area();
@@ -153,20 +153,22 @@ fn render_fullscreen_image(
 
     // Ensure the rendered_images entry exists — create from turn data if missing.
     if !app.rendered_images.contains_key(&session_id) {
-        let Some(turn) = app.display_for(session_id).view.turns.get(&turn_id) else {
+        let Some((metadata, data)) = app
+            .display_for(session_id)
+            .view
+            .turns
+            .get(&turn_id)
+            .and_then(|turn| slot_source(turn, &slot))
+        else {
             return;
         };
-        let Some(record) = turn.displayed_images.get(img_idx) else {
-            return;
-        };
-        let placeholder =
-            RenderedImage::new_placeholder(record.metadata.clone(), Arc::from(record.data.clone()));
+        let placeholder = RenderedImage::new_placeholder(metadata, Arc::from(data));
         app.rendered_images
             .entry(session_id)
             .or_default()
             .entry(turn_id)
             .or_default()
-            .insert(img_idx, placeholder);
+            .insert(slot.clone(), placeholder);
     }
 
     // Fast path — already encoded at full size.
@@ -174,7 +176,7 @@ fn render_fullscreen_image(
         .rendered_images
         .get_mut(&session_id)
         .and_then(|imgs| imgs.get_mut(&turn_id))
-        .and_then(|images| images.get_mut(&img_idx))
+        .and_then(|images| images.get_mut(&slot))
     {
         Some(img) => {
             if let Some(protocol) = img.protocols.get_mut(&full) {
@@ -207,18 +209,18 @@ fn render_fullscreen_image(
             .rendered_images
             .get(&session_id)
             .and_then(|imgs| imgs.get(&turn_id))
-            .and_then(|images| images.get(&img_idx))
+            .and_then(|images| images.get(&slot))
             .map(|img| (img.data.clone(), img.metadata.clone()));
         if let Some((data, meta)) = payload {
             if data.is_empty() && meta.byte_len > 0 {
                 // Bytes stripped from the snapshot: fetch on demand (see
                 // `render_turn_image` for the full rationale).
-                app.request_image_fetch(session_id, turn_id, img_idx);
+                app.request_image_fetch(session_id, turn_id, slot);
             } else {
                 app.submit_image_job(crate::state::ImageJobRequest {
                     session_id,
                     turn_id,
-                    img_idx,
+                    slot,
                     data,
                     metadata: meta,
                     cell_size: full,
@@ -566,7 +568,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         // cumulative visual-row offsets for O(log n) row→line lookups, the
         // per-line content column ranges (for selection clamping), and the
         // per-line chrome intervals the highlight subtracts from them.
-        let (text_lines_arc, text_height, text_offsets, content_ranges, chrome_ranges, img_count) = {
+        let (text_lines_arc, text_height, text_offsets, content_ranges, chrome_ranges, img_slots) = {
             let display = app.display_for(session_id);
             let Some(turn) = display.view.turns.get(&turn_id) else {
                 continue;
@@ -574,7 +576,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             if turn.undone {
                 continue;
             }
-            let count = turn.displayed_images.len();
+            let img_slots = turn_image_slots(turn);
             // Effective reasoning visibility: explicit override (header click)
             // wins, else the streaming-derived default.  The default is read
             // from the precomputed turn layout — rebuilt in lockstep with
@@ -624,13 +626,13 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 rendered.visual_offsets,
                 rendered.content_ranges,
                 rendered.chrome_ranges,
-                count,
+                img_slots,
             )
         };
 
         // ── Images (rendered first so they sit below text) ──
         let full_img_height = app.image_block_height() as usize;
-        for img_idx in (0..img_count).rev() {
+        for slot in img_slots.iter().rev() {
             if let Some((_top_line, visible_height)) = clipped_area(
                 full_img_height,
                 &mut rows_to_skip,
@@ -652,7 +654,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     img_rect,
                     session_id,
                     turn_id,
-                    img_idx,
+                    slot.clone(),
                     app,
                     fully_visible,
                 );
@@ -782,7 +784,17 @@ fn render_text_block(
     );
 }
 
-/// Render a single turn-displayed image block.
+/// A short human label for an image slot, used in placeholder titles so the
+/// reader can tell a displayed image from a tool-result vision image (and which
+/// tool call it belongs to).
+fn slot_label(slot: &ImageSlot) -> String {
+    match slot {
+        ImageSlot::Displayed(index) => format!("[{index}]"),
+        ImageSlot::ToolResult(call_id) => format!("[{call_id}]"),
+    }
+}
+
+/// Render a single turn image block (displayed or tool-result vision).
 ///
 /// Height is always `image_block_height()` regardless of encoding state,
 /// so scroll positions remain stable.
@@ -796,7 +808,7 @@ fn render_turn_image(
     area: Rect,
     session_id: u64,
     turn_id: u32,
-    img_idx: usize,
+    slot: ImageSlot,
     app: &mut App,
     fully_visible: bool,
 ) {
@@ -807,7 +819,7 @@ fn render_turn_image(
         .rendered_images
         .get_mut(&session_id)
         .and_then(|imgs| imgs.get_mut(&turn_id))
-        .and_then(|images| images.get_mut(&img_idx))
+        .and_then(|images| images.get_mut(&slot))
     {
         if let Some(protocol) = img.protocols.get_mut(&inline_size) {
             let title = format!(
@@ -844,24 +856,27 @@ fn render_turn_image(
             img.metadata.clone(),
         )
     } else {
-        let block = Block::default().title(format!("image {turn_id}[{img_idx}] (pending)"));
+        let block =
+            Block::default().title(format!("image {turn_id}{} (pending)", slot_label(&slot)));
         frame.render_widget(block, area);
         return;
     };
 
     if needs_job {
         if data.is_empty() && meta.byte_len > 0 {
-            // The bytes were stripped from the turn snapshot (protocol v6):
-            // fetch them on demand. The render path has no client sender, so
+            // The bytes were stripped from the turn snapshot: fetch them on
+            // demand. The render path has no client sender, so
             // `request_image_fetch` queues it (deduped) and the UI loop sends
             // the `GetImage`; the reply stores the bytes and clears the failed
-            // state so a later frame submits the decode job.
-            app.request_image_fetch(session_id, turn_id, img_idx);
+            // state so a later frame submits the decode job. This is the SAME
+            // path for a displayed image and a tool-result vision image — only
+            // the slot key differs.
+            app.request_image_fetch(session_id, turn_id, slot);
         } else {
             app.submit_image_job(crate::state::ImageJobRequest {
                 session_id,
                 turn_id,
-                img_idx,
+                slot,
                 data,
                 metadata: meta.clone(),
                 cell_size: inline_size,

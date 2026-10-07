@@ -308,9 +308,12 @@ pub struct ToolResultRecord {
     /// carries the normalized image **bytes** (`ImageReference::data`), so the
     /// request builder attaches them directly without re-reading the source
     /// file — an additive, `#[serde(default)]` field so old persisted turns
-    /// deserialize with `None`. `None` for text-only results and for image
-    /// results on non-vision models (the gate substitutes a text placeholder
-    /// instead of persisting a reference the model cannot use).
+    /// deserialize with `None`. `None` for text-only tool results.
+    ///
+    /// On the client-facing view (`turn_for_client`) the reference is KEPT but
+    /// its `data` is emptied, so a client learns the image exists (path, mime,
+    /// dimensions) and fetches the bytes on demand under
+    /// `ImageKey::ToolResult { call_id }`.
     #[serde(default)]
     pub image: Option<ImageReference>,
 }
@@ -320,12 +323,15 @@ pub struct ToolResultRecord {
 /// builder can attach them directly to the model request without re-reading
 /// the source file.
 ///
-/// `data` is daemon/model-only: it feeds the request builder directly, is
-/// stripped from client-facing turns by `turn_for_client`, and is persisted
-/// in the `session_attachments` DB table at write time (kept out of the
-/// zstd turn blob) and re-attached on read. `#[serde(default)]` keeps old
-/// persisted records backward compatible — they deserialize with an empty
-/// `data`.
+/// The `path`/`mime_type`/`width`/`height` metadata also tells a client that a
+/// vision image exists so it can render a placeholder and fetch the bytes on
+/// demand. `data` alone is daemon/model-only: it feeds the request builder
+/// directly, is persisted in the `session_attachments` DB table at write time
+/// (kept out of the zstd turn blob) and re-attached on read, and is emptied on
+/// the client-facing view by `turn_for_client` (the client fetches the bytes
+/// with `ClientMessage::GetImage` under `ImageKey::ToolResult { call_id }`).
+/// `#[serde(default)]` keeps old persisted records backward compatible — they
+/// deserialize with an empty `data`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImageReference {
     /// Source path the image was read from.
@@ -670,25 +676,28 @@ pub enum ClientMessage {
     ContinueGeneration {
         request_id: u32,
     },
-    /// Request the raw bytes of one **displayed** image — the `image_index`-th
-    /// entry of `turn_id`'s `Turn::displayed_images` in `session_id`.
+    /// Request the raw bytes of one turn attachment in `session_id` — either a
+    /// displayed image or a tool-result vision image — selected by [`ImageKey`].
     ///
-    /// Displayed-image bytes are deliberately kept OFF the session-scoped
-    /// snapshots (`SessionState`, `TurnAppended`, `TurnsRedone`): those carry
-    /// only the `ImageMetadata` (dimensions, mime, `byte_len`, alt), so a long
-    /// session's history no longer ships every image up front. The client
-    /// fetches each image on demand — typically when it scrolls into view —
-    /// and the daemon replies with a targeted [`DaemonMessage::Image`].
+    /// Attachment bytes are deliberately kept OFF the session-scoped snapshots
+    /// (`SessionState`, `TurnAppended`, `TurnsRedone`): displayed images carry
+    /// only `ImageMetadata`, and a tool-result vision image carries only a
+    /// byte-less `ImageReference` (path + mime + dimensions). A long session's
+    /// history therefore ships no image bytes up front; the client fetches each
+    /// image on demand — typically when it scrolls into view — and the daemon
+    /// replies with a targeted [`DaemonMessage::Image`].
     ///
     /// The bytes are served from the daemon's durable `session_attachments`
     /// store, keyed exactly like the wire request: (`session_id`, `turn_id`,
-    /// `d{image_index}`). `displayed_images` is append-only within a turn, so
-    /// the index is a stable identifier and matches the DB slot the turn was
-    /// persisted under.
+    /// slot), where the [`ImageKey`] maps to the slot (`d{index}` for a displayed
+    /// image, `r{call_id}` for a tool-result vision image). Both attachments are
+    /// append-only within a turn (a new displayed image lands at the next index;
+    /// a vision image is pinned to its tool call's id), so the key is a stable
+    /// identifier and matches the DB slot the turn was persisted under.
     GetImage {
         session_id: u64,
         turn_id: u32,
-        image_index: u32,
+        key: ImageKey,
     },
     /// Request the state of every configured MCP server. The daemon replies
     /// with [`DaemonMessage::McpStatus`].
@@ -730,6 +739,28 @@ pub enum ClientMessage {
 pub enum OutputStream {
     Answer,
     Reasoning,
+}
+
+/// Which turn attachment a [`ClientMessage::GetImage`] / [`DaemonMessage::Image`]
+/// addresses. The two attachments are TURN-SCOPED and share one durable byte
+/// store (`session_attachments`), so the fetch protocol addresses them with one
+/// message and a tagged key rather than two parallel request/reply pairs. The
+/// variant names the slot kind; the `session_attachments` slot name itself
+/// (`d{index}` / `r{call_id}`) is an internal storage detail the wire never sees.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ImageKey {
+    /// A **displayed** image — the `index`-th entry of the turn's
+    /// `displayed_images` (produced by `display_image`, `generate_image`, or a
+    /// `retrieve_webpage` screenshot). `displayed_images` is append-only within
+    /// a turn, so the positional index is a stable identifier.
+    Displayed { index: u32 },
+    /// A **tool-result vision image** — the normalized image a tool such as
+    /// `read_image` fed back to a vision model, attached to the tool result
+    /// whose `call_id` this is. Keyed by call id (not a position) because the
+    /// image belongs to a specific tool call and the call id is the only stable
+    /// handle across turn rewrites. A turn may carry several (one per
+    /// image-bearing tool result).
+    ToolResult { call_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1208,17 +1239,17 @@ pub enum DaemonMessage {
         providers: Vec<CatalogProvider>,
     },
     /// Targeted reply to [`ClientMessage::GetImage`]: the raw bytes of the
-    /// requested displayed image, or `None` when it is not found (the session
-    /// or turn was deleted, the attachment was evicted, or the index is
-    /// stale). `Some(vec![])` is a genuinely zero-byte image — distinct from
-    /// `None` (unknown), so the client can tell "empty image" from "fetch
-    /// failed" and avoid retrying a missing image forever. The `session_id`,
-    /// `turn_id`, and `image_index` echo the request so a client with several
-    /// fetches in flight can route the reply.
+    /// requested attachment (displayed image or tool-result vision image), or
+    /// `None` when it is not found (the session or turn was deleted, the
+    /// attachment was evicted, or the key is stale). `Some(vec![])` is a
+    /// genuinely zero-byte image — distinct from `None` (unknown), so the client
+    /// can tell "empty image" from "fetch failed" and avoid retrying a missing
+    /// image forever. The `session_id`, `turn_id`, and `key` echo the request so
+    /// a client with several fetches in flight can route the reply.
     Image {
         session_id: u64,
         turn_id: u32,
-        image_index: u32,
+        key: ImageKey,
         data: Option<Vec<u8>>,
     },
     /// Reply to [`ClientMessage::McpStatusRequest`], and the success reply to
@@ -2193,7 +2224,7 @@ mod tests {
                 DaemonMessage::Image {
                     session_id: 1,
                     turn_id: 1,
-                    image_index: 0,
+                    key: ImageKey::Displayed { index: 0 },
                     data: Some(vec![0u8; 4096]),
                 },
             ),

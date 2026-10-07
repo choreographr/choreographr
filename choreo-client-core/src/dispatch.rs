@@ -171,19 +171,21 @@ pub trait TurnEventHandler {
         token_usage: TokenUsage,
         last_prompt_tokens: Option<u32>,
     );
-    /// A previously-requested displayed image arrived (the reply to
+    /// A previously-requested turn attachment arrived (the reply to
     /// `ClientMessage::GetImage`). `data: Some(bytes)` carries the image; `None`
     /// means it was not found (deleted/evicted session or turn, or a stale
-    /// index). Only clients that render image *bytes* need this — the default
-    /// is a no-op so metadata-only frontends (e.g. the GUI's label) ignore it.
+    /// key). `key` echoes the request so a client with several fetches in flight
+    /// can route the reply to the right slot. Only clients that render image
+    /// *bytes* need this — the default is a no-op so metadata-only frontends
+    /// (e.g. the GUI's label) ignore it.
     fn handle_image(
         &mut self,
         session_id: u64,
         turn_id: u32,
-        image_index: u32,
+        key: choreo_proto::ImageKey,
         data: Option<Vec<u8>>,
     ) {
-        let _ = (session_id, turn_id, image_index, data);
+        let _ = (session_id, turn_id, key, data);
     }
     /// A session's `pinned`/`archived_at` flags changed (the daemon's
     /// `SessionFlagsChanged` broadcast, delivered with the origin session).
@@ -433,21 +435,22 @@ fn dispatch_flat_message(msg: DaemonMessage, handler: &mut impl TurnEventHandler
                 handler.handle_status_text(lines.join("\n"));
             }
         }
-        // On-demand displayed-image reply. The connection layer does NOT
-        // intercept this (unlike `Sessions`, handled before the generic
-        // dispatch), so it flows to the handler's `handle_image`, which fills
-        // the matching placeholder (data) or marks the fetch failed (None).
+        // On-demand turn-attachment reply (displayed image or tool-result
+        // vision image). The connection layer does NOT intercept this (unlike
+        // `Sessions`, handled before the generic dispatch), so it flows to the
+        // handler's `handle_image`, which fills the matching placeholder (data)
+        // or marks the fetch failed (None).
         DaemonMessage::Image {
             session_id,
             turn_id,
-            image_index,
+            key,
             data,
         } => {
             // By-value match: `data` is owned here, so it MOVES into the
             // handler. This is the whole point of the by-value dispatch — a
             // default-no-op `handle_image` (GUI/ACP) still pays nothing, and
             // an image-rendering handler gets the bytes without a clone.
-            handler.handle_image(session_id, turn_id, image_index, data);
+            handler.handle_image(session_id, turn_id, key, data);
         }
         // Explicit no-ops, enumerated so a new flat variant still forces this
         // match to grow:

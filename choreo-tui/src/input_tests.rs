@@ -123,7 +123,7 @@ fn paste_event_ignored_during_fullscreen_overlay() {
 
     app.input.text = "original".to_string();
     app.input.cursor = 8;
-    app.fullscreen_image_target = Some((0, 0, 0));
+    app.fullscreen_image_target = Some((0, 0, crate::state::ImageSlot::Displayed(0)));
     handle_terminal_event(Event::Paste("should be ignored".to_string()), &mut app, &tx)
         .expect("handle paste during fullscreen");
     // Text should be unchanged.

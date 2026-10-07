@@ -48,7 +48,7 @@ mod streaming;
 // re-exported here so `crate::state::X` references (in this crate and in
 // `app_tests.rs`/`render_tests.rs`) keep resolving exactly as before.
 pub(crate) use command_palette::*;
-pub(crate) use images::ImageJobRequest;
+pub(crate) use images::{ImageJobRequest, ImageSlot, slot_source, turn_image_slots};
 pub(crate) use input::*;
 pub(crate) use keymap::*;
 pub(crate) use layout::*;
@@ -377,14 +377,14 @@ impl Default for SessionDisplayState {
 pub(crate) struct App {
     pub(crate) input: InputBuffer,
     pub(crate) next_request_id: u32,
-    pub(crate) rendered_images: HashMap<u64, HashMap<u32, HashMap<usize, RenderedImage>>>,
-    pub(crate) pending_job_idx: HashMap<ImageId, (u64, u32, usize)>,
-    /// Displayed images the render path wants fetched on demand (protocol v6:
-    /// image bytes are stripped from turn snapshots). Queued here — deduped via
-    /// the per-image `fetching` flag — because the render path has no client
-    /// sender; the UI loop drains this each iteration and sends
-    /// `ClientMessage::GetImage`.
-    pub(crate) pending_image_fetch: Vec<(u64, u32, usize)>,
+    pub(crate) rendered_images: HashMap<u64, HashMap<u32, HashMap<ImageSlot, RenderedImage>>>,
+    pub(crate) pending_job_idx: HashMap<ImageId, (u64, u32, ImageSlot)>,
+    /// Images the render path wants fetched on demand (both displayed images and
+    /// tool-result vision images have their bytes stripped from turn snapshots).
+    /// Queued here — deduped via the per-image `fetching` flag — because the
+    /// render path has no client sender; the UI loop drains this each iteration
+    /// and sends `ClientMessage::GetImage`.
+    pub(crate) pending_image_fetch: Vec<(u64, u32, ImageSlot)>,
     pub(crate) history_viewport: HistoryViewport,
     pub(crate) should_quit: bool,
     /// Why the TUI is exiting, when it is NOT a user-initiated quit (Alt+Q).
@@ -446,7 +446,7 @@ pub(crate) struct App {
     /// that empty draft (see `exit_history_browsing`).  Reset to `None` on
     /// session switch.
     pub(crate) history_index: Option<usize>,
-    pub(crate) fullscreen_image_target: Option<(u64, u32, usize)>,
+    pub(crate) fullscreen_image_target: Option<(u64, u32, ImageSlot)>,
     pub(crate) status: Option<String>,
     /// Whether the current `status` came from a connection-task
     /// [`UiEvent::Status`] (a transient progress message like
@@ -1971,7 +1971,11 @@ impl SessionDisplayState {
 
             let mut image_ranges: Vec<(usize, usize)> = Vec::new();
             let mut total_img_height: usize = 0;
-            for _ in 0..turn.displayed_images.len() {
+            // Every image slot the turn exposes (displayed + tool-result vision)
+            // reserves one block, in the SAME order the render loop draws them
+            // (both derive the list from `turn_image_slots`), so a click's
+            // `image_ranges` index maps onto that slot list exactly.
+            for _ in &turn_image_slots(turn) {
                 let start = text_height + total_img_height;
                 image_ranges.push((start, start + fallback_img_height));
                 total_img_height += fallback_img_height;
@@ -2422,11 +2426,11 @@ impl TurnEventHandler for App {
         &mut self,
         session_id: u64,
         turn_id: u32,
-        image_index: u32,
+        key: choreo_proto::ImageKey,
         data: Option<Vec<u8>>,
     ) {
-        tracing::trace!(%session_id, %turn_id, %image_index, "handle_image");
-        self.handle_image_reply(session_id, turn_id, image_index, data);
+        tracing::trace!(%session_id, %turn_id, ?key, "handle_image");
+        self.handle_image_reply(session_id, turn_id, key, data);
     }
 
     fn handle_turn_appended(&mut self, session_id: u64, turn_id: u32, turn: Turn) {
@@ -4274,8 +4278,8 @@ mod tests {
 
         let images = app.rendered_images.get(&0).unwrap().get(&42).unwrap();
         assert_eq!(images.len(), 2);
-        assert_eq!(images[&0].data.as_ref(), b"svg-data");
-        assert_eq!(images[&1].data.as_ref(), b"more-svg");
+        assert_eq!(images[&ImageSlot::Displayed(0)].data.as_ref(), b"svg-data");
+        assert_eq!(images[&ImageSlot::Displayed(1)].data.as_ref(), b"more-svg");
         // Second call is idempotent — preserves existing entries
         app.sync_turn_images(0, 42, &turn);
         assert_eq!(
@@ -5113,14 +5117,15 @@ mod tests {
         app.sync_turn_images(0, 4, &turn_clone);
 
         let img_id = next_job_id();
-        app.pending_job_idx.insert(img_id, (0, 4, 0));
+        app.pending_job_idx
+            .insert(img_id, (0, 4, ImageSlot::Displayed(0)));
         let img = app
             .rendered_images
             .get_mut(&0)
             .unwrap()
             .get_mut(&4)
             .unwrap()
-            .get_mut(&0)
+            .get_mut(&ImageSlot::Displayed(0))
             .unwrap();
         img.pending_job = Some(img_id);
 
@@ -5138,7 +5143,7 @@ mod tests {
             .unwrap()
             .get(&4)
             .unwrap()
-            .get(&0)
+            .get(&ImageSlot::Displayed(0))
             .unwrap();
         assert!(img.failed_sizes.contains(&inline_size));
         assert!(img.pending_job.is_none());
@@ -5184,14 +5189,15 @@ mod tests {
         app.sync_turn_images(0, 5, &turn_clone);
 
         let img_id = next_job_id();
-        app.pending_job_idx.insert(img_id, (0, 5, 0));
+        app.pending_job_idx
+            .insert(img_id, (0, 5, ImageSlot::Displayed(0)));
         let img = app
             .rendered_images
             .get_mut(&0)
             .unwrap()
             .get_mut(&5)
             .unwrap()
-            .get_mut(&0)
+            .get_mut(&ImageSlot::Displayed(0))
             .unwrap();
         img.pending_job = Some(img_id);
 
@@ -5210,7 +5216,7 @@ mod tests {
             .unwrap()
             .get(&5)
             .unwrap()
-            .get(&0)
+            .get(&ImageSlot::Displayed(0))
             .unwrap();
         assert!(img.failed_sizes.contains(&non_inline_size));
     }

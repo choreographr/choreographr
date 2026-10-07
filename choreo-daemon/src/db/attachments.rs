@@ -15,7 +15,7 @@
 
 use std::io;
 
-use choreo_proto::Turn;
+use choreo_proto::{ImageKey, Turn};
 use redb::{ReadOnlyTable, ReadableDatabase, ReadableTable, TableDefinition};
 use tracing::debug;
 
@@ -42,8 +42,8 @@ pub(super) const SESSION_ATTACHMENTS: TableDefinition<(u64, u32, String), &[u8]>
 // ── Slot naming ────────────────────────────────────────────────────────────────
 
 /// Slot name for a displayed image at `index` in its turn: `d{index}`. This is
-/// exactly the index the wire `ClientMessage::GetImage` carries, so the slot
-/// name and the fetch key are the same by construction.
+/// exactly the index wire [`ImageKey::Displayed`] carries, so the slot name and
+/// the fetch key are the same by construction.
 fn display_slot(index: u32) -> String {
     format!("d{index}")
 }
@@ -53,6 +53,16 @@ fn display_slot(index: u32) -> String {
 /// specific call and the call id is the only stable handle across rewrites.
 fn result_slot(call_id: &str) -> String {
     format!("r{call_id}")
+}
+
+/// The [`SESSION_ATTACHMENTS`] slot a wire [`ImageKey`] addresses. The single
+/// place the key→slot mapping lives, so the on-demand read and the emit-time
+/// write can never disagree about where an attachment's bytes are stored.
+fn slot_for(key: &ImageKey) -> String {
+    match key {
+        ImageKey::Displayed { index } => display_slot(*index),
+        ImageKey::ToolResult { call_id } => result_slot(call_id),
+    }
 }
 
 /// The read-only attachment table type, aliased so the `Option<&…>` parameter
@@ -234,18 +244,18 @@ pub(super) fn reattach_turn_attachments(
 
 // ── On-demand reads / single-slot writes ────────────────────────────────────────
 
-/// Read a single persisted displayed-image attachment (raw bytes) by turn and
-/// index.
+/// Read a single persisted turn attachment (raw bytes) by turn and [`ImageKey`].
 ///
-/// The attachment table is keyed `(session_id, turn_id, slot)`, where a
-/// displayed image at index `i` in its turn is stored under slot `d{i}` — the
-/// exact index the wire `ClientMessage::GetImage` carries. This is a single
-/// `get`: no turn decode and no whole-session scan, so an on-demand image
-/// fetch (a client scrolling an image into view) is O(log n) rather than
-/// proportional to the session's history.
+/// The attachment table is keyed `(session_id, turn_id, slot)`, and the key maps
+/// to the slot here ([`slot_for`]) — `d{index}` for a displayed image, `r{call_id}`
+/// for a tool-result vision image. This is a single `get`: no turn decode and no
+/// whole-session scan, so an on-demand image fetch (a client scrolling an image
+/// into view) is O(log n) rather than proportional to the session's history. The
+/// two attachment kinds are served by ONE reader because they share ONE store;
+/// only the key→slot mapping knows they are stored under different slot names.
 ///
 /// Returns `Ok(None)` when the table or the slot is absent — a fresh database
-/// has no attachments table, a turn that persisted no image at that index has
+/// has no attachments table, a turn that persisted no image under that key has
 /// no row, and a deleted/evicted image is simply gone. All such cases are
 /// "not found", never an error.
 ///
@@ -253,15 +263,15 @@ pub(super) fn reattach_turn_attachments(
 ///
 /// Returns Err only for a genuine redb failure (read transaction open, table
 /// open other than "does not exist", or the `get`).
-pub fn read_display_image(
+pub fn read_attachment(
     db: &redb::Database,
     session_id: u64,
     turn_id: u32,
-    image_index: u32,
+    key: &ImageKey,
 ) -> io::Result<Option<Vec<u8>>> {
     let read_txn = db
         .begin_read()
-        .map_err(|e| db_err(format!("redb read txn (display image): {e}")))?;
+        .map_err(|e| db_err(format!("redb read txn (attachment): {e}")))?;
     let table = match read_txn.open_table(SESSION_ATTACHMENTS) {
         Ok(t) => t,
         // No attachments table yet (fresh database): nothing has ever been
@@ -269,29 +279,27 @@ pub fn read_display_image(
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
         Err(e) => {
             return Err(db_err(format!(
-                "redb open session_attachments (display image): {e}"
+                "redb open session_attachments (attachment): {e}"
             )));
         }
     };
-    // Display images occupy slot `d{index}` (see `write_turn_attachments`); the
-    // vision image slot `r{call_id}` is not served by this path.
-    let slot = display_slot(image_index);
+    let slot = slot_for(key);
     match table
         .get((session_id, turn_id, slot))
-        .map_err(|e| db_err(format!("redb get display attachment: {e}")))?
+        .map_err(|e| db_err(format!("redb get attachment: {e}")))?
     {
         Some(guard) => Ok(Some(guard.value().to_vec())),
         None => Ok(None),
     }
 }
 
-/// Persist exactly ONE displayed-image attachment — the O(1) persist-at-emit
-/// write.
+/// Persist exactly ONE attachment — the O(1) persist-at-emit write, shared by
+/// the displayed-image path (`emit_image`) and the tool-result vision path.
 ///
-/// `emit_image` calls this after appending an image to the in-memory turn so an
+/// The emitter calls this after appending an image to the in-memory turn so an
 /// on-demand `GetImage` for that image resolves immediately. Unlike
 /// [`super::write_turn`], it opens one write transaction and inserts exactly the
-/// single `(session_id, turn_id, d{image_index})` row: it does NOT clear the
+/// single `(session_id, turn_id, slot)` row for `key`: it does NOT clear the
 /// turn's other slots (they were written by earlier emits and must survive) and
 /// it does NOT touch the turn blob (re-written in full, blob + all attachments,
 /// atomically at `finalize_turn`). This keeps an N-image turn's emit-time disk
@@ -305,11 +313,11 @@ pub fn read_display_image(
 ///
 /// Returns Err only for a genuine redb failure (write transaction open, table
 /// open, insert, or commit).
-pub fn write_display_image_attachment(
+pub fn write_attachment(
     db: &redb::Database,
     session_id: u64,
     turn_id: u32,
-    image_index: u32,
+    key: &ImageKey,
     data: &[u8],
 ) -> io::Result<()> {
     if data.is_empty() {
@@ -317,19 +325,17 @@ pub fn write_display_image_attachment(
     }
     let write_txn = db
         .begin_write()
-        .map_err(|e| db_err(format!("redb write txn (display image): {e}")))?;
+        .map_err(|e| db_err(format!("redb write txn (attachment): {e}")))?;
     {
-        let mut table = write_txn.open_table(SESSION_ATTACHMENTS).map_err(|e| {
-            db_err(format!(
-                "redb open session_attachments (display image): {e}"
-            ))
-        })?;
+        let mut table = write_txn
+            .open_table(SESSION_ATTACHMENTS)
+            .map_err(|e| db_err(format!("redb open session_attachments (attachment): {e}")))?;
         table
-            .insert((session_id, turn_id, display_slot(image_index)), data)
-            .map_err(|e| db_err(format!("redb insert display attachment (emit): {e}")))?;
+            .insert((session_id, turn_id, slot_for(key)), data)
+            .map_err(|e| db_err(format!("redb insert attachment (emit): {e}")))?;
     }
     write_txn
         .commit()
-        .map_err(|e| db_err(format!("redb commit display attachment (emit): {e}")))?;
+        .map_err(|e| db_err(format!("redb commit attachment (emit): {e}")))?;
     Ok(())
 }

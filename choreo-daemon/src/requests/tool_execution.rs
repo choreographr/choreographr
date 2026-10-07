@@ -81,12 +81,14 @@ pub(crate) fn broadcast_turn_appended(
 /// including mid-request.
 ///
 /// The emit-time write is a single-slot insert
-/// ([`crate::db::write_display_image_attachment`]): just the one `d{index}`
-/// row, in its own transaction. That makes an N-image turn cost O(N) disk
-/// writes across its emits, instead of the O(N²) a whole-turn rewrite per
-/// image would incur (`write_turn` clears and rewrites every attachment slot).
-/// The turn blob itself is not touched here — it is (re)written in full, blob
-/// plus ALL attachments atomically, at `finalize_turn`.
+/// ([`crate::db::write_attachment`] with an [`ImageKey::Displayed`]): just the
+/// one `d{index}` row, in its own transaction. That makes an N-image turn cost
+/// O(N) disk writes across its emits, instead of the O(N²) a whole-turn rewrite
+/// per image would incur (`write_turn` clears and rewrites every attachment
+/// slot). The turn blob itself is not touched here — it is (re)written in full,
+/// blob plus ALL attachments atomically, at `finalize_turn`.
+///
+/// [`ImageKey::Displayed`]: choreo_proto::ImageKey::Displayed
 pub(crate) fn emit_image(
     cmd_tx: &crossbeam_channel::Sender<SessionCommand>,
     db: &redb::Database,
@@ -123,9 +125,13 @@ pub(crate) fn emit_image(
     // logged and swallowed: the image still renders from the in-memory turn,
     // and `finalize_turn` retries the full turn write (blob + all attachments)
     // at turn completion.
-    if let Err(e) =
-        crate::db::write_display_image_attachment(db, session_id, turn_id, index, &record.data)
-    {
+    if let Err(e) = crate::db::write_attachment(
+        db,
+        session_id,
+        turn_id,
+        &choreo_proto::ImageKey::Displayed { index },
+        &record.data,
+    ) {
         warn!(turn_id, error = %e, "failed to persist displayed image at emit time");
     }
     session.add_displayed_image(turn_id, record);
@@ -932,6 +938,27 @@ pub(crate) fn record_tool_completion(params: ToolCompletionParams<'_>) {
             ctx.session_id,
             current_turn_id,
         );
+    }
+
+    // Persist-at-emit for a tool-result VISION image (e.g. `read_image`): write
+    // this call's `r{call_id}` attachment slot right now so a client's
+    // on-demand `GetImage` — which may arrive as soon as the turn is
+    // (re)broadcast below, mid-request, long before `finalize_turn` — already
+    // resolves. Mirrors the displayed-image emit write: ONE slot, its own
+    // transaction, no whole-turn rewrite; a failure is logged and swallowed
+    // because `finalize_turn` rewrites blob + all attachments at completion.
+    if let Some(reference) = &output.image_ref
+        && let Err(e) = crate::db::write_attachment(
+            &ctx.db,
+            ctx.session_id,
+            current_turn_id,
+            &choreo_proto::ImageKey::ToolResult {
+                call_id: tool_call.id.clone(),
+            },
+            &reference.data,
+        )
+    {
+        warn!(turn_id = current_turn_id, error = %e, "failed to persist tool-result vision image at emit time");
     }
 
     finish_tool_call(request_id, session, tool_call, output, ctx, current_turn_id);

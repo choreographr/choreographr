@@ -10,9 +10,9 @@ use crate::tools::{ToolOutput, ToolRegistry};
 use choreo_ai_protocols::model_reasoning_capability;
 use choreo_keystore::ServiceCredential;
 use choreo_proto::{
-    AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, ReasoningArtifact,
-    ReasoningProducer, SessionEvent, SessionStatus, SessionSummary, TimestampMs, TokenUsage,
-    ToolResultRecord, Turn,
+    AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, ImageReference,
+    ReasoningArtifact, ReasoningProducer, SessionEvent, SessionStatus, SessionSummary, TimestampMs,
+    TokenUsage, ToolResultRecord, Turn,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
@@ -1150,20 +1150,22 @@ impl SessionState {
 /// Client-bound copy of a turn with the opaque reasoning round-trip payload
 /// and the image **bytes** stripped: only the daemon consumes
 /// `reasoning_artifact`/`reasoning_producer` (it rebuilds the next provider
-/// request from them), `ToolResultRecord.image` (the request builder reads
-/// the bytes from the authoritative daemon-side `SessionState`/DB), and
-/// `DisplayedImageRecord.data` (the bytes live in the DB; clients fetch them
-/// on demand via `ClientMessage::GetImage`).
+/// request from them), the vision image **bytes** in `ToolResultRecord.image`
+/// (the request builder reads them from the authoritative daemon-side
+/// `SessionState`/DB), and `DisplayedImageRecord.data` (the bytes live in the
+/// DB; clients fetch them on demand via `ClientMessage::GetImage`).
 ///
-/// Clients still receive each `DisplayedImageRecord`'s `metadata` (dimensions,
-/// mime, `byte_len`, alt), which is all they need to lay out and render a
-/// placeholder until the bytes are fetched — so a long session's history no
-/// longer ships every image up front. Stripping keeps the artifact and every
-/// image's bytes off each `DaemonMessage` payload (bandwidth + privacy:
-/// thinking-block JSON, encrypted provider blobs, and raw image bytes never
-/// leave the daemon process), while the authoritative `Turn` in `SessionState`
-/// and the DB keeps the full payload for the request builder and the image
-/// store.
+/// Image **metadata** stays on the client view for BOTH kinds: each
+/// `DisplayedImageRecord` keeps its `metadata` (dimensions, mime, `byte_len`,
+/// alt), and a `ToolResultRecord.image` keeps its `ImageReference` with `data`
+/// emptied (path, mime, dimensions) — all the clients need to lay out a
+/// placeholder and know there is an attachment to fetch, so a long session's
+/// history no longer ships every image up front. Stripping the bytes keeps the
+/// artifact and every image's bytes off each `DaemonMessage` payload
+/// (bandwidth + privacy: thinking-block JSON, encrypted provider blobs, and
+/// raw image bytes never ride the snapshots/broadcasts), while the
+/// authoritative `Turn` in `SessionState` and the DB keeps the full payload for
+/// the request builder and the image store.
 pub(crate) fn turn_for_client(turn: &Turn) -> Turn {
     // Reconstruct the client turn FIELD BY FIELD instead of `turn.clone()`:
     // a deep clone would COPY every image payload (display + vision bytes, up
@@ -1185,9 +1187,12 @@ pub(crate) fn turn_for_client(turn: &Turn) -> Turn {
         assistant_reasoning: turn.assistant_reasoning.clone(),
         tool_calls: turn.tool_calls.clone(),
         token_usage: turn.token_usage,
-        // Vision image bytes are daemon/model-only: the request builder
-        // consumes them from the authoritative daemon-side turn, and the
-        // client never renders them, so no `image` rides the client view.
+        // Vision image BYTES are daemon/model-only: the request builder
+        // consumes them from the authoritative daemon-side turn. But the client
+        // still learns the image EXISTS (and its dimensions/mime) so it can
+        // render a placeholder and fetch the bytes on demand — the reference
+        // rides the client view with `data` emptied, exactly like a
+        // `DisplayedImageRecord`'s bytes are stripped but its metadata kept.
         tool_results: turn
             .tool_results
             .iter()
@@ -1197,7 +1202,13 @@ pub(crate) fn turn_for_client(turn: &Turn) -> Turn {
                 content: r.content.clone(),
                 is_error: r.is_error,
                 invocation_description: r.invocation_description.clone(),
-                image: None,
+                image: r.image.as_ref().map(|img| ImageReference {
+                    path: img.path.clone(),
+                    mime_type: img.mime_type.clone(),
+                    width: img.width,
+                    height: img.height,
+                    data: Vec::new(),
+                }),
             })
             .collect(),
         // Displayed-image bytes are fetched on demand

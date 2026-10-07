@@ -10,7 +10,8 @@
 //! knows nothing about how they are rendered.
 
 use choreo_proto::{
-    ClientMessage, DaemonMessage, OutputStream, SessionEvent, SessionSummary, Turn, write_message,
+    ClientMessage, DaemonMessage, ImageKey, OutputStream, SessionEvent, SessionSummary, Turn,
+    write_message,
 };
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
@@ -311,7 +312,9 @@ fn collect_turn_images(
             requests.push(ClientMessage::GetImage {
                 session_id,
                 turn_id,
-                image_index: u32::try_from(idx).unwrap_or(u32::MAX),
+                key: ImageKey::Displayed {
+                    index: u32::try_from(idx).unwrap_or(u32::MAX),
+                },
             });
         }
     }
@@ -961,7 +964,7 @@ mod tests {
             vec![ClientMessage::GetImage {
                 session_id: 7,
                 turn_id: 3,
-                image_index: 1,
+                key: ImageKey::Displayed { index: 1 },
             }]
         );
     }

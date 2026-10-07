@@ -577,13 +577,13 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
         ClientMessage::GetImage {
             session_id,
             turn_id,
-            image_index,
+            key,
         } => {
             debug!(
-                "client {}: GetImage session={} turn={} index={}",
-                ctx.client_id, session_id, turn_id, image_index
+                "client {}: GetImage session={} turn={} key={:?}",
+                ctx.client_id, session_id, turn_id, key
             );
-            handle_client_get_image(session_id, turn_id, image_index, ctx);
+            handle_client_get_image(session_id, turn_id, key.clone(), ctx);
         }
         ClientMessage::RefreshModels { force } => {
             debug!("client {}: RefreshModels force={}", ctx.client_id, force);
@@ -1402,34 +1402,40 @@ fn handle_list_models_sync(ctx: &mut ClientCtx, attached_session_id: Option<u64>
     }
 }
 
-/// Handle a `GetImage` client message: read the requested displayed image's
-/// bytes and reply with a targeted [`DaemonMessage::Image`].
+/// Handle a `GetImage` client message: read the requested turn attachment's
+/// bytes (a displayed image or a tool-result vision image) and reply with a
+/// targeted [`DaemonMessage::Image`].
 ///
-/// Only images of the session THIS connection is attached to are served — the
-/// same trust boundary every other session-scoped command enforces. A request
-/// for any other (or no) session is answered `None` rather than reading an
-/// arbitrary session's attachments.
+/// Only attachments of the session THIS connection is attached to are served —
+/// the same trust boundary every other session-scoped command enforces. A
+/// request for any other (or no) session is answered `None` rather than reading
+/// an arbitrary session's attachments.
 ///
 /// The connection now owns a redb handle (see [`ClientCtx::db`]), so the read
-/// runs RIGHT HERE on the connection thread via [`crate::db::read_display_image`]
+/// runs RIGHT HERE on the connection thread via [`crate::db::read_attachment`]
 /// — a single O(log n) `get` against the attachment table, with no
 /// command-loop round-trip and no reply channel to drain. Each connection
 /// opens its own read transaction, so concurrent connections never serialize.
-fn handle_client_get_image(session_id: u64, turn_id: u32, image_index: u32, ctx: &ClientCtx) {
+fn handle_client_get_image(
+    session_id: u64,
+    turn_id: u32,
+    key: choreo_proto::ImageKey,
+    ctx: &ClientCtx,
+) {
     let data = if *ctx.attached_session_id == Some(session_id) {
         // `None` covers both "not found" and a redb read error; the client
         // treats them identically (mark the image failed, don't retry), so the
         // two collapse here intentionally — a transient redb hiccup must never
         // leak a raw error into the image-fetch protocol.
-        match crate::db::read_display_image(ctx.db, session_id, turn_id, image_index) {
+        match crate::db::read_attachment(ctx.db, session_id, turn_id, &key) {
             Ok(data) => data,
             Err(e) => {
                 warn!(
                     session_id,
                     turn_id,
-                    image_index,
+                    ?key,
                     error = %e,
-                    "failed to read display image attachment"
+                    "failed to read image attachment"
                 );
                 None
             }
@@ -1442,7 +1448,7 @@ fn handle_client_get_image(session_id: u64, turn_id: u32, image_index: u32, ctx:
         &DaemonMessage::Image {
             session_id,
             turn_id,
-            image_index,
+            key,
             data,
         },
     );
@@ -2706,17 +2712,86 @@ mod tests {
         };
         crate::db::write_turn(&TEST_DB, 5, 2, &turn).unwrap();
 
-        handle_client_get_image(5, 2, 1, &ctx);
+        handle_client_get_image(5, 2, choreo_proto::ImageKey::Displayed { index: 1 }, &ctx);
         let msg = writer_rx.recv().unwrap();
         match msg {
             DaemonMessage::Image {
                 session_id,
                 turn_id,
-                image_index,
+                key,
                 data,
             } => {
-                assert_eq!((session_id, turn_id, image_index), (5, 2, 1));
+                assert_eq!((session_id, turn_id), (5, 2));
+                assert_eq!(key, choreo_proto::ImageKey::Displayed { index: 1 });
                 assert_eq!(data, Some(vec![1, 2, 3]));
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_client_get_image_serves_a_tool_result_vision_image() {
+        // The same handler serves a tool-result vision image addressed by
+        // `ImageKey::ToolResult { call_id }` — one fetch protocol for both
+        // attachment kinds.
+        let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded();
+        let (sink, writer_rx) = test_sink();
+        let global_lag = Arc::new(AtomicUsize::new(0));
+        let mut attached = Some(6u64);
+        let mut none_tx = None;
+        let ctx = ClientCtx {
+            writer: &sink,
+            db: &TEST_DB,
+            global_lag: &global_lag,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut attached,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+            is_unix: true,
+        };
+        // Persist a turn whose tool result `call_v` carries [9, 8, 7] bytes
+        // (slot `rcall_v`).
+        let turn = choreo_proto::Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![choreo_proto::ToolResultRecord {
+                call_id: "call_v".into(),
+                name: "read_image".into(),
+                content: "image".into(),
+                is_error: false,
+                invocation_description: "read_image".into(),
+                image: Some(choreo_proto::ImageReference {
+                    path: "/tmp/a.png".into(),
+                    mime_type: "image/png".into(),
+                    width: 1,
+                    height: 1,
+                    data: vec![9, 8, 7],
+                }),
+            }],
+            displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        crate::db::write_turn(&TEST_DB, 6, 1, &turn).unwrap();
+
+        handle_client_get_image(
+            6,
+            1,
+            choreo_proto::ImageKey::ToolResult {
+                call_id: "call_v".into(),
+            },
+            &ctx,
+        );
+        let msg = writer_rx.recv().unwrap();
+        match msg {
+            DaemonMessage::Image { data, .. } => {
+                assert_eq!(data, Some(vec![9, 8, 7]));
             }
             other => panic!("expected Image, got {other:?}"),
         }
@@ -2757,7 +2832,7 @@ mod tests {
             client_id: 0,
             is_unix: true,
         };
-        handle_client_get_image(99, 0, 0, &ctx);
+        handle_client_get_image(99, 0, choreo_proto::ImageKey::Displayed { index: 0 }, &ctx);
         let msg = writer_rx.recv().unwrap();
         match msg {
             DaemonMessage::Image {
