@@ -16,6 +16,7 @@ use tracing::{debug, warn};
 
 mod assemble;
 mod block;
+mod incremental;
 mod inline;
 mod tables;
 mod text;
@@ -27,6 +28,7 @@ mod text;
 // its parent.
 pub(crate) use assemble::*;
 pub(crate) use block::*;
+pub(crate) use incremental::*;
 pub(crate) use inline::*;
 pub(crate) use tables::*;
 pub(crate) use text::*;
@@ -305,18 +307,25 @@ pub(crate) fn markdown_lines_joined(
     // `## First / ### Sub` document renders as level 1 + level 2.
     let heading_shift =
         first_heading_level(&document.blocks).map_or(0, |level| (level.saturating_sub(1)) as usize);
-    let mut lines = Vec::new();
-    let mut joins = Vec::new();
-    let mut chrome = Vec::new();
-    render_markdown_blocks(
-        &document.blocks,
-        &mut lines,
-        &mut joins,
-        &mut chrome,
-        0,
-        width as usize,
-        heading_shift,
-    );
+    render_document_lines(&document, width, heading_shift)
+}
+
+/// Render an already-parsed, heading-shift-normalized [`MarkdownDocument`] into
+/// styled lines plus the aligned per-line copy metadata.
+///
+/// This is the body shared by [`markdown_lines_joined`] and the incremental
+/// streaming renderer ([`IncrementalMarkdown`]), which parse their input in
+/// pieces but must produce byte-identical output to a whole-document render.
+/// Trailing blank rows are dropped and an empty document yields the single
+/// blank placeholder row, so a caller never hands the selection an empty
+/// buffer.
+pub(crate) fn render_document_lines(
+    document: &MarkdownDocument,
+    width: u16,
+    heading_shift: usize,
+) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
+    let (mut lines, mut joins, mut chrome) =
+        render_blocks_untrimmed(document, width, heading_shift);
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(String::new(), Style::default())));
         joins.push(LineJoin::Break);
@@ -332,6 +341,34 @@ pub(crate) fn markdown_lines_joined(
         joins.push(LineJoin::Break);
         chrome.push(LineChrome::default());
     }
+    (lines, joins, chrome)
+}
+
+/// Render a document's blocks **without** [`render_document_lines`]'s trailing
+/// blank-row strip and empty-document placeholder.
+///
+/// The incremental streaming renderer commits source pieces one at a time; a
+/// piece's trailing blank rows (e.g. the blank line an empty heading renders)
+/// are interior once a later piece is spliced on, so stripping them per piece
+/// would drop rows a whole-document render keeps.  Only the true tail piece —
+/// the end of the document — is stripped.
+pub(crate) fn render_blocks_untrimmed(
+    document: &MarkdownDocument,
+    width: u16,
+    heading_shift: usize,
+) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
+    let mut lines = Vec::new();
+    let mut joins = Vec::new();
+    let mut chrome = Vec::new();
+    render_markdown_blocks(
+        &document.blocks,
+        &mut lines,
+        &mut joins,
+        &mut chrome,
+        0,
+        width as usize,
+        heading_shift,
+    );
     (lines, joins, chrome)
 }
 
@@ -482,6 +519,58 @@ fn ensure_blank_line_joined(
         joins.push(LineJoin::Break);
         chrome.push(LineChrome::default());
     }
+}
+
+/// Top-level markdown block kind, as far as the incremental streaming renderer
+/// cares: whether a blank line adjacent to the block is a genuine, independent
+/// block boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockKind {
+    Paragraph,
+    Heading,
+    Rule,
+    CodeBlock,
+    Table,
+    List,
+    BlockQuote,
+}
+
+impl BlockKind {
+    /// Whether a blank line touching a block of this kind can be treated as a
+    /// split point for independent re-rendering.
+    ///
+    /// A list or block quote may *contain* the blank line (a loose list whose
+    /// items are blank-separated, or a multi-paragraph quote), so rendering the
+    /// two sides separately would drop the block's cross-line state (loose
+    /// spacing, marker alignment) and diverge from a whole-document render.
+    /// Every other kind ends cleanly at its blank line, so the two sides are
+    /// independent.
+    pub(crate) fn is_hard(self) -> bool {
+        !matches!(self, BlockKind::List | BlockKind::BlockQuote)
+    }
+}
+
+/// Classify a top-level block for the incremental renderer's boundary check.
+pub(crate) fn block_kind(block: &MarkdownBlock) -> BlockKind {
+    match block {
+        MarkdownBlock::Paragraph(_) => BlockKind::Paragraph,
+        MarkdownBlock::Heading { .. } => BlockKind::Heading,
+        MarkdownBlock::Rule => BlockKind::Rule,
+        MarkdownBlock::CodeBlock { .. } => BlockKind::CodeBlock,
+        MarkdownBlock::Table { .. } => BlockKind::Table,
+        MarkdownBlock::List { .. } => BlockKind::List,
+        MarkdownBlock::BlockQuote(_) => BlockKind::BlockQuote,
+    }
+}
+
+/// The kind of a document's first top-level block, if it has any.
+pub(crate) fn first_block_kind(blocks: &[MarkdownBlock]) -> Option<BlockKind> {
+    blocks.first().map(block_kind)
+}
+
+/// The kind of a document's last top-level block, if it has any.
+pub(crate) fn last_block_kind(blocks: &[MarkdownBlock]) -> Option<BlockKind> {
+    blocks.last().map(block_kind)
 }
 
 /// Find the level of the first heading in the block tree, walking nested

@@ -7,8 +7,9 @@
 //! code and its per-row classification helpers live here.
 
 use super::{
-    LineChrome, LineJoin, RenderedTurnLines, RowContent, ansi_lines_joined, classify_row_content,
-    expand_tabs, markdown_lines_joined, plain_text_lines_joined, sanitize_for_terminal,
+    IncrementalMarkdown, LineChrome, LineJoin, RenderedTurnLines, RowContent, ansi_lines_joined,
+    classify_row_content, expand_tabs, markdown_lines_joined, plain_text_lines_joined,
+    sanitize_for_terminal,
 };
 use crate::render::{BG_SHADE, format_timestamp};
 use choreo_proto::Turn;
@@ -206,6 +207,50 @@ pub(crate) fn render_turn_lines(
     reasoning_expanded: bool,
     tool_results_collapsed: &[bool],
 ) -> RenderedTurnLines {
+    render_turn_lines_impl(
+        turn,
+        content_width,
+        tool_content_width,
+        reasoning_expanded,
+        tool_results_collapsed,
+        None,
+    )
+}
+
+/// [`render_turn_lines`] for the streaming fast path: the assistant response is
+/// rendered through `response_cache` ([`IncrementalMarkdown`]), so each frame
+/// re-parses only the response tail rather than the whole response.  The output
+/// is byte-identical to [`render_turn_lines`] at every prefix.
+///
+/// Only the response is incremental; the reasoning section and tool-result
+/// bodies still render whole each frame (they are stable while the response
+/// streams, and were out of scope for the response-parse fix).
+pub(crate) fn render_turn_lines_streaming(
+    turn: &Turn,
+    content_width: u16,
+    tool_content_width: u16,
+    reasoning_expanded: bool,
+    tool_results_collapsed: &[bool],
+    response_cache: &mut IncrementalMarkdown,
+) -> RenderedTurnLines {
+    render_turn_lines_impl(
+        turn,
+        content_width,
+        tool_content_width,
+        reasoning_expanded,
+        tool_results_collapsed,
+        Some(response_cache),
+    )
+}
+
+fn render_turn_lines_impl(
+    turn: &Turn,
+    content_width: u16,
+    tool_content_width: u16,
+    reasoning_expanded: bool,
+    tool_results_collapsed: &[bool],
+    response_cache: Option<&mut IncrementalMarkdown>,
+) -> RenderedTurnLines {
     /// Tools whose result content is Markdown by design and may therefore be
     /// parsed as markdown. `pdf_to_markdown` emits extracted page text;
     /// `write_file` emits the written file's full contents fenced as a code
@@ -349,7 +394,12 @@ pub(crate) fn render_turn_lines(
         if let Some(ref text) = turn.assistant_text {
             let trimmed = text.trim();
             if !trimmed.is_empty() {
-                let (lines, joins, chrome) = markdown_lines_joined(trimmed, content_width);
+                // Streaming reuses the committed prefix; a one-shot render parses
+                // the whole response.
+                let (lines, joins, chrome) = match response_cache {
+                    Some(cache) => cache.render(trimmed, content_width),
+                    None => markdown_lines_joined(trimmed, content_width),
+                };
                 body.extend(lines);
                 body_joins.extend(joins);
                 body_chrome.extend(chrome);

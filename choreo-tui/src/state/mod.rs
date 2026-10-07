@@ -22,8 +22,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::markdown_render::{
-    LineChrome, LineJoin, RenderedTurnLines, compute_visual_offsets, lines_height,
-    plain_text_lines, reasoning_expanded_default, render_turn_lines, tool_result_default_collapsed,
+    IncrementalMarkdown, LineChrome, LineJoin, RenderedTurnLines, compute_visual_offsets,
+    lines_height, plain_text_lines, reasoning_expanded_default, render_turn_lines,
+    render_turn_lines_streaming, tool_result_default_collapsed,
 };
 
 // The input-editing key types are referenced only from the test module
@@ -198,6 +199,18 @@ pub(crate) struct RenderedCache {
     pub rendered: RenderedTurn,
 }
 
+/// Incremental response-render state for the streaming fast path.
+///
+/// The streaming fast path re-renders the in-flight turn on every chunk;
+/// keeping the assistant response's committed markdown (see
+/// [`IncrementalMarkdown`]) here lets it re-parse only the appended tail instead
+/// of the whole, growing response each frame.  It is keyed to the streaming
+/// turn so a new turn never reuses another turn's committed lines.
+pub(crate) struct StreamingResponseCache {
+    pub(crate) turn_id: u32,
+    pub(crate) markdown: IncrementalMarkdown,
+}
+
 /// Check `render_cache[index]` for a valid entry matching `key`.  On hit,
 /// return the cached [`RenderedTurn`].  On miss, call `compute`, store the
 /// result in `render_cache[index]`, and return it.
@@ -302,6 +315,9 @@ pub(crate) struct SessionDisplayState {
     /// landing between chunks).
     pub(crate) turn_versions: HashMap<u32, u64>,
     pub(crate) render_cache: Vec<Option<RenderedCache>>,
+    /// Incremental assistant-response render cache for the streaming fast path,
+    /// keyed to [`Self::streaming_turn_index`] (see [`StreamingResponseCache`]).
+    pub(crate) streaming_response: Option<StreamingResponseCache>,
     pub(crate) active: HashSet<u32>,
     pub(crate) live_input_estimate: u32,
     pub(crate) live_output_tokens: u32,
@@ -348,6 +364,7 @@ impl Default for SessionDisplayState {
             tool_collapse_override: HashMap::new(),
             turn_versions: HashMap::new(),
             render_cache: Vec::new(),
+            streaming_response: None,
             active: HashSet::new(),
             live_input_estimate: 0,
             live_output_tokens: 0,
@@ -1017,6 +1034,7 @@ impl App {
         display.turn_heights.clear();
         display.turn_layouts.clear();
         display.streaming_turn_index = None;
+        display.streaming_response = None;
         display.streaming_dirty = false;
         display.markers_dirty = true;
         display.content_dirty = false;
@@ -2198,18 +2216,41 @@ impl SessionDisplayState {
         // which would conflict with the `get_mut` held across the cache write.
         let content_version = self.turn_content_version(turn_id);
 
+        // Keep the incremental response cache keyed to this turn: a new
+        // streaming turn gets a fresh cache, so an unrelated response never
+        // reuses another turn's committed markdown.
+        if !matches!(&self.streaming_response, Some(cache) if cache.turn_id == turn_id) {
+            self.streaming_response = Some(StreamingResponseCache {
+                turn_id,
+                markdown: IncrementalMarkdown::new(),
+            });
+        }
+
         if let Some(Some(cached)) = self.render_cache.get_mut(turn_idx)
             && cached.key.turn_id == turn_id
             && cached.key.width == content_width
             && cached.key.viewport_width == viewport.width
         {
-            let rendered = render_turn_lines(
-                turn,
-                content_width,
-                tool_content_width,
-                reasoning_expanded,
-                &tool_results_collapsed,
-            );
+            // `streaming_response` was set to a cache for `turn_id` just above,
+            // so the `Some` arm is taken; the `None` arm keeps the path total if
+            // that invariant is ever broken.
+            let rendered = match self.streaming_response.as_mut() {
+                Some(cache) => render_turn_lines_streaming(
+                    turn,
+                    content_width,
+                    tool_content_width,
+                    reasoning_expanded,
+                    &tool_results_collapsed,
+                    &mut cache.markdown,
+                ),
+                None => render_turn_lines(
+                    turn,
+                    content_width,
+                    tool_content_width,
+                    reasoning_expanded,
+                    &tool_results_collapsed,
+                ),
+            };
             // Pin the same parallel-array invariant the rebuild path asserts
             // in `cached_or_compute_lines`: the streaming fast path replaces
             // the cache entry wholesale, so a join/content-range mismatch
@@ -2771,6 +2812,9 @@ impl TurnEventHandler for App {
         display.live_input_estimate = 0;
         display.live_output_tokens = 0;
         display.streaming_turn_index = None;
+        // Streaming is over: drop the incremental response cache so a later
+        // turn can never reuse this response's committed markdown.
+        display.streaming_response = None;
         display.mark_content_changed();
     }
 
@@ -2816,6 +2860,7 @@ impl TurnEventHandler for App {
         display.view.request_to_turn.remove(&request_id);
         display.active.remove(&request_id);
         display.streaming_turn_index = None;
+        display.streaming_response = None;
         display.mark_content_changed();
     }
 
@@ -6496,6 +6541,73 @@ mod tests {
             display.turn_heights[0] + display.turn_heights[1],
             "marker[2] content_line should reflect updated turn 1 height"
         );
+    }
+
+    #[test]
+    fn streaming_answer_reuses_the_incremental_response_cache() {
+        // Streaming a paragraph-heavy response one char at a time through the
+        // fast path must keep the response's committed markdown (so the total
+        // bytes re-parsed stays far below the naive sum of every prefix) and
+        // still leave the rendered cache matching a whole-response render.
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 200;
+
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some("ask".into()),
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        };
+        {
+            let display = app.active_display().unwrap();
+            display.view.insert_or_replace(1, turn);
+            display.view.request_to_turn.insert(7, 1);
+        }
+        app.rebuild_height_prefix();
+
+        let doc = "Hi.\n\n\
+            One two three four five.\n\n\
+            Six seven eight nine ten.\n\n\
+            Eleven twelve thirteen.\n\n\
+            Fourteen fifteen sixteen.\n";
+        let mut naive_bytes = 0usize;
+        let mut streamed = 0usize;
+        for ch in doc.chars() {
+            streamed += ch.len_utf8();
+            naive_bytes += streamed;
+            app.handle_request_stream(0, 7, OutputStream::Answer, Cow::Owned(ch.to_string()));
+            app.compute_total_height_and_markers();
+        }
+
+        let display = app.active_display_ref().unwrap();
+        let cache = display
+            .streaming_response
+            .as_ref()
+            .expect("streaming fast path must populate the response cache");
+        assert_eq!(cache.turn_id, 1, "cache is keyed to the streaming turn");
+        assert!(
+            cache.markdown.parsed_bytes * 2 < naive_bytes,
+            "incremental parsed {} bytes vs {naive_bytes} naive — prefix not reused",
+            cache.markdown.parsed_bytes
+        );
+
+        // The rendered cache entry must match a whole-response render exactly.
+        let turn = &display.view.turns[&1];
+        let cached = display.render_cache[0]
+            .as_ref()
+            .expect("streaming turn is cached");
+        let full = render_turn_lines(turn, 71, 79, false, &[]);
+        assert_eq!(&*cached.rendered.lines, full.lines.as_slice());
+        assert_eq!(&*cached.rendered.joins, full.joins.as_slice());
     }
 
     #[test]
