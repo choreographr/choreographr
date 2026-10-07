@@ -20,7 +20,9 @@ use crate::common;
 
 use choreo_client_core::error::ClientError;
 use choreo_client_core::run_daemon_tcp_connection;
+use choreo_proto::{ClientMessage, ClientMessageType};
 use choreo_transport::key::{ensure_transport_keypair, set_test_config_root};
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
@@ -36,14 +38,17 @@ const RELOAD_DEADLINE: Duration = Duration::from_secs(10);
 /// to what this test needs. The keypair override must be re-installed inside
 /// the connection thread (thread-local) — see the doc comment there.
 struct Client {
-    from_ui: crossbeam_channel::Sender<choreo_proto::ClientMessageType>,
+    from_ui: crossbeam_channel::Sender<ClientMessage>,
+    /// The next per-connection request id (the front-end owns id allocation
+    /// so replies correlate by id).
+    next_id: Cell<u64>,
     rx: mpsc::Receiver<choreo_proto::DaemonMessage>,
     result_rx: mpsc::Receiver<Result<(), ClientError>>,
 }
 
 impl Client {
     fn connect(addr: &str, server_pk: &[u8; 32], key_dir: PathBuf) -> Self {
-        let (from_ui, to_daemon) = crossbeam_channel::unbounded();
+        let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
         let (tx, rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
         let addr = addr.to_string();
@@ -64,9 +69,17 @@ impl Client {
         });
         Client {
             from_ui,
+            next_id: Cell::new(0),
             rx,
             result_rx,
         }
+    }
+
+    /// Frame `msg` with a fresh per-connection request id.
+    fn frame(&self, msg: ClientMessageType) -> ClientMessage {
+        let id = self.next_id.get();
+        self.next_id.set(id.wrapping_add(1));
+        ClientMessage::request(id, msg)
     }
 
     /// Whether the handshake succeeded and the encrypted channel answers a
@@ -75,8 +88,11 @@ impl Client {
     /// costs milliseconds, not a full Pong timeout; a live client waits for
     /// the Pong instead (its connection result only arrives at teardown).
     fn is_alive(&mut self) -> bool {
-        use choreo_proto::{ClientMessageType, DaemonMessageType};
-        if self.from_ui.send(ClientMessageType::Ping).is_err() {
+        if self
+            .from_ui
+            .send(self.frame(ClientMessageType::Ping))
+            .is_err()
+        {
             return false;
         }
         // Short bounded peek for a handshake rejection...
@@ -84,7 +100,10 @@ impl Client {
             return result.is_ok();
         }
         // ...otherwise the connection is (still) up: expect the Pong.
-        matches!(self.rx.recv_timeout(TIMEOUT), Ok(m) if m.inner == DaemonMessageType::Pong)
+        matches!(
+            self.rx.recv_timeout(TIMEOUT),
+            Ok(m) if m.inner == choreo_proto::DaemonMessageType::Pong
+        )
     }
 }
 
@@ -155,7 +174,7 @@ fn acl_edit_authorizes_new_client_without_restart() {
     // Prove the channel is live, then clean shutdown.
     client_b
         .from_ui
-        .send(choreo_proto::ClientMessageType::Ping)
+        .send(client_b.frame(ClientMessageType::Ping))
         .expect("send over hot-authorized connection");
     assert_eq!(
         client_b.rx.recv_timeout(TIMEOUT).expect("Pong").inner,
@@ -215,7 +234,10 @@ fn acl_add_from_local_client_enrolls_new_tcp_client() {
     // Subscribe to activity broadcasts, exactly like the real TUI does at
     // startup — that is the channel the AclUpdated control broadcast rides.
     from_ui
-        .send(choreo_proto::ClientMessageType::SubscribeAllActivity)
+        .send(ClientMessage::request(
+            0,
+            ClientMessageType::SubscribeAllActivity,
+        ))
         .expect("subscribe to activity");
 
     let pubkey_b64 = base64::engine::general_purpose::STANDARD.encode(client_pk_b);
@@ -234,9 +256,12 @@ fn acl_add_from_local_client_enrolls_new_tcp_client() {
 
     // Enroll client B via the LOCAL connection.
     from_ui
-        .send(choreo_proto::ClientMessageType::AclAdd {
-            pubkey: pubkey_b64.clone(),
-        })
+        .send(ClientMessage::request(
+            1,
+            ClientMessageType::AclAdd {
+                pubkey: pubkey_b64.clone(),
+            },
+        ))
         .expect("send AclAdd");
     // The AclUpdated broadcast is written to this client's writer BEFORE the
     // direct AclAddResult reply (the broadcast happens inside the handler,
@@ -286,7 +311,7 @@ fn acl_add_from_local_client_enrolls_new_tcp_client() {
     let client_b = connected.expect("the enrolled client must connect without a daemon restart");
     client_b
         .from_ui
-        .send(choreo_proto::ClientMessageType::Ping)
+        .send(client_b.frame(ClientMessageType::Ping))
         .expect("send over enrolled connection");
     assert_eq!(
         client_b.rx.recv_timeout(TIMEOUT).expect("Pong").inner,

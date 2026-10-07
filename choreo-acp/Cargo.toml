@@ -17,6 +17,10 @@ path = "src/main.rs"
 
 [dependencies]
 choreo-proto.workspace = true
+# The shared client pending-request table ([`PendingReplies`]): the bridge
+# allocates the per-connection request id through it so it cannot drift from the
+# TUI/GUI, and the daemon replies are correlated by that id.
+choreo-client-core.workspace = true
 choreo-shared.workspace = true
 anyhow.workspace = true
 clap.workspace = true

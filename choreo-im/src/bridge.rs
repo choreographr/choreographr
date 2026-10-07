@@ -9,9 +9,10 @@
 //! platform-agnostic: it folds daemon wire messages into [`BridgeEvent`]s and
 //! knows nothing about how they are rendered.
 
+use choreo_client_core::PendingReplies;
 use choreo_proto::{
-    ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, ImageKey, OutputStream,
-    SessionEvent, SessionSummary, Turn, write_message,
+    ClientMessageType, DaemonMessage, DaemonMessageType, ImageKey, OutputStream, SessionEvent,
+    SessionSummary, Turn, write_message,
 };
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
@@ -147,32 +148,54 @@ impl DaemonBridge {
         let (client_tx, client_rx) = crossbeam_channel::unbounded::<ClientMessageType>();
         let (event_tx, event_rx) = crossbeam_channel::unbounded::<BridgeEvent>();
         let writer_event_tx = event_tx.clone();
+        // The writer thread allocates the per-connection request ids through
+        // the shared pending table (the bridge's single send site); the reader
+        // relays the id of every correlated reply back over this channel so the
+        // writer resolves (and drops) the matching slot. The bridge ignores the
+        // CONTENT of acks for correlation — it renders the bridge events
+        // shape-by-shape — so this table exists to own id allocation and keep
+        // itself bounded, and a no-reply request simply ages out via `expire`.
+        let (resolved_tx, resolved_rx) = crossbeam_channel::unbounded::<u64>();
 
         info!("spawning daemon bridge tasks");
 
-        // Writer thread: reads ClientMessages from the channel and writes them
-        // to the daemon socket. On write failure, sends an error event and shuts down.
+        // Writer thread: reads `ClientMessageType`s from the channel, frames
+        // each with a fresh id from the pending table, and writes them to the
+        // daemon socket. On write failure, sends an error event and shuts down.
         std::thread::spawn(move || {
             let mut writer = writer;
-            let client_rx = client_rx;
-            // The bridge writer thread is its single send site: it stamps a
-            // per-connection request id onto every outbound frame (the IM
-            // bridge ignores replies).
-            let mut next_id: u64 = 0;
-            while let Ok(msg) = client_rx.recv() {
-                let framed = ClientMessage::request(next_id, msg);
-                next_id = next_id.wrapping_add(1);
-                debug!(?framed, "sending message to daemon");
-                if let Err(e) = write_message(&mut writer, &framed) {
-                    error!(%e, "write error, bridge writer shutting down");
-                    if let Err(send_err) =
-                        writer_event_tx.send(BridgeEvent::Error(format!("write error: {e}")))
-                    {
-                        warn!("failed to send write error event: {send_err}");
-                    }
-                    break;
+            let mut pending = PendingReplies::new();
+            loop {
+                // Biased toward the send arm so queued UI messages drain first.
+                crossbeam_channel::select_biased! {
+                    recv(client_rx) -> msg => match msg {
+                        Ok(msg) => {
+                            let framed = pending.frame(msg);
+                            debug!(?framed, "sending message to daemon");
+                            if let Err(e) = write_message(&mut writer, &framed) {
+                                error!(%e, "write error, bridge writer shutting down");
+                                if let Err(send_err) = writer_event_tx
+                                    .send(BridgeEvent::Error(format!("write error: {e}")))
+                                {
+                                    warn!("failed to send write error event: {send_err}");
+                                }
+                                break;
+                            }
+                            let _ = writer.flush();
+                        }
+                        // Every send-half is gone: nothing more can be sent.
+                        Err(_) => break,
+                    },
+                    // A correlated reply's id: resolve its pending slot. The
+                    // reader drops this sender when it ends (the connection is
+                    // gone), which closes the channel and stops the writer.
+                    recv(resolved_rx) -> id => match id {
+                        Ok(id) => {
+                            pending.resolve(id);
+                        }
+                        Err(_) => break,
+                    },
                 }
-                let _ = writer.flush();
             }
             info!("bridge writer task finished");
         });
@@ -200,6 +223,12 @@ impl DaemonBridge {
 
             let result = choreo_client_core::run_daemon_reader(&mut reader, |msg| {
                 debug!(?msg, "received daemon message");
+                // Relay a correlated reply's id to the writer so it resolves
+                // (drops) the matching pending slot; a broadcast (`id: None`)
+                // resolves nothing.
+                if let Some(id) = msg.id {
+                    let _ = resolved_tx.send(id);
+                }
                 // Attach handshake. The daemon only serves `GetImage` for — and
                 // only delivers session-scoped events (`TurnAppended`, …) to
                 // subscribers of — the session a connection is ATTACHED to, so

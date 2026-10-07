@@ -61,9 +61,9 @@ pub use command_catalog::{
     CommandGroup, CommandMatch, CommandSpec, command_catalog, match_commands,
 };
 pub use connection::{
-    ConnectionMode, Outbound, PreflightError, own_transport_pubkey, probe_server_key,
-    run_daemon_connection, run_daemon_connection_with_autostart, run_daemon_connection_with_mode,
-    run_daemon_reader, run_daemon_tcp_connection, run_daemon_tcp_connection_pinned,
+    ConnectionMode, PreflightError, own_transport_pubkey, probe_server_key, run_daemon_connection,
+    run_daemon_connection_with_autostart, run_daemon_connection_with_mode, run_daemon_reader,
+    run_daemon_tcp_connection, run_daemon_tcp_connection_pinned,
     run_daemon_tcp_connection_xx_first_contact, verify_daemon_authorization,
 };
 pub use credentials::{

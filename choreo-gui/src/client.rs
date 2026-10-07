@@ -1,22 +1,66 @@
 use crate::state::{AppState, UiEvent};
 use choreo_client_core::{
-    AutoBindAttempt, ClientError, Command, ConnectionMode, McpCommand, attempt_keystore_auto_bind,
-    build_add_credential_message, command_echo, dispatch_daemon_message, parse_input_line,
-    record_unlock_key, resolve_private_key, run_daemon_connection_with_mode,
+    AutoBindAttempt, ClientError, Command, ConnectionMode, McpCommand, Pending, PendingReplies,
+    attempt_keystore_auto_bind, build_add_credential_message, command_echo,
+    dispatch_daemon_message, parse_input_line, record_unlock_key, resolve_private_key,
+    run_daemon_connection_with_mode,
 };
 use choreo_proto::{
-    ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent, socket_path,
+    ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent, socket_path,
 };
 use dioxus::prelude::*;
 use futures_channel::mpsc::UnboundedSender;
+use std::cell::RefCell;
+use std::rc::Rc;
 use zeroize::Zeroize;
+
+/// The GUI's single outbound handle: the framed-message sender plus the
+/// pending-request table that allocates the per-connection request ids.
+///
+/// A dioxus `Signal<Option<DaemonHandle>>` holds one of these; every send site
+/// clones the handle out of the signal and calls [`DaemonHandle::send`], which
+/// allocates the id and records the slot so the daemon's reply resolves it by
+/// id (see [`PendingReplies`]). The table is plain single-threaded state shared
+/// through an `Rc<RefCell<..>>` because the handle is cloned into several UI
+/// callbacks — all of which run on the one dioxus UI thread, so a `RefCell`
+/// (never a lock) is the right cell. This is the GUI's only id-allocation path:
+/// the connection writer forwards the already-framed [`ClientMessage`]
+/// unchanged.
+#[derive(Clone)]
+pub(crate) struct DaemonHandle {
+    tx: crossbeam_channel::Sender<ClientMessage>,
+    pending: Rc<RefCell<PendingReplies>>,
+}
+
+impl DaemonHandle {
+    /// Wrap a framed-message sender with a fresh (empty) pending table.
+    pub(crate) fn new(tx: crossbeam_channel::Sender<ClientMessage>) -> Self {
+        Self {
+            tx,
+            pending: Rc::new(RefCell::new(PendingReplies::new())),
+        }
+    }
+
+    /// Allocate a request id, record the pending slot, frame `inner`, and send
+    /// it — the one path every GUI request takes. Returns the allocated id so a
+    /// caller can attach request-specific context if it needs to.
+    pub(crate) fn send(&self, inner: ClientMessageType) -> u64 {
+        self.pending.borrow_mut().send(&self.tx, inner)
+    }
+
+    /// Resolve the pending slot a reply's id answers (a side effect; the
+    /// payload is still dispatched normally by the caller).
+    pub(crate) fn resolve(&self, id: u64) -> Option<Pending> {
+        self.pending.borrow_mut().resolve(id)
+    }
+}
 
 // needless_pass_by_value waived: the sender is handed to the daemon
 // closure for the whole connection lifetime.
 #[expect(clippy::needless_pass_by_value)]
 pub(crate) fn run_client(
     mode: ConnectionMode,
-    client_rx: crossbeam_channel::Receiver<ClientMessageType>,
+    client_rx: crossbeam_channel::Receiver<ClientMessage>,
     ui_tx: UnboundedSender<UiEvent>,
 ) -> Result<(), ClientError> {
     let result = run_daemon_connection_with_mode(
@@ -37,10 +81,7 @@ pub(crate) fn run_client(
     result
 }
 
-pub(crate) fn submit_input(
-    state: &mut Signal<AppState>,
-    daemon_tx: Option<crossbeam_channel::Sender<ClientMessageType>>,
-) {
+pub(crate) fn submit_input(state: &mut Signal<AppState>, daemon_tx: Option<DaemonHandle>) {
     let line = state.read().input.trim().to_string();
     state.write().input.clear();
     let command = parse_input_line(&line);
@@ -69,7 +110,7 @@ pub(crate) fn connection_addr() -> String {
 
 pub(crate) fn handle_shell_command(
     state: &mut AppState,
-    daemon_tx: Option<crossbeam_channel::Sender<ClientMessageType>>,
+    daemon_tx: Option<DaemonHandle>,
     command: Command,
 ) {
     match command {
@@ -198,10 +239,10 @@ pub(crate) fn handle_shell_command(
 
 pub(crate) fn send_client_message(
     state: &mut AppState,
-    daemon_tx: Option<crossbeam_channel::Sender<ClientMessageType>>,
+    daemon_tx: Option<DaemonHandle>,
     message: ClientMessageType,
 ) {
-    let Some(sender) = daemon_tx else {
+    let Some(handle) = daemon_tx else {
         state
             .status_texts
             .push("[client] not connected".to_string());
@@ -212,11 +253,9 @@ pub(crate) fn send_client_message(
         state.status_texts.push(echo);
     }
 
-    if let Err(error) = sender.send(message) {
-        state
-            .status_texts
-            .push(format!("[client] failed to send command: {error}"));
-    }
+    // Allocate the id and record the pending slot; a closed connection is
+    // logged inside the table and the slot simply times out.
+    handle.send(message);
 }
 
 /// Handles session lifecycle messages (auto-attach, session creation, attaching).
@@ -226,7 +265,7 @@ pub(crate) fn send_client_message(
 /// this function.
 fn handle_session_message(
     state: &mut AppState,
-    daemon_tx: Option<&crossbeam_channel::Sender<ClientMessageType>>,
+    daemon_tx: Option<&DaemonHandle>,
     message: &DaemonMessage,
 ) -> bool {
     match &message.inner {
@@ -265,24 +304,22 @@ fn handle_session_message(
                 }
             }
             if state.attached_session_id.is_none()
-                && let Some(sender) = daemon_tx
+                && let Some(handle) = daemon_tx
             {
                 if let Some(first) = sessions.first() {
-                    if let Err(e) = sender.send(ClientMessageType::AttachSession {
+                    handle.send(ClientMessageType::AttachSession {
                         session_id: first.session_id,
-                    }) {
-                        tracing::error!("failed to send AttachSession: {e}");
-                    }
-                } else if let Err(e) = sender.send(ClientMessageType::CreateSession {
-                    title: Some("default".to_string()),
-                    parent_session_id: None,
-                    working_dir: None,
-                    context_config: None,
-                    account_name: None,
-                    selected_model: None,
-                    reasoning_effort: None,
-                }) {
-                    tracing::error!("failed to send CreateSession: {e}");
+                    });
+                } else {
+                    handle.send(ClientMessageType::CreateSession {
+                        title: Some("default".to_string()),
+                        parent_session_id: None,
+                        working_dir: None,
+                        context_config: None,
+                        account_name: None,
+                        selected_model: None,
+                        reasoning_effort: None,
+                    });
                 }
             }
             true
@@ -298,10 +335,7 @@ fn handle_session_message(
 /// this wrapper only maps the outcome to the GUI's status surfaces and
 /// performs the send. Returns `false` when the bind-loop guard suppressed it
 /// (the callers surface their own reconnect-to-retry message then).
-fn trigger_keystore_auto_bind(
-    state: &mut AppState,
-    daemon_tx: Option<crossbeam_channel::Sender<ClientMessageType>>,
-) -> bool {
+fn trigger_keystore_auto_bind(state: &mut AppState, daemon_tx: Option<DaemonHandle>) -> bool {
     match attempt_keystore_auto_bind(&mut state.keystore_auto_bind, &connection_addr()) {
         AutoBindAttempt::Bind { key, msg } => {
             // Same pending-confirm flow as Unlock/AddCredential: the `Bound`
@@ -326,8 +360,18 @@ fn trigger_keystore_auto_bind(
 pub(crate) fn apply_daemon_message(
     state: &mut AppState,
     message: DaemonMessage,
-    daemon_tx: Option<crossbeam_channel::Sender<ClientMessageType>>,
+    daemon_tx: Option<DaemonHandle>,
 ) {
+    // Resolve the reply's pending slot FIRST, before any state handling: a
+    // `Some(id)` message answers one of our requests, and resolving it is the
+    // correlation step (a broadcast `id: None` resolves nothing). Resolving is
+    // a side table — the payload's own state dispatch below still runs.
+    if let Some(handle) = &daemon_tx
+        && let Some(id) = message.id
+    {
+        handle.resolve(id);
+    }
+
     if handle_session_message(state, daemon_tx.as_ref(), &message) {
         return;
     }

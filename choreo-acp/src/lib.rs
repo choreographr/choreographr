@@ -35,10 +35,12 @@
 //! The bridge is three threads joined by one crossbeam event channel: the
 //! stdin reader and the daemon reader each send [`Event`](daemon_client::Event)
 //! values into it, and the main thread runs the event loop over the single
-//! receiver. A separate daemon writer thread consumes `ClientMessageType`s sent
-//! over its own channel. The event loop is single-threaded and all I/O is
-//! blocking, so the per-loop state ([`sessions::SessionManager`],
-//! [`pending::PendingRequests`]) needs no locking.
+//! receiver. A separate daemon writer thread consumes already-framed
+//! `ClientMessage`s sent over its own channel (the event loop allocates the
+//! per-connection request id through its pending table). The event loop is
+//! single-threaded and all I/O is blocking, so the per-loop state
+//! ([`sessions::SessionManager`], [`pending::PendingRequests`]) needs no
+//! locking.
 
 // Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
 // every public item carries docs, enforced as a hard error by clippy-strict's

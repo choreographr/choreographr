@@ -1,5 +1,5 @@
 use super::*;
-use crate::client::handle_shell_command;
+use crate::client::{DaemonHandle, handle_shell_command};
 use choreo_client_core::{Command, dispatch_daemon_message};
 use choreo_proto::{
     ClientMessageType, DaemonMessage, DaemonMessageType, DisplayedImageRecord, ImageMetadata,
@@ -159,12 +159,12 @@ fn handle_continue_when_attached_sends_continue_generation() {
     state.attached_session_id = Some(42);
     let (tx, rx) = crossbeam_channel::unbounded();
 
-    handle_shell_command(&mut state, Some(tx), Command::Continue);
+    handle_shell_command(&mut state, Some(DaemonHandle::new(tx)), Command::Continue);
 
     // The daemon assigns the run's stream id (reported on `Started`); the client
     // sends the bare request.
     let msg = rx.recv().expect("should send ContinueGeneration");
-    assert_eq!(msg, ClientMessageType::ContinueGeneration);
+    assert_eq!(msg.inner, ClientMessageType::ContinueGeneration);
 }
 
 #[test]
@@ -188,10 +188,10 @@ fn handle_stop_when_attached_sends_cancel_all() {
     state.attached_session_id = Some(42);
     let (tx, rx) = crossbeam_channel::unbounded();
 
-    handle_shell_command(&mut state, Some(tx), Command::Stop);
+    handle_shell_command(&mut state, Some(DaemonHandle::new(tx)), Command::Stop);
 
     let msg = rx.recv().expect("should send Cancel");
-    assert_eq!(msg, ClientMessageType::Cancel { stream_id: 0 });
+    assert_eq!(msg.inner, ClientMessageType::Cancel { stream_id: 0 });
 }
 
 #[test]
@@ -214,10 +214,10 @@ fn handle_undo_sends_undo_message() {
     let mut state = AppState::new("/tmp/choreographr.sock");
     let (tx, rx) = crossbeam_channel::unbounded();
 
-    handle_shell_command(&mut state, Some(tx), Command::Undo);
+    handle_shell_command(&mut state, Some(DaemonHandle::new(tx)), Command::Undo);
 
     let msg = rx.recv().expect("should send Undo");
-    assert_eq!(msg, ClientMessageType::Undo);
+    assert_eq!(msg.inner, ClientMessageType::Undo);
 }
 
 #[test]
@@ -225,10 +225,10 @@ fn handle_redo_sends_redo_message() {
     let mut state = AppState::new("/tmp/choreographr.sock");
     let (tx, rx) = crossbeam_channel::unbounded();
 
-    handle_shell_command(&mut state, Some(tx), Command::Redo);
+    handle_shell_command(&mut state, Some(DaemonHandle::new(tx)), Command::Redo);
 
     let msg = rx.recv().expect("should send Redo");
-    assert_eq!(msg, ClientMessageType::Redo);
+    assert_eq!(msg.inner, ClientMessageType::Redo);
 }
 
 // ── Keystore bind/unlock flow ─────────────────────────────────────
@@ -243,7 +243,7 @@ fn bound_message_records_the_pending_key() {
     apply_daemon_message(
         &mut state,
         DaemonMessage::broadcast(DaemonMessageType::Bound),
-        Some(tx),
+        Some(DaemonHandle::new(tx)),
     );
 
     assert!(state.pending_unlock_key.is_none(), "pending key consumed");
@@ -270,14 +270,14 @@ fn keystore_unbound_auto_binds_once() {
         DaemonMessage::broadcast(DaemonMessageType::KeystoreUnbound {
             error: "no binding".into(),
         }),
-        Some(tx.clone()),
+        Some(DaemonHandle::new(tx.clone())),
     );
     assert!(state.keystore_auto_bind.attempted(), "bind attempt latched");
     assert!(
         state.pending_unlock_key.is_some(),
         "minted key held pending"
     );
-    let ClientMessageType::BindKeystore { key } = rx.recv().expect("bind sent") else {
+    let ClientMessageType::BindKeystore { key } = rx.recv().expect("bind sent").inner else {
         panic!("auto-bind must send BindKeystore");
     };
     let store = choreo_client_core::KnownServers::load().unwrap();
@@ -294,7 +294,7 @@ fn keystore_unbound_auto_binds_once() {
         DaemonMessage::broadcast(DaemonMessageType::KeystoreUnbound {
             error: "still unbound".into(),
         }),
-        Some(tx),
+        Some(DaemonHandle::new(tx)),
     );
     assert!(rx.try_recv().is_err(), "no second bind attempt");
     assert!(
@@ -319,12 +319,12 @@ fn keystore_unbound_status_push_auto_binds() {
         DaemonMessage::broadcast(DaemonMessageType::Keystore {
             state: choreo_proto::KeystoreState::Unbound,
         }),
-        Some(tx.clone()),
+        Some(DaemonHandle::new(tx.clone())),
     );
     assert!(state.keystore_auto_bind.attempted());
     assert!(state.pending_unlock_key.is_some());
     assert!(matches!(
-        rx.recv().expect("bind sent"),
+        rx.recv().expect("bind sent").inner,
         ClientMessageType::BindKeystore { .. }
     ));
 
@@ -334,7 +334,7 @@ fn keystore_unbound_status_push_auto_binds() {
         DaemonMessage::broadcast(DaemonMessageType::Keystore {
             state: choreo_proto::KeystoreState::Unbound,
         }),
-        Some(tx),
+        Some(DaemonHandle::new(tx)),
     );
     assert!(rx.try_recv().is_err(), "no second bind attempt");
 }

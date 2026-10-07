@@ -5,7 +5,7 @@
 // dioxus (it fails to parse and defeats the reactive interpolation), so allow the
 // false positive here.
 #![expect(clippy::useless_format)]
-use crate::client::{send_client_message, submit_input};
+use crate::client::{DaemonHandle, send_client_message, submit_input};
 use crate::render::render_turn;
 #[cfg(target_os = "ios")]
 use crate::settings;
@@ -14,10 +14,7 @@ use choreo_proto::ClientMessageType;
 use dioxus::prelude::*;
 
 #[component]
-pub(crate) fn Toolbar(
-    state: Signal<AppState>,
-    tx: Signal<Option<crossbeam_channel::Sender<ClientMessageType>>>,
-) -> Element {
+pub(crate) fn Toolbar(state: Signal<AppState>, tx: Signal<Option<DaemonHandle>>) -> Element {
     let on_ping = {
         let t = tx;
         move |_| {
@@ -160,10 +157,7 @@ pub(crate) fn HistoryList(state: Signal<AppState>) -> Element {
 }
 
 #[component]
-pub(crate) fn Composer(
-    state: Signal<AppState>,
-    tx: Signal<Option<crossbeam_channel::Sender<ClientMessageType>>>,
-) -> Element {
+pub(crate) fn Composer(state: Signal<AppState>, tx: Signal<Option<DaemonHandle>>) -> Element {
     let on_submit = {
         let t = tx;
         move || submit_input(&mut state, t.read().clone())

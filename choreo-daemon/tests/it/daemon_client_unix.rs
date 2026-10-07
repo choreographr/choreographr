@@ -26,7 +26,10 @@
 )]
 use choreo_client_core::error::ClientError;
 use choreo_client_core::run_daemon_connection;
-use choreo_proto::{ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent};
+use choreo_proto::{
+    ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent,
+};
+use std::cell::Cell;
 use std::io::{self, Read};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
@@ -47,7 +50,11 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// thread blocks in the reader loop and forwards every decoded
 /// `DaemonMessage` into `rx`.
 struct Client {
-    from_ui: crossbeam_channel::Sender<ClientMessageType>,
+    from_ui: crossbeam_channel::Sender<ClientMessage>,
+    /// The next per-connection request id. The front-end (here, the test
+    /// client) owns id allocation so it can correlate the reply by id; the
+    /// connection writer forwards frames unchanged.
+    next_id: Cell<u64>,
     rx: mpsc::Receiver<DaemonMessage>,
     /// Sender half of `run_daemon_connection`'s optional shutdown channel.
     /// Sending on it makes the connection's shutdown thread call
@@ -59,7 +66,7 @@ struct Client {
 
 impl Client {
     fn connect(socket: &str) -> Self {
-        let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessageType>();
+        let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
         // The shutdown channel is wired for every client even though most
         // tests never use it: `disconnect()` needs it, and an unused one is
         // inert (its thread just blocks on `recv` until the test process
@@ -79,6 +86,7 @@ impl Client {
         });
         Client {
             from_ui,
+            next_id: Cell::new(0),
             rx,
             shutdown_tx,
             handle,
@@ -86,7 +94,11 @@ impl Client {
     }
 
     fn send(&self, msg: ClientMessageType) {
-        self.from_ui.send(msg).expect("send to daemon");
+        let id = self.next_id.get();
+        self.next_id.set(id.wrapping_add(1));
+        self.from_ui
+            .send(ClientMessage::request(id, msg))
+            .expect("send to daemon");
     }
 
     fn recv(&self) -> DaemonMessageType {

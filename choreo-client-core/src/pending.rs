@@ -173,6 +173,33 @@ impl PendingReplies {
         inner: ClientMessageType,
         now: Instant,
     ) -> u64 {
+        let (id, framed) = self.frame_at(inner, now);
+        if let Err(error) = tx.send(framed) {
+            warn!(
+                id,
+                kind = ?self.kind_of(id),
+                %error,
+                "failed to send correlated request over the daemon channel; it will time out"
+            );
+        }
+        id
+    }
+
+    /// Allocate a request id, record the pending slot, and return the framed
+    /// [`ClientMessage`] WITHOUT sending it.
+    ///
+    /// For a front-end that owns its transport and must observe the send error
+    /// itself (e.g. an adapter that aborts on a broken pipe), this is the same
+    /// id-allocation path as [`Self::send`]; read the id back from the returned
+    /// frame's `id` field.
+    pub fn frame(&mut self, inner: ClientMessageType) -> ClientMessage {
+        self.frame_at(inner, Instant::now()).1
+    }
+
+    /// Allocate the id, record the slot at `now`, and frame `inner`. The one
+    /// place the id counter and the in-flight map are touched on the outbound
+    /// path, so `send`/`send_at`/`frame` cannot drift.
+    fn frame_at(&mut self, inner: ClientMessageType, now: Instant) -> (u64, ClientMessage) {
         let id = self.next_id;
         // Wrapping is unreachable in practice (2^64 sends) but keeps the
         // counter total rather than panicking on a pathological overflow.
@@ -187,16 +214,13 @@ impl PendingReplies {
                 context: PendingContext::None,
             },
         );
-        let framed = ClientMessage::request(id, inner);
-        if let Err(error) = tx.send(framed) {
-            warn!(
-                id,
-                kind = ?kind,
-                %error,
-                "failed to send correlated request over the daemon channel; it will time out"
-            );
-        }
-        id
+        (id, ClientMessage::request(id, inner))
+    }
+
+    /// The kind recorded for `id`, if its slot is still in flight (used only
+    /// for the send-failure log line).
+    fn kind_of(&self, id: u64) -> Option<MessageKind> {
+        self.inflight.get(&id).map(|pending| pending.kind)
     }
 
     /// Attach a [`PendingContext`] to an in-flight slot created by

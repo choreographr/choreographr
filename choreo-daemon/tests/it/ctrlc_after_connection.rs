@@ -31,7 +31,9 @@
 // helper fns in this file need this file-level allowance.
 #![expect(clippy::expect_used, clippy::panic)]
 use choreo_client_core::run_daemon_connection;
-use choreo_proto::{ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent};
+use choreo_proto::{
+    ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent,
+};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
@@ -101,7 +103,7 @@ fn sigint_exits_after_ping_pong_connect_and_disconnect() {
     let mut daemon = common::SpawnedDaemon::start(&[]);
     {
         let (tx, rx) = mpsc::channel::<DaemonMessage>();
-        let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessageType>();
+        let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
         let socket = daemon.socket_str();
         let handle = thread::spawn(move || {
@@ -114,7 +116,9 @@ fn sigint_exits_after_ping_pong_connect_and_disconnect() {
                 Some(shutdown_rx),
             )
         });
-        from_ui.send(ClientMessageType::Ping).expect("send ping");
+        from_ui
+            .send(ClientMessage::request(0, ClientMessageType::Ping))
+            .expect("send ping");
         assert_eq!(
             rx.recv_timeout(Duration::from_secs(5)).expect("pong").inner,
             DaemonMessageType::Pong
@@ -145,7 +149,7 @@ fn sigint_exits_after_create_session_connect_and_disconnect() {
     let mut daemon = common::SpawnedDaemon::start(&[]);
     {
         let (tx, rx) = mpsc::channel::<DaemonMessage>();
-        let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessageType>();
+        let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
         let socket = daemon.socket_str();
         let handle = thread::spawn(move || {
@@ -159,15 +163,18 @@ fn sigint_exits_after_create_session_connect_and_disconnect() {
             )
         });
         from_ui
-            .send(ClientMessageType::CreateSession {
-                title: Some("repro".into()),
-                parent_session_id: None,
-                working_dir: None,
-                context_config: None,
-                account_name: None,
-                selected_model: None,
-                reasoning_effort: None,
-            })
+            .send(ClientMessage::request(
+                0,
+                ClientMessageType::CreateSession {
+                    title: Some("repro".into()),
+                    parent_session_id: None,
+                    working_dir: None,
+                    context_config: None,
+                    account_name: None,
+                    selected_model: None,
+                    reasoning_effort: None,
+                },
+            ))
             .expect("send create session");
         // Wait for the create reply (it follows the direct-reply path), so
         // the session thread is up before the client goes away.

@@ -2783,6 +2783,7 @@ name = "choreo-acp"
 version = "0.2.3"
 dependencies = [
  "anyhow",
+ "choreo-client-core",
  "choreo-proto",
  "choreo-shared",
  "clap",

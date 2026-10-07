@@ -3,10 +3,10 @@
 //! The bridge talks to the Choreographr daemon over its Unix socket using the
 //! MessagePack-framed `choreo-proto` protocol. This module owns both I/O
 //! threads — one draining [`DaemonMessage`]s into the shared event channel and
-//! one consuming [`ClientMessageType`]s from the event loop — plus the unified
-//! [`Event`] type the main loop dispatches on.
+//! one consuming already-framed [`ClientMessage`]s from the event loop — plus
+//! the unified [`Event`] type the main loop dispatches on.
 
-use choreo_proto::{ClientMessage, ClientMessageType, DaemonMessage, read_message, write_message};
+use choreo_proto::{ClientMessage, DaemonMessage, read_message, write_message};
 use crossbeam_channel::Sender;
 use std::io::{BufReader, BufWriter, Write};
 #[cfg(unix)]
@@ -56,12 +56,13 @@ pub enum Event {
 
 /// Handle to the daemon connection.
 ///
-/// `writer_tx` is used to send `ClientMessageType` values to the daemon writer
-/// thread.  `join_handle` allows waiting for the daemon reader thread to
-/// finish during shutdown.
+/// `writer_tx` carries already-framed [`ClientMessage`]s to the daemon writer
+/// thread (the event loop allocates the request id through its pending table).
+/// `join_handle` allows waiting for the daemon reader thread to finish during
+/// shutdown.
 pub struct DaemonClient {
-    /// Send `ClientMessageType` frames to the daemon writer thread.
-    pub writer_tx: Sender<ClientMessageType>,
+    /// Send framed [`ClientMessage`]s to the daemon writer thread.
+    pub writer_tx: Sender<ClientMessage>,
     /// Join handle for the daemon reader thread.
     pub join_handle: thread::JoinHandle<()>,
 }
@@ -94,8 +95,8 @@ pub fn spawn_daemon_io(
     let reader_stream = stream.try_clone()?;
     let mut writer_stream = BufWriter::new(stream);
 
-    // Writer channel: the main loop sends ClientMessages here.
-    let (writer_tx, writer_rx): (Sender<ClientMessageType>, _) = crossbeam_channel::unbounded();
+    // Writer channel: the main loop sends framed ClientMessages here.
+    let (writer_tx, writer_rx): (Sender<ClientMessage>, _) = crossbeam_channel::unbounded();
 
     // ------------------------------------------------------------------
     // Writer thread
@@ -107,16 +108,12 @@ pub fn spawn_daemon_io(
         .name("daemon-writer".into())
         .spawn(move || {
             info!("daemon writer thread started");
-            // This writer thread is the ACP bridge's single send site: it owns
-            // the per-connection request-id counter and stamps every outbound
-            // frame (the ACP bridge ignores replies, but the id is mandatory on
-            // the wire).
-            let mut next_id: u64 = 0;
+            // The event loop owns id allocation (its pending table frames each
+            // request); this thread just puts the already-framed frame on the
+            // wire.
             for msg in writer_rx {
                 debug!(?msg, "sending message to daemon");
-                let framed = ClientMessage::request(next_id, msg);
-                next_id = next_id.wrapping_add(1);
-                if let Err(e) = write_message(&mut writer_stream, &framed) {
+                if let Err(e) = write_message(&mut writer_stream, &msg) {
                     error!(error = %e, "daemon writer error");
                     break;
                 }

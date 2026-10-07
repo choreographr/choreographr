@@ -38,8 +38,11 @@ use choreo_client_core::error::ClientError;
 use choreo_client_core::run_daemon_connection;
 use choreo_client_core::run_daemon_tcp_connection;
 use choreo_client_core::run_daemon_tcp_connection_xx_first_contact;
-use choreo_proto::{ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent};
+use choreo_proto::{
+    ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent,
+};
 use choreo_transport::key::{ensure_transport_keypair, set_test_config_root};
+use std::cell::Cell;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -84,7 +87,10 @@ const LARGE_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 /// test can join it with a bounded `recv_timeout` instead of a blocking
 /// `thread::join`.
 struct NoiseClient {
-    from_ui: crossbeam_channel::Sender<ClientMessageType>,
+    from_ui: crossbeam_channel::Sender<ClientMessage>,
+    /// The next per-connection request id (see `daemon_client_unix.rs`'s
+    /// `Client`): the front-end owns id allocation so replies correlate by id.
+    next_id: Cell<u64>,
     rx: mpsc::Receiver<DaemonMessage>,
     shutdown_tx: crossbeam_channel::Sender<()>,
     result_rx: mpsc::Receiver<Result<(), ClientError>>,
@@ -103,7 +109,7 @@ impl NoiseClient {
     /// the thread's result is sent; if the thread panics first, the
     /// thread-local dies with the thread and leaks nothing.
     fn connect(addr: &str, server_pk: &[u8; 32], key_dir: PathBuf) -> Self {
-        let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessageType>();
+        let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
         let (tx, rx) = mpsc::channel::<DaemonMessage>();
         let (result_tx, result_rx) = mpsc::channel::<Result<(), ClientError>>();
@@ -125,6 +131,7 @@ impl NoiseClient {
         });
         NoiseClient {
             from_ui,
+            next_id: Cell::new(0),
             rx,
             shutdown_tx,
             result_rx,
@@ -132,7 +139,11 @@ impl NoiseClient {
     }
 
     fn send(&self, msg: ClientMessageType) {
-        self.from_ui.send(msg).expect("send to daemon");
+        let id = self.next_id.get();
+        self.next_id.set(id.wrapping_add(1));
+        self.from_ui
+            .send(ClientMessage::request(id, msg))
+            .expect("send to daemon");
     }
 
     fn recv(&self) -> DaemonMessageType {
@@ -300,7 +311,7 @@ fn noise_and_unix_share_daemon_state() {
     // Minimal inline Unix client: spawn `run_daemon_connection` in a
     // thread. Only send + recv + join are needed here — the full Client
     // helper lives in daemon_client_unix.rs.
-    let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessageType>();
+    let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
     let (tx, rx) = mpsc::channel::<DaemonMessage>();
     let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
     let socket = daemon.socket_str();
@@ -319,7 +330,7 @@ fn noise_and_unix_share_daemon_state() {
     noise_client.send(ClientMessageType::Ping);
     assert_eq!(noise_client.recv(), DaemonMessageType::Pong);
     from_ui
-        .send(ClientMessageType::Ping)
+        .send(ClientMessage::request(0, ClientMessageType::Ping))
         .expect("send to daemon");
     match rx
         .recv_timeout(TIMEOUT)
@@ -349,7 +360,7 @@ fn noise_and_unix_share_daemon_state() {
     // auto-registered), so no broadcast lands on the Unix channel before its
     // reply — the next message must be exactly the Sessions reply.
     from_ui
-        .send(ClientMessageType::ListSessions)
+        .send(ClientMessage::request(1, ClientMessageType::ListSessions))
         .expect("send to daemon");
     match rx
         .recv_timeout(TIMEOUT)
@@ -766,7 +777,7 @@ fn connect_xx(
     confirm: bool,
     learned_tx: mpsc::Sender<[u8; 32]>,
 ) -> NoiseClient {
-    let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessageType>();
+    let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();
     let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
     let (tx, rx) = mpsc::channel::<DaemonMessage>();
     let (result_tx, result_rx) = mpsc::channel::<Result<(), ClientError>>();
@@ -790,6 +801,7 @@ fn connect_xx(
     });
     NoiseClient {
         from_ui,
+        next_id: Cell::new(0),
         rx,
         shutdown_tx,
         result_rx,
@@ -867,6 +879,7 @@ fn noise_xx_first_contact_reject_closes_without_traffic() {
     // consumes the client, and the pins below need its channels.
     let NoiseClient {
         from_ui,
+        next_id: _,
         rx,
         shutdown_tx,
         result_rx,
@@ -887,7 +900,7 @@ fn noise_xx_first_contact_reject_closes_without_traffic() {
     // could ever reach the daemon. (A SendError here is the pin: pre-gate,
     // the writer thread would be draining this channel and the send would
     // succeed — which is exactly the leak the gate exists to prevent.)
-    let send_result = from_ui.send(ClientMessageType::Ping);
+    let send_result = from_ui.send(ClientMessage::request(0, ClientMessageType::Ping));
     assert!(
         send_result.is_err(),
         "after refusal no message path to the daemon may exist"

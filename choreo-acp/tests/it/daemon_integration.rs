@@ -105,10 +105,12 @@ fn daemon_io_send_and_receive() {
     // Wait for the fake daemon to be ready.
     daemon_ready.recv().unwrap();
 
-    // Send ListModels (this matches what dispatch_new_session does).
+    // Send ListModels (this matches what dispatch_new_session does). The
+    // bridge's pending table frames requests with the per-connection id; the
+    // mock here just needs a well-formed frame.
     client
         .writer_tx
-        .send(ClientMessageType::ListModels)
+        .send(ClientMessage::request(0, ClientMessageType::ListModels))
         .unwrap();
 
     // Receive the Models response (deterministic: the fake daemon
@@ -132,9 +134,12 @@ fn daemon_io_send_and_receive() {
     // Send a RunInput to trigger an echoed response.
     client
         .writer_tx
-        .send(ClientMessageType::RunInput {
-            input: b"hello".to_vec(),
-        })
+        .send(ClientMessage::request(
+            1,
+            ClientMessageType::RunInput {
+                input: b"hello".to_vec(),
+            },
+        ))
         .unwrap();
 
     // Receive the OutputChunk.
