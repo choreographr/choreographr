@@ -1170,6 +1170,28 @@ fn table_reading_order_fill_highlights_selected_cells() {
 }
 
 #[test]
+fn table_hard_split_cell_rejoins_without_space() {
+    // A cell holding a token longer than its shrunk column is hard-split across
+    // display rows; copying it must concatenate the pieces directly (the
+    // recorded `Join` per-cell join), not insert the word-wrap separating space.
+    // Regression: the reading-order rejoin used to hardcode a space, corrupting
+    // any long token (URL, hash, identifier) in a narrow table column.
+    let md = "| k | v |\n|---|---|\n| a | abcdefghijklmnopqrstuvwxyz |";
+    let mut app = test_app();
+    app.history_viewport.width = 40;
+    app.history_viewport.height = 40;
+    app.display_for(0).view.insert_or_replace(0, turn(md));
+    app.rebuild_height_prefix();
+    let (start, _) = locate(&app, "abcdefghij");
+    let (_, end) = locate(&app, "wxyz");
+    let copied = drag_and_finish(&mut app, start, end).expect("selection should extract");
+    assert_eq!(
+        copied, "abcdefghijklmnopqrstuvwxyz",
+        "a hard-split cell must rejoin with no inserted space: {copied:?}"
+    );
+}
+
+#[test]
 fn table_zwj_emoji_highlight_matches_copy() {
     // A ZWJ emoji family in a table cell: the highlighted extent and the
     // copied text must agree.  The trim used to measure columns by summing

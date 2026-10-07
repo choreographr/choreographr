@@ -164,14 +164,38 @@ fn many_body_rows_have_distinct_ids() {
 }
 
 #[test]
-fn wrapped_table_cell_joins_with_space() {
-    // A cell that wraps records a space-join on its continuation row, so a
-    // normal selection over the table rejoins the cell to its original text.
+fn wrapped_table_cell_records_per_cell_join() {
+    // A wrapped cell records a per-cell `Space` join on its continuation row
+    // (carried on the row line's chrome), so the selection's reading-order fill
+    // rejoins the cell to its original text.  The row-level `joins` vector is
+    // deliberately `Break` for table rows — the reading-order copy uses the
+    // per-cell joins instead of a collapsed row join.
     let md = "| Key | Value |\n|-----|-------|\n| k | alpha beta gamma delta epsilon |";
-    let (_lines, joins, _chrome) = markdown_lines_joined(md, 30);
+    let (_lines, joins, chrome) = markdown_lines_joined(md, 30);
     assert!(
-        joins.contains(&LineJoin::Space),
-        "a wrapped table cell must record a space-join: {joins:?}"
+        chrome
+            .iter()
+            .any(|c| c.cell_joins().contains(&LineJoin::Space)),
+        "a wrapped table cell must record a per-cell space-join: {chrome:#?}"
+    );
+    assert!(
+        joins.iter().all(|&j| j == LineJoin::Break),
+        "table rows carry no row-level continuation join: {joins:?}"
+    );
+}
+
+#[test]
+fn hard_split_table_cell_records_direct_join() {
+    // A cell holding a token wider than its shrunk column records a per-cell
+    // `Join` (not `Space`) on its continuation row, so the copy concatenates the
+    // pieces without inventing a space.
+    let md = "| k | v |\n|---|---|\n| a | abcdefghijklmnopqrstuvwxyz |";
+    let (_lines, _joins, chrome) = markdown_lines_joined(md, 30);
+    assert!(
+        chrome
+            .iter()
+            .any(|c| c.cell_joins().contains(&LineJoin::Join)),
+        "a hard-split table cell must record a direct join: {chrome:#?}"
     );
 }
 

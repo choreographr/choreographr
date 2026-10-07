@@ -12,7 +12,7 @@
 //! from the same [`pick_table_run`] the copy uses, so the box shown is exactly
 //! the box copied.
 
-use crate::markdown_render::LineChrome;
+use crate::markdown_render::{LineChrome, LineJoin};
 use crate::state::{App, SessionDisplayState};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -47,20 +47,23 @@ pub(crate) fn for_each_table_run(
     end: usize,
     mut f: impl FnMut(usize, usize),
 ) {
+    if start > end {
+        return;
+    }
     let mut content_line = start;
     while content_line <= end {
         let Some(table) = table_id_at(display, vp_width, content_line) else {
             content_line += 1;
             continue;
         };
-        let mut run_end = content_line + 1;
-        while run_end <= end
-            && matches!(table_id_at(display, vp_width, run_end), Some(t) if t == table)
-        {
-            run_end += 1;
+        let run_start = content_line;
+        content_line += 1;
+        // Extend the run over every following line that is the same table;
+        // `content_line` ends on the first line that is not (or past `end`).
+        while content_line <= end && table_id_at(display, vp_width, content_line) == Some(table) {
+            content_line += 1;
         }
-        f(content_line, run_end);
-        content_line = run_end;
+        f(run_start, content_line);
     }
 }
 
@@ -73,6 +76,10 @@ struct CellLine {
     line_idx: usize,
     /// The cell's display-column band on this line (padding included).
     band: (usize, usize),
+    /// How this display line glues to the cell's previous line (the renderer's
+    /// per-cell copy-join): `Space` at a word-wrap seam, `Join` at a hard
+    /// mid-word split, `Break` at the cell's first line or an embedded newline.
+    join: LineJoin,
 }
 
 /// One data-table cell: the display lines it spans (its wrapped pieces, in
@@ -120,12 +127,18 @@ fn table_cells(
             }
         }
         for (col, &band) in bands.iter().enumerate() {
+            let join = chrome
+                .cell_joins()
+                .get(col)
+                .copied()
+                .unwrap_or(LineJoin::Break);
             if let Some(cell) = cells.get_mut(row_start + col) {
                 cell.lines.push(CellLine {
                     content_line,
                     turn_idx,
                     line_idx,
                     band,
+                    join,
                 });
             }
         }
@@ -163,9 +176,10 @@ fn locate_cell(
 }
 
 /// The trimmed pieces of one cell (one per display line it has text on), each
-/// paired with its global content line and the display-column range of its
-/// non-whitespace content (the highlight range).  `from`/`to` slice the cell at
-/// a `(wrap_line, column)`; `None` means the cell's own start/end.
+/// paired with its global content line, the display-column range of its
+/// non-whitespace content (the highlight range), and the cell-line copy-join
+/// (how that line glues to the cell's previous line).  `from`/`to` slice the
+/// cell at a `(wrap_line, column)`; `None` means the cell's own start/end.
 ///
 /// The piece and its highlight range come from one grapheme walk
 /// ([`super::text::slice_line_columns_trimmed`]) so the copied text and the
@@ -176,7 +190,7 @@ fn cell_pieces(
     cell: &TableCell,
     from: Option<(usize, usize)>,
     to: Option<(usize, usize)>,
-) -> Vec<(usize, String, (usize, usize))> {
+) -> Vec<(usize, String, (usize, usize), LineJoin)> {
     let start = from.map_or(0, |(wrap, _)| wrap);
     let end = to.map_or(cell.lines.len().saturating_sub(1), |(wrap, _)| wrap);
     let mut pieces = Vec::new();
@@ -200,7 +214,7 @@ fn cell_pieces(
         };
         let (piece, band) = slice_line_columns_trimmed(text_line, lo, hi);
         if !piece.is_empty() {
-            pieces.push((line.content_line, piece, band));
+            pieces.push((line.content_line, piece, band, line.join));
         }
     }
     pieces
@@ -265,13 +279,20 @@ pub(crate) fn pick_table_run(
         if !copy.is_empty() {
             copy.push_str("\n\n");
         }
-        // Rejoin the cell's display lines with the single space the reflow
-        // consumed, and record each line's trimmed range for the highlight (so
-        // the cell padding is neither copied nor shown as selected).
+        // Rejoin the cell's display lines through the recorded per-cell copy
+        // joins — a word-wrap seam re-inserts the single space the reflow
+        // consumed, a hard mid-word split concatenates directly, an embedded
+        // newline is a real break — and record each line's trimmed range for the
+        // highlight (so the cell padding is neither copied nor shown as
+        // selected).
         let mut first_piece = true;
-        for (content_line, piece, band) in &pieces {
+        for (content_line, piece, band, join) in &pieces {
             if !first_piece {
-                copy.push(' ');
+                match join {
+                    LineJoin::Break => copy.push('\n'),
+                    LineJoin::Space => copy.push(' '),
+                    LineJoin::Join => {}
+                }
             }
             first_piece = false;
             copy.push_str(piece);

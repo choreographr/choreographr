@@ -93,8 +93,8 @@ pub(crate) enum LineJoin {
 pub(crate) struct TableRowId {
     /// Table ordinal, unique across the whole rendered session history (every
     /// turn of every table), so the selection can never merge two distinct
-    /// tables into one reading-order run.  Allocated from a process-wide
-    /// monotonic counter (see [`next_table_id`]).
+    /// tables into one reading-order run.  Allocated from a monotonic counter
+    /// thread-local to the render thread (see [`next_table_id`]).
     pub table: u32,
     /// Row index within the table, 0 = header; [`TableRowId::RULE`] marks a
     /// frame/separator rule (no cells).
@@ -122,10 +122,11 @@ impl TableRowId {
 /// frame and padding (see `render_code_box`), and the `│` borders and frame of
 /// a data table are the producers today.
 ///
-/// The record also carries the line's [`TableRowId`] (if any): it travels with
-/// the chrome through [`LineChrome::extend_shifted`] and the render cache, so
-/// the selection can regroup a table's wrapped rows into cells without a
-/// separate parallel buffer.
+/// The record also carries the line's [`TableRowId`] (if any) together with
+/// the row line's **per-cell copy-joins**: it all travels with the chrome
+/// through [`LineChrome::extend_shifted`] and the render cache, so the
+/// selection can regroup a table's wrapped rows into cells *and* rejoin each
+/// cell to its original text without a separate parallel buffer.
 ///
 /// Empty for the overwhelming majority of lines; a [`SmallVec`] keeps the
 /// common empty case allocation-free while still allowing more than one
@@ -137,6 +138,15 @@ impl TableRowId {
 pub(crate) struct LineChrome {
     intervals: SmallVec<[(u16, u16); 2]>,
     table: Option<TableRowId>,
+    /// Per-cell copy-joins of a data-table *row line*, aligned with the row's
+    /// selectable cell bands (the gaps between the `│` borders).  Entry `c`
+    /// records how cell `c`'s text on this line glues to the same cell's text
+    /// on the row line above: [`LineJoin::Space`] at a word-wrap seam,
+    /// [`LineJoin::Join`] at a hard mid-word split, [`LineJoin::Break`] at the
+    /// cell's first line or an embedded newline.  The selection's
+    /// reading-order fill rejoins a wrapped cell through these, so a hard
+    /// split is never given a spurious space.  Empty for every non-table line.
+    cell_joins: SmallVec<[LineJoin; 4]>,
 }
 
 impl LineChrome {
@@ -171,6 +181,9 @@ impl LineChrome {
         if self.table.is_none() {
             self.table = other.table;
         }
+        if self.cell_joins.is_empty() {
+            self.cell_joins.clone_from(&other.cell_joins);
+        }
     }
 
     /// True when the line has no non-selectable chrome.
@@ -191,6 +204,17 @@ impl LineChrome {
     /// Tag this record as part of `id`'s table row.
     pub(crate) fn set_table(&mut self, id: TableRowId) {
         self.table = Some(id);
+    }
+
+    /// Record one data-table cell's copy-join for this row line, in column
+    /// order (aligned with the row's selectable cell bands).
+    pub(crate) fn push_cell_join(&mut self, join: LineJoin) {
+        self.cell_joins.push(join);
+    }
+
+    /// The per-cell copy-joins of a data-table row line, in column order.
+    pub(crate) fn cell_joins(&self) -> &[LineJoin] {
+        &self.cell_joins
     }
 }
 

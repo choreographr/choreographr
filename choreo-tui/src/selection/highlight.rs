@@ -11,7 +11,7 @@
 
 use crate::markdown_render::LineChrome;
 use crate::state::App;
-use ratatui::style::Color;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
@@ -108,11 +108,7 @@ pub(crate) fn apply_selection_to_lines(
             // never highlighted as a plain line rectangle.
             if table.lines.contains(&content_line) {
                 if let Some(bands) = table.ranges.get(&content_line) {
-                    let mut styled = line.clone();
-                    for (c_lo, c_hi) in bands {
-                        styled = style_line_selection(&styled, *c_lo, *c_hi);
-                    }
-                    *line = styled;
+                    *line = style_line_selection_ranges(line, bands);
                 }
                 if row_hi - row_lo <= 1 {
                     break;
@@ -148,14 +144,10 @@ pub(crate) fn apply_selection_to_lines(
             if selectable.is_empty() {
                 continue;
             }
-            // Style each disjoint sub-interval in turn.  Restyling only the
-            // background (the text is preserved), so the column offsets stay
-            // valid across successive calls.
-            let mut styled = line.clone();
-            for (c_lo, c_hi) in &selectable {
-                styled = style_line_selection(&styled, *c_lo, *c_hi);
-            }
-            *line = styled;
+            // Style the disjoint selected sub-intervals in a single pass so a
+            // row whose cells are separated by chrome (a table row, a quote
+            // nested in a list) is restyled once, not once per interval.
+            *line = style_line_selection_ranges(line, &selectable);
             // A real (single-visual-row) line is fully covered by its one row.
             if row_hi - row_lo <= 1 {
                 break;
@@ -169,12 +161,34 @@ pub(crate) fn apply_selection_to_lines(
 /// spans at grapheme boundaries so a selection can never split a ZWJ emoji
 /// or combining sequence.  `col_hi` of `usize::MAX` means "to the end of
 /// the line".
+///
+/// Single-range convenience wrapper over [`style_line_selection_ranges`],
+/// kept for the unit tests; the production highlight path always calls the
+/// multi-range form.
+#[cfg(test)]
 pub(crate) fn style_line_selection(
     line: &Line<'static>,
     col_lo: usize,
     col_hi: usize,
 ) -> Line<'static> {
-    if col_lo >= col_hi {
+    style_line_selection_ranges(line, &[(col_lo, col_hi)])
+}
+
+/// Restyle several disjoint display-column ranges of a line with the
+/// selection highlight in a single pass.  Ranges are half-open `[lo, hi)` in
+/// display columns (`hi` of `usize::MAX` = end-of-line) and, by the
+/// [`super::extract::selectable_intervals`] contract, ascending and
+/// non-overlapping; each cut snaps to a grapheme boundary and the unselected
+/// text keeps its span's original style.
+///
+/// The whole-selection table highlight and the plain per-line highlight both
+/// route through here, so the multiple cell bands of one row are styled in one
+/// walk rather than by cloning and re-splitting the line once per band.
+pub(crate) fn style_line_selection_ranges(
+    line: &Line<'static>,
+    ranges: &[(usize, usize)],
+) -> Line<'static> {
+    if ranges.iter().all(|&(lo, hi)| lo >= hi) {
         return line.clone();
     }
     let mut out: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 2);
@@ -191,38 +205,64 @@ pub(crate) fn style_line_selection(
         let span_lo = col;
         let span_hi = col.saturating_add(span_w);
         col = span_hi;
-        if span_hi <= col_lo || span_lo >= col_hi {
-            // Entirely before or after the selection — keep as-is.
+        // This span's selected sub-intervals, in span-local columns, ascending.
+        let mut cuts: Vec<(usize, usize)> = Vec::new();
+        for &(lo, hi) in ranges {
+            let a = lo.max(span_lo);
+            let b = hi.min(span_hi);
+            if a < b {
+                cuts.push((a - span_lo, b - span_lo));
+            }
+        }
+        if cuts.is_empty() {
             out.push(span.clone());
             continue;
         }
-        // Overlap: split this span at the selection boundaries, snapping both
-        // cuts to grapheme boundaries.
-        let before_w = col_lo.saturating_sub(span_lo);
-        let sel_hi_col = col_hi.saturating_sub(span_lo).min(span_w);
-        let mut sel_lo = crate::state::grapheme_offset_at_column(span_text, before_w);
-        let mut sel_hi = crate::state::grapheme_offset_at_column(span_text, sel_hi_col);
-        // Defensive monotonicity (columns are ordered; the snap can't invert
-        // them, but a malformed range must never panic on the slice below).
-        if sel_lo > sel_hi {
-            std::mem::swap(&mut sel_lo, &mut sel_hi);
+        cuts.sort_unstable();
+        // Emit the span split at each cut, snapping every column to a grapheme
+        // boundary; the gaps between cuts stay unselected.
+        let mut cursor = 0usize;
+        for (a, b) in cuts {
+            if a > cursor {
+                push_selection_piece(&mut out, span_text, cursor, a, span.style, false);
+            }
+            let a = a.max(cursor);
+            if b > a {
+                push_selection_piece(&mut out, span_text, a, b, span.style, true);
+            }
+            cursor = cursor.max(b);
         }
-        // The snap offsets come from `grapheme_offset_at_column` over the same
-        // string, so both are char boundaries within `span_text` by
-        // construction; `.get()` keeps the slices total.
-        let before = span_text.get(..sel_lo).unwrap_or("");
-        let selected = span_text.get(sel_lo..sel_hi).unwrap_or("");
-        let after = span_text.get(sel_hi..).unwrap_or("");
-        if !before.is_empty() {
-            out.push(Span::styled(before.to_owned(), span.style));
-        }
-        out.push(Span::styled(
-            selected.to_owned(),
-            span.style.bg(SELECTION_BG),
-        ));
-        if !after.is_empty() {
-            out.push(Span::styled(after.to_owned(), span.style));
+        if cursor < span_w {
+            push_selection_piece(&mut out, span_text, cursor, span_w, span.style, false);
         }
     }
     Line::from(out)
+}
+
+/// Push one grapheme-snapped slice of `span_text` (span-local display columns
+/// `[lo, hi)`) onto `out`, with the selection background when `selected`.
+fn push_selection_piece(
+    out: &mut Vec<Span<'static>>,
+    span_text: &str,
+    lo: usize,
+    hi: usize,
+    style: Style,
+    selected: bool,
+) {
+    let a = crate::state::grapheme_offset_at_column(span_text, lo);
+    let b = crate::state::grapheme_offset_at_column(span_text, hi);
+    // The snap offsets come from `grapheme_offset_at_column` over the same
+    // string, so both are char boundaries within `span_text` by construction;
+    // `.get()` keeps the slice total and the swap guards monotonicity.
+    let (a, b) = if a > b { (b, a) } else { (a, b) };
+    let piece = span_text.get(a..b).unwrap_or("");
+    if piece.is_empty() {
+        return;
+    }
+    let style = if selected {
+        style.bg(SELECTION_BG)
+    } else {
+        style
+    };
+    out.push(Span::styled(piece.to_owned(), style));
 }

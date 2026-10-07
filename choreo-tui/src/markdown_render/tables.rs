@@ -346,34 +346,11 @@ pub(crate) fn render_table_row_wrapped(
         .map(|(cell, width)| wrap_cell_text(cell, *width))
         .collect();
     let row_height = wrapped_cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
-    // Row copy-joins: the first row is a fresh line, and each continuation
-    // joins as the wrap that produced it did — a word-boundary seam re-inserts
-    // the one separating space, a hard mid-word split joins directly, an
-    // embedded newline is a break.  When the cells on a line disagree, the
-    // strongest wins, so a hard split is never merged with a space.
-    let mut joins = Vec::with_capacity(row_height);
-    // The first row is always a fresh line; continuations default to a
-    // word-wrap seam (`Space`) and are upgraded below.
-    joins.push(LineJoin::Break);
-    joins.resize(row_height, LineJoin::Space);
-    for (line_index, row_join) in joins.iter_mut().enumerate().skip(1) {
-        for cell in &wrapped_cells {
-            if let Some((_, cell_join)) = cell.get(line_index) {
-                match cell_join {
-                    LineJoin::Break => {
-                        *row_join = LineJoin::Break;
-                        break;
-                    }
-                    LineJoin::Join => {
-                        if *row_join != LineJoin::Break {
-                            *row_join = LineJoin::Join;
-                        }
-                    }
-                    LineJoin::Space => {}
-                }
-            }
-        }
-    }
+    // Every display line of a table row is a fresh line in the copy: the
+    // reading-order fill reconstructs each cell from the per-cell copy-joins
+    // recorded on the row's chrome (below), not from a row-level join, so the
+    // row-level join this vector carries is always `Break`.
+    let joins = vec![LineJoin::Break; row_height];
     let mut lines = Vec::with_capacity(row_height);
     let mut chrome = Vec::with_capacity(row_height);
     for line_index in 0..row_height {
@@ -392,17 +369,24 @@ pub(crate) fn render_table_row_wrapped(
             // lookups are in bounds; `.get()` keeps them total.
             let cell_line = wrapped_cells
                 .get(column_index)
-                .and_then(|cell| cell.get(line_index))
-                .map_or("", |(text, _join)| text.as_str());
+                .and_then(|cell| cell.get(line_index));
             let Some(cell_width) = widths.get(column_index) else {
                 continue;
             };
+            // Record how this cell's text on this row line glues to the same
+            // cell's text on the line above — a word-wrap seam (`Space`), a hard
+            // mid-word split (`Join`), the cell's first line or an embedded
+            // newline (`Break`) — aligned with the cell's selectable band so the
+            // selection's reading-order fill can rejoin a wrapped cell to its
+            // original text without guessing.
+            row_chrome.push_cell_join(cell_line.map_or(LineJoin::Break, |(_, join)| *join));
+            let cell_text = cell_line.map_or("", |(text, _join)| text.as_str());
             // One padding space, the aligned cell text, then one padding space
             // and the cell's trailing border.
             text.push(' ');
             col += 1;
             let padded = pad_aligned(
-                cell_line,
+                cell_text,
                 *cell_width,
                 alignments
                     .get(column_index)

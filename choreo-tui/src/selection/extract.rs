@@ -225,8 +225,8 @@ pub(crate) fn content_range_for_row(
         // Deliberately NOT chrome: the extraction path turns it into an
         // empty slot (its `Break` join re-inserts the newline), so a blank
         // line inside the selected text is copied, not dropped.  The
-        // highlight path is unaffected: `style_line_selection` no-ops on an
-        // empty column range.  (An empty overlap on a non-blank row falls
+        // highlight path is unaffected: `style_line_selection_ranges` no-ops
+        // on an empty column range.  (An empty overlap on a non-blank row falls
         // through the first arm to `None` above; only the row's own empty
         // content range reaches this arm.)
         Some((clo, chi)) => Some((line_idx, (clo, chi))),
