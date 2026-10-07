@@ -44,6 +44,7 @@ fn test_state() -> SessionState {
             last_response_id_producer: None,
         },
         next_turn_id: 1,
+        next_stream_id: 1,
         last_undo_turn_ids: None,
         turns,
         loaded_skill_bodies: Vec::new(),
@@ -2678,7 +2679,7 @@ fn run_input_empty_acks_failed_and_broadcasts_stream_failure() {
     let target = target_for(18, MessageKind::RunInput, &sink, &ctx);
     let mut shutdown = false;
 
-    let _ = handle_run_input(5, b"", Some(target), &mut state, &mut shutdown, &ctx);
+    let _ = handle_run_input(b"", Some(target), &mut state, &mut shutdown, &ctx);
 
     let broadcasts = one_reply(
         &rx,
@@ -2688,19 +2689,20 @@ fn run_input_empty_acks_failed_and_broadcasts_stream_failure() {
             error: "empty input".to_string(),
         },
     );
-    // The unchanged stream failure is still broadcast (`id: None`), for the
+    // The daemon assigns the stream id (test_state starts the counter at 1);
+    // the unchanged stream failure is still broadcast (`id: None`), for the
     // requester and every other subscriber alike.
     assert!(broadcasts.iter().any(|m| matches!(
         &m.inner,
         DaemonMessageType::Session {
-            event: SessionEvent::Started { stream_id: 5, .. },
+            event: SessionEvent::Started { stream_id: 1, .. },
             ..
         }
     )));
     assert!(broadcasts.iter().any(|m| matches!(
         &m.inner,
         DaemonMessageType::Session {
-            event: SessionEvent::Failed { stream_id: 5, .. },
+            event: SessionEvent::Failed { stream_id: 1, .. },
             ..
         }
     )));
@@ -2730,7 +2732,7 @@ fn run_input_accept_acks_targeted_started_and_broadcasts_started() {
     let target = target_for(19, MessageKind::RunInput, &sink, &ctx);
     let mut shutdown = false;
 
-    let _ = handle_run_input(5, b"hello", Some(target), &mut state, &mut shutdown, &ctx);
+    let _ = handle_run_input(b"hello", Some(target), &mut state, &mut shutdown, &ctx);
 
     let broadcasts = one_reply(
         &rx,
@@ -2738,7 +2740,7 @@ fn run_input_accept_acks_targeted_started_and_broadcasts_started() {
         &DaemonMessageType::Session {
             session_id: Some(1),
             event: SessionEvent::Started {
-                stream_id: 5,
+                stream_id: 1,
                 turn_id: 1,
                 estimated_prompt_tokens: 0,
             },
@@ -2748,8 +2750,71 @@ fn run_input_accept_acks_targeted_started_and_broadcasts_started() {
     assert!(broadcasts.iter().any(|m| matches!(
         &m.inner,
         DaemonMessageType::Session {
-            event: SessionEvent::Started { stream_id: 5, .. },
+            event: SessionEvent::Started { stream_id: 1, .. },
             ..
         }
     )));
+}
+
+/// Extract the daemon-assigned `stream_id` from the single id-stamped
+/// `Started` reply on `replies` (the acceptance reply to `id`).
+fn targeted_started_stream_id(replies: &[DaemonMessage], id: u64) -> u64 {
+    assert_eq!(replies.len(), 1, "exactly one id-stamped reply");
+    assert_eq!(replies[0].id, Some(id));
+    match &replies[0].inner {
+        DaemonMessageType::Session {
+            event: SessionEvent::Started { stream_id, .. },
+            ..
+        } => *stream_id,
+        other => panic!("expected a targeted Started, got {other:?}"),
+    }
+}
+
+#[test]
+fn two_clients_same_session_get_distinct_daemon_assigned_stream_ids() {
+    use choreo_ai_protocols::openai::{OpenAiClient, ServiceConfig};
+
+    let (mut state, ctx) = broadcast_setup();
+    // A dead local endpoint so each accepted run's worker fails fast without
+    // touching the network; the acceptance reply the test reads is produced
+    // SYNCHRONOUSLY before any worker is spawned.
+    let client = OpenAiClient::new(
+        ServiceConfig {
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            ..ServiceConfig::default()
+        },
+        "k".into(),
+        &state.registry,
+    )
+    .expect("build a client against the dead endpoint");
+    state.provider = Some(InferenceProvider::from_openai(client));
+
+    // Two distinct clients subscribed to the SAME session.
+    let (sink_a, rx_a) = test_sink();
+    let (sink_b, rx_b) = test_sink();
+    state.subscribers.insert(10, sink_a.clone());
+    state.subscribers.insert(11, sink_b.clone());
+
+    let mut shutdown = false;
+    // Client A's run is accepted; the daemon assigns the stream id.
+    let target_a = target_for(20, MessageKind::RunInput, &sink_a, &ctx);
+    let _ = handle_run_input(b"from a", Some(target_a), &mut state, &mut shutdown, &ctx);
+    let (replies_a, _) = split_replies(&rx_a);
+    let stream_a = targeted_started_stream_id(&replies_a, 20);
+
+    // Client B runs on the same session. This unit test drives the session
+    // thread directly, so the in-flight guard from A's run is reset by hand to
+    // let B's run be accepted too.
+    state.active_requests.clear();
+    let target_b = target_for(21, MessageKind::RunInput, &sink_b, &ctx);
+    let _ = handle_run_input(b"from b", Some(target_b), &mut state, &mut shutdown, &ctx);
+    let (replies_b, _) = split_replies(&rx_b);
+    let stream_b = targeted_started_stream_id(&replies_b, 21);
+
+    // Daemon-assignment (a per-session monotonic counter) is what stops two
+    // clients' runs from colliding on a stream id they each picked themselves.
+    assert_ne!(
+        stream_a, stream_b,
+        "each client's run must get its own daemon-assigned stream id"
+    );
 }

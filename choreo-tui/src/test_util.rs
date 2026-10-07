@@ -25,8 +25,16 @@ pub fn test_app() -> App {
 /// Add a `UserText` turn to the session, mimicking what the daemon sends after
 /// processing a `RunInput`.
 pub fn add_user_text(app: &mut App, content: &str) {
-    let turn_id = u32::try_from(app.next_request_id).unwrap();
-    app.next_request_id += 1;
+    // The test harness mints its own turn ids; in production the daemon assigns
+    // them. Derive the next id from the display's existing turns so repeated
+    // calls stay increasing (no client-side counter exists any more).
+    let turn_id = app
+        .display_for(0)
+        .view
+        .turns
+        .keys()
+        .next_back()
+        .map_or(0, |k| k + 1);
     let turn = Turn {
         created_at: choreo_proto::TimestampMs::now(),
         undone: false,

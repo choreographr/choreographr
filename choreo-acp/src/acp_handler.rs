@@ -551,11 +551,11 @@ fn dispatch_prompt(
 
     // Validate session state *before* sending anything to the daemon so
     // that a SessionBusy/SessionNotFound error becomes a JSON-RPC error
-    // response instead of crashing the event loop (issue #2).
-    let daemon_request_id = sessions.next_request_id();
+    // response instead of crashing the event loop (issue #2).  The stream id
+    // is daemon-assigned; ACP learns it from the `Started` event below.
     let input = content_blocks_to_text(&prompt_req.prompt);
 
-    if let Err(e) = sessions.try_begin_prompt(acp_id, daemon_request_id) {
+    if let Err(e) = sessions.try_begin_prompt(acp_id) {
         return respond_err(req.id, -32000, &e.to_string(), out);
     }
 
@@ -569,7 +569,6 @@ fn dispatch_prompt(
     send_to_daemon(
         daemon_writer,
         ClientMessageType::RunInput {
-            stream_id: daemon_request_id,
             input: input.into_bytes(),
         },
     )?;
@@ -578,7 +577,7 @@ fn dispatch_prompt(
         acp_id,
         ActivePrompt {
             jsonrpc_id: req.id,
-            daemon_request_id,
+            stream_id: None,
             session_acp_id: acp_id.clone(),
         },
     );
@@ -599,17 +598,12 @@ fn dispatch_cancel(
         return Ok(());
     };
 
-    info!(
-        acp_id,
-        daemon_request_id = prompt.daemon_request_id,
-        "cancelling prompt"
-    );
-    send_to_daemon(
-        daemon_writer,
-        ClientMessageType::Cancel {
-            stream_id: prompt.daemon_request_id,
-        },
-    )?;
+    // Cancel by the daemon-assigned stream id once `Started` has arrived; before
+    // then, send the `CANCEL_ALL` sentinel (0) to stop whatever the attached
+    // session is running — the pre-`Started` window has no id to name yet.
+    let stream_id = prompt.stream_id.unwrap_or(0);
+    info!(acp_id, stream_id, "cancelling prompt");
+    send_to_daemon(daemon_writer, ClientMessageType::Cancel { stream_id })?;
     Ok(())
 }
 
@@ -625,6 +619,20 @@ fn handle_daemon_message(
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
     match &msg.inner {
+        // The acceptance event binds the daemon-assigned `stream_id` to the
+        // session's active prompt, so the many stream events that follow can be
+        // matched back to it.  A no-op when no prompt is active for the session
+        // (e.g. a `Started` for a session we merely observe).
+        DaemonMessageType::Session {
+            session_id: Some(session_id),
+            event: SessionEvent::Started { stream_id, .. },
+            ..
+        } => {
+            if let Some(acp_id) = sessions.get_by_daemon_id(*session_id) {
+                pending.assign_stream_id(acp_id, *stream_id);
+            }
+            Ok(())
+        }
         DaemonMessageType::Session {
             event:
                 SessionEvent::OutputChunk { .. }
@@ -673,8 +681,9 @@ fn handle_streaming_message(
 
     // Find the matching prompt.  If this stream_id doesn't belong to any
     // active prompt, the message is stale (e.g. from a prior connection)
-    // and can be safely ignored.
-    let Some(prompt) = pending.find_by_request_id(stream_id) else {
+    // and can be safely ignored.  A prompt whose `Started` has not yet arrived
+    // has no stream id and never matches.
+    let Some(prompt) = pending.find_by_stream_id(stream_id) else {
         return Ok(());
     };
     let jsonrpc_id = prompt.jsonrpc_id;

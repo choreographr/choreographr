@@ -302,7 +302,6 @@ fn warm_ping_fires_during_a_tool_run_and_stays_out_of_context() {
         .expect("set model");
     session_tx
         .send(SessionCommand::RunInput {
-            stream_id: 1,
             input: b"run the tool".to_vec(),
             reply: None,
         })
@@ -383,7 +382,6 @@ fn requests_metered_account_never_pings() {
         .expect("set model");
     session_tx
         .send(SessionCommand::RunInput {
-            stream_id: 1,
             input: b"run the tool".to_vec(),
             reply: None,
         })

@@ -17,7 +17,6 @@ pub(crate) enum UiEvent {
 #[derive(Debug, Clone)]
 pub(crate) struct AppState {
     pub(crate) input: String,
-    pub(crate) next_request_id: u64,
     pub(crate) session_view: SessionView,
     pub(crate) status_texts: Vec<String>,
     pub(crate) pending_cancel: String,
@@ -41,7 +40,6 @@ impl AppState {
         let socket_path = socket_path.to_string();
         Self {
             input: String::new(),
-            next_request_id: 1,
             session_view: SessionView::new(),
             status_texts: vec![format!("Connected to Choreographr at {socket_path}")],
             pending_cancel: String::new(),

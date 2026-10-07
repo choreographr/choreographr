@@ -26,11 +26,11 @@ use choreo_proto::{ClientMessage, ClientMessageType};
 /// Runs the shared client-side submit guard ([`App::new_turn_rejection`])
 /// first: a not-idle session or a locked keystore is refused locally with the
 /// guard's status message instead of a round-trip the daemon would only answer
-/// with a transient failure.  On success it allocates the request id, records
-/// the in-flight request on the active display (when one exists), ships the
-/// message, and scrolls to the newest turn.  `echo` shows the `> continue`
-/// shell echo — set for `/continue` (a typed command) but not for Alt+Enter
-/// (a bare keypress is its own feedback).
+/// with a transient failure.  On success it ships the message and scrolls to the
+/// newest turn; the daemon assigns the run's `stream_id` and the TUI records the
+/// in-flight stream when the `Started` reply/broadcast arrives.  `echo` shows the
+/// `> continue` shell echo — set for `/continue` (a typed command) but not for
+/// Alt+Enter (a bare keypress is its own feedback).
 ///
 /// With no session attached it reports "no session attached" and sends
 /// nothing.  Returns `Ok(())` whether the turn was sent or refused; only a
@@ -58,18 +58,8 @@ fn send_continue_generation(
     if echo && let Some(text) = command_echo(&Command::Continue) {
         app.status = Some(text);
     }
-    let stream_id = app.next_request_id;
-    app.next_request_id = app.next_request_id.wrapping_add(1);
-    // The guard above already checked `attached_session_id`, but the display
-    // entry may not exist yet — track the in-flight request only when there is
-    // a display to hold it, never panic on a missing one.
-    if let Some(display) = app.active_display() {
-        display.active.insert(stream_id);
-    }
-    app.pending.send(
-        client_tx,
-        ClientMessageType::ContinueGeneration { stream_id },
-    );
+    app.pending
+        .send(client_tx, ClientMessageType::ContinueGeneration);
     app.scroll_to(0);
     Ok(())
 }
@@ -326,14 +316,12 @@ pub(super) fn run_command(
             if echo && let Some(text) = command_echo(&Command::Send(message.clone())) {
                 app.status = Some(text);
             }
-            if let ClientMessageType::RunInput { stream_id, .. } = &message {
+            if let ClientMessageType::RunInput { .. } = &message {
                 app.error = None;
-                // The active display tracks in-flight request ids for the
-                // spinner; with no session active there is nothing to track, so
-                // skip instead of panicking.
-                if let Some(display) = app.active_display() {
-                    display.active.insert(*stream_id);
-                }
+                // The run's `stream_id` is daemon-assigned: the daemon reports it
+                // in the `Started` reply/broadcast, and `handle_started` records
+                // the in-flight stream on the active display then. Nothing to
+                // track here before sending.
             }
             app.pending.send(client_tx, message);
 
@@ -539,6 +527,6 @@ pub(super) fn run_named(
     app: &mut App,
     client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
-    let command = parse_input_line(&format!("/{name}"), &mut app.next_request_id);
+    let command = parse_input_line(&format!("/{name}"));
     run_command(command, echo, app, client_tx)
 }

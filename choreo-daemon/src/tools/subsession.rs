@@ -138,7 +138,6 @@ impl Tool for SpawnSubsession {
         let (result_tx, result_rx) = mpsc::channel();
         if child_tx
             .send(SessionCommand::RunChildInput {
-                stream_id: 1,
                 user_text: Some(args.prompt),
                 reply: result_tx,
             })

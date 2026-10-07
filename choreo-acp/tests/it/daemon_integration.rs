@@ -55,12 +55,12 @@ fn daemon_io_send_and_receive() {
             write_message(&mut writer, &response).unwrap();
             writer.flush().unwrap();
 
-            // Read a second message and echo the stream_id as OutputChunk.
+            // Read a second message (the run request) and echo the
+            // daemon-assigned stream_id as OutputChunk. The daemon, not the
+            // client, chooses the stream_id.
             let msg2: ClientMessage = read_message(&mut reader).unwrap();
-            let stream_id = match &msg2.inner {
-                ClientMessageType::RunInput { stream_id, .. } => *stream_id,
-                _ => panic!("expected RunInput, got {msg2:?}"),
-            };
+            assert!(matches!(msg2.inner, ClientMessageType::RunInput { .. }));
+            let stream_id = 42;
 
             let echo = DaemonMessage::broadcast(DaemonMessageType::Session {
                 session_id: None,
@@ -133,7 +133,6 @@ fn daemon_io_send_and_receive() {
     client
         .writer_tx
         .send(ClientMessageType::RunInput {
-            stream_id: 42,
             input: b"hello".to_vec(),
         })
         .unwrap();

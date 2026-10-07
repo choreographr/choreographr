@@ -43,10 +43,7 @@ pub(crate) fn submit_input(
 ) {
     let line = state.read().input.trim().to_string();
     state.write().input.clear();
-    let command = {
-        let mut guard = state.write();
-        parse_input_line(&line, &mut guard.next_request_id)
-    };
+    let command = parse_input_line(&line);
     handle_shell_command(&mut state.write(), daemon_tx, command);
 }
 
@@ -131,13 +128,8 @@ pub(crate) fn handle_shell_command(
         }
         Command::Continue => {
             if state.attached_session_id.is_some() {
-                let stream_id = state.next_request_id;
-                state.next_request_id = state.next_request_id.wrapping_add(1);
-                send_client_message(
-                    state,
-                    daemon_tx,
-                    ClientMessageType::ContinueGeneration { stream_id },
-                );
+                // The daemon assigns the run's stream id (reported on `Started`).
+                send_client_message(state, daemon_tx, ClientMessageType::ContinueGeneration);
             } else {
                 state.status_texts.push("no session attached".to_string());
             }

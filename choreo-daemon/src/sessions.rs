@@ -162,7 +162,6 @@ pub fn join_session_shutdown_with_grace_for_test(
 )]
 pub enum SessionCommand {
     RunInput {
-        stream_id: u64,
         input: Vec<u8>,
         /// The requester's reply target, when the run originated from a client
         /// request (`RunInput`/`ContinueGeneration`). The session thread sends
@@ -170,10 +169,13 @@ pub enum SessionCommand {
         /// `Failed` on reject — in addition to the unchanged broadcast stream.
         /// `None` for internally-requested runs (e.g. a child session's
         /// implicit continue) that have no client awaiting a reply.
+        ///
+        /// The run's `stream_id` is NOT carried here: the daemon assigns it on
+        /// the session thread when it accepts the run, so a client never
+        /// chooses one (the cross-client collision fix).
         reply: Option<ReplyTarget>,
     },
     RunChildInput {
-        stream_id: u64,
         user_text: Option<String>,
         reply: std::sync::mpsc::Sender<io::Result<ChildResult>>,
     },
@@ -670,6 +672,12 @@ pub struct ActiveSessionEntry {
 pub struct SessionState {
     pub config: SessionConfig,
     pub next_turn_id: u32,
+    /// The next `stream_id` this session will assign to an accepted run. It is a
+    /// per-session, monotonic counter owned by the session thread (never chosen
+    /// by a client), so two clients' runs on the same session can never collide
+    /// on a stream id. Starts at 1 so a real stream id is never the
+    /// `CANCEL_ALL` sentinel (`0`).
+    pub next_stream_id: u64,
     last_undo_turn_ids: Option<Vec<u32>>,
     pub turns: BTreeMap<u32, Turn>,
     subscribers: HashMap<u64, SubscriberSink>,
@@ -821,6 +829,10 @@ impl SessionState {
         Self {
             config: snapshot.config,
             next_turn_id: turn_count,
+            // A restored worker snapshot never accepts runs itself (the main
+            // session thread assigns stream ids), so the counter only needs a
+            // sentinel-safe starting value here.
+            next_stream_id: 1,
             last_undo_turn_ids: None,
             turns: snapshot.turns,
             subscribers,
@@ -1082,6 +1094,9 @@ impl SessionState {
         Self {
             config: SessionConfig::default(),
             next_turn_id: 0,
+            // Stream ids start at 1: 0 is the `CANCEL_ALL` sentinel, so a real
+            // stream id must never be 0.
+            next_stream_id: 1,
             last_undo_turn_ids: None,
             turns: BTreeMap::new(),
             subscribers: HashMap::new(),
@@ -1533,23 +1548,12 @@ fn process_command(
     ctx: &RequestContext,
 ) -> bool {
     match cmd {
-        SessionCommand::RunInput {
-            stream_id,
-            input,
-            reply,
-        } => handle_run_input(stream_id, &input, reply, state, shutdown_requested, ctx),
-        SessionCommand::RunChildInput {
-            stream_id,
-            user_text,
-            reply,
-        } => handle_run_child_input(
-            stream_id,
-            user_text.as_deref(),
-            reply,
-            state,
-            shutdown_requested,
-            ctx,
-        ),
+        SessionCommand::RunInput { input, reply } => {
+            handle_run_input(&input, reply, state, shutdown_requested, ctx)
+        }
+        SessionCommand::RunChildInput { user_text, reply } => {
+            handle_run_child_input(user_text.as_deref(), reply, state, shutdown_requested, ctx)
+        }
         SessionCommand::Cancel { stream_id } => handle_cancel(stream_id, state, ctx),
         SessionCommand::SetModel { model, reply } => handle_set_model(model, reply, state, ctx),
         SessionCommand::StatusChanged(new_status) => handle_status_changed(new_status, state, ctx),
@@ -1614,13 +1618,18 @@ fn process_command(
 
 /// Process a user input: validate, resolve provider, spawn a request worker.
 fn handle_run_input(
-    stream_id: u64,
     input: &[u8],
     reply: Option<ReplyTarget>,
     state: &mut SessionState,
     shutdown_requested: &mut bool,
     ctx: &RequestContext,
 ) -> bool {
+    // The daemon assigns the run's stream_id HERE, on the session thread, so a
+    // client never chooses one (two clients' runs on one session can no longer
+    // collide). Assign before every failure path below so a rejection's
+    // `Started`/`Failed` broadcast also carries a distinct, non-sentinel id.
+    let stream_id = state.next_stream_id;
+    state.next_stream_id = state.next_stream_id.wrapping_add(1);
     debug!("session {}: RunInput id={}", ctx.session_id, stream_id);
     let text = String::from_utf8_lossy(input).trim().to_string();
     info!(
@@ -1747,7 +1756,6 @@ fn handle_run_input(
 /// command only triggers the agent loop on whatever turns are already
 /// queued. The response is delivered through the `reply` channel.
 fn handle_run_child_input(
-    stream_id: u64,
     // Borrowed only: the text is cloned when injected into the worker's
     // user turn; the command variant still owns it.
     user_text: Option<&str>,
@@ -1756,6 +1764,11 @@ fn handle_run_child_input(
     shutdown_requested: &mut bool,
     ctx: &RequestContext,
 ) -> bool {
+    // Child runs get a daemon-assigned stream id too, so a subscriber to the
+    // child session (e.g. a viewer following it) can route its events and a
+    // parent's cancel propagation stays distinct.
+    let stream_id = state.next_stream_id;
+    state.next_stream_id = state.next_stream_id.wrapping_add(1);
     // Lazy resolution (same path as RunInput): a session thread that has
     // never run a request may still be provider-less (keystore was locked at
     // attach). The old wording ("daemon locked") is preserved for failures.

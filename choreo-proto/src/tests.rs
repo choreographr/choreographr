@@ -11,7 +11,6 @@ fn req(inner: ClientMessageType) -> ClientMessage {
 #[test]
 fn encode_decode_round_trip_client_message() {
     let message = req(ClientMessageType::RunInput {
-        stream_id: 42,
         input: b"hello".to_vec(),
     });
     let frame = encode_frame(&message).expect("encode");
@@ -65,7 +64,7 @@ fn redo_serde_round_trip() {
 
 #[test]
 fn continue_generation_serde_round_trip() {
-    let message = req(ClientMessageType::ContinueGeneration { stream_id: 7 });
+    let message = req(ClientMessageType::ContinueGeneration);
     let frame = encode_frame(&message).expect("encode");
     let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
     assert_eq!(decoded, message);

@@ -14,7 +14,6 @@ use choreo_client_core::{
 use choreo_markdown::render_markdown_html;
 use choreo_proto::{ClientMessageType, socket_path};
 use crossbeam_channel::{Receiver, Sender};
-use std::cell::Cell;
 use tracing::{debug, error, info, warn};
 
 use crate::bridge::BridgeEvent;
@@ -59,7 +58,6 @@ pub fn run(
     let state = TelegramState {
         bridge_tx,
         admin_ids,
-        stream_id: Cell::new(0),
         chat_id_tx,
     };
 
@@ -89,7 +87,6 @@ pub fn run(
 struct TelegramState {
     bridge_tx: Sender<ClientMessageType>,
     admin_ids: Vec<i64>,
-    stream_id: Cell<u64>,
     chat_id_tx: Sender<i64>,
 }
 
@@ -119,13 +116,13 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
 
     let _ = state.chat_id_tx.send(chat_id_val);
 
-    let mut stream_id = state.stream_id.get();
-    let command = parse_input_line(text, &mut stream_id);
-    state.stream_id.set(stream_id);
+    // The run's `stream_id` is daemon-assigned (reported on `Started`), so the
+    // bridge parses the command without minting one.
+    let command = parse_input_line(text);
 
     match command {
         Command::Send(client_msg) => {
-            if let ClientMessageType::RunInput { input, .. } = &client_msg {
+            if let ClientMessageType::RunInput { input } = &client_msg {
                 let echo = format!("> {}", String::from_utf8_lossy(input));
                 if let Err(e) = bot.send_message(chat_id_val, &echo, None) {
                     warn!("failed to send echo to telegram: {e}");

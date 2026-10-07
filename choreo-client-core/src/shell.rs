@@ -350,13 +350,14 @@ fn parse_mcp_command(rest: &str) -> Option<Command> {
 
 /// Parse a line of user input into a [`Command`].
 ///
-/// A plain (non-slash) non-empty line becomes a `ClientMessageType::RunInput` and
-/// consumes `next_request_id`, which is then incremented — the caller owns
-/// the id counter, so successive prompts get distinct request ids that route
-/// the daemon's streaming replies. Slash commands (`/name …`) never touch the
-/// counter; unknown ones come back as [`Command::UnknownCommand`].
+/// A plain (non-slash) non-empty line becomes a `ClientMessageType::RunInput`.
+/// The run's `stream_id` is NOT chosen here: the daemon assigns it when it
+/// accepts the run and reports it in the acceptance reply (`SessionEvent::
+/// Started`), so the parser needs no counter. Slash commands (`/name …`) are
+/// parsed by the internal slash-command parser; unknown ones come back as
+/// [`Command::UnknownCommand`].
 #[must_use]
-pub fn parse_input_line(line: &str, next_request_id: &mut u64) -> Command {
+pub fn parse_input_line(line: &str) -> Command {
     let line = line.trim();
     if line.is_empty() {
         return Command::Empty;
@@ -368,10 +369,7 @@ pub fn parse_input_line(line: &str, next_request_id: &mut u64) -> Command {
         return cmd;
     }
 
-    let stream_id = *next_request_id;
-    *next_request_id = next_request_id.wrapping_add(1);
     Command::Send(ClientMessageType::RunInput {
-        stream_id,
         input: line.as_bytes().to_vec(),
     })
 }
@@ -662,31 +660,28 @@ mod tests {
 
     #[test]
     fn refresh_models_parses_plain() {
-        let mut id = 0;
         assert_eq!(
-            parse_input_line("/refresh-models", &mut id),
+            parse_input_line("/refresh-models"),
             Command::RefreshModels { force: false },
         );
     }
 
     #[test]
     fn refresh_models_parses_force() {
-        let mut id = 0;
         assert_eq!(
-            parse_input_line("/refresh-models --force", &mut id),
+            parse_input_line("/refresh-models --force"),
             Command::RefreshModels { force: true },
         );
         assert_eq!(
-            parse_input_line("/refresh-models force", &mut id),
+            parse_input_line("/refresh-models force"),
             Command::RefreshModels { force: true },
         );
     }
 
     #[test]
     fn refresh_models_rejects_unknown_args() {
-        let mut id = 0;
         assert!(matches!(
-            parse_input_line("/refresh-models --bogus", &mut id),
+            parse_input_line("/refresh-models --bogus"),
             Command::UnknownCommand(_),
         ));
     }
@@ -705,18 +700,13 @@ mod tests {
 
     #[test]
     fn mcp_parses_bare_as_status() {
-        let mut id = 0;
-        assert_eq!(
-            parse_input_line("/mcp", &mut id),
-            Command::Mcp(McpCommand::Status),
-        );
+        assert_eq!(parse_input_line("/mcp"), Command::Mcp(McpCommand::Status),);
     }
 
     #[test]
     fn mcp_parses_reconnect() {
-        let mut id = 0;
         assert_eq!(
-            parse_input_line("/mcp reconnect docs", &mut id),
+            parse_input_line("/mcp reconnect docs"),
             Command::Mcp(McpCommand::Reconnect {
                 slug: "docs".to_string(),
             }),
@@ -725,43 +715,39 @@ mod tests {
 
     #[test]
     fn mcp_reconnect_requires_exactly_one_slug() {
-        let mut id = 0;
         assert!(matches!(
-            parse_input_line("/mcp reconnect", &mut id),
+            parse_input_line("/mcp reconnect"),
             Command::UnknownCommand(_),
         ));
         assert!(matches!(
-            parse_input_line("/mcp reconnect a b", &mut id),
+            parse_input_line("/mcp reconnect a b"),
             Command::UnknownCommand(_),
         ));
     }
 
     #[test]
     fn mcp_parses_reload() {
-        let mut id = 0;
         assert_eq!(
-            parse_input_line("/mcp reload", &mut id),
+            parse_input_line("/mcp reload"),
             Command::Mcp(McpCommand::Reload),
         );
     }
 
     #[test]
     fn mcp_reload_takes_no_argument() {
-        let mut id = 0;
         assert!(matches!(
-            parse_input_line("/mcp reload docs", &mut id),
+            parse_input_line("/mcp reload docs"),
             Command::UnknownCommand(_),
         ));
     }
 
     #[test]
     fn mcp_rejects_unknown_subcommands() {
-        let mut id = 0;
         // enable/disable have no daemon command, so they surface a usage error
         // rather than being silently ignored.
         for line in ["/mcp enable docs", "/mcp disable docs", "/mcp bogus"] {
             assert!(
-                matches!(parse_input_line(line, &mut id), Command::UnknownCommand(_)),
+                matches!(parse_input_line(line), Command::UnknownCommand(_)),
                 "{line} must be a usage error",
             );
         }

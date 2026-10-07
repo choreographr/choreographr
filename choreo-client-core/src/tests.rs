@@ -3,165 +3,128 @@ use choreo_proto::ClientMessageType;
 
 #[test]
 fn parses_empty_line() {
-    let mut next = 1;
-    assert_eq!(parse_input_line("   ", &mut next), Command::Empty);
-    assert_eq!(next, 1);
+    assert_eq!(parse_input_line("   "), Command::Empty);
 }
 
 #[test]
 fn parses_ping() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/ping", &mut next),
+        parse_input_line("/ping"),
         Command::Send(ClientMessageType::Ping)
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn parses_cancel() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/cancel 42", &mut next),
+        parse_input_line("/cancel 42"),
         Command::Send(ClientMessageType::Cancel { stream_id: 42 })
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn rejects_invalid_cancel() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/cancel nope", &mut next),
+        parse_input_line("/cancel nope"),
         Command::InvalidCancel("nope".to_string())
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn parses_unlock_raw() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/unlock", &mut next),
+        parse_input_line("/unlock"),
         Command::Unlock {
             method: UnlockMethod::Raw,
         }
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn parses_unlock_with_base64_key() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/unlock aGVsbG8=", &mut next),
+        parse_input_line("/unlock aGVsbG8="),
         Command::Unlock {
             method: UnlockMethod::Key("aGVsbG8=".to_string()),
         }
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn models_command_is_removed() {
     // `/models` was an alias for `/model`; the alias was dropped, so it is no
     // longer recognised (and must NOT be silently accepted).
-    let mut next = 10;
     assert_eq!(
-        parse_input_line("/models", &mut next),
+        parse_input_line("/models"),
         Command::UnknownCommand("unknown command: /models".to_string())
     );
-    assert_eq!(next, 10);
 }
 
 #[test]
 fn models_command_with_arg_is_removed() {
-    let mut next = 10;
     assert_eq!(
-        parse_input_line("/models gpt-5.4-nano", &mut next),
+        parse_input_line("/models gpt-5.4-nano"),
         Command::UnknownCommand("unknown command: /models gpt-5.4-nano".to_string())
     );
-    assert_eq!(next, 10);
 }
 
 #[test]
 fn model_bare_opens_selector() {
-    let mut next = 10;
-    assert_eq!(
-        parse_input_line("/model", &mut next),
-        Command::OpenModelSelector
-    );
-    assert_eq!(next, 10);
+    assert_eq!(parse_input_line("/model"), Command::OpenModelSelector);
 }
 
 #[test]
 fn model_set() {
-    let mut next = 10;
     assert_eq!(
-        parse_input_line("/model gpt-5.4-nano", &mut next),
+        parse_input_line("/model gpt-5.4-nano"),
         Command::Send(ClientMessageType::SetModel {
             model: "gpt-5.4-nano".to_string(),
         })
     );
-    assert_eq!(next, 10);
 }
 
 #[test]
 fn rejects_unknown_command() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/bogus", &mut next),
+        parse_input_line("/bogus"),
         Command::UnknownCommand("unknown command: /bogus".to_string())
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn session_bare_opens_manager() {
     // Bare `/session` opens the session manager.
-    let mut next = 3;
-    assert_eq!(
-        parse_input_line("/session", &mut next),
-        Command::OpenSessions
-    );
-    assert_eq!(next, 3);
+    assert_eq!(parse_input_line("/session"), Command::OpenSessions);
 }
 
 #[test]
 fn session_info_parses_id() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/session info 7", &mut next),
+        parse_input_line("/session info 7"),
         Command::Send(ClientMessageType::GetSessionState { session_id: 7 })
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn session_info_rejects_invalid_id() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/session info nope", &mut next),
+        parse_input_line("/session info nope"),
         Command::UnknownCommand("usage: /session info <id>".to_string())
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn session_list() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/session list", &mut next),
+        parse_input_line("/session list"),
         Command::Send(ClientMessageType::ListSessions)
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn session_new_with_title() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/session new my title", &mut next),
+        parse_input_line("/session new my title"),
         Command::Send(ClientMessageType::CreateSession {
             title: Some("my title".to_string()),
             parent_session_id: None,
@@ -172,14 +135,12 @@ fn session_new_with_title() {
             reasoning_effort: None,
         })
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn session_new_without_title() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/session new", &mut next),
+        parse_input_line("/session new"),
         Command::Send(ClientMessageType::CreateSession {
             title: None,
             parent_session_id: None,
@@ -190,25 +151,21 @@ fn session_new_without_title() {
             reasoning_effort: None,
         })
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn session_switch() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/session switch 5", &mut next),
+        parse_input_line("/session switch 5"),
         Command::Send(ClientMessageType::AttachSession { session_id: 5 })
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn new_without_title() {
     // Bare `/new` is the top-level shortcut for `/session new`.
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/new", &mut next),
+        parse_input_line("/new"),
         Command::Send(ClientMessageType::CreateSession {
             title: None,
             parent_session_id: None,
@@ -219,14 +176,12 @@ fn new_without_title() {
             reasoning_effort: None,
         })
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn new_with_title() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/new my title", &mut next),
+        parse_input_line("/new my title"),
         Command::Send(ClientMessageType::CreateSession {
             title: Some("my title".to_string()),
             parent_session_id: None,
@@ -237,7 +192,6 @@ fn new_with_title() {
             reasoning_effort: None,
         })
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
@@ -245,11 +199,9 @@ fn new_and_session_new_agree() {
     // `/new [title]` and `/session new [title]` must produce the same command
     // so the two entry points can never drift apart.
     for (bare, grouped) in [("/new", "/session new"), ("/new t", "/session new t")] {
-        let mut nb = 3;
-        let mut ng = 3;
         assert_eq!(
-            parse_input_line(bare, &mut nb),
-            parse_input_line(grouped, &mut ng),
+            parse_input_line(bare),
+            parse_input_line(grouped),
             "`{bare}` and `{grouped}` must parse identically"
         );
     }
@@ -257,71 +209,60 @@ fn new_and_session_new_agree() {
 
 #[test]
 fn session_switch_rejects_invalid_id() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/session switch nope", &mut next),
+        parse_input_line("/session switch nope"),
         Command::UnknownCommand("usage: /session switch <id>".to_string())
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn session_unknown_subcommand() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/session bogus", &mut next),
+        parse_input_line("/session bogus"),
         Command::UnknownCommand(
             "session subcommands: list, new [title], switch <id>, info <id>".to_string()
         )
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn parses_add_key() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/add-key openai sk-abc123", &mut next),
+        parse_input_line("/add-key openai sk-abc123"),
         Command::AddCredential {
             service: "openai".to_string(),
             credential_type: "api_key".to_string(),
             fields: vec!["sk-abc123".to_string()],
         }
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn ignores_trailing_unlock_arg_for_add_key() {
     // The `[unlock]` argument was removed with the per-daemon unlock-key
     // design: key resolution is per-addr inside build_add_credential_message.
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/add-key openai sk-abc123 unlock", &mut next),
+        parse_input_line("/add-key openai sk-abc123 unlock"),
         Command::AddCredential {
             service: "openai".to_string(),
             credential_type: "api_key".to_string(),
             fields: vec!["sk-abc123".to_string()],
         }
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn rejects_add_key_without_enough_args() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/add-key openai", &mut next),
+        parse_input_line("/add-key openai"),
         Command::UnknownCommand("usage: /add-key <service> <api_key>".to_string())
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn parses_add_x() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/add-x twitter ck cs at ats -", &mut next),
+        parse_input_line("/add-x twitter ck cs at ats -"),
         Command::AddCredential {
             service: "twitter".to_string(),
             credential_type: "x".to_string(),
@@ -334,14 +275,12 @@ fn parses_add_x() {
             ],
         }
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn parses_add_x_with_bearer() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/add-x twitter ck cs at ats mybearer", &mut next),
+        parse_input_line("/add-x twitter ck cs at ats mybearer"),
         Command::AddCredential {
             service: "twitter".to_string(),
             credential_type: "x".to_string(),
@@ -354,69 +293,60 @@ fn parses_add_x_with_bearer() {
             ],
         }
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn rejects_add_x_without_enough_args() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/add-x twitter ck cs", &mut next),
+        parse_input_line("/add-x twitter ck cs"),
         Command::UnknownCommand("usage: /add-x <service> <api_key> <api_key_secret> <access_token> <access_token_secret> <bearer_or_->_".to_string())
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn parses_remove_key() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/remove-key openai", &mut next),
+        parse_input_line("/remove-key openai"),
         Command::RemoveCredential {
             service: "openai".to_string(),
         }
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn parses_acl_add_with_valid_key() {
-    let mut next = 3;
     // b64 of exactly 32 bytes.
     let key_b64 = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
     assert_eq!(
-        parse_input_line(&format!("/acl add {key_b64}"), &mut next),
+        parse_input_line(&format!("/acl add {key_b64}")),
         Command::AclAdd {
             pubkey: key_b64.to_string(),
         }
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn rejects_acl_add_with_bad_base64_or_wrong_length() {
-    let mut next = 3;
     assert!(matches!(
-        parse_input_line("/acl add not-base64!!!", &mut next),
+        parse_input_line("/acl add not-base64!!!"),
         Command::UnknownCommand(_)
     ));
     // Valid base64 but 16 bytes.
     assert!(matches!(
-        parse_input_line("/acl add c29tZTE2Ynl0ZXNr", &mut next),
+        parse_input_line("/acl add c29tZTE2Ynl0ZXNr"),
         Command::UnknownCommand(_)
     ));
     // Missing argument.
     assert!(matches!(
-        parse_input_line("/acl add", &mut next),
+        parse_input_line("/acl add"),
         Command::UnknownCommand(_)
     ));
 }
 
 #[test]
 fn rejects_remove_key_with_invalid_service_name() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/remove-key my service", &mut next),
+        parse_input_line("/remove-key my service"),
         Command::UnknownCommand(
             "account name must be lowercase alphanumeric, hyphens, or underscores".to_string()
         )
@@ -425,9 +355,8 @@ fn rejects_remove_key_with_invalid_service_name() {
 
 #[test]
 fn rejects_add_key_with_invalid_service_name() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/add-key Jonathan sk-test", &mut next),
+        parse_input_line("/add-key Jonathan sk-test"),
         Command::UnknownCommand(
             "account name must be lowercase alphanumeric, hyphens, or underscores".to_string()
         )
@@ -436,9 +365,8 @@ fn rejects_add_key_with_invalid_service_name() {
 
 #[test]
 fn rejects_account_set_with_invalid_name() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/account Jonathan's Opencode", &mut next),
+        parse_input_line("/account Jonathan's Opencode"),
         Command::UnknownCommand(
             "account name must be lowercase alphanumeric, hyphens, or underscores".to_string()
         )
@@ -447,9 +375,8 @@ fn rejects_account_set_with_invalid_name() {
 
 #[test]
 fn rejects_remove_key_without_service() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/remove-key", &mut next),
+        parse_input_line("/remove-key"),
         Command::UnknownCommand("usage: /remove-key <service>".to_string())
     );
 }
@@ -476,230 +403,181 @@ fn is_valid_account_name_rejects_invalid() {
 }
 
 #[test]
-fn parses_run_input_and_increments_request_id() {
-    let mut next = 10;
+fn parses_run_input() {
+    // The run carries only its input; the daemon assigns the `stream_id`.
     assert_eq!(
-        parse_input_line("hello world", &mut next),
+        parse_input_line("hello world"),
         Command::Send(ClientMessageType::RunInput {
-            stream_id: 10,
             input: b"hello world".to_vec(),
         })
     );
-    assert_eq!(next, 11);
 }
 
 // ── Account sub-commands ──────────────────────────────────────────────────
 
 #[test]
 fn account_list() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/account list", &mut next),
+        parse_input_line("/account list"),
         Command::Send(ClientMessageType::ListAccounts)
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn account_bare_opens_page() {
-    let mut next = 3;
-    assert_eq!(
-        parse_input_line("/account", &mut next),
-        Command::OpenAccounts
-    );
-    assert_eq!(next, 3);
+    assert_eq!(parse_input_line("/account"), Command::OpenAccounts);
 }
 
 #[test]
 fn account_remove() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/account remove my-provider", &mut next),
+        parse_input_line("/account remove my-provider"),
         Command::Send(ClientMessageType::RemoveAccount {
             name: "my-provider".to_string()
         })
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn account_remove_missing_name() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/account remove", &mut next),
+        parse_input_line("/account remove"),
         Command::UnknownCommand("usage: /account remove <name>".to_string())
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn account_set_valid_name() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/account my-account", &mut next),
+        parse_input_line("/account my-account"),
         Command::Send(ClientMessageType::SetSessionAccount {
             name: "my-account".to_string()
         })
     );
-    assert_eq!(next, 3);
 }
 
 // ── Reasoning effort ──────────────────────────────────────────────────────
 
 #[test]
 fn reasoning_bare_cycles() {
-    let mut next = 3;
-    assert_eq!(
-        parse_input_line("/reasoning", &mut next),
-        Command::ReasoningCycle
-    );
-    assert_eq!(next, 3);
+    assert_eq!(parse_input_line("/reasoning"), Command::ReasoningCycle);
 }
 
 #[test]
 fn reasoning_list() {
-    let mut next = 3;
-    assert_eq!(
-        parse_input_line("/reasoning list", &mut next),
-        Command::ReasoningList
-    );
-    assert_eq!(next, 3);
+    assert_eq!(parse_input_line("/reasoning list"), Command::ReasoningList);
 }
 
 #[test]
 fn reasoning_set_off() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/reasoning off", &mut next),
+        parse_input_line("/reasoning off"),
         Command::Send(ClientMessageType::SetReasoningEffort {
             effort: "off".to_string()
         })
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn reasoning_set_low() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/reasoning low", &mut next),
+        parse_input_line("/reasoning low"),
         Command::Send(ClientMessageType::SetReasoningEffort {
             effort: "low".to_string()
         })
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn reasoning_set_medium() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/reasoning medium", &mut next),
+        parse_input_line("/reasoning medium"),
         Command::Send(ClientMessageType::SetReasoningEffort {
             effort: "medium".to_string()
         })
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn reasoning_set_high() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/reasoning high", &mut next),
+        parse_input_line("/reasoning high"),
         Command::Send(ClientMessageType::SetReasoningEffort {
             effort: "high".to_string()
         })
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn reasoning_set_none_alias() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/reasoning none", &mut next),
+        parse_input_line("/reasoning none"),
         Command::Send(ClientMessageType::SetReasoningEffort {
             effort: "off".to_string()
         })
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn reasoning_set_disabled_alias() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/reasoning disabled", &mut next),
+        parse_input_line("/reasoning disabled"),
         Command::Send(ClientMessageType::SetReasoningEffort {
             effort: "off".to_string()
         })
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn reasoning_set_med_alias() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/reasoning med", &mut next),
+        parse_input_line("/reasoning med"),
         Command::Send(ClientMessageType::SetReasoningEffort {
             effort: "medium".to_string()
         })
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn reasoning_set_on() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/reasoning on", &mut next),
+        parse_input_line("/reasoning on"),
         Command::Send(ClientMessageType::SetReasoningEffort {
             effort: "on".to_string()
         })
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn reasoning_unknown_slug_passes_through() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/reasoning turbo", &mut next),
+        parse_input_line("/reasoning turbo"),
         Command::Send(ClientMessageType::SetReasoningEffort {
             effort: "turbo".to_string()
         })
     );
-    assert_eq!(next, 3);
 }
 
 #[test]
 fn reasoning_max_slug_passes_through() {
-    let mut next = 3;
     assert_eq!(
-        parse_input_line("/reasoning max", &mut next),
+        parse_input_line("/reasoning max"),
         Command::Send(ClientMessageType::SetReasoningEffort {
             effort: "max".to_string()
         })
     );
-    assert_eq!(next, 3);
 }
 
 // ── Undo / Redo commands ────────────────────────────────────────────────
 
 #[test]
 fn parses_undo() {
-    let mut next = 5;
-    assert_eq!(parse_input_line("/undo", &mut next), Command::Undo);
-    assert_eq!(next, 5);
+    assert_eq!(parse_input_line("/undo"), Command::Undo);
 }
 
 #[test]
 fn parses_redo() {
-    let mut next = 5;
-    assert_eq!(parse_input_line("/redo", &mut next), Command::Redo);
-    assert_eq!(next, 5);
+    assert_eq!(parse_input_line("/redo"), Command::Redo);
 }
 
 #[test]
@@ -716,16 +594,12 @@ fn command_echo_redo() {
 
 #[test]
 fn parses_continue() {
-    let mut next = 3;
-    assert_eq!(parse_input_line("/continue", &mut next), Command::Continue);
-    assert_eq!(next, 3);
+    assert_eq!(parse_input_line("/continue"), Command::Continue);
 }
 
 #[test]
 fn parses_stop() {
-    let mut next = 3;
-    assert_eq!(parse_input_line("/stop", &mut next), Command::Stop);
-    assert_eq!(next, 3);
+    assert_eq!(parse_input_line("/stop"), Command::Stop);
 }
 
 #[test]
@@ -743,9 +617,7 @@ fn shell_command_stop_echo() {
 
 #[test]
 fn parses_quit() {
-    let mut next = 3;
-    assert_eq!(parse_input_line("/quit", &mut next), Command::Quit);
-    assert_eq!(next, 3);
+    assert_eq!(parse_input_line("/quit"), Command::Quit);
 }
 
 // ── Command catalog drift guard ──────────────────────────────────────────
@@ -804,8 +676,7 @@ fn probe_invocation(name: &str) -> String {
 fn every_catalog_command_is_parseable() {
     for spec in command_catalog() {
         let line = probe_invocation(spec.name);
-        let mut next = 0;
-        let cmd = parse_input_line(&line, &mut next);
+        let cmd = parse_input_line(&line);
         assert!(
             !matches!(cmd, Command::UnknownCommand(_)),
             "parser rejects catalog command `{}` (probe `{line}` -> {cmd:?})",

@@ -56,12 +56,9 @@ fn spawn_subsession_happy_path() {
 
                 // ── Receive and verify RunChildInput with user_text ──
                 match child_rx.recv().unwrap() {
-                    SessionCommand::RunChildInput {
-                        stream_id,
-                        user_text,
-                        reply,
-                    } => {
-                        assert_eq!(stream_id, 1);
+                    SessionCommand::RunChildInput { user_text, reply } => {
+                        // The child run's `stream_id` is daemon-assigned on the
+                        // child session thread, so it is not carried here.
                         assert_eq!(user_text.as_deref(), Some("work on this task"));
                         reply
                             .send(Ok(ChildResult {

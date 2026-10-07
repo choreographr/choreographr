@@ -86,7 +86,7 @@ pub(super) fn handle_chat_event(
                 KeyCode::Enter if command_active && plain => {
                     let line = app.command_palette_enter_line();
                     if !line.is_empty() {
-                        let command = parse_input_line(&line, &mut app.next_request_id);
+                        let command = parse_input_line(&line);
                         run_command(command, true, app, client_tx)?;
                         app.discard_command_line();
                     }
@@ -179,7 +179,7 @@ pub(super) fn handle_chat_event(
                     // doesn't resurface when the user returns to this session.
                     app.clear_current_draft();
                     app.commit_to_history();
-                    let command = parse_input_line(&line, &mut app.next_request_id);
+                    let command = parse_input_line(&line);
                     run_command(command, true, app, client_tx)?;
                 }
                 // Every text-editing and cursor key goes through

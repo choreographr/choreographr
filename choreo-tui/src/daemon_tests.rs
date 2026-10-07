@@ -538,12 +538,10 @@ fn enter_continue_when_attached_sends_continue_generation() {
     .expect("handle enter");
 
     assert_eq!(app.status.as_deref(), Some("> continue"));
-    assert!(app.display_for(0).active.contains(&1));
     let msg = rx.recv().expect("should send ContinueGeneration");
-    assert_eq!(
-        msg.inner,
-        ClientMessageType::ContinueGeneration { stream_id: 1 }
-    );
+    // The daemon assigns the stream id (reported on `Started`); the client
+    // sends the bare request.
+    assert_eq!(msg.inner, ClientMessageType::ContinueGeneration);
 }
 
 #[test]

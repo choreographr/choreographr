@@ -157,14 +157,14 @@ fn apply_daemon_turn_appended_with_image() {
 fn handle_continue_when_attached_sends_continue_generation() {
     let mut state = AppState::new("/tmp/choreographr.sock");
     state.attached_session_id = Some(42);
-    state.next_request_id = 5;
     let (tx, rx) = crossbeam_channel::unbounded();
 
     handle_shell_command(&mut state, Some(tx), Command::Continue);
 
-    assert_eq!(state.next_request_id, 6);
+    // The daemon assigns the run's stream id (reported on `Started`); the client
+    // sends the bare request.
     let msg = rx.recv().expect("should send ContinueGeneration");
-    assert_eq!(msg, ClientMessageType::ContinueGeneration { stream_id: 5 });
+    assert_eq!(msg, ClientMessageType::ContinueGeneration);
 }
 
 #[test]

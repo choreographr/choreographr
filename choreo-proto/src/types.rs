@@ -14,12 +14,18 @@
 //! # Two orthogonal axes
 //!
 //! The **reply axis** (`id`) is per-connection and one-shot: one request, one
-//! reply. The **stream axis** (`stream_id`, carried in the payload by the
-//! streaming requests and their [`SessionEvent`]s) is per-session and many-shot:
-//! a single `RunInput`/`ContinueGeneration` fans many events out to EVERY
-//! session subscriber, including mid-stream joiners. They are never merged,
-//! because two clients each use their own request id 0, while a stream needs an
-//! id unique across a namespace all subscribers share.
+//! reply. The **stream axis** (`stream_id`, carried in the payload of the
+//! streaming [`SessionEvent`]s a run fans out) is per-session and many-shot: a
+//! single `RunInput`/`ContinueGeneration` fans many events out to EVERY session
+//! subscriber, including mid-stream joiners. They are never merged, because two
+//! clients each use their own request id 0, while a stream needs an id unique
+//! across a namespace all subscribers share.
+//!
+//! The **daemon owns stream-id assignment**: a client does not choose a
+//! `stream_id`. The session thread allocates one (per-session, monotonic) when it
+//! accepts a `RunInput`/`ContinueGeneration` and reports it on the acceptance
+//! reply and the `Started` broadcast; the client learns it from there (to key its
+//! `stream_id → turn_id` map and to address a later `Cancel`).
 //!
 //! # Reply/broadcast overlap
 //!
@@ -590,7 +596,10 @@ impl SessionSummary {
 /// events a single `RunInput`/`ContinueGeneration` fans out to every session
 /// subscriber. Two clients may each use their own request id 0, but a stream
 /// fanned to all subscribers needs an id unique in a namespace they share —
-/// which is why the two cannot be the same key.
+/// which is why the two cannot be the same key. The daemon, not the client,
+/// assigns `stream_id`; the client learns it from the run's acceptance reply
+/// (`SessionEvent::Started`) or, for a pre-acceptance cancel, uses the
+/// `CANCEL_ALL` sentinel.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientMessage {
     /// The per-connection request id the daemon echoes onto its reply.
@@ -634,8 +643,14 @@ pub enum ClientMessageType {
     GetSessionState {
         session_id: u64,
     },
+    /// Submit user input to the attached session. The daemon allocates the
+    /// run's `stream_id` when it accepts the request and reports it in the
+    /// targeted acceptance reply and the broadcast `SessionEvent::Started`; the
+    /// client does not choose it. While the run is pending, `Cancel` with the
+    /// `CANCEL_ALL` sentinel (`stream_id = 0`) stops whatever is active on the
+    /// attached session; once `Started` arrives the client cancels by the
+    /// learned `stream_id`.
     RunInput {
-        stream_id: u64,
         input: Vec<u8>,
     },
     Cancel {
@@ -743,10 +758,9 @@ pub enum ClientMessageType {
     Undo,
     Redo,
     /// Create a new turn with the text "Continue." and run the agent loop.
-    /// Semantically distinct from `RunInput` — the daemon controls the prompt text.
-    ContinueGeneration {
-        stream_id: u64,
-    },
+    /// Semantically distinct from `RunInput` — the daemon controls the prompt
+    /// text. Like `RunInput`, the daemon assigns the run's `stream_id`.
+    ContinueGeneration,
     /// Request the raw bytes of one turn attachment in `session_id` — either a
     /// displayed image or a tool-result vision image — selected by [`ImageKey`].
     ///
@@ -897,7 +911,7 @@ impl From<&ClientMessageType> for MessageKind {
             ClientMessageType::GetReasoningEffort => Self::GetReasoningEffort,
             ClientMessageType::Undo => Self::Undo,
             ClientMessageType::Redo => Self::Redo,
-            ClientMessageType::ContinueGeneration { .. } => Self::ContinueGeneration,
+            ClientMessageType::ContinueGeneration => Self::ContinueGeneration,
             ClientMessageType::GetImage { .. } => Self::GetImage,
             ClientMessageType::McpStatusRequest => Self::McpStatusRequest,
             ClientMessageType::McpReconnect { .. } => Self::McpReconnect,

@@ -502,15 +502,15 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             ctx.reply_handle()
                 .send(DaemonMessageType::Accepted { kind });
         }
-        ClientMessageType::RunInput { stream_id, input } => {
-            debug!("client {}: RunInput id={}", ctx.client_id, stream_id);
+        ClientMessageType::RunInput { input } => {
+            debug!("client {}: RunInput", ctx.client_id);
             // Hand the reply obligation to the session thread: it sends the
             // TARGETED acceptance reply (`Started` on accept, `Failed` on
-            // reject) plus the unchanged broadcast stream.
+            // reject) plus the unchanged broadcast stream. The daemon assigns
+            // the run's `stream_id` there and reports it on `Started`.
             let target = ctx.reply_target(kind);
             if let Some(tx) = ctx.attached_session_tx.as_ref() {
                 let _ = tx.send(SessionCommand::RunInput {
-                    stream_id,
                     input,
                     reply: Some(target),
                 });
@@ -555,15 +555,11 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 target.fail("no session attached");
             }
         }
-        ClientMessageType::ContinueGeneration { stream_id } => {
-            debug!(
-                "client {}: ContinueGeneration id={}",
-                ctx.client_id, stream_id
-            );
+        ClientMessageType::ContinueGeneration => {
+            debug!("client {}: ContinueGeneration", ctx.client_id);
             let target = ctx.reply_target(kind);
             if let Some(tx) = ctx.attached_session_tx.as_ref() {
                 let _ = tx.send(SessionCommand::RunInput {
-                    stream_id,
                     input: b"Continue.".to_vec(),
                     reply: Some(target),
                 });
@@ -3452,7 +3448,7 @@ mod tests {
         };
 
         dispatch_client_message(
-            ClientMessage::request(0, ClientMessageType::ContinueGeneration { stream_id: 7 }),
+            ClientMessage::request(0, ClientMessageType::ContinueGeneration),
             &mut ctx,
         )
         .unwrap();
@@ -3460,11 +3456,7 @@ mod tests {
         let cmd = session_rx.try_recv().expect("should receive RunInput");
         assert!(matches!(
             &cmd,
-            SessionCommand::RunInput {
-                stream_id: 7,
-                input,
-                ..
-            } if input == b"Continue."
+            SessionCommand::RunInput { input, .. } if input == b"Continue."
         ));
     }
 
@@ -3488,7 +3480,7 @@ mod tests {
         };
 
         dispatch_client_message(
-            ClientMessage::request(0, ClientMessageType::ContinueGeneration { stream_id: 7 }),
+            ClientMessage::request(0, ClientMessageType::ContinueGeneration),
             &mut ctx,
         )
         .unwrap();

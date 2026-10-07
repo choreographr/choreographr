@@ -121,7 +121,6 @@ fn terminal_event_submits_run_input() {
     assert_eq!(
         message.inner,
         ClientMessageType::RunInput {
-            stream_id: 1,
             input: b"hello".to_vec(),
         }
     );
@@ -237,7 +236,6 @@ fn submitting_prompt_while_idle_is_sent() {
     assert_eq!(
         rx.recv().expect("sent message").inner,
         ClientMessageType::RunInput {
-            stream_id: 1,
             input: b"hello".to_vec(),
         }
     );
@@ -360,7 +358,7 @@ fn alt_enter_while_idle_is_sent() {
 
     assert!(matches!(
         rx.recv().expect("sent message").inner,
-        ClientMessageType::ContinueGeneration { .. }
+        ClientMessageType::ContinueGeneration
     ));
     assert!(app.status.is_none(), "no status message on success");
 }
@@ -655,7 +653,6 @@ fn chat_alt_enter_continues_generation() {
     let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.attached_session_id = Some(42);
-    let next_id = app.next_request_id;
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
@@ -664,20 +661,10 @@ fn chat_alt_enter_continues_generation() {
     )
     .expect("handle alt+enter");
 
+    // The daemon assigns the stream id and reports it on `Started`; the client
+    // sends only the request (its reply id is allocated by `pending`).
     let msg = rx.recv().expect("sent message");
-    assert_eq!(
-        msg.inner,
-        ClientMessageType::ContinueGeneration { stream_id: next_id }
-    );
-    assert!(
-        app.display_for(0).active.contains(&next_id),
-        "stream_id should be in active set"
-    );
-    assert_eq!(
-        app.next_request_id,
-        next_id.wrapping_add(1),
-        "next_request_id should be incremented"
-    );
+    assert_eq!(msg.inner, ClientMessageType::ContinueGeneration);
     assert!(app.status.is_none(), "no status message on success");
 }
 

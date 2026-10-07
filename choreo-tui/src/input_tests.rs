@@ -765,7 +765,7 @@ fn cursor_down_from_wrapped_line() {
 fn navigate_history_up_down_with_multi_line() {
     let mut app = test_app();
     // Insert a turn with user_text so history exists
-    let id = u32::try_from(app.next_request_id).unwrap();
+    let id = 0;
     app.display_for(0).view.insert_or_replace(
         id,
         choreo_proto::Turn {
@@ -783,8 +783,6 @@ fn navigate_history_up_down_with_multi_line() {
             reasoning_producer: None,
         },
     );
-    app.next_request_id += 1;
-
     // Navigation should set cursor to end of text
     app.navigate_history_up();
     assert_eq!(app.input.text, "multi\nline\ntext");
@@ -803,7 +801,7 @@ fn navigate_history_up_adjusts_scroll_offset_for_long_entry() {
         .map(|i| format!("line {i}\n"))
         .collect::<Vec<_>>()
         .concat();
-    let id = u32::try_from(app.next_request_id).unwrap();
+    let id = 0;
     app.display_for(0).view.insert_or_replace(
         id,
         choreo_proto::Turn {
@@ -821,8 +819,6 @@ fn navigate_history_up_adjusts_scroll_offset_for_long_entry() {
             reasoning_producer: None,
         },
     );
-    app.next_request_id += 1;
-
     app.navigate_history_up();
     // After loading a long history entry and setting cursor to end,
     // scroll_offset should be adjusted so the cursor is visible.

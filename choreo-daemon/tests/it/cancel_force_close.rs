@@ -230,7 +230,6 @@ fn mid_stream_cancel_finishes_promptly_via_registry_force_close() {
         &ClientMessage::request(
             0,
             ClientMessageType::RunInput {
-                stream_id: 1,
                 input: b"hello".to_vec(),
             },
         ),

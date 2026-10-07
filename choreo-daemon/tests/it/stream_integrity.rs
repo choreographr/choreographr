@@ -316,7 +316,6 @@ fn streamed_answer_matches_final_turn_byte_for_byte() {
         .expect("set model");
     session_tx
         .send(SessionCommand::RunInput {
-            stream_id: 1,
             input: b"hello".to_vec(),
             reply: None,
         })
@@ -385,7 +384,6 @@ fn tool_streaming_delivers_every_chunk_in_order() {
         .expect("set model");
     session_tx
         .send(SessionCommand::RunInput {
-            stream_id: 1,
             input: b"run the tool".to_vec(),
             reply: None,
         })
@@ -533,7 +531,6 @@ fn evicts_client_that_stops_reading() {
         &ClientMessage::request(
             0,
             ClientMessageType::RunInput {
-                stream_id: 1,
                 input: b"stream a lot".to_vec(),
             },
         ),

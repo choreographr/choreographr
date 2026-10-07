@@ -41,8 +41,10 @@ pub struct PendingEntry {
 pub struct ActivePrompt {
     /// The JSON-RPC id of the editor's `session/prompt` request.
     pub jsonrpc_id: u64,
-    /// The daemon-assigned request id this prompt's stream is tagged with.
-    pub daemon_request_id: u64,
+    /// The daemon-assigned `stream_id` this prompt's stream is tagged with.
+    /// `None` until `SessionEvent::Started` arrives (the daemon assigns it on
+    /// acceptance).  Until then a cancel uses the `CANCEL_ALL` sentinel.
+    pub stream_id: Option<u64>,
     /// The ACP session id the prompt belongs to.
     pub session_acp_id: String,
 }
@@ -177,14 +179,24 @@ impl PendingRequests {
         self.prompts.get(session_id)
     }
 
-    /// Find an active prompt by daemon request ID.  This is needed because
-    /// streaming `DaemonMessage` values carry `stream_id` but not the
-    /// session ID, and we need to map back to the ACP session.
+    /// Record the daemon-assigned `stream_id` on a session's active prompt, so
+    /// the many stream events for that run can be matched back to the prompt.
+    /// A no-op when the session has no active prompt.
+    pub fn assign_stream_id(&mut self, session_id: &str, stream_id: u64) {
+        if let Some(prompt) = self.prompts.get_mut(session_id) {
+            prompt.stream_id = Some(stream_id);
+        }
+    }
+
+    /// Find an active prompt by daemon-assigned `stream_id`.  This is needed
+    /// because streaming `DaemonMessage` values are matched by `stream_id`,
+    /// and we need to map back to the ACP session.  Prompts whose `Started`
+    /// has not yet arrived (`stream_id: None`) never match.
     #[must_use]
-    pub fn find_by_request_id(&self, daemon_request_id: u64) -> Option<&ActivePrompt> {
+    pub fn find_by_stream_id(&self, stream_id: u64) -> Option<&ActivePrompt> {
         self.prompts
             .values()
-            .find(|p| p.daemon_request_id == daemon_request_id)
+            .find(|p| p.stream_id == Some(stream_id))
     }
 
     /// Drain all active prompts (called when daemon disconnects).
@@ -294,14 +306,14 @@ mod tests {
         let mut p = PendingRequests::new();
         let prompt = ActivePrompt {
             jsonrpc_id: 100,
-            daemon_request_id: 5,
+            stream_id: Some(5),
             session_acp_id: "sess_test".into(),
         };
         p.insert_prompt("sess_test", prompt);
         assert!(!p.is_idle());
         let taken = p.take_prompt("sess_test").unwrap();
         assert_eq!(taken.jsonrpc_id, 100);
-        assert_eq!(taken.daemon_request_id, 5);
+        assert_eq!(taken.stream_id, Some(5));
         assert_eq!(taken.session_acp_id, "sess_test");
         assert!(p.is_idle());
     }
@@ -313,7 +325,7 @@ mod tests {
             "sess_a",
             ActivePrompt {
                 jsonrpc_id: 1,
-                daemon_request_id: 10,
+                stream_id: Some(10),
                 session_acp_id: "sess_a".into(),
             },
         );
@@ -321,7 +333,7 @@ mod tests {
         assert_eq!(borrowed.jsonrpc_id, 1);
         // Still present after borrow
         let taken = p.take_prompt("sess_a").unwrap();
-        assert_eq!(taken.daemon_request_id, 10);
+        assert_eq!(taken.stream_id, Some(10));
     }
 
     #[test]
@@ -337,13 +349,13 @@ mod tests {
     }
 
     #[test]
-    fn find_by_request_id() {
+    fn find_by_stream_id() {
         let mut p = PendingRequests::new();
         p.insert_prompt(
             "sess_1",
             ActivePrompt {
                 jsonrpc_id: 10,
-                daemon_request_id: 1,
+                stream_id: Some(1),
                 session_acp_id: "sess_1".into(),
             },
         );
@@ -351,19 +363,19 @@ mod tests {
             "sess_2",
             ActivePrompt {
                 jsonrpc_id: 20,
-                daemon_request_id: 2,
+                stream_id: Some(2),
                 session_acp_id: "sess_2".into(),
             },
         );
-        let found = p.find_by_request_id(2).unwrap();
+        let found = p.find_by_stream_id(2).unwrap();
         assert_eq!(found.jsonrpc_id, 20);
         assert_eq!(found.session_acp_id, "sess_2");
     }
 
     #[test]
-    fn find_by_request_id_not_found() {
+    fn find_by_stream_id_not_found() {
         let p = PendingRequests::new();
-        assert!(p.find_by_request_id(999).is_none());
+        assert!(p.find_by_stream_id(999).is_none());
     }
 
     #[test]
@@ -373,7 +385,7 @@ mod tests {
             "sess_a",
             ActivePrompt {
                 jsonrpc_id: 1,
-                daemon_request_id: 10,
+                stream_id: Some(10),
                 session_acp_id: "sess_a".into(),
             },
         );
@@ -381,7 +393,7 @@ mod tests {
             "sess_b",
             ActivePrompt {
                 jsonrpc_id: 2,
-                daemon_request_id: 20,
+                stream_id: Some(20),
                 session_acp_id: "sess_b".into(),
             },
         );
@@ -425,7 +437,7 @@ mod tests {
             "sess_x",
             ActivePrompt {
                 jsonrpc_id: 1,
-                daemon_request_id: 1,
+                stream_id: Some(1),
                 session_acp_id: "sess_x".into(),
             },
         );

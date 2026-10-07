@@ -376,17 +376,15 @@ impl Default for SessionDisplayState {
 
 pub(crate) struct App {
     pub(crate) input: InputBuffer,
-    /// The STREAM-id allocator for `RunInput`/`ContinueGeneration` (the
-    /// per-session streaming axis), NOT the reply-axis request id: that is
-    /// owned by [`App::pending`]. The daemon uses the client-supplied stream id
-    /// verbatim and echoes it on every stream event, so the front-end still
-    /// allocates it.
-    pub(crate) next_request_id: u64,
     /// The client's pending-request table: the single outbound path plus the
     /// reply-correlation side table (see [`PendingReplies`]). Every outbound
     /// `ClientMessageType` goes through [`PendingReplies::send`], and every
     /// inbound reply with `id: Some` resolves its slot here before the normal
     /// state dispatch runs.
+    ///
+    /// There is no client-side `stream_id` allocator: the daemon assigns a run's
+    /// `stream_id` and reports it on `SessionEvent::Started`, from which the TUI
+    /// records the live stream (see `handle_started`).
     pub(crate) pending: PendingReplies,
     pub(crate) rendered_images: HashMap<u64, HashMap<u32, HashMap<ImageSlot, RenderedImage>>>,
     pub(crate) pending_job_idx: HashMap<ImageId, (u64, u32, ImageSlot)>,
@@ -594,7 +592,6 @@ impl App {
     pub(crate) fn new() -> Self {
         Self {
             input: InputBuffer::new(),
-            next_request_id: 1,
             pending: PendingReplies::new(),
             rendered_images: HashMap::new(),
             pending_image_fetch: Vec::new(),
@@ -6422,6 +6419,17 @@ mod tests {
             Some(0),
             "should find turn 10 at index 0"
         );
+        assert_eq!(display.view.request_to_turn.get(&1), Some(&10));
+        assert!(display.active.contains(&1));
+
+        // Idempotent: the requester sees the targeted `Started` reply AND the
+        // broadcast `Started` for the same run, so applying it twice must not
+        // change the display's live-stream state.
+        app.handle_started(0, 1, 10, 100);
+        let display = app.active_display_ref().unwrap();
+        assert_eq!(display.streaming_turn_index, Some(0));
+        assert_eq!(display.view.request_to_turn.get(&1), Some(&10));
+        assert!(display.active.contains(&1));
     }
 
     #[test]
