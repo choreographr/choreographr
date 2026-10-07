@@ -485,20 +485,46 @@ fn locate_cell(
     best.map(|(index, wrap, band)| (index, (wrap, col.clamp(band.0, band.1))))
 }
 
-/// The text of one cell, sliced from `from` and to `to` (each a
-/// `(wrap_line, column)` within the cell): `None` means the cell's own
-/// start/end.  The cell's display lines are trimmed and rejoined with the
-/// spaces the reflow consumed.
-fn cell_text(
+/// The display-column range of the non-whitespace content within `[lo, hi)` of
+/// `text`, or `(lo, lo)` when the range is all whitespace.  The highlight uses
+/// this so it shows exactly the text the copy keeps (which trims each line's
+/// cell padding).
+fn trimmed_column_range(text: &str, lo: usize, hi: usize) -> (usize, usize) {
+    let mut col = 0usize;
+    let mut first: Option<usize> = None;
+    let mut end = lo;
+    for ch in text.chars() {
+        let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width == 0 {
+            continue;
+        }
+        let start = col;
+        col += width;
+        if start < lo || start >= hi {
+            continue;
+        }
+        if !ch.is_whitespace() {
+            first.get_or_insert(start);
+            end = col;
+        }
+    }
+    (first.unwrap_or(lo), end)
+}
+
+/// The trimmed pieces of one cell (one per display line it has text on), each
+/// paired with its global content line and the display-column range of its
+/// non-whitespace content (the highlight range).  `from`/`to` slice the cell at
+/// a `(wrap_line, column)`; `None` means the cell's own start/end.
+fn cell_pieces(
     display: &SessionDisplayState,
     vp_width: usize,
     cell: &TableCell,
     from: Option<(usize, usize)>,
     to: Option<(usize, usize)>,
-) -> String {
+) -> Vec<(usize, String, (usize, usize))> {
     let start = from.map_or(0, |(wrap, _)| wrap);
     let end = to.map_or(cell.lines.len().saturating_sub(1), |(wrap, _)| wrap);
-    let mut pieces: Vec<String> = Vec::new();
+    let mut pieces = Vec::new();
     for wrap in start..=end {
         let Some(line) = cell.lines.get(wrap) else {
             continue;
@@ -506,7 +532,7 @@ fn cell_text(
         let Some(rendered) = cached_rendered_turn(display, line.turn_idx, vp_width) else {
             continue;
         };
-        let Some(text) = rendered.lines.get(line.line_idx) else {
+        let Some(text_line) = rendered.lines.get(line.line_idx) else {
             continue;
         };
         let lo = match from {
@@ -517,12 +543,16 @@ fn cell_text(
             Some((w, c)) if w == wrap => c.min(line.band.1),
             _ => line.band.1,
         };
-        let piece = slice_line_columns(text, lo, hi).trim().to_string();
+        let piece = slice_line_columns(text_line, lo, hi).trim().to_string();
         if !piece.is_empty() {
-            pieces.push(piece);
+            pieces.push((
+                line.content_line,
+                piece,
+                trimmed_column_range(&line_text(text_line), lo, hi),
+            ));
         }
     }
-    pieces.join(" ")
+    pieces
 }
 
 /// The reading-order-fill result for one table run: the copied text plus the
@@ -580,27 +610,22 @@ fn pick_table_run(
         };
         let from = if index == lo_i { lo_point } else { None };
         let to = if index == hi_i { hi_point } else { None };
+        let pieces = cell_pieces(display, vp_width, cell, from, to);
         if !copy.is_empty() {
             copy.push_str("\n\n");
         }
-        copy.push_str(&cell_text(display, vp_width, cell, from, to));
-        // The matching highlight ranges (the same slicing) per display line.
-        let start = from.map_or(0, |(wrap, _)| wrap);
-        let end = to.map_or(cell.lines.len().saturating_sub(1), |(wrap, _)| wrap);
-        for wrap in start..=end {
-            let Some(line) = cell.lines.get(wrap) else {
-                continue;
-            };
-            let lo = match from {
-                Some((w, c)) if w == wrap => c.max(line.band.0),
-                _ => line.band.0,
-            };
-            let hi = match to {
-                Some((w, c)) if w == wrap => c.min(line.band.1),
-                _ => line.band.1,
-            };
-            if lo < hi {
-                highlights.push((line.content_line, (lo, hi)));
+        // Rejoin the cell's display lines with the single space the reflow
+        // consumed, and record each line's trimmed range for the highlight (so
+        // the cell padding is neither copied nor shown as selected).
+        let mut first_piece = true;
+        for (content_line, piece, band) in &pieces {
+            if !first_piece {
+                copy.push(' ');
+            }
+            first_piece = false;
+            copy.push_str(piece);
+            if band.0 < band.1 {
+                highlights.push((*content_line, *band));
             }
         }
     }

@@ -1157,17 +1157,12 @@ fn table_reading_order_fill_highlights_selected_cells() {
     start_selection(&mut app, start.0, start.1);
     update_selection(&mut app, end.0, end.1);
     let selected = selected_highlight_text(&app);
-    for cell in ["cd", "ef gh", "ij kl", "mn op", "qr st"] {
-        assert!(
-            selected.contains(cell),
-            "cell {cell:?} must be highlighted: {selected:?}"
-        );
-    }
-    for cell in ["ab", "uv wx"] {
-        assert!(
-            !selected.contains(cell),
-            "cell {cell:?} must not be highlighted: {selected:?}"
-        );
-    }
+    // Exactly the trimmed cell text is highlighted — no cell padding, and
+    // neither the part of the first cell before the anchor (`ab`) nor the
+    // out-of-range body cell (`uv wx`).
+    assert_eq!(
+        selected, "cdef ghij klmn opqr st",
+        "only the copied text is highlighted: {selected:?}"
+    );
     app.text_selection = None;
 }
