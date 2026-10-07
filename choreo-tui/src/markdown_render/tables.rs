@@ -6,6 +6,52 @@ use super::{
     TableRowId, display_width, indented_line, indented_styled_line, render_math_pretty,
     split_word_to_width,
 };
+use std::cell::Cell;
+
+// ── Table identity ────────────────────────────────────────────────────────
+
+thread_local! {
+    /// Hands out each rendered data table a distinct ordinal.
+    ///
+    /// Rendering is synchronous on the UI thread (the render cache is rebuilt
+    /// in place, never on a worker), so a per-thread counter is process-consistent
+    /// for the whole session.
+    static TABLE_ORDINAL: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Allocate the next unique [`TableRowId::table`] ordinal.
+///
+/// The id must be unique across the *whole* rendered session history, not just
+/// within one `markdown_lines_joined` buffer: the selection detects a table's
+/// contiguous line run by comparing ids across every turn, so two tables that
+/// shared an id would be merged into one reading-order run.  A per-document line
+/// offset cannot guarantee that — it repeats across turns, and across the
+/// separate buffers a blockquote or list renders its nested blocks into — so a
+/// monotonically increasing counter that never hands out the same value twice
+/// is used instead.
+pub(crate) fn next_table_id() -> u32 {
+    TABLE_ORDINAL.with(|cell| {
+        let id = cell.get();
+        // `wrapping_add` is a theoretical guard only: exhausting the u32 space
+        // would take billions of tables in one process.  It must not panic in a
+        // release build if it ever did.
+        cell.set(id.wrapping_add(1));
+        id
+    })
+}
+
+/// Map a table body row's positional index to its [`TableRowId::row`].
+///
+/// Body rows start at 1 (0 is the header), so `u32` is ample for any real
+/// table.  An astronomically long one saturates to the largest non-sentinel
+/// value rather than panicking or colliding with [`TableRowId::RULE`] (which
+/// would merge those rows' cells in the selection).
+fn body_row_index(index: usize) -> u32 {
+    u32::try_from(index)
+        .ok()
+        .filter(|row| *row != TableRowId::RULE)
+        .unwrap_or(TableRowId::RULE - 1)
+}
 // ── Table rendering ───────────────────────────────────────────────────────
 
 /// The box-drawing glyphs for a data table's outer frame.
@@ -130,11 +176,11 @@ pub(crate) fn render_table_lines(
         rule_id,
     );
     for (index, row) in table_rows.iter().enumerate().skip(1) {
-        // Body row `index` (0 is the header) — `index` fits u16 for any real
-        // table; saturate defensively rather than panic.
+        // Body row `index` (0 is the header); `body_row_index` maps it to a
+        // `u32` row id that is collision-free for any real table.
         let row_id = TableRowId {
             table: table_id,
-            row: u16::try_from(index).unwrap_or(TableRowId::RULE.saturating_sub(1)),
+            row: body_row_index(index),
         };
         let (row_lines, row_joins, row_chrome) = render_table_row_wrapped(
             row,

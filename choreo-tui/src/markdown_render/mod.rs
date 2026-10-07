@@ -89,16 +89,19 @@ pub(crate) enum LineJoin {
 /// table lines stays unambiguous.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TableRowId {
-    /// Table ordinal within the rendered document.
+    /// Table ordinal, unique across the whole rendered session history (every
+    /// turn of every table), so the selection can never merge two distinct
+    /// tables into one reading-order run.  Allocated from a process-wide
+    /// monotonic counter (see [`next_table_id`]).
     pub table: u32,
     /// Row index within the table, 0 = header; [`TableRowId::RULE`] marks a
     /// frame/separator rule (no cells).
-    pub row: u16,
+    pub row: u32,
 }
 
 impl TableRowId {
     /// Sentinel row index for a table's frame/separator rules.
-    pub(crate) const RULE: u16 = u16::MAX;
+    pub(crate) const RULE: u32 = u32::MAX;
 
     /// Whether this identity is a table rule row rather than a data row.
     pub(crate) fn is_rule(self) -> bool {

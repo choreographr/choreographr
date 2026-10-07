@@ -1,4 +1,5 @@
 use super::super::*;
+use std::fmt::Write as _;
 
 // ── copy-chrome negatives (chrome is emitted, never inferred) ─────────
 
@@ -85,6 +86,80 @@ fn table_lines_carry_row_identity() {
             .iter()
             .any(|c| c.table().is_some_and(TableRowId::is_rule)),
         "frame/separator rules carry the sentinel: {chrome:#?}"
+    );
+}
+
+#[test]
+fn separate_tables_get_distinct_ids() {
+    // The table id must be unique across the whole session history, not just
+    // within one `markdown_lines_joined` buffer: the selection detects a
+    // table's contiguous run by comparing ids across every turn, so two tables
+    // rendered from separate calls must never share an id.
+    let md = "| a | b |\n|---|---|\n| 1 | 2 |";
+    let (_l1, _j1, c1) = markdown_lines_joined(md, 60);
+    let (_l2, _j2, c2) = markdown_lines_joined(md, 60);
+    let id1 = c1
+        .iter()
+        .find_map(LineChrome::table)
+        .expect("first table id");
+    let id2 = c2
+        .iter()
+        .find_map(LineChrome::table)
+        .expect("second table id");
+    assert_ne!(
+        id1.table, id2.table,
+        "two tables rendered separately must not share a table id"
+    );
+}
+
+#[test]
+fn a_tables_lines_share_one_id_with_header_zero_and_rules_marked() {
+    // Every line of one table records the same `table` id, the header is row
+    // 0, and the frame/separator rules carry the `RULE` sentinel — the run
+    // detection and cell regrouping both depend on this.
+    let md = "| a | b |\n|---|---|\n| 1 | 2 |";
+    let (_lines, _joins, chrome) = markdown_lines_joined(md, 60);
+    let ids: Vec<TableRowId> = chrome.iter().filter_map(LineChrome::table).collect();
+    assert!(!ids.is_empty(), "a table emits row identities");
+    let table = ids[0].table;
+    assert!(
+        ids.iter().all(|id| id.table == table),
+        "every line of one table shares its id: {ids:?}"
+    );
+    assert!(ids.iter().any(|id| id.row == 0), "header is row 0: {ids:?}");
+    assert!(ids.iter().any(|id| id.row == 1), "body is row 1: {ids:?}");
+    assert!(
+        ids.iter().any(|id| id.is_rule()),
+        "rules carry the sentinel: {ids:?}"
+    );
+}
+
+#[test]
+fn many_body_rows_have_distinct_ids() {
+    // A table with more rows than `u16::MAX` proves the row index no longer
+    // saturates: collapsing every row past 65534 onto one id would merge their
+    // cells into a single row in the selection.  All header + body row ids must
+    // be distinct.
+    let body_rows = 70_000usize; // comfortably above u16::MAX (65_535)
+    let mut md = String::from("| h |\n|---|\n");
+    // `writeln!` into one buffer (rather than `push_str(&format!(..))`) avoids a
+    // throwaway `String` per row and satisfies the pedantic lint.
+    for i in 0..body_rows {
+        let _ = writeln!(md, "| r{i} |");
+    }
+    let (_lines, _joins, chrome) = markdown_lines_joined(&md, 40);
+    let mut rows: Vec<u32> = chrome
+        .iter()
+        .filter_map(LineChrome::table)
+        .filter(|id| !id.is_rule())
+        .map(|id| id.row)
+        .collect();
+    rows.sort_unstable();
+    rows.dedup();
+    assert_eq!(
+        rows.len(),
+        body_rows + 1,
+        "header + every body row must have a distinct row id"
     );
 }
 

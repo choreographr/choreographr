@@ -5,8 +5,8 @@ use super::{
     Color, GlobalLruCache, HighlightLines, Line, LineChrome, LineJoin, MarkdownBlock, Modifier,
     QUOTE_BAR, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH, Span, Style, TABLE_BORDERS, debug, display_width,
     ensure_blank_line_joined, grapheme_chunks, heading_prefix, highlight_theme, inlines_to_lines,
-    pad_marker, render_table_lines, syntax_set, to_ratatui_color, try_render_diff_content,
-    wrap_styled_line_joined,
+    next_table_id, pad_marker, render_table_lines, syntax_set, to_ratatui_color,
+    try_render_diff_content, wrap_styled_line_joined,
 };
 pub(crate) fn find_syntax<'a>(
     ss: &'a syntect::parsing::SyntaxSet,
@@ -616,10 +616,13 @@ pub(crate) fn render_markdown_block(
             header,
             rows,
         } => {
-            // Table id = the line index where the table begins: unique within
-            // the document buffer, so a contiguous run of table lines shares it.
-            // `u32` is ample for any real document; saturate defensively.
-            let table_id = u32::try_from(lines.len()).unwrap_or(u32::MAX);
+            // Allocate a session-unique table ordinal (see `next_table_id`):
+            // the selection detects a table's contiguous run by comparing ids
+            // across contiguous content lines, so the id must be collision-free
+            // across the whole rendered history — a per-buffer line offset would
+            // repeat across turns and across the separate buffers nested blocks
+            // render into, letting two unrelated tables merge into one run.
+            let table_id = next_table_id();
             let (table_lines, table_joins, table_chrome) =
                 render_table_lines(alignments, header, rows, table_id, indent, width);
             lines.extend(table_lines);

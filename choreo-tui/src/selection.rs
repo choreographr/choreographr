@@ -413,7 +413,7 @@ fn table_cells(
     hi: usize,
 ) -> Vec<TableCell> {
     let mut cells: Vec<TableCell> = Vec::new();
-    let mut cur_row: Option<u16> = None;
+    let mut cur_row: Option<u32> = None;
     let mut row_start = 0usize;
     for content_line in lo..hi {
         let Some((turn_idx, line_idx)) = resolve_line(display, vp_width, content_line) else {
