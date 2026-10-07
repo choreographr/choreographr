@@ -239,6 +239,46 @@ pub(crate) fn fan_out_evicting(
     (evict_clients, evict_largest)
 }
 
+/// The shared reply-envelope mechanism: an owned request id, the acting
+/// client's delivery sink, and a clone of the daemon-wide lag counter.
+///
+/// Both reply paths enqueue through this one [`send`](Self::send) — the
+/// connection thread's `ReplyHandle` guard (which owns a `ReplySink` plus an
+/// exactly-once flag) and the channel-crossing [`ReplyTarget`] (a `ReplySink`
+/// plus the request's [`MessageKind`]) — so the "stamp the id, then enqueue via
+/// [`SubscriberSink::send_unchecked`]" step is written once. Sending routes
+/// through the no-threshold path: a reply is a request/response contract that
+/// must never be dropped for lag.
+pub(crate) struct ReplySink {
+    /// The request id echoed onto every reply.
+    id: u64,
+    /// The acting client's delivery sink (owns the byte counter).
+    sink: SubscriberSink,
+    /// The daemon-wide lag counter, cloned so it can cross threads.
+    global: Arc<AtomicUsize>,
+}
+
+impl ReplySink {
+    /// Build a reply sink for request `id`, delivering through `sink` and
+    /// accounting bytes into `global`.
+    #[must_use]
+    pub(crate) fn new(id: u64, sink: SubscriberSink, global: Arc<AtomicUsize>) -> Self {
+        Self { id, sink, global }
+    }
+
+    /// The request id this sink answers.
+    #[must_use]
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Enqueue `inner` stamped with the request id.
+    pub(crate) fn send(&self, inner: DaemonMessageType) {
+        self.sink
+            .send_unchecked(&DaemonMessage::reply(self.id, inner), &self.global);
+    }
+}
+
 /// An OWNED obligation to answer one request, usable across a channel.
 ///
 /// The connection thread mints one per request whose reply is produced OFF the
@@ -246,25 +286,18 @@ pub(crate) fn fan_out_evicting(
 /// capturing the request id, its [`MessageKind`] tag, the acting client's
 /// delivery sink, and a clone of the daemon-wide lag counter. Because it OWNS
 /// all four it can travel over a `SessionCommand`/`DaemonCommand` channel; the
-/// connection thread's borrow-based `ReplyHandle` cannot cross a thread.
-///
-/// Sending routes through [`SubscriberSink::send_unchecked`] (the no-threshold
-/// path): a reply is a request/response contract that must never be dropped for
-/// lag, the same reasoning the connection thread's reply path documents.
+/// connection thread's `ReplyHandle` guard also owns its [`ReplySink`] but
+/// must be answered on the connection thread.
 ///
 /// `kind` is the request's [`MessageKind`] so the generic [`accept`](Self::accept)
 /// / [`fail`](Self::fail) acknowledgements can self-identify without the
 /// producer re-deriving it; commands that answer with a richer payload (the
 /// keystore replies) simply call [`send`](Self::send) directly.
 pub struct ReplyTarget {
-    /// The request id echoed onto every reply.
-    id: u64,
+    /// The shared reply mechanism (request id + delivery sink + lag counter).
+    sink: ReplySink,
     /// The request's kind tag (used by `accept`/`fail`).
     kind: MessageKind,
-    /// The acting client's delivery sink (owns the byte counter).
-    sink: SubscriberSink,
-    /// The daemon-wide lag counter, cloned so the target owns it across threads.
-    global: Arc<AtomicUsize>,
 }
 
 impl ReplyTarget {
@@ -273,10 +306,8 @@ impl ReplyTarget {
     #[must_use]
     pub fn new(id: u64, kind: MessageKind, sink: SubscriberSink, global: Arc<AtomicUsize>) -> Self {
         Self {
-            id,
+            sink: ReplySink::new(id, sink, global),
             kind,
-            sink,
-            global,
         }
     }
 
@@ -286,8 +317,7 @@ impl ReplyTarget {
     /// produce a short reply SEQUENCE (the `AddCredential` path sends `Unlocked`
     /// then `CredentialAdded`), so the target must be reusable for the same id.
     pub fn send(&self, inner: DaemonMessageType) {
-        self.sink
-            .send_unchecked(&DaemonMessage::reply(self.id, inner), &self.global);
+        self.sink.send(inner);
     }
 
     /// Terminal success acknowledgement for a fire-and-confirm mutation:
