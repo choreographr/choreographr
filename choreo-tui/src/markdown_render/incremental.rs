@@ -15,7 +15,7 @@
 //! halves — one blank line, plus a second before a heading — is reproduced
 //! manually.
 //!
-//! Two details keep the splice faithful to a whole-document parse:
+//! Three details keep the splice faithful to a whole-document parse:
 //!
 //! * **Heading shift.**  The renderer normalizes every heading by the
 //!   document's *first* heading level (see [`super::markdown_lines_joined`]).
@@ -26,6 +26,13 @@
 //! * **Fences.**  A blank line inside a fenced code block is code content, not
 //!   a boundary, so the boundary scan tracks fence open/close state across the
 //!   tail.
+//! * **Indented code.**  An indented (four-column) code block may also contain
+//!   blank lines between its lines; a blank line whose preceding non-blank line
+//!   is indented is therefore withheld as a boundary (see
+//!   [`last_blank_boundary`]).  Withholding a boundary is always safe — a
+//!   missed boundary only costs a whole-tail re-render, never a divergent
+//!   result — so this stays conservative rather than trying to prove the blank
+//!   interior.
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -50,9 +57,6 @@ pub(crate) struct IncrementalMarkdown {
     /// Document-wide heading shift, pinned once the first heading is seen.
     /// `None` means no heading has appeared yet, so the shift is still free.
     heading_shift: Option<usize>,
-    /// Fence state (fence char, minimum run length) at the end of
-    /// `committed_src`, or `None` when not inside a fence.
-    in_fence: Option<(u8, usize)>,
     /// Bytes handed to the parser, for the reuse test.
     #[cfg(test)]
     pub(crate) parsed_bytes: usize,
@@ -90,7 +94,6 @@ impl IncrementalMarkdown {
             committed_joins: Vec::new(),
             committed_chrome: Vec::new(),
             heading_shift: None,
-            in_fence: None,
             #[cfg(test)]
             parsed_bytes: 0,
             #[cfg(test)]
@@ -106,7 +109,6 @@ impl IncrementalMarkdown {
         self.committed_joins.clear();
         self.committed_chrome.clear();
         self.heading_shift = None;
-        self.in_fence = None;
     }
 
     /// Render one source piece, returning its lines plus the boundary metadata
@@ -192,6 +194,12 @@ impl IncrementalMarkdown {
         if seg.lines.iter().all(line_is_blank) {
             return self.trimmed_committed();
         }
+        // The committed prefix is cloned into the assembled output every
+        // frame.  That copy is O(committed), but it is not the re-parse the
+        // cache exists to avoid: the caller materializes the turn's full
+        // rendered lines (the render cache owns them) regardless of this
+        // cache, so the clone is the same order as building the output.
+        // Parsing is the expensive part, and it is now O(appended).
         let mut lines = self.committed.clone();
         let mut joins = self.committed_joins.clone();
         let mut chrome = self.committed_chrome.clone();
@@ -234,7 +242,7 @@ impl IncrementalMarkdown {
             return;
         }
         let tail = src.get(start..).unwrap_or("");
-        let Some(boundary) = last_blank_boundary(tail, self.in_fence) else {
+        let Some(boundary) = last_blank_boundary(tail) else {
             return;
         };
         let Some(region) = tail.get(..boundary) else {
@@ -260,9 +268,6 @@ impl IncrementalMarkdown {
         self.committed_joins.extend(seg.joins);
         self.committed_chrome.extend(seg.chrome);
         self.committed_src.push_str(region);
-        // The chosen boundary is outside any fence by construction, so the next
-        // scan resumes with a closed fence.
-        self.in_fence = None;
         // A heading here is now a settled (committed) block, so its level — the
         // document's first heading — can be pinned for every later piece.
         self.heading_shift = self.heading_shift.or(seg.shift);
@@ -303,38 +308,80 @@ fn push_blank(
     chrome.push(LineChrome::default());
 }
 
-/// Byte offset, within `src`, just past the last blank line that is not inside
-/// a fenced code block.  `in_fence` is the fence state at the start of `src`.
+/// Byte offset, within `src`, just past the last blank line that is a genuine
+/// block boundary.  `None` when no such line exists.
+///
+/// A blank line is not a boundary when it is interior to a block that spans it:
+/// inside a fenced code block (tracked by [`fence_open`]/[`fence_close`]), or
+/// directly after an *indented* (four-column) code line — an indented code
+/// block may contain blank lines between its lines, so a blank whose preceding
+/// non-blank line is indented could be its interior.  Withholding such a blank
+/// is always safe: a missed boundary only costs a whole-tail re-render, never a
+/// divergent result.  Because every returned boundary sits outside any fence or
+/// indented code block, the scan needs no cross-call state — it starts fresh
+/// from the committed boundary each frame.
 ///
 /// The offset points at the first byte after the blank line's terminating
 /// newline, i.e. the start of the next line, so `&src[..offset]` ends on a line
 /// boundary and `&src[offset..]` begins at a line boundary.  A trailing blank
 /// line without a following newline is not counted (it is not a complete line,
 /// so it cannot yet be a settled boundary).
-fn last_blank_boundary(src: &str, in_fence: Option<(u8, usize)>) -> Option<usize> {
-    let mut fence = in_fence;
+fn last_blank_boundary(src: &str) -> Option<usize> {
+    // Fence state within this scan; a blank line inside a fence is code, not a
+    // boundary.
+    let mut fence: Option<(u8, usize)> = None;
+    // Whether the most recent non-blank line was an indented code line, so a
+    // following blank line may be interior to that code block.
+    let mut prev_indented = false;
     let mut last = None;
     let mut offset = 0usize;
     for piece in src.split_inclusive('\n') {
         let complete = piece.ends_with('\n');
         let content = piece.strip_suffix('\n').unwrap_or(piece);
-        match fence {
-            None => {
-                if let Some(open) = fence_open(content) {
-                    fence = Some(open);
-                } else if complete && content.trim().is_empty() {
-                    last = Some(offset + piece.len());
-                }
+        if let Some((ch, min)) = fence {
+            // Inside a fence: only a closing fence changes state, and no blank
+            // line here is a boundary.
+            if fence_close(content, ch, min) {
+                fence = None;
             }
-            Some((ch, min)) => {
-                if fence_close(content, ch, min) {
-                    fence = None;
-                }
+            prev_indented = false;
+        } else if let Some(open) = fence_open(content) {
+            fence = Some(open);
+            prev_indented = false;
+        } else if complete && content.trim().is_empty() {
+            // A blank line: a boundary unless it may sit inside an indented
+            // code block (its preceding non-blank line was an indented code
+            // line).
+            if !prev_indented {
+                last = Some(offset + piece.len());
             }
+        } else {
+            prev_indented = is_indented_code_line(content);
         }
         offset += piece.len();
     }
     last
+}
+
+/// Whether `line` begins (or continues) an indented code block: its leading
+/// whitespace reaches column 4.  A tab advances to the next multiple of four,
+/// matching CommonMark's indentation rule; a blank line is never a code line.
+fn is_indented_code_line(line: &str) -> bool {
+    if line.trim().is_empty() {
+        return false;
+    }
+    let mut cols = 0usize;
+    for ch in line.chars() {
+        match ch {
+            ' ' => cols += 1,
+            '\t' => cols += 4 - (cols % 4),
+            _ => return false,
+        }
+        if cols >= 4 {
+            return true;
+        }
+    }
+    false
 }
 
 /// Fence opener for `line`: an optional run of up to three leading spaces, then

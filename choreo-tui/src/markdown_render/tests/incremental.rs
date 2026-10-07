@@ -31,6 +31,10 @@ const CORPUS: &[(&str, &str)] = &[
         "Lead.\n\n~~~sh\necho one\n\necho two\n~~~\n\nTrail.\n",
     ),
     (
+        "indented code with inner blanks",
+        "Lead paragraph.\n\n    fn a() {}\n\n    fn b() {}\n\nTrailing paragraph.\n",
+    ),
+    (
         "table",
         "Before.\n\n| a | b |\n| - | - |\n| 1 | 2 |\n| 3 | 4 |\n\nAfter.\n",
     ),
@@ -84,9 +88,8 @@ fn assert_every_prefix_matches(name: &str, doc: &str, width: u16) {
     }
 }
 
-/// A `LineChrome` view with table ordinals renumbered to their first-seen order,
-/// so two renders that group the same rows into tables compare equal regardless
-/// of the absolute process-wide ordinals.
+/// One normalized [`LineChrome`] row: its intervals plus its (renumbered)
+/// table identity, if any.
 type NormalizedChromeRow = (Vec<(u16, u16)>, Option<(u32, u32)>);
 
 /// A `LineChrome` view with table ordinals renumbered to their first-seen order,
