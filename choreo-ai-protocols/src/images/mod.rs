@@ -21,14 +21,15 @@ mod zai;
 ///
 /// Image generation is *slow by design* — tens of seconds is normal for a
 /// high-quality gpt-image request (and glm-image's `hd` quality renders in
-/// ~20 s) — so the chat client's 120 s idle-read default is too tight and
-/// the 3600 s total default is absurdly loose for a single bounded POST.
-/// 180 s covers the slowest legitimate generation while still guaranteeing a
-/// hung attempt cannot wedge a worker for minutes on end. Applied via
-/// `build_agent`'s `timeout_global` (the only timeout that fires even when
-/// the connection trickles keep-alive bytes), and — because the agent is
-/// shared with the URL-download path of URL-returning adapters — it also
-/// bounds that post-response fetch.
+/// ~20 s) — and it returns a single, silent response with no streamed progress
+/// to reset the idle bound.  The chat client's 120 s idle default would
+/// therefore fire mid-render, and the 3600 s total default is absurdly loose
+/// for a single bounded POST, so this one value is applied as BOTH bounds: the
+/// idle cap on the socket read and `timeout_global`.  180 s covers the slowest
+/// legitimate generation while still guaranteeing a hung attempt cannot wedge
+/// a worker for minutes on end.  Because the agent is shared with the
+/// URL-download path of URL-returning adapters, it also bounds that
+/// post-response fetch.
 ///
 /// `pub` (not `pub(crate)`) because the daemon derives the `generate_image`
 /// tool's outer wait-loop floor from the adapters' bounded worst case — the

@@ -28,20 +28,34 @@ use ureq::{Error, Timeout};
 use crate::socket_registry::OwnedSock;
 use crate::{SocketId, SocketRegistry, SocketTuning};
 
-/// A [`Connector`] that registers every socket it opens.
+/// A [`Connector`] that registers every socket it opens and optionally caps
+/// each socket's read timeout.
 ///
 /// Cheaply cloneable (the registry is); `Debug + Send + Sync + 'static` as
 /// required by the [`Connector`] trait bounds.
 #[derive(Debug, Clone)]
 pub struct RegisteringTcpConnector {
     registry: SocketRegistry,
+    /// Per-read idle cap cloned onto every transport this connector dials: the
+    /// socket read timeout never exceeds it, so a silent peer wakes the reader
+    /// at a bounded interval instead of blocking for the whole request budget.
+    /// `None` leaves the socket timeout entirely to ureq's own budget.
+    idle_timeout: Option<time::Duration>,
 }
 
 impl RegisteringTcpConnector {
     /// Creates a connector feeding the given registry.
+    ///
+    /// `idle_timeout` caps the per-read socket timeout (a silent peer then
+    /// wakes the reader at a bounded interval, letting the caller notice the
+    /// idle and the wall-clock deadline bound the wait); `None` leaves the
+    /// socket timeout to ureq's own budget.
     #[must_use]
-    pub fn new(registry: SocketRegistry) -> Self {
-        Self { registry }
+    pub fn new(registry: SocketRegistry, idle_timeout: Option<time::Duration>) -> Self {
+        Self {
+            registry,
+            idle_timeout,
+        }
     }
 }
 
@@ -111,6 +125,7 @@ impl<In: Transport> Connector<In> for RegisteringTcpConnector {
             buffers,
             registration,
             self.registry.clone(),
+            self.idle_timeout,
         ))))
     }
 }
@@ -369,10 +384,41 @@ fn dial_one(addr: SocketAddr, per_addr: Option<Duration>) -> Result<TcpStream, E
     })
 }
 
+/// Resolve the socket read timeout for one read: ureq's requested budget,
+/// capped by the connector's configured idle timeout.
+///
+/// `NextTimeout::not_zero` reproduces ureq's own mapping (a zero budget gets a
+/// 1 s grace, `NotHappening` means no ureq bound). The cap is what turns the
+/// idle `request_timeout_secs` into a genuine per-read no-progress bound: the
+/// socket read timeout fires after at most `idle` of silence and resets on
+/// every byte, unlike ureq's whole-body `timeout_recv_body`.
+fn cap_read_timeout(
+    timeout: NextTimeout,
+    idle_timeout: Option<time::Duration>,
+) -> Option<time::Duration> {
+    let requested = timeout.not_zero().map(|d| *d);
+    match (requested, idle_timeout) {
+        (Some(requested), Some(idle)) => Some(requested.min(idle)),
+        (Some(requested), None) => Some(requested),
+        (None, idle) => idle,
+    }
+}
+
+/// Whether a socket read/write failed because its timeout elapsed: unix
+/// reports `WouldBlock`, windows `TimedOut`, and both mean "no progress within
+/// the socket timeout". Mirrors ureq's own `normalize_would_block` + match.
+fn is_socket_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
 /// Our own socket transport (ureq's `TcpTransport` is not public). The
 /// read/write behavior mirrors ureq's socket transport: set the socket
 /// timeout only when the requested one changes, map socket timeouts to
-/// `Error::Timeout`, and answer `is_open` with a non-blocking peek probe.
+/// `Error::Timeout`, and answer `is_open` with a non-blocking peek probe. The
+/// read side additionally caps the timeout at the connector's `idle_timeout`.
 pub struct RegisteredTcpTransport {
     stream: TcpStream,
     buffers: LazyBuffers,
@@ -384,6 +430,8 @@ pub struct RegisteredTcpTransport {
     // call site otherwise; ureq's transport caches the same way.
     timeout_write: Option<time::Duration>,
     timeout_read: Option<time::Duration>,
+    // Per-read idle cap on the read timeout (see `RegisteringTcpConnector`).
+    idle_timeout: Option<time::Duration>,
 }
 
 impl RegisteredTcpTransport {
@@ -392,6 +440,7 @@ impl RegisteredTcpTransport {
         buffers: LazyBuffers,
         registration: Option<SocketId>,
         registry: SocketRegistry,
+        idle_timeout: Option<time::Duration>,
     ) -> Self {
         Self {
             stream,
@@ -399,23 +448,19 @@ impl RegisteredTcpTransport {
             registration: registration.map(|id| (id, registry)),
             timeout_read: None,
             timeout_write: None,
+            idle_timeout,
         }
     }
 
     /// The goal here is to only cause a syscall to set the timeout if it's
-    /// necessary (lifted from ureq's tcp.rs, same rationale).
+    /// necessary (lifted from ureq's tcp.rs, same rationale). `maybe_timeout`
+    /// is the already-resolved value; `None` clears any socket timeout.
     fn maybe_update_timeout(
-        timeout: NextTimeout,
+        maybe_timeout: Option<time::Duration>,
         previous: &mut Option<time::Duration>,
         stream: &TcpStream,
         f: impl Fn(&TcpStream, Option<time::Duration>) -> std::io::Result<()>,
     ) -> Result<(), Error> {
-        let maybe_timeout: Option<time::Duration> =
-            // ureq's `Duration` is its own enum wrapper (Exact/NotHappening)
-            // that derefs to std's; normalize to std's Duration here so the
-            // memoized state and the socket setters share one type.
-            timeout.not_zero().map(|d| *d);
-
         if maybe_timeout != *previous {
             (f)(stream, maybe_timeout)?;
             *previous = maybe_timeout;
@@ -450,8 +495,14 @@ impl Transport for RegisteredTcpTransport {
     }
 
     fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), Error> {
+        // The idle cap is applied to READS only: the concern is a silent peer,
+        // and a large request body (a multi-MB reasoning context, say) is
+        // legitimately slow to write, bounded by ureq's own send budget.
+        // ureq's `Duration` is its own enum wrapper (Exact/NotHappening) that
+        // derefs to std's; `not_zero` reproduces ureq's zero→1s grace.
+        let write_timeout = timeout.not_zero().map(|d| *d);
         Self::maybe_update_timeout(
-            timeout,
+            write_timeout,
             &mut self.timeout_write,
             &self.stream,
             TcpStream::set_write_timeout,
@@ -466,16 +517,22 @@ impl Transport for RegisteredTcpTransport {
         let output = buf.get(..amount).unwrap_or(buf);
         match self.stream.write_all(output) {
             Ok(v) => Ok(v),
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                Err(Error::Timeout(timeout.reason))
-            }
+            // Normalize WouldBlock (unix) / TimedOut (windows) to a ureq
+            // timeout exactly as ureq's own transport does (`normalize_would_block`
+            // then map), so the two transports are interchangeable.
+            Err(e) if is_socket_timeout(&e) => Err(Error::Timeout(timeout.reason)),
             Err(e) => Err(e.into()),
         }
     }
 
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, Error> {
+        // Cap the socket read timeout at the configured idle bound. The socket
+        // timeout resets on every byte received, so this gives a genuine
+        // no-progress timeout even though ureq's own recv-body budget is a
+        // whole-body total (which the caller leaves disabled for streams).
+        let read_timeout = cap_read_timeout(timeout, self.idle_timeout);
         Self::maybe_update_timeout(
-            timeout,
+            read_timeout,
             &mut self.timeout_read,
             &self.stream,
             TcpStream::set_read_timeout,
@@ -484,9 +541,11 @@ impl Transport for RegisteredTcpTransport {
         let input = self.buffers.input_append_buf();
         let amount = match self.stream.read(input) {
             Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                return Err(Error::Timeout(timeout.reason));
-            }
+            // A socket read timeout means no bytes arrived within the interval.
+            // Normalize WouldBlock (unix) / TimedOut (windows) and map to a
+            // ureq timeout, matching ureq's transport; the caller sees a clean
+            // timeout rather than a stray `WouldBlock`.
+            Err(e) if is_socket_timeout(&e) => return Err(Error::Timeout(timeout.reason)),
             Err(e) => return Err(e.into()),
         };
         self.buffers.input_appended(amount);
@@ -533,6 +592,53 @@ impl fmt::Debug for RegisteredTcpTransport {
 mod tests {
     use super::*;
     use ureq::unversioned::resolver::ArrayVec;
+
+    /// A `NextTimeout` with an exact `after`, for the read-timeout-cap tests.
+    fn exact_timeout(secs: u64) -> NextTimeout {
+        NextTimeout {
+            after: Duration::Exact(time::Duration::from_secs(secs)),
+            reason: Timeout::Global,
+        }
+    }
+
+    #[test]
+    fn read_timeout_is_capped_by_idle() {
+        let idle = time::Duration::from_secs(120);
+        // ureq's budget exceeds the idle cap → idle wins.
+        assert_eq!(cap_read_timeout(exact_timeout(300), Some(idle)), Some(idle));
+        // ureq's budget is tighter than idle → ureq wins.
+        assert_eq!(
+            cap_read_timeout(exact_timeout(30), Some(idle)),
+            Some(time::Duration::from_secs(30))
+        );
+        // No cap → ureq's own budget passes through.
+        assert_eq!(
+            cap_read_timeout(exact_timeout(300), None),
+            Some(time::Duration::from_secs(300))
+        );
+        // No ureq bound (NotHappening) but an idle cap → the cap applies.
+        let not_happening = NextTimeout {
+            after: Duration::NotHappening,
+            reason: Timeout::Global,
+        };
+        assert_eq!(cap_read_timeout(not_happening, Some(idle)), Some(idle));
+        // Neither bound → no socket timeout at all.
+        assert_eq!(cap_read_timeout(not_happening, None), None);
+    }
+
+    #[test]
+    fn socket_timeout_covers_both_platform_kinds() {
+        // Unix reports WouldBlock, windows TimedOut — both are timeouts.
+        assert!(is_socket_timeout(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+        assert!(is_socket_timeout(&std::io::Error::from(
+            std::io::ErrorKind::TimedOut
+        )));
+        assert!(!is_socket_timeout(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset
+        )));
+    }
 
     /// A placeholder address for building a `ResolvedSocketAddrs` (its
     /// `from_fn` constructor must fill all 16 slots, so a sentinel is needed).

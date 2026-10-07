@@ -180,34 +180,41 @@ pub(crate) fn provider_error_to_inference(e: ProviderError) -> InferenceError {
 
 /// Build a ureq agent with connect, idle-read, and total-deadline timeouts.
 ///
-/// Two distinct read-side bounds are applied, because a streaming SSE body
-/// needs both:
+/// Three timeouts are applied:
 ///
-/// - `read_timeout_secs` is an *idle*/no-progress timeout — it resets each
-///   time a new chunk arrives on a streaming response.  A value of `0` means
-///   no limit.  It cannot interrupt a stream that keeps trickling keep-alive
-///   bytes without ever forming a complete event.
+/// - `connect_timeout_secs` bounds each individual connection attempt.
+/// - `idle_timeout_secs` is a genuine *no-progress* timeout: the socket read
+///   timeout is capped at it (via the connector's `idle_timeout`), and because
+///   a socket read timeout resets on every received byte, it fires only when
+///   the provider sends nothing for that long.  It never aborts a steadily
+///   streaming response, however long.  A value of `0` disables it.
+///
+///   It deliberately does NOT use ureq's `timeout_recv_body`: that is a
+///   *whole-body total* (its own docs say "the budget is not restarted for
+///   each read"), so mapping this idle bound to it would abort any stream
+///   longer than the bound even while bytes flow.
 /// - `total_timeout_secs` is a hard wall-clock deadline for a single HTTP
 ///   attempt, from DNS lookup through the last byte of the body read.  ureq's
 ///   `timeout_global` is the only timeout that fires even when keep-alive data
-///   trickles in, so it is the backstop that prevents a stalled SSE stream
-///   from hanging the worker forever.  A value of `0` means no limit.  It
-///   covers one attempt: each retry restarts the deadline, so retries plus
-///   their backoff can exceed this value in aggregate.
+///   trickles in, so it is the backstop that prevents a stream from hanging
+///   the worker forever (it also bounds the non-streaming request/response
+///   paths).  A value of `0` means no limit.  It covers one attempt: each
+///   retry restarts the deadline, so retries plus their backoff can exceed
+///   this value in aggregate.
 pub(crate) fn build_agent(
     registry: &SocketRegistry,
     connect_timeout_secs: u64,
-    read_timeout_secs: u64,
+    idle_timeout_secs: u64,
     total_timeout_secs: u64,
     user_agent: Option<&str>,
 ) -> ureq::Agent {
     let mut cfg = ureq::Agent::config_builder()
         .timeout_connect(Some(std::time::Duration::from_secs(connect_timeout_secs)))
-        .timeout_recv_body(if read_timeout_secs > 0 {
-            Some(std::time::Duration::from_secs(read_timeout_secs))
-        } else {
-            None
-        })
+        // Left disabled on purpose: `timeout_recv_body` is a whole-body total,
+        // not an idle timeout, so it would cut long streams short.  The idle
+        // bound is enforced at the socket level instead (the connector caps
+        // the per-read socket timeout, which resets on every byte).
+        .timeout_recv_body(None)
         .timeout_global(if total_timeout_secs > 0 {
             Some(std::time::Duration::from_secs(total_timeout_secs))
         } else {
@@ -244,10 +251,19 @@ pub(crate) fn build_agent(
     //      in choreo-sockreg: ureq does not expose the proxy connector's fd).
     //   3. `RustlsConnector` — wraps in TLS for `https`, passes `http`
     //      through, using the same rustls config ureq's default chain uses.
-    let connector =
-        ().chain(ConnectProxyConnector::default())
-            .chain(RegisteringTcpConnector::new(registry.clone()))
-            .chain(RustlsConnector::default());
+    let connector = ()
+        .chain(ConnectProxyConnector::default())
+        .chain(RegisteringTcpConnector::new(
+            registry.clone(),
+            // Zero disables the idle cap; otherwise the socket read timeout
+            // is capped here so a silent peer surfaces as a timeout.
+            if idle_timeout_secs > 0 {
+                Some(std::time::Duration::from_secs(idle_timeout_secs))
+            } else {
+                None
+            },
+        ))
+        .chain(RustlsConnector::default());
     ureq::Agent::with_parts(cfg.build(), connector, DefaultResolver::default())
 }
 

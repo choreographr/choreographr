@@ -77,7 +77,7 @@ fn ureq_request_through_registering_connector() {
     // minus TLS).
     let agent = Agent::with_parts(
         Config::default(),
-        RegisteringTcpConnector::new(registry.clone()),
+        RegisteringTcpConnector::new(registry.clone(), None),
         DefaultResolver::default(),
     );
 
@@ -125,7 +125,7 @@ fn registry_returns_to_predial_level_after_agent_drop() {
 
     let agent = Agent::with_parts(
         Config::default(),
-        RegisteringTcpConnector::new(registry.clone()),
+        RegisteringTcpConnector::new(registry.clone(), None),
         DefaultResolver::default(),
     );
     let mut res = agent
@@ -173,7 +173,7 @@ fn first_refused_resolved_address_falls_through_to_second() {
         Config::builder()
             .timeout_connect(Some(std::time::Duration::from_secs(2)))
             .build(),
-        RegisteringTcpConnector::new(registry.clone()),
+        RegisteringTcpConnector::new(registry.clone(), None),
         ScriptedResolver {
             addrs: vec![dead_addr, live_addr],
         },
@@ -204,7 +204,7 @@ fn all_refused_resolved_addresses_report_refusal() {
         Config::builder()
             .timeout_connect(Some(std::time::Duration::from_secs(2)))
             .build(),
-        RegisteringTcpConnector::new(registry.clone()),
+        RegisteringTcpConnector::new(registry.clone(), None),
         ScriptedResolver {
             addrs: vec![dead_addr, dead_addr],
         },

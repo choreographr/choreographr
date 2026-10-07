@@ -75,7 +75,7 @@ impl<T> Drop for SseStream<T> {
     }
 }
 
-/// Origin of one SSE stream, carried onto the reader thread so an absorbed idle
+/// Origin of one SSE stream, carried onto the reader thread so a stream read
 /// timeout can be attributed to the request that produced it.  The provider
 /// crate has no session id, so provider slug + model is the identity available
 /// at this layer.
@@ -85,24 +85,21 @@ pub(crate) struct SseContext {
     pub model: String,
 }
 
-/// How many idle-read timeouts one stream may absorb before the normally
-/// `debug`-level line escalates to `warn!`.  One stall that recovers is
-/// routine; a run of them means the provider is trickling keep-alive bytes
-/// while making no progress — a condition the eventual `DeadlineExceeded`
-/// alone cannot tell apart from an ordinary slow stream.
-const IDLE_TIMEOUT_WARN_THRESHOLD: u32 = 3;
-
-/// Whether an idle-timeout count should log at `warn!` rather than `debug!`:
-/// exactly at the threshold, so a repeatedly-stalling provider gets one loud
-/// line without per-stall spam.
-fn idle_timeout_warns(count: u32) -> bool {
-    count == IDLE_TIMEOUT_WARN_THRESHOLD
+/// Whether an `io::Error` is a ureq timeout wrapped by `Error::into_io`
+/// (`io::Error::other(ureq::Error)`, so the ureq error is the `get_ref`
+/// source).  During a streaming body read the socket timeout is capped at the
+/// configured idle bound, so a timeout here means the provider sent nothing for
+/// that long — worth a clear `warn!` rather than a bare socket-error line.
+fn is_stream_timeout(e: &io::Error) -> bool {
+    e.get_ref()
+        .and_then(|inner| inner.downcast_ref::<ureq::Error>())
+        .is_some_and(|err| matches!(err, ureq::Error::Timeout(_)))
 }
 
 /// Spawn a dedicated thread that runs the blocking SSE read loop and
 /// forwards each parsed event through a crossbeam channel.
 ///
-/// `context` identifies the request (provider slug + model) so an absorbed idle
+/// `context` identifies the request (provider slug + model) so a stream read
 /// timeout is attributable in the log instead of a bare "a stall happened".
 ///
 /// `deadline` is the hard wall-clock deadline for this response's whole
@@ -147,9 +144,6 @@ where
     // headers → body) rather than just this body read.
     tracing::trace!(?deadline, "spawning SSE reader thread");
     let handle = std::thread::spawn(move || {
-        // Idle timeouts absorbed on THIS stream — a per-stream count used only
-        // to escalate the log once a provider stalls repeatedly in one attempt.
-        let mut idle_timeouts: u32 = 0;
         loop {
             // Abort check at the loop boundary: the consumer cancelling (or
             // dropping the stream) must stop the thread as soon as it is not
@@ -177,47 +171,24 @@ where
                     let _ = tx.send(SseStreamMsg::End);
                     return;
                 }
-                // A body-read idle timeout: the socket is blocking-with-a-
-                // timeout, so `read` simply re-blocks for another interval and
-                // reports `WouldBlock` (EAGAIN) when no bytes arrive in time.
-                // That is "no progress", not a failure — the terminator for a
-                // genuinely stalled stream is the consumer's wall-clock
-                // deadline (checked in `recv_sse_event`), which fires even
-                // while keep-alive bytes trickle. Looping re-checks the abort
-                // flag each iteration, so a cancel is still observed within one
-                // timeout interval — and this is the single place the handling
-                // lives, so every provider's stream inherits it.
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    // A recovered stall is no-progress, not a failure, so it
-                    // only logs.  Count it per stream so a provider that stalls
-                    // repeatedly in one attempt is distinguishable from one
-                    // that hiccuped once: the line rides at `debug`, escalating
-                    // to a single `warn` at the threshold so the signal is loud
-                    // without per-stall spam.
-                    idle_timeouts = idle_timeouts.saturating_add(1);
-                    if idle_timeout_warns(idle_timeouts) {
+                // Any read failure ends the stream.  A socket read timeout is
+                // a real no-progress failure, not something to loop past: the
+                // socket timeout is capped at the configured idle bound (see
+                // the connector's `idle_timeout`), so its firing means the
+                // provider sent nothing for that long.  The wall-clock deadline
+                // (`recv_sse_event`) remains the backstop for a stream that
+                // trickles keep-alive bytes without ever forming an event.
+                Err(e) => {
+                    if is_stream_timeout(&e) {
                         tracing::warn!(
                             provider = %context.provider,
                             model = %context.model,
-                            count = idle_timeouts,
-                            "SSE stream idle-timed out repeatedly; provider may be stalled"
+                            error = %e,
+                            "provider stream timed out with no data; failing the attempt"
                         );
                     } else {
-                        tracing::debug!(
-                            provider = %context.provider,
-                            model = %context.model,
-                            count = idle_timeouts,
-                            "SSE read idle timeout; re-blocking"
-                        );
+                        tracing::debug!(error = %e, "SSE reader error; forwarding to consumer");
                     }
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "SSE reader error; forwarding to consumer");
                     let _ = tx.send(SseStreamMsg::Err(e));
                     return;
                 }
@@ -545,60 +516,34 @@ mod tests {
     }
 
     #[test]
-    fn idle_timeout_is_absorbed_not_surfaced_as_error() {
-        // A body-read idle timeout returns `WouldBlock` (EAGAIN) on Unix, or a
-        // `TimedOut`-classified error depending on the transport; BOTH mean
-        // "no progress", not a stream failure.  The reader must loop past them
-        // and still deliver the eventual event rather than mapping the timeout
-        // to `ProviderError::Io(EAGAIN)`.  Deterministic: each closure call
-        // pops one queued value (no sleeps), first the two timeout kinds, then
-        // the event.
-        let mut results = vec![
-            Err(io::Error::from(io::ErrorKind::WouldBlock)),
-            Err(io::Error::from(io::ErrorKind::TimedOut)),
-            Ok(Some("after idle".to_string())),
-        ]
-        .into_iter();
-        let sse = spawn_sse_reader(
+    fn read_timeout_is_forwarded_not_absorbed() {
+        // A read timeout is what a silent provider produces once the socket
+        // read timeout is capped at the idle bound.  The reader must surface it
+        // as an error (ending the stream), NOT loop past it as the removed
+        // idle-absorb path did.
+        let mut items = std::iter::once(Err(io::Error::new(io::ErrorKind::TimedOut, "idle")));
+        let sse: SseStream<i32> = spawn_sse_reader(
             SseContext::default(),
-            move || results.next().unwrap_or(Ok(None)),
+            move || items.next().unwrap_or(Ok(None)),
             None,
         );
-        assert_eq!(
-            recv_sse_event(&sse, None).unwrap().as_deref(),
-            Some("after idle")
-        );
+        match sse.rx.recv() {
+            Ok(SseStreamMsg::Err(e)) => assert_eq!(e.kind(), io::ErrorKind::TimedOut),
+            other => panic!("expected SseStreamMsg::Err, got {other:?}"),
+        }
     }
 
     #[test]
-    fn idle_timeout_escalates_at_the_threshold_only() {
-        // The escalation rule pinned directly: exactly one `warn` at the
-        // threshold, `debug` either side — so a repeatedly-stalling provider is
-        // loud once without per-stall spam.
-        assert!(!idle_timeout_warns(0));
-        assert!(!idle_timeout_warns(IDLE_TIMEOUT_WARN_THRESHOLD - 1));
-        assert!(idle_timeout_warns(IDLE_TIMEOUT_WARN_THRESHOLD));
-        assert!(!idle_timeout_warns(IDLE_TIMEOUT_WARN_THRESHOLD + 1));
-    }
-
-    #[test]
-    fn many_idle_timeouts_still_deliver_events() {
-        // Crossing the warn threshold must not abort the stream: after a run of
-        // idle timeouts the reader still forwards the eventual event.
-        // Deterministic — a fixed queue of timeout kinds then the event, no
-        // sleeps; repeating `WouldBlock` past the threshold exercises the
-        // escalation branch without changing the delivered result.
-        let mut results = (0..IDLE_TIMEOUT_WARN_THRESHOLD + 2)
-            .map(|_| Err(io::Error::from(io::ErrorKind::WouldBlock)))
-            .chain(std::iter::once(Ok(Some("after many".to_owned()))));
-        let sse = spawn_sse_reader(
-            SseContext::default(),
-            move || results.next().unwrap_or(Ok(None)),
-            None,
-        );
-        assert_eq!(
-            recv_sse_event(&sse, None).unwrap().as_deref(),
-            Some("after many")
-        );
+    fn wrapped_ureq_timeout_is_recognized() {
+        // A ureq timeout reaches the reader wrapped as
+        // `io::Error::other(ureq::Error)` (see `ureq::Error::into_io`), so
+        // `is_stream_timeout` must see through the wrapper to log it loudly —
+        // and must not fire for anything else.
+        let wrapped = io::Error::other(ureq::Error::Timeout(ureq::Timeout::RecvBody));
+        assert!(is_stream_timeout(&wrapped));
+        assert!(!is_stream_timeout(&io::Error::other("plain io error")));
+        assert!(!is_stream_timeout(&io::Error::from(
+            io::ErrorKind::ConnectionReset
+        )));
     }
 }

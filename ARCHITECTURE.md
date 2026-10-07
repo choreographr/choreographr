@@ -3889,13 +3889,17 @@ counts survive the attach instead of regressing.
    keep-alive trickles could otherwise outlive the deadline). Expiry surfaces as a dedicated
    `ProviderError::DeadlineExceeded` — non-retryable and distinct from a socket `Io` error.
    Each retry restarts the deadline, so retries plus their backoff can exceed the configured
-   value in aggregate. A body-read idle timeout (`WouldBlock`/`TimedOut` — a blocking socket
-   read that goes idle past `request_timeout_secs` returns EAGAIN) is absorbed by the reader
-   thread, which loops and re-checks its abort flag; the wall-clock deadline above, not the
-   idle read timeout, is what ends a stalled stream. This stops a brief provider pause from
-   aborting a healthy request as `ProviderError::Io(os error 11)`. Each absorbed timeout is
-   logged with the request's provider slug + model (`SseContext`), and the per-stream count
-   escalates to one `warn!` once a provider stalls repeatedly within an attempt.
+   value in aggregate. A separate body-read **idle timeout** (`request_timeout_secs`) is
+   enforced at the socket level: the connector caps the socket read timeout at that bound,
+   and because a socket timeout resets on every received byte it fires only when the provider
+   sends nothing for that long — so a steadily streaming response is never cut short, however
+   long, while a silent one fails promptly. ureq's own `timeout_recv_body` is NOT used: it is
+   a whole-body total ("the budget is not restarted for each read"), so mapping the idle bound
+   to it would abort any stream longer than the bound even while bytes flow. A read timeout is
+   surfaced as a fatal stream error and logged (`warn!`) with the request's provider slug +
+   model (`SseContext`) so a silent provider is attributable; the wall-clock deadline above
+   remains the backstop for a stream that trickles keep-alive bytes without ever forming an
+   event.
 
 9. **Markdown as the intermediate format** — all text (tool output, assistant text, error
     messages) is treated as markdown and rendered as HTML (desktop) or shaped to terminal output

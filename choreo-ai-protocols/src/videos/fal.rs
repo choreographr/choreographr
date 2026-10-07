@@ -287,6 +287,9 @@ impl FalVideoClient {
         let http = crate::shared::build_agent(
             registry,
             config.connect_timeout_secs,
+            // Idle and total both take the per-request deadline: the quick
+            // queue calls return a single silent response, so the whole job's
+            // budget lives in the driver, not here.
             FAL_VIDEO_HTTP_TIMEOUT_SECS,
             FAL_VIDEO_HTTP_TIMEOUT_SECS,
             config.user_agent.as_deref(),

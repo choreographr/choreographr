@@ -41,13 +41,19 @@ pub struct ServiceConfig {
     pub retry_initial_backoff_ms: u64,
     pub retry_max_backoff_ms: u64,
     pub connect_timeout_secs: u64,
+    /// Idle read timeout in seconds: if no bytes arrive on the response for
+    /// this long, the attempt fails.  It resets on every received byte, so a
+    /// steadily streaming response is never cut short however long it runs;
+    /// `0` disables it.  Enforced by capping the socket read timeout at this
+    /// value (ureq's `timeout_recv_body` is a whole-body total, not an idle
+    /// timeout, so it is deliberately not used here).
     pub request_timeout_secs: u64,
     /// Hard wall-clock deadline for a single HTTP request attempt, including
-    /// the streaming body read; 0 disables.  Unlike `request_timeout_secs` (an
-    /// idle/no-progress timeout that resets per chunk), this fires even when a
-    /// provider trickles keep-alive bytes, so it bounds a stalled SSE stream.
-    /// It covers one attempt: each retry restarts the deadline, so retries
-    /// plus their backoff can exceed this value in aggregate.
+    /// the streaming body read; 0 disables.  Unlike `request_timeout_secs`
+    /// (which resets per chunk), this fires even when a provider trickles
+    /// keep-alive bytes, so it bounds a stalled SSE stream.  It covers one
+    /// attempt: each retry restarts the deadline, so retries plus their
+    /// backoff can exceed this value in aggregate.
     pub total_timeout_secs: u64,
     pub context: ContextConfig,
     pub programmatic_tool_calling: bool,

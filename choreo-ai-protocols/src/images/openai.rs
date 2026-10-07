@@ -84,9 +84,10 @@ impl OpenAiImageClient {
         let http = crate::shared::build_agent(
             registry,
             config.connect_timeout_secs,
-            // Idle-read timeout: a generation can be silent for a long time,
-            // so the idle bound must not be tighter than the wall-clock
-            // bound or it would fire first and misreport the failure mode.
+            // Idle-read timeout: an image generation is a single silent
+            // response (there is no streamed progress to reset the idle bound),
+            // so the idle bound is set equal to the wall-clock bound — the
+            // total is what actually ends a hung attempt.
             IMAGE_TOTAL_TIMEOUT_SECS,
             IMAGE_TOTAL_TIMEOUT_SECS,
             config.user_agent.as_deref(),
