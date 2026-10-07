@@ -366,16 +366,19 @@ impl DaemonState {
             service = %service,
             "AddCredential: persisted, tested, and implicitly unlocked the keystore"
         );
-        // ORDERING INVARIANT: the targeted Unlocked+CredentialAdded replies
-        // are enqueued HERE, by this thread, BEFORE the lock-state broadcast
-        // (see handle_unlock) — the acting client keys its key-recording on
-        // the CredentialAdded confirmation, so the broadcast must never
-        // overtake it on the same writer queue.
+        // ORDERING INVARIANT: the targeted CredentialAdded reply is enqueued
+        // HERE, by this thread, BEFORE the lock-state broadcast (see
+        // handle_unlock) — the acting client keys its key-recording on the
+        // CredentialAdded confirmation, so the broadcast must never overtake it
+        // on the same writer queue. AddCredential yields exactly ONE terminal
+        // reply (the reply axis is one request → one reply): the implicit
+        // unlock's state transition rides the `Keystore { state: Unlocked }`
+        // broadcast below (it fires whenever the daemon was locked), not a
+        // second id-bearing reply.
         if let Some(target) = reply {
-            target.send(DaemonMessageType::Unlocked);
             target.send(DaemonMessageType::CredentialAdded { service });
         } else {
-            warn!("no reply target for targeted AddCredential replies; dropping replies");
+            warn!("no reply target for the targeted AddCredential reply; dropping reply");
         }
         let _ = ack.send(());
         // A valid AddCredential to a locked daemon IS a lock-state transition

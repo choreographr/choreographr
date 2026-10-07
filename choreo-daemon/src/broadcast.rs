@@ -64,6 +64,7 @@ use crossbeam_channel::Sender;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tracing::warn;
 
 /// Per-subscriber delivery sink: an UNBOUNDED crossbeam channel plus a
 /// shared in-flight byte counter.
@@ -279,7 +280,7 @@ impl ReplySink {
     }
 }
 
-/// An OWNED obligation to answer one request, usable across a channel.
+/// An OWNED obligation to answer exactly one request, usable across a channel.
 ///
 /// The connection thread mints one per request whose reply is produced OFF the
 /// connection thread — on a session thread or the daemon command loop —
@@ -293,11 +294,29 @@ impl ReplySink {
 /// / [`fail`](Self::fail) acknowledgements can self-identify without the
 /// producer re-deriving it; commands that answer with a richer payload (the
 /// keystore replies) simply call [`send`](Self::send) directly.
+///
+/// # Exactly one terminal reply
+///
+/// A request gets exactly one `id: Some` terminal reply on the wire. `send`,
+/// `accept`, and `fail` CONSUME the target, so a handler cannot answer the same
+/// request twice — the same one-shot discipline the connection thread's
+/// [`ReplyTarget`] sibling enforces. As a backstop, `Drop` answers a target that
+/// was dropped UNANSWERED (the owner vanished — the session/daemon thread that
+/// would have replied went away before it could, or a channel send failed and
+/// returned the command here) with a best-effort [`Failed`](DaemonMessageType::Failed)
+/// so the client's pending slot never strands. Unlike the connection thread's
+/// `ReplyHandle`, which can afford a `debug_assert!` because every
+/// connection-thread path explicitly answers or abandons, this target crosses
+/// threads and can be legitimately dropped when the receiver is gone, so it uses
+/// a non-panicking best-effort send instead.
 pub struct ReplyTarget {
     /// The shared reply mechanism (request id + delivery sink + lag counter).
     sink: ReplySink,
-    /// The request's kind tag (used by `accept`/`fail`).
+    /// The request's kind tag (used by `accept`/`fail` and the drop backstop).
     kind: MessageKind,
+    /// Whether the one terminal reply has been sent. `false` only on the
+    /// drop-unanswered path the `Drop` backstop targets.
+    answered: bool,
 }
 
 impl ReplyTarget {
@@ -308,30 +327,63 @@ impl ReplyTarget {
         Self {
             sink: ReplySink::new(id, sink, global),
             kind,
+            answered: false,
         }
+    }
+
+    /// The request id this target answers.
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.sink.id()
     }
 
     /// Answer the request with `inner`, stamped with the request id.
     ///
-    /// Borrows (`&self`) rather than consuming: a request may legitimately
-    /// produce a short reply SEQUENCE (the `AddCredential` path sends `Unlocked`
-    /// then `CredentialAdded`), so the target must be reusable for the same id.
-    pub fn send(&self, inner: DaemonMessageType) {
+    /// Consumes the target: the reply axis is one request → exactly one terminal
+    /// reply. A request cannot legitimately produce a second `id: Some` reply;
+    /// anything staggered rides the broadcast (`id: None`) or per-session
+    /// `stream_id` axis instead.
+    pub fn send(mut self, inner: DaemonMessageType) {
+        // Mark answered BEFORE the send so the drop backstop is satisfied even
+        // if the enqueue path is unwound through.
+        self.answered = true;
         self.sink.send(inner);
     }
 
     /// Terminal success acknowledgement for a fire-and-confirm mutation:
     /// `Accepted { kind }` for this request's kind.
-    pub fn accept(&self) {
-        self.send(DaemonMessageType::Accepted { kind: self.kind });
+    pub fn accept(self) {
+        let kind = self.kind;
+        self.send(DaemonMessageType::Accepted { kind });
     }
 
     /// Terminal failure reply: `Failed { kind, error }` for this request's kind.
-    pub fn fail(&self, error: impl Into<String>) {
+    pub fn fail(self, error: impl Into<String>) {
+        let kind = self.kind;
         self.send(DaemonMessageType::Failed {
-            kind: self.kind,
+            kind,
             error: error.into(),
         });
+    }
+}
+
+impl Drop for ReplyTarget {
+    fn drop(&mut self) {
+        if !self.answered {
+            // Dropped unanswered: the owner that would have produced the reply
+            // is gone. Answer best-effort so the client's pending slot never
+            // strands; a send to a dead sink is a harmless no-op (it only
+            // self-corrects the byte counters).
+            warn!(
+                id = self.sink.id(),
+                kind = ?self.kind,
+                "reply target dropped without a terminal reply; sending a Failed backstop"
+            );
+            self.sink.send(DaemonMessageType::Failed {
+                kind: self.kind,
+                error: "request was not answered by the daemon".to_string(),
+            });
+        }
     }
 }
 

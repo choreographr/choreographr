@@ -302,6 +302,16 @@ pub enum SessionCommand {
     GetReasoningEffort {
         reply: mpsc::Sender<String>,
     },
+    /// Reply with the session's current full-state snapshot (`SessionState`) to
+    /// answer a `GetSessionState` request. The requesting client does NOT attach
+    /// (it just wants to look), so this is a read-only snapshot built by the
+    /// authoritative session thread — the same `session_state_message` the
+    /// attach push uses, so the wire shape cannot drift. The reply carries the
+    /// daemon's own `io::Result` wrapper so the session thread can answer an
+    /// active session directly, off the daemon command loop.
+    GetState {
+        reply: mpsc::Sender<io::Result<DaemonMessageType>>,
+    },
     Undo {
         /// The requester's reply target: `Accepted` when turns were undone,
         /// `Failed { kind: Undo, error: "nothing to undo" }` when there was
@@ -1339,25 +1349,17 @@ fn fail_request(
     error: impl Into<String>,
 ) -> bool {
     let error = error.into();
-    // Targeted acceptance-reply failure to the requester: the request's
-    // terminal reply (`id: Some`). Sent BEFORE the unchanged broadcast stream
-    // below — the two ride the same per-client writer queue, so the requester
-    // sees its rejection then the broadcast `Started`/`Failed` pair.
+    // Targeted terminal failure to the requester: the request's one `id: Some`
+    // reply. Sent BEFORE the broadcast below — the two ride the same per-client
+    // writer queue, so the requester sees its rejection, then the broadcast
+    // `Failed`.
     if let Some(target) = reply {
         target.fail(error.clone());
     }
-    broadcast(
-        subscribers,
-        ctx,
-        &DaemonMessageType::Session {
-            session_id: Some(session_id),
-            event: SessionEvent::Started {
-                stream_id,
-                turn_id: 0,
-                estimated_prompt_tokens: 0,
-            },
-        },
-    );
+    // Only the `Failed` broadcast: a REJECTED run never started, so there is no
+    // stream to open. Broadcasting a `Started` here (the old `turn_id: 0`
+    // shape) would register a phantom live stream on every subscriber until the
+    // follow-up `Failed` cleared it; the `Failed` alone is the whole event.
     broadcast(
         subscribers,
         ctx,

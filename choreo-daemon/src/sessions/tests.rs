@@ -2691,15 +2691,19 @@ fn run_input_empty_acks_failed_and_broadcasts_stream_failure() {
         },
     );
     // The daemon assigns the stream id (test_state starts the counter at 1);
-    // the unchanged stream failure is still broadcast (`id: None`), for the
-    // requester and every other subscriber alike.
-    assert!(broadcasts.iter().any(|m| matches!(
-        &m.inner,
-        DaemonMessageType::Session {
-            event: SessionEvent::Started { stream_id: 1, .. },
-            ..
-        }
-    )));
+    // a REJECTED run broadcasts ONLY the `Failed` (`id: None`), never a
+    // `Started` — there is no stream to open, and a phantom `Started` would
+    // register a live stream on every subscriber until the `Failed` cleared it.
+    assert!(
+        !broadcasts.iter().any(|m| matches!(
+            &m.inner,
+            DaemonMessageType::Session {
+                event: SessionEvent::Started { .. },
+                ..
+            }
+        )),
+        "a rejected run must not broadcast a Started"
+    );
     assert!(broadcasts.iter().any(|m| matches!(
         &m.inner,
         DaemonMessageType::Session {

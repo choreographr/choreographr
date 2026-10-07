@@ -1,3 +1,4 @@
+use super::handlers::*;
 use super::*;
 use crate::broadcast::test_sink;
 use std::sync::LazyLock;
@@ -382,13 +383,15 @@ fn reply_handle_send_stamps_id_and_accounts_bytes() {
     );
 }
 
-/// The defensive wildcard must REPLY, not drop: `GetSessionState` is on the
-/// wire but has no connection-thread handler, so it lands in the wildcard,
-/// which answers a typed `Failed` naming the request's kind. This keeps the
-/// client's pending slot resolvable instead of stranding it until timeout.
+/// `GetSessionState` is handled: the connection thread forwards a
+/// `DaemonCommand::GetSessionState` and relays the daemon's reply (the
+/// session thread's `SessionState` snapshot) straight back, carrying the
+/// request's correlation id. A missing session is answered as a typed
+/// `Failed` naming the request's kind, so the client's pending slot always
+/// resolves.
 #[test]
-fn dispatch_unhandled_request_replies_failed_with_kind() {
-    let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
+fn dispatch_get_session_state_relays_the_daemon_reply() {
+    let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
     let (sink, writer_rx) = test_sink();
     let global_lag = Arc::new(AtomicUsize::new(0));
     let mut none_id = None;
@@ -405,6 +408,30 @@ fn dispatch_unhandled_request_replies_failed_with_kind() {
         is_unix: true,
     };
 
+    let snapshot = DaemonMessageType::Session {
+        session_id: Some(1),
+        event: SessionEvent::SessionState {
+            title: None,
+            selected_model: None,
+            parent_session_id: None,
+            working_dir: None,
+            turns: std::collections::BTreeMap::new(),
+            active_tool_groups: Vec::new(),
+            token_usage: None,
+            context_window: None,
+            last_prompt_tokens: None,
+            status: choreo_proto::SessionStatus::Inactive,
+            reasoning_effort: None,
+            reasoning_capability: None,
+        },
+    };
+    let snapshot_for_thread = snapshot.clone();
+    std::thread::spawn(move || {
+        if let Ok(DaemonCommand::GetSessionState { reply, .. }) = daemon_rx.recv() {
+            let _ = reply.send(Ok(snapshot_for_thread));
+        }
+    });
+
     dispatch_client_message(
         ClientMessage::request(11, ClientMessageType::GetSessionState { session_id: 1 }),
         &mut ctx,
@@ -414,11 +441,11 @@ fn dispatch_unhandled_request_replies_failed_with_kind() {
     let msg = writer_rx.recv().unwrap();
     assert_eq!(msg.id, Some(11));
     assert!(matches!(
-        &msg.inner,
-        DaemonMessageType::Failed {
-            kind: choreo_proto::MessageKind::GetSessionState,
-            error,
-        } if error == "unsupported request"
+        msg.inner,
+        DaemonMessageType::Session {
+            session_id: Some(1),
+            event: SessionEvent::SessionState { .. },
+        }
     ));
 }
 
@@ -492,7 +519,7 @@ fn handle_unlock_sync_ok() {
     // BEFORE the ack (the ORDERING INVARIANT shape).
     std::thread::spawn(move || {
         if let Ok(DaemonCommand::Unlock { reply, ack, .. }) = daemon_rx.recv() {
-            if let Some(target) = &reply {
+            if let Some(target) = reply {
                 target.send(DaemonMessageType::Unlocked);
             }
             let _ = ack.send(());
@@ -525,7 +552,7 @@ fn handle_unlock_sync_err() {
     // the stub simulates that (see the ordering-invariant note above).
     std::thread::spawn(move || {
         if let Ok(DaemonCommand::Unlock { reply, ack, .. }) = daemon_rx.recv() {
-            if let Some(target) = &reply {
+            if let Some(target) = reply {
                 target.send(DaemonMessageType::LockedError {
                     error: "wrong password".to_string(),
                 });
@@ -542,7 +569,7 @@ fn handle_unlock_sync_err() {
 }
 
 #[test]
-fn handle_unlock_sync_disconnected() {
+fn handle_unlock_sync_disconnected_sends_failed_backstop() {
     let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
     let (sink, writer_rx) = test_sink();
     let global_lag = Arc::new(AtomicUsize::new(0));
@@ -559,9 +586,21 @@ fn handle_unlock_sync_disconnected() {
         request_id: 0,
         is_unix: true,
     };
+    // The daemon command channel is gone, so the reply target can never be
+    // answered by the command loop: it is dropped UNANSWERED, and its Drop
+    // backstop answers the request best-effort so the client's pending slot
+    // never strands (one terminal reply is always produced).
     drop(daemon_rx);
     handle_unlock_sync(&mut ctx, MessageKind::Unlock, vec![0u8; 32]);
-    assert!(writer_rx.try_recv().is_err());
+    let msg = writer_rx.recv().unwrap();
+    assert_eq!(msg.id, Some(0));
+    assert!(matches!(
+        msg.inner,
+        DaemonMessageType::Failed {
+            kind: MessageKind::Unlock,
+            ..
+        }
+    ));
 }
 
 #[test]

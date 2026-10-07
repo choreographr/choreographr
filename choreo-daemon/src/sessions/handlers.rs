@@ -81,6 +81,7 @@ pub(super) fn process_command(
         SessionCommand::GetReasoningEffort { reply } => {
             handle_get_reasoning_effort(&reply, state, ctx)
         }
+        SessionCommand::GetState { reply } => handle_get_state(&reply, state, ctx),
         SessionCommand::Undo { reply } => handle_undo(reply, state, ctx),
         SessionCommand::Redo { reply } => handle_redo(reply, state, ctx),
         SessionCommand::Shutdown => handle_shutdown(state, shutdown_requested, ctx),
@@ -1292,6 +1293,19 @@ pub(super) fn handle_get_reasoning_effort(
         .clone()
         .unwrap_or_else(|| "off".to_string());
     let _ = reply.send(current);
+    false
+}
+
+/// Reply with the session's current [`SessionEvent::SessionState`] snapshot —
+/// the answer to a `GetSessionState` request from a client that is NOT
+/// attached. Reuses `session_state_message`, the same builder the attach push
+/// uses, so the snapshot can never drift from the attach snapshot.
+fn handle_get_state(
+    reply: &mpsc::Sender<io::Result<DaemonMessageType>>,
+    state: &SessionState,
+    ctx: &RequestContext,
+) -> bool {
+    let _ = reply.send(Ok(state.session_state_message(ctx.session_id)));
     false
 }
 

@@ -672,13 +672,10 @@ fn noise_large_message_through_daemon() {
         encrypted_payload: blob,
         unlock_key: unlock_key.to_vec(),
     });
-    match client.recv_within(LARGE_MESSAGE_TIMEOUT) {
-        // A successful AddCredential now implicitly unlocks the keystore, so
-        // the daemon emits `Unlocked` before `CredentialAdded` (mirroring a
-        // successful `Unlock`).
-        DaemonMessageType::Unlocked => {}
-        other => panic!("expected Unlocked, got {other:?}"),
-    }
+    // A successful AddCredential yields exactly ONE targeted reply — the
+    // `CredentialAdded`. The implicit-unlock transition is a `Keystore { state:
+    // Unlocked }` BROADCAST, and this client is not an activity subscriber, so
+    // nothing precedes the targeted reply.
     match client.recv_within(LARGE_MESSAGE_TIMEOUT) {
         DaemonMessageType::CredentialAdded { service } => assert_eq!(service, "big-blob"),
         other => panic!("expected CredentialAdded, got {other:?}"),

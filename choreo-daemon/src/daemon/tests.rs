@@ -4176,16 +4176,19 @@ fn add_credential_verify_only_implicitly_unlocks_bound_keystore() {
         ack: reply,
     });
     reply_rx.recv().unwrap();
-    // Targeted replies arrive in the daemon-mandated order: Unlocked then
-    // CredentialAdded, BEFORE the transition broadcast (asserted below).
-    assert!(matches!(
-        writer_rx.recv().unwrap().inner,
-        DaemonMessageType::Unlocked
-    ));
+    // The reply axis is one request → exactly one terminal reply: a single
+    // targeted CredentialAdded. The implicit unlock's state transition rides
+    // the `Keystore { Unlocked }` broadcast below, NOT a second id-bearing
+    // reply (the old Unlocked+CredentialAdded sequence violated the contract and
+    // made the client's pending table log a spurious resolve miss).
     assert!(matches!(
         writer_rx.recv().unwrap().inner,
         DaemonMessageType::CredentialAdded { .. }
     ));
+    assert!(
+        writer_rx.try_recv().is_err(),
+        "AddCredential must yield exactly one targeted reply, not a sequence"
+    );
     assert!(!state.locked, "valid AddCredential implicitly unlocks");
     assert!(matches!(
         state.credentials.get("svc"),

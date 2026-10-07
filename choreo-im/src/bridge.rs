@@ -153,8 +153,11 @@ impl DaemonBridge {
         // relays the id of every correlated reply back over this channel so the
         // writer resolves (and drops) the matching slot. The bridge ignores the
         // CONTENT of acks for correlation — it renders the bridge events
-        // shape-by-shape — so this table exists to own id allocation and keep
-        // itself bounded, and a no-reply request simply ages out via `expire`.
+        // shape-by-shape — so this table exists only to own id allocation and
+        // to keep itself bounded. Every request the daemon trusts itself to
+        // answer gets exactly one terminal reply (the wire contract), so each
+        // slot is dropped when its reply arrives; the slot is NOT swept by a
+        // timer here (the bridge has no UI tick, and a reply is guaranteed).
         let (resolved_tx, resolved_rx) = crossbeam_channel::unbounded::<u64>();
 
         info!("spawning daemon bridge tasks");

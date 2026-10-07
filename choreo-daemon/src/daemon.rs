@@ -260,6 +260,16 @@ pub enum DaemonCommand {
         session_id: u64,
         reply: std::sync::mpsc::Sender<Option<SessionSummary>>,
     },
+    /// Reply with the session's current full-state snapshot for a
+    /// `GetSessionState` request. Ensures the session thread is live — loading
+    /// it from the DB if it had slept — and forwards the reply channel straight
+    /// to it, so the snapshot is built off the command loop (the connection
+    /// thread is the one that blocks). A missing or deleted session answers
+    /// `NotFound`.
+    GetSessionState {
+        session_id: u64,
+        reply: std::sync::mpsc::Sender<io::Result<DaemonMessageType>>,
+    },
     UpdateMetadata {
         session_id: u64,
         metadata: SessionMetadata,
@@ -762,6 +772,9 @@ impl DaemonState {
             DaemonCommand::ListSessions { reply } => self.handle_list_sessions(&reply),
             DaemonCommand::GetSession { session_id, reply } => {
                 self.handle_get_session(session_id, &reply);
+            }
+            DaemonCommand::GetSessionState { session_id, reply } => {
+                self.handle_get_session_state(session_id, reply);
             }
             DaemonCommand::UpdateMetadata {
                 session_id,
@@ -1528,6 +1541,44 @@ impl DaemonState {
         self.broadcast(&status_msg);
     }
 
+    /// Ensure a session's thread is live, returning its command sender: the
+    /// already-active thread when one exists, otherwise loading the session from
+    /// the DB and spawning a fresh thread. A session marked deleted, or one with
+    /// no stored record, is `NotFound`.
+    ///
+    /// Shared by every entry point that needs a session's authoritative thread
+    /// rather than just its metadata index ([`handle_attach_session`],
+    /// [`handle_get_session_state`]) so the load-or-spawn policy (and its
+    /// deleted-session guard) lives in exactly one place.
+    fn ensure_active_session(
+        &mut self,
+        session_id: u64,
+    ) -> io::Result<crossbeam_channel::Sender<SessionCommand>> {
+        // A deleted session's still-shutting-down thread can leave the DB record
+        // in place until `handle_session_exited` finalizes the delete (and drops
+        // the deleted marker). Without this guard, reviving it would resurrect a
+        // session the user deleted — the record would be gone moments later,
+        // stranding the new thread.
+        if self.deleted_sessions.contains(&session_id) {
+            debug!(session_id, "ensure_active_session: session is deleted");
+            return Err(io::Error::new(io::ErrorKind::NotFound, "session not found"));
+        }
+        if let Some(entry) = self.active_sessions.get(&session_id) {
+            return Ok(entry.cmd_tx.clone());
+        }
+        match db::read_session(&self.db, session_id) {
+            Ok(Some(record)) => {
+                let mut metadata: SessionMetadata = record.clone().into();
+                metadata.status = SessionStatus::Inactive;
+                let session_tx = self.spawn_session(session_id, record, metadata);
+                info!(session_id, "loaded session from db");
+                Ok(session_tx)
+            }
+            Ok(None) => Err(io::Error::new(io::ErrorKind::NotFound, "session not found")),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Attach to an existing session by ID. Loads from the database if the
     /// session is not currently active.
     fn handle_attach_session(
@@ -1539,71 +1590,24 @@ impl DaemonState {
         // Attaching to a session is allowed regardless of lock state.
         // Credentials are only needed to run models (RunInput), not
         // to browse or attach to existing sessions.
-        //
-        // A deleted session's still-shutting-down thread can leave the DB
-        // record in place until `handle_session_exited` finalizes the delete
-        // (and drops the deleted marker).  Without this guard, an attach in
-        // that window would resurrect a session the user deleted — the
-        // record would be gone moments later, stranding the new session.
-        if self.deleted_sessions.contains(&session_id) {
-            debug!(
-                session_id,
-                "AttachSession: session is deleted, refusing attach"
-            );
-            let _ = reply.send(Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "session not found",
-            )));
-            return;
-        }
-        match self
-            .active_sessions
-            .get(&session_id)
-            .map(|entry| entry.cmd_tx.clone())
-        {
-            Some(cmd_tx) => {
-                // Attach to an already-active session also warms its model
-                // list in the background — the session may have been joined on
-                // a different client (or before this account's cache went
-                // stale), and the in-flight guard keeps this idempotent.
-                // The sender is cloned out first (above) so no borrow of
-                // `self` is live across the mutable spawn call.
-                let account = self
+        match self.ensure_active_session(session_id) {
+            Ok(session_tx) => {
+                // Attaching also warms the session's model list in the
+                // background — the session may have been joined on a different
+                // client (or before this account's cache went stale), and the
+                // in-flight guard keeps this idempotent.
+                if let Some(name) = self
                     .session_metadata
                     .get(&session_id)
-                    .and_then(|m| m.account_name.clone());
-                if let Some(name) = account {
+                    .and_then(|m| m.account_name.clone())
+                {
                     self.maybe_spawn_model_prefetch(&name);
                 }
-                let _ = reply.send(Ok(cmd_tx));
+                let _ = reply.send(Ok(session_tx));
             }
-            None => match db::read_session(&self.db, session_id) {
-                Ok(Some(record)) => {
-                    let mut metadata: SessionMetadata = record.clone().into();
-                    metadata.status = SessionStatus::Inactive;
-                    let session_tx = self.spawn_session(session_id, record, metadata);
-                    info!("AttachSession: loaded session {} from db", session_id);
-                    // Warm the model list for the reattached session's
-                    // account in the background (no-op when fresh).
-                    if let Some(name) = self
-                        .session_metadata
-                        .get(&session_id)
-                        .and_then(|m| m.account_name.clone())
-                    {
-                        self.maybe_spawn_model_prefetch(&name);
-                    }
-                    let _ = reply.send(Ok(session_tx));
-                }
-                Ok(None) => {
-                    let _ = reply.send(Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "session not found",
-                    )));
-                }
-                Err(e) => {
-                    let _ = reply.send(Err(e));
-                }
-            },
+            Err(e) => {
+                let _ = reply.send(Err(e));
+            }
         }
     }
 
@@ -1636,6 +1640,33 @@ impl DaemonState {
             .get(&session_id)
             .map(|meta| meta.to_summary(session_id));
         let _ = reply.send(summary);
+    }
+
+    /// Answer a `GetSessionState` request: ensure the session thread is live
+    /// (loading it from the DB if it had slept), then forward the client's reply
+    /// channel straight to it so the snapshot is built off the command loop —
+    /// the connection thread is the one that blocks. A missing or deleted
+    /// session answers `NotFound`.
+    fn handle_get_session_state(
+        &mut self,
+        session_id: u64,
+        reply: mpsc::Sender<io::Result<DaemonMessageType>>,
+    ) {
+        debug!(session_id, "GetSessionState");
+        match self.ensure_active_session(session_id) {
+            Ok(session_tx) => {
+                // Hand the reply channel to the session thread. If the send
+                // fails the thread is gone; the command (and its reply sender)
+                // is dropped, which unblocks the connection thread with a
+                // `RecvError`, and it answers its own failure.
+                if session_tx.send(SessionCommand::GetState { reply }).is_err() {
+                    debug!(session_id, "GetSessionState: session thread gone");
+                }
+            }
+            Err(e) => {
+                let _ = reply.send(Err(e));
+            }
+        }
     }
 
     /// Set the daemon-owned `pinned`/`archived` flags of a session. The daemon

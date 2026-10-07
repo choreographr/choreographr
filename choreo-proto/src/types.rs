@@ -828,6 +828,21 @@ pub enum ClientMessageType {
 /// every request/reply exchange self-identifies without the receiver having to
 /// reconstruct which request a bare success reply answered. It is `Copy`
 /// because it is a pure tag carried by value.
+///
+/// # Why this is a separate enum, not [`ClientMessageType`] itself
+///
+/// It is deliberately NOT the payload enum reused as a tag. The ack rides the
+/// wire back to the client (and into logs), and several request payloads carry
+/// SECRET material — `Unlock { private_key }`, `BindKeystore { key }`,
+/// `AddCredential { unlock_key, encrypted_payload }` — so echoing the request
+/// back would put key material on the wire and in client logs. `MessageKind`
+/// is the payload-free projection, `Copy` for cheap logging/timeout keys.
+///
+/// The two enums cannot silently drift: the [`From<&ClientMessageType>`](From)
+/// impl below is exhaustive with no wildcard, so adding a [`ClientMessageType`]
+/// variant fails to compile until the matching [`MessageKind`] variant and its
+/// `From` arm are added. That impl is the single mapping point — edit it, not a
+/// parallel list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageKind {
     CreateSession,
