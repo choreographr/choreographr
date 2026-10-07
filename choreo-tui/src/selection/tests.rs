@@ -1090,3 +1090,84 @@ fn table_selected_with_surrounding_prose_copies_cells_per_line() {
     );
     assert!(!copied.contains('│'), "no cell border copied: {copied:?}");
 }
+
+/// The text of every line span that currently carries the selection background.
+fn selected_highlight_text(app: &App) -> String {
+    let display = app.active_display_ref().expect("display");
+    let cached = display
+        .render_cache
+        .first()
+        .and_then(Option::as_ref)
+        .expect("render cache");
+    let mut lines = cached.rendered.lines.to_vec();
+    apply_selection_to_lines(
+        app,
+        0,
+        &cached.rendered.visual_offsets,
+        &cached.rendered.content_ranges,
+        &cached.rendered.chrome_ranges,
+        0,
+        &mut lines,
+    );
+    let mut out = String::new();
+    for line in &lines {
+        for span in &line.spans {
+            if span.style.bg == Some(SELECTION_BG) {
+                out.push_str(&span.content);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn table_reading_order_fill_copies_cells_with_partial_ends() {
+    // Reading-order fill: the cells read row-major from the anchor's cell to the
+    // head's cell (inclusive); every middle cell whole, the two end cells sliced
+    // at the anchor/head point, one per line, blank-line separated.
+    let md = "| ab cd | ef gh | ij kl |\n|---|---|---|\n| mn op | qr st | uv wx |";
+    let mut app = test_app();
+    app.history_viewport.width = 200;
+    app.history_viewport.height = 40;
+    app.display_for(0).view.insert_or_replace(0, turn(md));
+    app.rebuild_height_prefix();
+    // Anchor mid header cell 0 (at "cd"), head at the end of body cell 1's "st".
+    let (start, _) = locate(&app, "cd");
+    let (_, end) = locate(&app, "st");
+    let copied = drag_and_finish(&mut app, start, end).expect("selection should extract");
+    assert_eq!(
+        copied, "cd\n\nef gh\n\nij kl\n\nmn op\n\nqr st",
+        "header cell 0 sliced from 'cd', body cell 1 sliced to 'st': {copied:?}"
+    );
+}
+
+#[test]
+fn table_reading_order_fill_highlights_selected_cells() {
+    // The highlight uses the same reading-order fill as the copy, so a cell
+    // outside the run (here body column 3) is never highlighted, and neither is
+    // the part of an end cell before the anchor.
+    let md = "| ab cd | ef gh | ij kl |\n|---|---|---|\n| mn op | qr st | uv wx |";
+    let mut app = test_app();
+    app.history_viewport.width = 200;
+    app.history_viewport.height = 40;
+    app.display_for(0).view.insert_or_replace(0, turn(md));
+    app.rebuild_height_prefix();
+    let (start, _) = locate(&app, "cd");
+    let (_, end) = locate(&app, "st");
+    start_selection(&mut app, start.0, start.1);
+    update_selection(&mut app, end.0, end.1);
+    let selected = selected_highlight_text(&app);
+    for cell in ["cd", "ef gh", "ij kl", "mn op", "qr st"] {
+        assert!(
+            selected.contains(cell),
+            "cell {cell:?} must be highlighted: {selected:?}"
+        );
+    }
+    for cell in ["ab", "uv wx"] {
+        assert!(
+            !selected.contains(cell),
+            "cell {cell:?} must not be highlighted: {selected:?}"
+        );
+    }
+    app.text_selection = None;
+}
