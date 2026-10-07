@@ -3,8 +3,8 @@ use crate::markdown_render::*;
 use crate::state::*;
 use crate::test_util::{make_session, test_app};
 use choreo_proto::{
-    AccountInfo, CatalogProvider, ClientMessageType, DaemonMessage, DaemonMessageType,
-    McpServerStatus, ReasoningCapability, RefreshStatus, SessionStatus, Turn,
+    AccountInfo, CatalogProvider, ClientMessage, ClientMessageType, DaemonMessage,
+    DaemonMessageType, McpServerStatus, ReasoningCapability, RefreshStatus, SessionStatus, Turn,
 };
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
@@ -119,7 +119,7 @@ fn terminal_event_submits_run_input() {
     assert_eq!(app.input.cursor, 0);
     let message = rx.recv().expect("sent message");
     assert_eq!(
-        message,
+        message.inner,
         ClientMessageType::RunInput {
             stream_id: 1,
             input: b"hello".to_vec(),
@@ -169,7 +169,7 @@ fn submitting_prompt_while_locked_is_rejected_with_feedback() {
 // available so the user can still e.g. `/cancel`.
 
 /// Drive a bare Enter keypress through the full terminal-event pipeline.
-fn press_enter(app: &mut App, tx: &crossbeam_channel::Sender<ClientMessageType>) {
+fn press_enter(app: &mut App, tx: &crossbeam_channel::Sender<ClientMessage>) {
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         app,
@@ -235,7 +235,7 @@ fn submitting_prompt_while_idle_is_sent() {
 
     assert!(app.input.is_empty());
     assert_eq!(
-        rx.recv().expect("sent message"),
+        rx.recv().expect("sent message").inner,
         ClientMessageType::RunInput {
             stream_id: 1,
             input: b"hello".to_vec(),
@@ -277,7 +277,7 @@ fn slash_command_is_accepted_while_busy() {
     press_enter(&mut app, &tx);
 
     assert_eq!(
-        rx.recv().expect("sent message"),
+        rx.recv().expect("sent message").inner,
         ClientMessageType::Ping,
         "slash-commands must bypass the idle guard"
     );
@@ -300,7 +300,7 @@ fn empty_submission_while_busy_is_a_noop() {
 }
 
 /// Drive an Alt+Enter keypress through the full terminal-event pipeline.
-fn press_alt_enter(app: &mut App, tx: &crossbeam_channel::Sender<ClientMessageType>) {
+fn press_alt_enter(app: &mut App, tx: &crossbeam_channel::Sender<ClientMessage>) {
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
         app,
@@ -359,7 +359,7 @@ fn alt_enter_while_idle_is_sent() {
     press_alt_enter(&mut app, &tx);
 
     assert!(matches!(
-        rx.recv().expect("sent message"),
+        rx.recv().expect("sent message").inner,
         ClientMessageType::ContinueGeneration { .. }
     ));
     assert!(app.status.is_none(), "no status message on success");
@@ -581,7 +581,7 @@ fn chat_alt_a_enters_ai_providers() {
 
     assert_eq!(app.page, Page::AIProviders);
     let msg = rx.recv().expect("sent message");
-    assert_eq!(msg, ClientMessageType::ListAccounts);
+    assert_eq!(msg.inner, ClientMessageType::ListAccounts);
 }
 
 #[test]
@@ -597,7 +597,7 @@ fn chat_alt_up_sends_undo() {
     .expect("handle alt+up");
 
     let msg = rx.recv().expect("sent message");
-    assert_eq!(msg, ClientMessageType::Undo);
+    assert_eq!(msg.inner, ClientMessageType::Undo);
 }
 
 #[test]
@@ -613,7 +613,7 @@ fn chat_alt_down_sends_redo() {
     .expect("handle alt+down");
 
     let msg = rx.recv().expect("sent message");
-    assert_eq!(msg, ClientMessageType::Redo);
+    assert_eq!(msg.inner, ClientMessageType::Redo);
 }
 
 #[test]
@@ -630,7 +630,7 @@ fn chat_esc_stops_active_session() {
     .expect("handle esc");
 
     let msg = rx.recv().expect("sent message");
-    assert_eq!(msg, ClientMessageType::Cancel { stream_id: 0 });
+    assert_eq!(msg.inner, ClientMessageType::Cancel { stream_id: 0 });
     assert!(app.status.is_none(), "no status message on success");
 }
 
@@ -666,7 +666,7 @@ fn chat_alt_enter_continues_generation() {
 
     let msg = rx.recv().expect("sent message");
     assert_eq!(
-        msg,
+        msg.inner,
         ClientMessageType::ContinueGeneration { stream_id: next_id }
     );
     assert!(
@@ -1061,7 +1061,7 @@ mod unsent_draft_tests {
         .expect("submit refresh-models");
 
         let msg = rx.recv().expect("RefreshModels sent");
-        assert_eq!(msg, ClientMessageType::RefreshModels { force: true });
+        assert_eq!(msg.inner, ClientMessageType::RefreshModels { force: true });
         assert_eq!(
             app.status.as_deref(),
             Some("refreshing models… (forced)"),
@@ -1155,7 +1155,7 @@ mod unsent_draft_tests {
         .expect("submit /mcp");
 
         let msg = rx.recv().expect("McpStatusRequest sent");
-        assert_eq!(msg, ClientMessageType::McpStatusRequest);
+        assert_eq!(msg.inner, ClientMessageType::McpStatusRequest);
         assert_eq!(app.status.as_deref(), Some("> /mcp"));
     }
 
@@ -1175,7 +1175,7 @@ mod unsent_draft_tests {
 
         let msg = rx.recv().expect("McpReconnect sent");
         assert_eq!(
-            msg,
+            msg.inner,
             ClientMessageType::McpReconnect {
                 slug: "docs".to_string(),
             }
@@ -1284,7 +1284,7 @@ mod unsent_draft_tests {
         .expect("submit /mcp reload");
 
         let msg = rx.recv().expect("McpReload sent");
-        assert_eq!(msg, ClientMessageType::McpReload);
+        assert_eq!(msg.inner, ClientMessageType::McpReload);
         assert_eq!(app.status.as_deref(), Some("reloading MCP configuration…"));
     }
 
@@ -1689,7 +1689,7 @@ mod unsent_draft_tests {
 // drive the full terminal-event pipeline to pin the end-to-end behavior.
 
 /// Send one unmodified key through the full terminal-event pipeline.
-fn press(app: &mut App, tx: &crossbeam_channel::Sender<ClientMessageType>, code: KeyCode) {
+fn press(app: &mut App, tx: &crossbeam_channel::Sender<ClientMessage>, code: KeyCode) {
     handle_terminal_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), app, tx)
         .expect("handle key");
 }
@@ -1783,7 +1783,7 @@ fn palette_enter_runs_the_command_and_clears_the_line() {
         "Enter runs `/model`, opening the model selector"
     );
     assert_eq!(
-        rx.recv().expect("ListModels"),
+        rx.recv().expect("ListModels").inner,
         ClientMessageType::ListModels
     );
     assert!(
@@ -1820,7 +1820,7 @@ fn palette_shift_enter_runs_the_command_without_a_newline() {
         "Shift+Enter runs the command like Enter"
     );
     assert_eq!(
-        rx.recv().expect("ListModels"),
+        rx.recv().expect("ListModels").inner,
         ClientMessageType::ListModels
     );
     assert!(
@@ -1868,11 +1868,11 @@ fn palette_enter_on_empty_line_runs_the_highlighted_command() {
         "Enter ran the highlighted `/session`"
     );
     assert_eq!(
-        rx.recv().expect("ListSessions"),
+        rx.recv().expect("ListSessions").inner,
         ClientMessageType::ListSessions
     );
     assert_eq!(
-        rx.recv().expect("SubscribeSessionsSummary"),
+        rx.recv().expect("SubscribeSessionsSummary").inner,
         ClientMessageType::SubscribeSessionsSummary
     );
     assert!(
@@ -1901,7 +1901,7 @@ fn palette_enter_on_a_partial_token_runs_the_highlighted_command() {
         "Enter ran the highlighted `/model`"
     );
     assert_eq!(
-        rx.recv().expect("ListModels"),
+        rx.recv().expect("ListModels").inner,
         ClientMessageType::ListModels
     );
     assert!(
@@ -1932,7 +1932,7 @@ fn palette_enter_runs_the_row_the_arrows_selected() {
         "Enter ran the arrow-selected `/model`"
     );
     assert_eq!(
-        rx.recv().expect("ListModels"),
+        rx.recv().expect("ListModels").inner,
         ClientMessageType::ListModels
     );
     assert!(!app.command_palette_active());
@@ -2066,7 +2066,7 @@ fn literal_slash_command_line_runs() {
 
     assert!(app.model_selector.is_open(), "`/model` opens the selector");
     assert_eq!(
-        rx.recv().expect("ListModels"),
+        rx.recv().expect("ListModels").inner,
         ClientMessageType::ListModels
     );
     assert!(!app.command_palette_active());
@@ -2116,7 +2116,7 @@ fn alt_r_cycles_reasoning_effort() {
     assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("low"));
     assert_eq!(app.status.as_deref(), Some("reasoning: low"));
     assert_eq!(
-        rx.recv().expect("sent message"),
+        rx.recv().expect("sent message").inner,
         ClientMessageType::SetReasoningEffort {
             effort: "low".to_string()
         }
@@ -2137,11 +2137,11 @@ fn alt_s_opens_session_manager() {
 
     assert_eq!(app.page, Page::SessionManager);
     assert_eq!(
-        rx.recv().expect("ListSessions"),
+        rx.recv().expect("ListSessions").inner,
         ClientMessageType::ListSessions
     );
     assert_eq!(
-        rx.recv().expect("SubscribeSessionsSummary"),
+        rx.recv().expect("SubscribeSessionsSummary").inner,
         ClientMessageType::SubscribeSessionsSummary
     );
     // A bare keypress must not echo a `> /session` status.
@@ -2162,7 +2162,7 @@ fn alt_m_opens_selector_and_requests_models() {
 
     assert!(app.model_selector.is_open());
     assert_eq!(
-        rx.recv().expect("ListModels"),
+        rx.recv().expect("ListModels").inner,
         ClientMessageType::ListModels
     );
     assert!(app.status.is_none(), "a bare keypress must not echo");

@@ -3,8 +3,8 @@ use crate::state::*;
 use crate::test_util::{make_session, test_app};
 use choreo_client_core::TurnEventHandler;
 use choreo_proto::{
-    ClientMessageType, DaemonMessage, DaemonMessageType, DisplayedImageRecord, ImageMetadata,
-    SessionEvent, SessionStatus, TokenUsage, Turn,
+    ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, DisplayedImageRecord,
+    ImageMetadata, SessionEvent, SessionStatus, TokenUsage, Turn,
 };
 use crossterm::event::Event;
 
@@ -223,9 +223,12 @@ mod session_manager_key_tests {
         assert_eq!(app.page, Page::Chat);
         assert_eq!(app.attached_session_id, Some(1));
         let msg = rx.recv().expect("sent message (unsub)");
-        assert_eq!(msg, ClientMessageType::UnsubscribeSessionsSummary);
+        assert_eq!(msg.inner, ClientMessageType::UnsubscribeSessionsSummary);
         let msg = rx.recv().expect("sent message");
-        assert_eq!(msg, ClientMessageType::AttachSession { session_id: 1 });
+        assert_eq!(
+            msg.inner,
+            ClientMessageType::AttachSession { session_id: 1 }
+        );
     }
 
     #[test]
@@ -283,9 +286,9 @@ mod session_manager_key_tests {
 
         assert_eq!(app.page, Page::SessionManager);
         let msg = rx.recv().expect("sent message");
-        assert_eq!(msg, ClientMessageType::ListSessions);
+        assert_eq!(msg.inner, ClientMessageType::ListSessions);
         let msg = rx.recv().expect("sent message");
-        assert_eq!(msg, ClientMessageType::SubscribeSessionsSummary);
+        assert_eq!(msg.inner, ClientMessageType::SubscribeSessionsSummary);
     }
 
     #[test]
@@ -393,7 +396,7 @@ mod session_manager_key_tests {
 
     #[test]
     fn session_manager_p_sends_toggled_pin() {
-        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessageType>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
         let mut app = make_sm_app();
         // The highlighted session (1) starts un-pinned.
         assert_eq!(app.session_mgr.sessions[0].session_id, 1);
@@ -405,7 +408,7 @@ mod session_manager_key_tests {
         )
         .expect("handle p");
         assert_eq!(
-            rx.recv().expect("sent message"),
+            rx.recv().expect("sent message").inner,
             ClientMessageType::SetSessionPinned {
                 session_id: 1,
                 pinned: true,
@@ -421,7 +424,7 @@ mod session_manager_key_tests {
         )
         .expect("handle p");
         assert_eq!(
-            rx.recv().expect("sent message"),
+            rx.recv().expect("sent message").inner,
             ClientMessageType::SetSessionPinned {
                 session_id: 1,
                 pinned: false,
@@ -431,7 +434,7 @@ mod session_manager_key_tests {
 
     #[test]
     fn session_manager_a_archives_on_list_and_unarchives_on_archived() {
-        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessageType>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
         let mut app = make_sm_app();
 
         handle_terminal_event(
@@ -441,7 +444,7 @@ mod session_manager_key_tests {
         )
         .expect("handle a");
         assert_eq!(
-            rx.recv().expect("sent message"),
+            rx.recv().expect("sent message").inner,
             ClientMessageType::SetSessionArchived {
                 session_id: 1,
                 archived: true,
@@ -462,7 +465,7 @@ mod session_manager_key_tests {
         )
         .expect("handle a");
         assert_eq!(
-            rx.recv().expect("sent message"),
+            rx.recv().expect("sent message").inner,
             ClientMessageType::SetSessionArchived {
                 session_id: 1,
                 archived: false,
@@ -504,15 +507,18 @@ mod session_manager_key_tests {
         assert_eq!(app.page, Page::Chat);
         assert_eq!(app.attached_session_id, Some(1));
         let msg = rx.recv().expect("sent message (unsub)");
-        assert_eq!(msg, ClientMessageType::UnsubscribeSessionsSummary);
+        assert_eq!(msg.inner, ClientMessageType::UnsubscribeSessionsSummary);
         let msg = rx.recv().expect("sent message");
-        assert_eq!(msg, ClientMessageType::AttachSession { session_id: 1 });
+        assert_eq!(
+            msg.inner,
+            ClientMessageType::AttachSession { session_id: 1 }
+        );
     }
 
     #[test]
     fn session_manager_n_sends_create_session() {
         let mut app = make_sm_app();
-        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessageType>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
 
         handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
@@ -523,7 +529,7 @@ mod session_manager_key_tests {
 
         let msg = rx.recv().expect("sent message");
         assert_eq!(
-            msg,
+            msg.inner,
             ClientMessageType::CreateSession {
                 title: None,
                 parent_session_id: None,
@@ -568,9 +574,12 @@ mod session_manager_key_tests {
         );
         assert_eq!(app.attached_session_id, Some(2));
         let msg = rx.recv().expect("sent message (unsub)");
-        assert_eq!(msg, ClientMessageType::UnsubscribeSessionsSummary);
+        assert_eq!(msg.inner, ClientMessageType::UnsubscribeSessionsSummary);
         let msg = rx.recv().expect("sent message");
-        assert_eq!(msg, ClientMessageType::AttachSession { session_id: 2 });
+        assert_eq!(
+            msg.inner,
+            ClientMessageType::AttachSession { session_id: 2 }
+        );
     }
 
     #[test]
@@ -1655,7 +1664,7 @@ fn session_created_for_sub_session_does_not_hijack_chat_view() {
     // Chat page renders `Sessions` replies into the status line — no
     // unsolicited list refresh either (it would rewrite the status line and
     // reflow the viewed viewport).
-    let msgs: Vec<ClientMessageType> = rx.try_iter().collect();
+    let msgs: Vec<ClientMessageType> = rx.try_iter().map(|m| m.inner).collect();
     assert!(
         !msgs.iter().any(
             |m| matches!(m, ClientMessageType::AttachSession { session_id } if *session_id == 99)
@@ -1700,7 +1709,7 @@ fn session_created_for_sub_session_on_session_manager_refreshes_list() {
     // renders into the session list, not the status line.
     assert_eq!(app.attached_session_id, Some(42));
     assert_eq!(app.active_session_id, Some(42));
-    let msgs: Vec<ClientMessageType> = rx.try_iter().collect();
+    let msgs: Vec<ClientMessageType> = rx.try_iter().map(|m| m.inner).collect();
     assert!(
         !msgs.iter().any(
             |m| matches!(m, ClientMessageType::AttachSession { session_id } if *session_id == 99)
@@ -1749,7 +1758,7 @@ fn session_created_for_user_session_attaches_on_chat_page() {
         app.display_for(99).selected_model.as_deref(),
         Some("gpt-new")
     );
-    let msgs: Vec<ClientMessageType> = rx.try_iter().collect();
+    let msgs: Vec<ClientMessageType> = rx.try_iter().map(|m| m.inner).collect();
     assert!(
         msgs.iter().any(
             |m| matches!(m, ClientMessageType::AttachSession { session_id } if *session_id == 99)
@@ -1798,7 +1807,7 @@ fn session_created_for_user_session_on_session_manager_navigates() {
     assert_eq!(app.attached_session_id, Some(99));
     assert_eq!(app.active_session_id, Some(99));
     assert_eq!(app.display_for(99).account_name.as_deref(), Some("acct"));
-    let msgs: Vec<ClientMessageType> = rx.try_iter().collect();
+    let msgs: Vec<ClientMessageType> = rx.try_iter().map(|m| m.inner).collect();
     assert!(
         msgs.iter().any(
             |m| matches!(m, ClientMessageType::AttachSession { session_id } if *session_id == 99)
@@ -1856,7 +1865,7 @@ fn session_created_broadcast_does_not_attach_on_chat_page() {
         "another client's creation must not change the attached session"
     );
     assert_eq!(app.active_session_id, Some(42));
-    let msgs: Vec<ClientMessageType> = rx.try_iter().collect();
+    let msgs: Vec<ClientMessageType> = rx.try_iter().map(|m| m.inner).collect();
     assert!(
         !msgs
             .iter()
@@ -1899,7 +1908,7 @@ fn session_created_broadcast_on_session_manager_refreshes_list_only() {
 
     assert_eq!(app.attached_session_id, Some(42));
     assert_eq!(app.active_session_id, Some(42));
-    let msgs: Vec<ClientMessageType> = rx.try_iter().collect();
+    let msgs: Vec<ClientMessageType> = rx.try_iter().map(|m| m.inner).collect();
     assert!(
         !msgs
             .iter()
@@ -2025,7 +2034,7 @@ fn subsession_finish_switches_back_to_parent_with_notification() {
     assert_eq!(app.active_session_id, Some(42));
     // The daemon was asked to attach to the parent, mirroring the Session
     // Manager Enter path (summary unsubscription first, then attach).
-    let msgs: Vec<ClientMessageType> = rx.try_iter().collect();
+    let msgs: Vec<ClientMessageType> = rx.try_iter().map(|m| m.inner).collect();
     assert!(
         msgs.iter().any(|m| matches!(
             m,
@@ -2241,7 +2250,10 @@ fn handle_sessions_auto_attach_prefers_top_level_session() {
     // The auto-attach must pick the top-level session, not the sub-session
     // that happens to be the most recently modified.
     let msg = rx.recv().expect("auto-attach message");
-    assert_eq!(msg, ClientMessageType::AttachSession { session_id: 3 });
+    assert_eq!(
+        msg.inner,
+        ClientMessageType::AttachSession { session_id: 3 }
+    );
     assert_eq!(app.attached_session_id, Some(3));
     assert_eq!(app.active_session_id, Some(3));
 
@@ -2269,7 +2281,10 @@ fn handle_sessions_auto_attach_falls_back_to_child_when_no_top_level() {
 
     // With no top-level session at all, fall back to the most recent session.
     let msg = rx.recv().expect("auto-attach message");
-    assert_eq!(msg, ClientMessageType::AttachSession { session_id: 7 });
+    assert_eq!(
+        msg.inner,
+        ClientMessageType::AttachSession { session_id: 7 }
+    );
 }
 
 #[test]
@@ -2287,7 +2302,7 @@ fn handle_sessions_empty_creates_default_session_without_working_dir() {
 
     let msg = rx.recv().expect("CreateSession message");
     assert_eq!(
-        msg,
+        msg.inner,
         ClientMessageType::CreateSession {
             title: Some("default".into()),
             parent_session_id: None,
@@ -2320,7 +2335,10 @@ fn handle_sessions_auto_attach_skips_archived_sessions() {
         .expect("handle_sessions should succeed");
 
     let msg = rx.recv().expect("auto-attach message");
-    assert_eq!(msg, ClientMessageType::AttachSession { session_id: 3 });
+    assert_eq!(
+        msg.inner,
+        ClientMessageType::AttachSession { session_id: 3 }
+    );
     assert_eq!(app.attached_session_id, Some(3));
 }
 
@@ -2340,6 +2358,6 @@ fn handle_sessions_only_archived_creates_default_instead_of_attaching() {
         .expect("handle_sessions should succeed");
 
     let msg = rx.recv().expect("CreateSession message");
-    assert!(matches!(msg, ClientMessageType::CreateSession { .. }));
+    assert!(matches!(msg.inner, ClientMessageType::CreateSession { .. }));
     assert_eq!(app.attached_session_id, None);
 }

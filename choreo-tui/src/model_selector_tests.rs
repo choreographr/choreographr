@@ -1,7 +1,7 @@
 use crate::connection::{handle_daemon_message, handle_terminal_event};
 use crate::state::{App, PROVIDER_PAGE_LINES, selector_list_layout};
 use crate::test_util::test_app;
-use choreo_proto::{ClientMessageType, DaemonMessage, DaemonMessageType};
+use choreo_proto::{ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -14,7 +14,7 @@ fn send_mouse(
     kind: MouseEventKind,
     column: u16,
     row: u16,
-    tx: &crossbeam_channel::Sender<ClientMessageType>,
+    tx: &crossbeam_channel::Sender<ClientMessage>,
 ) {
     handle_terminal_event(
         Event::Mouse(MouseEvent {
@@ -46,7 +46,7 @@ fn chat_alt_m_opens_selector_and_requests_models() {
     assert!(app.model_selector.is_open(), "alt+m opens the selector");
     assert!(app.model_selector.loading, "selector waits for the reply");
     let msg = rx.recv().expect("sent message");
-    assert_eq!(msg, ClientMessageType::ListModels);
+    assert_eq!(msg.inner, ClientMessageType::ListModels);
 }
 
 #[test]
@@ -79,16 +79,23 @@ fn model_selector_populates_from_models_reply() {
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
+    // The reply populates the popup only when it resolves this client's own
+    // `ListModels` request (correlation by id), so register the pending slot
+    // the selector's open would have sent, then answer it targeted.
+    let id = app.pending.send(&tx, ClientMessageType::ListModels);
 
     handle_daemon_message(
-        DaemonMessage::broadcast(DaemonMessageType::Models {
-            models: vec![
-                "gpt-4o".to_string(),
-                "gpt-4o-mini".to_string(),
-                "claude-3".to_string(),
-            ],
-            selected_model: Some("gpt-4o-mini".to_string()),
-        }),
+        DaemonMessage::reply(
+            id,
+            DaemonMessageType::Models {
+                models: vec![
+                    "gpt-4o".to_string(),
+                    "gpt-4o-mini".to_string(),
+                    "claude-3".to_string(),
+                ],
+                selected_model: Some("gpt-4o-mini".to_string()),
+            },
+        ),
         &mut app,
         &tx,
     )
@@ -125,7 +132,7 @@ fn model_selector_enter_sends_set_model_and_closes() {
     assert!(!app.model_selector.is_open(), "enter closes the selector");
     let msg = rx.recv().expect("sent message");
     assert_eq!(
-        msg,
+        msg.inner,
         ClientMessageType::SetModel {
             model: "gpt-4o".to_string()
         }
@@ -192,7 +199,7 @@ fn model_selector_filter_narrows_and_submits_highlighted() {
     assert!(!app.model_selector.is_open());
     let msg = rx.recv().expect("sent message");
     assert_eq!(
-        msg,
+        msg.inner,
         ClientMessageType::SetModel {
             model: "gpt-4o-mini".to_string()
         }
@@ -249,11 +256,17 @@ fn model_selector_failed_reply_shows_error_when_open() {
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
+    // The failure lands in the popup only when it resolves this client's own
+    // `ListModels` request.
+    let id = app.pending.send(&tx, ClientMessageType::ListModels);
 
     handle_daemon_message(
-        DaemonMessage::broadcast(DaemonMessageType::ModelsFailed {
-            error: "no credential".to_string(),
-        }),
+        DaemonMessage::reply(
+            id,
+            DaemonMessageType::ModelsFailed {
+                error: "no credential".to_string(),
+            },
+        ),
         &mut app,
         &tx,
     )
@@ -454,7 +467,7 @@ fn model_selector_click_row_selects_and_sends_set_model() {
     );
     let msg = rx.recv().expect("sent message");
     assert_eq!(
-        msg,
+        msg.inner,
         ClientMessageType::SetModel {
             model: "gpt-4o-mini".to_string()
         }
@@ -601,7 +614,7 @@ fn model_selector_click_after_page_jump_maps_to_drawn_row() {
     );
     let msg = rx.recv().expect("sent message");
     assert_eq!(
-        msg,
+        msg.inner,
         ClientMessageType::SetModel {
             model: "model-1".to_string()
         },

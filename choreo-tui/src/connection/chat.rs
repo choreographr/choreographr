@@ -1,8 +1,8 @@
 use crate::render::{mouse_in_history_box, mouse_in_scrollbar_column};
 use crate::state::{App, INPUT_PAD, PAGE_SCROLL_LINES, find_turn_at_row, input_inner_width};
 use crate::{clipboard, parse_input_line, selection};
-use choreo_client_core::{ClientError, broken_pipe};
-use choreo_proto::ClientMessageType;
+use choreo_client_core::ClientError;
+use choreo_proto::{ClientMessage, ClientMessageType};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
@@ -15,7 +15,7 @@ use super::command::{run_command, run_named};
 pub(super) fn handle_chat_event(
     event: &Event,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     match event {
         Event::Key(key) => {
@@ -129,9 +129,8 @@ pub(super) fn handle_chat_event(
                 KeyCode::Esc => {
                     if app.attached_session_id.is_some() {
                         tracing::debug!("Esc stopping generation");
-                        client_tx
-                            .send(ClientMessageType::Cancel { stream_id: 0 })
-                            .map_err(broken_pipe)?;
+                        app.pending
+                            .send(client_tx, ClientMessageType::Cancel { stream_id: 0 });
                     } else {
                         tracing::debug!("Esc ignored — no session attached");
                         app.status = Some("no session attached".to_string());

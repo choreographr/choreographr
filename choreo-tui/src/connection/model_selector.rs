@@ -1,6 +1,6 @@
 use crate::state::{App, apply_selector_left_click};
-use choreo_client_core::{ClientError, broken_pipe};
-use choreo_proto::ClientMessageType;
+use choreo_client_core::ClientError;
+use choreo_proto::{ClientMessage, ClientMessageType};
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 
 /// Handle events while the model selector overlay is open (Chat page).
@@ -12,10 +12,11 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind
 /// left-click on a list row selects it exactly like Enter, and a left-click
 /// on the filter row positions the input cursor.  Quit is handled via Alt+Q
 /// at the terminal-event level.
+#[expect(clippy::unnecessary_wraps)]
 pub(super) fn handle_model_selector_event(
     event: &Event,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     match *event {
         Event::Key(key) => {
@@ -34,9 +35,8 @@ pub(super) fn handle_model_selector_event(
             if key.code == KeyCode::Enter {
                 if let Some(model) = app.model_selector.submit() {
                     tracing::info!(%model, "model selector: selecting model");
-                    client_tx
-                        .send(ClientMessageType::SetModel { model })
-                        .map_err(broken_pipe)?;
+                    app.pending
+                        .send(client_tx, ClientMessageType::SetModel { model });
                 }
                 return Ok(());
             }
@@ -106,9 +106,8 @@ pub(super) fn handle_model_selector_event(
                         app.model_selector.focused = idx;
                         if let Some(model) = app.model_selector.submit() {
                             tracing::info!(%model, "model selector: selecting model");
-                            client_tx
-                                .send(ClientMessageType::SetModel { model })
-                                .map_err(broken_pipe)?;
+                            app.pending
+                                .send(client_tx, ClientMessageType::SetModel { model });
                         }
                     }
                 }

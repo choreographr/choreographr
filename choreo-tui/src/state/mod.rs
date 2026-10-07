@@ -10,10 +10,10 @@ use crate::RenderedImage;
 use crate::image_worker::{ImageId, ImageJob};
 use crate::selection::TextSelection;
 use choreo_client_core::dispatch::{SessionStateData, ToolCallEvent};
-use choreo_client_core::{ClientError, SessionView, TurnEventHandler, broken_pipe};
+use choreo_client_core::{ClientError, PendingReplies, SessionView, TurnEventHandler};
 use choreo_proto::{
-    AccountInfo, ClientMessageType, OutputStream, ReasoningCapability, SessionStatus,
-    SessionSummary, TokenUsage, ToolResultRecord, Turn, socket_path,
+    AccountInfo, ClientMessage, ClientMessageType, OutputStream, ReasoningCapability,
+    SessionStatus, SessionSummary, TokenUsage, ToolResultRecord, Turn, socket_path,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::Line;
@@ -376,7 +376,18 @@ impl Default for SessionDisplayState {
 
 pub(crate) struct App {
     pub(crate) input: InputBuffer,
+    /// The STREAM-id allocator for `RunInput`/`ContinueGeneration` (the
+    /// per-session streaming axis), NOT the reply-axis request id: that is
+    /// owned by [`App::pending`]. The daemon uses the client-supplied stream id
+    /// verbatim and echoes it on every stream event, so the front-end still
+    /// allocates it.
     pub(crate) next_request_id: u64,
+    /// The client's pending-request table: the single outbound path plus the
+    /// reply-correlation side table (see [`PendingReplies`]). Every outbound
+    /// `ClientMessageType` goes through [`PendingReplies::send`], and every
+    /// inbound reply with `id: Some` resolves its slot here before the normal
+    /// state dispatch runs.
+    pub(crate) pending: PendingReplies,
     pub(crate) rendered_images: HashMap<u64, HashMap<u32, HashMap<ImageSlot, RenderedImage>>>,
     pub(crate) pending_job_idx: HashMap<ImageId, (u64, u32, ImageSlot)>,
     /// Images the render path wants fetched on demand (both displayed images and
@@ -466,12 +477,6 @@ pub(crate) struct App {
     /// the socket path so tests (which bypass `run_app`) still have a valid
     /// value.
     pub(crate) connection_addr: String,
-    /// The unlock key sent in the most recent `Unlock` or `AddCredential`,
-    /// held until the daemon CONFIRMS it (an `Unlocked` or `CredentialAdded`
-    /// reply) and then recorded per-daemon via `record_unlock_key`. Never
-    /// persisted on send — only on confirmed success. Cleared once recorded
-    /// (and when a send fails to avoid recording a stale key later).
-    pub(crate) pending_unlock_key: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy)]
@@ -590,6 +595,7 @@ impl App {
         Self {
             input: InputBuffer::new(),
             next_request_id: 1,
+            pending: PendingReplies::new(),
             rendered_images: HashMap::new(),
             pending_image_fetch: Vec::new(),
             history_viewport: HistoryViewport::new(),
@@ -644,7 +650,6 @@ impl App {
             session_displays: HashMap::new(),
             active_session_id: None,
             connection_addr: socket_path(),
-            pending_unlock_key: None,
         }
     }
 
@@ -1181,7 +1186,7 @@ impl App {
         account_name: Option<String>,
         selected_model: Option<String>,
         reasoning_effort: Option<String>,
-        client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+        client_tx: &crossbeam_channel::Sender<ClientMessage>,
     ) -> Result<(), ClientError> {
         // Agent-spawned sub-sessions (parent_session_id = Some) are transient
         // tool artifacts, not sessions the user opened.  Navigating to one
@@ -1229,9 +1234,8 @@ impl App {
         // original "one list refresh per create, not two" invariant now that a
         // create from ANY page funnels through this handler.
         if self.page != Page::SessionManager {
-            client_tx
-                .send(ClientMessageType::ListSessions)
-                .map_err(broken_pipe)?;
+            self.pending
+                .send(client_tx, ClientMessageType::ListSessions);
         }
         // Shared attach sequence (also used by the Session Manager's Enter):
         // it sends UnsubscribeSessionsSummary + AttachSession, hands the input
@@ -1261,7 +1265,7 @@ impl App {
         &mut self,
         session_id: u64,
         parent_session_id: Option<u64>,
-        client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+        client_tx: &crossbeam_channel::Sender<ClientMessage>,
     ) {
         tracing::debug!(
             session_id,
@@ -1272,7 +1276,8 @@ impl App {
             // Best-effort refresh: a broken channel means the whole connection
             // is tearing down, and the reply renders into the session list
             // (never the status line), so there is nothing to propagate.
-            let _ = client_tx.send(ClientMessageType::ListSessions);
+            self.pending
+                .send(client_tx, ClientMessageType::ListSessions);
         }
     }
 
@@ -1552,17 +1557,16 @@ impl App {
     /// that will actually render next — and `attached_status` is refreshed
     /// immediately from the summary instead of waiting for the daemon's
     /// `SessionAttached` reply to arrive.
+    #[expect(clippy::unnecessary_wraps)]
     pub(crate) fn attach_to_session(
         &mut self,
         session_id: u64,
-        client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+        client_tx: &crossbeam_channel::Sender<ClientMessage>,
     ) -> Result<(), ClientError> {
-        client_tx
-            .send(ClientMessageType::UnsubscribeSessionsSummary)
-            .map_err(broken_pipe)?;
-        client_tx
-            .send(ClientMessageType::AttachSession { session_id })
-            .map_err(broken_pipe)?;
+        self.pending
+            .send(client_tx, ClientMessageType::UnsubscribeSessionsSummary);
+        self.pending
+            .send(client_tx, ClientMessageType::AttachSession { session_id });
         // Discard a command line BEFORE the input hand-off below: it is not a
         // prompt, so it must be dropped (not stashed as the outgoing session's
         // draft) and the target session's draft loaded in its place.
@@ -1600,7 +1604,7 @@ impl App {
         &mut self,
         finished_session_id: u64,
         parent_id: u64,
-        client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+        client_tx: &crossbeam_channel::Sender<ClientMessage>,
     ) -> Result<(), ClientError> {
         // Titles come from the summary list — the same source that told us
         // the sub-session's parent — falling back to "untitled" exactly like
@@ -1629,10 +1633,11 @@ impl App {
         self.refresh_attached_account_slug();
     }
 
+    #[expect(clippy::unnecessary_wraps)]
     pub(crate) fn handle_sessions(
         &mut self,
         sessions: &[SessionSummary],
-        client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+        client_tx: &crossbeam_channel::Sender<ClientMessage>,
     ) -> Result<(), ClientError> {
         self.session_mgr.set_sessions(sessions.to_vec());
         if self.page == Page::Chat {
@@ -1690,11 +1695,12 @@ impl App {
                     self.persist_input_draft(first.session_id);
                     self.reset_for_session_switch(first.session_id);
                     self.attached_session_id = Some(first.session_id);
-                    client_tx
-                        .send(ClientMessageType::AttachSession {
+                    self.pending.send(
+                        client_tx,
+                        ClientMessageType::AttachSession {
                             session_id: first.session_id,
-                        })
-                        .map_err(broken_pipe)?;
+                        },
+                    );
                 } else {
                     // Inherit account_name from the first available account,
                     // so the auto-created default session doesn't lose the
@@ -1707,8 +1713,9 @@ impl App {
                     // session working directory. The working directory is chosen
                     // later (e.g. via `set_working_dir` or when attaching a
                     // session that already has one).
-                    client_tx
-                        .send(ClientMessageType::CreateSession {
+                    self.pending.send(
+                        client_tx,
+                        ClientMessageType::CreateSession {
                             title: Some("default".to_string()),
                             parent_session_id: None,
                             working_dir: None,
@@ -1716,8 +1723,8 @@ impl App {
                             account_name: default_account,
                             selected_model: None,
                             reasoning_effort: None,
-                        })
-                        .map_err(broken_pipe)?;
+                        },
+                    );
                 }
             }
         }

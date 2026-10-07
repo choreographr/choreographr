@@ -1,7 +1,9 @@
 use crate::connection::{handle_daemon_message, handle_terminal_event};
 use crate::state::*;
 use crate::test_util::test_app;
-use choreo_proto::{AccountInfo, ClientMessageType, DaemonMessage, DaemonMessageType};
+use choreo_proto::{
+    AccountInfo, ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType,
+};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -15,7 +17,7 @@ fn send_mouse(
     kind: MouseEventKind,
     column: u16,
     row: u16,
-    tx: &crossbeam_channel::Sender<ClientMessageType>,
+    tx: &crossbeam_channel::Sender<ClientMessage>,
 ) {
     handle_terminal_event(
         Event::Mouse(MouseEvent {
@@ -62,7 +64,7 @@ fn ai_providers_enter_selects_account_and_returns_to_chat() {
     assert_eq!(app.page, Page::Chat);
     let msg = rx.recv().expect("sent message");
     assert_eq!(
-        msg,
+        msg.inner,
         ClientMessageType::SetSessionAccount {
             name: "personal-account".to_string(),
         }
@@ -136,7 +138,7 @@ fn ai_providers_list_click_selects_account_and_returns_to_chat() {
     );
     let msg = rx.recv().expect("sent message");
     assert_eq!(
-        msg,
+        msg.inner,
         ClientMessageType::SetSessionAccount {
             name: "personal-account".to_string(),
         }
@@ -312,7 +314,7 @@ fn setup_providers_new_account(app: &mut App) {
 /// returning nothing.  `provider` is matched by slug.
 fn advance_to_slug_phase(
     app: &mut App,
-    tx: &crossbeam_channel::Sender<ClientMessageType>,
+    tx: &crossbeam_channel::Sender<ClientMessage>,
     provider: &str,
 ) {
     setup_providers_new_account(app);
@@ -788,7 +790,7 @@ fn ai_providers_new_account_submit_creates_account_and_redirects_to_credential()
     // AddAccount was sent with the slug as the account name.
     let msg = rx.recv().expect("AddAccount message");
     assert_eq!(
-        msg,
+        msg.inner,
         ClientMessageType::AddAccount {
             name: "my-account".to_string(),
             provider: "openai".to_string(),
@@ -887,7 +889,7 @@ fn ai_providers_credential_added_refreshes_account_list() {
     .expect("handle CredentialAdded");
 
     let msg = rx.recv().expect("ListAccounts sent after credential added");
-    assert_eq!(msg, ClientMessageType::ListAccounts);
+    assert_eq!(msg.inner, ClientMessageType::ListAccounts);
 
     // Removal refreshes the list the same way.
     handle_daemon_message(
@@ -902,7 +904,7 @@ fn ai_providers_credential_added_refreshes_account_list() {
     let msg = rx
         .recv()
         .expect("ListAccounts sent after credential removed");
-    assert_eq!(msg, ClientMessageType::ListAccounts);
+    assert_eq!(msg.inner, ClientMessageType::ListAccounts);
 }
 
 // ── New-account wizard mouse support ──────────────────────

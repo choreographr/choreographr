@@ -540,7 +540,10 @@ fn enter_continue_when_attached_sends_continue_generation() {
     assert_eq!(app.status.as_deref(), Some("> continue"));
     assert!(app.display_for(0).active.contains(&1));
     let msg = rx.recv().expect("should send ContinueGeneration");
-    assert_eq!(msg, ClientMessageType::ContinueGeneration { stream_id: 1 });
+    assert_eq!(
+        msg.inner,
+        ClientMessageType::ContinueGeneration { stream_id: 1 }
+    );
 }
 
 #[test]
@@ -605,7 +608,7 @@ fn enter_stop_when_attached_sends_cancel_all() {
 
     assert_eq!(app.status.as_deref(), Some("> stop"));
     let msg = rx.recv().expect("should send Cancel");
-    assert_eq!(msg, ClientMessageType::Cancel { stream_id: 0 });
+    assert_eq!(msg.inner, ClientMessageType::Cancel { stream_id: 0 });
 }
 
 #[test]
@@ -640,7 +643,7 @@ fn enter_undo_sends_undo() {
 
     assert_eq!(app.status.as_deref(), Some("> undo"));
     let msg = rx.recv().expect("should send Undo");
-    assert_eq!(msg, ClientMessageType::Undo);
+    assert_eq!(msg.inner, ClientMessageType::Undo);
 }
 
 #[test]
@@ -658,7 +661,7 @@ fn enter_redo_sends_redo() {
 
     assert_eq!(app.status.as_deref(), Some("> redo"));
     let msg = rx.recv().expect("should send Redo");
-    assert_eq!(msg, ClientMessageType::Redo);
+    assert_eq!(msg.inner, ClientMessageType::Redo);
 }
 
 #[test]
@@ -768,7 +771,7 @@ fn ctrl_r_cycles_through_valid_slugs() {
     assert_eq!(app.status.as_deref(), Some("reasoning: low"));
     let msg = rx.recv().expect("SetReasoningEffort 1");
     assert_eq!(
-        msg,
+        msg.inner,
         ClientMessageType::SetReasoningEffort {
             effort: "low".to_string()
         }
@@ -787,7 +790,7 @@ fn ctrl_r_cycles_through_valid_slugs() {
     );
     let msg = rx.recv().expect("SetReasoningEffort 2");
     assert_eq!(
-        msg,
+        msg.inner,
         ClientMessageType::SetReasoningEffort {
             effort: "medium".to_string()
         }
@@ -803,7 +806,7 @@ fn ctrl_r_cycles_through_valid_slugs() {
     assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("high"));
     let msg = rx.recv().expect("SetReasoningEffort 3");
     assert_eq!(
-        msg,
+        msg.inner,
         ClientMessageType::SetReasoningEffort {
             effort: "high".to_string()
         }
@@ -819,7 +822,7 @@ fn ctrl_r_cycles_through_valid_slugs() {
     assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("off"));
     let msg = rx.recv().expect("SetReasoningEffort 4");
     assert_eq!(
-        msg,
+        msg.inner,
         ClientMessageType::SetReasoningEffort {
             effort: "off".to_string()
         }
@@ -901,7 +904,7 @@ fn ctrl_r_google_off_on() {
     assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("on"));
     let msg = rx.recv().expect("SetReasoningEffort 1");
     assert_eq!(
-        msg,
+        msg.inner,
         ClientMessageType::SetReasoningEffort {
             effort: "on".to_string()
         }
@@ -917,7 +920,7 @@ fn ctrl_r_google_off_on() {
     assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("off"));
     let msg = rx.recv().expect("SetReasoningEffort 2");
     assert_eq!(
-        msg,
+        msg.inner,
         ClientMessageType::SetReasoningEffort {
             effort: "off".to_string()
         }

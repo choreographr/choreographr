@@ -17,7 +17,10 @@
 use super::App;
 use crate::RenderedImage;
 use crate::image_worker::{ImageId, ImageJob, ImageResult, next_job_id};
-use choreo_proto::{ClientMessageType, ImageKey, ImageMetadata, ImageReference, Turn};
+use choreo_client_core::PendingContext;
+use choreo_proto::{
+    ClientMessage, ClientMessageType, ImageKey, ImageMetadata, ImageReference, Turn,
+};
 use ratatui::layout::Size;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -269,14 +272,32 @@ impl App {
     /// next pass.
     pub(crate) fn flush_image_fetches(
         &mut self,
-        client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+        client_tx: &crossbeam_channel::Sender<ClientMessage>,
     ) {
-        for (session_id, turn_id, slot) in self.pending_image_fetch.drain(..) {
-            let _ = client_tx.send(ClientMessageType::GetImage {
-                session_id,
-                turn_id,
-                key: slot.to_key(),
-            });
+        // Collect the queue first so `self.pending.send` (which borrows `self`
+        // mutably) does not alias the drain borrow of `self.pending_image_fetch`.
+        let queued: Vec<(u64, u32, ImageSlot)> = std::mem::take(&mut self.pending_image_fetch);
+        for (session_id, turn_id, slot) in queued {
+            let key = slot.to_key();
+            let id = self.pending.send(
+                client_tx,
+                ClientMessageType::GetImage {
+                    session_id,
+                    turn_id,
+                    key: key.clone(),
+                },
+            );
+            // The composite key rides the request context so the fetch can be
+            // attributed by id; the wire `Image` reply still echoes it for the
+            // byte-routing handler.
+            self.pending.set_context(
+                id,
+                PendingContext::Image {
+                    session_id,
+                    turn_id,
+                    key,
+                },
+            );
         }
     }
 
@@ -395,7 +416,7 @@ mod tests {
         // that actually has bytes (`byte_len > 0`) — never for one whose bytes
         // are already present, nor for a genuinely zero-byte image.
         let mut app = test_app();
-        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessageType>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
         let meta = |byte_len| choreo_proto::ImageMetadata {
             mime_type: "image/png".to_string(),
             width: 4,
@@ -445,7 +466,7 @@ mod tests {
         app.request_image_fetch(3, 9, ImageSlot::Displayed(1));
 
         app.flush_image_fetches(&tx);
-        let sent: Vec<ClientMessageType> = rx.try_iter().collect();
+        let sent: Vec<ClientMessageType> = rx.try_iter().map(|m| m.inner).collect();
         assert_eq!(
             sent,
             vec![ClientMessageType::GetImage {
@@ -463,7 +484,7 @@ mod tests {
         // `ImageKey::ToolResult { call_id }` and store the reply in the same
         // `RenderedImage` map, keyed by the call id.
         let mut app = test_app();
-        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessageType>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
         let turn = Turn {
             created_at: choreo_proto::TimestampMs::now(),
             undone: false,
@@ -502,7 +523,7 @@ mod tests {
 
         app.request_image_fetch(2, 5, slot.clone());
         app.flush_image_fetches(&tx);
-        let sent: Vec<ClientMessageType> = rx.try_iter().collect();
+        let sent: Vec<ClientMessageType> = rx.try_iter().map(|m| m.inner).collect();
         assert_eq!(
             sent,
             vec![ClientMessageType::GetImage {

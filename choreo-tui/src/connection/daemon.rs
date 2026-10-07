@@ -1,22 +1,38 @@
-use super::{SessionUpdateRouting, route_session_update};
+use super::route_session_update;
 use crate::state::{App, Page, ProviderInfo, merge_token_usage};
 use crate::terminal_progress;
 use choreo_client_core::{
-    AutoBindAttempt, ClientError, attempt_keystore_auto_bind, dispatch_daemon_message,
-    record_unlock_key,
+    AutoBindAttempt, ClientError, Pending, PendingContext, attempt_keystore_auto_bind,
+    dispatch_daemon_message, record_unlock_key,
 };
 use choreo_proto::{
-    ClientMessageType, DaemonMessage, DaemonMessageType, KeystoreState, RefreshStatus, SessionEvent,
+    ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, KeystoreState, MessageKind,
+    RefreshStatus, SessionEvent,
 };
 use zeroize::Zeroize;
+
+/// Whether a resolved pending slot names a `ListModels` request — i.e. the
+/// reply answers THIS client's model-list request (the only requester of
+/// `ListModels`), so it belongs in the model-selector popup rather than the
+/// chat history.
+fn is_list_models_reply(resolved: Option<&Pending>) -> bool {
+    resolved.is_some_and(|pending| pending.kind == MessageKind::ListModels)
+}
 
 // Owned-message call sites live in test files outside connection/, so the
 // by-value signature is kept for those ergonomic owned-value call sites.
 pub(crate) fn handle_daemon_message(
     message: DaemonMessage,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
+    // Resolve the reply's pending slot FIRST, before any state handling: a
+    // `Some(id)` message answers one of our requests, and the resolved slot's
+    // kind/context tell the arms below what the reply means (the model-list
+    // popup, a keystore key to record). A broadcast (`id: None`) resolves
+    // nothing. This is a side table: resolving never replaces the payload's own
+    // state dispatch at the bottom.
+    let mut resolved = message.id.and_then(|id| app.pending.resolve(id));
     // Dispatch per-variant handlers first, then let the generic
     // dispatch in choreo_client_core handle the rest (text notifications,
     // stream appends, image assembly, etc.).
@@ -156,7 +172,7 @@ pub(crate) fn handle_daemon_message(
         }
         DaemonMessageType::AccountAdded { name } => {
             app.status = Some(format!("[daemon] account added: {name}"));
-            let _ = client_tx.send(ClientMessageType::ListAccounts);
+            app.pending.send(client_tx, ClientMessageType::ListAccounts);
         }
         DaemonMessageType::AccountAddFailed { name, error } => {
             // The account never got created, so drop the credential modal the
@@ -174,7 +190,7 @@ pub(crate) fn handle_daemon_message(
         DaemonMessageType::AccountRemoved { name } => {
             app.status = Some(format!("[daemon] account removed: {name}"));
             app.ai_providers.remove_account(name);
-            let _ = client_tx.send(ClientMessageType::ListAccounts);
+            app.pending.send(client_tx, ClientMessageType::ListAccounts);
         }
         DaemonMessageType::AccountRemoveFailed { name, error } => {
             app.error = Some(format!("[daemon] failed to remove account {name}: {error}"));
@@ -187,12 +203,12 @@ pub(crate) fn handle_daemon_message(
             app.status = Some(format!("[daemon] credential added: {service}"));
             // The daemon accepted the unlock key this credential carried —
             // record it per-daemon on CONFIRMED success only (never on send).
-            record_confirmed_unlock_key(app);
-            let _ = client_tx.send(ClientMessageType::ListAccounts);
+            record_confirmed_unlock_key(app, resolved.as_ref());
+            app.pending.send(client_tx, ClientMessageType::ListAccounts);
         }
         DaemonMessageType::CredentialRemoved { service } => {
             app.status = Some(format!("[daemon] credential removed: {service}"));
-            let _ = client_tx.send(ClientMessageType::ListAccounts);
+            app.pending.send(client_tx, ClientMessageType::ListAccounts);
         }
         // ACL enrollment feedback: the direct reply says whether THIS add
         // worked; the broadcast tells every connected client the new total
@@ -330,27 +346,24 @@ pub(crate) fn handle_daemon_message(
             // Route the per-session display update to whichever session the
             // message belongs to (never the attached one when they differ).
             let reported = *session_id;
-            match route_session_update(app, reported, |app, session_id| {
+            if !route_session_update(app, reported, message.id, |app, session_id| {
                 app.handle_model_selected(session_id, model, reasoning_capability.clone());
             }) {
-                SessionUpdateRouting::Suppress => {
-                    // Background session: the per-session display was already
-                    // updated above; stop here so the generic dispatch's
-                    // "[daemon] selected model: …" status write does not
-                    // rewrite the global status line the user is looking at
-                    // (which would reflow the viewed viewport).
-                    tracing::debug!(
-                        session_id = reported,
-                        %model,
-                        "suppressing status feedback for background session's model selection",
-                    );
-                    return Ok(());
-                }
-                // Attached session (or a connection-level `None` reply): fall
-                // through so the user's own `/model` command still prints its
-                // confirmation to the status line.
-                SessionUpdateRouting::FallThrough => {}
+                // Background session: the per-session display was already
+                // updated above; stop here so the generic dispatch's
+                // "[daemon] selected model: …" status write does not
+                // rewrite the global status line the user is looking at
+                // (which would reflow the viewed viewport).
+                tracing::debug!(
+                    session_id = reported,
+                    %model,
+                    "suppressing status feedback for background session's model selection",
+                );
+                return Ok(());
             }
+            // Attached session (or a targeted/connection-level reply): fall
+            // through so the user's own `/model` command still prints its
+            // confirmation to the status line.
         }
         DaemonMessageType::Session {
             session_id,
@@ -367,21 +380,18 @@ pub(crate) fn handle_daemon_message(
             // attached session fall through so the user sees the rejection of
             // their own `/model` command.
             let reported = *session_id;
-            match route_session_update(app, reported, |_, _| {}) {
-                SessionUpdateRouting::Suppress => {
-                    tracing::debug!(
-                        session_id = reported,
-                        %model,
-                        %error,
-                        "suppressing status feedback for background session's model selection failure",
-                    );
-                    return Ok(());
-                }
-                // Attached session (or a connection-level `None` reply): fall
-                // through so the generic dispatch writes the `[daemon] failed
-                // to select model …` error line.
-                SessionUpdateRouting::FallThrough => {}
+            if !route_session_update(app, reported, message.id, |_, _| {}) {
+                tracing::debug!(
+                    session_id = reported,
+                    %model,
+                    %error,
+                    "suppressing status feedback for background session's model selection failure",
+                );
+                return Ok(());
             }
+            // Attached session (or a targeted/connection-level reply): fall
+            // through so the generic dispatch writes the `[daemon] failed
+            // to select model …` error line.
         }
         DaemonMessageType::Session {
             session_id,
@@ -396,26 +406,23 @@ pub(crate) fn handle_daemon_message(
             // session's display and the gate does not swallow the user's own
             // feedback.
             let reported = *session_id;
-            match route_session_update(app, reported, |app, session_id| {
+            if !route_session_update(app, reported, message.id, |app, session_id| {
                 app.handle_reasoning_effort_set(session_id, effort.clone());
             }) {
-                SessionUpdateRouting::Suppress => {
-                    // Background session: the per-session display was already
-                    // updated above; stop here so the generic dispatch's
-                    // "[daemon] reasoning effort: …" status write does not
-                    // rewrite the global status line.
-                    tracing::debug!(
-                        session_id = reported,
-                        %effort,
-                        "suppressing status feedback for background session's reasoning effort change",
-                    );
-                    return Ok(());
-                }
-                // Attached session (or a connection-level `None` reply): fall
-                // through so the user's own `/reasoning` command still prints
-                // its confirmation to the status line.
-                SessionUpdateRouting::FallThrough => {}
+                // Background session: the per-session display was already
+                // updated above; stop here so the generic dispatch's
+                // "[daemon] reasoning effort: …" status write does not
+                // rewrite the global status line.
+                tracing::debug!(
+                    session_id = reported,
+                    %effort,
+                    "suppressing status feedback for background session's reasoning effort change",
+                );
+                return Ok(());
             }
+            // Attached session (or a targeted/connection-level reply): fall
+            // through so the user's own `/reasoning` command still prints
+            // its confirmation to the status line.
         }
         DaemonMessageType::Session {
             session_id,
@@ -429,30 +436,27 @@ pub(crate) fn handle_daemon_message(
             // connection-level `None` ("no session attached") resolves to
             // the attached session, matching ReasoningEffortSet above.
             let reported = *session_id;
-            match route_session_update(app, reported, |app, session_id| {
+            if !route_session_update(app, reported, message.id, |app, session_id| {
                 app.display_for(session_id).reasoning_effort = Some("off".to_string());
             }) {
-                SessionUpdateRouting::Suppress => {
-                    // Background session: log at debug — an agent thrashing an
-                    // unsupported effort in the background is not a warning
-                    // for the user — and stop here so neither the status-line
-                    // notice below nor the generic dispatch's `app.error`
-                    // write can clobber the global status/error line for a
-                    // session the user is not viewing.
-                    tracing::debug!(
-                        session_id = reported,
-                        %effort,
-                        %error,
-                        "suppressing status feedback for background session's reasoning effort rejection",
-                    );
-                    return Ok(());
-                }
-                // Attached session (or a connection-level `None` reply): the
-                // user's own `/reasoning` command failed — surface the
-                // rejection notice and fall through so the generic dispatch
-                // records the error as well.
-                SessionUpdateRouting::FallThrough => {}
+                // Background session: log at debug — an agent thrashing an
+                // unsupported effort in the background is not a warning
+                // for the user — and stop here so neither the status-line
+                // notice below nor the generic dispatch's `app.error`
+                // write can clobber the global status/error line for a
+                // session the user is not viewing.
+                tracing::debug!(
+                    session_id = reported,
+                    %effort,
+                    %error,
+                    "suppressing status feedback for background session's reasoning effort rejection",
+                );
+                return Ok(());
             }
+            // Attached session (or a targeted/connection-level reply): the
+            // user's own `/reasoning` command failed — surface the
+            // rejection notice and fall through so the generic dispatch
+            // records the error as well.
             tracing::warn!(%effort, %error, "reasoning effort rejected by daemon");
             app.status = Some(format!("reasoning effort rejected: {error}"));
         }
@@ -467,26 +471,23 @@ pub(crate) fn handle_daemon_message(
             // no-session account change goes through SessionFailed), so the
             // connection-level `None` resolution is defensive but harmless.
             let reported = *session_id;
-            match route_session_update(app, reported, |app, session_id| {
+            if !route_session_update(app, reported, message.id, |app, session_id| {
                 app.handle_session_account_set(session_id, account);
             }) {
-                SessionUpdateRouting::Suppress => {
-                    // Background session: the per-session display was already
-                    // updated above; stop here so the generic dispatch's
-                    // "[daemon] session account set: …" status write does not
-                    // rewrite the global status line.
-                    tracing::debug!(
-                        session_id = reported,
-                        %account,
-                        "suppressing status feedback for background session's account change",
-                    );
-                    return Ok(());
-                }
-                // Attached session (or a connection-level `None` reply): fall
-                // through so the user's own `/account` command still prints
-                // its confirmation to the status line.
-                SessionUpdateRouting::FallThrough => {}
+                // Background session: the per-session display was already
+                // updated above; stop here so the generic dispatch's
+                // "[daemon] session account set: …" status write does not
+                // rewrite the global status line.
+                tracing::debug!(
+                    session_id = reported,
+                    %account,
+                    "suppressing status feedback for background session's account change",
+                );
+                return Ok(());
             }
+            // Attached session (or a targeted/connection-level reply): fall
+            // through so the user's own `/account` command still prints
+            // its confirmation to the status line.
         }
         DaemonMessageType::Session {
             session_id: Some(session_id),
@@ -536,11 +537,14 @@ pub(crate) fn handle_daemon_message(
             models,
             selected_model,
         } => {
-            if app.model_selector.is_open() {
-                // While the selector is open, the reply populates the popup
-                // and must NOT fall through to the generic dispatch, which
-                // would print the whole list into the chat history.  Prefer
-                // the daemon's reported selection, falling back to the
+            // A `Models` reply that resolved a pending `ListModels` slot is the
+            // answer to OUR model-list request, so it populates the selector
+            // popup and must NOT fall through to the generic dispatch (which
+            // would print the whole list into the chat history). Correlating on
+            // the request id replaces the old "is the selector open?" guess:
+            // the requester is known structurally.
+            if is_list_models_reply(resolved.as_ref()) {
+                // Prefer the daemon's reported selection, falling back to the
                 // display's cached model when it is absent.
                 let selected = selected_model.clone().or_else(|| {
                     app.active_display_ref()
@@ -554,15 +558,18 @@ pub(crate) fn handle_daemon_message(
                 app.model_selector.apply_models(models.clone(), selected);
                 return Ok(());
             }
-            // Selector closed: fall through to dispatch_daemon_message so
-            // `/model` keeps printing the list into the chat history.
+            // Not our reply (no pending ListModels slot): fall through to
+            // dispatch_daemon_message so `/model` keeps printing the list into
+            // the chat history.
         }
-        DaemonMessageType::ModelsFailed { error } if app.model_selector.is_open() => {
-            tracing::warn!(%error, "model selector: failed to list models");
-            app.model_selector.apply_error(error.clone());
-            return Ok(());
+        DaemonMessageType::ModelsFailed { error } => {
+            if is_list_models_reply(resolved.as_ref()) {
+                tracing::warn!(%error, "model selector: failed to list models");
+                app.model_selector.apply_error(error.clone());
+                return Ok(());
+            }
+            // Not our reply: fall through to the generic error handling.
         }
-        // Selector closed: fall through to the generic error handling.
 
         // ── S4: /refresh-models replies + catalog updates ────────────────
         DaemonMessageType::ModelsRefreshed {
@@ -721,7 +728,7 @@ pub(crate) fn handle_daemon_message(
         // unlocked" status.
         DaemonMessageType::Unlocked => {
             app.keystore_locked = false;
-            record_confirmed_unlock_key(app);
+            record_confirmed_unlock_key(app, resolved.as_ref());
         }
         // Targeted reply to our `BindKeystore`: the unbound daemon ADOPTED the
         // fresh key we minted and ran the shared unlock tail, so from the
@@ -734,7 +741,7 @@ pub(crate) fn handle_daemon_message(
         // and unlocked" status.
         DaemonMessageType::Bound => {
             app.keystore_locked = false;
-            record_confirmed_unlock_key(app);
+            record_confirmed_unlock_key(app, resolved.as_ref());
         }
         // The daemon (re-)locked its keystore (/lock) or a freshly-connecting
         // client latched the subscribe-time lock-state push: set the
@@ -759,11 +766,13 @@ pub(crate) fn handle_daemon_message(
         // the generic dispatch still surfaces the error text.
         DaemonMessageType::LockedError { .. } => {
             app.keystore_locked = true;
-            discard_rejected_unlock_key(app);
+            discard_rejected_unlock_key(app, &mut resolved);
         }
         // Same pending-key discipline for a rejected AddCredential: drop the
         // in-flight key, leave the store alone.
-        DaemonMessageType::CredentialAddFailed { .. } => discard_rejected_unlock_key(app),
+        DaemonMessageType::CredentialAddFailed { .. } => {
+            discard_rejected_unlock_key(app, &mut resolved);
+        }
         // Verify-only operation against a daemon whose keystore has NO
         // binding yet (either the subscribe-time lock-state push or the reply
         // to the connect-time auto-unlock attempt). The daemon has no
@@ -780,7 +789,7 @@ pub(crate) fn handle_daemon_message(
             // The stale verify key belongs to THIS frontend's pending-key
             // lifecycle: drop it (zeroized) BEFORE the shared state machine
             // runs, so the minted bind key can be held pending afterwards.
-            discard_rejected_unlock_key(app);
+            discard_rejected_unlock_key(app, &mut resolved);
             // Distinct guidance: this is not "wrong key" but "never bound" —
             // the fix is automatic, not something the user must do.
             app.status = Some(
@@ -810,7 +819,7 @@ pub(crate) fn handle_daemon_message(
                 // in flight — otherwise the latch would surface a spurious
                 // "still unbound" error and drop the minted pending key.
                 if !app.keystore_auto_bind.attempted() {
-                    discard_rejected_unlock_key(app);
+                    discard_rejected_unlock_key(app, &mut resolved);
                     app.status = Some(
                         "keystore not initialized — a binding will be created automatically"
                             .to_string(),
@@ -823,7 +832,7 @@ pub(crate) fn handle_daemon_message(
             }
             KeystoreState::Unlocked => {
                 app.keystore_locked = false;
-                record_confirmed_unlock_key(app);
+                record_confirmed_unlock_key(app, resolved.as_ref());
             }
         },
         DaemonMessageType::Session {
@@ -874,15 +883,16 @@ pub(crate) fn handle_daemon_message(
 /// already in flight on this connection.
 fn trigger_keystore_auto_bind(
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> bool {
     match attempt_keystore_auto_bind(&mut app.keystore_auto_bind, &app.connection_addr) {
         AutoBindAttempt::Bind { key, msg } => {
-            // The minted key is held pending so the `Bound` confirmation
-            // records it through the SAME path as an `Unlocked` — one confirm
-            // flow for all senders.
-            app.pending_unlock_key = Some(key.to_vec());
-            let _ = client_tx.send(msg);
+            // The minted key rides the request's pending context so the `Bound`
+            // confirmation records it through the SAME path as an `Unlocked` —
+            // one confirm flow for all senders.
+            let id = app.pending.send(client_tx, msg);
+            app.pending
+                .set_context(id, PendingContext::UnlockKey(key.to_vec()));
             true
         }
         // Bind-loop guard: already attempted on this connection. The caller
@@ -901,18 +911,21 @@ fn trigger_keystore_auto_bind(
 
 /// Record the daemon-confirmed unlock key per-daemon, exactly once.
 ///
-/// The pending key (`app.pending_unlock_key`) is stored when an `Unlock`,
-/// `AddCredential`, or (auto-) `BindKeystore` is SENT (see `run_app`'s
-/// auto-unlock, the chat/credential handlers, and the `KeystoreUnbound` arm).
-/// A daemon that accepts the key replies `Unlocked` / `CredentialAdded` /
-/// `Bound` — and only then do we persist it into the daemon's `known_servers`
-/// entry — the TOFU core of the per-daemon keystore design: a key the daemon
-/// REJECTS (misbound keystore) is never recorded.
-fn record_confirmed_unlock_key(app: &mut App) {
-    let Some(key) = app.pending_unlock_key.take() else {
+/// The key rides the request's pending context ([`PendingContext::UnlockKey`]),
+/// attached when the `Unlock`/`AddCredential`/`BindKeystore` is SENT (see
+/// `run_app`'s auto-unlock, the chat/credential handlers, and the auto-bind
+/// path). A daemon that accepts the key replies `Unlocked` / `CredentialAdded`
+/// / `Bound`, resolving that slot — and only then do we persist the key into
+/// the daemon's `known_servers` entry. This is the TOFU core of the per-daemon
+/// keystore design: a key the daemon REJECTS (misbound keystore) is never
+/// recorded.
+fn record_confirmed_unlock_key(app: &mut App, resolved: Option<&Pending>) {
+    // The key lives in the resolved slot's context. A reply with no UnlockKey
+    // context (a broadcast, or a request that carried no key) records nothing.
+    let Some(key) = resolved.and_then(|pending| pending.context.unlock_key()) else {
         return;
     };
-    match record_unlock_key(&app.connection_addr, &key) {
+    match record_unlock_key(&app.connection_addr, key) {
         Ok(()) => {
             tracing::info!(
                 addr = %app.connection_addr,
@@ -932,15 +945,21 @@ fn record_confirmed_unlock_key(app: &mut App) {
 /// in `choreo-client-core` (`resolve_keystore_key`) — the stored key may be a
 /// valid confirmed key (the daemon reports transient failures through the
 /// same error), and manual re-pair (`remove(addr)`) is the recovery path for
-/// a genuinely wrong one.
-fn discard_rejected_unlock_key(app: &mut App) {
-    if let Some(mut key) = app.pending_unlock_key.take() {
-        key.zeroize();
-        tracing::info!(
-            addr = %app.connection_addr,
-            "daemon rejected the presented unlock key; the known_servers record is kept"
-        );
-    }
+/// a genuinely wrong one. Takes the key out of the resolved slot so an
+/// in-process reply cannot linger after the rejection.
+fn discard_rejected_unlock_key(app: &mut App, resolved: &mut Option<Pending>) {
+    let Some(Pending {
+        context: PendingContext::UnlockKey(mut key),
+        ..
+    }) = resolved.take()
+    else {
+        return;
+    };
+    key.zeroize();
+    tracing::info!(
+        addr = %app.connection_addr,
+        "daemon rejected the presented unlock key; the known_servers record is kept"
+    );
 }
 
 #[cfg(test)]
@@ -952,7 +971,7 @@ mod tests {
     /// dispatch's status/error handling needs a sender, but none of the
     /// lock-state messages send anything, so a disconnected sender works.
     fn dispatch(message: DaemonMessage, app: &mut App) {
-        let (tx, _rx) = crossbeam_channel::unbounded::<ClientMessageType>();
+        let (tx, _rx) = crossbeam_channel::unbounded::<ClientMessage>();
         handle_daemon_message(message, app, &tx).expect("handle_daemon_message");
     }
 
@@ -995,42 +1014,66 @@ mod tests {
         let mut app = test_app();
         app.keystore_locked = false;
         // An unconfirmed key (e.g. the optimistic fresh-key record) is being
-        // rejected: it must be reverted and the lock flag kept latched.
-        app.pending_unlock_key = Some(vec![7u8; 32]);
-        dispatch(
-            DaemonMessage::broadcast(DaemonMessageType::LockedError {
-                error: "unlock key does not match the keystore binding".into(),
-            }),
-            &mut app,
+        // rejected: it must be reverted and the lock flag kept latched. The
+        // key rides the pending slot's context, so a TARGETED (id-bearing)
+        // rejection resolves it.
+        let (tx, _rx) = crossbeam_channel::unbounded::<ClientMessage>();
+        let id = app.pending.send(
+            &tx,
+            ClientMessageType::Unlock {
+                private_key: vec![7u8; 32],
+            },
         );
+        app.pending
+            .set_context(id, PendingContext::UnlockKey(vec![7u8; 32]));
+        handle_daemon_message(
+            DaemonMessage::reply(
+                id,
+                DaemonMessageType::LockedError {
+                    error: "unlock key does not match the keystore binding".into(),
+                },
+            ),
+            &mut app,
+            &tx,
+        )
+        .unwrap();
         assert!(
             app.keystore_locked,
             "a rejected unlock means the daemon is still locked"
         );
-        // The rejection drops the pending key so a later, unrelated
+        // The rejection consumes the pending slot so a later, unrelated
         // confirmation cannot attribute it (see discard_rejected_unlock_key).
-        assert!(app.pending_unlock_key.is_none());
+        assert!(app.pending.is_empty(), "the rejected slot is consumed");
     }
 
     #[test]
     fn locked_broadcast_does_not_touch_a_pending_unlock_key() {
         // A `Locked` broadcast (subscribe-time push or /lock transition) is
         // NOT a key rejection: it must latch the flag but leave the pending
-        // auto-unlock key alone, so the Unlock reply (Unlocked/LockedError)
-        // — which arrives next on the wire — decides the key's fate.
+        // auto-unlock slot alone, so the Unlock reply (Unlocked/LockedError) —
+        // which arrives next on the wire — decides the key's fate.
         let mut app = test_app();
         app.keystore_locked = true;
-        let key = vec![9u8; 32];
-        app.pending_unlock_key = Some(key.clone());
-        dispatch(
+        let (tx, _rx) = crossbeam_channel::unbounded::<ClientMessage>();
+        let id = app.pending.send(
+            &tx,
+            ClientMessageType::Unlock {
+                private_key: vec![9u8; 32],
+            },
+        );
+        app.pending
+            .set_context(id, PendingContext::UnlockKey(vec![9u8; 32]));
+        handle_daemon_message(
             DaemonMessage::broadcast(DaemonMessageType::Locked),
             &mut app,
-        );
+            &tx,
+        )
+        .unwrap();
         assert!(app.keystore_locked);
         assert_eq!(
-            app.pending_unlock_key,
-            Some(key),
-            "Locked must not drop the pending unlock key"
+            app.pending.len(),
+            1,
+            "a Locked broadcast must not consume the pending unlock slot"
         );
     }
 
@@ -1058,27 +1101,31 @@ mod tests {
         let mut app = test_app();
         app.keystore_locked = true;
         app.connection_addr = "bound-test:1".to_string();
-        app.pending_unlock_key = Some(vec![3u8; 32]);
 
-        // Unlike the plain `dispatch` helper, capture what the handler SENDS
-        // (a Bound flow must never send anything itself).
-        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessageType>();
+        // A `BindKeystore` whose reply (`Bound`) confirms the carried key: the
+        // key rides the request's pending context and is recorded when the
+        // targeted `Bound` resolves the slot.
+        let (tx, _rx) = crossbeam_channel::unbounded::<ClientMessage>();
+        let id = app
+            .pending
+            .send(&tx, ClientMessageType::BindKeystore { key: vec![3u8; 32] });
+        app.pending
+            .set_context(id, PendingContext::UnlockKey(vec![3u8; 32]));
         handle_daemon_message(
-            DaemonMessage::broadcast(DaemonMessageType::Bound),
+            DaemonMessage::reply(id, DaemonMessageType::Bound),
             &mut app,
             &tx,
         )
         .unwrap();
 
         assert!(!app.keystore_locked, "Bound must clear the lock flag");
-        assert!(app.pending_unlock_key.is_none(), "pending key is consumed");
+        assert!(app.pending.is_empty(), "pending key is consumed");
         let store = choreo_client_core::KnownServers::load().unwrap();
         assert_eq!(
             store.unlock_key("bound-test:1").unwrap(),
             Some([3u8; 32]),
             "the confirmed key is recorded per-daemon"
         );
-        assert!(rx.try_recv().is_err(), "Bound sends no client messages");
     }
 
     #[test]
@@ -1087,11 +1134,8 @@ mod tests {
         let mut app = test_app();
         app.keystore_locked = false; // daemon had been thought unlocked
         app.connection_addr = "unbound-test:1".to_string();
-        // A stale pending key (the verify attempt that just failed with
-        // KeystoreUnbound) must be discarded before the bind mints its own.
-        app.pending_unlock_key = Some(vec![5u8; 32]);
 
-        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessageType>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
         handle_daemon_message(
             DaemonMessage::broadcast(DaemonMessageType::KeystoreUnbound {
                 error: "keystore has no binding".into(),
@@ -1103,10 +1147,11 @@ mod tests {
 
         assert!(app.keystore_locked, "unbound latches the lock-ish banner");
         assert!(app.keystore_auto_bind.attempted(), "the bind is latched");
-        assert!(app.pending_unlock_key.is_some(), "minted key held pending");
         // Exactly one BindKeystore sent, carrying the key that was recorded
-        // into known_servers PRE-SEND.
-        let ClientMessageType::BindKeystore { key } = rx.try_recv().unwrap() else {
+        // into known_servers PRE-SEND. The minted key rides the bind's pending
+        // context (checked indirectly by the store pre-send record below).
+        let framed = rx.try_recv().unwrap();
+        let ClientMessageType::BindKeystore { key } = framed.inner else {
             panic!("auto-bind must send BindKeystore");
         };
         assert!(rx.try_recv().is_err(), "exactly one bind message");
@@ -1138,13 +1183,13 @@ mod tests {
     #[test]
     fn auto_bind_flow_end_to_end_unlocks_on_bound() {
         // The full connect-time unbound flow: KeystoreUnbound mints+sends the
-        // bind, the daemon replies Bound, and the connection ends up unlocked
-        // with the minted key recorded.
+        // bind, the daemon replies Bound to that request's id, and the
+        // connection ends up unlocked with the minted key recorded.
         let (_dir, _guard) = choreo_client_core::test_support::isolate_config();
         let mut app = test_app();
         app.connection_addr = "e2e-bind:1".to_string();
 
-        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessageType>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
         handle_daemon_message(
             DaemonMessage::broadcast(DaemonMessageType::KeystoreUnbound {
                 error: "unbound".into(),
@@ -1154,19 +1199,22 @@ mod tests {
         )
         .unwrap();
         assert!(app.keystore_locked);
-        let minted = match rx.try_recv().unwrap() {
-            ClientMessageType::BindKeystore { key } => key,
-            other => panic!("expected BindKeystore, got {other:?}"),
+        // Recover the id the bind was sent under from the captured frame (the
+        // same id `pending.send` recorded), so the reply targets the slot.
+        let framed = rx.try_recv().unwrap();
+        let bind_id = framed.id;
+        let ClientMessageType::BindKeystore { key: minted } = framed.inner else {
+            panic!("expected BindKeystore");
         };
 
         handle_daemon_message(
-            DaemonMessage::broadcast(DaemonMessageType::Bound),
+            DaemonMessage::reply(bind_id, DaemonMessageType::Bound),
             &mut app,
             &tx,
         )
         .unwrap();
         assert!(!app.keystore_locked, "Bound unlocks the daemon");
-        assert!(app.pending_unlock_key.is_none());
+        assert!(app.pending.is_empty());
         let store = choreo_client_core::KnownServers::load().unwrap();
         assert_eq!(
             store.unlock_key("e2e-bind:1").unwrap(),
@@ -1185,7 +1233,7 @@ mod tests {
         let mut app = test_app();
         app.connection_addr = "push-bind:1".to_string();
 
-        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessageType>();
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
         handle_daemon_message(
             DaemonMessage::broadcast(DaemonMessageType::Keystore {
                 state: KeystoreState::Unbound,
@@ -1197,8 +1245,8 @@ mod tests {
 
         assert!(app.keystore_locked, "unbound latches the lock banner");
         assert!(app.keystore_auto_bind.attempted(), "bind latched");
-        assert!(app.pending_unlock_key.is_some(), "minted key held pending");
-        let ClientMessageType::BindKeystore { key } = rx.try_recv().unwrap() else {
+        let framed = rx.try_recv().unwrap();
+        let ClientMessageType::BindKeystore { key } = framed.inner else {
             panic!("unbound status push must auto-bind");
         };
         let store = choreo_client_core::KnownServers::load().unwrap();
@@ -1228,7 +1276,7 @@ mod tests {
         // The status push latches the banner in both directions.
         let mut app = test_app();
         app.keystore_locked = false;
-        let (tx, _rx) = crossbeam_channel::unbounded::<ClientMessageType>();
+        let (tx, _rx) = crossbeam_channel::unbounded::<ClientMessage>();
         handle_daemon_message(
             DaemonMessage::broadcast(DaemonMessageType::Keystore {
                 state: KeystoreState::Locked,

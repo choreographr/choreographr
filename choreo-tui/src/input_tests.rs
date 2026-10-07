@@ -1,7 +1,7 @@
 use crate::connection::handle_terminal_event;
 use crate::state::*;
 use crate::test_util::{add_user_text, test_app};
-use choreo_proto::{ClientMessageType, Turn};
+use choreo_proto::{ClientMessage, ClientMessageType, Turn};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -2345,7 +2345,7 @@ fn scroll_mouse_outside_history_box_does_not_update_accumulator() {
 /// Send a left-click at terminal (column, row) through the event pipeline.
 fn click_input(
     app: &mut App,
-    tx: &crossbeam_channel::Sender<ClientMessageType>,
+    tx: &crossbeam_channel::Sender<ClientMessage>,
     column: u16,
     row: u16,
 ) {
@@ -2756,7 +2756,7 @@ fn alt_shift_m_opens_selector_like_alt_m() {
         "alt+shift+m opens the selector"
     );
     let msg = rx.recv().expect("sent message");
-    assert_eq!(msg, ClientMessageType::ListModels);
+    assert_eq!(msg.inner, ClientMessageType::ListModels);
 }
 
 #[test]

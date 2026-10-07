@@ -30,6 +30,38 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::thread;
 use tracing::{debug, error, info, warn};
 
+/// An outbound payload the connection writer can put on the wire.
+///
+/// The writer thread is a connection's single send site. A [`ClientMessageType`]
+/// is an UNFRAMED request: the writer stamps it with the per-connection request
+/// `id` (its own counter, starting at 0). A [`ClientMessage`] is ALREADY framed
+/// by the front-end and is forwarded unchanged — the front-end that owns a
+/// [`crate::pending::PendingReplies`] table allocates the id itself, so it
+/// knows the id its reply will carry and can resolve the slot by it.
+///
+/// This keeps one writer implementation for both shapes while the front-ends
+/// migrate to the framed path; a front-end that has not yet adopted the table
+/// keeps the older stamp-in-the-writer behaviour unchanged.
+pub trait Outbound {
+    /// Frame this payload with the writer-assigned `id`, or forward an
+    /// already-framed message unchanged.
+    fn frame(self, id: u64) -> ClientMessage;
+}
+
+impl Outbound for ClientMessageType {
+    fn frame(self, id: u64) -> ClientMessage {
+        ClientMessage::request(id, self)
+    }
+}
+
+impl Outbound for ClientMessage {
+    fn frame(self, _id: u64) -> ClientMessage {
+        // Already framed by the front-end (which allocated the id so it can
+        // correlate the reply); the writer-assigned id is not applied.
+        self
+    }
+}
+
 /// Read `DaemonMessages` from `reader` in a blocking loop, calling
 /// `handle_daemon_message` for each successfully decoded message.
 ///
@@ -86,10 +118,10 @@ pub fn run_daemon_reader<R: BufRead>(
 /// Returns [`ClientError`] if the unix socket cannot be connected, the
 /// Noise handshake fails, or the connection loop hits an I/O or protocol
 /// error.
-pub fn run_daemon_connection(
+pub fn run_daemon_connection<M: Outbound + Send + 'static>(
     socket_path: &str,
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: CrossbeamReceiver<ClientMessageType>,
+    from_ui: CrossbeamReceiver<M>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     info!("connecting to daemon at {socket_path}");
@@ -120,11 +152,11 @@ pub fn run_daemon_connection(
 /// Returns the error from the first dial if it is classified as more than
 /// "nothing listening", or the retry dial's error verbatim if the autostart
 /// hook ran but the connection still failed.
-pub fn run_daemon_connection_with_autostart(
+pub fn run_daemon_connection_with_autostart<M: Outbound + Send + 'static>(
     socket_path: &str,
     ensure_daemon: &mut dyn FnMut() -> Result<(), ClientError>,
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: CrossbeamReceiver<ClientMessageType>,
+    from_ui: CrossbeamReceiver<M>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     info!("connecting to daemon at {socket_path}");
@@ -146,10 +178,10 @@ pub fn run_daemon_connection_with_autostart(
 /// closes the stream. Split out of `run_daemon_connection` so the autostart
 /// variant can hand over a stream it already dialed (the successful first
 /// dial is never discarded).
-fn pump_connection(
+fn pump_connection<M: Outbound + Send + 'static>(
     stream: UnixStream,
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: CrossbeamReceiver<ClientMessageType>,
+    from_ui: CrossbeamReceiver<M>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     let reader = BufReader::new(stream.try_clone()?);
@@ -160,10 +192,12 @@ fn pump_connection(
     // the reader sends at most one stop signal, so capacity 1 never blocks it.
     let (writer_shutdown_tx, writer_shutdown_rx) = crossbeam_channel::bounded::<()>(1);
 
-    // This writer thread is the client's SINGLE send site: it owns the
-    // per-connection request-id counter and stamps every outbound frame. The
-    // counter starts at 0 and increments per send, never reused for the
-    // connection's life (the daemon echoes the id onto the matching reply).
+    // This writer thread is the client's single send site. It frames each
+    // outbound payload via [`Outbound`]: an unframed `ClientMessageType` gets
+    // the per-connection request-id counter (starts at 0, increments per send,
+    // never reused for the connection's life — the daemon echoes the id onto
+    // the matching reply), while an already-framed `ClientMessage` from a
+    // front-end that owns its own pending table is forwarded unchanged.
     let writer_handle = thread::spawn(move || {
         let mut next_id: u64 = 0;
         loop {
@@ -174,8 +208,8 @@ fn pump_connection(
             // matching the previous drain-then-stop behaviour exactly.
             crossbeam_channel::select_biased! {
                 recv(from_ui) -> msg => match msg {
-                    Ok(inner) => {
-                        let framed = ClientMessage::request(next_id, inner);
+                    Ok(outbound) => {
+                        let framed = outbound.frame(next_id);
                         next_id = next_id.wrapping_add(1);
                         if let Err(e) = write_message(&mut writer, &framed) {
                             warn!("writer thread write error: {e}");
@@ -295,11 +329,11 @@ impl Default for ConnectionMode {
 ///
 /// Returns [`ClientError`] if dialing fails, the Noise IK handshake fails,
 /// or any reader/writer I/O error kills the connection.
-pub fn run_daemon_tcp_connection(
+pub fn run_daemon_tcp_connection<M: Outbound + Send + 'static>(
     addr: &str,
     server_pk: &[u8; 32],
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: CrossbeamReceiver<ClientMessageType>,
+    from_ui: CrossbeamReceiver<M>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     info!("connecting to daemon at {addr}");
@@ -354,12 +388,12 @@ fn ik_handshake_raw(
 /// the caller must dial separately: only then does a `ConnectionRefused`
 /// returned from here unambiguously mean the HANDSHAKE failed, not the
 /// network.
-fn ik_handshake_and_serve(
+fn ik_handshake_and_serve<M: Outbound + Send + 'static>(
     tcp: std::net::TcpStream,
     client_sk: &[u8; 32],
     server_pk: &[u8; 32],
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: CrossbeamReceiver<ClientMessageType>,
+    from_ui: CrossbeamReceiver<M>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     let noise = ik_handshake_raw(tcp, client_sk, server_pk).map_err(|e| {
@@ -397,10 +431,10 @@ fn ik_handshake_and_serve(
 /// Returns [`ClientError`] if dialing fails, the XX handshake fails, the
 /// learned server key is rejected by `on_first_contact`, or an I/O error
 /// kills the connection.
-pub fn run_daemon_tcp_connection_xx_first_contact(
+pub fn run_daemon_tcp_connection_xx_first_contact<M: Outbound + Send + 'static>(
     addr: &str,
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: CrossbeamReceiver<ClientMessageType>,
+    from_ui: CrossbeamReceiver<M>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
     on_first_contact: impl FnOnce([u8; 32]) -> bool,
 ) -> Result<(), ClientError> {
@@ -447,10 +481,10 @@ pub fn run_daemon_tcp_connection_xx_first_contact(
 /// [`run_daemon_tcp_connection_xx_first_contact`] (XX) share one writer/reader
 /// implementation — the two modes differ ONLY in preamble + handshake, not in
 /// how the established transport is served.
-fn serve_noise_connection(
+fn serve_noise_connection<M: Outbound + Send + 'static>(
     mut noise: choreo_transport::noise::NoiseStream,
     mut handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: CrossbeamReceiver<ClientMessageType>,
+    from_ui: CrossbeamReceiver<M>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     // Channel to signal the writer thread to stop when the reader finishes.
@@ -463,15 +497,16 @@ fn serve_noise_connection(
     // message arm is FIRST (biased) so queued UI messages are drained before a
     // simultaneous stop is honoured; no socket-level timeout is set.
     let mut writer = noise.try_clone().map_err(ClientError::Io)?;
-    // The noise writer thread is this connection's single send site: it owns
-    // the per-connection request-id counter and stamps every outbound frame.
+    // The noise writer thread is this connection's single send site: it frames
+    // each outbound payload via [`Outbound`] (an unframed request gets the
+    // per-connection id; an already-framed one is forwarded unchanged).
     let writer_handle = thread::spawn(move || {
         let mut next_id: u64 = 0;
         loop {
             crossbeam_channel::select_biased! {
                 recv(from_ui) -> msg => match msg {
-                    Ok(inner) => {
-                        let framed = ClientMessage::request(next_id, inner);
+                    Ok(outbound) => {
+                        let framed = outbound.frame(next_id);
                         next_id = next_id.wrapping_add(1);
                         if let Err(e) = writer.send_client_message(&framed) {
                             warn!("writer thread error: {e}");
@@ -683,10 +718,10 @@ pub fn verify_daemon_authorization(addr: &str, server_pk: &[u8; 32]) -> Result<(
 ///
 /// Returns [`ClientError`] if dialing or the pinned-key IK handshake fails,
 /// or an I/O error kills the connection.
-pub fn run_daemon_tcp_connection_pinned(
+pub fn run_daemon_tcp_connection_pinned<M: Outbound + Send + 'static>(
     addr: &str,
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: CrossbeamReceiver<ClientMessageType>,
+    from_ui: CrossbeamReceiver<M>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     let known = crate::known_servers::KnownServers::load()?;
@@ -773,11 +808,11 @@ pub fn run_daemon_tcp_connection_pinned(
 /// its end (its `EmbeddedDaemon::shutdown()` delivers `ShuttingDown` as a
 /// value, then closes the channel, which unblocks this reader exactly the
 /// way a daemon EOF unblocks the socket reader).
-fn run_daemon_connection_in_process(
+fn run_daemon_connection_in_process<M: Outbound + Send + 'static>(
     daemon_tx: CrossbeamSender<ClientMessage>,
     daemon_rx: CrossbeamReceiver<DaemonMessage>,
     mut handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: CrossbeamReceiver<ClientMessageType>,
+    from_ui: CrossbeamReceiver<M>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) {
     info!("serving in-process (embedded daemon) connection");
@@ -796,15 +831,16 @@ fn run_daemon_connection_in_process(
     // broken-pipe analogue.  The message arm is FIRST (biased) so queued UI
     // messages are drained before a simultaneous stop is honoured.
     // The in-process writer thread is this connection's single send site: it
-    // owns the per-connection request-id counter and stamps every outbound
-    // frame before forwarding it into the embedded daemon's channel.
+    // frames each outbound payload via [`Outbound`] (an unframed request gets
+    // the per-connection id; an already-framed one is forwarded unchanged)
+    // before forwarding it into the embedded daemon's channel.
     let writer_handle = thread::spawn(move || {
         let mut next_id: u64 = 0;
         loop {
             crossbeam_channel::select_biased! {
                 recv(from_ui) -> msg => match msg {
-                    Ok(inner) => {
-                        let framed = ClientMessage::request(next_id, inner);
+                    Ok(outbound) => {
+                        let framed = outbound.frame(next_id);
                         next_id = next_id.wrapping_add(1);
                         if daemon_tx.send(framed).is_err() {
                             warn!(
@@ -861,10 +897,10 @@ fn run_daemon_connection_in_process(
 ///
 /// Returns [`ClientError`] as raised by the connection mode actually used
 /// (unix, TCP variants, first-contact preflight, or in-process).
-pub fn run_daemon_connection_with_mode(
+pub fn run_daemon_connection_with_mode<M: Outbound + Send + 'static>(
     mode: ConnectionMode,
     handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: CrossbeamReceiver<ClientMessageType>,
+    from_ui: CrossbeamReceiver<M>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
     match mode {

@@ -15,10 +15,10 @@
 use crate::state::{App, Page};
 use crate::{Command, parse_input_line};
 use choreo_client_core::{
-    ClientError, McpCommand, broken_pipe, build_add_credential_message, command_echo,
+    ClientError, McpCommand, PendingContext, build_add_credential_message, command_echo,
     resolve_private_key,
 };
-use choreo_proto::ClientMessageType;
+use choreo_proto::{ClientMessage, ClientMessageType};
 
 /// Send a `ContinueGeneration` for the attached session — the shared body of
 /// the two new-turn triggers that map to it, Alt+Enter and `/continue`.
@@ -35,9 +35,10 @@ use choreo_proto::ClientMessageType;
 /// With no session attached it reports "no session attached" and sends
 /// nothing.  Returns `Ok(())` whether the turn was sent or refused; only a
 /// broken client channel is an error, so callers can `?` this directly.
+#[expect(clippy::unnecessary_wraps)]
 fn send_continue_generation(
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
     echo: bool,
 ) -> Result<(), ClientError> {
     if app.attached_session_id.is_none() {
@@ -65,9 +66,10 @@ fn send_continue_generation(
     if let Some(display) = app.active_display() {
         display.active.insert(stream_id);
     }
-    client_tx
-        .send(ClientMessageType::ContinueGeneration { stream_id })
-        .map_err(broken_pipe)?;
+    app.pending.send(
+        client_tx,
+        ClientMessageType::ContinueGeneration { stream_id },
+    );
     app.scroll_to(0);
     Ok(())
 }
@@ -79,24 +81,24 @@ fn send_continue_generation(
 /// routes mouse events away from the history-pane selection arms, so a mid-drag
 /// open must not leave a dangling gesture that swallows the first click after
 /// the selector closes.
+#[expect(clippy::unnecessary_wraps)]
 fn open_model_selector(
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     tracing::debug!("[choreo-tui] opening model selector");
     app.text_selection = None;
     app.model_selector.open();
-    client_tx
-        .send(ClientMessageType::ListModels)
-        .map_err(broken_pipe)?;
+    app.pending.send(client_tx, ClientMessageType::ListModels);
     Ok(())
 }
 
 /// Open the session manager, highlighting the session the user was just viewing
 /// — the shared body of the `Alt+S` shortcut and the bare `/session` command.
+#[expect(clippy::unnecessary_wraps)]
 fn open_session_manager(
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     tracing::debug!("[choreo-tui] navigating to session manager");
     // Record the viewed session so the ListSessions reply lands the highlight
@@ -105,26 +107,22 @@ fn open_session_manager(
         app.session_mgr.select_session(session_id);
     }
     app.set_page(Page::SessionManager);
-    client_tx
-        .send(ClientMessageType::ListSessions)
-        .map_err(broken_pipe)?;
-    client_tx
-        .send(ClientMessageType::SubscribeSessionsSummary)
-        .map_err(broken_pipe)?;
+    app.pending.send(client_tx, ClientMessageType::ListSessions);
+    app.pending
+        .send(client_tx, ClientMessageType::SubscribeSessionsSummary);
     Ok(())
 }
 
 /// Open the AI-provider accounts page — the shared body of the `Alt+A`
 /// shortcut and the bare `/account` command.
+#[expect(clippy::unnecessary_wraps)]
 fn open_accounts_page(
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     tracing::debug!("[choreo-tui] navigating to AI provider accounts");
     app.set_page(Page::AIProviders);
-    client_tx
-        .send(ClientMessageType::ListAccounts)
-        .map_err(broken_pipe)?;
+    app.pending.send(client_tx, ClientMessageType::ListAccounts);
     Ok(())
 }
 
@@ -136,9 +134,10 @@ fn open_accounts_page(
 /// bounds-checked against the cached capability, and a distinct message for
 /// "not supported" (an empty level set) versus "not yet known" (`None` with a
 /// model selected) versus "no model selected".
+#[expect(clippy::unnecessary_wraps)]
 fn cycle_reasoning(
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     let Some(display) = app.active_display_ref() else {
         // No session attached — there is no display whose capability could be
@@ -176,9 +175,10 @@ fn cycle_reasoning(
                     next = %next,
                     "cycling reasoning effort",
                 );
-                client_tx
-                    .send(ClientMessageType::SetReasoningEffort { effort: next })
-                    .map_err(broken_pipe)?;
+                app.pending.send(
+                    client_tx,
+                    ClientMessageType::SetReasoningEffort { effort: next },
+                );
             } else {
                 // `cycle_from` only returns None for an empty level set, which
                 // the guard above already handled — this is a defensive
@@ -261,7 +261,7 @@ pub(super) fn run_command(
     command: Command,
     echo: bool,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     match command {
         Command::Empty => {}
@@ -335,7 +335,7 @@ pub(super) fn run_command(
                     display.active.insert(*stream_id);
                 }
             }
-            client_tx.send(message).map_err(broken_pipe)?;
+            app.pending.send(client_tx, message);
 
             // Scroll the history view to the bottom so the user can see their
             // submitted message appear as the daemon processes it.
@@ -344,10 +344,17 @@ pub(super) fn run_command(
         Command::Unlock { method } => {
             match resolve_private_key(&method, &app.connection_addr) {
                 Ok(private_key) => {
-                    // Hold the key until the daemon CONFIRMS the unlock, then
-                    // record it per-daemon.
-                    app.pending_unlock_key = Some(private_key.clone());
-                    let _ = client_tx.send(ClientMessageType::Unlock { private_key });
+                    // Hold the key in the request's pending context until the
+                    // daemon CONFIRMS the unlock (records it per-daemon) or
+                    // rejects it (drops it).
+                    let id = app.pending.send(
+                        client_tx,
+                        ClientMessageType::Unlock {
+                            private_key: private_key.clone(),
+                        },
+                    );
+                    app.pending
+                        .set_context(id, PendingContext::UnlockKey(private_key));
                 }
                 Err(e) => {
                     tracing::warn!("[choreo-tui] unlock failed: {e}");
@@ -373,9 +380,10 @@ pub(super) fn run_command(
             ) {
                 Ok((msg, key)) => {
                     // Record only after the daemon CONFIRMS (CredentialAdded /
-                    // Unlocked) — see `record_confirmed_unlock_key`.
-                    app.pending_unlock_key = Some(key);
-                    let _ = client_tx.send(msg);
+                    // Unlocked): the key rides the request's pending context
+                    // (see `record_confirmed_unlock_key`).
+                    let id = app.pending.send(client_tx, msg);
+                    app.pending.set_context(id, PendingContext::UnlockKey(key));
                 }
                 Err(e) => {
                     tracing::warn!("[choreo-tui] add credential failed: {e}");
@@ -390,9 +398,12 @@ pub(super) fn run_command(
             {
                 app.status = Some(text);
             }
-            let _ = client_tx.send(ClientMessageType::AclAdd {
-                pubkey: pubkey.clone(),
-            });
+            app.pending.send(
+                client_tx,
+                ClientMessageType::AclAdd {
+                    pubkey: pubkey.clone(),
+                },
+            );
         }
         Command::RemoveCredential { ref service } => {
             if echo
@@ -402,21 +413,24 @@ pub(super) fn run_command(
             {
                 app.status = Some(text);
             }
-            let _ = client_tx.send(ClientMessageType::RemoveCredential {
-                service: service.clone(),
-            });
+            app.pending.send(
+                client_tx,
+                ClientMessageType::RemoveCredential {
+                    service: service.clone(),
+                },
+            );
         }
         Command::Undo => {
             if echo && let Some(text) = command_echo(&Command::Undo) {
                 app.status = Some(text);
             }
-            let _ = client_tx.send(ClientMessageType::Undo);
+            app.pending.send(client_tx, ClientMessageType::Undo);
         }
         Command::Redo => {
             if echo && let Some(text) = command_echo(&Command::Redo) {
                 app.status = Some(text);
             }
-            let _ = client_tx.send(ClientMessageType::Redo);
+            app.pending.send(client_tx, ClientMessageType::Redo);
         }
         Command::Continue => {
             // `/continue` (or Alt+Enter) — same guard, same
@@ -432,9 +446,8 @@ pub(super) fn run_command(
             // whatever request is currently active on the attached session and
             // all its children.
             if app.attached_session_id.is_some() {
-                client_tx
-                    .send(ClientMessageType::Cancel { stream_id: 0 })
-                    .map_err(broken_pipe)?;
+                app.pending
+                    .send(client_tx, ClientMessageType::Cancel { stream_id: 0 });
             } else {
                 app.status = Some("no session attached".to_string());
             }
@@ -444,9 +457,8 @@ pub(super) fn run_command(
             // ModelsRefreshed / ModelsRefreshFailed.
             let suffix = if force { " (forced)" } else { "" };
             app.status = Some(format!("refreshing models…{suffix}"));
-            client_tx
-                .send(ClientMessageType::RefreshModels { force })
-                .map_err(broken_pipe)?;
+            app.pending
+                .send(client_tx, ClientMessageType::RefreshModels { force });
         }
         Command::Mcp(mcp) => {
             if echo && let Some(text) = command_echo(&Command::Mcp(mcp.clone())) {
@@ -456,42 +468,32 @@ pub(super) fn run_command(
                 McpCommand::Status => {
                     // The daemon replies asynchronously with McpStatus; the
                     // reply handler renders the per-server lines.
-                    client_tx
-                        .send(ClientMessageType::McpStatusRequest)
-                        .map_err(broken_pipe)?;
+                    app.pending
+                        .send(client_tx, ClientMessageType::McpStatusRequest);
                 }
                 McpCommand::Reconnect { slug } => {
                     // Immediate feedback; the reply is a refreshed McpStatus
                     // (success) or McpReconnectFailed.
                     app.status = Some(format!("reconnecting MCP server {slug}…"));
-                    client_tx
-                        .send(ClientMessageType::McpReconnect { slug })
-                        .map_err(broken_pipe)?;
+                    app.pending
+                        .send(client_tx, ClientMessageType::McpReconnect { slug });
                 }
                 McpCommand::Reload => {
                     // Immediate feedback; the reply is McpReloaded (success) or
                     // McpReloadFailed.
                     app.status = Some("reloading MCP configuration…".to_string());
-                    client_tx
-                        .send(ClientMessageType::McpReload)
-                        .map_err(broken_pipe)?;
+                    app.pending.send(client_tx, ClientMessageType::McpReload);
                 }
                 McpCommand::Trust => {
                     app.status = Some("trusting project MCP root…".to_string());
-                    client_tx
-                        .send(ClientMessageType::McpTrust)
-                        .map_err(broken_pipe)?;
+                    app.pending.send(client_tx, ClientMessageType::McpTrust);
                 }
                 McpCommand::Untrust => {
                     app.status = Some("revoking project MCP trust…".to_string());
-                    client_tx
-                        .send(ClientMessageType::McpUntrust)
-                        .map_err(broken_pipe)?;
+                    app.pending.send(client_tx, ClientMessageType::McpUntrust);
                 }
                 McpCommand::TrustList => {
-                    client_tx
-                        .send(ClientMessageType::McpTrustList)
-                        .map_err(broken_pipe)?;
+                    app.pending.send(client_tx, ClientMessageType::McpTrustList);
                 }
             }
         }
@@ -535,7 +537,7 @@ pub(super) fn run_named(
     name: &str,
     echo: bool,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     let command = parse_input_line(&format!("/{name}"), &mut app.next_request_id);
     run_command(command, echo, app, client_tx)

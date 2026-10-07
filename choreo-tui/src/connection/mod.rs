@@ -4,10 +4,10 @@ use crate::render::render;
 use crate::state::{AccountWizardStep, App, Page, UiEvent};
 use crate::terminal_progress;
 use choreo_client_core::{
-    ClientError, ConnectionMode, run_daemon_connection_with_autostart,
+    ClientError, ConnectionMode, PendingContext, run_daemon_connection_with_autostart,
     run_daemon_connection_with_mode,
 };
-use choreo_proto::ClientMessageType;
+use choreo_proto::{ClientMessage, ClientMessageType};
 use crossbeam_channel as channel;
 use crossbeam_channel::select;
 use crossterm::event::{
@@ -187,7 +187,7 @@ fn notify_disconnected(rx: &channel::Receiver<()>) -> bool {
 pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     tracing::info!("[choreo-tui] run_app starting");
 
-    let (client_tx, client_rx) = crossbeam_channel::unbounded::<ClientMessageType>();
+    let (client_tx, client_rx) = crossbeam_channel::unbounded::<ClientMessage>();
     // The address that keys this daemon's unlock key in known_servers: the
     // actual dial address for TCP, the unix socket path otherwise. Derived
     // up front (by reference) because `mode` is moved into the connection
@@ -574,8 +574,17 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     // daemon CONFIRMS (`Unlocked`), so a rejected key is never persisted.
     if let Some(private_key) = choreo_client_core::try_auto_unlock_key(&app.connection_addr) {
         tracing::info!("[choreo-tui] auto-unlocking daemon on connect");
-        app.pending_unlock_key = Some(private_key.clone());
-        let _ = client_tx.send(ClientMessageType::Unlock { private_key });
+        // The key rides the request's pending context so the daemon's reply
+        // (`Unlocked`/`KeystoreUnbound`/`LockedError`) resolves it and records
+        // or discards it — one confirm flow for every sender.
+        let id = app.pending.send(
+            &client_tx,
+            ClientMessageType::Unlock {
+                private_key: private_key.clone(),
+            },
+        );
+        app.pending
+            .set_context(id, PendingContext::UnlockKey(private_key));
     } else {
         tracing::info!("[choreo-tui] no unlock key available — awaiting keystore status");
         // Startup feedback while the daemon's authoritative keystore status
@@ -592,15 +601,12 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         );
     }
 
-    client_tx
-        .send(ClientMessageType::ListSessions)
-        .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
-    client_tx
-        .send(ClientMessageType::ListAccounts)
-        .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
-    client_tx
-        .send(ClientMessageType::SubscribeAllActivity)
-        .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
+    app.pending
+        .send(&client_tx, ClientMessageType::ListSessions);
+    app.pending
+        .send(&client_tx, ClientMessageType::ListAccounts);
+    app.pending
+        .send(&client_tx, ClientMessageType::SubscribeAllActivity);
     let result = run_ui_loop(
         &mut terminal,
         &mut app,
@@ -674,7 +680,7 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
 fn run_ui_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
     ui_rx: &channel::Receiver<UiEvent>,
     image_result_rx: &channel::Receiver<ImageResult>,
     terminal_rx: &channel::Receiver<Event>,
@@ -775,6 +781,27 @@ fn run_ui_loop(
             if !progress {
                 break;
             }
+        }
+
+        // Sweep the pending-request table for requests whose reply never
+        // arrived within their per-kind budget. The sweep is driven by the UI
+        // tick (an event just woke the loop) rather than a timer channel, per
+        // the workspace's event-driven rule; a timeout surfaces on the status
+        // line and drops the slot. Runs before the no-op short-circuit so a
+        // control-flow-only event still lets a timeout through.
+        for timeout in app.pending.expire(std::time::Instant::now()) {
+            tracing::warn!(
+                id = timeout.id,
+                kind = ?timeout.kind,
+                elapsed_secs = timeout.elapsed.as_secs_f64(),
+                "request timed out without a daemon reply"
+            );
+            app.status = Some(format!(
+                "[daemon] {:?} timed out after {:.0}s",
+                timeout.kind,
+                timeout.elapsed.as_secs_f64()
+            ));
+            dirty = true;
         }
 
         // Skip rendering entirely when nothing has changed.
@@ -943,7 +970,7 @@ fn shift_char(c: char) -> char {
 pub(crate) fn handle_terminal_event(
     event: Event,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     // Normalise kitty-protocol SHIFT reporting before anything else so the
     // paste guard and all page handlers see legacy-equivalent events.
@@ -1116,7 +1143,7 @@ fn paste_into_text_state(state: &mut impl tui_prompts::State, data: &str) {
 fn handle_fullscreen_event(
     event: &Event,
     app: &mut App,
-    _client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    _client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) {
     let Event::Key(key) = event else {
         return;
@@ -1137,7 +1164,7 @@ fn handle_fullscreen_event(
 fn handle_ui_event(
     event: UiEvent,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<bool, ClientError> {
     match event {
         UiEvent::Daemon(message) => {
@@ -1178,48 +1205,35 @@ fn handle_ui_event(
     }
 }
 
-/// How a routed per-session daemon message should be handled by the caller
-/// after `route_session_update` has applied the display update.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SessionUpdateRouting {
-    /// The message belongs to the attached session (or a connection-level
-    /// `None` reply) — the caller should fall through to the generic dispatch
-    /// so the user sees the status/error feedback for their own command.
-    FallThrough,
-    /// The message belongs to a background session — the per-session display
-    /// was already updated, but the caller must not fall through: the generic
-    /// dispatch would rewrite the global status/error line the user is
-    /// looking at (reflowing the viewed viewport).
-    Suppress,
-}
-
 /// Route a per-session display update for a daemon-reported session id and
-/// report whether the message must also fall through to the generic dispatch.
+/// report whether the message should also fall through to the generic
+/// dispatch.
 ///
-/// Connection-level replies carry `session_id: None` (no origin session —
-/// e.g. a "no session attached" failure or a bare `GetReasoningEffort` reply
-/// without an attachment), so `resolve_daemon_session` maps them (and every
-/// real id) to the session whose display `update` mutates — never a phantom
-/// entry.  Background messages (a real session that is not the attached one)
-/// still get their display updated, so the per-session state is already
-/// correct when the user switches to it, but they must not fall through.
-/// Returns [`SessionUpdateRouting::Suppress`] for background noise — the
-/// caller should log and return early — or
-/// [`SessionUpdateRouting::FallThrough`] for the attached session /
-/// connection-level (`None`) replies.
+/// The display update lands on the session the message names
+/// ([`App::resolve_daemon_session`]): a real id updates that session's display,
+/// and a connection-level reply (`None`, no origin — e.g. a bare
+/// `GetReasoningEffort` reply without an attachment, or a "no session
+/// attached" failure) resolves to the attached session, never a phantom entry.
+/// Background sessions (a real id that is not the attached one) still get
+/// their display updated — so the per-session state is correct when the user
+/// switches to it — but must not rewrite the global status/error line.
+///
+/// The fall-through decision is now structural rather than a UI-state guess: a
+/// **targeted reply** (`reply_id: Some`, the answer to this client's own
+/// request) always falls through so the user sees feedback for the command they
+/// issued, while a **broadcast** (`reply_id: None`) from a background session is
+/// suppressed. Returns `true` to fall through, `false` to suppress (the caller
+/// logs and returns early).
 pub(super) fn route_session_update(
     app: &mut App,
     reported: Option<u64>,
+    reply_id: Option<u64>,
     update: impl FnOnce(&mut App, u64),
-) -> SessionUpdateRouting {
+) -> bool {
     if let Some(session_id) = app.resolve_daemon_session(reported) {
         update(app, session_id);
     }
-    if app.is_background_session_message(reported) {
-        SessionUpdateRouting::Suppress
-    } else {
-        SessionUpdateRouting::FallThrough
-    }
+    !(reply_id.is_none() && app.is_background_session_message(reported))
 }
 
 /// Shared skeleton for the two full-page list mouse handlers (the AI-providers

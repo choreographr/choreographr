@@ -21,6 +21,9 @@
 //!   that turns protocol events into UI callbacks.
 //! - [`shell`] — the shared command-line parser ([`parse_input_line`]) for the
 //!   TUI's input box.
+//! - [`pending`] — the client's pending-request table ([`PendingReplies`]),
+//!   the single outbound path plus the reply-correlation side table every
+//!   front-end routes its requests through.
 //! - [`history`] — the read-only session view ([`SessionView`]) assembling
 //!   transcript state for rendering.
 //! - [`diff`] — the unified-diff data model ([`FileDiff`] and friends) the
@@ -44,6 +47,7 @@ pub mod dispatch;
 pub mod error;
 pub mod history;
 pub mod known_servers;
+pub mod pending;
 pub mod shell;
 
 // Test-only fixtures, compiled solely when a dependent crate opts into the
@@ -57,9 +61,9 @@ pub use command_catalog::{
     CommandGroup, CommandMatch, CommandSpec, command_catalog, match_commands,
 };
 pub use connection::{
-    ConnectionMode, PreflightError, own_transport_pubkey, probe_server_key, run_daemon_connection,
-    run_daemon_connection_with_autostart, run_daemon_connection_with_mode, run_daemon_reader,
-    run_daemon_tcp_connection, run_daemon_tcp_connection_pinned,
+    ConnectionMode, Outbound, PreflightError, own_transport_pubkey, probe_server_key,
+    run_daemon_connection, run_daemon_connection_with_autostart, run_daemon_connection_with_mode,
+    run_daemon_reader, run_daemon_tcp_connection, run_daemon_tcp_connection_pinned,
     run_daemon_tcp_connection_xx_first_contact, verify_daemon_authorization,
 };
 pub use credentials::{
@@ -72,6 +76,7 @@ pub use dispatch::{SessionStateData, ToolCallEvent, TurnEventHandler, dispatch_d
 pub use error::{ClientError, broken_pipe};
 pub use history::SessionView;
 pub use known_servers::{KnownServerEntry, KnownServers, known_servers_path};
+pub use pending::{Pending, PendingContext, PendingReplies, Timeout, deadline_for};
 pub use shell::{
     Command, McpCommand, UnlockMethod, command_echo, is_valid_account_name, parse_input_line,
 };

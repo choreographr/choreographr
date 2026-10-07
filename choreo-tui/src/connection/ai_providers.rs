@@ -2,15 +2,15 @@ use crate::state::{
     AccountWizardStep, App, Page, PolkadotImportStep, ai_providers_list_click_index,
     apply_selector_left_click,
 };
-use choreo_client_core::{ClientError, broken_pipe, is_valid_account_name};
-use choreo_proto::ClientMessageType;
+use choreo_client_core::{ClientError, PendingContext, is_valid_account_name};
+use choreo_proto::{ClientMessage, ClientMessageType};
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use tui_prompts::State;
 
 pub(super) fn handle_ai_providers_event(
     event: &Event,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     // The wizard and credential modals are dispatched from `handle_ui_event`
     // before this function; only the accounts list reaches here.
@@ -21,10 +21,11 @@ pub(super) fn handle_ai_providers_event(
     }
 }
 
+#[expect(clippy::unnecessary_wraps)]
 fn handle_ai_providers_list_key(
     key: crossterm::event::KeyEvent,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     if key.kind != KeyEventKind::Press {
         return Ok(());
@@ -42,9 +43,10 @@ fn handle_ai_providers_list_key(
             KeyCode::Char('y' | 'Y') => {
                 if let Some(name) = app.ai_providers.confirm_remove.take() {
                     tracing::info!(name, "sending RemoveAccount");
-                    client_tx
-                        .send(ClientMessageType::RemoveAccount { name: name.clone() })
-                        .map_err(broken_pipe)?;
+                    app.pending.send(
+                        client_tx,
+                        ClientMessageType::RemoveAccount { name: name.clone() },
+                    );
                 }
             }
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
@@ -79,9 +81,8 @@ fn handle_ai_providers_list_key(
                 // accounts page instead of being stranded on Chat with an
                 // un-sent selection.
                 tracing::debug!(name, "selecting account for the active session");
-                client_tx
-                    .send(ClientMessageType::SetSessionAccount { name })
-                    .map_err(broken_pipe)?;
+                app.pending
+                    .send(client_tx, ClientMessageType::SetSessionAccount { name });
                 app.set_page(Page::Chat);
             }
         }
@@ -134,7 +135,7 @@ fn handle_ai_providers_list_key(
 fn handle_ai_providers_list_mouse(
     mouse: MouseEvent,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     super::handle_full_page_list_mouse(
         app,
@@ -168,9 +169,8 @@ fn handle_ai_providers_list_mouse(
                 // leaves the user on the accounts page, not stranded on Chat
                 // with an un-sent selection.
                 tracing::debug!(name, "selecting account via click");
-                client_tx
-                    .send(ClientMessageType::SetSessionAccount { name })
-                    .map_err(broken_pipe)?;
+                app.pending
+                    .send(client_tx, ClientMessageType::SetSessionAccount { name });
                 app.set_page(Page::Chat);
             }
             Ok(())
@@ -184,7 +184,7 @@ fn handle_ai_providers_list_mouse(
 pub(super) fn handle_credential_modal_event(
     event: &Event,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) {
     let Event::Key(key) = event else {
         return;
@@ -226,9 +226,12 @@ pub(super) fn handle_credential_modal_event(
                 vec![api_key],
             ) {
                 Ok((msg, key)) => {
-                    app.pending_unlock_key = Some(key);
+                    // The unlock key rides the request's pending context so the
+                    // daemon's confirmation (`CredentialAdded`/`Unlocked`)
+                    // records it per-daemon.
                     tracing::info!(account_name, "credential encrypted and sent");
-                    let _ = client_tx.send(msg);
+                    let id = app.pending.send(client_tx, msg);
+                    app.pending.set_context(id, PendingContext::UnlockKey(key));
                     app.status = Some(format!(
                         "[daemon] credential stored for account: {account_name}"
                     ));
@@ -262,7 +265,7 @@ pub(super) fn handle_credential_modal_event(
 pub(super) fn handle_polkadot_import_event(
     event: &Event,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) {
     let Event::Key(key) = event else {
         return;
@@ -336,7 +339,7 @@ pub(super) fn handle_polkadot_import_event(
 ///
 /// The password is used only here (client-side), never logged and never sent
 /// to the daemon; it is zeroized on every exit path.
-fn submit_polkadot_import(app: &mut App, client_tx: &crossbeam_channel::Sender<ClientMessageType>) {
+fn submit_polkadot_import(app: &mut App, client_tx: &crossbeam_channel::Sender<ClientMessage>) {
     let name = app
         .ai_providers
         .polkadot_import
@@ -384,11 +387,10 @@ fn submit_polkadot_import(app: &mut App, client_tx: &crossbeam_channel::Sender<C
             name,
             "sent encrypted Substrate credential to daemon"
         );
-        app.pending_unlock_key = Some(key);
-        client_tx
-            .send(msg)
-            .map_err(broken_pipe)
-            .map_err(|e| e.to_string())?;
+        // The unlock key rides the request's pending context so the daemon's
+        // confirmation records it per-daemon.
+        let id = app.pending.send(client_tx, msg);
+        app.pending.set_context(id, PendingContext::UnlockKey(key));
         Ok(format!(
             "[daemon] Substrate account '{name}' stored ({account_id}); unlock the daemon to sign with it"
         ))
@@ -420,7 +422,7 @@ fn submit_polkadot_import(app: &mut App, client_tx: &crossbeam_channel::Sender<C
 pub(super) fn handle_account_wizard_event(
     event: &Event,
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     match event {
         Event::Key(key) => {
@@ -562,9 +564,10 @@ pub(super) fn handle_account_wizard_event(
 /// Send `AddAccount` for the slug entered in step 2, then close the wizard and
 /// auto-open the credential modal so the user can immediately paste an API
 /// key.
+#[expect(clippy::unnecessary_wraps)]
 fn submit_new_account(
     app: &mut App,
-    client_tx: &crossbeam_channel::Sender<ClientMessageType>,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     let slug = app.ai_providers.wizard.slug.value().trim().to_string();
     let provider_str = app
@@ -586,8 +589,9 @@ fn submit_new_account(
 
     // Create the account (no credential yet — the credential modal handles
     // that next).
-    client_tx
-        .send(ClientMessageType::AddAccount {
+    app.pending.send(
+        client_tx,
+        ClientMessageType::AddAccount {
             name: slug.clone(),
             provider: provider_str,
             base_url: None,
@@ -596,8 +600,8 @@ fn submit_new_account(
             connect_timeout_secs: None,
             request_timeout_secs: None,
             total_timeout_secs: None,
-        })
-        .map_err(broken_pipe)?;
+        },
+    );
 
     // Close the wizard and immediately open the credential modal for the
     // account just created.
