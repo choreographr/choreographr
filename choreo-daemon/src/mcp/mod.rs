@@ -424,10 +424,13 @@ impl McpManager {
     /// three connection collections being empty *is* the "nothing to do"
     /// condition — nothing else on the manager is a live connection.
     pub fn shutdown_all(&mut self) {
-        let total = self.servers.len() + self.project_shared.len() + self.session_slots.len();
-        if total == 0 {
+        // `is_empty` is the single definition of "nothing left to shut down",
+        // shared with the public predicate, so the no-op guard cannot drift from
+        // the emptiness check the rest of the manager relies on.
+        if self.is_empty() {
             return;
         }
+        let total = self.servers.len() + self.project_shared.len() + self.session_slots.len();
         info!(count = total, "shutting down MCP servers");
         for (slug, slot) in self.servers.drain() {
             debug!(server = %slug, "shutting down MCP server");
