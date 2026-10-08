@@ -414,8 +414,20 @@ impl McpManager {
     }
 
     /// Shut down all MCP servers, joining each dispatcher with a bounded wait.
+    ///
+    /// Idempotent: a call with nothing left to shut down is a silent no-op.
+    /// On the normal teardown path the command loop calls this explicitly (see
+    /// `start_daemon_core`), and the manager's own `Drop` — the panic-path
+    /// safety net — calls it a second time when `DaemonState` is dropped; the
+    /// second call must not repeat the begin/end log pair for work the first
+    /// already did. Every drained slot closes its connection on drop, so the
+    /// three connection collections being empty *is* the "nothing to do"
+    /// condition — nothing else on the manager is a live connection.
     pub fn shutdown_all(&mut self) {
         let total = self.servers.len() + self.project_shared.len() + self.session_slots.len();
+        if total == 0 {
+            return;
+        }
         info!(count = total, "shutting down MCP servers");
         for (slug, slot) in self.servers.drain() {
             debug!(server = %slug, "shutting down MCP server");
@@ -464,6 +476,12 @@ impl McpManager {
 
 #[cfg(feature = "mcp")]
 impl Drop for McpManager {
+    /// Safety net for the paths that drop the manager WITHOUT the command
+    /// loop's explicit [`McpManager::shutdown_all`] call — a panicking command
+    /// loop, or a manager built outside the daemon (tests). On the normal path
+    /// it finds nothing to do and returns silently, because `shutdown_all` is
+    /// idempotent; keeping it unconditional means a manager is always joined
+    /// with the same bounded wait no matter how it goes out of scope.
     fn drop(&mut self) {
         self.shutdown_all();
     }
@@ -488,6 +506,30 @@ mod tests {
         let mut manager = McpManager::empty();
         manager.shutdown_all();
         assert!(manager.is_empty());
+    }
+
+    #[test]
+    fn shutdown_all_ignores_bookkeeping_and_is_idempotent() {
+        // `configs`/`order`/`failures` are bookkeeping, not live connections: a
+        // manager configured with a server that never connected has NOTHING to
+        // shut down, so repeated calls are no-ops that leave the config view
+        // intact. This is exactly the normal teardown sequence — the command
+        // loop calls `shutdown_all` explicitly and the manager's `Drop` calls
+        // it again — so the second call must not re-emit the begin/end log pair
+        // over already-drained collections.
+        let mut manager = McpManager::empty();
+        manager.order = vec!["never-connected".to_string()];
+        manager.configs.insert(
+            "never-connected".to_string(),
+            stdio_entry("never-connected", true),
+        );
+
+        manager.shutdown_all();
+        manager.shutdown_all();
+
+        assert!(manager.is_empty());
+        assert_eq!(manager.order, ["never-connected"]);
+        assert!(manager.configs.contains_key("never-connected"));
     }
 
     #[test]
