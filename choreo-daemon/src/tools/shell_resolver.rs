@@ -2,9 +2,9 @@
 //!
 //! The `sh` tool no longer asks the model to pick a shell: at daemon startup it
 //! resolves the best available Unix-compatible shell, caches the decision, and
-//! advertises the resolved shell (type + compatibility mode + version) in the
-//! tool description. The model writes portable POSIX `sh` and the tool routes
-//! the command to whatever interpreter this machine offers.
+//! advertises the resolved shell (type + compatibility mode + version) and the
+//! capability tier it provides in the tool description, so the model writes for
+//! the dialect this machine actually runs.
 //!
 //! Resolution is **tier-major, lazy, and cached**: shell *types* are walked in a
 //! fixed order (`bash >= 4 > zsh > ksh/mksh > dash > ash > busybox(ash)`) and
@@ -626,8 +626,9 @@ const KSH_VERSION_PROBE: &str = r#"printf '%s' "${KSH_VERSION:-}""#;
 const KSH93_VERSION_PROBE: &str = r#"printf '%s' "${.sh.version}""#;
 
 /// Build the model-facing tool description: shell type + compatibility mode +
-/// version, and NEVER the filesystem path (the interpreter varies by machine, so
-/// the model is told what it is running under, not where it lives).
+/// version + the capability tier the resolved shell provides, and NEVER the
+/// filesystem path (the model is told what it runs under and what that dialect
+/// offers, not where the binary lives).
 fn build_description(kind: ShellKind, version: Option<&str>) -> String {
     let shell = match kind {
         ShellKind::Bash => "bash",
@@ -650,23 +651,27 @@ fn build_description(kind: ShellKind, version: Option<&str>) -> String {
         ShellKind::Zsh => ", sh-compatibility mode",
         _ => "",
     };
+    // The capability line states exactly what this resolved shell offers, so the
+    // model writes for the dialect the machine actually runs rather than a
+    // lowest-common-denominator POSIX subset. zsh is invoked in sh-emulation
+    // mode (see [`build_resolved`]), so only POSIX syntax is safe there.
+    let capability = match kind {
+        ShellKind::Bash => {
+            "bash >=4 features such as arrays, `[[ ]]`, and `mapfile` are available."
+        }
+        ShellKind::Zsh => "POSIX `sh` syntax only; zsh-specific syntax is disabled.",
+        ShellKind::Ksh => {
+            "POSIX `sh` plus ksh extensions such as arrays, `[[ ]]`, and `(( ))` are available."
+        }
+        ShellKind::Dash | ShellKind::Ash | ShellKind::BusyboxAsh => "POSIX `sh` only.",
+    };
 
-    let mut description = format!(
+    format!(
         "Execute a POSIX shell command. On this system, commands run under \
-         {subject}{compat}. Because the interpreter varies by machine, write \
-         portable POSIX `sh` — it runs correctly here and everywhere."
-    );
-    if kind == ShellKind::Bash {
-        description.push_str(
-            " bash >=4 extensions such as arrays, `[[ ]]`, and `mapfile` are available here.",
-        );
-    }
-    description.push_str(
-        " Supports pipes, redirects, glob expansion, and environment variables. Prefer this \
-         over `exec` when you need shell features. Non-interactive only — commands that read \
-         from stdin will hang.",
-    );
-    description
+         {subject}{compat}. {capability} Supports pipes, redirects, glob expansion, and \
+         environment variables. Prefer this over `exec` when you need shell features. \
+         Non-interactive only — commands that read from stdin will hang."
+    )
 }
 
 #[cfg(test)]
@@ -1058,6 +1063,54 @@ mod tests {
             Some("1.0.10".into()),
         );
         assert!(ksh.description.contains("ksh 1.0.10"));
+    }
+
+    #[test]
+    fn description_states_each_tier_capability() {
+        // Every tier advertises exactly what its resolved shell offers, and the
+        // shared tail is identical across tiers. The bash string is asserted in
+        // full to pin the overall shape (subject → capability → shared tail).
+        let bash = build_description(ShellKind::Bash, Some("5.3.20"));
+        assert_eq!(
+            bash,
+            "Execute a POSIX shell command. On this system, commands run under bash 5.3.20. \
+             bash >=4 features such as arrays, `[[ ]]`, and `mapfile` are available. Supports \
+             pipes, redirects, glob expansion, and environment variables. Prefer this over \
+             `exec` when you need shell features. Non-interactive only — commands that read \
+             from stdin will hang."
+        );
+
+        assert_eq!(
+            build_description(ShellKind::Zsh, Some("5.9")),
+            "Execute a POSIX shell command. On this system, commands run under zsh 5.9, \
+             sh-compatibility mode. POSIX `sh` syntax only; zsh-specific syntax is disabled. \
+             Supports pipes, redirects, glob expansion, and environment variables. Prefer this \
+             over `exec` when you need shell features. Non-interactive only — commands that \
+             read from stdin will hang."
+        );
+
+        assert_eq!(
+            build_description(ShellKind::Ksh, Some("1.0.10")),
+            "Execute a POSIX shell command. On this system, commands run under ksh 1.0.10. \
+             POSIX `sh` plus ksh extensions such as arrays, `[[ ]]`, and `(( ))` are \
+             available. Supports pipes, redirects, glob expansion, and environment \
+             variables. Prefer this over `exec` when you need shell features. \
+             Non-interactive only — commands that read from stdin will hang."
+        );
+
+        // dash and ash share the minimal POSIX line; busybox's subject still names
+        // the BusyBox version while its capability line stays minimal.
+        for kind in [ShellKind::Dash, ShellKind::Ash] {
+            let description = build_description(kind, None);
+            assert!(
+                description.contains("POSIX `sh` only."),
+                "{kind:?}: {description}"
+            );
+            assert!(!description.contains("are available"));
+        }
+        let busybox = build_description(ShellKind::BusyboxAsh, Some("1.36.1"));
+        assert!(busybox.contains("ash (BusyBox 1.36.1)"));
+        assert!(busybox.contains("POSIX `sh` only."));
     }
 
     #[test]
