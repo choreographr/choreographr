@@ -22,6 +22,11 @@
 //! PATH-lookup closure, a realpath closure, and a run-and-capture closure — as
 //! parameters, so its tier/version selection is unit-testable across every
 //! platform from any host with no real filesystem, subprocess, or sleep.
+//!
+//! The real run-and-capture closure ([`run_program`]) executes every probe
+//! through the shared shell watchdog, so each run is bounded by
+//! `PROBE_TIMEOUT_MS` and inherits the daemon's child hardening (env
+//! sanitization + process-group isolation) rather than running unbounded.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -223,16 +228,29 @@ fn which_lookup(path_env: Option<&OsString>, name: &str) -> Vec<PathBuf> {
     }
 }
 
+/// How long a single probe run may take before the watchdog kills its process
+/// tree. A probe is a trivial `-c` command that answers in milliseconds; the
+/// bound exists only so a wedged or hostile candidate reached through PATH (or
+/// forced via `CHOREO_SHELL`) can never hang daemon startup.
+const PROBE_TIMEOUT_MS: u64 = 5_000;
+
 /// Run `program` with `args`, returning its combined stdout+stderr on a zero
-/// exit status. stdin is `/dev/null` so a no-argument shell probe (used for the
-/// `BusyBox` banner) can never block reading a terminal.
+/// exit status.
+///
+/// stdin is `/dev/null` so a no-argument shell probe (used for the `BusyBox`
+/// banner) can never block reading a terminal, and the run is bounded by
+/// `PROBE_TIMEOUT_MS` through the shared shell watchdog
+/// (`shell_util::spawn_with_watchdog`) — which also applies the child hardening
+/// (env sanitization, process-group isolation) and kills the whole process tree
+/// on timeout — so a candidate that never exits cannot hang resolution.
 fn run_program(program: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new(program);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = cmd.output().ok()?;
+    let (output, _was_killed) =
+        super::shell_util::spawn_with_watchdog(&mut cmd, PROBE_TIMEOUT_MS).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -345,9 +363,6 @@ fn resolve_tier(env: &ShellEnv<'_>, kind: ShellKind) -> Option<ResolvedShell> {
             if kind == ShellKind::Bash && !bash_major_ok(version.as_deref()) {
                 continue;
             }
-            if !runs_ok(env, &real, kind) {
-                continue;
-            }
             let resolved = build_resolved(kind, real, version);
             if best
                 .as_ref()
@@ -401,9 +416,6 @@ fn resolve_forced(env: &ShellEnv<'_>, spec: &str) -> Option<ResolvedShell> {
             Family::Posix => posix_kind_from_name(&real),
         };
         if kind == ShellKind::Bash && !bash_major_ok(version.as_deref()) {
-            continue;
-        }
-        if !runs_ok(env, &real, kind) {
             continue;
         }
         return Some(build_resolved(kind, real, version));
@@ -505,15 +517,6 @@ fn tier_accepts(kind: ShellKind, family: Family) -> bool {
     }
 }
 
-/// The `-c 'exit 0'` smoke check: the binary must actually run a command. The
-/// busybox variant goes through its `ash` applet, matching how it will be run.
-fn runs_ok(env: &ShellEnv<'_>, path: &Path, kind: ShellKind) -> bool {
-    match kind {
-        ShellKind::BusyboxAsh => (env.run_capture)(path, &["ash", "-c", "exit 0"]).is_some(),
-        _ => (env.run_capture)(path, &["-c", "exit 0"]).is_some(),
-    }
-}
-
 /// Assemble a [`ResolvedShell`], applying the per-kind compatibility treatment
 /// (`argv0`) and building its model-facing description.
 fn build_resolved(kind: ShellKind, program: PathBuf, version: Option<String>) -> ResolvedShell {
@@ -598,7 +601,7 @@ fn extract_version(text: &str) -> Option<String> {
             let keep = is_digit || b == b'.';
             if !keep {
                 let token = text.get(s..i).unwrap_or_default();
-                // Reject a bare trailing dot (e.g. "v1.").
+                // A trailing dot is trimmed, not kept: "v1." reads as "1".
                 let trimmed = token.trim_end_matches('.');
                 if !trimmed.is_empty() {
                     return Some(trimmed.to_string());

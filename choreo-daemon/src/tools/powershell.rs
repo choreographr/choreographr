@@ -36,8 +36,8 @@ impl JsonSchema for PsShell {
 
     fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
         // Flat string enum — many OpenAI-compatible providers reject the
-        // oneOf/const form schemars would otherwise emit (same rationale as
-        // sh.rs's `Shell`).
+        // oneOf/const form schemars would otherwise emit. Any tool exposing a
+        // fixed string choice uses this same flat-enum treatment.
         schemars::json_schema!({
             "type": "string",
             "enum": ["powershell", "pwsh"]
@@ -222,8 +222,8 @@ mod tests {
 
     #[test]
     fn ps_shell_enum_json_schema_uses_flat_enum_format() {
-        // Same provider-compatibility contract as sh.rs's `Shell`: a flat
-        // string enum, not oneOf/const.
+        // Provider-compatibility contract: a flat string enum, not oneOf/const
+        // (many OpenAI-compatible providers reject the latter).
         let mut generator = SchemaGenerator::default();
         let schema = super::PsShell::json_schema(&mut generator);
         let json: serde_json::Value = serde_json::to_value(&schema).unwrap();
