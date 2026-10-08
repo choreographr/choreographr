@@ -2,8 +2,8 @@
 //! fan-out, lag-eviction, shutdown notification, and disconnect cleanup.
 //!
 //! These are the `impl DaemonState` methods that manage the per-client
-//! subscriber maps (`summary_subscribers`, `activity_subscribers`,
-//! `client_writers`, `client_subscribed_sessions`) and apply the shared
+//! `clients` map (each [`ClientState`] carrying its writer sink, its
+//! summary/activity flags, and its attached sessions) and apply the shared
 //! lossless broadcast policy from `crate::broadcast`. They live in a child
 //! module so `daemon.rs` stays focused on the daemon's core command handling
 //! (session CRUD, accounts, catalog); the methods are `pub(super)` because
@@ -16,8 +16,8 @@
 //! daemon module is imported explicitly.
 
 use super::{
-    DaemonMessage, DaemonState, Ordering, SessionCommand, SessionEvent, SessionStatus,
-    SubscriberSink, catalog_provider_pairs, debug, info, warn,
+    ClientId, ClientState, DaemonMessage, DaemonState, Ordering, SessionCommand, SessionEvent,
+    SessionStatus, SubscriberSink, catalog_provider_pairs, debug, info, warn,
 };
 use crate::broadcast::fan_out_evicting;
 use choreo_proto::{DaemonMessageType, KeystoreState};
@@ -103,25 +103,23 @@ impl DaemonState {
         // subscriber must see sessions appear and disappear even though it
         // never joined the session-list bus.
         let (evict_activity, evict_activity_largest) = fan_out_evicting(
-            &mut self.activity_subscribers,
+            &mut self.clients,
             &msg,
             &self.lag_limits,
             &self.global_lag,
-            |_| false, // lifecycle events have no per-session dedup here
+            |_id, client| !client.wants_activity, // only activity subscribers
         );
         self.finish_evictions(evict_activity, evict_activity_largest);
 
         let (evict_clients, evict_largest) = fan_out_evicting(
-            &mut self.summary_subscribers,
+            &mut self.clients,
             &msg,
             &self.lag_limits,
             &self.global_lag,
-            |client_id| {
-                // All-activity subscriber — already delivered by the fan-out
-                // above; skipping keeps per-client delivery exactly-once
-                // across the two buses.
-                self.activity_subscribers.contains_key(&client_id)
-            },
+            // Summary subscribers, EXCEPT all-activity clients the fan-out
+            // above already served — skipping keeps per-client delivery
+            // exactly-once across the two buses.
+            |_id, client| !client.wants_summary || client.wants_activity,
         );
         self.finish_evictions(evict_clients, evict_largest);
     }
@@ -131,7 +129,7 @@ impl DaemonState {
     /// crossed) disconnect the currently most-lagging client. Runs AFTER the
     /// retain loop because eviction mutates `self` (removing sinks) while
     /// the loop still borrows the subscriber map.
-    pub(super) fn finish_evictions(&mut self, evict_clients: Vec<u64>, evict_largest: bool) {
+    pub(super) fn finish_evictions(&mut self, evict_clients: Vec<ClientId>, evict_largest: bool) {
         for client_id in evict_clients {
             self.handle_evict_client(client_id);
         }
@@ -143,15 +141,23 @@ impl DaemonState {
     /// Register a client to receive session summary broadcasts.
     pub(super) fn handle_register_summary_subscriber(
         &mut self,
-        client_id: u64,
+        client_id: ClientId,
         writer: &SubscriberSink,
     ) {
-        self.summary_subscribers.insert(client_id, writer.clone());
+        // Create the entry if the writer was not registered yet, then flip the
+        // flag — keeps a subscribe self-contained regardless of its ordering
+        // with `RegisterClientWriter`.
+        self.clients
+            .entry(client_id)
+            .or_insert_with(|| ClientState::new(writer.clone()))
+            .wants_summary = true;
     }
 
     /// Unregister a client from session summary broadcasts.
-    pub(super) fn handle_unregister_summary_subscriber(&mut self, client_id: u64) {
-        self.summary_subscribers.remove(&client_id);
+    pub(super) fn handle_unregister_summary_subscriber(&mut self, client_id: ClientId) {
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.wants_summary = false;
+        }
     }
 
     /// Broadcast a session status change to all summary subscribers and keep
@@ -218,37 +224,40 @@ impl DaemonState {
             // and activity subscribers (they got it via the activity fan-out),
             // so every client receives `SessionStatusChanged` exactly once.
             let (evict_clients, evict_largest) = fan_out_evicting(
-                &mut self.summary_subscribers,
+                &mut self.clients,
                 &msg,
                 &self.lag_limits,
                 &self.global_lag,
-                |client_id| {
-                    // Direct session subscriber of the changed session — the
-                    // per-session broadcast already delivered this change.
-                    if self
-                        .client_subscribed_sessions
-                        .get(&client_id)
-                        .is_some_and(|sessions| sessions.contains(&session_id))
-                    {
-                        return true;
-                    }
-                    // All-activity subscriber — the session thread's broadcast
-                    // forwarded this exact change via `BroadcastActivity`.
-                    self.activity_subscribers.contains_key(&client_id)
+                |_id, client| {
+                    // Only summary subscribers; skip a direct session
+                    // subscriber of the changed session (the per-session
+                    // broadcast already delivered this change) and any
+                    // all-activity subscriber (the session thread's broadcast
+                    // forwarded this exact change via `BroadcastActivity`).
+                    !client.wants_summary
+                        || client.sessions.contains(&session_id)
+                        || client.wants_activity
                 },
             );
             self.finish_evictions(evict_clients, evict_largest);
         }
     }
 
-    /// Register a client to receive all session activity broadcasts.
+    /// Register a client to receive all session activity broadcasts, pushing it
+    /// the current catalog + keystore state so its view is live at once.
     pub(super) fn handle_register_activity_subscriber(
         &mut self,
-        client_id: u64,
+        client_id: ClientId,
         writer: &SubscriberSink,
     ) {
         info!("registering activity subscriber: client_id={}", client_id);
-        self.activity_subscribers.insert(client_id, writer.clone());
+        // Create the entry if the writer was not registered yet, then flip the
+        // flag (keeps a subscribe self-contained regardless of its ordering
+        // with `RegisterClientWriter`).
+        self.clients
+            .entry(client_id)
+            .or_insert_with(|| ClientState::new(writer.clone()))
+            .wants_activity = true;
         // Send the CURRENT provider list to the freshly-subscribed client so
         // its provider picker reflects the live catalog immediately (not just
         // the static default) — a client that connects after the daemon's
@@ -277,19 +286,21 @@ impl DaemonState {
 
     /// Unregister a client from all session activity broadcasts.
     ///
-    /// Only removes from the activity subscriber map — does NOT clear
-    /// `client_subscribed_sessions`.  Session subscription tracking is
-    /// cleaned up by explicit `UntrackSessionSubscription` messages sent
-    /// from session threads on client detach, and by `handle_client_disconnected`
-    /// when the client fully disconnects.
+    /// Only clears the entry's activity flag — it does NOT drop the client's
+    /// session memberships.  Those are cleaned up by explicit
+    /// `UntrackSessionSubscription` messages sent from session threads on client
+    /// detach, and by `handle_client_disconnected`/
+    /// [`remove_client`](Self::remove_client) when the client is torn down.
     ///
     /// This preserves the invariant that a client that explicitly unsubscribes
     /// from all activity but remains attached to sessions can re-subscribe
     /// without causing duplicate delivery (the dedup filter in
     /// `handle_broadcast_activity` still knows about their session subscriptions).
-    pub(super) fn handle_unregister_activity_subscriber(&mut self, client_id: u64) {
+    pub(super) fn handle_unregister_activity_subscriber(&mut self, client_id: ClientId) {
         debug!("unregistering activity subscriber: client_id={}", client_id);
-        self.activity_subscribers.remove(&client_id);
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.wants_activity = false;
+        }
     }
 
     /// The flat control message representing the daemon's CURRENT keystore
@@ -329,10 +340,15 @@ impl DaemonState {
 
     /// Register a connection's writer channel so the shutdown path can route
     /// `ShuttingDown` through that connection's single writer thread.
-    pub(super) fn handle_register_client_writer(&mut self, client_id: u64, writer: SubscriberSink) {
+    pub(super) fn handle_register_client_writer(
+        &mut self,
+        client_id: ClientId,
+        writer: SubscriberSink,
+    ) {
         debug!("registering client writer: client_id={}", client_id);
-        // A fresh connection owns its client_id, so any prior entry is stale.
-        self.client_writers.insert(client_id, writer);
+        // A fresh connection owns its (monotonic, never-reused) client_id, so
+        // any prior entry is stale.
+        self.clients.insert(client_id, ClientState::new(writer));
     }
 
     /// Disconnect a client whose delivery queue crossed the lag limits.
@@ -349,68 +365,61 @@ impl DaemonState {
     /// (`server::connection::WRITER_WRITE_TIMEOUT`), the write fails, and
     /// the writer shuts the socket down, unblocking the reader's blocking
     /// read and running the normal `cleanup_client` teardown.
-    pub(super) fn handle_evict_client(&mut self, client_id: u64) {
+    pub(super) fn handle_evict_client(&mut self, client_id: ClientId) {
         // Single lookup serving both the idempotency guard and the two uses
         // below (backlog read + advisory send). Idempotent (no-op for an
         // unknown client): multiple producers can observe `ClientOverLag`
         // for the same client before the first eviction command lands, and
         // each re-signal must not double-evict or panic.
-        let Some(sink) = self.client_writers.get(&client_id) else {
+        let Some(client) = self.clients.get(&client_id) else {
             return;
         };
         warn!(
             "evicting lagging client: client_id={}, backlog_bytes={}",
             client_id,
-            sink.bytes_in_flight.load(Ordering::Relaxed)
+            client.writer.bytes_in_flight.load(Ordering::Relaxed)
         );
         // Best-effort advisory: a healthy writer flushes it and closes its
         // own socket; a wedged writer never sees it (the write timeout
-        // reaps the connection instead). Enqueue BEFORE dropping the sink,
+        // reaps the connection instead). Enqueue BEFORE dropping the entry,
         // through the accounting path: the writer's per-dequeue decrement
         // (or the exit drain, if the advisory is abandoned behind the stop
         // point) needs a matching increment, and a dead receiver
-        // self-corrects inside `send_unchecked`. Sent while `sink` is still
-        // borrowed; the borrow ends here, before the map mutations below
-        // (the daemon command loop is single-threaded, so reordering the
-        // advisory ahead of the removals is unobservable).
-        let _ = sink.send_unchecked(
+        // self-corrects inside `send_unchecked`. Sent while the entry is
+        // still borrowed; the borrow ends here, before `remove_client` below
+        // (the daemon command loop is single-threaded, so ordering the
+        // advisory ahead of the removal is unobservable).
+        let _ = client.writer.send_unchecked(
             &DaemonMessage::broadcast(DaemonMessageType::Evicted),
             &self.global_lag,
         );
-        self.summary_subscribers.remove(&client_id);
-        self.activity_subscribers.remove(&client_id);
-        // Promptly remove this client from every session's subscriber map
-        // instead of waiting for the lazy disconnect detection on the next
-        // broadcast — the evicted client's queued bytes should be released
-        // as soon as possible, and a session must not keep streaming to a
-        // client that is being torn down.
-        self.remove_client_from_sessions(client_id);
-        // Drop the registered writer channel; the advisory is already
-        // queued, and the connection thread's own sink clone (dropped by
-        // cleanup_client) is what keeps the writer draining until it closes
-        // the socket.
-        self.client_writers.remove(&client_id);
+        // Drop the whole entry (writer + subscription state) in one step and
+        // tell every session it was attached to stop streaming to it — the
+        // advisory is already queued, and the connection thread's own sink
+        // clone (dropped by `cleanup_client`) is what keeps the writer
+        // draining until it closes the socket.
+        self.remove_client(client_id);
         crate::metrics::record_eviction();
     }
 
     /// Disconnect the currently most-lagging client (used when the daemon-wide
-    /// backlog crosses [`LagLimits::global_budget`]). Only `client_writers`
-    /// is scanned: every real connection's per-client counter lives on its
-    /// writer sink (the activity/summary/session maps hold clones of that
-    /// same sink, sharing one `Arc<AtomicUsize>`), and a client without a
-    /// writer entry has no connection to tear down — `handle_evict_client`
-    /// would no-op on it, silently failing to relieve the pressure.
+    /// backlog crosses [`LagLimits::global_budget`]). Every connected client has
+    /// exactly one `clients` entry, and its per-client byte counter lives on
+    /// that entry's writer sink (the session subscriber maps hold clones of the
+    /// same sink, sharing one `Arc<AtomicUsize>`), so the scan covers them all.
     pub(super) fn handle_evict_largest_lagging(&mut self) {
         // Hand-rolled max over the per-client byte counters, expressed as a
         // `max_by_key` scan: zero-lag writers are excluded (they have nothing
-        // to relieve) and the winner is the largest in-flight backlog.
+        // to relieve) and the winner is the largest in-flight backlog. The id
+        // is copied out (ClientId is Copy) so the borrow ends before the evict.
         let best = self
-            .client_writers
+            .clients
             .iter()
-            .filter(|(_, sink)| sink.bytes_in_flight.load(Ordering::Relaxed) > 0)
-            .max_by_key(|(_, sink)| sink.bytes_in_flight.load(Ordering::Relaxed));
-        if let Some((client_id, _)) = best {
-            self.handle_evict_client(*client_id);
+            .filter(|(_, client)| client.writer.bytes_in_flight.load(Ordering::Relaxed) > 0)
+            .max_by_key(|(_, client)| client.writer.bytes_in_flight.load(Ordering::Relaxed))
+            .map(|(client_id, _)| *client_id);
+        if let Some(client_id) = best {
+            self.handle_evict_client(client_id);
         }
     }
 
@@ -424,17 +433,20 @@ impl DaemonState {
     /// not reading, writer stuck in a blocking socket write) is still bounded
     /// by the writer-join grace in `cleanup_client` + `run_server`, unchanged.
     pub(super) fn handle_broadcast_shutting_down(&mut self) {
-        let clients = self.client_writers.len();
+        // Hoist the shared counters out of the loop: the retain closure borrows
+        // the map mutably, so it must not also touch `self` fields.
+        let global = &self.global_lag;
+        let clients = self.clients.len();
         info!("broadcasting ShuttingDown to {clients} client(s)");
-        self.client_writers.retain(|client_id, sink| {
+        self.clients.retain(|client_id, client| {
             // Accounted send: the writer thread decrements on dequeue (and
             // the exit drain picks up anything queued behind the
             // notification), so the notification must be counted like every
             // other message; `send_unchecked` self-corrects when the
             // receiver is gone.
-            if sink.send_unchecked(
+            if client.writer.send_unchecked(
                 &DaemonMessage::broadcast(DaemonMessageType::ShuttingDown),
-                &self.global_lag,
+                global,
             ) {
                 true
             } else {
@@ -444,69 +456,65 @@ impl DaemonState {
         });
     }
 
-    /// Clean up all per-client tracking when a client disconnects.
-    /// Removes from summary subscribers, activity subscribers, session
-    /// subscription tracking, the writer registry, and the evict handle in a
-    /// single atomic operation so stale entries don't accumulate.
-    pub(super) fn handle_client_disconnected(&mut self, client_id: u64) {
+    /// Clean up all per-client tracking when a client disconnects: drop its
+    /// entry from [`DaemonState::clients`] (which also releases its writer
+    /// channel so the connection's writer thread can exit once its
+    /// connection-local sender is dropped) and tell every attached session to
+    /// drop it — a single atomic operation so stale entries don't accumulate.
+    pub(super) fn handle_client_disconnected(&mut self, client_id: ClientId) {
         info!("client disconnected cleanup: client_id={}", client_id);
-        self.summary_subscribers.remove(&client_id);
-        self.activity_subscribers.remove(&client_id);
-        // Promptly remove the client from every session it was attached to
-        // (same as eviction), so a session does not keep streaming to a dead
-        // client's sink until the next broadcast detects the disconnect.
-        self.remove_client_from_sessions(client_id);
-        // Drop the registered writer channel so this connection's writer
-        // thread can exit: with the connection-local sender (dropped by
-        // cleanup_client) gone too, writer_rx disconnects and the thread's
-        // for-loop terminates.
-        self.client_writers.remove(&client_id);
+        self.remove_client(client_id);
     }
 
-    /// Remove `client_id` from every session's subscriber map via
-    /// `RemoveSubscriber` commands, and drop its session-membership tracking.
-    /// Used when a client is being torn down (lag-evicted or fully
-    /// disconnected) so sessions stop streaming to it promptly instead of
-    /// waiting for the next broadcast to notice the dead sink; releasing the
-    /// queued bytes sooner also relieves lag-budget pressure earlier.
-    pub(super) fn remove_client_from_sessions(&mut self, client_id: u64) {
-        if let Some(sessions) = self.client_subscribed_sessions.remove(&client_id) {
-            for session_id in &sessions {
-                if let Some(entry) = self.active_sessions.get(session_id) {
-                    let _ = entry
-                        .cmd_tx
-                        .send(SessionCommand::RemoveSubscriber { client_id });
-                }
+    /// Remove a client's entry from [`DaemonState::clients`] and tell every
+    /// session it was attached to drop it via `RemoveSubscriber`. Shared by full
+    /// disconnect and lag-eviction, so a torn-down client stops being streamed
+    /// to promptly (releasing its queued bytes) instead of waiting for the next
+    /// broadcast to notice the dead sink.
+    fn remove_client(&mut self, client_id: ClientId) {
+        let Some(client) = self.clients.remove(&client_id) else {
+            return;
+        };
+        for session_id in &client.sessions {
+            if let Some(entry) = self.active_sessions.get(session_id) {
+                let _ = entry
+                    .cmd_tx
+                    .send(SessionCommand::RemoveSubscriber { client_id });
             }
         }
     }
 
     /// Track that `client_id` is a direct subscriber of `session_id`.
     /// Idempotent — re-attach to the same session is a no-op.
-    pub(super) fn handle_track_session_subscription(&mut self, client_id: u64, session_id: u64) {
+    pub(super) fn handle_track_session_subscription(
+        &mut self,
+        client_id: ClientId,
+        session_id: u64,
+    ) {
         debug!(
             "track session subscription: client_id={}, session_id={}",
             client_id, session_id
         );
-        self.client_subscribed_sessions
-            .entry(client_id)
-            .or_default()
-            .insert(session_id);
+        // A `Track` for a client that has no entry (the disconnect raced ahead
+        // of the session's command) is dropped rather than resurrecting a stale
+        // entry — a disconnected client must not be recreated by a late track.
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.sessions.insert(session_id);
+        }
     }
 
     /// Untrack that `client_id` is no longer a direct subscriber of `session_id`.
-    pub(super) fn handle_untrack_session_subscription(&mut self, client_id: u64, session_id: u64) {
+    pub(super) fn handle_untrack_session_subscription(
+        &mut self,
+        client_id: ClientId,
+        session_id: u64,
+    ) {
         debug!(
             "untrack session subscription: client_id={}, session_id={}",
             client_id, session_id
         );
-        if let std::collections::hash_map::Entry::Occupied(mut entry) =
-            self.client_subscribed_sessions.entry(client_id)
-        {
-            entry.get_mut().remove(&session_id);
-            if entry.get().is_empty() {
-                entry.remove();
-            }
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.sessions.remove(&session_id);
         }
     }
 
@@ -549,23 +557,18 @@ impl DaemonState {
             );
         }
         let (evict_clients, evict_largest) = fan_out_evicting(
-            &mut self.activity_subscribers,
+            &mut self.clients,
             msg,
             &self.lag_limits,
             &self.global_lag,
-            |client_id| {
-                // Skip if this client is also a direct subscriber of the
-                // origin session — they'll receive it through the per-session
-                // broadcast path, avoiding duplicate delivery. `Option<u64>`
-                // is Copy, so `session_id` moves into the closure by copy and
-                // needs no clone.
-                if let Some(sid) = session_id
-                    && let Some(sessions) = self.client_subscribed_sessions.get(&client_id)
-                    && sessions.contains(&sid)
-                {
-                    return true;
-                }
-                false
+            |_id, client| {
+                // Only activity subscribers; skip a client that is also a direct
+                // subscriber of the origin session — it receives the message
+                // through the per-session broadcast path, avoiding duplicate
+                // delivery. `Option<u64>` is Copy, so `session_id` is captured
+                // by copy.
+                !client.wants_activity
+                    || session_id.is_some_and(|sid| client.sessions.contains(&sid))
             },
         );
         self.finish_evictions(evict_clients, evict_largest);

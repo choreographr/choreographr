@@ -211,7 +211,7 @@ impl EmbeddedDaemon {
         // Same reason for the DB handle: the connection thread owns its own
         // clone, so on-demand image reads never touch `self`.
         let db = Arc::clone(&self.db);
-        info!(client_id, "embedded client connecting");
+        info!(client_id = %client_id, "embedded client connecting");
         crate::metrics::record_connection_accepted();
         let handle = thread::spawn(move || {
             // Held for the connection thread's whole lifetime: released

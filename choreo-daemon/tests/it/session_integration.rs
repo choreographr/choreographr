@@ -1,4 +1,4 @@
-use choreo_daemon::broadcast::{LagLimits, SubscriberSink};
+use choreo_daemon::broadcast::{ClientId, LagLimits, SubscriberSink};
 use choreo_daemon::{RequestContext, SessionCommand, db, session_main};
 use choreo_proto::{DaemonMessage, DaemonMessageType, SessionEvent};
 use std::path::PathBuf;
@@ -57,7 +57,7 @@ fn session_starts_and_accepts_commands() {
 
     let (tx, writer_rx) = crossbeam_channel::unbounded::<DaemonMessage>();
     let writer_tx = SubscriberSink::new(tx);
-    let client_id = 42;
+    let client_id = ClientId::from_raw(42);
 
     session_tx
         .send(SessionCommand::Attach {
@@ -124,7 +124,7 @@ fn session_cancel_nonexistent_request_does_not_panic() {
     let writer_tx = SubscriberSink::new(tx);
     session_tx
         .send(SessionCommand::Attach {
-            client_id: 10,
+            client_id: ClientId::from_raw(10),
             tx: writer_tx,
         })
         .unwrap();

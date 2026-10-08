@@ -62,17 +62,86 @@
 use choreo_proto::{DaemonMessage, DaemonMessageType, MessageKind};
 use crossbeam_channel::Sender;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use tracing::warn;
+
+/// Per-connection identity inside the daemon.
+///
+/// A `ClientId` names exactly one client connection. It is minted once, when
+/// the connection is accepted (see
+/// [`register_client_writer`](crate::server::connection::register_client_writer)),
+/// from a process-wide monotonic counter, and it is the key the daemon uses to
+/// track everything about that client: its writer channel, its summary/activity
+/// subscription flags, and the sessions it is attached to (consolidated into one
+/// [`ClientState`](crate::daemon::ClientState) per client). It is an in-process
+/// handle only — it never crosses the wire (it is absent from `choreo-proto`)
+/// and the counter resets to 1 on every daemon start — so `u32` is ample:
+/// uniqueness within a single run is all the in-process maps require, and the
+/// counter can never wrap in a daemon's life (one id per accepted connection,
+/// bounded by `MAX_CONCURRENT_CONNECTIONS` at any instant). Wrapping the raw
+/// `u32` in a distinct type keeps it from being confused with the bare `u64`
+/// `session_id`/`stream_id`/request-id values it travels alongside, and gives
+/// the logging format one place to live.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct ClientId(u32);
+
+impl ClientId {
+    /// Mint the next id from the process-wide monotonic counter (starts at 1).
+    ///
+    /// The counter is a lock-free process-wide `AtomicU32` — a single-purpose
+    /// bookkeeping counter in the spirit of the sanctioned atomic exceptions
+    /// (it carries no protocol data, only mints unique tokens) — chosen over
+    /// `rand::random` so ids read as small sequential numbers in logs and so
+    /// there is no (however remote) collision risk: a counter cannot repeat
+    /// until it wraps, which a daemon's lifetime never reaches.
+    #[must_use]
+    pub(crate) fn next() -> Self {
+        static NEXT: AtomicU32 = AtomicU32::new(1);
+        ClientId(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Build a `ClientId` from a raw value.
+    ///
+    /// Production code mints ids through [`ClientId::next`] so they stay
+    /// unique per run; this constructor exists for tests (unit and integration)
+    /// that need a stable, known id.
+    #[must_use]
+    pub fn from_raw(value: u32) -> Self {
+        ClientId(value)
+    }
+}
+
+impl fmt::Display for ClientId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// A value the lossless fan-out can deliver to: it exposes its
+/// [`SubscriberSink`]. Implemented for the bare sink (the per-session subscriber
+/// maps) and for the daemon's consolidated per-client entry
+/// ([`ClientState`](crate::daemon::ClientState)), so all three fan-outs share the
+/// one [`fan_out_evicting`] policy regardless of what else their map values
+/// carry.
+pub(crate) trait FanoutTarget {
+    fn sink(&self) -> &SubscriberSink;
+}
+
+impl FanoutTarget for SubscriberSink {
+    fn sink(&self) -> &SubscriberSink {
+        self
+    }
+}
 
 /// Per-subscriber delivery sink: an UNBOUNDED crossbeam channel plus a
 /// shared in-flight byte counter.
 ///
 /// Clone cheaply (channel sender + `Arc<AtomicUsize>`) so the same sink can
-/// be registered in several maps at once — e.g. a connection's writer sink
-/// appears in `client_writers`, `summary_subscribers`, and
-/// `activity_subscribers`, all sharing ONE byte counter.
+/// appear in several places at once — e.g. a connection's sink is held by the
+/// daemon's per-client [`ClientState`](crate::daemon::ClientState) and by every
+/// session the client is attached to, all sharing ONE byte counter.
 #[derive(Clone)]
 pub struct SubscriberSink {
     pub tx: Sender<DaemonMessage>,
@@ -211,20 +280,20 @@ impl SubscriberSink {
 /// retain closure would fight the borrow of the subscriber map): the daemon
 /// calls its `finish_evictions`, a session thread sends `EvictClient` /
 /// `EvictLargestLagging` daemon commands.
-pub(crate) fn fan_out_evicting(
-    subscribers: &mut HashMap<u64, SubscriberSink>,
+pub(crate) fn fan_out_evicting<V: FanoutTarget>(
+    subscribers: &mut HashMap<ClientId, V>,
     msg: &DaemonMessage,
     lag_limits: &LagLimits,
     global: &AtomicUsize,
-    mut should_skip: impl FnMut(u64) -> bool,
-) -> (Vec<u64>, bool) {
+    mut should_skip: impl FnMut(&ClientId, &V) -> bool,
+) -> (Vec<ClientId>, bool) {
     let mut evict_clients = Vec::new();
     let mut evict_largest = false;
-    subscribers.retain(|client_id, sink| {
-        if should_skip(*client_id) {
+    subscribers.retain(|client_id, entry| {
+        if should_skip(client_id, entry) {
             return true;
         }
-        match sink.enqueue(msg, lag_limits, global) {
+        match entry.sink().enqueue(msg, lag_limits, global) {
             EnqueueOutcome::Delivered => true,
             EnqueueOutcome::Disconnected => false,
             EnqueueOutcome::ClientOverLag => {

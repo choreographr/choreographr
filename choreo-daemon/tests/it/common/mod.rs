@@ -92,10 +92,7 @@ pub fn test_daemon_state_with_limits(limits: LagLimits) -> DaemonState {
         tool_policy: choreo_daemon::tools::ToolPolicy::Full,
         platform_tool_bridge: None,
         daemon_tx,
-        summary_subscribers: HashMap::new(),
-        client_writers: HashMap::new(),
-        activity_subscribers: HashMap::new(),
-        client_subscribed_sessions: HashMap::new(),
+        clients: HashMap::new(),
         global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         lag_limits: limits,
         // Production default. Tests that exercise the wedged-writer eviction

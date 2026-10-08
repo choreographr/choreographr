@@ -1,5 +1,5 @@
 use crate::accounts::{AccountConfig, AccountManager, AccountOverrides};
-use crate::broadcast::{LagLimits, ReplyTarget, SubscriberSink};
+use crate::broadcast::{ClientId, FanoutTarget, LagLimits, ReplyTarget, SubscriberSink};
 use crate::cache_warm::{CacheWarmingConfig, WarmPolicy};
 use crate::catalog::{CatalogPaths, MaintenanceEvent, RefreshReport, RefreshRequester};
 use crate::db::{self, SessionRecord};
@@ -93,6 +93,51 @@ pub struct SessionMcpProject {
     pub trusted: bool,
 }
 
+/// Everything the daemon tracks about one connected client, keyed by its
+/// [`ClientId`] in [`DaemonState::clients`].
+///
+/// One entry per client replaces the former `client_writers` /
+/// `summary_subscribers` / `activity_subscribers` / `client_subscribed_sessions`
+/// maps, which had to be kept in lockstep on every register/unregister/
+/// disconnect/evict. The subscription flags and the session-membership set are
+/// exactly the "is this id present in map X" facts those maps encoded, so the
+/// fan-out dedup checks read them straight off the entry rather than
+/// cross-referencing sibling maps.
+pub struct ClientState {
+    /// The client's delivery sink: its unbounded writer channel plus the
+    /// per-client in-flight byte counter (shared with the writer thread).
+    pub writer: SubscriberSink,
+    /// Receives session-summary broadcasts (was: present in
+    /// `summary_subscribers`).
+    pub wants_summary: bool,
+    /// Receives all-activity broadcasts (was: present in
+    /// `activity_subscribers`).
+    pub wants_activity: bool,
+    /// The sessions this client is a direct subscriber of (was:
+    /// `client_subscribed_sessions`). Used to suppress duplicate delivery of a
+    /// session's events through the activity bus.
+    pub sessions: HashSet<u64>,
+}
+
+impl ClientState {
+    /// A freshly-connected client's entry: holds its writer, subscribed to
+    /// nothing yet.
+    fn new(writer: SubscriberSink) -> Self {
+        Self {
+            writer,
+            wants_summary: false,
+            wants_activity: false,
+            sessions: HashSet::new(),
+        }
+    }
+}
+
+impl FanoutTarget for ClientState {
+    fn sink(&self) -> &SubscriberSink {
+        &self.writer
+    }
+}
+
 pub struct DaemonState {
     pub next_session_id: u64,
     pub max_turns: u32,
@@ -172,18 +217,16 @@ pub struct DaemonState {
     /// rebuild re-registers the protected `ios` group identically.
     pub platform_tool_bridge: Option<Arc<dyn crate::tools::ios_bridge::IosToolBridge>>,
     pub daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
-    pub summary_subscribers: HashMap<u64, SubscriberSink>,
-    /// Writer channel of EVERY connected client (both transports), registered
-    /// on connect and removed on disconnect. The shutdown path uses it to
-    /// route `ShuttingDown` through each connection's single writer thread —
-    /// distinct from the opt-in summary/activity subscriber maps.
-    pub client_writers: HashMap<u64, SubscriberSink>,
-    pub activity_subscribers: HashMap<u64, SubscriberSink>,
-    /// Tracks which clients are direct session subscribers of which sessions.
-    /// Used by `handle_broadcast_activity` to skip duplicate delivery to
-    /// clients that are both activity subscribers AND session subscribers
-    /// — the message reaches them through the per-session subscriber path.
-    pub client_subscribed_sessions: HashMap<u64, HashSet<u64>>,
+    /// Every connected client (both transports), keyed by its [`ClientId`],
+    /// holding its delivery sink and its subscription/correlation state in ONE
+    /// entry. Registered on connect and removed on disconnect/eviction; the
+    /// shutdown path routes `ShuttingDown` through every entry's writer thread.
+    /// Consolidating the former `client_writers` / `summary_subscribers` /
+    /// `activity_subscribers` / `client_subscribed_sessions` maps into one entry
+    /// makes register/disconnect/evict a single map operation and lets the
+    /// fan-out dedup checks read flags on the entry instead of cross-referencing
+    /// sibling maps.
+    pub clients: HashMap<ClientId, ClientState>,
     /// Daemon-wide bytes in flight to every connected client's queue, shared
     /// by ALL subscriber sinks (see `broadcast::SubscriberSink::enqueue`).
     /// The 6th sanctioned shared-state exception (see AGENTS.md); writers
@@ -403,36 +446,36 @@ pub enum DaemonCommand {
         result: Result<Vec<String>, String>,
     },
     RegisterSummarySubscriber {
-        client_id: u64,
+        client_id: ClientId,
         writer: SubscriberSink,
     },
     UnregisterSummarySubscriber {
-        client_id: u64,
+        client_id: ClientId,
     },
     RegisterActivitySubscriber {
-        client_id: u64,
+        client_id: ClientId,
         writer: SubscriberSink,
     },
     UnregisterActivitySubscriber {
-        client_id: u64,
+        client_id: ClientId,
     },
     /// Track that a client is now a direct subscriber of a session.
     /// The daemon uses this to avoid duplicate delivery through the
     /// activity subscriber path (see `handle_broadcast_activity`).
     TrackSessionSubscription {
-        client_id: u64,
+        client_id: ClientId,
         session_id: u64,
     },
     /// Untrack that a client is no longer a direct subscriber of a session.
     UntrackSessionSubscription {
-        client_id: u64,
+        client_id: ClientId,
         session_id: u64,
     },
     /// Clean up all per-client tracking when a client disconnects.
     /// Removes from summary subscribers, activity subscribers, and session
     /// subscription tracking in a single atomic command.
     ClientDisconnected {
-        client_id: u64,
+        client_id: ClientId,
     },
     /// Auto-exit mode (`--auto-exit`): sent by a connection thread AFTER its
     /// connection has fully ended and its RAII [`ConnectionSlot`] has been
@@ -444,13 +487,13 @@ pub enum DaemonCommand {
     /// Register a connection's writer channel so the shutdown path can route
     /// `ShuttingDown` through that connection's single writer thread.
     RegisterClientWriter {
-        client_id: u64,
+        client_id: ClientId,
         writer: SubscriberSink,
     },
     /// Disconnect a client that fell too far behind its delivery queue (see
     /// `broadcast::EnqueueOutcome::ClientOverLag`). Idempotent.
     EvictClient {
-        client_id: u64,
+        client_id: ClientId,
     },
     /// Disconnect the currently most-lagging client (see
     /// `broadcast::EnqueueOutcome::GlobalOverBudget`).

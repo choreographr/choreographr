@@ -1,10 +1,67 @@
 use super::*;
-use crate::broadcast::test_sink;
+use crate::broadcast::{ClientId, SubscriberSink, test_sink};
 use crate::sessions::SessionMetadata;
 use choreo_proto::{DaemonMessage, SessionEvent, SessionStatus};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+/// Test-only shorthand for a raw client id.
+fn cid(n: u32) -> ClientId {
+    ClientId::from_raw(n)
+}
+
+/// Test-only: install a client entry directly with the given subscription
+/// flags and session memberships — the replacement for the former direct
+/// inserts into the four per-client maps.
+fn put_client(
+    state: &mut DaemonState,
+    id: u32,
+    sink: &SubscriberSink,
+    summary: bool,
+    activity: bool,
+    sessions: &[u64],
+) {
+    state.clients.insert(
+        cid(id),
+        ClientState {
+            writer: sink.clone(),
+            wants_summary: summary,
+            wants_activity: activity,
+            sessions: sessions.iter().copied().collect(),
+        },
+    );
+}
+
+/// Test-only: is `id` a session-summary subscriber?
+fn summary_subscribed(state: &DaemonState, id: u32) -> bool {
+    state.clients.get(&cid(id)).is_some_and(|c| c.wants_summary)
+}
+
+/// Test-only: is `id` an all-activity subscriber?
+fn activity_subscribed(state: &DaemonState, id: u32) -> bool {
+    state
+        .clients
+        .get(&cid(id))
+        .is_some_and(|c| c.wants_activity)
+}
+
+/// Test-only: does `id` have a connected-client entry?
+fn has_client(state: &DaemonState, id: u32) -> bool {
+    state.clients.contains_key(&cid(id))
+}
+
+/// Test-only: `id`'s session memberships, if it has an entry.
+fn client_sessions(state: &DaemonState, id: u32) -> Option<&HashSet<u64>> {
+    state.clients.get(&cid(id)).map(|c| &c.sessions)
+}
+
+/// Test-only: register a connected client (writer only, no subscriptions) —
+/// the minimum entry `TrackSessionSubscription` needs to latch a session.
+fn register_client(state: &mut DaemonState, id: u32) {
+    let (sink, _rx) = test_sink();
+    put_client(state, id, &sink, false, false, &[]);
+}
 
 /// `pub(super)` so the sibling `daemon::image_provider` test module can
 /// build a fresh locked state without duplicating the constructor.
@@ -45,10 +102,7 @@ pub(super) fn make_daemon_state() -> (DaemonState, crossbeam_channel::Receiver<D
         tool_policy: crate::tools::ToolPolicy::Full,
         platform_tool_bridge: None,
         daemon_tx,
-        summary_subscribers: HashMap::new(),
-        client_writers: HashMap::new(),
-        activity_subscribers: HashMap::new(),
-        client_subscribed_sessions: HashMap::new(),
+        clients: HashMap::new(),
         global_lag: Arc::new(AtomicUsize::new(0)),
         lag_limits: LagLimits::default(),
         writer_write_timeout: crate::server::connection::WRITER_WRITE_TIMEOUT,
@@ -350,20 +404,13 @@ fn handle_evict_client_removes_from_maps_and_sends_advisory() {
     let (mut state, _rx) = make_daemon_state();
     // Register the client in every map the way a live connection would.
     let (sink, rx) = test_sink();
-    state.client_writers.insert(7, sink.clone());
-    state.summary_subscribers.insert(7, sink.clone());
-    state.activity_subscribers.insert(7, sink.clone());
-    state
-        .client_subscribed_sessions
-        .insert(7, HashSet::from([1]));
+    // A fully-subscribed, session-attached client, as a live connection would be.
+    put_client(&mut state, 7, &sink, true, true, &[1]);
 
-    state.handle_command(DaemonCommand::EvictClient { client_id: 7 });
+    state.handle_command(DaemonCommand::EvictClient { client_id: cid(7) });
 
-    // Evicted from every daemon-side map.
-    assert!(!state.client_writers.contains_key(&7));
-    assert!(!state.summary_subscribers.contains_key(&7));
-    assert!(!state.activity_subscribers.contains_key(&7));
-    assert!(!state.client_subscribed_sessions.contains_key(&7));
+    // Evicted: the client's single entry is gone entirely.
+    assert!(!has_client(&state, 7));
     // The best-effort advisory was enqueued before the sink was dropped.
     assert_eq!(
         rx.recv().unwrap(),
@@ -377,8 +424,10 @@ fn handle_evict_client_is_idempotent_for_unknown_client() {
     // Evicting an unknown client must be a silent no-op (multiple
     // producers can signal the same over-lag client before the first
     // eviction lands).
-    state.handle_command(DaemonCommand::EvictClient { client_id: 999 });
-    assert!(state.client_writers.is_empty());
+    state.handle_command(DaemonCommand::EvictClient {
+        client_id: cid(999),
+    });
+    assert!(state.clients.is_empty());
 }
 
 #[test]
@@ -386,28 +435,28 @@ fn handle_evict_largest_lagging_evicts_biggest_backlog() {
     let (mut state, _rx) = make_daemon_state();
     let (sink_small, _) = test_sink();
     sink_small.bytes_in_flight.store(10, Ordering::Relaxed);
-    state.client_writers.insert(1, sink_small);
+    put_client(&mut state, 1, &sink_small, false, false, &[]);
     let (sink_big, _) = test_sink();
     sink_big.bytes_in_flight.store(1_000, Ordering::Relaxed);
-    state.client_writers.insert(2, sink_big);
+    put_client(&mut state, 2, &sink_big, false, false, &[]);
 
     state.handle_command(DaemonCommand::EvictLargestLagging);
 
     assert!(
-        !state.client_writers.contains_key(&2),
+        !has_client(&state, 2),
         "the largest backlog must be evicted"
     );
-    assert!(state.client_writers.contains_key(&1));
+    assert!(has_client(&state, 1));
 }
 
 #[test]
 fn handle_evict_largest_lagging_noop_when_all_healthy() {
     let (mut state, _rx) = make_daemon_state();
     let (sink, _) = test_sink();
-    state.client_writers.insert(1, sink);
+    put_client(&mut state, 1, &sink, false, false, &[]);
     // Zero backlog: nothing to shed.
     state.handle_command(DaemonCommand::EvictLargestLagging);
-    assert!(state.client_writers.contains_key(&1));
+    assert!(has_client(&state, 1));
 }
 #[test]
 fn handle_list_sessions_empty() {
@@ -590,7 +639,7 @@ fn handle_set_session_flags_applies_persists_and_broadcasts() {
     // A summary subscriber observes the broadcast (the success signal).
     let (tx, rx) = test_sink();
     state.handle_command(DaemonCommand::RegisterSummarySubscriber {
-        client_id: 1,
+        client_id: cid(1),
         writer: tx,
     });
     let _ = rx.try_iter().count(); // drain any subscribe-time pushes
@@ -856,14 +905,14 @@ fn handle_get_credential_locked() {
 fn handle_register_unregister_subscriber() {
     let (mut state, _rx) = make_daemon_state();
     let (tx, _rx_sub) = test_sink();
-    assert!(!state.summary_subscribers.contains_key(&42));
+    assert!(!summary_subscribed(&state, 42));
     state.handle_command(DaemonCommand::RegisterSummarySubscriber {
-        client_id: 42,
+        client_id: cid(42),
         writer: tx,
     });
-    assert!(state.summary_subscribers.contains_key(&42));
-    state.handle_command(DaemonCommand::UnregisterSummarySubscriber { client_id: 42 });
-    assert!(!state.summary_subscribers.contains_key(&42));
+    assert!(summary_subscribed(&state, 42));
+    state.handle_command(DaemonCommand::UnregisterSummarySubscriber { client_id: cid(42) });
+    assert!(!summary_subscribed(&state, 42));
 }
 
 #[test]
@@ -893,7 +942,7 @@ fn handle_broadcast_session_status() {
     );
     let (tx, rx) = test_sink();
     state.handle_command(DaemonCommand::RegisterSummarySubscriber {
-        client_id: 1,
+        client_id: cid(1),
         writer: tx,
     });
     state.handle_command(DaemonCommand::BroadcastSessionStatus {
@@ -960,11 +1009,11 @@ fn handle_broadcast_session_status_dedups_against_session_and_activity_subscribe
     // summary subscriber — receives the change via the per-session fan-out.
     let (tx1, rx1) = test_sink();
     state.handle_command(DaemonCommand::RegisterSummarySubscriber {
-        client_id: 1,
+        client_id: cid(1),
         writer: tx1,
     });
     state.handle_command(DaemonCommand::TrackSessionSubscription {
-        client_id: 1,
+        client_id: cid(1),
         session_id: 42,
     });
 
@@ -972,11 +1021,11 @@ fn handle_broadcast_session_status_dedups_against_session_and_activity_subscribe
     // the change via the `BroadcastActivity` forward.
     let (tx2, rx2) = test_sink();
     state.handle_command(DaemonCommand::RegisterSummarySubscriber {
-        client_id: 2,
+        client_id: cid(2),
         writer: tx2.clone(),
     });
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 2,
+        client_id: cid(2),
         writer: tx2,
     });
     // Drain the send-on-subscribe messages so only the status change (or
@@ -988,7 +1037,7 @@ fn handle_broadcast_session_status_dedups_against_session_and_activity_subscribe
     // summary fan-out is its ONLY delivery path.
     let (tx3, rx3) = test_sink();
     state.handle_command(DaemonCommand::RegisterSummarySubscriber {
-        client_id: 3,
+        client_id: cid(3),
         writer: tx3,
     });
 
@@ -1472,7 +1521,7 @@ fn session_exited_does_not_delete_non_deleted_session() {
 fn broadcast_sends_to_subscriber() {
     let (mut state, _rx) = make_daemon_state();
     let (tx, rx) = test_sink();
-    state.summary_subscribers.insert(1, tx);
+    put_client(&mut state, 1, &tx, true, false, &[]);
     let msg = DaemonMessageType::Session {
         session_id: Some(42),
         event: SessionEvent::SessionDeleted,
@@ -1481,21 +1530,21 @@ fn broadcast_sends_to_subscriber() {
     let received = rx.recv().unwrap();
     assert_eq!(received, DaemonMessage::broadcast(msg));
     // Subscriber should still be registered
-    assert!(state.summary_subscribers.contains_key(&1));
+    assert!(summary_subscribed(&state, 1));
 }
 
 #[test]
 fn broadcast_removes_disconnected_subscriber() {
     let (mut state, _rx) = make_daemon_state();
     let (tx, rx) = test_sink();
-    state.summary_subscribers.insert(1, tx);
+    put_client(&mut state, 1, &tx, true, false, &[]);
     drop(rx); // Disconnect the receiver
     state.broadcast(&DaemonMessageType::Session {
         session_id: Some(42),
         event: SessionEvent::SessionDeleted,
     });
     // Dead subscriber should be removed
-    assert!(!state.summary_subscribers.contains_key(&1));
+    assert!(!summary_subscribed(&state, 1));
 }
 
 #[test]
@@ -1510,8 +1559,7 @@ fn broadcast_enqueues_losslessly_and_evicts_over_lag_client() {
     // The subscriber must also be in the writer registry for eviction to
     // have a connection to tear down (handle_evict_client requires it).
     let (sink, rx) = test_sink();
-    state.summary_subscribers.insert(7, sink.clone());
-    state.client_writers.insert(7, sink);
+    put_client(&mut state, 7, &sink, true, false, &[]);
 
     let msg = DaemonMessageType::Session {
         session_id: Some(42),
@@ -1523,11 +1571,11 @@ fn broadcast_enqueues_losslessly_and_evicts_over_lag_client() {
     assert_eq!(rx.recv().unwrap(), DaemonMessage::broadcast(msg));
     // …but the client is evicted for lag, from every map.
     assert!(
-        !state.summary_subscribers.contains_key(&7),
+        !summary_subscribed(&state, 7),
         "over-lag subscriber must be evicted from the summary map"
     );
     assert!(
-        !state.client_writers.contains_key(&7),
+        !has_client(&state, 7),
         "over-lag subscriber must be evicted from the writer registry"
     );
 }
@@ -1551,19 +1599,19 @@ fn broadcast_lifecycle_delivers_to_summary_and_activity_exactly_once_per_client(
 
     // Client 1: summary-only. Client 2: activity-only. Client 3: both.
     state.handle_command(DaemonCommand::RegisterSummarySubscriber {
-        client_id: 1,
+        client_id: cid(1),
         writer: tx1,
     });
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 2,
+        client_id: cid(2),
         writer: tx2,
     });
     state.handle_command(DaemonCommand::RegisterSummarySubscriber {
-        client_id: 3,
+        client_id: cid(3),
         writer: tx3.clone(),
     });
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 3,
+        client_id: cid(3),
         writer: tx3,
     });
     // Activity registration pushes the current provider list; drain it so
@@ -2194,7 +2242,7 @@ fn handle_acl_add_enrolls_key_updates_file_and_broadcasts() {
     // An activity subscriber observes the AclUpdated broadcast.
     let (writer, writer_rx) = test_sink();
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 1,
+        client_id: cid(1),
         writer,
     });
     // Registration sends the current catalog first (the subscriber's
@@ -2282,7 +2330,7 @@ fn handle_accounts_reload_applies_external_change_and_broadcasts() {
 
     let (writer, writer_rx) = test_sink();
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 1,
+        client_id: cid(1),
         writer,
     });
     drain_send_on_subscribe(&writer_rx);
@@ -2324,7 +2372,7 @@ fn handle_accounts_reload_noops_when_logically_unchanged() {
 
     let (writer, writer_rx) = test_sink();
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 1,
+        client_id: cid(1),
         writer,
     });
     drain_send_on_subscribe(&writer_rx);
@@ -2504,11 +2552,11 @@ fn handle_register_activity_subscriber_adds_to_map() {
     let (tx, _) = test_sink();
 
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 10,
+        client_id: cid(10),
         writer: tx,
     });
 
-    assert!(state.activity_subscribers.contains_key(&10));
+    assert!(activity_subscribed(&state, 10));
 }
 
 #[test]
@@ -2519,16 +2567,16 @@ fn handle_register_activity_subscriber_replaces_existing() {
     let (tx2, _) = test_sink();
 
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 10,
+        client_id: cid(10),
         writer: tx1,
     });
     // Re-register with a different writer — should replace without error
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 10,
+        client_id: cid(10),
         writer: tx2,
     });
 
-    assert!(state.activity_subscribers.contains_key(&10));
+    assert!(activity_subscribed(&state, 10));
 }
 
 #[test]
@@ -2539,22 +2587,21 @@ fn handle_unregister_activity_subscriber_preserves_session_tracking() {
 
     // Set up: client 10 is subscribed to activity AND subscribed to session 42
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 10,
+        client_id: cid(10),
         writer: tx,
     });
     state.handle_command(DaemonCommand::TrackSessionSubscription {
-        client_id: 10,
+        client_id: cid(10),
         session_id: 42,
     });
 
     // Unsubscribe from all activity — this should NOT clear session tracking
-    state.handle_command(DaemonCommand::UnregisterActivitySubscriber { client_id: 10 });
+    state.handle_command(DaemonCommand::UnregisterActivitySubscriber { client_id: cid(10) });
 
     // Verify: activity subscriber is gone
-    assert!(!state.activity_subscribers.contains_key(&10));
+    assert!(!activity_subscribed(&state, 10));
     // Verify: session tracking is PRESERVED
-    assert!(state.client_subscribed_sessions.contains_key(&10));
-    let sessions = state.client_subscribed_sessions.get(&10).unwrap();
+    let sessions = client_sessions(&state, 10).expect("client still has an entry");
     assert!(sessions.contains(&42));
     assert_eq!(sessions.len(), 1);
 }
@@ -2567,54 +2614,54 @@ fn handle_client_disconnected_clears_all_tracking() {
 
     // Set up: client 10 is registered in all three maps
     state.handle_command(DaemonCommand::RegisterSummarySubscriber {
-        client_id: 10,
+        client_id: cid(10),
         writer: tx.clone(),
     });
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 10,
+        client_id: cid(10),
         writer: tx,
     });
     state.handle_command(DaemonCommand::TrackSessionSubscription {
-        client_id: 10,
+        client_id: cid(10),
         session_id: 1,
     });
     state.handle_command(DaemonCommand::TrackSessionSubscription {
-        client_id: 10,
+        client_id: cid(10),
         session_id: 2,
     });
 
-    assert!(state.summary_subscribers.contains_key(&10));
-    assert!(state.activity_subscribers.contains_key(&10));
-    assert!(state.client_subscribed_sessions.contains_key(&10));
+    assert!(summary_subscribed(&state, 10));
+    assert!(activity_subscribed(&state, 10));
+    assert!(client_sessions(&state, 10).is_some_and(|s| !s.is_empty()));
 
     // Disconnect: clears everything
-    state.handle_command(DaemonCommand::ClientDisconnected { client_id: 10 });
+    state.handle_command(DaemonCommand::ClientDisconnected { client_id: cid(10) });
 
-    assert!(!state.summary_subscribers.contains_key(&10));
-    assert!(!state.activity_subscribers.contains_key(&10));
-    assert!(!state.client_subscribed_sessions.contains_key(&10));
+    assert!(!summary_subscribed(&state, 10));
+    assert!(!activity_subscribed(&state, 10));
+    assert!(!has_client(&state, 10));
 }
 
 #[test]
 fn handle_client_disconnected_noop_for_unknown_client() {
     let (mut state, _rx) = make_daemon_state();
-    state.handle_command(DaemonCommand::ClientDisconnected { client_id: 999 });
+    state.handle_command(DaemonCommand::ClientDisconnected {
+        client_id: cid(999),
+    });
     // Just checking no panic
 }
 
 #[test]
 fn handle_track_session_subscription_adds_entry() {
     let (mut state, _rx) = make_daemon_state();
+    register_client(&mut state, 10);
 
     state.handle_command(DaemonCommand::TrackSessionSubscription {
-        client_id: 10,
+        client_id: cid(10),
         session_id: 42,
     });
 
-    let sessions = state
-        .client_subscribed_sessions
-        .get(&10)
-        .expect("client should have entry");
+    let sessions = client_sessions(&state, 10).expect("client should have entry");
     assert!(sessions.contains(&42));
     assert_eq!(sessions.len(), 1);
 }
@@ -2622,21 +2669,19 @@ fn handle_track_session_subscription_adds_entry() {
 #[test]
 fn handle_track_session_subscription_idempotent_re_attach() {
     let (mut state, _rx) = make_daemon_state();
+    register_client(&mut state, 10);
 
     // Attach to same session twice — should be idempotent
     state.handle_command(DaemonCommand::TrackSessionSubscription {
-        client_id: 10,
+        client_id: cid(10),
         session_id: 42,
     });
     state.handle_command(DaemonCommand::TrackSessionSubscription {
-        client_id: 10,
+        client_id: cid(10),
         session_id: 42,
     });
 
-    let sessions = state
-        .client_subscribed_sessions
-        .get(&10)
-        .expect("client should have entry");
+    let sessions = client_sessions(&state, 10).expect("client should have entry");
     assert!(sessions.contains(&42));
     assert_eq!(sessions.len(), 1, "should not duplicate session_id");
 }
@@ -2644,20 +2689,18 @@ fn handle_track_session_subscription_idempotent_re_attach() {
 #[test]
 fn handle_track_session_subscription_tracks_multiple_sessions() {
     let (mut state, _rx) = make_daemon_state();
+    register_client(&mut state, 10);
 
     state.handle_command(DaemonCommand::TrackSessionSubscription {
-        client_id: 10,
+        client_id: cid(10),
         session_id: 42,
     });
     state.handle_command(DaemonCommand::TrackSessionSubscription {
-        client_id: 10,
+        client_id: cid(10),
         session_id: 99,
     });
 
-    let sessions = state
-        .client_subscribed_sessions
-        .get(&10)
-        .expect("client should have entry");
+    let sessions = client_sessions(&state, 10).expect("client should have entry");
     assert!(sessions.contains(&42));
     assert!(sessions.contains(&99));
     assert_eq!(sessions.len(), 2);
@@ -2666,68 +2709,69 @@ fn handle_track_session_subscription_tracks_multiple_sessions() {
 #[test]
 fn handle_untrack_session_subscription_removes_session() {
     let (mut state, _rx) = make_daemon_state();
+    register_client(&mut state, 10);
 
     state.handle_command(DaemonCommand::TrackSessionSubscription {
-        client_id: 10,
+        client_id: cid(10),
         session_id: 42,
     });
     state.handle_command(DaemonCommand::TrackSessionSubscription {
-        client_id: 10,
+        client_id: cid(10),
         session_id: 99,
     });
 
     // Untrack one session
     state.handle_command(DaemonCommand::UntrackSessionSubscription {
-        client_id: 10,
+        client_id: cid(10),
         session_id: 42,
     });
 
-    let sessions = state
-        .client_subscribed_sessions
-        .get(&10)
-        .expect("client should still have entry");
+    let sessions = client_sessions(&state, 10).expect("client should still have entry");
     assert!(!sessions.contains(&42));
     assert!(sessions.contains(&99));
     assert_eq!(sessions.len(), 1);
 }
 
 #[test]
-fn handle_untrack_session_subscription_removes_client_when_empty() {
+fn handle_untrack_session_subscription_leaves_client_without_sessions() {
     let (mut state, _rx) = make_daemon_state();
+    register_client(&mut state, 10);
 
     state.handle_command(DaemonCommand::TrackSessionSubscription {
-        client_id: 10,
+        client_id: cid(10),
         session_id: 42,
     });
 
     // Untrack the only session
     state.handle_command(DaemonCommand::UntrackSessionSubscription {
-        client_id: 10,
+        client_id: cid(10),
         session_id: 42,
     });
 
-    // Client entry should be removed entirely when empty
-    assert!(!state.client_subscribed_sessions.contains_key(&10));
+    // The client entry persists (the connection is still live); only its
+    // session membership is cleared.
+    assert!(client_sessions(&state, 10).is_some_and(HashSet::is_empty));
 }
 
 #[test]
 fn handle_untrack_session_subscription_noop_for_unknown_session() {
     let (mut state, _rx) = make_daemon_state();
+    register_client(&mut state, 10);
 
-    // Untrack a session that was never tracked — should be a no-op
+    // Untrack a session that was never tracked — should be a no-op.
     state.handle_command(DaemonCommand::UntrackSessionSubscription {
-        client_id: 10,
+        client_id: cid(10),
         session_id: 42,
     });
 
-    assert!(!state.client_subscribed_sessions.contains_key(&10));
+    assert!(client_sessions(&state, 10).is_some_and(HashSet::is_empty));
 }
 
 #[test]
 fn handle_untrack_session_subscription_noop_for_unknown_client() {
     let (mut state, _rx) = make_daemon_state();
     state.handle_command(DaemonCommand::UntrackSessionSubscription {
-        client_id: 999,
+        client_id: cid(999),
         session_id: 42,
     });
     // Just checking no panic
@@ -2740,7 +2784,7 @@ fn handle_broadcast_activity_sends_to_subscriber() {
     let (tx, rx) = test_sink();
 
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 10,
+        client_id: cid(10),
         writer: tx,
     });
     drain_send_on_subscribe(&rx);
@@ -2761,7 +2805,7 @@ fn handle_broadcast_activity_sends_to_subscriber() {
     let received = rx.recv().unwrap();
     assert_eq!(received, DaemonMessage::broadcast(msg));
     // Subscriber should still be registered
-    assert!(state.activity_subscribers.contains_key(&10));
+    assert!(activity_subscribed(&state, 10));
 }
 
 #[test]
@@ -2774,12 +2818,12 @@ fn handle_broadcast_activity_skips_dedup_for_session_subscriber() {
 
     // Client 10 is both an activity subscriber AND a subscriber of session 1
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 10,
+        client_id: cid(10),
         writer: tx,
     });
     drain_send_on_subscribe(&rx);
     state.handle_command(DaemonCommand::TrackSessionSubscription {
-        client_id: 10,
+        client_id: cid(10),
         session_id: 1,
     });
 
@@ -2807,7 +2851,7 @@ fn handle_broadcast_activity_skips_dedup_for_session_subscriber() {
         rx.try_recv().is_err(),
         "message should have been suppressed for session subscriber"
     );
-    assert!(state.activity_subscribers.contains_key(&10));
+    assert!(activity_subscribed(&state, 10));
 }
 
 #[test]
@@ -2818,12 +2862,12 @@ fn handle_broadcast_activity_no_dedup_for_different_session() {
 
     // Client 10 subscribes to session 1, but the broadcast is about session 2
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 10,
+        client_id: cid(10),
         writer: tx,
     });
     drain_send_on_subscribe(&rx);
     state.handle_command(DaemonCommand::TrackSessionSubscription {
-        client_id: 10,
+        client_id: cid(10),
         session_id: 1,
     });
 
@@ -2856,7 +2900,7 @@ fn handle_broadcast_activity_sends_when_no_session_id() {
     let (tx, rx) = test_sink();
 
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 10,
+        client_id: cid(10),
         writer: tx,
     });
     drain_send_on_subscribe(&rx);
@@ -2882,7 +2926,7 @@ fn handle_broadcast_activity_removes_disconnected_subscriber() {
     let (tx, rx) = test_sink();
 
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 10,
+        client_id: cid(10),
         writer: tx,
     });
 
@@ -2903,7 +2947,7 @@ fn handle_broadcast_activity_removes_disconnected_subscriber() {
     });
 
     // Dead subscriber should be removed
-    assert!(!state.activity_subscribers.contains_key(&10));
+    assert!(!activity_subscribed(&state, 10));
 }
 
 #[test]
@@ -2921,13 +2965,13 @@ fn handle_broadcast_activity_evicts_over_lag_subscriber() {
     };
     let (tx, rx) = test_sink();
 
+    // The single client entry holds the writer the eviction tears down (a real
+    // connection registers it at accept time); the activity subscription routes
+    // the broadcast to it.
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 10,
-        writer: tx.clone(),
+        client_id: cid(10),
+        writer: tx,
     });
-    // The writer registry entry is what eviction tears down (the real
-    // connection registers it at accept time).
-    state.client_writers.insert(10, tx);
     // Drain the send-on-subscribe CatalogUpdated so the assertions below
     // only observe the broadcast.
     drain_send_on_subscribe(&rx);
@@ -2950,11 +2994,11 @@ fn handle_broadcast_activity_evicts_over_lag_subscriber() {
     assert_eq!(rx.recv().unwrap(), DaemonMessage::broadcast(broadcast));
     // …and the subscriber is evicted from every map.
     assert!(
-        !state.activity_subscribers.contains_key(&10),
+        !activity_subscribed(&state, 10),
         "over-lag subscriber must be evicted from the activity map"
     );
     assert!(
-        !state.client_writers.contains_key(&10),
+        !has_client(&state, 10),
         "over-lag subscriber must be evicted from the writer registry"
     );
 }
@@ -2969,17 +3013,17 @@ fn handle_broadcast_activity_handles_multiple_clients() {
     // Client 10: activity subscriber + session 1 subscriber
     // Client 20: activity subscriber only
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 10,
+        client_id: cid(10),
         writer: tx1,
     });
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 20,
+        client_id: cid(20),
         writer: tx2,
     });
     drain_send_on_subscribe(&rx1);
     drain_send_on_subscribe(&rx2);
     state.handle_command(DaemonCommand::TrackSessionSubscription {
-        client_id: 10,
+        client_id: cid(10),
         session_id: 1,
     });
 
@@ -3022,12 +3066,12 @@ fn handle_broadcast_activity_dedup_keyed_on_command_origin_not_message_shape() {
     // Client 10 is both an activity subscriber AND a subscriber of session
     // 42 — exactly the profile the duplicate-suppression targets.
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 10,
+        client_id: cid(10),
         writer: tx,
     });
     drain_send_on_subscribe(&rx);
     state.handle_command(DaemonCommand::TrackSessionSubscription {
-        client_id: 10,
+        client_id: cid(10),
         session_id: 42,
     });
 
@@ -3046,7 +3090,7 @@ fn handle_broadcast_activity_dedup_keyed_on_command_origin_not_message_shape() {
         rx.try_recv().is_err(),
         "message should have been suppressed: origin came from the command, not the payload"
     );
-    assert!(state.activity_subscribers.contains_key(&10));
+    assert!(activity_subscribed(&state, 10));
 }
 
 #[test]
@@ -3273,7 +3317,7 @@ fn catalog_base_changed_swaps_broadcasts_and_replies() {
     let _restore = RestoreBundledCatalogOnDrop;
     let (mut state, _rx) = make_daemon_state();
     let (writer_tx, writer_rx) = test_sink();
-    state.activity_subscribers.insert(1, writer_tx);
+    put_client(&mut state, 1, &writer_tx, false, true, &[]);
     let (reply, reply_rx) = mpsc::channel();
 
     state.handle_command(DaemonCommand::CatalogBaseChanged {
@@ -3439,7 +3483,7 @@ fn activity_subscriber_gets_current_provider_list_on_register() {
     let (mut state, _rx) = make_daemon_state();
     let (writer_tx, writer_rx) = test_sink();
 
-    state.handle_register_activity_subscriber(1, &writer_tx);
+    state.handle_register_activity_subscriber(cid(1), &writer_tx);
 
     let msg = writer_rx.recv().unwrap();
     match &msg.inner {
@@ -3467,7 +3511,7 @@ fn activity_subscriber_gets_current_lock_state_on_register() {
     let (writer_tx, writer_rx) = test_sink();
 
     // Fresh state: no binding yet → the subscribe push is `Unbound`.
-    state.handle_register_activity_subscriber(1, &writer_tx);
+    state.handle_register_activity_subscriber(cid(1), &writer_tx);
     let msg = writer_rx.recv().unwrap(); // CatalogUpdated
     assert!(matches!(
         &msg.inner,
@@ -3484,7 +3528,7 @@ fn activity_subscriber_gets_current_lock_state_on_register() {
     state.keystore_bound = true;
     state.locked = false;
     let (writer_tx2, writer_rx2) = test_sink();
-    state.handle_register_activity_subscriber(2, &writer_tx2);
+    state.handle_register_activity_subscriber(cid(2), &writer_tx2);
     let _ = writer_rx2.recv().unwrap(); // CatalogUpdated
     match writer_rx2.recv().unwrap().inner {
         DaemonMessageType::Keystore { state } => {
@@ -3507,11 +3551,11 @@ fn broadcast_keystore_state_sends_current_state_to_all_activity_subscribers() {
     let (writer_a, rx_a) = test_sink();
     let (writer_b, rx_b) = test_sink();
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 1,
+        client_id: cid(1),
         writer: writer_a,
     });
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 2,
+        client_id: cid(2),
         writer: writer_b,
     });
     drain_send_on_subscribe(&rx_a);
@@ -3554,7 +3598,7 @@ fn handle_lock_clears_credentials_latches_locked_and_broadcasts() {
     let (mut state, _rx) = make_daemon_state();
     let (writer, writer_rx) = test_sink();
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 1,
+        client_id: cid(1),
         writer,
     });
     drain_send_on_subscribe(&writer_rx);
@@ -3606,7 +3650,7 @@ fn handle_lock_when_already_locked_does_not_rebroadcast() {
     let (mut state, _rx) = make_daemon_state();
     let (writer, writer_rx) = test_sink();
     state.handle_command(DaemonCommand::RegisterActivitySubscriber {
-        client_id: 1,
+        client_id: cid(1),
         writer,
     });
     drain_send_on_subscribe(&writer_rx);
@@ -4131,7 +4175,7 @@ fn add_credential_verify_only_implicitly_unlocks_bound_keystore() {
     // The REGISTERED activity subscriber (a separate sink from the acting
     // client's client_writer below) receives the transition broadcasts.
     let (sub_writer, sub_rx) = test_sink();
-    state.handle_register_activity_subscriber(1, &sub_writer);
+    state.handle_register_activity_subscriber(cid(1), &sub_writer);
     drain_send_on_subscribe(&sub_rx);
 
     let key: [u8; 32] = [7u8; 32];

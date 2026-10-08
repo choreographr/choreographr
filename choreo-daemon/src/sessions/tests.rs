@@ -1,9 +1,14 @@
 use super::handlers::*;
 use super::*;
-use crate::broadcast::test_sink;
+use crate::broadcast::{ClientId, test_sink};
 use crate::tools::{ToolOutput, ToolRegistry};
 use choreo_proto::{MessageKind, SessionStatus};
 use std::collections::HashMap;
+
+/// Test-only shorthand for a raw client id.
+fn cid(n: u32) -> ClientId {
+    ClientId::from_raw(n)
+}
 
 /// A fresh in-memory database fixture for the session tests. In-memory (no
 /// filesystem path) keeps these unit tests off the system boundary — they
@@ -709,8 +714,8 @@ fn broadcast_delivers_message_to_all_subscribers() {
     let (tx1, rx1) = test_sink();
     let (tx2, rx2) = test_sink();
     let (mut state, ctx) = broadcast_setup();
-    state.subscribers.insert(10, tx1);
-    state.subscribers.insert(20, tx2);
+    state.subscribers.insert(cid(10), tx1);
+    state.subscribers.insert(cid(20), tx2);
 
     let mut shutdown = false;
     process_command(
@@ -777,7 +782,7 @@ fn broadcast_handles_disconnected_subscriber_gracefully() {
     let (tx, rx) = test_sink();
     drop(rx);
     let (mut state, ctx) = broadcast_setup();
-    state.subscribers.insert(99, tx);
+    state.subscribers.insert(cid(99), tx);
 
     let mut shutdown = false;
     process_command(
@@ -801,7 +806,7 @@ fn broadcast_enqueues_losslessly_and_signals_eviction() {
         global_budget: usize::MAX,
     };
     let (tx, rx) = test_sink();
-    state.subscribers.insert(10, tx);
+    state.subscribers.insert(cid(10), tx);
 
     // A message large enough to cross the tiny per-client cap.
     let broadcast = DaemonMessageType::Session {
@@ -823,7 +828,7 @@ fn broadcast_enqueues_losslessly_and_signals_eviction() {
     assert_eq!(rx.recv().unwrap().inner, broadcast);
     // The subscriber stays in the map (eviction happens daemon-side via
     // the EvictClient signal + the daemon's handle_evict_client).
-    assert!(state.subscribers.contains_key(&10));
+    assert!(state.subscribers.contains_key(&cid(10)));
     // The session itself keeps running.
     assert!(!shutdown);
 }
@@ -834,7 +839,7 @@ fn broadcast_enqueues_losslessly_and_signals_eviction() {
 fn set_working_dir_updates_config_and_broadcasts() {
     let (mut state, ctx) = broadcast_setup();
     let (tx, rx) = test_sink();
-    state.subscribers.insert(10, tx);
+    state.subscribers.insert(cid(10), tx);
     let (reply_tx, reply_rx) = mpsc::channel();
     // Pre-populate the skill cache so we can verify it gets invalidated.
     state.discovered_skills = Some(Vec::new());
@@ -1414,7 +1419,7 @@ fn accumulated_usage_in_attach_snapshot() {
     let mut shutdown = false;
     process_command(
         SessionCommand::Attach {
-            client_id: 42,
+            client_id: cid(42),
             tx: sub_tx,
         },
         &mut state,
@@ -1460,7 +1465,7 @@ fn sync_accumulated_usage_updates_config_and_broadcasts() {
     let mut state = test_state();
 
     let (sub_tx, sub_rx) = test_sink();
-    state.subscribers.insert(42, sub_tx);
+    state.subscribers.insert(cid(42), sub_tx);
 
     // The worker's cumulative total, as routed from the private clone in
     // `broadcast_token_usage` (requests.rs).
@@ -1554,7 +1559,7 @@ fn attach_snapshot_carries_mid_turn_accumulated_usage() {
     let (sub_tx, sub_rx) = test_sink();
     process_command(
         SessionCommand::Attach {
-            client_id: 42,
+            client_id: cid(42),
             tx: sub_tx,
         },
         &mut state,
@@ -1665,7 +1670,7 @@ fn attach_with_active_requests_sends_started_to_new_subscriber() {
     let mut shutdown = false;
     process_command(
         SessionCommand::Attach {
-            client_id: 42,
+            client_id: cid(42),
             tx: sub_tx,
         },
         &mut state,
@@ -1720,7 +1725,7 @@ fn attach_without_active_requests_does_not_send_started() {
     let mut shutdown = false;
     process_command(
         SessionCommand::Attach {
-            client_id: 42,
+            client_id: cid(42),
             tx: sub_tx,
         },
         &mut state,
@@ -2431,7 +2436,7 @@ fn one_reply(
 fn set_model_success_acks_accepted_and_broadcasts_model_selected() {
     let (mut state, ctx) = broadcast_setup();
     let (sink, rx) = test_sink();
-    state.subscribers.insert(10, sink.clone());
+    state.subscribers.insert(cid(10), sink.clone());
     let target = target_for(7, MessageKind::SetModel, &sink, &ctx);
 
     let _ = handle_set_model("gpt-4".into(), Some(target), &mut state, &ctx);
@@ -2456,7 +2461,7 @@ fn set_model_success_acks_accepted_and_broadcasts_model_selected() {
 fn set_reasoning_effort_success_acks_accepted_and_broadcasts_effort_set() {
     let (mut state, ctx) = broadcast_setup();
     let (sink, rx) = test_sink();
-    state.subscribers.insert(10, sink.clone());
+    state.subscribers.insert(cid(10), sink.clone());
     let target = target_for(8, MessageKind::SetReasoningEffort, &sink, &ctx);
 
     let _ = handle_set_reasoning_effort("high".into(), Some(target), &mut state, &ctx);
@@ -2481,7 +2486,7 @@ fn set_reasoning_effort_success_acks_accepted_and_broadcasts_effort_set() {
 fn set_reasoning_effort_too_long_acks_failed_and_broadcasts_failure() {
     let (mut state, ctx) = broadcast_setup();
     let (sink, rx) = test_sink();
-    state.subscribers.insert(10, sink.clone());
+    state.subscribers.insert(cid(10), sink.clone());
     let target = target_for(9, MessageKind::SetReasoningEffort, &sink, &ctx);
 
     let _ = handle_set_reasoning_effort("x".repeat(65), Some(target), &mut state, &ctx);
@@ -2507,7 +2512,7 @@ fn set_reasoning_effort_too_long_acks_failed_and_broadcasts_failure() {
 fn set_account_success_acks_accepted_and_broadcasts_account_set() {
     let (mut state, ctx) = broadcast_setup();
     let (sink, rx) = test_sink();
-    state.subscribers.insert(10, sink.clone());
+    state.subscribers.insert(cid(10), sink.clone());
     let target = target_for(11, MessageKind::SetSessionAccount, &sink, &ctx);
 
     let _ = handle_set_account("acct".into(), Some(target), &mut state, &ctx);
@@ -2532,7 +2537,7 @@ fn set_account_success_acks_accepted_and_broadcasts_account_set() {
 fn undo_success_acks_accepted_and_broadcasts_turns_undone() {
     let (mut state, ctx) = broadcast_setup();
     let (sink, rx) = test_sink();
-    state.subscribers.insert(10, sink.clone());
+    state.subscribers.insert(cid(10), sink.clone());
     let target = target_for(12, MessageKind::Undo, &sink, &ctx);
 
     let _ = handle_undo(Some(target), &mut state, &ctx);
@@ -2558,7 +2563,7 @@ fn undo_nothing_to_undo_acks_failed() {
     let (mut state, ctx) = broadcast_setup();
     state.turns.clear();
     let (sink, rx) = test_sink();
-    state.subscribers.insert(10, sink.clone());
+    state.subscribers.insert(cid(10), sink.clone());
     let target = target_for(13, MessageKind::Undo, &sink, &ctx);
 
     let _ = handle_undo(Some(target), &mut state, &ctx);
@@ -2577,7 +2582,7 @@ fn undo_nothing_to_undo_acks_failed() {
 fn redo_nothing_to_redo_acks_failed() {
     let (mut state, ctx) = broadcast_setup();
     let (sink, rx) = test_sink();
-    state.subscribers.insert(10, sink.clone());
+    state.subscribers.insert(cid(10), sink.clone());
     let target = target_for(14, MessageKind::Redo, &sink, &ctx);
 
     let _ = handle_redo(Some(target), &mut state, &ctx);
@@ -2596,7 +2601,7 @@ fn redo_nothing_to_redo_acks_failed() {
 fn set_title_success_acks_accepted_and_broadcasts_title_set() {
     let (mut state, ctx) = broadcast_setup();
     let (sink, rx) = test_sink();
-    state.subscribers.insert(10, sink.clone());
+    state.subscribers.insert(cid(10), sink.clone());
     // Title changes have no wire client message (the agent tool drives them), so
     // there is no `MessageKind` variant for one; the filler kind exercises the
     // generic ack path.
@@ -2624,7 +2629,7 @@ fn set_title_success_acks_accepted_and_broadcasts_title_set() {
 fn set_title_too_long_acks_failed() {
     let (mut state, ctx) = broadcast_setup();
     let (sink, rx) = test_sink();
-    state.subscribers.insert(10, sink.clone());
+    state.subscribers.insert(cid(10), sink.clone());
     let target = target_for(16, MessageKind::CreateSession, &sink, &ctx);
 
     let _ = handle_set_title(
@@ -2647,7 +2652,7 @@ fn set_title_too_long_acks_failed() {
 fn set_working_dir_success_acks_accepted_and_broadcasts_workdir_set() {
     let (mut state, ctx) = broadcast_setup();
     let (sink, rx) = test_sink();
-    state.subscribers.insert(10, sink.clone());
+    state.subscribers.insert(cid(10), sink.clone());
     // Same filler as `set_title` (no wire client message exists).
     let target = target_for(17, MessageKind::CreateSession, &sink, &ctx);
     let (tool_tx, _tool_rx) = mpsc::channel();
@@ -2680,7 +2685,7 @@ fn set_working_dir_success_acks_accepted_and_broadcasts_workdir_set() {
 fn run_input_empty_acks_failed_and_broadcasts_stream_failure() {
     let (mut state, ctx) = broadcast_setup();
     let (sink, rx) = test_sink();
-    state.subscribers.insert(10, sink.clone());
+    state.subscribers.insert(cid(10), sink.clone());
     let target = target_for(18, MessageKind::RunInput, &sink, &ctx);
     let mut shutdown = false;
 
@@ -2737,7 +2742,7 @@ fn run_input_accept_acks_targeted_started_and_broadcasts_started() {
     state.provider = Some(InferenceProvider::from_openai(client));
 
     let (sink, rx) = test_sink();
-    state.subscribers.insert(10, sink.clone());
+    state.subscribers.insert(cid(10), sink.clone());
     let target = target_for(19, MessageKind::RunInput, &sink, &ctx);
     let mut shutdown = false;
 
@@ -2801,8 +2806,8 @@ fn two_clients_same_session_get_distinct_daemon_assigned_stream_ids() {
     // Two distinct clients subscribed to the SAME session.
     let (sink_a, rx_a) = test_sink();
     let (sink_b, rx_b) = test_sink();
-    state.subscribers.insert(10, sink_a.clone());
-    state.subscribers.insert(11, sink_b.clone());
+    state.subscribers.insert(cid(10), sink_a.clone());
+    state.subscribers.insert(cid(11), sink_b.clone());
 
     let mut shutdown = false;
     // Client A's run is accepted; the daemon assigns the stream id.

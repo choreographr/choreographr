@@ -32,7 +32,7 @@ use choreo_ai_protocols::catalog::{ModelCost, ModelEntry, PromptCacheTtl, Provid
 use choreo_ai_protocols::openai::{MaxTokensField, OpenAiClient, ServiceConfig};
 use choreo_ai_protocols::test_utils::MockProvider;
 use choreo_ai_protocols::{ProviderProtocol, catalog_snapshot, replace_catalog};
-use choreo_daemon::broadcast::{LagLimits, SubscriberSink};
+use choreo_daemon::broadcast::{ClientId, LagLimits, SubscriberSink};
 use choreo_daemon::cache_warm::{CacheWarmingMode, MeterKind, WarmPolicy};
 use choreo_daemon::providers::InferenceProvider;
 use choreo_daemon::{RequestContext, SessionCommand, session_main};
@@ -290,7 +290,7 @@ fn warm_ping_fires_during_a_tool_run_and_stays_out_of_context() {
     let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
     session_tx
         .send(SessionCommand::Attach {
-            client_id: 10,
+            client_id: ClientId::from_raw(10),
             tx: SubscriberSink::new(tx),
         })
         .expect("attach");
@@ -370,7 +370,7 @@ fn requests_metered_account_never_pings() {
     let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
     session_tx
         .send(SessionCommand::Attach {
-            client_id: 10,
+            client_id: ClientId::from_raw(10),
             tx: SubscriberSink::new(tx),
         })
         .expect("attach");

@@ -6,7 +6,7 @@
 
 use super::worker::{RequestWorkerArgs, run_request_worker};
 use super::{
-    ActiveRequest, ChildResult, DaemonCommand, DaemonMessage, DaemonMessageType, HashMap,
+    ActiveRequest, ChildResult, ClientId, DaemonCommand, DaemonMessage, DaemonMessageType, HashMap,
     InferenceProvider, MAX_TITLE_CHARS, Path, ReplyTarget, RequestContext, SessionCommand,
     SessionEvent, SessionMcpOverlay, SessionMetadata, SessionRecord, SessionSnapshot, SessionState,
     SessionStatus, SessionSummary, SubscriberSink, TimestampMs, TokenUsage, UnicodeSegmentation,
@@ -524,7 +524,7 @@ pub(super) fn handle_status_changed(
 /// subsequent streaming chunks (`OutputChunk`, `ToolResultChunk`, etc.) to
 /// the correct turn — without this, those chunks would be silently dropped.
 pub(super) fn handle_attach(
-    client_id: u64,
+    client_id: ClientId,
     tx: SubscriberSink,
     state: &mut SessionState,
     ctx: &RequestContext,
@@ -589,7 +589,7 @@ pub(super) fn handle_attach(
 
 /// Detach a client from this session.
 pub(super) fn handle_detach(
-    client_id: u64,
+    client_id: ClientId,
     state: &mut SessionState,
     shutdown_requested: bool,
     ctx: &RequestContext,
@@ -616,7 +616,7 @@ pub(super) fn handle_detach(
 /// removal. The exit predicate is the same as detach: a session with no
 /// subscribers and no active requests (and not mid-shutdown) can exit.
 pub(super) fn handle_remove_subscriber(
-    client_id: u64,
+    client_id: ClientId,
     state: &mut SessionState,
     shutdown_requested: bool,
     ctx: &RequestContext,

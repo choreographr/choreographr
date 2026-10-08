@@ -1,7 +1,12 @@
 use super::handlers::*;
 use super::*;
-use crate::broadcast::test_sink;
+use crate::broadcast::{ClientId, test_sink};
 use std::sync::LazyLock;
+
+/// Test-only shorthand for a raw client id.
+fn cid(n: u32) -> ClientId {
+    ClientId::from_raw(n)
+}
 
 /// Shared in-memory database for the `ClientCtx` literals in this module.
 /// Every literal now carries a `db: &'a redb::Database` field (required by
@@ -403,7 +408,7 @@ fn dispatch_get_session_state_relays_the_daemon_reply() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -467,7 +472,7 @@ fn handle_acl_add_sync_refuses_remote_clients_without_dialing_daemon() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 7,
+        client_id: cid(7),
         request_id: 0,
         is_unix: false, // a TCP/Noise client
     };
@@ -510,7 +515,7 @@ fn handle_unlock_sync_ok() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -544,7 +549,7 @@ fn handle_unlock_sync_err() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -582,7 +587,7 @@ fn handle_unlock_sync_disconnected_sends_failed_backstop() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -621,7 +626,7 @@ fn handle_lock_sync_ok_replies_locked() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -650,7 +655,7 @@ fn handle_lock_sync_err_replies_locked_error() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -681,7 +686,7 @@ fn handle_list_models_sync_ok() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -716,7 +721,7 @@ fn handle_refresh_models_sync_ok() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -757,7 +762,7 @@ fn handle_refresh_models_sync_err() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -793,7 +798,7 @@ fn mcp_ctx<'a>(
         daemon_tx,
         attached_session_id,
         attached_session_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     }
@@ -977,7 +982,7 @@ fn handle_list_models_sync_err() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -1013,7 +1018,7 @@ fn handle_client_get_image_serves_attached_session() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut attached,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -1077,7 +1082,7 @@ fn handle_client_get_image_serves_a_tool_result_vision_image() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut attached,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -1163,7 +1168,7 @@ fn handle_client_get_image_refuses_unattached_session() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut attached,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -1205,7 +1210,7 @@ fn handle_get_credential_sync_some() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -1239,7 +1244,7 @@ fn handle_get_credential_sync_none() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -1275,7 +1280,7 @@ fn switch_session_to_different_sends_detach_to_old() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut attached_id,
         attached_session_tx: &mut attached_tx,
-        client_id: 42,
+        client_id: cid(42),
         request_id: 0,
         is_unix: true,
     };
@@ -1285,12 +1290,12 @@ fn switch_session_to_different_sends_detach_to_old() {
     // Detach sent to old session
     assert!(matches!(
         old_rx.try_recv().ok(),
-        Some(SessionCommand::Detach { client_id: 42 })
+        Some(SessionCommand::Detach { client_id }) if client_id == cid(42)
     ));
     // Attach sent to new session
     assert!(matches!(
         new_rx.try_recv().ok(),
-        Some(SessionCommand::Attach { client_id: 42, .. })
+        Some(SessionCommand::Attach { client_id, .. }) if client_id == cid(42)
     ));
     // State updated to new session
     assert_eq!(attached_id, Some(2));
@@ -1312,7 +1317,7 @@ fn switch_session_same_skips_detach() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut attached_id,
         attached_session_tx: &mut attached_tx,
-        client_id: 42,
+        client_id: cid(42),
         request_id: 0,
         is_unix: true,
     };
@@ -1324,7 +1329,7 @@ fn switch_session_same_skips_detach() {
     // Attach still sent (caller expects the subscription)
     assert!(matches!(
         new_rx.try_recv().ok(),
-        Some(SessionCommand::Attach { client_id: 42, .. })
+        Some(SessionCommand::Attach { client_id, .. }) if client_id == cid(42)
     ));
     // State stays at session 1
     assert_eq!(attached_id, Some(1));
@@ -1344,7 +1349,7 @@ fn handle_delete_session_sync_success_sends_accepted() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -1381,7 +1386,7 @@ fn handle_delete_session_sync_error_sends_session_delete_failed() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -1419,7 +1424,7 @@ fn handle_delete_session_sync_disconnected() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -1444,7 +1449,7 @@ fn switch_session_from_none_no_detach() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut attached_id,
         attached_session_tx: &mut attached_tx,
-        client_id: 42,
+        client_id: cid(42),
         request_id: 0,
         is_unix: true,
     };
@@ -1454,7 +1459,7 @@ fn switch_session_from_none_no_detach() {
     assert_eq!(attached_id, Some(1));
     assert!(matches!(
         new_rx.try_recv().ok(),
-        Some(SessionCommand::Attach { client_id: 42, .. })
+        Some(SessionCommand::Attach { client_id, .. }) if client_id == cid(42)
     ));
 }
 
@@ -1475,7 +1480,7 @@ fn dispatch_undo_when_attached_sends_undo_command() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut attached_id,
         attached_session_tx: &mut attached_tx,
-        client_id: 42,
+        client_id: cid(42),
         request_id: 0,
         is_unix: true,
     };
@@ -1502,7 +1507,7 @@ fn dispatch_undo_when_not_attached_sends_failed() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -1538,7 +1543,7 @@ fn dispatch_redo_when_attached_sends_redo_command() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut attached_id,
         attached_session_tx: &mut attached_tx,
-        client_id: 42,
+        client_id: cid(42),
         request_id: 0,
         is_unix: true,
     };
@@ -1565,7 +1570,7 @@ fn dispatch_redo_when_not_attached_sends_failed() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -1600,7 +1605,7 @@ fn dispatch_continue_generation_when_attached_sends_run_input() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut attached_id,
         attached_session_tx: &mut attached_tx,
-        client_id: 42,
+        client_id: cid(42),
         request_id: 0,
         is_unix: true,
     };
@@ -1632,7 +1637,7 @@ fn dispatch_continue_generation_when_not_attached_sends_failed() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -1670,7 +1675,7 @@ fn dispatch_subscribe_all_activity_acks_accepted() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -1710,7 +1715,7 @@ fn dispatch_unsubscribe_all_activity_acks_accepted() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -1751,7 +1756,7 @@ fn dispatch_cancel_acks_accepted() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -1788,7 +1793,7 @@ fn dispatch_set_session_pinned_success_acks_accepted() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };
@@ -1834,7 +1839,7 @@ fn dispatch_set_session_pinned_failure_sends_session_failed() {
         daemon_tx: &daemon_tx,
         attached_session_id: &mut none_id,
         attached_session_tx: &mut none_tx,
-        client_id: 0,
+        client_id: cid(0),
         request_id: 0,
         is_unix: true,
     };

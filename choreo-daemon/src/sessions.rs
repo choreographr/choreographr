@@ -1,4 +1,4 @@
-use crate::broadcast::{LagLimits, ReplyTarget, SubscriberSink, fan_out_evicting};
+use crate::broadcast::{ClientId, LagLimits, ReplyTarget, SubscriberSink, fan_out_evicting};
 use crate::cache_warm::WarmPolicy;
 use crate::context::{LoadedSkill, SkillMeta};
 use crate::daemon::{DaemonCommand, ResolvedAccount};
@@ -191,18 +191,18 @@ pub enum SessionCommand {
     },
     StatusChanged(SessionStatus),
     Attach {
-        client_id: u64,
+        client_id: ClientId,
         tx: SubscriberSink,
     },
     Detach {
-        client_id: u64,
+        client_id: ClientId,
     },
     /// Remove a subscriber without detaching the session (used by the daemon
     /// when a client is evicted for lag or fully disconnects — the daemon
     /// knows the client's session memberships and cleans them up promptly
     /// instead of waiting for the next broadcast to notice the dead sink).
     RemoveSubscriber {
-        client_id: u64,
+        client_id: ClientId,
     },
     GetSummary {
         reply: std::sync::mpsc::Sender<SessionSummary>,
@@ -690,7 +690,7 @@ pub struct SessionState {
     pub next_stream_id: u64,
     last_undo_turn_ids: Option<Vec<u32>>,
     pub turns: BTreeMap<u32, Turn>,
-    subscribers: HashMap<u64, SubscriberSink>,
+    subscribers: HashMap<ClientId, SubscriberSink>,
     pub(crate) active_requests: BTreeMap<u64, ActiveRequest>,
     pub provider: Option<InferenceProvider>,
     /// The account's **provider slug** (catalog key, e.g. "opencode-go"),
@@ -831,7 +831,10 @@ impl SessionState {
         }
     }
 
-    fn from_snapshot(snapshot: SessionSnapshot, subscribers: HashMap<u64, SubscriberSink>) -> Self {
+    fn from_snapshot(
+        snapshot: SessionSnapshot,
+        subscribers: HashMap<ClientId, SubscriberSink>,
+    ) -> Self {
         // usize→u32 turn count: a session with 4 billion turns is impossible
         // in practice (each turn is a full provider round-trip).
         #[expect(clippy::cast_possible_truncation)]
@@ -1297,7 +1300,7 @@ pub(crate) fn turn_for_client(turn: &Turn) -> Turn {
 }
 
 fn broadcast(
-    subscribers: &mut HashMap<u64, SubscriberSink>,
+    subscribers: &mut HashMap<ClientId, SubscriberSink>,
     ctx: &RequestContext,
     message: &DaemonMessageType,
 ) {
@@ -1330,7 +1333,7 @@ fn broadcast(
         &framed,
         &ctx.lag_limits,
         &ctx.global_lag,
-        |_| false, // session subscribers are never duplicate-suppressed
+        |_id, _| false, // session subscribers are never duplicate-suppressed
     );
     for client_id in evict_clients {
         let _ = ctx.daemon_tx.send(DaemonCommand::EvictClient { client_id });
@@ -1341,7 +1344,7 @@ fn broadcast(
 }
 
 fn fail_request(
-    subscribers: &mut HashMap<u64, SubscriberSink>,
+    subscribers: &mut HashMap<ClientId, SubscriberSink>,
     ctx: &RequestContext,
     session_id: u64,
     stream_id: u64,

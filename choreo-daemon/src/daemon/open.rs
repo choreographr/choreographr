@@ -280,10 +280,7 @@ impl DaemonState {
             tool_registry,
             tool_policy: opts.tool_policy,
             platform_tool_bridge: opts.platform_tool_bridge,
-            summary_subscribers: HashMap::new(),
-            client_writers: HashMap::new(),
-            activity_subscribers: HashMap::new(),
-            client_subscribed_sessions: HashMap::new(),
+            clients: HashMap::new(),
             // One daemon-wide lag counter shared by every connection's sink
             // and every session thread (see `broadcast::SubscriberSink`).
             global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),

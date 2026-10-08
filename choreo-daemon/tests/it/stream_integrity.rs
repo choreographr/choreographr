@@ -37,7 +37,7 @@
 #![expect(clippy::expect_used, clippy::panic)]
 use choreo_ai_protocols::openai::{MaxTokensField, OpenAiClient, ServiceConfig};
 use choreo_ai_protocols::test_utils::MockProvider;
-use choreo_daemon::broadcast::{LagLimits, SubscriberSink};
+use choreo_daemon::broadcast::{ClientId, LagLimits, SubscriberSink};
 use choreo_daemon::providers::InferenceProvider;
 use choreo_daemon::{RequestContext, SessionCommand, session_main};
 use choreo_proto::{
@@ -182,12 +182,12 @@ fn spawn_session_with_provider(
 /// Attach a `SubscriberSink` to the session and return its receiver.
 fn attach(
     session_tx: &crossbeam_channel::Sender<SessionCommand>,
-    client_id: u64,
+    client_id: u32,
 ) -> crossbeam_channel::Receiver<DaemonMessage> {
     let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
     session_tx
         .send(SessionCommand::Attach {
-            client_id,
+            client_id: ClientId::from_raw(client_id),
             tx: SubscriberSink::new(tx),
         })
         .expect("send attach");

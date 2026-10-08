@@ -1,3 +1,4 @@
+use crate::broadcast::ClientId;
 use crate::daemon::DaemonCommand;
 use crate::sessions::SessionCommand;
 use choreo_proto::{
@@ -243,13 +244,15 @@ fn writer_thread<W: ConnectionWriter>(
 pub(crate) fn register_client_writer(
     daemon_tx: &crossbeam_channel::Sender<DaemonCommand>,
 ) -> (
-    u64,
+    ClientId,
     crate::broadcast::SubscriberSink,
     crossbeam_channel::Receiver<DaemonMessage>,
 ) {
     let (writer_tx, writer_rx) = crossbeam_channel::unbounded::<DaemonMessage>();
     let sink = crate::broadcast::SubscriberSink::new(writer_tx);
-    let client_id = rand::random::<u64>();
+    // Mint the connection's id from the process-wide monotonic counter (see
+    // `ClientId`): small, readable, collision-free for a daemon's lifetime.
+    let client_id = ClientId::next();
     let _ = daemon_tx.send(DaemonCommand::RegisterClientWriter {
         client_id,
         writer: sink.clone(),
@@ -331,7 +334,7 @@ struct ClientCtx<'a> {
     daemon_tx: &'a crossbeam_channel::Sender<DaemonCommand>,
     attached_session_id: &'a mut Option<u64>,
     attached_session_tx: &'a mut Option<crossbeam_channel::Sender<SessionCommand>>,
-    client_id: u64,
+    client_id: ClientId,
     /// The correlation id of the request currently being dispatched on this
     /// connection — the value stamped onto every reply. Set once at dispatch
     /// entry from the inbound [`ClientMessage::id`]; a connection thread
@@ -394,7 +397,7 @@ impl ClientCtx<'_> {
 /// metric.  Owns the `writer_tx` sender and writer handle so both are consumed.
 fn cleanup_client(
     attached_session_tx: Option<&crossbeam_channel::Sender<SessionCommand>>,
-    client_id: u64,
+    client_id: ClientId,
     daemon_tx: &crossbeam_channel::Sender<DaemonCommand>,
     writer: crate::broadcast::SubscriberSink,
     writer_handle: std::thread::JoinHandle<()>,
@@ -440,7 +443,7 @@ pub(crate) struct ClientConn {
     /// can increment it in balance with the writer thread's per-dequeue
     /// decrement.
     global_lag: Arc<AtomicUsize>,
-    client_id: u64,
+    client_id: ClientId,
     /// Whether this connection arrived over the local Unix socket (vs the
     /// TCP/Noise listener). Trust-boundary input for local-only commands
     /// (see `ClientCtx::is_unix`).
@@ -474,7 +477,7 @@ pub(crate) struct ConnThreadArgs {
     pub writer_rx: crossbeam_channel::Receiver<DaemonMessage>,
     /// Daemon-wide lag counter, shared by every connection.
     pub global_lag: Arc<AtomicUsize>,
-    pub client_id: u64,
+    pub client_id: ClientId,
     /// Whether this connection is the LOCAL trust domain — the Unix socket or
     /// the in-process embedded link — as opposed to the TCP/Noise listener.
     /// Trust-boundary input for local-only commands (see [`ClientCtx::is_unix`]).
