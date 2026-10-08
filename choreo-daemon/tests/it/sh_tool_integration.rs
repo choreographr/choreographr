@@ -1,7 +1,5 @@
-use choreo_daemon::{ShArgs, Shell, execute_sh_tool};
+use choreo_daemon::{ShArgs, execute_sh_tool};
 use std::path::Path;
-
-const SHELL: Shell = Shell::Bash;
 
 #[test]
 #[ignore = "integration"]
@@ -9,7 +7,6 @@ fn echo_hello() {
     let result = execute_sh_tool(
         &ShArgs {
             command: "echo hello world".into(),
-            shell: SHELL,
             workdir: None,
             timeout: None,
         },
@@ -26,7 +23,6 @@ fn exit_nonzero() {
     let result = execute_sh_tool(
         &ShArgs {
             command: "exit 42".into(),
-            shell: SHELL,
             workdir: None,
             timeout: None,
         },
@@ -45,7 +41,6 @@ fn working_directory() {
     let result = execute_sh_tool(
         &ShArgs {
             command: "pwd".into(),
-            shell: SHELL,
             workdir: Some(dir.display().to_string()),
             timeout: None,
         },
@@ -61,7 +56,6 @@ fn timeout_kills_command() {
     let result = execute_sh_tool(
         &ShArgs {
             command: "sleep 10".into(),
-            shell: SHELL,
             workdir: None,
             timeout: Some(500),
         },
@@ -78,7 +72,6 @@ fn output_truncation() {
     let result = execute_sh_tool(
         &ShArgs {
             command: "head -c 200000 /dev/zero | tr '\\0' 'x'".into(),
-            shell: SHELL,
             workdir: None,
             timeout: None,
         },
@@ -94,7 +87,6 @@ fn stderr_output_included() {
     let result = execute_sh_tool(
         &ShArgs {
             command: "echo out && echo err >&2".into(),
-            shell: SHELL,
             workdir: None,
             timeout: None,
         },

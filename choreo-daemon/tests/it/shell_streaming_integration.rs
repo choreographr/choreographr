@@ -176,7 +176,6 @@ fn execute_sh_tool_non_streaming_still_works() {
     let result = execute_sh_tool(
         &ShArgs {
             command: "echo hello".into(),
-            shell: choreo_daemon::Shell::Bash,
             workdir: None,
             timeout: None,
         },

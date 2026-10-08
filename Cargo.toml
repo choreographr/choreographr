@@ -523,6 +523,10 @@ url = "2"
 uds_windows = "1.2.1"
 humfmt = "0.7.0"
 hex = "0.4"
+# In-process PATH lookup for the `sh` tool's startup shell resolution. Used
+# instead of spawning `which(1)` so resolution stays a pure, dependency-light
+# binary query with no subprocess (see choreo-daemon's `tools/shell_resolver.rs`).
+which = "8.0.6"
 # Substrate client (native/light + JSON-RPC) — promoted to the workspace now
 # that BOTH choreo-blockchain (the `blockchain` feature) and choreo-content (the
 # always-on Coordination Platform tools) use it.

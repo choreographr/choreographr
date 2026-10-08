@@ -1,6 +1,7 @@
 use super::{
     Tool, ToolExecError,
     context::ToolContext,
+    shell_resolver::{self, ResolvedShell},
     shell_util::{format_shell_output, resolve_workdir, run_shell_streaming, spawn_with_watchdog},
 };
 use choreo_keystore::ServiceCredential;
@@ -8,51 +9,36 @@ use crossbeam_channel;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Shell {
-    /// Bourne Again `SHell`
-    Bash,
-    /// Debian Almquist `SHell`
-    Dash,
-    /// Z `SHell`
-    Zsh,
-}
-
-impl JsonSchema for Shell {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        std::borrow::Cow::Borrowed("Shell")
-    }
-
-    fn schema_id() -> std::borrow::Cow<'static, str> {
-        std::borrow::Cow::Borrowed(concat!(module_path!(), "::Shell"))
-    }
-
-    fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        // Use the simple "enum" format instead of schemars' default
-        // "oneOf" with "const" — many OpenAI-compatible providers do
-        // not support the const keyword in tool parameter schemas.
-        schemars::json_schema!({
-            "type": "string",
-            "enum": ["bash", "dash", "zsh"]
-        })
-    }
-}
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ShArgs {
     /// The shell command to execute (runs via `<shell> -c`)
     pub command: String,
-    /// Which POSIX-compatible shell to use
-    pub shell: Shell,
     /// Working directory for the command (relative to the session working directory, or absolute)
     pub workdir: Option<String>,
     /// Timeout in milliseconds (default 30000; the daemon's outer deadline is raised to cover this when longer)
     pub timeout: Option<u64>,
 }
 
-pub(crate) struct Sh;
+/// The `sh` tool.
+///
+/// The shell is resolved ONCE at daemon startup (see [`shell_resolver`]) and
+/// carried here: the model never picks a shell, so [`ShArgs`] has no `shell`
+/// parameter. The tool is only registered when resolution succeeds, so `Sh`
+/// always has a usable [`ResolvedShell`].
+pub(crate) struct Sh {
+    shell: ResolvedShell,
+}
+
+impl Sh {
+    /// Resolve the shell this machine's `sh` tool should run under, or `None`
+    /// when no suitable POSIX shell is installed (in which case the tool is not
+    /// registered at all).
+    pub(crate) fn resolve() -> Option<Sh> {
+        shell_resolver::detect_default().map(|shell| Sh { shell })
+    }
+}
 
 impl Tool for Sh {
     type Args = ShArgs;
@@ -67,8 +53,10 @@ impl Tool for Sh {
         "shell"
     }
 
-    fn description(&self) -> &'static str {
-        "Execute a shell command using a POSIX-compatible shell (bash, dash, or zsh). Supports pipes, redirects, glob expansion, and environment variables. Prefer this over `exec` when you need shell features. Non-interactive only — commands that read from stdin will hang. The `shell` parameter must be explicitly specified (bash, dash, or zsh)."
+    fn description(&self) -> &str {
+        // The description names the resolved shell (type + compatibility +
+        // version) and never the filesystem path.
+        &self.shell.description
     }
 
     fn supports_streaming_output() -> bool {
@@ -77,7 +65,6 @@ impl Tool for Sh {
 
     fn describe_invocation(&self, args: &Self::Args) -> String {
         let mut parts = vec![format!("Running shell command: `{}`.", args.command)];
-        parts.push(format!(" Shell: {:?}.", args.shell));
         if let Some(timeout) = args.timeout {
             parts.push(format!(" Timeout: {timeout}ms."));
         }
@@ -91,7 +78,7 @@ impl Tool for Sh {
         working_dir: Option<&Path>,
         _ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, Self::Error> {
-        execute_sh_tool(&args, working_dir)
+        execute_sh_with(&self.shell, &args, working_dir)
     }
 
     fn execute_streaming(
@@ -102,20 +89,14 @@ impl Tool for Sh {
         output_tx: crossbeam_channel::Sender<Vec<u8>>,
         _ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, Self::Error> {
-        let shell_str = match args.shell {
-            Shell::Bash => "bash",
-            Shell::Dash => "dash",
-            Shell::Zsh => "zsh",
-        };
         let command = &args.command;
         let timeout_ms = args.timeout.unwrap_or(30000);
         let resolved = resolve_workdir(args.workdir.as_deref(), working_dir);
 
-        let mut cmd = std::process::Command::new(shell_str);
-        cmd.args(["-c", command])
-            .current_dir(&resolved)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+        let mut cmd = build_command(&self.shell, command);
+        cmd.current_dir(&resolved)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         run_shell_streaming(&mut cmd, command, timeout_ms, output_tx)
     }
@@ -125,19 +106,37 @@ impl Tool for Sh {
     }
 }
 
-/// Run a command in the selected POSIX-compatible shell and return its
-/// output.
+/// Build the child `Command` that runs `command` under the resolved shell.
+///
+/// The single place that knows the shell's invocation shape, shared by the
+/// buffered and streaming paths: `-c command` for every family, plus the
+/// forced `argv[0]` when the resolved shell needs one (zsh → `sh`, busybox →
+/// `ash`). `arg0` is a Unix-only primitive — this is a Unix-shell tool, so the
+/// forcing is gated to Unix and a resolved shell on Windows (Git/WSL bash)
+/// carries no `argv0`.
+fn build_command(shell: &ResolvedShell, command: &str) -> Command {
+    let mut cmd = Command::new(&shell.program);
+    cmd.args(["-c", command]);
+    #[cfg(unix)]
+    if let Some(argv0) = &shell.argv0 {
+        use std::os::unix::process::CommandExt as _;
+        cmd.arg0(argv0);
+    }
+    cmd
+}
+
+/// Run `command` under `shell` and return its buffered output. The core of the
+/// `sh` tool, shared with the public [`execute_sh_tool`] convenience entry point.
 ///
 /// # Errors
 ///
-/// Returns Err if the shell cannot be spawned, the command times out, or
-/// the command exits non-zero.
-pub fn execute_sh_tool(args: &ShArgs, working_dir: Option<&Path>) -> Result<String, ToolExecError> {
-    let shell_str = match args.shell {
-        Shell::Bash => "bash",
-        Shell::Dash => "dash",
-        Shell::Zsh => "zsh",
-    };
+/// Returns Err if the shell cannot be spawned, the command times out, or the
+/// command exits non-zero.
+pub(crate) fn execute_sh_with(
+    shell: &ResolvedShell,
+    args: &ShArgs,
+    working_dir: Option<&Path>,
+) -> Result<String, ToolExecError> {
     let command = &args.command;
     // The per-tool timeout (default 30s) governs shell execution.
     // The outer deadline in execute_tool_with_timeout (300s) is the
@@ -146,11 +145,10 @@ pub fn execute_sh_tool(args: &ShArgs, working_dir: Option<&Path>) -> Result<Stri
 
     let resolved = resolve_workdir(args.workdir.as_deref(), working_dir);
 
-    let mut cmd = std::process::Command::new(shell_str);
-    cmd.args(["-c", command])
-        .current_dir(&resolved)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    let mut cmd = build_command(shell, command);
+    cmd.current_dir(&resolved)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let (output, was_killed) = spawn_with_watchdog(&mut cmd, timeout_ms)?;
 
@@ -159,49 +157,46 @@ pub fn execute_sh_tool(args: &ShArgs, working_dir: Option<&Path>) -> Result<Stri
     ))
 }
 
+/// Run `command` under the process's resolved POSIX shell and return its output.
+///
+/// A convenience entry point that resolves (and caches) the shell itself; the
+/// `sh` tool uses [`execute_sh_with`] with the shell it already holds.
+///
+/// # Errors
+///
+/// Returns Err if no suitable POSIX shell is installed, the shell cannot be
+/// spawned, the command times out, or the command exits non-zero.
+pub fn execute_sh_tool(args: &ShArgs, working_dir: Option<&Path>) -> Result<String, ToolExecError> {
+    let shell = shell_resolver::detect_default()
+        .ok_or_else(|| ToolExecError("no suitable POSIX shell found on this system".into()))?;
+    execute_sh_with(&shell, args, working_dir)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::tools::Tool;
-    use schemars::JsonSchema;
-    use schemars::SchemaGenerator;
 
     #[test]
-    fn sh_tool_has_valid_metadata() {
-        let tool = super::Sh;
-        assert_ne!(tool.name(), "");
-        assert_ne!(tool.description(), "");
-        let schema = tool.schema();
-        assert!(schema.is_object());
+    fn sh_tool_has_valid_metadata_when_a_shell_is_available() {
+        // On a host with a POSIX shell the tool resolves and advertises a
+        // non-empty description; on a host without one `resolve` is `None` and
+        // the tool is simply not registered.
+        if let Some(tool) = super::Sh::resolve() {
+            assert_eq!(tool.name(), "sh");
+            assert_ne!(tool.description(), "");
+            assert!(tool.schema().is_object());
+        }
     }
 
     #[test]
-    fn shell_enum_json_schema_uses_flat_enum_format() {
-        let mut generator = SchemaGenerator::default();
-        let schema = super::Shell::json_schema(&mut generator);
-        let json: serde_json::Value = serde_json::to_value(&schema).unwrap();
-        // Should use simple string enum, not oneOf/const
-        assert_eq!(json["type"], "string", "Shell should be a string schema");
-        let variants: Vec<&str> = json["enum"]
-            .as_array()
-            .expect("Shell should have an enum array")
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
-        assert_eq!(variants, vec!["bash", "dash", "zsh"]);
-    }
-
-    #[test]
-    fn sh_tool_schema_shell_param_uses_flat_enum() {
-        let schema = super::Sh.schema();
-        // The shell property should use the flat enum format
-        let shell_schema = &schema["properties"]["shell"];
-        assert_eq!(shell_schema["type"], "string");
-        let variants: Vec<&str> = shell_schema["enum"]
-            .as_array()
-            .expect("shell parameter should have enum")
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
-        assert_eq!(variants, vec!["bash", "dash", "zsh"]);
+    fn args_schema_has_no_shell_parameter() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(super::ShArgs)).expect("serialize schema");
+        let properties = &schema["properties"];
+        assert!(properties.get("command").is_some());
+        assert!(
+            properties.get("shell").is_none(),
+            "the model must not pick a shell"
+        );
     }
 }

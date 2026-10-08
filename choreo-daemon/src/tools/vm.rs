@@ -470,15 +470,6 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
         results
     }
 
-    // ── Shell variants (mirrors host Shell enum) ─────────────────────
-
-    /// Shell variants matching the host Shell enum for `sh()`.
-    pub enum Shell {
-        Bash,
-        Dash,
-        Zsh,
-    }
-
     // ── Per-tool wrappers ─────────────────────────────────────────────
 
     /// db_get(key: &str) -> raw value bytes. Empty vec = not found or error.
@@ -626,13 +617,12 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
         dec_double_str_result(&resp).unwrap_or_default()
     }
 
-    /// sh(command: &str, shell: Shell) -> command output string.
-    /// Execute a shell command using the specified POSIX-compatible shell.
-    pub fn sh(command: &str, shell: Shell, workdir: Option<&str>, timeout_ms: Option<u64>) -> String {
+    /// sh(command: &str, workdir: Option<&str>, timeout_ms: Option<u64>) -> command output string.
+    /// Execute a shell command under the host's resolved POSIX shell (the host
+    /// picks the best available shell at startup; the guest does not choose one).
+    pub fn sh(command: &str, workdir: Option<&str>, timeout_ms: Option<u64>) -> String {
         let mut args = Vec::new();
         enc_str(command, &mut args);
-        // Encode Shell as a postcard unit variant index (0 = Bash, 1 = Dash, 2 = Zsh)
-        enc_varint(shell as u64, &mut args);
         enc_option_str(workdir, &mut args);
         enc_option_u64(timeout_ms, &mut args);
         let resp = call("sh", &args);
@@ -1392,7 +1382,7 @@ impl Tool for RunRiscV {
     }
 
     fn description(&self) -> &'static str {
-        "Compile and run Rust code in a RISC-V sandboxed VM. PREFER the 'source' parameter over 'program'. With 'source', only provide a `fn main()` body — the tool auto-generates #![no_std], #![no_main], #[panic_handler], _start, and the `choreo` module. For externally-compiled ELFs, use 'program' (base64) or 'program_path' (path to an ELF file on disk) — the binary must be compiled with the choreographr syscall ABI. Use per-tool convenience wrappers: choreo::read_file(path), choreo::write_file(path, content, overwrite), choreo::db_get(key), choreo::db_set(key, value), choreo::db_delete(key), choreo::sh(command, shell, workdir, timeout_ms), choreo::exec(command, args, workdir, timeout_ms), choreo::grep(pattern, regex, include, path, max_results), choreo::find(pattern, glob, path, max_results), choreo::http_request(method, url, headers, body, timeout_secs). CRITICAL: For grep, pass regex:true for regex patterns and regex:false for literal substring matching. The wrappers handle postcard encoding automatically. Use choreo::write(b\"...\") for VM output and choreo::exit(code) to finish. Do NOT use raw ecall with Linux syscall number 64 (write) — it is not supported. The guest is a single-hart RISC-V VM with the A (atomic) extension disabled, so guests must not use `core::sync::atomic` read-modify-write operations (they fail at compile time)."
+        "Compile and run Rust code in a RISC-V sandboxed VM. PREFER the 'source' parameter over 'program'. With 'source', only provide a `fn main()` body — the tool auto-generates #![no_std], #![no_main], #[panic_handler], _start, and the `choreo` module. For externally-compiled ELFs, use 'program' (base64) or 'program_path' (path to an ELF file on disk) — the binary must be compiled with the choreographr syscall ABI. Use per-tool convenience wrappers: choreo::read_file(path), choreo::write_file(path, content, overwrite), choreo::db_get(key), choreo::db_set(key, value), choreo::db_delete(key), choreo::sh(command, workdir, timeout_ms), choreo::exec(command, args, workdir, timeout_ms), choreo::grep(pattern, regex, include, path, max_results), choreo::find(pattern, glob, path, max_results), choreo::http_request(method, url, headers, body, timeout_secs). CRITICAL: For grep, pass regex:true for regex patterns and regex:false for literal substring matching. The wrappers handle postcard encoding automatically. Use choreo::write(b\"...\") for VM output and choreo::exit(code) to finish. Do NOT use raw ecall with Linux syscall number 64 (write) — it is not supported. The guest is a single-hart RISC-V VM with the A (atomic) extension disabled, so guests must not use `core::sync::atomic` read-modify-write operations (they fail at compile time)."
     }
 
     fn supports_streaming_output() -> bool {
@@ -1442,7 +1432,7 @@ impl Tool for RunRiscV {
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "Rust source code for `fn main()`. CRITICAL: Do NOT include #![no_std], #![no_main], #[panic_handler], _start, or the `choreo` module — these are auto-generated. Do NOT use raw ecall with Linux syscall number 64 (write) — it is not supported. Use the provided wrappers (they handle postcard encoding automatically — no need to call choreo::tool_call or choreo::call directly):\n- choreo::write(b\"...\"), choreo::exit(code)\n- choreo::read_file(path: &str) -> String (line-numbered: a `path:`/`lines:` header then `N | content` lines — strip the header and gutter for raw text)\n- choreo::write_file(path: &str, content: &str, overwrite: bool)\n- choreo::db_get(key: &str) -> Vec<u8>, choreo::db_set(key: &str, value: &[u8]), choreo::db_delete(key: &str) -> bool\n- choreo::sh(command: &str, shell: Shell, workdir: Option<&str>, timeout_ms: Option<u64>) -> String\n- choreo::exec(command: &str, args: &[&str], workdir: Option<&str>, timeout_ms: Option<u64>) -> String\n- choreo::grep(pattern: &str, regex: bool, include: Option<&str>, path: Option<&str>, max_results: Option<u32>) -> String — pass regex: true for regular expression patterns, regex: false for literal substring matching. include is a file glob filter (e.g. Some(\"*.rs\")). path scopes the search directory.\n- choreo::find(pattern: &str, glob: bool, path: Option<&str>, max_results: Option<u32>) -> String — glob: true = glob mode; false = auto-detect.\n- choreo::http_request(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&str>, timeout_secs: Option<u64>) -> String\nExample: `fn main() { let content = choreo::read_file(\"Cargo.toml\"); choreo::write(content.as_bytes()); }`. Alloc types are pre-imported: Vec, String, Box, format!, .to_string(). The guest is a single-hart RISC-V VM with the A (atomic) extension disabled — do not use `core::sync::atomic` read-modify-write operations (they fail at compile time)."
+                    "description": "Rust source code for `fn main()`. CRITICAL: Do NOT include #![no_std], #![no_main], #[panic_handler], _start, or the `choreo` module — these are auto-generated. Do NOT use raw ecall with Linux syscall number 64 (write) — it is not supported. Use the provided wrappers (they handle postcard encoding automatically — no need to call choreo::tool_call or choreo::call directly):\n- choreo::write(b\"...\"), choreo::exit(code)\n- choreo::read_file(path: &str) -> String (line-numbered: a `path:`/`lines:` header then `N | content` lines — strip the header and gutter for raw text)\n- choreo::write_file(path: &str, content: &str, overwrite: bool)\n- choreo::db_get(key: &str) -> Vec<u8>, choreo::db_set(key: &str, value: &[u8]), choreo::db_delete(key: &str) -> bool\n- choreo::sh(command: &str, workdir: Option<&str>, timeout_ms: Option<u64>) -> String\n- choreo::exec(command: &str, args: &[&str], workdir: Option<&str>, timeout_ms: Option<u64>) -> String\n- choreo::grep(pattern: &str, regex: bool, include: Option<&str>, path: Option<&str>, max_results: Option<u32>) -> String — pass regex: true for regular expression patterns, regex: false for literal substring matching. include is a file glob filter (e.g. Some(\"*.rs\")). path scopes the search directory.\n- choreo::find(pattern: &str, glob: bool, path: Option<&str>, max_results: Option<u32>) -> String — glob: true = glob mode; false = auto-detect.\n- choreo::http_request(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&str>, timeout_secs: Option<u64>) -> String\nExample: `fn main() { let content = choreo::read_file(\"Cargo.toml\"); choreo::write(content.as_bytes()); }`. Alloc types are pre-imported: Vec, String, Box, format!, .to_string(). The guest is a single-hart RISC-V VM with the A (atomic) extension disabled — do not use `core::sync::atomic` read-modify-write operations (they fail at compile time)."
                 },
                 "program": {
                     "type": "string",

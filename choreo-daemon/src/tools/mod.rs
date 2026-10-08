@@ -215,6 +215,8 @@ pub(crate) mod retrieve_webpage;
 pub(crate) mod series;
 pub(crate) mod session_inspect;
 pub(crate) mod sh;
+// Startup POSIX-shell resolution for the `sh` tool (tier-major, cached).
+pub(crate) mod shell_resolver;
 pub mod shell_util;
 pub mod subsession;
 pub(crate) mod time;
@@ -300,7 +302,12 @@ pub trait Tool: Send + Sync {
     fn group(&self) -> &'static str {
         "core"
     }
-    fn description(&self) -> &'static str;
+    /// The model-facing description. Returns `&str` (not `&'static str`) so a
+    /// tool can carry a runtime-built description — the `sh` tool names the
+    /// POSIX shell resolved at startup, which is not a compile-time constant.
+    /// The `define_tool!` macro and every manual `&'static str` impl still
+    /// satisfy this (a `&'static str` literal coerces to `&str`).
+    fn description(&self) -> &str;
 
     /// Auto-derived JSON Schema for the tool's input arguments.
     fn schema(&self) -> serde_json::Value {
@@ -491,7 +498,7 @@ impl<T: Tool + 'static> ToolDyn for T {
     fn group(&self) -> &'static str {
         Tool::group(self)
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         Tool::description(self)
     }
     fn schema(&self) -> serde_json::Value {
@@ -654,7 +661,7 @@ pub fn static_groups() -> &'static [ToolGroup] {
             },
             ToolGroup {
                 name: "shell".into(),
-                description: "Shell command execution (bash, nushell, fish, powershell, exec)".into(),
+                description: "Shell command execution (POSIX sh, nushell, fish, powershell, exec)".into(),
             },
             ToolGroup {
                 name: "x".into(),
@@ -775,7 +782,13 @@ impl ToolRegistry {
         reg.register(git::GitShow);
         // Shell/exec tools — the group the Mobile policy exists to omit.
         if policy == ToolPolicy::Full {
-            reg.register(sh::Sh);
+            // `sh` runs under a POSIX shell resolved once at startup; when the
+            // machine has no suitable shell (no bash>=4/zsh/ksh/dash/ash/busybox)
+            // the tool is simply not registered, so the model is never offered a
+            // tool that cannot spawn.
+            if let Some(sh) = sh::Sh::resolve() {
+                reg.register(sh);
+            }
             if shell_util::binary_exists("nu") {
                 reg.register(nu::NuShell);
             }

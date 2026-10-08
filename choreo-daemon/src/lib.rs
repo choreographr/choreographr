@@ -53,7 +53,7 @@ pub use crate::tools::nu::{NuArgs, execute_nu_tool};
 pub use crate::tools::pdf::{
     PdfClassifyArgs, PdfToMarkdownArgs, execute_pdf_classify, execute_pdf_to_markdown,
 };
-pub use crate::tools::sh::{ShArgs, Shell, execute_sh_tool};
+pub use crate::tools::sh::{ShArgs, execute_sh_tool};
 #[cfg(test)]
 pub(crate) use crate::tools::sha256_hex;
 pub use crate::tools::vm::{RunRiscVInput, execute_run_riscv_tool};
