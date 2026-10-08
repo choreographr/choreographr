@@ -37,8 +37,8 @@ headless_chrome = "1.0.22"
 
 # gix 0.87 removed the `tree-editor` feature (tree editing is now part of the
 # default API surface); `tree-error` enables the error-context variant.
-gix = { version = "0.87", features = ["revision"] }
-gix-imara-diff = { version = "0.2", features = ["unified_diff"] }
+gix = { version = "0.88", features = ["revision"] }
+gix-imara-diff = { version = "0.3", features = ["unified_diff"] }
 hmac = "0.13"
 image.workspace = true
 heif-oxide.workspace = true

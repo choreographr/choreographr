@@ -492,7 +492,7 @@ postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 # frames, so the on-disk schema-2 contract is unchanged. Numeric compression
 # levels 1–22 map to C zstd numbering (COMPRESSION_LEVEL=6 keeps the tuned
 # speed/ratio trade-off). Apache-2.0, matching the workspace license.
-structured-zstd = "0.0.55"
+structured-zstd = "0.0.58"
 # Atomic lock-free snapshot swap for process-wide state with a single writer
 # (the provider catalog in choreo-ai-protocols, the client ACL in
 # choreo-daemon — both read from many threads and swapped only from the
