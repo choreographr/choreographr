@@ -216,7 +216,8 @@ impl ImageGenerationClient for OpenAiImageClient {
         tracing::info!(
             model = %req.model,
             image_b64_len = image_b64.len(),
-            revised_prompt = revised_prompt.as_deref().unwrap_or(""),
+            // Length only: the revised prompt is derived from the user's prompt.
+            revised_prompt_len = revised_prompt.as_deref().map_or(0, str::len),
             "image generation succeeded"
         );
 

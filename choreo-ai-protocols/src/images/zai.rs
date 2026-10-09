@@ -276,7 +276,7 @@ impl ImageGenerationClient for ZaiImageClient {
             model = %req.model,
             ?req.size,
             ?req.quality,
-            body = %body,
+            // No `body`: the request carries the image prompt.
             max_attempts = retry_cfg.max_attempts,
             "sending z.ai image generation request"
         );

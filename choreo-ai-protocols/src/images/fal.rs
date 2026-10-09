@@ -290,7 +290,7 @@ impl ImageGenerationClient for FalImageClient {
             model = %req.model,
             ?req.size,
             ?req.output_format,
-            body = %body,
+            // No `body`: the request carries the image prompt.
             max_attempts = retry_cfg.max_attempts,
             "sending fal image generation request"
         );

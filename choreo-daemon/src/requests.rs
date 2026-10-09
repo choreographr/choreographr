@@ -724,7 +724,9 @@ pub(crate) fn run_agent_loop(
                     session_id = ctx.session_id,
                     turn = turn_iter,
                     response_len = final_text.content.len(),
-                    reasoning = final_text.reasoning.as_deref().unwrap_or_default(),
+                    // Length only: the reasoning (and the answer it may carry)
+                    // is model content and must never be logged.
+                    reasoning_len = final_text.reasoning.as_deref().map_or(0, str::len),
                     "model returned final text",
                 );
                 let token_usage = final_text.usage;
