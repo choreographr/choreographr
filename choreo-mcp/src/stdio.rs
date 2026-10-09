@@ -248,7 +248,8 @@ impl StdioTransport {
             .map_err(|e| McpError::SpawnFailed(e.to_string()))?;
 
         // With a per-server log configured, drain the child's stderr into it on
-        // the sidecar runtime. The task ends when the child closes stderr.
+        // a dedicated blocking thread (never the rmcp sidecar runtime — see
+        // `log`). The thread ends when the child closes stderr.
         if let Some(path) = log_path
             && let Some(stderr) = child.stderr().take()
         {

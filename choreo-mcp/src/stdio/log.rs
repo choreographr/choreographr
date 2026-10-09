@@ -3,11 +3,20 @@
 //! A stdio server's own `stderr` is drained into a size-capped, owner-only log
 //! file so its diagnostics are isolated per server (the path is chosen by the
 //! daemon's `config::server_log_path`) rather than mixed into the daemon's log.
+//!
+//! The drain runs on a dedicated **blocking** thread over `std::io`/`std::fs`,
+//! NOT on the `rmcp` sidecar tokio runtime: only `rmcp` earns the async runtime
+//! (see `runtime`), and a log file is a slow blocking sink with no reason to
+//! share it (`tokio::fs` would only shunt the blocking write onto the runtime's
+//! blocking pool). To get a blocking handle, the child's stderr fd is pulled out
+//! of the `tokio::process::ChildStderr` and put back into blocking mode — tokio
+//! sets its process pipes non-blocking for its reactor.
+//!
 //! The drain is generic over the reader (rather than taking a concrete
-//! `ChildStderr`) so the truncate/rotate/append logic is unit-testable without a
-//! real child process, and runs on the sidecar runtime. This is a child module
-//! of `stdio`; the capped JSON-RPC transport itself lives in the parent module.
+//! `ChildStderr`) so the create/rotate/append logic is unit-testable without a
+//! real child process.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tokio::process::ChildStderr;
 
@@ -22,144 +31,138 @@ const MAX_SERVER_LOG_BYTES: u64 = 2 * 1024 * 1024;
 /// Bytes read from the child's stderr per drain iteration.
 const STDERR_CHUNK: usize = 8192;
 
-/// Best-effort owner-only permissions (0600) on a per-server log file.
+/// Open (creating) the per-server log for append, hardened so a planted symlink
+/// or a foreign file at the predictable path cannot redirect a server's captured
+/// stderr — which may echo operator-configured values (a header, a token).
 ///
-/// A server's stderr may echo operator-configured values (a header, a token),
-/// so the log must not be group- or world-readable. Mirrors the trust store's
-/// `set_file_private`; a no-op on non-Unix platforms, where the default ACL on
-/// a newly created file already scopes it to the creating user.
-#[cfg(unix)]
-fn set_file_private(path: &Path) {
-    use std::os::unix::fs::PermissionsExt as _;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+/// Create+append with `O_NOFOLLOW` and mode 0600, then a post-open check that
+/// the result is a regular file owned by this euid. Returns `None` when the open
+/// fails or the entry is refused, so the caller skips logging rather than writing
+/// anywhere unexpected. On non-Unix the file inherits the parent directory's
+/// ACLs (a newly created file is scoped to the creating user).
+fn open_log_append(path: &Path) -> Option<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            // 0600 applies on creation; re-asserted below for a laxer pre-existing file.
+            .mode(0o600)
+            // O_NOFOLLOW: fail rather than follow a symlink at the path.
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+            .open(path)
+            .ok()?;
+        // Refuse to append into anything we do not control: a pre-created file
+        // owned by another user, or a non-regular file (a symlink target, a
+        // device/FIFO), must not receive a server's diagnostics.
+        let meta = file.metadata().ok()?;
+        if !meta.is_file() || meta.uid() != rustix::process::geteuid().as_raw() {
+            return None;
+        }
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        Some(file)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+    }
 }
 
-#[cfg(not(unix))]
-fn set_file_private(_path: &Path) {}
-
-/// Drain `stderr` into `path`, size-capped, until the reader reaches EOF.
+/// Drain `reader` into `path`, size-capped, until EOF. Blocking; runs on a
+/// dedicated thread.
 ///
-/// Generic over the reader (rather than taking a concrete `ChildStderr`) so the
-/// truncate/rotate/append logic is unit-testable without a real child process.
-/// A pre-existing oversized file is truncated so a restart starts clean; the
-/// file is re-created at the cap boundary (a simple single-file rotation).
-async fn drain_stderr_to_log<R: tokio::io::AsyncRead + Unpin>(mut stderr: R, path: PathBuf) {
-    // Truncate a pre-existing oversized file so a restart starts clean.
-    let mut written = match tokio::fs::metadata(&path).await {
-        Ok(meta) if meta.len() >= MAX_SERVER_LOG_BYTES => 0,
-        Ok(meta) => meta.len(),
-        Err(_) => 0,
+/// Generic over the reader so the create/rotate/append logic is unit-testable
+/// without a real child process. A pre-existing oversized file is truncated so a
+/// restart starts clean; the file is re-created at the cap boundary (a simple
+/// single-file rotation). The file is opened in append mode, so after a
+/// truncation writes resume from the start without seeking.
+fn drain_stderr_to_log<R: Read>(mut reader: R, path: &Path) {
+    let Some(mut file) = open_log_append(path) else {
+        return;
     };
-    if written == 0 {
-        let _ = tokio::fs::write(&path, b"").await;
-        // Tighten the freshly created file to owner-only immediately: it may
-        // hold server stderr with operator secrets (see the parent module's
-        // `sanitize_child_env` residual-exposure note).
-        set_file_private(&path);
+    let mut written = file.metadata().map_or(0, |m| m.len());
+    if written >= MAX_SERVER_LOG_BYTES {
+        let _ = file.set_len(0);
+        written = 0;
     }
-    let open = || {
-        let path = path.clone();
-        async move {
-            let file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .await
-                .ok();
-            // Re-assert owner-only on every open, so a file created earlier
-            // under a laxer umask (or by the rotation reopen below) is
-            // tightened too.
-            if file.is_some() {
-                set_file_private(&path);
-            }
-            file
-        }
-    };
-    let mut file = open().await;
     let mut buf = [0u8; STDERR_CHUNK];
     loop {
-        match tokio::io::AsyncReadExt::read(&mut stderr, &mut buf).await {
+        match reader.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 // Rotate before writing when the cap is reached, so the file
                 // never exceeds it by more than one chunk.
                 if written >= MAX_SERVER_LOG_BYTES {
-                    let _ = tokio::fs::write(&path, b"").await;
-                    file = open().await;
+                    let _ = file.set_len(0);
                     written = 0;
                 }
-                if let Some(file) = file.as_mut() {
-                    // The cap fits any platform's `usize`; the fallback
-                    // keeps the arithmetic total regardless.
-                    let remaining =
-                        usize::try_from(MAX_SERVER_LOG_BYTES - written).unwrap_or(usize::MAX);
-                    let take = n.min(remaining);
-                    let Some(chunk) = buf.get(..take) else {
-                        continue;
-                    };
-                    if tokio::io::AsyncWriteExt::write_all(file, chunk)
-                        .await
-                        .is_ok()
-                    {
-                        written += take as u64;
-                    }
+                // The cap fits any platform's `usize`; the fallback keeps the
+                // arithmetic total regardless.
+                let remaining =
+                    usize::try_from(MAX_SERVER_LOG_BYTES - written).unwrap_or(usize::MAX);
+                let take = n.min(remaining);
+                if let Some(chunk) = buf.get(..take)
+                    && file.write_all(chunk).is_ok()
+                {
+                    written += take as u64;
                 }
             }
         }
     }
     // Flush the last buffered write so the log is durable the moment the child
     // exits, rather than left to the file's asynchronous Drop flush.
-    if let Some(file) = file.as_mut() {
-        let _ = tokio::io::AsyncWriteExt::flush(file).await;
-    }
+    let _ = file.flush();
 }
 
-/// Capture a stdio server's `stderr` into `path`, size-capped.
+/// Capture a stdio server's `stderr` into `path`, size-capped, on a dedicated
+/// blocking thread.
 ///
-/// Runs on the sidecar runtime (see [`drain_stderr_to_log`], which owns the
-/// drain/rotation logic); the task ends when the child closes its stderr
-/// (i.e. on exit), so it needs no explicit teardown. When the sidecar runtime is
-/// unavailable it builds a short-lived current-thread runtime on a dedicated
-/// thread so the stream is still drained rather than left to block the child on
-/// a full pipe.
+/// Takes the raw fd out of the tokio handle (which deregisters it from the
+/// reactor), switches it back to blocking mode, and hands it to a std thread
+/// running [`drain_stderr_to_log`]. The thread ends when the child closes stderr
+/// (i.e. on exit), so it needs no explicit teardown.
 pub(super) fn spawn_stderr_logger(stderr: ChildStderr, path: PathBuf) {
-    let drain = drain_stderr_to_log(stderr, path);
+    #[cfg(unix)]
+    let reader = {
+        let Ok(fd) = stderr.into_owned_fd() else {
+            return;
+        };
+        set_blocking(&fd);
+        std::fs::File::from(fd)
+    };
+    #[cfg(not(unix))]
+    let reader = {
+        let Ok(handle) = stderr.into_owned_handle() else {
+            return;
+        };
+        std::fs::File::from(handle)
+    };
+    // A detached thread; it ends when the child closes stderr. Use the
+    // fallible builder so a thread-spawn failure degrades to no file logging
+    // rather than panicking the daemon (which owns this process).
+    let _ = std::thread::Builder::new()
+        .name("mcp-stderr-log".into())
+        .spawn(move || drain_stderr_to_log(reader, &path));
+}
 
-    match crate::runtime::handle() {
-        Ok(handle) => {
-            handle.spawn(drain);
-        }
-        Err(_) => {
-            // No sidecar runtime (unreachable in practice — the transport is
-            // built inside `runtime::block_on`). Drive the drain on a
-            // short-lived thread with its OWN current-thread runtime: there is
-            // no runtime to run it on otherwise, and dropping `drain` unpolled
-            // would leave the child's stderr unconsumed (a full pipe can then
-            // block the child). Building the runtime here guarantees the drain
-            // actually runs.
-            std::thread::spawn(move || {
-                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    return;
-                };
-                rt.block_on(drain);
-            });
-        }
+/// Clear `O_NONBLOCK` on `fd` so a blocking `read` does not return `WouldBlock`
+/// (tokio's process pipes are non-blocking by default).
+#[cfg(unix)]
+fn set_blocking(fd: &std::os::fd::OwnedFd) {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    if let Ok(flags) = fcntl_getfl(fd) {
+        let _ = fcntl_setfl(fd, flags - OFlags::NONBLOCK);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Drive a read on the sidecar runtime, the same context the real drain
-    /// runs in.
-    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-        crate::runtime::init().expect("runtime init");
-        crate::runtime::block_on(fut).expect("runtime available")
-    }
 
     /// The per-server stderr log is created owner-only (0600) on Unix: it may
     /// hold server stderr with operator-configured secrets.
@@ -170,7 +173,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("mcp-fresh.log");
 
-        block_on(drain_stderr_to_log(&b"server started\n"[..], path.clone()));
+        drain_stderr_to_log(&b"server started\n"[..], &path);
 
         let mode = std::fs::metadata(&path)
             .expect("log file exists")
@@ -181,10 +184,29 @@ mod tests {
         assert_eq!(std::fs::read(&path).expect("read log"), b"server started\n");
     }
 
+    /// A symlink planted at the (predictable) log path must be refused, so a
+    /// server's captured stderr never lands in an attacker-chosen file.
+    #[test]
+    #[cfg(unix)]
+    fn stderr_log_refuses_a_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("victim");
+        std::fs::write(&target, b"do not touch").expect("write target");
+        let link = dir.path().join("mcp-link.log");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        drain_stderr_to_log(&b"secret\n"[..], &link);
+
+        assert_eq!(
+            std::fs::read(&target).expect("read target"),
+            b"do not touch",
+            "the symlink target must be untouched"
+        );
+    }
+
     /// An existing log left group/world-readable (a laxer umask on a previous
-    /// run) is re-tightened to 0600 when it is next opened, and un-rotated
-    /// bytes below the cap are preserved (single-file rotation truncates only
-    /// at the cap).
+    /// run) is re-tightened to 0600 when it is next opened, and bytes below the
+    /// cap are appended, not truncated.
     #[test]
     #[cfg(unix)]
     fn stderr_log_file_is_tightened_on_reopen() {
@@ -194,7 +216,7 @@ mod tests {
         std::fs::write(&path, b"earlier\n").expect("seed");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
 
-        block_on(drain_stderr_to_log(&b"more\n"[..], path.clone()));
+        drain_stderr_to_log(&b"more\n"[..], &path);
 
         let mode = std::fs::metadata(&path)
             .expect("log file exists")

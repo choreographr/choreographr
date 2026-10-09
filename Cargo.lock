@@ -3065,6 +3065,7 @@ dependencies = [
  "process-wrap",
  "reqwest 0.13.5",
  "rmcp",
+ "rustix 1.1.5",
  "serde",
  "serde_json",
  "tempfile",

@@ -42,11 +42,17 @@ reqwest.workspace = true
 # owns one process-wide multi-thread runtime that drives the client futures, and
 # the daemon calls this crate's blocking `McpServer::*` methods. `sync` provides
 # the per-call cancellation primitive; `macros` the `select!` in the call task.
-tokio = { workspace = true, features = ["sync", "macros", "fs", "io-util"] }
+tokio = { workspace = true, features = ["sync", "macros", "io-util"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+# The per-server stderr log's hardened open (O_NOFOLLOW + euid check) and the
+# unix fcntl that returns the child's non-blocking stderr pipe to blocking mode
+# for the drain thread. Unix-only; Windows inherits the parent dir's ACLs.
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
 
 # Test fixture: a scripted MCP stdio server that the integration suite spawns as
 # a subprocess (via `env!("CARGO_BIN_EXE_mcp-fixture-server")`), removing the
