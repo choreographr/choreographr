@@ -388,7 +388,8 @@ and the daemon and IM bridge also mirror every event to stderr (so `systemd`'s
 journald keeps capturing them); the GUI and ACP adapter mirror only when their
 stderr is a terminal. `--log-file <path>` only chooses the file's location: it
 never changes the level and never mutes stderr, and the first line of every run
-prints the resolved path.
+prints the resolved path. Logs older than a week (the suite's own and the
+captured `mcp-*.log` server logs alike) are pruned on startup.
 
 `RUST_LOG` supplies the directives when no `-v`/`-q` flag is given; explicit
 flags win over it. Every binary in the suite shares this policy — the daemon,

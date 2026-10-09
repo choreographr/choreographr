@@ -15,7 +15,8 @@
 //! [`init`] entry point that installs the suite's subscriber: diagnostics go to
 //! a **file** (always) and, where a console exists, are **mirrored to stderr**.
 //! The file is pid-keyed (`<binary>-<pid>.log`) so every process gets a fresh
-//! file — "the pid is the rotation" — and stale siblings are pruned on startup.
+//! file — "the pid is the rotation" — and stale logs (its own and captured MCP
+//! `mcp-<…>.log` server logs alike) older than a week are pruned on startup.
 //! Which binaries mirror to stderr, and whether that mirror is unconditional or
 //! terminal-gated, is chosen per binary via [`ConsoleSink`].
 
@@ -23,7 +24,7 @@ use crate::paths;
 use clap::Args;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tracing_subscriber::EnvFilter;
 
 /// Where the console copy of the logs goes, in addition to the always-on file
@@ -65,9 +66,11 @@ pub struct LogOptions<'a> {
     pub require_file: bool,
 }
 
-/// The number of most-recent pid-keyed logs kept per binary. Older siblings are
-/// pruned on startup so a long-lived log directory stays small.
-const KEEP_LOG_FILES: usize = 5;
+/// How long a log file is kept in the log directory before the startup pruner
+/// removes it. Retention is time-based, not count-based: a quiet instance keeps
+/// a full week of history, and a busy one does not hold an unbounded number of
+/// recent files.
+const LOG_RETENTION: Duration = Duration::from_hours(7 * 24);
 
 /// Install the process-wide subscriber: the shared level policy, a file sink,
 /// and an optional console sink. Returns the resolved log-file path when a file
@@ -93,16 +96,19 @@ pub fn init(opts: LogOptions<'_>) -> io::Result<Option<PathBuf>> {
         }
     }
 
-    // Resolve the file path. For the default (pid-keyed) name, prune stale
-    // siblings first so retention stays small; an explicit `--log-file` is used
-    // verbatim and never pruned.
-    let path = if let Some(p) = opts.log_file {
-        PathBuf::from(p)
-    } else {
-        if let Some(dir) = paths::log_dir_default() {
-            prune_logs(&dir, opts.binary);
-        }
-        paths::log_file(opts.binary, std::process::id())
+    // Prune stale suite logs (older than one week) up front. The log directory
+    // is shared housekeeping, so this runs whether or not this run uses the
+    // default file, and it covers every binary's own log plus captured MCP
+    // server logs.
+    if let Some(dir) = paths::log_dir_default() {
+        prune_logs(&dir);
+    }
+
+    // Resolve the file path. The default is pid-keyed; an explicit `--log-file`
+    // is used verbatim.
+    let path = match opts.log_file {
+        Some(p) => PathBuf::from(p),
+        None => paths::log_file(opts.binary, std::process::id()),
     };
 
     // Open the file (hardened). A failure degrades to the console sink unless
@@ -298,49 +304,62 @@ fn create_new(path: &Path) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Best-effort startup prune of stale pid-keyed logs for `binary` in `dir`,
-/// keeping the newest `KEEP_LOG_FILES` and removing the rest.
+/// Whether `name` is a log file this suite writes, and therefore prunes: the
+/// suite's own pid-keyed `<binary>-<pid>.log`, or a captured MCP server stderr
+/// `mcp-<…>.log`. A user's explicit `--log-file` under any other name is left
+/// alone.
+fn is_suite_log_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".log") else {
+        return false;
+    };
+    if stem.starts_with("mcp-") {
+        return true;
+    }
+    // `<binary>-<pid>`: split at the last '-', the tail must be all digits.
+    match stem.rsplit_once('-') {
+        Some((prefix, pid)) => {
+            !prefix.is_empty() && !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// Best-effort startup prune: remove every suite log in `dir` older than the
+/// retention window (one week).
 ///
-/// Only files named exactly `<binary>-<digits>.log` are considered, so a user's
-/// explicit `--log-file` (any other name) and the MCP per-server `mcp-*.log`
-/// captures (a different prefix) are never touched. Never fails: an unreadable
-/// directory or an undeletable file is silently left alone — retention is
-/// housekeeping, never a startup precondition.
-pub fn prune_logs(dir: &Path, binary: &str) {
-    let prefix = format!("{binary}-");
+/// Only files this suite names are considered (see `is_suite_log_name`) — the
+/// suite's own `<binary>-<pid>.log` and the captured `mcp-<…>.log` server logs
+/// alike. A user's explicit `--log-file` under another name, an unrelated file,
+/// or a non-regular file (a symlink or directory) is never touched. Never
+/// fails: an unreadable directory or an undeletable file is silently left
+/// alone — retention is housekeeping, never a startup precondition.
+pub fn prune_logs(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-
-    let mut files: Vec<(SystemTime, PathBuf)> = Vec::new();
+    let Some(cutoff) = SystemTime::now().checked_sub(LOG_RETENTION) else {
+        return;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(rest) = name.strip_prefix(prefix.as_str()) else {
-            continue;
-        };
-        let Some(digits) = rest.strip_suffix(".log") else {
-            continue;
-        };
-        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        if !is_suite_log_name(name) {
             continue;
         }
-        let Ok(meta) = entry.metadata() else { continue };
+        // `symlink_metadata` reports the entry itself, so a symlink (whose
+        // `is_file` is false) and a directory are both skipped.
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
         if !meta.is_file() {
             continue;
         }
-        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        files.push((mtime, entry.path()));
-    }
-
-    if files.len() <= KEEP_LOG_FILES {
-        return;
-    }
-    // Oldest first: the leading `len - KEEP` entries are the ones to drop.
-    files.sort_by_key(|(mtime, _)| *mtime);
-    let excess = files.len() - KEEP_LOG_FILES;
-    for (_, path) in files.into_iter().take(excess) {
-        let _ = std::fs::remove_file(path);
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if modified < cutoff {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -589,66 +608,63 @@ mod tests {
 
     // ── prune_logs retention ─────────────────────────────────────────
 
-    /// Pruning keeps the newest `KEEP_LOG_FILES` pid-keyed logs and removes the
-    /// older ones, and leaves unrelated names (an explicit `--log-file`, an
-    /// `mcp-*.log` capture) untouched.
-    #[test]
-    fn prune_keeps_the_newest_and_spares_foreign_names() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        // Create KEEP+2 daemon logs with strictly increasing mtimes.
-        let total = KEEP_LOG_FILES + 2;
-        for i in 0..total {
-            let path = dir.path().join(format!("daemon-{}.log", 1000 + i));
-            std::fs::write(&path, b"x").expect("write");
-            // File mtimes have coarse resolution on some filesystems; nudge
-            // each one forward so the newest is unambiguous.
-            let file = std::fs::File::options()
-                .write(true)
-                .open(&path)
-                .expect("open");
-            let mtime = std::time::SystemTime::UNIX_EPOCH
-                + std::time::Duration::from_secs(1_700_000_000 + i as u64);
-            file.set_modified(mtime).expect("set mtime");
-        }
-        // Foreign names that must never be pruned.
-        std::fs::write(dir.path().join("custom.log"), b"x").expect("write custom");
-        std::fs::write(dir.path().join("mcp-docs-abc.log"), b"x").expect("write mcp");
-
-        prune_logs(dir.path(), "daemon");
-
-        let remaining = std::fs::read_dir(dir.path())
-            .expect("read_dir")
-            .flatten()
-            .filter_map(|e| e.file_name().to_str().map(str::to_owned))
-            .collect::<Vec<_>>();
-        let daemon_logs = remaining
-            .iter()
-            .filter(|n| n.starts_with("daemon-"))
-            .count();
-        assert_eq!(daemon_logs, KEEP_LOG_FILES, "only the newest are kept");
-        assert!(remaining.iter().any(|n| n == "custom.log"));
-        assert!(remaining.iter().any(|n| n == "mcp-docs-abc.log"));
-        // The two oldest daemon logs (1000, 1001) are gone.
-        assert!(!dir.path().join("daemon-1000.log").exists());
-        assert!(!dir.path().join("daemon-1001.log").exists());
-        assert!(
-            dir.path()
-                .join(format!("daemon-{}.log", 1000 + total - 1))
-                .exists()
-        );
+    /// Write a one-byte log file and set its mtime.
+    fn seed_log(dir: &std::path::Path, name: &str, mtime: SystemTime) {
+        let path = dir.join(name);
+        std::fs::write(&path, b"x").expect("write");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(mtime)
+            .expect("set mtime");
     }
 
-    /// With no more than `KEEP_LOG_FILES` logs, pruning removes nothing.
+    /// Pruning removes suite logs older than the retention window — both the
+    /// suite's own `<binary>-<pid>.log` and the captured `mcp-<…>.log` server
+    /// logs — and keeps newer ones, while never touching a foreign file name.
     #[test]
-    fn prune_is_a_no_op_below_the_cap() {
+    fn prune_removes_logs_older_than_the_retention_window() {
         let dir = tempfile::tempdir().expect("temp dir");
-        for i in 0..KEEP_LOG_FILES {
-            std::fs::write(dir.path().join(format!("tui-{i}.log")), b"x").expect("write");
+        let now = SystemTime::now();
+        let old = now - Duration::from_hours(8 * 24); // 8 days
+        let fresh = now - Duration::from_mins(1); // a minute
+
+        for name in ["daemon-1000.log", "tui-1000.log", "mcp-docs-abc123.log"] {
+            seed_log(dir.path(), name, old);
         }
-        prune_logs(dir.path(), "tui");
-        assert_eq!(
-            std::fs::read_dir(dir.path()).expect("read_dir").count(),
-            KEEP_LOG_FILES
-        );
+        for name in ["daemon-2000.log", "mcp-filesystem-def456.log"] {
+            seed_log(dir.path(), name, fresh);
+        }
+        // Foreign names must never be pruned, however old.
+        seed_log(dir.path(), "custom.log", old);
+        seed_log(dir.path(), "notes.txt", old);
+
+        prune_logs(dir.path());
+
+        for name in ["daemon-1000.log", "tui-1000.log", "mcp-docs-abc123.log"] {
+            assert!(!dir.path().join(name).exists(), "{name} should be pruned");
+        }
+        for name in [
+            "daemon-2000.log",
+            "mcp-filesystem-def456.log",
+            "custom.log",
+            "notes.txt",
+        ] {
+            assert!(dir.path().join(name).exists(), "{name} should be kept");
+        }
+    }
+
+    /// Retention is time-based, not count-based: any number of recent logs
+    /// survives, however many there are.
+    #[test]
+    fn prune_keeps_many_recent_logs() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let fresh = SystemTime::now() - Duration::from_mins(1);
+        for i in 0..20 {
+            seed_log(dir.path(), &format!("tui-{i}.log"), fresh);
+        }
+        prune_logs(dir.path());
+        assert_eq!(std::fs::read_dir(dir.path()).expect("read_dir").count(), 20);
     }
 }

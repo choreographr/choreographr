@@ -1134,8 +1134,8 @@ through the shared `choreo_shared::logging::init`: a hardened, pid-keyed log
 file (`{base}/log/daemon-<pid>.log` under a base, else
 `$XDG_STATE_HOME/choreographr/daemon-<pid>.log`, else the platform temp dir) is
 always written (create-new `O_EXCL` + `O_NOFOLLOW`, 0600, replacing only a
-regular file the daemon owns when a reused pid finds a stale one; siblings are
-pruned to the newest few), and every event is **also mirrored to stderr** (the
+regular file the daemon owns when a reused pid finds a stale one; logs older
+than a week are pruned on startup), and every event is **also mirrored to stderr** (the
 console or journald), so `--base-dir` never silences the console. `--log-file
 <path>` chooses the file's path only (used verbatim, no pid key) — it never
 changes the level and never mutes stderr; an unopenable log file is a fatal
@@ -3378,7 +3378,7 @@ so all five binaries — daemon, TUI, GUI, IM, and ACP — share the exact same
 policy and the exact same sink layout: diagnostics always go to a **hardened,
 pid-keyed file** (`<binary>-<pid>.log` in `{base}/log`, else
 `$XDG_STATE_HOME/choreographr`, else the platform temp dir; create-new `O_EXCL` +
-`O_NOFOLLOW` + 0600, stale siblings pruned on startup) **and**, where a console
+`O_NOFOLLOW` + 0600) **and**, where a console
 exists, are **mirrored to stderr** from the same filter. Which binaries mirror,
 and whether the mirror is unconditional or terminal-gated, is chosen per binary:
 the daemon and IM bridge always mirror (their stderr is the console *or*
@@ -3389,6 +3389,13 @@ to the console sink for the others. `--log-file <path>` on any binary chooses th
 file's path only (used verbatim, with no pid key) — it never affects the level
 and never mutes the console; with no base dir and no XDG state dir the file falls
 back to the platform temp dir (Termux/Android included).
+
+Every binary also **prunes** the shared log directory on startup: any log the
+suite names older than **one week** is removed — its own `<binary>-<pid>.log`
+and the captured MCP server `mcp-<…>.log` files alike. Retention is time-based
+(not a fixed file count), so a quiet instance keeps a full week of history while
+a busy one never accumulates unbounded files. A user's `--log-file` under any
+other name is never touched.
 
 **Session persistence:** On daemon start, sessions are loaded from the database into
 `session_metadata` (in-memory). Model selection (`/model <name>`) updates both the
