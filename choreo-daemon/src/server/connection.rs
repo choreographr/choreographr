@@ -620,7 +620,7 @@ pub(crate) fn client_thread(
 /// here — unknown preamble, silent/garbage peer, rejected handshake — must
 /// unregister via `ClientDisconnected`, exactly as the old inline handshake
 /// failure path in `server/lifecycle.rs` did. This keeps the daemon's
-/// `client_writers` registry honest: a connection that never produced a
+/// `DaemonState::clients` map honest: a connection that never produced a
 /// working transport must not leave a stale writer entry behind.
 ///
 /// **The preamble is UNAUTHENTICATED by design.** It is a cleartext mode

@@ -339,16 +339,32 @@ impl DaemonState {
     }
 
     /// Register a connection's writer channel so the shutdown path can route
-    /// `ShuttingDown` through that connection's single writer thread.
+    /// `ShuttingDown` through that connection's single writer thread, and so
+    /// the client's entry exists before any subscription or membership command
+    /// for it is processed.
+    ///
+    /// This is the FIRST command the daemon ever sees for a `ClientId`: the
+    /// acceptor registers the writer before it spawns the connection thread (see
+    /// [`register_client_writer`](crate::server::connection::register_client_writer)),
+    /// and every later command for that id — subscribe, track — is sent on the
+    /// same FIFO command channel by that thread, so it is always processed after
+    /// this one. Should that order ever invert, the entry-based update below
+    /// keeps any subscription state already recorded rather than wiping it, and
+    /// simply adopts the fresh writer.
     pub(super) fn handle_register_client_writer(
         &mut self,
         client_id: ClientId,
         writer: SubscriberSink,
     ) {
         debug!("registering client writer: client_id={}", client_id);
-        // A fresh connection owns its (monotonic, never-reused) client_id, so
-        // any prior entry is stale.
-        self.clients.insert(client_id, ClientState::new(writer));
+        // Adopt the connection's writer while preserving any state a
+        // (mis-ordered) subscribe already recorded, instead of resetting the
+        // entry wholesale.
+        let entry = self
+            .clients
+            .entry(client_id)
+            .or_insert_with(|| ClientState::new(writer.clone()));
+        entry.writer = writer;
     }
 
     /// Disconnect a client whose delivery queue crossed the lag limits.

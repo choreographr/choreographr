@@ -611,7 +611,7 @@ pub(super) fn handle_detach(
 /// Remove a subscriber at the daemon's request (client evicted for lag or
 /// fully disconnected). Mirrors [`handle_detach`] but does NOT send
 /// `UntrackSessionSubscription` — the daemon already removed the client from
-/// its own tracking in `client_subscribed_sessions` when it initiated the
+/// its own tracking (`ClientState::sessions`) when it initiated the
 /// eviction/cleanup, and sending the untrack here would race the daemon's own
 /// removal. The exit predicate is the same as detach: a session with no
 /// subscribers and no active requests (and not mid-shutdown) can exit.

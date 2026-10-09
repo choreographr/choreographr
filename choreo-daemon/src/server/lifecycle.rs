@@ -477,7 +477,7 @@ pub fn run_server(
     // must exist before either accept path is spawned).
 
     // TCP listener for Noise IK clients. The `ShuttingDown` notification is
-    // routed through the daemon's client_writers registry, exactly as on the
+    // routed through the daemon's `DaemonState::clients` map, exactly as on the
     // Unix path; the TCP accept thread just spawns a per-connection
     // `tcp_client_thread`, whose writer thread owns and closes its own socket.
     let tcp_shutdown = Arc::clone(&shutdown);
@@ -741,7 +741,7 @@ pub fn run_server(
     drain_tcp_handles(&tcp_client_rx, &mut client_threads);
 
     // Route the shutdown notification through each connection's single writer
-    // thread (via the command loop's client_writers registry), then stop the
+    // thread (via the command loop's `DaemonState::clients` map), then stop the
     // command loop. Each writer thread flushes ShuttingDown and closes its own
     // socket, so a client observes the notification before the EOF. The main
     // thread writes nothing to client sockets — that is what guarantees the

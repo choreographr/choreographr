@@ -96,26 +96,23 @@ pub struct SessionMcpProject {
 /// Everything the daemon tracks about one connected client, keyed by its
 /// [`ClientId`] in [`DaemonState::clients`].
 ///
-/// One entry per client replaces the former `client_writers` /
-/// `summary_subscribers` / `activity_subscribers` / `client_subscribed_sessions`
-/// maps, which had to be kept in lockstep on every register/unregister/
-/// disconnect/evict. The subscription flags and the session-membership set are
-/// exactly the "is this id present in map X" facts those maps encoded, so the
-/// fan-out dedup checks read them straight off the entry rather than
-/// cross-referencing sibling maps.
+/// One entry per client holds everything the daemon tracks about that
+/// connection: its writer sink and its subscription/membership state together,
+/// so register/unregister/disconnect/evict are each a single map operation
+/// rather than edits that must be kept in lockstep across sibling maps. The
+/// subscription flags and the session-membership set are the "is this client
+/// in class X" facts the fan-out policies key on, so the dedup checks read
+/// them straight off the entry.
 pub struct ClientState {
     /// The client's delivery sink: its unbounded writer channel plus the
     /// per-client in-flight byte counter (shared with the writer thread).
     pub writer: SubscriberSink,
-    /// Receives session-summary broadcasts (was: present in
-    /// `summary_subscribers`).
+    /// Whether this client receives session-summary broadcasts.
     pub wants_summary: bool,
-    /// Receives all-activity broadcasts (was: present in
-    /// `activity_subscribers`).
+    /// Whether this client receives all-activity broadcasts.
     pub wants_activity: bool,
-    /// The sessions this client is a direct subscriber of (was:
-    /// `client_subscribed_sessions`). Used to suppress duplicate delivery of a
-    /// session's events through the activity bus.
+    /// The sessions this client is a direct subscriber of. Used to suppress
+    /// duplicate delivery of a session's events through the activity bus.
     pub sessions: HashSet<u64>,
 }
 
@@ -221,9 +218,7 @@ pub struct DaemonState {
     /// holding its delivery sink and its subscription/correlation state in ONE
     /// entry. Registered on connect and removed on disconnect/eviction; the
     /// shutdown path routes `ShuttingDown` through every entry's writer thread.
-    /// Consolidating the former `client_writers` / `summary_subscribers` /
-    /// `activity_subscribers` / `client_subscribed_sessions` maps into one entry
-    /// makes register/disconnect/evict a single map operation and lets the
+    /// Register/disconnect/evict are each a single map operation here, and the
     /// fan-out dedup checks read flags on the entry instead of cross-referencing
     /// sibling maps.
     pub clients: HashMap<ClientId, ClientState>,

@@ -79,11 +79,11 @@ use tracing::warn;
 /// handle only — it never crosses the wire (it is absent from `choreo-proto`)
 /// and the counter resets to 0 on every daemon start — so `u32` is ample:
 /// uniqueness within a single run is all the in-process maps require, and the
-/// counter can never wrap in a daemon's life (one id per accepted connection,
-/// bounded by `MAX_CONCURRENT_CONNECTIONS` at any instant). Wrapping the raw
-/// `u32` in a distinct type keeps it from being confused with the bare `u64`
-/// `session_id`/`stream_id`/request-id values it travels alongside, and gives
-/// the logging format one place to live.
+/// counter cannot wrap in any realistic daemon lifetime (ids are minted one per
+/// accepted connection, so it would take 4 billion connections in one run).
+/// Wrapping the raw `u32` in a distinct type keeps it from being confused with
+/// the bare `u64` `session_id`/`stream_id`/request-id values it travels
+/// alongside, and gives the logging format one place to live.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct ClientId(u32);
 
@@ -107,6 +107,7 @@ impl ClientId {
     /// Production code mints ids through [`ClientId::next`] so they stay
     /// unique per run; this constructor exists for tests (unit and integration)
     /// that need a stable, known id.
+    #[doc(hidden)]
     #[must_use]
     pub fn from_raw(value: u32) -> Self {
         ClientId(value)
@@ -126,6 +127,8 @@ impl fmt::Display for ClientId {
 /// one [`fan_out_evicting`] policy regardless of what else their map values
 /// carry.
 pub(crate) trait FanoutTarget {
+    /// The subscriber's delivery sink (its unbounded writer channel plus the
+    /// per-client in-flight byte counter).
     fn sink(&self) -> &SubscriberSink;
 }
 
