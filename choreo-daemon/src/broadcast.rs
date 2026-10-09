@@ -77,7 +77,7 @@ use tracing::warn;
 /// subscription flags, and the sessions it is attached to (consolidated into one
 /// [`ClientState`](crate::daemon::ClientState) per client). It is an in-process
 /// handle only — it never crosses the wire (it is absent from `choreo-proto`)
-/// and the counter resets to 1 on every daemon start — so `u32` is ample:
+/// and the counter resets to 0 on every daemon start — so `u32` is ample:
 /// uniqueness within a single run is all the in-process maps require, and the
 /// counter can never wrap in a daemon's life (one id per accepted connection,
 /// bounded by `MAX_CONCURRENT_CONNECTIONS` at any instant). Wrapping the raw
@@ -88,7 +88,7 @@ use tracing::warn;
 pub struct ClientId(u32);
 
 impl ClientId {
-    /// Mint the next id from the process-wide monotonic counter (starts at 1).
+    /// Mint the next id from the process-wide monotonic counter (starts at 0).
     ///
     /// The counter is a lock-free process-wide `AtomicU32` — a single-purpose
     /// bookkeeping counter in the spirit of the sanctioned atomic exceptions
@@ -98,7 +98,7 @@ impl ClientId {
     /// until it wraps, which a daemon's lifetime never reaches.
     #[must_use]
     pub(crate) fn next() -> Self {
-        static NEXT: AtomicU32 = AtomicU32::new(1);
+        static NEXT: AtomicU32 = AtomicU32::new(0);
         ClientId(NEXT.fetch_add(1, Ordering::Relaxed))
     }
 
