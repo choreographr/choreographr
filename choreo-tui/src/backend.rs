@@ -17,8 +17,8 @@
 //!    lands one column too far right, and every later write on the row
 //!    inherits the offset.
 //!
-//! Both are fixed on ratatui `main` (PRs #2686 and #2721, milestone v0.30.3),
-//! but no released crate carries the fix yet.  Until one does, wrapping the
+//! Both are fixed on ratatui `main` (PRs #2686 and #2721), but no released
+//! crate carries the fix yet.  Until one does, wrapping the
 //! crossterm backend and dropping that single reserved cell restores correct
 //! cursor positioning: with the reserved cell gone, the following cell is no
 //! longer judged contiguous, so the backend emits the `MoveTo` it needs.
@@ -29,7 +29,9 @@
 //! cleared.  That is the pre-#2686 behaviour for that narrow terminal class,
 //! and far less disruptive than the universal one-column row shift this wrapper
 //! removes.  Delete this module — and its wiring in `connection` — when the
-//! workspace resolves `ratatui` 0.30.3 / `ratatui-crossterm` 0.1.3.
+//! workspace resolves a release carrying both fixes: `ratatui-core` 0.1.3
+//! (#2686, the buffer-diff change) and `ratatui-crossterm` 0.1.3 (#2721, the
+//! backend change), or any later versions.
 
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
 use ratatui::buffer::{Cell, CellWidth};
