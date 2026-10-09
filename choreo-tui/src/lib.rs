@@ -25,6 +25,7 @@
 // API contract — the re-exports exist only for that test target.
 #[doc(hidden)]
 pub mod autostart;
+mod backend;
 mod cache;
 mod clipboard;
 mod connection;

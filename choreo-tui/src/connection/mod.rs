@@ -1,3 +1,4 @@
+use crate::backend::TuiBackend;
 use crate::build_picker;
 use crate::image_worker::{ImageResult, ImageWorker};
 use crate::render::render;
@@ -23,7 +24,7 @@ use mio::{Events, Interest, Poll, Token};
 use nix::fcntl::{F_SETFD, F_SETFL, FdFlag, OFlag, fcntl};
 #[cfg(unix)]
 use nix::sys::signal::{Signal, raise};
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::Terminal;
 #[cfg(unix)]
 use signal_hook::low_level::pipe as signal_pipe;
 use std::io;
@@ -370,7 +371,9 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         crossterm::event::EnableMouseCapture,
         PushKeyboardEnhancementFlags(KITTY_KEYBOARD_FLAGS),
     )?;
-    let backend = CrosstermBackend::new(stdout);
+    // `TuiBackend` wraps `CrosstermBackend` to work around ratatui's VS16
+    // reserved-cell rendering bug; see the `backend` module docs.
+    let backend = TuiBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     // Prime crossterm's internal event reader before the terminal thread starts
@@ -678,7 +681,7 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
 }
 
 fn run_ui_loop(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    terminal: &mut Terminal<TuiBackend>,
     app: &mut App,
     client_tx: &crossbeam_channel::Sender<ClientMessage>,
     ui_rx: &channel::Receiver<UiEvent>,
@@ -858,7 +861,7 @@ fn run_ui_loop(
 #[cfg(unix)]
 fn handle_resume_command(
     cmd: ResumeCommand,
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    terminal: &mut Terminal<TuiBackend>,
 ) -> io::Result<bool> {
     match cmd {
         ResumeCommand::ReinitTerminal => {
@@ -900,7 +903,7 @@ fn handle_resume_command(
 #[cfg(windows)]
 fn handle_resume_command(
     _cmd: ResumeCommand,
-    _terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    _terminal: &mut Terminal<TuiBackend>,
 ) -> io::Result<bool> {
     // Windows has no job-control suspend; ResumeCommand is never produced.
     Ok(false)
