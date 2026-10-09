@@ -48,7 +48,7 @@ pub enum ConsoleSink {
 #[derive(Clone, Copy)]
 pub struct LogOptions<'a> {
     /// The binary's log-name stem (`"daemon"`, `"tui"`, …): the default file is
-    /// `<binary>-<pid>.log`, and the pruner only ever touches that prefix.
+    /// `<binary>-<pid>.log`.
     pub binary: &'a str,
     /// The shared `-v`/`-q` verbosity (explicit flags win over `RUST_LOG`).
     pub verbosity: Verbosity,

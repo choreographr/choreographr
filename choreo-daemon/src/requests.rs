@@ -1000,12 +1000,9 @@ pub(crate) fn run_agent_loop(
                         turn = turn_iter,
                         tool_name = %tool_call.name,
                         tool_call_id = %tool_call.id,
-                        args_preview = %tool_call
-                            .arguments_json
-                            .get(..tool_call.arguments_json.len().min(200))
-                            // Char boundary by construction (len-capped ASCII-safe
-                            // prefix); fall back to the full string if not.
-                            .unwrap_or(&tool_call.arguments_json),
+                        // Length only: `arguments_json` is the model's tool input
+                        // and must never be logged (see AGENTS.md -> Logging).
+                        args_len = tool_call.arguments_json.len(),
                         "executing tool (serial)",
                     );
 
