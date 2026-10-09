@@ -2793,7 +2793,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tracing",
- "tracing-subscriber",
  "uds_windows",
 ]
 
@@ -2953,7 +2952,6 @@ dependencies = [
  "tiny_http",
  "toml 1.1.7+spec-1.1.0",
  "tracing",
- "tracing-subscriber",
  "uds_windows",
  "unicode-segmentation",
  "ureq",
@@ -2990,7 +2988,6 @@ dependencies = [
  "tempfile",
  "toml 1.1.7+spec-1.1.0",
  "tracing",
- "tracing-subscriber",
  "zeroize",
 ]
 
@@ -3013,7 +3010,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
- "tracing-subscriber",
  "uds_windows",
  "ureq",
 ]
@@ -3117,6 +3113,7 @@ version = "0.2.3"
 dependencies = [
  "clap",
  "dirs",
+ "rustix 1.1.5",
  "tempfile",
  "tracing",
  "tracing-subscriber",
@@ -3187,7 +3184,6 @@ dependencies = [
  "syntect",
  "tempfile",
  "tracing",
- "tracing-subscriber",
  "tui-prompts",
  "unicode-segmentation",
  "unicode-width 0.2.2",

@@ -9,8 +9,9 @@
 //! - [`clap_styles()`] — the one shared clap [`Styles`](clap::builder::Styles)
 //!   used by every CLI (previously copy-pasted into each crate).
 //! - [`logging`] — the shared `-v`/`-q` verbosity flags, the log-level
-//!   resolution every binary applies identically, and the one hardened
-//!   pid-keyed log-file opener the file-only binaries share.
+//!   resolution every binary applies identically, and the one subscriber
+//!   initializer (an always-on hardened pid-keyed log file plus an optional
+//!   per-binary stderr mirror) every binary installs.
 //! - [`paths`] — the one filesystem-layout resolver: the XDG config/data/
 //!   runtime/state locations and the `--base-dir` override that relocates an
 //!   entire instance under a single root.

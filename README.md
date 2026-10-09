@@ -378,8 +378,17 @@ cargo run --release -p choreographr -- -q   # warnings only
 ```
 
 ```bash
-cargo run --release -p choreographr -- --log-file /tmp/choreo.log  # log to a file instead of stderr
+cargo run --release -p choreographr -- --log-file /tmp/choreo.log  # choose the log file's path (stderr is still mirrored)
 ```
+
+Every binary writes a hardened, pid-keyed log file by default —
+`{base}/log/<binary>-<pid>.log` under `--base-dir`, else
+`$XDG_STATE_HOME/choreographr/<binary>-<pid>.log`, else the platform temp dir —
+and the daemon and IM bridge also mirror every event to stderr (so `systemd`'s
+journald keeps capturing them); the GUI and ACP adapter mirror only when their
+stderr is a terminal. `--log-file <path>` only chooses the file's location: it
+never changes the level and never mutes stderr, and the first line of every run
+prints the resolved path.
 
 `RUST_LOG` supplies the directives when no `-v`/`-q` flag is given; explicit
 flags win over it. Every binary in the suite shares this policy — the daemon,
@@ -398,11 +407,12 @@ cargo run --release -p choreo-im       # IM bridge
 cargo run --release -p choreo-acp      # ACP bridge for editors
 ```
 
-Each client accepts the same `-v`/`-q` flags as the daemon. The TUI and GUI
-write diagnostics to `$XDG_STATE_HOME/choreographr/tui-<pid>.log` and
-`$XDG_STATE_HOME/choreographr/gui-<pid>.log` (falling back to the platform temp
-dir where there is no XDG state dir); the ACP adapter writes to its `--log-file`
-(default `$XDG_STATE_HOME/choreographr/acp.log`, else the temp dir).
+Each client accepts the same `-v`/`-q` flags as the daemon and the same
+`--log-file`. Every binary writes a hardened pid-keyed file
+(`$XDG_STATE_HOME/choreographr/<binary>-<pid>.log`, or `{base}/log/...` under
+`--base-dir`, else the platform temp dir — e.g. `tui-<pid>.log`, `gui-<pid>.log`,
+`acp-<pid>.log`); the daemon and IM bridge also mirror to stderr, while the GUI
+and ACP adapter mirror only on a terminal.
 
 ### First conversation
 
@@ -1389,7 +1399,10 @@ choreographr`).
   `$XDG_STATE_HOME/choreographr/tui-<pid>.log` (falling back to the platform
   temp dir); check there for client-side issues, and pass `-v`/`-vv` for more
   detail.
-- The daemon logs to stderr; use `-v`/`-vv` for more detail, or set
+- The daemon writes `$XDG_STATE_HOME/choreographr/daemon-<pid>.log` under no
+  base dir (or `{base}/log/daemon-<pid>.log` under `--base-dir`) and also mirrors
+  to stderr (journald captures that for the service unit); the first line of
+  every run prints the exact path. Use `-v`/`-vv` for more detail, or set
   `RUST_LOG`. Every binary takes the same `-v`/`-q` flags (explicit flags win
   over `RUST_LOG`).
 

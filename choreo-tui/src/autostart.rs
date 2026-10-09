@@ -4,10 +4,11 @@
 //! directly (the dial inside `choreo_client_core`), and only when that dial
 //! itself fails because nothing is listening does it launch the `choreographr`
 //! daemon binary (sibling of the TUI executable) with `--auto-exit` (so the
-//! daemon cleans itself up when the TUI disconnects) and `--log-file` (so a
-//! failed start is diagnosable from the log path the TUI reports on failure),
-//! then the connection is retried. The TCP path (`--tcp-addr`) NEVER spawns
-//! anything: remote daemons are not launchable from here by definition.
+//! daemon cleans itself up when the TUI disconnects). The daemon names its own
+//! pid-keyed log file; the TUI reconstructs that path from the child's pid (via
+//! the shared naming helper) so a failed start is diagnosable from the path it
+//! reports, then the connection is retried. The TCP path (`--tcp-addr`) NEVER
+//! spawns anything: remote daemons are not launchable from here by definition.
 //!
 //! All helpers are factored as pure functions over injected parameters (paths,
 //! a probe closure) so they are unit-testable without real sockets; only
@@ -38,20 +39,6 @@ pub(crate) fn daemon_binary_path(exe_dir: &Path) -> PathBuf {
         "choreographr"
     };
     exe_dir.join(name)
-}
-
-/// The daemon's log file path: `{base}/log/daemon-<tui-pid>.log` under a base
-/// dir, else `$XDG_STATE_HOME/choreographr/daemon-<tui-pid>.log`, else under
-/// the PLATFORM temp dir (TMPDIR-aware — see `init_file_logging` for the Termux
-/// rationale), keyed by the TUI's OWN pid. The child's pid is unknowable before
-/// spawn via `std::process::Command` (`Command` has no pre-spawn handle), so
-/// the TUI pid is the unique key that distinguishes parallel spawns from
-/// different TUI instances sharing one machine — each spawn gets its own log
-/// file and never clobbers another's.
-pub(crate) fn daemon_log_path() -> PathBuf {
-    let pid = std::process::id();
-    choreo_shared::paths::log_file_default(&format!("daemon-{pid}"))
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("choreo-daemon-{pid}.log")))
 }
 
 /// Wait for the daemon WE JUST SPAWNED to come up: poll the socket path until
@@ -98,15 +85,12 @@ pub fn poll_until_listening(
 /// Spawn the daemon binary detached from this TUI's lifecycle.
 ///
 /// All three stdios are `Stdio::null()`: the TUI owns the terminal, so any
-/// daemon stdout/stderr would corrupt the TUI display, and `--log-file`
-/// (passed by the caller) already captures diagnostics. `spawn()` (no
-/// `status()`/`output()`) keeps the daemon detached — the TUI does not wait
-/// on it; it polls the socket instead.
-fn spawn_daemon(binary: &Path, log_path: &Path) -> anyhow::Result<Child> {
+/// daemon stdout/stderr would corrupt the TUI display, and the daemon writes
+/// its own log file. `spawn()` (no `status()`/`output()`) keeps the daemon
+/// detached — the TUI does not wait on it; it polls the socket instead.
+fn spawn_daemon(binary: &Path) -> anyhow::Result<Child> {
     Command::new(binary)
         .arg("--auto-exit")
-        .arg("--log-file")
-        .arg(log_path)
         // No inheritance in any direction: the TUI's terminal is the child's
         // terminal only by accident of forking — a detached daemon must not
         // draw into it (would garble the alternate screen) and must not
@@ -151,9 +135,12 @@ pub(crate) fn start_daemon(socket_path: &str) -> anyhow::Result<()> {
         );
     }
 
-    let log_path = daemon_log_path();
+    let mut child = spawn_daemon(&binary)?;
+    // The daemon names its own pid-keyed log file; reconstruct the same path
+    // from the child's pid, through the one shared naming helper, so a failed
+    // start can point at it — and the two sides cannot drift.
+    let log_path = choreo_shared::paths::log_file("daemon", child.id());
     tracing::info!(binary = %binary.display(), log = %log_path.display(), "spawning daemon");
-    let mut child = spawn_daemon(&binary, &log_path)?;
 
     if poll_until_listening(
         socket_path,
@@ -197,25 +184,6 @@ mod tests {
     fn daemon_binary_gets_the_exe_suffix_on_windows() {
         let path = daemon_binary_path(Path::new(r"C:\tools"));
         assert_eq!(path, PathBuf::from(r"C:\tools\choreographr.exe"));
-    }
-
-    /// The daemon log name must be pid-keyed with a `.log` extension, and the
-    /// path must come from the shared log-dir seam rather than the real state or
-    /// temp dirs. The pid keeps parallel TUI spawns from clobbering each other's
-    /// log; installing `TestLogDirGuard` redirects the shared policy at a temp
-    /// dir so this unit test never creates `$XDG_STATE_HOME/choreographr/` on the
-    /// machine running it (the state/temp-dir fallback itself is
-    /// `choreo_shared::paths::log_file_default`'s concern, tested there).
-    #[test]
-    fn daemon_log_path_is_pid_keyed_under_state_or_temp() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let _guard = choreo_shared::paths::TestLogDirGuard::set(Some(dir.path().to_path_buf()));
-        let path = daemon_log_path();
-        assert_eq!(
-            path,
-            dir.path()
-                .join(format!("daemon-{}.log", std::process::id()))
-        );
     }
 
     // ── Poll helper (injected probe — no sleeping, no real sockets) ──

@@ -196,16 +196,36 @@ pub fn default_socket_path() -> Option<PathBuf> {
     }
 }
 
-/// The base-derived log file for `binary` (`{base}/log/<binary>.log`),
-/// creating the log directory if needed; `None` without a base.
+/// The log directory: `{base}/log` under a base, else
+/// `$XDG_STATE_HOME/choreographr`, else `None` when no state dir exists
+/// (macOS/Windows, and some Android environments), so the caller falls back to
+/// the platform temp dir.
 ///
-/// For the always-stderr binaries (the daemon and the IM bridge) — they keep
-/// the console/journald as their default sink and only write a file when a base
-/// relocates them.
+/// Public so the startup log pruner and the TUI's reconstruction of an
+/// autostarted daemon's path resolve through the same one definition the
+/// log-file default uses.
 #[must_use]
-pub fn base_log_file(binary: &str) -> Option<PathBuf> {
-    let base = base_dir()?;
-    Some(log_file_in(&base.join(LOG_SUBDIR), binary))
+pub fn log_dir_default() -> Option<PathBuf> {
+    log_dir()
+}
+
+/// The pid-keyed log file for `binary`: `{logdir}/<binary>-<pid>.log`, where
+/// `{logdir}` is [`log_dir_default`], else the platform temp dir
+/// (`choreo-<binary>-<pid>.log` — respects `TMPDIR`, and is the only writable
+/// choice where no XDG state dir exists).
+///
+/// The `-<pid>` key makes every process's log a distinct, fresh file ("the pid
+/// is the rotation"): parallel instances never clobber one another and no run
+/// appends to a predecessor's file. This is the single naming definition — the
+/// daemon's own default and the TUI's reconstruction of an autostarted daemon's
+/// path both go through it, so the two cannot drift.
+#[must_use]
+pub fn log_file(binary: &str, pid: u32) -> PathBuf {
+    let stem = format!("{binary}-{pid}");
+    match log_dir() {
+        Some(dir) => log_file_in(&dir, &stem),
+        None => std::env::temp_dir().join(format!("choreo-{stem}.log")),
+    }
 }
 
 /// The default log file for a file-logging `binary`.

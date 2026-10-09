@@ -442,6 +442,11 @@ ureq = { version = "3", features = ["json", "brotli", "multipart"] }
 ammonia = "4"
 base64 = "0.23"
 dirs = "7"
+# Type-safe syscall bindings, shared by the daemon's process-control path
+# (kill/pgid/pidfd, pipe-drain poll, fcntl) and by the suite-wide hardened
+# log-file opener in `choreo-shared::logging` (O_NOFOLLOW + euid check).
+# `event`/`fs`/`process`: the daemon adds `event`, the opener needs `fs`+`process`.
+rustix = { version = "1.1.5", features = ["fs", "process"] }
 redb = "4"
 # Raster image codecs. Trimmed from default (which would pull the AVIF
 # *encoder* `ravif` — dead weight, since we only ever re-encode to PNG/JPEG).

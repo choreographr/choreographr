@@ -58,7 +58,6 @@ choreo-proto.workspace = true
 serde.workspace = true
 toml.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 # The daemon-connection seam (choreo-client-core's `run_daemon_connection_with_mode`)
 # and the iOS tool bridge both speak crossbeam: the client channel that feeds the
 # connection writer and the boxed reply Sender that travels across the C ABI are

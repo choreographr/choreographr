@@ -64,7 +64,7 @@ use std::thread;
 
 use anyhow::Context;
 use choreo_shared::clap_styles;
-use choreo_shared::logging::{LoggingConfig, Verbosity};
+use choreo_shared::logging::{ConsoleSink, LogOptions, Verbosity};
 use clap::Parser;
 
 #[derive(Parser)]
@@ -87,9 +87,12 @@ struct Cli {
     #[arg(long = "socket-path")]
     socket_path: Option<String>,
 
-    /// Path to the log file (defaults to `{base-dir}/log/acp.log` under a base
-    /// dir, else the platform temp dir). stderr is unused to avoid corrupting
-    /// the ACP protocol stream.
+    /// Write the adapter's log file to this path instead of the default
+    /// (`{base}/log/acp-<pid>.log` under a base, else the XDG state dir, else
+    /// the platform temp dir). stdout carries the ACP JSON-RPC stream, so
+    /// diagnostics never go there; they are also mirrored to stderr when one is
+    /// a terminal (a hand-run debug launch). This only chooses the path; it
+    /// never affects RUST_LOG/-v/-q level selection.
     #[arg(long = "log-file")]
     log_file: Option<String>,
 
@@ -102,47 +105,6 @@ struct Cli {
     // Increase logging verbosity (-v debug, -vv trace)
     #[command(flatten)]
     verbosity: Verbosity,
-}
-
-/// The ACP adapter's default log file: under the PLATFORM temp dir
-/// (`std::env::temp_dir()`), never a hardcoded `/tmp` — on Android/Termux
-/// there is no writable `/tmp`, and the adapter is started by an ACP client
-/// (editor) that cannot pass CLI flags, so the default must work there.
-fn default_log_file() -> String {
-    std::env::temp_dir()
-        .join("choreo-acp.log")
-        .to_string_lossy()
-        .into_owned()
-}
-
-fn setup_logging(log_file: &str, verbosity: Verbosity) {
-    // The log file is auxiliary diagnostics — stdout carries the ACP JSON-RPC
-    // stream and the adapter's job is to relay it, so a failure to create the
-    // log must never kill the adapter (the Termux /tmp lesson: diagnostics
-    // are never a startup precondition). The warning goes to stderr, which
-    // ACP clients surface as adapter logs without protocol corruption.
-    let Some(file) = choreo_shared::logging::create_log_file(std::path::Path::new(log_file)) else {
-        eprintln!(
-            "warning: could not create log file '{log_file}'; continuing without file logging"
-        );
-        return;
-    };
-    // Shared level policy (flags win over RUST_LOG), plus this adapter's own
-    // module kept at debug by default: an ACP client owns the terminal, so the
-    // adapter's diagnostics are only ever read from the log file, and the
-    // default `info` would hide them.
-    let logging = LoggingConfig::resolve(verbosity);
-    let mut filter = logging.filter.clone();
-    if let Ok(directive) = "choreo_acp=debug".parse::<tracing_subscriber::filter::Directive>() {
-        filter = filter.add_directive(directive);
-    }
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_ansi(false)
-        .with_writer(std::sync::Mutex::new(file))
-        .init();
-    // Observable now that the subscriber exists (shared wording).
-    logging.emit_startup_logs();
 }
 
 /// Entry point for the `choreo-acp` bridge binary.
@@ -159,7 +121,7 @@ fn setup_logging(log_file: &str, verbosity: Verbosity) {
 pub fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
 
-    // Apply the base-dir override BEFORE resolving the socket/log paths: clap
+    // Apply the base-dir override BEFORE the socket path is resolved: clap
     // evaluates `default_value_t` at parse time, before a sibling `--base-dir`
     // is applied, so those defaults are resolved here instead.
     choreo_shared::paths::set_base_dir_from_cli(cli.base_dir.clone());
@@ -167,18 +129,23 @@ pub fn main() -> Result<(), anyhow::Error> {
         .socket_path
         .clone()
         .unwrap_or_else(choreo_proto::socket_path);
-    let log_file = cli
-        .log_file
-        .clone()
-        .or_else(|| {
-            choreo_shared::paths::log_file_default("acp").map(|p| p.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(default_log_file);
 
-    // Logging goes to the log file (never stderr, which is unused in the ACP
-    // protocol — stdout carries the JSON-RPC stream); if the log file cannot
-    // be created the adapter continues without file logging.
-    setup_logging(&log_file, cli.verbosity);
+    // Logging goes to a hardened, pid-keyed file via the shared initializer
+    // (never stdout, which carries the ACP JSON-RPC stream); the adapter's own
+    // module is kept at `debug` by default. A terminal-gated stderr mirror is
+    // added so a hand-run debug launch is visible while an editor-launched
+    // adapter (stderr not a terminal) stays quiet. A failed log-file open
+    // degrades rather than failing — diagnostics are never a startup
+    // precondition.
+    let _ = choreo_shared::logging::init(LogOptions {
+        binary: "acp",
+        verbosity: cli.verbosity,
+        log_file: cli.log_file.as_deref(),
+        console: ConsoleSink::StderrIfTty,
+        with_target: true,
+        extra_directives: &["choreo_acp=debug"],
+        require_file: false,
+    });
 
     tracing::info!(
         socket_path = %socket_path,
@@ -250,39 +217,38 @@ mod cli_tests {
         assert!(err.to_string().contains(&expected));
     }
 
-    /// The default log file must live under the PLATFORM temp dir — never a
-    /// hardcoded `/tmp`, which is not writable on Android/Termux (where the
-    /// ACP client launches the adapter without CLI flags, so the default is
-    /// the only path there is).
-    #[test]
-    fn default_log_file_is_under_the_platform_temp_dir() {
-        let path = default_log_file();
-        let expected = std::env::temp_dir().join("choreo-acp.log");
-        assert_eq!(path, expected.to_string_lossy());
-    }
-
     /// A log file that cannot be created must not prevent the adapter from
-    /// starting: `setup_logging` degrades to no file logging (its stderr
-    /// warning is the only trace, safe in ACP since stdout carries the
-    /// JSON-RPC stream).
+    /// starting: the shared initializer degrades (no console sink is forced
+    /// here) rather than failing — diagnostics are never a startup
+    /// precondition, and stdout carries the JSON-RPC stream regardless.
     #[test]
-    fn setup_logging_survives_an_uncreatable_log_file() {
+    fn init_survives_an_uncreatable_log_file() {
         // A path under a regular FILE cannot be created as a directory
         // child — deterministic EACCES/ENOENT without root assumptions.
         let blocker = std::env::temp_dir().join("choreo-acp-log-test-blocker");
         std::fs::write(&blocker, b"not a directory").expect("write blocker file");
         let impossible = blocker.join("choreo-acp.log");
+        let impossible = impossible.to_string_lossy().into_owned();
 
-        // setup_logging cannot fail (it returns unit) — the assertion is
-        // only that reaching here means the function degraded safely.
-        setup_logging(
-            &impossible.to_string_lossy(),
-            Verbosity {
+        let result = choreo_shared::logging::init(LogOptions {
+            binary: "acp",
+            verbosity: Verbosity {
                 verbose: 0,
                 quiet: 0,
             },
-        );
-
+            log_file: Some(&impossible),
+            console: ConsoleSink::None,
+            with_target: false,
+            extra_directives: &[],
+            require_file: false,
+        });
         let _ = std::fs::remove_file(&blocker);
+
+        // The open failed, so no file sink was installed — a clean degrade
+        // (Ok(None)), never an error, and never a panic.
+        assert_eq!(
+            result.expect("an uncreatable log must degrade, not fail"),
+            None
+        );
     }
 }

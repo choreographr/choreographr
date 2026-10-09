@@ -1129,18 +1129,18 @@ and the indexer (`tungstenite`) are synchronous.
 
 Entry point: `choreo_daemon::main` — invoked from the root package's
 `src/bin/choreographr.rs` wrapper — first applies `--base-dir` (equivalently
-`CHOREOGRAPHR_BASE_DIR`; see **The base directory**), then initializes tracing
-(to stderr, or to a
-file with `--log-file <path>` — append mode, ANSI off, created 0600 on unix
-and opened `O_NOFOLLOW`, with the opened file verified to be a regular file
-owned by the daemon's own euid and its mode tightened to 0600 — the TUI
-autostart writes the log into the shared temp dir under a predictable
-pid-keyed name, so a planted symlink or a pre-created file owned by another
-user must not redirect or collect the daemon's (potentially sensitive)
-diagnostics; level control
-unchanged; an unopenable log file is a fatal startup error; under a base dir
-with no explicit `--log-file`, the default log is `{base}/log/daemon.log`),
-creates
+`CHOREOGRAPHR_BASE_DIR`; see **The base directory**), then initializes logging
+through the shared `choreo_shared::logging::init`: a hardened, pid-keyed log
+file (`{base}/log/daemon-<pid>.log` under a base, else
+`$XDG_STATE_HOME/choreographr/daemon-<pid>.log`, else the platform temp dir) is
+always written (create-new `O_EXCL` + `O_NOFOLLOW`, 0600, replacing only a
+regular file the daemon owns when a reused pid finds a stale one; siblings are
+pruned to the newest few), and every event is **also mirrored to stderr** (the
+console or journald), so `--base-dir` never silences the console. `--log-file
+<path>` chooses the file's path only (used verbatim, no pid key) — it never
+changes the level and never mutes stderr; an unopenable log file is a fatal
+startup error, and the first line of every run names the resolved file. Then
+`main` creates
 `DaemonState`, runs socket server. `--auto-exit` (see the
 `server/lifecycle.rs` and `server/core.rs` rows) shuts the daemon down
 gracefully when the last client disconnects — a mode intended for the TUI's
@@ -3372,14 +3372,23 @@ cap; individual sessions no longer carry their own `max_turns`.
 CLI flags `-v` (debug), `-vv` (trace), or `-q` (warn) override the level, and
 **explicit flags take precedence over `RUST_LOG`** (the Unix convention; `RUST_LOG`
 is a per-target directive language, applied verbatim when no flag is given). The
-flag parsing (`Verbosity`) and the level resolution (`LoggingConfig::resolve`)
-live once in `choreo-shared::logging`, so all five binaries — daemon, TUI, GUI,
-IM, and ACP — share the exact same policy. Subscriber construction stays
-per-crate because destinations differ: the daemon logs to stderr or `--log-file`,
-the TUI and GUI to `$XDG_STATE_HOME/choreographr/tui-<pid>.log` /
-`gui-<pid>.log`, and the ACP adapter to `--log-file` (default
-`$XDG_STATE_HOME/choreographr/acp.log`) — all three falling back to the platform
-temp dir where no XDG state dir exists.
+flag parsing (`Verbosity`), the level resolution (`LoggingConfig::resolve`), and
+the one subscriber initializer (`logging::init`) live in `choreo-shared::logging`,
+so all five binaries — daemon, TUI, GUI, IM, and ACP — share the exact same
+policy and the exact same sink layout: diagnostics always go to a **hardened,
+pid-keyed file** (`<binary>-<pid>.log` in `{base}/log`, else
+`$XDG_STATE_HOME/choreographr`, else the platform temp dir; create-new `O_EXCL` +
+`O_NOFOLLOW` + 0600, stale siblings pruned on startup) **and**, where a console
+exists, are **mirrored to stderr** from the same filter. Which binaries mirror,
+and whether the mirror is unconditional or terminal-gated, is chosen per binary:
+the daemon and IM bridge always mirror (their stderr is the console *or*
+journald/launchd); the GUI and ACP adapter mirror only when stderr is a terminal
+(a desktop-icon / editor launch has none); the TUI never mirrors (it owns the
+alternate screen). A file open that fails is fatal for the daemon and degrades
+to the console sink for the others. `--log-file <path>` on any binary chooses the
+file's path only (used verbatim, with no pid key) — it never affects the level
+and never mutes the console; with no base dir and no XDG state dir the file falls
+back to the platform temp dir (Termux/Android included).
 
 **Session persistence:** On daemon start, sessions are loaded from the database into
 `session_metadata` (in-memory). Model selection (`/model <name>`) updates both the

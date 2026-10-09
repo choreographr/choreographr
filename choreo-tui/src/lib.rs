@@ -150,9 +150,8 @@ pub(crate) fn connection_quit_message(error: &ClientError) -> String {
 
 use anyhow::Context;
 use choreo_shared::clap_styles;
-use choreo_shared::logging::{LoggingConfig, Verbosity};
+use choreo_shared::logging::{ConsoleSink, LogOptions, Verbosity};
 use clap::Parser;
-use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 // `--version` prints the crate version (CARGO_PKG_VERSION) with the release
@@ -179,6 +178,14 @@ struct Cli {
     /// TUI-spawned daemon inherits it.
     #[arg(long = "base-dir", value_name = "PATH")]
     base_dir: Option<std::path::PathBuf>,
+
+    /// Write the TUI's log file to this path instead of the default
+    /// (`{base}/log/tui-<pid>.log`, else `$XDG_STATE_HOME/choreographr`, else
+    /// the platform temp dir). The TUI owns the terminal, so it never mirrors
+    /// to stderr — diagnostics are read from this file. This only chooses the
+    /// path; it never affects RUST_LOG/-v/-q level selection.
+    #[arg(long = "log-file")]
+    log_file: Option<String>,
 
     /// Connect via TCP/Noise IK at this address (e.g. 127.0.0.1:9443)
     #[arg(long = "tcp-addr")]
@@ -439,17 +446,19 @@ pub fn main() -> anyhow::Result<()> {
 
     // Logging is initialized FIRST — before the TCP trust flow below, which
     // emits `tracing` events (this mirrors the daemon, whose logging init is
-    // its very first act). The file subscriber's level comes from the shared
-    // resolver, so the TUI honors `-v`/`-q` (flags win) and `RUST_LOG` exactly
-    // as every other binary does.
-    let logging = LoggingConfig::resolve(cli.verbosity);
-    let log_path = init_file_logging(logging.filter.clone());
-    let _ = log_path; // path is diagnostics only; run_app does not need it
-
-    // Only once a subscriber exists is this observable (an event logged before
-    // `init()` has no subscriber and is dropped); the shared reporter emits the
-    // same warning + banner as every other binary.
-    logging.emit_startup_logs();
+    // its very first act). The TUI owns the terminal (the alternate screen), so
+    // it installs NO console mirror — diagnostics go to a hardened, pid-keyed
+    // file only, through the shared initializer (the same level policy every
+    // binary uses: `-v`/`-q` flags win over `RUST_LOG`).
+    let _ = choreo_shared::logging::init(LogOptions {
+        binary: "tui",
+        verbosity: cli.verbosity,
+        log_file: cli.log_file.as_deref(),
+        console: ConsoleSink::None,
+        with_target: true,
+        extra_directives: &[],
+        require_file: false,
+    });
 
     let mode = if let Some(addr) = cli.tcp_addr {
         resolve_connect_mode(
@@ -468,8 +477,9 @@ pub fn main() -> anyhow::Result<()> {
 
     // Best-effort startup banner carrying the release name
     // (choreo-shared/release-name.txt) alongside the crate version. Logging here
-    // is deliberately best-effort: when init_file_logging found no writable log
-    // file, no subscriber is installed and this event is simply dropped.
+    // is deliberately best-effort: when the shared initializer found no writable
+    // log file (and the console sink is `None`), no subscriber is installed and
+    // this event is simply dropped.
     tracing::info!(
         version = %choreo_shared::release_name::version_string(env!("CARGO_PKG_VERSION")),
         "choreo-tui starting"
@@ -477,59 +487,6 @@ pub fn main() -> anyhow::Result<()> {
 
     connection::run_app(mode)?;
     Ok(())
-}
-
-/// Initialize file logging to `$XDG_STATE_HOME/choreographr/tui-<pid>.log`
-/// (or `{base}/log/tui-<pid>.log` under `--base-dir`) and return the path, or
-/// `None` when the log file cannot be created.
-///
-/// Where neither a base nor an XDG state dir exists (macOS/Windows), this falls
-/// back to the platform temp dir (not a hardcoded `/tmp`) — essential on
-/// Android/Termux where there is no writable `/tmp`, where a bare `?` on the
-/// log-file create used to kill the TUI before it started with a context-free
-/// "Permission denied (os error 13)". Logging is auxiliary diagnostics and must
-/// never be a startup precondition: any failure degrades this run to no file
-/// logging (tracing events are then simply dropped — no subscriber is
-/// installed).
-///
-/// `env_filter` sets the subscriber's level exactly as every other binary does.
-/// It is applied via `fmt()` (NOT `registry().with(fmt::layer())`): a bare
-/// layer carries no filter, so the subscriber's max level defaults to TRACE and
-/// every debug/trace event from this crate and its dependencies is written —
-/// the multi-hundred-MB log file this replaced.
-fn init_file_logging(env_filter: EnvFilter) -> Option<std::path::PathBuf> {
-    let log_path = log_file_path();
-    // Owner-only (0600) and symlink-refusing: the platform temp dir is shared
-    // and the pid-keyed name is predictable, so the open is hardened through
-    // the one shared helper rather than a bare `File::create`.
-    let Some(log_file) = choreo_shared::logging::create_log_file(&log_path) else {
-        // No panic, no error exit: a missing log must not take the TUI down
-        // (the observed Termux failure mode). Diagnostics for THIS decision
-        // cannot go through tracing (no subscriber yet) — the silent
-        // degradation is documented here and pinned by the tests below.
-        return None;
-    };
-    // ANSI is off for file output (escape codes are unreadable in a log file);
-    // a plain `File` is the `MakeWriter`.
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_ansi(false)
-        .with_writer(log_file)
-        .init();
-    Some(log_path)
-}
-
-/// The per-process log file path: `{base}/log/tui-<pid>.log` under a base dir,
-/// otherwise `$XDG_STATE_HOME/choreographr/tui-<pid>.log`, otherwise (no state
-/// dir — macOS/Windows) under the PLATFORM temp dir (respects `TMPDIR` —
-/// critical on Termux/Android where `/tmp` is not writable). The pid keeps
-/// parallel instances from clobbering each other.
-fn log_file_path() -> std::path::PathBuf {
-    let pid = std::process::id();
-    if let Some(path) = choreo_shared::paths::log_file_default(&format!("tui-{pid}")) {
-        return path;
-    }
-    std::env::temp_dir().join(format!("choreo-tui-{pid}.log"))
 }
 
 #[cfg(test)]
@@ -723,7 +680,7 @@ mod cli_tests {
     fn log_file_path_is_pid_keyed_in_the_log_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
         let _guard = choreo_shared::paths::TestLogDirGuard::set(Some(dir.path().to_path_buf()));
-        let path = log_file_path();
+        let path = choreo_shared::paths::log_file("tui", std::process::id());
         assert_eq!(path.parent(), Some(dir.path()));
         assert_eq!(
             path,
@@ -740,21 +697,6 @@ mod cli_tests {
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("log")),
             "the log name must be tui-<pid>.log, got {name}"
         );
-    }
-
-    /// A writable log dir must yield a created, writable log file (the happy
-    /// path). Sole caller of `init_file_logging` in the test suite: it installs
-    /// the process-global tracing subscriber, which must only happen once per
-    /// process. The override keeps the file out of the developer's real state
-    /// dir.
-    #[test]
-    fn init_file_logging_creates_the_log_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let _guard = choreo_shared::paths::TestLogDirGuard::set(Some(dir.path().to_path_buf()));
-        let path = init_file_logging(EnvFilter::new("info"))
-            .expect("a writable dir must yield a log file");
-        assert!(path.exists(), "the log file must have been created");
-        assert!(path.starts_with(dir.path()));
     }
 
     /// The shared `-v`/`-q` flags are flattened into the TUI's CLI, so `-vv`

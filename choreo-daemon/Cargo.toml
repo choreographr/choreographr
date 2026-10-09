@@ -31,7 +31,9 @@ hex.workspace = true
 which.workspace = true
 # Type-safe syscall bindings for the process-control path (kill/pgid/pidfd),
 # the bounded pipe-drain poll loop, and the non-blocking fcntl on child pipes.
-rustix = { version = "1.1.5", features = ["event", "fs", "process"] }
+# Shared with `choreo-shared` (the log-file opener); `event` is this crate's
+# additional feature.
+rustix = { workspace = true, features = ["event"] }
 
 # Local headless Chromium/Chrome control for the `retrieve_webpage` tool (CDP).
 # Uses default features (no `fetch`): the tool requires a Chromium/Chrome
@@ -89,7 +91,6 @@ signal-hook.workspace = true
 notify.workspace = true
 toml.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 unicode-segmentation.workspace = true
 # OpenMetrics / Prometheus monitoring.
 # The `process` feature exposes process-level metrics (RSS, CPU, FD count)

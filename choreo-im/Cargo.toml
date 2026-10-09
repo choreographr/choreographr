@@ -24,7 +24,6 @@ choreo-keystore.workspace = true
 choreo-client-core.workspace = true
 choreo-markdown.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 thiserror.workspace = true
 ureq.workspace = true
 serde.workspace = true

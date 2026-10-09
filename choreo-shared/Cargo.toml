@@ -20,6 +20,11 @@ dirs.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# The hardened log-file opener (O_NOFOLLOW + euid check) is Unix-only; Windows
+# builds inherit the parent directory's ACLs instead and pull no rustix.
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 

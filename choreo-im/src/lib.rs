@@ -29,14 +29,13 @@ use choreo_proto::{
     write_message,
 };
 use choreo_shared::clap_styles;
-use choreo_shared::logging::{LoggingConfig, Verbosity};
+use choreo_shared::logging::{ConsoleSink, LogOptions, Verbosity};
 use clap::Parser;
 use std::env;
 use std::io::{BufReader, BufWriter, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use tracing::{error, info};
-use tracing_subscriber::fmt;
 // Windows: std::os::windows::net::UnixStream is unstable (E0658, feature
 // `windows_unix_domain_sockets`, rust-lang/rust#150487), so uds_windows provides
 // the same connect/try_clone/shutdown API over named pipes.
@@ -69,6 +68,15 @@ struct Cli {
     #[arg(long = "base-dir", value_name = "PATH")]
     base_dir: Option<std::path::PathBuf>,
 
+    /// Write the bridge's log file to this path instead of the default
+    /// (`{base}/log/im-<pid>.log` under a base, else `$XDG_STATE_HOME/choreographr`,
+    /// else the platform temp dir). Diagnostics are always ALSO mirrored to
+    /// stderr (a bridge is often run detached, where stderr is the only live
+    /// sink) — this only chooses the file's path; it never affects
+    /// RUST_LOG/-v/-q level selection and never mutes the console.
+    #[arg(long = "log-file")]
+    log_file: Option<String>,
+
     // Increase logging verbosity (-v debug, -vv trace)
     #[command(flatten)]
     verbosity: Verbosity,
@@ -91,11 +99,19 @@ pub fn main() -> anyhow::Result<()> {
     choreo_shared::paths::set_base_dir_from_cli(cli.base_dir.clone());
 
     // Logging init AFTER arg parsing so the `-v`/`-q` flags can be honored
-    // (flags win over RUST_LOG); the shared resolver keeps every binary's
-    // policy identical.
-    let logging = LoggingConfig::resolve(cli.verbosity);
-    init_logging(logging.filter.clone());
-    logging.emit_startup_logs();
+    // (flags win over RUST_LOG); the shared initializer keeps every binary's
+    // policy identical. The bridge writes a hardened, pid-keyed file AND
+    // mirrors to stderr unconditionally (a bridge is often run detached).
+    // `.with_target(false)` keeps the log lines terse.
+    let _ = choreo_shared::logging::init(LogOptions {
+        binary: "im",
+        verbosity: cli.verbosity,
+        log_file: cli.log_file.as_deref(),
+        console: ConsoleSink::Stderr,
+        with_target: false,
+        extra_directives: &[],
+        require_file: false,
+    });
 
     let path = socket_path();
     let stream = UnixStream::connect(&path).context("failed to connect to daemon")?;
@@ -148,24 +164,6 @@ pub fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-/// Install the bridge's subscriber. Under a base dir, diagnostics go to
-/// `{base}/log/im.log` (a bridge is often detached from a terminal); otherwise
-/// they stay on stderr. `.with_target(false)` keeps the log lines terse.
-fn init_logging(filter: tracing_subscriber::EnvFilter) {
-    if let Some(log_path) = choreo_shared::paths::base_log_file("im")
-        && let Some(file) = choreo_shared::logging::create_log_file(&log_path)
-    {
-        fmt()
-            .with_env_filter(filter)
-            .with_target(false)
-            .with_ansi(false)
-            .with_writer(std::sync::Mutex::new(file))
-            .init();
-        return;
-    }
-    fmt().with_env_filter(filter).with_target(false).init();
 }
 
 /// Connect-time keystore establishment: auto-unlock with the stored/legacy

@@ -37,12 +37,11 @@ use crate::state::{AppState, UiEvent};
 use choreo_client_core::{ConnectionMode, read_server_pk};
 use choreo_proto::socket_path;
 use choreo_shared::clap_styles;
-use choreo_shared::logging::{LoggingConfig, Verbosity};
+use choreo_shared::logging::{ConsoleSink, LogOptions, Verbosity};
 use clap::Parser;
 use dioxus::prelude::*;
 use futures_util::StreamExt as _;
 use std::sync::OnceLock;
-use tracing_subscriber::EnvFilter;
 
 /// Global connection mode, set once at startup from CLI args.
 static CONNECTION_MODE: OnceLock<ConnectionMode> = OnceLock::new();
@@ -280,6 +279,14 @@ struct Cli {
     /// Path to the server's Noise IK public key (defaults to ~/.config/choreographr/transport.pub)
     #[arg(long = "server-pk")]
     server_pk: Option<String>,
+
+    /// Write the GUI's log file to this path instead of the default
+    /// (`{base}/log/gui-<pid>.log`, else `$XDG_STATE_HOME/choreographr`, else
+    /// the platform temp dir). Diagnostics are also mirrored to stderr when one
+    /// is a terminal (a terminal launch). This only chooses the path; it never
+    /// affects RUST_LOG/-v/-q level selection.
+    #[arg(long = "log-file")]
+    log_file: Option<String>,
 }
 
 /// Entry point for the `choreo-gui` UI binary.
@@ -296,13 +303,20 @@ pub fn main() {
     // file, the embedded daemon's DB/config, and the GUI settings store).
     choreo_shared::paths::set_base_dir_from_cli(cli.base_dir.clone());
 
-    // A windowed app has no reliable stderr (launched from a desktop icon it is
-    // lost), so diagnostics go to a file selected by the shared
-    // `-v`/`-q`/RUST_LOG policy every other binary uses: `{base}/log/gui.log`
-    // under a base dir, else a pid-keyed file under the platform temp dir.
-    let logging = LoggingConfig::resolve(cli.verbosity);
-    init_file_logging(logging.filter.clone());
-    logging.emit_startup_logs();
+    // Diagnostics go to a hardened, pid-keyed file via the shared initializer
+    // (`{base}/log/gui-<pid>.log` under a base, else the XDG state dir, else the
+    // platform temp dir), covering the case where a desktop-icon launch has no
+    // stderr at all. Because a terminal launch IS useful for debugging, a
+    // terminal-gated stderr mirror is added when one exists.
+    let _ = choreo_shared::logging::init(LogOptions {
+        binary: "gui",
+        verbosity: cli.verbosity,
+        log_file: cli.log_file.as_deref(),
+        console: ConsoleSink::StderrIfTty,
+        with_target: true,
+        extra_directives: &[],
+        require_file: false,
+    });
 
     let mode = if let Some(addr) = cli.tcp_addr {
         // On iOS there is no `~/.config/choreographr/transport.pub` to read —
@@ -338,33 +352,6 @@ pub fn main() {
     // cfg routes this to the Dioxus Native (Blitz) renderer, which serves
     // desktop, Android and iOS — no desktop()/mobile() branching anywhere.
     dioxus::launch(App);
-}
-
-/// Initialize file logging to `{base}/log/gui-<pid>.log` under a base dir, else
-/// `$XDG_STATE_HOME/choreographr/gui-<pid>.log`, else `$TMPDIR/choreo-gui-<pid>.log`.
-///
-/// The platform temp dir (not a hardcoded `/tmp`) keeps the fallback working on
-/// Termux/Android, where `/tmp` is not writable, and the pid-keyed name lets
-/// parallel instances coexist. A failure to create the log degrades to no file
-/// logging (an event before a subscriber exists is dropped) — logging is never
-/// a startup precondition. ANSI is off (escape codes are unreadable in a file);
-/// the shared `env_filter` sets the level exactly as every other binary does.
-fn init_file_logging(env_filter: EnvFilter) {
-    let pid = std::process::id();
-    let log_path = choreo_shared::paths::log_file_default(&format!("gui-{pid}"))
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("choreo-gui-{pid}.log")));
-    // Owner-only (0600) and symlink-refusing via the shared opener: the
-    // platform temp dir is shared and the pid-keyed name is predictable, so a
-    // planted symlink or a world-readable file must not divert or expose the
-    // GUI's diagnostics.
-    let Some(log_file) = choreo_shared::logging::create_log_file(&log_path) else {
-        return;
-    };
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_ansi(false)
-        .with_writer(log_file)
-        .init();
 }
 
 // ── Android entry glue ────────────────────────────────────────────────────────

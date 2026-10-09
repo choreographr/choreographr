@@ -3,12 +3,11 @@ use crate::daemon::DaemonState;
 use anyhow::Context;
 use choreo_proto::socket_path;
 use choreo_shared::clap_styles;
-use choreo_shared::logging::{LoggingConfig, Verbosity};
+use choreo_shared::logging::{ConsoleSink, LogOptions, Verbosity};
 use choreo_transport::key::ensure_transport_keypair;
 use clap::Parser;
 use std::path::PathBuf;
 use tracing::info;
-use tracing_subscriber::fmt;
 
 #[derive(Parser)]
 // `--version`/`-V` reports this crate's CARGO_PKG_VERSION (which the Homebrew
@@ -51,10 +50,13 @@ struct Cli {
     #[arg(long = "tcp-addr")]
     tcp_addr: Option<String>,
 
-    /// Write daemon logs to this file instead of stderr (ANSI styling is
-    /// disabled for file output; RUST_LOG/-v/-q level selection is
-    /// unchanged). The daemon refuses to start when the file cannot be
-    /// created or opened.
+    /// Write the daemon's log file to this path instead of the default
+    /// (`{base}/log/daemon-<pid>.log`, else `$XDG_STATE_HOME/choreographr`,
+    /// else the platform temp dir). Diagnostics are always ALSO mirrored to
+    /// stderr (the console or journald) — this only chooses the file's path;
+    /// it never affects RUST_LOG/-v/-q level selection and never mutes the
+    /// console. The daemon refuses to start when the file cannot be created or
+    /// opened.
     #[arg(long = "log-file")]
     log_file: Option<String>,
 
@@ -578,72 +580,6 @@ fn parse_max_turns_env(val: &str) -> anyhow::Result<u32> {
         .map_err(|e| anyhow::anyhow!("CHOREOGRAPHR_MAX_TURNS={val:?} is not a valid u32: {e}"))
 }
 
-/// Open (creating if absent) the `--log-file` for append, with the hardening
-/// that suits a daemon log the TUI autostart writes into the shared temp dir.
-///
-/// Unix: created 0600, and the open uses `O_NOFOLLOW` so a symlink planted at
-/// the (predictable, pid-keyed) log path cannot redirect the daemon's
-/// diagnostics into an attacker-chosen file. The opened file is then verified
-/// to be a REGULAR file owned by this process's euid — a pre-created file
-/// owned by another user (or a FIFO/device) must never collect our logs — and
-/// its mode is explicitly tightened to 0600, because the create mode applies
-/// only on creation and a file left behind by an earlier run could be 0644.
-///
-/// Windows: ACLs are inherited from the parent directory (the user's own temp
-/// dir), so a plain create+append is correct there.
-#[cfg(unix)]
-fn open_log_file(path: &str) -> anyhow::Result<std::fs::File> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        // O_NOFOLLOW: fail rather than follow a symlink at the log path.
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
-        .open(path)
-        .with_context(|| {
-            format!(
-                "failed to open --log-file {path} for writing; check that the \
-                 directory exists and is writable"
-            )
-        })?;
-    // Refuse to append into anything we do not control: a pre-created file
-    // owned by another user, or a non-regular file, must not receive our
-    // (potentially sensitive) diagnostics.
-    let meta = file
-        .metadata()
-        .with_context(|| format!("failed to stat --log-file {path}"))?;
-    let euid = rustix::process::geteuid().as_raw();
-    if !meta.is_file() || meta.uid() != euid {
-        anyhow::bail!(
-            "refusing to write --log-file {path}: it is not a regular file owned by the \
-             current user"
-        );
-    }
-    // Tighten a pre-existing looser mode (the create mode above applies only
-    // on creation; a file from an earlier run could be group/world-readable).
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to set 0600 on --log-file {path}"))?;
-    Ok(file)
-}
-
-/// Windows twin of [`open_log_file`]: create+append with inherited ACLs (the
-/// parent directory is the user's own temp dir), so no mode/ownership work is
-/// needed — and `mode`/`O_NOFOLLOW`/`geteuid` do not exist outside unix.
-#[cfg(not(unix))]
-fn open_log_file(path: &str) -> anyhow::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| {
-            format!(
-                "failed to open --log-file {path} for writing; check that the \
-                 directory exists and is writable"
-            )
-        })
-}
-
 /// Daemon entry point: parse CLI args, initialize logging, and run the
 /// daemon.
 ///
@@ -660,42 +596,25 @@ pub fn main() -> anyhow::Result<()> {
     // sound.
     choreo_shared::paths::set_base_dir_from_cli(cli.base_dir.clone());
 
-    // Resolve the log configuration from the shared `-v`/`-q` flags. Explicit
-    // flags win over RUST_LOG (the Unix precedence convention); the decision is
-    // made here but the "flags take precedence" warning is emitted AFTER the
-    // subscriber is installed — a warning logged before `init()` has no
-    // subscriber and is silently dropped.
-    let logging = LoggingConfig::resolve(cli.verbosity);
-
     // Logging init happens HERE — before any subcommand/state work — because
-    // everything after it wants to log. Under a base dir with no explicit
-    // `--log-file`, the daemon logs to `{base}/log/daemon.log` so a redirected
-    // instance keeps its diagnostics with it; otherwise it stays on stderr (a
-    // standalone daemon's console/journald sink). With --log-file, open the
-    // file first and make failure fatal: a TUI-spawned daemon whose log path
-    // is bad must fail loudly with the path, not silently lose all
-    // diagnostics. ANSI is always off for file output (escape codes are
-    // unreadable in a log file).
-    let log_file: Option<String> = cli.log_file.clone().or_else(|| {
-        choreo_shared::paths::base_log_file("daemon").map(|p| p.to_string_lossy().into_owned())
-    });
-    if let Some(path) = &log_file {
-        let file = open_log_file(path)?;
-        // `Mutex<File>` is a `MakeWriter`: each tracing event locks the file
-        // briefly, serializing writes without any extra plumbing.
-        fmt()
-            .with_env_filter(logging.filter.clone())
-            .with_ansi(false)
-            .with_writer(std::sync::Mutex::new(file))
-            .init();
-    } else {
-        fmt().with_env_filter(logging.filter.clone()).init();
-    }
-
-    // Now that a subscriber exists, these are observable: the shared reporter
-    // warns when the flags the user passed override a set RUST_LOG, then logs
-    // the effective level (identical wording in every binary).
-    logging.emit_startup_logs();
+    // everything after it wants to log. The shared initializer writes a
+    // hardened, pid-keyed file (`{base}/log/daemon-<pid>.log` under a base,
+    // else the XDG state dir, else the platform temp dir) AND mirrors every
+    // event to stderr unconditionally, so a `--base-dir` (or any file sink)
+    // never silences the console or the platform log (journald/launchd).
+    // `--log-file` chooses the file's path only. An unopenable log file is a
+    // fatal startup error: a TUI-spawned daemon whose log path is bad must
+    // fail loudly with the path, not silently lose all diagnostics.
+    choreo_shared::logging::init(LogOptions {
+        binary: "daemon",
+        verbosity: cli.verbosity,
+        log_file: cli.log_file.as_deref(),
+        console: ConsoleSink::Stderr,
+        with_target: true,
+        extra_directives: &[],
+        require_file: true,
+    })
+    .context("failed to initialize logging")?;
 
     // Utility subcommands exit early — they are one-shot file operations and
     // never touch the DB, providers, or listeners below.
@@ -821,57 +740,6 @@ pub fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── --log-file hardening ─────────────────────────────────────────
-
-    /// A fresh log file is created 0600 (not the umask-derived 0644), so
-    /// other users on a shared machine cannot read the daemon's diagnostics.
-    #[cfg(unix)]
-    #[test]
-    fn open_log_file_creates_with_0600() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("daemon.log");
-        let file = open_log_file(path.to_str().unwrap()).unwrap();
-        drop(file);
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "fresh daemon logs must be owner-only");
-    }
-
-    /// A file left behind by an earlier run could be group/world-readable;
-    /// opening it must tighten the mode to 0600 (the create mode only applies
-    /// when the file is actually created).
-    #[cfg(unix)]
-    #[test]
-    fn open_log_file_tightens_a_preexisting_loose_file() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("existing.log");
-        std::fs::write(&path, b"old log").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        open_log_file(path.to_str().unwrap()).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "an existing loose log must be tightened");
-    }
-
-    /// A symlink planted at the (predictable, pid-keyed) log path must fail
-    /// the open (`O_NOFOLLOW`), never redirect our diagnostics into an
-    /// attacker-chosen file.
-    #[cfg(unix)]
-    #[test]
-    fn open_log_file_refuses_a_symlink() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("target.log");
-        std::fs::write(&target, b"secret").unwrap();
-        let link = dir.path().join("link.log");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(
-            open_log_file(link.to_str().unwrap()).is_err(),
-            "a symlink at the log path must be refused"
-        );
-        // The target must not have been touched by the refused open.
-        assert_eq!(std::fs::read(&target).unwrap(), b"secret");
-    }
 
     // ── mcp CLI core ─────────────────────────────────────────────────
 
