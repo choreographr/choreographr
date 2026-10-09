@@ -436,7 +436,8 @@ impl VideoGenerationClient for FalVideoClient {
             .map_err(InferenceError::Io)?;
         let auth = self.auth_header();
         let body = build_fal_video_body(&req.model, req);
-        tracing::debug!(url = %url, model = %req.model, body = %body, "submitting fal video job");
+        // The request body carries the prompt; log only the endpoint and model.
+        tracing::debug!(url = %url, model = %req.model, "submitting fal video job");
         // NO retry: a duplicate submit is a duplicate, billable job.
         let response = self
             .http

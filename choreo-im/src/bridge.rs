@@ -136,6 +136,30 @@ pub enum BridgeEvent {
     Pong,
 }
 
+impl BridgeEvent {
+    /// A payload-free name for this variant, for logs.
+    ///
+    /// Several variants carry user content — the assistant [`Text`](Self::Text)
+    /// and a tool's `arguments_json`/`output` — so a whole event must never be
+    /// `Debug`-formatted into a log. This projects only the variant name.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Text(_) => "Text",
+            Self::ToolCallStarted { .. } => "ToolCallStarted",
+            Self::ToolCallFinished { .. } => "ToolCallFinished",
+            Self::ToolCallFailed { .. } => "ToolCallFailed",
+            Self::Image { .. } => "Image",
+            Self::Error(_) => "Error",
+            Self::Models { .. } => "Models",
+            Self::ModelSelected(_) => "ModelSelected",
+            Self::Unlocked => "Unlocked",
+            Self::Locked => "Locked",
+            Self::Pong => "Pong",
+        }
+    }
+}
+
 impl DaemonBridge {
     /// Spawn the writer and reader threads and return a handle onto them.
     ///
@@ -174,7 +198,7 @@ impl DaemonBridge {
                     recv(client_rx) -> msg => match msg {
                         Ok(msg) => {
                             let framed = pending.frame(msg);
-                            debug!(?framed, "sending message to daemon");
+                            debug!(id = framed.id, kind = ?framed.inner.kind(), "sending message to daemon");
                             if let Err(e) = write_message(&mut writer, &framed) {
                                 error!(%e, "write error, bridge writer shutting down");
                                 if let Err(send_err) = writer_event_tx
@@ -225,7 +249,7 @@ impl DaemonBridge {
             let mut attached = false;
 
             let result = choreo_client_core::run_daemon_reader(&mut reader, |msg| {
-                debug!(?msg, "received daemon message");
+                debug!(id = ?msg.id, "received daemon message");
                 // Relay a correlated reply's id to the writer so it resolves
                 // (drops) the matching pending slot; a broadcast (`id: None`)
                 // resolves nothing.
@@ -556,7 +580,7 @@ fn daemon_to_bridge_events(
             // counters. None of these map to a rendered bridge event, so drop
             // them at debug rather than warning on every ordinary turn.
             debug!(
-                ?msg,
+                id = ?msg.id,
                 "bridge ignoring attached-session metadata/status event"
             );
             None
@@ -572,7 +596,7 @@ fn daemon_to_bridge_events(
         | DaemonMessageType::CredentialRemoved { .. }
         | DaemonMessageType::CredentialRemoveFailed { .. }
         | DaemonMessageType::Credential { .. } => {
-            warn!(?msg, "unhandled daemon message variant in bridge");
+            warn!(id = ?msg.id, "unhandled daemon message variant in bridge");
             None
         }
         DaemonMessageType::Session {

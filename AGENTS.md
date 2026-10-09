@@ -91,6 +91,8 @@ All crates in the workspace (`choreographr`, `choreo-client-core`, `choreo-keyst
 
 In the `choreo-tui` crate specifically, do not use `eprintln!` for diagnostics — output goes to the per-process log file `$XDG_STATE_HOME/choreographr/tui-<pid>.log` (with a `std::env::temp_dir()` fallback where no XDG state dir exists, so it works on Termux/Android too). A failure to create that log file must degrade to no logging, never abort the TUI.
 
+**Never log message payloads.** A log line must not carry a user prompt, an assistant response, tool arguments or output, a request body, or any secret (a bot token, an unlock key, a credential). Log the *id*, *length*, *kind tag*, or *count* instead. The protocol and event enums (`ClientMessage`, `DaemonMessage`, `SessionEvent`, `ToolCallEvent`, `BridgeEvent`, MCP server log data, …) derive `Debug` and several variants carry exactly this content, so **never `?`-format one of them into a log line or an error/bail string** — project a payload-free name/tag (`MessageKind`, `BridgeEvent::kind`) or a length. The same applies to `bail!`/`anyhow!` messages, which are printed and may be logged.
+
 ## Thread Communication
 
 Do not share mutable state between threads. Use message-passing channels for all cross-thread communication. Shared-state patterns (`Arc<RwLock<…>>`, `Arc<Mutex<…>>`) should be avoided in favor of channel-based designs.

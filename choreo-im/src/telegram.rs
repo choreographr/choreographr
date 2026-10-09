@@ -41,7 +41,7 @@ pub fn run(
         std::thread::spawn(move || {
             let mut chat_id: Option<i64> = None;
             while let Ok(event) = bridge_rx.recv() {
-                debug!(?event, "bridge event received");
+                debug!(kind = event.kind(), "bridge event received");
                 while let Ok(cid) = chat_id_rx.try_recv() {
                     chat_id = Some(cid);
                 }
@@ -112,7 +112,8 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
     }
 
     let chat_id_val = msg.chat.id;
-    debug!(%user_id, input = %text, "received telegram message");
+    // Log only the length, never the text: the user's message must not appear.
+    debug!(%user_id, input_len = text.len(), "received telegram message");
 
     let _ = state.chat_id_tx.send(chat_id_val);
 

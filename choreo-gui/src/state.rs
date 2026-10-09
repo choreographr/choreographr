@@ -131,7 +131,8 @@ impl TurnEventHandler for AppState {
     }
 
     fn handle_tool_call_event(&mut self, _session_id: u64, stream_id: u64, event: ToolCallEvent) {
-        trace!(%stream_id, ?event, "handle_tool_call_event");
+        // Never `?event`: it carries the tool's arguments and output.
+        trace!(%stream_id, "handle_tool_call_event");
         match event {
             ToolCallEvent::Started {
                 call_id,

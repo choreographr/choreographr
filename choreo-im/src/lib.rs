@@ -153,9 +153,9 @@ pub fn main() -> anyhow::Result<()> {
                  binds automatically on connect"
             );
         }
-        Ok(other) => {
-            error!(?other, "unexpected response to GetCredential");
-            bail!("unexpected response to GetCredential: {other:?}");
+        Ok(_) => {
+            error!("unexpected response to GetCredential");
+            bail!("unexpected response to GetCredential");
         }
         Err(e) => {
             error!(%e, "failed to read credential response");
@@ -235,9 +235,9 @@ pub fn establish_keystore<R: std::io::Read, W: std::io::Write>(
                         error!(%bind_err, "bind failed");
                         bail!("bind failed: {bind_err}");
                     }
-                    Ok(other) => {
-                        error!(?other, "unexpected response to bind");
-                        bail!("unexpected response to bind: {other:?}");
+                    Ok(_) => {
+                        error!("unexpected response to bind");
+                        bail!("unexpected response to bind");
                     }
                     Err(e) => {
                         error!(%e, "failed to read bind response");
@@ -252,9 +252,9 @@ pub fn establish_keystore<R: std::io::Read, W: std::io::Write>(
                  does not hold; re-pair it via the TUI"
                 );
             }
-            Ok(other) => {
-                error!(?other, "unexpected response to unlock");
-                bail!("unexpected response to unlock: {other:?}");
+            Ok(_) => {
+                error!("unexpected response to unlock");
+                bail!("unexpected response to unlock");
             }
             Err(e) => {
                 error!(%e, "failed to read unlock response");
@@ -283,9 +283,9 @@ pub fn establish_keystore<R: std::io::Read, W: std::io::Write>(
                 error!(%error, "bind rejected against an unbound keystore");
                 bail!("bind failed: {error}");
             }
-            Ok(other) => {
-                error!(?other, "unexpected response to bind probe");
-                bail!("unexpected response to bind probe: {other:?}");
+            Ok(_) => {
+                error!("unexpected response to bind probe");
+                bail!("unexpected response to bind probe");
             }
             Err(e) => {
                 error!(%e, "failed to read bind probe response");

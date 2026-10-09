@@ -106,10 +106,11 @@ pub(super) fn handle_run_input(
     state.next_stream_id = state.next_stream_id.wrapping_add(1);
     debug!("session {}: RunInput id={}", ctx.session_id, stream_id);
     let text = String::from_utf8_lossy(input).trim().to_string();
+    // Log only the length, never the text: the user's prompt must not appear
+    // in the daemon's log.
     info!(
         session_id = ctx.session_id,
         input_len = text.len(),
-        input_preview = %text.chars().take(120).collect::<String>(),
         "session received input",
     );
     if text.is_empty() {

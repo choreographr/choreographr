@@ -3397,6 +3397,15 @@ and the captured MCP server `mcp-<…>.log` files alike. Retention is time-based
 a busy one never accumulates unbounded files. A user's `--log-file` under any
 other name is never touched.
 
+**Logs never carry message payloads.** A log line (and any `bail!`/`anyhow!`
+message, which is printed and may be logged) holds only an *id*, *kind tag*,
+*length*, or *count* — never a user prompt, an assistant response, tool
+arguments/output, a request body, or a secret. The protocol and event enums
+derive `Debug` and several variants carry exactly this content, so they are
+never `?`-formatted into a line; a payload-free projection (`MessageKind`,
+`DaemonMessageType`'s variant, `BridgeEvent::kind`) or a length is used instead
+(see AGENTS.md → Logging).
+
 **Session persistence:** On daemon start, sessions are loaded from the database into
 `session_metadata` (in-memory). Model selection (`/model <name>`) updates both the
 in-memory metadata and the database via `UpdateMetadata → db::write_session`. The

@@ -1436,7 +1436,8 @@ impl TurnEventHandler for App {
         session_id: u64,
         turns: std::collections::BTreeMap<u32, Turn>,
     ) {
-        tracing::trace!(?turns, "handle_turns_redone");
+        // Never `?turns`: a `Turn` carries message content.
+        tracing::trace!(count = turns.len(), "handle_turns_redone");
         // Sync images first, then get display to avoid borrow conflict.
         for (tid, turn) in &turns {
             self.sync_turn_images(session_id, *tid, turn);

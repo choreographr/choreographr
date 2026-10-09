@@ -112,7 +112,7 @@ pub fn spawn_daemon_io(
             // request); this thread just puts the already-framed frame on the
             // wire.
             for msg in writer_rx {
-                debug!(?msg, "sending message to daemon");
+                debug!(id = msg.id, kind = ?msg.inner.kind(), "sending message to daemon");
                 if let Err(e) = write_message(&mut writer_stream, &msg) {
                     error!(error = %e, "daemon writer error");
                     break;
@@ -143,7 +143,7 @@ pub fn spawn_daemon_io(
             loop {
                 match read_message::<_, DaemonMessage>(&mut reader) {
                     Ok(msg) => {
-                        debug!(?msg, "received daemon message");
+                        debug!(id = ?msg.id, "received daemon message");
                         if event_tx.send(Event::DaemonMessage(msg)).is_err() {
                             // Main loop dropped the receiver — shutting down.
                             break;
