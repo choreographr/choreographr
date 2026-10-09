@@ -241,25 +241,13 @@ fn console_wants_ansi() -> bool {
 pub fn open_log_file(path: &Path) -> io::Result<std::fs::File> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt as _;
-
         match create_new(path) {
             Ok(file) => Ok(file),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 // A reused pid: replace the (older) file only when it is a
                 // regular file we own; refuse a symlink, a device/FIFO, or
                 // another user's file outright.
-                let meta = std::fs::symlink_metadata(path)?;
-                if !meta.is_file() || meta.uid() != rustix::process::geteuid().as_raw() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!(
-                            "refusing to replace {}: not a regular file owned by the current user",
-                            path.display()
-                        ),
-                    ));
-                }
-                std::fs::remove_file(path)?;
+                replace_if_owned(path)?;
                 create_new(path)
             }
             Err(e) => Err(e),
@@ -283,6 +271,80 @@ pub fn open_log_file(path: &Path) -> io::Result<std::fs::File> {
             Err(e) => Err(e),
         }
     }
+}
+
+/// Open a log at `path` for append (creating it if absent), hardened like
+/// [`open_log_file`]: `O_NOFOLLOW`, mode `0600`, and a post-open check that the
+/// result is a regular file owned by this euid.
+///
+/// For a log that is *appended* across reconnects rather than recreated per
+/// open — the captured stderr of a stdio MCP server, whose per-server file
+/// (`mcp-<slug>-<hash>.log`) is stable. Refusing a symlink or a foreign file
+/// keeps a server's diagnostics from being diverted.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error, or the refusal when a non-regular / foreign
+/// entry sits at the path.
+pub fn open_log_append(path: &Path) -> io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            // 0600 applies on creation; `verify_owned_regular` re-applies it.
+            .mode(0o600)
+            // O_NOFOLLOW: fail rather than follow a symlink at the path.
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+            .open(path)?;
+        verify_owned_regular(&file, path)?;
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    }
+}
+
+/// Remove a stale log at `path`, but only when it is a regular file we own;
+/// refuse anything else.
+#[cfg(unix)]
+fn replace_if_owned(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.is_file() || meta.uid() != rustix::process::geteuid().as_raw() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to replace {}: not a regular file owned by the current user",
+                path.display()
+            ),
+        ));
+    }
+    std::fs::remove_file(path)
+}
+
+/// Verify an opened log is a regular file owned by this euid and tighten it to
+/// 0600; refuse otherwise.
+#[cfg(unix)]
+fn verify_owned_regular(file: &std::fs::File, path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.uid() != rustix::process::geteuid().as_raw() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing {}: not a regular file owned by the current user",
+                path.display()
+            ),
+        ));
+    }
+    let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    Ok(())
 }
 
 /// Create a brand-new 0600 file at `path`, refusing to follow a symlink there.
@@ -604,6 +666,39 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "the replacement must be owner-only");
+    }
+
+    /// The append opener (`open_log_append`, used for a stdio MCP server's
+    /// captured stderr) hardens the same way: a symlink is refused and a fresh
+    /// file is owner-only, while an existing file is appended to.
+    #[cfg(unix)]
+    #[test]
+    fn open_log_append_hardens_and_appends() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        // A symlink at the path is refused (O_NOFOLLOW).
+        let target = dir.path().join("victim");
+        std::fs::write(&target, b"do not touch").expect("write target");
+        let link = dir.path().join("mcp-link.log");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert!(open_log_append(&link).is_err(), "a symlink must be refused");
+
+        // A fresh file is created owner-only, and a second open appends.
+        let path = dir.path().join("mcp-fresh.log");
+        let mut file = open_log_append(&path).expect("open");
+        std::io::Write::write_all(&mut file, b"one\n").expect("write");
+        drop(file);
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "a fresh per-server log must be owner-only");
+        let mut file = open_log_append(&path).expect("reopen");
+        std::io::Write::write_all(&mut file, b"two\n").expect("append");
+        drop(file);
+        assert_eq!(std::fs::read(&path).expect("read"), b"one\ntwo\n");
     }
 
     // ── prune_logs retention ─────────────────────────────────────────

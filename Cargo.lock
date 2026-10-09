@@ -3061,6 +3061,7 @@ name = "choreo-mcp"
 version = "0.2.3"
 dependencies = [
  "choreo-sanitize",
+ "choreo-shared",
  "crossbeam-channel",
  "process-wrap",
  "reqwest 0.13.5",

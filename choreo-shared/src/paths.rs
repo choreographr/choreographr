@@ -208,33 +208,30 @@ pub fn log_dir_default() -> Option<PathBuf> {
     log_dir()
 }
 
-/// The pid-keyed log file for `binary`: `{logdir}/<binary>-<pid>.log`, where
-/// `{logdir}` is [`log_dir_default`], else the platform temp dir
-/// (`choreo-<binary>-<pid>.log` — respects `TMPDIR`, and is the only writable
-/// choice where no XDG state dir exists).
+/// The resolved log file for a log `stem`: `{logdir}/<stem>.log` under the log
+/// directory, else the platform temp dir (`choreo-<stem>.log` — respects
+/// `TMPDIR`, and is the only writable choice where no XDG state dir exists).
 ///
-/// The `-<pid>` key makes every process's log a distinct, fresh file ("the pid
-/// is the rotation"): parallel instances never clobber one another and no run
-/// appends to a predecessor's file. This is the single naming definition — the
-/// daemon's own default and the TUI's reconstruction of an autostarted daemon's
-/// path both go through it, so the two cannot drift.
+/// The single path definition for every log the suite's binaries and the MCP
+/// transport write, so their layout cannot drift.
 #[must_use]
-pub fn log_file(binary: &str, pid: u32) -> PathBuf {
-    let stem = format!("{binary}-{pid}");
+pub fn log_file_path(stem: &str) -> PathBuf {
     match log_dir() {
-        Some(dir) => log_file_in(&dir, &stem),
+        Some(dir) => log_file_in(&dir, stem),
         None => std::env::temp_dir().join(format!("choreo-{stem}.log")),
     }
 }
 
-/// The default log file for a file-logging `binary`.
+/// The pid-keyed log file for `binary`: [`log_file_path`] of `<binary>-<pid>`.
 ///
-/// Under a base: `{base}/log/<binary>.log`. Otherwise the XDG state dir
-/// (`$XDG_STATE_HOME/choreographr/<binary>.log`), or `None` when the state dir
-/// is unavailable (macOS/Windows) so the caller keeps its own fallback.
+/// The `-<pid>` key makes every process's log a distinct, fresh file ("the pid
+/// is the rotation"): parallel instances never clobber one another and no run
+/// appends to a predecessor's file. The daemon's own default and the TUI's
+/// reconstruction of an autostarted daemon's path both go through it, so the
+/// two cannot drift.
 #[must_use]
-pub fn log_file_default(binary: &str) -> Option<PathBuf> {
-    log_dir().map(|dir| log_file_in(&dir, binary))
+pub fn log_file(binary: &str, pid: u32) -> PathBuf {
+    log_file_path(&format!("{binary}-{pid}"))
 }
 
 /// The log/state directory: the test override, else `{base}/log`, else
@@ -315,7 +312,7 @@ fn log_file_in(dir: &Path, binary: &str) -> PathBuf {
 }
 
 /// Test-only override for the log directory. When set, the log path resolvers
-/// ([`log_file_default`], [`log_file`]) write under it instead of the base/state
+/// ([`log_file_path`], [`log_file`]) write under it instead of the base/state
 /// dir, so tests never create a log in the developer's real `$XDG_STATE_HOME`.
 ///
 /// Process-global, not thread-local: the log directory is resolved from many
@@ -392,10 +389,10 @@ mod tests {
     }
 
     #[test]
-    fn log_file_default_honors_the_test_override() {
+    fn log_file_path_honors_the_test_override() {
         let temp = std::env::temp_dir().join("choreo-paths-log-override");
         let _guard = TestLogDirGuard::set(Some(temp.clone()));
-        let path = log_file_default("tui-1").unwrap();
+        let path = log_file_path("tui-1");
         assert_eq!(path, temp.join("tui-1.log"));
     }
 }

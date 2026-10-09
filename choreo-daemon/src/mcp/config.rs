@@ -149,7 +149,7 @@ fn resolve_transport(
                 args: entry.args.clone(),
                 env: maybe_expand_env_map(&entry.env, expand_env),
                 cwd: entry.cwd.as_deref().map(expand_tilde),
-                log_path: server_log_path(identity, slug),
+                log_path: Some(server_log_path(identity, slug)),
             })
         }
         McpTransportKind::Http => {
@@ -219,17 +219,18 @@ fn resolve_entry(
     })
 }
 
-/// The per-server log file path (`mcp-<safe-slug>-<hash>.log`) for a stdio
-/// server.
+/// The per-server log file path for a stdio server.
 ///
 /// The child's `stderr` is captured here (size-capped) so each server's own
-/// diagnostics are isolated rather than mixed into the daemon's log. The slug is
-/// sanitized to filename-safe characters and disambiguated by a short hash of
-/// the tier-scoped `identity` plus the slug.
-/// `None` when no log directory is available (macOS/Windows with no
-/// `XDG_STATE_HOME`); the child then inherits the daemon's stderr.
-fn server_log_path(identity: &str, slug: &str) -> Option<PathBuf> {
-    choreo_shared::paths::log_file_default(&log_file_stem(identity, slug))
+/// diagnostics are isolated rather than mixed into the daemon's log. The stem is
+/// `mcp-<safe-slug>-<hash>` — the slug sanitized to filename-safe characters and
+/// disambiguated by a short hash of the tier-scoped `identity` plus the slug.
+/// The path is resolved through the same [`choreo_shared::paths::log_file_path`]
+/// as every other Choreographr log (`{base}/log` → `$XDG_STATE_HOME/choreographr`
+/// → the platform temp dir), so there is always a file — never a silent
+/// "child inherits stderr" on macOS/Windows.
+fn server_log_path(identity: &str, slug: &str) -> PathBuf {
+    choreo_shared::paths::log_file_path(&log_file_stem(identity, slug))
 }
 
 /// The per-server log file stem (`mcp-<safe-slug>-<hash>`): the slug sanitized

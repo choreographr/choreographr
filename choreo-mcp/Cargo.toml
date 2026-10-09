@@ -16,6 +16,11 @@ rust-version.workspace = true
 # deliberately tiny leaf crate (only `unicode-general-category`), so this adds
 # no meaningful weight to this otherwise-light client crate.
 choreo-sanitize.workspace = true
+# The one hardened log-file open (O_NOFOLLOW + euid/regular-file check + 0600)
+# shared with the suite's own logs, so a stdio server's captured stderr is
+# opened exactly like every other Choreographr log rather than re-deriving the
+# hardening here.
+choreo-shared.workspace = true
 # Cross-thread control-plane channels: the per-server dispatcher's command and
 # reply channels, and the call-completion notifications it drains between
 # commands. Workspace policy: crossbeam, never std mpsc.

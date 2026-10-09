@@ -31,48 +31,6 @@ const MAX_SERVER_LOG_BYTES: u64 = 2 * 1024 * 1024;
 /// Bytes read from the child's stderr per drain iteration.
 const STDERR_CHUNK: usize = 8192;
 
-/// Open (creating) the per-server log for append, hardened so a planted symlink
-/// or a foreign file at the predictable path cannot redirect a server's captured
-/// stderr — which may echo operator-configured values (a header, a token).
-///
-/// Create+append with `O_NOFOLLOW` and mode 0600, then a post-open check that
-/// the result is a regular file owned by this euid. Returns `None` when the open
-/// fails or the entry is refused, so the caller skips logging rather than writing
-/// anywhere unexpected. On non-Unix the file inherits the parent directory's
-/// ACLs (a newly created file is scoped to the creating user).
-fn open_log_append(path: &Path) -> Option<std::fs::File> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            // 0600 applies on creation; re-asserted below for a laxer pre-existing file.
-            .mode(0o600)
-            // O_NOFOLLOW: fail rather than follow a symlink at the path.
-            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
-            .open(path)
-            .ok()?;
-        // Refuse to append into anything we do not control: a pre-created file
-        // owned by another user, or a non-regular file (a symlink target, a
-        // device/FIFO), must not receive a server's diagnostics.
-        let meta = file.metadata().ok()?;
-        if !meta.is_file() || meta.uid() != rustix::process::geteuid().as_raw() {
-            return None;
-        }
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
-        Some(file)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .ok()
-    }
-}
-
 /// Drain `reader` into `path`, size-capped, until EOF. Blocking; runs on a
 /// dedicated thread.
 ///
@@ -82,7 +40,7 @@ fn open_log_append(path: &Path) -> Option<std::fs::File> {
 /// single-file rotation). The file is opened in append mode, so after a
 /// truncation writes resume from the start without seeking.
 fn drain_stderr_to_log<R: Read>(mut reader: R, path: &Path) {
-    let Some(mut file) = open_log_append(path) else {
+    let Ok(mut file) = choreo_shared::logging::open_log_append(path) else {
         return;
     };
     let mut written = file.metadata().map_or(0, |m| m.len());
