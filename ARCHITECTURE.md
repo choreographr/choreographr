@@ -1138,8 +1138,9 @@ regular file the daemon owns when a reused pid finds a stale one; logs older
 than a week are pruned on startup), and every event is **also mirrored to stderr** (the
 console or journald), so `--base-dir` never silences the console. `--log-file
 <path>` chooses the file's path only (used verbatim, no pid key) — it never
-changes the level and never mutes stderr; an unopenable log file is a fatal
-startup error, and the first line of every run names the resolved file. Then
+changes the level and never mutes stderr; a log file that cannot be opened is
+never fatal (the run degrades to the stderr sink with a warning), and the first
+line of every run names the resolved file. Then
 `main` creates
 `DaemonState`, runs socket server. `--auto-exit` (see the
 `server/lifecycle.rs` and `server/core.rs` rows) shuts the daemon down
@@ -3384,8 +3385,9 @@ and whether the mirror is unconditional or terminal-gated, is chosen per binary:
 the daemon and IM bridge always mirror (their stderr is the console *or*
 journald/launchd); the GUI and ACP adapter mirror only when stderr is a terminal
 (a desktop-icon / editor launch has none); the TUI never mirrors (it owns the
-alternate screen). A file open that fails is fatal for the daemon and degrades
-to the console sink for the others. `--log-file <path>` on any binary chooses the
+alternate screen). A file open that fails is never fatal for any binary: it
+degrades to the console sink (with a warning), so an unwritable log directory
+cannot take a binary down. `--log-file <path>` on any binary chooses the
 file's path only (used verbatim, with no pid key) — it never affects the level
 and never mutes the console; with no base dir and no XDG state dir the file falls
 back to the platform temp dir (Termux/Android included).
@@ -3768,6 +3770,16 @@ carries no protocol data and never crosses the wire, chosen over a random id
 so connection ids read as small sequential numbers in logs.  The daemon's
 consolidated `DaemonState::clients` map is keyed by it — one entry per client
 holding its writer sink, its subscription flags, and its session memberships.
+
+The one process-global override shared with tests is `choreo-shared`'s
+`paths::TEST_LOG_DIR` (a `static RwLock<Option<PathBuf>>`) — the eleventh
+sanctioned shared-state exception (see AGENTS.md).  Integration tests must keep
+the suite's log directory out of the developer's real `$XDG_STATE_HOME`, but
+that directory is resolved from many threads (the daemon command loop and each
+per-server MCP thread), so a thread-local override would let a worker leak its
+log there; a process-global override is shared instead.  It carries no protocol
+data and is a no-op in production (nothing sets it outside tests), and
+nextest's process-per-test keeps one override per process isolated.
 
 Token bookkeeping follows the same per-session rule.  `LiveOutputTokenCount`
 (during streaming) and `SessionState` snapshots (attach / `load_tools` /

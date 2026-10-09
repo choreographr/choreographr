@@ -13,7 +13,9 @@
 //!
 //! Beyond the flag parsing and the level decision, this module owns the one
 //! [`init`] entry point that installs the suite's subscriber: diagnostics go to
-//! a **file** (always) and, where a console exists, are **mirrored to stderr**.
+//! a hardened, pid-keyed **file** and, where a console exists, are **mirrored to
+//! stderr**. A file that cannot be opened is never fatal — the run degrades to
+//! the console sink (with a warning).
 //! The file is pid-keyed (`<binary>-<pid>.log`) so every process gets a fresh
 //! file — "the pid is the rotation" — and stale logs (its own and captured MCP
 //! `mcp-<…>.log` server logs alike) older than a week are pruned on startup.
@@ -61,9 +63,6 @@ pub struct LogOptions<'a> {
     /// Extra filter directives added after the level policy (e.g. a crate kept
     /// at `debug` regardless of the resolved level).
     pub extra_directives: &'a [&'a str],
-    /// Whether a failed file open is fatal (`true`, the daemon) or degrades to
-    /// the console sink (`false`, every other binary).
-    pub require_file: bool,
 }
 
 /// How long a log file is kept in the log directory before the startup pruner
@@ -75,15 +74,14 @@ const LOG_RETENTION: Duration = Duration::from_hours(7 * 24);
 /// Install the process-wide subscriber: the shared level policy, a file sink,
 /// and an optional console sink. Returns the resolved log-file path when a file
 /// sink was installed, or `None` when the file could not be opened and the
-/// process degraded to its console sink (or to no subscriber, when the console
-/// sink is [`ConsoleSink::None`]).
+/// process degraded to its console sink (or to no subscriber at all, when the
+/// console sink is [`ConsoleSink::None`]).
 ///
-/// # Errors
-///
-/// Returns the file-open error when `require_file` is set and the file cannot
-/// be opened; with `require_file` unset a failed open degrades instead of
-/// failing.
-pub fn init(opts: LogOptions<'_>) -> io::Result<Option<PathBuf>> {
+/// A failed file open is never fatal: diagnostics are never a startup
+/// precondition (see AGENTS.md -> Logging), so the failure degrades to the
+/// console sink instead of aborting the process. The failure is reported once
+/// the subscriber exists, so it is visible on that sink rather than swallowed.
+pub fn init(opts: LogOptions<'_>) -> Option<PathBuf> {
     let LoggingConfig {
         filter,
         effective_level,
@@ -96,14 +94,6 @@ pub fn init(opts: LogOptions<'_>) -> io::Result<Option<PathBuf>> {
         }
     }
 
-    // Prune stale suite logs (older than one week) up front. The log directory
-    // is shared housekeeping, so this runs whether or not this run uses the
-    // default file, and it covers every binary's own log plus captured MCP
-    // server logs.
-    if let Some(dir) = paths::log_dir_default() {
-        prune_logs(&dir);
-    }
-
     // Resolve the file path. The default is pid-keyed; an explicit `--log-file`
     // is used verbatim.
     let path = match opts.log_file {
@@ -111,40 +101,73 @@ pub fn init(opts: LogOptions<'_>) -> io::Result<Option<PathBuf>> {
         None => paths::log_file(opts.binary, std::process::id()),
     };
 
-    // Open the file (hardened). A failure degrades to the console sink unless
-    // the caller made the file mandatory.
-    let file = match open_log_file(&path) {
-        Ok(file) => Some(file),
-        Err(e) => {
-            if opts.require_file {
-                return Err(e);
-            }
-            None
-        }
-    };
-    let log_path = file.as_ref().map(|_| path);
-
-    // Install the subscriber only when it has at least one sink; with none,
-    // there is nothing to receive the startup banner, so skip it.
-    if log_path.is_some() || opts.console != ConsoleSink::None {
-        install(filter, file, opts.console, opts.with_target);
-        emit_startup_banner(effective_level, rust_log_ignored, log_path.as_deref());
+    // Prune stale suite logs (older than one week) up front — shared
+    // housekeeping that covers every binary's own log plus captured MCP server
+    // logs, whether or not this run uses the default file. This run's explicit
+    // `--log-file` is protected from the sweep even if its name matches the
+    // suite pattern.
+    if let Some(dir) = paths::log_dir_default() {
+        prune_logs(&dir, opts.log_file.map(Path::new));
     }
-    Ok(log_path)
+
+    // Open the file (hardened). A failure is never fatal — see the doc above.
+    // The error is captured and reported AFTER the subscriber exists, since a
+    // warning emitted before `init` has no subscriber and would be dropped.
+    let (file, file_error) = match open_log_file(&path) {
+        Ok(file) => (Some(file), None),
+        Err(e) => (None, Some(e)),
+    };
+    let log_path = file.is_some().then(|| path.clone());
+
+    // Install the subscriber only when it has at least one REAL sink: with
+    // neither a file nor a live console sink there is nothing to receive the
+    // startup diagnostics, so skip the install entirely (a filter-only
+    // subscriber would just mark `tracing` initialized and drop every event).
+    if log_path.is_some() || has_console_sink(opts.console) {
+        install(filter, file, opts.console, opts.with_target);
+        emit_startup_diagnostics(
+            effective_level,
+            rust_log_ignored,
+            log_path.as_deref(),
+            &path,
+            file_error.as_ref(),
+        );
+    }
+    log_path
+}
+
+/// Whether a console layer will actually be installed for `console` — the
+/// terminal-gated [`ConsoleSink::StderrIfTty`] counts only on a real terminal.
+fn has_console_sink(console: ConsoleSink) -> bool {
+    match console {
+        ConsoleSink::None => false,
+        ConsoleSink::Stderr => true,
+        ConsoleSink::StderrIfTty => stderr_is_tty(),
+    }
 }
 
 /// Emit the post-install startup diagnostics: the "flags take precedence"
-/// warning (only when explicit flags overrode a set `RUST_LOG`) and the
+/// warning (only when explicit flags overrode a set `RUST_LOG`), a warning when
+/// the log file could not be opened (naming the path and the error), and the
 /// effective-level banner, naming the resolved log file when a file sink is
 /// installed. MUST run AFTER the subscriber is installed — an event logged
 /// before `init()` has no subscriber and is silently dropped.
-fn emit_startup_banner(
+fn emit_startup_diagnostics(
     effective_level: &'static str,
     rust_log_ignored: bool,
     log_path: Option<&Path>,
+    attempted_path: &Path,
+    file_error: Option<&io::Error>,
 ) {
     if rust_log_ignored {
         tracing::warn!("RUST_LOG is set; -v/-q CLI flags take precedence");
+    }
+    if let Some(error) = file_error {
+        tracing::warn!(
+            log_file = %attempted_path.display(),
+            %error,
+            "could not open the log file; continuing with the console sink only"
+        );
     }
     if let Some(path) = log_path {
         tracing::info!(
@@ -391,11 +414,13 @@ fn is_suite_log_name(name: &str) -> bool {
 ///
 /// Only files this suite names are considered (see `is_suite_log_name`) — the
 /// suite's own `<binary>-<pid>.log` and the captured `mcp-<…>.log` server logs
-/// alike. A user's explicit `--log-file` under another name, an unrelated file,
-/// or a non-regular file (a symlink or directory) is never touched. Never
-/// fails: an unreadable directory or an undeletable file is silently left
-/// alone — retention is housekeeping, never a startup precondition.
-pub fn prune_logs(dir: &Path) {
+/// alike. `keep`, when given, is this run's explicit `--log-file`: it is spared
+/// even if its name matches the suite pattern, so a caller can never prune the
+/// file it is about to write. An unrelated file or a non-regular file (a
+/// symlink or directory) is never touched. Never fails: an unreadable directory
+/// or an undeletable file is silently left alone — retention is housekeeping,
+/// never a startup precondition.
+pub fn prune_logs(dir: &Path, keep: Option<&Path>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -403,6 +428,9 @@ pub fn prune_logs(dir: &Path) {
         return;
     };
     for entry in entries.flatten() {
+        if keep == Some(entry.path().as_path()) {
+            continue;
+        }
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if !is_suite_log_name(name) {
@@ -735,7 +763,7 @@ mod tests {
         seed_log(dir.path(), "custom.log", old);
         seed_log(dir.path(), "notes.txt", old);
 
-        prune_logs(dir.path());
+        prune_logs(dir.path(), None);
 
         for name in ["daemon-1000.log", "tui-1000.log", "mcp-docs-abc123.log"] {
             assert!(!dir.path().join(name).exists(), "{name} should be pruned");
@@ -759,7 +787,29 @@ mod tests {
         for i in 0..20 {
             seed_log(dir.path(), &format!("tui-{i}.log"), fresh);
         }
-        prune_logs(dir.path());
+        prune_logs(dir.path(), None);
         assert_eq!(std::fs::read_dir(dir.path()).expect("read_dir").count(), 20);
+    }
+
+    /// The path passed to `keep` (this run's explicit `--log-file`) is spared
+    /// even when its name matches the suite pattern and it is past retention.
+    #[test]
+    fn prune_spares_the_protected_log_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let old = SystemTime::now() - Duration::from_hours(8 * 24);
+        seed_log(dir.path(), "daemon-1000.log", old);
+        seed_log(dir.path(), "daemon-2000.log", old);
+
+        let keep = dir.path().join("daemon-2000.log");
+        prune_logs(dir.path(), Some(&keep));
+
+        assert!(
+            keep.exists(),
+            "the protected explicit log file must not be pruned"
+        );
+        assert!(
+            !dir.path().join("daemon-1000.log").exists(),
+            "an unprotected suite log must still be pruned"
+        );
     }
 }

@@ -55,8 +55,8 @@ struct Cli {
     /// else the platform temp dir). Diagnostics are always ALSO mirrored to
     /// stderr (the console or journald) — this only chooses the file's path;
     /// it never affects RUST_LOG/-v/-q level selection and never mutes the
-    /// console. The daemon refuses to start when the file cannot be created or
-    /// opened.
+    /// console. A log file that cannot be created or opened degrades to stderr
+    /// (with a warning) rather than preventing the daemon from starting.
     #[arg(long = "log-file")]
     log_file: Option<String>,
 
@@ -602,19 +602,19 @@ pub fn main() -> anyhow::Result<()> {
     // else the XDG state dir, else the platform temp dir) AND mirrors every
     // event to stderr unconditionally, so a `--base-dir` (or any file sink)
     // never silences the console or the platform log (journald/launchd).
-    // `--log-file` chooses the file's path only. An unopenable log file is a
-    // fatal startup error: a TUI-spawned daemon whose log path is bad must
-    // fail loudly with the path, not silently lose all diagnostics.
-    choreo_shared::logging::init(LogOptions {
+    // `--log-file` chooses the file's path only. A file that cannot be opened
+    // is never fatal: the daemon degrades to the stderr sink (with a warning)
+    // rather than refusing to start, so an unwritable log directory — a
+    // read-only `$XDG_STATE_HOME`, a bare container — cannot take the daemon
+    // down. Diagnostics are never a startup precondition.
+    let _ = choreo_shared::logging::init(LogOptions {
         binary: "daemon",
         verbosity: cli.verbosity,
         log_file: cli.log_file.as_deref(),
         console: ConsoleSink::Stderr,
         with_target: true,
         extra_directives: &[],
-        require_file: true,
-    })
-    .context("failed to initialize logging")?;
+    });
 
     // Utility subcommands exit early — they are one-shot file operations and
     // never touch the DB, providers, or listeners below.

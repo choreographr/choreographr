@@ -110,7 +110,6 @@ pub fn main() -> anyhow::Result<()> {
         console: ConsoleSink::Stderr,
         with_target: false,
         extra_directives: &[],
-        require_file: false,
     });
 
     let path = socket_path();

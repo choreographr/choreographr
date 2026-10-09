@@ -457,7 +457,6 @@ pub fn main() -> anyhow::Result<()> {
         console: ConsoleSink::None,
         with_target: true,
         extra_directives: &[],
-        require_file: false,
     });
 
     let mode = if let Some(addr) = cli.tcp_addr {

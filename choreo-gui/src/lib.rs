@@ -315,7 +315,6 @@ pub fn main() {
         console: ConsoleSink::StderrIfTty,
         with_target: true,
         extra_directives: &[],
-        require_file: false,
     });
 
     let mode = if let Some(addr) = cli.tcp_addr {

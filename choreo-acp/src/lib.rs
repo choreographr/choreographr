@@ -144,7 +144,6 @@ pub fn main() -> Result<(), anyhow::Error> {
         console: ConsoleSink::StderrIfTty,
         with_target: true,
         extra_directives: &["choreo_acp=debug"],
-        require_file: false,
     });
 
     tracing::info!(
@@ -240,15 +239,11 @@ mod cli_tests {
             console: ConsoleSink::None,
             with_target: false,
             extra_directives: &[],
-            require_file: false,
         });
         let _ = std::fs::remove_file(&blocker);
 
-        // The open failed, so no file sink was installed — a clean degrade
-        // (Ok(None)), never an error, and never a panic.
-        assert_eq!(
-            result.expect("an uncreatable log must degrade, not fail"),
-            None
-        );
+        // The open failed, so no file sink was installed and the console sink
+        // is `None` — a clean degrade (None), never an error, never a panic.
+        assert_eq!(result, None);
     }
 }
