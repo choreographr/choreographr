@@ -702,6 +702,13 @@ jobs:
       - name: Compile check (both targets, rlib only)
         # Same crate-type restriction as build-ios.sh: the rlib only — the
         # cdylib needs Apple's linker and is not the target Xcode links.
+        #
+        # This step is what first reaches nix (via choreo-gui -> choreo-daemon
+        # -> choreo-sockreg/choreo-transport). libc is held at 0.2.189 in
+        # Cargo.lock because 0.2.190 made the Apple SYSPROTO_CONTROL /
+        # UTUN_OPT_IFNAME constants macOS-only while nix 0.31.3 still names them
+        # for iOS — see the hold note beside `nix` in the root Cargo.toml
+        # (nix-rust/nix#2830).
         run: |
           ./scripts/build-stable.sh check -p choreo-gui --lib --target aarch64-apple-ios
           ./scripts/build-stable.sh check -p choreo-gui --lib --target aarch64-apple-ios-sim

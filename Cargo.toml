@@ -545,6 +545,17 @@ bs58 = "0.5"
 # into the static-musl release). `handshake` enables `tungstenite::connect`.
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 nix = "0.31.3"
+# libc is a transitive dep (via nix) held at 0.2.189 in Cargo.lock by an exact
+# `cargo update -p libc --precise 0.2.189`: libc 0.2.190 moved SYSPROTO_CONTROL,
+# SYSPROTO_EVENT, AF_SYS_CONTROL, and UTUN_OPT_FLAGS/UTUN_OPT_IFNAME behind
+# `#[cfg(target_os = "macos")]` (they were unconditional across all Apple
+# targets before), while nix 0.31.3 still references them under its
+# `apple_targets` cfg (ios INCLUDED) — breaking the aarch64-apple-ios(-sim)
+# compile the iOS build job checks (choreo-gui embeds choreo-daemon, which pulls
+# nix through choreo-sockreg/choreo-transport). Do NOT let a `cargo update`
+# silently lift this: re-pin until nix narrows KextControl/UtunIfname to
+# target_os = "macos" (tracked in nix-rust/nix#2830). A future dep-refresh must
+# keep libc at 0.2.189.
 # Windows FFI (Win32 APIs): Job Objects kill-switch (choreo-daemon), Winsock
 # socket shutdown/probe/keepalive (choreo-sockreg), suspend/resume
 # notifications (choreo-power-events). Per AGENTS.md a crate used by two or
