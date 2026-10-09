@@ -1410,7 +1410,7 @@ fn persist_session_metadata(state: &mut SessionState, ctx: &RequestContext, labe
 /// registry, so stale names can never be re-activated.
 fn default_active_tool_groups() -> HashSet<String> {
     // `mut` is only needed when the `content` feature inserts its group.
-    #[cfg_attr(not(feature = "content"), allow(unused_mut))]
+    #[cfg_attr(not(feature = "content"), expect(unused_mut))]
     let mut groups = HashSet::from(["core".to_string(), "git".to_string(), "shell".to_string()]);
     #[cfg(feature = "content")]
     groups.insert("content".to_string());

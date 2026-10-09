@@ -1556,8 +1556,9 @@ fn broadcast_enqueues_losslessly_and_evicts_over_lag_client() {
         per_client_cap: 16,
         global_budget: usize::MAX,
     };
-    // The subscriber must also be in the writer registry for eviction to
-    // have a connection to tear down (handle_evict_client requires it).
+    // The client's entry holds the writer eviction tears down
+    // (handle_evict_client needs it) plus the summary flag that routes the
+    // broadcast to it.
     let (sink, rx) = test_sink();
     put_client(&mut state, 7, &sink, true, false, &[]);
 
@@ -1569,14 +1570,14 @@ fn broadcast_enqueues_losslessly_and_evicts_over_lag_client() {
 
     // Lossless: the crossing message is still delivered, never dropped.
     assert_eq!(rx.recv().unwrap(), DaemonMessage::broadcast(msg));
-    // …but the client is evicted for lag, from every map.
+    // …but the client's entry is gone (evicted for lag).
     assert!(
         !summary_subscribed(&state, 7),
         "over-lag subscriber must be evicted from the summary map"
     );
     assert!(
         !has_client(&state, 7),
-        "over-lag subscriber must be evicted from the writer registry"
+        "over-lag client must be evicted (its entry is gone)"
     );
 }
 
@@ -2992,14 +2993,14 @@ fn handle_broadcast_activity_evicts_over_lag_subscriber() {
 
     // Lossless: the crossing message was delivered, not dropped.
     assert_eq!(rx.recv().unwrap(), DaemonMessage::broadcast(broadcast));
-    // …and the subscriber is evicted from every map.
+    // …and the subscriber's entry is gone (evicted for lag).
     assert!(
         !activity_subscribed(&state, 10),
         "over-lag subscriber must be evicted from the activity map"
     );
     assert!(
         !has_client(&state, 10),
-        "over-lag subscriber must be evicted from the writer registry"
+        "over-lag client must be evicted (its entry is gone)"
     );
 }
 

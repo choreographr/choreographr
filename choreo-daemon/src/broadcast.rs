@@ -84,18 +84,18 @@ use tracing::warn;
 /// Wrapping the raw `u32` in a distinct type keeps it from being confused with
 /// the bare `u64` `session_id`/`stream_id`/request-id values it travels
 /// alongside, and gives the logging format one place to live.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ClientId(u32);
 
 impl ClientId {
     /// Mint the next id from the process-wide monotonic counter (starts at 0).
     ///
-    /// The counter is a lock-free process-wide `AtomicU32` — a single-purpose
-    /// bookkeeping counter in the spirit of the sanctioned atomic exceptions
-    /// (it carries no protocol data, only mints unique tokens) — chosen over
-    /// `rand::random` so ids read as small sequential numbers in logs and so
-    /// there is no (however remote) collision risk: a counter cannot repeat
-    /// until it wraps, which a daemon's lifetime never reaches.
+    /// The counter is a lock-free process-wide `AtomicU32` — the tenth
+    /// sanctioned shared-state exception (see AGENTS.md; it carries no protocol
+    /// data, only mints unique tokens) — chosen over `rand::random` so ids read
+    /// as small sequential numbers in logs and so there is no (however remote)
+    /// collision risk: a counter cannot repeat until it wraps, which a daemon's
+    /// lifetime never reaches.
     #[must_use]
     pub(crate) fn next() -> Self {
         static NEXT: AtomicU32 = AtomicU32::new(0);

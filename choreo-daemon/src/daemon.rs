@@ -466,9 +466,10 @@ pub enum DaemonCommand {
         client_id: ClientId,
         session_id: u64,
     },
-    /// Clean up all per-client tracking when a client disconnects.
-    /// Removes from summary subscribers, activity subscribers, and session
-    /// subscription tracking in a single atomic command.
+    /// Clean up all per-client tracking when a client disconnects: drop the
+    /// client's entry from `DaemonState::clients` (its writer, subscription
+    /// flags, and session memberships together) and tell each of its sessions
+    /// to drop it, in a single atomic command.
     ClientDisconnected {
         client_id: ClientId,
     },
@@ -1458,7 +1459,7 @@ impl DaemonState {
         // contributes nothing to `available_definitions`, and load/unload
         // validation rejects unknown names on new requests only.
         // `mut` is only needed when the `content` feature pushes its group.
-        #[cfg_attr(not(feature = "content"), allow(unused_mut))]
+        #[cfg_attr(not(feature = "content"), expect(unused_mut))]
         let mut default_groups = vec!["core".to_string(), "git".to_string(), "shell".to_string()];
         #[cfg(feature = "content")]
         default_groups.push("content".to_string());

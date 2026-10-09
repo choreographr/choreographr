@@ -146,7 +146,10 @@ impl DaemonState {
     ) {
         // Create the entry if the writer was not registered yet, then flip the
         // flag — keeps a subscribe self-contained regardless of its ordering
-        // with `RegisterClientWriter`.
+        // with `RegisterClientWriter`. Unlike a `Track`, a subscribe MAY create
+        // the entry: only the connection thread sends subscribes, on the same
+        // FIFO command channel as (and before) its own `ClientDisconnected`, so
+        // it can never resurrect a torn-down client.
         self.clients
             .entry(client_id)
             .or_insert_with(|| ClientState::new(writer.clone()))
@@ -253,7 +256,10 @@ impl DaemonState {
         info!("registering activity subscriber: client_id={}", client_id);
         // Create the entry if the writer was not registered yet, then flip the
         // flag (keeps a subscribe self-contained regardless of its ordering
-        // with `RegisterClientWriter`).
+        // with `RegisterClientWriter`). Unlike a `Track`, a subscribe MAY create
+        // the entry: only the connection thread sends subscribes, on the same
+        // FIFO command channel as (and before) its own `ClientDisconnected`, so
+        // it can never resurrect a torn-down client.
         self.clients
             .entry(client_id)
             .or_insert_with(|| ClientState::new(writer.clone()))
@@ -360,11 +366,11 @@ impl DaemonState {
         // Adopt the connection's writer while preserving any state a
         // (mis-ordered) subscribe already recorded, instead of resetting the
         // entry wholesale.
-        let entry = self
-            .clients
-            .entry(client_id)
-            .or_insert_with(|| ClientState::new(writer.clone()));
-        entry.writer = writer;
+        if let Some(entry) = self.clients.get_mut(&client_id) {
+            entry.writer = writer;
+        } else {
+            self.clients.insert(client_id, ClientState::new(writer));
+        }
     }
 
     /// Disconnect a client whose delivery queue crossed the lag limits.
