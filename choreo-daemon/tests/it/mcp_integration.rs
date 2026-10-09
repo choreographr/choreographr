@@ -26,15 +26,7 @@ const FIXTURE_BIN: &str = env!("CARGO_BIN_EXE_mcp-daemon-fixture-server");
 #[test]
 #[ignore = "integration"]
 fn mcp_fixture_tools_are_discovered_and_callable() {
-    // The stdlib test harness has no per-test timeout, so a regression in the
-    // MCP stack (e.g. a shutdown that blocks) would hang CI forever. Install a
-    // watchdog that aborts the process if the test body outlives its budget;
-    // the internal protocol timeouts bound a healthy run to well under this.
-    std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_secs(120));
-        eprintln!("mcp_integration: test exceeded 120s; aborting to avoid an indefinite hang");
-        std::process::abort();
-    });
+    watchdog();
 
     // ── 1. Create a temporary config directory with mcp.json ──
     let config_dir = tempfile::tempdir().expect("tempdir for config");
@@ -181,11 +173,7 @@ fn write_single_server_config(
 #[test]
 #[ignore = "integration"]
 fn mcp_resource_tools_are_registered_and_callable() {
-    std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_secs(120));
-        eprintln!("mcp_integration: test exceeded 120s; aborting");
-        std::process::abort();
-    });
+    watchdog();
 
     let (config_dir, slug) =
         write_single_server_config("res", "modern-resources").expect("write config");
@@ -245,11 +233,7 @@ fn mcp_resource_tools_are_registered_and_callable() {
 #[test]
 #[ignore = "integration"]
 fn mcp_list_change_is_forwarded_and_reregisters() {
-    std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_secs(120));
-        eprintln!("mcp_integration: test exceeded 120s; aborting");
-        std::process::abort();
-    });
+    watchdog();
 
     // The fixture declares `tools.listChanged` and emits one tools list-changed
     // notification right after acknowledging the subscription, so the manager's
@@ -378,11 +362,7 @@ fn count_lines(path: &std::path::Path) -> usize {
 #[test]
 #[ignore = "integration"]
 fn mcp_startup_budget_bounds_slow_tool_listing() {
-    std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_secs(120));
-        eprintln!("mcp_integration: test exceeded 120s; aborting");
-        std::process::abort();
-    });
+    watchdog();
 
     // The `slow-list` fixture handshakes promptly but never answers
     // `tools/list`. The server's own request timeout is 60 s, so a caller that
@@ -432,11 +412,7 @@ fn mcp_startup_budget_bounds_slow_tool_listing() {
 #[test]
 #[ignore = "integration"]
 fn mcp_catalogue_refresh_is_bounded_by_the_refresh_deadline() {
-    std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_secs(120));
-        eprintln!("mcp_integration: test exceeded 120s; aborting");
-        std::process::abort();
-    });
+    watchdog();
 
     // The fixture answers the FIRST `tools/list` (so the server connects and
     // registers normally) then parks on every later one. A catalogue refresh
@@ -481,11 +457,7 @@ fn mcp_catalogue_refresh_is_bounded_by_the_refresh_deadline() {
 #[test]
 #[ignore = "integration"]
 fn project_server_slug_maps_to_its_referencing_sessions() {
-    std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_secs(120));
-        eprintln!("mcp_integration: test exceeded 120s; aborting");
-        std::process::abort();
-    });
+    watchdog();
 
     // A project whose `.mcp.json` declares the fixture server, so the server is
     // a session's PRIVATE project server (never in the daemon catalogue).
@@ -532,11 +504,7 @@ fn project_server_slug_maps_to_its_referencing_sessions() {
 #[test]
 #[ignore = "integration"]
 fn mcp_shutdown_all_is_bounded_with_a_stubborn_server() {
-    std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_secs(120));
-        eprintln!("mcp_integration: test exceeded 120s; aborting");
-        std::process::abort();
-    });
+    watchdog();
 
     // A server that ignores stdin EOF and never exits must not be able to wedge
     // `McpManager::shutdown_all`: each slot's `Drop` joins its dispatcher with a
@@ -584,11 +552,7 @@ fn mcp_shutdown_all_is_bounded_with_a_stubborn_server() {
 #[test]
 #[ignore = "integration"]
 fn mcp_progress_streams_through_the_wrapper() {
-    std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_secs(120));
-        eprintln!("mcp_integration: test exceeded 120s; aborting");
-        std::process::abort();
-    });
+    watchdog();
 
     let (config_dir, slug) =
         write_single_server_config("prog", "modern-progress").expect("write config");
@@ -629,12 +593,30 @@ fn mcp_progress_streams_through_the_wrapper() {
 
 /// Install the standard watchdog so a regression that hangs the MCP stack
 /// aborts rather than wedging CI forever (the stdlib harness has no per-test
-/// timeout).
+/// timeout), and isolate the suite's log directory (see [`isolate_log_dir`]).
 fn watchdog() {
+    isolate_log_dir();
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_secs(120));
         eprintln!("mcp_integration: test exceeded 120s; aborting to avoid an indefinite hang");
         std::process::abort();
+    });
+}
+
+/// Point the suite's log directory at a per-process temp dir (created lazily),
+/// so a spawned MCP server's per-server log — resolved through
+/// `choreo_shared::paths` in `mcp::config::server_log_path` — is written under
+/// the system temp dir, never the developer's real `$XDG_STATE_HOME`.
+///
+/// The override is process-global, and cargo-nextest runs every test in its own
+/// process, so each test gets its own dir. Idempotent within a process.
+fn isolate_log_dir() {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let _ = DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("choreo-mcp-it-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        choreo_shared::paths::set_test_log_dir(Some(dir.clone()));
+        dir
     });
 }
 

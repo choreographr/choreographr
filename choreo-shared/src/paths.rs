@@ -51,7 +51,6 @@
 //! migrate` uses them as the source when copying an existing install into a
 //! base dir.
 
-use std::cell::RefCell;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -241,7 +240,11 @@ pub fn log_file_default(binary: &str) -> Option<PathBuf> {
 /// The log/state directory: the test override, else `{base}/log`, else
 /// `$XDG_STATE_HOME/choreographr`.
 fn log_dir() -> Option<PathBuf> {
-    if let Some(dir) = TEST_LOG_DIR.with(|c| c.borrow().clone()) {
+    if let Some(dir) = TEST_LOG_DIR
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
         return Some(dir);
     }
     if let Some(base) = base_dir() {
@@ -311,21 +314,28 @@ fn log_file_in(dir: &Path, binary: &str) -> PathBuf {
     dir.join(format!("{binary}.log"))
 }
 
-thread_local! {
-    /// Test-only override for the log directory. When set, `log_file_default`
-    /// writes under it instead of the base/state dir, so tests never create a
-    /// log in the developer's real `$XDG_STATE_HOME`.
-    ///
-    /// Deliberately NOT `#[cfg(test)]`-gated: integration tests compile the
-    /// crate without `cfg(test)`, so the hook must exist in normal builds too
-    /// (it is a no-op unless explicitly set).
-    static TEST_LOG_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
-}
+/// Test-only override for the log directory. When set, the log path resolvers
+/// ([`log_file_default`], [`log_file`]) write under it instead of the base/state
+/// dir, so tests never create a log in the developer's real `$XDG_STATE_HOME`.
+///
+/// Process-global, not thread-local: the log directory is resolved from many
+/// threads (the daemon's command loop and each per-server MCP thread), so a
+/// per-thread override would let a worker — e.g. a spawned MCP server's
+/// captured-stderr drain — leak its log into the real state dir. cargo-nextest
+/// runs every test in its own process, so one global override per process stays
+/// isolated between tests.
+///
+/// Deliberately NOT `#[cfg(test)]`-gated: integration tests compile the crate
+/// without `cfg(test)`, so the hook must exist in normal builds too (it is a
+/// no-op unless explicitly set).
+static TEST_LOG_DIR: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
 
 /// Set the log-directory test override (see `TEST_LOG_DIR`).
 #[doc(hidden)]
 pub fn set_test_log_dir(dir: Option<PathBuf>) {
-    TEST_LOG_DIR.with(|c| c.replace(dir));
+    *TEST_LOG_DIR
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = dir;
 }
 
 /// Guard that resets the log-directory test override on drop, even on panic.
