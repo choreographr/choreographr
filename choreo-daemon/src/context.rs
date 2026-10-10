@@ -46,6 +46,9 @@ pub struct ContextBundle {
     pub fingerprint: u64,
 }
 
+/// The `SKILL.md` YAML frontmatter every skill must carry: `name` is the
+/// identity discovery dedups and [`load_skill_body_from`] resolves by, and
+/// `description` is what the base prompt lists.
 #[derive(Debug, Clone, Deserialize)]
 struct SkillFrontmatter {
     name: String,
@@ -93,8 +96,11 @@ pub fn discover_context(working_dir: &Path, config: &ContextConfig) -> io::Resul
     Ok(ContextBundle { files, fingerprint })
 }
 
-// Neither loader can fail (file loads degrade to skips), so they return () —
-// no transparent Ok(()) wrappers to force `?` on callers.
+// Global files load in a fixed precedence order — the config-dir `AGENTS.md`,
+// then the optional Claude Code prompt, then the shared `~/.agents` scope —
+// each contributing only when it exists and is non-empty. Neither loader can
+// fail (file loads degrade to skips), so they return () rather than a
+// transparent Ok(()) a caller would have to `?`.
 fn load_global_files(files: &mut Vec<DiscoveredFile>, config: &ContextConfig) {
     if let Ok(config_dir) = choreo_shared::paths::config_dir() {
         let path = config_dir.join("AGENTS.md");
@@ -120,6 +126,12 @@ fn load_global_files(files: &mut Vec<DiscoveredFile>, config: &ContextConfig) {
     }
 }
 
+/// Walk from the working directory up to the repository root (or the filesystem
+/// root when there is no `.git`), taking at most one context file per directory
+/// — the first name in `config.context_file_names` that exists there. Files are
+/// pushed innermost-first during the walk, so the reverse before appending
+/// renders the outermost ancestor first and the working directory last, letting
+/// the nearest instructions override the more distant ones.
 fn load_project_files(working_dir: &Path, files: &mut Vec<DiscoveredFile>, config: &ContextConfig) {
     let git_root = find_git_root(working_dir);
     let boundary = git_root.as_deref().unwrap_or_else(|| Path::new("/"));
@@ -276,6 +288,9 @@ pub fn build_base_prompt(
     base
 }
 
+/// Read the user's `system.md` override from the config dir
+/// (`~/.config/choreographr/system.md`), or `None` when it is absent or empty
+/// so the caller falls back to [`default_system_prompt`].
 fn load_user_system_prompt() -> Option<String> {
     let path = choreo_shared::paths::config_dir().ok()?.join("system.md");
     let content = fs::read_to_string(&path).ok()?;
@@ -287,6 +302,8 @@ fn load_user_system_prompt() -> Option<String> {
     }
 }
 
+/// The compiled-in fallback base prompt (`choreo-daemon/system.md`), embedded
+/// so a session always has a non-empty base even without a user override.
 fn default_system_prompt() -> String {
     include_str!("../system.md").to_string()
 }

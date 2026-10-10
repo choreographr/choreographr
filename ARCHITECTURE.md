@@ -2761,144 +2761,88 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
 
 ## Context file discovery
 
-The daemon automatically discovers and injects project-specific context files
-(`AGENTS.md`, `CLAUDE.md`) and skills at session creation, and refreshes them
-before every model call (every turn of the tool-call loop).
+The daemon discovers project-specific context files (`AGENTS.md`, `CLAUDE.md`)
+and Agent Skills at session start and re-checks them before every model call
+(every turn of the tool-call loop), feeding what it finds into the system
+prompt. The discovery walk, the skill scopes and precedence, the fingerprint
+cache, and the `load_skill` body plumbing are documented in-source (see
+`choreo-daemon`'s `context` and `requests` modules, `cargo doc -p choreo-daemon`
+/ `just doc`), held complete by the `#![warn(missing_docs)]` + `doc-check` gate.
 
 ### System prompt construction
 
-Each turn in the agent loop calls `build_system_content()`, which **always**
-returns a full system prompt (a `String`, not an `Option<String>`), assembled
-from four sources:
-
-1. **Base prompt** — identity, tool group listing, available skill metadata, any
-   loaded skill bodies (accumulated via `load_skill` calls), and the session
-   title. These are built unconditionally, so a session with **no** working
-   directory still receives a full system prompt.
-2. **Project context files** (`AGENTS.md`, `CLAUDE.md`, etc.) — discovered by
-   `discover_context()` and assembled by `assemble_context()`. This source
-   requires a working directory and contributes nothing when the session has
-   none. Results are cached
-   on `SessionState::context_cache` (fingerprint + assembled text) and reused
-   when the fingerprint is unchanged.
-3. **Subdirectory hints** — hints accumulated from filesystem tool calls in the
-   previous turn, appended under "## New context from project subdirectories".
-   Requires a working directory.
-4. **Loaded skills** — `<skill name="...">...</skill>` blocks injected after the
-   "Available skills" listing.
-
-Global skills (`~/.agents/skills`) are always scanned; only the project-local
-skills walk (`.agents/skills/` under the working directory) needs a directory.
-Skills are deduplicated by frontmatter `name`, and the project walk is scanned
-before the global scope, so a project-local skill **shadows** a same-named
-global one. The system prompt is rebuilt every turn so that newly loaded skills
-and newly discovered subdirectory hints are visible to the model immediately.
+`build_system_content()` runs once per loop iteration and **always** returns a
+full system prompt, so a session with no working directory still receives the
+base prompt (identity, tool groups, skill metadata, loaded skill bodies, session
+title); the context files, pending subdirectory hints, and their fingerprint
+cache are the only working-dir-gated parts. Documented in-source
+(`choreo-daemon`'s `requests/system_content.rs`).
 
 ### Discovery algorithm
 
-1. **Global files** (loaded first, prepended):
-   - `~/.config/choreographr/AGENTS.md`
-   - `~/.claude/CLAUDE.md` (unless `disable_claude_code_prompt` is set)
-   - `~/.agents/AGENTS.md`
-2. **Project files** (walking from session working directory up to the git repository root):
-   - At each ancestor directory, checks `AGENTS.md` first, then `CLAUDE.md`.
-   - Only one file per directory (first match in the configured `context_file_names` list).
-   - Collected bottom-up (outermost first), then rendered in reverse order so
-     closer-to-working-directory instructions appear last.
+Global files load first in a fixed order — the config-dir `AGENTS.md`, then
+`~/.claude/CLAUDE.md` (unless `disable_claude_code_prompt` is set), then
+`~/.agents/AGENTS.md`. The project tree is then walked from the session working
+directory up to the git repository root (or the filesystem root when there is no
+`.git`), taking at most one file per directory (the first `context_file_names`
+match that exists) and rendering the outermost ancestor first and the working
+directory last, so the nearest instructions win. Documented in-source
+(`choreo-daemon`'s `context.rs`).
 
 ### Subdirectory hints
 
-When filesystem tools (`read_file`, `list_files`, `grep`, `find`, etc.) access a file
-in a subdirectory below the session working directory, the daemon walks up from that file's
-parent toward the working directory and checks for `AGENTS.md`/`CLAUDE.md` files not already in
-the main context. Any found hint content is appended to the tool result message
-(not the system prompt), preserving prompt cache stability.
+When a filesystem tool (`read_file`, `list_files`, `grep`, `find`, …) touches a
+path below the working directory, the daemon walks up from that path toward the
+working directory and appends any newly found `AGENTS.md`/`CLAUDE.md` to the
+**tool result** rather than the system prompt, so nested instructions surface
+without disturbing prompt-cache stability. Documented in-source
+(`choreo-daemon`'s `context.rs::subdirectory_hints`).
 
 ### Skills (Agent Skills standard)
 
-Skills are discovered from:
-- `~/.agents/skills/<name>/SKILL.md` (global — always scanned)
-- `.agents/skills/<name>/SKILL.md` (project, relative to session working directory — scanned only when the session has a working directory)
-
-The project scope is scanned before the global scope and results are
-deduplicated by frontmatter `name`, so a project-local skill shadows a
-same-named global one (and, within the project walk, a more-local skill shadows
-one higher up the tree). Within a single scope the candidate directories are
-visited in sorted order, so if two directories declare the same `name` the
-lexicographically-first path wins deterministically (rather than depending on
-the unspecified `read_dir` order).
-
-Each `SKILL.md` must have YAML frontmatter with `name` and `description`.
-
-**Progressive disclosure:** At session start, only metadata (name + description)
-is included in the stable prompt (`messages[0]`). When the model calls the
-`load_skill` tool with a skill name, the full `SKILL.md` body is loaded and
-injected as a new `SystemText` message.
+Skills follow the Agent Skills standard: a `<name>/SKILL.md` under
+`~/.agents/skills` (global — always scanned) or `.agents/skills` (project —
+scanned only when the session has a working directory), each carrying YAML
+frontmatter with `name` and `description`. The project scope is scanned first
+and results dedup by frontmatter `name`, so a project-local skill shadows a
+same-named global one (and a more-local skill shadows one higher up the tree);
+within a scope the lexicographically-first path wins deterministically rather
+than depending on the unspecified `read_dir` order. **Progressive disclosure:**
+only the name + description metadata rides the stable prompt (`messages[0]`); the
+full body is injected when the model calls `load_skill`. Documented in-source
+(`choreo-daemon`'s `context.rs`).
 
 ### Fingerprint-based refresh
 
-Before each turn in the tool-call loop, the daemon computes a fingerprint via
-`compute_fingerprint()` of all known context file paths and their mtimes. If the
-fingerprint matches the cached value on `SessionState::context_cache`, the assembled
-context string is reused without re-reading files from disk. If it differs (file
-added, removed, or modified), the context is rebuilt and the cache is updated.
+Before each turn the daemon fingerprints the known context-file paths and their
+mtimes (not their contents); an unchanged fingerprint reuses the assembled text
+cached on `SessionState::context_cache`, while a change (a file added, removed,
+or modified) rebuilds it. Documented in-source
+(`choreo-daemon`'s `context.rs::compute_fingerprint`).
 
 ### Configuration
 
-```toml
-# ~/.config/choreographr/config.toml
-[context]
-context_file_names = ["AGENTS.md", "CLAUDE.md"]   # ordered list; first match per directory
-context_file_max_bytes = 32768                     # max combined context size
-disable_claude_code_prompt = false                 # skip ~/.claude/CLAUDE.md
-```
+The `[context]` table (`context_file_names`, `context_file_max_bytes`,
+`disable_claude_code_prompt`) is documented in the README and in the
+`ContextConfig` rustdoc (`choreo-proto`).
 
 ### User system prompt override
 
-The stable base prompt (`messages[0]`) is loaded from
-`~/.config/choreographr/system.md` if it exists. Otherwise, a built-in default is
-used. The default lives at `choreo-daemon/system.md` in the repository and is
-embedded at compile time via `include_str!`.
-
-### Module
-
-Implementation lives in `choreo-daemon/src/context.rs`. Key entry points:
-
-| Function | Purpose |
-|---|---|
-| `discover_context(working_dir, config)` | Walk filesystem, return `ContextBundle` with all discovered files |
-| `SkillScopes { global_home, working_dir }` | The two skill-discovery scopes as a named struct — a project walk scoped to the session working directory, plus the always-on global `<global_home>/.agents/skills`. Named (not two positional `Option<&Path>`s) so the two same-typed scopes cannot be swapped by mistake. |
-| `discover_skills(SkillScopes)` | Scan Agent Skills directories — the project-local walk under `scopes.working_dir` (only when a directory is present) first, then the global `<scopes.global_home>/.agents/skills` — deduplicated by frontmatter `name` so project skills shadow global ones; return `Vec<SkillMeta>`. `global_home` is injected so tests can supply a temp home. |
-| `discover_skills_ambient(working_dir: Option<&Path>)` | `discover_skills` with `dirs::home_dir()` as the global scope — the production entry point |
-| `assemble_context(bundle)` | Render discovered files into an XML-like format for injection |
-| `build_base_prompt(skills, groups, loaded_skills)` | Build the stable system prompt (identity + tool groups + skill metadata + loaded skill bodies) |
-| `recheck_context(working_dir, config, old_fp)` | Re-discover and compare fingerprints |
-| `subdirectory_hints(tool_name, args, working_dir, known)` | Return `Option<(String, Vec<PathBuf>)>` — subdirectory hint text and newly discovered paths |
-| `load_skill_body_from(skills: &[SkillMeta], name)` | Read a skill's body from an already-resolved skill list, stripping YAML frontmatter. Both the `load_skill` tool (via `ToolContext::discovered_skills`) and `persist_loaded_skill` resolve against the SAME `SessionState::discovered_skills` snapshot |
-| `load_skill_body(name, working_dir: Option<&Path>)` | Discover then read a skill's body (a fresh ambient walk); the `load_skill` tool falls back to this only when it has no session snapshot to resolve against |
+The stable base prompt (`messages[0]`) is `~/.config/choreographr/system.md`
+when present, otherwise the built-in default (`choreo-daemon/system.md`,
+embedded at compile time via `include_str!`). Documented in-source
+(`choreo-daemon`'s `context.rs`).
 
 ### Tool: `load_skill`
 
-Registered alongside other tools in the tool loop (core group). When the model calls
-`load_skill(name)`, the daemon:
-
-1. Finds the matching skill in the session's `discovered_skills` snapshot, which the
-   agent loop computes once per request and shares with tools via
-   `ToolContext::discovered_skills` (falling back to a fresh ambient walk only when no
-   snapshot is available, e.g. a direct unit-test call)
-2. Strips the YAML frontmatter
-3. Returns `"Loaded skill: <name>"` as the tool result
-
-Resolving against the shared snapshot means the tool needs no second filesystem walk and
-the body it returns can never diverge from the body `persist_loaded_skill` records into
-the system prompt — both read the same list.
-
-**Persistence:** After the tool result is collected, `run_agent_loop` detects the
-`load_skill` call and pushes a `LoadedSkill { name, body }` into
-`SessionState::loaded_skill_bodies`. On every subsequent turn, the
-`build_system_content` helper includes all loaded skill bodies in the system prompt,
-wrapped in `<skill name="...">` XML tags. This ensures skill instructions remain
-visible to the model even as tool results scroll out of the context window.
+`load_skill(name)` (core group) resolves the name against the session's
+`discovered_skills` snapshot — the same list the prompt listing was built from,
+falling back to a fresh ambient walk only when no snapshot is available — strips
+the YAML frontmatter, and returns `Loaded skill: <name>` plus the body. The agent
+loop then persists the body into `SessionState::loaded_skill_bodies`, re-injected
+under `<skill name="...">` on every later turn so its instructions stay visible
+after the tool result scrolls out of the context window. Documented in-source
+(`choreo-daemon`'s `tools/admin/load_skill.rs` and `requests/system_content.rs`).
 
 ### `run_riscv` — RISC-V sandboxed code execution
 

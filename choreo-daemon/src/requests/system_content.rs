@@ -3,6 +3,12 @@
 //! files), `collect_tool_result` (feeding a finished tool into the next-call
 //! accumulator, with its hint paths), and `persist_loaded_skill`. Re-exported
 //! from `requests.rs` via `pub(crate) use system_content::*;`.
+//!
+//! `build_system_content` runs once per loop iteration, so the prompt is rebuilt
+//! every turn and newly loaded skills or subdirectory hints reach the model
+//! immediately. It always returns a full prompt — only the project context files
+//! and pending hints depend on a working directory; a dir-less session still
+//! gets the base prompt (identity, tool groups, skills, title).
 use crate::context::{self, LoadedSkill, SkillMeta};
 use crate::sessions::SessionState;
 use crate::tools::{ToolOutput, ToolRegistry};
@@ -29,6 +35,11 @@ pub(crate) struct SystemContentParams<'a> {
     pub(crate) session_title: Option<&'a str>,
 }
 
+/// Assemble this turn's system prompt: the base prompt plus, when the session
+/// has a working directory, the fingerprint-cached context files and any pending
+/// subdirectory hints. Always returns a full prompt (a dir-less session gets the
+/// base prompt alone); rebuilt each turn so newly loaded skills and hints are
+/// visible at once.
 pub(crate) fn build_system_content(
     params: &SystemContentParams,
     context_cache: &mut Option<(u64, Arc<String>)>,
