@@ -809,6 +809,11 @@ pub struct SessionState {
     /// The session's conversation turns, keyed by turn id.
     pub turns: BTreeMap<u32, Turn>,
     subscribers: HashMap<ClientId, SubscriberSink>,
+    /// The session's in-flight request(s), keyed by `stream_id`. A session runs
+    /// at most one request at a time — the run handlers reject a second while
+    /// this is non-empty ("session already has an active request") — so the map
+    /// holds at most one entry; the `stream_id` key is what a cancel/lookup
+    /// names the run by.
     pub(crate) active_requests: BTreeMap<u64, ActiveRequest>,
     /// The lazily built inference provider client for this session's account, or
     /// `None` before the first request resolves one (or after a

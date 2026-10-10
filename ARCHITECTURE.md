@@ -2404,126 +2404,22 @@ the `#![warn(missing_docs)]` + `doc-check` gate.
 
 ### Schema versioning & migrations
 
-The `meta` table persists the schema version under the `schema_version` key
-(`SCHEMA_VERSION`, currently `2`). A database file created by `open_db` (fresh
-install, or a 0-byte interrupted-create corpse) is stamped immediately with
-`INITIAL_SCHEMA_VERSION` (`1`) — the 0 → 1 transition is *initialization*
-at creation, never a migration, so a fresh database is versioned from the
-moment it exists. On every startup the daemon then runs `db::run_migrations`
-right after `open_db` and before any session data is read; it is idempotent —
-a database already at the current version exits immediately, and calling it
-repeatedly is safe.
-
-Schema 2 (the current version) is the first real migration: the
-`session_turns` value codec changed from raw MessagePack to zstd-compressed
-MessagePack. The 1 → 2 migration (`migrate_turn_values_to_zstd`) re-encodes
-every existing turn row by wrapping its MessagePack bytes in a zstd frame
-(compression is codec-orthogonal to serialization, so no deserialize/
-re-serialize is needed); the stored rows are identified as already-compressed
-by the zstd frame magic so the migration is safe to re-run after a crash.
-The codec is implemented by `structured-zstd`, a pure-Rust library that emits
-and reads standard zstd frames (numeric levels map onto C zstd numbering, so
-`COMPRESSION_LEVEL=6` keeps its tuned meaning) and needs no libzstd C build.
-Decompression on read is **bounded** to `MAX_TURN_DECODED_BYTES` (256 MiB per
-row, far above any legitimate turn payload): `read_turns` stream-decodes
-through a `Take` cap instead of trusting the frame header's declared content
-size, so a corrupt/malicious row cannot pin the daemon's memory (a
-"decompression bomb"). The decoder also requires the row to be exactly one
-frame and consumed to EOF — trailing bytes or a second concatenated frame are
-refused, not silently truncated. Reads also use a bounded `(session_id, …)` key-range
-scan over only the target session's turns rather than decompressing the whole
-table.
-
-- **Versioning policy (additive vs breaking).** An additive change — a new
-  struct field with `#[serde(default)]`, or a new enum variant appended — needs
-  no migration and no version bump: named MessagePack tolerates it on decode.
-  A breaking change — reordering/removing/mid-inserting a struct field,
-  reordering or removing an enum variant, changing a type, key, or table
-  (split/merge), or swapping the codec — requires a numbered
-  `migrate_vX_to_vX+1` migration and a `SCHEMA_VERSION` bump. Future migrations
-  that rewrite historical shapes must define frozen local copies of the old
-  structs, and each migration ships with a fixture-based unit test (build a DB
-  as the old version would have written it, run the runner, assert contents +
-  version stamp + idempotency + backup artifact).
-- **Migration chain.** `MIGRATIONS` holds one entry at release — version 1 → 2
-  (the `session_turns` zstd codec change). Version 1 is the
-  *initial* stamped version, reached by initialization at database creation
-  (`open_db` stamps `INITIAL_SCHEMA_VERSION`), never by a migration. Each entry
-  carries its source version explicitly (`from`, upgrading `from → from + 1`),
-  so an entry's position in the array is irrelevant — the 0 → 1 transition is
-  initialization, never a migration, so the first real migration is `from == 1`.
-  Before applying anything, the runner validates that the entries' `from`
-  values form the exact contiguous sequence `1..SCHEMA_VERSION`; a gap or
-  misplaced entry is a hard error, never a silent stamp over data that was not
-  migrated. Every migration must be idempotent under re-run (crash recovery
-  re-applies from the last persisted version), transactional (one redb write
-  transaction), and shipped with a fixture-based unit test.
-- **Pre-release legacy data.** A database with no `meta` table reports version
-  0. Since `open_db` stamps fresh files at creation, a database still reporting
-  0 at startup is a *pre-existing* unversioned file: while the target is 1 it
-  is initialized the same way (stamped to 1; nothing else happens), and any
-  undecodable legacy blobs it holds are *not* migrated —
-  `read_all_sessions` / `read_turns` skip undecodable entries with a warning,
-  and single-record `read_session` treats an undecodable record as absent, so
-  legacy sessions drop out loudly-but-non-fatally on first read. Once the chain
-  grows past 1, a no-meta database is treated as pre-release leftovers and
-  `run_migrations` refuses to start.
-- **Backups.** A pre-migration snapshot (`state.redb` → `state.redb.bak-v{from}`,
-  named after the version being migrated *from*, so a `bak-v2` file IS a v2
-  database and restoring it rolls back to exactly the pre-migration state) is
-  taken only *before a real migration writes* — never for the pure 0 → 1
-  initialization stamp. The 1 → 2 zstd migration therefore writes a
-  `state.redb.bak-v1` backup on the first startup after upgrade.
-- **redb `UpgradeRequired` is a separate axis.** The redb file-format version
-  (the library's on-disk format) is independent of the app's `schema_version`.
-  If a newer redb wrote the file, `open_db` hard-errors with guidance to restore
-  a backup (`state.redb.bak-v*`) or use the documented dump/restore path —
-  it no longer silently recreates (and thereby destroys) a database it cannot
-  open. A database whose `schema_version` is *newer* than the binary supports
-  likewise errors at startup with "upgrade choreographr before continuing". A
-  0-byte `state.redb` (the corpse of an interrupted create) is the one exception
-  to the refuse-to-recreate rule — it holds no recoverable data, so `open_db`
-  recreates it and stamps `INITIAL_SCHEMA_VERSION`, exactly like a fresh
-  database.
+The `meta` table holds the persisted schema version, and the daemon runs the
+migration chain right after opening the database on every startup. The versioning
+policy (an additive change needs no migration; a breaking change gets a numbered
+migration and a version bump), the migration contract (a contiguous chain,
+idempotent, transactional, and fixture-tested), the pre-migration backup, and the
+downgrade / redb `UpgradeRequired` refusals are documented in-source (see
+`choreo-daemon`'s `db` module, `cargo doc -p choreo-daemon` / `just doc`), held
+complete by the `#![warn(missing_docs)]` + `doc-check` gate.
 
 ### Session state (in-memory)
 
-Each active session has a `SessionState` owned by its control thread. Persistent
-configuration fields are extracted into `SessionConfig` to avoid duplication
-across snapshot/restore, metadata conversion, and record persistence:
-
-The persisted fields live on `SessionConfig`; the runtime-only fields live on
-`SessionState` (the in-memory turn map, the subscriber set, the in-flight request
-map, the per-session provider client and socket registry, and the context/skill
-caches). The structs and every field's rationale — the `last_response_id`
-response-chain provenance, the per-session `next_stream_id` counter, the
-`context_cache` fingerprint — are documented in-source (see `choreo-daemon`'s
+Each active session's in-memory state is a `SessionState` owned by its control
+thread, with the persisted fields extracted into `SessionConfig`. The structs and
+every field's rationale are documented in-source (see `choreo-daemon`'s
 `sessions` module, `cargo doc -p choreo-daemon` / `just doc`), held complete by
 the `#![warn(missing_docs)]` + `doc-check` gate.
-
-### Hierarchy and working directory inheritance
-
-Sessions form a tree: a session can have a `parent_session_id` pointing to another
-session. When creating a child session, if no explicit `working_dir` is
-provided, it inherits the parent's value. This allows sub-sessions (subagents)
-to operate in the same directory as their parent.
-
-### Persistence lifecycle
-
-- **Startup**: `new_daemon_state()` reads all sessions and messages from the DB,
-  reconstructing the in-memory `HashMap`. If the DB is empty, a default session #1
-  is created.
-- **Session creation**: Writes a `SessionRecord` to the DB immediately.
-- **Message append**: Each `SessionMessage` (including `DisplayedImage` records for
-  persisted images) is written to the DB alongside the in-memory push via
-  `append_message_and_persist()`.
-- **Shutdown**: The daemon sends `SessionCommand::Shutdown` to each active session, then joins each session thread bounded by `SESSION_SHUTDOWN_GRACE` (5s). The graceful path exits promptly once request workers drain; a worker stuck in an LLM provider read that a cancel cannot interrupt is abandoned rather than hanging the daemon — completed turns are already persisted as they finalize. Session joins happen concurrently (one join thread per session), so N stuck sessions cost ~one grace period, not N × grace. Deleted sessions are not joined here (their threads are reaped via the delete finalize on `SessionExited`); if the daemon exits before that finalize runs, the deletion tombstone ensures the next startup purges any record the zombie left behind.
-
-### Multiple concurrent sessions
-
-Multiple sessions can be active at the same time. Each session control thread stays
-responsive while at most one request worker runs for that session. Request workers own a
-snapshot of the session state and use cooperative cancellation via an `AtomicBool`.
 
 ### Undo/Redo
 
@@ -2536,29 +2432,6 @@ complete by the `#![warn(missing_docs)]` + `doc-check` gate. Two cross-cutting
 facts about that payload: the daemon strips it from every client-bound
 `DaemonMessage` (only its own request builder reads it), and the builder's
 same-model provenance check drops the artifact after a mid-session model switch.
-
-**Undo flow (`/undo` → `ClientMessage::Undo` → `SessionCommand::Undo` → `handle_undo`):**
-1. `SessionState::undo_turns()` finds the most recent non-undone turn with `user_text: Some(...)` via reverse scan.
-2. Marks that turn and all higher-ID turns as `undone = true`.
-3. Stores the undone turn IDs in `last_undo_turn_ids` for potential redo.
-4. If a `last_response_id` is set, clears it (and its producer) and persists the session record — an undo invalidates the server-side response chain, which would otherwise leak the undone turns' context back into the model on the next chained request (the builder skips undone turns, but the chain does not). If an undo lands while a request worker is in flight, the worker's snapshot (taken from a child session that never saw the undo) cannot resurrect the cleared id: `handle_request_finished` compares undone-ness between the snapshot and live state and drops the stale id from the snapshot before applying it, and it refuses to overwrite the undone turns with the worker's pre-undo copies.
-5. Persists each updated turn to the database.
-6. Broadcasts `SessionEvent::TurnsUndone { turn_ids }` (on the `DaemonMessage::Session` envelope) to all subscribers.
-7. The client removes the turns from its local history view.
-
-**Redo flow** (`/redo` → `ClientMessage::Redo` → `SessionCommand::Redo` → `handle_redo`):
-1. `SessionState::redo_turns()` restores the turn IDs stored in `last_undo_turn_ids` from the prior undo.
-2. Sets `undone = false` on those turns.
-3. Returns the restored turns as a `BTreeMap<u32, Turn>`.
-4. Persists each restored turn.
-5. Broadcasts `SessionEvent::TurnsRedone { turns }` (on the `DaemonMessage::Session` envelope) with full `Turn` objects so the client re-inserts them.
-
-**Redo invalidation:** Starting a new turn with `user_text: Some(...)` after an undo clears
-`last_undo_turn_ids`, making the redo unavailable — new user input starts a fresh editing session.
-
-**Turn ordering on the client:** The `Started` and `ToolCallStarted` daemon messages
-carry a `turn_id` that predicts the ID of the subsequent `Turn`. The client
-uses `turn_id` to maintain a globally ordered history.
 
 ---
 
