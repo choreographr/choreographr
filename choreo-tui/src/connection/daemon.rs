@@ -383,7 +383,7 @@ pub(crate) fn handle_daemon_message(
                 tracing::debug!(
                     session_id = reported,
                     %model,
-                    %error,
+                    error_len = error.len(),
                     "suppressing status feedback for background session's model selection failure",
                 );
                 return Ok(());
@@ -447,7 +447,7 @@ pub(crate) fn handle_daemon_message(
                 tracing::debug!(
                     session_id = reported,
                     %effort,
-                    %error,
+                    error_len = error.len(),
                     "suppressing status feedback for background session's reasoning effort rejection",
                 );
                 return Ok(());
@@ -456,7 +456,7 @@ pub(crate) fn handle_daemon_message(
             // user's own `/reasoning` command failed — surface the
             // rejection notice and fall through so the generic dispatch
             // records the error as well.
-            tracing::warn!(%effort, %error, "reasoning effort rejected by daemon");
+            tracing::warn!(%effort, error_len = error.len(), "reasoning effort rejected by daemon");
             app.status = Some(format!("reasoning effort rejected: {error}"));
         }
         DaemonMessageType::Session {
@@ -563,7 +563,10 @@ pub(crate) fn handle_daemon_message(
         }
         DaemonMessageType::ModelsFailed { error } => {
             if is_list_models_reply(resolved.as_ref()) {
-                tracing::warn!(%error, "model selector: failed to list models");
+                tracing::warn!(
+                    error_len = error.len(),
+                    "model selector: failed to list models"
+                );
                 app.model_selector.apply_error(error.clone());
                 return Ok(());
             }
@@ -592,7 +595,7 @@ pub(crate) fn handle_daemon_message(
             return Ok(());
         }
         DaemonMessageType::ModelsRefreshFailed { error } => {
-            tracing::warn!(%error, "refresh-models failed");
+            tracing::warn!(error_len = error.len(), "refresh-models failed");
             app.error = Some(format!("[daemon] refresh-models failed: {error}"));
             return Ok(());
         }
@@ -656,7 +659,7 @@ pub(crate) fn handle_daemon_message(
             return Ok(());
         }
         DaemonMessageType::McpReconnectFailed { slug, error } => {
-            tracing::warn!(%slug, %error, "mcp reconnect failed");
+            tracing::warn!(%slug, error_len = error.len(), "mcp reconnect failed");
             app.error = Some(format!("[daemon] mcp reconnect {slug} failed: {error}"));
             return Ok(());
         }
@@ -672,7 +675,7 @@ pub(crate) fn handle_daemon_message(
             return Ok(());
         }
         DaemonMessageType::McpReloadFailed { error } => {
-            tracing::warn!(%error, "mcp reload failed");
+            tracing::warn!(error_len = error.len(), "mcp reload failed");
             app.error = Some(format!("[daemon] mcp reload failed: {error}"));
             return Ok(());
         }

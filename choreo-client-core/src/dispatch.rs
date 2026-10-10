@@ -471,13 +471,17 @@ fn dispatch_flat_message(msg: DaemonMessageType, handler: &mut impl TurnEventHan
         //   dispatch.
         // - Evicted: the best-effort advisory travels ahead of the
         //   disconnect and the connection layer shows it.
-        // The `@` binding keeps the whole owned envelope available for the
-        // debug line even though the arm matches several variants by shape.
+        // The `@` binding keeps the whole value available so the debug line can
+        // log its payload-free `kind()` tag rather than `?msg` (CatalogUpdated
+        // carries the provider catalog; the failure variants carry error text).
         msg @ (DaemonMessageType::ModelsRefreshed { .. }
         | DaemonMessageType::ModelsRefreshFailed { .. }
         | DaemonMessageType::CatalogUpdated { .. }
         | DaemonMessageType::Evicted) => {
-            debug!("flat daemon message has no generic-dispatch text: {msg:?}");
+            debug!(
+                kind = msg.kind(),
+                "flat daemon message has no generic-dispatch text"
+            );
         }
         // Terminal acknowledgement replies to the client's own requests.
         // `Accepted` is a silent success: the request's own outcome broadcast
@@ -504,9 +508,12 @@ fn dispatch_flat_message(msg: DaemonMessageType, handler: &mut impl TurnEventHan
         DaemonMessageType::Session {
             session_id, event, ..
         } => {
+            // Log the payload-free event tag, never `?event`: a `SessionEvent`
+            // carries turn text and tool arguments/output.
             warn!(
                 ?session_id,
-                "session envelope reached the flat-message dispatch; event is dropped: {event:?}"
+                kind = event.kind(),
+                "session envelope reached the flat-message dispatch; event is dropped"
             );
         }
     }
@@ -590,7 +597,12 @@ fn dispatch_session_event(
     // would silently lose client-visible data, so this is a warn, not a
     // debug, and the event is not dispatched.
     let Some(session_id) = session_id else {
-        warn!("session-scoped event without an origin session, dropping it: {event:?}");
+        // Log the payload-free tag, never `?event`: a `SessionEvent` carries
+        // turn text and tool arguments/output, which must not reach a log line.
+        warn!(
+            kind = event.kind(),
+            "session-scoped event without an origin session, dropping it"
+        );
         return;
     };
 

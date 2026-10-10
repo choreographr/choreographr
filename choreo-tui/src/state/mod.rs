@@ -1639,7 +1639,9 @@ impl TurnEventHandler for App {
         // to rather than a phantom display.
         let is_connection_level = session_id.is_none();
         let Some(session_id) = self.resolve_daemon_session(session_id) else {
-            tracing::debug!(%stream_id, %error, "dropping failure: no attached session to route the connection-level failure to");
+            // Never `%error` (even here): a failure message can embed
+            // provider/request text, so log only its length.
+            tracing::debug!(%stream_id, error_len = error.len(), "dropping failure: no attached session to route the connection-level failure to");
             // No display to update, but a connection-level rejection (e.g.
             // "no session attached") is exactly what the user needs to see
             // on the status line.

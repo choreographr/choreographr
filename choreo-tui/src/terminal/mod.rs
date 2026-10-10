@@ -38,7 +38,7 @@ pub(crate) fn osc(code: u16, body: &str) -> String {
 pub(crate) fn write(seq: &str) {
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    let _ = write!(handle, "{seq}");
+    let _ = handle.write_all(seq.as_bytes());
     let _ = handle.flush();
 }
 
@@ -51,6 +51,24 @@ pub(crate) fn write(seq: &str) {
 /// terminate a sequence, so every OSC family strips them before framing.
 pub(crate) fn is_control_char(c: char) -> bool {
     matches!(u32::from(c), 0x00..=0x1F | 0x7F | 0x80..=0x9F)
+}
+
+/// Whether `c` is a bidirectional-formatting control.
+///
+/// These Unicode `Cf` characters reorder or hide text when displayed, so a
+/// hostile session title could use them to visually spoof a window title or a
+/// status record. The OSC 7501 spec's Security section calls for disarming
+/// them before free text is shown outside the terminal grid; we strip them at
+/// the source for the same reason we strip control bytes. The zero-width
+/// space/non-joiner/joiner (`U+200B`–`U+200D`) are deliberately NOT stripped —
+/// they are legitimate inside emoji ZWJ sequences.
+pub(crate) fn is_bidi_control(c: char) -> bool {
+    matches!(u32::from(c),
+        0x061C            // ARABIC LETTER MARK
+        | 0x200E | 0x200F // LRM, RLM
+        | 0x202A..=0x202E // LRE, RLE, PDF, LRO, RLO
+        | 0x2066..=0x2069 // LRI, RLI, FSI, PDI
+    )
 }
 
 #[cfg(test)]
@@ -73,5 +91,19 @@ mod tests {
         assert!(is_control_char('\u{9d}')); // OSC (C1)
         assert!(!is_control_char('a'));
         assert!(!is_control_char('\u{2014}')); // em dash
+    }
+
+    #[test]
+    fn is_bidi_control_covers_overrides_and_marks_but_not_zwj() {
+        assert!(is_bidi_control('\u{061c}')); // Arabic letter mark
+        assert!(is_bidi_control('\u{200e}')); // LRM
+        assert!(is_bidi_control('\u{200f}')); // RLM
+        assert!(is_bidi_control('\u{202e}')); // RLO
+        assert!(is_bidi_control('\u{2066}')); // LRI
+        assert!(is_bidi_control('\u{2069}')); // PDI
+        // Zero-width joiners are legitimate (emoji ZWJ sequences).
+        assert!(!is_bidi_control('\u{200b}'));
+        assert!(!is_bidi_control('\u{200d}'));
+        assert!(!is_bidi_control('a'));
     }
 }

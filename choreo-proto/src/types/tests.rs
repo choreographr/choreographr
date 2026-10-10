@@ -1095,3 +1095,40 @@ fn approx_wire_size_never_underestimates_encoded_payload() {
         "every sample must be checked"
     );
 }
+
+#[test]
+fn daemon_message_and_session_event_kinds_are_payload_free_tags() {
+    // `kind()` is the payload-free projection used in log lines. It names the
+    // variant and never the payload, so a session event's turn text/tool
+    // arguments can never reach a log line through it.
+    assert_eq!(DaemonMessageType::Pong.kind(), "Pong");
+    assert_eq!(
+        DaemonMessageType::Session {
+            session_id: Some(1),
+            event: SessionEvent::Cancelled { stream_id: 7 },
+        }
+        .kind(),
+        "Session"
+    );
+    assert_eq!(SessionEvent::Cancelled { stream_id: 7 }.kind(), "Cancelled");
+    assert_eq!(
+        SessionEvent::Failed {
+            stream_id: 7,
+            error: "secret payload".into(),
+        }
+        .kind(),
+        "Failed",
+        "the tag must not carry the error text"
+    );
+    assert_eq!(
+        SessionEvent::ToolCallStarted {
+            stream_id: 7,
+            call_id: "c1".into(),
+            tool_name: "shell".into(),
+            arguments_json: "{}".into(),
+            invocation_description: String::new(),
+        }
+        .kind(),
+        "ToolCallStarted"
+    );
+}

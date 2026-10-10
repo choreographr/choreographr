@@ -1272,6 +1272,51 @@ pub enum SessionEvent {
     },
 }
 
+impl SessionEvent {
+    /// A stable, payload-free name for the variant, for logging and metrics.
+    ///
+    /// A `SessionEvent` carries session payload — turn text, tool arguments
+    /// and output, stream bytes — so its `Debug` output must never be formatted
+    /// into a log line or a bail string. Log this tag instead (alongside the
+    /// envelope's origin session id). See [`DaemonMessageType::kind`].
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::SessionCreated { .. } => "SessionCreated",
+            Self::SessionCreatedForRequester { .. } => "SessionCreatedForRequester",
+            Self::SessionAttached => "SessionAttached",
+            Self::SessionState { .. } => "SessionState",
+            Self::TurnAppended { .. } => "TurnAppended",
+            Self::SessionStatusChanged { .. } => "SessionStatusChanged",
+            Self::SessionFailed { .. } => "SessionFailed",
+            Self::Started { .. } => "Started",
+            Self::ToolCallStarted { .. } => "ToolCallStarted",
+            Self::ToolCallFinished { .. } => "ToolCallFinished",
+            Self::ToolResultChunk { .. } => "ToolResultChunk",
+            Self::ToolCallFailed { .. } => "ToolCallFailed",
+            Self::TokenUsageUpdate { .. } => "TokenUsageUpdate",
+            Self::LiveOutputTokenCount { .. } => "LiveOutputTokenCount",
+            Self::OutputChunk { .. } => "OutputChunk",
+            Self::Done { .. } => "Done",
+            Self::Failed { .. } => "Failed",
+            Self::Cancelled { .. } => "Cancelled",
+            Self::ModelSelected { .. } => "ModelSelected",
+            Self::ModelSelectionFailed { .. } => "ModelSelectionFailed",
+            Self::SessionDeleted => "SessionDeleted",
+            Self::SessionDeleteFailed { .. } => "SessionDeleteFailed",
+            Self::SessionFlagsChanged { .. } => "SessionFlagsChanged",
+            Self::TurnsUndone { .. } => "TurnsUndone",
+            Self::TurnsRedone { .. } => "TurnsRedone",
+            Self::SessionAccountSet { .. } => "SessionAccountSet",
+            Self::ContextWindowResolved { .. } => "ContextWindowResolved",
+            Self::SessionWorkingDirSet { .. } => "SessionWorkingDirSet",
+            Self::SessionTitleSet { .. } => "SessionTitleSet",
+            Self::ReasoningEffortSet { .. } => "ReasoningEffortSet",
+            Self::ReasoningEffortSetFailed { .. } => "ReasoningEffortSetFailed",
+        }
+    }
+}
+
 /// Authoritative daemon keystore STATUS (see [`DaemonMessageType::Keystore`]).
 ///
 /// Three states, because "unbound" is a distinct fact from "locked": a fresh
@@ -1598,6 +1643,11 @@ impl DaemonMessageType {
     /// [`Self::Session`]'s inner [`SessionEvent`], so this enum's `Debug`
     /// output must never be formatted into a log line or a bail string. Log
     /// this tag (with the envelope's correlation `id`) instead.
+    ///
+    /// Returns a `&'static str` rather than a `MessageKind`-style enum:
+    /// this exists only as a log/metric tag, never a value anyone matches on,
+    /// so the string is the whole contract. ([`ClientMessageType::kind`]
+    /// returns an enum because the daemon branches on it.)
     #[must_use]
     pub fn kind(&self) -> &'static str {
         match self {

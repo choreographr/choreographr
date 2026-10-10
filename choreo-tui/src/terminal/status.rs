@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 use choreo_proto::SessionStatus;
 
-use super::{is_control_char, osc, write};
+use super::{is_bidi_control, is_control_char, osc, write};
 
 /// Stable machine-readable program name placed on every record (children
 /// cannot inherit `app` from the unlabeled OSC 9;4 root).
@@ -58,17 +58,20 @@ fn encode(text: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(text.as_bytes())
 }
 
-/// Strip control characters and truncate to `max_bytes` on a char boundary.
+/// Strip control characters and bidi-formatting controls, then truncate to
+/// `max_bytes` on a char boundary.
 ///
 /// The spec requires a report's decoded `title` / `msg` to contain no control
 /// character and caps both by decoded byte length; a report that breaks either
 /// is discarded whole, so the emitter must sanitize and cap before framing.
-/// Truncation snaps to a char boundary so a multi-byte character is never
-/// split.
+/// Bidirectional-formatting characters are also stripped: the spec's Security
+/// section calls for disarming them before free text is shown, and a title/
+/// `msg` is display text. Truncation snaps to a char boundary so a multi-byte
+/// character is never split.
 fn sanitize_value(text: &str, max_bytes: usize) -> String {
     let mut out = String::with_capacity(text.len().min(max_bytes));
     for c in text.chars() {
-        if is_control_char(c) {
+        if is_control_char(c) || is_bidi_control(c) {
             continue;
         }
         if out.len() + c.len_utf8() > max_bytes {
@@ -264,6 +267,16 @@ mod tests {
         assert_eq!(
             seq,
             "\x1b]7501;state=working:app=choreo-tui:id=1:title=YWI=:msg=Y2Q=\x1b\\"
+        );
+    }
+
+    #[test]
+    fn record_strips_bidi_formatting_from_title_and_msg() {
+        // An RLO (U+202E) is stripped from both fields; "ab" -> "YWI=".
+        let seq = record(1, APP, "working", Some("a\u{202e}b"), Some("a\u{202e}b"));
+        assert_eq!(
+            seq,
+            "\x1b]7501;state=working:app=choreo-tui:id=1:title=YWI=:msg=YWI=\x1b\\"
         );
     }
 
