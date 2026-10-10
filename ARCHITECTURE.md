@@ -2574,7 +2574,7 @@ Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protoc
   specific error variants (e.g. `DbError::NotFound`, `HttpError::InvalidUrl`).
 - **Tool call frame (VM → host):** `[tool_name: postcard String][args: postcard-encoded Args]`
 
-### Available tools (up to 59 total, some dependent on installed binaries / the `blockchain` feature)
+### Available tools
 
 Each tool's contract — its arguments, return shape, and output behaviour, and its
 feature/binary gating — is documented in-source (see `choreo-daemon`'s tool modules,
