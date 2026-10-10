@@ -498,7 +498,6 @@ impl TurnEventHandler for App {
             display.reasoning_capability = Some(cap);
         }
         display.mark_content_changed();
-        let _ = display;
         // Only the attached session's snapshot may update the status bar's
         // per-attachment state — a background session's snapshot must not
         // overwrite the status/tool-group display while the user is viewing

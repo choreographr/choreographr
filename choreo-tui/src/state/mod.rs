@@ -1176,6 +1176,13 @@ impl App {
         client_tx: &crossbeam_channel::Sender<ClientMessage>,
     ) -> Result<(), ClientError> {
         self.session_mgr.set_sessions(sessions.to_vec());
+        // `Sessions` is a full replacement, so drop terminal-outcome overrides
+        // for sessions that no longer exist. `SessionDeleted` also removes an
+        // entry, but a refresh is the catch-all — this keeps
+        // `term_status_override` bounded by the live session set instead of
+        // growing once per session ever seen with an outcome.
+        self.term_status_override
+            .retain(|id, _| sessions.iter().any(|s| s.session_id == *id));
         if self.page == Page::Chat {
             if sessions.is_empty() {
                 self.status = Some("[daemon] no sessions".to_string());

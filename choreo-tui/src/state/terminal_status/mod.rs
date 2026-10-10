@@ -33,7 +33,7 @@ impl App {
         let title = self
             .attached_session_id
             .and_then(|id| self.session_title(id));
-        terminal::title::window_title(title.as_deref())
+        terminal::title::window_title(title)
     }
 
     /// The OSC 7501 child records to publish right now, keyed by session id.
@@ -81,20 +81,21 @@ impl App {
             live.and_then(tool_call_name)
         };
         let title = self.session_title(id);
-        terminal::status::record(id, terminal::status::APP, state, title.as_deref(), msg)
+        terminal::status::record(id, terminal::status::APP, state, title, msg)
     }
 
     /// The raw title of the session `id`, if it has one.
     ///
-    /// Sanitization and capping happen at each consumer's boundary —
-    /// `terminal::title` (200 chars) for OSC 2, `terminal::status` (192 bytes)
-    /// for the record's `title` — because the two have different limits.
-    fn session_title(&self, id: u64) -> Option<String> {
+    /// Borrowed rather than cloned — the caller only reads it. Sanitization
+    /// and capping happen at each consumer's boundary — `terminal::title` (200
+    /// chars) for OSC 2, `terminal::status` (192 bytes) for the record's
+    /// `title` — because the two have different limits.
+    fn session_title(&self, id: u64) -> Option<&str> {
         self.session_mgr
             .all
             .iter()
             .find(|s| s.session_id == id)
-            .and_then(|s| s.title.clone())
+            .and_then(|s| s.title.as_deref())
     }
 }
 

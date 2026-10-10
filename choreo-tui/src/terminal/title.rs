@@ -55,9 +55,13 @@ pub(crate) fn sanitize(text: &str) -> String {
 
 /// The window title text: the plain program name when no session title is
 /// known, else `choreo-tui — <session title>`.
+///
+/// The session title is sanitized before the emptiness check, so a title whose
+/// every character is stripped (control/bidi only) falls back to the plain
+/// program name rather than a dangling `choreo-tui — ` separator.
 pub(crate) fn window_title(session_title: Option<&str>) -> String {
-    match session_title {
-        Some(title) if !title.is_empty() => format!("{APP_NAME} — {}", sanitize(title)),
+    match session_title.map(sanitize) {
+        Some(title) if !title.is_empty() => format!("{APP_NAME} — {title}"),
         _ => APP_NAME.to_string(),
     }
 }
@@ -113,5 +117,12 @@ mod tests {
             window_title(Some("bad\u{1b}]2;evil")),
             "choreo-tui — bad]2;evil"
         );
+    }
+
+    #[test]
+    fn window_title_falls_back_when_the_title_strips_to_empty() {
+        // A title made only of stripped characters must not leave a dangling
+        // `choreo-tui — ` separator.
+        assert_eq!(window_title(Some("\u{1b}\u{202e}")), "choreo-tui");
     }
 }
