@@ -5,7 +5,8 @@
 //! because that crate already owns `ureq` + the normalization pipeline
 //! ([`crate::catalog::normalize_modelsdev`]). The daemon's maintenance thread
 //! calls [`fetch_modelsdev`] with the cached etag and hands the result to the
-//! daemon command loop, which merges overlays, swaps the [`PROVIDER_CATALOG`],
+//! daemon command loop, which merges overlays, swaps the
+//! [`PROVIDER_CATALOG`](crate::catalog::PROVIDER_CATALOG),
 //! and persists the cache — so the fetch itself stays out of the command loop
 //! (it can block for the whole timeout) and the pure normalization/merge stays
 //! unit-testable here.
@@ -40,7 +41,12 @@ pub enum RefreshOutcome {
     NotModified,
     /// `200 OK` — the remote changed. `etag` is the new entity tag (absent
     /// if the server did not send one) and must replace the cached value.
-    Fetched { json: String, etag: Option<String> },
+    Fetched {
+        /// The raw models.dev JSON snapshot body.
+        json: String,
+        /// The new entity tag, absent when the server sent none.
+        etag: Option<String>,
+    },
 }
 
 /// Structured fetch errors — never a panic. The maintenance thread logs them
@@ -55,7 +61,10 @@ pub enum RefreshError {
     /// `http_status_as_error(false)`, so these arrive as responses, not
     /// errors).
     #[error("models.dev returned HTTP {status}")]
-    HttpStatus { status: u16 },
+    HttpStatus {
+        /// The non-200/304 HTTP status the server returned.
+        status: u16,
+    },
     /// Failed to read the response body.
     #[error("failed to read response body: {0}")]
     Body(#[from] std::io::Error),

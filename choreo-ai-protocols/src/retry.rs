@@ -1,3 +1,10 @@
+//! Shared HTTP retry machinery used by every provider client.
+//!
+//! Owns the retry/backoff loop ([`retry_loop`]), the `Retry-After` parsing and
+//! budget gate (`retry_decision`), cancellation-aware waits, and the
+//! normalized [`ProviderHttpError`] each adapter maps into its own error type.
+//! The retry decision is status + `Retry-After` only — never the response body.
+
 use std::collections::HashSet;
 use std::io;
 use std::sync::{LazyLock, Mutex};
@@ -28,7 +35,7 @@ pub type RetryCallback = Box<dyn FnMut(u32, u32, Duration) + Send>;
 ///
 /// `retry_max_backoff_ms` is user-facing configuration with no upper bound of
 /// its own, and it doubles as the Retry-After budget gate (see
-/// [`retry_decision`]): without a ceiling, a typo (or hostile config) would
+/// `retry_decision`): without a ceiling, a typo (or hostile config) would
 /// make that gate tautological — every provider cooldown "fits" the budget —
 /// and let a single retry sleep past every other timeout in the request path
 /// (`AttemptDeadline` bounds the send, not the wait).  1 hour is the policy
@@ -36,10 +43,14 @@ pub type RetryCallback = Box<dyn FnMut(u32, u32, Duration) + Send>;
 /// well below it, so ordinary configs are unaffected.
 pub const MAX_BACKOFF_MS: u64 = 3_600_000;
 
+/// Retry/backoff policy for a provider client.
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
+    /// Maximum number of attempts, including the first (`1` means no retry).
     pub max_attempts: u32,
+    /// Initial backoff before the first retry; grows exponentially after.
     pub initial_backoff_ms: u64,
+    /// Ceiling on the backoff delay and the `Retry-After` budget gate.
     pub max_backoff_ms: u64,
 }
 
@@ -127,7 +138,7 @@ pub struct AttemptDeadline {
 
 impl AttemptDeadline {
     /// Create a deadline for the given budget, left unarmed until
-    /// [`AttemptDeadline::reset`] is called — [`retry_loop`] does that at the
+    /// `AttemptDeadline::reset` is called — [`retry_loop`] does that at the
     /// top of every attempt, including the first.
     #[must_use]
     pub fn new(total_timeout_secs: u64) -> Self {
@@ -169,6 +180,8 @@ pub struct AttemptContext<'a> {
 }
 
 impl<'a> AttemptContext<'a> {
+    /// Bundle the per-call retry context for [`retry_loop`].
+    #[must_use]
     pub fn new(
         on_retry: &'a mut Option<RetryCallback>,
         cancel_rx: Option<&'a crossbeam_channel::Receiver<()>>,
@@ -186,25 +199,41 @@ impl<'a> AttemptContext<'a> {
 /// its own error type via `From`.
 #[derive(Debug)]
 pub enum ProviderHttpError {
+    /// Authentication/authorization failure (HTTP 401/403).
     Unauthorized {
+        /// HTTP status code.
         status: u16,
+        /// Provider's human-readable error detail.
         detail: String,
     },
+    /// Rate limited (HTTP 429); the provider may name a cooldown.
     RateLimited {
+        /// HTTP status code.
         status: u16,
+        /// Parsed `Retry-After` cooldown, when the provider sent one.
         retry_after_secs: Option<u64>,
+        /// Provider's human-readable error detail.
         detail: String,
     },
+    /// Server-side failure (HTTP 5xx).
     ServerError {
+        /// HTTP status code.
         status: u16,
+        /// Provider's human-readable error detail.
         detail: String,
     },
+    /// Non-retryable client error (4xx other than 401/403/429).
     ClientError {
+        /// HTTP status code.
         status: u16,
+        /// Provider's human-readable error detail.
         detail: String,
     },
+    /// The provider returned a success status but an empty body.
     EmptyResponse,
+    /// The request was cancelled during a retry wait or pre-attempt check.
     Cancelled,
+    /// A transport error, or a terminal status with no structured wrapper.
     Io(io::Error),
 }
 
@@ -247,6 +276,9 @@ impl std::error::Error for ProviderHttpError {
     }
 }
 
+/// The exponential backoff delay before attempt `retry_number`: the configured
+/// initial backoff doubled per attempt, capped at `max_backoff_ms`, then
+/// jittered by 0.75–1.25× so a fleet of callers does not retry in lockstep.
 #[must_use]
 #[expect(
     clippy::cast_possible_truncation,
@@ -268,7 +300,7 @@ pub fn backoff_duration(retry_number: u32, config: &RetryConfig) -> Duration {
 /// entitlement — so resending it verbatim cannot succeed.
 ///
 /// This is a status-level pre-filter only.  For 429 the full decision also
-/// needs the `Retry-After` header (see [`retry_decision`]): the status alone
+/// needs the `Retry-After` header (see `retry_decision`): the status alone
 /// cannot distinguish a throttle that clears in seconds from a cooldown that
 /// outlives the retry budget.
 #[must_use]

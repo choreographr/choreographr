@@ -31,6 +31,11 @@
 //! - [`ProviderError`], [`ContextWindowConfig`], [`ProviderOverrides`] —
 //!   shared error, context-window, and account-override carriers.
 
+// Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
+// every public item carries docs, enforced as a hard error by clippy-strict's
+// `-D warnings`.
+#![warn(missing_docs)]
+
 pub mod anthropic;
 pub mod catalog;
 pub mod google;

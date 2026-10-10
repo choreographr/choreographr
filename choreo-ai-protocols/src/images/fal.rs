@@ -198,6 +198,8 @@ impl FalImageClient {
         }
     }
 
+    /// The client's configuration, with `total_timeout_secs` synced to the
+    /// image attempt deadline the agent actually uses.
     #[must_use]
     pub fn config(&self) -> &ServiceConfig {
         &self.config

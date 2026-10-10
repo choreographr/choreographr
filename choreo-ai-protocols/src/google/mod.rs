@@ -1,3 +1,10 @@
+//! Google Gemini API client.
+//!
+//! Implements the [`ProviderClient`] trait over Gemini's
+//! `generateContent` / `streamGenerateContent` endpoints, including the
+//! `thought: true` reasoning-part split and the opaque encrypted
+//! `thoughtSignature` round-trip.
+
 mod requests;
 #[cfg(test)]
 mod tests;
@@ -23,12 +30,23 @@ const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta
 /// Configuration for the Google Gemini API client.
 #[derive(Debug, Clone)]
 pub struct GoogleConfig {
+    /// Base URL of the Gemini API (defaults to
+    /// `https://generativelanguage.googleapis.com/v1beta`).
     pub base_url: String,
+    /// Per-model context-window resolution (catalog facts plus account
+    /// overrides).
     pub context_window_config: ContextWindowConfig,
+    /// Whether to request a streamed response; when `false` the streaming turn
+    /// falls back to a non-streaming call whose events are emitted through the
+    /// callback.
     pub streaming: bool,
+    /// Maximum number of attempts (including the first) in the retry loop.
     pub retry_max_attempts: u32,
+    /// Initial retry backoff before the first retry; grows exponentially after.
     pub retry_initial_backoff_ms: u64,
+    /// Ceiling on the retry backoff (clamped to the shared hard bound).
     pub retry_max_backoff_ms: u64,
+    /// Bounds each individual connection attempt, in seconds.
     pub connect_timeout_secs: u64,
     /// Idle read timeout in seconds: if no bytes arrive on the response for
     /// this long, the attempt fails.  It resets on every received byte, so a
@@ -156,11 +174,14 @@ impl GoogleClient {
         })
     }
 
+    /// The client's configuration.
     #[must_use]
     pub fn config(&self) -> &GoogleConfig {
         &self.config
     }
 
+    /// The API key, for callers that must rebuild a client or inspect it. Kept
+    /// as a borrowed `&str` so the zeroizing owner stays inside the client.
     #[must_use]
     pub fn api_key(&self) -> &str {
         // `Zeroizing<String>` derefs to `String`, so `as_str()` works directly.

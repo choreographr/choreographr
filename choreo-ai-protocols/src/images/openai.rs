@@ -50,7 +50,7 @@ struct ImagesResponse {
 
 /// Client for the `OpenAI` Images API (`/images/generations`).
 ///
-/// Construction mirrors [`super::OpenAiClient::new`]: it takes the same
+/// Construction mirrors [`crate::OpenAiClient::new`]: it takes the same
 /// [`ServiceConfig`] shape so an account configured for chat works as-is
 /// (base URL, timeouts, retry backoff, user agent are all shared), then
 /// overrides the two knobs the image path must set differently (the 180 s
@@ -75,7 +75,7 @@ impl std::fmt::Debug for OpenAiImageClient {
 
 impl OpenAiImageClient {
     /// The agent is built with the image attempt deadline (see
-    /// [`IMAGE_TOTAL_TIMEOUT_SECS`]) rather than the chat config's total
+    /// [`super::IMAGE_TOTAL_TIMEOUT_SECS`]) rather than the chat config's total
     /// timeout — the deadline lives on the agent, so
     /// `config.total_timeout_secs` is deliberately overridden here and the
     /// caller's value for that one field is not honored.
@@ -102,6 +102,8 @@ impl OpenAiImageClient {
         }
     }
 
+    /// The client's configuration, with `total_timeout_secs` synced to the
+    /// image attempt deadline the agent actually uses.
     #[must_use]
     pub fn config(&self) -> &ServiceConfig {
         &self.config

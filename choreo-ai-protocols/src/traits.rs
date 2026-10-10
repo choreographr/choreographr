@@ -9,17 +9,28 @@ use choreo_proto::InferenceError;
 /// A single tool result to feed back into a Responses API turn.
 #[derive(Debug, Clone)]
 pub struct ToolResultItem {
+    /// Id of the tool call this result answers (matches
+    /// [`ChatToolCall::id`](crate::ChatToolCall)).
     pub call_id: String,
+    /// The tool's output, already serialized to a string for the wire.
     pub output: String,
+    /// Optional caller attribution (programmatic tool calling).
     pub caller: Option<CallerInfo>,
 }
 
 /// Holds the common parameters for a chat completion turn.
 pub struct ChatTurnRequest<'a> {
+    /// Model id to send the turn to.
     pub model: &'a str,
+    /// The conversation so far, oldest message first.
     pub messages: &'a [ChatRequestMessage],
+    /// Tool definitions advertised to the provider for this turn.
     pub tools: &'a [ChatToolDefinition],
+    /// Mapped reasoning effort slug (e.g. `"off"`, `"medium"`) resolved from
+    /// the account's setting for this model.
     pub thinking_effort: String,
+    /// Optional callback invoked before each retry wait, for progress
+    /// reporting; `None` disables the callback.
     pub on_retry: &'a mut Option<RetryCallback>,
     /// Cancellation channel.  A crossbeam receiver so the retry backoff and
     /// SSE waits can `select!` on it alongside their own channels instead of

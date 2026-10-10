@@ -36,10 +36,13 @@ use std::sync::{Arc, Mutex};
 /// One HTTP request captured by the mock provider.
 #[derive(Debug, Clone)]
 pub struct CapturedRequest {
+    /// HTTP method (e.g. `POST`).
     pub method: String,
+    /// Request path (e.g. `/v1/messages`).
     pub path: String,
     /// Header lines captured verbatim (lowercased name → value).
     pub headers: Vec<(String, String)>,
+    /// Raw request body bytes.
     pub body: Vec<u8>,
 }
 

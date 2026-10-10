@@ -1,3 +1,10 @@
+//! OpenAI-compatible client (Chat Completions + Responses API).
+//!
+//! Owns the canonical [`ChatRequestMessage`] / [`ChatToolDefinition`] types
+//! that the Anthropic and Google clients translate into their own wire formats,
+//! and dispatches each turn to the Chat Completions or Responses wire format
+//! from the model's catalog-recorded [`RequestFormat`].
+
 mod chat_completions;
 mod config;
 mod responses;
@@ -37,10 +44,13 @@ use std::io;
 /// use `super::OpenAiError` without structural changes.
 pub use crate::shared::ProviderError as OpenAiError;
 
+/// The wire format a turn is sent in.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestFormat {
+    /// The Responses API (`/responses`).
     Responses,
+    /// The Chat Completions API (`/chat/completions`).
     ChatCompletions,
 }
 
@@ -84,10 +94,13 @@ pub(crate) struct SimpleParams<'a> {
     pub cancel_rx: Option<&'a crossbeam_channel::Receiver<()>>,
 }
 
+/// The kinds of caller a tool may be restricted to.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AllowedCaller {
+    /// A caller that is the end user (the normal path).
     Direct,
+    /// A caller that is itself a model call — programmatic tool calling.
     Programmatic,
 }
 
@@ -121,35 +134,52 @@ pub(crate) struct PromptTokensDetails {
     cached_tokens: u32,
 }
 
+/// A tool definition advertised to an OpenAI-compatible provider.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatToolDefinition {
     #[serde(rename = "type")]
     kind: &'static str,
+    /// The single `function` entry the definition wraps.
     pub function: ChatToolFunction,
 }
 
+/// The function a [`ChatToolDefinition`] wraps: its name, description, and
+/// JSON-Schema parameters, plus optional programmatic-calling metadata.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatToolFunction {
+    /// Function name the model must call.
     pub name: String,
+    /// Human-readable description guiding the model's use of the tool.
     pub description: String,
+    /// JSON Schema for the function's arguments.
     pub parameters: serde_json::Value,
+    /// Optional JSON Schema for the tool's output (programmatic tool calling).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<serde_json::Value>,
+    /// Optional allowlist of callers permitted to invoke the tool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_callers: Option<Vec<AllowedCaller>>,
 }
 
+/// A tool call echoed back to the provider on an assistant message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantToolCall {
+    /// Provider-assigned id of the call.
     pub id: String,
+    /// The call type tag (always `"function"`).
     #[serde(rename = "type")]
     pub kind: String,
+    /// The function the model called.
     pub function: AssistantToolFunction,
 }
 
+/// The function half of an [`AssistantToolCall`]: name plus the raw argument
+/// string as the provider emitted it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantToolFunction {
+    /// Function name.
     pub name: String,
+    /// The arguments as a raw JSON string (kept verbatim, never re-encoded).
     pub arguments: String,
 }
 
@@ -186,18 +216,27 @@ impl ChatImagePart {
     }
 }
 
+/// One message in a chat conversation, in the canonical `OpenAI` shape the
+/// other adapters translate from.
 #[derive(Debug, Clone)]
 pub struct ChatRequestMessage {
+    /// Message role (`"system"`, `"user"`, `"assistant"`, or `"tool"`).
     pub role: &'static str,
+    /// Text content of the message, when it has any.
     pub content: Option<String>,
     /// Images attached to this message (user role). Empty for text-only
     /// messages. Rendered per-provider by the serializers; see
     /// [`ChatImagePart`].
     pub images: Vec<ChatImagePart>,
+    /// For a `"tool"` message, the id of the call it answers.
     pub tool_call_id: Option<String>,
+    /// For an `"assistant"` message, the tool calls it requested.
     pub tool_calls: Option<Vec<AssistantToolCall>>,
+    /// Provider reasoning under the `reasoning_content` wire field.
     pub reasoning_content: Option<String>,
+    /// Provider reasoning under the `reasoning` wire field.
     pub reasoning: Option<String>,
+    /// Provider reasoning under the `reasoning_text` wire field.
     pub reasoning_text: Option<String>,
     /// Opaque reasoning round-trip artifact captured by the producing adapter
     /// at parse time (see `ReasoningArtifact`). Never serialized as a field of
@@ -304,6 +343,7 @@ impl Serialize for ChatRequestMessage {
 }
 
 impl ChatRequestMessage {
+    /// Build a text-only message of the given role.
     #[must_use]
     pub fn simple(role: &'static str, content: String) -> Self {
         ChatRequestMessage::with_images(role, content, Vec::new())
@@ -382,6 +422,9 @@ impl ChatRequestMessage {
 }
 
 impl ChatToolDefinition {
+    /// Build a plain function tool definition (no output schema, no caller
+    /// allowlist).
+    #[must_use]
     pub fn function(
         name: impl Into<String>,
         description: impl Into<String>,
@@ -420,6 +463,8 @@ impl ChatToolDefinition {
     }
 }
 
+/// The OpenAI-compatible client: an `OpenAI`, OpenAI-protocol gateway, or any
+/// other provider served over the Chat Completions / Responses wire formats.
 #[derive(Clone)]
 pub struct OpenAiClient {
     config: ServiceConfig,
@@ -468,11 +513,14 @@ impl OpenAiClient {
         })
     }
 
+    /// The client's configuration.
     #[must_use]
     pub fn config(&self) -> &ServiceConfig {
         &self.config
     }
 
+    /// The API key, for callers that must rebuild a client or inspect it. Kept
+    /// as a borrowed `&str` so the zeroizing owner stays inside the client.
     #[must_use]
     pub fn api_key(&self) -> &str {
         // `Zeroizing<String>` derefs to `String`, so `as_str()` works directly.
@@ -484,7 +532,7 @@ impl OpenAiClient {
     // Each method inspects `self.config.request_format_for_model(model)` to
     // delegate to either Chat Completions or Responses API logic.
 
-    /// List available models; falls back per [`crate::shared::list_models_with_fallback`] when a
+    /// List available models; falls back per `list_models_with_fallback` when a
     /// provider path is in play.
     ///
     /// # Errors

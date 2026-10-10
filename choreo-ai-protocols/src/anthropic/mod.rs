@@ -1,3 +1,12 @@
+//! Anthropic Messages API client.
+//!
+//! Implements the [`ProviderClient`] trait over
+//! Anthropic's `/v1/messages` endpoint, including its extended-thinking
+//! (`thinking` / `redacted_thinking`) round-trip and top-level automatic prompt
+//! caching. The catalog slug it reports drives gateway header gating, so the
+//! same client also serves Anthropic-format gateway routes
+//! (`opencode-go-anthropic-compatible`).
+
 mod requests;
 #[cfg(test)]
 mod tests;
@@ -30,14 +39,29 @@ pub struct AnthropicConfig {
     /// the `ProviderClient::provider_slug` metric label; defaults to the
     /// first-party "anthropic".
     pub provider_slug: String,
+    /// Base URL of the Messages API (defaults to `https://api.anthropic.com`).
     pub base_url: String,
+    /// `anthropic-version` header value sent on every request; pinning the API
+    /// version keeps the request/response shapes this client parses stable.
     pub api_version: String,
+    /// Default `max_tokens` for an outgoing request: Anthropic requires the
+    /// field, and it also bounds the thinking budget (see `thinking_payload`) —
+    /// a tiny per-call override therefore cannot collapse the budget.
     pub max_tokens: u32,
+    /// Per-model context-window resolution (catalog facts plus account
+    /// overrides).
     pub context_window_config: ContextWindowConfig,
+    /// Whether to request a streamed response; when `false` the streaming turn
+    /// falls back to a non-streaming call whose events are emitted through the
+    /// callback.
     pub streaming: bool,
+    /// Maximum number of attempts (including the first) in the retry loop.
     pub retry_max_attempts: u32,
+    /// Initial retry backoff before the first retry; grows exponentially after.
     pub retry_initial_backoff_ms: u64,
+    /// Ceiling on the retry backoff (clamped to the shared hard bound).
     pub retry_max_backoff_ms: u64,
+    /// Bounds each individual connection attempt, in seconds.
     pub connect_timeout_secs: u64,
     /// Idle read timeout in seconds: if no bytes arrive on the response for
     /// this long, the attempt fails.  It resets on every received byte, so a
@@ -229,11 +253,14 @@ impl AnthropicClient {
         })
     }
 
+    /// The client's configuration.
     #[must_use]
     pub fn config(&self) -> &AnthropicConfig {
         &self.config
     }
 
+    /// The API key, for callers that must rebuild a client or inspect it. Kept
+    /// as a borrowed `&str` so the zeroizing owner stays inside the client.
     #[must_use]
     pub fn api_key(&self) -> &str {
         // `Zeroizing<String>` derefs to `String`, so `as_str()` works directly.

@@ -27,18 +27,41 @@ pub enum MaxTokensField {
 /// Each provider module re-exports this as its own error type.
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
+    /// Authentication/authorization failure (HTTP 401/403).
     #[error("unauthorized ({status}): {detail}")]
-    Unauthorized { status: u16, detail: String },
-    #[error("rate limited ({status}): {detail}")]
-    RateLimited {
+    Unauthorized {
+        /// HTTP status code.
         status: u16,
-        retry_after_secs: Option<u64>,
+        /// Provider's human-readable error detail.
         detail: String,
     },
+    /// Rate limited (HTTP 429); the provider may name a cooldown.
+    #[error("rate limited ({status}): {detail}")]
+    RateLimited {
+        /// HTTP status code.
+        status: u16,
+        /// Parsed `Retry-After` cooldown, when the provider sent one.
+        retry_after_secs: Option<u64>,
+        /// Provider's human-readable error detail.
+        detail: String,
+    },
+    /// Server-side failure (HTTP 5xx).
     #[error("server error ({status}): {detail}")]
-    ServerError { status: u16, detail: String },
+    ServerError {
+        /// HTTP status code.
+        status: u16,
+        /// Provider's human-readable error detail.
+        detail: String,
+    },
+    /// Non-retryable client error (4xx other than 401/403/429).
     #[error("client error ({status}): {detail}")]
-    ClientError { status: u16, detail: String },
+    ClientError {
+        /// HTTP status code.
+        status: u16,
+        /// Provider's human-readable error detail.
+        detail: String,
+    },
+    /// The provider returned a success status but an empty body.
     #[error("provider returned an empty response")]
     EmptyResponse,
     /// The provider accepted the request but the referenced artifact is not
@@ -48,27 +71,44 @@ pub enum ProviderError {
     /// never be conflated with [`ProviderError::EmptyResponse`], which means
     /// a genuinely empty body and is terminal on the download path.
     #[error("provider artifact not ready yet: {detail}")]
-    NotReady { detail: String },
+    NotReady {
+        /// Provider's detail describing the pending artifact.
+        detail: String,
+    },
     /// The provider's content filter blocked the generation. The HTTP
     /// response itself was a success code, so this variant carries NO status:
     /// policy denial is not a 4xx and must not be reported as one.
     #[error("provider content filter blocked the generation: {detail}")]
-    ContentFiltered { detail: String },
+    ContentFiltered {
+        /// Provider's detail describing the policy block.
+        detail: String,
+    },
     /// The prompt exceeded the model's context window (e.g. z.ai's
     /// `finish_reason: "model_context_window_exceeded"`). Terminal: retrying
     /// the same prompt cannot succeed, and the distinct variant signals a
     /// compaction bug rather than an ordinary provider failure. Mirrors the
     /// `InferenceError` variant of the same name in `choreo-proto`.
     #[error("prompt exceeded the model's context window: {detail}")]
-    ContextWindowExceeded { detail: String },
+    ContextWindowExceeded {
+        /// Provider's detail (often the raw finish reason).
+        detail: String,
+    },
+    /// The request was cancelled (during a retry backoff or an inter-poll
+    /// wait).
     #[error("request cancelled during retry backoff")]
     Cancelled,
+    /// The total request deadline was exceeded while reading a streaming body.
     #[error("total request deadline exceeded while reading streaming response")]
     DeadlineExceeded,
+    /// The provider truncated one or more tool call argument strings (e.g. cut
+    /// off mid-stream); the affected calls were discarded.
     #[error("tool call arguments truncated by provider: {}", .discarded.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(", "))]
     TruncatedToolCall {
+        /// The tool calls discarded because their arguments were not valid
+        /// JSON.
         discarded: Vec<choreo_proto::DiscardedToolCall>,
     },
+    /// An underlying I/O failure.
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }

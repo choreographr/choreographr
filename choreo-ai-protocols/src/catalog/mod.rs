@@ -24,7 +24,7 @@
 //!
 //! The per-model fact **lookups** ([`lookup_context_window`],
 //! [`lookup_max_output_tokens`], [`model_request_format`], …) live in the
-//! sibling [`lookup`] module and are re-exported here so the public surface of
+//! sibling `lookup` module and are re-exported here so the public surface of
 //! the crate is unchanged.
 
 use std::fmt;
@@ -129,7 +129,9 @@ pub struct PromptCacheTtl {
 /// explicit effort levels, and reasoning round-trip format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelEntry {
+    /// Model id (exact wire name).
     pub model: String,
+    /// Context window in tokens; `0` means unknown.
     pub context_window: u32,
     /// Whether this model supports reasoning/thinking at all.
     /// Applicable across all protocols — `OpenAi`, `AnthropicMessages`,
@@ -250,19 +252,32 @@ impl Default for ModelEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum ProviderProtocol {
-    OpenAi { max_tokens_field: MaxTokensField },
+    /// OpenAI-compatible: Chat Completions or Responses, with the field that
+    /// carries the output-token limit.
+    OpenAi {
+        /// The JSON field carrying the output-token limit.
+        max_tokens_field: MaxTokensField,
+    },
+    /// Anthropic Messages API.
     AnthropicMessages,
+    /// Google Gemini `generateContent` API.
     GoogleGenerativeAi,
 }
 
 /// A provider and its curated model list, loaded from `<slug>.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderEntry {
+    /// Catalog slug (the key callers look up by).
     pub slug: String,
+    /// Human-readable provider name for display.
     pub display_name: String,
+    /// Wire protocol this provider speaks.
     pub protocol: ProviderProtocol,
+    /// API base URL (empty for models.dev-only providers with no endpoint).
     pub base_url: String,
+    /// Model id selected when the account names none.
     pub default_model: String,
+    /// The provider's curated model list.
     pub models: Vec<ModelEntry>,
     /// Provider-level prompt-cache TTL default (overlay policy). `None` means
     /// the provider declares no TTL; a per-model override on a [`ModelEntry`]

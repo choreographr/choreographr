@@ -54,7 +54,7 @@ pub const VIDEO_POLL_INTERVAL_MS: u64 = 2_000;
 /// URL. Video files dwarf images, so this is far larger than the image path's
 /// 8 MiB [`crate::images`] ceiling; 256 MiB covers a reasonable short clip
 /// while still bounding memory against a hostile/huge response. Enforced
-/// during the streaming read (see [`crate::download::download_media_bytes`]).
+/// during the streaming read (see `crate::download::download_media_bytes`).
 pub const VIDEO_DOWNLOAD_CAP_BYTES: usize = 256 * 1024 * 1024;
 
 // ── Wire enums ────────────────────────────────────────────────────────────
@@ -73,12 +73,16 @@ use serde::{Deserialize, Serialize};
 /// contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum VideoResolution {
+    /// 480p.
     #[serde(rename = "480p")]
     R480,
+    /// 720p.
     #[serde(rename = "720p")]
     R720,
+    /// 768p.
     #[serde(rename = "768p")]
     R768,
+    /// 1080p.
     #[serde(rename = "1080p")]
     R1080,
 }
@@ -102,18 +106,25 @@ impl std::fmt::Display for VideoResolution {
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
 )]
 pub enum VideoAspectRatio {
+    /// 16:9 (landscape).
     #[serde(rename = "16:9")]
     R16x9,
+    /// 9:16 (portrait).
     #[serde(rename = "9:16")]
     R9x16,
+    /// 1:1 (square).
     #[serde(rename = "1:1")]
     R1x1,
+    /// 4:3 (standard landscape).
     #[serde(rename = "4:3")]
     R4x3,
+    /// 3:4 (standard portrait).
     #[serde(rename = "3:4")]
     R3x4,
+    /// 21:9 (ultrawide).
     #[serde(rename = "21:9")]
     R21x9,
+    /// Let the provider choose (omitted from the wire body).
     #[serde(rename = "auto")]
     #[default]
     Auto,
@@ -146,20 +157,29 @@ impl std::fmt::Display for VideoAspectRatio {
 /// omitted from the wire body rather than sent as an explicit default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoGenerationRequest {
+    /// Text prompt describing the video to generate.
     pub prompt: String,
+    /// Model id to run the job on.
     pub model: String,
+    /// Clip length in whole seconds, when the model takes a duration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_secs: Option<u32>,
+    /// Output resolution, when the model supports a choice.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution: Option<VideoResolution>,
+    /// Output aspect ratio, when the model supports a choice.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aspect_ratio: Option<VideoAspectRatio>,
+    /// Deterministic-generation seed, when the model documents one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
+    /// What to avoid in the render, when the model documents a negative prompt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub negative_prompt: Option<String>,
+    /// First-frame image URL for image-to-video.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from_frame_url: Option<String>,
+    /// Last-frame image URL for image-to-video.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_frame_url: Option<String>,
 }
@@ -190,11 +210,17 @@ impl VideoGenerationRequest {
 /// self-describing for logging and metrics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoJobHandle {
+    /// Provider-assigned job id.
     pub request_id: String,
+    /// Catalog slug of the provider that owns the job.
     pub provider_slug: String,
+    /// Model the job was submitted for.
     pub model: String,
+    /// URL to poll the job's status.
     pub status_url: String,
+    /// URL to fetch the finished artifact.
     pub response_url: String,
+    /// URL to request cancellation.
     pub cancel_url: String,
 }
 
@@ -212,19 +238,30 @@ pub struct VideoMetrics {
 #[derive(Debug, Clone, PartialEq)]
 pub enum VideoJobStatus {
     /// Waiting in the queue; `position` is the provider's estimate when given.
-    Queued { position: Option<u32> },
+    Queued {
+        /// Provider's 1-based queue position, when reported.
+        position: Option<u32>,
+    },
     /// Actively rendering. `logs` carries any provider progress lines (only
     /// populated when the poll requested logs).
-    InProgress { logs: Vec<String> },
+    InProgress {
+        /// Provider progress lines (empty unless the poll requested logs).
+        logs: Vec<String>,
+    },
     /// Finished successfully; `metrics` is whatever timing the provider
     /// reported.
-    Completed { metrics: Option<VideoMetrics> },
+    Completed {
+        /// Timing the provider reported, when any.
+        metrics: Option<VideoMetrics>,
+    },
     /// The job failed. `detail` is the human-readable reason and `error_type`
     /// is the provider's machine-readable classifier when supplied (a
     /// `COMPLETED` status body can carry this third error site — see
-    /// [`crate::fal::error`]).
+    /// `crate::fal::error`).
     Failed {
+        /// Human-readable failure reason.
         detail: String,
+        /// Provider's machine-readable error classifier, when supplied.
         error_type: Option<String>,
     },
 }
@@ -232,7 +269,7 @@ pub enum VideoJobStatus {
 /// A finished video generation.
 ///
 /// The artifact is returned as a **URL** ([`Self::url`]) — the adapter never
-/// downloads it (see [`crate::download`] for a caller that wants the bytes).
+/// downloads it (see `download` for a caller that wants the bytes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoGenerationResult {
     /// URL of the generated video (provider-signed / CDN).

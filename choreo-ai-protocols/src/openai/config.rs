@@ -18,28 +18,51 @@ const DEFAULT_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 /// `choreographr`'s `config::DaemonConfig`.
 #[derive(Debug, Clone)]
 pub struct ServiceConfig {
+    /// API root the endpoint paths are appended to.
     pub base_url: String,
+    /// Path of the model-list endpoint (e.g. `/models`).
     pub model_list_path: String,
+    /// Path of the Responses API endpoint.
     pub responses_path: String,
+    /// Path of the Chat Completions endpoint.
     pub chat_completions_path: String,
+    /// Wire format used for models the catalog has no recorded format for.
     pub default_request_format: RequestFormat,
     /// Catalog slug for this service (e.g. `"opencode"` for an OpenAI-format
     /// gateway). Owned: the catalog lookup that supplies it returns a clone,
     /// so the slug cannot be a `'static` reference anymore.
     pub provider_slug: String,
+    /// Default Chat Completions output-token limit, when the model records no
+    /// per-model value.
     pub chat_completions_max_tokens: Option<u32>,
+    /// Per-model Chat Completions output-token limits, keyed by model id.
     pub model_max_tokens: HashMap<String, u32>,
+    /// Per-model context-window resolution (catalog facts plus account
+    /// overrides).
     pub context_window_config: crate::ContextWindowConfig,
+    /// Default Responses API `max_output_tokens`, when the model records no
+    /// per-model value.
     pub responses_max_output_tokens: Option<u32>,
+    /// Per-model Responses API `max_output_tokens` limits, keyed by model id.
     pub model_responses_max_output_tokens: HashMap<String, u32>,
+    /// Default Chat Completions field that carries the output-token limit.
     pub chat_completions_max_tokens_field: MaxTokensField,
+    /// Per-model output-token limit field override, keyed by model id.
     pub model_max_tokens_fields: HashMap<String, MaxTokensField>,
+    /// Whether to request streamed responses; `false` falls back to a
+    /// non-streaming call with events emitted through the callback.
     pub streaming: bool,
+    /// Whether to request the streamed usage/options trailer (`stream_options`).
     pub stream_options: bool,
+    /// Optional cap on conversational turns.
     pub max_turns: Option<u32>,
+    /// Maximum number of attempts (including the first) in the retry loop.
     pub retry_max_attempts: u32,
+    /// Initial retry backoff before the first retry; grows exponentially after.
     pub retry_initial_backoff_ms: u64,
+    /// Ceiling on the retry backoff (clamped to the shared hard bound).
     pub retry_max_backoff_ms: u64,
+    /// Bounds each individual connection attempt, in seconds.
     pub connect_timeout_secs: u64,
     /// Idle read timeout in seconds: if no bytes arrive on the response for
     /// this long, the attempt fails.  It resets on every received byte, so a
@@ -55,7 +78,11 @@ pub struct ServiceConfig {
     /// attempt: each retry restarts the deadline, so retries plus their
     /// backoff can exceed this value in aggregate.
     pub total_timeout_secs: u64,
+    /// Conversational-context shaping config (system-prompt policy etc.).
     pub context: ContextConfig,
+    /// Whether programmatic tool calling is enabled account-wide; also
+    /// auto-enabled per-model for gpt-5.6+ Responses models (see
+    /// [`Self::programmatic_tool_calling_for_model`]).
     pub programmatic_tool_calling: bool,
     /// User-Agent for inference requests. The daemon sets
     /// `choreographr/<version>`; `None` keeps ureq's default (tests).
@@ -159,6 +186,8 @@ impl ServiceConfig {
         }
     }
 
+    /// The Responses API `max_output_tokens` for a model, clamped down to the
+    /// catalog's per-model ceiling when one is recorded.
     #[must_use]
     pub fn max_output_tokens_for_model(&self, model: &str) -> Option<u32> {
         // Clamp-down against the catalog ceiling at the single resolution
@@ -171,6 +200,8 @@ impl ServiceConfig {
             .map(|requested| self.clamp_output_to_catalog(model, requested))
     }
 
+    /// The Chat Completions output-token limit for a model: the per-model value
+    /// if recorded, else the configured default.
     #[must_use]
     pub fn max_tokens_for_model(&self, model: &str) -> Option<u32> {
         self.model_max_tokens
@@ -179,6 +210,8 @@ impl ServiceConfig {
             .or(self.chat_completions_max_tokens)
     }
 
+    /// The context-window size for a model, when the catalog or an override
+    /// records one.
     #[must_use]
     pub fn context_window_for_model(&self, model: &str) -> Option<u32> {
         self.context_window_config.context_window_for_model(model)
@@ -202,6 +235,9 @@ impl ServiceConfig {
         false
     }
 
+    /// The output-token field this model uses: the per-model override if
+    /// recorded, else the configured default.
+    #[must_use]
     pub fn max_tokens_field_for_model(&self, model: &str) -> MaxTokensField {
         let field = self
             .model_max_tokens_fields

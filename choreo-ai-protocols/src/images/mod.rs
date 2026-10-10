@@ -8,7 +8,7 @@
 //! [`InferenceError`] so callers of the chat trait and of this trait share one
 //! error type and one metrics-label mapping — no new error taxonomy is
 //! invented for the image path. The URL-download machinery the URL-returning
-//! adapters share is hoisted to the crate-level [`crate::download`] module
+//! adapters share is hoisted to the crate-level `download` module
 //! (reused by the video queue's URL downloads).
 
 mod fal;
@@ -129,13 +129,17 @@ use serde::{Deserialize, Serialize};
     Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema,
 )]
 pub enum ImageSize {
+    /// Let the provider choose.
     #[serde(rename = "auto")]
     #[default]
     Auto,
+    /// 1024x1024 (square).
     #[serde(rename = "1024x1024")]
     Square1024,
+    /// 1024x1536 (portrait).
     #[serde(rename = "1024x1536")]
     Portrait1024x1536,
+    /// 1536x1024 (landscape).
     #[serde(rename = "1536x1024")]
     Landscape1536x1024,
 }
@@ -146,10 +150,14 @@ pub enum ImageSize {
 )]
 #[serde(rename_all = "lowercase")]
 pub enum ImageQuality {
+    /// Let the provider choose.
     #[default]
     Auto,
+    /// Low quality (cheapest, fastest).
     Low,
+    /// Medium quality.
     Medium,
+    /// High quality (slowest, most expensive).
     High,
 }
 
@@ -160,9 +168,12 @@ pub enum ImageQuality {
 )]
 #[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
+    /// PNG (lossless; the only format that supports a transparent background).
     #[default]
     Png,
+    /// JPEG.
     Jpeg,
+    /// WebP.
     Webp,
 }
 
@@ -173,9 +184,12 @@ pub enum OutputFormat {
 )]
 #[serde(rename_all = "lowercase")]
 pub enum Background {
+    /// Let the provider choose.
     #[default]
     Auto,
+    /// Fully opaque background.
     Opaque,
+    /// Transparent background (png/webp only).
     Transparent,
 }
 
@@ -196,14 +210,20 @@ pub enum Background {
 /// compatible request and the knobs opt in only when the caller sets them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImageGenerationRequest {
+    /// Text prompt describing the image to generate.
     pub prompt: String,
+    /// Model id to generate with.
     pub model: String,
+    /// Output canvas size; omitted from the wire body at the `auto` default.
     #[serde(skip_serializing_if = "ImageSize::is_default")]
     pub size: ImageSize,
+    /// Render quality hint; omitted from the wire body at the `auto` default.
     #[serde(skip_serializing_if = "ImageQuality::is_default")]
     pub quality: ImageQuality,
+    /// Encoded format of the returned bytes; omitted at the `png` default.
     #[serde(skip_serializing_if = "OutputFormat::is_default")]
     pub output_format: OutputFormat,
+    /// Background handling; omitted at the `auto` default.
     #[serde(skip_serializing_if = "Background::is_default")]
     pub background: Background,
     /// Optional deterministic-generation seed. Honored ONLY by providers whose

@@ -282,6 +282,11 @@ impl std::fmt::Debug for FalVideoClient {
 }
 
 impl FalVideoClient {
+    /// Build the video client from a [`ServiceConfig`] shape: the account's
+    /// image/chat config clones in as-is (base URL, connect timeout, user
+    /// agent, slug, backoff knobs), then the per-attempt HTTP deadline is set
+    /// to `FAL_VIDEO_HTTP_TIMEOUT_SECS` — the whole-job budget lives in the
+    /// driver, not the agent.
     #[must_use]
     pub fn new(mut config: ServiceConfig, api_key: String, registry: &SocketRegistry) -> Self {
         let http = crate::shared::build_agent(
@@ -314,6 +319,8 @@ impl FalVideoClient {
         self
     }
 
+    /// The client's configuration, with `total_timeout_secs` synced to the
+    /// per-attempt HTTP deadline the agent actually uses.
     #[must_use]
     pub fn config(&self) -> &ServiceConfig {
         &self.config
