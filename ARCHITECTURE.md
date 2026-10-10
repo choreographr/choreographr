@@ -448,44 +448,23 @@ joins the `doc_crates` list that `just doc-check` (a `pre-commit` step) holds to
 
 ### `choreo-shared` — Shared binary helpers
 
-A deliberately tiny **leaf crate** (dependencies: `clap`, `dirs`, `tracing`,
-and `tracing-subscriber` only) holding the small, binary-facing helpers that
-every
-CLI crate in the
-suite used to duplicate. It carries no protocol or transport logic —
-`choreo-proto` stays the wire protocol.
+A deliberately tiny **leaf crate** (`clap`, `dirs`, `tracing`, and
+`tracing-subscriber` only) holding the small, binary-facing helpers every CLI
+crate in the suite would otherwise duplicate. It carries no protocol or
+transport logic — `choreo-proto` stays the wire protocol. The public API —
+modules, types, functions, and error variants — is documented in-source:
+`cargo doc -p choreo-shared` (or `just doc`), held complete by the
+`#![warn(missing_docs)]` + `doc-check` gate.
 
-- **`release_name`** — the build-info source of truth for the suite's
-dance-style release name. The raw name lives in one file,
-`choreo-shared/release-name.txt`, pulled in with `include_str!` (compile-time
-inclusion, no `build.rs`) so it is baked into every binary; the file sits inside
-the crate directory so it also ships in the published `.crate`. `release_name()`
-returns `Option<&str>` (`None` when the file is empty — the unnamed 0.1.0
-series) and `version_string(base)` renders `"0.2.0 (Lindy)"` for a binary's own
-`CARGO_PKG_VERSION`, or `base` unchanged when unnamed. Every clap binary
-(`choreographr`, `choreo-tui`, `choreo-im`, `choreo-acp`, `choreo-gui`) passes it
-to `#[command(version = …)]` so `--version` reports it, and the daemon, TUI, IM,
-ACP, and GUI binaries log it at startup. The CI release job reads the same file
-for the GitHub release title. (The suite's release notes are no longer a
-hand-maintained `CHANGELOG.md`: they are generated from commit messages by
-git-cliff — `cliff.toml`, via `scripts/release-notes.sh`.)
-- **`clap_styles`** — the single shared clap `Styles` (green headers/usage, cyan
-literals/placeholders) every CLI's `#[command(...)]` names; previously
-copy-pasted into each crate.
-- **`logging`** — the shared `Verbosity` flags (`#[command(flatten)]` `-v`/`-q`)
-and `LoggingConfig::resolve`, the one place the suite's level policy lives (see
-**Logging** below).
-- **`paths`** — the ONE filesystem-layout resolver for the whole suite:
-  `config_dir()` / `data_dir()` (the historical
-  `dirs::{config,data}_dir()/choreographr` by default) plus the
-  `--base-dir` / `CHOREOGRAPHR_BASE_DIR` override that relocates an entire
-  instance under one root (`{base}/config`, `{base}/data`, `{base}/run` for the
-  socket, `{base}/log`). `default_config_dir` / `default_data_dir` ignore the
-  override and are the migration source. The base choice travels by environment
-  (written once at startup by `set_base_dir_from_cli`, read by every resolver
-  AND by `choreo-proto`'s socket default), so the daemon a TUI autostarts and
-  the ACP/IM bridges an operator launches inherit it without any forwarding.
-  See **The base directory** below.
+The crate owns the suite's dance-style **release name**: the raw name in
+`choreo-shared/release-name.txt` is baked into every binary with `include_str!`
+(compile-time inclusion, no `build.rs`; the file sits inside the crate directory
+so it also ships in the published `.crate`) and read by the CI release job for
+the GitHub release title, so every binary's `--version`/startup banner and the
+release title share one source of truth (see [RELEASE.md](./RELEASE.md)). The
+shared `-v`/`-q` verbosity flags and log-level policy, and the one
+filesystem-layout resolver every crate resolves through, also live here; the
+resolver's `--base-dir` override is described in **The base directory** below.
 
 ### The base directory (`--base-dir`)
 
@@ -548,37 +527,33 @@ on Windows). Keeping the dial and its "nothing is listening" classification
 here means the client (autostart) and the daemon (stale-socket probe) cannot
 classify a socket path differently.
 
-**Key types:**
+The public API — modules, types, functions, and error variants — is documented
+in-source: `cargo doc -p choreo-proto` (or `just doc`), held complete by the
+`#![warn(missing_docs)]` + `doc-check` gate.
 
-| Type | Purpose |
-|---|---|
-| `ClientMessage` | The client→server **frame**: `{ id: u64, inner: ClientMessageType }`. `id` is a per-connection request id (a monotonic counter from 0, never reused for the connection's life); the daemon MUST answer every request with exactly one `DaemonMessage { id: Some(the same id), .. }` — the terminal reply, success or failure — and broadcasts never resolve a request. The request payloads are the `ClientMessageType` enum. This `id` is the **reply axis**: per-connection, one-shot, exactly one terminal reply. It is deliberately kept SEPARATE from the **stream axis** (`stream_id`): the stream axis is per-session and many-event (fanned to every subscriber, including mid-stream joiners), so its key space is per-session while the reply axis's is per-connection — they cannot merge, and no code carries both. |
-| `DaemonMessage` | The daemon→client **frame**: `{ id: Option<u64>, inner: DaemonMessageType }`. `id: Some(n)` is the targeted terminal reply to client request `n` (`Accepted`/`Failed` carry the request's `MessageKind` for otherwise-silent mutations); `id: None` is a broadcast. Reply-ness is a property of the SEND, not the payload type — the same `inner` (e.g. `SessionState`, `ReasoningEffortSet`) may ride either way, and a variant is split into a dedicated type only for requester-relative intent (`SessionCreatedForRequester`). `DaemonMessageType` splits into a `Session { session_id: Option<u64>, event }` **envelope** carrying the 31 session-scoped [`SessionEvent`]s (next row) plus the flat connection/reply/global variants (`Sessions`, `Pong`, `Models`, keystore + account replies, `ModelsRefreshed`/`ModelsRefreshFailed`, `CatalogUpdated`, `McpStatus`/`McpReconnectFailed`/`McpReloaded`/`McpReloadFailed`, `ShuttingDown`, `Evicted`, `Bound`, `KeystoreUnbound`, `Accepted`, `Failed`, …). No `#[non_exhaustive]` on the payload enum — the variant set IS the wire contract, so every consumer match enumerates it fully. |
-| `SessionEvent` | Enum of the 31 session-scoped events (`SessionCreated`, `SessionCreatedForRequester`, `SessionAttached`, `SessionState`, `SessionStatusChanged`, `TurnAppended`, `TurnsUndone`/`TurnsRedone`, `Started`, `OutputChunk`, `ToolCallStarted`/`Finished`/`Failed`, `ToolResultChunk`, `Done`, `Failed`, `Cancelled`, `TokenUsageUpdate`, `LiveOutputTokenCount`, `ModelSelected`/`ModelSelectionFailed`, `SessionAccountSet`, `ContextWindowResolved`, `SessionWorkingDirSet`, `SessionTitleSet`, `ReasoningEffortSet`/`Failed`, `SessionFlagsChanged`, …). Events do NOT carry a `session_id` — it is hoisted onto the [`DaemonMessage::Session`] envelope's `Option<u64>` field, so every event has an origin session **by construction** (`Some(id)` for session-scoped broadcasts; `None` for the connection-level replies the daemon synthesizes with no session, e.g. "no session attached" failures) — it can never be forgotten, mismatched, or duplicated; the wire nests the event inside the envelope, so the origin is present on the wire too. |
-| `SessionMessage` | A single turn in a conversation with `message_id: u32` (monotonically increasing per-session), `parent_id: Option<u32>` (links to the triggering user/ATU message for undo subtree traversal), `deleted: bool` (soft-delete for undo), a `created_at: TimestampMs` field and a `kind: SessionMessageKind` enum. Variants (`SessionMessageKind`): `SystemText`, `UserText`, `AssistantText`, `AssistantToolUse`, `ToolResult`, `DisplayedImage` (persisted image replay) |
-| `ImageMetadata` | Mime type, dimensions, byte length for streamed images |
-| `DisplayedImageRecord` | Binary image data + `ImageMetadata` for persisted image replay (carried inside `SessionMessageKind::DisplayedImage`) |
-| `ReasoningCapability` | Struct with `available_effort_levels: Vec<String>` — the reasoning effort slugs a model supports (e.g. `"off"`, `"low"`, `"medium"`, `"high"`, `"max"`). Empty means reasoning is not supported. Cycle helper validates/rotates through slugs. |
-| `ReasoningArtifact` | **Opaque reasoning round-trip payload**, captured verbatim by a provider adapter at the parse boundary and re-emitted verbatim on the next request. Variants: `ChatReasoning { field: ChatReasoningField, bytes: Vec<u8> }` (OpenAI-compatible chat — `field` tags which wire field the text came from, `reasoning_content` / `reasoning` / `reasoning_text`, so re-emission targets the same field; DeepSeek/Kimi capture `reasoning_content`), `AnthropicThinking(Vec<u8>)` (ordered thinking / redacted_thinking block JSON, signatures + redacted data intact), `GoogleSignatures(Vec<u8>)` (Gemini encrypted thought signatures), `ResponsesItems(Vec<u8>)` (OpenAI/xAI Responses opaque reasoning items). Stored as raw bytes so `choreo-proto` stays dependency-light — only the producing adapter may interpret a payload (each adapter (de)serializes its own wire representation). Carried on `Turn.reasoning_artifact`. |
-| `ReasoningProducer` | `{ provider_slug: String, model: String }` — identity of the model that produced a turn's reasoning artifact, stored on `Turn.reasoning_producer`. The request builder compares it against the current provider+model (same-model provenance): artifacts are model-bound, so a turn produced by a different model must not have its (possibly encrypted) payload replayed after a mid-session model switch. |
-| `TokenUsage` | Tracks LLM token consumption (`input_tokens`, `output_tokens`, `total_tokens`, plus `cached_tokens` — the provider's cached-prompt-token **read/hit** count, e.g. z.ai's `usage.prompt_tokens_details.cached_tokens` or Anthropic's `usage.cache_read_input_tokens` — and `cache_write_tokens` — the prompt-cache **write** count, e.g. Anthropic's `usage.cache_creation_input_tokens`; both `#[serde(default)]`/0 when unreported, tracked separately because a cache write is priced differently from a read). Embedded in `SessionMessageKind::AssistantText` and `SessionMessageKind::AssistantToolUse` for per-turn accounting, in `SessionSummary` and `SessionEvent::SessionState` (inside `DaemonMessage::Session`) for session-level totals, and in `SessionEvent::Done` (same envelope) for per-request usage. |
-| `last_prompt_tokens` | `Option<u32>` field on session metadata and protocol messages tracking the `input_tokens` from the most recent API response — the actual context size being sent to the model, used for context-window progress displays. |
-| `last_modified` | `i64` Unix-epoch-**milliseconds** on `SessionSummary` / `SessionEvent::SessionStatusChanged` (proto) and `SessionMetadata` / `SessionConfig` / `SessionRecord` (daemon). Bumped on **completed requests**, session creation, and explicit metadata edits (title/model/account/reasoning) — NOT on transient status transitions (Inference/ToolCall/Retrying), which would re-sort the sessions list mid-request. The sessions list is ordered by it (newest first) and it survives restarts via `SessionRecord`. All session-level timestamps (`created_at`, `last_modified`) are milliseconds to match `Turn.created_at` (`TimestampMs`). |
-| `SessionStatus` | Enum representing the current session state: `Inactive`, `Inference`, `ToolCall(String)`, `Retrying {…}`, `Sleeping`. Included in `SessionSummary` and `SessionEvent::SessionState` for live status display in client toolbars. |
-| `ToolResultRecord` | Persisted tool result with fields `call_id`, `name`, `content`, `is_error`, `invocation_description`, and an additive `image: Option<ImageReference>` (a **reference** to a vision image this tool produced — the source path + MIME + dimensions **plus the normalized bytes** in `ImageReference::data`; `#[serde(default)]` so old persisted turns deserialize with `None`). The bytes are daemon/model-only: they feed the request builder directly and are moved to the `session_attachments` table at persistence time. On the client-facing view `turn_for_client` keeps the reference's METADATA (path, mime, dimensions) but empties `data`, so a client knows the image exists and fetches the bytes on demand under `ClientMessage::GetImage { key: ImageKey::ToolResult { call_id } }` — the same on-demand path displayed images use. |
-
-`ClientMessageType` variants:
-`CreateSession`, `ListSessions`, `AttachSession`, `GetSessionState`, `RunInput`,
-`TestImage`, `Cancel`, `Ping`, `GetCredential`, `ListModels`, `SetModel`, `Unlock`,
-`Lock`, `BindKeystore`, `AddCredential`, `RemoveCredential`, `AddAccount`, `RemoveAccount`,
-`ListAccounts`, `SetSessionAccount`, `SetReasoningEffort`, `GetReasoningEffort`,
-`Undo`, `Redo`, `ContinueGeneration`, `GetImage`, `SetSessionPinned`, `SetSessionArchived`, `McpStatusRequest`, `McpReconnect`, `McpReload`
-- `CreateSession` now carries optional `context_config`, `account_name`, `selected_model`, and `reasoning_effort` (slug string) fields
-- `BindKeystore` establishes the keystore binding (the ONLY wire path that can create it — see the Security model's Lock/Unlock flow); `AddCredential` requires the unlock key
-
-`DaemonMessageType` variants — split into two families:
-- **Session-scoped events** ride the `Session { session_id: Option<u64>, event: SessionEvent }` envelope: `Some(id)` for every event broadcast by a session task (the origin by construction), `None` for the connection-level replies the daemon synthesizes without a session task ("no session attached" failures, create/attach/set-account errors). Inner [`SessionEvent`]s: `SessionCreated`, `SessionCreatedForRequester`, `SessionAttached`, `SessionState`, `SessionStatusChanged`, `SessionFailed`, `SessionDeleted`, `SessionDeleteFailed`, `TurnAppended`, `TurnsUndone`, `TurnsRedone`, `Started`, `OutputChunk`, `ToolCallStarted`, `ToolCallFinished`, `ToolCallFailed`, `ToolResultChunk`, `Done`, `Failed`, `Cancelled`, `TokenUsageUpdate`, `LiveOutputTokenCount`, `ModelSelected`, `ModelSelectionFailed`, `SessionAccountSet`, `ContextWindowResolved`, `SessionWorkingDirSet`, `SessionTitleSet`, `ReasoningEffortSet`, `ReasoningEffortSetFailed`, `SessionFlagsChanged`
-- **Flat variants** (connection/reply/global — no session scope): `Sessions`, `Pong`, `Models`, `ModelsFailed`, `Unlocked`, `Locked` (targeted operation replies — `Unlocked` confirms an `Unlock`, `Locked` confirms a `/lock`), `Keystore { state: KeystoreState }` (the authoritative three-state keystore STATUS — `Unbound` (no binding yet) / `Locked` (bound, no cleartext) / `Unlocked` — pushed to a client at subscribe time and broadcast to activity subscribers on each transition; `Unbound` is what lets a first-run client AUTO-BIND instead of inferring "unbound" from a reply), `LockedError`, `Bound` (targeted confirmation that an unbound keystore adopted a `BindKeystore` key — distinct from `Unlocked` so the client can tell "I just created this binding" from "I verified an existing one"), `KeystoreUnbound` (targeted error for Unlock/AddCredential/BindKeystore against a keystore with NO binding — distinct from `LockedError`, which means "bound but wrong key", so the client knows it can AUTO-BIND instead of replaying a key that can never match), `CredentialAdded`, `CredentialAddFailed`, `CredentialRemoved`, `CredentialRemoveFailed`, `Credential`, `AccountAdded`, `AccountAddFailed`, `AccountRemoved`, `AccountRemoveFailed`, `Accounts`, `AccountListFailed`, `ModelsRefreshed`/`ModelsRefreshFailed` (with `RefreshStatus`: `UpToDate`/`Updated`/`Forced`), `CatalogUpdated`, `McpStatus { servers: Vec<McpServerStatus> }` (the reply to `ClientMessage::McpStatusRequest` AND the success reply to `ClientMessage::McpReconnect` — the state of every configured MCP server, each with its slug/transport/target/`connected`/`tool_count`/advertised name+version/`last_error`), `McpReconnectFailed { slug, error }` (the failure reply to `ClientMessage::McpReconnect`), `McpReloaded { summary, servers }`/`McpReloadFailed { error }` (the success/failure reply to `ClientMessage::McpReload` — the reload summary plus the refreshed server list, or the config read/parse error), `Image { key: ImageKey, data }` (targeted reply to `ClientMessage::GetImage` — the raw bytes of one attachment, displayed image or tool-result vision image, selected by `ImageKey`, or `None` when not found — read from the `session_attachments` store ON THE CONNECTION THREAD via its own `Arc<redb::Database>` handle, so an on-demand image fetch never serializes on the command loop), `ShuttingDown`, `Evicted` (best-effort advisory sent just before a lag-eviction disconnect; clients use it to distinguish eviction from a crash)
+The envelope design is cross-cutting. Both directions use one shaped frame — a
+`ClientMessage` is `{ id: u64, inner: ClientMessageType }`, a `DaemonMessage` is
+`{ id: Option<u64>, inner: DaemonMessageType }`. The `id` is the **reply axis**:
+per-connection and one-shot — the daemon MUST answer every request with exactly
+one `DaemonMessage { id: Some(the same id), .. }` (the terminal reply, success or
+failure), and a broadcast (`id: None`) never resolves a request. It is
+deliberately kept SEPARATE from the **stream axis** (`stream_id`): the stream
+axis is per-session and many-event (fanned to every subscriber, including
+mid-stream joiners), so its key space is per-session while the reply axis's is
+per-connection — they cannot merge, and no code carries both. Reply-ness is a
+property of the SEND, not the payload type: the same `inner` (e.g.
+`SessionState`, `ReasoningEffortSet`) may ride either way, and a variant is split
+into a dedicated type only for requester-relative intent
+(`SessionCreatedForRequester`). Session-scoped `SessionEvent`s ride the
+`DaemonMessage::Session { session_id: Option<u64>, event }` **envelope**, which
+hoists the origin session off the event: events do NOT carry a `session_id`, so
+every event has an origin by construction (`Some(id)` for session-scoped
+broadcasts; `None` for the connection-level replies the daemon synthesizes with
+no session, e.g. "no session attached" failures) — it can never be forgotten,
+mismatched, or duplicated; the wire nests the event inside the envelope, so the
+origin is present on the wire too. The daemon's payload enum is deliberately not
+`#[non_exhaustive]`: the variant set IS the wire contract, so every consumer
+match enumerates it fully.
 
 **Wire format:**
 
@@ -591,8 +566,6 @@ classify a socket path differently.
 
 - Protocol version: `9` (v9 = live MCP config reload: the new `ClientMessage::McpReload` request and its `DaemonMessage::McpReloaded`/`McpReloadFailed` replies, so a running daemon can pick up `mcp.json` edits (added/removed/changed servers) without a restart; v8 = per-session `pinned`/`archived` flags: the new `ClientMessage::SetSessionPinned`/`SetSessionArchived` requests, the daemon-GENERATED broadcast `SessionEvent::SessionFlagsChanged` (rides `DaemonState::broadcast()`, so a client learns of a flag change via the broadcast rather than a targeted reply), and the `SessionSummary::pinned`/`archived_at` fields they surface. v7 = the create-session reply is split from the create-session broadcast: `SessionEvent::SessionCreatedForRequester` is the direct reply to the creating connection and is the ONLY create event a frontend may auto-attach to, while `SessionEvent::SessionCreated` is notification-only (broadcast to every subscriber) and must never move a client's view — fixing a client hijacking its own view when ANOTHER client created a session. Delete/status lifecycle messages are unaffected: `SessionDeleted` was already broadcast-only with the requester already knowing the id it deleted; v6 = displayed-image bytes are no longer shipped in session-scoped snapshots (`SessionState`/`TurnAppended`/`TurnsRedone`) — they carry only `ImageMetadata` — and are instead fetched on demand via the new `ClientMessage::GetImage` ⇄ `DaemonMessage::Image` pair, keyed by `(session_id, turn_id, image_index)` and served from the durable `session_attachments` store; v5 = the two-state `Locked`/`Unlocked` status *broadcasts* were replaced by `DaemonMessage::Keystore { state: KeystoreState }` (`Unbound`/`Locked`/`Unlocked`), pushed at subscribe time and on every transition so a first-run client learns it must BIND; `Locked`/`Unlocked` remain targeted operation replies. v4 = the 29 session-scoped events were moved into `SessionEvent` and now ride the `DaemonMessage::Session { session_id: Option<u64>, event }` envelope; v3 had removed `TurnFinalized` — the final-turn snapshot rides `TurnAppended` — and added `Evicted`, a best-effort lag-eviction advisory; mixed-version peers fail fast at the version gate). The v4 shape was amended in place before the first release — the `session_id: 0` sentinel became `Option<u64>` (`None` for connection-level replies) — so the wire version stayed `4` with no bump at that point. The MCP trust-query request/reply variants (`ClientMessage::McpTrust`/`McpUntrust`/`McpTrustList`, `DaemonMessage::McpTrustUpdated`/`McpTrustList`) were added to v9 the same way, before any release carried v9; the policy is that variants may be added to the **current, unreleased** wire version without a bump, because mixed-version peers do not exist until a release ships and the version gate fails fast on a mismatch either way. A bump is required only once a version has shipped in a release. Under the same pre-release policy, the v6 `GetImage`/`Image` pair was reshaped for v9 before any release carried v9: its positional `image_index: u32` became a tagged `key: ImageKey` (`Displayed { index }` or `ToolResult { call_id }`), so one fetch protocol now serves both displayed images and tool-result vision images from the shared `session_attachments` store. Under the same pre-release policy, the v9 frame was amended in place to the uniform correlation envelope: `ClientMessage` = `{ id: u64, inner: ClientMessageType }`, `DaemonMessage` = `{ id: Option<u64>, inner: DaemonMessageType }` (a broadcast is `id: None`; a reply stamps the request's id), the payload enums were renamed `ClientMessageType`/`DaemonMessageType`, the streaming `request_id` was renamed `stream_id` and widened to `u64`, and the `MessageKind` tag plus the `Accepted`/`Failed` acknowledgement replies were added. No bump — no release has shipped v9. Under the same pre-release policy, the v9 streaming axis was made daemon-owned: the session thread assigns a run's `stream_id` (a per-session, monotonic counter) when it accepts a `RunInput`/`ContinueGeneration` and reports it on the acceptance `Started` reply/broadcast, so those requests no longer carry a client-chosen `stream_id` (the client learns it from `Started`, which also fixes the cross-client collision where two clients fanned one session could each claim the same id); the `CANCEL_ALL` sentinel (`stream_id = 0`) remains for a pre-`Started` cancel.
 - Max frame size: 64 MiB
-- Framing functions: `encode_frame`, `decode_frame`, `read_message`, `write_message`
-- **Error type**: `ProtoError` (thiserror enum) — `Codec`, `FrameTooLarge`, `TrailingBytes`, `UnsupportedVersion`, `Io`
 - Lag-eviction byte gauge: `DaemonMessage::approx_wire_size` / `Turn::approx_size` (in `choreo-proto/src/size.rs`) — a deliberate over-estimate used by the daemon's lag accounting, pinned by `types::tests::approx_wire_size_never_underestimates_encoded_payload` (see the daemon broadcast section)
 
 Payloads are MessagePack in **named mode** (`rmp_serde::to_vec_named`): structs
@@ -618,81 +591,54 @@ foreign reader will ever touch the bytes.
 
 An internal leaf crate (`publish = true`, no workspace deps beyond
 `unicode-general-category`) that is the single source of truth for three things
-every consumer of tool output must agree on:
+every consumer of tool output must agree on — the Unicode "spoofing"
+predicates, the tool-output byte budget, and the child-process code-injection
+environment set. The public API — modules, types, functions, and error variants
+— is documented in-source: `cargo doc -p choreo-sanitize` (or `just doc`), held
+complete by the `#![warn(missing_docs)]` + `doc-check` gate.
 
-- **The Unicode "spoofing" predicates.** [`is_unsafe_unicode`] (line/paragraph
-  separators U+2028/U+2029 plus every Unicode *format* character — general
-  category Cf — except the joiners U+200C/U+200D) is used by the daemon's
-  line-oriented sanitizers (`sanitize_keeps`), the TUI's terminal sink filter
-  (`terminal_keeps` in `markdown_render/text.rs`), and the blockchain tools'
-  node-output sanitizer. [`is_non_joiner_format_char`] is the Cf-only subset
-  the LLM-transcript sanitizer (`sanitize_transcript`) escapes. The Cf set
-  comes from the Unicode data tables, so newly-assigned format characters are
-  escaped automatically on a crate bump; a code-space sweep test next to the
-  predicates guards them against the tables.
-- **The tool-output byte budget.** [`MAX_TOOL_OUTPUT_BYTES`] (128 KiB) and the
-  shared `...[truncated]` marker (`TRUNCATION_MARKER` / `TRUNCATION_SUFFIX`),
-  with [`truncate_tool_output`] / [`finish_tool_output`] applying the cap and
-  [`ByteBudget`] tracking it incrementally on streaming paths. The daemon
-  (`tools/mod.rs` re-exports them), the blockchain crate, and the client's
-  live streaming cap (`history.rs`) all use these, so the final record, the
-  streamed live view, and the client's live accumulation read identically.
-- **The child-process code-injection environment set.**
-  `child_env::INJECTION_ENV_VARS` is the canonical list of loader/runtime
-  variables (`LD_*`, `DYLD_*`, `PYTHONPATH`, `PERL5LIB`, `RUBYLIB`) removed from
-  every spawned child; `child_env::strip_injection_env` applies it. The daemon's
-  shell/exec tool (`tools/shell_util.rs::sanitize_env`) and the MCP stdio
-  transport (`choreo-mcp`'s `stdio.rs::sanitize_child_env`) both delegate to it,
-  so the two spawn paths cannot drift apart.
-
-Previously this logic was duplicated across `choreo-daemon`'s `tools/mod.rs`,
-`choreo-blockchain`'s `lib.rs`, `choreo-tui`'s `markdown_render/text.rs`,
-`choreo-client-core`'s `history.rs`, and (for the injection set)
-`choreo-daemon`'s `tools/shell_util.rs` and `choreo-mcp`'s `stdio.rs`;
-consolidating it into one leaf crate means
-a policy or budget change (or a Unicode table bump, or an added injection
-variable) is applied everywhere at
-once, and the guard tests live next to the code they protect.
+The crate exists so this logic has exactly one home: it would otherwise be
+duplicated across `choreo-daemon` (the line-oriented `sanitize_keeps`
+predicates, the `tools/mod.rs` re-exports, and `tools/shell_util.rs`'s
+`strip_injection_env`), `choreo-blockchain` (the node-output sanitizer),
+`choreo-tui` (`markdown_render/text.rs`'s terminal sink filter),
+`choreo-client-core` (`history.rs`'s live streaming cap), and `choreo-mcp`
+(`stdio.rs`'s child-env stripping). Consolidating it into one leaf crate means a
+policy or budget change (or a Unicode table bump, or an added injection
+variable) is applied everywhere at once, and the guard tests live next to the
+code they protect.
 
 
 ### `choreo-image` — Shared image decode helpers
 
 A leaf crate (`publish = true`, depends only on `image` + `heif-oxide` +
-`tracing`) that
-owns the two decode paths shared by `choreo-daemon` (vision normalization for
-`read_image`, and `display_image`) and `choreo-tui` (client display decode), so
-the model path and the UI path can never drift apart. Its only log emission is
-a `warn!`-level `tracing` event when the HEIC guard rejects a container, so a
-rejected hostile input is observable without the crate owning any state:
+`tracing`) that owns the two decode paths shared by `choreo-daemon` (vision
+normalization for `read_image`, and `display_image`) and `choreo-tui` (client
+display decode), so the model path and the UI path can never drift apart. The
+public API — modules, types, functions, and error variants — is documented
+in-source: `cargo doc -p choreo-image` (or `just doc`), held complete by the
+`#![warn(missing_docs)]` + `doc-check` gate. Its only log emission is a
+`warn!`-level `tracing` event when the HEIC guard rejects a container, so a
+rejected hostile input is observable without the crate owning any state.
 
-| Function | Purpose |
-|---|---|
-| `decode_raster_oriented` | `image`-crate raster decode with EXIF orientation baked in (JPEG/WebP/PNG-`eXIf`), in one pass, under a decompression-bomb guard: a total-pixel budget (`MAX_DECODE_PIXELS`, checked against the image's declared size before any allocation) plus `image::Limits` (`MAX_SOURCE_DIMENSION` per-side sanity cap, `MAX_DECODE_ALLOC`) as defense-in-depth. |
-| `decode_heic` | Pure-Rust `heif-oxide` HEIC/HEIF decode. Applies the container's orientation, delivers display-ready sRGB, and runs a **pre-decode allocation guard** (see below) — a rejection is logged via `tracing`. |
-
-**HEIC decompression-bomb guard.** `heif-oxide` exposes no decoder limit and
-allocates its YUV/RGB/RGBA buffers from file-declared geometry, so an
-untrusted HEIC could otherwise drive a huge allocation before resize. The
-crate pre-parses the container (`heif::heif_geometry`, in
-`choreo-image/src/heif.rs`) for the geometry it allocates, without decoding
-any pixels: every `ispe` (ImageSpatialExtentsProperty) extent — the per-item
-frame size a single coded image or grid tile is decoded from — and every
-`grid` derived item's canvas, read from the grid item payload located via
-`iinf`/`iloc` (`rows`/`cols` × tile extent), which is the amplification
-vector a per-item cap alone does not close. Any container whose declared
-extent or canvas exceeds the total-pixel budget [`MAX_DECODE_PIXELS`] (or whose
-geometry cannot be proved — no `ispe`, an unlocatable/unsupported grid
-payload) is rejected before `heif-oxide` runs, the safe default. The box walk
-descends only into the `meta`/`iinf`/`iprp`/`ipco` containers and is careful
-about **full boxes**
-(`meta`/`iinf` carry a version/flags prefix + count), never descending into
-`mdat` raw media data, so arbitrary payload bytes cannot cause a false
-rejection.
+Both decode paths run under a decompression-bomb guard: the raster path checks
+the total-pixel budget `MAX_DECODE_PIXELS` against the image's declared size
+before any allocation (with `image::Limits` as defense-in-depth), and the HEIC
+pre-decode path parses the container's declared geometry — every `ispe` extent
+and every `grid` derived item's canvas — and rejects any container that exceeds
+the budget or whose geometry cannot be proved, before `heif-oxide` runs.
+`heif-oxide` exposes no decoder limit and allocates from file-declared geometry,
+so this guard is what closes the pre-allocation amplification vector a per-item
+cap alone does not; the box-walk detail lives in `choreo-image`'s `heif` module
+docs.
 
 ### `choreo-keystore` — Per-daemon unlock-key keystore crypto
 
-Provides the cryptographic primitives for credential management. No longer a standalone
-CLI binary — it is a library used by `choreo-client-core` and `choreo-daemon`.
+Provides the cryptographic primitives for credential management. No longer a
+standalone CLI binary — it is a library used by `choreo-client-core` and
+`choreo-daemon`. The public API — modules, types, functions, and error variants
+— is documented in-source: `cargo doc -p choreo-keystore` (or `just doc`), held
+complete by the `#![warn(missing_docs)]` + `doc-check` gate.
 
 **Per-daemon unlock key (X25519):**
 Each daemon's credential keystore is governed by ONE X25519 keypair belonging to
@@ -717,46 +663,81 @@ have been **removed**. One legacy file remains as a fallback unlock-key source:
   of truth). Encrypted-key resolution (`identity.pk.enc` +
   `CHOREOGRAPHR_KEYSTORE_PASSPHRASE`) has been **removed** entirely.
 
-**Credential encryption pipeline (client-side):**
-```
-credential ──► postcard serialize ──► ECDH (ephemeral + daemon-unlock-key pubkey)
-  ──► HKDF ──► AES-256-GCM encrypt ──► encrypted payload
-```
-
-Output format for each credential:
-```
-eph_public(32) || salt(32) || nonce(12) || ciphertext(rest)
-```
-
-Credentials are encrypted per-credential, using ECDH key agreement so only the
-authorized holder of the unlock key can test-decrypt them. The encrypted blobs are
-stored in the `redb` database alongside sessions, and the daemon refuses to
-persist a blob it cannot test-decrypt with its bound key (enforcing that every
-credential in a keystore shares one key).
-
-**Modules:**
-
-| Module | Purpose |
-|---|---|
-| `crypto.rs` | X25519 keypair generation, ECDH + HKDF + AES-256-GCM encrypt/decrypt; shared AES-256-GCM helpers |
-| `paths.rs` | Resolves filesystem paths for the legacy key files (migration source only), via the shared `choreo_shared::paths::config_dir()` so the `--base-dir` override relocates the keystore with the rest of the instance |
-| `error.rs` | `KeystoreError` enum |
-
-**Credential types:** `ApiKey` (OpenAI), `X` (Twitter OAuth 1.0a credentials)
-**Error type:** `KeystoreError` (thiserror enum) — `Io`, `TooShort`, `InvalidKeyLength`, `EncryptionFailed`, `DecryptionFailed`, `ConfigDirNotFound`
+Credentials are encrypted per-credential — a client-side pipeline of postcard
+serialization, X25519 ECDH against the daemon's unlock-key public key, HKDF, and
+AES-256-GCM — so only the authorized holder of the unlock key can test-decrypt
+them; the envelope layout and flow live in the `crypto` module docs. The
+encrypted blobs are stored in the `redb` database alongside sessions, and the
+daemon refuses to persist a blob it cannot test-decrypt with its bound key
+(enforcing that every credential in a keystore shares one key). The keystore's
+on-disk path layout resolves through the shared `choreo_shared::paths::config_dir()`,
+so the `--base-dir` override relocates the keystore with the rest of the instance.
 
 
 ### `choreo-transport` — Noise IK/XX encrypted transport
 
 A small crate providing Noise IK and XX handshakes and encrypted message I/O over
-TCP.  Used by both `choreo-client-core` (client side) and `choreo-daemon` (server side).
+TCP, used by both `choreo-client-core` (client side) and `choreo-daemon` (server
+side). The public API — modules, types, functions, and error variants — is
+documented in-source: `cargo doc -p choreo-transport` (or `just doc`), held
+complete by the `#![warn(missing_docs)]` + `doc-check` gate.
 
-| Module | Purpose |
-|---|---|
-| `noise.rs` | `NoiseStream` — wraps `TcpStream` + `snow::TransportState` with length-prefixed AES-256-GCM framing. Payloads above snow's 65535-byte single-message ciphertext cap are split into fragments and reassembled transparently, so the effective per-message cap is now the proto codec's 64 MiB `MAX_FRAME_SIZE`. The reassembly decision is made from an AUTHENTICATED continuation byte embedded as the first byte of each fragment's plaintext (covered by the AES-GCM tag) — the 4-byte wire length prefix carries no continuation flag, so a wire-level tamper can never silently truncate or extend a message: any prefix flip either trips the size cap or fails the GCM authentication. The unauthenticated prefix is validated before any allocation (snow's 65535-byte ciphertext cap) and reassembly is capped at the codec's 64 MiB `MAX_FRAME_SIZE` (enforced on both send and receive), so a hostile or corrupted peer cannot force a huge buffer allocation. The shared `TransportState` lock is held only per-chunk during encryption, never during the blocking socket writes — together with the single-writer-per-connection discipline on the daemon, this prevents a bidirectional large-message deadlock (see `noise_concurrent_bidirectional_large_messages`). A runtime single-writer guard on `send_message` rejects a concurrent second sender instead of interleaving fragments. The data plane reuses per-stream buffers (`send_buf`/`send_frag`/`recv_ct_buf`/`recv_pt_buf`) so no buffer is allocated per message or fragment, and each frame is written as ONE coalesced `write_all` (4-byte prefix + ciphertext); an empty payload still emits a single real frame (a cleared continuation header), so `recv_message` never blocks forever on a missing length prefix. EOF-class read failures (the peer closing its end mid-read) surface as `TransportError::ConnectionClosed` rather than a raw `Io(UnexpectedEof)`, so the daemon's read loop logs a graceful disconnect instead of an error. The `Arc<Mutex<TransportState>>` and the `Arc<AtomicBool>` single-writer guard are shared across `try_clone` reader/writer clones — a deliberate, documented exception to the workspace's message-passing rule (the transport state must be shared for the clones to interleave encrypt/decrypt on one connection; the guard is a single-bit flag in the spirit of the sanctioned cooperative-cancellation-flag exception). |
-| `handshake.rs` | Noise handshake (split out of `noise.rs`): `handshake_initiator()` / `handshake_responder()` implement Noise IK, and `handshake_initiator_xx()` / `handshake_responder_xx()` implement Noise XX — both with X25519 key agreement over 2-byte-BE-length-prefixed handshake messages. **TCP wire v5: every TCP connection starts with a 1-byte unauthenticated mode preamble** (`PREAMBLE_IK` = 0x01, `PREAMBLE_XX` = 0x02; 0x00 is deliberately never assigned so all-zero garbage can never select a mode), read by the daemon via `read_handshake_preamble()` to pick the responder. The preamble authorizes NOTHING — it only selects which equally-authenticated handshake runs; a MITM cannot downgrade or impersonate via it because both handshakes authenticate both static keys. IK is the normal authenticated mode (client knows the server's static in advance — the pinned `transport.pub`); XX is first-contact mode (the client does NOT know the server's static, learns it from handshake message 2, and `handshake_initiator_xx` returns it alongside the transport so the caller can verify it out-of-band — fingerprint confirmation — BEFORE any protocol traffic flows; `run_daemon_tcp_connection_xx_first_contact` enforces that gate by starting the writer thread only after the caller's `on_first_contact` callback approves, so an `Unlock` can never leak to an unconfirmed server). XX's ACL check necessarily runs after message 3 (the client's static only arrives there), so a rejected XX client's handshake succeeds client-side and the rejection surfaces as a clean `ConnectionClosed` on the data plane — the rejected client never sends or receives a single data-plane byte. All four handshakes are bounded by an ABSOLUTE deadline (an `Instant` budget enforced across every handshake read AND write — `read_handshake_exact` / `write_handshake_all` re-arm the socket timeout to the time *remaining* until the deadline, so a per-read timeout alone (resettable by a peer dribbling bytes) cannot stretch the total, and a peer that stops reading mid-handshake cannot hold the writer past the deadline; both timeouts are cleared before the data plane, which has no timeout by design): the ACL check happens mid-handshake, so a peer that connects and stalls — or dribbles to keep per-read timers from firing — must not be able to hold a connection thread + FD forever. Deadline expiry surfaces as `TransportError::HandshakeTimeout` (read/write `WouldBlock`/`TimedOut` map to it, since the socket is blocking and the timeout is armed to the remaining budget). Pinned by `noise_handshake_times_out_when_peer_silent` and `noise_handshake_times_out_against_dribbling_peer` (and their `*_xx_*` twins). The budget is injectable: `handshake_initiator_with_timeout` / `handshake_responder_with_timeout` / `handshake_initiator_xx_with_timeout` / `handshake_responder_xx_with_timeout` take their own `Duration` (the plain functions delegate to them with the 10 s default), so tests exercise the timeout path in milliseconds. |
-| `error.rs` | `TransportError` enum — `Io`, `Noise`, `Protocol`, `InvalidFragment`, `HandshakeTimeout` (absolute-deadline expiry), `AuthFailed`, `ConnectionClosed` (peer closed the connection mid-read; classified from EOF/reset kinds by `noise::recv_message`). |
-| `key.rs` | Transport keypair handling — `TransportSecretKey` (type-safe X25519 secret), `ensure_transport_keypair()` (generate-or-load with advisory file locking), `read_server_pk()`, `fingerprint()` / `fingerprint_of_file()` (human-comparable rendering of a public key: base64 clustered into 4-char groups — bijective with the 32-byte key, no hashing, and cross-checkable against the ACL's plain-base64 form by stripping separators; `fingerprint_of_file` enforces exactly-32-bytes so a truncated file errors rather than rendering a plausible lie). `set_test_config_root()` is the keypair-directory test override, now `pub` (and `#[doc(hidden)]` — a test seam, not part of the public contract) so integration tests can redirect keypair generation to a temp dir — matching the `choreo_keystore::paths` / `choreo_daemon::mcp::config` precedent. The directory itself resolves through the shared `choreo_shared::paths::config_dir()`, so `--base-dir` relocates the keypair with the rest of the instance. |
+**`noise` — the encrypted stream.** `NoiseStream` wraps `TcpStream` +
+`snow::TransportState` with length-prefixed AES-256-GCM framing. Payloads above
+snow's 65535-byte single-message ciphertext cap are split into fragments and
+reassembled transparently, so the effective per-message cap is the proto codec's
+64 MiB `MAX_FRAME_SIZE`. The reassembly decision is made from an AUTHENTICATED
+continuation byte embedded as the first byte of each fragment's plaintext
+(covered by the AES-GCM tag) — the 4-byte wire length prefix carries no
+continuation flag, so a wire-level tamper can never silently truncate or extend a
+message: any prefix flip either trips the size cap or fails the GCM
+authentication. The unauthenticated prefix is validated before any allocation
+(snow's 65535-byte ciphertext cap) and reassembly is capped at the codec's 64 MiB
+`MAX_FRAME_SIZE` (enforced on both send and receive), so a hostile or corrupted
+peer cannot force a huge buffer allocation. The shared `TransportState` lock is
+held only per-chunk during encryption, never during the blocking socket writes —
+together with the single-writer-per-connection discipline on the daemon, this
+prevents a bidirectional large-message deadlock (see
+`noise_concurrent_bidirectional_large_messages`). A runtime single-writer guard
+on `send_message` rejects a concurrent second sender instead of interleaving
+fragments. EOF-class read failures (the peer closing its end mid-read) surface as
+`TransportError::ConnectionClosed` rather than a raw `Io(UnexpectedEof)`, so the
+daemon's read loop logs a graceful disconnect instead of an error. The
+`Arc<Mutex<TransportState>>` and the `Arc<AtomicBool>` single-writer guard are
+shared across `try_clone` reader/writer clones — a deliberate, documented
+exception to the workspace's message-passing rule (the transport state must be
+shared for the clones to interleave encrypt/decrypt on one connection; the guard
+is a single-bit flag in the spirit of the sanctioned cooperative-cancellation-flag
+exception).
+
+**`handshake` — IK/XX and the wire-v5 mode preamble.** IK is the normal
+authenticated mode (the client knows the server's static in advance — the pinned
+`transport.pub`); XX is first-contact mode (the client does NOT know the server's
+static, learns it from handshake message 2, and returns it so the caller can
+verify it out-of-band — fingerprint confirmation — BEFORE any protocol traffic
+flows; the daemon starts the writer thread only after the caller's
+`on_first_contact` callback approves, so an `Unlock` can never leak to an
+unconfirmed server). **TCP wire v5: every TCP connection starts with a 1-byte
+unauthenticated mode preamble** (`PREAMBLE_IK` = 0x01, `PREAMBLE_XX` = 0x02; 0x00
+is deliberately never assigned so all-zero garbage can never select a mode),
+which authorizes NOTHING — it only selects which equally-authenticated handshake
+runs; a MITM cannot downgrade or impersonate via it because both handshakes
+authenticate both static keys. XX's ACL check necessarily runs after message 3
+(the client's static only arrives there), so a rejected XX client's handshake
+succeeds client-side and the rejection surfaces as a clean `ConnectionClosed` on
+the data plane — the rejected client never sends or receives a single data-plane
+byte. All four handshakes are bounded by an ABSOLUTE deadline enforced across
+every handshake read AND write, so a peer that connects and stalls — or dribbles
+bytes to keep a per-read timeout from firing — cannot hold a connection thread +
+FD forever; deadline expiry surfaces as `TransportError::HandshakeTimeout`.
+
+**`key` — transport keypair.** The on-disk keypair resolves through the shared
+`choreo_shared::paths::config_dir()`, so `--base-dir` relocates it with the rest
+of the instance. The human-comparable `fingerprint` rendering is a cross-crate
+contract: base64 clustered into 4-char groups — bijective with the 32-byte key,
+no hashing — and cross-checkable against the ACL's plain-base64 form by stripping
+separators; it enforces exactly 32 bytes so a truncated file errors rather than
+rendering a plausible lie.
 
 The server-side TCP/Noise handler lives in `choreo-daemon/src/server/connection.rs`
 (`tcp_client_thread`, with the preamble read + handshake-mode dispatch in
@@ -767,22 +748,21 @@ socket clients.
 
 ### `choreo-client-core` — Shared client logic
 
-Used by `choreo-tui`, `choreo-gui`, and `choreo-im`.
+Used by `choreo-tui`, `choreo-gui`, and `choreo-im`. The public API — modules,
+types, functions, and error variants — is documented in-source:
+`cargo doc -p choreo-client-core` (or `just doc`), held complete by the
+`#![warn(missing_docs)]` + `doc-check` gate.
 
-| Module | Purpose |
-|---|---|---|
-| `shell.rs` | The unified command model: the `Command` enum (the single parse result — every command, daemon-bound or local-UI) and `parse_input_line()` (parses one input line into a `Command`, allocating a request id for `RunInput`), plus `command_echo()` (the `> …` shell echo shown for a typed command; `None` for keypress-only/local commands). `/session` opens the manager (`list`/`new`/`switch`/`info` subcommands; `/new [title]` is the top-level shortcut for `/session new`), `/model` opens the picker (`/model <id>` sets it directly — there is **no** `/models` alias), `/account` opens the accounts page (`list`/`remove`/`<name>` subcommands), `/reasoning` cycles (`list`/`<level>` subcommands), plus `/quit`, `/ping`, `/cancel`, `/unlock`, `/lock`, `/acl add`, `/add-key`, `/add-x`, `/remove-key`, `/refresh-models`, `/mcp [reload | reconnect <slug>]`, `/undo`, `/redo`, `/continue`, `/stop`, or `RunInput(prompt)`. A command either sends a `ClientMessage` or drives local UI (`OpenSessions`/`OpenAccounts`/`OpenModelSelector`/`ReasoningCycle`/`ReasoningList`/`Quit` — the TUI acts on these; the enum has no client-vs-daemon split). All commands use the `/` prefix exclusively; bare invocations are the "most useful form" (open the surface), while subcommands are the direct form. |
-| `command_catalog.rs` | The single source of truth for command DISCOVERY/descriptions — a static `command_catalog()` of `CommandSpec { name, summary, arg_hint, group }` in alphabetical order by name (each entry still tags its `Session`/`Account`/`Security`/`System` `group` as metadata, but that grouping does not drive the presentation order — the palette lists the catalog verbatim, so it reads A→Z), plus `match_commands(query)` (case-insensitive exact-then-prefix match over command names, returning `CommandMatch` with highlight char positions). The parser stays the source of truth for behavior; drift-guard tests in `tests.rs` pin the two together — every catalog command must parse, and the catalog must equal the explicit list of parser command names a new parse arm is required to extend. Keyboard shortcuts are a TUI-layer concern, never represented here. |
-| `credentials.rs` | Shared helpers: `resolve_private_key()` (verify-only unlock-key resolution: stored known_servers key, legacy raw `identity.pk` fallback copied into the store, or a caller-supplied base64 key decoded WRITE-FREE — recording happens only on the daemon's targeted confirmation, never on send), `bind_fresh_daemon()` (mint a fresh CSPRNG binding key + record it into known_servers PRE-SEND + return the `ClientMessage::BindKeystore` — the ONLY key-creation path), `build_add_credential_message()` (encrypt and package a credential for the daemon; verify-only key resolution, `NoUnlockKey` when nothing resolves — no fresh-mint fallback), `record_unlock_key()` (persist a daemon-confirmed key). Eliminates duplicated logic across `choreo-tui`, `choreo-gui`, and `choreo-im`. |
-| `image.rs` | `ImageAssembler` — kept for legacy `choreo-im` use. No longer used by TUI/Dioxus (images delivered mid-turn as `DisplayedImage` via `SessionMessageAppended`). |
-| `history.rs` | `SessionView` — the client-side transcript view shared by the TUI and GUI. Holds the `turn_id → Turn` map (ordered) plus the `stream_id → turn_id` routing map, a bounded `call_id → invocation-description` stash, and routes streaming chunks / tool lifecycle into the right turn (`insert_or_replace`, `stream_chunk`, `tool_call_started`, `tool_result_chunk`). Owns `finish_request(stream_id)`, the front-end-agnostic request-terminal teardown every client runs on `Done`/`Failed`/`Cancelled`: it clears the closing turn's `tool_call_descriptions` stash (a request that never re-broadcasts its final turn would otherwise leak them) and drops the `stream_id → turn_id` mapping, so each front-end performs the bookkeeping identically and layers only its own display state on top. |
-| `diff.rs` | Types for structured unified diff representation (`DiffLineKind`, `DiffLine`, `DiffHunk`, `FileDiff`) |
-| `dispatch.rs` | `TurnEventHandler` trait + `dispatch_daemon_message()` — splits the v4 `DaemonMessage` into its two families before any per-arm work: `dispatch_session_event` (the inner `SessionEvent` of the `Session` envelope, with the origin resolved exactly once; the six None-capable events — `Failed`, `Cancelled`, `ModelSelectionFailed`, `ReasoningEffortSet`/`Failed`, `SessionFailed` — are pre-handled so a `None` origin (connection-level reply with no session) surfaces its status/error instead of being dropped, while every other event hard-requires `Some` via a guard that `warn!`s if a producer ever emits a session-scoped event without an origin) and `dispatch_flat_message` (all 31 flat connection/reply/global variants enumerated explicitly — no wildcard arm — so a new `DaemonMessage` variant must be triaged at compile time, matching the no-`#[non_exhaustive]` wire-contract rule). Used by all UI clients (TUI, GUI, IM bridge) to avoid duplicating the routing logic. |
-| `pending.rs` | `PendingReplies` — the client's single pending-request table: the one outbound path (`send()` allocates a per-connection request `id`, records a `Pending { kind, sent_at, deadline, context }`, frames a `ClientMessage`, and sends it) plus the reply-correlation side table (`resolve(id)` returns the slot a `Some(id)` reply answered, `expire(now)` sweeps slots past their per-kind `deadline_for` budget from the UI tick, `clear()` voids in-flight slots on a reset). `PendingContext` carries request-specific data a reply does not echo (a pending unlock key to record on confirmation, an image fetch key). Plain single-threaded state (no locks), with `Instant` clocks injected for deterministic tests; a front-end interprets the table, it never replaces the payload's own state dispatch. |
-| `connection.rs` | Daemon connection helpers: `run_daemon_connection()` (Unix socket), `run_daemon_tcp_connection()` (Noise IK with the wire-v5 mode preamble), `run_daemon_tcp_connection_xx_first_contact()` (Noise XX first contact — the trust gate: the session/writer threads only start after the caller's `on_first_contact` callback approves the server key learned from the handshake, so an `Unlock` can never flow to an unconfirmed server), `probe_server_key()` (XX handshake-ONLY probe: learn the server's static and drop the stream — the building block UIs use to run the fingerprint confirmation synchronously before any TUI/GUI starts), `run_daemon_tcp_connection_pinned()` (IK against the `known_servers.toml` pin; the DIAL is a separate step so a network-down daemon is a plain connect error, and on HANDSHAKE failure the error carries the pinned fingerprint plus the explicit re-pair guidance, so a changed server key is loud — the guidance attaches only to the handshake-failure case, never to a dial failure or a mid-session disconnect), `run_daemon_connection_with_mode()` (dispatch), `run_daemon_reader()` (blocking reader). Every `from_ui`-bearing entry point takes a `Receiver<ClientMessage>`: its writer thread is a PURE FORWARDER, so the front-end — which owns a [`PendingReplies`] table — allocates each request's per-connection id and frames the message itself. That is the single id-allocation path in the whole client stack, and it is what lets the front-end resolve the reply by the id it chose rather than by payload shape or arrival order. The IK path's preamble+handshake+serve tail is shared by both TCP modes in `ik_handshake_and_serve`, so they cannot drift. `ConnectionMode` enum (`UnixSocket` | `Tcp` | `TcpPinned` | `InProcess`) selects the transport. `InProcess` carries the RAW crossbeam channel ends of an embedded daemon's `EmbeddedLink` as values — client-core never depends on choreo-daemon (the GUI creates the link and stuffs the ends in) — and is served by `run_daemon_connection_in_process`, a pump that mirrors the Noise structure exactly: the calling thread drains `daemon_rx` into `handle_daemon_message` (channel close = clean EOF, mapped to the same `Ok(())` the unix path returns, so `UiEvent::ReaderClosed` is identical), and a dedicated writer thread forwards `from_ui` into `daemon_tx` with the SAME event-driven writer structure the socket modes use — a `crossbeam_channel::select_biased!` over `from_ui` (message arm first, so a queued message is drained before a simultaneous stop) and an internal writer-shutdown channel, with no polling (closing `from_ui` drops the client-side sender, which is the EOF the daemon's embedded connection cleans up on). In-process shutdown is deliberately COOPERATIVE (no socket exists to `Shutdown::Both`): an external shutdown signal stops the writer only; the reader ends when the embedded daemon closes its channel (`EmbeddedDaemon::shutdown()` delivers `ShuttingDown` as a value, then the close). The enum uses a manual `Debug` impl that reproduces the derive output for the socket variants and renders `InProcess(<embedded link>)`. |
-| `known_servers.rs` | The client's pinned server keys + per-daemon unlock keys — the SSH `known_hosts` analogue extended with the keystore unlock key. `KnownServers` loads `known_servers.toml` (`[[server]]` entries: `addr`, optional base64 `pubkey` (absent for unix-socket unlock-key carriers), optional base64 `unlock_key`), `lookup(addr)` returns the pinned key for IK connections (pinned-but-changed server keys are the CALLER's hard error), `unlock_key(addr)` / `set_unlock_key(addr, key)` resolve/record the per-daemon keystore unlock key (`set_unlock_key` creates a pubkey-less entry for unix-socket daemons; the ONLY pre-send record is the fresh key minted by `bind_fresh_daemon` — MANDATORY there, because an unbound daemon adopts whatever key arrives first, so even a lost `Bound` confirmation leaves the recorded key matching the binding (nothing to overwrite). All other keys (unlock, AddCredential, `/unlock <key>`) are recorded via `record_unlock_key` ONLY on the daemon's targeted confirmation (`Unlocked`/`Bound`/`CredentialAdded`), so a key the daemon rejects never pollutes the store. Records are NEVER auto-deleted — the store semantics are "unlock_key = the key the client intends to use, provisionally until the daemon confirms it"; provisional records persist benignly, the binding is TOFU-once and never rotates (a confirmed record can never be wrong), the daemon reports transient failures through the same rejection error (deleting could erase a good key), and manual re-pair via `remove(addr)` is the one recovery path), `pin(addr, pk)` persists the human-confirmed first-contact key (updating ONLY the pin in place, preserving any stored unlock key — the two fields are independent), `remove(addr)` removes the whole entry (pin and unlock key together). Failure policy: tolerant on load (missing/corrupt/garbage file → empty store + warning — the worst case is a re-confirmed XX first contact, never silent trust; entries with a PRESENT-but-invalid pubkey are dropped, entries with no pubkey are kept, a corrupt unlock_key drops just that field) and strict on write (whole-file rewrite under an advisory exclusive file lock, same discipline as `ensure_transport_keypair`). Path resolves through `choreo_keystore::paths::config_dir()` so test overrides agree with the rest of the config family. |
-
-`TurnEventHandler` is the `choreo-client-core` dispatch sink; the `ClientError` type used by the connection layer is a thiserror enum — `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch`, `PrivateKeyRead`, `PrivateKeyInvalid`, `NoUnlockKey`, `PublicKeyRead`, `PublicKeyInvalid`, `CredentialParse`, `Postcard`, `Encryption`.
+Two contracts here are cross-crate. The crate never depends on `choreo-daemon`:
+an in-process connection is built by stuffing the raw crossbeam channel ends of
+an embedded daemon's link into `ConnectionMode::InProcess` (the GUI creates the
+link and passes the ends in). And the dispatch layer enumerates the daemon's
+payload enum with no wildcard arm, matching the wire-contract rule that the
+variant set IS the protocol, so a new variant is a compile-time triage point.
+Every other per-module contract — the unified command model and catalog, the
+connect-time keystore handshake, the `known_servers` trust store, the
+pending-request table, and the session-transcript view — lives in its module's
+docs.
 
 
 ## Enrollment & transport trust
