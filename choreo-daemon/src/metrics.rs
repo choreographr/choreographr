@@ -9,6 +9,11 @@
 //! also mirrors the real implementation's existing "no-op when never
 //! initialized" behavior (see the `METRICS.get()` guards), so feature-off
 //! builds behave exactly like feature-on builds that never called [`init`].
+//!
+//! The `prometheus` crate is built with its `process` feature, so the standard
+//! process collector — resident memory, CPU seconds, and open file descriptors —
+//! is registered alongside the application's own gauges, counters, and
+//! histograms.
 
 #[cfg(feature = "metrics")]
 mod backend {
@@ -284,6 +289,11 @@ mod backend {
 
     /// HTTP server loop that serves `/metrics` on the given address.
     /// Checks an `AtomicBool` shutdown flag every 1-second poll and exits when set.
+    ///
+    /// This is the one place that polls the flag rather than selecting on it: a
+    /// blocking `tiny_http` accept cannot be interrupted by a channel, so the
+    /// flag (sanctioned shared-state exception #1) is the only stop hint
+    /// available.
     pub fn serve_metrics(addr: SocketAddr, shutdown: &Arc<AtomicBool>) {
         let server = match Server::http(addr) {
             Ok(s) => s,

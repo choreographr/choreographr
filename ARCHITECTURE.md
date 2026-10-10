@@ -1403,14 +1403,16 @@ cascade-deletion rules.
 
 ## Session architecture
 
-### Data model
-
 Sessions are persisted to a `redb` (v4) embedded key-value store at
-`~/.local/share/choreographr/state.redb`. The table schema — every table's key and value
-codec, the zstd turn-value compression, the turn-attachment byte split, the deletion
-tombstone, and the runtime catalog-refresh state — is documented in-source (see
-`choreo-daemon`'s `db` module, `cargo doc -p choreo-daemon` / `just doc`), held complete by
-the `#![warn(missing_docs)]` + `doc-check` gate.
+`~/.local/share/choreographr/state.redb`, and each active session's in-memory state
+is a `SessionState` owned by its control thread with the persisted fields extracted
+into `SessionConfig`. The table schema — every table's key and value codec, the
+zstd turn-value compression, the turn-attachment byte split, the deletion
+tombstone, and the runtime catalog-refresh state — and the
+`SessionState`/`SessionConfig` split, with every field's rationale, are documented
+in-source (see `choreo-daemon`'s `db` and `sessions` modules, `cargo doc -p
+choreo-daemon` / `just doc`), held complete by the `#![warn(missing_docs)]` +
+`doc-check` gate.
 
 ### Schema versioning & migrations
 
@@ -1422,14 +1424,6 @@ idempotent, transactional, and fixture-tested), the pre-migration backup, and th
 downgrade / redb `UpgradeRequired` refusals are documented in-source (see
 `choreo-daemon`'s `db` module, `cargo doc -p choreo-daemon` / `just doc`), held
 complete by the `#![warn(missing_docs)]` + `doc-check` gate.
-
-### Session state (in-memory)
-
-Each active session's in-memory state is a `SessionState` owned by its control
-thread, with the persisted fields extracted into `SessionConfig`. The structs and
-every field's rationale are documented in-source (see `choreo-daemon`'s
-`sessions` module, `cargo doc -p choreo-daemon` / `just doc`), held complete by
-the `#![warn(missing_docs)]` + `doc-check` gate.
 
 ### Undo/Redo
 
@@ -1579,35 +1573,20 @@ absent no metrics server is started — the daemon runs exactly as before.
 
 **Endpoint:** `GET /metrics` returns `Content-Type: text/plain; version=0.0.4; charset=utf-8`.
 
-### Exposed metrics
-
 The full metric set — names, types, labels, and the exported help text — is documented
 in-source in the daemon's `metrics` module, where every `record_*` function names the metric
 it updates (`cargo doc -p choreo-daemon --features metrics` / `just doc`), held complete by
 the `#![warn(missing_docs)]` + `doc-check` gate.
 
-Process-level metrics (RSS, CPU, FD count) are also exposed via the `prometheus`
-crate's `process` feature.
-
 ### Implementation
 
-The metrics module (`src/metrics.rs`) keeps the real implementation in a
-feature-gated `backend` module (selected by `#[cfg(feature = "metrics")]`,
-with a no-op stub backend when disabled, re-exported behind the same public
-API) using `std::sync::OnceLock` for a single static `Metrics` struct that
-wraps Prometheus counters/gauges/histograms. All operations are atomic (no
-`Arc<Mutex>` needed). A dedicated thread serves the `/metrics` endpoint via
-`tiny_http`; because a blocking `tiny_http` accept cannot be interrupted by a
-channel, its serve loop is the one place that consults the exception-#1
-shutdown flag on a bounded (1 s) `recv_timeout`, exiting cleanly once the flag
-is set.
-
-### Instrumentation points
-
-Where each metric is recorded is documented at the call site — every `record_*` call lives
-in the module it instruments (`sessions.rs`, `requests/`, `cache_warm.rs`, `providers/`, and
-`server/`), and the daemon's `metrics` module names each `record_*` function and the metric it
-emits.
+The metrics module keeps the real implementation in a feature-gated `backend`
+module (a no-op stub backend when disabled, re-exported behind the same public
+API), holding one static `Metrics` (a `std::sync::OnceLock`) of atomic Prometheus
+counters/gauges/histograms. A dedicated thread serves `/metrics` via `tiny_http`;
+because a blocking accept cannot be interrupted by a channel, that serve loop is
+the one place that consults the exception-#1 shutdown flag, on a bounded (1 s)
+`recv_timeout`.
 
 ---
 
@@ -1957,6 +1936,9 @@ prompt. The discovery walk, the skill scopes and precedence, the fingerprint
 cache, and the `load_skill` body plumbing are documented in-source (see
 `choreo-daemon`'s `context` and `requests` modules, `cargo doc -p choreo-daemon`
 / `just doc`), held complete by the `#![warn(missing_docs)]` + `doc-check` gate.
+The `[context]` config table (`context_file_names`, `context_file_max_bytes`,
+`disable_claude_code_prompt`) is documented in the README and the `ContextConfig`
+rustdoc (`choreo-proto`).
 
 ### System prompt construction
 
@@ -2008,12 +1990,6 @@ mtimes (not their contents); an unchanged fingerprint reuses the assembled text
 cached on `SessionState::context_cache`, while a change (a file added, removed,
 or modified) rebuilds it. Documented in-source
 (`choreo-daemon`'s `context.rs::compute_fingerprint`).
-
-### Configuration
-
-The `[context]` table (`context_file_names`, `context_file_max_bytes`,
-`disable_claude_code_prompt`) is documented in the README and in the
-`ContextConfig` rustdoc (`choreo-proto`).
 
 ### User system prompt override
 
