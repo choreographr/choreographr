@@ -307,7 +307,7 @@ fn kill_child_tree(pid: u32, pidfd: Option<&OwnedFd>) -> bool {
 /// therefore sound; the `unsafe impl`s only let the value cross thread
 /// boundaries — the handle itself is closed exactly once, by `Drop` on the
 /// last owner. (Fifth sanctioned shared-state exception — documented in
-/// AGENTS.md and ARCHITECTURE.md's `tools/shell_util.rs` row.)
+/// AGENTS.md and ARCHITECTURE.md's `sh`-tool section.)
 #[cfg(windows)]
 struct ChildJob(windows_sys::Win32::Foundation::HANDLE);
 

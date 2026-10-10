@@ -1106,12 +1106,7 @@ The daemon's tool machinery — the typed `Tool` trait, its type-erased `ToolDyn
 counterpart, the `ToolRegistry` that owns and dispatches every tool, and the
 `define_tool!` macro — is documented in-source (see `choreo-daemon`'s `tools`
 module, `cargo doc -p choreo-daemon` / `just doc`), held complete by the
-`#![warn(missing_docs)]` + `doc-check` gate. A tool declares its own argument and
-return types (both `serde`- and `schemars`-compatible, so its JSON schemas are
-auto-derived and sanitized for provider compatibility), runs on a dedicated
-per-call thread, and may stream incremental output over a channel. Tools are
-`Send + Sync`, are registered once at daemon startup, and are shared across every
-session — so a tool must keep no per-invocation state.
+`#![warn(missing_docs)]` + `doc-check` gate.
 
 The system has three dispatch paths with distinct callers:
 
@@ -1273,15 +1268,6 @@ layout and per-tool contracts are documented in-source (see `tools/pdf/`).
 > `tests/it/pdf_tool_integration.rs` still covers the vuln: with `lopdf >= 0.42` the parser
 > caps nesting depth, so the PoC yields a clean parse error or a graceful `SCANNED`
 > classification (exit 0) instead of SIGABRT.
-
-- **`pdf_classify`** runs `pdf_inspector::detect_pdf_mem` (DetectOnly mode, ~10–50ms) and
-  reports `pdf_type` (text_based / scanned / image_based / mixed), `confidence`,
-  `page_count`, and `pages_needing_ocr` — the smart-routing signal for deciding between
-  local extraction and OCR.
-- **`pdf_to_markdown`** runs `process_pdf_mem_with_options` (Full mode) with optional
-  1-indexed `pages` and an opt-in `compact` profile (`MarkdownProfile::Compact`, which
-  collapses long dot leaders for token efficiency). Scanned/image-based PDFs return an
-  OCR-routing notice instead of empty output.
 
 Both tools funnel through `read_validated_pdf`, which resolves the path (working dir + `~`),
 requires a regular file, caps input at 50 MiB, and rejects anything without the `%PDF-` magic
@@ -2069,64 +2055,22 @@ boundary, enforced by [Landlock](https://landlock.io/) on Linux and
 no in-process path confinement or resource limits are applied. The shell the `sh`
 tool runs under is resolved once at daemon startup (see `tools/shell_resolver.rs`).
 
-Shell tools (`sh`, `fish`, `nu`, `powershell`, `exec`, and the streaming
-variants) put the
-child in its own process group (`setup_child` in `tools/shell_util.rs`, applied
-inside the shared `spawn_with_watchdog` / `spawn_with_streaming` helpers); on
-timeout the watchdog kills the whole group via `killpg(2)`. On Linux the
-child's identity is first pinned with a `pidfd` so a recycled PID can never
-redirect the kill at an unrelated process; on platforms without `pidfd` (or
-when `pidfd_send_signal` fails with a non-ESRCH error such as a seccomp
-policy denying it) the kill is gated on the child being its group's leader
-(`getpgid`), with a direct-kill fallback otherwise — rather than just killing
-the direct child. This matters for shells that don't `exec` the final command
-(fish): killing only the wrapper would orphan grandchildren like `sleep`, which
-keep the output pipes open and turn a 500ms timeout into a ~10s hang.
+On Windows the same helpers swap in the platform analogues: `setup_child` has
+no process group to create, so the child is assigned to a Job Object
+(`ChildJob`, created right after spawn — `Command` has no pre-exec hook — with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` making the handle a whole-tree kill
+switch), and the watchdog's timeout kill is gated on a `ProcessIsAlive` probe
+(a zero-timeout `WaitForSingleObject` on a copy of the child's process handle)
+so a child that already exited is not misreported as killed — the Windows
+analogue of the Unix pidfd/ESRCH check. The `Arc<ChildJob>` and `ProcessIsAlive`
+handle copies are the fifth sanctioned shared-state exception (see AGENTS.md
+#5): a `HANDLE` is a kernel-table index, not an address-space pointer, and every
+Job Object operation is thread-safe kernel-side, so the watchdog and drain
+threads share one immutable value whose handle is closed exactly once by `Drop`
+on the last owner. The kernel-handle rationale is in `choreo-daemon`'s
+`tools/shell_util.rs`.
 
-The stdout/stderr pipes are drained in bounded background threads
-(`drain_fd` / `poll_readable` in `tools/shell_util.rs`): each drain polls in
-100ms slices and is stopped once the direct child is reaped. Without this, a
-surviving grandchild that holds a pipe write end (a backgrounded
-`sleep 10 &`, or a process that raced the killpg sweep) would keep the drain
-thread blocked in `read(2)` past the timeout even though the direct child is
-already gone. Every drain delivers its buffer (or a completion message) over
-a channel, so the spawn helpers wait with `recv_timeout` — the same
-channel-driven pattern as the watchdog — never by polling `is_finished`, and
-every wait is bounded by a completion grace: a drain that misses it is
-detached rather than hung (on Unix the handle is dropped and the thread exits
-on its own once the survivor does — there is no way to force EOF without
-killing the survivor, which we have no handle to).
-
-On Windows the same helpers swap in the platform analogues: `setup_child`
-has no process group to create, so the child is instead assigned to a Job
-Object (`ChildJob`, created right after spawn — `Command` has no pre-exec
-hook — with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` making the handle a
-whole-tree kill switch). The pipes are drained with blocking reads
-(`drain_reader`), which have no `poll(2)`/stop signal to interrupt; a drain
-still silent at the 1s completion grace is wedged on a pipe a surviving
-grandchild holds open, so the caller terminates the job to force EOF
-(killing the survivor — the only way to close the write-end a blocking read
-waits on) before waiting for delivery, bounded by a 5s grace after which the
-thread is detached rather than hung. The watchdog's timeout kill is gated on
-a `ProcessIsAlive` probe (a `WaitForSingleObject(0)` on a copy of the
-child's process handle) so a child that finished on its own at the same
-instant is not misreported as killed — the Windows analogue of the Unix
-pidfd/ESRCH check. The `Arc<ChildJob>` and `ProcessIsAlive` handle copies
-are the fifth sanctioned shared-state exception; the full rationale is in
-AGENTS.md (exception #5) and `choreo-daemon`'s `tools/shell_util.rs` module docs.
-
-On the streaming path (`spawn_with_streaming`), both drains split their
-output into complete lines and forward them through a single merge channel
-in arrival order — each stream keeps its relative order; the stdout/stderr
-interleave itself is scheduling-dependent. The merger escapes Cf chars
-before the bytes enter the stream budget and accumulates that same escaped
-stream, so the recorded output contains exactly what was streamed,
-truncation marker included (the stream budget reserves the record framing
-via `RecordFraming` so the final cap never re-cuts the body). A watchdog
-timeout additionally signals an abort channel that the merger selects on
-while blocked on a full output channel, so a stalled subscriber cannot
-wedge the tool past its timeout; the error path (a rare `wait()` failure)
-tears every thread down before propagating.
+## Testing
 
 | Layer | What's tested | Location |
 |---|---|---|
@@ -2238,7 +2182,6 @@ cargo test-integration    # nextest: integration tests only
 cargo test                # libtest unit tests
 cargo test -- --ignored   # libtest integration tests
 ```
-
 
 ---
 
