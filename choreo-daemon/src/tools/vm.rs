@@ -970,6 +970,16 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for ChoreographrSyscall 
     }
 }
 
+/// Compile `source` (with the generated boilerplate prepended) to a
+/// `riscv64imac-unknown-none-elf` ELF via one `rustc +stable` invocation.
+///
+/// The codegen flags are performance- and surface-driven: `opt-level=2`
+/// measurably beats `opt-level=z` on the interpreter (≈8% fewer cycles in
+/// benchmarks), and `+b` lets LLVM emit RISC-V Bitmanip instructions (`cpop`,
+/// `clz`, `ctz`, `rev8`, …) that ckb-vm's `ISA_B` fully implements — harmless
+/// when unused, faster for bit-manip-heavy guests. `-a` disables the A (atomic)
+/// extension, matching the VM's ISA mask (see the mask comment in
+/// `run_riscv_impl`).
 // Guest builds MUST stay a direct `rustc +stable` invocation: cargo config,
 // per-profile rustflags, and RUSTFLAGS can never reach them (rustc itself does
 // not read RUSTFLAGS or any cargo config — only cargo does). This is what
@@ -1367,6 +1377,14 @@ fn drain_vm_output(rx: &crossbeam_channel::Receiver<Vec<u8>>) -> Vec<u8> {
     out
 }
 
+/// The `run_riscv` tool: compiles Rust to a RISC-V ELF (or accepts a
+/// pre-compiled one) and runs it in a `ckb-vm` sandbox, dispatching guest tool
+/// calls back into the live [`ToolRegistry`].
+///
+/// A manual [`Tool`] impl rather than a `define_tool!` so the guest syscall
+/// handler can be handed the caller's `x_credentials` and `working_dir`: the
+/// guest's tool calls must run with the same context as the host agent's
+/// (the macro wires only `args` + `working_dir`).
 pub(crate) struct RunRiscV {
     registry: Weak<ToolRegistry>,
 }

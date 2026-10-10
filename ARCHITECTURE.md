@@ -3433,147 +3433,25 @@ visible to the model even as tool results scroll out of the context window.
 
 ### `run_riscv` — RISC-V sandboxed code execution
 
-`run_riscv` is a tool that compiles Rust source code into a RISC-V ELF binary and executes it
-inside a sandboxed virtual machine powered by `ckb-vm`. It is registered as a manual
-`impl Tool` (not via `define_tool!`) to pass `x_credentials` and `working_dir` through
-to the guest syscall handler.
-
-**Execution flow:**
-
-1. Accepts Rust `source`, pre-compiled base64 `program`, or `program_path` pointing at a
-   pre-compiled ELF file on disk (read with a 4MB size cap — the same
-   `ckb_vm::RISCV_MAX_MEMORY` bound as the VM's flat memory, see step 3).
-2. If `source` is provided, it is first formatted via `rustfmt` (silently skipped
-   if `rustfmt` is unavailable).  The formatted source is then prepended with a
-    `#![no_std]` boilerplate (panic handler, entry point, `Choreographr` module with
-     `tool_call`, `write`, `exit` syscall wrappers, dynamically-sized linked-list allocator)
-    and compiled via a single
-    `rustc +stable --target riscv64imac-unknown-none-elf -C opt-level=2 -C target-feature=+b,-a` invocation in a temp
-   directory.  `opt-level=2` measurably reduces interpreter cycles
-    versus the previous `-C opt-level=z` (≈8% in benchmarks), and `+b` lets LLVM emit
-    RISC-V Bitmanip instructions (`cpop`, `clz`, `ctz`, `rev8`, …) that ckb-vm's `ISA_B`
-    fully implements — harmless when unused, faster for bit-manip-heavy guests.
-    The `-a` flag disables the RISC-V A (atomic) extension: the VM is single-hart (one
-    instruction stream), so atomics have no real concurrency semantics, and removing them
-    shrinks the untrusted instruction surface.  The machine is built with the same reduced
-    ISA mask (`ISA_IMC | ISA_B | ISA_MOP`, no `ISA_A`), and guests that use
-    `core::sync::atomic` read-modify-write operations (e.g. `AtomicU32::fetch_add`) are
-    rejected at compile time — LLVM cannot select `amoadd.w` without the A extension.
-3. Creates a `DefaultCoreMachine<u64, FlatMemory<u64>>` with 4 MB of flat memory
-   (the default and the maximum — ckb-vm 0.24.14 hard-codes `RISCV_MAX_MEMORY = 4 << 20`
-   in `ckb-vm-definitions`. `FlatMemory::new_with_memory` asserts on it and every memory
-   access goes through `get_page_indices`, which rejects addresses beyond it, so 4MB is
-   the largest VM this dependency can construct. The tool validates `memory_size` against
-   `ckb_vm::RISCV_MAX_MEMORY` up front so an oversized request fails with a clean error
-   instead of a panic inside the dependency. Raising the cap to 16MB requires a newer
-   ckb-vm release — upstream `develop` has removed the cap, but nothing newer than
-   0.24.14 is published; the `DEFAULT_VM_MEMORY` constant and schema text are derived
-   from the upstream constant so they follow automatically on upgrade).  The default
-    cycle budget is 10M (`DEFAULT_MAX_CYCLES`, configurable via `max_cycles`) — a ~10x
-    bump over the original 1M, which real I/O-heavy guests (large tool outputs, line-heavy
-    reports) routinely exhausted; a spinning `loop {}` still trips the cap in roughly a
-    second of wall clock.
-4. Registers a `ChoreographrSyscall` handler that intercepts three guest syscalls:
-   - **Syscall #0 (TOOL_CALL)** — reads a postcard-encoded frame `[tool_name: String][args: bytes]`
-     from guest memory, dispatches it via the `ToolRegistry::execute_dyn()`, and writes the
-     postcard-encoded `Result<Return, String>` result to the guest's output buffer.
-   - **Syscall #1 (WRITE)** — copies guest data into an accumulator buffer that becomes the tool's
-     output upon VM exit.
-   - **Syscall #93 (EXIT)** — stops the VM. Uses the Linux exit syscall number
-     so that CKB-VM's `DefaultMachine::ecall()` handles it natively, properly
-     propagating the exit code from register A0.
-5. Loads the ELF via `TraceMachine::load_program` and runs via `TraceMachine::run()`.
-6. After execution, the machine is dropped and the output channel is drained with
-   a blocking `recv()` loop (deterministic — no buffered-item race).
-7. Returns the formatted source wrapped in a `rust` markdown fenced code block,
-   followed by the accumulated WRITE output, then a `[VM: exited with code N in M cycles]`
-   summary line.  The TUI renders it as a syntax-highlighted code box (the fence
-   markers are replaced by the box's table-style frame — see `markdown_render/`).
-
-**Guest ABI** (auto-generated in the boilerplate):
-
-```rust
-pub mod Choreographr {
-    pub unsafe fn tool_call(request: &[u8], output: &mut [u8]) -> usize;
-    pub fn write(data: &[u8]);
-    pub fn exit(code: i32) -> !;
-}
-```
-
-A `#[global_allocator]` linked-list allocator is always included, enabling `alloc` crate
-types (`Vec`, `String`, `format!`, `Box`, etc.), and `args()` is injected as a free function
-returning `Vec<Vec<u8>>`:
-
-```rust
-pub fn args() -> Vec<Vec<u8>>;
-```
-
-**Safety:** The guest runs in an isolated VM with 4 MB of flat memory (ckb-vm's maximum). All tool access goes
-through the same `ToolRegistry` as the host agent, respecting the same `x_credentials` and `working_dir`.
-The guest cannot access host memory, syscalls, or files outside the VM without going through
-registered tools.
-
-### `exec` — direct program execution (no shell)
-
-`exec` spawns a single program directly without shell interpretation. The command and each
-argument are passed literally to `execvp` — no pipes, redirects, glob expansion, or
-environment variable interpolation.
-
-Two pre-flight guards steer the model away from the tool's two most common misuses; both
-return actionable errors before anything is spawned:
-
-1. **Shell-syntax guard** — a `|`, `>`, `<`, `&`, `;`, `$`, backtick, `*`, `?`, quote, or
-   apostrophe in the command or any argument aborts with a message pointing the model to the
-   `sh`/`nushell`/`fish` tools (pipes, redirects, globs, env vars, and chaining all require a
-   shell).
-2. **Program-existence check** — the command is resolved against PATH (or used directly when
-   it contains a path separator); a miss returns the searched PATH and suggests `command -v
-   <name>` via `sh` or an absolute path.
-
-The tool description leads with the narrow use case (a concrete, existing program) and
-explicitly defaults to `sh` when in doubt.
-
-Sandboxing is identical to the shell tools: timeout, rlimits, env sanitization, output
-truncation, and non-interactive stdin.
+The guest runs in an isolated VM: it cannot reach host memory, syscalls, or files
+except through the registered tools, and every guest tool call goes through the
+same `ToolRegistry` the host agent uses, so it honours the same `x_credentials`
+and `working_dir` context. The tool's own contract — the compile-and-run flow,
+the guest ABI and syscall set, and the ckb-vm memory/cycle bounds — is documented
+in-source (`choreo-daemon`'s `tools/vm.rs`).
 
 ### `sh` — POSIX shell command execution
 
-`sh` runs shell commands under a POSIX-compatible shell chosen automatically at daemon startup — the model no longer picks one. Resolution (`tools/shell_resolver.rs`) walks shell *types* in a fixed tier order (`bash >= 4 > zsh > ksh/mksh > dash > ash > busybox(ash)`) and stops at the first tier that yields a suitable binary; within a tier each candidate is verified by running it (its path name is never trusted), deduped by resolved real path, and the highest version wins. `bash` is the only version-floored tier (`>= 4`, so macOS's `/bin/bash` 3.2 is excluded); only `zsh` is forced into a POSIX compatibility mode (`argv[0] = "sh"`) and busybox runs through its `ash` applet — everything else runs native. The tool description names the resolved shell (type + compatibility + version — never the filesystem path) and states the capabilities that shell provides (for example bash ≥4 extensions, or POSIX `sh` only). When no suitable shell is installed the tool is simply not registered, so the model is never offered a tool that cannot spawn. The `shell` parameter is gone from `ShArgs` (and from the RISC-V VM guest's `choreo::sh` wrapper, which now passes no shell). An operator can force a shell with the `CHOREO_SHELL` env var (a type name such as `zsh`, or a binary path/name; an unresolvable value warns and falls back to autodetection).
-
-Sandboxing (shared across all shell/exec tools via `shell_util.rs`):
-
-1. **Timeout** — the command is killed after a configurable timeout (default 30s). A watchdog thread enforces the inner timeout; the outer tool loop timeout is a 300s floor that the tool's requested `timeout` raises when longer.
-
-2. **Resource limits** — set via `setrlimit` in the child (pre-exec): `RLIMIT_AS` (4 GB) prevents runaway memory allocation, `RLIMIT_FSIZE` (100 MB) prevents disk-filling writes.
-
-3. **Environment sanitization** — dangerous env vars (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `LD_DEBUG`, `PYTHONPATH`, `PERL5LIB`, `RUBYLIB`, `DYLD_INSERT_LIBRARIES`) are stripped in the child before exec.
-
-4. **Output limits** — stdout/stderr are combined and truncated to 16 KB via `truncate_tool_output`, preventing context overflow.
-
-5. **Non-interactive** — stdin is not connected. Commands that attempt to read from stdin will hang until the timeout.
-
-In-process path confinement (`confine_path`) was removed in favour of OS-level sandboxing:
-the session working directory is the boundary enforced by [Landlock](https://landlock.io/)
-on Linux and [Seatbelt](https://theapplewiki.com/wiki/Dev:Seatbelt) on macOS (see README).
-Tools still resolve relative paths against the working directory, but the boundary check
-itself is the kernel's responsibility.
-
-### `nushell` — nushell command execution with sandboxing
-
-`nushell` runs commands in a child `nu -c` process with the same sandboxing as `sh`. Registered only when the `nu` binary is found in `PATH`.
-
-### `fish` — fish shell command execution with sandboxing
-
-`fish` runs commands in a child `fish -c` process with the same sandboxing as `sh`. Registered only when the `fish` binary is found in `PATH`.
-
-### `powershell` — PowerShell command execution (Windows)
-
-`powershell` runs commands in a child `powershell.exe` (Windows PowerShell 5.1, always present on Windows) or `pwsh.exe` (PowerShell 7+) process with the same watchdog/streaming plumbing as the other shell tools. Registered only on Windows, and only when at least one of the two binaries is found in `PATH` (probed with PATHEXT-aware resolution — see `binary_exists` in `tools/shell_util.rs`). Two Windows-specific hardenings are baked into every invocation:
-
-1. **`-EncodedCommand`** — the script (a UTF-8 output-encoding preamble plus the user's command) is Base64-encoded as UTF-16LE, sidestepping Windows' nested command-line quoting rules entirely: LLM-generated commands containing any mix of quotes, `%VAR%`, `!`, or carets arrive byte-exact at the shell.
-2. **UTF-8 output** — `[Console]::OutputEncoding` is forced to UTF-8 (and `$ProgressPreference` silenced) at the start of the script, so redirected stdout is UTF-8 like every other platform instead of the console code page.
-
-`-NoProfile` and `-NonInteractive` keep user profile scripts and interactive prompts out of the tool path. Exit codes follow PowerShell semantics: `exit N` sets a nonzero code.
+The shell/exec tools (`sh`, `nushell`, `fish`, `powershell`, `exec`) share one
+sandbox contract, implemented in `tools/shell_util.rs` and documented in-source:
+a watchdog kills the child's process tree on timeout; the child's environment is
+stripped of the canonical injection variables; stdin is not connected, so a
+command that reads from it hangs until the timeout; and output is bounded by the
+shared 128 KiB cap. Confinement is OS-level — the session working directory is the
+boundary, enforced by [Landlock](https://landlock.io/) on Linux and
+[Seatbelt](https://theapplewiki.com/wiki/Dev:Seatbelt) on macOS (see README) — so
+no in-process path confinement or resource limits are applied. The shell the `sh`
+tool runs under is resolved once at daemon startup (see `tools/shell_resolver.rs`).
 
 Shell tools (`sh`, `fish`, `nu`, `powershell`, `exec`, and the streaming
 variants) put the
@@ -3633,7 +3511,6 @@ timeout additionally signals an abort channel that the merger selects on
 while blocked on a full output channel, so a stalled subscriber cannot
 wedge the tool past its timeout; the error path (a rare `wait()` failure)
 tears every thread down before propagating.
-
 
 | Layer | What's tested | Location |
 |---|---|---|

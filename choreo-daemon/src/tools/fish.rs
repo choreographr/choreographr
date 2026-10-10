@@ -12,8 +12,7 @@ use std::path::Path;
 /// Arguments for the `fish` tool ([`execute_fish_tool`]).
 ///
 /// The command runs in a child `fish -c` process with the same sandboxing as
-/// `sh` (timeout, rlimits, env sanitization, output truncation, non-interactive
-/// stdin).
+/// `sh` (timeout, env sanitization, output truncation, non-interactive stdin).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FishArgs {
     /// The fish command to execute (runs via `fish -c`)
