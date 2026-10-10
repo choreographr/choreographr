@@ -176,9 +176,9 @@ fn failed_and_cancelled_records() {
 #[test]
 fn window_title_reflects_the_attached_session() {
     let mut app = test_app();
-    assert_eq!(app.window_title(), "choreo-tui");
+    assert_eq!(app.window_title(), "Choreographr");
 
     app.attached_session_id = Some(1);
     app.session_mgr.all = vec![make_session(1, "Fix the parser")];
-    assert_eq!(app.window_title(), "choreo-tui — Fix the parser");
+    assert_eq!(app.window_title(), "Choreographr - Fix the parser");
 }

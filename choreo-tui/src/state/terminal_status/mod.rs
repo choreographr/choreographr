@@ -28,7 +28,7 @@ fn tool_call_name(status: &SessionStatus) -> Option<&str> {
 
 impl App {
     /// The current OSC 2 window title: the plain program name when no titled
-    /// session is attached, else `choreo-tui — <attached session title>`.
+    /// session is attached, else `Choreographr - <attached session title>`.
     pub(crate) fn window_title(&self) -> String {
         let title = self
             .attached_session_id

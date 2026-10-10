@@ -1,7 +1,7 @@
 //! OSC 2 window/tab title.
 //!
 //! The TUI names the terminal window/tab after itself and, once a session is
-//! attached, after that session: `choreo-tui — <session title>`. The title is
+//! attached, after that session: `Choreographr - <session title>`. The title is
 //! set with the OSC 2 sequence (`ESC ] 2 ; <text> ST`) and cleared (set to
 //! empty) on suspend and exit so the TUI does not leave a stale name behind.
 //!
@@ -15,7 +15,7 @@
 use super::{is_bidi_control, is_control_char, osc, write};
 
 /// The program name shown in the window title when no session is attached.
-const APP_NAME: &str = "choreo-tui";
+const APP_NAME: &str = "Choreographr";
 
 /// Upper bound on the sanitized OSC 2 title length (in characters). OSC 2 is
 /// free-form with no protocol limit and a session title can be long; capping
@@ -54,14 +54,14 @@ pub(crate) fn sanitize(text: &str) -> String {
 }
 
 /// The window title text: the plain program name when no session title is
-/// known, else `choreo-tui — <session title>`.
+/// known, else `Choreographr - <session title>`.
 ///
 /// The session title is sanitized before the emptiness check, so a title whose
 /// every character is stripped (control/bidi only) falls back to the plain
-/// program name rather than a dangling `choreo-tui — ` separator.
+/// program name rather than a dangling `Choreographr - ` separator.
 pub(crate) fn window_title(session_title: Option<&str>) -> String {
     match session_title.map(sanitize) {
-        Some(title) if !title.is_empty() => format!("{APP_NAME} — {title}"),
+        Some(title) if !title.is_empty() => format!("{APP_NAME} - {title}"),
         _ => APP_NAME.to_string(),
     }
 }
@@ -102,11 +102,11 @@ mod tests {
 
     #[test]
     fn window_title_with_and_without_a_session_title() {
-        assert_eq!(window_title(None), "choreo-tui");
-        assert_eq!(window_title(Some("")), "choreo-tui");
+        assert_eq!(window_title(None), "Choreographr");
+        assert_eq!(window_title(Some("")), "Choreographr");
         assert_eq!(
             window_title(Some("Fix the parser")),
-            "choreo-tui — Fix the parser"
+            "Choreographr - Fix the parser"
         );
     }
 
@@ -115,14 +115,14 @@ mod tests {
         // A control byte in the session title never reaches the sequence.
         assert_eq!(
             window_title(Some("bad\u{1b}]2;evil")),
-            "choreo-tui — bad]2;evil"
+            "Choreographr - bad]2;evil"
         );
     }
 
     #[test]
     fn window_title_falls_back_when_the_title_strips_to_empty() {
         // A title made only of stripped characters must not leave a dangling
-        // `choreo-tui — ` separator.
-        assert_eq!(window_title(Some("\u{1b}\u{202e}")), "choreo-tui");
+        // `Choreographr - ` separator.
+        assert_eq!(window_title(Some("\u{1b}\u{202e}")), "Choreographr");
     }
 }
