@@ -1591,5 +1591,57 @@ pub enum DaemonMessageType {
     },
 }
 
+impl DaemonMessageType {
+    /// A stable, payload-free name for the variant, for logging and metrics.
+    ///
+    /// A session payload (turn text, tool arguments/results) rides
+    /// [`Self::Session`]'s inner [`SessionEvent`], so this enum's `Debug`
+    /// output must never be formatted into a log line or a bail string. Log
+    /// this tag (with the envelope's correlation `id`) instead.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Session { .. } => "Session",
+            Self::Sessions { .. } => "Sessions",
+            Self::Pong => "Pong",
+            Self::Models { .. } => "Models",
+            Self::ModelsFailed { .. } => "ModelsFailed",
+            Self::Unlocked => "Unlocked",
+            Self::Locked => "Locked",
+            Self::Keystore { .. } => "Keystore",
+            Self::LockedError { .. } => "LockedError",
+            Self::Bound => "Bound",
+            Self::KeystoreUnbound { .. } => "KeystoreUnbound",
+            Self::CredentialAdded { .. } => "CredentialAdded",
+            Self::CredentialAddFailed { .. } => "CredentialAddFailed",
+            Self::CredentialRemoved { .. } => "CredentialRemoved",
+            Self::CredentialRemoveFailed { .. } => "CredentialRemoveFailed",
+            Self::AclAddResult { .. } => "AclAddResult",
+            Self::AclUpdated { .. } => "AclUpdated",
+            Self::Credential { .. } => "Credential",
+            Self::AccountAdded { .. } => "AccountAdded",
+            Self::AccountAddFailed { .. } => "AccountAddFailed",
+            Self::AccountRemoved { .. } => "AccountRemoved",
+            Self::AccountRemoveFailed { .. } => "AccountRemoveFailed",
+            Self::Accounts { .. } => "Accounts",
+            Self::AccountListFailed { .. } => "AccountListFailed",
+            Self::ModelsRefreshed { .. } => "ModelsRefreshed",
+            Self::ModelsRefreshFailed { .. } => "ModelsRefreshFailed",
+            Self::CatalogUpdated { .. } => "CatalogUpdated",
+            Self::Image { .. } => "Image",
+            Self::McpStatus { .. } => "McpStatus",
+            Self::McpReconnectFailed { .. } => "McpReconnectFailed",
+            Self::McpReloaded { .. } => "McpReloaded",
+            Self::McpReloadFailed { .. } => "McpReloadFailed",
+            Self::McpTrustUpdated { .. } => "McpTrustUpdated",
+            Self::McpTrustList { .. } => "McpTrustList",
+            Self::ShuttingDown => "ShuttingDown",
+            Self::Evicted => "Evicted",
+            Self::Accepted { .. } => "Accepted",
+            Self::Failed { .. } => "Failed",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

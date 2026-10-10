@@ -219,7 +219,9 @@ pub trait TurnEventHandler {
 ///   catalog/refresh replies, on-demand `Image`, …), handled by
 ///   `dispatch_flat_message`.
 pub fn dispatch_daemon_message(msg: DaemonMessage, handler: &mut impl TurnEventHandler) {
-    debug!("dispatching daemon message: {msg:?}");
+    // Log a payload-free tag, never `?msg`: a `Session` envelope carries turn
+    // text and tool arguments/output that must not reach a log line.
+    debug!(id = ?msg.id, kind = msg.inner.kind(), "dispatching daemon message");
     // The correlation id rides the envelope (`msg.id`); the front-end resolves
     // the matching pending slot before calling this (it owns the
     // `PendingReplies` table), so dispatch keys purely on the payload. The

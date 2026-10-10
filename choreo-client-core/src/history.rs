@@ -107,8 +107,9 @@ impl SessionView {
     /// re-broadcasts its turn (`Failed` arrives with no final `TurnAppended`),
     /// and a success whose final broadcast was dropped under load would
     /// otherwise leak entries too.  Callers invoke this from their
-    /// request-terminal handlers (`handle_done` / `handle_failed`) so the map
-    /// stays bounded by in-flight calls even on those paths.
+    /// request-terminal handlers (`handle_done` / `handle_failed` /
+    /// `handle_cancelled`) so the map stays bounded by in-flight calls even on
+    /// those paths.
     pub fn clear_tool_call_descriptions(&mut self, turn_id: u32) {
         if let Some(turn) = self.turns.get(&turn_id) {
             for tc in &turn.tool_calls {

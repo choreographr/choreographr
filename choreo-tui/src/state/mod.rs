@@ -1630,7 +1630,8 @@ impl TurnEventHandler for App {
     }
 
     fn handle_failed(&mut self, session_id: Option<u64>, stream_id: u64, error: String) {
-        tracing::trace!(%stream_id, %error, "handle_failed");
+        // Never `%error`: a failure message can embed provider/request text.
+        tracing::trace!(%stream_id, error_len = error.len(), "handle_failed");
         // A connection-level failure (e.g. "no session attached" from
         // RunInput/SetModel/SetReasoningEffort) arrives with `session_id:
         // None` — no origin session — meaning "the attached session".  Resolve

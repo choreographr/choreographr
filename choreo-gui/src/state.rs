@@ -118,7 +118,8 @@ impl TurnEventHandler for AppState {
     }
 
     fn handle_failed(&mut self, _session_id: Option<u64>, stream_id: u64, error: String) {
-        trace!(%stream_id, %error, "handle_failed");
+        // Never `%error`: a failure message can embed provider/request text.
+        trace!(%stream_id, error_len = error.len(), "handle_failed");
         // A failed request never re-broadcasts its turn, so `insert_or_replace`
         // won't clean the description map — clear it here (before the
         // request→turn mapping is removed) to keep the map bounded by
