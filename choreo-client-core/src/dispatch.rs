@@ -124,9 +124,14 @@ pub trait TurnEventHandler {
         token_usage: Option<TokenUsage>,
         last_prompt_tokens: Option<u32>,
     );
-    /// A request failed or was cancelled. `session_id` is `None` for
-    /// connection-level failures with no originating session.
+    /// A request failed. `session_id` is `None` for connection-level failures
+    /// with no originating session.
     fn handle_failed(&mut self, session_id: Option<u64>, stream_id: u64, error: String);
+    /// A request was cancelled by the user. Unlike [`Self::handle_failed`], this
+    /// is not an error — implementations should report it as a cancel, not a
+    /// failure. `session_id` is `None` for connection-level cancels with no
+    /// originating session.
+    fn handle_cancelled(&mut self, session_id: Option<u64>, stream_id: u64);
     /// A tool-call lifecycle event occurred for `stream_id`.
     fn handle_tool_call_event(&mut self, session_id: u64, stream_id: u64, event: ToolCallEvent);
     /// A chunk of raw tool-result bytes arrived for `call_id` on `stream_id`.
@@ -512,7 +517,9 @@ fn dispatch_flat_message(msg: DaemonMessageType, handler: &mut impl TurnEventHan
 /// Connection-level replies arrive without an origin session (`None`) — the
 /// daemon synthesizes them on its connection dispatch when there is no
 /// session task to supply an origin (e.g. `Failed` "no session attached").
-/// Six events are None-capable: the two failure-shaped ones below, plus
+/// Six events are None-capable: the two request-terminal ones below —
+/// `Failed` (routed to `handle_failed`) and `Cancelled` (routed to
+/// `handle_cancelled`) — plus
 /// `ModelSelectionFailed`/`ReasoningEffortSet(`/`Failed`)/`SessionFailed` —
 /// which never use the origin in this generic dispatch (they surface via
 /// `handle_error`/`handle_status_text`), so the `None` case must not be
@@ -549,7 +556,10 @@ fn dispatch_session_event(
             return;
         }
         SessionEvent::Cancelled { stream_id } => {
-            handler.handle_failed(session_id.copied(), *stream_id, "cancelled".to_string());
+            // A cancel is its own terminal outcome, not a failure: route it to
+            // `handle_cancelled` so the front-end reports `idle` rather than a
+            // red error block.
+            handler.handle_cancelled(session_id.copied(), *stream_id);
             return;
         }
         SessionEvent::ModelSelectionFailed { model, error } => {
@@ -770,5 +780,138 @@ fn dispatch_session_event(
         | SessionEvent::ReasoningEffortSet { .. }
         | SessionEvent::ReasoningEffortSetFailed { .. }
         | SessionEvent::SessionFailed { .. } => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal recording [`TurnEventHandler`] that captures which terminal
+    /// handler each dispatched event reached, so a test can prove a cancel is
+    /// routed to `handle_cancelled` and never to `handle_failed`.
+    #[derive(Default)]
+    struct Recorder {
+        failed: Vec<(Option<u64>, u64)>,
+        cancelled: Vec<(Option<u64>, u64)>,
+    }
+
+    impl TurnEventHandler for Recorder {
+        fn handle_turn_appended(&mut self, _session_id: u64, _turn_id: u32, _turn: Turn) {}
+        fn handle_turns_undone(&mut self, _session_id: u64, _turn_ids: &[u32]) {}
+        fn handle_turns_redone(&mut self, _session_id: u64, _turns: BTreeMap<u32, Turn>) {}
+        fn handle_request_stream(
+            &mut self,
+            _session_id: u64,
+            _stream_id: u64,
+            _stream: OutputStream,
+            _data: Cow<'_, str>,
+        ) {
+        }
+        fn handle_started(
+            &mut self,
+            _session_id: u64,
+            _stream_id: u64,
+            _turn_id: u32,
+            _estimated_prompt_tokens: u32,
+        ) {
+        }
+        fn handle_done(
+            &mut self,
+            _session_id: u64,
+            _stream_id: u64,
+            _token_usage: Option<TokenUsage>,
+            _last_prompt_tokens: Option<u32>,
+        ) {
+        }
+        fn handle_failed(&mut self, session_id: Option<u64>, stream_id: u64, _error: String) {
+            self.failed.push((session_id, stream_id));
+        }
+        fn handle_cancelled(&mut self, session_id: Option<u64>, stream_id: u64) {
+            self.cancelled.push((session_id, stream_id));
+        }
+        fn handle_tool_call_event(
+            &mut self,
+            _session_id: u64,
+            _stream_id: u64,
+            _event: ToolCallEvent,
+        ) {
+        }
+        fn handle_tool_result_chunk(
+            &mut self,
+            _session_id: u64,
+            _stream_id: u64,
+            _call_id: String,
+            _data: Vec<u8>,
+        ) {
+        }
+        fn handle_session_state(&mut self, _state: SessionStateData) {}
+        fn handle_status_text(&mut self, _text: String) {}
+        fn handle_error(&mut self, _error: String) {}
+        fn handle_session_attached(&mut self, _session_id: u64) {}
+        fn handle_session_created(
+            &mut self,
+            _session_id: u64,
+            _title: Option<String>,
+            _working_dir: Option<String>,
+            _account_name: Option<String>,
+            _selected_model: Option<String>,
+            _reasoning_effort: Option<String>,
+        ) {
+        }
+        fn handle_session_status_changed(
+            &mut self,
+            _session_id: u64,
+            _status: SessionStatus,
+            _last_modified: i64,
+        ) {
+        }
+        fn handle_token_usage_update(
+            &mut self,
+            _session_id: u64,
+            _token_usage: TokenUsage,
+            _last_prompt_tokens: Option<u32>,
+        ) {
+        }
+    }
+
+    /// Wrap a session event in the `Session` envelope the daemon uses for
+    /// session-scoped broadcasts (origin session present).
+    fn session_msg(event: SessionEvent) -> DaemonMessage {
+        DaemonMessage::broadcast(DaemonMessageType::Session {
+            session_id: Some(1),
+            event,
+        })
+    }
+
+    #[test]
+    fn cancelled_reaches_handle_cancelled_not_handle_failed() {
+        let mut rec = Recorder::default();
+        dispatch_daemon_message(
+            session_msg(SessionEvent::Cancelled { stream_id: 7 }),
+            &mut rec,
+        );
+        assert_eq!(rec.cancelled, vec![(Some(1), 7)]);
+        assert!(
+            rec.failed.is_empty(),
+            "a cancel must be routed away from handle_failed"
+        );
+    }
+
+    #[test]
+    fn failed_reaches_handle_failed_not_handle_cancelled() {
+        let mut rec = Recorder::default();
+        dispatch_daemon_message(
+            session_msg(SessionEvent::Failed {
+                stream_id: 9,
+                error: "boom".to_string(),
+            }),
+            &mut rec,
+        );
+        assert_eq!(rec.failed, vec![(Some(1), 9)]);
+        assert!(
+            rec.cancelled.is_empty(),
+            "a failure must be routed away from handle_cancelled"
+        );
     }
 }

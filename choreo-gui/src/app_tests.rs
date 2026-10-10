@@ -338,3 +338,59 @@ fn keystore_unbound_status_push_auto_binds() {
     );
     assert!(rx.try_recv().is_err(), "no second bind attempt");
 }
+
+// ── Turn cancellation vs failure ──────────────────────────────────────
+
+#[test]
+fn cancelled_records_no_error_while_failed_does() {
+    let mut state = AppState::new("/tmp/choreographr.sock");
+
+    // Map stream 7 to a turn so the teardown has something to drop.
+    dispatch_daemon_message(
+        DaemonMessage::broadcast(DaemonMessageType::Session {
+            session_id: Some(1),
+            event: SessionEvent::Started {
+                stream_id: 7,
+                turn_id: 1,
+                estimated_prompt_tokens: 0,
+            },
+        }),
+        &mut state,
+    );
+    assert_eq!(state.session_view.request_to_turn.get(&7), Some(&1));
+
+    // A user cancel tears the request down without any `[error]` line.
+    dispatch_daemon_message(
+        DaemonMessage::broadcast(DaemonMessageType::Session {
+            session_id: Some(1),
+            event: SessionEvent::Cancelled { stream_id: 7 },
+        }),
+        &mut state,
+    );
+    assert!(
+        !state.status_texts.iter().any(|t| t.starts_with("[error]")),
+        "a cancel must not push an error line: {:?}",
+        state.status_texts
+    );
+    assert!(
+        !state.session_view.request_to_turn.contains_key(&7),
+        "the cancelled request must be torn down"
+    );
+
+    // A failure still surfaces as an error line.
+    dispatch_daemon_message(
+        DaemonMessage::broadcast(DaemonMessageType::Session {
+            session_id: Some(1),
+            event: SessionEvent::Failed {
+                stream_id: 8,
+                error: "boom".to_string(),
+            },
+        }),
+        &mut state,
+    );
+    assert!(
+        state.status_texts.iter().any(|t| t == "[error] boom"),
+        "a failure must push an error line: {:?}",
+        state.status_texts
+    );
+}

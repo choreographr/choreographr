@@ -3995,6 +3995,24 @@ fn failed_and_cancelled_records() {
         s
     }];
 
+    app.handle_cancelled(Some(1), 8);
+    let seq = app
+        .desired_status_records()
+        .into_iter()
+        .find(|(id, _)| *id == 1)
+        .map(|(_, seq)| seq)
+        .expect("attached record");
+    assert!(seq.contains("state=idle"), "got {seq}");
+    assert!(
+        app.display_for(1).error.is_none(),
+        "a user cancel must not record an error"
+    );
+    assert!(
+        app.error.is_none(),
+        "a user cancel must not write the global error bar"
+    );
+
+    // A real failure still reports `error` and records its message.
     app.handle_failed(Some(1), 7, "boom".into());
     let seq = app
         .desired_status_records()
@@ -4003,17 +4021,7 @@ fn failed_and_cancelled_records() {
         .map(|(_, seq)| seq)
         .expect("attached record");
     assert!(seq.contains("state=error"), "got {seq}");
-
-    // A cancellation is routed here with the literal "cancelled" error and
-    // reports `idle`, not `error`.
-    app.handle_failed(Some(1), 8, "cancelled".into());
-    let seq = app
-        .desired_status_records()
-        .into_iter()
-        .find(|(id, _)| *id == 1)
-        .map(|(_, seq)| seq)
-        .expect("attached record");
-    assert!(seq.contains("state=idle"), "got {seq}");
+    assert_eq!(app.display_for(1).error.as_deref(), Some("boom"));
 }
 
 #[test]

@@ -22,13 +22,6 @@ use std::collections::{HashMap, HashSet};
 
 use crate::markdown_render::{lines_height, plain_text_lines};
 
-/// The literal error `choreo-client-core`'s dispatcher attaches to a
-/// `SessionEvent::Cancelled` when it routes it through
-/// [`TurnEventHandler::handle_failed`] (see `dispatch_session_event`). A
-/// cancellation is not a failure, so the program-status record reports `idle`
-/// rather than `error`.
-const CANCELLED_ERROR: &str = "cancelled";
-
 /// The tool NAME of a `ToolCall` status (never its arguments), used as an
 /// OSC 7501 `msg`.
 fn tool_call_name(status: &SessionStatus) -> Option<&str> {
@@ -1519,6 +1512,30 @@ fn turn_has_live_content(accumulated: &Turn, snapshot: &Turn) -> bool {
         || (!accumulated.displayed_images.is_empty() && snapshot.displayed_images.is_empty())
 }
 
+impl App {
+    /// Tear down the per-session display state a terminal request outcome
+    /// leaves behind.  A failure (`handle_failed`) and a cancel
+    /// (`handle_cancelled`) both end an in-flight request, so they share this
+    /// teardown: clear the tool-call description map for the closing turn,
+    /// drop the request→turn mapping, and reset streaming state.
+    fn finish_request(&mut self, session_id: u64, stream_id: u64) {
+        let display = self.display_for(session_id);
+        // A request that ends without re-broadcasting its turn never runs
+        // `insert_or_replace`, so the description map is not cleaned
+        // automatically — clear it here (before the request→turn mapping is
+        // removed) to keep the map bounded by in-flight calls even on the
+        // terminal path.
+        if let Some(&turn_id) = display.view.request_to_turn.get(&stream_id) {
+            display.view.clear_tool_call_descriptions(turn_id);
+        }
+        display.view.request_to_turn.remove(&stream_id);
+        display.active.remove(&stream_id);
+        display.streaming_turn_index = None;
+        display.streaming_response = None;
+        display.mark_content_changed();
+    }
+}
+
 // ── TurnEventHandler implementation ──────────────────────────────────
 
 impl TurnEventHandler for App {
@@ -1717,22 +1734,14 @@ impl TurnEventHandler for App {
             }
             return;
         };
-        // A request-level failure/cancellation is a turn outcome
-        // `SessionStatus` cannot express — record it so it survives the
-        // trailing idle status. A connection-level rejection has no origin
-        // session and is not a session turn outcome, so it is left to the
-        // status line. A cancellation is not a failure, so it reports `idle`
-        // (the dispatcher routes `SessionEvent::Cancelled` here with the
-        // literal `cancelled` error).
+        // A request-level failure is a turn outcome `SessionStatus` cannot
+        // express — record it so it survives the trailing idle status. A
+        // connection-level rejection has no origin session and is not a
+        // session turn outcome, so it is left to the status line.  A
+        // cancellation never reaches here (it has its own `handle_cancelled`)
+        // — this is a real failure, so it reports `error`.
         if !is_connection_level {
-            self.term_status_override.insert(
-                session_id,
-                if error == CANCELLED_ERROR {
-                    "idle"
-                } else {
-                    "error"
-                },
-            );
+            self.term_status_override.insert(session_id, "error");
             self.term_status_dirty = true;
         }
         // A connection-level failure has no turn to render an error block in,
@@ -1745,22 +1754,30 @@ impl TurnEventHandler for App {
         if is_connection_level {
             self.error = Some(error.clone());
         }
-        let display = self.display_for(session_id);
         // The per-session display records the failure for whichever session it
         // belongs to (rendered once the user views that session).
-        display.error = Some(error);
-        // A failed request never re-broadcasts its turn, so `insert_or_replace`
-        // won't clean the description map — clear it here (before the
-        // request→turn mapping is removed) to keep the map bounded by
-        // in-flight calls even on the failure path.
-        if let Some(&turn_id) = display.view.request_to_turn.get(&stream_id) {
-            display.view.clear_tool_call_descriptions(turn_id);
-        }
-        display.view.request_to_turn.remove(&stream_id);
-        display.active.remove(&stream_id);
-        display.streaming_turn_index = None;
-        display.streaming_response = None;
-        display.mark_content_changed();
+        self.display_for(session_id).error = Some(error);
+        self.finish_request(session_id, stream_id);
+    }
+
+    fn handle_cancelled(&mut self, session_id: Option<u64>, stream_id: u64) {
+        tracing::trace!(%stream_id, "handle_cancelled");
+        // A connection-level cancel (no origin session) resolves to the
+        // attached session, mirroring `handle_failed`, so it never lands in a
+        // phantom display.  A cancel carries no text, so when there is no
+        // session to route to there is nothing to show and we simply stop.
+        let Some(session_id) = self.resolve_daemon_session(session_id) else {
+            tracing::debug!(%stream_id, "dropping cancel: no attached session to route it to");
+            return;
+        };
+        // A cancel is a terminal turn outcome `SessionStatus` cannot express,
+        // but it is NOT a failure: report `idle` rather than `error` so the
+        // cancelled turn clears its working state without a red error block.
+        self.term_status_override.insert(session_id, "idle");
+        self.term_status_dirty = true;
+        // Deliberately NO error text (neither `self.error` nor `display.error`)
+        // — a user cancel must not render as a failure.
+        self.finish_request(session_id, stream_id);
     }
 
     fn handle_tool_call_event(&mut self, session_id: u64, stream_id: u64, event: ToolCallEvent) {

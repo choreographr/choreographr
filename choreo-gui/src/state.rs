@@ -130,6 +130,17 @@ impl TurnEventHandler for AppState {
         self.status_texts.push(format!("[error] {error}"));
     }
 
+    fn handle_cancelled(&mut self, _session_id: Option<u64>, stream_id: u64) {
+        trace!(%stream_id, "handle_cancelled");
+        // A cancel ends the in-flight request exactly like a failure, so run
+        // the same request→turn teardown — but a user cancel is not an error,
+        // so nothing is pushed to the status feed (no `[error]` line).
+        if let Some(&turn_id) = self.session_view.request_to_turn.get(&stream_id) {
+            self.session_view.clear_tool_call_descriptions(turn_id);
+        }
+        self.session_view.request_to_turn.remove(&stream_id);
+    }
+
     fn handle_tool_call_event(&mut self, _session_id: u64, stream_id: u64, event: ToolCallEvent) {
         // Never `?event`: it carries the tool's arguments and output.
         trace!(%stream_id, "handle_tool_call_event");
