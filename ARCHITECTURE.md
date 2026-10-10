@@ -1690,7 +1690,7 @@ On the client side, `last_prompt_tokens` is not cumulative, so the TUI
 gap-fills it from snapshots (never overwriting a fresher value) instead of
 max-merging it.
 
-**Key type** — `TokenUsage` (choreo-proto/src/types.rs):
+**Key type** — `TokenUsage` (choreo-proto/src/types/common.rs):
 ```rust
 pub struct TokenUsage {
     pub input_tokens: u32,

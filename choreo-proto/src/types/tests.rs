@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeMap;
 
 #[test]
 fn session_status_idle_and_active_partition_busy_states() {
