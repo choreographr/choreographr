@@ -17,7 +17,8 @@
 //!
 //! All four modules expose [`ContentError`]-returning, blocking `execute_*`
 //! functions. The daemon registers thin `Tool` wrappers over them under the
-//! `coord` tool group.
+//! `content` tool group (the tools themselves keep their pre-rename `coord_*`
+//! names).
 //!
 //! [tokio sidecar runtime]: runtime
 

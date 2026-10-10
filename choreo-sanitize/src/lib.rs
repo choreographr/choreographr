@@ -1,6 +1,6 @@
 //! Shared string-safety primitives for tool output.
 //!
-//! This leaf crate is the single source of truth for two things every
+//! This leaf crate is the single source of truth for three things every
 //! consumer of tool output needs to agree on:
 //!
 //! - **The Unicode spoofing predicates** — which characters may reorder,

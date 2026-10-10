@@ -433,103 +433,9 @@ is declared by the root package's `src/bin/choreographr.rs`.
 
 ---
 
-## Crate details
+## Wire protocol
 
-This section keeps the **cross-cutting** story; the per-module **API reference**
-for each crate lives in its in-source rustdoc (`cargo doc`, `just doc`). The two
-are complementary by design: rustdoc owns a module's purpose, its public items'
-contracts, and its local invariants/portability notes (everything that changes
-when exactly one crate changes), while this file owns what spans two or more
-crates — topology, data flow, the security model, and design rationale. A crate
-is **migrated** once every public item carries docs and its rustdoc is
-warning-free; it then carries `#![warn(missing_docs)]` at its crate root and
-joins the `doc_crates` list that `just doc-check` (a `pre-commit` step) holds to
-`-D warnings`.
-
-### `choreo-shared` — Shared binary helpers
-
-A deliberately tiny **leaf crate** (`clap`, `dirs`, `tracing`, and
-`tracing-subscriber` only) holding the small, binary-facing helpers every CLI
-crate in the suite would otherwise duplicate. It carries no protocol or
-transport logic — `choreo-proto` stays the wire protocol. The public API —
-modules, types, functions, and error variants — is documented in-source:
-`cargo doc -p choreo-shared` (or `just doc`), held complete by the
-`#![warn(missing_docs)]` + `doc-check` gate.
-
-The crate owns the suite's dance-style **release name**: the raw name in
-`choreo-shared/release-name.txt` is baked into every binary with `include_str!`
-(compile-time inclusion, no `build.rs`; the file sits inside the crate directory
-so it also ships in the published `.crate`) and read by the CI release job for
-the GitHub release title, so every binary's `--version`/startup banner and the
-release title share one source of truth (see [RELEASE.md](./RELEASE.md)). The
-shared `-v`/`-q` verbosity flags and log-level policy, and the one
-filesystem-layout resolver every crate resolves through, also live here; the
-resolver's `--base-dir` override is described in **The base directory** below.
-
-### The base directory (`--base-dir`)
-
-By default each path resolves through its own XDG base directory (the spec
-mandates no single base): `dirs::config_dir()/choreographr`,
-`dirs::data_dir()/choreographr`, the socket in `$XDG_RUNTIME_DIR`, and logs in
-`$XDG_STATE_HOME/choreographr` (the last two falling back to the platform temp
-dir where no runtime/state dir exists — macOS/Windows). The
-`--base-dir <PATH>` flag (all five binaries: `choreographr`, `choreo-tui`,
-`choreo-gui`, `choreo-acp`, `choreo-im`) — or the `CHOREOGRAPHR_BASE_DIR`
-environment variable — relocates the WHOLE instance under one root. Because the
-base plays the role of the entire XDG home, its parents are already
-app-private, so the `choreographr` segment is dropped (unlike the default,
-where `~/.config` / `~/.local/share` are shared):
-
-```text
-{base}/config/   config.toml, accounts.toml, mcp.json, trust.toml,
-                 models-overlay.toml, authorized_clients.toml,
-                 identity.pk, transport.sec/.pub, known_servers.toml
-{base}/data/     state.redb, catalog.bin
-{base}/run/      choreographr.sock
-{base}/log/      <binary>.log
-```
-
-Precedence: `--base-dir` / `CHOREOGRAPHR_BASE_DIR` over the platform dirs; the
-file-specific `CHOREOGRAPHR_DB_PATH` / `CHOREOGRAPHR_SOCKET_PATH` still win over
-both, so a single file can be pinned independently.
-
-**Why an environment variable carries it.** The base must be visible to path
-resolution in *separate processes* — the daemon is a child of the TUI, the ACP
-adapter is launched by an editor, the IM bridge by an operator — and the socket
-path is resolved in `choreo-proto`, which has no other reason to know the
-config dir. `set_base_dir_from_cli` writes `CHOREOGRAPHR_BASE_DIR` once at
-startup (single-threaded, before any thread spawns — the one contained
-`set_var` in the suite), so every resolver and every child process agrees
-without explicit forwarding.
-
-**Migration.** The default layout's config and data roots are two separate
-platform dirs, so they cannot both be expressed as one base. `choreographr
-migrate --base-dir <PATH> [--move] [--dry-run] [--force]` relocates an existing
-install (copy by default, leaving the old layout reversible); it reads the
-*platform-default* locations as the source and copies the keystore files
-verbatim, so the transport identity is preserved and a client's pinned server
-key keeps verifying (no re-pair). With a base set but its dirs empty while the
-default dirs exist, startup logs a loud warning (a silent fresh instance is the
-one real footgun).
-
-### `choreo-proto` — Wire protocol
-
-Defines all shared message types and framing. It depends on `choreo-shared`
-only for the filesystem-layout resolver (the base-dir-aware socket default).
-It also owns the two unix-socket-path helpers every side of the wire must agree
-on: `socket_path()` (the `CHOREOGRAPHR_SOCKET_PATH`-aware default, which falls
-back to `default_socket_path()` — `{base}/run/choreographr.sock` under a base
-dir, else `$XDG_RUNTIME_DIR/choreographr.sock`, else the platform temp dir) and
-the
-dial primitives `connect_unix` / `socket_listening` / `dial_error_means_no_listener`
-(with the platform-resolved `UnixStream` re-export: std on unix, `uds_windows`
-on Windows). Keeping the dial and its "nothing is listening" classification
-here means the client (autostart) and the daemon (stale-socket probe) cannot
-classify a socket path differently.
-
-The public API — modules, types, functions, and error variants — is documented
-in-source: `cargo doc -p choreo-proto` (or `just doc`), held complete by the
-`#![warn(missing_docs)]` + `doc-check` gate.
+Defines all shared message types and framing.
 
 The envelope design is cross-cutting. Both directions use one shaped frame — a
 `ClientMessage` is `{ id: u64, inner: ClientMessageType }`, a `DaemonMessage` is
@@ -586,185 +492,6 @@ Rust-only, language-isolated internal channels —
 the RISC-V VM↔host protocol and the encrypted credential pipeline — where no
 foreign reader will ever touch the bytes.
 
-
-### `choreo-sanitize` — Shared string-safety primitives
-
-An internal leaf crate (`publish = true`, no workspace deps beyond
-`unicode-general-category`) that is the single source of truth for three things
-every consumer of tool output must agree on — the Unicode "spoofing"
-predicates, the tool-output byte budget, and the child-process code-injection
-environment set. The public API — modules, types, functions, and error variants
-— is documented in-source: `cargo doc -p choreo-sanitize` (or `just doc`), held
-complete by the `#![warn(missing_docs)]` + `doc-check` gate.
-
-The crate exists so this logic has exactly one home: it would otherwise be
-duplicated across `choreo-daemon` (the line-oriented `sanitize_keeps`
-predicates, the `tools/mod.rs` re-exports, and `tools/shell_util.rs`'s
-`strip_injection_env`), `choreo-blockchain` (the node-output sanitizer),
-`choreo-tui` (`markdown_render/text.rs`'s terminal sink filter),
-`choreo-client-core` (`history.rs`'s live streaming cap), and `choreo-mcp`
-(`stdio.rs`'s child-env stripping). Consolidating it into one leaf crate means a
-policy or budget change (or a Unicode table bump, or an added injection
-variable) is applied everywhere at once, and the guard tests live next to the
-code they protect.
-
-
-### `choreo-image` — Shared image decode helpers
-
-A leaf crate (`publish = true`, depends only on `image` + `heif-oxide` +
-`tracing`) that owns the two decode paths shared by `choreo-daemon` (vision
-normalization for `read_image`, and `display_image`) and `choreo-tui` (client
-display decode), so the model path and the UI path can never drift apart. The
-public API — modules, types, functions, and error variants — is documented
-in-source: `cargo doc -p choreo-image` (or `just doc`), held complete by the
-`#![warn(missing_docs)]` + `doc-check` gate. Its only log emission is a
-`warn!`-level `tracing` event when the HEIC guard rejects a container, so a
-rejected hostile input is observable without the crate owning any state.
-
-Both decode paths run under a decompression-bomb guard: the raster path checks
-the total-pixel budget `MAX_DECODE_PIXELS` against the image's declared size
-before any allocation (with `image::Limits` as defense-in-depth), and the HEIC
-pre-decode path parses the container's declared geometry — every `ispe` extent
-and every `grid` derived item's canvas — and rejects any container that exceeds
-the budget or whose geometry cannot be proved, before `heif-oxide` runs.
-`heif-oxide` exposes no decoder limit and allocates from file-declared geometry,
-so this guard is what closes the pre-allocation amplification vector a per-item
-cap alone does not; the box-walk detail lives in `choreo-image`'s `heif` module
-docs.
-
-### `choreo-keystore` — Per-daemon unlock-key keystore crypto
-
-Provides the cryptographic primitives for credential management. No longer a
-standalone CLI binary — it is a library used by `choreo-client-core` and
-`choreo-daemon`. The public API — modules, types, functions, and error variants
-— is documented in-source: `cargo doc -p choreo-keystore` (or `just doc`), held
-complete by the `#![warn(missing_docs)]` + `doc-check` gate.
-
-**Per-daemon unlock key (X25519):**
-Each daemon's credential keystore is governed by ONE X25519 keypair belonging to
-that daemon. The daemon stores only the *binding* — the public key derived from
-that pair — and the private half (the "unlock key") is held CLIENT-side, one per
-daemon, in the client's `known_servers.toml`. The binding is created by exactly
-ONE wire path, `ClientMessage::BindKeystore` (TOFU): on an unbound keystore it
-ADOPTS the presented key (loud `KEYSTORE BOUND` log) and implies unlock; on an
-already-bound keystore it verifies only. `Unlock` and `AddCredential` are
-strictly VERIFY-ONLY — they never create a binding (an unbound keystore answers
-`KeystoreUnbound`, a bound one answers `LockedError` on a mismatch). Binding
-keys are always freshly generated client-side at bind time; pre-held keys
-(stored known_servers key or the legacy file) verify existing bindings and never
-create new ones. Binding is TOFU-once — there is no rotation.
-
-The legacy `identity.pk` / `public.pk` client keypair (and `ensure_keypair`)
-have been **removed**. One legacy file remains as a fallback unlock-key source:
-- `~/.config/choreographr/identity.pk` — raw 32-byte legacy private key. Used
-  ONLY as an unlock-VERIFICATION fallback when no unlock key is stored for the
-  addr — it NEVER creates a binding and is NEVER deleted; the file's key is
-  COPIED into `known_servers.toml` on first use (the store is the single source
-  of truth). Encrypted-key resolution (`identity.pk.enc` +
-  `CHOREOGRAPHR_KEYSTORE_PASSPHRASE`) has been **removed** entirely.
-
-Credentials are encrypted per-credential — a client-side pipeline of postcard
-serialization, X25519 ECDH against the daemon's unlock-key public key, HKDF, and
-AES-256-GCM — so only the authorized holder of the unlock key can test-decrypt
-them; the envelope layout and flow live in the `crypto` module docs. The
-encrypted blobs are stored in the `redb` database alongside sessions, and the
-daemon refuses to persist a blob it cannot test-decrypt with its bound key
-(enforcing that every credential in a keystore shares one key). The keystore's
-on-disk path layout resolves through the shared `choreo_shared::paths::config_dir()`,
-so the `--base-dir` override relocates the keystore with the rest of the instance.
-
-
-### `choreo-transport` — Noise IK/XX encrypted transport
-
-A small crate providing Noise IK and XX handshakes and encrypted message I/O over
-TCP, used by both `choreo-client-core` (client side) and `choreo-daemon` (server
-side). The public API — modules, types, functions, and error variants — is
-documented in-source: `cargo doc -p choreo-transport` (or `just doc`), held
-complete by the `#![warn(missing_docs)]` + `doc-check` gate.
-
-**`noise` — the encrypted stream.** `NoiseStream` wraps `TcpStream` +
-`snow::TransportState` with length-prefixed AES-256-GCM framing. Payloads above
-snow's 65535-byte single-message ciphertext cap are split into fragments and
-reassembled transparently, so the effective per-message cap is the proto codec's
-64 MiB `MAX_FRAME_SIZE`. The reassembly decision is made from an AUTHENTICATED
-continuation byte embedded as the first byte of each fragment's plaintext
-(covered by the AES-GCM tag) — the 4-byte wire length prefix carries no
-continuation flag, so a wire-level tamper can never silently truncate or extend a
-message: any prefix flip either trips the size cap or fails the GCM
-authentication. The unauthenticated prefix is validated before any allocation
-(snow's 65535-byte ciphertext cap) and reassembly is capped at the codec's 64 MiB
-`MAX_FRAME_SIZE` (enforced on both send and receive), so a hostile or corrupted
-peer cannot force a huge buffer allocation. The shared `TransportState` lock is
-held only per-chunk during encryption, never during the blocking socket writes —
-together with the single-writer-per-connection discipline on the daemon, this
-prevents a bidirectional large-message deadlock (see
-`noise_concurrent_bidirectional_large_messages`). A runtime single-writer guard
-on `send_message` rejects a concurrent second sender instead of interleaving
-fragments. EOF-class read failures (the peer closing its end mid-read) surface as
-`TransportError::ConnectionClosed` rather than a raw `Io(UnexpectedEof)`, so the
-daemon's read loop logs a graceful disconnect instead of an error. The
-`Arc<Mutex<TransportState>>` and the `Arc<AtomicBool>` single-writer guard are
-shared across `try_clone` reader/writer clones — a deliberate, documented
-exception to the workspace's message-passing rule (the transport state must be
-shared for the clones to interleave encrypt/decrypt on one connection; the guard
-is a single-bit flag in the spirit of the sanctioned cooperative-cancellation-flag
-exception).
-
-**`handshake` — IK/XX and the wire-v5 mode preamble.** IK is the normal
-authenticated mode (the client knows the server's static in advance — the pinned
-`transport.pub`); XX is first-contact mode (the client does NOT know the server's
-static, learns it from handshake message 2, and returns it so the caller can
-verify it out-of-band — fingerprint confirmation — BEFORE any protocol traffic
-flows; the daemon starts the writer thread only after the caller's
-`on_first_contact` callback approves, so an `Unlock` can never leak to an
-unconfirmed server). **TCP wire v5: every TCP connection starts with a 1-byte
-unauthenticated mode preamble** (`PREAMBLE_IK` = 0x01, `PREAMBLE_XX` = 0x02; 0x00
-is deliberately never assigned so all-zero garbage can never select a mode),
-which authorizes NOTHING — it only selects which equally-authenticated handshake
-runs; a MITM cannot downgrade or impersonate via it because both handshakes
-authenticate both static keys. XX's ACL check necessarily runs after message 3
-(the client's static only arrives there), so a rejected XX client's handshake
-succeeds client-side and the rejection surfaces as a clean `ConnectionClosed` on
-the data plane — the rejected client never sends or receives a single data-plane
-byte. All four handshakes are bounded by an ABSOLUTE deadline enforced across
-every handshake read AND write, so a peer that connects and stalls — or dribbles
-bytes to keep a per-read timeout from firing — cannot hold a connection thread +
-FD forever; deadline expiry surfaces as `TransportError::HandshakeTimeout`.
-
-**`key` — transport keypair.** The on-disk keypair resolves through the shared
-`choreo_shared::paths::config_dir()`, so `--base-dir` relocates it with the rest
-of the instance. The human-comparable `fingerprint` rendering is a cross-crate
-contract: base64 clustered into 4-char groups — bijective with the 32-byte key,
-no hashing — and cross-checkable against the ACL's plain-base64 form by stripping
-separators; it enforces exactly 32 bytes so a truncated file errors rather than
-rendering a plausible lie.
-
-The server-side TCP/Noise handler lives in `choreo-daemon/src/server/connection.rs`
-(`tcp_client_thread`, with the preamble read + handshake-mode dispatch in
-`tcp_handshake_and_client_thread`), where the Noise IK or XX handshake is
-performed and the encrypted stream enters the same dispatch loop as Unix
-socket clients.
-
-
-### `choreo-client-core` — Shared client logic
-
-Used by `choreo-tui`, `choreo-gui`, and `choreo-im`. The public API — modules,
-types, functions, and error variants — is documented in-source:
-`cargo doc -p choreo-client-core` (or `just doc`), held complete by the
-`#![warn(missing_docs)]` + `doc-check` gate.
-
-Two contracts here are cross-crate. The crate never depends on `choreo-daemon`:
-an in-process connection is built by stuffing the raw crossbeam channel ends of
-an embedded daemon's link into `ConnectionMode::InProcess` (the GUI creates the
-link and passes the ends in). And the dispatch layer enumerates the daemon's
-payload enum with no wildcard arm, matching the wire-contract rule that the
-variant set IS the protocol, so a new variant is a compile-time triage point.
-Every other per-module contract — the unified command model and catalog, the
-connect-time keystore handshake, the `known_servers` trust store, the
-pending-request table, and the session-transcript view — lives in its module's
-docs.
-
-
 ## Enrollment & transport trust
 
 The TCP enrollment model is a deliberate ASYMMETRY — the SSH `known_hosts`
@@ -805,255 +532,17 @@ operator already trusts, or is confirmed by a human comparing fingerprints:
   seems to require in-band trust bootstrapping is a sign of trying to automate
   operator trust; revisit the XX confirm UX before weakening the gate.
 
-### `choreo-mcp` — MCP client (Model Context Protocol)
+The Noise transport's shared state is the workspace's **second** sanctioned
+shared-state exception (see AGENTS.md). `NoiseStream` clones one
+`Arc<Mutex<TransportState>>` and one `Arc<AtomicBool>` single-writer guard
+across its `try_clone` reader/writer halves, which must interleave
+encrypt/decrypt against the same snow `TransportState` — so the state is shared,
+not channeled. The lock is held only per chunk, never across blocking socket
+I/O (that scope is what prevents the bidirectional large-message deadlock), and
+the guard is a single-bit flag in the spirit of the cooperative-cancellation
+flag; the full rationale is in `choreo-transport`'s `noise` module docs.
 
-Communicates with MCP servers over the **official `rmcp` SDK**, using either the
-stdio transport (a child subprocess) or the **Streamable HTTP** transport (a
-remote POST endpoint). Used by `choreo-daemon` to reach external MCP servers
-and register their tools (via the daemon's `mcp` cargo feature, on by default —
-an embedder that cannot host MCP subprocesses opts out with
-`default-features = false`, which excludes the crate and makes the daemon's
-`mcp/` module compile to a no-op stub). Because `rmcp` is async and the daemon is
-thread-only, the crate owns one process-wide sidecar tokio runtime (`runtime`)
-and one **dispatcher thread per server** (`session`); the daemon never sees an
-`rmcp` type — the boundary is typed on this crate's own `McpServer`,
-`McpServerHandle`, `McpTool`, and `CallToolResult`.
-
-The public API — modules, types, functions, and error variants — is documented
-in-source: `cargo doc -p choreo-mcp` (or `just doc`), held complete by the
-`#![warn(missing_docs)]` + `doc-check` gate.
-
-Two values inside the `rmcp` engine are shared across threads as documented
-exceptions to the repo's channel-only thread-communication rule (see AGENTS.md).
-The engine's `running` field — the live `RunningService` handle — sits in a
-`tokio::sync::Mutex<Option<..>>` (the 8th sanctioned exception): a
-connection-lifecycle handle that must stay alive for the whole connection and be
-closed exactly once, so it is never touched per message — it sits behind a mutex
-only because `close` needs `&mut`, and `shutdown(&self)` `take`s it and holds the
-lock across the bounded `close_with_timeout(..).await`. The `ClientHandler`'s
-notification rate limiter carries a shared `Arc<std::sync::Mutex<LimiterState>>`
-(the 9th exception): `rmcp` delivers notifications to the handler on more than
-one task, so the fixed-window counter that bounds a connection's server logging
-notifications is shared across those callbacks — the lock guards only a handful
-of integers and is never held across an `await`.
-
-### `choreo-sockreg` — Provider-socket registry + keepalive tuning
-
-Two responsibilities, one small leaf crate: (1) `SocketRegistry` — tracks live
-provider sockets (by duplicate fd it OWNS) so a control thread can
-`shutdown_all` them out from under workers blocked in a provider
-`read`/`write` — channels cannot reach into a syscall, but
-`shutdown(fd, SHUT_RDWR)` makes the blocked read return immediately — and
-`prune_dead` (a non-blocking liveness probe) bounds growth; (2) `SocketTuning` —
-TCP keepalive options applied once right after connect so a half-dead connection
-(NAT timeout, cable pull) is noticed by the kernel. Registered sockets are
-duplicated at registration; the registry closes every fd it holds exactly once
-(explicit `close`, never `Drop`, so an already-closed fd's EBADF is logged rather
-than double-closed).
-
-The public API — modules, types, functions, and error variants — is documented
-in-source: `cargo doc -p choreo-sockreg` (or `just doc`), held complete by the
-`#![warn(missing_docs)]` + `doc-check` gate.
-
-The registry is the 7th sanctioned shared-state exception (see AGENTS.md). Each
-SESSION owns a registry (in `SessionState`), plus one daemon-owned one for
-non-session-scoped work (model prefetch, catalog fetch — never individually
-cancelled); each provider client is constructed against the registry of the unit
-of work that will use it. The daemon command loop holds one clone per live
-session (`DaemonState::session_registries`, entered at session spawn, dropped at
-session exit) so it can force-close a wedged session's sockets from the one
-thread that DECIDED the cancel — a session thread blocked in a provider `read()`
-cannot observe a channel message, and `shutdown` is the only thing that can
-un-block it. Cancellation granularity is exactly the SESSION (a registry = a
-session; sub-sessions own their own; a parent cancel closes the whole subtree).
-The internal lock is held only for a handful of fd syscalls and carries no
-message traffic, so channels (which cannot express "un-block another thread's
-blocked syscall") are not applicable. RAII deregistration completes the
-lifecycle: `register` returns a `SocketId`, and the `ureq` connector's
-`RegisteredTcpTransport` holds it plus a registry clone so its `Drop` calls
-`unregister` — entry removal is the single close-ownership-transfer signal, so
-the unregister after a prior `shutdown_all`/`prune` is a documented no-op and the
-guard can never double-close. In steady state the registry tracks only LIVE
-connections; the prune and the 256-entry cap remain purely as backstops. Both
-platforms are implemented — Unix via `nix`, Windows via `windows-sys` — behind
-one documented `socket_handle` helper.
-
-### `choreo-power-events` — Platform suspend/wake notifications
-
-One small leaf crate emitting `SuspendEvent::Sleep`/`Wake` on an unbounded
-crossbeam channel, consumed by the daemon's command loop (which forwards each
-event as `DaemonCommand::PowerEvent` over a dedicated `spawn_power_event_forwarder`
-thread — the same forwarder-into-command-channel shape as the config/ACL
-watchers).
-
-The public API — modules, types, functions, and error variants — is documented
-in-source: `cargo doc -p choreo-power-events` (or `just doc`), held complete by
-the `#![warn(missing_docs)]` + `doc-check` gate.
-
-These events are a CONVENIENCE layer, never a correctness layer: a machine can
-suspend without the platform API firing, so consumers must treat missed events as
-a non-issue and rely on sockreg's kernel keepalives as the fallback.
-`PowerMonitor::new` is strict (returns the underlying error);
-`PowerMonitor::best_effort` logs once and falls back to the inert mode — the
-daemon uses `best_effort`. `handle_suspend_event` force-closes EVERY session's
-socket registry (plus the daemon's own) on `Sleep` (proactively — the logind
-event precedes suspension) and logs only on `Wake`.
-
-### `choreo-ai-protocols` — Provider protocols
-
-The wire-protocol layer for LLM providers. Owns the three chat client
-implementations (`openai`, `anthropic`, `google`), the image- and
-video-generation clients, the `ProviderClient` trait and shared turn/error/message
-types they all use, the retry machinery, and the static provider catalog. It is
-free of daemon concerns — no metrics, no account configuration, no sessions — so
-it can be consumed independently of `choreo-daemon` (the daemon supplies those
-concerns at the boundary, e.g. via `ProviderOverrides` and by timing calls
-itself).
-
-The public API — modules, types, functions, and error variants — is documented
-in-source: `cargo doc -p choreo-ai-protocols` (or `just doc`), held complete by
-the `#![warn(missing_docs)]` + `doc-check` gate.
-
-**Threading — the single-writer `ArcSwap` snapshots (catalog + tool registry).**
-Two process-wide values are held in an `ArcSwap` as a documented exception to the
-repo's channel-only thread-communication rule (see AGENTS.md): the provider
-catalog (`PROVIDER_CATALOG`) and the daemon's tool registry
-(`DaemonState::tool_registry`, the `Arc<ArcSwap<ToolRegistry>>` every session
-and request worker shares). For both, readers are lock-free and the swap is an
-atomic `store()`, but there is a strict **single-writer invariant** — only the
-daemon command loop calls `replace_catalog` (after a catalog refresh, overlay
-change, or `/refresh-models`) and only the command loop swaps the tool registry
-(on `DaemonCommand::McpListChanged`, after an MCP server reports a list change).
-Every *change request* still travels by channel (maintenance thread → daemon
-loop → store; the MCP forwarder thread → daemon loop → store); no other thread
-mutates either value. Neither carries per-message data — each is an immutable
-snapshot atomically replaced wholesale.
-
-### `choreo-acp` — ACP bridge (Agent Communication Protocol)
-
-Its own crate: the `choreo-acp` package owns the binary (`src/main.rs`, a thin
-wrapper calling `choreo_acp::main()`), so default and release builds of the
-root package exclude it entirely; build it explicitly with `cargo build -p
-choreo-acp`. Entry point `src/main.rs`: initializes logging, connects to the
-daemon's Unix socket, spawns I/O threads, runs the main event loop.
-
-The ACP bridge translates the **Agent Communication Protocol** (JSON-RPC 2.0 over
-stdin/stdout) into `choreo-proto` messages sent to the daemon over its Unix socket.
-This allows ACP-compatible editors (Claude Code, Cline, etc.) to manage Choreographr sessions,
-send prompts, and receive streaming responses as if they were native Choreographr clients.
-
-**Thread topology:**
-
-```
-main()
-├── acp-reader thread: reads newline-delimited JSON-RPC lines from stdin,
-│   parses them, sends parsed RpcMessage into the shared event channel
-├── daemon-reader thread: reads DaemonMessages from the daemon socket,
-│   forwards them into the shared event channel
-├── daemon-writer thread: receives ClientMessages via a crossbeam channel
-│   and writes length-prefixed MessagePack frames to the daemon socket
-└── main thread: event loop — receives from the shared event channel
-    and dispatches to the appropriate handler
-```
-
-The public API — modules, types, functions, and error variants — is documented
-in-source: `cargo doc -p choreo-acp` (or `just doc`), held complete by the
-`#![warn(missing_docs)]` + `doc-check` gate.
-
-**Key behaviors:**
-
-- **Concurrency:** Pure OS threads with `crossbeam_channel` message passing. No `Arc<Mutex>` shared state.
-  Threads communicate exclusively through a single shared event channel (`crossbeam_channel::Receiver<Event>`).
-- **Session lifecycle:** Sessions are created on the daemon via `CreateSession` and tracked locally
-  in `SessionManager`. `session/close` cleans up local state only (the daemon keeps sessions alive
-  until explicitly deleted). `session/delete` sends `DeleteSession` to the daemon and waits for
-  confirmation before removing local state.
-- **Streaming:** Prompt responses are streamed from the daemon as `OutputChunk` events, translated
-  to ACP `session/update` notifications, and finalized with a JSON-RPC response on `Done`/`Failed`/`Cancelled`.
-
-
-### `choreo-content` — Coordination Platform client
-
-Implements the feature-gated `content` tool group (compiled only behind the
-daemon's `content` cargo feature — off by default; a plain build registers no
-content tools, and persisted sessions carrying the stale pre-rename `coord`
-group name silently ignore it) against the Choreographr
-Coordination Platform: a Substrate content registry (publish/retract items,
-revisions, profiles, account pins) with content stored on IPFS and revisions
-resolved through an event indexer. Reads are indexer-first with on-chain
-authority for control state; writes encode content → pin to IPFS → submit the
-extrinsic. Only the subxt submit path uses the tokio sidecar; IPFS (`ureq`)
-and the indexer (`tungstenite`) are synchronous. The tools keep their pre-rename
-`coord_*` names; only the tool GROUP is named `content`.
-
-The public API — modules, types, functions, and error variants — is documented
-in-source: `cargo doc -p choreo-content` (or `just doc`), held complete by the
-`#![warn(missing_docs)]` + `doc-check` gate.
-
-### `choreo-daemon` — Core server (binary `choreographr`)
-
-Entry point: `choreo_daemon::main` — invoked from the root package's
-`src/bin/choreographr.rs` wrapper — first applies `--base-dir` (equivalently
-`CHOREOGRAPHR_BASE_DIR`; see **The base directory**), then initializes logging
-through the shared `choreo_shared::logging::init`: a hardened, pid-keyed log
-file (`{base}/log/daemon-<pid>.log` under a base, else
-`$XDG_STATE_HOME/choreographr/daemon-<pid>.log`, else the platform temp dir) is
-always written (create-new `O_EXCL` + `O_NOFOLLOW`, 0600, replacing only a
-regular file the daemon owns when a reused pid finds a stale one; logs older
-than a week are pruned on startup), and every event is **also mirrored to stderr** (the
-console or journald), so `--base-dir` never silences the console. `--log-file
-<path>` chooses the file's path only (used verbatim, no pid key) — it never
-changes the level and never mutes stderr; a log file that cannot be opened is
-never fatal (the run degrades to the stderr sink with a warning), and the first
-line of every run names the resolved file. Then
-`main` creates
-`DaemonState`, runs socket server. `--auto-exit` shuts the daemon down
-gracefully when the last client disconnects — a mode intended for the TUI's
-autospawned daemon, never needed for a user-managed service. The one-shot
-utility subcommands (`acl-add`, `fingerprint`, `migrate`) exit before any
-daemon work; `migrate` is the base-dir relocation helper (see **The base
-directory**).
-
-**Concurrency model:** Pure OS threads with message passing (actor model). No async code
-in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads. The one
-exception is the optional `blockchain` and `content` features: `choreo-blockchain` (linked only with the former) and
-`choreo-content` (linked only with the latter) each hold a tokio sidecar runtime for their async
-alloy/subxt clients, and the daemon calls their synchronous `execute_*` entry points (which
-`block_on` internally).
-
-The public API — modules, types, functions, and error variants — is documented
-in-source: `cargo doc -p choreo-daemon` (or `just doc`), held complete by the
-`#![warn(missing_docs)]` + `doc-check` gate.
-
-The following are the daemon's deliberate, single-purpose exceptions to the
-workspace's channel-only thread-communication rule (see AGENTS.md); each is
-lock-free or minimally scoped and carries no protocol data:
-
-- **The single-writer `ArcSwap` snapshots (4th).** The provider catalog and the
-  daemon's tool registry (`DaemonState::tool_registry`, shared with every session
-  and request worker) are read lock-free; only the command loop swaps either
-  (the tool registry on `DaemonCommand::McpListChanged`, after an MCP server
-  reports a list change), and every change *request* still travels by channel —
-  the swap is the only mutation.
-- **The live-connection counter (3rd).** `server/lifecycle.rs`'s
-  `Arc<AtomicUsize>` enforces `MAX_CONCURRENT_CONNECTIONS` atomically across the
-  two accept paths and is released by every connection thread's exit (RAII
-  `ConnectionSlot`) — a channel cannot express that without a dedicated
-  accounting thread.
-- **The delivery-lag byte counters (6th).** Each subscriber's in-flight byte
-  backlog is incremented by the producers on enqueue and decremented by the
-  connection writer thread on dequeue — inherently shared state that bounds
-  per-client memory rather than carrying messages.
-- **The client-id counter (10th).** `broadcast::ClientId`'s process-wide
-  `AtomicU32` mints one unique id per accepted connection *before* its thread
-  spawns; a channel round-trip would add latency on the accept path for a token
-  no thread ever reads back.
-- **The Windows Job Object (5th).** `tools/shell_util.rs`'s `Arc<ChildJob>` is a
-  kernel handle (an index into the kernel table, not an address-space pointer)
-  whose operations are thread-safe kernel-side, so the timeout watchdog and the
-  drain thread share one immutable value to terminate the whole process tree.
-
-### Provider Architecture
+## Provider Architecture
 
 Provider support is layered across two crates, and the seam between them is the
 point of the split. `choreo-ai-protocols` owns every wire protocol — the
@@ -1204,6 +693,13 @@ merges the bundled overlay once; every later access goes straight to the
 daemon command loop), so lookups return *owned* values cloned out of the
 atomic guard rather than `&'static` references.
 
+The same single-writer `ArcSwap` shape is the workspace's **fourth** sanctioned
+shared-state exception (see AGENTS.md): the daemon's tool registry
+(`DaemonState::tool_registry`, an `Arc<ArcSwap<ToolRegistry>>` shared with every
+session and request worker) is read lock-free and swapped only by the command
+loop, on `DaemonCommand::McpListChanged` — a wholesale registry swap is what
+lets a live MCP list change reach in-flight sessions without a restart.
+
 #### Reasoning round-trip (capture → carry → re-emit)
 
 For Anthropic (thinking blocks + signatures), DeepSeek/Kimi
@@ -1287,7 +783,7 @@ RunInput received
         └► stream chunks via SSE → emit OutputChunk per token → Done
 ```
 
-### Token Usage & Context Window Tracking
+## Token Usage & Context Window Tracking
 
 Token usage flows from providers through the daemon to all clients.
 Each session also tracks the model's **context window size**, resolved when the model
@@ -1401,322 +897,6 @@ handle_set_model / handle_set_account
 ```
 
 All new fields use `#[serde(default)]` so old persisted sessions remain compatible (deserialize to zero usage).
-
-### `choreo-tui` — Terminal client
-
-Entry point: `src/main.rs`
-
-**Daemon autostart (`autostart.rs`).** In Unix-socket mode only, the TUI
-connects to the daemon socket DIRECTLY — there is no pre-flight probe. The
-dial is `choreo_proto::connect_unix` (the ONE cross-platform unix-socket dial
-primitive: std's `UnixStream` on unix, the `uds_windows` shim on Windows),
-kept as a single helper by `choreo_client_core`'s
-`run_daemon_connection_with_autostart`, which keeps the stream of a successful
-first dial and invokes the TUI's autostart hook ONLY when the dial itself
-fails with `NotFound` or `ConnectionRefused` (nothing listening — classified via
-`choreo_proto::dial_error_means_no_listener`, the same predicate the daemon's
-stale-socket probe mirrors, so the two sides can never disagree). The hook spawns
-the SIBLING
-`choreographr` binary (same directory as its own executable, via
-`current_exe` — so both must be installed side by side, which the
-.tarball/.deb/binstall layouts already guarantee) as a detached child with
-`--auto-exit --log-file <state-dir>/choreographr/daemon-<tui-pid>.log`, polls the
-socket (100 ms interval, 5 s budget — waiting for OUR OWN spawned child, not
-probing a foreign daemon) via `choreo_proto::socket_listening` and returns; the
-connection is then retried.
-Autostart runs on the connection thread after the alternate screen is up, so
-nothing is printed to the terminal — feedback travels as a
-`UiEvent::Status` message ("no daemon running — starting choreographr…",
-then "daemon started") painted on the UI's status line. A `Status` event is
-flagged transient (`App::status_is_transient`) so the first real daemon
-message clears it — the reassurance must not linger once the connection is
-live and the first turn is quiet. Failures surface
-as the TUI quit message
-naming the daemon's log path. TCP mode (`--tcp-addr`) never spawns — a remote
-daemon is not launchable from the client machine, by definition.
-Once connected, a protocol-version mismatch (`ProtoError::UnsupportedVersion`)
-quits with the actionable "the daemon's protocol version is incompatible —
-restart the daemon (it may be an older build)" instead of a raw codec
-error (`connection_quit_message`); every other connection error keeps the
-generic wording.
-
-**Thread topology:**
-
-```
-main()
-├── reader task: read DaemonMessages from socket → push to UI event channel
-├── writer task: receive ClientMessages from a crossbeam channel → write to socket
-├── terminal-event thread: mio::Poll on three sources —
-│   ├── stdin (fd 0) → crossterm events (keyboard, mouse, resize)
-│   ├── notification pipe → clean shutdown signal
-│   └── signal pipe (self-pipe trick) → SIGCONT/SIGTSTP (suspend/resume),
-│       SIGWINCH (resize wakeup)
-│       └── forwards signals as ResumeCommand via crossbeam channel
-│           (SIGWINCH is not a ResumeCommand — it only wakes the poll so the
-│           crossterm drain below reports `Event::Resize`)
-└── UI loop: crossbeam select! on five event sources + ratatui rendering
-```
-
-**Signal handling (suspend/resume + resize wakeup):**
-
-`SIGCONT`, `SIGTSTP`, and `SIGWINCH` are caught using the self-pipe trick for
-POSIX portability (Linux and macOS). A pair of pipe fds (FD_CLOEXEC) is
-created; the read end is registered with `mio::Poll` in the terminal-event
-thread, and `signal_hook::low_level::pipe` installs signal handlers that
-atomically write a byte to the write end. The terminal-event thread reads
-from the pipe and forwards `ResumeCommand` messages through a crossbeam
-channel to the UI loop. The UI loop handles `PrepareForSuspend`
-(disable raw mode, leave alternate screen, `raise(SIGSTOP)`) and
-`ReinitTerminal` (re-enable raw mode, re-enter alternate screen, clear).
-
-`SIGWINCH` is deliberately *not* mapped to a `ResumeCommand`. Its only purpose
-is to wake the terminal thread's `mio::Poll` (which otherwise sleeps on stdin
-and would miss a resize entirely), so the thread's event drain calls
-`crossterm::event::poll`/`read` and picks up the `Event::Resize` that
-crossterm 0.29 generates from its own internal SIGWINCH handler. Without this,
-a terminal resize — e.g. toggling fullscreen in Ghostty — would leave the
-viewport at the stale size until the next keypress, breaking the layout.
-`run_app` also primes crossterm's event reader once at startup (a
-zero-timeout `event::poll`) so that lazy SIGWINCH handler is installed before
-the first resize can arrive.
-
-> **Note:** In raw mode, `termios` `ISIG` is disabled, so pressing Ctrl+Z in the
-> terminal sends byte `0x1A` to stdin as a regular character — it does **not**
-> generate a `SIGTSTP` signal. The self-pipe suspend only catches external
-> `SIGTSTP` (e.g. from `kill`, shell job control, or another terminal).
-> To support Ctrl+Z keyboard suspend from within the TUI, the page event
-> handlers (`handle_chat_event`, etc.) would need an explicit
-> `KeyCode::Char('z')` + `KeyModifiers::CONTROL` match that calls
-> `handle_resume_command(PrepareForSuspend, …)`.
-
-**Per-frame sequence (UI loop):**
-
-```
-while !app.should_quit:
-  1. Block in crossbeam select! until any event arrives:
-     - terminal events (keyboard, mouse, resize)
-     - daemon messages from the reader task
-     - image encoding results from the worker thread
-     - resume commands from the terminal-event thread
-  2. Drain all five event sources (non-blocking try_recv):
-     - crossterm events
-     - UI event channel (daemon messages)
-     - image result channel
-     - resume commands
-  3. If nothing was dirty, skip render (continue)
-  4. Consume scroll accumulator → apply batched delta
-  5. Update history viewport dimensions from terminal size
-  6. Clamp scroll state to valid range
-  7. Render via ratatui terminal.draw()
-  8. Publish terminal-visible state OUTSIDE the draw closure (a raw stdout
-     write during draw would interleave with the frame): if `term_status_dirty`,
-     diff and write the OSC 7501 program-status records (`App::desired_status_records`
-     → `terminal::status::Publisher::sync`) and re-emit the OSC 2 window title
-     when it changed; the OSC 9;4 progress bar is emitted directly by the
-     event handlers (Done/SessionState) rather than through this flag
-```
-
-**Keystore-lock awareness (persistent banner).** The TUI latches the daemon's
-keystore locked state in `App::keystore_locked`, defaulting to `true` (assume
-locked until told otherwise). It is latched from the daemon's authoritative
-`Keystore { state }` status push (subscribe time and every transition) and the
-targeted operation replies (`Keystore { Unlocked }`/`Unlocked` → `false`;
-`Keystore { Locked }`/`Locked`/`LockedError` → `true`) in `connection/daemon.rs`
-(`handle_daemon_message`), and — unlike the transient `status`/`error` lines a
-keypress clears — it is NOT reset by the per-keypress clear, so it drives a
-PERSISTENT status-bar banner (`🔒 keystore locked`, `render/mod.rs`) that
-survives every keystroke until the daemon reports unlocked, and makes client
-B's unlock update client A's banner. Startup surfaces the locked state; when no
-unlock key resolves the TUI awaits the daemon's status push — `Keystore
-{ state: Unbound }` triggers the once-per-connection AUTO-BIND (mint a fresh
-key, `BindKeystore`, confirm on `Bound`), so a first-run client binds the
-daemon with no user action, while `Keystore { state: Locked }` (bound to
-another key) leaves the banner and guides the user to `/unlock <base64-key>`. Submitting a prompt (`RunInput`) to
-a locked daemon is rejected CLIENT-SIDE with a clear "daemon is locked —
-unlock it first" status instead of sending a message that would silently fail
-at inference time (the client-driven guard beats waiting for a transient
-`Failed`); while locked the status-bar context readout is suppressed (no
-misleading `X / ?` fill when the context window isn't loaded), and `/lock`
-(re-)latches the banner via a `Locked` broadcast.
-
-**New-turn submit guard (client-side).** Every action that begins a new
-inference turn — a plain prompt (`RunInput`), Alt+Enter, and the `/continue`
-command (the latter two both becoming a `ContinueGeneration`, which the daemon
-turns into a `RunInput`) — runs through
-the single `App::new_turn_rejection` helper. It returns the rejection message
-(`None` = allowed) for two conditions, in order: the attached session is not
-idle, or the daemon's keystore is locked. The idle branch reads
-`App::attached_status` (kept fresh from session summaries,
-`SessionStatusChanged` broadcasts, and `SessionAttached` replies) and uses
-`SessionStatus::is_idle` (exactly `Inactive`; `Sleeping` — the session-thread
-exit marker — is not idle): a `RunInput` can only begin a turn from `Inactive`,
-so the guard beats sending a message the daemon would answer with a transient
-`session already has an active request`. The locked branch mirrors the
-persistent lock banner. Like the keystore-lock guard was, this is a client-side
-UX guard only — the daemon stays authoritative, and an unknown status (`None`,
-e.g. a fresh client) fails open. For a plain prompt the guard runs *before* the
-input buffer is cleared and the per-session draft forgotten, so a rejected
-prompt stays in the input bar to resubmit; slash-commands (e.g. `/cancel`) skip
-the guard entirely so they stay available while a session is busy — the lone
-exception being `/continue`, which is itself a new-turn trigger and so is
-guarded too. The two `ContinueGeneration` senders (Alt+Enter and `/continue`)
-share a single `connection::chat::send_continue_generation` helper that owns
-the guard, the request-id allocation, the in-flight tracking and the send, so
-the triggers cannot drift; they differ only in whether they echo `> continue`
-(the typed command does, the bare keypress does not).
-`attached_status` (and `attached_tool_groups`) are cleared when the attached
-session is deleted (`handle_session_deleted`), so a later prompt with nothing
-attached fails open instead of being rejected against a dead session's stale
-status. A future change replaces this blunt guard with prompt queueing for
-async tool calls. See `connection/chat.rs` and `state::App::new_turn_rejection`.
-
-The public API — modules, types, functions, and error variants — is documented
-in-source: `cargo doc -p choreo-tui` (or `just doc`), held complete by the
-`#![warn(missing_docs)]` + `doc-check` gate.
-
-**Session-manager list views (`SessionManagerState`, in `state/session_manager.rs`).**  The page keeps the
-FULL list in `all` and the rendered rows in `sessions`; a private
-`rebuild_view` re-derives `sessions` from `all` on every mutation — sorting by
-the SHARED `SessionSummary::cmp_for_list` (pinned desc, `last_modified` desc,
-`session_id` desc) that the daemon's `ListSessions` also uses, so the two
-orders cannot drift — keeping only the rows the
-current `view` shows (`List` → `archived_at.is_none()`, `Archived` →
-`archived_at.is_some()`, `Detail` treated as `List`), and re-pointing the
-selection at the same session by id (clamping to the old row index — a
-neighbour — when it left the view).  When the one-shot `pending_select` (set by
-`select_session` when the manager opens on the attached session) names a
-session that lives in the OTHER partition — an ARCHIVED attached session, with
-the live list as the default view — `set_sessions` switches to that view so the
-highlight lands on the session the user was viewing, not a first row of the
-live list.  `Tab` is the only view-switch key
-(`toggle_view`, List ↔ Archived; Alt+A is the Chat-page accounts shortcut).
-`p` and `a` send `SetSessionPinned`/`SetSessionArchived` but NEVER mutate local
-state: the daemon is the authority — it persists the flag change BEFORE
-touching its in-memory index and broadcasting, so a failed persist can never
-leave the daemon's list ahead of disk — and its `SessionFlagsChanged` broadcast
-(rides the activity bus, so the TUI receives it on any page) —
-applied via `App::handle_session_flags_changed` → `SessionManagerState::apply_session_flags`
-(`rebuild_view` plus an in-place update of an open `detail_data`) — is the
-success signal (there is no targeted reply; a failure arrives as a targeted
-`SessionFailed` and is shown on the page).  Full-list lookups (status changes,
-the attached summary, `attach_to_session`) read `all`, never the filtered
-`sessions`, so an archived attached session still updates correctly.  A newly
-created session refreshes the manager list via the broadcast
-`SessionCreated` (`note_session_created`) while the user is still on that page;
-the requester's own `SessionCreatedForRequester` reply instead navigates the
-creator to the new session (`App::handle_session_created` →
-`attach_to_session`, which leaves the Session Manager for the Chat page), so a
-create from `n` on this page lands the creator on the session it just made.
-
-### `choreo-gui` — Desktop/Android client (iOS: embedded-daemon host)
-
-Entry point: `src/bin/choreo-gui.rs` (thin wrapper calling `choreo_gui::main()`
-in `src/lib.rs`) — the crate owns its binary, as do all the suite binaries
-since the binary split (choreo-tui / choreo-im / choreo-acp own their
-wrappers too).
-
-Unix socket or Noise IK encrypted TCP transport (selected via `--tcp-addr` / `--server-pk` CLI flags)
-rendered via Dioxus components on the Dioxus Native (Blitz/wgpu) renderer —
-one renderer for desktop, Android and iOS (no webview anywhere; the crate is
-built as a lib+cdylib so dx/gradle can package it as an APK). Uses hooks to spawn async reader/writer tasks inside
-the Dioxus runtime. Subscribes to the session summary at connect
-(`SubscribeSessionsSummary`, alongside the initial `ListSessions`) so its session
-list stays live via daemon push broadcasts — required since the daemon stopped
-auto-registering TCP clients as summary subscribers.
-
-**iOS: embedded in-process daemon.** On `target_os = "ios"` (and ONLY there —
-the whole construction is `#[cfg(target_os = "ios")]` and the choreo-daemon
-dependency is target-gated in Cargo.toml, so desktop and Android builds never
-compile or link any of it) the GUI runs the daemon in-process:
-`default_connection_mode()` calls `embedded_connection_mode()`, which opens
-`DaemonState` via `DaemonState::open` under `ToolPolicy::Mobile` (sandbox-safe:
-no shell/exec/RISC-V tools, no MCP subprocess spawning) at the standard
-`dirs`-based paths (which resolve inside the app sandbox), spawns it with
-`choreo_daemon::spawn_embedded`, and mints an `EmbeddedLink` whose channel ends
-become `ConnectionMode::InProcess`. Messages travel as values — no codec, no
-socket — and the same `ClientConn` state machine serves the connection. Any
-construction failure is logged (`error!`) and the mode degrades to the
-previous `TcpPinned` remote-daemon fallback (`IOS_DEFAULT_TCP_ADDR`), so the
-app always launches. The `EmbeddedDaemon` handle is kept in a static
-`OnceLock<Mutex<…>>` (`EMBEDDED_DAEMON`): there is no graceful-shutdown hook
-in the Dioxus Native lifecycle, so shutdown happens at process teardown — the
-`Drop` warn in `embedded.rs` is expected there. The embedded daemon's keystore
-binding is keyed under the distinct stable string `"embedded"`
-(`client.rs::connection_addr`), never under `socket_path()`, so it cannot
-collide with a real unix daemon's binding; the UI shows the label
-"embedded daemon" for this mode. Desktop behavior is byte-for-byte unchanged
-(UnixSocket default, pinned by `default_mode_is_unix_socket_on_host`; the iOS
-branch is `#[cfg]`-selected, so an on-host test can only pin the desktop
-branch — the iOS branch is exercised on-device and by `scripts/check-ios.sh`'s
-target compile).
-
-**On-device tools + the settings store (iOS only).** The embedded daemon gets
-`OpenOptions.platform_tool_bridge: Some(SwiftIosToolBridge)` — the C-ABI bridge
-to `ios/IosToolHost.swift` (see `choreo-daemon`'s `tools/ios_bridge` module
-docs) —
-which makes `DaemonState::open` register the four protected on-device tools
-(`clipboard_write`, `clipboard_read`, `open_url`, `notify`). The bridge hand-off
-is gated by the user's persisted **on-device tools** setting (default ON — all
-four tools are iOS permission-free). `settings.rs` is the GUI's own minimal
-preference store (the crate's FIRST settings mechanism): `gui-settings.toml` in
-the shared config dir (via `choreo_keystore::paths::config_dir()` — inside the
-iOS app sandbox, NOT the daemon DB, because the bridge decision happens BEFORE
-any daemon exists). Load is deliberately tolerant (missing/corrupt/unparseable
-file → defaults + warning; every field is `#[serde(default)]`, so older files
-stay parseable), and persistence is a whole-file rewrite (tiny file, single
-GUI writer — no advisory lock, unlike known_servers.toml). A toolbar toggle
-(`OnDeviceToolsToggle`, iOS-only; desktop/Android render an empty component so
-the call site compiles unchanged) flips the setting and persists it; BOTH the
-button label and the confirmation status state that the change **applies on
-next app start**, because the bridge is handed to `DaemonState::open` during
-startup and the protected group cannot be re-registered live. The in-session
-toggle reads/writes a startup-cached `AtomicBool` (a single startup-resolved
-bit, no protocol data); the persisted FILE is the source of truth the next
-launch reads, and it is written BEFORE the cache adopts the new value, so a
-failed write leaves the cache matching disk. All of the settings surface is
-compiled on every target (platform-neutral concept; host unit tests cover the
-load/persist round-trip), with the iOS consumers cfg-gated; a plain desktop
-build's behavior is unchanged.
-
-The public API — modules, types, functions, and error variants — is documented
-in-source: `cargo doc -p choreo-gui` (or `just doc`), held complete by the
-`#![warn(missing_docs)]` + `doc-check` gate.
-
-### `choreo-im` — IM platform bridge
-
-Its own crate: the `choreo-im` package owns the binary, so default and release
-builds of the root package exclude it entirely; build it explicitly with
-`cargo build -p choreo-im`.
-
-Entry point: `src/main.rs` (thin wrapper calling `choreo_im::main()` in the
-library)
-
-Single binary (`choreo-im`) that bridges IM platforms to the daemon.
-The binary takes a single required positional platform argument via clap:
-`choreo-im telegram`. Like the rest of the suite it supports `--help` and
-`--version`, with help output styled by a per-crate `clap_styles()` helper
-(duplicated in each CLI crate — choreo-proto is the wire protocol and does
-not host CLI styling) and `ColorChoice::Auto` (color only on a TTY).
-
-**Credentials:** The daemon serves platform credentials via the `GetCredential` wire
-message. The admin stores credentials via `/add-key` or `/add-x` at runtime, which
-encrypts them with the derived unlock-key public key. On unlock (`/unlock`) the daemon decrypts
-all stored credentials into memory using its private key.
-
-The public API — modules, types, functions, and error variants — is documented
-in-source: `cargo doc -p choreo-im` (or `just doc`), held complete by the
-`#![warn(missing_docs)]` + `doc-check` gate.
-
-**Data flow:**
-
-```
-Telegram user → teloxide polling → handle_message()
-  → parse_input_line() → ClientMessage → bridge.send()
-  → daemon
-  → DaemonMessage → bridge reader task → BridgeEvent
-  → send_daemon_event() → Telegram HTML/photo
-```
-
 
 ---
 
@@ -1906,6 +1086,16 @@ data, never as instructions or configuration:
 - **Egress.** A remote server is contacted only when explicitly configured; there is no
   discovery of servers from arbitrary content. Credentials are a static token in
   `headers` (OAuth is a post-ship addition), never shared across issuers.
+
+Two values inside the `rmcp` engine are sanctioned shared-state exceptions (see
+AGENTS.md). The live `RunningService` handle sits in a
+`tokio::sync::Mutex<Option<..>>` (the **eighth** exception) — a
+connection-lifecycle handle closed exactly once and never touched per message,
+holding the lock only across the bounded `close_with_timeout` on shutdown. The
+`ClientHandler`'s notification rate limiter carries a shared
+`Arc<std::sync::Mutex<LimiterState>>` (the **ninth** exception) because `rmcp`
+delivers notifications on more than one task; the lock guards a handful of
+integers and is never held across an `await`.
 
 
 ---
@@ -2361,6 +1551,19 @@ in-memory metadata and the database via `UpdateMetadata → db::write_session`. 
 `AttachSession` handler also populates `session_metadata` when re-loading a session
 from the database, ensuring `ListModels` and metadata queries see the correct
 `selected_model`.
+
+Two sanctioned shared-state exceptions (see AGENTS.md) underpin session
+cancellation and the daemon's connection accounting. Each session owns a
+`choreo-sockreg` registry (the **seventh** exception) — plus one daemon-level
+registry for non-session-scoped work (prefetch, catalog fetch) — so the command
+loop can force-close a wedged session's provider sockets from the thread that
+decided the cancel: `shutdown(fd, SHUT_RDWR)` is the only way to un-block a
+worker blocked in a provider `read()`, and the registry's lock is held only for
+a handful of fd syscalls. The daemon's live-connection counter (the **third**
+exception, `server/lifecycle.rs`'s `Arc<AtomicUsize>` released by the RAII
+`ConnectionSlot`) enforces `MAX_CONCURRENT_CONNECTIONS` atomically across the
+two accept paths — a bound no channel can express without a dedicated
+accounting thread.
 
 ---
 
