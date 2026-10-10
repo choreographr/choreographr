@@ -1,3 +1,8 @@
+//! System-prompt assembly and tool-result collection for the agent loop:
+//! `build_system_content` (the base prompt plus working-dir-gated context
+//! files), `collect_tool_result` (feeding a finished tool into the next-call
+//! accumulator, with its hint paths), and `persist_loaded_skill`. Re-exported
+//! from `requests.rs` via `pub(crate) use system_content::*;`.
 use crate::context::{self, LoadedSkill, SkillMeta};
 use crate::sessions::SessionState;
 use crate::tools::{ToolOutput, ToolRegistry};

@@ -1,3 +1,22 @@
+//! Tool-dispatch and execution machinery for one agent-loop turn: channel
+//! wiring, per-tool timeout resolution, the wait loops, the streaming
+//! forwarder, and per-tool result recording — shared by the serial
+//! (`execute_tool_with_timeout`) and concurrent (`spawn_single_tool`) paths.
+//!
+//! The system-prompt / tool-result-collection helpers (`build_system_content`,
+//! `collect_tool_result`, `persist_loaded_skill`, …) live in the sibling
+//! `requests::system_content` module; both are re-exported from `requests.rs`
+//! via `pub(crate) use <mod>::*;` so every `crate::requests::X` reference keeps
+//! resolving, and `run_agent_loop` stays in `requests.rs`.
+//!
+//! # Thread topology
+//!
+//! Each concurrent tool runs on three threads: an **execution thread** that
+//! runs the tool via `ToolDyn::execute_streaming_json`, a **forwarding thread**
+//! that relays streaming chunks to subscribers, and a **wait-loop thread** that
+//! enforces the per-tool timeout and drains the image channel. Dispatching N
+//! tools therefore adds up to 3N threads beyond the agent loop's own thread;
+//! the kernel scheduler handles that for typical N (< 10) with no trouble.
 use crate::requests::system_content::{CollectToolResultParams, collect_tool_result};
 use crate::sessions::{RequestContext, SessionCommand, SessionState, turn_for_client};
 use crate::tools::context::ToolContext;

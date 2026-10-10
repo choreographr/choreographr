@@ -2078,318 +2078,51 @@ data, never as instructions or configuration:
 
 ## Tool system
 
-### Generic `Tool` trait
+The daemon's tool machinery — the typed `Tool` trait, its type-erased `ToolDyn`
+counterpart, the `ToolRegistry` that owns and dispatches every tool, and the
+`define_tool!` macro — is documented in-source (see `choreo-daemon`'s `tools`
+module, `cargo doc -p choreo-daemon` / `just doc`), held complete by the
+`#![warn(missing_docs)]` + `doc-check` gate. A tool declares its own argument and
+return types (both `serde`- and `schemars`-compatible, so its JSON schemas are
+auto-derived and sanitized for provider compatibility), runs on a dedicated
+per-call thread, and may stream incremental output over a channel. Tools are
+`Send + Sync`, are registered once at daemon startup, and are shared across every
+session — so a tool must keep no per-invocation state.
 
-The tool trait is generic over argument and return types. Each tool declares its own
-`type Args` (must implement `DeserializeOwned + JsonSchema`) and `type Return`
-(must implement `Serialize + JsonSchema`). Both `schema()` and `output_schema()` are
-auto-derived via `schemars` by default, eliminating the need for hand-written JSON schemas.
-The generated schemas are then sanitized — `$schema`, `title`, and `$defs`/`$ref` are
-stripped/resolved for compatibility with providers that do not support Draft 2020-12
-meta-schema features, and `additionalProperties: false` is injected for parameter schemas.
+The system has three dispatch paths with distinct callers:
 
-```rust
-pub trait Tool: Send + Sync {
-    type Args: DeserializeOwned + JsonSchema + 'static;
-    type Return: Serialize + JsonSchema + 'static;
-    /// Error type — each tool defines its own. Simple tools use `ToolExecError`
-    /// (a string-wrapper). Tools whose errors are consumed by VM guests (e.g.
-    /// `DbError`, `HttpError`) define a `thiserror` enum that is serde-serializable,
-    /// enabling the guest to pattern-match on specific variants.
-    type Error: std::error::Error + Send + Sync + Serialize + DeserializeOwned + 'static;
+| Path | Input | Output | Caller |
+|---|---|---|---|
+| `ToolDyn::execute_json` | `&str` (JSON) | `Result<ToolOutput, ToolError>` | LLM tool calls (OpenAI/Anthropic …) |
+| `ToolDyn::execute_streaming_json` | `&str` (JSON) | `Result<ToolOutput, ToolError>` | streaming shell/VM tools |
+| `ToolDyn::execute_postcard` | `&[u8]` (postcard) | `Vec<u8>` | RISC-V VM guest ecalls (see "Postcard binary encoding") |
 
-    fn name(&self) -> &'static str;
-    fn group(&self) -> &'static str { "core" }
-    fn description(&self) -> &'static str;
+The two JSON paths take a `ToolOutputFormat` so the caller chooses `Text`
+(human/LLM rendering via `Tool::return_string`) or `Json` (Programmatic Tool
+Calling — the typed return serialized with `serde_json`). A tool's `Error`
+associated type is per-tool: simple tools use the string-wrapper `ToolExecError`;
+tools whose structured errors are consumed by VM guests (e.g. `DbError`,
+`HttpError`) define a `thiserror` enum that is serde-serializable, so the guest
+can pattern-match on specific variants. Tools gate which callers may invoke them
+via `allowed_callers()` (direct model call, programmatic PTC call, or both), and
+tools that need session context receive it through `ToolContext`. A tool that
+produces an image carries it on its typed return value, drained by the request
+worker over an out-of-band multi-message channel (an MCP result may carry several
+image blocks) rather than embedded in the response struct.
 
-    /// Auto-derived JSON Schema for the tool's input arguments.
-    /// Sanitized via `sanitize_params_schema` (strips `$schema`/`title`/`$defs`,
-    /// resolves `$ref`s inline, injects `additionalProperties: false`, converts
-    /// unit-arg `{"type":"null"}` to empty object).
-    fn schema(&self) -> serde_json::Value {
-        sanitize_params_schema(
-            serde_json::to_value(schemars::schema_for!(Self::Args)).unwrap_or_default(),
-        )
-    }
+**Invocation descriptions.** The human-readable sentence `Tool::describe_invocation`
+produces before execution is stored in `ToolOutput.invocation_description`, carried
+onto `ToolResultRecord.invocation_description`, and rendered by clients as the
+first line of the tool-result block. It is seeded onto every placeholder result
+when the model's tool calls are recorded, so clients render the tool's context
+(e.g. "Running command: `…`.") the moment the seeded turn is broadcast — before
+any output streams. It is deliberately excluded from LLM message construction:
+the model never sees it.
 
-    /// JSON Schema for the tool's return value (for Programmatic Tool Calling).
-    /// Auto-derived from the return type. Override for types schemars cannot represent.
-    /// Sanitized via `sanitize_output_schema` (same as above but without
-    /// `additionalProperties`).
-    fn output_schema(&self) -> Option<serde_json::Value> {
-        Some(sanitize_output_schema(
-            serde_json::to_value(schemars::schema_for!(Self::Return)).unwrap_or_default(),
-        ))
-    }
-
-    /// Controls which callers can invoke this tool
-    /// (`Direct`, `Programmatic`, or both).
-    fn allowed_callers(&self) -> Vec<AllowedCaller> {
-        vec![AllowedCaller::Direct, AllowedCaller::Programmatic]
-    }
-
-    fn execute(
-        &self,
-        args: Self::Args,
-        x_credentials: Option<&ServiceCredential>,
-        working_dir: Option<&Path>,
-        ctx: Option<&ToolContext>,
-    ) -> Result<Self::Return, Self::Error>;
-
-    fn execute_streaming(
-        &self,
-        args: Self::Args,
-        x_credentials: Option<&ServiceCredential>,
-        working_dir: Option<&Path>,
-        _output_tx: crossbeam_channel::Sender<Vec<u8>>,
-        ctx: Option<&ToolContext>,
-    ) -> Result<Self::Return, Self::Error> {
-        // Non-streaming tools deliver their result via TurnAppended —
-        // no ToolResultChunk traffic needed.
-        self.execute(args, x_credentials, working_dir, ctx)
-    }
-
-    fn extract_image(&self, _ret: &Self::Return) -> Option<PreparedImage> { None }
-
-    /// Produce a human-readable description of what the tool is about to do,
-    /// using every supplied argument for detail (e.g. "Reading file `main.rs`.",
-    /// "Making POST HTTP request to `https://api.example.com/data`.").
-    /// Returns a natural English sentence. There is no default — every tool
-    /// must provide one. The value is stored in `ToolOutput.invocation_description`
-    /// and flowes through to `ToolResultRecord.invocation_description` for the
-    /// TUI to render as the first line of the tool result block.
-    fn describe_invocation(&self, args: &Self::Args) -> String;
-
-    /// Produce a human-readable string from the return value.
-    /// The default implementation JSON-encodes the value.
-    /// Tools whose `Return` is `String` override this to return
-    /// the raw string directly (e.g. shell tools, macro-defined tools).
-    fn return_string(ret: &Self::Return) -> String {
-        serde_json::to_string(ret).unwrap_or_default()
-    }
-}
-```
-
-`ToolOutput` replaces the old `ToolExecutionOutput` + `ToolResult` pair:
-
-```rust
-pub enum ToolOutputFormat { Text, Json }
-pub struct ToolOutput {
-    pub content: String,
-    pub is_error: bool,
-    /// Human-readable sentence describing what the tool is about to do,
-    /// produced by `Tool::describe_invocation()` before execution.
-    /// Empty string when the description is unavailable (e.g. spawned
-    /// thread error paths before the description could be generated).
-    pub invocation_description: String,
-    /// The tool's structured return value (`serde_json::to_value(ret)`),
-    /// populated by the blanket `ToolDyn` impl after a successful execution.
-    /// `None` for error/timeout outputs.  The request worker reads this to
-    /// mirror session-config mutations (e.g. `set_working_dir`'s canonical
-    /// path) onto its config copy without re-executing the tool.
-    pub result_json: Option<serde_json::Value>,
-}
-```
-
-`Text` format is used for LLM-facing tool results (human-readable, uses `return_string`).
-`Json` format is used for Programmatic Tool Calling (PTC) — JSON-encodes the return via `serde_json::to_string`.
-`invocation_description` is stored in `ToolResultRecord` and seeded onto every placeholder result when the
-model's tool calls are recorded, so clients render the tool's context (e.g. "Running command: `…`.")
-the moment the seeded turn is broadcast — before any output streams. It is explicitly excluded from LLM
-message construction — the model never sees it.
-
-Tools that need session context (`ToolContext` — used by `list_sessions`, `get_session`,
-`read_session`, `load_skill`)
-receive it in the `ctx` parameter. Tools that return structured data override
-`output_schema()` to describe their return JSON shape, enabling the model to call
-them programmatically (see [Programmatic Tool Calling](#114-programmatic-tool-calling-responses-api-gpt-56)).
-Tools can restrict callers via `allowed_callers()`, gating whether the model calls
-them directly, from generated JavaScript, or both.
-
-Tools that produce images (e.g. `display_image`) override `extract_image()` to return a
-`PreparedImage` from the typed return value. The conversion layer (see `ToolDyn` below)
-sends the image through an out-of-band `image_tx: Option<crossbeam_channel::Sender<PreparedImage>>`
-channel rather than embedding it in the response struct — a tool can emit several
-images (an MCP result may carry multiple image blocks), so the sink is a
-multi-message channel. The agent loop drains this
-channel after execution to persist and broadcast the image.
-
-### `ToolDyn` — type-erased dispatch trait
-
-The `ToolDyn` trait erases the generic parameters so tools can be stored in a `HashMap`:
-
-```rust
-pub trait ToolDyn: Send + Sync {
-    fn name(&self) -> &str;
-    fn group(&self) -> &str;
-    fn description(&self) -> &str;
-    fn schema(&self) -> serde_json::Value;
-    fn output_schema(&self) -> Option<serde_json::Value>;
-    fn allowed_callers(&self) -> Vec<AllowedCaller>;
-
-    /// Human-readable invocation description from JSON args.
-    /// Delegates to `Tool::describe_invocation` via the blanket impl.
-    /// Returns the static `description()` fallback when args fail to parse.
-    fn describe_invocation_json(&self, args_json: &str) -> String;
-
-    /// JSON path — takes JSON args, returns Result so callers can distinguish
-    /// infrastructure errors (deserialisation failures) from tool errors.
-    fn execute_json(&self, args_json: &str, format: ToolOutputFormat, ...) -> Result<ToolOutput, ToolError>;
-    /// Streaming JSON path.
-    fn execute_streaming_json(&self, args_json: &str, format: ToolOutputFormat, ...) -> Result<ToolOutput, ToolError>;
-    /// Postcard binary path (VM ecall). Returns bytes encoding
-    /// `Result<Result<T::Return, T::Error>, ToolError>` — all outcomes
-    /// (infra error, tool error, tool success) are contained in the buffer.
-    fn execute_postcard(&self, args_bytes: &[u8], ...) -> Vec<u8>;
-}
-```
-
-A blanket impl `impl<T: Tool> ToolDyn for T` provides `describe_invocation_json` (deserializes
-args and delegates to `Tool::describe_invocation`, falling back to `description()` on parse
-failure) and all three dispatch paths:
-
-| Path | Input | Output | Used by |
-|---|---|---|---|---|
-| `execute_json` | `&str` (JSON) + `ToolOutputFormat` | `Result<ToolOutput, ToolError>` | LLM tool calls (OpenAI/Anthropic etc.) |
-| `execute_streaming_json` | `&str` (JSON) + `ToolOutputFormat` | `Result<ToolOutput, ToolError>` | Streaming shell/VM tools via LLM |
-| `execute_postcard` | `&[u8]` (postcard) | `Vec<u8>` (postcard of `Result<Result<R, E>, ToolError>`) | RISC-V VM tool calls |
-
-The JSON path deserializes arguments with `serde_json`, calls `Tool::execute()`, then
-returns a `ToolOutput`. Both `execute_json` and `execute_streaming_json` first call
-`T::describe_invocation(self, &args)` to produce the invocation description, then store
-it on the returned `ToolOutput`. In the streaming path the description is deliberately
-NOT sent as a chunk (a chunk can be dropped under load, and a chunk without a trailing
-newline would be mashed against the first output line): it is delivered reliably via the
-`ToolCallStarted` broadcast (queued before the tool starts) and on the seeded placeholder
-result, so clients render the same header live and in the final record. When `format` is
-`Text`, the content is produced via `T::return_string()` (human-readable). When `format`
-is `Json`, the return value is JSON-encoded via `serde_json::to_string()` (for PTC
-responses). The binary path uses `postcard` for both deserialization and serialization,
-enabling compact cross-VM communication.
-
-### `define_tool!` macro
-
-The `define_tool!` macro reduces boilerplate for the common tool case
-(`Return = String`, no credentials needed). It lives in `choreo-daemon/src/tools/mod.rs`.
-The JSON schema is auto-derived from the args type via `schemars`, so no manual
-schema parameter is needed. The macro now takes 7 arguments — the 7th is a
-`fn(&Args) -> String` path that provides the invocation description:
-
-```rust
-define_tool!(MyTool, "my_tool", "Description...", MyToolArgs,
-    execute_my_tool, "core", describe_my_tool_invocation);
-```
-
-The describe function is also used by the blanket `ToolDyn::describe_invocation_json`
-implementation and by `ToolRegistry::describe_invocation`.
-
-Tools that need custom `output_schema()`, `allowed_callers()`, non-`String` return types,
-session context (`ToolContext`), or credentials (`ServiceCredential`) are written as
-manual `impl Tool` blocks instead. Examples:
-`DbGet`/`DbGetRange`/`DbList`/`DbCount` (custom `output_schema`),
-`GetCurrentTime` (`Return = u64`), `DisplayImage` (overrides `extract_image`),
-`ListSessions`/`GetSession` (need `ToolContext`).
-
-### Registry
-
-Tools are registered in a `ToolRegistry` stored as `Box<dyn ToolDyn>`. The registry is
-owned by `DaemonStateInner`, constructed once at daemon startup. The agent loop extracts
-an `Arc<ToolRegistry>` from the daemon state to list available tool definitions and
-dispatch tool execution.
-
-The registry provides `describe_invocation()`, `describe_invocation_for()`,
-`execute_json()`, `execute_streaming_json()`, and `execute_postcard()` for dispatch:
-
-```rust
-pub fn describe_invocation(&self, tool_call: &ChatToolCall) -> String;
-pub fn describe_invocation_for(&self, name: &str, args_json: &str) -> Option<String>;
-pub fn execute_json(&self, tool_call: &ChatToolCall, format: ToolOutputFormat, ...) -> ToolOutput;
-pub fn execute_streaming_json(&self, tool_call: &ChatToolCall, format: ToolOutputFormat, ...) -> ToolOutput;
-pub fn execute_postcard(&self, name: &str, args_bytes: &[u8], ...) -> Vec<u8>;
-```
-
-`describe_invocation` returns the invocation description for a tool call by name + JSON args,
-falling back to the tool name for unknown tools. `describe_invocation_for` returns `None`
-for unknown tools. These are used by `run_agent_loop` to generate the description before
-spawning tool threads, so error paths (timeout, panic) can include it in the `ToolOutput`.
-
-`execute_postcard` replaces the old `execute_dyn` and calls `ToolDyn::execute_postcard()`.
-`execute_json` and `execute_streaming_json` accept a `ToolOutputFormat` parameter so
-callers can choose between `Text` (LLM) and `Json` (PTC) output formats.
-
-Each tool receives an optional `working_dir: Option<&Path>` parameter that represents the session's
-working directory. Filesystem and Git tools resolve relative paths against this working directory.
-A leading `~` or `~/` in any path argument is expanded to the user's home directory via
-`expand_tilde()` inside `resolve_path()`, so callers can write `~/project` instead of the
-full absolute path. The `~user` form is *not* expanded and is passed through unchanged.
-
-### File-read tool limits
-
-`read_file` streams a numbered, optionally windowed view of a UTF-8 text file —
-the single file-read tool (the former separate `read_file_range` was merged into
-it). It lives in `tools/read_file.rs`; the shared
-streaming and binary-sniff helpers (`open_text_reader`, `TextStream`, `render_streamed_line`,
-`OutputBudget`, `read_line_capped`, `drain_rest_of_line`) live in `tools/text_stream.rs`
-and are shared with `line_count` (which drains the same `TextStream` via
-`TextStream::drain_counting`, cloning no line content, so its total matches
-`read_file`'s `of N` and a giant file is never loaded whole);
-the sanitization suite (`sanitize_name`, `sanitize_text`/`sanitize_content`,
-`sanitize_transcript`, `sanitize_multiline`, `truncation_marker`, …) lives in
-`tools/sanitize.rs`; and the shared byte budget,
-`truncate_tool_output`, and `finish_tool_output` now live in the
-`choreo-sanitize` leaf crate and are re-exported from `tools/mod.rs` (alongside the
-split-out helpers, so every `crate::tools::X` reference keeps resolving unchanged).
-The line-oriented output-formatting helpers `human_size` and `symlink_target_label`
-stay in `tools/mod.rs`.
-`finish_tool_output` caps a body at the shared
-byte budget, reserving room *inside* the budget for the marker/footer it
-appends — so the count signal survives even a byte-capped result, and stays
-alive through the transcript re-cap in `record_tool_completion` (which
-re-applies the cap after `sanitize_transcript`; a tail riding past the budget
-would be cut off there). `TextStream` yields one capped line at a time
-with byte accounting; `render_streamed_line` validates and renders a single line (NUL /
-UTF-8 checks, CRLF normalization, control-character escaping, truncation marker);
-`OutputBudget` enforces the shared
-byte cap across appended lines.
-
-- **Binary rejection:** the tool peeks the first 8 KiB (`BINARY_SNIFF_BYTES`) and rejects
-  files containing a NUL byte with a friendly `"appears to be a binary file"` error,
-  mirroring ripgrep's heuristic. Returned content is always valid UTF-8 — invalid UTF-8
-  in the head or in a returned line yields an explicit `"not valid UTF-8"` error rather
-  than a raw std I/O error. The head is *always* sniffed, regardless of the requested
-  window; beyond the head, only lines that are actually returned are
-  validated, so invalid content outside the requested window is skipped, not rejected.
-- **Control-character escaping:** every returned line is also run through the shared
-  `sanitize_content` policy (tabs kept; ESC, backspace, U+2028/U+2029, and the Unicode
-  format-char spoofing set escaped) — the same defense `grep` applies to matched lines,
-  so a hostile file cannot inject terminal escape sequences or bidi-spoof the transcript
-  through the file-read tools either (see "Tool output sanitization and bounding").
-- **Line window:** `start_line` (1-based, default 1) and `max_lines` (default and cap
-  2000, `MAX_READ_FILE_LINES`) select the window; omitting both reads from the top.
-  Requests that run past EOF clamp to the last line, while a `start_line` past EOF is a
-  validation error. Output is a `path:` / `lines: a-b of N` header followed by the
-  selected lines, each prefixed with its 1-based number and a ` | ` gutter (unpadded —
-  padding was measured to cost ~16% more tokens for no accuracy gain). The gutter is a
-  display aid, not file content: `edit_file`'s `old_text` must exclude it. When the
-  window (not the byte budget) caps the output, a `...[more lines follow: showing A of B
-  lines — continue with start_line=N]` marker names the next unread line, mirroring the
-  byte-budget marker below.
-- **Output budget:** tool output is capped at 128 KiB **bytes**
-  (`MAX_TOOL_OUTPUT_BYTES`). Bytes are used rather than chars so the effective token cost
-  is roughly uniform across scripts (ASCII and CJK are both ~3-4 bytes per token).
-  Truncation always reports totals — `showing X of Y bytes (A of B lines)` — and names
-  the resume value (`continue with start_line=N`), so the agent knows what it is missing
-  and can pick up mechanically. X counts the returned content up to the marker — body +
-  prepended header + separator newline — so the reported figure matches the
-  bytes actually returned (the marker text itself is appended past the budget). The
-  window-cap marker above carries the same `continue with start_line=N` contract, so the
-  agent gets a mechanical resume line whether the byte budget or the line window binds.
-- **Per-line cap:** a single line longer than 64 KiB (`MAX_LINE_DISPLAY_BYTES`) is shown
-  as a truncated prefix with a `...[line truncated]` marker; the remainder is drained
-  (counted for totals, never buffered).
-- **Memory:** the tool streams via `BufReader` + `TextStream` (`read_line_capped`),
-  holding at most one capped line plus the output budget in memory regardless of file
-  size (previously the whole file was loaded via `read_to_string`).
+Each tool call executes with an optional `working_dir` — the session's working
+directory — that filesystem and Git tools resolve relative paths against. A
+leading `~` or `~/` in any path argument is expanded to the user's home directory;
+the `~user` form is passed through unchanged.
 
 ### Tool output sanitization and bounding
 
@@ -2494,13 +2227,12 @@ at the source, delivery is capped per client queue.)
 
 ### PDF tools
 
-`pdf_classify` and `pdf_to_markdown` (both under `tools/pdf/` — one file per tool,
-`classify.rs` and `markdown.rs`, with the shared helpers in `mod.rs` following the
-workspace's one-tool-per-file convention) give the agent native PDF
-ingestion by wrapping `pdf-inspector` (Firecrawl) — a pure-Rust, extraction-only PDF
-parser built on `lopdf`. The parser has no JavaScript engine, never renders pages, and
-never executes embedded files or `/Launch` actions, so the classic PDF malware
-*execution* vectors are excluded by construction.
+`pdf_classify` and `pdf_to_markdown` give the agent native PDF ingestion by
+wrapping `pdf-inspector` (Firecrawl) — a pure-Rust, extraction-only PDF parser
+built on `lopdf`. The parser has no JavaScript engine, never renders pages, and
+never executes embedded files, `/Launch` actions, or external references, so the
+classic PDF malware *execution* vectors are excluded by construction. The tool
+layout and per-tool contracts are documented in-source (see `tools/pdf/`).
 
 > **Dependency — security.** `pdf-inspector` is an **unconditional registry dependency**
 > of `choreo-daemon` (`pdf-inspector = "1"`, version 1.x, no feature gate). The old
@@ -2579,7 +2311,7 @@ Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protoc
 Each tool's contract — its arguments, return shape, and output behaviour, and its
 feature/binary gating — is documented in-source (see `choreo-daemon`'s tool modules,
 `cargo doc -p choreo-daemon` / `just doc`), held complete by the `#![warn(missing_docs)]` +
-`doc-check` gate. The registry lists the shipped tools (see "Registry" above).
+`doc-check` gate. The registry lists the shipped tools (see the `tools` module and its `ToolRegistry` docs).
 
 ### Tool groups
 
@@ -2597,304 +2329,65 @@ Groups affect only tool **availability** in the API `tools` array — they are a
 mechanism, not access control. The RISC-V VM (`run_riscv`) always has access to all registered
 tools regardless of group state.
 
-Implementation details:
-- `ToolRegistry::available_definitions(active)` returns definitions for all registry
-  tools in the active set; every tool — including `load_tools`, `unload_tools`, and
-  `set_working_dir` — is a proper `Tool` trait implementation registered in the
-  default registry via `ToolRegistry::build()`
-- The former meta-tools were converted from inline `&mut SessionState` handlers in
-  `execute_tool_with_timeout()` to registry tools (see `tools/set_working_dir.rs`,
-  `tools/load_tools.rs`, `tools/unload_tools.rs`).  They follow the
-  `set_session_title` pattern: validate in the tool, then route the mutation
-  through `DaemonCommand` → daemon → `SessionCommand` → the session's main loop,
-  which applies it to the authoritative `SessionConfig` (broadcast + persist).
-  This fixes a lost-update bug where the old inline handlers mutated the request
-  worker's throwaway snapshot, which was discarded at request end
-- `set_working_dir` supports tilde expansion in its `path` argument (inherited from
-  `resolve_path`) and canonicalizes the target (rejecting non-existent paths and
-  symlink escapes); `load_tools`/`unload_tools` carry a weak reference to the
-  registry so their `groups` schema enum reflects the live group catalog
-  (including dynamic MCP groups) at definition time
-- `set_working_dir` performs a synchronous reply round-trip like
-  `load_tools`/`unload_tools`: the daemon replies with an error immediately if
-  the session is inactive, and the session main loop replies after applying the
-  change — so a tool success means the authoritative state was actually updated
-- `load_tools`/`unload_tools` validate their group names against the live
-  registry catalog before sending (the schema enum is advisory): unknown groups
-  are rejected with a clear error instead of being silently persisted into the
-  session's active set.  The session handlers re-validate as defense-in-depth
-  (see `unknown_group_names` / `ToolRegistry::known_group_names`)
-- The three tools are restricted to `AllowedCaller::Direct` (model only) and are
-  kept in the serial dispatch phase to preserve same-turn ordering of
-  session-config mutations
-- `list_sessions`, `get_session`, `load_skill`, and `spawn_subsession` are also
-  proper `Tool` trait implementations registered in the default registry via
-  `ToolRegistry::build()`, using `ToolContext.daemon_tx` to communicate with the
-  daemon command loop
-- `read_session` (group `core`) reads the readable *text* of another session's
-  conversation — the user messages, the assistant responses, and the assistant's
-  displayed reasoning — straight from the shared redb database via
-  `db::read_turns` (the same read path `session_inspect` uses), with no daemon
-  round-trip. It deliberately omits tool-call inputs and tool results (noisy, and
-  the part of a transcript most likely to carry injected network content) and
-  never emits the opaque reasoning artifacts (encrypted blobs / thinking-block
-  JSON), which stay daemon-only like every other client view. It reads the most
-  recent turns by default (a researched answer lands at the tail), supports a
-  forward `from`/`limit` window, skips `undone` turns, caps each field at
-  `max_field_chars` (default 2000), and trims whole turn blocks to the shared
-  `MAX_TOOL_OUTPUT_BYTES` budget. The daemon is single-user with no session
-  access control, so any session's text is readable from any other; only
-  *committed* turns are visible (a turn is persisted at the end of its
-  agent-loop request, so an in-flight draft is not yet readable).
-- `session_inspect` (group `debug`) is a **read-only** diagnostic (built with
-  `Tool`): it opens the session record + turns via redb **read** transactions and
-  dry-runs `build_chat_request_messages` + `warn_on_missing_reasoning_artifacts`
-  with the manifest `model_reasoning_passback` policy, serializing each built
-  `ChatRequestMessage` the way the adapter emits it — so its
-  "would carry reasoning_content on the wire" count is exactly what the provider
-  sees. It replays the reasoning-echo decision (ToolLoop/provenance/passback)
-  per assistant turn to surface which turns are sent bare (the DeepSeek/Kimi
-  `reasoning_content` must-be-passed-back 400 shape) and — via
-  `include_reasoning_artifact`, the same helper the builder uses — flags wire
-  EMPTY assistant messages (content-less, tool-less, no reasoning echo) as
-  "must not be empty" 400 candidates, so a history that would fail at the
-  upstream is visible before the request is sent. Privacy mirrors
-  `turn_for_client`: artifact metadata + producer identity are shown for any
-  session, but message-text previews and raw reasoning bytes are rendered only
-  for the calling session, and raw reasoning additionally requires `include_raw`
-  (thinking blocks / encrypted signatures never leave the daemon otherwise).
-- Session state stores `active_tool_groups: HashSet<String>` (default: `{core, git, shell}`, plus `content` only when the `content` cargo feature is enabled; a persisted stale `coord` group name is silently ignored)
-- `ToolGroup` struct and `GROUPS` constant live in `choreo-daemon/src/tools/mod.rs`
-- Group metadata is appended to the system prompt in `context::build_base_prompt()`
-
 ### Concurrent tool dispatch
 
-The tool-dispatch and execution machinery (channel wiring, the wait-loop,
-streaming forwarder, timeout resolution, and per-tool result recording) lives in
-`requests/tool_execution.rs`, and the system-prompt / tool-result-collection
-helpers (`build_system_content`, `collect_tool_result`, `persist_loaded_skill`, …)
-live in `requests/system_content.rs`; both are re-exported from `requests.rs`
-via `pub(crate) use <mod>::*;` so every existing `crate::requests::X` reference
-keeps resolving unchanged. `run_agent_loop` stays in `requests.rs`.
+`run_agent_loop` partitions each response's tool calls into a **serial
+(session-config)** phase — `load_tools`, `unload_tools`, `set_working_dir`, and
+the other session-config mutators — and a **concurrent** phase holding every
+remaining tool (shell, filesystem, VM, HTTP, Git, `spawn_subsession`, …) whose
+execution is independent of session state. The partition, the typed
+`PendingConfigChange` capture, and the Phase-3 worker-copy mirror that carries
+successful session-config mutations onto the request worker's config copy are
+documented in-source (`choreo-daemon`'s `requests` module).
 
-Each agent-loop iteration assembles the turn's tool list by merging the shared
-registry's definitions (active ∪ protected, minus shadowed groups) with the
-session's project tools, then runs a **provider preflight** before the list is
-used: `crate::tools::retain_valid_tool_definitions(&mut tools)` drops any
-definition `is_valid_tool_definition` rejects and returns the dropped names for
-a `tracing::warn!` (naming the session id). MCP names/schemas are sanitized at
-registration, so a violation here is a regression; dropping just the offending
-tool keeps the session usable instead of dispatching a request the provider is
-guaranteed to reject with an opaque, bodiless 400.
+The dispatch and execution machinery (channel wiring, per-tool timeout
+resolution, the wait loops, the streaming forwarder, and per-tool result
+recording) lives in `requests/tool_execution.rs`, and the system-prompt /
+tool-result-collection helpers live in `requests/system_content.rs`; both are
+re-exported from `requests.rs`. Each concurrent tool runs on a dedicated
+execution thread, a forwarding thread, and a wait-loop thread — see the
+`requests/tool_execution.rs` module docs for the thread topology and the
+per-tool timeout budgets.
 
-`run_agent_loop` in `requests.rs` partitions tool calls into two groups before execution:
+Cancellation is fully event-driven: every wait blocks on a
+`crossbeam_channel::select_biased!` between its result channel, the request's
+cancel channel, and (where a timeout applies) an exact `after(remaining)` timer
+— there are no `recv_timeout` poll loops — and every wait biases the cancel arm
+first, so a queued cancel is selected deterministically and a cancel that lands
+mid-block is more likely to beat a simultaneously-ready result. When a cancel
+wins a race, an already-completed result is still drained (non-blocking) rather
+than discarded, so the tool's real output is recorded while the request still
+stops (sticky `cancelled` flag). A cancel observed by the concurrent collector
+sends every still-running wait-loop a per-tool kill and keeps draining until all
+batch handles have arrived, so each unfinished call records a deterministic
+`"tool '<name>' cancelled"` outcome; the placeholder sweep
+(`mark_unexecuted_tool_results`) remains a safety net for wait-loops that die
+before delivering. Tool results are always rendered in the model's original call
+order — placeholders are seeded in call order and filled **in place by
+`call_id`** as each tool streams or finishes, and the accumulator fed to the
+provider is re-sorted back to call order (`sort_by_call_order`) after the batch.
+A tool thread that panics is caught and reported as a `ToolOutput` with
+`is_error: true` instead of crashing the daemon.
 
-- **Serial (session-config)** — `load_tools`, `unload_tools`, `set_working_dir`.
-  These no longer require `&mut SessionState` (they route mutations to the
-  session main loop via `DaemonCommand`), but they still execute serially so
-  same-turn ordering of session-config mutations is preserved.
-- **Worker-copy mirror (Phase 3)** — after every tool in the response has
-  executed, `run_agent_loop` mirrors successful session-config mutations onto
-  its own worker config copy so the next agent-loop iteration observes them
-  (tool definitions, system content, working-dir-relative file ops).  The
-  mutations are captured in Phase 1 as a typed `PendingConfigChange`
-  (`LoadTools(Vec<String>)`, `UnloadTools(Vec<String>)`,
-  `SetWorkingDir(Option<PathBuf>)`) and applied in call order in Phase 3:
-  the shared `apply_load_tools`/`apply_unload_tools` for the group sets, and
-  for `set_working_dir` the tool's **executed result** — the canonical path is
-  carried on `ToolOutput.result_json` (populated by the blanket `ToolDyn` impl
-  from the tool's typed return), so the mirror reproduces exactly what the
-  main loop applied with no re-resolution and therefore no TOCTOU window.  A
-  rarely-reachable fallback re-runs the shared `resolve_working_dir_path`
-  helper (against the working directory in effect when the response was
-  planned); if even that fails, the worker still invalidates its `discovered_skills`
-  cache so a stale skill set can never leak across the request boundary.  The
-  mirror is deferred until the end of the response because the model planned
-  every tool call in the batch against the pre-change state (parallel
-  semantics) — `set_working_dir` therefore takes effect on the next
-  agent-loop turn, matching its advertised description.  The worker copy is
-  discarded at request end, so it cannot drift from the main loop's
-  authoritative state across requests.
-- **Concurrent** — all remaining tools (shell, filesystem, VM, HTTP, Git,
-  `spawn_subsession`, etc.) — tools whose execution is independent of session state.
-  These are dispatched across multiple OS threads in parallel using `spawn_single_tool()`.
-
-**Cache warming** hooks in exactly between the two: right after a `ToolUse`
-result is recorded (the assistant message, its placeholders, and the response
-id are all persisted) and just before the tools run — the blocking window a
-warm ping bridges. When `SessionState::warm_policy.mode == Streaming` (resolved
-by the daemon per account and refreshed whenever the session re-resolves its
-account — the spawn-time value initialises it, and every `ResolveAccountCmd`
-reply updates it), `run_agent_loop` spawns a per-request warmer (`cache_warm::spawn_warmer`) at
-loop entry and, on each tool turn, sends it an `Arm(WarmRequest)` carrying the
-just-sent `messages`/`tools`, `estimated_prompt_tokens` as `prefix_tokens`, the
-catalog `prompt_cache_ttl`/`model_cost`, `retention: Short`, and `replayable =
-is_replayable(protocol_is_anthropic(provider_slug), thinking_enabled)`. The
-`WarmRequest` clone is O(conversation) — the same order
-`build_chat_request_messages` already costs each iteration — and happens ONLY on
-a tool turn (no arm on `FinalText`, which returns). The returned `WarmHandle`
-is an RAII guard held for the whole loop, so the thread is stopped and joined
-on every exit path (final text, cancel, error, and panic — the drop runs during
-unwind, before `run_request_worker`'s `catch_unwind`). No new `SessionEvent` is
-emitted: the warmer surfaces status only through `tracing` and Prometheus (a
-status/broadcast event is a deliberate follow-up).
-
-For concurrent tools, each call gets:
-1. A dedicated **execution thread** that runs the tool via `ToolDyn::execute_streaming_json()`.
-2. A **forwarding thread** that relays streaming output chunks to session subscribers in
-   real time through the session command channel. It is fully event-driven — a
-   `crossbeam_channel::select_biased!` on the streaming-output receiver (first arm) and
-   the per-call kill receiver — so a kill signal is honored the instant it is sent and
-   chunks already queued are still drained before the thread exits. The streaming-output
-   channel between the execution thread and the forwarder is *bounded* (64 chunks), so a
-   tool that out-produces the forwarder applies backpressure (blocks on `send`) instead of
-   buffering an unbounded number of chunks in memory — the same bounded-channel design the
-   SSE reader uses. It cannot deadlock: the forwarder drains continuously into the
-   unbounded session command channel, and when it exits it drops the receiver, failing any
-   blocked `send`.
-3. A **wait-loop thread** that enforces the per-tool timeout (300s for shell tools, a floor derived from the image adapters' shared
-   constants for `generate_image` — (POST attempts + URL-download attempts) × the 180 s per-attempt agent deadline plus a 60 s
-   inter-attempt backoff headroom, currently 960 s, so a slow provider render is never discarded as an outer timeout after a
-   PAID generation — 60s for others, no limit for sub-sessions).
-4. A dedicated **image channel** — the tool emits any produced image through this channel,
-   which the wait-loop drains after execution completes.
-
-**Thread count:** Because each concurrent tool spawns three threads (execution, forwarding,
-wait-loop), dispatching N tools simultaneously creates up to 3N + 1 additional threads
-(the +1 is the agent loop's main thread). The kernel scheduler handles these efficiently
-for typical N (< 10), but callers should be aware of the resource footprint.
-
-Tool results are always rendered in the model's original call order. When the model
-returns a `ToolUse`, `run_agent_loop` seeds one placeholder `ToolResultRecord` per call
-(empty content, in call order) into the turn and broadcasts it, so the transcript shows
-every tool result slot in call order from the very start. Streaming chunks flow live via
-per-tool forwarding threads (`ToolResultChunk`), and each tool's wait-loop thread delivers
-its final `ToolHandle` through a shared batch channel the moment it finishes — both update
-the matching placeholder **in place by `call_id`** (`update_tool_result`), then broadcast
-`TurnAppended`. Because updates are in place, the rendered order never changes regardless
-of completion order. Only the accumulator fed to the provider on the next call is
-re-sorted back to call order (via `sort_by_call_order`) after the batch completes, so tool
-messages mirror the assistant's `tool_calls` array. If a tool thread panics, the error is
-caught and reported as a `ToolOutput` with `is_error: true` instead of crashing the daemon.
-The `invocation_description` is generated before spawning (via
-`ToolRegistry::describe_invocation`) and passed through `SpawnToolArgs`, so even timeout
-and panic error paths carry a meaningful description in the `ToolOutput`. If the request
-is cancelled before every tool's outcome was recorded, the unfilled placeholders are marked
-`[cancelled — result not recorded]` (`SessionState::mark_unexecuted_tool_results`) before the
-request stops, so the transcript shows what happened and the next provider request never
-carries empty tool messages for calls whose outcome is unknown.
-
-Cancellation during tool execution is fully event-driven: the concurrent collector and
-`execute_tool_with_timeout` (serial phase) block on `crossbeam_channel::select_biased!`
-between their result channels, the request's cancel channel, and (where a timeout applies)
-an exact `after(remaining)` timer — there are no `recv_timeout` poll loops, and timeouts
-fire precisely. Every wait that involves cancellation biases the cancel arm first, so a cancel already
-queued when the wait begins is selected deterministically and a cancel that lands mid-block
-is *more likely* to beat a simultaneously-ready result (bias for cancel — a preference,
-not a guarantee, and both outcomes are handled correctly); when a cancel wins the race, an
-already-completed result is still drained (non-blocking) rather than discarded, so
-the tool's real output is recorded while the request still stops (sticky `cancelled` flag).
-A cancel observed by the concurrent collector stops waiting for the slowest tool without
-making the transcript nondeterministic: every still-running wait-loop receives a per-tool
-kill (its forwarder stops streaming promptly and its `ToolContext.cancelled` flag is set
-so the tool itself can stop early), pending handles are drained, and — because every
-wait-loop selects on its kill channel — the collector keeps draining until all batch
-handles have arrived. Each unfinished call therefore records a deterministic
-`"tool '<name>' cancelled"` outcome instead of racing the placeholder sweep; the sweep
-(`mark_unexecuted_tool_results`) remains as a safety net for wait-loop threads that die
-before delivering (those are synthesized as panics) and for the serial phase. The drain
-is bounded by thread scheduling, not by the slowest tool — its execution thread keeps
-running in the background either way. The tool's *execution thread* cannot be
-interrupted mid-call (Rust threads are not killable) and runs to completion in the
-background, but every channel it would deliver through — exec result, streaming output,
-image — has been dropped by the wait-loop's exit, so its late result is discarded and it
-can no longer affect the transcript; external side effects (file writes, child processes)
-still complete. Both the per-tool wait-loop threads and the
-serial-phase wait drain the result channel before reporting a timeout, so a tool whose
-result was already queued when the deadline fired is not reported as timed out (the
-wait-loops bias their result arm ahead of the deadline timer; the serial wait drains once
-the timer fires). The per-tool forwarding threads are event-driven too: they
-`select_biased!` on the streaming-output channel and a dedicated kill channel (output arm
-first, so the burst queued when a kill is observed is drained — bounded by the queue length
-at that instant — before the kill is honored) and additionally re-check the
-kill channel after every forwarded chunk, so a continuously-streaming tool cannot starve the
-kill arm — a busy stream stops after one bounded final drain rather than streaming on
-forever.
-This removed the last poll loop from the tool execution path — the streaming channel itself
-is a bounded crossbeam channel, so the forwarder blocks until a chunk or kill actually
-arrives rather than waking on a 200 ms interval (and a tool that out-produces the
-forwarder is throttled rather than buffered unboundedly). Both phases share a
-`ToolContext.cancelled` flag with the running tool — the serial wait sets it when it
-observes a cancel or the deadline expires, and the concurrent collector's per-tool kill
-sets it on the wait-loop's behalf — so a tool that consults it can stop early. (This
-lock-free flag is the one sanctioned shared-state exception to the repo's channel-only
-thread-communication rule; see AGENTS.md.) The per-request cancel
-channel is a crossbeam channel created in `sessions.rs`
-(`ActiveRequest.cancel_tx`) and threaded through `run_agent_loop` → `ChatTurnRequest` →
-retry/stream, so every wait (provider SSE, retry backoff, serial tool, concurrent
-collector) can `select_biased!` on it directly (cancel arm first; `sleep_or_cancel` too).
-The sender is held by `ActiveRequest` and dropped
-only at `RequestFinished`, so a firing cancel arm always means a real cancel — never a
-disconnect (the one deliberate exception is `sleep_or_cancel`, which proceeds on the
-unreachable disconnect rather than aborting a retry loop). A cancel observed mid-batch
-stops the request (sticky `cancelled` flag) after Phase 3 has mirrored the already-executed
-config changes and the never-executed placeholders have been marked.
+Both phases share a `ToolContext.cancelled` flag with the running tool so a tool
+that consults it can stop early — the one sanctioned shared-state exception to
+the repo's channel-only thread-communication rule (see AGENTS.md).
 
 ### spawn_subsession
 
-`spawn_subsession` is a core-group `Tool` trait implementation registered in `ToolRegistry`.
-It runs in the concurrent dispatch path alongside other tools. When invoked:
+`spawn_subsession` is a core-group `Tool` implementation that runs in the
+concurrent dispatch path. Invoked, it creates a child session
+(`DaemonCommand::CreateSession`, parent as `parent_session_id`, inheriting the
+parent's working directory and tool groups), pushes the prompt as a `SystemText`
+message, drives the child's own `run_agent_loop()` (subject to the daemon-wide
+`max_turns` cap), and returns the child's assistant text to the parent; the child
+persists as a normal session. The tool's contract is documented in-source
+(`choreo-daemon`'s `tools/subsession.rs`).
 
-1. A child session is created via `DaemonCommand::CreateSession` with the parent as
-   `parent_session_id` and inheriting the parent's working directory and tool groups.
-2. The prompt argument is pushed as a `SystemText` message into the child session.
-3. The child session runs its own `run_agent_loop()` (model → tools → model), subject to the daemon-wide `max_turns` cap.
-4. The child's assistant text output is collected and returned to the parent as the tool result.
-5. The child session persists in the database and is listable/attachable like any other session.
-
-The daemon maintains a `children: HashMap<u64, Vec<u64>>` on `DaemonState` tracking the
-parent→child relationship. This is used for **cancellation propagation** and **cascade
-deletion**:
-
-- **Cancellation:** When a client sends `Cancel`, the daemon routes it through
-  `DaemonCommand::CancelRequest` rather than sending `SessionCommand::Cancel` directly to the
-  session thread. After forwarding the cancel to the target session, the daemon also calls
-  `cancel_children_of()` to propagate the cancel to all active child sessions, so they stop
-  their work without polling.
-- **Session exit:** When a parent session exits (sleeps), `handle_session_exited` calls
-  `cancel_and_shutdown_child()` on each child to shut them down gracefully.
-- **Session deletion:** `handle_delete_session` cascade-deletes children before the parent by
-  calling `delete_session_inner()` on each child, logging but continuing if a child's DB
-  delete fails. `delete_session_inner` never blocks the command loop: it removes the entry,
-  records the id in `DaemonState::deleted_sessions` and writes a deletion tombstone
-  (`deleted_sessions` DB table) **before** sending the thread `Cancel` + `Shutdown`, so a
-  crash in the window after `Shutdown` but before the tombstone commits cannot leave a
-  re-created record unmarked for the startup purge. The marker also means straggler
-  `UpdateMetadata`/status messages from the still-shutting-down thread cannot re-insert the
-  session into the in-memory index. The actual record delete is deferred to
-  `handle_session_exited` — the thread's `persist_and_exit` runs *before* it sends
-  `SessionExited`, so by the time the handler runs the record on disk is the thread's
-  final state and can be removed without a re-create race. That delete runs on a
-  **background thread** (`finalize_session_delete` — a pathologically large session, since
-  `db::delete_session` walks every turn and kv entry, cannot block the command loop) and
-  reports back via `DaemonCommand::SessionDeleteFinalized`; only a *successful* delete drops
-  the `deleted_sessions` marker, on failure the marker and tombstone stay in place so the
-  session cannot be attached or resurrected, and the startup purge
-  (`db::purge_tombstoned_sessions`) retries. Two fast paths avoid the tombstone write and
-  the deferred finalize entirely: deleting a session with **no live thread** (nothing can
-  re-create the record) deletes immediately and sweeps any stale tombstone; deleting a
-  session whose thread has **already terminated** (`JoinHandle::is_finished()` — its
-  `persist_and_exit` ran and its `SessionExited` is queued) also deletes immediately, but
-  *does* set the deleted marker — the thread's straggler messages are queued ahead of its
-  `SessionExited`, so without the marker they would re-insert the session into the index,
-  and the queued `SessionExited` then runs the standard finalize (an idempotent no-op
-  delete, since the record is already gone) which clears the tombstone and drops the marker.
-  The tombstone also covers the crash window: if the daemon dies while the thread is still
-  shutting down, the next startup removes any record the zombie left behind.
-
-The child session uses `ToolContext` (`active_tool_groups`, `reasoning_effort`, `working_dir`,
-`daemon_tx`) to inherit parent config and communicate with the daemon command loop.
-
+The daemon tracks the parent→child relationship (`DaemonState::children`) so a
+parent's cancellation, exit, or deletion also stops its children — see the
+daemon's session-lifecycle docs for the cancellation-propagation and
+cascade-deletion rules.
 
 ---
 
