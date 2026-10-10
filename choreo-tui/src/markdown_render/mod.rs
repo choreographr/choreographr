@@ -16,8 +16,10 @@ use tracing::{debug, warn};
 
 mod assemble;
 mod block;
+mod code;
 mod incremental;
 mod inline;
+mod list;
 mod tables;
 mod text;
 
@@ -28,8 +30,10 @@ mod text;
 // its parent.
 pub(crate) use assemble::*;
 pub(crate) use block::*;
+pub(crate) use code::*;
 pub(crate) use incremental::*;
 pub(crate) use inline::*;
+pub(crate) use list::*;
 pub(crate) use tables::*;
 pub(crate) use text::*;
 
