@@ -8,8 +8,8 @@
 //! `terminal_status/tests.rs` reaches `make_session` as
 //! `crate::state::tests::make_session`.
 
-use crate::state::{App, SessionStatus, SessionSummary};
-use choreo_proto::Turn;
+use crate::state::{App, SessionStatus};
+use choreo_proto::{SessionSummary, Turn};
 
 mod content_version;
 mod find_turn;
