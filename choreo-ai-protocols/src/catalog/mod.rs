@@ -85,9 +85,8 @@ pub enum ReasoningPassback {
 /// object; `cache_read`/`cache_write` are frequently absent (many
 /// OpenAI-compatible models record only `input`/`output`/`cache_read`), so
 /// they are optional. Consumed by the cache-warming cost gate — currently
-/// **recorded but unwired**: no production caller reads it yet (see the
-/// catalog-facts paragraph in ARCHITECTURE.md, alongside
-/// `model_supports_temperature`).
+/// **recorded but unwired**: no production caller reads it yet, alongside
+/// `model_supports_temperature`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ModelCost {
     /// Prompt (input) price, USD per million tokens.
@@ -181,8 +180,7 @@ pub struct ModelEntry {
     /// [`model_supports_temperature`]. Currently **recorded but unwired**:
     /// no request builder sends a `temperature` parameter today, so the
     /// resolver has no production caller — the fact is kept so the gate
-    /// exists the moment temperature sending is added (see ARCHITECTURE.md,
-    /// the catalog-facts paragraph).
+    /// exists the moment temperature sending is added.
     #[serde(default = "default_true")]
     pub supports_temperature: bool,
     /// Whether the snapshot marks the model deprecated (`status ==

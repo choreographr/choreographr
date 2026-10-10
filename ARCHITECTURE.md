@@ -1055,244 +1055,111 @@ lock-free or minimally scoped and carries no protocol data:
 
 ### Provider Architecture
 
-The provider system has three layers, now split across two crates:
+Provider support is layered across two crates, and the seam between them is the
+point of the split. `choreo-ai-protocols` owns every wire protocol — the
+`ProviderClient` trait (`src/traits.rs`), the `ChatTurnRequest` /
+`ChatTurnResult` turn types it is expressed in (`src/types.rs`), the three chat
+adapters (`openai/`, `anthropic/`, `google/`), and the static catalog
+(`src/catalog/`). `choreo-daemon` owns `InferenceProvider`
+(`src/providers/mod.rs`), the only daemon type that dispatches by protocol: it
+wraps a `dyn ProviderClient` together with the **catalog slug** (e.g.
+`"opencode"` even when the client is an `OpenAiClient`) because catalog lookups
+need the provider identity the client itself may report generically, and
+`from_account_config` resolves the account's slug through the catalog and builds
+the matching client. All wire-format knowledge stays in `choreo-ai-protocols`;
+the daemon supplies the account-config, metrics, and session concerns at the
+boundary.
 
-**1. `ProviderClient` trait (`choreo-ai-protocols/src/traits.rs`):**
-```rust
-/// Holds the common parameters for a chat completion turn.
-pub struct ChatTurnRequest<'a> {
-    pub model: &'a str,
-    pub messages: &'a [ChatRequestMessage],
-    pub tools: &'a [ChatToolDefinition],
-    pub thinking_effort: String,
-    pub on_retry: &'a mut Option<RetryCallback>,
-    pub cancel_rx: Option<&'a crossbeam_channel::Receiver<()>>,
-    pub previous_response_id: Option<&'a str>,
-    pub tool_results: &'a [ToolResultItem],
-    pub programmatic_tool_calling: bool,
-    pub max_output_tokens_override: Option<u32>,
-    pub no_retry: bool,
-}
+Two contracts cross that boundary and are public surfaces in their own right:
 
-pub trait ProviderClient: Debug + Send + Sync {
-    fn provider_slug(&self) -> &str;
-    fn chat_completion_turn(&self, params: ChatTurnRequest<'_>) -> Result<ChatTurnResult, InferenceError>;
-    fn chat_completion_turn_streaming(&self, params: ChatTurnRequest<'_>, on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>) -> Result<ChatTurnResult, InferenceError>;
-    fn list_models(&self) -> Result<Vec<String>, InferenceError>;
-    fn supports_programmatic_tool_calling(&self, model: &str) -> bool;
-    fn context_window_for_model(&self, model: &str) -> Option<u32>;
-}
-```
+- **Streaming.** A turn is delivered as a sequence of `StreamEvent`s
+  (`Answer`/`Reasoning`, `src/types.rs`) through a `&mut dyn FnMut` callback
+  (kept object-safe); a non-streaming turn is converted to the identical event
+  sequence by `emit_non_streaming_events` (`src/shared.rs`), so one event-driven
+  path serves both a streaming and a non-streaming configuration without
+  per-provider duplication.
+- **Metrics.** `InferenceProvider` records `record_api_call` /
+  `record_api_error` around every turn — timing lives in the daemon so
+  `choreo-ai-protocols` stays free of daemon concerns. The `endpoint` label is
+  the **catalog slug**, not the protocol name (e.g. `"opencode"` rather than
+  `"openai"`): more precise, but part of the public Prometheus contract, so
+  renaming a slug changes that provider's series. Error labels come from
+  `InferenceError::metric_label()` in `choreo-proto`, the single canonical
+  mapping shared by all providers.
 
-`ChatTurnRequest` consolidates the per-turn parameters into a single struct
-to eliminate repetitive argument passing across all provider implementations.
-Uses `&mut dyn FnMut` for the streaming callback to keep the trait object-safe.
-Two fields are per-call request knobs the cache-warming ping sets (and ordinary
-turns leave at their defaults `None`/`false`): `max_output_tokens_override`
-caps THIS call's output (a 1-token cap keeps the ping cheap) and `no_retry`
-makes it a single best-effort attempt (realised by collapsing the effective
-`RetryConfig` to `max_attempts == 1` via `RetryConfig::with_no_retry`). Each
-protocol maps the cap onto its own output-length field: Anthropic `max_tokens`
-(the thinking budget still derives from the configured `max_tokens`, so a
-small cap cannot collapse it; `0` is Anthropic's documented cache pre-warm),
-OpenAI Chat Completions `max_tokens`/`max_completion_tokens` (the slot the model
-uses), Responses `max_output_tokens`, and Google
-`generationConfig.maxOutputTokens` (emitted only when the override is set, so
-ordinary turns are unchanged). `context_window_for_model()` returns the model's context window size, using a
-resolution chain: per-model config → global fallback → catalog fallback.
-Each client implementation maps the `&str` effort slug to its wire format:
-- **OpenAI**: `reasoning_effort` field (`None` for `"off"`, otherwise slug → API string). For the Zhipu slugs (`zai`/`zhipuai`) the chat adapter instead applies the documented z.ai model-specific mapping (`zhipu_reasoning_effort_api_value` in `choreo-ai-protocols/src/openai/mod.rs`): GLM-5.3/-flash accept only `low`/`high`/`max` (unsupported slugs are coerced, `off` omits the field — 5.3 cannot disable thinking and thinks at its `max` default), and GLM-5.2-and-below follow the documented 5.2 family mappings (`minimal` skips thinking, `low`/`medium`→`high`, `xhigh`→`max`).
-- **Anthropic**: `thinking` block with `budget_tokens` (slug ≠ `"off"` enables thinking, clamping to `max_tokens - 1024`)
-- **Google**: `thinkingConfig` with `includeThoughts: true` (slug ≠ `"off"` enables thinking)
-- **Mistral**: `reasoning_effort` field (`"off"` omits the field, otherwise slug → `"low"`/`"medium"`/`"high"`)
+Each client maps the account's `&str` reasoning-effort slug onto its own wire
+format (OpenAI-compatible `reasoning_effort`, Anthropic a `thinking` block with
+`budget_tokens`, Google `thinkingConfig`) — see each adapter module for its
+exact mapping. The catalog's own data pipeline is described under
+**models.dev + overlay**; the one-time slug migration under **Slug renames**.
 
-**2. `InferenceProvider` struct (`choreo-daemon/src/providers/mod.rs`):**
-```rust
-pub struct InferenceProvider {
-    client: Arc<dyn ProviderClient>,
-    slug: String, // catalog slug, owned (e.g. "opencode" even for an OpenAiClient)
-}
-```
-Created via `from_account_config()` which looks up the provider slug in the catalog (returning an owned clone) and dispatches to the appropriate client constructor by protocol type. `provider_slug()` borrows `&str` from the owned slug. All wire-protocol knowledge lives in `choreo-ai-protocols`; the daemon's `InferenceProvider` is the only daemon type that dispatches by protocol. It also records API metrics (`record_api_call` / `record_api_error`) around every turn — timing moved here from the provider crates so `choreo-ai-protocols` stays free of daemon concerns.
-
-The metrics `endpoint` label is the **catalog slug** (e.g. `"opencode"` rather than the protocol name `"openai"`) — more precise than the protocol, but part of the public metrics contract: renaming it changes the Prometheus series for that provider. Error labels come from `InferenceError::metric_label()` in `choreo-proto`, the single canonical mapping shared by all providers.
-
-**3. Provider Catalog (`choreo-ai-protocols/src/catalog/`):**
-```rust
-pub enum ProviderProtocol {
-    OpenAi { max_tokens_field: MaxTokensField },
-    AnthropicMessages,
-    GoogleGenerativeAi,
-}
-```
-
-**`StreamEvent`** (`choreo-ai-protocols/src/types.rs`) replaces the old `(CompletionChunkKind, String)` callback tuple:
-```rust
-pub enum StreamEvent {
-    Answer(String),
-    Reasoning(String),
-}
-```
-Each variant carries its data inline so the streaming callback is self-describing and extensible.
-`emit_non_streaming_events()` in `providers/shared.rs` converts a `ChatTurnResult` into the
-equivalent sequence of `StreamEvent`s, allowing non-streaming configurations to reuse the
-same event-driven path as streaming ones without duplication across providers.
-
-**3. Provider Catalog (`choreo-ai-protocols/src/catalog/`):**
-```rust
-pub enum ProviderProtocol {
-    OpenAi { max_tokens_field: MaxTokensField },
-    AnthropicMessages,
-    GoogleGenerativeAi,
-}
-```
-
-(Note: Mistral speaks the OpenAI wire format — `POST /v1/chat/completions` —
-so it is catalogued under `OpenAi`, not a protocol of its own.)
+(Note: Mistral speaks the OpenAI wire format — `POST /v1/chat/completions` — so
+it is catalogued under `OpenAi`, not a protocol of its own.)
 
 ### models.dev + overlay
 
-The catalog is a two-layer pipeline (`choreo-ai-protocols/src/catalog/`):
+The catalog is a two-layer pipeline in `choreo-ai-protocols/src/catalog/`: a
+**normalized models.dev base** supplies the facts — provider slugs/names, base
+URLs, and per-model context/reasoning/cost data — and a **bundled policy
+overlay** (`catalog/models-overlay.toml`) supplies everything models.dev cannot
+express: wire-protocol selection, endpoint and default-model policy, per-model
+passback exceptions, the prompt-cache TTL tiers, and the wholesale overlay-only
+providers models.dev does not cover. `catalog/models.dev.json` is a **local,
+gitignored** snapshot (`catalog-gen` fetches it when missing), so the only
+committed catalog data file is the embedded postcard blob `catalog/catalog.bin`
+that `normalize_modelsdev` produces deterministically (its JSON object order is
+load-bearing: the derived default model is a provider's first model id). The
+overlay is merged **at load time** (`merge_overlay`), never baked into the blob,
+so S4 can re-merge the same base with a user overlay at runtime.
 
-```text
-catalog/models.dev.json  (local, gitignored)  ──catalog-gen──►  catalog/catalog.bin   (embedded postcard base)
-                                                      │
-                                             include_bytes!  ▼
-                                    load_bundled_base() → ProviderEntry base
-                                                      │
-                  catalog/models-overlay.toml (include_str!)  ▼
-                                              merge_overlay() → load_catalog()
-```
-
-- **Base — normalized models.dev facts.** `catalog/models.dev.json` is a
-  **local, gitignored** snapshot of the models.dev API (fetched by
-  `catalog-gen` when it is absent — the only committed catalog data file is
-  `catalog.bin`).
-  `normalize_modelsdev` turns it into base `ProviderEntry` values: slug/name
-  from the provider key/`name`, `base_url` from `api` (empty when absent),
-  `default_model` = the FIRST model id in the snapshot's JSON order, protocol
-  derived from the `npm` package (`@ai-sdk/anthropic` → Anthropic,
-  `@ai-sdk/google` → Google, everything else OpenAI-compatible), and per-model
-  `context_window` / `reasoning_supported` / effort levels derived from
-  `limit.context` / `reasoning` / `reasoning_options`, plus the per-model
-  `cost` object (`input`/`output`/`cache_read`/`cache_write`, USD per million
-  tokens) where the snapshot records one. The `catalog-gen` binary
-  (`cargo run --bin catalog-gen`) normalizes the snapshot, postcard-serializes
-  the **normalized base only**, and writes `catalog/catalog.bin` **atomically**
-  (temp → fsync → rename), which the library embeds via `include_bytes!`.
-  Normalization is deterministic (JSON order preserved), so re-running the
-  generator over the same snapshot yields a byte-identical blob (guarded by the
-  `embedded_blob_matches_local_snapshot` unit test when the snapshot is present
-  locally, and by `catalog-gen --check` for CI). `--check` is strictly
-  read-only; `--snapshot <path>` lets CI point at a cached snapshot artifact so
-  the check never needs the network.
-- **Overlay — everything not derivable.** `catalog/models-overlay.toml` is
-  `include_str!` and merged at load time by `merge_overlay` — never baked into
-  the blob, so S4 can re-merge the same base with a user overlay at runtime.
-  It carries: provider-level endpoint/protocol/default-model policy for
-  models.dev-covered providers (base_url where models.dev has none or differs,
-  `max_tokens_field` for `max_tokens` gateways, protocol overrides such as
-  Fireworks/Vercel's Anthropic-mode endpoints), per-model exceptions
-  (Anthropic `tool_loop` passback pins, the `responses = true` flags on
-  opencode/github-copilot GPT-5.x entries, Cerebras' `gpt-oss-120b`
-  `none` pin, and the two `claude-opus-4-1` models the snapshot dropped), and
-  the **wholesale overlay-only providers** models.dev does not cover (ollama,
-  kimi-code, custom-*, … — they keep their pre-models.dev slugs and carry
-  their full model lists verbatim), and the prompt-cache TTL policy
-  (`prompt_cache_short` / `prompt_cache_long`, in seconds) — a provider-level
-  default (`[provider.<slug>]`, e.g. Anthropic's 300/3600) with a per-model
-  override on `[provider.<slug>.models."<id>"]`; models.dev carries no TTL
-  fact, so the whole TTL is overlay policy.
-- **Merge semantics** (`merge_overlay`): provider scalars field-wise replace
-  with omitted fields falling through; naming a model replaces that entry's
-  fields onto the base (new keys add); unknown keys warn + skip, never fatal.
+The per-field normalization, the exact overlay schema, and the merge precedence
+(provider scalars field-wise replace, a named model overrides that entry's
+fields onto the base so "new keys add", and unknown keys warn and are skipped
+rather than failing the daemon) are documented in the `catalog` module and in
+`catalog/models-overlay.toml`.
 
 ### Runtime catalog refresh (S4)
 
-The compiled-in catalog is the *fallback*; at runtime the daemon layers a
-**local cache + a user overlay** on top and keeps the base fresh from
-models.dev:
+The compiled-in catalog is only the *fallback*: at runtime the daemon layers a
+local cache and a user overlay on top and keeps the base fresh from models.dev.
+One maintenance thread (`choreo-daemon/src/catalog.rs`) owns the whole pipeline
+but never mutates the catalog itself — every change is sent to the daemon
+command loop, the single writer of the `ArcSwap`, over a channel.
 
 - **Cache.** The normalized base is cached at
   `$XDG_DATA_HOME/choreographr/catalog.bin` (postcard, same format as the
-  embedded blob — one load path), written **atomically** (temp file → fsync →
-  rename). The models.dev **etag is persisted in the DB** (`catalog_state`
-  table), written by the daemon command loop AFTER the bin is on disk — so a
-  crash between the two leaves the OLD etag paired with the OLD bin
-  (self-healing: the next conditional GET 200s and stores a fresh etag),
-  never a NEW etag over OLD content (which would 304 forever against a stale
-  cache). The etag is only *used* when the cache loaded — a missing/corrupt
-  cache produces no `If-None-Match`, so the next fetch is a plain GET that
-  rebuilds both. Load order at startup: valid cache file → embedded
-  `catalog.bin` (a corrupt cache logs a warning and falls back). The
-  effective catalog is `merge_overlay(base, [bundled_overlay, user_overlay])`.
-- **Refresh pacing — the 25 h attempt cooldown.** A models.dev fetch is
-  attempted at most once per 25 h, whatever the last outcome (200/304/
-  failure). The cooldown is anchored on a **wall-clock attempt timestamp in
-  the DB** (`catalog_state.last_attempt_ms`), written by the maintenance
-  thread **BEFORE the fetch starts** — so a daemon that crashes mid-fetch and
-  restarts immediately cannot re-fetch, and the cadence survives restarts (a
-  daemon restarted daily fetches once per ~day of wall time, not once per
-  start). The 25 h period (not 24 h) makes each daemon's fetch time drift
-  +1 h/day, spreading load across the daily cycle. `/refresh-models` bypasses
-  the cooldown but still records the attempt. A DB-write failure is logged
-  and the fetch proceeds — the timestamp is advisory pacing.
-- **Startup gate.** The maintenance thread fetches at startup immediately iff
-  there is no valid cache, no recorded attempt (first run / upgrade from a
-  build without the key), or the attempt is stale; otherwise it skips the
-  startup fetch and arms the in-run timer for the remaining time, derived
-  from the persisted timestamp. Within a single run the countdown is
-  monotonic — suspend pauses it (a suspended laptop fetches after 25 h of
-  *awake* time); restart behavior is strict wall time via the DB anchor.
-- **Background refresh.** The same maintenance thread does the conditional
-  GET against `https://models.dev/api.json` (`If-None-Match` with the DB
-  etag; models.dev serves `ETag` + `must-revalidate`). 200 → normalize →
-  validate non-empty → hand the new base to the daemon command loop, which
-  merges overlays, atomically swaps the catalog (`replace_catalog`), persists
-  the cache + etag, and broadcasts `CatalogUpdated`. Every outcome arms the
-  next revalidation 25 h out (the thread's channel `recv_timeout` is the
-  timer). The fetch helper (`choreo-ai-protocols`
-  `catalog::refresh::fetch_modelsdev`) owns ureq + normalization; the daemon
-  command loop never does HTTP.
+  embedded blob, so one load path) and written atomically; the models.dev etag
+  is persisted in the DB *after* the bin is on disk, so a crash between the two
+  self-heals (a new etag over stale content would 304 forever). Startup loads a
+  valid cache first, else the embedded blob.
+- **Refresh pacing.** A models.dev fetch is attempted at most once per 25 h,
+  whatever the last outcome, anchored on a wall-clock attempt timestamp written
+  to the DB *before* the fetch starts — so the cadence survives restarts and a
+  crash mid-fetch cannot re-fetch. The 25 h period (not 24 h) makes each
+  daemon's fetch time drift +1 h/day, spreading load. `/refresh-models` bypasses
+  the cooldown but still records the attempt.
+- **Background refresh.** The conditional GET against
+  `https://models.dev/api.json` (`If-None-Match` with the DB etag) — the fetch
+  half lives in `choreo-ai-protocols` `catalog::refresh`, so the command loop
+  never does HTTP — normalizes a 200, validates it non-empty, and hands the new
+  base to the command loop, which merges overlays, atomically swaps the catalog,
+  persists cache + etag, and broadcasts `CatalogUpdated`.
 - **User overlay.** `$XDG_CONFIG_HOME/choreographr/models-overlay.toml`, the
   same schema as the bundled layer, merged last (highest precedence). The
-  unified config transport (`config_watch.rs`) watches the config
-  *directory* (rename-safe; basename-filtered to `models-overlay.toml`) and
-  surfaces edits to the maintenance thread, which reloads via a
-  **fingerprint gate** — the file is re-read and compared against the
-  last-applied contents, so editor save-event storms collapse naturally after
-  the first reload. Deleting the file falls back to bundled-only (warn). The
-  config transport **creates the config dir at startup** (before the watch is
-  installed and the models.dev fetch runs) so the first watch install succeeds
-  even on a fresh system — a failed watch is **retried** in the transport
-  loop only as a last-resort fallback.
-- **`/refresh-models`.** TUI slash command → `ClientMessage::RefreshModels`
-  → the daemon hands the request to the maintenance thread over its channel
-  (never blocking the command loop on the download) → reply routed back as
-  `DaemonMessage::ModelsRefreshed` (with `RefreshStatus`:
-  `UpToDate`/`Updated`/`Forced`) or `ModelsRefreshFailed`. `--force` sends
-  `Cache-Control: no-cache` and skips the etag. The request also **re-reads
-  the user overlay** (fingerprint-gated, shared with the watcher) so it is the
-  documented reload fallback when the watch could not start, and a burst of
-  queued requests is **coalesced** into a single fetch (force flags OR-ed;
-  each requester's reply status reflects its own flag; the whole burst is ONE
-  recorded attempt). `/refresh-models` **bypasses the 25 h cooldown** (explicit
-  user intent) but still records the attempt timestamp, so the DB anchor
-  reflects reality — otherwise the next startup would re-fetch immediately. A
-  304 reply is
-  **routed through the daemon command loop** (as `CatalogNotModified`, not
-  sent directly by the maintenance thread) so an overlay reload queued just
-  before the request is applied first and the `UpToDate` counts reflect the
-  current catalog.
-- **`CatalogUpdated` broadcast.** Every catalog swap (startup refresh,
-  overlay reload, `/refresh-models`) broadcasts the full provider list
-  (slug + display name) to all activity subscribers — and a freshly
-  subscribed client is sent the current list immediately, so the TUI's
-  new-account wizard provider picker tracks the live catalog instead of the
-  static default.  The TUI sorts the incoming list alphabetically by display
-  name (`sort_providers` in `choreo-tui/src/state/providers.rs`, applied at
-  both the static-default and broadcast entry points) because the catalog is
-  ordered by provenance, not name.
+  unified config transport watches the config *directory* and surfaces edits to
+  the maintenance thread, which reloads through a fingerprint gate so editor
+  save-event storms collapse; deleting the file falls back to bundled-only.
+- **`/refresh-models`.** TUI slash command → `ClientMessage::RefreshModels` →
+  handed to the maintenance thread over its channel (never blocking the command
+  loop on the download) → reply as `DaemonMessage::ModelsRefreshed` (with
+  `RefreshStatus`: `UpToDate`/`Updated`/`Forced`) or `ModelsRefreshFailed`. A
+  burst of requests is coalesced into one fetch (force flags OR-ed, each
+  requester's status reflecting its own flag). It also re-reads the user overlay
+  as the documented watch-fallback.
+- **`CatalogUpdated` broadcast.** Every catalog swap (startup, overlay reload,
+  `/refresh-models`) broadcasts the full provider list (slug + display name) to
+  all activity subscribers, and a freshly subscribed client is sent the current
+  list immediately, so the TUI's provider picker tracks the live catalog.
 - **`/mcp`.** The TUI's `/mcp` slash command (and the `choreographr mcp` CLI)
   surfaces the state of the configured MCP servers. `ClientMessage::McpStatusRequest`
   is translated by the connection thread into `DaemonCommand::McpStatus` (the
@@ -1337,53 +1204,27 @@ merges the bundled overlay once; every later access goes straight to the
 daemon command loop), so lookups return *owned* values cloned out of the
 atomic guard rather than `&'static` references.
 
-A `ProviderEntry` maps each provider slug to:
-- `display_name` — human-readable name for UIs
-- `protocol` — which wire protocol to use
-- `base_url` — well-known API endpoint
-- `default_model` — sensible default model name
-- `prompt_cache` — provider-level prompt-cache TTL default (`short_secs`/`long_secs` in seconds; overlay policy; `None` = the provider declares none)
-- `models` — curated `ModelEntry` list with `context_window`, `max_output_tokens` (from the snapshot's `limit.output`; `0` = unknown), and **wired as a clamp**: the outgoing `max_tokens` / `max_completion_tokens` / `max_output_tokens` request fields are clamped *down* to this fact when the lookup resolves and the request would exceed it (clamp-down only — a smaller request is never raised; see `ServiceConfig::clamp_output_to_catalog`), `reasoning_supported`, explicit `openai_reasoning_levels`, whether the model uses the Responses API (`openai_responses`), `reasoning_content_required` (ingested from the snapshot's `interleaved.field == "reasoning_content"`; see the resolver paragraph below), `supports_temperature` (from the snapshot's `temperature` flag; absent → permissive `true` — currently a **recorded-but-unwired** fact: no request builder sends a `temperature` parameter today, so there is nothing to gate; the fact and the `model_supports_temperature` resolver are kept so the gate exists the moment temperature sending is added), `deprecated` (from the snapshot's `status == "deprecated"`), `supports_vision` (whether it accepts image input; derived from models.dev `modalities.input` and overridable in the overlay), `cost` (the snapshot's `ModelCost` token prices — `input`/`output`/`cache_read`/`cache_write` in USD per million tokens; `None` when unrecorded — consumed by the cache-warming `payg` cost gate), and `prompt_cache` (per-model TTL override, wins over the provider default — consumed by cache-warming TTL scheduling). All snapshot facts are overlay-overridable per model without regenerating the blob
-
-Model-level reasoning is resolved at runtime by `model_reasoning_capability()`, which returns a `ReasoningCapability` with the model's available effort slugs. Providers without explicit entries fall back to protocol defaults (`off/low/medium/high` for OpenAI & Anthropic, `off/on` for Google).
-
 #### Reasoning round-trip (capture → carry → re-emit)
 
-Reasoning text is not only *displayed* — for several providers it must also be **sent back** on the next request, or the tool-call loop is rejected with a 400 (Anthropic requires the encrypted thinking blocks echoed unmodified; DeepSeek/Kimi require `reasoning_content` on every assistant tool-call message; Gemini requires the encrypted thought signatures back for reasoning continuity). The round-trip payload is an **opaque, provider-owned artifact** handled in three layers, each owning one concern:
-
-| Layer | Owns |
-|---|---|
-| Catalog (`choreo-ai-protocols/src/catalog/`) | `reasoning_passback` format enum (`ReasoningPassback`), per-model + protocol-defaulted — *how* to send |
-| Adapters (`openai/`, `anthropic/`, `google/`) | capture the artifact verbatim at the parse boundary; re-emit it verbatim in their own wire format on request build |
-| Daemon (`build_chat_request_messages` in `choreo-daemon/src/reasoning.rs`) | derives *whether* to send (same-model provenance + passback policy); never interprets the payload |
-
-**Capture** happens inside each adapter before the display field is consumed: OpenAI chat wraps the raw reasoning string — from whichever chat field the provider populated (`reasoning_content`, `reasoning`, or `reasoning_text`, with that precedence) — into `ChatReasoning { field, bytes }`, tagging the artifact with the field it came from; Anthropic serializes the ordered thinking / redacted_thinking blocks (signatures + redacted data intact, order preserved) into `AnthropicThinking`; Google collects the `thoughtSignature` values (the `thought: true` marker may carry a signature on **any** part type — the wire-format fix; there is no separate `thinking` key) into `GoogleSignatures`; Responses collects the raw reasoning output items verbatim — type tag, id, summary, `encrypted_content` in stateless mode, and any unknown fields (e.g. a newer `content` shape), preserved exactly as returned — into `ResponsesItems`. The artifact rides out of the provider crate on `ChatAssistantToolUse`/`FinalTextResult.reasoning_artifact` and is stored on the `Turn` by the agent loop via `SessionState::set_assistant_response` — which now takes an `AssistantResponse` struct bundling text, reasoning, tool calls, usage, and the artifact + producer pair — alongside `Turn.reasoning_producer` (provider slug + model).
-
-**Carry** is a pure store-and-forward: the daemon never reads the payload bytes. It also strips the artifact (and its producer) from every client-bound `DaemonMessage` payload — the `SessionEvent::TurnAppended`, `SessionEvent::SessionState`, and `SessionEvent::TurnsRedone` events (on the `DaemonMessage::Session` envelope) carry client copies with `reasoning_artifact`/`reasoning_producer` set to `None` (see `turn_for_client` in `choreo-daemon/src/sessions.rs`), so the bytes never leave the daemon process; only the request builder consumes them, from the authoritative `Turn` in `SessionState` and the DB. The builder's only job is the *whether*: an artifact is attached to an assistant message only when (1) **same-model provenance** holds — `turn.reasoning_producer == {current provider_slug, current model}` — so a turn produced by a different model (mid-session `/model` switch) never replays its possibly-encrypted payload, and (2) the resolved `ReasoningPassback` policy says to (or the **empty-message fallback** kicks in — see the empty-message paragraph below):
-
-| `reasoning_passback` | Meaning | Wire behavior |
-|---|---|---|
-| `None` | display-only providers/fields | never replay |
-| `ToolLoop` | echo reasoning on assistant messages that had tool calls (DeepSeek/Kimi chat; the minimum for Anthropic tool loops) | attach artifact on tool-involving turns only |
-| `AllTurns` | echo across all turns of the session (Anthropic keep-all models, GPT-5.6 `all_turns`) | attach artifact on every assistant message |
-| `Signature` | send back encrypted thought signatures (Gemini) | attach artifact on every assistant message; the adapter attaches the final signature to the last part |
-| `ResponseId` | chain via `previous_response_id` / opaque reasoning items (OpenAI/xAI Responses) | never via the message; continuity flows through the response id (see below) |
-
-`model_reasoning_passback(slug, model)` mirrors `model_reasoning_capability`: an explicit per-model override from the overlay wins (including an explicit `none` — a model that must never replay can be pinned without inventing a provider), otherwise the protocol default applies — OpenAI-protocol with `responses = true` → `ResponseId`; OpenAI-protocol chat-completions → `ToolLoop`; Anthropic → `AllTurns` (last-turn-only models like `claude-haiku-4-5` carry an explicit `tool_loop` override in the overlay); Google → `Signature`; unknown providers → `None`. The overlay sets the field only where nuance matters (the Anthropic last-turn-only pins, Cerebras' `gpt-oss-120b` `none`; DeepSeek's `tool_loop` was already the derived default and is not carried).
-
-**DeepSeek/Kimi `reasoning_content` must be *present*.** Beyond the echo policy, the chat-completions builder injects an explicit `reasoning_content: ""` (empty) on every assistant message that has nothing to echo for a model that requires the field (DeepSeek/GLM-5.x chat — the upstream 400s a history whose assistant tool-call message omits it, even when the model produced no reasoning on that call). A single `requires_reasoning_content(slug, model)` resolver drives this, and it is **purely data-driven**: the flag is a FACT ingested from the models.dev snapshot (the model's `interleaved` value names `"reasoning_content"` as the echo field — the snapshot encodes that value as either an object `{field: ...}` or a plain-string shorthand; a bare `true` is a capability flag with no field and is not a fact), stored on the `ModelEntry.reasoning_content_required` option at `catalog-gen` time; an explicit per-model overlay override (`reasoning_content_required = true|false` — the only path for models the snapshot does not cover, e.g. the wholesale-defined `opencode-go`/`glm-5.3-flash` entry) wins over the ingested fact. There is **no name-based fallback**: `None` (no fact) or an unknown model resolves to `false`, so a catalog gap surfaces as the upstream provider's own 400 about the missing field — auditable and fixable by adding the model with an explicit flag — instead of a substring guess (the former `is_deepseek_or_kimi` heuristic) that silently misses new family members (GLM 5.x carries the flag; GLM 4.5/4.6 do not, which a family-wide `"glm"` match would get wrong) and can never be overridden per model. The empty string is only injected when the artifact is absent — a real artifact still re-emits its text — and the field is never sent on Responses-API models (where `reasoning_content` is invalid). `session_inspect` mirrors the resolver so its ledger-vs-wire parity check stays exact.
-
-**The empty-message fallback** closes the remaining hole in that injection: a turn recorded as *reasoning-only* (empty content, no tool calls — e.g. a response that streamed only `reasoning_content`) would serialize as a wholly empty assistant message that OpenAI-compatible chat providers reject with "the message ... with role 'assistant' must not be empty" — this is exactly the opencode-go deepseek→kimi shape (an empty assistant turn in history 400s the very next Continue). The single `include_reasoning_artifact()` helper (used by the builder, the precondition guard, and `session_inspect`) forces such a turn's **same-model** artifact in even though ToolLoop alone would skip it (no tool involvement): the artifact's real reasoning text is the only payload that keeps the wire message non-empty. The fallback is provider-agnostic — it fires on every passback that may legally echo (`ToolLoop`/`AllTurns`/`Signature`), not only the DeepSeek/Kimi `requires_rc` models — but deliberately does NOT fire under `None` (an explicit never-replay override: the gateway may itself reject replayed reasoning, e.g. Cerebras gpt-oss) or `ResponseId` (continuity flows through `previous_response_id`/input items, not the message reasoning field). A foreign-model artifact (mid-session switch) or a missing artifact leaves the message unfixable — the guard flags it as a "must not be empty" risk on any artifact-policed passback (not only `requires_rc` models) instead of letting the provider fail silently.
-
-**Re-emit** is per-adapter, verbatim: OpenAI chat writes the `ChatReasoning` bytes back as the wire field recorded at capture (`reasoning_content` / `reasoning` / `reasoning_text` — DeepSeek/Kimi being `reasoning_content`), so a provider that streamed `reasoning_text` gets `reasoning_text` back, not `reasoning_content` (the artifact field itself never appears on the wire); Anthropic deserializes the block array and pushes the blocks verbatim (in order, ahead of text/tool_use — never rebuilt or reordered, and only when thinking is enabled for the request, `!thinking_disabled`); Google attaches the captured signatures to the assistant parts; Responses re-emits the opaque items into `input` ahead of the message and chains continuity through `previous_response_id`. A foreign artifact variant (e.g. a `ChatReasoning` payload on an Anthropic request) is dropped by the adapter — payloads stay opaque until their producer decodes them.
-
-**ResponseId continuity:** the agent loop persists the last `response_id` on `SessionConfig.last_response_id` after every model call and restores it at the top of the next `run_agent_loop` invocation, so a new user turn continues the chain (`previous_response_id` + `reasoning.context: all_turns` guidance) instead of resetting it. Other policies reset to `None` so a stale id never leaks into a request that does not understand it.
-
-When chaining a fresh user turn via `previous_response_id`, the request `input` carries only the messages that postdate the last assistant message (the new user message, plus the freshly rebuilt system prompt) — the server already holds everything up to the last response, and resending the full history would duplicate every prior turn on top of the chained context (billing + context-window inflation). Tool-loop turns keep sending only the new `function_call_output` items, as before. The adapter-level `messages_to_responses_input` still re-emits opaque reasoning items for non-chained (stateless-style) conversions. An `/undo` invalidates the chain: the persisted id points at a response whose conversation includes the undone turns, so `handle_undo` clears `last_response_id` (and its producer) and persists the cleared record — the next request falls back to a non-chained one carrying only the visible turns (redo does not restore the id; a stateless request is always safe).
-
-A precondition guard (`warn_on_missing_reasoning_artifacts`) runs before any echo-policy request: a turn whose artifact is missing (e.g. pre-migration session state) or whose artifact was produced by a different model (a mid-session model switch — the builder never replays a foreign-model payload) is logged as a diagnosable warning instead of surfacing as a mysterious provider 400. `ToolLoop` policies check only tool-involving turns (that is where the provider demands the echo); `AllTurns`/`Signature` echo on every assistant message, so the guard checks every assistant turn there.
-
-Replayed reasoning is billed as input on keep-all models, so `estimate_prompt_tokens` counts the artifact bytes (UTF-8 text when decodable, else a bytes/4 heuristic). The estimate counts the full conversation in `messages` as-is, which already covers the server-side chained context for `previous_response_id` requests: the adapter trims only the *wire* payload to the chain tail, but the provider bills the whole chain, and the full conversation in `messages` is that chain plus the new tail. There is deliberately no chained-context addend — adding the last request's `prompt_tokens` would count the conversation twice.
+For Anthropic (thinking blocks + signatures), DeepSeek/Kimi
+(`reasoning_content`), Gemini (thought signatures), and OpenAI/xAI Responses
+(opaque reasoning items + `previous_response_id`), reasoning must be sent back
+on the next request or the tool-call loop fails with a 400. The round-trip
+payload is an **opaque, provider-owned artifact** handled in three layers: the
+catalog decides *how* to send (`ReasoningPassback`, per-model override else
+protocol default via `model_reasoning_passback`); each adapter captures the
+artifact verbatim at its parse boundary and re-emits it verbatim in its own wire
+format; the daemon's request builder (`choreo-daemon/src/reasoning.rs`) decides
+*whether* to send and never interprets the bytes. *Whether* is derived, never
+configured: same-model provenance (`Turn.reasoning_producer` versus the current
+provider + model, so a mid-session model switch drops every old artifact) plus
+the passback policy — with the empty-message fallback (a reasoning-only turn is
+never shipped as a wholly empty assistant message), the data-driven
+`requires_reasoning_content` fact (ingested from the snapshot, with no
+name-based heuristic), and the `previous_response_id` continuity chain. The
+artifact never leaves the daemon process — client-bound `SessionEvent`s carry it
+as `None`. The variant semantics and the resolver contracts are documented on
+`ReasoningPassback` and the resolver functions.
 
 Currently supports 208 providers (184 from the models.dev base + 24 overlay-only). Adding or refreshing a provider is a data change in `catalog/`: update the snapshot (or add an overlay entry) and re-run `cargo run --bin catalog-gen` — zero client code.
 
@@ -1528,14 +1369,11 @@ On the client side, `last_prompt_tokens` is not cumulative, so the TUI
 gap-fills it from snapshots (never overwriting a fresher value) instead of
 max-merging it.
 
-**Key type** — `TokenUsage` (choreo-proto/src/types/common.rs):
-```rust
-pub struct TokenUsage {
-    pub input_tokens: u32,
-    pub output_tokens: u32,
-    pub total_tokens: u32,
-}
-```
+Token usage is the protocol-agnostic `TokenUsage` struct
+(`choreo-proto/src/types/common.rs`) — `input_tokens` / `output_tokens` /
+`total_tokens` plus the prompt-cache `cached_tokens` / `cache_write_tokens`
+counts — whose per-field-max `merge_max` is the merge policy shared by the
+daemon's mid-turn sync and the TUI's attach-snapshot merge.
 
 **Context window resolution chain (per session):**
 
@@ -1561,10 +1399,6 @@ handle_set_model / handle_set_account
        ▼
      Client display (e.g. "Context: 45,000 / 128,000 (35%)")
 ```
-
-The `ContextWindowConfig` struct (shared across all provider configs) holds the
-per-model map and global fallback. Provider configs embed this struct; `AccountConfig`
-applies its overrides through the shared `apply_overrides()` method.
 
 All new fields use `#[serde(default)]` so old persisted sessions remain compatible (deserialize to zero usage).
 

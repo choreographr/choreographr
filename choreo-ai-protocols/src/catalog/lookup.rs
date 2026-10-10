@@ -97,8 +97,7 @@ fn with_provider_and_model_fact<T>(
 /// snapshot simply carries no price fact for it — never a synthetic zero).
 ///
 /// Consumed by the cache-warming cost gate — currently **recorded but
-/// unwired** (no production caller yet; see the catalog-facts paragraph in
-/// ARCHITECTURE.md, alongside `model_supports_temperature`).
+/// unwired** (no production caller yet, alongside `model_supports_temperature`).
 #[must_use]
 pub fn model_cost(provider_slug: &str, model: &str) -> Option<ModelCost> {
     // `ModelCost` is `Copy`, so the projection is a plain value clone.
