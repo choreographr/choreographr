@@ -1,12 +1,15 @@
 //! Unit tests for `state` (moved out of `mod.rs`).
 
+use super::turn::turn_has_live_content;
 use super::*;
 use crate::markdown_render::{LineChrome, LineJoin, render_turn_lines};
 use crate::test_util::test_app;
-use choreo_proto::ToolResultRecord;
+use choreo_client_core::TurnEventHandler;
+use choreo_proto::{OutputStream, ToolResultRecord, Turn};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Size;
 use ratatui::text::Line;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 pub(super) fn make_session(id: u64, title: &str) -> SessionSummary {
