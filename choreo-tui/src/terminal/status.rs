@@ -19,11 +19,19 @@ use std::collections::{HashMap, HashSet};
 
 use choreo_proto::SessionStatus;
 
-use super::{osc, write};
+use super::{is_control_char, osc, write};
 
 /// Stable machine-readable program name placed on every record (children
 /// cannot inherit `app` from the unlabeled OSC 9;4 root).
 pub(crate) const APP: &str = "choreo-tui";
+
+/// Protocol cap on the decoded `title` field, in bytes (spec "Limits": 192
+/// decoded, 256 encoded).
+const MAX_TITLE_BYTES: usize = 192;
+
+/// Protocol cap on the decoded `msg` field, in bytes (spec "Limits": 2048
+/// decoded, 2732 encoded).
+const MAX_MSG_BYTES: usize = 2048;
 
 /// Map a session status to an OSC 7501 `state` value.
 ///
@@ -50,10 +58,34 @@ fn encode(text: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(text.as_bytes())
 }
 
+/// Strip control characters and truncate to `max_bytes` on a char boundary.
+///
+/// The spec requires a report's decoded `title` / `msg` to contain no control
+/// character and caps both by decoded byte length; a report that breaks either
+/// is discarded whole, so the emitter must sanitize and cap before framing.
+/// Truncation snaps to a char boundary so a multi-byte character is never
+/// split.
+fn sanitize_value(text: &str, max_bytes: usize) -> String {
+    let mut out = String::with_capacity(text.len().min(max_bytes));
+    for c in text.chars() {
+        if is_control_char(c) {
+            continue;
+        }
+        if out.len() + c.len_utf8() > max_bytes {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Build the OSC 7501 child record sequence for `id`.
 ///
 /// The body always carries `state`, `app`, and `id`; `title` and `msg` are
-/// appended (base64) when present.
+/// appended (base64) when present and non-empty after sanitization. Both are
+/// run through [`sanitize_value`] so the emitted report can never exceed the
+/// protocol's per-field limit nor carry a decoded control character; an empty
+/// field is dropped rather than emitted as a meaningless `title=`/`msg=`.
 pub(crate) fn record(
     id: u64,
     app: &str,
@@ -63,12 +95,18 @@ pub(crate) fn record(
 ) -> String {
     let mut body = format!("state={state}:app={app}:id={id}");
     if let Some(title) = title {
-        body.push_str(":title=");
-        body.push_str(&encode(title));
+        let title = sanitize_value(title, MAX_TITLE_BYTES);
+        if !title.is_empty() {
+            body.push_str(":title=");
+            body.push_str(&encode(&title));
+        }
     }
     if let Some(msg) = msg {
-        body.push_str(":msg=");
-        body.push_str(&encode(msg));
+        let msg = sanitize_value(msg, MAX_MSG_BYTES);
+        if !msg.is_empty() {
+            body.push_str(":msg=");
+            body.push_str(&encode(&msg));
+        }
     }
     osc(7501, &body)
 }
@@ -166,6 +204,8 @@ impl Publisher {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+
     use super::*;
 
     fn child(id: u64, state: &str) -> String {
@@ -213,6 +253,62 @@ mod tests {
         let seq = child(1, "idle");
         assert!(!seq.contains(":title="));
         assert!(!seq.contains(":msg="));
+    }
+
+    #[test]
+    fn record_strips_control_chars_from_title_and_msg() {
+        // A decoded control character makes a terminal discard the whole
+        // report, so the fields are stripped before base64. "ab" -> "YWI=",
+        // "cd" -> "Y2Q=".
+        let seq = record(1, APP, "working", Some("a\u{1b}b"), Some("c\u{9d}d"));
+        assert_eq!(
+            seq,
+            "\x1b]7501;state=working:app=choreo-tui:id=1:title=YWI=:msg=Y2Q=\x1b\\"
+        );
+    }
+
+    #[test]
+    fn record_drops_a_field_that_sanitizes_to_empty() {
+        let seq = record(1, APP, "idle", Some("\u{1b}"), Some("\u{07}"));
+        assert_eq!(seq, "\x1b]7501;state=idle:app=choreo-tui:id=1\x1b\\");
+    }
+
+    #[test]
+    fn record_caps_title_at_the_protocol_byte_limit() {
+        let title = "x".repeat(300);
+        let seq = record(1, APP, "done", Some(&title), None);
+        let encoded = seq
+            .split(":title=")
+            .nth(1)
+            .and_then(|s| s.strip_suffix("\x1b\\"))
+            .expect("title field present");
+        // 192 decoded bytes -> exactly 256 base64 chars.
+        assert_eq!(encoded.len(), 256, "got {encoded}");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("valid base64");
+        assert_eq!(decoded, vec![b'x'; 192]);
+    }
+
+    #[test]
+    fn record_caps_msg_at_the_protocol_byte_limit_without_splitting_a_char() {
+        // A run of 3-byte characters: 700 of them is 2100 bytes, over the
+        // 2048 limit, so the cap keeps 682 (2046 bytes) and never splits one.
+        let msg = "\u{2603}".repeat(700);
+        let seq = record(1, APP, "working", None, Some(&msg));
+        let encoded = seq
+            .split(":msg=")
+            .nth(1)
+            .and_then(|s| s.strip_suffix("\x1b\\"))
+            .expect("msg field present");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("valid base64");
+        assert_eq!(decoded.len(), 2046);
+        assert!(
+            std::str::from_utf8(&decoded).is_ok(),
+            "truncation must stay on a char boundary"
+        );
     }
 
     #[test]

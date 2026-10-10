@@ -11,14 +11,17 @@
 //! caps the length so a pathologically long title cannot emit an unbounded
 //! escape.
 
-use super::{osc, write};
+use super::{is_control_char, osc, write};
 
 /// The program name shown in the window title when no session is attached.
 const APP_NAME: &str = "choreo-tui";
 
-/// Upper bound on the sanitized title length (in characters). The OSC 2 title
-/// is free-form and a session title can be long; capping keeps the escape
-/// small and bounds what a daemon/LLM-supplied title can emit.
+/// Upper bound on the sanitized OSC 2 title length (in characters). OSC 2 is
+/// free-form with no protocol limit and a session title can be long; capping
+/// keeps the escape small and bounds what a daemon/LLM-supplied title can
+/// emit. (The OSC 7501 record's `title` has its own, tighter protocol byte
+/// cap — see `terminal::status` — so the two deliberately do not share a
+/// constant.)
 const MAX_TITLE_CHARS: usize = 200;
 
 /// Build the OSC 2 set-title sequence for `text` (sanitized and capped).
@@ -37,20 +40,15 @@ pub(crate) fn clear() {
     write(&build(""));
 }
 
-/// Strip control bytes and cap the length of a title.
+/// Strip control bytes and cap the length of an OSC 2 title.
 ///
 /// Removes C0 (`U+0000..=U+001F`), DEL (`U+007F`), and C1 (`U+0080..=U+009F`)
 /// control characters, then caps at [`MAX_TITLE_CHARS`].
 pub(crate) fn sanitize(text: &str) -> String {
     text.chars()
-        .filter(|c| !is_control(*c))
+        .filter(|c| !is_control_char(*c))
         .take(MAX_TITLE_CHARS)
         .collect()
-}
-
-/// Whether `c` is a C0, DEL, or C1 control character.
-fn is_control(c: char) -> bool {
-    matches!(u32::from(c), 0x00..=0x1F | 0x7F | 0x80..=0x9F)
 }
 
 /// The window title text: the plain program name when no session title is

@@ -22,23 +22,6 @@ use std::collections::{HashMap, HashSet};
 
 use crate::markdown_render::{lines_height, plain_text_lines};
 
-/// The tool NAME of a `ToolCall` status (never its arguments), used as an
-/// OSC 7501 `msg`.
-fn tool_call_name(status: &SessionStatus) -> Option<&str> {
-    match status {
-        SessionStatus::ToolCall(name) => Some(name.as_str()),
-        _ => None,
-    }
-}
-
-/// The sanitized title carried on an OSC 7501 record; an empty title is
-/// dropped so the record never carries a meaningless `title=`.
-fn record_title(title: Option<&str>) -> Option<String> {
-    title
-        .map(terminal::title::sanitize)
-        .filter(|t| !t.is_empty())
-}
-
 mod command_palette;
 mod draft;
 mod history;
@@ -50,6 +33,7 @@ mod pages;
 mod providers;
 mod session_manager;
 mod streaming;
+mod terminal_status;
 
 // Compatibility layer: every item moved into the sibling modules is
 // re-exported here so `crate::state::X` references (in this crate and in
@@ -445,77 +429,6 @@ impl App {
     }
     pub(crate) fn active_display_ref(&self) -> Option<&SessionDisplayState> {
         self.session_displays.get(&self.active_session_id?)
-    }
-
-    /// The current OSC 2 window title: the plain program name when no titled
-    /// session is attached, else `choreo-tui — <attached session title>`.
-    pub(crate) fn window_title(&self) -> String {
-        let title = self
-            .attached_session_id
-            .and_then(|id| self.session_title(id));
-        terminal::title::window_title(title.as_deref())
-    }
-
-    /// The OSC 7501 child records to publish right now, keyed by session id.
-    ///
-    /// Every record is a CHILD record (`id=<session_id>`); the OSC 9;4 root
-    /// record is owned by the progress family. The attached session is always
-    /// present; active background sessions are added. Idle/sleeping background
-    /// sessions are omitted so a stale `working` record is cleared. A terminal
-    /// turn outcome (`done`/`error`, tracked in `term_status_override`) wins
-    /// over the attached session's live status until a new turn begins.
-    pub(crate) fn desired_status_records(&self) -> Vec<(u64, String)> {
-        let mut desired: Vec<(u64, String)> = Vec::new();
-        if let Some(id) = self.attached_session_id {
-            let override_state = self.term_status_override.get(&id).copied();
-            let state = override_state
-                .or_else(|| {
-                    self.attached_status
-                        .as_ref()
-                        .map(terminal::status::state_for)
-                })
-                .unwrap_or("idle");
-            // A terminal outcome has no tool name, so `msg` is derived from the
-            // live status only (never a stale ToolCall name) when an override is
-            // active.
-            let msg = if override_state.is_some() {
-                None
-            } else {
-                self.attached_status.as_ref().and_then(tool_call_name)
-            };
-            let title = self.session_title(id);
-            desired.push((
-                id,
-                terminal::status::record(id, terminal::status::APP, state, title.as_deref(), msg),
-            ));
-        }
-        for summary in &self.session_mgr.all {
-            if !summary.status.is_active() || Some(summary.session_id) == self.attached_session_id {
-                continue;
-            }
-            desired.push((
-                summary.session_id,
-                terminal::status::record(
-                    summary.session_id,
-                    terminal::status::APP,
-                    terminal::status::state_for(&summary.status),
-                    record_title(summary.title.as_deref()).as_deref(),
-                    tool_call_name(&summary.status),
-                ),
-            ));
-        }
-        desired
-    }
-
-    /// The sanitized title of the session `id`, if it has one.
-    fn session_title(&self, id: u64) -> Option<String> {
-        record_title(
-            self.session_mgr
-                .all
-                .iter()
-                .find(|s| s.session_id == id)
-                .and_then(|s| s.title.as_deref()),
-        )
     }
 
     /// Whether a daemon message carrying the given wire session id is
