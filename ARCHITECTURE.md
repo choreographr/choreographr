@@ -2461,165 +2461,47 @@ emits.
 
 ### Image flow (tool-triggered)
 
-Images are delivered out-of-band via a crossbeam channel rather than embedded in
-`ToolOutput` (a tool can emit several — an MCP result may carry multiple image
-blocks):
-
-```
-Model calls display_image tool
-  → daemon creates (image_tx, image_rx) channel
-  → passes image_tx to ToolDyn::execute_json → execute_streaming_json
-  → tool extracts PreparedImage from typed return → sends via image_tx
-  → agent loop drains image_rx after tool completion
-  → emit_and_persist_image creates SessionMessageKind::DisplayedImage
-  → broadcasts it to live subscribers mid-turn via
-    SessionCommand::Broadcast(SessionMessageAppended { DisplayedImage })
-  → client push_session_message converts DisplayedImage → RenderedImage
-  → also persists to DB + pushes to session messages for replay
-  → after request completes, handle_request_finished skips DisplayedImage
-    entries in its snapshot delta (already delivered mid-turn) and
-    broadcasts only non-image messages (AssistantText, ToolResult, …)
-```
+An image a tool produces (a `display_image`/`generate_image` call, a
+`retrieve_webpage` screenshot, an MCP image block) is delivered to subscribers
+out-of-band — a tool can emit several, so an image cannot ride the `ToolOutput`
+value — and is persisted to `session_attachments` at emit time, so a client's
+on-demand `GetImage` never races the turn's final write. The tool→session→client
+plumbing (the `Tool::extract_image` hook, `emit_image`, and the mid-turn
+`TurnAppended` broadcast) is documented in-source (see `choreo-daemon`'s `tools`
+and `requests` modules, `cargo doc -p choreo-daemon` / `just doc`), held
+complete by the `#![warn(missing_docs)]` + `doc-check` gate.
 
 ### Vision input flow (`read_image` → model)
 
-**Vision input** is the mirror-image pipeline: images are sent *to* the model rather than
-*from* it. The `read_image` tool (`tools/read_image.rs`) and `crate::image_prep` decode
-and normalize an image file: every raster format the `image` crate decodes (PNG, JPEG,
-WebP, GIF, BMP, TIFF, TGA, DDS, ICO, PNM, HDR, OpenEXR, Farbfeld, QOI), **SVG**
-(rasterized via `resvg`), **HEIC/HEIF** (via the pure-Rust `heif-oxide` decoder), and
-**AVIF** — the last gated behind the `avif` feature (`image/avif-native`/dav1d, a C
-library) so the default/release build stays C-free. Raster EXIF orientation is baked in
-(`ImageReader::into_decoder` → `decoder.orientation` → `apply_orientation`) so
-phone/camera photos reach the model upright; `heif-oxide` applies HEIC's own orientation.
-The raster-decode and HEIC-decode paths (and the HEIC pre-decode allocation guard) live
-in the shared [`choreo-image`](#choreo-image--shared-image-decode-helpers) leaf crate, so
-the model path and the TUI display path use the same guarded decoder. The `display_image`
-dimension probe (`tools/image.rs::inspect_image_dimensions`) also routes through the
-shared guarded decoders for *every* source — raster (via `decode_raster_oriented`'s
-`image::Limits` guard) and HEIC (via its pre-decode guard) — so a hostile image cannot
-drive a huge allocation during the probe, not just during the display/model decode.
-All sources are resized to ≤2000px, and re-encoded to PNG (alpha) or JPEG (opaque) under
-a decompression-bomb guard. An optional `region` (given as fractions of the image) crops
-before that resize — raster/HEIC sources are cropped from the decoded pixels (after EXIF
-orientation is baked), while SVG sources render only the region into the pixmap — so
-a small crop reaches the model at native resolution instead of the ≤2000px downscale, and
-no cropped copy is written to disk. The tool reports a text handle (path, dimensions, MIME,
-bytes), and returns an `ImageReference` that carries the **normalized bytes**
-(`ImageReference::data`)
-via the `Tool::extract_image_ref` hook. The framework moves that reference onto the
-durable `ToolResultRecord.image` field, and the bytes are persisted in the raw
-`session_attachments` table (split out of the zstd turn blob) so the model always has the
-image on later turns — the source file is never re-read, so it can vanish without breaking
-the session. At request-build time (`build_chat_request_messages` in `reasoning.rs`), each
-image-bearing tool result attaches its stored bytes directly to a **synthetic user
-message** appended *after* all of the turn's tool messages (preserving
-`tool_use → tool_result` adjacency), and the provider adapters serialize it per protocol:
+Vision input is the mirror pipeline — images sent *to* the model rather than
+*from* it. `read_image` decodes and normalizes a source image to
+provider-allowlisted PNG/JPEG (every `image`-crate raster format, SVG via
+`resvg`, HEIC/HEIF, and feature-gated AVIF), reports a text handle, and carries
+an `ImageReference` whose normalized bytes the framework stores on the turn's
+tool result and persists in `session_attachments`. At request-build time the
+bytes are re-attached to a **synthetic user message** appended after the turn's
+tool messages (preserving `tool_use → tool_result` adjacency), under two gates:
+**decay** (only turns belonging to the request currently in flight attach pixels;
+older turns replay a path-naming placeholder, never converting back) and
+**vision** (`catalog::model_supports_vision` — no bytes on a text-only model).
+The normalization (`choreo-daemon`'s `image_prep`) and the decay/vision gates
+(`reasoning.rs`'s `build_chat_request_messages` / `tool_result_image_messages`)
+are documented in-source (see `choreo-daemon`'s `image_prep` and `reasoning`
+modules and `choreo-image`, `cargo doc -p choreo-daemon` / `just doc`), held
+complete by the `#![warn(missing_docs)]` + `doc-check` gate.
 
-```
-read_image tool → image_prep::load_and_normalize → ImageReference(data) → ToolResultRecord.image
-  → persisted: bytes → session_attachments; blob carries byte-less turn
-  → build_chat_request_messages: decay gate + model_supports_vision gate
-      turn in current request + vision model
-                    → attach ImageReference.data → ChatRequestMessage.images (synthetic user msg)
-      older turn (decay) OR turn in current request + text-only
-                    → placeholder text message (never pixels) — decay / vision gate
-  → provider serializer: OpenAI chat image_url / Responses input_image /
-                         Anthropic image / Google inline_data
-```
+### Session switch flow
 
-The vision image's **bytes** never ride the snapshots: `turn_for_client` keeps
-`ToolResultRecord.image`'s `ImageReference` METADATA (path, mime, dimensions) but empties its
-`data`, exactly as it strips a displayed image's bytes while keeping its `ImageMetadata` — so
-the client learns the image exists and can size a placeholder. Displayed images
-(`displayed_images`, from `display_image`/`generate_image`/`retrieve_webpage` screenshots) and
-tool-result vision images persist in the SAME `session_attachments` table and are served to
-clients **on demand** through ONE fetch pair: the session-scoped snapshots carry only
-metadata, and a client fetches an attachment's bytes when it needs to render it
-(`ClientMessage::GetImage { key: ImageKey }` → `DaemonMessage::Image`, where `ImageKey`
-selects the attachment — `Displayed { index }` or `ToolResult { call_id }`; the CONNECTION
-THREAD reads a single slot via `read_attachment` against its own shared
-`Arc<redb::Database>` handle — no command-loop round-trip). `read_attachment` maps the key to
-its slot (`d{index}` / `r{call_id}`) in the one place that owns slot naming, so both
-attachment kinds share one reader. This is what lets the TUI show the user the exact
-normalized image the model saw — even after the model-side decay gate stops re-attaching it.
-`emit_image` persists each displayed image the instant the tool produces it (persist-at-emit)
-and the tool-completion path persists each vision image the same way (slot `r{call_id}`), so
-the DB is authoritative for the bytes even mid-request, when the turn's final write has not
-happened yet — the on-demand fetch must never race that write. That emit-time write is a
-SINGLE-slot insert (`db::write_attachment`: one row, one transaction, no stale-slot clear), so
-an N-image turn costs O(N) disk writes across its emits rather than the O(N²) a whole-turn
-rewrite-per-image would incur; the full turn (blob + all attachments) is still (re)written
-atomically at `finalize_turn`.
-
-**Image decay** replaces the old always-replay policy: previously the same normalized
-bytes rode EVERY later request too, so a long image-heavy session re-attached megabytes
-of PNG/JPEG to each request indefinitely. The builder now takes the request's first
-turn id (captured exactly by `run_agent_loop` as `session.next_turn_id` before its first
-`start_turn`; `None` for callers with no request in flight — the `session_inspect`
-dry-run): only turns at or after that id (the request's own tool-loop turns, user turn
-included) attach pixels, every OLDER turn emits the placeholder instead. Decayed
-placeholders never convert back to pixels. A session loaded from disk decays
-all historical images automatically (no persisted marker — the window is derived purely
-from each request's own turn-id boundary, so no schema change), and undone turns are
-skipped by the builder before the decay gate, so undo still never resurrects anything.
-The placeholder names the source path so the model can re-read the file with a text tool
-if it needs the image again.
-
-The **vision gate** is `catalog::model_supports_vision(provider_slug, model)` (from the
-models.dev `modalities.input` flag, overridable via the overlay): on a text-only model
-no bytes are ever sent, whatever the decay marker says. Attached images contribute
-a fixed `IMAGE_TOKEN_ESTIMATE` (1000)
-per image to the prompt-token estimate for context-window accounting.
-
-
-### Session switch flow (updated)
-
-Because the TUI subscribes to *all* session activity (`SubscribeAllActivity`,
-sent once at startup), every session's streaming events (`Started`,
-`OutputChunk`, `TurnAppended`, `ToolCallStarted`, `ToolResultChunk`, `Done`,
-…) are routed into per-session `SessionDisplayState` entries in
-`session_displays` keyed by `session_id` — even for sessions the user is not
-currently viewing.  Switching sessions therefore does **not** discard that
-accumulated state:
-
-```
-User presses Enter on a session in the session manager
-  → reset_for_session_switch(session_id)
-      • preserves live state: view.turns, view.request_to_turn, active
-        request set, live token estimates, reasoning overrides
-      • preserves the per-session reading position as an ABSOLUTE anchor: on
-        the way out it captures the content line at the top of the viewport
-        (`ScrollRestore { top_line, at_bottom }`), and on the target's first
-        rebuild the anchor is converted back to a from-bottom offset against
-        the fresh total.  The raw offset is only a distance from the bottom,
-        so it would slide the content when the viewport height differs on
-        return (the help/status bands reflow on attach) or when the session
-        streamed in the background — the anchor is immune to both.  A session
-        left pinned to the bottom (`at_bottom`) follows new content instead.
-      • resets only transient render state (markers, height caches), which is
-        rebuilt on the next layout pass (markers_dirty); the anchor is applied
-        at the end of that rebuild
-      • the UI loop's pre-render `clamp_scroll_state` is guarded on
-        `markers_dirty` (skip while a rebuild is pending), so it cannot clamp
-        against the cleared (max_scroll 0) height cache before the draw-time
-        rebuild runs; render still clamps for the frame, and the next frame's
-        clamp settles any real overflow
-  → AttachSession sent to daemon
-  → daemon responds with SessionState { turns, … }
-  → handle_session_state MERGES the snapshot with the accumulated turns:
-      • finished turns come from the snapshot (daemon-canonical)
-      • the in-flight turn keeps the accumulated version — the snapshot only
-        holds the empty placeholder from start_turn, while the accumulated
-        turn has the live streamed content (see turn_has_live_content)
-  → rendered_images re-synced from the merged turn set
-```
-
-This makes switching into a streaming session seamless: the user "jumps in"
-to the live content accumulated so far instead of seeing a blank turn until
-the next chunk arrives.  (Cold-starting clients that were never subscribed
-to the session still miss pre-attach content — the worker owns the live turn
-and only syncs back on `RequestFinished`.)
+Because the TUI subscribes to *all* session activity at startup, every
+session's streaming events are routed into a per-session display even for
+sessions the user is not viewing, so switching sessions preserves that
+accumulated state and merges it with the daemon's attach snapshot (finished
+turns come from the snapshot; the in-flight turn keeps the accumulated version,
+which holds the live content the snapshot's placeholder lacks). The TUI-side
+mechanics (`reset_for_session_switch`, the absolute scroll anchor, the display
+merge, and the per-session status/token routing) are documented in-source (see
+`choreo-tui`'s `state` and `connection` modules, `cargo doc -p choreo-tui` /
+`just doc`), held complete by the `#![warn(missing_docs)]` + `doc-check` gate.
 
 The all-activity subscription is **sticky**: the daemon's activity broadcast
 (`handle_broadcast_activity`) never drops a message for a subscriber —
@@ -2732,126 +2614,6 @@ panics still releases its entry.  It carries no protocol data.  Only the three
 directory does not serialize against a write of a file inside it, and a tool
 that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
 `output_path`) is not covered.
-
-Token bookkeeping follows the same per-session rule.  `LiveOutputTokenCount`
-(during streaming) and `SessionState` snapshots (attach / `load_tools` /
-`unload_tools` broadcasts) are routed to the display of the session they
-belong to, never to the one the user happens to be viewing.  The status
-bar's `↑/↓` token readout and context-fill come from the active session's
-`SessionDisplayState` (`display_token_usage`), so a background session
-streaming via the all-activity subscription cannot bleed its counts into
-the session on screen — and its counts are already correct by the time the
-user switches to it (`reset_for_session_switch` preserves live estimates).
-
-The same rule extends to every other per-session status message the daemon
-broadcasts over the all-activity subscription.  `ModelSelected`,
-`ReasoningEffortSet`, `ReasoningEffortSetFailed`, `SessionAccountSet` and
-`Failed` are routed to the display of the session they belong to (only
-touching the status bar's identity fields when that session is the attached
-one); `ModelSelectionFailed` — whose failure means there is no new model to
-record — is gated the same way but updates no display.  The routing and the
-gate are one operation: the shared `route_session_update` helper resolves
-the reported id, applies the display update, and returns a
-`SessionUpdateRouting` verdict (`FallThrough` for the attached session /
-connection-level `None`, `Suppress` for background noise).  For a non-attached session the
-`connection.rs` handler returns early so the global status/error line is not
-rewritten either — a background session changing its model, reasoning effort
-or account must not rewrite the fields of the session on screen, nor reflow
-its viewport via a status-height change.  Request failures additionally
-get recorded on the turn itself (`Turn.error`): the agent loop marks the
-open turn and finalizes + broadcasts it before propagating the inference
-error, so both clients render a red "Error:" block in the transcript and the
-failure survives a daemon restart.  Because that transcript block is the
-persistent home for a request-level failure, `handle_failed` deliberately
-writes the global error line only for *connection-level* failures — the
-daemon's `session_id: None` connection-level replies ("no session attached") — which have no
-turn to render in; a request failure's block is never duplicated on the
-status bar.  A user cancellation is not a failure: the dispatcher routes
-`SessionEvent::Cancelled` to its own required `handle_cancelled` (distinct
-from `handle_failed`), which runs the same request teardown but reports
-`idle` and writes no error text.
-
-The one inference outcome that is *not* terminal is a truncated tool call
-(`InferenceError::TruncatedToolCall`): the provider cut a response off at its
-output-token limit mid-tool-call, so the partial (invalid-JSON) call was
-discarded as unsafe to execute. Rather than fail the request, `run_agent_loop`
-records the truncation as an explanatory assistant turn, seeds
-`TRUNCATION_RECOVERY_INSTRUCTION` as the next turn's user text, and retries —
-bounded by `MAX_TRUNCATION_RECOVERIES` so an output-limited model cannot spin
-the loop forever (this bounding is necessary because sessions may run with
-`max_turns == 0`, i.e. unlimited). For `ResponseId`-policy (Responses-API)
-providers the retry also clears `previous_response_id` (and the persisted
-session id): the truncated turn's own response id was never captured, so
-chaining onto the pre-truncation id would replay a `function_call` whose
-matching `function_call_output` was dropped, leaving an unpaired call on the
-wire — the retry resends the full, self-consistent history instead. The
-observed trigger is a single oversized `write_file` whose arguments exceed the
-provider's output budget (e.g. `glm-5.3-flash` on `opencode-go`).
-
-Two daemon conventions keep this gating correct:
-
-- The daemon replies to `GetReasoningEffort` (bare `/reasoning`) with the
-  attached session's real id, and sends some connection-level errors with
-  `session_id: None` (no session exists).  `App::resolve_daemon_session` maps
-  `None` to the attached id (when one exists) so the update lands in the right
-  display (never a phantom session entry), and
-  `App::is_background_session_message` — the single gate used
-  by every arm above — treats `None`, like the attached session itself,
-  as the user's own feedback rather than background noise.  The two are
-  composed in the `route_session_update` helper so a message can never be
-  resolved without also being gated (`ReasoningEffortSetFailed` runs its
-  display reset through the same helper).  Without this, the
-  background gating would swallow the confirmation of the user's own
-  `/reasoning` and `/model` commands.
-
-Two session-switch details keep the status bar honest after switching into
-a streaming session:
-
-- `handle_session_attached` fills *missing* display fields from the (possibly
-  stale) session summary but never clobbers values already accumulated via
-the all-activity subscription, so fresher per-turn token usage and live
-counts survive the attach instead of regressing.
-- The startup auto-attach in `handle_sessions` prefers the most recently
-  modified *top-level* session (skipping agent-spawned sub-sessions, whose
-  `last_modified` is bumped each time one of their requests completes and
-  would otherwise hijack the view) and sets attachment state immediately so a
-  second `Sessions` reply cannot re-fire the attach to a different session.
-  Archived sessions are excluded first: they are hidden from the live list, so
-  they must not be auto-opened either — when EVERY session is archived the
-  bootstrap creates a fresh default session instead of attaching to one.
-- The auto-attach rule keys on the EVENT, not on `parent_session_id`:
-  `SessionCreatedForRequester` — the direct reply to THIS client's
-  `CreateSession` (parent `None`) — is the ONLY create event that may attach.
-  It navigates the creator to the new session from ANY page — including the
-  Session Manager, where `n` (or `/new`, or `/session new`) creates — via the
-  shared `App::attach_to_session` (`UnsubscribeSessionsSummary` + `AttachSession`,
-  then the Chat page); a `ListSessions` is sent first so the summary is present
-  when `SessionAttached` fills any remaining display gaps.
-- Every broadcast `SessionCreated` is notification-only (`App::note_session_created`):
-  the new session is never attached, whether it is a top-level session created
-  by ANOTHER client (the phone-view-follows-laptop bug this split fixes) or an
-  agent-spawned sub-session (`parent_session_id = Some`, e.g. from
-  `spawn_subsession`).  The session list is refreshed only while the user is on
-  the Session Manager page — an unsolicited `ListSessions` from the Chat page
-  would make the daemon reply with `Sessions`, whose handler writes the
-  global status line and reflows the viewed viewport.
-- The mirror-image rule: when the user *is* reading a sub-session on the Chat
-  page and it finishes (its status transitions from active — inference / tool
-  call / retrying — to idle), the TUI switches back to the parent session and
-  shows `Subsession "…" finished. Switched back to parent "…".` on the
-  status line.  Detection runs in the `SessionStatusChanged` dispatch *before*
-  the status is applied (`App::attached_subsession_finished`), so the
-  pre-transition active status is what distinguishes "just finished" from a
-  duplicate idle→idle broadcast (summary refresh, re-attach of an already
-  finished child), which never re-fires.  The switch (`App::switch_back_to_parent`)
-  delegates to the shared `App::attach_to_session` sequence used by every
-  attach path (Session Manager list/detail Enter included) —
-  `UnsubscribeSessionsSummary` then `AttachSession`, sent before the local
-  state is mutated — so a broken pipe leaves the view untouched.  The check
-  also requires the parent to still exist in the summary list: a child whose
-  parent was deleted while it ran stays put instead of attaching to a dead
-  session id.
-
 
 ---
 

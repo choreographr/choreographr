@@ -1,12 +1,13 @@
 //! Vision image normalization: turn a raw image file on disk into a
 //! well-formed image the provider serializers can send.
 //!
-//! The `read_image` tool calls this to produce metadata (MIME + dimensions)
-//! for its text handle and the durable `ImageReference`, and the request
-//! builder calls it again at request time to produce the actual bytes
-//! (pass-through design: no artifact store, so the file is re-read and
-//! re-normalized on every request). Keeping both paths on one function means
-//! the handle text reports the same dimensions the model actually sees.
+//! The `read_image` tool calls this to normalize the source once: the returned
+//! metadata (MIME + dimensions) fills its text handle, and the normalized bytes
+//! ride the durable `ImageReference` the framework stores on the turn's tool
+//! result and persists in `session_attachments`. The request builder then
+//! attaches those stored bytes directly rather than re-reading the source file,
+//! so the handle text reports the same dimensions the model actually sees and
+//! the source can vanish without breaking the session.
 //!
 //! Supported sources, all normalized to provider-allowlisted PNG (alpha) or
 //! JPEG (opaque):
