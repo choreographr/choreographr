@@ -1,3 +1,12 @@
+//! The `http_request` tool: make an HTTP(S) request and return the status,
+//! response headers, and (text) body.
+//!
+//! It is a `core`-group tool with its own structured [`HttpError`] type so a
+//! VM guest can pattern-match failures. The response body is attacker-
+//! controlled, so reads are byte-capped before buffering and the content is
+//! sanitized per line before it reaches the transcript — a hostile server can
+//! neither balloon daemon memory nor inject terminal escapes / bidi spoofs.
+
 use super::{MAX_TOOL_OUTPUT_BYTES, sanitize_multiline, sanitize_name, truncate_tool_output};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -27,14 +36,25 @@ const MAX_HTTP_TIMEOUT_SECS: u64 = 30;
 /// HTTP tool errors — a structured error type for `http_request` failures.
 #[derive(Debug, Serialize, Deserialize, thiserror::Error)]
 pub enum HttpError {
+    /// The requested HTTP method is not in the supported set.
     #[error("unsupported method: {0}")]
     UnsupportedMethod(String),
+    /// The URL could not be parsed.
     #[error("invalid url: {0}")]
     InvalidUrl(String),
+    /// The URL's scheme is not `http` or `https`.
     #[error("unsupported URL scheme: {0}")]
     UnsupportedUrlScheme(String),
+    /// A caller-supplied header is invalid — an empty/control/colon name or a
+    /// newline in a value (the header-injection guard).
     #[error("invalid header {name}: {error}")]
-    InvalidHeader { name: String, error: String },
+    InvalidHeader {
+        /// The offending header name.
+        name: String,
+        /// Why the header was rejected.
+        error: String,
+    },
+    /// The request itself failed (transport error, timeout, DNS, …).
     #[error("request failed: {0}")]
     RequestFailed(String),
 }
@@ -48,6 +68,8 @@ fn default_method() -> String {
     "GET".to_string()
 }
 
+/// Arguments for `http_request`: the method, URL, optional headers, optional
+/// body, and an optional timeout (clamped to the supported range).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct HttpRequestArgs {
     /// HTTP method (GET, POST, PUT, DELETE, PATCH, HEAD; defaults to GET)

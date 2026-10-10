@@ -247,7 +247,7 @@ pub(super) fn reattach_turn_attachments(
 /// Read a single persisted turn attachment (raw bytes) by turn and [`ImageKey`].
 ///
 /// The attachment table is keyed `(session_id, turn_id, slot)`, and the key maps
-/// to the slot here ([`slot_for`]) — `d{index}` for a displayed image, `r{call_id}`
+/// to the slot here (`slot_for`) — `d{index}` for a displayed image, `r{call_id}`
 /// for a tool-result vision image. This is a single `get`: no turn decode and no
 /// whole-session scan, so an on-demand image fetch (a client scrolling an image
 /// into view) is O(log n) rather than proportional to the session's history. The
@@ -306,7 +306,7 @@ pub fn read_attachment(
 /// cost O(N) instead of the O(N²) a whole-turn rewrite per image would incur.
 /// The table is created lazily on first insert, as redb does.
 ///
-/// Empty `data` writes nothing (mirrors [`write_turn_attachments`], which skips
+/// Empty `data` writes nothing (mirrors `write_turn_attachments`, which skips
 /// empty images): there is no byte payload to fetch, so no row is needed.
 ///
 /// # Errors

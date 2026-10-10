@@ -12,8 +12,10 @@ use super::{
     path_from_bytes, repo_work_dir_display, sort_and_dedup, write_section,
 };
 
+/// Arguments for the `git_status` tool ([`execute_git_status_tool`]).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GitRepoArgs {
+    /// Path to the git repository. Defaults to the session working directory.
     pub repo_path: Option<String>,
 }
 

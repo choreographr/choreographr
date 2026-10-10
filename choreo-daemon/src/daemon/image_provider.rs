@@ -40,15 +40,26 @@ pub enum ImageProviderError {
         "account '{name}' is not configured or has no resolved provider — \
          add it and set it on the session"
     )]
-    AccountNotConfigured { name: String },
+    AccountNotConfigured {
+        /// The requested (but missing) account name — carried so the message
+        /// names the typo/wrong-session account rather than the generic
+        /// "no account is configured".
+        name: String,
+    },
     /// The account resolved, but its provider has no image backend.
     #[error("provider '{slug}' does not support image generation")]
-    NoImageBackend { slug: String },
+    NoImageBackend {
+        /// The resolved provider's catalog slug.
+        slug: String,
+    },
     /// Unlocked, but NO credentialed account has an image backend — the
     /// slug names the deterministic (sorted-first) provider that was
     /// inspected, so the message names an actual blocker.
     #[error("provider '{slug}' does not support image generation")]
-    NoImageCapableAccount { slug: String },
+    NoImageCapableAccount {
+        /// The deterministic (sorted-first) provider slug that was inspected.
+        slug: String,
+    },
 }
 
 impl DaemonState {

@@ -11,6 +11,11 @@ use serde::Deserialize;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+/// Arguments for the `sh` tool ([`execute_sh_tool`]).
+///
+/// The shell itself is resolved once at daemon startup (see `shell_resolver`)
+/// and carried by the `Sh` tool struct, so there is deliberately no `shell`
+/// parameter — the model never picks a shell.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ShArgs {
     /// The shell command to execute (runs via `<shell> -c`)
@@ -160,7 +165,7 @@ pub(crate) fn execute_sh_with(
 /// Run `command` under the process's resolved POSIX shell and return its output.
 ///
 /// A convenience entry point that resolves (and caches) the shell itself; the
-/// `sh` tool uses [`execute_sh_with`] with the shell it already holds.
+/// `sh` tool uses `execute_sh_with` with the shell it already holds.
 ///
 /// # Errors
 ///

@@ -1,3 +1,9 @@
+//! Unified-diff generation.
+//!
+//! [`generate_diff`] renders a `diff -u`-style unified diff between two strings,
+//! used by the file-and-git tools to show the change a write or commit would
+//! produce without shelling out to `git`.
+
 /// Generate a unified diff between two strings, formatted like `diff -u`.
 /// Uses gix-imara-diff for line-by-line comparison.
 #[must_use]

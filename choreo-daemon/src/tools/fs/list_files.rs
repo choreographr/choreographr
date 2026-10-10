@@ -9,6 +9,7 @@ use std::fs;
 use std::path::Path;
 use tracing::warn;
 
+/// Arguments for the `list_files` tool ([`execute_list_files_tool`]).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListFilesArgs {
     /// Relative or absolute path to a directory (defaults to working directory)

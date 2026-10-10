@@ -1,3 +1,18 @@
+//! The daemon's tool system: the typed [`Tool`] trait, its type-erased
+//! [`ToolDyn`] counterpart, and the [`ToolRegistry`] that owns and dispatches
+//! every tool.
+//!
+//! A tool is a typed, synchronous request handler. It declares its argument and
+//! return types (both `serde`- and `schemars`-compatible, so the JSON schemas
+//! are auto-derived), runs on a dedicated per-call thread, and may stream
+//! incremental output over a channel. Tools are `Send + Sync`, are registered
+//! once, and are shared across every session — so a tool must keep no
+//! per-invocation state (see [`Tool::extract_image`]).
+//!
+//! The registry organizes tools into [`ToolGroup`]s the model discovers and
+//! activates with `load_tools`/`unload_tools`; a [`ToolPolicy`] decides at
+//! registration time which groups exist at all.
+
 use choreo_ai_protocols::ChatToolCall;
 pub(crate) use choreo_ai_protocols::openai::AllowedCaller;
 use choreo_ai_protocols::openai::ChatToolDefinition;
@@ -159,6 +174,8 @@ impl<'de> Deserialize<'de> for EmptyArgs {
     }
 }
 
+/// The session-level [`ToolContext`](context::ToolContext) and configuration
+/// threaded through tool execution.
 pub mod context;
 // Choreographr Coordination Platform tools (blockchain content registry + IPFS
 // + indexer) — behind the `content` feature (off by default). The
@@ -188,6 +205,8 @@ pub(crate) mod grep;
 // concrete Swift-side impl lives in choreo-gui behind
 // #[cfg(target_os = "ios")].
 pub mod http;
+/// The `display_image` tool plus the shared image preparation pipeline
+/// (`prepare_image_from_bytes`).
 pub mod image;
 pub mod image_gen;
 pub mod ios;
@@ -217,22 +236,40 @@ pub(crate) mod session_inspect;
 pub(crate) mod sh;
 // Startup POSIX-shell resolution for the `sh` tool (tier-major, cached).
 pub(crate) mod shell_resolver;
+/// Shared shell-tool helpers: process spawn/drain, byte budgeting, and
+/// binary-existence probes used by tool registration.
 pub mod shell_util;
 pub mod subsession;
 pub(crate) mod time;
 pub(crate) mod vm;
 pub(crate) mod x;
 
+/// How a tool's return value is rendered into [`ToolOutput::content`]: `Text`
+/// for the human/LLM-facing path (via [`Tool::return_string`]) and `Json` for
+/// Programmatic Tool Calling (the return serialized with `serde_json`).
 #[derive(Debug, Clone, Copy)]
 pub enum ToolOutputFormat {
+    /// Human-readable rendering, produced by [`Tool::return_string`].
     Text,
+    /// JSON encoding of the typed return, for Programmatic Tool Calling.
     Json,
 }
 
+/// The framework-level outcome of one tool invocation: the content handed back
+/// to the model, whether it is an error, the description of what the tool did,
+/// and any structured or vision side data.
 #[derive(Debug, Clone, Default)]
 pub struct ToolOutput {
+    /// The result text (or error message) delivered to the model. For a `Text`
+    /// tool this is [`Tool::return_string`]'s output; for a `Json` tool it is
+    /// the serialized return value.
     pub content: String,
+    /// Whether this outcome is a failure — set from the tool's `Err` path, a
+    /// timeout, or a panic in the tool thread.
     pub is_error: bool,
+    /// The human-readable sentence produced by [`Tool::describe_invocation`]
+    /// before execution, rendered as the tool result's header. Empty when no
+    /// description could be produced.
     pub invocation_description: String,
     /// A vision image reference this tool produced (e.g. `read_image`), fed
     /// back to a vision-capable model on the next request. Carried as a
@@ -247,6 +284,12 @@ pub struct ToolOutput {
     pub result_json: Option<serde_json::Value>,
 }
 
+/// A decoded, validated image ready for the client pipeline: its bytes, MIME
+/// type, probed dimensions, and optional alt text.
+///
+/// Produced by the shared `prepare_image_from_bytes` pipeline (`display_image`,
+/// `generate_image`, and `retrieve_webpage` screenshots) and carried on the
+/// tool's typed return value, so no shared state is involved.
 #[derive(Debug, Clone)]
 pub struct PreparedImage {
     pub(crate) mime_type: String,
@@ -266,23 +309,31 @@ impl PreparedImage {
     pub fn mime_type(&self) -> &str {
         &self.mime_type
     }
+    /// The encoded image bytes.
     #[must_use]
     pub fn data(&self) -> &[u8] {
         &self.data
     }
+    /// The image's `(width, height)` in pixels, probed from the encoded bytes.
     #[must_use]
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
     }
+    /// The caller-supplied alt text, when present and non-empty.
     #[must_use]
     pub fn alt_text(&self) -> Option<&str> {
         self.alt.as_deref()
     }
 }
 
+/// A named bucket of tools the model can activate or deactivate as a unit via
+/// `load_tools`/`unload_tools`.
 #[derive(Debug, Clone)]
 pub struct ToolGroup {
+    /// The group's identifier (e.g. `"core"`, `"shell"`): a tool's `group()`
+    /// value and the name used in the load/unload schema enum.
     pub name: String,
+    /// The model-facing description shown in the system prompt's group listing.
     pub description: String,
 }
 
@@ -298,7 +349,11 @@ pub trait Tool: Send + Sync {
     /// tools whose structured errors are consumed by VM guests define a `thiserror` enum.
     type Error: std::error::Error + Send + Sync + Serialize + DeserializeOwned + 'static;
 
+    /// The tool's unique name — the key it is registered and dispatched under
+    /// (the model-visible function name in the API `tools` array).
     fn name(&self) -> &'static str;
+    /// The tool group that gates the tool's availability (which `load_tools`
+    /// activation enables it). Defaults to `"core"`.
     fn group(&self) -> &'static str {
         "core"
     }
@@ -431,13 +486,22 @@ pub trait Tool: Send + Sync {
 /// Type-erased dispatch trait stored in `ToolRegistry`.
 /// Converts between JSON/binary and the typed `Tool::execute()`.
 pub trait ToolDyn: Send + Sync {
+    /// Delegates to [`Tool::name`] via the blanket impl.
     fn name(&self) -> &str;
+    /// Delegates to [`Tool::group`] via the blanket impl.
     fn group(&self) -> &str;
+    /// Delegates to [`Tool::description`] via the blanket impl.
     fn description(&self) -> &str;
+    /// Delegates to [`Tool::schema`] via the blanket impl.
     fn schema(&self) -> serde_json::Value;
+    /// Delegates to [`Tool::output_schema`] via the blanket impl.
     fn output_schema(&self) -> Option<serde_json::Value>;
+    /// Delegates to [`Tool::allowed_callers`] via the blanket impl.
     fn allowed_callers(&self) -> Vec<AllowedCaller>;
 
+    /// Human-readable invocation description from JSON args. Delegates to
+    /// [`Tool::describe_invocation`] via the blanket impl, falling back to the
+    /// static [`Tool::description`] when the args fail to parse.
     fn describe_invocation_json(&self, args_json: &str) -> String;
 
     /// Whether this tool produces streaming output.
@@ -637,6 +701,14 @@ impl<T: Tool + 'static> ToolDyn for T {
     }
 }
 
+/// The process-wide catalog of statically-registered [`ToolGroup`]s, built once
+/// and cached in a `OnceLock`.
+///
+/// The catalog is feature-conditional: the `blockchain` and `content` groups are
+/// pushed only when their cargo feature is compiled in, so a build never
+/// advertises a group whose tools are absent. The slice is shared by every
+/// [`ToolRegistry`]; per-registry protected ("ios") and dynamic (MCP) groups are
+/// layered on top by [`ToolRegistry::groups`].
 pub fn static_groups() -> &'static [ToolGroup] {
     static GROUPS: OnceLock<Vec<ToolGroup>> = OnceLock::new();
     GROUPS.get_or_init(|| {
@@ -706,6 +778,15 @@ pub fn static_groups() -> &'static [ToolGroup] {
     })
 }
 
+/// The daemon's owned collection of tools: a name-keyed map of type-erased
+/// [`ToolDyn`] handlers plus the group metadata needed to advertise and
+/// dispatch them.
+///
+/// A registry is built once at startup ([`ToolRegistry::new`] →
+/// [`ToolRegistry::build`]) into a shared, atomically-swappable handle
+/// ([`ToolRegistry::into_shared`]) that every session and request worker reads
+/// lock-free; the daemon command loop is its sole writer, replacing it wholesale
+/// when an MCP server's tool list changes.
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn ToolDyn>>,
     dynamic_groups: Vec<(String, String)>,
@@ -746,13 +827,14 @@ pub enum ToolPolicy {
 }
 
 impl ToolRegistry {
+    /// Build a registry under the default [`ToolPolicy::Full`].
     #[must_use]
     pub fn new() -> Self {
         Self::new_for_policy(ToolPolicy::Full)
     }
 
     /// Build the registry under a [`ToolPolicy`]. `Mobile` simply skips the
-    /// registrations for shell/exec and (in [`build_for_policy`]) the VM
+    /// registrations for shell/exec and (in [`ToolRegistry::build_for_policy`]) the VM
     /// sandbox — see the policy docs for why registration-time filtering is
     /// the right granularity.
     #[must_use]
@@ -938,7 +1020,7 @@ impl ToolRegistry {
         Arc::new(arc_swap::ArcSwap::from(self))
     }
 
-    /// Build a shared registry under a [`ToolPolicy`]. See [`build`] for the
+    /// Build a shared registry under a [`ToolPolicy`]. See [`ToolRegistry::build`] for the
     /// `Arc::new_cyclic` rationale; `Mobile` skips the RISC-V sandbox
     /// registration entirely (`run_series`/`load_tools`/`unload_tools` stay —
     /// they are session-surface tools, not execution sandboxes).
@@ -1026,6 +1108,10 @@ impl ToolRegistry {
         }
     }
 
+    /// The invocation description for a tool call by name + JSON args, falling
+    /// back to the raw tool name for an unknown tool. Called before a tool
+    /// thread is spawned so the description is available even on timeout and
+    /// panic paths.
     #[must_use]
     pub fn describe_invocation(&self, tool_call: &ChatToolCall) -> String {
         match self.tools.get(tool_call.name.as_str()) {
@@ -1034,6 +1120,9 @@ impl ToolRegistry {
         }
     }
 
+    /// Like [`describe_invocation`](Self::describe_invocation) but keyed by an
+    /// explicit `name`/`args_json` pair, returning `None` for an unknown tool
+    /// (instead of the name fallback).
     #[must_use]
     pub fn describe_invocation_for(&self, name: &str, args_json: &str) -> Option<String> {
         self.tools
@@ -1087,6 +1176,8 @@ impl ToolRegistry {
         removed
     }
 
+    /// The full group catalog for listings: the static groups ([`static_groups`])
+    /// plus this registry's protected ("ios") and dynamic (MCP) groups.
     #[must_use]
     pub fn groups(&self) -> Vec<ToolGroup> {
         let mut groups: Vec<ToolGroup> = static_groups().to_vec();
@@ -1145,7 +1236,7 @@ impl ToolRegistry {
     /// Uses plain `ChatToolDefinition::function()` — no `output_schema` or
     /// `allowed_callers` — so the definitions are compatible with both Chat
     /// Completions and Responses API paths.  The Responses API path should
-    /// call [`available_definitions_for_responses`] instead when it needs
+    /// call [`ToolRegistry::available_definitions_for_responses`] instead when it needs
     /// those fields.
     #[must_use]
     pub fn available_definitions(&self, active: &HashSet<String>) -> Vec<ChatToolDefinition> {
@@ -1178,7 +1269,7 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Like [`available_definitions`] but includes `output_schema` and
+    /// Like [`ToolRegistry::available_definitions`] but includes `output_schema` and
     /// `allowed_callers` for the Responses API (programmatic tool calling).
     /// Only use this when sending requests to a Responses API endpoint.
     #[must_use]

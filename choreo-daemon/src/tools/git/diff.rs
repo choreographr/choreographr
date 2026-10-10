@@ -8,10 +8,20 @@ use super::{
     collect_cached_diff_lines, open_repo, path_from_bytes, pathspec_patterns, repo_work_dir_display,
 };
 
+/// Arguments for the `git_diff` tool ([`execute_git_diff_tool`]).
+///
+/// Produces unified diffs for changed files; every diff is emitted inside a
+/// ```` ```diff ```` fenced code block.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GitDiffArgs {
+    /// Path to the git repository. Defaults to the session working directory.
     pub repo_path: Option<String>,
+    /// When true, compare HEAD↔index (staged changes); when false (the
+    /// default), compare index↔worktree (unstaged changes).
     pub cached: Option<bool>,
+    /// Pathspecs limiting the diff to matching paths. Omitted or empty means
+    /// all paths. Entries are resolved relative to the session working
+    /// directory and remapped to the repository root.
     pub pathspec: Option<Vec<String>>,
 }
 

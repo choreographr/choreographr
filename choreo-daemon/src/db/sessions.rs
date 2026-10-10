@@ -30,13 +30,20 @@ use super::{DELETED_SESSIONS, SESSION_KV, SESSION_TURNS, SESSIONS, db_err};
 
 /// A persisted session record: the durable form of a session's identity and
 /// configuration. Stored MessagePack-encoded under its session id in
-/// [`SESSIONS`]; read back by `read_session`/`read_all_sessions`.
+/// `SESSIONS`; read back by `read_session`/`read_all_sessions`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
+    /// User-editable session title; `None` until set.
     pub title: Option<String>,
+    /// The model slug currently selected for the session; `None` until one is
+    /// chosen.
     pub selected_model: Option<String>,
+    /// The parent's session id for a sub-session, `None` for a root session.
     pub parent_session_id: Option<u64>,
+    /// The session's working directory; `None` to inherit the parent's, else the
+    /// daemon's cwd.
     pub working_dir: Option<String>,
+    /// Number of turns persisted for this session (bounds the turns-table scan).
     pub turn_count: u32,
     /// Creation time, Unix-epoch-milliseconds.
     pub created_at: i64,
@@ -44,11 +51,19 @@ pub struct SessionRecord {
     /// turn completion, title/model edits).  Persisted so the sessions list
     /// keeps its "newest first" ordering across daemon restarts.
     pub last_modified: i64,
+    /// Names of the tool groups loaded for this session, persisted so a restart
+    /// restores the same tool set.
     pub active_tool_groups: Vec<String>,
+    /// Context-file discovery settings for this session; `#[serde(default)]`
+    /// keeps older records decoding.
     #[serde(default)]
     pub context_config: ContextConfig,
+    /// The inference account this session is bound to, `None` when unbound;
+    /// `#[serde(default)]` keeps older records decoding.
     #[serde(default)]
     pub account_name: Option<String>,
+    /// The selected reasoning-effort slug, `None` for the model's default;
+    /// `#[serde(default)]` keeps older records decoding.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     /// Last provider response id, persisted so ResponseId-policy models

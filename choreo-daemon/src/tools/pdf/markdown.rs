@@ -14,6 +14,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use tracing::{info, warn};
 
+/// Arguments for the `pdf_to_markdown` tool ([`execute_pdf_to_markdown`]).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PdfToMarkdownArgs {
     /// Path to the PDF file

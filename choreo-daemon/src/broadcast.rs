@@ -53,7 +53,7 @@
 //! exactness.
 //!
 //! One carve-out from the per-client budget: a solicited `Image` reply (see
-//! [`counts_toward_client_lag`]) is EXCLUDED from the per-client counter — it is
+//! `counts_toward_client_lag`) is EXCLUDED from the per-client counter — it is
 //! request-driven and can be multi-megabyte, so counting it could evict a
 //! client merely for fetching its own images. It still counts in the
 //! daemon-wide total (which bounds memory), and the writer thread mirrors the
@@ -71,7 +71,7 @@ use tracing::warn;
 ///
 /// A `ClientId` names exactly one client connection. It is minted once, when
 /// the connection is accepted (see
-/// [`register_client_writer`](crate::server::connection::register_client_writer)),
+/// `register_client_writer`),
 /// from a process-wide monotonic counter, and it is the key the daemon uses to
 /// track everything about that client: its writer channel, its summary/activity
 /// subscription flags, and the sessions it is attached to (consolidated into one
@@ -147,6 +147,9 @@ impl FanoutTarget for SubscriberSink {
 /// session the client is attached to, all sharing ONE byte counter.
 #[derive(Clone)]
 pub struct SubscriberSink {
+    /// The client's unbounded writer channel. Unbounded so an enqueue can
+    /// never block the producer (a session thread or the command loop); the
+    /// connection's writer thread is the sole receiver.
     pub tx: Sender<DaemonMessage>,
     /// Bytes sitting in this subscriber's queue right now. Producers
     /// increment (on enqueue), the connection's writer thread decrements
@@ -166,6 +169,8 @@ pub struct SubscriberSink {
 }
 
 impl SubscriberSink {
+    /// Wrap a freshly-created writer channel with a byte counter starting at
+    /// zero. The caller owns the matching receiver.
     #[must_use]
     pub fn new(tx: Sender<DaemonMessage>) -> Self {
         SubscriberSink {
@@ -359,7 +364,7 @@ impl ReplySink {
 /// capturing the request id, its [`MessageKind`] tag, the acting client's
 /// delivery sink, and a clone of the daemon-wide lag counter. Because it OWNS
 /// all four it can travel over a `SessionCommand`/`DaemonCommand` channel; the
-/// connection thread's `ReplyHandle` guard also owns its [`ReplySink`] but
+/// connection thread's `ReplyHandle` guard also owns its `ReplySink` but
 /// must be answered on the connection thread.
 ///
 /// `kind` is the request's [`MessageKind`] so the generic [`accept`](Self::accept)
@@ -515,7 +520,11 @@ pub(crate) fn counts_toward_client_lag(msg: &DaemonMessage) -> bool {
 /// MUST be injectable so unit/integration tests can use tiny caps.
 #[derive(Debug, Clone, Copy)]
 pub struct LagLimits {
+    /// Per-client in-flight byte cap. Crossing it evicts THIS client (a
+    /// genuinely lagging subscriber); the crossing message is still delivered.
     pub per_client_cap: usize,
+    /// Daemon-wide in-flight byte budget across every subscriber. Crossing it
+    /// sheds the largest lagging client; bounds total queued memory.
     pub global_budget: usize,
 }
 

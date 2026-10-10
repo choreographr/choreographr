@@ -1,5 +1,5 @@
 //! iOS-native tools (`clipboard_write`, `clipboard_read`, `open_url`,
-//! `notify`) — thin [`Tool`] wrappers over the bridge seam in
+//! `notify`) — thin [`Tool`](crate::tools::Tool) wrappers over the bridge seam in
 //! [`crate::tools::ios_bridge`].
 //!
 //! Compiled UNCONDITIONALLY on every target (the `powershell` precedent):
@@ -15,7 +15,8 @@
 //! 1. The cancelled flag is checked at ENTRY, before dispatch — a cancelled
 //!    call must never touch the bridge (pinned by tests via
 //!    `MockBridge::dispatched()` being empty).
-//! 2. [`IosToolPending::wait`] polls the same flag while waiting for the
+//! 2. [`IosToolPending::wait`](crate::tools::ios_bridge::IosToolPending::wait)
+//!    polls the same flag while waiting for the
 //!    reply and implements cancel-wins-on-reply.
 //! 3. On the cancel path the tool calls `pending.cancel()` best-effort, so
 //!    the Swift host can drop a still-queued request nobody will read.

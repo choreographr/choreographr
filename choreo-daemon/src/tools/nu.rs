@@ -9,6 +9,11 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
 
+/// Arguments for the `nushell` tool ([`execute_nu_tool`]).
+///
+/// The command runs in a child `nu -c` process with the same sandboxing as
+/// `sh` (timeout, rlimits, env sanitization, output truncation, non-interactive
+/// stdin).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct NuArgs {
     /// The nushell command to execute (runs via `nu -c`)

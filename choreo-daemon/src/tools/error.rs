@@ -11,12 +11,16 @@ pub struct ToolExecError(pub String);
 /// Never produced directly by a tool's `execute()`.
 #[derive(Debug, Serialize, Deserialize, thiserror::Error)]
 pub enum ToolError {
+    /// The tool's arguments could not be parsed (a JSON/schema mismatch).
     #[error("invalid arguments: {0}")]
     InvalidArguments(String),
+    /// An I/O failure in the dispatch layer (distinct from a tool's own error).
     #[error("I/O error: {0}")]
     Io(String),
+    /// A `postcard` encode/decode failure on the binary (VM) dispatch path.
     #[error("postcard error: {0}")]
     Postcard(String),
+    /// Any other infrastructure failure, including an unknown tool name.
     #[error("{0}")]
     Other(String),
 }

@@ -1,3 +1,15 @@
+//! The MCP (Model Context Protocol) client: the `McpManager` type and the
+//! modules it is split across.
+//!
+//! MCP tools are dynamic: the manager connects stdio and Streamable-HTTP
+//! servers, pools and ref-counts their connections, and registers their
+//! advertised tools into the daemon's tool registry under `mcp/<slug>` groups.
+//! The manager is split across cohesive child modules — `paths`, `status`,
+//! `project`, `pool`, `slot`, `overlay`, `query` — whose `impl McpManager`
+//! blocks reach the manager's private fields, plus `stub` for the feature-off
+//! build. The items other modules use are re-exported here so every
+//! `crate::mcp::…` path is unchanged.
+
 // Real implementation (connect/handshake/discover/shutdown over stdio) is
 // compiled only with the `mcp` feature. Without it, the module degrades to a
 // no-op stub (see `stub.rs`) so the manager's call sites in cli.rs / daemon.rs /
@@ -101,7 +113,7 @@ impl McpManager {
     /// `shared = false` daemon-tier servers are NOT connected here: they are
     /// per-session, connected lazily when a session resolves its overlay (see
     /// [`McpManager::ensure_session`]). Servers connect in parallel on
-    /// background threads; the whole batch is bounded by [`STARTUP_BUDGET`].
+    /// background threads; the whole batch is bounded by `STARTUP_BUDGET`.
     pub fn from_config(registry: &mut ToolRegistry) -> Self {
         let mut configs: Vec<McpEntry> = match config::load_daemon_config() {
             Ok(configs) => configs,
@@ -207,10 +219,10 @@ impl McpManager {
 
     /// Re-register every daemon-tier shared server's tools into `registry`.
     ///
-    /// Each server is listed with the short [`CATALOGUE_REFRESH_BUDGET`]
+    /// Each server is listed with the short `CATALOGUE_REFRESH_BUDGET`
     /// deadline, not the per-server request timeout: this sweep runs on the
     /// command loop, and one slow server must not freeze every session. The
-    /// WHOLE sweep is additionally bounded by [`CATALOGUE_REFRESH_TOTAL_BUDGET`],
+    /// WHOLE sweep is additionally bounded by `CATALOGUE_REFRESH_TOTAL_BUDGET`,
     /// so a reload/reconnect over many servers cannot compound into an unbounded
     /// command-loop stall. A server that misses either deadline keeps its
     /// previously-listed tool set (so its group does not blink out of the
@@ -254,7 +266,7 @@ impl McpManager {
     /// A list-changed event names exactly one server, so re-listing only that
     /// server keeps the catalogue rebuild off every other server's request
     /// path: a full [`McpManager::register_all`] sweep would re-list all N
-    /// connected servers (each bounded by [`CATALOGUE_REFRESH_BUDGET`]), so a
+    /// connected servers (each bounded by `CATALOGUE_REFRESH_BUDGET`), so a
     /// single event could stall the command loop for up to N × the budget.
     ///
     /// The re-listing is bounded by the same short catalogue-refresh deadline

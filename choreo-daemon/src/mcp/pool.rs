@@ -74,7 +74,7 @@ impl super::McpManager {
     /// project `shared = false` server has one with `root = Some(..)`). Every
     /// matching connection is rebuilt in place: a failed rebuild is collected,
     /// not fatal, so one bad connection does not skip the rest. The WHOLE walk
-    /// is bounded by [`RECONNECT_TOTAL_BUDGET`], so a slug referenced from many
+    /// is bounded by `RECONNECT_TOTAL_BUDGET`, so a slug referenced from many
     /// projects cannot stall the command loop for one budget per connection.
     ///
     /// Each connection is rebuilt the SAME way — the replacement slot is built

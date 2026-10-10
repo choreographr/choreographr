@@ -1,3 +1,14 @@
+//! Provider construction and the protocol-erased [`InferenceProvider`] facade.
+//!
+//! [`InferenceProvider`] is the only daemon type that dispatches by wire
+//! protocol; all protocol knowledge lives in `choreo-ai-protocols`. The
+//! `from_*` constructors wrap an already-built client, while
+//! [`InferenceProvider::from_account_config`] resolves an account's provider
+//! slug through the catalog and builds the matching client, registering its
+//! sockets in the `SocketRegistry` of the unit of work that will use it (a
+//! session's registry for session-scoped requests, otherwise the daemon-wide
+//! one).
+
 use std::io;
 use std::sync::Arc;
 
@@ -74,6 +85,10 @@ pub(crate) fn daemon_user_agent() -> String {
 }
 
 impl InferenceProvider {
+    /// Construct a provider from an already-built [`OpenAiClient`], tagged with
+    /// the catalog slug `"openai"`. Image generation is left unconfigured —
+    /// [`from_account_config`](Self::from_account_config) is what attaches an
+    /// image backend based on the account's protocol.
     #[must_use]
     pub fn from_openai(client: OpenAiClient) -> Self {
         Self {
@@ -83,6 +98,9 @@ impl InferenceProvider {
         }
     }
 
+    /// Construct a provider from an already-built [`AnthropicClient`], tagged
+    /// with the catalog slug `"anthropic"`. Anthropic has no image-generation
+    /// backend, so the image client is left unconfigured.
     #[must_use]
     pub fn from_anthropic(client: AnthropicClient) -> Self {
         Self {
@@ -92,6 +110,9 @@ impl InferenceProvider {
         }
     }
 
+    /// Construct a provider from an already-built [`GoogleClient`], tagged with
+    /// the catalog slug `"google"`. Gemini has no image-generation backend in
+    /// v1, so the image client is left unconfigured.
     #[must_use]
     pub fn from_google(client: GoogleClient) -> Self {
         Self {
@@ -332,6 +353,9 @@ impl InferenceProvider {
         self.client.list_models()
     }
 
+    /// Whether the underlying client reports that `model` can be driven with
+    /// programmatic (model-issued) tool calling; the answer is protocol-
+    /// specific.
     #[must_use]
     pub fn supports_programmatic_tool_calling(&self, model: &str) -> bool {
         self.client.supports_programmatic_tool_calling(model)

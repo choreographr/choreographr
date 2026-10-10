@@ -7,6 +7,7 @@ use serde::Deserialize;
 use std::path::Path;
 use tracing::debug;
 
+/// Arguments for the `pdf_classify` tool ([`execute_pdf_classify`]).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PdfClassifyArgs {
     /// Path to the PDF file

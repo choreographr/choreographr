@@ -7,6 +7,12 @@ use serde::Deserialize;
 use std::path::Path;
 use tracing::{info, warn};
 
+/// Arguments for the `edit_file` tool ([`execute_edit_file_tool`]).
+///
+/// The file is read, the edits are located and applied against its
+/// LF-normalized content, and the file's original line ending is restored on
+/// write. A CRLF file therefore matches `old_text` copied from `read_file`'s
+/// LF view and round-trips losslessly.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EditFileArgs {
     /// Relative or absolute path to the file to edit
@@ -19,6 +25,11 @@ pub struct EditFileArgs {
     pub dry_run: Option<bool>,
 }
 
+/// One exact-match replacement in an [`EditFileArgs`] edit list.
+///
+/// Each edit locates `old_text` in the file's LF-normalized content and
+/// substitutes `new_text`; its own text is LF-normalized first so it matches
+/// regardless of the file's line ending.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TextEditArgs {
     /// Exact text to replace (must match at least once)

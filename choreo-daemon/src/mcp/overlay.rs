@@ -66,7 +66,7 @@ impl super::McpManager {
     /// therefore leaves the daemon server of that slug in place.
     ///
     /// The connect portion of the whole resolve is bounded by
-    /// [`SESSION_CONNECT_BUDGET`], so a project whose servers are slow to start
+    /// `SESSION_CONNECT_BUDGET`, so a project whose servers are slow to start
     /// cannot stall the command loop for one budget per server; a server that
     /// misses the deadline is skipped from this resolve and retried on the
     /// next. Connections already pooled for this session/server are reused and
@@ -92,7 +92,7 @@ impl super::McpManager {
     /// a trust-watch reload) call this with a SHARED deadline, so re-resolving
     /// many sessions cannot compound into one budget per session; a server
     /// reached after the deadline is deferred to the next resolve.
-    /// [`SESSION_CONNECT_BUDGET`] is the budget a lone resolve gets.
+    /// `SESSION_CONNECT_BUDGET` is the budget a lone resolve gets.
     pub fn ensure_session_within(
         &mut self,
         session_id: u64,

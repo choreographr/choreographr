@@ -242,7 +242,7 @@ impl McpToolWrapper {
     /// collision by appending a hash).
     ///
     /// The `input_schema`/`output_schema` are normalized by
-    /// [`normalize_mcp_schema`] at construction (draft `$schema`/`title`
+    /// `normalize_mcp_schema` at construction (draft `$schema`/`title`
     /// stripped, `$defs`/`$ref` preserved) so a server-supplied schema can never
     /// reach a provider carrying a meta key that would reject the whole request.
     #[must_use]

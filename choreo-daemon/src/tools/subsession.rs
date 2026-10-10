@@ -1,3 +1,12 @@
+//! The `spawn_subsession` tool: create and run an autonomous child session and
+//! return its final text output to the parent.
+//!
+//! It runs in the concurrent dispatch path. It talks to the daemon command loop
+//! over its `ToolContext` channel to create the child, then drives the child
+//! over its `SessionCommand` channel and blocks on the child's result.
+//! Cancellation cascades at the daemon level via parent→child tracking, so this
+//! tool never polls.
+
 use crate::daemon::DaemonCommand;
 use crate::sessions::SessionCommand;
 use crate::tools::context::ToolContext;
@@ -9,6 +18,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+/// Arguments for `spawn_subsession`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SpawnSubsessionArgs {
     /// Task description for the sub-session to work on autonomously
@@ -19,6 +29,7 @@ pub struct SpawnSubsessionArgs {
     pub categories: Option<Vec<String>>,
 }
 
+/// The `spawn_subsession` tool handle.
 pub struct SpawnSubsession;
 
 impl Tool for SpawnSubsession {

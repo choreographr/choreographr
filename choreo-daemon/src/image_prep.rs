@@ -2,7 +2,7 @@
 //! well-formed image the provider serializers can send.
 //!
 //! The `read_image` tool calls this to produce metadata (MIME + dimensions)
-//! for its text handle and the durable [`ImageReference`], and the request
+//! for its text handle and the durable `ImageReference`, and the request
 //! builder calls it again at request time to produce the actual bytes
 //! (pass-through design: no artifact store, so the file is re-read and
 //! re-normalized on every request). Keeping both paths on one function means
@@ -36,7 +36,7 @@
 //! baked); SVG sources pass the region into the rasterizer so only that
 //! rectangle of the vector tree is drawn — so a crop keeps full source detail
 //! instead of downscaling the whole image first. With no region the pipeline is
-//! byte-for-byte unchanged, and the crop lands *before* [`finalize`], so a
+//! byte-for-byte unchanged, and the crop lands *before* `finalize`, so a
 //! region smaller than [`MAX_IMAGE_DIMENSION`] bypasses the downscale entirely.
 
 use std::io::{Cursor, Read};
@@ -60,10 +60,14 @@ const JPEG_QUALITY: u8 = 85;
 /// A normalized, ready-to-send image.
 #[derive(Debug)]
 pub struct PreparedVisionImage {
+    /// The re-encoded image bytes in the provider-allowlisted format below.
     pub data: Vec<u8>,
     /// `image/png` (alpha) or `image/jpeg` (opaque) after re-encode.
     pub mime_type: &'static str,
+    /// Width in pixels after downscale/crop — the same value the `read_image`
+    /// tool reports in its handle and the model actually sees.
     pub width: u32,
+    /// Height in pixels after downscale/crop.
     pub height: u32,
 }
 
@@ -76,9 +80,13 @@ pub struct PreparedVisionImage {
 /// [`CropRegion::to_pixels`] still clamps defensively.
 #[derive(Debug, Clone, Copy)]
 pub struct CropRegion {
+    /// Left edge as a fraction of the displayed width (0.0 = left).
     pub x: f32,
+    /// Top edge as a fraction of the displayed height (0.0 = top).
     pub y: f32,
+    /// Region width as a fraction of the displayed width.
     pub width: f32,
+    /// Region height as a fraction of the displayed height.
     pub height: f32,
 }
 
@@ -87,9 +95,13 @@ pub struct CropRegion {
 /// baked).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PixelCrop {
+    /// Left edge in decoded-image pixels.
     pub x: u32,
+    /// Top edge in decoded-image pixels.
     pub y: u32,
+    /// Crop width in pixels (non-zero — an empty crop is rejected).
     pub width: u32,
+    /// Crop height in pixels (non-zero — an empty crop is rejected).
     pub height: u32,
 }
 

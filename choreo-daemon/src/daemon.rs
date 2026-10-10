@@ -1,3 +1,25 @@
+//! The daemon command loop: the [`DaemonCommand`] enum, the [`DaemonState`]
+//! it mutates, and the single-threaded handler that dispatches between them.
+//!
+//! [`DaemonState`] is owned exclusively by the command-loop thread. Every
+//! other thread — connection threads, session threads, config/power watchers,
+//! and the detached model-prefetch and catalog-maintenance workers —
+//! communicates with it only by sending a [`DaemonCommand`] over the single
+//! `daemon_tx` crossbeam channel, so all daemon state is mutated through
+//! [`DaemonState::handle_command`] with no shared-mutable-state lock. This is
+//! the workspace's actor model (AGENTS.md "Thread Communication"); see
+//! ARCHITECTURE.md's `daemon.rs` row for the module's role in the system.
+//!
+//! Replies travel back per-request over a channel the sender placed in the
+//! command (a one-shot `std::sync::mpsc` or a crossbeam sender), never through
+//! the broadcast fan-outs unless the message is a genuine client-visible event.
+//! The subscriber broadcast fan-outs, the keystore handlers, the MCP command
+//! handlers, and per-session overlay resolution live in child modules
+//! (`daemon/subscriber_handlers.rs`, `daemon/keystore.rs`,
+//! `daemon/mcp_commands.rs`, `daemon/image_provider.rs`); this module keeps the
+//! state and command types plus the core command handling. `DaemonState` is
+//! constructed by `daemon/open.rs`.
+
 use crate::accounts::{AccountConfig, AccountManager, AccountOverrides};
 use crate::broadcast::{ClientId, FanoutTarget, LagLimits, ReplyTarget, SubscriberSink};
 use crate::cache_warm::{CacheWarmingConfig, WarmPolicy};
@@ -89,7 +111,12 @@ pub struct ResolvedAccount {
 /// leaving, and so a trust change is never mistaken for an unchanged project.
 #[derive(Debug, Clone, Default)]
 pub struct SessionMcpProject {
+    /// The project root the overlay was last resolved for, or `None` when the
+    /// session has no project tier.
     pub root: Option<PathBuf>,
+    /// Whether `root` was trusted at resolve time. Part of the identity so a
+    /// trust flip on the same root counts as a project CHANGE, not an
+    /// unchanged project.
     pub trusted: bool,
 }
 
@@ -135,10 +162,25 @@ impl FanoutTarget for ClientState {
     }
 }
 
+/// All daemon state, owned exclusively by the command-loop thread.
+///
+/// Because exactly one thread ever touches it, every field is plain data with
+/// no synchronization; mutating handlers take `&mut self` and run to completion
+/// on the loop. Background threads never hold a reference — they send a
+/// [`DaemonCommand`] and let the loop apply the change. A field's doc either
+/// states a single-writer invariant or names the handler that maintains it.
 pub struct DaemonState {
+    /// The next session id to hand out; monotonic, incremented per creation.
     pub next_session_id: u64,
+    /// Per-session turn ceiling applied to every spawned session thread (from
+    /// the daemon config).
     pub max_turns: u32,
+    /// Live session threads, keyed by session id: the command sender handed to
+    /// clients/tools plus the join handle used to detect an already-finished
+    /// thread at delete time.
     pub active_sessions: HashMap<u64, ActiveSessionEntry>,
+    /// The daemon's in-memory session index (the summaries served to clients,
+    /// plus status and flags). The authoritative view every list/get reads.
     pub session_metadata: HashMap<u64, SessionMetadata>,
     /// Sessions that have been deleted but whose session thread may still be
     /// alive (shutting down after `Cancel`/`Shutdown`).  Guards the in-memory
@@ -153,6 +195,9 @@ pub struct DaemonState {
     /// Tracks parent→children session relationships so that cancelling or
     /// deleting a parent session also stops its child sub-sessions.
     pub children: HashMap<u64, Vec<u64>>,
+    /// Named inference accounts with their config overrides. The command loop
+    /// is its single writer (loaded at unlock, on `AccountsReload`, and on
+    /// add/remove).
     pub accounts: AccountManager,
     /// The daemon-owned provider-socket registry, used only for provider
     /// clients that are NOT session-scoped: model prefetch and catalog
@@ -179,7 +224,11 @@ pub struct DaemonState {
     /// Entries are set in `resolve_and_push_session_overlay` /
     /// `refresh_session_overlay` and dropped in `handle_session_exited`.
     pub session_mcp_projects: HashMap<u64, SessionMcpProject>,
+    /// Decrypted credentials held in memory while the keystore is unlocked,
+    /// keyed by service name. Empty while locked; cleared by `/lock`.
     pub credentials: HashMap<String, ServiceCredential>,
+    /// The X/Twitter credential, mirrored out of `credentials` for the `x_*`
+    /// tools' single `x_credentials` slot.
     pub x_credentials: Option<ServiceCredential>,
     /// Whether the credential keystore is currently locked (no decrypted
     /// credentials in memory). Starts `true` at daemon startup — the keystore
@@ -200,6 +249,9 @@ pub struct DaemonState {
     /// could only report "locked", never "unbound", so a first-run client
     /// with no key had no signal that it should auto-bind.
     pub keystore_bound: bool,
+    /// The shared redb database handle. Every connection thread holds its own
+    /// clone for concurrent reads; the command loop is the writer for
+    /// daemon-owned records (sessions, credentials, the catalog etag).
     pub db: Arc<redb::Database>,
     /// The daemon's live tool catalogue, shared with every session and request
     /// worker as one `Arc<ArcSwap<…>>`. Readers load the current registry
@@ -213,6 +265,9 @@ pub struct DaemonState {
     /// The platform-tool bridge the registry was built with (if any). Kept so a
     /// rebuild re-registers the protected `ios` group identically.
     pub platform_tool_bridge: Option<Arc<dyn crate::tools::ios_bridge::IosToolBridge>>,
+    /// The command loop's own sender, cloned to every thread that needs to
+    /// enqueue a [`DaemonCommand`] (session threads, connection threads,
+    /// background workers, watchers).
     pub daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
     /// Every connected client (both transports), keyed by its [`ClientId`],
     /// holding its delivery sink and its subscription/correlation state in ONE
@@ -234,10 +289,14 @@ pub struct DaemonState {
     /// (bounds a single blocking `write` syscall so a wedged client — receive
     /// window permanently zero — is reaped by lag eviction instead of stalling
     /// its writer forever). Injectable so a wedged-writer test can use a tiny
-    /// value; production uses [`crate::server::connection::WRITER_WRITE_TIMEOUT`]
+    /// value; production uses `crate::server::connection::WRITER_WRITE_TIMEOUT`
     /// (5 s). Read once by the transport adapters when a connection is
     /// accepted.
     pub writer_write_timeout: Duration,
+    /// Cached provider model lists, keyed by account name, with the instant
+    /// they were fetched. The command loop is its single writer (the
+    /// [`DaemonCommand::ModelPrefetchResult`] insert); `MODEL_CACHE_TTL` is
+    /// the freshness bound.
     pub model_cache: HashMap<String, (Vec<String>, Instant)>,
     /// Accounts with a model-list prefetch currently running on a background
     /// thread. The command loop sets a name when it spawns the fetch thread
@@ -247,6 +306,9 @@ pub struct DaemonState {
     /// loop (single writer); the fetch threads themselves never touch it —
     /// they report back through the `daemon_tx` channel.
     pub model_prefetch_in_flight: HashSet<String>,
+    /// The MCP connection manager: the daemon-tier shared servers plus every
+    /// session's project/per-session pools and the tool catalogue they feed.
+    /// The command loop drives its reconciliation.
     pub mcp_manager: McpManager,
     /// The MCP project-trust store (the set of project roots whose `.mcp.json`
     /// the daemon honours). Owned by the command loop (its single writer); the
@@ -273,29 +335,63 @@ pub struct DaemonState {
     pub cache_warming: CacheWarmingConfig,
 }
 
+/// Every message the daemon command loop can receive.
+///
+/// Senders enqueue a command on the single `daemon_tx` channel and the loop
+/// dispatches it in FIFO order from [`DaemonState::handle_command`]. A command
+/// that expects an answer carries its own reply channel, used exactly once; a
+/// client-visible event is delivered through the broadcast fan-outs instead.
+/// Ordering on this one channel is load-bearing: a registration that must
+/// precede a broadcast is queued ahead of it, and a targeted keystore reply is
+/// enqueued before the lock-state transition broadcast it must precede.
 pub enum DaemonCommand {
+    /// Stop the daemon. Handled at the command-loop level (not in
+    /// `handle_command`) so it can also wake the accept loop.
     Shutdown,
+    /// Create a new session — a conversation container creatable while the
+    /// keystore is locked — and reply with its id and command sender.
     CreateSession {
+        /// Optional display title for the new session.
         title: Option<String>,
+        /// Parent session to register the new session under as a child, if any.
         parent_session_id: Option<u64>,
+        /// Optional initial working directory.
         working_dir: Option<PathBuf>,
+        /// Optional initial reasoning-effort setting.
         reasoning_effort: Option<String>,
+        /// Optional initial model selection.
         selected_model: Option<String>,
+        /// Optional context-management configuration.
         context_config: Option<ContextConfig>,
+        /// Optional inference account to bind the session to.
         account_name: Option<String>,
+        /// Tool groups to activate at creation; the default set is used when
+        /// empty.
         active_tool_groups: Vec<String>,
+        /// Replies with the new session id and its command sender, or an
+        /// IO error.
         reply:
             std::sync::mpsc::Sender<io::Result<(u64, crossbeam_channel::Sender<SessionCommand>)>>,
     },
+    /// Ensure a stored session's thread is live and reply with its command
+    /// sender (loading it from the DB if it had slept).
     AttachSession {
+        /// The session to attach to.
         session_id: u64,
+        /// Replies with the session's command sender, or `NotFound` when the
+        /// session is unknown or deleted.
         reply: std::sync::mpsc::Sender<io::Result<crossbeam_channel::Sender<SessionCommand>>>,
     },
+    /// List every known session as a summary, in the shared list order.
     ListSessions {
+        /// Replies with the session summaries.
         reply: std::sync::mpsc::Sender<Vec<SessionSummary>>,
     },
+    /// Fetch one session's summary by id.
     GetSession {
+        /// The session to look up.
         session_id: u64,
+        /// Replies with the summary, or `None` when unknown.
         reply: std::sync::mpsc::Sender<Option<SessionSummary>>,
     },
     /// Reply with the session's current full-state snapshot for a
@@ -305,14 +401,26 @@ pub enum DaemonCommand {
     /// thread is the one that blocks). A missing or deleted session answers
     /// `NotFound`.
     GetSessionState {
+        /// The session whose snapshot is requested.
         session_id: u64,
+        /// Replies with the session thread's full-state snapshot, or
+        /// `NotFound`.
         reply: std::sync::mpsc::Sender<io::Result<DaemonMessageType>>,
     },
+    /// Replace a session's in-memory metadata from its thread's snapshot,
+    /// guarded against resurrecting a deleted session and against a stale
+    /// timestamp or status.
     UpdateMetadata {
+        /// The session the metadata belongs to.
         session_id: u64,
+        /// The latest metadata snapshot from the session thread.
         metadata: SessionMetadata,
     },
+    /// The session thread has terminated and persisted its final state; the
+    /// loop marks the session sleeping, releases its registries and MCP refs,
+    /// and finalizes any pending delete.
     SessionExited {
+        /// The exited session.
         session_id: u64,
     },
     /// Sent by the background delete-finalize thread after it has removed the
@@ -320,9 +428,14 @@ pub enum DaemonCommand {
     /// `SessionExited`: the record is only gone once this re-delete commits, so
     /// only this message drops the `deleted_sessions` marker.
     SessionDeleteFinalized {
+        /// The session whose record the background finalize removed.
         session_id: u64,
     },
+    /// Present a keystore unlock key. Verify-only against the stored binding,
+    /// then run the shared unlock tail (bulk-decrypt, load accounts, clear
+    /// `locked`).
     Unlock {
+        /// The raw X25519 private key presented for unlock.
         private_key: Vec<u8>,
         /// The acting client's reply target. The TARGETED reply is enqueued
         /// through it DIRECTLY by the daemon command loop — before any
@@ -341,9 +454,11 @@ pub enum DaemonCommand {
     /// already-bound keystore the key is verified against the binding and a
     /// mismatch is rejected without unlocking or overwriting.
     BindKeystore {
+        /// The raw X25519 private key to adopt as the keystore binding.
         key: Vec<u8>,
         /// See `Unlock.reply` for why the targeted reply rides here.
         reply: Option<ReplyTarget>,
+        /// One-shot ACK back to the blocked connection thread; see `Unlock.ack`.
         ack: mpsc::Sender<()>,
     },
     /// Lock the daemon's keystore: clear all decrypted in-memory credentials
@@ -354,10 +469,17 @@ pub enum DaemonCommand {
     /// untouched — they remain browsable, only inference is disabled until the
     /// next unlock.
     Lock {
+        /// Replies `Ok` once the keystore is locked and the state broadcast
+        /// sent, or `Err` on failure.
         reply: mpsc::Sender<Result<(), String>>,
     },
+    /// Persist an encrypted credential blob and run the implicit unlock tail.
+    /// Verify-only against the binding — rebinding happens only via
+    /// [`DaemonCommand::BindKeystore`].
     SaveCredential {
+        /// The service name the credential is stored under.
         service: String,
+        /// The credential blob, already encrypted client-side.
         encrypted_blob: Vec<u8>,
         /// REQUIRED (per-daemon keystore design): the raw X25519 private
         /// key the credential blob was encrypted with. The daemon VERIFY-ONLY
@@ -368,10 +490,15 @@ pub enum DaemonCommand {
         unlock_key: Vec<u8>,
         /// See `Unlock.reply` for why the targeted replies ride here.
         reply: Option<ReplyTarget>,
+        /// One-shot ACK back to the blocked connection thread; see `Unlock.ack`.
         ack: mpsc::Sender<()>,
     },
+    /// Remove a stored credential by service name and invalidate the sessions
+    /// bound to it.
     RemoveCredentialCmd {
+        /// The service name to remove.
         service: String,
+        /// Replies `Ok`, or an error string on failure.
         reply: mpsc::Sender<Result<(), String>>,
     },
     /// Enroll a client key in the ACL (from a LOCAL connection only — the
@@ -380,11 +507,19 @@ pub enum DaemonCommand {
     /// file lock, hot-reloads the `SharedAcl` (single writer), broadcasts
     /// `AclUpdated`, and replies with the new total.
     AclAddCmd {
+        /// The base64-encoded 32-byte client public key to enroll.
         pubkey: String,
+        /// Replies with the new trusted-client count, or an error string.
         reply: mpsc::Sender<Result<usize, String>>,
     },
+    /// List the models available to a session's account (or, with no session,
+    /// the default account context).
     ListModels {
+        /// The session whose account scope applies; `None` uses the default
+        /// account context.
         session_id: Option<u64>,
+        /// Replies with the model names and the selected model, or an error
+        /// string.
         reply: ListModelsReply,
     },
     /// A client requested `/refresh-models`. The daemon does NOT do the HTTP
@@ -394,7 +529,9 @@ pub enum DaemonCommand {
     /// or [`DaemonCommand::CatalogNotModified`] (304) once the maintenance
     /// thread has a result.
     RefreshModels {
+        /// Whether to force a refetch even if the cache is fresh.
         force: bool,
+        /// Replies with the refresh report, or an error string.
         reply: mpsc::Sender<Result<RefreshReport, String>>,
     },
     /// The maintenance thread delivered a (possibly refreshed) models.dev
@@ -403,7 +540,10 @@ pub enum DaemonCommand {
     /// optionally persists the cache, broadcasts `CatalogUpdated`, and
     /// replies to the `/refresh-models` requester(s).
     CatalogBaseChanged {
+        /// The (possibly refreshed) models.dev base provider entries.
         base: Vec<choreo_ai_protocols::ProviderEntry>,
+        /// The HTTP etag for the fetched base, persisted for the next
+        /// conditional GET.
         etag: Option<String>,
         /// The user overlay contents, or `None` for bundled-only. `Some`
         /// with a fresh value means the file was edited; `None` after `Some`
@@ -423,47 +563,68 @@ pub enum DaemonCommand {
     /// is applied first and the `UpToDate` counts reflect the current
     /// catalog. Carries no base: no swap happens.
     CatalogNotModified {
+        /// The coalesced `/refresh-models` requesters to answer `UpToDate`.
         reply: Vec<RefreshRequester>,
     },
+    /// Fetch a stored credential's API key by service name.
     GetCredential {
+        /// The service name to look up.
         service: String,
+        /// Replies with the API key, or `None` when locked or absent.
         reply: std::sync::mpsc::Sender<Option<String>>,
     },
     /// A background model-prefetch thread (spawned by
-    /// [`DaemonState::maybe_spawn_model_prefetch`]) finished fetching an
+    /// `DaemonState::maybe_spawn_model_prefetch`) finished fetching an
     /// account's model list. Routed through the command loop — the single
     /// writer of `model_cache` — so the insert is serialized with all other
     /// cache mutations. `result` carries the fetch outcome so the loop can
     /// release the per-account in-flight guard even on failure (otherwise a
     /// failed fetch would permanently block re-prefetching that account).
     ModelPrefetchResult {
+        /// The account whose model list was fetched.
         account: String,
+        /// The fetch outcome: model names, or an error string. The loop
+        /// releases the in-flight guard either way.
         result: Result<Vec<String>, String>,
     },
+    /// Register a client to receive session-summary broadcasts.
     RegisterSummarySubscriber {
+        /// The registering client.
         client_id: ClientId,
+        /// The client's delivery sink.
         writer: SubscriberSink,
     },
+    /// Stop a client's session-summary broadcasts.
     UnregisterSummarySubscriber {
+        /// The client to unregister.
         client_id: ClientId,
     },
+    /// Register a client to receive all-activity broadcasts.
     RegisterActivitySubscriber {
+        /// The registering client.
         client_id: ClientId,
+        /// The client's delivery sink.
         writer: SubscriberSink,
     },
+    /// Stop a client's all-activity broadcasts.
     UnregisterActivitySubscriber {
+        /// The client to unregister.
         client_id: ClientId,
     },
     /// Track that a client is now a direct subscriber of a session.
     /// The daemon uses this to avoid duplicate delivery through the
     /// activity subscriber path (see `handle_broadcast_activity`).
     TrackSessionSubscription {
+        /// The subscribing client.
         client_id: ClientId,
+        /// The session the client now subscribes to directly.
         session_id: u64,
     },
     /// Untrack that a client is no longer a direct subscriber of a session.
     UntrackSessionSubscription {
+        /// The client dropping its subscription.
         client_id: ClientId,
+        /// The session the client no longer subscribes to.
         session_id: u64,
     },
     /// Clean up all per-client tracking when a client disconnects: drop the
@@ -471,10 +632,11 @@ pub enum DaemonCommand {
     /// flags, and session memberships together) and tell each of its sessions
     /// to drop it, in a single atomic command.
     ClientDisconnected {
+        /// The client that disconnected.
         client_id: ClientId,
     },
     /// Auto-exit mode (`--auto-exit`): sent by a connection thread AFTER its
-    /// connection has fully ended and its RAII [`ConnectionSlot`] has been
+    /// connection has fully ended and its RAII `ConnectionSlot` has been
     /// released (the live-connection counter decremented). Deliberately
     /// carries no data — the shutdown DECISION reads the shared counter on
     /// the command loop, keeping that decision on a single thread (connection
@@ -483,12 +645,15 @@ pub enum DaemonCommand {
     /// Register a connection's writer channel so the shutdown path can route
     /// `ShuttingDown` through that connection's single writer thread.
     RegisterClientWriter {
+        /// The client whose writer is being registered.
         client_id: ClientId,
+        /// The client's writer sink, used to route `ShuttingDown`.
         writer: SubscriberSink,
     },
     /// Disconnect a client that fell too far behind its delivery queue (see
     /// `broadcast::EnqueueOutcome::ClientOverLag`). Idempotent.
     EvictClient {
+        /// The client to evict.
         client_id: ClientId,
     },
     /// Disconnect the currently most-lagging client (see
@@ -509,33 +674,58 @@ pub enum DaemonCommand {
     /// the origin session — it no longer reverse-engineers the origin from
     /// the message shape.
     BroadcastActivity {
+        /// The origin session for duplicate suppression, or `None` for a
+        /// global/control broadcast. Must agree with the message's own origin.
         session_id: Option<u64>,
+        /// The daemon message to fan out.
         msg: DaemonMessage,
     },
+    /// Broadcast one session's status change to the summary subscribers
+    /// (deduplicated against the activity path).
     BroadcastSessionStatus {
+        /// The session whose status changed.
         session_id: u64,
+        /// The new status.
         status: SessionStatus,
     },
+    /// Delete a session and its children, shutting down the session thread.
     DeleteSession {
+        /// The session to delete.
         session_id: u64,
+        /// Replies `Ok`, or an IO error on failure.
         reply: std::sync::mpsc::Sender<io::Result<()>>,
     },
+    /// Add a new inference account.
     AddAccountCmd {
+        /// The account name.
         name: String,
+        /// The provider slug/protocol key.
         provider: String,
+        /// Optional base URL override.
         base_url: Option<String>,
+        /// Optional streaming override.
         streaming: Option<bool>,
+        /// Optional retry-attempt ceiling override.
         retry_max_attempts: Option<u32>,
+        /// Optional connect-timeout override, in seconds.
         connect_timeout_secs: Option<u64>,
+        /// Optional request-timeout override, in seconds.
         request_timeout_secs: Option<u64>,
+        /// Optional total-timeout override, in seconds.
         total_timeout_secs: Option<u64>,
+        /// Replies `Ok`, or an error string on failure.
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     },
+    /// Remove an inference account.
     RemoveAccountCmd {
+        /// The account name to remove.
         name: String,
+        /// Replies `Ok`, or an error string on failure.
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     },
+    /// List all inference accounts with credential status.
     ListAccountsCmd {
+        /// Replies with the account info list, or an error string.
         reply: std::sync::mpsc::Sender<Result<Vec<AccountInfo>, String>>,
     },
     /// The config watcher detected an `accounts.toml` edit (or the daemon's
@@ -561,7 +751,10 @@ pub enum DaemonCommand {
     /// lingering as an ordinary `String`. `None` covers unknown account,
     /// keystore locked, and no credential stored.
     ResolveAccountCmd {
+        /// The account to resolve.
         account: String,
+        /// Replies with the resolved account, or `None` when the account is
+        /// unknown, the keystore is locked, or no credential is stored.
         reply: crossbeam_channel::Sender<Option<ResolvedAccount>>,
     },
     /// Fetch an opaque image-generation client (plus the provider slug) for
@@ -578,22 +771,35 @@ pub enum DaemonCommand {
         /// Explicit account to use; `None` selects deterministically among
         /// the image-capable credentialed accounts (sorted by account name).
         account_name: Option<String>,
+        /// Replies with the image-provider handle, or a structured
+        /// [`ImageProviderError`].
         reply: crossbeam_channel::Sender<Result<ImageProviderHandle, ImageProviderError>>,
     },
+    /// Check whether an account with the given name exists.
     AccountExists {
+        /// The account name to test.
         name: String,
+        /// Replies `true` when the account exists.
         reply: std::sync::mpsc::Sender<bool>,
     },
+    /// Validate that a model is available for a session's account. Best-effort:
+    /// a model is allowed through when nothing is cached to check against.
     ValidateModel {
+        /// The session whose account scope applies.
         session_id: u64,
+        /// The model name to validate.
         model: String,
+        /// Replies `Ok`, or a guidance error string.
         reply: mpsc::Sender<Result<(), String>>,
     },
     /// Cancel the active request in a session and propagate cancellation
     /// to any child sub-sessions.  The daemon handles child propagation
     /// directly so that leaf sessions never generate unnecessary messages.
     CancelRequest {
+        /// The session whose active request is cancelled.
         session_id: u64,
+        /// The stream id of the request to cancel (or `CANCEL_ALL` for the
+        /// whole session).
         stream_id: u64,
     },
     /// An MCP server reported a tool- or resource-list change on its
@@ -604,7 +810,10 @@ pub enum DaemonCommand {
     /// (which needs the catalogue rebuild) from a RESOURCES list change (which
     /// does not — the resource catalogue is read on demand, never snapshotted).
     McpListChanged {
+        /// The MCP server slug that changed (carried for logging).
         slug: String,
+        /// Whether the TOOLS list changed (needs a catalogue rebuild) as
+        /// opposed to RESOURCES only.
         tools_changed: bool,
     },
     /// Report the state of every MCP server visible to `session_id` (daemon
@@ -614,14 +823,19 @@ pub enum DaemonCommand {
     /// handler) can wait for it. `session_id: None` reports only the daemon
     /// tier (the `session_inspect` diagnostic path).
     McpStatus {
+        /// The session whose MCP servers to report; `None` reports only the
+        /// daemon tier.
         session_id: Option<u64>,
+        /// Replies with the status report.
         reply: std::sync::mpsc::Sender<McpStatusReport>,
     },
     /// Reconnect one MCP server (rebuild its connection), then rebuild the tool
     /// catalogue. Replies with the outcome, targeted to the requesting
     /// connection (or the tool caller).
     McpReconnect {
+        /// The server slug to reconnect.
         slug: String,
+        /// Replies `Ok`, or an error string.
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     },
     /// Reconcile the MCP configuration: re-read the daemon-tier `mcp.json`
@@ -633,7 +847,10 @@ pub enum DaemonCommand {
     /// session's project file). Replies with the reload outcome, targeted to
     /// the requesting connection.
     McpReload {
+        /// The session whose project `.mcp.json` to reconcile, or `None` for
+        /// the daemon tier only.
         session_id: Option<u64>,
+        /// Replies with the reload outcome, or an error string.
         reply: std::sync::mpsc::Sender<Result<McpReloadOutcome, String>>,
     },
     /// Resolve (or re-resolve) a session's MCP overlay: compute its project
@@ -648,19 +865,26 @@ pub enum DaemonCommand {
     /// to the session via [`SessionCommand::SetMcpOverlay`]; there is no reply
     /// (fire-and-forget).
     McpEnsureSession {
+        /// The session whose overlay to resolve.
         session_id: u64,
+        /// Whether to stop the session's in-flight calls to its previous
+        /// project; the loop also cancels on a detected project change.
         cancel_inflight: bool,
     },
     /// Set (`trusted = true`) or revoke (`trusted = false`) trust for the
     /// active session's project root, then re-resolve the session's overlay.
     /// Replies with the resulting trust state.
     McpTrustSet {
+        /// The session whose project root trust is set.
         session_id: u64,
+        /// `true` to trust, `false` to revoke.
         trusted: bool,
+        /// Replies with the resulting trust state.
         reply: std::sync::mpsc::Sender<McpTrustOutcome>,
     },
     /// List the trusted project roots. Read-only.
     McpTrustList {
+        /// Replies with the trusted project roots.
         reply: std::sync::mpsc::Sender<Vec<PathBuf>>,
     },
     /// The config watcher detected an `mcp.json` edit. The command loop (the
@@ -675,7 +899,9 @@ pub enum DaemonCommand {
     /// Set the display title for a session, forwarded to the session's
     /// main loop for in-memory update, broadcast, and persistence.
     SetSessionTitle {
+        /// The session whose title is set.
         session_id: u64,
+        /// The new title.
         title: String,
     },
     /// Set the daemon-owned `pinned`/`archived` flags of a session. `Some`
@@ -685,9 +911,13 @@ pub enum DaemonCommand {
     /// requesting connection) on failure; the SUCCESS signal to other clients
     /// is the broadcast `SessionFlagsChanged`.
     SetSessionFlags {
+        /// The session whose flags are set.
         session_id: u64,
+        /// `Some` sets pinned, `None` leaves it untouched.
         pinned: Option<bool>,
+        /// `Some` sets archived, `None` leaves it untouched.
         archived: Option<bool>,
+        /// Replies `Ok`, or an IO error on failure.
         reply: std::sync::mpsc::Sender<io::Result<()>>,
     },
     /// Set the session working directory, forwarded to the session's main
@@ -696,8 +926,11 @@ pub enum DaemonCommand {
     /// error immediately if the session is inactive so the caller (a blocked
     /// tool execution) never hangs.
     SetWorkingDir {
+        /// The session whose working directory is set.
         session_id: u64,
+        /// The new working directory.
         path: PathBuf,
+        /// Replies with the applied path, or an error string.
         reply: mpsc::Sender<Result<String, String>>,
     },
     /// A platform power transition (suspend/wake) detected by the
@@ -713,16 +946,22 @@ pub enum DaemonCommand {
     /// applies the change to the authoritative active-group set and replies
     /// with a summary of what changed.
     LoadTools {
+        /// The session to activate groups on.
         session_id: u64,
+        /// The tool-group names to activate.
         groups: Vec<String>,
+        /// Replies with a summary of what changed, or an error string.
         reply: mpsc::Sender<Result<String, String>>,
     },
     /// Deactivate tool groups ("core" is protected).  Forwarded to the
     /// session's main loop, which applies the change and replies with a
     /// summary of what changed.
     UnloadTools {
+        /// The session to deactivate groups on.
         session_id: u64,
+        /// The tool-group names to deactivate.
         groups: Vec<String>,
+        /// Replies with a summary of what changed, or an error string.
         reply: mpsc::Sender<Result<String, String>>,
     },
 }
@@ -780,6 +1019,13 @@ struct CreateSessionParams {
 }
 
 impl DaemonState {
+    /// Dispatch one [`DaemonCommand`] on the command-loop thread.
+    ///
+    /// The loop's sole entry point for daemon state mutation: it routes the
+    /// command to the matching `handle_*` method (or the child-module handler).
+    /// `Shutdown` and `LastClientDisconnected` are intentionally handled by the
+    /// loop caller, not here, because they need the accept loop / connection
+    /// counter that [`DaemonState`] does not own.
     pub fn handle_command(&mut self, cmd: DaemonCommand) {
         match cmd {
             DaemonCommand::CreateSession {

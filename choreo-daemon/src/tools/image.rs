@@ -10,6 +10,11 @@ use std::{io, time::Duration};
 use tracing::{debug, info, warn};
 use url::Url;
 
+/// Arguments for the `display_image` tool.
+///
+/// Exactly one of `path`, `url`, `base64_data`, or `svg_text` must be set; the
+/// selected bytes are normalized, size-capped, and dimension-probed before
+/// being shown in the client UI.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DisplayImageArgs {
     /// MIME type of the image (e.g. "image/png", "image/svg+xml")

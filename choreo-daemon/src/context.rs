@@ -1,3 +1,13 @@
+//! Context and skill discovery for a session working directory.
+//!
+//! Walks the ambient instruction files a session should see (a config-dir
+//! `AGENTS.md`, an optional `~/.claude/CLAUDE.md`, `~/.agents/AGENTS.md`, and
+//! the project tree from the git root down to the working directory), bundles
+//! them with a content fingerprint so a re-read can be skipped when nothing
+//! changed, and discovers Agent Skills with project-local precedence over the
+//! global scope. The request builder renders the assembled context and the
+//! base system prompt into the messages it sends.
+
 use crate::tools::ToolGroup;
 use choreo_proto::ContextConfig;
 use itertools::Itertools;
@@ -10,15 +20,29 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// One discovered context file, with the metadata the fingerprint and the
+/// assembled prompt need.
 #[derive(Debug, Clone)]
 pub struct DiscoveredFile {
+    /// Absolute path the file was read from; also the sort key the fingerprint
+    /// is computed over, so discovery order cannot perturb it.
     pub path: PathBuf,
+    /// Modification time at discovery. The fingerprint hashes this (not the
+    /// content), so a bare `touch` alone invalidates a stale bundle.
     pub mtime: SystemTime,
+    /// Trimmed file contents. Never empty: an empty file is skipped at load
+    /// time rather than yielding a contentless entry.
     pub content: String,
 }
 
+/// The context discovered for one working directory, plus a fingerprint the
+/// daemon compares across requests to decide whether a re-read is needed.
 pub struct ContextBundle {
+    /// Discovered files in injection order: global files first, then the
+    /// project tree from the outermost ancestor down to the working directory.
     pub files: Vec<DiscoveredFile>,
+    /// Cheap change-detection key over the file set (see
+    /// [`compute_fingerprint`]); an unchanged value means an unchanged context.
     pub fingerprint: u64,
 }
 
@@ -28,16 +52,29 @@ struct SkillFrontmatter {
     description: String,
 }
 
+/// Metadata for one discovered skill, parsed from its `SKILL.md` YAML
+/// frontmatter. The name is the identity [`load_skill_body_from`] resolves by
+/// and the key discovery dedups on (a project skill shadows a same-named
+/// global one).
 #[derive(Debug, Clone)]
 pub struct SkillMeta {
+    /// The skill's frontmatter `name`.
     pub name: String,
+    /// The skill's frontmatter `description`, listed in the base prompt.
     pub description: String,
+    /// Path to the skill's `SKILL.md`; read lazily for the body only when the
+    /// skill is actually loaded.
     pub path: PathBuf,
 }
 
+/// A skill whose body has been loaded into the session, re-injected into the
+/// system prompt on every subsequent turn so its instructions stay visible
+/// after the tool result scrolls out of the context window.
 #[derive(Debug, Clone)]
 pub struct LoadedSkill {
+    /// The skill's name (the `name` on its wrapping `<skill>` tag).
     pub name: String,
+    /// The skill body, with its YAML frontmatter stripped.
     pub body: String,
 }
 
@@ -146,6 +183,12 @@ fn try_load_file(path: &Path) -> Option<DiscoveredFile> {
     })
 }
 
+/// Fold a file set into a cheap change-detection key.
+///
+/// Hashes each path with its modification time (not its content), sorted by
+/// path so discovery order cannot perturb the result; only the first 8 bytes
+/// of the SHA-256 digest are kept as the `u64`. [`recheck_context`] compares
+/// this value across requests to decide whether the bundle must be rebuilt.
 #[must_use]
 pub fn compute_fingerprint(files: &[DiscoveredFile]) -> u64 {
     let mut hasher = Sha256::new();
@@ -169,6 +212,9 @@ pub fn compute_fingerprint(files: &[DiscoveredFile]) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
+/// Render the bundle's files into the `<agent_instructions>` format injected
+/// into the system prompt. Returns an empty string for an empty bundle, so a
+/// caller can concatenate it unconditionally.
 #[must_use]
 pub fn assemble_context(bundle: &ContextBundle) -> String {
     if bundle.files.is_empty() {
@@ -187,6 +233,10 @@ pub fn assemble_context(bundle: &ContextBundle) -> String {
     out
 }
 
+/// Build the stable base system prompt from the user's `system.md` (or the
+/// compiled-in default), then append the tool-group listing and any available
+/// or already-loaded skills. Pure string assembly — the caller decides when to
+/// rebuild it.
 pub fn build_base_prompt(
     skills: &[SkillMeta],
     groups: &[ToolGroup],
@@ -430,6 +480,19 @@ pub fn recheck_context(
     }
 }
 
+/// Build a hint block from the `AGENTS.md`/`CLAUDE.md` files found in the
+/// target path's ancestor directories, up to but excluding the session working
+/// directory.
+///
+/// Called when a file-touching tool runs: the returned text is appended to the
+/// tool result so a nested instruction file is surfaced even though only the
+/// top-level context was assembled at request start. `known_paths` lists files
+/// already surfaced, so each hint is delivered once; the returned paths are the
+/// newly-added ones for the caller to fold into that list. Paths are kept raw
+/// (not canonicalized) so they round-trip consistently through that tracking,
+/// while the containment check itself compares in canonical space so a `/var`
+/// symlink cannot wrongly end the walk. Returns `None` when no new hints are
+/// found.
 #[must_use]
 pub fn subdirectory_hints(
     tool_name: &str,

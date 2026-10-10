@@ -10,6 +10,7 @@ use crate::tools::{ToolError, truncate_tool_output};
 
 use super::open_repo;
 
+/// Arguments for the `git_show` tool ([`execute_git_show_tool`]).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GitShowArgs {
     /// Path to the git repository. Defaults to the session working directory.

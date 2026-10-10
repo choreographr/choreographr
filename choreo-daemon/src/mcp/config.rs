@@ -1,3 +1,13 @@
+//! MCP server config parsing and expansion for both tiers.
+//!
+//! Parses the standard MCP `mcpServers` shape — `command`/`args`/`env`/`cwd`
+//! for a stdio server, `url`/`headers` for a remote one, with an explicit
+//! `transport` overriding inference from the keys present — expands `${VAR}`
+//! references and a leading `~` in `cwd`, and produces the `choreo-mcp`
+//! server config the manager connects with. A project tier's entries are
+//! expanded only when the project root is trusted (an untrusted project is
+//! read for status but never expanded and never spawned).
+
 use anyhow::{Context, Result};
 use choreo_mcp::{McpProtocolMode, McpServerConfig, McpTransport, McpTransportKind};
 use serde::Deserialize;

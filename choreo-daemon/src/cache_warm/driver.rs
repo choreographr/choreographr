@@ -52,7 +52,7 @@ enum Command {
 /// Handle to a running warmer thread.
 ///
 /// This is an RAII guard: [`WarmHandle::stop`] (and therefore `Drop`) sends
-/// [`Command::Stop`] and joins, so holding it in [`crate::requests::run_agent_loop`]
+/// `Command::Stop` and joins, so holding it in `crate::requests::run_agent_loop`
 /// guarantees the thread is joined on **every** exit path — final text, cancel,
 /// error, and panic (the drop runs during unwinding, before
 /// `run_request_worker`'s `catch_unwind` catches).

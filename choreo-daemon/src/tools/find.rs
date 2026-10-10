@@ -20,6 +20,7 @@ const DEFAULT_MAX_RESULTS: u32 = 50;
 /// LLM context window.
 const MAX_RESULTS_CAP: u32 = 200;
 
+/// Arguments for the `find` tool ([`execute_find_tool`]).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindArgs {
     /// File name pattern to search for (supports glob like '*.rs')

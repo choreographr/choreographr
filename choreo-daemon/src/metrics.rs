@@ -149,42 +149,56 @@ mod backend {
         Ok(())
     }
 
+    /// Record a new session (gauge `choreo_sessions_active` +1).
+    /// Silently a no-op before [`init`] has registered the metrics.
     pub fn record_session_created() {
         if let Some(m) = METRICS.get() {
             m.sessions_active.inc();
         }
     }
 
+    /// Record a session exit (gauge `choreo_sessions_active` -1).
+    /// Silently a no-op before [`init`].
     pub fn record_session_exited() {
         if let Some(m) = METRICS.get() {
             m.sessions_active.dec();
         }
     }
 
+    /// Record a client connection (gauge `choreo_connections_active` +1).
+    /// Silently a no-op before [`init`].
     pub fn record_client_connected() {
         if let Some(m) = METRICS.get() {
             m.connections_active.inc();
         }
     }
 
+    /// Record a client disconnect (gauge `choreo_connections_active` -1).
+    /// Silently a no-op before [`init`].
     pub fn record_client_disconnected() {
         if let Some(m) = METRICS.get() {
             m.connections_active.dec();
         }
     }
 
+    /// Record an accepted connection (counter `choreo_connections_total` +1).
+    /// Silently a no-op before [`init`].
     pub fn record_connection_accepted() {
         if let Some(m) = METRICS.get() {
             m.connections_total.inc();
         }
     }
 
+    /// Count a finished request, keyed by `status` (`done`/`failed`/`cancelled`).
+    /// Silently a no-op before [`init`].
     pub fn record_request_total(status: &str) {
         if let Some(m) = METRICS.get() {
             m.requests_total.with_label_values(&[status]).inc();
         }
     }
 
+    /// Observe a request's end-to-end latency in `secs`, keyed by `status`.
+    /// Silently a no-op before [`init`].
     pub fn record_request_duration(status: &str, secs: f64) {
         if let Some(m) = METRICS.get() {
             m.request_duration_seconds
@@ -193,6 +207,8 @@ mod backend {
         }
     }
 
+    /// Count one tool call and observe its duration in `secs`, keyed by `tool`
+    /// and `ok`/`error`. Silently a no-op before [`init`].
     pub fn record_tool_execution(tool: &str, secs: f64, is_error: bool) {
         if let Some(m) = METRICS.get() {
             let status = if is_error { "error" } else { "ok" };
@@ -205,12 +221,17 @@ mod backend {
         }
     }
 
+    /// Count one agent-loop turn, keyed by `model`. Silently a no-op before
+    /// [`init`].
     pub fn record_turn(model: &str) {
         if let Some(m) = METRICS.get() {
             m.turns_total.with_label_values(&[model]).inc();
         }
     }
 
+    /// Count one provider API call and observe its round-trip time, keyed by
+    /// `model` and the catalog `endpoint` slug. Silently a no-op before
+    /// [`init`].
     pub fn record_api_call(model: &str, endpoint: &str, secs: f64) {
         if let Some(m) = METRICS.get() {
             m.api_calls_total
@@ -222,6 +243,8 @@ mod backend {
         }
     }
 
+    /// Count one provider API error, keyed by `model` and `error_type` (from
+    /// `InferenceError::metric_label`). Silently a no-op before [`init`].
     pub fn record_api_error(model: &str, error_type: &str) {
         if let Some(m) = METRICS.get() {
             m.api_errors_total
@@ -485,32 +508,46 @@ mod backend {
         Ok(())
     }
 
+    /// No-op: metrics support is compiled out, so there is nothing to record.
     pub fn record_session_created() {}
 
+    /// No-op: metrics support is compiled out, so there is nothing to record.
     pub fn record_session_exited() {}
 
+    /// No-op: metrics support is compiled out, so there is nothing to record.
     pub fn record_client_connected() {}
 
+    /// No-op: metrics support is compiled out, so there is nothing to record.
     pub fn record_client_disconnected() {}
 
+    /// No-op: metrics support is compiled out, so there is nothing to record.
     pub fn record_connection_accepted() {}
 
+    /// No-op: metrics support is compiled out, so there is nothing to record.
     pub fn record_request_total(_status: &str) {}
 
+    /// No-op: metrics support is compiled out, so there is nothing to record.
     pub fn record_request_duration(_status: &str, _secs: f64) {}
 
+    /// No-op: metrics support is compiled out, so there is nothing to record.
     pub fn record_tool_execution(_tool: &str, _secs: f64, _is_error: bool) {}
 
+    /// No-op: metrics support is compiled out, so there is nothing to record.
     pub fn record_turn(_model: &str) {}
 
+    /// No-op: metrics support is compiled out, so there is nothing to record.
     pub fn record_api_call(_model: &str, _endpoint: &str, _secs: f64) {}
 
+    /// No-op: metrics support is compiled out, so there is nothing to record.
     pub fn record_api_error(_model: &str, _error_type: &str) {}
 
+    /// No-op: metrics support is compiled out, so there is nothing to record.
     pub fn record_eviction() {}
 
+    /// No-op: metrics support is compiled out, so there is nothing to record.
     pub fn record_cache_warm_attempt() {}
 
+    /// No-op: metrics support is compiled out, so there is nothing to record.
     pub fn record_cache_warm_skip(_reason: &str) {}
 
     /// No-op: the daemon refuses `--metrics-addr` at startup when the feature

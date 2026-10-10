@@ -6,10 +6,18 @@ use std::io;
 
 use super::{collect_cached_diff_lines, load_mutable_index, open_repo, path_from_bytes};
 
+/// Arguments for the `git_commit` tool ([`execute_git_commit_tool`]).
+///
+/// Commits the current index as a new commit on `HEAD`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GitCommitArgs {
+    /// Path to the git repository. Defaults to the session working directory.
     pub repo_path: Option<String>,
+    /// Commit message. Must be non-empty after trimming; an empty message is
+    /// an error.
     pub message: String,
+    /// When true, allow a commit with no staged changes (`--allow-empty`).
+    /// Defaults to false, in which case an empty index is an error.
     pub allow_empty: Option<bool>,
 }
 

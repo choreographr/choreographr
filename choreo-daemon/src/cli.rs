@@ -1,3 +1,12 @@
+//! The `choreographr` CLI: argument parsing and the process entry point.
+//!
+//! [`main`] is the binary's entry point — it parses the command line, installs
+//! logging, opens the daemon state, and then either runs the server (the
+//! default, no-subcommand case) or dispatches one of the offline utility
+//! subcommands (`acl-add`, `fingerprint`, `migrate`, `mcp`). The serve flags
+//! (base-dir, listeners, log destination, auto-exit) live on the parent command
+//! so `choreographr --tcp-addr …` keeps working without a subcommand.
+
 use crate::config::{DaemonConfig, load_daemon_config};
 use crate::daemon::DaemonState;
 use anyhow::Context;

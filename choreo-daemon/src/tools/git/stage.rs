@@ -12,9 +12,17 @@ use super::{
     describe_head, load_mutable_index, open_repo, pathspec_patterns, repo_work_dir_display,
 };
 
+/// Arguments for the `git_add` tool ([`execute_git_add_tool`]).
+///
+/// Stages the paths (tracked or untracked) matched by `pathspec`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GitAddArgs {
+    /// Path to the git repository. Defaults to the session working directory.
     pub repo_path: Option<String>,
+    /// Paths or glob pathspecs to stage, resolved relative to the session
+    /// working directory and remapped to the repository root. At least one
+    /// non-empty entry is required, and the pathspec must match a tracked or
+    /// untracked path.
     pub pathspec: Vec<String>,
 }
 

@@ -1,3 +1,11 @@
+//! Daemon-level configuration from `config.toml`.
+//!
+//! Only truly global settings live here — [`DaemonConfig`]'s `max_turns`,
+//! `[context]`, and `[cache_warming]`. Provider-level configuration (endpoints,
+//! timeouts, retry, credentials) belongs in `accounts.toml` (see
+//! [`crate::accounts`]). Fields are all `#[serde(default)]`, so a file written
+//! by a newer daemon still parses and unknown keys are ignored.
+
 use choreo_proto::ContextConfig;
 use serde::Deserialize;
 use std::{fs, io, path::PathBuf};
@@ -11,8 +19,12 @@ use crate::cache_warm::CacheWarmingConfig;
 /// accounts.toml (see [`crate::accounts`]).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DaemonConfig {
+    /// Cap on agent-loop turns per request; `None` uses the request/session
+    /// default.
     #[serde(default)]
     pub max_turns: Option<u32>,
+    /// Context-file discovery settings (`[context]`); defaults to
+    /// `ContextConfig::default()` when absent.
     #[serde(default)]
     pub context: ContextConfig,
     /// Global cache-warming defaults (off by default). Per-account `meter`/

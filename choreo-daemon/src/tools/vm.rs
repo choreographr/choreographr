@@ -700,13 +700,22 @@ fn format_rust_source(source: &str) -> String {
     }
 }
 
+/// Arguments for `run_riscv`. The guest is supplied as exactly one of inline
+/// Rust `source`, a pre-compiled base64 `program`, or a `program_path` to a
+/// pre-compiled ELF on disk.
 #[derive(Default, Deserialize, Serialize, JsonSchema)]
 pub struct RunRiscVInput {
+    /// Inline Rust source to format and compile before running.
     pub source: Option<String>,
+    /// A pre-compiled guest program, base64-encoded.
     pub program: Option<String>,
+    /// Path to a pre-compiled guest ELF on disk (read with a 4 MB cap).
     pub program_path: Option<String>,
+    /// Arguments passed to the guest, exposed to it via the injected `args()`.
     pub args: Option<Vec<String>>,
+    /// Instruction-count budget before the VM is stopped (default 10M).
     pub max_cycles: Option<u64>,
+    /// Flat guest memory size in bytes; capped at ckb-vm's 4 MB maximum.
     pub memory_size: Option<usize>,
 }
 

@@ -5,6 +5,10 @@ use serde::Deserialize;
 use std::{io, path::Path};
 use tracing::{info, warn};
 
+/// Arguments for the `write_file` tool ([`execute_write_file_tool`]).
+///
+/// The result previews the written content in a `fence_content`-sized code
+/// block tagged from the file's extension.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WriteFileArgs {
     /// Relative or absolute path to the file to write

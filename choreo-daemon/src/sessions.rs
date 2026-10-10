@@ -160,8 +160,27 @@ pub fn join_session_shutdown_with_grace_for_test(
     clippy::large_enum_variant,
     reason = "a control-plane channel message enum whose variants carry large payloads (`DaemonMessage` broadcasts, per-request snapshots) by nature; boxing every payload variant would churn every construction and match site for a human-rate channel where throughput is not the bottleneck"
 )]
+/// Commands sent to a session's control thread over its crossbeam command
+/// channel.
+///
+/// The session control thread owns the authoritative [`SessionState`]; every
+/// mutation of a session's model, account, title, working directory, tool
+/// groups, or turn history flows through one of these messages rather than a
+/// shared-lock write, so all cross-thread state changes serialize on the one
+/// thread that owns the state. Request workers hold only a snapshot of that
+/// state and report results back through here as well.
+///
+/// Several variants carry an optional `ReplyTarget` — the daemon's one-shot
+/// reply channel back to the originating client. The reply axis is strictly one
+/// request → exactly one terminal reply, so a `ReplyTarget` is consumed by the
+/// single reply it sends (and a dropped one answers with a best-effort
+/// `Failed`); the variant's unchanged `id: None` broadcast stream rides
+/// alongside that targeted reply.
 pub enum SessionCommand {
+    /// Start a run on this session from raw user input.
     RunInput {
+        /// The user input bytes for the run; the handler decodes them as UTF-8,
+        /// trims, and rejects an empty prompt.
         input: Vec<u8>,
         /// The requester's reply target, when the run originated from a client
         /// request (`RunInput`/`ContinueGeneration`). The session thread sends
@@ -175,26 +194,49 @@ pub enum SessionCommand {
         /// chooses one (the cross-client collision fix).
         reply: Option<ReplyTarget>,
     },
+    /// Run the agent loop on a child session and deliver the result back to the
+    /// parent through a one-shot channel.
+    ///
+    /// The caller is responsible for injecting any prompt into the child before
+    /// sending this; the run only exercises whatever turns are already queued.
+    /// The reply is a one-shot `std::sync::mpsc` channel (single producer,
+    /// single consumer, consumed once by the blocked parent) rather than a
+    /// `ReplyTarget`, because the result never reaches a wire client directly.
     RunChildInput {
+        /// Optional user text to append to the child session before running.
         user_text: Option<String>,
+        /// One-shot reply to the blocked parent thread with the child's
+        /// [`ChildResult`], or an error if the run could not start.
         reply: std::sync::mpsc::Sender<io::Result<ChildResult>>,
     },
+    /// Cancel an in-flight run, or every run when the `stream_id` is the
+    /// `CANCEL_ALL` sentinel (`0`).
     Cancel {
+        /// The `stream_id` to cancel; `0` cancels all active requests.
         stream_id: u64,
     },
+    /// Select the model for this session.
     SetModel {
+        /// The model name to select.
         model: String,
         /// The requester's reply target: `Accepted` on success,
         /// `Failed { kind: SetModel }` on rejection. The `ModelSelected` /
         /// `ModelSelectionFailed` broadcasts still fire unchanged.
         reply: Option<ReplyTarget>,
     },
+    /// Update the session's status and broadcast the change to subscribers.
     StatusChanged(SessionStatus),
+    /// Register a client as a subscriber so it receives this session's
+    /// broadcasts.
     Attach {
+        /// The attaching client's id.
         client_id: ClientId,
+        /// The client's outbound writer sink that broadcasts fan out into.
         tx: SubscriberSink,
     },
+    /// Remove a client's subscription when it detaches from the session.
     Detach {
+        /// The detaching client's id.
         client_id: ClientId,
     },
     /// Remove a subscriber without detaching the session (used by the daemon
@@ -202,13 +244,22 @@ pub enum SessionCommand {
     /// knows the client's session memberships and cleans them up promptly
     /// instead of waiting for the next broadcast to notice the dead sink).
     RemoveSubscriber {
+        /// The evicted or disconnected client's id whose sink should be
+        /// dropped.
         client_id: ClientId,
     },
+    /// Build this session's summary for the daemon's session list.
     GetSummary {
+        /// One-shot reply carrying the freshly built summary.
         reply: std::sync::mpsc::Sender<SessionSummary>,
     },
+    /// Signal that a request worker has finished and hand back its state
+    /// snapshot for the main thread to merge and persist.
     RequestFinished {
+        /// The `stream_id` of the request that finished.
         stream_id: u64,
+        /// The worker's final session snapshot, merged into the authoritative
+        /// state with any mid-request mutations the worker never saw preserved.
         snapshot: SessionSnapshot,
     },
     /// Route a daemon message through the main session thread's subscriber
@@ -223,10 +274,15 @@ pub enum SessionCommand {
     /// the worker's cumulative total here (and re-broadcasting the update
     /// from the authoritative state) keeps every consumer fresh mid-turn.
     SyncAccumulatedUsage {
+        /// The worker's cumulative token total for the session so far.
         token_usage: TokenUsage,
+        /// `input_tokens` from the worker's most recent provider response, for
+        /// the context-window progress display.
         last_prompt_tokens: Option<u32>,
     },
+    /// Rename the session.
     SetTitle {
+        /// The new title (its grapheme-cluster length is validated upstream).
         title: String,
         /// The requester's reply target. Title changes are driven by the agent's
         /// `set_session_title` tool, which has no client request id, so this is
@@ -240,6 +296,7 @@ pub enum SessionCommand {
     /// request worker's throwaway copy).  Replies with the applied path once
     /// the change has been broadcast and persisted.
     SetWorkingDir {
+        /// The new working directory to adopt.
         path: PathBuf,
         /// One-shot reply to the blocked `set_working_dir` tool caller (the
         /// tool's synchronous round-trip), carrying the applied path or the
@@ -259,16 +316,24 @@ pub enum SessionCommand {
     /// Activate tool groups on the authoritative active-group set, then
     /// reply to the caller with a summary of what changed.
     LoadTools {
+        /// The tool group names to activate.
         groups: Vec<String>,
+        /// One-shot reply with a human-readable summary of what changed, or a
+        /// rejection reason if no group matched.
         reply: mpsc::Sender<Result<String, String>>,
     },
     /// Deactivate tool groups on the authoritative active-group set, then
     /// reply to the caller with a summary of what changed.
     UnloadTools {
+        /// The tool group names to deactivate.
         groups: Vec<String>,
+        /// One-shot reply with a human-readable summary of what changed, or a
+        /// rejection reason if no group matched.
         reply: mpsc::Sender<Result<String, String>>,
     },
+    /// Bind an inference account to this session.
     SetAccount {
+        /// The account name to bind.
         name: String,
         /// The requester's reply target: `Accepted` on success. The account's
         /// existence is verified on the connection thread BEFORE this command
@@ -289,9 +354,14 @@ pub enum SessionCommand {
     /// account was removed — clear the recorded slug. Sent alongside
     /// [`SessionCommand::DropProvider`] by the daemon's accounts-reload path.
     SetProviderSlug {
+        /// The non-secret provider slug to record, or `None` to clear it after
+        /// the account was removed.
         slug: Option<String>,
     },
+    /// Set this session's reasoning effort slug.
     SetReasoningEffort {
+        /// The reasoning effort slug to apply (e.g. `"off"`, `"low"`,
+        /// `"medium"`, `"high"`).
         effort: String,
         /// The requester's reply target: `Accepted` on success,
         /// `Failed { kind: SetReasoningEffort }` on rejection. The
@@ -299,7 +369,9 @@ pub enum SessionCommand {
         /// fire unchanged.
         reply: Option<ReplyTarget>,
     },
+    /// Report the session's current reasoning effort slug.
     GetReasoningEffort {
+        /// One-shot reply carrying the effort slug.
         reply: mpsc::Sender<String>,
     },
     /// Reply with the session's current full-state snapshot (`SessionState`) to
@@ -310,19 +382,25 @@ pub enum SessionCommand {
     /// daemon's own `io::Result` wrapper so the session thread can answer an
     /// active session directly, off the daemon command loop.
     GetState {
+        /// One-shot reply carrying the `SessionState` snapshot message, or the
+        /// session's `io::Error` if it is currently inactive.
         reply: mpsc::Sender<io::Result<DaemonMessageType>>,
     },
+    /// Undo the most recent user-initiated turn(s).
     Undo {
         /// The requester's reply target: `Accepted` when turns were undone,
         /// `Failed { kind: Undo, error: "nothing to undo" }` when there was
         /// nothing to undo (closing the silent no-op gap).
         reply: Option<ReplyTarget>,
     },
+    /// Redo the most recent undo, restoring exactly the turns it removed.
     Redo {
         /// The requester's reply target: `Accepted` when turns were restored,
         /// `Failed { kind: Redo, error: "nothing to redo" }` otherwise.
         reply: Option<ReplyTarget>,
     },
+    /// Ask the session thread to persist its final state and exit. Sent by the
+    /// daemon's lifecycle shutdown.
     Shutdown,
 }
 
@@ -353,7 +431,7 @@ pub struct RequestContext {
     /// daemon command loop (the 6th sanctioned shared-state exception).
     pub global_lag: Arc<AtomicUsize>,
     /// The daemon's Substrate credential, plumbed to the request worker so the
-    /// `content` write tools can build a signing [`ChainAccount`].
+    /// `content` write tools can build a signing `ChainAccount`.
     ///
     /// // TEMPORARY: this rides the Tool trait's single `x_credentials` slot
     /// (the same slot the X tools use), so only ONE credential can be active
@@ -370,26 +448,51 @@ pub struct RequestContext {
     pub warm_policy: WarmPolicy,
 }
 
+/// The outcome of a child session's run, returned to the parent thread.
 pub struct ChildResult {
+    /// The child's final assistant output text.
     pub output: String,
+    /// Whether the run ended in an error.
     pub is_error: bool,
 }
 
+/// A snapshot of a session's state for the daemon's in-memory index, session
+/// listings, and the `UpdateMetadata` command.
+///
+/// Carries only the fields the daemon needs to describe a session; runtime-only
+/// state (subscribers, in-flight requests, turn contents) is dropped, and the
+/// `PathBuf` working directory is stringified for the wire.
 #[derive(Debug, Clone)]
 pub struct SessionMetadata {
+    /// Display name, or `None` for an untitled session.
     pub title: Option<String>,
+    /// The selected model name, or `None` before one is chosen.
     pub selected_model: Option<String>,
+    /// The per-session reasoning effort slug, or `None` when unset.
     pub reasoning_effort: Option<String>,
+    /// The parent session's id for a sub-session, or `None` for a root session.
     pub parent_session_id: Option<u64>,
+    /// Working directory for filesystem tools, stringified for the wire.
     pub working_dir: Option<String>,
+    /// Unix-epoch-milliseconds creation timestamp.
     pub created_at: i64,
+    /// Unix-epoch-milliseconds of the last modification; drives the
+    /// newest-first session-list ordering.
     pub last_modified: i64,
+    /// Number of turns in the session.
     pub turn_count: u32,
+    /// The session's current status.
     pub status: SessionStatus,
+    /// The tool groups active for this session.
     pub active_tool_groups: Vec<String>,
+    /// The bound inference account's name, or `None` when unbound.
     pub account_name: Option<String>,
+    /// The session-level accumulated token counter.
     pub accumulated_usage: TokenUsage,
+    /// The model's context window size, once resolved.
     pub context_window: Option<u32>,
+    /// `input_tokens` from the most recent provider response, used for the
+    /// context-window progress display.
     pub last_prompt_tokens: Option<u32>,
     /// Whether this session is pinned. The DAEMON is the sole authority for
     /// this flag (the session thread's `SessionConfig` does not carry it —
@@ -482,6 +585,8 @@ impl From<&SessionState> for SessionMetadata {
 }
 
 impl SessionMetadata {
+    /// Build the wire [`SessionSummary`] for this session, stamping the given
+    /// `session_id` onto it.
     #[must_use]
     pub fn to_summary(&self, session_id: u64) -> SessionSummary {
         SessionSummary {
@@ -674,13 +779,25 @@ pub(crate) struct ActiveRequest {
     pub(crate) turn_id: u32,
 }
 
+/// A live session's control handles, held by the daemon's session manager.
 pub struct ActiveSessionEntry {
+    /// Channel to send [`SessionCommand`]s to the session's control thread.
     pub cmd_tx: crossbeam_channel::Sender<SessionCommand>,
+    /// The session control thread's join handle, used to bound shutdown.
     pub handle: std::thread::JoinHandle<()>,
 }
 
+/// A live session's full in-memory state, owned by its control thread.
+///
+/// The persistent fields live in `config` (a `SessionConfig`); the rest is
+/// runtime-only — turn history, the subscriber set, in-flight requests, the
+/// lazily built provider client, and this session's private socket registry.
+/// The whole value lives on exactly one thread and is mutated only in response
+/// to a [`SessionCommand`].
 pub struct SessionState {
+    /// Persistent configuration fields (see `SessionConfig`).
     pub config: SessionConfig,
+    /// Monotonic counter for turn ids.
     pub next_turn_id: u32,
     /// The next `stream_id` this session will assign to an accepted run. It is a
     /// per-session, monotonic counter owned by the session thread (never chosen
@@ -689,9 +806,14 @@ pub struct SessionState {
     /// `CANCEL_ALL` sentinel (`0`).
     pub next_stream_id: u64,
     last_undo_turn_ids: Option<Vec<u32>>,
+    /// The session's conversation turns, keyed by turn id.
     pub turns: BTreeMap<u32, Turn>,
     subscribers: HashMap<ClientId, SubscriberSink>,
     pub(crate) active_requests: BTreeMap<u64, ActiveRequest>,
+    /// The lazily built inference provider client for this session's account, or
+    /// `None` before the first request resolves one (or after a
+    /// `DropProvider`). Every socket it dials registers in this session's
+    /// registry.
     pub provider: Option<InferenceProvider>,
     /// The account's **provider slug** (catalog key, e.g. "opencode-go"),
     /// recorded as soon as the account config resolves — at spawn time (the
@@ -724,8 +846,14 @@ pub struct SessionState {
     /// triple — agent + pool + registry. Future async tool calls will reuse
     /// this same triple so their sockets land in the same cancellable scope.
     pub registry: choreo_ai_protocols::SocketRegistry,
+    /// Accumulated skill bodies from `load_skill` tool calls, injected into the
+    /// system prompt on every turn.
     pub loaded_skill_bodies: Vec<LoadedSkill>,
+    /// Cached context-bundle fingerprint and assembled text, so unchanged
+    /// context files are not re-read from disk each turn.
     pub context_cache: Option<(u64, Arc<String>)>,
+    /// The skill metadata discovered in the working directory, or `None` before
+    /// discovery runs.
     pub discovered_skills: Option<Vec<SkillMeta>>,
     /// This session's private MCP tool set (project servers plus any
     /// `shared = false` per-session servers). Merged on top of the shared
@@ -746,11 +874,19 @@ pub struct SessionState {
 /// through [`SessionState::set_assistant_response`].
 #[derive(Debug, Clone, Default)]
 pub struct AssistantResponse {
+    /// The assistant's display text, or `None` for a pure tool-use turn.
     pub text: Option<String>,
+    /// The assistant's reasoning/thinking text, if the provider exposed it.
     pub reasoning: Option<String>,
+    /// The tool calls the model requested, if any.
     pub tool_calls: Vec<AssistantToolCallRecord>,
+    /// Token usage for this response, when the provider reported it.
     pub token_usage: Option<TokenUsage>,
+    /// The opaque reasoning round-trip payload to replay to the provider on the
+    /// next chained request, when one was captured.
     pub reasoning_artifact: Option<ReasoningArtifact>,
+    /// The provider+model that produced `reasoning_artifact`, used for the
+    /// same-model provenance check before replaying it.
     pub reasoning_producer: Option<ReasoningProducer>,
 }
 
@@ -1423,6 +1559,20 @@ fn default_active_tool_groups() -> HashSet<String> {
     groups
 }
 
+/// The session control thread's entry point.
+///
+/// Owns the authoritative [`SessionState`] for one session and processes
+/// [`SessionCommand`]s in a receive loop until a `Shutdown` arrives or the
+/// command channel closes. On startup it rebuilds turn history from the
+/// database, reconstructs accumulated token usage, and seeds the daemon's
+/// metadata index; on exit it persists the final record. Mutating commands are
+/// dispatched to the `handlers` submodule; request work runs on separate worker
+/// threads that report back via `RequestFinished`.
+///
+/// `initial_provider` is `None` in production (the client is resolved lazily on
+/// this thread at the first request); tests may seed one directly to skip the
+/// daemon resolution round-trip. `init_record` and `ctx` are borrowed for the
+/// thread's lifetime.
 pub fn session_main(
     rx: &crossbeam_channel::Receiver<SessionCommand>,
     initial_provider: Option<InferenceProvider>,

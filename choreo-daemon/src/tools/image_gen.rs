@@ -23,6 +23,7 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use tracing::{info, warn};
 
+/// Arguments for `generate_image`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GenerateImageArgs {
     /// What to depict. Photographic results come from photographic language
@@ -115,6 +116,8 @@ fn pick_image_model(
     Ok(candidates.first().cloned().unwrap_or_default())
 }
 
+/// The `generate_image` tool handle. Stateless: the provider, model, and
+/// credentials are resolved per invocation through the daemon command loop.
 pub struct GenerateImage {}
 
 impl Default for GenerateImage {
@@ -124,6 +127,7 @@ impl Default for GenerateImage {
 }
 
 impl GenerateImage {
+    /// Construct the tool; equivalent to [`GenerateImage::default`].
     #[must_use]
     pub fn new() -> Self {
         GenerateImage {}

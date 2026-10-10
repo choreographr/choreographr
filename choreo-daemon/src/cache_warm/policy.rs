@@ -194,7 +194,7 @@ impl WarmPolicy {
     /// If the request is ineligible (mode off, caching disabled, no/too-short
     /// TTL, or not replayable) the returned plan is inactive and carries the
     /// [`SkipReason`]. Otherwise it schedules the first warm ping at
-    /// `now + delay` — see [`warm_delay_secs`] for the delay rule — and the
+    /// `now + delay` — see `warm_delay_secs` for the delay rule — and the
     /// refresh deadline a ping must not miss.
     #[must_use]
     pub fn arm(&self, facts: WarmFacts, now: Duration) -> WarmPlan {

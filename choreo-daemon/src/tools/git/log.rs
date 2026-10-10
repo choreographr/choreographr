@@ -6,9 +6,15 @@ use std::{fmt::Write as _, io};
 
 use super::{describe_head, open_repo, repo_work_dir_display};
 
+/// Arguments for the `git_log` tool ([`execute_git_log_tool`]).
+///
+/// Walks the commit history reachable from `HEAD`, newest first.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GitLogArgs {
+    /// Path to the git repository. Defaults to the session working directory.
     pub repo_path: Option<String>,
+    /// Maximum number of commits to show. Defaults to 10 and is clamped to
+    /// the range `1..=100`.
     pub limit: Option<usize>,
 }
 

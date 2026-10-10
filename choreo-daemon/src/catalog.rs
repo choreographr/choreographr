@@ -15,7 +15,7 @@
 //! transport forwards overlay events over another channel.
 //!
 //! **Refresh pacing (S4).** A models.dev fetch is attempted at most once per
-//! [`REFRESH_ATTEMPT_INTERVAL`] (25 h), regardless of whether the last attempt
+//! `REFRESH_ATTEMPT_INTERVAL` (25 h), regardless of whether the last attempt
 //! succeeded, 304'd, or failed. The cooldown is anchored on a **wall-clock
 //! attempt timestamp persisted in the DB** ([`crate::db`] `catalog_state`),
 //! written BEFORE the fetch starts — so the cadence survives restarts (a
@@ -72,20 +72,25 @@ pub const USER_OVERLAY_NAME: &str = "models-overlay.toml";
 /// Reply payload for a `/refresh-models` request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RefreshReport {
+    /// Number of providers in the refreshed catalog.
     pub providers: usize,
+    /// Total number of models across those providers.
     pub models: usize,
+    /// How the fetch resolved for the requester (updated / forced / up-to-date).
     pub status: RefreshStatus,
 }
 
 /// One `/refresh-models` requester folded into a coalesced batch: its reply
 /// channel plus whether IT asked for a forced fetch. The batch performs ONE
-/// shared fetch, forced if ANY requester asked ([`run_refresh`]'s `force` is
+/// shared fetch, forced if ANY requester asked (`run_refresh`'s `force` is
 /// the OR), but each requester's reply status reflects its own flag — a
 /// plain request folded into a forced burst is reported `Updated`, not
 /// `Forced`, matching what it actually asked for.
 #[derive(Debug)]
 pub struct RefreshRequester {
+    /// Whether THIS requester asked for a forced fetch (bypassing the cooldown).
     pub force: bool,
+    /// One-shot reply channel this requester's coalesced-batch result is sent on.
     pub tx: mpsc::Sender<Result<RefreshReport, String>>,
 }
 
@@ -99,7 +104,9 @@ pub enum MaintenanceEvent {
     /// command loop — it can block for the whole 30s timeout); the result is
     /// then handed back through the daemon loop, which owns the catalog swap.
     RefreshNow {
+        /// Whether the user forced the fetch (bypasses the refresh cooldown).
         force: bool,
+        /// One-shot reply channel carrying the fetch result back to the requester.
         reply: mpsc::Sender<Result<RefreshReport, String>>,
     },
 }

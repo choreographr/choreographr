@@ -1,3 +1,13 @@
+//! Named inference-account configuration, backed by `accounts.toml`.
+//!
+//! [`AccountManager`] loads and saves the file; [`AccountConfig`] carries the
+//! per-account overrides applied to a provider's service config. Saves are
+//! **deterministic** (accounts sorted by name) and **atomic** (temp + fsync +
+//! rename), so the unified config watcher can never observe a torn file and
+//! identical logical state always serializes to identical bytes — which is
+//! what makes the command loop's parse-compare reload a no-op for self-writes
+//! and for byte-different-but-logically-identical edits.
+
 use choreo_proto::AccountInfo;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -18,51 +28,89 @@ use crate::cache_warm::{CacheWarmingMode, MeterKind};
 /// identical logical states).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountConfig {
+    /// Unique account name: the key accounts are stored under and looked up by.
     pub name: String,
+    /// Provider slug resolved through the catalog (e.g. `"openai"`, `"anthropic"`).
     pub provider: String,
+    /// Endpoint base URL override; `None` uses the catalog entry's default.
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Whether responses stream token-by-token; `None` uses the provider default.
     #[serde(default)]
     pub streaming: Option<bool>,
+    /// Whether to request stream options (e.g. usage in the final chunk); `None`
+    /// uses the provider default.
     #[serde(default)]
     pub stream_options: Option<bool>,
+    /// Maximum retry attempts for a failed request; `None` uses the provider
+    /// default.
     #[serde(default)]
     pub retry_max_attempts: Option<u32>,
+    /// TCP connect timeout in seconds; `None` uses the provider default.
     #[serde(default)]
     pub connect_timeout_secs: Option<u64>,
+    /// Idle/no-progress request timeout in seconds; `None` uses the provider
+    /// default. One half of the timeout pair (the other is `total_timeout_secs`).
     #[serde(default)]
     pub request_timeout_secs: Option<u64>,
+    /// Hard wall-clock deadline for the whole request, including a streaming
+    /// body; `None` uses the provider default.
     #[serde(default)]
     pub total_timeout_secs: Option<u64>,
     // Endpoint path overrides (OpenAI-compatible only)
+    /// Endpoint path for model listing (OpenAI-compatible only); `None` uses the
+    /// catalog default.
     #[serde(default)]
     pub model_list_path: Option<String>,
+    /// Endpoint path for the Responses API (OpenAI-compatible only); `None` uses
+    /// the catalog default.
     #[serde(default)]
     pub responses_path: Option<String>,
+    /// Endpoint path for chat completions (OpenAI-compatible only); `None` uses
+    /// the catalog default.
     #[serde(default)]
     pub chat_completions_path: Option<String>,
     // Request format overrides (OpenAI-compatible only)
+    /// Default wire format for OpenAI-compatible requests (Chat Completions vs
+    /// Responses); `None` uses the catalog default.
     #[serde(default)]
     pub default_request_format: Option<RequestFormat>,
     // Token limit overrides (OpenAI-compatible only)
+    /// Chat-completions output-token cap (OpenAI-compatible only); `None` uses
+    /// the provider default.
     #[serde(default)]
     pub chat_completions_max_tokens: Option<u32>,
+    /// Per-model chat-completions output-token caps, keyed by model slug; `None`
+    /// uses the provider default.
     #[serde(default)]
     pub model_max_tokens: Option<HashMap<String, u32>>,
+    /// Which wire field carries the chat-completions token cap (`max_tokens` vs
+    /// `max_completion_tokens`); `None` uses the catalog default.
     #[serde(default)]
     pub chat_completions_max_tokens_field: Option<MaxTokensField>,
     // Responses API overrides (OpenAI Responses API)
+    /// Responses-API output-token cap; `None` uses the provider default.
     #[serde(default)]
     pub responses_max_output_tokens: Option<u32>,
+    /// Per-model Responses-API output-token caps, keyed by model slug; `None`
+    /// uses the provider default.
     #[serde(default)]
     pub model_responses_max_output_tokens: Option<HashMap<String, u32>>,
+    /// Whether to enable programmatic (model-issued) tool calling; `None` uses
+    /// the provider default.
     #[serde(default)]
     pub programmatic_tool_calling: Option<bool>,
+    /// Per-model overrides of which wire field carries the chat-completions
+    /// token cap; `None` uses the catalog default.
     #[serde(default)]
     pub model_max_tokens_fields: Option<HashMap<String, MaxTokensField>>,
     // Context window overrides
+    /// Context-window size override in tokens; `None` uses the client/provider
+    /// resolution chain (client config → catalog).
     #[serde(default)]
     pub context_window: Option<u32>,
+    /// Per-model context-window overrides in tokens, keyed by model slug; `None`
+    /// falls back to the client/catalog resolution chain.
     #[serde(default)]
     pub model_context_windows: Option<HashMap<String, u32>>,
     /// Enable prompt caching for providers that support it (Anthropic's
@@ -80,8 +128,12 @@ pub struct AccountConfig {
     #[serde(default)]
     pub cache_warming: Option<CacheWarmingMode>,
     // Retry timing (all providers)
+    /// Initial retry backoff in milliseconds (all providers); validated against
+    /// the ceiling at accounts-file load and at `add`.
     #[serde(default)]
     pub retry_initial_backoff_ms: Option<u64>,
+    /// Maximum retry backoff in milliseconds — this *is* the retry budget, so it
+    /// is validated against `MAX_BACKOFF_MS` at accounts-file load and at `add`.
     #[serde(default)]
     pub retry_max_backoff_ms: Option<u64>,
 }
@@ -96,11 +148,19 @@ pub struct AccountConfig {
 /// `too_many_arguments` lint needs no suppression.
 #[derive(Debug, Default, Clone)]
 pub struct AccountOverrides {
+    /// Endpoint base URL override; `None` keeps the catalog default.
     pub base_url: Option<String>,
+    /// Whether responses stream; `None` keeps the provider default.
     pub streaming: Option<bool>,
+    /// Maximum retry attempts; `None` keeps the provider default.
     pub retry_max_attempts: Option<u32>,
+    /// TCP connect timeout in seconds; `None` keeps the provider default.
     pub connect_timeout_secs: Option<u64>,
+    /// Idle/no-progress request timeout in seconds; `None` keeps the provider
+    /// default.
     pub request_timeout_secs: Option<u64>,
+    /// Hard wall-clock deadline for the whole request; `None` keeps the provider
+    /// default.
     pub total_timeout_secs: Option<u64>,
 }
 
@@ -287,6 +347,9 @@ impl AccountConfig {
         choreo_ai_protocols::ProviderOverrides::from(self)
     }
 
+    /// Project this account into the wire-level [`AccountInfo`] the client sees,
+    /// flagging whether a credential is present. The API key itself is never
+    /// included.
     #[must_use]
     pub fn to_info(&self, has_credential: bool) -> AccountInfo {
         AccountInfo {
@@ -494,11 +557,15 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Look up an account's config by name, or `None` when it is not present.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&AccountConfig> {
         self.accounts.get(name)
     }
 
+    /// Every account as an [`AccountInfo`], sorted by name, marking each as
+    /// credentialed iff its name is in `credentialed`. The stable order is what
+    /// makes the client's account list deterministic.
     #[must_use]
     pub fn list(&self, credentialed: &std::collections::HashSet<String>) -> Vec<AccountInfo> {
         let mut configs: Vec<AccountInfo> = self
@@ -510,6 +577,8 @@ impl AccountManager {
         configs
     }
 
+    /// Every stored [`AccountConfig`], cloned and sorted by name — a
+    /// deterministic order for callers that iterate all accounts.
     #[must_use]
     pub fn all_configs(&self) -> Vec<AccountConfig> {
         let mut configs: Vec<AccountConfig> = self.accounts.values().cloned().collect();
@@ -517,11 +586,13 @@ impl AccountManager {
         configs
     }
 
+    /// Whether the manager holds no accounts (its un-loaded / `empty` state).
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.accounts.is_empty()
     }
 
+    /// Whether an account with this name exists.
     #[must_use]
     pub fn contains(&self, name: &str) -> bool {
         self.accounts.contains_key(name)
@@ -544,6 +615,8 @@ impl AccountManager {
         names
     }
 
+    /// The account whose name sorts first, or `None` when empty — the
+    /// deterministic default-account pick (never `HashMap` iteration order).
     #[must_use]
     pub fn first(&self) -> Option<&AccountConfig> {
         let mut keys: Vec<&String> = self.accounts.keys().collect();

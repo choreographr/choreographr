@@ -35,7 +35,7 @@ use crate::sessions::SessionState;
 /// before its first `start_turn`), or `None` when no request is in flight
 /// (session load / dry-run). Turns with id >= the marker belong to the
 /// current request and attach image bytes; every OLDER turn decays to a text
-/// placeholder (see [`tool_result_image_messages`]). This is purely a request-
+/// placeholder (see `tool_result_image_messages`). This is purely a request-
 /// builder parameter — nothing is persisted on the turn, and after the request
 /// finishes the next request's window simply starts at a newer turn id, so
 /// all earlier images naturally decay without any cleanup.

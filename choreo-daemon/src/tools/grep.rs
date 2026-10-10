@@ -90,6 +90,7 @@ fn default_regex_enabled() -> bool {
     true
 }
 
+/// Arguments for the `grep` tool ([`execute_grep_tool`]).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GrepArgs {
     /// Search pattern. Treated as a regular expression by default; set

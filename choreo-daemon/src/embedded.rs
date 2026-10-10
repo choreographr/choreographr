@@ -10,11 +10,11 @@
 //! * the daemon's connection thread blocks on `for msg in client_rx`;
 //! * channel close is the EOF in both directions.
 //!
-//! The state machine is the SAME [`ClientConn`] the Unix and TCP/Noise
+//! The state machine is the SAME `ClientConn` the Unix and TCP/Noise
 //! transports run (see `server::connection`), so every daemon behavior —
 //! session attach, lag accounting, eviction, the shutdown broadcast — is
 //! transport-independent by construction. Only the read loop (channel instead
-//! of socket) and the writer buffer ([`ChannelConnectionWriter`] in
+//! of socket) and the writer buffer (`ChannelConnectionWriter` in
 //! `server::connection`, which forwards values instead of bytes) differ.
 
 use crate::daemon::{DaemonCommand, DaemonState};
@@ -44,11 +44,17 @@ pub struct EmbeddedOptions {}
 ///   is evicted (after an `Evicted` value) — notify-before-close, delivered
 ///   by the same single-writer contract the socket transports use.
 pub struct EmbeddedLink {
+    /// Send `ClientMessage`s into the daemon (values, no codec).
     pub client_tx: crossbeam_channel::Sender<ClientMessage>,
+    /// Receive `DaemonMessage`s from the daemon (values). The receiver ends
+    /// with `Err`/`None` when the link is dropped, the daemon shuts down
+    /// (after a final `ShuttingDown` value), or this client is evicted (after
+    /// an `Evicted` value) — notify-before-close, per the single-writer
+    /// contract the socket transports use.
     pub daemon_rx: crossbeam_channel::Receiver<DaemonMessage>,
 }
 
-/// An embedded daemon: the transport-independent core ([`DaemonCore`]) plus
+/// An embedded daemon: the transport-independent core (`DaemonCore`) plus
 /// the connection-thread accounting the accept paths do in `run_server`.
 ///
 /// # Drop semantics
@@ -154,14 +160,14 @@ impl EmbeddedDaemon {
     /// Open a new embedded connection, mirroring the TCP accept arm in
     /// `run_server`:
     ///
-    /// 1. take a [`ConnectionSlot`] (`MAX_CONCURRENT_CONNECTIONS` applies to
+    /// 1. take a `ConnectionSlot` (`MAX_CONCURRENT_CONNECTIONS` applies to
     ///    embedded connections too — a wedged GUI is bounded like a wedged
     ///    socket client);
     /// 2. register the writer channel with the daemon BEFORE spawning the
     ///    connection thread (ordering invariant, see
     ///    `register_client_writer`: a concurrently-shutting-down client is
     ///    guaranteed to still receive `ShuttingDown`);
-    /// 3. spawn [`embedded_client_thread`], ferrying its `JoinHandle` over the
+    /// 3. spawn `embedded_client_thread`, ferrying its `JoinHandle` over the
     ///    handle channel.
     ///
     /// `connect()` returns only after the connection thread is spawned, so
@@ -253,7 +259,7 @@ impl EmbeddedDaemon {
     /// 2. `Shutdown` — the command loop drains sessions and MCP;
     /// 3. drop the command channel and join the command-loop thread;
     /// 4. drain the `JoinHandle` ferry and bounded-join every connection
-    ///    thread against the shared [`CONNECTION_DRAIN_GRACE`] deadline.
+    ///    thread against the shared `CONNECTION_DRAIN_GRACE` deadline.
     ///
     /// Consuming `self` is the point: no link can be opened after or during
     /// the drain, and `Drop` is suppressed for the taken fields.

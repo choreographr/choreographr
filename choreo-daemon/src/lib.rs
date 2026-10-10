@@ -1,3 +1,37 @@
+//! Core server for the Choreographr suite (the library half of the shipped
+//! `choreographr` binary).
+//!
+//! This crate is the engine behind every client. It owns the session tree, the
+//! tool registry, the provider connections, and the durable stores (the redb
+//! database, the accounts and daemon config, the catalog cache), and it exposes
+//! them over three transports: a Unix socket, TCP behind the Noise IK/XX
+//! encrypted handshake, and an in-process [embedded link](embedded).
+//!
+//! ## Concurrency model
+//!
+//! The daemon is pure OS threads with message passing (an actor model): one
+//! command-loop thread owns [`DaemonState`] and every
+//! session has its own control thread, with crossbeam channels carrying
+//! [`DaemonCommand`] and
+//! [`SessionCommand`] between them. No async code runs
+//! in the daemon's own logic; the only tokio runtimes live in the optional
+//! `blockchain` and `content` features, whose crates expose blocking
+//! `execute_*` entry points the daemon calls directly.
+//!
+//! ## Public surface
+//!
+//! The modules are exposed so an embedder (the GUI's on-device daemon) can open
+//! state, register tools, and drive the server without the CLI. The crate root
+//! re-exports the types the embedder and the integration tests use most
+//! ([`DaemonCommand`], [`OpenOptions`],
+//! [`run_server`], [`spawn_embedded`],
+//! and the tool argument types and `execute_*` functions).
+
+// Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
+// every public item carries docs, enforced as a hard error by clippy-strict's
+// `-D warnings`.
+#![warn(missing_docs)]
+
 pub mod accounts;
 pub mod broadcast;
 pub mod cache_warm;

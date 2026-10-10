@@ -23,13 +23,13 @@
 //!
 //! The module splits cleanly into two halves:
 //!
-//! * [`policy`] — the **pure, clock-injected** state machine: [`WarmPolicy`]
+//! * `policy` — the **pure, clock-injected** state machine: [`WarmPolicy`]
 //!   resolved from the parsed config, and [`WarmPolicy::arm`]/[`WarmPlan::decide`]
 //!   taking an injected `now` (`Duration`, a monotonic value the caller
 //!   supplies) so nothing reads a clock and everything is deterministic and
 //!   testable without timers.
-//! * [`driver`] — the runtime consumer ([`spawn_warmer`]): a thread that owns an
-//!   [`InferenceProvider`], waits event-driven on a control channel plus a
+//! * `driver` — the runtime consumer ([`spawn_warmer`]): a thread that owns an
+//!   `InferenceProvider`, waits event-driven on a control channel plus a
 //!   timer, and on [`Action::Ping`] re-sends the armed request with a capped
 //!   output. The agent loop arms it after a `ToolUse` result and just before
 //!   the tools run (the blocking window), and the returned [`WarmHandle`] is

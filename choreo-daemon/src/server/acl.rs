@@ -1,3 +1,14 @@
+//! Client-key ACL for Noise authentication, and its hot-reloadable holder.
+//!
+//! [`Acl`] parses the authorized-client key set from `authorized_clients.toml`,
+//! and [`SharedAcl`] pairs the file path with an `arc_swap::ArcSwap` — the
+//! single-writer shared-state exception — so every TCP handshake checks a
+//! client key against a consistent snapshot lock-free while the daemon command
+//! loop remains the sole writer. Reload failure policy is deliberately
+//! different from initial load: a missing/unparseable file keeps the current
+//! keys (a torn editor save must never un-authorize live clients), while a
+//! valid empty file swaps in as an intentional deny-all.
+
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, warn};

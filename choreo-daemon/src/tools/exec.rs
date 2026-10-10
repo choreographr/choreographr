@@ -9,6 +9,11 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+/// Arguments for the `exec` tool ([`execute_exec_tool`]).
+///
+/// Model-facing invocations are pre-validated (`validate_exec_invocation`'s
+/// guards): shell metacharacters are rejected with a pointer to the shell
+/// tools, and an unresolvable program is rejected before anything is spawned.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExecArgs {
     /// Program to execute directly (not a shell command). This is not parsed

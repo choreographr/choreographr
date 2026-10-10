@@ -1,3 +1,18 @@
+//! The daemon's durable store: a `redb` embedded key-value database holding
+//! sessions, turns, credentials, the per-session KV store, deletion tombstones,
+//! the keystore binding, and the runtime catalog-refresh state.
+//!
+//! This module owns the schema (the table definitions and their codecs), the
+//! open-and-migrate sequence (`open_db` + `run_migrations`), and the
+//! credential/catalog/KV plumbing. The per-entity CRUD is split into cohesive
+//! child modules — `sessions` (session records + turns), `attachments` (the raw
+//! image byte store), and `codec` (the zstd turn-value codec) — whose public
+//! items are re-exported here so `db::…` call sites are unchanged.
+//!
+//! All I/O is synchronous `redb` transactions on the calling thread; `redb`'s
+//! `Database` is safe for concurrent readers, so one shared handle is threaded
+//! to every connection thread for on-demand image reads.
+
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -180,7 +195,7 @@ fn current_schema_version(db: &redb::Database) -> io::Result<u64> {
 
 /// Read the current schema version of an open database: the value stamped in
 /// `meta`, or `0` for an unversioned database. Public wrapper over the private
-/// [`current_schema_version`] so callers outside this module (the CLI's
+/// `current_schema_version` so callers outside this module (the CLI's
 /// open→version→drop→backup→reopen startup sequence) can read the version
 /// without depending on the internal table layout.
 ///
@@ -226,7 +241,7 @@ fn backup_path_for(path: &std::path::Path, from: u64) -> std::path::PathBuf {
 }
 
 /// Snapshot the database file at `path` to `{file_name}.bak-v{from_version}`
-/// (the same name [`backup_db_file`] uses), where `from_version` is the schema
+/// (the same name `backup_db_file` uses), where `from_version` is the schema
 /// version being migrated away from.
 ///
 /// # Why this exists as a separate pre-lock entry point
@@ -338,7 +353,7 @@ pub(crate) fn migration_backup_version(db: &redb::Database) -> io::Result<Option
 }
 
 /// Bring the database up to [`SCHEMA_VERSION`]. Idempotent; safe to call on
-/// every startup, right after [`open_db`]. Delegates to [`run_migrations_to`]
+/// every startup, right after [`open_db`]. Delegates to `run_migrations_to`
 /// with the production version and chain, resolving the database file path
 /// once so the pre-migration backup targets the file that is actually being
 /// migrated (never injected from a test's tempdir).

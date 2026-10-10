@@ -8,13 +8,28 @@ use super::{
     open_repo, repo_work_dir_display, run_git_command, yes_no,
 };
 
+/// Arguments for the `git_push` tool ([`execute_git_push_tool`]).
+///
+/// The repository is discovered from `repo_path` (or the session working
+/// directory), and the push is invoked as `git push`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GitPushArgs {
+    /// Path to the git repository. Defaults to the session working directory.
     pub repo_path: Option<String>,
+    /// Remote to push to, such as `origin`. Must be non-empty after trimming.
     pub remote: String,
+    /// Branch to push. Defaults to the current branch; an error when HEAD is
+    /// detached and no branch is supplied.
     pub branch: Option<String>,
+    /// When true, set the upstream tracking branch (`--set-upstream`).
+    /// Defaults to false.
     pub set_upstream: Option<bool>,
+    /// When true, push with `--force-with-lease`, which refuses to overwrite
+    /// remote work the local ref does not already know about. Defaults to
+    /// false.
     pub force_with_lease: Option<bool>,
+    /// When true, run `--dry-run` — report what would be pushed without
+    /// pushing. Defaults to false.
     pub dry_run: Option<bool>,
 }
 

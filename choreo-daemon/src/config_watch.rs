@@ -53,8 +53,11 @@ pub struct ConfigChange {
 /// noise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeKind {
+    /// The watched file appeared (created, or renamed into place).
     Create,
+    /// The watched file's contents changed in place.
     Modify,
+    /// The watched file was removed (or renamed away).
     Remove,
 }
 
