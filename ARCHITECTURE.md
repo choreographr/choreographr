@@ -2576,43 +2576,19 @@ Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protoc
 
 ### Available tools (up to 59 total, some dependent on installed binaries / the `blockchain` feature)
 
-| Group | Tools |
-|---|---|
-| **Core** | `list_sessions`, `get_session`, `read_session`, `load_skill`, `set_session_title`, `set_working_dir`, `load_tools`, `unload_tools`, `read_file`, `write_file`, `edit_file`, `list_files`, `delete_files`, `line_count`, `random` (integers, floats, booleans, bytes, UUID v4 — with optional seed), `get_current_time` (Unix millisecond timestamp), `pdf_classify` (PDF type/confidence/OCR pages), `pdf_to_markdown` (PDF → Markdown, optional pages + compact), `retrieve_webpage` (render a URL in a local headless Chromium/Chrome — `http`/`https`/`file` — content / text / screenshot (PNG, inline or to `output_path`) / pdf (to `output_path`); opt-in `webgl` for new-headless + SwiftShader WebGL rendering) |
-| **HTTP** | `http_request` (GET/POST/HEAD with headers, body, timeout) |
-| **Image** | `display_image` (from path, URL, base64, or SVG text), `read_image` (read an image file — optionally a fractional sub-region — from disk and feed it to a vision-capable model as image input) |
-| **Git** | `git_status`, `git_diff`, `git_log`, `git_add`, `git_commit`, `git_push`, `git_show` |
-> **`git_diff` output:** Always returns a line-by-line unified diff wrapped in a ````diff` fenced code block. The old `full` parameter (which previously toggled between summary-only and full diff modes) has been removed — the tool now always produces full diffs. The diff output for each file change is enclosed in ````diff` ... ```` fences for clear markdown formatting. Every diff fence the daemon emits (`append_fenced_diff` for git tools, `edit_file` in `format_edit_result`) routes through the shared `fence_content` helper in `tools/fs/mod.rs`, so a diff whose content carries a backtick run (e.g. a bare ``` context line while editing a Markdown file) cannot close the fence early in the TUI's markdown renderer; backtick-free diffs keep the canonical 3-backtick fence.
-
-> **`git_show` output:** Commit, tag, and blob bodies are emitted verbatim inside a fenced code block (fence sized so content containing backticks cannot close it early, via the shared `fence_content` helper in `tools/fs/mod.rs`). Commit/tag messages are untrusted repo data, so they are never emitted as bare markdown — the TUI's markdown renderer would re-interpret headings/lists, mangle `--` with smart punctuation, and render a spoofed ```diff fence as a fake diff. The surrounding metadata (Author/Date/Tree/Head, etc.) renders normally; only the message/blob bodies are fenced.
-| **Blockchain** | `evm_chain`, `evm_balance`, `evm_token_balance`, `evm_block`, `evm_transaction`, `evm_call`, `evm_gas`, `evm_logs`, `evm_nonce`, `evm_resolve`, `subxt_chain`, `subxt_balance`, `subxt_query`, `subxt_block` — **behind the `blockchain` cargo feature** (off by default; the tools live in the `choreo-blockchain` crate) |
-| **File search** | `grep` (file content search), `find` (file name search) |
-> **`find` output:** One match per line. Files render with a human-readable size (`blob.bin  4 KiB`), directories with a trailing `/`, symlinks as `name -> target`. Glob patterns containing `/` (e.g. `src/*.rs`) are matched natively by the walker against root-relative paths and prune traversal outside the pattern's literal prefix; bare patterns match file names (basename). A leading `./` is stripped and absolute patterns are converted to root-relative (erroring when outside the search root). `grep`'s `include` glob follows the same split — patterns with `/` match root-relative paths in directory mode (the file name for a directly-named file), bare patterns match basenames.
->
-> **`grep` output:** Patterns are treated as regular expressions by default (`regex:false` switches to literal substring matching); `ignore_case:true` and `context: N` (surrounding lines, rendered `path-{line}-{content}` with `--` between non-contiguous groups) extend it. `output_mode` selects `content` (default), `files_with_matches` (one sorted path per hit file, rg `-l` semantics), or `count` (`path: N` matching lines per file, rg `-c` semantics). When `max_results` cuts the walk short, a `...[truncated at N results]` line is appended — note this signals *at least* N matches (the cap is hit before the walk proves nothing more exists); `grep` appends `...[truncated at N matches]` (`...[truncated at N files]` in the two non-content modes) the same way. The shared byte budget can stop collection before the cap (see below); the marker then reports the count actually collected, still an "at least N" figure. When `max_results` stops the walk mid-file, the capped match's trailing context lines are still delivered (rg `-m` + `-C` semantics); the searcher is capped at the same match limit (`SearcherBuilder::max_matches`), so it stops natively once the after-context window is exhausted instead of scanning the file's remaining tail — and with no context configured it stops at the cap line itself. If a line in the drain window exceeds the 64 KiB line cap (pathological input), it is delivered capped and then ends the drain: filling the rest of the window would otherwise force the searcher to scan the remainder of the file one giant line at a time. A directly-named single file in the two non-content modes never reports truncation — the result is provably complete once that one file is searched — while Content mode keeps the marker because the searcher may stop mid-file at the cap or byte budget. A search with no hits returns `No matches found.` rather than an empty string, so the model can distinguish "nothing matched" from a failed call; when the walk searched no file at all (an include glob filtered everything out, an empty directory), the regex-mode hint is suppressed the same way, because the empty result cannot be blamed on the pattern. A directly-named file that cannot be searched (e.g. permission denied) returns an error instead of a misleading no-match. Both tools escape control characters in file names and symlink targets so output stays one line per result; `grep` likewise escapes control characters in matched line *content* (ESC, backspace, … — tabs are kept literal) so a hostile file cannot inject terminal escape sequences. The escaping also covers Unicode line/paragraph separators (U+2028/U+2029, which terminals render as line breaks despite not being C0/C1 controls) and every Unicode *format* character (general category Cf) except the joiners U+200C/U+200D — the bidi marks/embeddings/overrides/isolates (U+061C, U+200E/U+200F, U+202A–U+202E, U+2066–U+206F), zero-width space (U+200B), word joiner and invisible operators (U+2060–U+2064), the BOM (U+FEFF), soft hyphen, the Mongolian vowel separator (U+180E), and the rarer format controls (tags, musical/phonetic, Egyptian hieroglyph, …) — all invisible and capable of reordering, hiding, or spoofing rendered text (only the joiners pass through; they are legitimate in Persian/Indic scripts and neither reorder nor hide). Matched and context lines are capped at 64 KiB with a `...[line truncated: exceeds 64 KiB]` marker (the same line cap and marker the file-read tools use), so a giant minified one-liner cannot balloon the result into memory; the aggregate buffered output is bounded to the same 128 KiB budget the renderer keeps — collection charges each item's exact rendered size (label + separators + line number + content + newline, precisely what `join` emits) and stops as soon as buffering more would exceed it, so a pathological tree of 64 KiB lines cannot balloon the result before rendering (if a single match's sanitized line alone exceeds the budget — e.g. a line dense with control characters, each escaping to ~6 bytes — the tool reports `...[truncated: matches exceed the 128 KiB output budget]` rather than a misleading no-match). Files whose head contains a NUL byte are treated as binary and skipped (ripgrep's default `BinaryDetection::quit`), so a binary blob cannot flood the result with garbage lines; output collected from a file before the NUL is discarded — a count-mode tally or a content-mode bucket of matches — so the file renders as skipped rather than leaking pre-NUL text. The one exception is `files_with_matches`: the searcher stops at the first hit (rg `-l` semantics) before it can observe a later NUL, so a file that matched before binary data is still listed — exactly what ripgrep does, which reports a file as soon as it matches.
-| **RISC-V VM** | `run_riscv` (compile & run Rust code in a sandboxed RISC-V VM with access to all registered tools) |
-| **Shell** | `exec` (direct program execution), `sh` (bash/dash/zsh — detected at startup), `nushell` (if `nu` is installed), `fish` (if `fish` is installed) |
-| **X/Twitter** | `x_post`, `x_search_recent`, `x_user_lookup` |
-| **DB** | `db_set`, `db_get`, `db_delete`, `db_delete_range`, `db_get_range`, `db_list`, `db_count` |
-| **Sub-session** | `spawn_subsession` (spawns an autonomous child session with its own tool-calling loop) |
+Each tool's contract — its arguments, return shape, and output behaviour, and its
+feature/binary gating — is documented in-source (see `choreo-daemon`'s tool modules,
+`cargo doc -p choreo-daemon` / `just doc`), held complete by the `#![warn(missing_docs)]` +
+`doc-check` gate. The registry lists the shipped tools (see "Registry" above).
 
 ### Tool groups
 
 Tools are organized into groups to reduce context overhead. Each tool declares its group
-via `fn group() -> &'static str` on the `Tool` trait. Groups are:
-
-| Group | Default | Description |
-|---|---|---|
-| `core` | always on | File system, HTTP, images, PDF classification/Markdown extraction, file search, random values, and time queries |
-| `db` | off | Session-scoped key-value database |
-| `git` | on | Local Git operations |
-| `shell` | on | Shell and exec |
-| `x` | off | X/Twitter API |
-| `vm` | off | RISC-V sandboxed code execution |
-| `content` | off | Choreographr Coordination Platform (publish/retract items, revisions, profiles, account pins; IPFS + indexer + Substrate) — only present when the `content` cargo feature is enabled (the tool group was previously named `coord`) |
-| `blockchain` | off | EVM and Substrate/Polkadot blockchain queries (alloy/subxt) — only present when the `blockchain` cargo feature is enabled |
-| `mcp` | on | Dynamic tools from MCP servers over stdio subprocesses or the Streamable HTTP transport (`mcp/<slug>` groups via `McpManager`) — present in a default build; opt out with `default-features = false` |
-| `debug` | off | Read-only diagnostics and request dry-runs (`session_inspect`) — opt-in via `load_tools`, never on by default |
+via `fn group() -> &'static str` on the `Tool` trait. The group catalog — each group's name,
+its model-facing description, and its cargo-feature gating — is documented in-source (see
+`choreo-daemon`'s `tools` module, `cargo doc -p choreo-daemon` / `just doc`), held complete by
+the `#![warn(missing_docs)]` + `doc-check` gate; the default active set (`core`, `git`, and
+`shell`) travels with the session-config default in `choreo-daemon`'s `sessions` module.
 
 The system prompt lists all groups and their descriptions. The model uses `load_tools` to
 activate additional groups and `unload_tools` to deactivate them. **core** cannot be unloaded.
@@ -2927,21 +2903,11 @@ The child session uses `ToolContext` (`active_tool_groups`, `reasoning_effort`, 
 ### Data model
 
 Sessions are persisted to a `redb` (v4) embedded key-value store at
-`~/.local/share/choreographr/state.redb`. Seven tables:
-
-| Table | Key | Value |
-|---|---|---|
-| `sessions` | `u64` session ID | MessagePack named(`SessionRecord`). All session-record CRUD — the `SessionRecord` struct plus `write_session`/`read_session`/`read_all_sessions`/`update_session_flags`/`delete_session`, the deletion-tombstone helpers, and the session/turn retry wrappers — lives in the `db/sessions.rs` submodule, re-exported from `db/mod.rs` |
-| `session_turns` | `(u64, u32)` (session ID, turn ID) | zstd-compressed MessagePack named(`Turn`) — since schema 2 each value is a zstd frame around the MessagePack blob; turn text/tool-output/reasoning is the bulk of the DB and compresses 4–10×. Image/attachment bytes are **split out** of the blob into `session_attachments` (they are already incompressible PNG/JPEG). The turn read/write/retry wrappers and the session-wide turn delete live in the `db/sessions.rs` submodule (re-exported from `db/mod.rs`), next to the session-record CRUD |
-| `session_attachments` | `(u64, u32, String)` (session ID, turn ID, slot) | raw `Vec<u8>` — the general on-demand byte store for a turn: display + vision image bytes, persisted uncompressed and keyed by slot (`d{i}` for display index `i`, `r<call_id>` for a tool-result vision image), re-attached into the decoded turn by `read_turns`; written atomically with the turn blob in `write_turn` (which first clears the turn's stale slots so a rewrite with a shifted image layout never re-attaches old bytes to the wrong slot), removed by the session-wide delete helpers and both delete paths. All of its I/O lives in the `db/attachments.rs` submodule (`db/mod.rs` re-exports `read_attachment`/`write_attachment`). Also the source for the on-demand image protocol: `read_attachment(db, session_id, turn_id, key)` maps the wire `ImageKey` to its slot (`d{i}` / `r<call_id>`) and does a single lookup (no turn decode) to serve a client's `GetImage`, and both `emit_image` and the tool-completion path persist each image the instant a tool produces it (persist-at-emit) via `write_attachment` — a single-slot, single-transaction insert of just that attachment's row (O(1) per image; it does NOT clear the turn's other slots), so the DB is authoritative for image bytes even mid-request. The full turn (blob + ALL attachment slots) is still (re)written atomically at `finalize_turn` |
-| `credentials` | `&str` service name | encrypted blob |
-| `session_kv` | `(u64, String)` (session ID, key) | `Vec<u8>` |
-| `deleted_sessions` | `u64` session ID | `()` tombstone — marks a deleted session whose still-shutting-down thread may re-create the record; written only when the delete is deferred (a live thread exists), cleared once the exit finalize re-deletes the record, purged at startup |
-| `meta` | `&str` key (e.g. `schema_version`) | `u64` — persisted schema version (currently `2`) |
-| `catalog_state` | `&str` key | `&[u8]` — runtime catalog-refresh state (S4): `last_attempt_ms` (Unix epoch millis, 8-byte LE — the 25 h cooldown anchor, written by the maintenance thread BEFORE every fetch) and `etag` (UTF-8 — the models.dev entity-tag, written by the daemon command loop after the cache bin is persisted). Created lazily on first write; purely additive, no schema bump |
-
-`SessionRecord` fields: `title`, `selected_model`, `parent_session_id`, `working_dir`,
-`turn_count`, `created_at`, `context_config`, `account_name`.
+`~/.local/share/choreographr/state.redb`. The table schema — every table's key and value
+codec, the zstd turn-value compression, the turn-attachment byte split, the deletion
+tombstone, and the runtime catalog-refresh state — is documented in-source (see
+`choreo-daemon`'s `db` module, `cargo doc -p choreo-daemon` / `just doc`), held complete by
+the `#![warn(missing_docs)]` + `doc-check` gate.
 
 ### Schema versioning & migrations
 
@@ -3033,37 +2999,14 @@ Each active session has a `SessionState` owned by its control thread. Persistent
 configuration fields are extracted into `SessionConfig` to avoid duplication
 across snapshot/restore, metadata conversion, and record persistence:
 
-**`SessionConfig` (persisted):**
-
-- `title: Option<String>` — display name
-- `selected_model: Option<String>` — AI model for this session
-- `reasoning_effort: Option<String>` — per-session reasoning effort slug (e.g. `"off"`, `"low"`, `"medium"`, `"high"`)
-- `parent_session_id: Option<u64>` — parent session for sub-sessions
-- `working_dir: Option<PathBuf>` — working directory for filesystem tools
-- `created_at: i64` — Unix timestamp of creation
-- `status: SessionStatus` — current status (Inactive, Inference, Retrying, Sleeping, …)
-- `active_tool_groups: HashSet<String>` — tool groups active for this session
-- `context_config: ContextConfig` — file discovery settings (context file names, max bytes)
-- `account_name: Option<String>` — inference account assigned to this session
-- `accumulated_usage: TokenUsage` — session-level token counter
-- `context_window: Option<u32>` — model's context window size, resolved at model selection
-- `last_prompt_tokens: Option<u32>` — `input_tokens` from the most recent API response;
-  used for context-window progress displays (separate from the billing counter)
-- `last_response_id: Option<String>` — the `response_id` of the most recent model call,
-  persisted so ResponseId-policy providers (OpenAI/xAI Responses) can chain reasoning
-  continuity across user turns via `previous_response_id` (restored at the top of each
-  `run_agent_loop` invocation); every other policy keeps it `None`
-
-**Runtime fields (not persisted directly):**
-
-- `turns: BTreeMap<u32, Turn>` — conversation turns (persisted to DB separately)
-- `next_turn_id: u32` — monotonically increasing counter for turn IDs
-- `last_undo_turn_ids: Option<Vec<u32>>` — stores the turn IDs from the most recent undo, enabling `/redo` to restore exactly those turns; cleared when new user input is appended after an undo
-- `subscribers: HashMap<u64, SubscriberSink>` — attached clients
-- `active_requests: HashMap<u32, ActiveRequest>` — running request cancel flags
-- `provider: Option<InferenceProvider>` — resolved inference provider for the account
-- `loaded_skill_bodies: Vec<LoadedSkill>` — accumulated skill bodies from `load_skill` tool calls, injected into the system prompt on every turn
-- `context_cache: Option<(u64, String)>` — cached context bundle fingerprint and assembled text, avoiding re-reading context files from disk when unchanged
+The persisted fields live on `SessionConfig`; the runtime-only fields live on
+`SessionState` (the in-memory turn map, the subscriber set, the in-flight request
+map, the per-session provider client and socket registry, and the context/skill
+caches). The structs and every field's rationale — the `last_response_id`
+response-chain provenance, the per-session `next_stream_id` counter, the
+`context_cache` fingerprint — are documented in-source (see `choreo-daemon`'s
+`sessions` module, `cargo doc -p choreo-daemon` / `just doc`), held complete by
+the `#![warn(missing_docs)]` + `doc-check` gate.
 
 ### Hierarchy and working directory inheritance
 
@@ -3091,20 +3034,15 @@ snapshot of the session state and use cooperative cancellation via an `AtomicBoo
 
 ### Undo/Redo
 
-Sessions support undo/redo via an `undone` boolean flag on each `Turn`:
-
-**Turn model:** Each `Turn` carries:
-- `turn_id: u32` — monotonically increasing, assigned by `SessionState::start_turn()`.
-- `undone: bool` — soft-delete flag; set to `true` on undo, back to `false` on redo.
-- `user_text: Option<String>` — present for user-initiated turns, `None` for follow-up tool-loop turns.
-- `assistant_text`, `assistant_reasoning`, `tool_calls`, `tool_results`, `displayed_images` — the assistant response.
-- `reasoning_artifact: Option<ReasoningArtifact>` — the opaque reasoning round-trip payload captured by
-  the provider adapter at parse time (see Provider Architecture); forwarded to the next request verbatim
-  when the same model is still active and the passback policy asks for it. The daemon strips it from
-  client-bound `DaemonMessage` payloads (clients receive `None`); only the daemon's request builder reads it.
-- `reasoning_producer: Option<ReasoningProducer>` — the `{ provider_slug, model }` that produced the turn's
-  artifact; the builder's same-model provenance check drops the artifact after a mid-session model switch.
-  Also stripped from client-bound copies alongside the artifact.
+Sessions support undo/redo via an `undone` boolean flag on each `Turn`. The `Turn`
+struct — its `turn_id`/`undone`/`user_text` fields, the assistant-response bundle,
+and the opaque `reasoning_artifact`/`reasoning_producer` round-trip payload — is
+documented in-source in `choreo-proto` (alongside its `ReasoningArtifact` and
+`ReasoningProducer` companions; `cargo doc -p choreo-proto` / `just doc`), held
+complete by the `#![warn(missing_docs)]` + `doc-check` gate. Two cross-cutting
+facts about that payload: the daemon strips it from every client-bound
+`DaemonMessage` (only its own request builder reads it), and the builder's
+same-model provenance check drops the artifact after a mid-session model switch.
 
 **Undo flow (`/undo` → `ClientMessage::Undo` → `SessionCommand::Undo` → `handle_undo`):**
 1. `SessionState::undo_turns()` finds the most recent non-undone turn with `user_text: Some(...)` via reverse scan.
@@ -3254,19 +3192,10 @@ absent no metrics server is started — the daemon runs exactly as before.
 
 ### Exposed metrics
 
-| Metric | Type | Labels | Description |
-|---|---|---|---|
-| `choreo_sessions_active` | Gauge | — | Number of active sessions |
-| `choreo_connections_active` | Gauge | — | Number of active client connections |
-| `choreo_requests_total` | Counter | `status` (`done`, `failed`, `cancelled`) | Total requests processed |
-| `choreo_tool_executions_total` | Counter | `tool`, `status` (`ok`, `error`) | Tool call count |
-| `choreo_api_calls_total` | Counter | `model`, `endpoint` | API call count |
-| `choreo_api_errors_total` | Counter | `model`, `error_type` | API error breakdown |
-| `choreo_connections_total` | Counter | — | Total connections accepted |
-| `choreo_turns_total` | Counter | `model` | Agent loop turns |
-| `choreo_request_duration_seconds` | Histogram | `status` | Request latency |
-| `choreo_tool_execution_duration_seconds` | Histogram | `tool` | Per-tool execution time |
-| `choreo_api_call_duration_seconds` | Histogram | `model`, `endpoint` | API round-trip time |
+The full metric set — names, types, labels, and the exported help text — is documented
+in-source in the daemon's `metrics` module, where every `record_*` function names the metric
+it updates (`cargo doc -p choreo-daemon --features metrics` / `just doc`), held complete by
+the `#![warn(missing_docs)]` + `doc-check` gate.
 
 Process-level metrics (RSS, CPU, FD count) are also exposed via the `prometheus`
 crate's `process` feature.
@@ -3286,19 +3215,10 @@ is set.
 
 ### Instrumentation points
 
-| Location | Function | Metrics recorded |
-|---|---|---|
-| `daemon.rs` — `CreateSession` handler | `record_session_created` | `choreo_sessions_active +1` |
-| `daemon.rs` — `SessionExited` handler | `record_session_exited` | `choreo_sessions_active -1` |
-| `server/connection.rs` — `client_thread` start | `record_client_connected` | `choreo_connections_active +1` |
-| `server/connection.rs` — `client_thread` end | `record_client_disconnected` | `choreo_connections_active -1` |
-| `server/lifecycle.rs` — accept loop | `record_connection_accepted` | `choreo_connections_total +1` |
-| `sessions.rs` — `run_request_worker` | `record_request_total`, `record_request_duration` | request status + latency |
-| `requests.rs` — `run_agent_loop` turn | `record_turn` | turn count per model |
-| `cache_warm.rs` — warm ping sent | `record_cache_warm_attempt` | `choreo_cache_warm_attempts_total +1` |
-| `cache_warm.rs` — warm plan declined | `record_cache_warm_skip` | `choreo_cache_warm_skips_total{reason} +1` |
-| `requests/tool_execution.rs` — `execute_tool_with_timeout` | `record_tool_execution` | tool duration + status |
-| `providers/shared.rs` — `timed_result` | `record_api_call`, `record_api_error` | API latency + errors (all providers) |
+Where each metric is recorded is documented at the call site — every `record_*` call lives
+in the module it instruments (`sessions.rs`, `requests/`, `cache_warm.rs`, `providers/`, and
+`server/`), and the daemon's `metrics` module names each `record_*` function and the metric it
+emits.
 
 ---
 
