@@ -1427,10 +1427,12 @@ fn turn_has_live_content(accumulated: &Turn, snapshot: &Turn) -> bool {
 
 impl App {
     /// Tear down the per-session display state a terminal request outcome
-    /// leaves behind.  A failure (`handle_failed`) and a cancel
-    /// (`handle_cancelled`) both end an in-flight request, so they share this
-    /// teardown: clear the tool-call description map for the closing turn,
-    /// drop the request→turn mapping, and reset streaming state.
+    /// leaves behind.  A completion ([`App::handle_done`]), a failure
+    /// ([`App::handle_failed`]), and a cancel ([`App::handle_cancelled`]) all
+    /// end an in-flight request, so they share this teardown: clear the
+    /// tool-call description map for the closing turn, drop the request→turn
+    /// mapping, reset the streaming state and the live token estimates, and
+    /// mark the content changed.
     fn finish_request(&mut self, session_id: u64, stream_id: u64) {
         let display = self.display_for(session_id);
         // A request that ends without re-broadcasting its turn never runs
@@ -1443,6 +1445,8 @@ impl App {
         }
         display.view.request_to_turn.remove(&stream_id);
         display.active.remove(&stream_id);
+        display.live_input_estimate = 0;
+        display.live_output_tokens = 0;
         display.streaming_turn_index = None;
         display.streaming_response = None;
         display.mark_content_changed();
@@ -1600,33 +1604,25 @@ impl TurnEventHandler for App {
         // the daemon broadcasts when the request finishes.
         self.term_status_override.insert(session_id, "done");
         self.term_status_dirty = true;
-        let display = self.display_for(session_id);
-        // The final TurnAppended already cleaned description entries via
-        // `insert_or_replace`, but if that broadcast was dropped under load
-        // the map would keep them — clear for this turn so the map stays
-        // bounded by in-flight calls even when the terminal broadcast is
-        // lost.  (Looked up before `request_to_turn` is removed.)
-        if let Some(&turn_id) = display.view.request_to_turn.get(&stream_id) {
-            display.view.clear_tool_call_descriptions(turn_id);
-        }
-        display.view.request_to_turn.remove(&stream_id);
-        display.active.remove(&stream_id);
-        if let Some(usage) = token_usage {
-            display.token_usage = Some(usage);
-            if last_prompt_tokens.is_none() {
-                display.last_prompt_tokens = Some(usage.input_tokens);
+        // Apply the completed turn's token accounting before the shared
+        // teardown resets the live estimates.  The final `TurnAppended` already
+        // cleaned description entries via `insert_or_replace`, but if that
+        // broadcast was dropped under load the map would keep them —
+        // `finish_request` clears them for this turn so the map stays bounded by
+        // in-flight calls even when the terminal broadcast is lost.
+        {
+            let display = self.display_for(session_id);
+            if let Some(usage) = token_usage {
+                display.token_usage = Some(usage);
+                if last_prompt_tokens.is_none() {
+                    display.last_prompt_tokens = Some(usage.input_tokens);
+                }
+            }
+            if let Some(tokens) = last_prompt_tokens {
+                display.last_prompt_tokens = Some(tokens);
             }
         }
-        if let Some(tokens) = last_prompt_tokens {
-            display.last_prompt_tokens = Some(tokens);
-        }
-        display.live_input_estimate = 0;
-        display.live_output_tokens = 0;
-        display.streaming_turn_index = None;
-        // Streaming is over: drop the incremental response cache so a later
-        // turn can never reuse this response's committed markdown.
-        display.streaming_response = None;
-        display.mark_content_changed();
+        self.finish_request(session_id, stream_id);
     }
 
     fn handle_failed(&mut self, session_id: Option<u64>, stream_id: u64, error: String) {
