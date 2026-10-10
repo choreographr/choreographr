@@ -566,7 +566,7 @@ match enumerates it fully.
 
 - Protocol version: `9` (v9 = live MCP config reload: the new `ClientMessage::McpReload` request and its `DaemonMessage::McpReloaded`/`McpReloadFailed` replies, so a running daemon can pick up `mcp.json` edits (added/removed/changed servers) without a restart; v8 = per-session `pinned`/`archived` flags: the new `ClientMessage::SetSessionPinned`/`SetSessionArchived` requests, the daemon-GENERATED broadcast `SessionEvent::SessionFlagsChanged` (rides `DaemonState::broadcast()`, so a client learns of a flag change via the broadcast rather than a targeted reply), and the `SessionSummary::pinned`/`archived_at` fields they surface. v7 = the create-session reply is split from the create-session broadcast: `SessionEvent::SessionCreatedForRequester` is the direct reply to the creating connection and is the ONLY create event a frontend may auto-attach to, while `SessionEvent::SessionCreated` is notification-only (broadcast to every subscriber) and must never move a client's view — fixing a client hijacking its own view when ANOTHER client created a session. Delete/status lifecycle messages are unaffected: `SessionDeleted` was already broadcast-only with the requester already knowing the id it deleted; v6 = displayed-image bytes are no longer shipped in session-scoped snapshots (`SessionState`/`TurnAppended`/`TurnsRedone`) — they carry only `ImageMetadata` — and are instead fetched on demand via the new `ClientMessage::GetImage` ⇄ `DaemonMessage::Image` pair, keyed by `(session_id, turn_id, image_index)` and served from the durable `session_attachments` store; v5 = the two-state `Locked`/`Unlocked` status *broadcasts* were replaced by `DaemonMessage::Keystore { state: KeystoreState }` (`Unbound`/`Locked`/`Unlocked`), pushed at subscribe time and on every transition so a first-run client learns it must BIND; `Locked`/`Unlocked` remain targeted operation replies. v4 = the 29 session-scoped events were moved into `SessionEvent` and now ride the `DaemonMessage::Session { session_id: Option<u64>, event }` envelope; v3 had removed `TurnFinalized` — the final-turn snapshot rides `TurnAppended` — and added `Evicted`, a best-effort lag-eviction advisory; mixed-version peers fail fast at the version gate). The v4 shape was amended in place before the first release — the `session_id: 0` sentinel became `Option<u64>` (`None` for connection-level replies) — so the wire version stayed `4` with no bump at that point. The MCP trust-query request/reply variants (`ClientMessage::McpTrust`/`McpUntrust`/`McpTrustList`, `DaemonMessage::McpTrustUpdated`/`McpTrustList`) were added to v9 the same way, before any release carried v9; the policy is that variants may be added to the **current, unreleased** wire version without a bump, because mixed-version peers do not exist until a release ships and the version gate fails fast on a mismatch either way. A bump is required only once a version has shipped in a release. Under the same pre-release policy, the v6 `GetImage`/`Image` pair was reshaped for v9 before any release carried v9: its positional `image_index: u32` became a tagged `key: ImageKey` (`Displayed { index }` or `ToolResult { call_id }`), so one fetch protocol now serves both displayed images and tool-result vision images from the shared `session_attachments` store. Under the same pre-release policy, the v9 frame was amended in place to the uniform correlation envelope: `ClientMessage` = `{ id: u64, inner: ClientMessageType }`, `DaemonMessage` = `{ id: Option<u64>, inner: DaemonMessageType }` (a broadcast is `id: None`; a reply stamps the request's id), the payload enums were renamed `ClientMessageType`/`DaemonMessageType`, the streaming `request_id` was renamed `stream_id` and widened to `u64`, and the `MessageKind` tag plus the `Accepted`/`Failed` acknowledgement replies were added. No bump — no release has shipped v9. Under the same pre-release policy, the v9 streaming axis was made daemon-owned: the session thread assigns a run's `stream_id` (a per-session, monotonic counter) when it accepts a `RunInput`/`ContinueGeneration` and reports it on the acceptance `Started` reply/broadcast, so those requests no longer carry a client-chosen `stream_id` (the client learns it from `Started`, which also fixes the cross-client collision where two clients fanned one session could each claim the same id); the `CANCEL_ALL` sentinel (`stream_id = 0`) remains for a pre-`Started` cancel.
 - Max frame size: 64 MiB
-- Lag-eviction byte gauge: `DaemonMessage::approx_wire_size` / `Turn::approx_size` (in `choreo-proto/src/size.rs`) — a deliberate over-estimate used by the daemon's lag accounting, pinned by `types::tests::approx_wire_size_never_underestimates_encoded_payload` (see the daemon broadcast section)
+- Lag-eviction byte gauge: `DaemonMessage::approx_wire_size` / `Turn::approx_size` (in `choreo-proto/src/size.rs`) — a deliberate over-estimate used by the daemon's lag accounting, pinned by `types::tests::approx_wire_size_never_underestimates_encoded_payload` (see the daemon's `broadcast` module docs for the lag accounting)
 
 Payloads are MessagePack in **named mode** (`rmp_serde::to_vec_named`): structs
 serialize as maps with field names and enum variants by variant name, so the
@@ -2447,7 +2447,7 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
 diverge unboundedly from the recorded result. (Note the two independent bounds: this
 section is about `ByteBudget` capping a single tool's *content*; the lossless delivery
 design separately bounds *delivery* — the per-client in-flight bytes that trigger
-lag-eviction — see the broadcast section below. They don't collide: content is capped
+lag-eviction — see the `choreo-daemon` `broadcast` module docs. They don't collide: content is capped
 at the source, delivery is capped per client queue.)
 
 - `spawn_with_streaming` (sh/exec/fish/nu) streams **both** stdout and stderr:
@@ -3563,7 +3563,7 @@ a socket write timeout (`DaemonState::writer_write_timeout`, default 5 s `WRITER
 (zero receive window) cannot stall its writer forever — the write fails,
 the writer shuts the socket down itself (notify-before-EOF on the graceful
 path), and the reader's blocking read unblocks into the normal
-`cleanup_client` teardown.  See the `server/connection.rs` row.
+`cleanup_client` teardown (see the `choreo-daemon` `server` module docs).
 
 Evictions are not lost silently: every one increments the
 `choreo_evictions_total` Prometheus counter served on `/metrics`, so a
@@ -4206,7 +4206,7 @@ child's process handle) so a child that finished on its own at the same
 instant is not misreported as killed — the Windows analogue of the Unix
 pidfd/ESRCH check. The `Arc<ChildJob>` and `ProcessIsAlive` handle copies
 are the fifth sanctioned shared-state exception; the full rationale is in
-AGENTS.md and the `tools/shell_util.rs` module row above.
+AGENTS.md (exception #5) and `choreo-daemon`'s `tools/shell_util.rs` module docs.
 
 On the streaming path (`spawn_with_streaming`), both drains split their
 output into complete lines and forward them through a single merge channel
