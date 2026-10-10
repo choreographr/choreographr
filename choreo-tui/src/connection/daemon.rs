@@ -1,6 +1,6 @@
 use super::route_session_update;
 use crate::state::{App, Page, ProviderInfo, merge_token_usage};
-use crate::terminal_progress;
+use crate::terminal::progress;
 use choreo_client_core::{
     AutoBindAttempt, ClientError, Pending, PendingContext, attempt_keystore_auto_bind,
     dispatch_daemon_message, record_unlock_key,
@@ -326,7 +326,7 @@ pub(crate) fn handle_daemon_message(
                     if let (Some(cw), Some(tokens)) =
                         (display.context_window, display.last_prompt_tokens)
                     {
-                        terminal_progress::update_terminal_progress(Some(tokens), Some(cw));
+                        progress::update(Some(tokens), Some(cw));
                     }
                 }
             }

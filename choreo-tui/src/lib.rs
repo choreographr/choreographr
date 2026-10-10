@@ -7,11 +7,11 @@
 //! stays unit-testable without a real terminal.
 //!
 //! The public surface is intentionally small: the entry point ([`main`]), the
-//! background image-encoding [`image_worker`], the terminal-native progress
-//! helper ([`terminal_progress`]), the [`RenderedImage`] model shared with the
-//! render path, its [`IMAGE_RESIZE`] filter, and [`build_picker`]. Everything
-//! else — rendering, selection, syntax highlighting, connection handling — is
-//! crate-private.
+//! background image-encoding [`image_worker`], the [`RenderedImage`] model
+//! shared with the render path, its [`IMAGE_RESIZE`] filter, and
+//! [`build_picker`]. Everything else — rendering, selection, syntax
+//! highlighting, connection handling, and all direct-to-stdout terminal OSC
+//! emission (the crate-private `terminal` module) — is crate-private.
 
 // Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
 // every public item carries docs, enforced as a hard error by clippy-strict's
@@ -27,7 +27,6 @@
 pub mod autostart;
 mod backend;
 mod cache;
-mod clipboard;
 mod connection;
 mod diff_render;
 mod markdown_render;
@@ -36,6 +35,7 @@ mod scrollbar;
 mod selection;
 mod state;
 mod syntax;
+mod terminal;
 
 pub use choreo_client_core::{ClientError, Command, parse_input_line};
 pub use choreo_markdown::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline};
@@ -129,7 +129,6 @@ pub fn build_picker() -> Picker {
 }
 
 pub mod image_worker;
-pub mod terminal_progress;
 
 use choreo_proto::ProtoError;
 

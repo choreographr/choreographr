@@ -9,6 +9,7 @@
 use crate::RenderedImage;
 use crate::image_worker::{ImageId, ImageJob};
 use crate::selection::TextSelection;
+use crate::terminal;
 use choreo_client_core::dispatch::{SessionStateData, ToolCallEvent};
 use choreo_client_core::{ClientError, PendingReplies, SessionView, TurnEventHandler};
 use choreo_proto::{
@@ -20,6 +21,30 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use crate::markdown_render::{lines_height, plain_text_lines};
+
+/// The literal error `choreo-client-core`'s dispatcher attaches to a
+/// `SessionEvent::Cancelled` when it routes it through
+/// [`TurnEventHandler::handle_failed`] (see `dispatch_session_event`). A
+/// cancellation is not a failure, so the program-status record reports `idle`
+/// rather than `error`.
+const CANCELLED_ERROR: &str = "cancelled";
+
+/// The tool NAME of a `ToolCall` status (never its arguments), used as an
+/// OSC 7501 `msg`.
+fn tool_call_name(status: &SessionStatus) -> Option<&str> {
+    match status {
+        SessionStatus::ToolCall(name) => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+/// The sanitized title carried on an OSC 7501 record; an empty title is
+/// dropped so the record never carries a meaningless `title=`.
+fn record_title(title: Option<&str>) -> Option<String> {
+    title
+        .map(terminal::title::sanitize)
+        .filter(|t| !t.is_empty())
+}
 
 mod command_palette;
 mod draft;
@@ -224,6 +249,24 @@ pub(crate) struct App {
     pub(crate) attached_account_slug: Option<String>,
     pub(crate) attached_status: Option<SessionStatus>,
     pub(crate) attached_tool_groups: Vec<String>,
+    /// OSC 7501 program-status publisher: the child records currently emitted
+    /// to the terminal, cached so an unchanged record is not rewritten. Every
+    /// report is a CHILD record keyed by session id; the OSC 9;4 root record
+    /// belongs to the progress family (see `terminal::status`).
+    pub(crate) term_status: terminal::status::Publisher,
+    /// Set when something changed that affects the published program-status
+    /// records or the window title; the UI loop recomputes and publishes them
+    /// outside the render closure.
+    pub(crate) term_status_dirty: bool,
+    /// Terminal turn outcomes the session status cannot express: `done` after
+    /// a completed turn, `error` after a failed one, `idle` after a
+    /// cancellation. Keyed by session id; persists until a new turn begins (a
+    /// fresh active `SessionStatusChanged`) so the outcome survives the
+    /// trailing idle status of the finished turn.
+    pub(crate) term_status_override: HashMap<u64, &'static str>,
+    /// The last window title (OSC 2) emitted, so an unchanged title is not
+    /// re-sent every frame.
+    pub(crate) term_title: Option<String>,
     /// Persistent latch of whether the daemon's credential keystore is locked.
     /// Latched from the daemon's lock-state broadcasts (`Locked`/`Unlocked`)
     /// and the subscribe-time lock-state push in `handle_daemon_message`;
@@ -322,6 +365,10 @@ impl App {
             attached_account_slug: None,
             attached_status: None,
             attached_tool_groups: Vec::new(),
+            term_status: terminal::status::Publisher::new(),
+            term_status_dirty: false,
+            term_status_override: HashMap::new(),
+            term_title: None,
             // Assume locked until the daemon tells us otherwise (via the
             // subscribe-time lock-state push or a transition broadcast).
             keystore_locked: true,
@@ -405,6 +452,77 @@ impl App {
     }
     pub(crate) fn active_display_ref(&self) -> Option<&SessionDisplayState> {
         self.session_displays.get(&self.active_session_id?)
+    }
+
+    /// The current OSC 2 window title: the plain program name when no titled
+    /// session is attached, else `choreo-tui — <attached session title>`.
+    pub(crate) fn window_title(&self) -> String {
+        let title = self
+            .attached_session_id
+            .and_then(|id| self.session_title(id));
+        terminal::title::window_title(title.as_deref())
+    }
+
+    /// The OSC 7501 child records to publish right now, keyed by session id.
+    ///
+    /// Every record is a CHILD record (`id=<session_id>`); the OSC 9;4 root
+    /// record is owned by the progress family. The attached session is always
+    /// present; active background sessions are added. Idle/sleeping background
+    /// sessions are omitted so a stale `working` record is cleared. A terminal
+    /// turn outcome (`done`/`error`, tracked in `term_status_override`) wins
+    /// over the attached session's live status until a new turn begins.
+    pub(crate) fn desired_status_records(&self) -> Vec<(u64, String)> {
+        let mut desired: Vec<(u64, String)> = Vec::new();
+        if let Some(id) = self.attached_session_id {
+            let override_state = self.term_status_override.get(&id).copied();
+            let state = override_state
+                .or_else(|| {
+                    self.attached_status
+                        .as_ref()
+                        .map(terminal::status::state_for)
+                })
+                .unwrap_or("idle");
+            // A terminal outcome has no tool name, so `msg` is derived from the
+            // live status only (never a stale ToolCall name) when an override is
+            // active.
+            let msg = if override_state.is_some() {
+                None
+            } else {
+                self.attached_status.as_ref().and_then(tool_call_name)
+            };
+            let title = self.session_title(id);
+            desired.push((
+                id,
+                terminal::status::record(id, terminal::status::APP, state, title.as_deref(), msg),
+            ));
+        }
+        for summary in &self.session_mgr.all {
+            if !summary.status.is_active() || Some(summary.session_id) == self.attached_session_id {
+                continue;
+            }
+            desired.push((
+                summary.session_id,
+                terminal::status::record(
+                    summary.session_id,
+                    terminal::status::APP,
+                    terminal::status::state_for(&summary.status),
+                    record_title(summary.title.as_deref()).as_deref(),
+                    tool_call_name(&summary.status),
+                ),
+            ));
+        }
+        desired
+    }
+
+    /// The sanitized title of the session `id`, if it has one.
+    fn session_title(&self, id: u64) -> Option<String> {
+        record_title(
+            self.session_mgr
+                .all
+                .iter()
+                .find(|s| s.session_id == id)
+                .and_then(|s| s.title.as_deref()),
+        )
     }
 
     /// Whether a daemon message carrying the given wire session id is
@@ -780,6 +898,8 @@ impl App {
     pub(crate) fn handle_session_attached(&mut self, session_id: u64) {
         self.active_session_id = Some(session_id);
         self.attached_session_id = Some(session_id);
+        // Attaching (re)points the terminal records at this session.
+        self.term_status_dirty = true;
         // Copy session summary fields before borrowing display.
         let (
             token_usage,
@@ -934,6 +1054,9 @@ impl App {
                 s.title = Some(title.to_owned());
             }
         }
+        // The window title (OSC 2) and this session's program-status record
+        // (OSC 7501 `title=`) both carry the title.
+        self.term_status_dirty = true;
     }
 
     /// The account for the session `session_id` was set.  Only that session's
@@ -983,6 +1106,14 @@ impl App {
         if self.attached_session_id == Some(session_id) {
             self.attached_status = Some(status.clone());
         }
+        // A new turn (or the session going to sleep) clears the previous
+        // turn's done/error outcome; the trailing idle status of a
+        // just-finished turn leaves it in place so the outcome survives the
+        // prompt. Either way the published records may have changed.
+        if !matches!(status, SessionStatus::Inactive) {
+            self.term_status_override.remove(&session_id);
+        }
+        self.term_status_dirty = true;
     }
 
     /// Detect when the user is reading an agent-spawned sub-session on the
@@ -1085,6 +1216,9 @@ impl App {
             .iter()
             .find(|s| s.session_id == session_id)
             .map(|s| s.status.clone());
+        // The attached session changed, so both the window title (OSC 2) and
+        // the program-status records (OSC 7501) must be re-published.
+        self.term_status_dirty = true;
         Ok(())
     }
 
@@ -1191,6 +1325,9 @@ impl App {
                     self.persist_input_draft(first.session_id);
                     self.reset_for_session_switch(first.session_id);
                     self.attached_session_id = Some(first.session_id);
+                    // The auto-attach changed the attached session, so the
+                    // window title and program-status records must refresh.
+                    self.term_status_dirty = true;
                     self.pending.send(
                         client_tx,
                         ClientMessageType::AttachSession {
@@ -1265,6 +1402,12 @@ impl App {
             self.input.clear();
             self.commit_to_history();
         }
+        // Drop the deleted session's terminal records too, and re-publish:
+        // its child record must be cleared (the publisher's sync clears an id
+        // that vanished from the desired set) and, if it was attached, the
+        // window title falls back to the plain program name.
+        self.term_status_override.remove(&session_id);
+        self.term_status_dirty = true;
     }
 
     pub(crate) fn handle_session_delete_failed(&mut self, session_id: u64, error: &str) {
@@ -1522,6 +1665,11 @@ impl TurnEventHandler for App {
         let Some(session_id) = self.resolve_daemon_session(Some(session_id)) else {
             return;
         };
+        // A completed turn is a terminal outcome `SessionStatus` cannot
+        // express; record it as `done` so it survives the trailing idle status
+        // the daemon broadcasts when the request finishes.
+        self.term_status_override.insert(session_id, "done");
+        self.term_status_dirty = true;
         let display = self.display_for(session_id);
         // The final TurnAppended already cleaned description entries via
         // `insert_or_replace`, but if that broadcast was dropped under load
@@ -1569,6 +1717,24 @@ impl TurnEventHandler for App {
             }
             return;
         };
+        // A request-level failure/cancellation is a turn outcome
+        // `SessionStatus` cannot express — record it so it survives the
+        // trailing idle status. A connection-level rejection has no origin
+        // session and is not a session turn outcome, so it is left to the
+        // status line. A cancellation is not a failure, so it reports `idle`
+        // (the dispatcher routes `SessionEvent::Cancelled` here with the
+        // literal `cancelled` error).
+        if !is_connection_level {
+            self.term_status_override.insert(
+                session_id,
+                if error == CANCELLED_ERROR {
+                    "idle"
+                } else {
+                    "error"
+                },
+            );
+            self.term_status_dirty = true;
+        }
         // A connection-level failure has no turn to render an error block in,
         // so the global status/error bar is its only surface.  A request-level
         // failure (a real session id) already renders the full error as the
@@ -1810,6 +1976,7 @@ impl TurnEventHandler for App {
     fn handle_session_attached(&mut self, session_id: u64) {
         self.active_session_id = Some(session_id);
         self.attached_session_id = Some(session_id);
+        self.term_status_dirty = true;
     }
 
     fn handle_session_created(

@@ -1,6 +1,7 @@
 use crate::render::{mouse_in_history_box, mouse_in_scrollbar_column};
 use crate::state::{App, INPUT_PAD, PAGE_SCROLL_LINES, find_turn_at_row, input_inner_width};
-use crate::{clipboard, parse_input_line, selection};
+use crate::terminal::clipboard;
+use crate::{parse_input_line, selection};
 use choreo_client_core::ClientError;
 use choreo_proto::{ClientMessage, ClientMessageType};
 use crossterm::event::{

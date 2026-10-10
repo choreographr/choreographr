@@ -3,7 +3,7 @@ use crate::build_picker;
 use crate::image_worker::{ImageResult, ImageWorker};
 use crate::render::render;
 use crate::state::{AccountWizardStep, App, Page, UiEvent};
-use crate::terminal_progress;
+use crate::terminal::{progress, title};
 use choreo_client_core::{
     ClientError, ConnectionMode, PendingContext, run_daemon_connection_with_autostart,
     run_daemon_connection_with_mode,
@@ -610,6 +610,14 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         .send(&client_tx, ClientMessageType::ListAccounts);
     app.pending
         .send(&client_tx, ClientMessageType::SubscribeAllActivity);
+    // Emit the initial window title now that the alternate screen is active
+    // and the app state can name the attached session. Seed `term_title` with
+    // what was emitted so the UI loop does not re-send it unchanged.
+    {
+        let initial_title = app.window_title();
+        title::set(&initial_title);
+        app.term_title = Some(initial_title);
+    }
     let result = run_ui_loop(
         &mut terminal,
         &mut app,
@@ -644,8 +652,13 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         PopKeyboardEnhancementFlags,
     )?;
     terminal.show_cursor()?;
-    // Clear the terminal-native progress bar now that the TUI is exiting.
-    terminal_progress::update_terminal_progress(None, None);
+    // Clear every terminal-native record now that the TUI is exiting: the
+    // native progress bar (OSC 9;4), the program-status records (OSC 7501),
+    // and the window title (OSC 2). These must not outlive the TUI's
+    // ownership of the display.
+    progress::update(None, None);
+    app.term_status.clear_all();
+    title::clear();
 
     // Surface why the TUI exited (daemon eviction / graceful shutdown / a
     // dropped connection) once the alternate screen is gone and the message
@@ -744,7 +757,7 @@ fn run_ui_loop(
                     if matches!(&cmd, ResumeCommand::PrepareForSuspend) {
                         app.text_selection = None;
                     }
-                    dirty = handle_resume_command(cmd, terminal)?;
+                    dirty = handle_resume_command(cmd, terminal, app)?;
                 }
             }
         }
@@ -776,7 +789,7 @@ fn run_ui_loop(
                 if matches!(&cmd, ResumeCommand::PrepareForSuspend) {
                     app.text_selection = None;
                 }
-                dirty = handle_resume_command(cmd, terminal)?;
+                dirty = handle_resume_command(cmd, terminal, app)?;
             }
 
             // If none of the channels had anything new the drain is
@@ -805,6 +818,29 @@ fn run_ui_loop(
                 timeout.elapsed.as_secs_f64()
             ));
             dirty = true;
+        }
+
+        // Publish the terminal-visible program status and window title.
+        // These write raw bytes to stdout, so they MUST run here — never
+        // inside the `terminal.draw` render closure, which would interleave
+        // with the frame. `term_status_dirty` is set by the event handlers
+        // that change session status/title/attachment; when it is clear the
+        // loop writes nothing. The desired records are computed into an
+        // owned Vec first, so the immutable borrow of `app` ends before
+        // `sync` takes a mutable one.
+        if app.term_status_dirty {
+            let desired = app.desired_status_records();
+            app.term_status.sync(desired);
+            app.term_status_dirty = false;
+
+            // Dedupe the window title against the last one emitted; a title
+            // change (attach/switch, SessionTitleSet, delete) also set
+            // `term_status_dirty`.
+            let desired_title = app.window_title();
+            if app.term_title.as_deref() != Some(desired_title.as_str()) {
+                title::set(&desired_title);
+                app.term_title = Some(desired_title);
+            }
         }
 
         // Skip rendering entirely when nothing has changed.
@@ -846,7 +882,7 @@ fn run_ui_loop(
                 d.progress_dirty = false;
             }
             if app.page != Page::Chat {
-                terminal_progress::update_terminal_progress(None, None);
+                progress::update(None, None);
             }
         }
     }
@@ -858,10 +894,15 @@ fn run_ui_loop(
 ///
 /// Returns `true` when re-rendering is necessary (`ReinitTerminal`),
 /// or `false` when the terminal was only torn down (`PrepareForSuspend`).
+///
+/// `app` carries the terminal-native records that must be cleared on suspend
+/// and re-published on resume (the OSC 7501 program-status records and the
+/// OSC 2 window title), alongside the OSC 9;4 progress bar handled here.
 #[cfg(unix)]
 fn handle_resume_command(
     cmd: ResumeCommand,
     terminal: &mut Terminal<TuiBackend>,
+    app: &mut App,
 ) -> io::Result<bool> {
     match cmd {
         ResumeCommand::ReinitTerminal => {
@@ -875,10 +916,26 @@ fn handle_resume_command(
                 PushKeyboardEnhancementFlags(KITTY_KEYBOARD_FLAGS),
             )?;
             terminal.clear()?;
+            // The suspend cleared the program-status records and the window
+            // title; re-apply the title now and flag the status records for
+            // the UI loop to re-publish (it owns the diff against `term_status`).
+            // The OSC 9;4 progress bar is re-emitted by the existing
+            // progress path once a status/turn event supplies fresh data.
+            let resumed_title = app.window_title();
+            title::set(&resumed_title);
+            app.term_title = Some(resumed_title);
+            app.term_status_dirty = true;
             Ok(true)
         }
         ResumeCommand::PrepareForSuspend => {
             tracing::info!("[choreo-tui] restoring terminal for suspend");
+            // Clear the terminal-native records BEFORE the process stops so
+            // the shell the user lands in does not show a stale progress bar,
+            // program-status record, or window title left by the TUI.
+            progress::update(None, None);
+            app.term_status.clear_all();
+            title::clear();
+            app.term_title = None;
             crossterm::terminal::disable_raw_mode()?;
             crossterm::execute!(
                 terminal.backend_mut(),
@@ -904,6 +961,7 @@ fn handle_resume_command(
 fn handle_resume_command(
     _cmd: ResumeCommand,
     _terminal: &mut Terminal<TuiBackend>,
+    _app: &mut App,
 ) -> io::Result<bool> {
     // Windows has no job-control suspend; ResumeCommand is never produced.
     Ok(false)

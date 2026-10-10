@@ -17,14 +17,14 @@
 //!   sequences, so writing a multi-megabyte sequence would stall the UI loop
 //!   for a paste the terminal would likely discard anyway.
 //!
-//! This mirrors the existing `terminal_progress` module's OSC 9;4 usage:
-//! build the sequence as a string, write it to stdout, ignore errors.  A
-//! write is only ever triggered by a user-initiated mouse-up over their own
-//! selection, so a hostile LLM/tool output can never inject a clipboard
-//! write through this path.
+//! The sequence is framed and written through [`super::osc`] / [`super::write`]
+//! exactly like the other OSC families.  A write is only ever triggered by a
+//! user-initiated mouse-up over their own selection, so a hostile LLM/tool
+//! output can never inject a clipboard write through this path.
 
 use base64::Engine as _;
-use std::io::Write;
+
+use super::{osc, write};
 
 /// Maximum size (in bytes of text) of a selection written via OSC 52.
 const MAX_OSC52_BYTES: usize = 1 << 20; // 1 MiB of text
@@ -40,7 +40,7 @@ fn within_osc52_limit(text: &str) -> bool {
 /// unit-testable without a terminal.
 pub(crate) fn build_osc52(text: &str) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    format!("\x1b]52;c;{encoded}\x1b\\")
+    osc(52, &format!("c;{encoded}"))
 }
 
 /// Copy `text` to the system clipboard via OSC 52.
@@ -48,18 +48,13 @@ pub(crate) fn build_osc52(text: &str) -> String {
 /// Returns `true` when the sequence was written; `false` (without writing)
 /// when the text exceeds [`MAX_OSC52_BYTES`], so the caller can report a
 /// "too large to copy" status instead of pretending the copy succeeded.
-/// Writes to stdout exactly like `terminal_progress::update_terminal_progress`.
 /// Errors are swallowed on purpose: an unsupported or denying terminal must
 /// degrade to "nothing happened", never disturb the UI loop.
 pub(crate) fn copy_to_clipboard(text: &str) -> bool {
     if !within_osc52_limit(text) {
         return false;
     }
-    let seq = build_osc52(text);
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    let _ = write!(handle, "{seq}");
-    let _ = handle.flush();
+    write(&build_osc52(text));
     true
 }
 
