@@ -118,6 +118,23 @@ impl SessionView {
         }
     }
 
+    /// End the in-flight request `stream_id`: clear the closing turn's
+    /// tool-call-description stash and drop the `stream_id → turn_id` mapping.
+    ///
+    /// This is the front-end-agnostic bookkeeping every request-terminal
+    /// outcome (`Done` / `Failed` / `Cancelled`) performs, so each front-end
+    /// does it identically whichever way the request ended, and layers its own
+    /// display-specific teardown on top.  `clear_tool_call_descriptions` runs
+    /// first (before the mapping is dropped) because the closing turn's id is
+    /// only reachable through `request_to_turn`; a request that never
+    /// re-broadcasts its final turn would otherwise leak the stash entries.
+    pub fn finish_request(&mut self, stream_id: u64) {
+        if let Some(&turn_id) = self.request_to_turn.get(&stream_id) {
+            self.clear_tool_call_descriptions(turn_id);
+        }
+        self.request_to_turn.remove(&stream_id);
+    }
+
     /// The turn with `turn_id`, if present.
     #[must_use]
     pub fn get(&self, turn_id: u32) -> Option<&Turn> {
@@ -672,6 +689,39 @@ mod tests {
         // Idempotent, and a no-op for unknown turns.
         view.clear_tool_call_descriptions(1);
         view.clear_tool_call_descriptions(999);
+    }
+
+    #[test]
+    fn finish_request_clears_descriptions_and_drops_the_mapping() {
+        // The shared request-terminal teardown both front-ends call: the stash
+        // is cleared for the closing turn (looked up before the mapping is
+        // dropped) and the request→turn mapping is removed.
+        let mut view = SessionView::new();
+        view.insert_or_replace(1, turn_with_tool_call("call-1", "sh"));
+        view.request_to_turn.insert(7, 1);
+        view.tool_call_started(
+            7,
+            "call-1".into(),
+            "sh".into(),
+            "{}".into(),
+            "Running shell command: `ls`.",
+        );
+        assert_eq!(view.tool_call_descriptions.len(), 1);
+
+        view.finish_request(7);
+
+        assert!(
+            view.tool_call_descriptions.is_empty(),
+            "the closing turn's descriptions must be dropped"
+        );
+        assert!(
+            !view.request_to_turn.contains_key(&7),
+            "the request→turn mapping must be dropped"
+        );
+
+        // Idempotent, and a no-op for an unknown stream id.
+        view.finish_request(7);
+        view.finish_request(999);
     }
 
     #[test]

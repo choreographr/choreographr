@@ -69,21 +69,16 @@ impl App {
     /// Tear down the per-session display state a terminal request outcome
     /// leaves behind.  A completion ([`App::handle_done`]), a failure
     /// ([`App::handle_failed`]), and a cancel ([`App::handle_cancelled`]) all
-    /// end an in-flight request, so they share this teardown: clear the
-    /// tool-call description map for the closing turn, drop the request→turn
-    /// mapping, reset the streaming state and the live token estimates, and
-    /// mark the content changed.
+    /// end an in-flight request, so they share this teardown: the
+    /// front-end-agnostic bookkeeping (clear the closing turn's tool-call
+    /// descriptions, drop the request→turn mapping) runs in
+    /// `SessionView::finish_request`, and the TUI-specific display state (the
+    /// active-request set, the live token estimates, and the streaming slot)
+    /// is reset here before the content is marked changed.
     fn finish_request(&mut self, session_id: u64, stream_id: u64) {
         let display = self.display_for(session_id);
-        // A request that ends without re-broadcasting its turn never runs
-        // `insert_or_replace`, so the description map is not cleaned
-        // automatically — clear it here (before the request→turn mapping is
-        // removed) to keep the map bounded by in-flight calls even on the
-        // terminal path.
-        if let Some(&turn_id) = display.view.request_to_turn.get(&stream_id) {
-            display.view.clear_tool_call_descriptions(turn_id);
-        }
-        display.view.request_to_turn.remove(&stream_id);
+        // The request→turn bookkeeping is shared with the GUI's `SessionView`.
+        display.view.finish_request(stream_id);
         display.active.remove(&stream_id);
         display.live_input_estimate = 0;
         display.live_output_tokens = 0;

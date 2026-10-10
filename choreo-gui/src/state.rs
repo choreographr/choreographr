@@ -107,39 +107,28 @@ impl TurnEventHandler for AppState {
         _last_prompt_tokens: Option<u32>,
     ) {
         trace!(%stream_id, "handle_done");
-        // The final TurnAppended usually cleaned description entries via
-        // `insert_or_replace`; clear for this turn anyway (before the
-        // request→turn mapping is removed) so a dropped final broadcast
-        // can't leak them.
-        if let Some(&turn_id) = self.session_view.request_to_turn.get(&stream_id) {
-            self.session_view.clear_tool_call_descriptions(turn_id);
-        }
-        self.session_view.request_to_turn.remove(&stream_id);
+        // Shared request-terminal teardown (see `SessionView::finish_request`):
+        // the final `TurnAppended` usually cleaned the description stash via
+        // `insert_or_replace`, but this clears it defensively — and drops the
+        // request→turn mapping — even if that broadcast was lost.
+        self.session_view.finish_request(stream_id);
     }
 
     fn handle_failed(&mut self, _session_id: Option<u64>, stream_id: u64, error: String) {
         // Never `%error`: a failure message can embed provider/request text.
         trace!(%stream_id, error_len = error.len(), "handle_failed");
-        // A failed request never re-broadcasts its turn, so `insert_or_replace`
-        // won't clean the description map — clear it here (before the
-        // request→turn mapping is removed) to keep the map bounded by
-        // in-flight calls even on the failure path.
-        if let Some(&turn_id) = self.session_view.request_to_turn.get(&stream_id) {
-            self.session_view.clear_tool_call_descriptions(turn_id);
-        }
-        self.session_view.request_to_turn.remove(&stream_id);
+        // A failure ends the request exactly like a cancel; the shared teardown
+        // keeps the description stash bounded by in-flight calls, and the error
+        // is surfaced on the status feed.
+        self.session_view.finish_request(stream_id);
         self.status_texts.push(format!("[error] {error}"));
     }
 
     fn handle_cancelled(&mut self, _session_id: Option<u64>, stream_id: u64) {
         trace!(%stream_id, "handle_cancelled");
-        // A cancel ends the in-flight request exactly like a failure, so run
-        // the same request→turn teardown — but a user cancel is not an error,
-        // so nothing is pushed to the status feed (no `[error]` line).
-        if let Some(&turn_id) = self.session_view.request_to_turn.get(&stream_id) {
-            self.session_view.clear_tool_call_descriptions(turn_id);
-        }
-        self.session_view.request_to_turn.remove(&stream_id);
+        // A cancel ends the in-flight request exactly like a failure, but a
+        // user cancel is not an error, so nothing is pushed to the status feed.
+        self.session_view.finish_request(stream_id);
     }
 
     fn handle_tool_call_event(&mut self, _session_id: u64, stream_id: u64, event: ToolCallEvent) {
