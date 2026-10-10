@@ -3798,10 +3798,18 @@ read-modify-write in `edit_file`, a `write_file` racing an `edit_file`, a
 `delete_files` racing either — would otherwise both read the original and
 silently lose one update; the per-path lock serializes them while mutations of
 different files stay parallel (pi's `withFileMutationQueue` is the same idea).
-The key is the file's canonical path, so two symlinks to one target share a
-lock; the map lock is held only for the brief reserve/prune steps (never
-across the mutation) and each per-path mutex only for the mutation itself; and
-it carries no protocol data.
+The key is the target's canonical path — canonicalizing the parent directory
+and re-appending the file name when the target does not exist yet, so a create
+racing an edit of the now-existing file agrees on one key even through a
+symlinked or `..`-bearing parent, and two symlinks to one target share a lock.
+The registry reserves each path's handle under the map lock (brief, never
+across the mutation), holds each per-path mutex only for the mutation itself,
+and prunes unreferenced entries from a RAII guard's `Drop` — so a mutation that
+panics still releases its entry.  It carries no protocol data.  Only the three
+`fs` mutation tools take it, and the key is a *single* path: deleting a
+directory does not serialize against a write of a file inside it, and a tool
+that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
+`output_path`) is not covered.
 
 Token bookkeeping follows the same per-session rule.  `LiveOutputTokenCount`
 (during streaming) and `SessionState` snapshots (attach / `load_tools` /

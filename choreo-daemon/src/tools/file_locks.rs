@@ -19,10 +19,20 @@
 //! mutation), and each per-path `Mutex` is held only for the mutation itself.
 //! Do **not** call it reentrantly on a path you already hold — the per-path
 //! `Mutex` is not reentrant and would deadlock.
+//!
+//! Scope: only the three `fs` mutation tools (`write_file`, `edit_file`,
+//! `delete_files`) take these locks, and the key is the *exact* file path. Two
+//! consequences follow. First, `delete_files` of a *directory* does not
+//! serialize against a `write_file`/`edit_file` of a file *inside* it — the
+//! directory path and the child path are different keys. Second, a tool that
+//! writes to an arbitrary path outside this module (`retrieve_webpage`'s
+//! `output_path`, for one) is not covered. Any new mutating tool that can run
+//! in a concurrent batch should route its write through [`with_file_lock`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, TryLockError};
+use tracing::debug;
 
 /// Registry of per-canonical-path mutation locks.
 struct FileLocks {
@@ -30,7 +40,7 @@ struct FileLocks {
     /// strong `Arc`s (not `Weak`): a weak handle would let two acquirers that
     /// race the last release mint *separate* mutexes for one path and fail to
     /// serialize. Entries are pruned on release once no other thread holds or
-    /// awaits them (see `with_many`).
+    /// awaits them (see [`Cleanup`]).
     map: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
 }
 
@@ -46,59 +56,106 @@ impl FileLocks {
     /// two overlapping multi-path callers deadlock-free.
     fn with_many<R>(&self, keys: &[PathBuf], f: impl FnOnce() -> R) -> R {
         // Reserve one lock handle per key under the map lock (brief), so every
-        // concurrent acquirer of a key shares the *same* `Mutex`.
+        // concurrent acquirer of a key shares the *same* `Mutex`. `Cleanup` owns
+        // the handles so the prune runs whether `f` returns or panics.
         let handles: Vec<Arc<Mutex<()>>> = {
-            let mut map = self
-                .map
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
             keys.iter()
                 .map(|key| Arc::clone(map.entry(key.clone()).or_default()))
                 .collect()
         };
+        let cleanup = Cleanup {
+            registry: self,
+            keys,
+            handles,
+        };
 
-        // Take the per-key locks in `keys` order; hold them across `f`.
-        let guards: Vec<_> = handles
+        // Take each per-key lock in `keys` order (a single global order, so
+        // overlapping multi-path callers cannot deadlock). The fast path is
+        // silent; only genuine contention logs and blocks.
+        let guards: Vec<_> = cleanup
+            .handles
             .iter()
-            .map(|handle| {
-                handle
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .zip(keys)
+            .map(|(handle, key)| match handle.try_lock() {
+                Ok(guard) => guard,
+                // A poisoned lock marks that a prior holder panicked mid-mutation;
+                // recover the guard rather than cascade the panic — the file lock
+                // itself is unaffected by the poison marker.
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                // Held by another thread: log the (rare — file mutations are
+                // human-rate) wait, then block until it is released.
+                Err(TryLockError::WouldBlock) => {
+                    debug!(path = %key.display(), "file mutation lock contended; waiting");
+                    handle.lock().unwrap_or_else(PoisonError::into_inner)
+                }
             })
             .collect();
         let out = f();
+        // Drop the guards before returning so `cleanup`'s prune (on scope exit,
+        // or during unwind) observes a registry with no other live contention.
         drop(guards);
+        out
+    }
+}
 
-        // Prune entries no other thread holds or awaits: the map plus `handles`
-        // are then the only owners (`strong_count == 2`). Doing the check under
-        // the map lock closes the race with a concurrent reserve.
-        {
-            let mut map = self
-                .map
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for key in keys {
-                if map
-                    .get(key)
-                    .is_some_and(|entry| Arc::strong_count(entry) == 2)
-                {
-                    map.remove(key);
-                }
+/// Owns the reserved lock handles for one [`FileLocks::with_many`] call and
+/// prunes the registry when dropped. Running the prune from `Drop` — rather than
+/// only on the normal return path — means a mutation that panics still releases
+/// its registry entry instead of leaking it. The per-path guards are declared
+/// after `cleanup` and so drop first, leaving the registry consistent when this
+/// runs.
+struct Cleanup<'a> {
+    registry: &'a FileLocks,
+    keys: &'a [PathBuf],
+    handles: Vec<Arc<Mutex<()>>>,
+}
+
+impl Drop for Cleanup<'_> {
+    fn drop(&mut self) {
+        // Prune entries no other thread holds or awaits: the map plus
+        // `self.handles` are then the only owners (`strong_count == 2`). Doing
+        // the check under the map lock closes the race with a concurrent reserve.
+        let mut map = self
+            .registry
+            .map
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for key in self.keys {
+            if map
+                .get(key)
+                .is_some_and(|entry| Arc::strong_count(entry) == 2)
+            {
+                map.remove(key);
             }
         }
-        drop(handles);
-
-        out
     }
 }
 
 static FILE_LOCKS: LazyLock<FileLocks> = LazyLock::new(FileLocks::new);
 
 /// The lock key for a resolved path: its canonical path when the target exists
-/// (so two symlinks to one file share a lock), else the lexically-absolutized
-/// path (so two concurrent *creates* of the same new file still serialize).
+/// (so two symlinks to one file share a lock), else a key derived by
+/// canonicalizing the parent directory and re-appending the file name.
 fn mutation_key(resolved: &Path) -> PathBuf {
-    std::fs::canonicalize(resolved).unwrap_or_else(|_| absolute(resolved))
+    if let Ok(canonical) = std::fs::canonicalize(resolved) {
+        return canonical;
+    }
+    // The target does not exist yet (a create). Canonicalize the parent so the
+    // key normalizes the same way the post-create `canonicalize` above would:
+    // otherwise a parent reached through a symlink or `..` yields a *different*
+    // key for the same file, and a create racing an edit of the now-existing
+    // file would fail to serialize. A parent that cannot be canonicalized
+    // (itself missing, or the root) falls back to the lexical absolutization.
+    match (resolved.parent(), resolved.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+            std::fs::canonicalize(parent).map_or_else(
+                |_| absolute(resolved),
+                |canonical_parent| canonical_parent.join(name),
+            )
+        }
+        _ => absolute(resolved),
+    }
 }
 
 /// Absolutize `path` against the process working directory without touching the
@@ -228,6 +285,27 @@ mod tests {
         assert_eq!(mutation_key(&link), mutation_key(&target));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn mutation_key_canonicalizes_symlinked_parent_for_missing_file() {
+        // Neither file exists yet (both are creates). The two spellings reach
+        // the same directory through a symlink, so they must share one key —
+        // otherwise a create racing an edit of the file would not serialize.
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let via_link = link.join("new.txt");
+        let via_real = real.join("new.txt");
+        assert_eq!(
+            mutation_key(&via_link),
+            mutation_key(&via_real),
+            "a missing file under a symlinked parent must key on the real parent"
+        );
+    }
+
     #[test]
     fn mutation_key_falls_back_for_missing_path() {
         // A path that does not exist yet (a create) still yields a stable,
@@ -270,5 +348,32 @@ mod tests {
         assert_eq!(seen, [1, 2]);
         t1.join().unwrap();
         t2.join().unwrap();
+    }
+
+    #[test]
+    fn panicking_mutation_prunes_its_entry_and_stays_usable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("boom.txt");
+        std::fs::write(&path, "x").unwrap();
+
+        // A mutation that panics must not leave its registry entry behind
+        // (`Cleanup` prunes on unwind) nor make the path permanently unusable.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_file_lock(&path, || panic!("boom"));
+        }));
+        assert!(panicked.is_err(), "the closure's panic must propagate");
+
+        let key = mutation_key(&path);
+        assert!(
+            !FILE_LOCKS
+                .map
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&key),
+            "the panicking mutation must have pruned its entry"
+        );
+
+        // The path is still acquirable (a fresh, unpoisoned mutex now owns it).
+        with_file_lock(&path, || {});
     }
 }
