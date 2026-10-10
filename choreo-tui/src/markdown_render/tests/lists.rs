@@ -47,6 +47,26 @@ fn ordered_list_items_share_content_column() {
 }
 
 #[test]
+fn ordered_list_numbers_are_right_aligned() {
+    // The digit columns line up on the ones place: item 9's "9" must sit
+    // directly above item 10's "0" (not its "1"), with the ". " suffix and
+    // following content at a fixed column for every item.
+    let md = "9. ninth\n10. tenth\n11. eleventh";
+    let result = markdown_lines(md, 80);
+    let text: Vec<String> = result.iter().map(ToString::to_string).collect();
+    assert_eq!(text[0], " 9. ninth", "item 9 right-aligned under item 10");
+    assert_eq!(text[1], "10. tenth");
+    assert_eq!(text[2], "11. eleventh");
+    // The ". " of every marker sits at the same column (index 2 here).
+    for line in &text {
+        assert_eq!(line.find(". "), Some(2), "period column fixed: {line:?}");
+    }
+    // The ones digits share a column: "9" (line 0) above "0" (line 1).
+    assert_eq!(text[0].as_bytes()[1], b'9');
+    assert_eq!(text[1].as_bytes()[1], b'0');
+}
+
+#[test]
 fn ordered_list_wrapped_lines_share_widest_marker_indent() {
     // Item 1's marker is 3 columns wide but item 10's is 4; every item's
     // continuation lines must indent to the widest marker (4 columns) so
@@ -56,8 +76,10 @@ fn ordered_list_wrapped_lines_share_widest_marker_indent() {
     let result = markdown_lines(&md, 20);
     let text: Vec<String> = result.iter().map(ToString::to_string).collect();
     // Both wrapped items must continue under the widest marker, and their
-    // first-line content must start at the same column as well.
-    for marker in ["1. ", "10. "] {
+    // first-line content must start at the same column as well.  Item 1's
+    // number is right-aligned in the two-digit column, so its marker is
+    // " 1. " (leading pad) rather than "1. ".
+    for marker in [" 1. ", "10. "] {
         let idx = text
             .iter()
             .position(|l| l.starts_with(marker))
@@ -109,9 +131,11 @@ fn ordered_list_three_digit_marker_indent() {
     let md = format!("98. {long}\n99. {long}\n100. {long}");
     let result = markdown_lines(&md, 20);
     let text: Vec<String> = result.iter().map(ToString::to_string).collect();
+    // Item 98's number is right-aligned in the three-digit column, so its
+    // marker is " 98. " (leading pad).
     let idx = text
         .iter()
-        .position(|l| l.starts_with("98. "))
+        .position(|l| l.starts_with(" 98. "))
         .expect("item 98 should render");
     let cont = text
         .get(idx + 1)

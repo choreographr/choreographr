@@ -5,7 +5,7 @@ use super::{
     Color, GlobalLruCache, HighlightLines, Line, LineChrome, LineJoin, MarkdownBlock, Modifier,
     QUOTE_BAR, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH, Span, Style, TABLE_BORDERS, debug, display_width,
     ensure_blank_line_joined, grapheme_chunks, heading_prefix, highlight_theme, inlines_to_lines,
-    next_table_id, pad_marker, render_table_lines, syntax_set, to_ratatui_color,
+    next_table_id, ordered_marker, render_table_lines, syntax_set, to_ratatui_color,
     try_render_diff_content, wrap_styled_line_joined,
 };
 pub(crate) fn find_syntax<'a>(
@@ -469,41 +469,44 @@ pub(crate) fn render_markdown_block(
             // old per-item spacing (where one long item created a single
             // lopsided gap in an otherwise tight list).
             //
-            // The list also shares a single indentation unit: the width of the
-            // *widest* marker (the item with the highest number, e.g. 4 columns
-            // for "10. ").  Every marker is padded with trailing spaces up to
-            // that width ("9. " -> "9.  ") so every item's *content* starts at
-            // the same column, and every continuation line is indented to that
-            // same column — so first lines and wrapped lines all line up as one
-            // block regardless of how many digits each marker has.
-            let max_marker_width = if *ordered {
-                // Item numbers run start..=start + len - 1, so the widest marker
+            // The list shares a single indentation unit: the width of the
+            // *widest* number plus the fixed ". " suffix for an ordered list
+            // (4 columns for a list reaching "10. "), or the bullet marker's
+            // width for an unordered list.  Ordered markers are right-aligned
+            // within that digit column — the number is left-padded with spaces
+            // ("9" -> " 9") — so the ones digits stack vertically (item 9's "9"
+            // sits above item 10's "0", not its "1") while the ". " suffix and
+            // the content that follows stay at a fixed column.  Every
+            // continuation line is indented to that same column, so first lines
+            // and wrapped lines all line up as one block.
+            let (max_number_width, max_marker_width) = if *ordered {
+                // Item numbers run start..=start + len - 1, so the widest number
                 // is always the last one — O(1) per list, no per-item scan.
                 // `saturating_add` is cheap overflow hardening: CommonMark caps
                 // marker digits at 9, so `start` is small today, but the marker
                 // arithmetic must never be able to overflow (and panic in debug)
                 // if a parser or future input ever allows a larger start.
-                items.len().checked_sub(1).map_or(0, |last| {
-                    display_width(&format!("{}. ", start.saturating_add(last)))
-                })
+                let number_width = items.len().checked_sub(1).map_or(1, |last| {
+                    display_width(&start.saturating_add(last).to_string())
+                });
+                // ". " is two fixed columns after the number column.
+                (number_width, number_width + 2)
             } else {
-                display_width("• ")
+                (0, display_width("• "))
             };
             let mut rendered_items: Vec<RenderedItem> = Vec::with_capacity(items.len());
             for (index, item) in items.iter().enumerate() {
                 let marker = if *ordered {
                     // saturating_add: a huge literal list start must render,
-                    // not overflow (see max_marker_width above).
-                    format!("{}. ", start.saturating_add(index))
+                    // not overflow (see max_number_width above).
+                    ordered_marker(start.saturating_add(index), max_number_width)
                 } else {
                     "• ".to_string()
                 };
-                // Pad the marker to the list-wide width so first-line content
-                // aligns with every other item's first line (and with the
-                // continuation lines below).  Without this, "9. " content sits
-                // one column left of its "10. " sibling — the wrapped lines
-                // lined up, but the visible first line was still misaligned.
-                let marker = pad_marker(&marker, max_marker_width);
+                // Every marker is already exactly `max_marker_width` columns
+                // wide (fixed digit column + ". ", or the bullet marker), so
+                // first-line content aligns with every other item's first line
+                // (and with the continuation lines below).
                 let mut rendered = Vec::new();
                 let mut rendered_joins = Vec::new();
                 let mut rendered_chrome = Vec::new();

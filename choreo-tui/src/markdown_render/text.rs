@@ -609,15 +609,15 @@ pub(crate) fn display_width(text: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(text)
 }
 
-/// Right-pad a list marker with trailing spaces to `width` display columns so
-/// every item's content starts at the same column regardless of how wide the
-/// marker text is ("9. " -> "9.  " when a sibling is "10. ").  The pad is pure
-/// alignment whitespace: it carries no meaning and is simply what makes the
-/// whole list read as one block.  Markers are short ASCII (digits + ". " or
-/// "• "), so column padding via spaces is exact.
-pub(crate) fn pad_marker(marker: &str, width: usize) -> String {
-    let pad = width.saturating_sub(display_width(marker));
-    format!("{}{}", marker, " ".repeat(pad))
+/// Build a right-aligned ordered-list marker: the number is left-padded with
+/// spaces to `number_width` display columns so the ones digits stack vertically
+/// across the list (the "9" of item 9 sits above the "0" of item 10, not above
+/// its "1").  The ". " suffix is a fixed two columns, so every marker is exactly
+/// `number_width + 2` wide and every item's content — and every continuation
+/// line — starts at the same column.  The pad is pure alignment whitespace: it
+/// carries no meaning and is simply what makes the whole list read as one block.
+pub(crate) fn ordered_marker(number: usize, number_width: usize) -> String {
+    format!("{number:>number_width$}. ")
 }
 
 pub(crate) fn grapheme_width(grapheme: &str) -> usize {
