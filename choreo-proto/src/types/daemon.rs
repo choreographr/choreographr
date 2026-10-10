@@ -9,14 +9,18 @@ use super::client::MessageKind;
 use super::common::AccountInfo;
 use super::session::{SessionEvent, SessionSummary};
 
+/// Which stream an [`SessionEvent::OutputChunk`](crate::SessionEvent::OutputChunk) belongs to: the model's visible
+/// answer vs. its reasoning trace, which a client renders in separate channels.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum OutputStream {
+    /// The user-visible answer text.
     Answer,
+    /// The model's reasoning/thinking trace.
     Reasoning,
 }
 
-/// Which turn attachment a [`ClientMessageType::GetImage`] / [`DaemonMessageType::Image`]
+/// Which turn attachment a [`ClientMessageType::GetImage`](crate::ClientMessageType::GetImage) / [`DaemonMessageType::Image`]
 /// addresses. The two attachments are TURN-SCOPED and share one durable byte
 /// store (`session_attachments`), so the fetch protocol addresses them with one
 /// message and a tagged key rather than two parallel request/reply pairs. The
@@ -37,22 +41,38 @@ pub enum ImageKey {
     /// `displayed_images` (produced by `display_image`, `generate_image`, or a
     /// `retrieve_webpage` screenshot). `displayed_images` is append-only within
     /// a turn, so the positional index is a stable identifier.
-    Displayed { index: u32 },
+    Displayed {
+        /// The zero-based position in the turn's append-only
+        /// `displayed_images` list.
+        index: u32,
+    },
     /// A **tool-result vision image** — the normalized image a tool such as
     /// `read_image` fed back to a vision model, attached to the tool result
     /// whose `call_id` this is. Keyed by call id (not a position) because the
     /// image belongs to a specific tool call and the call id is the only stable
     /// handle across turn rewrites. A turn may carry several (one per
     /// image-bearing tool result).
-    ToolResult { call_id: String },
+    ToolResult {
+        /// The `call_id` of the tool call whose result produced this vision
+        /// image.
+        call_id: String,
+    },
 }
 
+/// Metadata describing one turn attachment: its MIME type, pixel dimensions,
+/// encoded byte length, and optional alt text.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImageMetadata {
+    /// The image's MIME type (e.g. `image/png`).
     pub mime_type: String,
+    /// Width in pixels.
     pub width: u32,
+    /// Height in pixels.
     pub height: u32,
+    /// Encoded byte length of the image.
     pub byte_len: u64,
+    /// Optional alt text for accessibility/display; `None` when the producer
+    /// supplied none.
     pub alt: Option<String>,
 }
 
@@ -74,7 +94,9 @@ pub enum RefreshStatus {
 /// plain wire pair — the TUI maps it into its own `ProviderInfo`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogProvider {
+    /// The provider slug the daemon's catalog is keyed by (e.g. `anthropic`).
     pub slug: String,
+    /// The human-readable provider name for the picker.
     pub display_name: String,
 }
 
@@ -144,11 +166,11 @@ impl McpServerStatus {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum KeystoreState {
     /// No binding exists yet — a fresh daemon. A client mints a bind key and
-    /// sends [`ClientMessageType::BindKeystore`]; the frontends do this
+    /// sends [`ClientMessageType::BindKeystore`](crate::ClientMessageType::BindKeystore); the frontends do this
     /// automatically, once per connection, when they observe this state.
     Unbound,
     /// A binding exists, but no cleartext credentials are in memory. A client
-    /// unlocks by presenting the bound key via [`ClientMessageType::Unlock`].
+    /// unlocks by presenting the bound key via [`ClientMessageType::Unlock`](crate::ClientMessageType::Unlock).
     Locked,
     /// A binding exists and the credentials are decrypted in memory.
     Unlocked,
@@ -237,26 +259,38 @@ pub enum DaemonMessageType {
     /// daemon "no session attached" failures) carry `session_id: None`,
     /// absent on the wire as `null`.
     Session {
+        /// The origin session's id, or `None` for a connection-level reply
+        /// with no session scope.
         session_id: Option<u64>,
+        /// The session-scoped event this envelope carries.
         event: SessionEvent,
     },
+    /// The full session list as summaries, in the shared list order (pinned
+    /// first, then newest).
     Sessions {
+        /// The sessions, already ordered as the daemon will render them.
         sessions: Vec<SessionSummary>,
     },
+    /// Liveness reply to a [`ClientMessageType::Ping`](crate::ClientMessageType::Ping).
     Pong,
+    /// The available model ids plus the currently selected one.
     Models {
+        /// The available model ids.
         models: Vec<String>,
+        /// The currently selected model id, if any.
         selected_model: Option<String>,
     },
+    /// The model list could not be produced.
     ModelsFailed {
+        /// Why the model list failed.
         error: String,
     },
-    /// Targeted reply to [`ClientMessageType::Unlock`]: the presented key matched
+    /// Targeted reply to [`ClientMessageType::Unlock`](crate::ClientMessageType::Unlock): the presented key matched
     /// the binding and the daemon decrypted its credentials. This is an
     /// OPERATION OUTCOME; the current keystore *status* is pushed separately
     /// as [`DaemonMessageType::Keystore`].
     Unlocked,
-    /// Targeted reply to [`ClientMessageType::Lock`]: the daemon wiped its
+    /// Targeted reply to [`ClientMessageType::Lock`](crate::ClientMessageType::Lock): the daemon wiped its
     /// in-memory credentials and re-latched the locked state. An OPERATION
     /// OUTCOME; the current keystore *status* is pushed separately as
     /// [`DaemonMessageType::Keystore`].
@@ -271,12 +305,16 @@ pub enum DaemonMessageType {
     /// client with no key
     /// bind the daemon automatically.
     Keystore {
+        /// The daemon's current keystore binding/unlock state.
         state: KeystoreState,
     },
+    /// Error reply for an unlock/credential operation against a bound keystore
+    /// whose presented key did not match the binding.
     LockedError {
+        /// The failure reason (e.g. the presented key was wrong).
         error: String,
     },
-    /// Targeted reply to [`ClientMessageType::BindKeystore`] when an unbound
+    /// Targeted reply to [`ClientMessageType::BindKeystore`](crate::ClientMessageType::BindKeystore) when an unbound
     /// keystore adopted the presented key and the implicit unlock succeeded.
     /// Distinct from [`DaemonMessageType::Unlocked`] so the client can tell "I just
     /// created this binding" from "I verified an existing one". Ordering
@@ -292,77 +330,116 @@ pub enum DaemonMessageType {
     /// with a freshly generated key instead of replaying a stored key that
     /// can never match a nonexistent binding.
     KeystoreUnbound {
+        /// The failure reason (the keystore has no binding to verify against).
         error: String,
     },
+    /// Reply confirming a credential was stored for one service.
     CredentialAdded {
+        /// The service key the credential was stored under.
         service: String,
     },
+    /// The credential could not be stored.
     CredentialAddFailed {
+        /// The service key whose credential failed to store.
         service: String,
+        /// Why the credential could not be stored.
         error: String,
     },
+    /// Reply confirming a stored credential was removed.
     CredentialRemoved {
+        /// The service key whose credential was removed.
         service: String,
     },
+    /// The stored credential could not be removed.
     CredentialRemoveFailed {
+        /// The service key whose credential failed to remove.
         service: String,
+        /// Why the credential could not be removed.
         error: String,
     },
-    /// Reply to [`ClientMessageType::AclAdd`]: `ok` false carries the failure
+    /// Reply to [`ClientMessageType::AclAdd`](crate::ClientMessageType::AclAdd): `ok` false carries the failure
     /// reason in `message` (rejected transport, bad key, I/O error); `ok`
     /// true carries the new total of authorized clients.
     AclAddResult {
+        /// Whether the enrollment succeeded.
         ok: bool,
+        /// On failure, the reason (rejected transport, bad key, I/O error); on
+        /// success, a human-readable note.
         message: String,
     },
     /// Global broadcast (connection-level, no session) after a successful
     /// ACL change: the new total of authorized client keys. Clients that
     /// surface ACL information can refresh; it carries no key material.
     AclUpdated {
+        /// The new total of authorized client keys.
         clients: u64,
     },
+    /// Reply to [`ClientMessageType::GetCredential`](crate::ClientMessageType::GetCredential): the stored credential for one
+    /// service, or `None` when none is stored.
     Credential {
+        /// The service key the credential belongs to.
         service: String,
+        /// The stored credential value, or `None` when none is stored.
         key: Option<String>,
     },
+    /// Reply confirming a provider account was added.
     AccountAdded {
+        /// The name of the account that was added.
         name: String,
     },
+    /// The provider account could not be added.
     AccountAddFailed {
+        /// The name of the account that failed to add.
         name: String,
+        /// Why the account could not be added.
         error: String,
     },
+    /// Reply confirming a provider account was removed.
     AccountRemoved {
+        /// The name of the account that was removed.
         name: String,
     },
+    /// The provider account could not be removed.
     AccountRemoveFailed {
+        /// The name of the account that failed to remove.
         name: String,
+        /// Why the account could not be removed.
         error: String,
     },
+    /// The full list of configured provider accounts.
     Accounts {
+        /// Every configured account.
         accounts: Vec<AccountInfo>,
     },
+    /// The account list could not be produced.
     AccountListFailed {
+        /// Why the account list could not be produced.
         error: String,
     },
     /// Reply to `ClientMessageType::RefreshModels`. `status` distinguishes
     /// "nothing changed" (304) from a real swap (200), and a forced swap.
     ModelsRefreshed {
+        /// The number of providers in the refreshed catalog.
         providers: usize,
+        /// The number of models in the refreshed catalog.
         models: usize,
+        /// Whether the catalog was already current, was swapped, or was
+        /// force-swapped.
         status: RefreshStatus,
     },
     /// Reply to `ClientMessageType::RefreshModels` when the fetch/merge failed.
     ModelsRefreshFailed {
+        /// Why the refresh failed.
         error: String,
     },
     /// Broadcast whenever the daemon swaps the provider catalog (startup
     /// refresh, user-overlay reload, `/refresh-models`). Carries the full
     /// provider list so clients can replace their static default picker.
     CatalogUpdated {
+        /// The full provider list replacing the client's static default.
         providers: Vec<CatalogProvider>,
     },
-    /// Targeted reply to [`ClientMessageType::GetImage`]: the raw bytes of the
+    /// Targeted reply to [`ClientMessageType::GetImage`](crate::ClientMessageType::GetImage): the raw bytes of the
     /// requested attachment (displayed image or tool-result vision image), or
     /// `None` when it is not found (the session or turn was deleted, the
     /// attachment was evicted, or the key is stale). `Some(vec![])` is a
@@ -371,19 +448,25 @@ pub enum DaemonMessageType {
     /// image forever. The `session_id`, `turn_id`, and `key` echo the request so
     /// a client with several fetches in flight can route the reply.
     Image {
+        /// The session the attachment belongs to (echoes the request).
         session_id: u64,
+        /// The turn the attachment belongs to (echoes the request).
         turn_id: u32,
+        /// Which attachment this reply answers (echoes the request).
         key: ImageKey,
+        /// The raw attachment bytes, or `None` when not found; `Some(vec![])`
+        /// is a genuinely zero-byte image.
         data: Option<Vec<u8>>,
     },
-    /// Reply to [`ClientMessageType::McpStatusRequest`], and the success reply to
-    /// [`ClientMessageType::McpReconnect`]: the current state of every visible
+    /// Reply to [`ClientMessageType::McpStatusRequest`](crate::ClientMessageType::McpStatusRequest), and the success reply to
+    /// [`ClientMessageType::McpReconnect`](crate::ClientMessageType::McpReconnect): the current state of every visible
     /// MCP server (daemon-tier servers plus, for an attached session, that
     /// session's own project servers), each tagged with its `tier`. Carries
     /// the active session's project root and its trust state, plus the slugs
     /// of any project servers that were read but ignored because the root is
     /// untrusted.
     McpStatus {
+        /// The current state of each visible MCP server.
         servers: Vec<McpServerStatus>,
         /// The active session's project MCP root, when it has a working
         /// directory that resolves to one.
@@ -394,38 +477,50 @@ pub enum DaemonMessageType {
         /// read so the operator can see what is being ignored, never spawned.
         ignored_project_servers: Vec<String>,
     },
-    /// Reply to [`ClientMessageType::McpReconnect`] when the reconnect failed: the
+    /// Reply to [`ClientMessageType::McpReconnect`](crate::ClientMessageType::McpReconnect) when the reconnect failed: the
     /// slug it targeted and the failure reason.
     McpReconnectFailed {
+        /// The slug of the MCP server that failed to reconnect.
         slug: String,
+        /// Why the reconnect failed.
         error: String,
     },
-    /// Reply to [`ClientMessageType::McpReload`]: a one-line human-readable summary
+    /// Reply to [`ClientMessageType::McpReload`](crate::ClientMessageType::McpReload): a one-line human-readable summary
     /// of what the reload changed (added/removed/restarted/unchanged/failed
     /// counts) plus the refreshed state of every configured server.
     McpReloaded {
+        /// A one-line summary of what the reload changed.
         summary: String,
+        /// The refreshed state of every configured server.
         servers: Vec<McpServerStatus>,
     },
-    /// Reply to [`ClientMessageType::McpReload`] when the reload could not run at
+    /// Reply to [`ClientMessageType::McpReload`](crate::ClientMessageType::McpReload) when the reload could not run at
     /// all (the config file could not be read or parsed): the failure reason.
     McpReloadFailed {
+        /// Why the reload could not run.
         error: String,
     },
-    /// Reply to [`ClientMessageType::McpTrust`] / [`ClientMessageType::McpUntrust`]: the
+    /// Reply to [`ClientMessageType::McpTrust`](crate::ClientMessageType::McpTrust) / [`ClientMessageType::McpUntrust`](crate::ClientMessageType::McpUntrust): the
     /// resulting trust state of the target root (or `None` when the active
     /// session has no resolvable project root) plus a one-line human-readable
     /// summary of what happened.
     McpTrustUpdated {
+        /// The resulting trust target root, or `None` when the session has no
+        /// resolvable project root.
         root: Option<String>,
+        /// Whether the root is now trusted.
         trusted: bool,
+        /// A one-line human-readable summary of what happened.
         message: String,
     },
-    /// Reply to [`ClientMessageType::McpTrustList`]: the trusted project MCP
+    /// Reply to [`ClientMessageType::McpTrustList`](crate::ClientMessageType::McpTrustList): the trusted project MCP
     /// roots, in stable (sorted) order.
     McpTrustList {
+        /// The trusted project MCP roots, in stable (sorted) order.
         roots: Vec<String>,
     },
+    /// Broadcast immediately before the daemon exits, so clients can shut down
+    /// cleanly instead of treating the dropped connection as a crash.
     ShuttingDown,
     /// Best-effort advisory, sent by the daemon immediately before it
     /// disconnects a client that has fallen too far behind the streaming
@@ -440,6 +535,7 @@ pub enum DaemonMessageType {
     /// request's own outcome broadcast (if any) still rides `id: None`; this
     /// acknowledgement exists so every request has exactly one targeted reply.
     Accepted {
+        /// The kind of the request that was accepted.
         kind: MessageKind,
     },
     /// Terminal failure reply to any request that could not be honoured, tagged
@@ -447,7 +543,9 @@ pub enum DaemonMessageType {
     /// the uniform failure channel: a request that used to fall through a
     /// dispatch wildcard now has somewhere concrete to report why.
     Failed {
+        /// The kind of the request that failed.
         kind: MessageKind,
+        /// The human-readable failure reason.
         error: String,
     },
 }
@@ -462,7 +560,7 @@ impl DaemonMessageType {
     ///
     /// Returns a `&'static str` rather than a `MessageKind`-style enum:
     /// this exists only as a log/metric tag, never a value anyone matches on,
-    /// so the string is the whole contract. ([`ClientMessageType::kind`]
+    /// so the string is the whole contract. ([`ClientMessageType::kind`](crate::ClientMessageType::kind)
     /// returns an enum because the daemon branches on it.)
     #[must_use]
     pub fn kind(&self) -> &'static str {

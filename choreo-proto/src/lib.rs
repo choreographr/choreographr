@@ -1,3 +1,11 @@
+//! Wire protocol for the Choreographr daemon/client transport: the framed
+//! message envelope, the wire types it carries, and the socket I/O helpers.
+
+// Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
+// every public item carries docs, enforced as a hard error by clippy-strict's
+// `-D warnings`.
+#![warn(missing_docs)]
+
 mod error;
 mod frame;
 mod io;

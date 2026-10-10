@@ -9,26 +9,45 @@ use super::TimestampMs;
 use super::common::{ReasoningCapability, TokenUsage};
 use super::daemon::{ImageMetadata, OutputStream};
 
+/// One displayed image attached to a turn: the image's metadata, its raw
+/// bytes, and the id of the tool call that produced it (when one did).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DisplayedImageRecord {
+    /// The image's MIME type, pixel dimensions, byte length, and alt text.
     pub metadata: ImageMetadata,
+    /// The raw encoded image bytes.
     pub data: Vec<u8>,
+    /// The `call_id` of the tool call that displayed this image (e.g.
+    /// `display_image`), or `None` for a user-supplied or non-tool image.
     pub tool_call_id: Option<String>,
 }
 
+/// One assistant tool call recorded on a turn: the provider's call id, the tool
+/// name, and the raw JSON arguments the model produced.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AssistantToolCallRecord {
+    /// The provider-assigned call id, echoed back on the matching tool result.
     pub call_id: String,
+    /// The tool name the model invoked.
     pub name: String,
+    /// The JSON-encoded arguments the model produced for the call.
     pub arguments_json: String,
 }
 
+/// One tool result recorded on a turn: the matching call id, the tool name, the
+/// result content, and whether the tool reported an error.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolResultRecord {
+    /// The `call_id` of the tool call this result answers.
     pub call_id: String,
+    /// The tool name that produced the result.
     pub name: String,
+    /// The result payload (text, or a serialized tool-specific rendering).
     pub content: String,
+    /// Whether the tool reported the call as failed.
     pub is_error: bool,
+    /// Human-readable description of the invocation (e.g. the command run),
+    /// rendered alongside the result.
     pub invocation_description: String,
     /// A vision image this tool result produced, stored as a *reference* that
     /// carries the normalized image **bytes** (`ImageReference::data`), so the
@@ -118,7 +137,10 @@ pub enum ReasoningArtifact {
     /// field it was captured from (see [`ChatReasoningField`]), so re-emission
     /// targets the same field the provider used.
     ChatReasoning {
+        /// Which chat field the reasoning text was captured from, so it is
+        /// re-emitted to the same field.
         field: ChatReasoningField,
+        /// The reasoning text bytes, exactly as the provider sent them.
         bytes: Vec<u8>,
     },
     /// Anthropic: ordered thinking / `redacted_thinking` blocks, JSON as
@@ -133,21 +155,36 @@ pub enum ReasoningArtifact {
 /// Identity of the model that produced a reasoning artifact.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReasoningProducer {
+    /// The slug of the provider that produced the artifact.
     pub provider_slug: String,
+    /// The model id that produced the artifact.
     pub model: String,
 }
 
+/// One persisted turn of a session: the user's input, the assistant's response
+/// (text and/or tool calls), any reasoning, the tool results, and the images
+/// displayed, plus the turn's own status flags.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Turn {
+    /// When the turn was created.
     pub created_at: TimestampMs,
+    /// Whether the turn has been undone.
     pub undone: bool,
+    /// A terminal error that aborted the turn, if any.
     pub error: Option<String>,
+    /// The user's input text for this turn, when it carried one.
     pub user_text: Option<String>,
+    /// The assistant's final answer text for this turn, when it produced one.
     pub assistant_text: Option<String>,
+    /// The assistant's reasoning text for this turn, when the model exposed it.
     pub assistant_reasoning: Option<String>,
+    /// The tool calls the assistant requested this turn, in order.
     pub tool_calls: Vec<AssistantToolCallRecord>,
+    /// Token usage for this turn, if the provider reported it.
     pub token_usage: Option<TokenUsage>,
+    /// The results of the tool calls, in order.
     pub tool_results: Vec<ToolResultRecord>,
+    /// The images displayed during this turn, in display order.
     pub displayed_images: Vec<DisplayedImageRecord>,
     /// Opaque reasoning round-trip artifact (None when never captured or
     /// when the provider exposes no reusable artifact).
@@ -160,21 +197,28 @@ pub struct Turn {
     pub reasoning_producer: Option<ReasoningProducer>,
 }
 
+/// The processing state of a session, as last reported by its thread.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SessionStatus {
+    /// The session's thread has parked; only an `AttachSession` reloads it.
     Sleeping,
     /// Default initial state — session is loaded and ready but not processing.
     #[default]
     Inactive,
+    /// The session is streaming an inference response.
     Inference,
+    /// The session is running a tool call; the string is the tool name.
     ToolCall(String),
     /// The daemon received a retryable HTTP error (429/5xx/connection) and is
     /// waiting before the next attempt.  Displayed in the TUI so the user
     /// knows the model call hasn't stalled and can choose to cancel.
     Retrying {
+        /// The attempt number about to be made (1-based).
         attempt: u32,
+        /// The maximum number of attempts configured before giving up.
         max_attempts: u32,
+        /// The backoff delay before the next attempt, in milliseconds.
         delay_ms: u64,
     },
 }
@@ -205,13 +249,21 @@ impl SessionStatus {
     }
 }
 
+/// A session's metadata row, as listed and ordered by the sessions manager:
+/// identity, display fields, timestamps, status, and the pinned/archived flags.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionSummary {
+    /// The session's unique id.
     pub session_id: u64,
+    /// The session's title, when set.
     pub title: Option<String>,
+    /// The currently selected model id, when set.
     pub selected_model: Option<String>,
+    /// The current reasoning-effort slug, when set.
     pub reasoning_effort: Option<String>,
+    /// The parent session this one branches from, when it is a sub-session.
     pub parent_session_id: Option<u64>,
+    /// The session's working directory, when set.
     pub working_dir: Option<String>,
     /// Session creation time, Unix-epoch-milliseconds.
     pub created_at: i64,
@@ -219,8 +271,11 @@ pub struct SessionSummary {
     /// daemon whenever the session's status, title, model, or turn count
     /// changes, and used to order the sessions list (newest first).
     pub last_modified: i64,
+    /// The number of turns the session currently holds.
     pub turn_count: u32,
+    /// The session's current processing state.
     pub status: SessionStatus,
+    /// The tool groups active for the session (e.g. `shell`, `web`).
     pub active_tool_groups: Vec<String>,
     /// The AI provider account name associated with this session, if any.
     pub account_name: Option<String>,
@@ -272,7 +327,7 @@ impl SessionSummary {
 ///
 /// These 31 events used to be `DaemonMessage` variants that each carried
 /// their own `session_id` field. They now live inside
-/// [`DaemonMessageType::Session`], whose envelope supplies the origin session
+/// [`DaemonMessageType::Session`](crate::DaemonMessageType::Session), whose envelope supplies the origin session
 /// for every session-scoped event: `session_id: Some(id)`, present on the
 /// wire as `Some(id)`, so every event has an origin session **by
 /// construction** — it can never be forgotten, mismatched, or duplicated.
@@ -284,15 +339,25 @@ impl SessionSummary {
 /// the wire the origin is absent as `null`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SessionEvent {
+    /// Broadcast notification that a new session was created, sent to every
+    /// subscriber. A sub-session arrives here with a non-null
+    /// `parent_session_id`.
     SessionCreated {
+        /// The new session's initial title, when set.
         title: Option<String>,
+        /// The parent session the new one branches from, when it is a
+        /// sub-session.
         parent_session_id: Option<u64>,
+        /// The new session's working directory, when set.
         working_dir: Option<String>,
+        /// The account the new session is bound to, when set.
         account_name: Option<String>,
+        /// The model the new session selected, when set.
         selected_model: Option<String>,
+        /// The reasoning-effort slug the new session started with, when set.
         reasoning_effort: Option<String>,
     },
-    /// Direct reply to the creating connection's [`ClientMessageType::CreateSession`].
+    /// Direct reply to the creating connection's [`ClientMessageType::CreateSession`](crate::ClientMessageType::CreateSession).
     ///
     /// Unlike [`SessionEvent::SessionCreated`] — which is BROADCAST to every
     /// subscriber as a notification — this variant is sent ONLY to the client
@@ -311,20 +376,37 @@ pub enum SessionEvent {
     /// indistinguishable from the broadcast). A sub-session still arrives as a
     /// broadcast `SessionCreated` with a non-null `parent_session_id`.
     SessionCreatedForRequester {
+        /// The new session's initial title, when set.
         title: Option<String>,
+        /// The parent session the new one branches from, when a sub-session.
         parent_session_id: Option<u64>,
+        /// The new session's working directory, when set.
         working_dir: Option<String>,
+        /// The account the new session is bound to, when set.
         account_name: Option<String>,
+        /// The model the new session selected, when set.
         selected_model: Option<String>,
+        /// The reasoning-effort slug the new session started with, when set.
         reasoning_effort: Option<String>,
     },
+    /// Reply confirming the requester is now attached to a session; carries no
+    /// payload (the state arrives separately as
+    /// [`SessionEvent::SessionState`]).
     SessionAttached,
+    /// The full state of a session, sent on attach (and as a resync): the
+    /// session's metadata, every turn, and the live status/token fields.
     SessionState {
+        /// The session's title, when set.
         title: Option<String>,
+        /// The currently selected model id, when set.
         selected_model: Option<String>,
+        /// The parent session this one branches from, when a sub-session.
         parent_session_id: Option<u64>,
+        /// The session's working directory, when set.
         working_dir: Option<String>,
+        /// Every turn of the session, keyed by turn id.
         turns: BTreeMap<u32, Turn>,
+        /// The tool groups active for the session.
         active_tool_groups: Vec<String>,
         /// Accumulated token usage for this session, if available.
         #[serde(default)]
@@ -339,35 +421,58 @@ pub enum SessionEvent {
         /// Current session status (`Inactive`, `Inference`, `ToolCall`, etc.).
         #[serde(default)]
         status: SessionStatus,
+        /// The current reasoning-effort slug, when set.
         #[serde(default)]
         reasoning_effort: Option<String>,
+        /// The selected model's reasoning capability, when known.
         #[serde(default)]
         reasoning_capability: Option<ReasoningCapability>,
     },
+    /// A new turn was appended to the session.
     TurnAppended {
+        /// The id assigned to the appended turn.
         turn_id: u32,
+        /// The turn's full content.
         turn: Turn,
     },
+    /// The session's processing status changed.
     SessionStatusChanged {
+        /// The new status.
         status: SessionStatus,
         /// Unix-epoch-milliseconds timestamp of this status change, so the
         /// TUI can re-sort the sessions list (most recently modified first)
         /// without waiting for a fresh `ListSessions` round-trip.
         last_modified: i64,
     },
+    /// A session-scoped operation failed; distinct from a per-run
+    /// [`SessionEvent::Failed`].
     SessionFailed {
+        /// The operation that failed (e.g. `SetSessionPinned`).
         operation: String,
+        /// The human-readable failure reason (also delivered to the requester
+        /// as its targeted reply).
         error: String,
     },
+    /// The daemon accepted a run: it carries the allocated `stream_id` and the
+    /// turn about to be generated, so subscribers can key the stream.
     Started {
+        /// The run's stream id, allocated by the daemon.
         stream_id: u64,
+        /// The id of the turn this run will produce.
         turn_id: u32,
+        /// The daemon's estimate of the run's prompt tokens.
         estimated_prompt_tokens: u32,
     },
+    /// A tool call has started; carries the call's identity and arguments
+    /// before any output arrives.
     ToolCallStarted {
+        /// The run's stream id.
         stream_id: u64,
+        /// The provider-assigned call id for this tool call.
         call_id: String,
+        /// The tool name being invoked.
         tool_name: String,
+        /// The raw JSON arguments the model produced for the call.
         arguments_json: String,
         /// Human-readable invocation description (e.g. "Running command:
         /// `cargo build`.") so clients can render the tool's context as soon
@@ -375,38 +480,62 @@ pub enum SessionEvent {
         /// or the final result.  Mirrors `ToolOutput.invocation_description`.
         invocation_description: String,
     },
+    /// A tool call finished successfully.
     ToolCallFinished {
+        /// The run's stream id.
         stream_id: u64,
+        /// The call id of the finished tool call.
         call_id: String,
+        /// The tool name that finished.
         tool_name: String,
     },
+    /// A chunk of a tool's streaming output.
     ToolResultChunk {
+        /// The run's stream id.
         stream_id: u64,
+        /// The call id the chunk belongs to.
         call_id: String,
+        /// A chunk of the tool's streaming output.
         data: Vec<u8>,
     },
+    /// A tool call failed.
     ToolCallFailed {
+        /// The run's stream id.
         stream_id: u64,
+        /// The call id of the failed tool call.
         call_id: String,
+        /// The tool name that failed.
         tool_name: String,
+        /// The human-readable failure reason.
         error: String,
     },
+    /// A mid-run token-usage update for the session.
     TokenUsageUpdate {
+        /// The updated accumulated token usage.
         token_usage: TokenUsage,
+        /// The most recent `prompt_tokens`, if available.
         last_prompt_tokens: Option<u32>,
     },
     /// Cumulative output-token estimate for the current turn, updated as
     /// each stream chunk arrives.  Used by the TUI for live token display.
     LiveOutputTokenCount {
+        /// The run's stream id.
         stream_id: u64,
+        /// The cumulative output-token count so far.
         output_tokens: u32,
     },
+    /// A chunk of streamed model output (answer or reasoning).
     OutputChunk {
+        /// The run's stream id.
         stream_id: u64,
+        /// Which stream (answer vs. reasoning) this chunk belongs to.
         stream: OutputStream,
+        /// The chunk's raw bytes.
         data: Vec<u8>,
     },
+    /// The run completed successfully.
     Done {
+        /// The run's stream id.
         stream_id: u64,
         /// Token usage for the completed request, if reported by the provider.
         token_usage: Option<TokenUsage>,
@@ -415,24 +544,38 @@ pub enum SessionEvent {
         #[serde(default)]
         last_prompt_tokens: Option<u32>,
     },
+    /// The run failed terminally.
     Failed {
+        /// The run's stream id.
         stream_id: u64,
+        /// The human-readable failure reason.
         error: String,
     },
+    /// The run was cancelled.
     Cancelled {
+        /// The run's stream id.
         stream_id: u64,
     },
+    /// The session's model was selected (or changed).
     ModelSelected {
+        /// The newly selected model id.
         model: String,
+        /// The new model's reasoning capability, when known.
         #[serde(default)]
         reasoning_capability: Option<ReasoningCapability>,
     },
+    /// The session's model could not be selected.
     ModelSelectionFailed {
+        /// The model id that failed to select.
         model: String,
+        /// The human-readable failure reason.
         error: String,
     },
+    /// The session was deleted; subscribers can drop it from their lists.
     SessionDeleted,
+    /// The session could not be deleted.
     SessionDeleteFailed {
+        /// The human-readable failure reason.
         error: String,
     },
     /// The session's `pinned`/`archived_at` flags changed. This is a
@@ -445,32 +588,51 @@ pub enum SessionEvent {
     /// success, `SessionFailed` on failure. It carries the full post-change
     /// flag state so a subscriber can update its view directly.
     SessionFlagsChanged {
+        /// Whether the session is now pinned.
         pinned: bool,
+        /// When the session was archived, or `None` when it is not archived.
         archived_at: Option<i64>,
     },
+    /// Turns were undone; the listed turn ids are now marked undone.
     TurnsUndone {
+        /// The ids of the turns that were undone.
         turn_ids: Vec<u32>,
     },
+    /// Turns were redone; carries their restored content keyed by turn id.
     TurnsRedone {
+        /// The redone turns, keyed by turn id.
         turns: BTreeMap<u32, Turn>,
     },
+    /// The session's bound provider account changed.
     SessionAccountSet {
+        /// The new account name.
         account: String,
     },
+    /// The session's model context window was resolved.
     ContextWindowResolved {
+        /// The resolved context window size, in tokens.
         context_window: u32,
     },
+    /// The session's working directory changed.
     SessionWorkingDirSet {
+        /// The new working directory, or `None` when cleared.
         path: Option<String>,
     },
+    /// The session's title changed.
     SessionTitleSet {
+        /// The new title.
         title: String,
     },
+    /// The session's reasoning effort was set.
     ReasoningEffortSet {
+        /// The new reasoning-effort slug.
         effort: String,
     },
+    /// The session's reasoning effort could not be set.
     ReasoningEffortSetFailed {
+        /// The effort slug that failed to apply.
         effort: String,
+        /// The human-readable failure reason.
         error: String,
     },
 }
@@ -481,7 +643,7 @@ impl SessionEvent {
     /// A `SessionEvent` carries session payload — turn text, tool arguments
     /// and output, stream bytes — so its `Debug` output must never be formatted
     /// into a log line or a bail string. Log this tag instead (alongside the
-    /// envelope's origin session id). See [`DaemonMessageType::kind`].
+    /// envelope's origin session id). See [`DaemonMessageType::kind`](crate::DaemonMessageType::kind).
     #[must_use]
     pub fn kind(&self) -> &'static str {
         match self {

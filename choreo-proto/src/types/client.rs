@@ -51,22 +51,47 @@ impl ClientMessage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ClientMessageType {
+    /// Create a session with the given initial metadata.
     CreateSession {
+        /// Initial session title; `None` leaves it untitled for the daemon to
+        /// name later.
         title: Option<String>,
+        /// The session this one branches from, for a sub-session; `None` for a
+        /// root session.
         parent_session_id: Option<u64>,
+        /// The session's working directory; `None` inherits the daemon
+        /// default.
         working_dir: Option<String>,
+        /// Overrides for context-file discovery; `None` uses the default
+        /// [`ContextConfig`].
         context_config: Option<ContextConfig>,
+        /// The AI provider account to bind the session to; `None` uses the
+        /// daemon default.
         account_name: Option<String>,
+        /// The initial model id; `None` uses the account/provider default.
         selected_model: Option<String>,
+        /// The initial reasoning-effort slug; `None` uses the model default.
+        /// Must be one the model's capability set advertises.
         reasoning_effort: Option<String>,
     },
+    /// List every session as a [`SessionSummary`](crate::SessionSummary), in the
+    /// shared list order (pinned first, then newest).
     ListSessions,
+    /// Subscribe this connection to session-summary broadcasts: session
+    /// create/delete plus status, title, and flag changes.
     SubscribeSessionsSummary,
+    /// Stop session-summary broadcasts for this connection.
     UnsubscribeSessionsSummary,
+    /// Attach this connection to a session, loading its state and subscribing
+    /// it to that session's events.
     AttachSession {
+        /// The id of the session to attach to.
         session_id: u64,
     },
+    /// Fetch a session's full state (`ClientMessageType::SessionState`
+    /// payload) without attaching.
     GetSessionState {
+        /// The id of the session whose state is requested.
         session_id: u64,
     },
     /// Submit user input to the attached session. The daemon allocates the
@@ -77,15 +102,24 @@ pub enum ClientMessageType {
     /// attached session; once `Started` arrives the client cancels by the
     /// learned `stream_id`.
     RunInput {
+        /// The raw user input bytes submitted for the attached session.
         input: Vec<u8>,
     },
+    /// Cancel the run identified by `stream_id`, or whatever is active on the
+    /// attached session when the `CANCEL_ALL` sentinel (`0`) is used.
     Cancel {
+        /// The run's `stream_id`, or the `CANCEL_ALL` sentinel `0`.
         stream_id: u64,
     },
+    /// Liveness probe; the daemon answers with
+    /// [`DaemonMessageType::Pong`](crate::DaemonMessageType::Pong).
     Ping,
+    /// Fetch the stored (encrypted) credential for one service.
     GetCredential {
+        /// The service key whose stored credential is requested.
         service: String,
     },
+    /// Request the available model ids and the currently selected model.
     ListModels,
     /// Ask the daemon to refresh the models.dev catalog from upstream: a
     /// conditional GET against the cached etag, then a catalog swap when the
@@ -93,38 +127,55 @@ pub enum ClientMessageType {
     /// The daemon replies with `DaemonMessageType::ModelsRefreshed` (or
     /// `ModelsRefreshFailed`).
     RefreshModels {
+        /// When `true`, bypass the cached etag and fetch the catalog
+        /// unconditionally (`Cache-Control: no-cache`).
         force: bool,
     },
+    /// Select a model for the attached session.
     SetModel {
+        /// The model id to select.
         model: String,
     },
+    /// Unlock the daemon's keystore by presenting the bound unlock key.
     Unlock {
+        /// The 32-byte X25519 private unlock key, verified against the binding.
         private_key: Vec<u8>,
     },
+    /// Wipe the daemon's in-memory credentials and re-latch the locked state.
     Lock,
     /// Establish (TOFU-bind) the daemon's keystore binding with the 32-byte
     /// X25519 private unlock key. This is the ONLY wire path that can create
     /// the binding: on an unbound keystore the daemon adopts the key (loud
     /// `KEYSTORE BOUND` log), runs the shared unlock tail (same code path as
     /// `AddCredential`'s implicit unlock), and replies
-    /// [`DaemonMessageType::Bound`]. On an ALREADY-bound keystore the key is
+    /// [`DaemonMessageType::Bound`](crate::DaemonMessageType::Bound). On an ALREADY-bound keystore the key is
     /// verified against the binding — a mismatch is rejected with the usual
     /// wrong-key semantics (no unlock, no overwrite). Unlock and `AddCredential`
     /// are strictly VERIFY-ONLY and cannot create a binding.
     BindKeystore {
+        /// The 32-byte X25519 private unlock key to adopt (or verify) as the
+        /// daemon's keystore binding.
         key: Vec<u8>,
     },
+    /// Store a client-side-encrypted credential, implicitly unlocking the
+    /// daemon on receipt.
     AddCredential {
+        /// The service key the credential is stored under.
         service: String,
+        /// The client-side-encrypted credential blob to persist.
         encrypted_payload: Vec<u8>,
         // Required (not Option): the credential blob is encrypted with the
         // unlock key client-side, so the daemon must be able to
         // test-decrypt + implicitly unlock on receipt (TOFU per-daemon
         // keystore binding). An omitted key would leave an undecryptable
         // blob persisted, breaking the whole keystore.
+        /// The 32-byte unlock key the blob was encrypted with, required so the
+        /// daemon can test-decrypt and implicitly unlock on receipt.
         unlock_key: Vec<u8>,
     },
+    /// Remove the stored credential for one service.
     RemoveCredential {
+        /// The service key whose stored credential is removed.
         service: String,
     },
     /// Enroll a NEW client in the daemon's ACL (base64 of the client's
@@ -137,21 +188,26 @@ pub enum ClientMessageType {
     /// chain makes it authoritative immediately, and an `AclUpdated`
     /// broadcast informs every connected client.
     AclAdd {
+        /// Base64 of the new client's 32-byte transport public key.
         pubkey: String,
     },
+    /// Delete a session and its persisted turns.
     DeleteSession {
+        /// The id of the session to delete.
         session_id: u64,
     },
     /// Set (or clear) the session's `pinned` flag. The daemon is the
     /// authority: it updates its metadata index, persists the flag via a
     /// read-modify-write that touches ONLY the two flag columns, and
-    /// broadcasts [`SessionEvent::SessionFlagsChanged`] to every subscriber
+    /// broadcasts [`SessionEvent::SessionFlagsChanged`](crate::SessionEvent::SessionFlagsChanged) to every subscriber
     /// (the requesting connection included) — that broadcast is the state
     /// update, not the acknowledgement. The requester ALSO gets exactly one
-    /// targeted terminal reply: a [`DaemonMessageType::Accepted`] on success,
-    /// or a session-scoped [`SessionEvent::SessionFailed`] on failure.
+    /// targeted terminal reply: a [`DaemonMessageType::Accepted`](crate::DaemonMessageType::Accepted) on success,
+    /// or a session-scoped [`SessionEvent::SessionFailed`](crate::SessionEvent::SessionFailed) on failure.
     SetSessionPinned {
+        /// The id of the session whose `pinned` flag is set.
         session_id: u64,
+        /// The new pinned state (`true` pins, `false` unpins).
         pinned: bool,
     },
     /// Set (or clear) the session's `archived` state. Archiving stamps the
@@ -159,31 +215,57 @@ pub enum ClientMessageType {
     /// Same daemon-authoritative update/broadcast/ack contract as
     /// [`ClientMessageType::SetSessionPinned`].
     SetSessionArchived {
+        /// The id of the session whose archived state is set.
         session_id: u64,
+        /// Whether to archive (`true`) or unarchive (`false`) the session.
         archived: bool,
     },
+    /// Add a provider account (a named endpoint plus its transport tuning).
     AddAccount {
+        /// The account's unique name.
         name: String,
+        /// The provider the account targets (e.g. `anthropic`, `openai`).
         provider: String,
+        /// Override for the provider API base URL; `None` uses the provider
+        /// default.
         base_url: Option<String>,
+        /// Whether to request streamed responses; `None` uses the provider
+        /// default.
         streaming: Option<bool>,
+        /// Maximum retry attempts on retryable errors; `None` uses the
+        /// default.
         retry_max_attempts: Option<u32>,
+        /// Connect timeout in seconds; `None` uses the default.
         connect_timeout_secs: Option<u64>,
+        /// Per-request timeout in seconds; `None` uses the default.
         request_timeout_secs: Option<u64>,
+        /// Total deadline across all retries, in seconds; `None` uses the
+        /// default.
         total_timeout_secs: Option<u64>,
     },
+    /// Remove a provider account by name.
     RemoveAccount {
+        /// The name of the account to remove.
         name: String,
     },
+    /// Request every configured account as [`AccountInfo`](crate::AccountInfo).
     ListAccounts,
+    /// Bind the attached session to a provider account.
     SetSessionAccount {
+        /// The account name to bind the session to.
         name: String,
     },
+    /// Set the attached session's reasoning-effort slug.
     SetReasoningEffort {
+        /// The reasoning-effort slug to set (must be in the model's available
+        /// set).
         effort: String,
     },
+    /// Request the attached session's current reasoning-effort setting.
     GetReasoningEffort,
+    /// Undo the most recent turn.
     Undo,
+    /// Redo the most recently undone turn.
     Redo,
     /// Create a new turn with the text "Continue." and run the agent loop.
     /// Semantically distinct from `RunInput` — the daemon controls the prompt
@@ -198,7 +280,7 @@ pub enum ClientMessageType {
     /// byte-less `ImageReference` (path + mime + dimensions). A long session's
     /// history therefore ships no image bytes up front; the client fetches each
     /// image on demand — typically when it scrolls into view — and the daemon
-    /// replies with a targeted [`DaemonMessageType::Image`].
+    /// replies with a targeted [`DaemonMessageType::Image`](crate::DaemonMessageType::Image).
     ///
     /// The bytes are served from the daemon's durable `session_attachments`
     /// store, keyed exactly like the wire request: (`session_id`, `turn_id`,
@@ -208,49 +290,56 @@ pub enum ClientMessageType {
     /// a vision image is pinned to its tool call's id), so the key is a stable
     /// identifier and matches the DB slot the turn was persisted under.
     GetImage {
+        /// The id of the session the attachment belongs to.
         session_id: u64,
+        /// The turn the attachment belongs to.
         turn_id: u32,
+        /// Which of the turn's attachments to fetch (see [`ImageKey`]).
         key: ImageKey,
     },
     /// Request the state of every configured MCP server. The daemon replies
-    /// with [`DaemonMessageType::McpStatus`].
+    /// with [`DaemonMessageType::McpStatus`](crate::DaemonMessageType::McpStatus).
     McpStatusRequest,
     /// Reconnect one configured MCP server (rebuild its connection and refresh
     /// the tool catalogue), identified by its slug. On success the daemon
-    /// replies with a refreshed [`DaemonMessageType::McpStatus`]; on failure with
-    /// [`DaemonMessageType::McpReconnectFailed`].
+    /// replies with a refreshed [`DaemonMessageType::McpStatus`](crate::DaemonMessageType::McpStatus); on failure with
+    /// [`DaemonMessageType::McpReconnectFailed`](crate::DaemonMessageType::McpReconnectFailed).
     McpReconnect {
+        /// The slug of the MCP server to reconnect.
         slug: String,
     },
     /// Reload the MCP server configuration: reconcile the active session's
     /// project `.mcp.json` (its daemon-tier `mcp.json` and `trust.toml` are
     /// hot-reloaded by the daemon's config watcher), rebuilding the tool
     /// catalogue — without restarting the daemon. On success the daemon
-    /// replies with [`DaemonMessageType::McpReloaded`]; when the config cannot be
-    /// read or parsed, with [`DaemonMessageType::McpReloadFailed`].
+    /// replies with [`DaemonMessageType::McpReloaded`](crate::DaemonMessageType::McpReloaded); when the config cannot be
+    /// read or parsed, with [`DaemonMessageType::McpReloadFailed`](crate::DaemonMessageType::McpReloadFailed).
     McpReload,
     /// Trust the ACTIVE session's project MCP root: the directory containing
     /// the nearest `.mcp.json` found by walking up from the session's working
     /// directory to the git root. Trust is whole-project (one decision covers
     /// every server that root's `.mcp.json` declares) and content-agnostic (a
     /// root with no `.mcp.json` yet may be trusted). The daemon replies with
-    /// [`DaemonMessageType::McpTrustUpdated`].
+    /// [`DaemonMessageType::McpTrustUpdated`](crate::DaemonMessageType::McpTrustUpdated).
     McpTrust,
     /// Revoke trust for the ACTIVE session's project MCP root (the same root
     /// [`ClientMessageType::McpTrust`] would trust). Replies with
-    /// [`DaemonMessageType::McpTrustUpdated`].
+    /// [`DaemonMessageType::McpTrustUpdated`](crate::DaemonMessageType::McpTrustUpdated).
     McpUntrust,
     /// Request the list of currently trusted project MCP roots. Replies with
-    /// [`DaemonMessageType::McpTrustList`].
+    /// [`DaemonMessageType::McpTrustList`](crate::DaemonMessageType::McpTrustList).
     McpTrustList,
+    /// Subscribe this connection to the all-activity fan-out: every session's
+    /// events, deduplicated across sessions.
     SubscribeAllActivity,
+    /// Stop the all-activity fan-out for this connection.
     UnsubscribeAllActivity,
 }
 
 /// A coarse tag naming a request kind, one variant per [`ClientMessageType`].
 ///
-/// The daemon surfaces it in [`DaemonMessageType::Accepted`] /
-/// [`DaemonMessageType::Failed`] and clients use it as the log/timeout key, so
+/// The daemon surfaces it in [`DaemonMessageType::Accepted`](crate::DaemonMessageType::Accepted) /
+/// [`DaemonMessageType::Failed`](crate::DaemonMessageType::Failed) and clients use it as the log/timeout key, so
 /// every request/reply exchange self-identifies without the receiver having to
 /// reconstruct which request a bare success reply answered. It is `Copy`
 /// because it is a pure tag carried by value.
@@ -271,45 +360,85 @@ pub enum ClientMessageType {
 /// parallel list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageKind {
+    /// Create a new session.
     CreateSession,
+    /// List all sessions.
     ListSessions,
+    /// Subscribe to session-summary broadcasts.
     SubscribeSessionsSummary,
+    /// Unsubscribe from session-summary broadcasts.
     UnsubscribeSessionsSummary,
+    /// Attach to a session.
     AttachSession,
+    /// Fetch a session's full state without attaching.
     GetSessionState,
+    /// Submit user input to the attached session.
     RunInput,
+    /// Cancel an in-flight run.
     Cancel,
+    /// Liveness probe.
     Ping,
+    /// Fetch a stored credential.
     GetCredential,
+    /// List the available models.
     ListModels,
+    /// Refresh the model catalog from upstream.
     RefreshModels,
+    /// Select a model for the attached session.
     SetModel,
+    /// Unlock the keystore.
     Unlock,
+    /// Lock the keystore.
     Lock,
+    /// Bind the keystore to a new key.
     BindKeystore,
+    /// Store a client-encrypted credential.
     AddCredential,
+    /// Remove a stored credential.
     RemoveCredential,
+    /// Enroll a new client in the ACL.
     AclAdd,
+    /// Delete a session.
     DeleteSession,
+    /// Set a session's pinned flag.
     SetSessionPinned,
+    /// Set a session's archived state.
     SetSessionArchived,
+    /// Add a provider account.
     AddAccount,
+    /// Remove a provider account.
     RemoveAccount,
+    /// List the configured provider accounts.
     ListAccounts,
+    /// Bind the attached session to a provider account.
     SetSessionAccount,
+    /// Set the reasoning effort.
     SetReasoningEffort,
+    /// Read the reasoning effort.
     GetReasoningEffort,
+    /// Undo the last turn.
     Undo,
+    /// Redo an undone turn.
     Redo,
+    /// Continue generation with the daemon-supplied prompt.
     ContinueGeneration,
+    /// Fetch a turn attachment's bytes.
     GetImage,
+    /// Fetch MCP server status.
     McpStatusRequest,
+    /// Reconnect an MCP server.
     McpReconnect,
+    /// Reload the MCP configuration.
     McpReload,
+    /// Trust the active session's project MCP root.
     McpTrust,
+    /// Revoke trust for the active session's project MCP root.
     McpUntrust,
+    /// List the trusted project MCP roots.
     McpTrustList,
+    /// Subscribe to the all-activity fan-out.
     SubscribeAllActivity,
+    /// Unsubscribe from the all-activity fan-out.
     UnsubscribeAllActivity,
 }
 

@@ -52,7 +52,7 @@ use std::io::Cursor;
 /// required only once a version has shipped in a release.
 pub const PROTOCOL_VERSION: u8 = 9;
 /// Max serialised *payload* size, enforced identically on encode (before the
-/// 4-byte length prefix is added — [`encode_inner`]) and on decode
+/// 4-byte length prefix is added — `encode_inner`) and on decode
 /// (`read_payload`, which checks the length prefix before reading the body).
 /// A payload at the limit therefore produces a frame of
 /// `MAX_FRAME_SIZE + 4` bytes.

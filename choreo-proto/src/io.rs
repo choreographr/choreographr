@@ -3,6 +3,9 @@ use crate::frame::{MAX_FRAME_SIZE, decode_frame, encode_frame};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
+/// Environment variable that overrides the default unix-socket path; when set
+/// (and non-empty) its value is returned verbatim by [`socket_path`], so the
+/// daemon and every client resolve the same path from one place.
 pub const SOCKET_PATH_ENV: &str = "CHOREOGRAPHR_SOCKET_PATH";
 
 // The unix-socket stream type, resolved per platform: std's `UnixStream` on

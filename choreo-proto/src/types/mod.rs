@@ -82,6 +82,7 @@ impl TimestampMs {
         )
     }
 
+    /// The underlying Unix-epoch-milliseconds value.
     #[must_use]
     pub fn as_millis(&self) -> i64 {
         self.0
