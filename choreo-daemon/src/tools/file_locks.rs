@@ -21,13 +21,14 @@
 //! `Mutex` is not reentrant and would deadlock.
 //!
 //! Scope: only the three `fs` mutation tools (`write_file`, `edit_file`,
-//! `delete_files`) take these locks, and the key is the *exact* file path. Two
-//! consequences follow. First, `delete_files` of a *directory* does not
-//! serialize against a `write_file`/`edit_file` of a file *inside* it — the
-//! directory path and the child path are different keys. Second, a tool that
-//! writes to an arbitrary path outside this module (`retrieve_webpage`'s
-//! `output_path`, for one) is not covered. Any new mutating tool that can run
-//! in a concurrent batch should route its write through [`with_file_lock`].
+//! `delete_files`) take these locks, and the key is a single canonical path —
+//! one lock per file, not a subtree. Two consequences follow. First,
+//! `delete_files` of a *directory* does not serialize against a
+//! `write_file`/`edit_file` of a file *inside* it — the directory path and the
+//! child path are different keys. Second, a tool that writes to an arbitrary
+//! path outside this module (`retrieve_webpage`'s `output_path`, for one) is not
+//! covered. Any new mutating tool that can run in a concurrent batch should
+//! route its write through [`with_file_lock`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -137,6 +138,15 @@ static FILE_LOCKS: LazyLock<FileLocks> = LazyLock::new(FileLocks::new);
 /// The lock key for a resolved path: its canonical path when the target exists
 /// (so two symlinks to one file share a lock), else a key derived by
 /// canonicalizing the parent directory and re-appending the file name.
+///
+/// When even the parent cannot be canonicalized (a create under a directory
+/// that does not exist yet) the key falls back to a lexical absolutization that
+/// two differently-symlinked spellings of that missing parent could disagree
+/// on. That cannot lose an update: the only read-modify-write tool (`edit_file`)
+/// must read the target and so always runs on an existing file, taking the
+/// canonical branch above, while a pair of whole-file writes or deletes has no
+/// lost update to prevent. The fallback is therefore a missed — not a harmful —
+/// serialization.
 fn mutation_key(resolved: &Path) -> PathBuf {
     if let Ok(canonical) = std::fs::canonicalize(resolved) {
         return canonical;
