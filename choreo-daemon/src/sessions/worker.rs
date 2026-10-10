@@ -89,7 +89,14 @@ pub(super) fn run_request_worker(args: RequestWorkerArgs<'_>) {
                 }));
         }
         RequestOutcome::Failed(error) => {
-            info!(session_id = ctx.session_id, stream_id, error = %error, "request failed");
+            // Never `%error`: a request-failure message can embed provider/
+            // request text, so log only its length.
+            info!(
+                session_id = ctx.session_id,
+                stream_id,
+                error_len = error.to_string().len(),
+                "request failed"
+            );
             // Route through the main session thread so detach is respected.
             let _ = ctx
                 .cmd_tx

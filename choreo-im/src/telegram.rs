@@ -262,7 +262,7 @@ fn send_daemon_event(bot: &Bot, chat_id: i64, event: BridgeEvent) {
             name,
             error: error_msg,
         } => {
-            error!(%name, %error_msg, "tool call failed");
+            error!(%name, error_len = error_msg.len(), "tool call failed");
             if let Err(e) = bot.send_message(
                 chat_id,
                 &format!("<b>{name}</b> failed: {error_msg}"),
@@ -278,7 +278,8 @@ fn send_daemon_event(bot: &Bot, chat_id: i64, event: BridgeEvent) {
             }
         }
         BridgeEvent::Error(msg) => {
-            error!(%msg, "sending error to telegram");
+            // Never `%msg`: the error text can embed payload.
+            error!(error_len = msg.len(), "sending error to telegram");
             if let Err(e) = bot.send_message(chat_id, &msg, None) {
                 warn!("failed to send error event to telegram: {e}");
             }
