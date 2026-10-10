@@ -1,4 +1,5 @@
 use super::{ensure_parent_directories, validate_nonempty_path, write_text_file};
+use crate::tools::file_locks::with_file_lock;
 use crate::tools::{ToolExecError, resolve_path};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -34,29 +35,35 @@ pub fn execute_write_file_tool(
 ) -> Result<String, ToolExecError> {
     let path = validate_nonempty_path(&args.path)?;
     let resolved = resolve_path(&path, working_dir);
-    ensure_parent_directories(&resolved, args.create_parents.unwrap_or(true))?;
 
-    match write_text_file(&resolved, &args.content, args.overwrite.unwrap_or(true)) {
-        Ok(()) => {
-            info!(path = %resolved.display(), bytes = args.content.len(), "write_file: wrote file");
-            let lang = ext_to_lang(&resolved.display().to_string());
-            let fenced = super::fence_content(&args.content, lang);
-            Ok(format!("wrote file: {}\n\n{}", resolved.display(), fenced))
-        }
-        Err(error) => {
-            let overwrite = args.overwrite.unwrap_or(true);
-            if !overwrite && error.kind() == io::ErrorKind::AlreadyExists {
-                warn!(path = %resolved.display(), "write_file: refusing to overwrite existing file");
-                Err(ToolExecError(format!(
-                    "refusing to overwrite existing file: {}",
-                    resolved.display()
-                )))
-            } else {
-                warn!(path = %resolved.display(), error = %error, "write_file: failed to write file");
-                Err(ToolExecError(format!("{error}")))
+    // Hold the per-file mutation lock so a concurrent write (or edit) of the
+    // same file in one turn serializes — tool calls in a turn are dispatched
+    // concurrently (see `tools::file_locks`).
+    with_file_lock(&resolved, || {
+        ensure_parent_directories(&resolved, args.create_parents.unwrap_or(true))?;
+
+        match write_text_file(&resolved, &args.content, args.overwrite.unwrap_or(true)) {
+            Ok(()) => {
+                info!(path = %resolved.display(), bytes = args.content.len(), "write_file: wrote file");
+                let lang = ext_to_lang(&resolved.display().to_string());
+                let fenced = super::fence_content(&args.content, lang);
+                Ok(format!("wrote file: {}\n\n{}", resolved.display(), fenced))
+            }
+            Err(error) => {
+                let overwrite = args.overwrite.unwrap_or(true);
+                if !overwrite && error.kind() == io::ErrorKind::AlreadyExists {
+                    warn!(path = %resolved.display(), "write_file: refusing to overwrite existing file");
+                    Err(ToolExecError(format!(
+                        "refusing to overwrite existing file: {}",
+                        resolved.display()
+                    )))
+                } else {
+                    warn!(path = %resolved.display(), error = %error, "write_file: failed to write file");
+                    Err(ToolExecError(format!("{error}")))
+                }
             }
         }
-    }
+    })
 }
 
 fn ext_to_lang(path: &str) -> &'static str {

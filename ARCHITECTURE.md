@@ -3788,6 +3788,21 @@ log there; a process-global override is shared instead.  It carries no protocol
 data and is a no-op in production (nothing sets it outside tests), and
 nextest's process-per-test keeps one override per process isolated.
 
+The tools' per-file mutation locks (the daemon's
+`tools::file_locks::FILE_LOCKS`, a `LazyLock<FileLocks>` wrapping a
+`Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>`) are the twelfth sanctioned
+shared-state exception (see AGENTS.md).  Each turn's non-config tool calls run
+on their own threads (`requests.rs`, "Phase 2: All remaining tools
+(concurrent)"), so two mutations of the same file in one batch — the
+read-modify-write in `edit_file`, a `write_file` racing an `edit_file`, a
+`delete_files` racing either — would otherwise both read the original and
+silently lose one update; the per-path lock serializes them while mutations of
+different files stay parallel (pi's `withFileMutationQueue` is the same idea).
+The key is the file's canonical path, so two symlinks to one target share a
+lock; the map lock is held only for the brief reserve/prune steps (never
+across the mutation) and each per-path mutex only for the mutation itself; and
+it carries no protocol data.
+
 Token bookkeeping follows the same per-session rule.  `LiveOutputTokenCount`
 (during streaming) and `SessionState` snapshots (attach / `load_tools` /
 `unload_tools` broadcasts) are routed to the display of the session they

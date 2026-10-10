@@ -191,6 +191,7 @@ pub(crate) mod exec;
 // wrappers over its synchronous `execute_*` entry points.
 #[cfg(feature = "blockchain")]
 pub(crate) mod evm;
+pub(crate) mod file_locks;
 pub(crate) mod find;
 pub(crate) mod fish;
 pub(crate) mod fs;

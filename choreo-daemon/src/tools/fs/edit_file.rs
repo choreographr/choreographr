@@ -1,4 +1,5 @@
 use super::{validate_nonempty_path, write_text_file};
+use crate::tools::file_locks::with_file_lock;
 use crate::tools::{
     ToolExecError, display_path_label, resolve_path, sanitize_content, sanitize_name, sha256_hex,
 };
@@ -65,48 +66,55 @@ pub fn execute_edit_file_tool(
     }
 
     let resolved = resolve_path(&path, working_dir);
-    let original_content = std::fs::read_to_string(&resolved)?;
 
-    if let Some(expected_sha256) = args.expected_sha256.as_deref() {
-        let actual_sha256 = sha256_hex(&original_content);
-        if actual_sha256 != expected_sha256.trim().to_ascii_lowercase() {
-            return Err(ToolExecError(format!(
-                "expected_sha256 mismatch for {}: expected {}, got {}",
-                resolved.display(),
-                expected_sha256.trim(),
-                actual_sha256
-            )));
+    // Hold the per-file mutation lock across the whole read-modify-write so two
+    // concurrent edits (or an edit and a write) of the same file in one turn
+    // can't both read the original and lose an update — tool calls in a turn are
+    // dispatched concurrently (see `tools::file_locks`).
+    with_file_lock(&resolved, || {
+        let original_content = std::fs::read_to_string(&resolved)?;
+
+        if let Some(expected_sha256) = args.expected_sha256.as_deref() {
+            let actual_sha256 = sha256_hex(&original_content);
+            if actual_sha256 != expected_sha256.trim().to_ascii_lowercase() {
+                return Err(ToolExecError(format!(
+                    "expected_sha256 mismatch for {}: expected {}, got {}",
+                    resolved.display(),
+                    expected_sha256.trim(),
+                    actual_sha256
+                )));
+            }
         }
-    }
 
-    // Match on LF-normalized text so a CRLF file — whose `read_file` view is
-    // already LF-normalized — still matches the `old_text` the model copied,
-    // then restore the file's original line ending on write. Without this,
-    // exact matching fails on *every* line of a Windows-style file. (opencode
-    // and pi do the same normalize-match / restore-on-write dance.)
-    let line_ending = detect_line_ending(&original_content);
-    let normalized = to_lf(&original_content);
-    let edit_summary = apply_text_edits(&normalized, &args.edits).map_err(ToolExecError)?;
-    let final_content = restore_line_endings(&edit_summary.content, line_ending);
+        // Match on LF-normalized text so a CRLF file — whose `read_file` view is
+        // already LF-normalized — still matches the `old_text` the model copied,
+        // then restore the file's original line ending on write. Without this,
+        // exact matching fails on *every* line of a Windows-style file. (opencode
+        // and pi do the same normalize-match / restore-on-write dance.)
+        let line_ending = detect_line_ending(&original_content);
+        let normalized = to_lf(&original_content);
+        let edit_summary = apply_text_edits(&normalized, &args.edits).map_err(ToolExecError)?;
+        let final_content = restore_line_endings(&edit_summary.content, line_ending);
 
-    // Sanitize the display label: a hostile file name must not corrupt the
-    // line-oriented result (the same policy `grep`/`read_file` apply to paths).
-    let display = sanitize_name(&display_path_label(&resolved, working_dir));
+        // Sanitize the display label: a hostile file name must not corrupt the
+        // line-oriented result (the same policy `grep`/`read_file` apply to paths).
+        let display = sanitize_name(&display_path_label(&resolved, working_dir));
 
-    if args.dry_run.unwrap_or(false) {
-        return Ok(format_edit_result("would edit", &display, &edit_summary));
-    }
-
-    match write_text_file(&resolved, &final_content, true) {
-        Ok(()) => {
-            info!(path = %resolved.display(), replacement_count = edit_summary.replacement_count, "edit_file: applied edits");
-            Ok(format_edit_result("edited", &display, &edit_summary))
+        if args.dry_run.unwrap_or(false) {
+            return Ok(format_edit_result("would edit", &display, &edit_summary));
         }
-        Err(error) => {
-            warn!(path = %resolved.display(), error = %error, "edit_file: failed to write edited content");
-            Err(ToolExecError(format!("{error}")))
+
+        match write_text_file(&resolved, &final_content, true) {
+            Ok(()) => {
+                info!(path = %resolved.display(), replacement_count = edit_summary.replacement_count, "edit_file: applied edits");
+                Ok(format_edit_result("edited", &display, &edit_summary))
+            }
+            Err(error) => {
+                warn!(path = %resolved.display(), error = %error, "edit_file: failed to write edited content");
+                Err(ToolExecError(format!("{error}")))
+            }
         }
-    }
+    })
 }
 
 #[derive(Debug)]

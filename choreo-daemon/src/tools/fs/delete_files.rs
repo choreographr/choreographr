@@ -1,3 +1,4 @@
+use crate::tools::file_locks::with_file_locks;
 use crate::tools::glob_util::GlobFilter;
 use crate::tools::{ToolExecError, resolve_path, truncate_tool_output};
 use schemars::JsonSchema;
@@ -116,83 +117,89 @@ pub(crate) fn execute_delete_files_tool(
     // Collect partial results rather than failing fast. When deleting multiple
     // files, a single permission error should not prevent the rest from being
     // cleaned up. The caller receives both success and failure lists.
-    let mut deleted: Vec<String> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
+    //
+    // Hold the per-file mutation locks for every target across the deletion so a
+    // concurrent write/edit of one of these files in the same turn serializes —
+    // tool calls in a turn are dispatched concurrently (see `tools::file_locks`).
+    with_file_locks(&targets, || {
+        let mut deleted: Vec<String> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
 
-    for target in &targets {
-        // Use symlink_metadata (not metadata) to avoid following symlinks.
-        // If the target is a symlink to a directory outside the working dir,
-        // we only remove the symlink itself, not the remote directory.
-        let metadata = match std::fs::symlink_metadata(target) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!("delete_files: failed to stat '{}': {e}", target.display());
-                errors.push(format!("{}: {e}", target.display()));
-                continue;
-            }
-        };
+        for target in &targets {
+            // Use symlink_metadata (not metadata) to avoid following symlinks.
+            // If the target is a symlink to a directory outside the working dir,
+            // we only remove the symlink itself, not the remote directory.
+            let metadata = match std::fs::symlink_metadata(target) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("delete_files: failed to stat '{}': {e}", target.display());
+                    errors.push(format!("{}: {e}", target.display()));
+                    continue;
+                }
+            };
 
-        if metadata.is_dir() {
-            if args.recursive.unwrap_or(false) {
-                match std::fs::remove_dir_all(target) {
-                    Ok(()) => deleted.push(format!("{} (directory)", target.display())),
+            if metadata.is_dir() {
+                if args.recursive.unwrap_or(false) {
+                    match std::fs::remove_dir_all(target) {
+                        Ok(()) => deleted.push(format!("{} (directory)", target.display())),
+                        Err(e) => {
+                            error!(
+                                "delete_files: failed to remove directory '{}': {e}",
+                                target.display()
+                            );
+                            errors.push(format!("{}: {e}", target.display()));
+                        }
+                    }
+                } else {
+                    warn!(
+                        "delete_files: '{}' is a directory, recursive not set",
+                        target.display()
+                    );
+                    errors.push(format!(
+                        "{} is a directory; set recursive=true to delete it",
+                        target.display()
+                    ));
+                }
+            } else {
+                match std::fs::remove_file(target) {
+                    Ok(()) => deleted.push(target.display().to_string()),
                     Err(e) => {
-                        error!(
-                            "delete_files: failed to remove directory '{}': {e}",
+                        warn!(
+                            "delete_files: failed to remove file '{}': {e}",
                             target.display()
                         );
                         errors.push(format!("{}: {e}", target.display()));
                     }
                 }
-            } else {
-                warn!(
-                    "delete_files: '{}' is a directory, recursive not set",
-                    target.display()
-                );
-                errors.push(format!(
-                    "{} is a directory; set recursive=true to delete it",
-                    target.display()
-                ));
-            }
-        } else {
-            match std::fs::remove_file(target) {
-                Ok(()) => deleted.push(target.display().to_string()),
-                Err(e) => {
-                    warn!(
-                        "delete_files: failed to remove file '{}': {e}",
-                        target.display()
-                    );
-                    errors.push(format!("{}: {e}", target.display()));
-                }
             }
         }
-    }
 
-    info!(
-        "delete_files: completed — {} deleted, {} errors",
-        deleted.len(),
-        errors.len(),
-    );
+        info!(
+            "delete_files: completed — {} deleted, {} errors",
+            deleted.len(),
+            errors.len(),
+        );
 
-    // Build the output string with results grouped by success/failure.
-    let mut output = String::new();
-    if !deleted.is_empty() {
-        let _ = writeln!(output, "Deleted {} item(s):", deleted.len());
-        for item in &deleted {
-            let _ = writeln!(output, "  - {item}");
+        // Build the output string with results grouped by success/failure.
+        let mut output = String::new();
+        if !deleted.is_empty() {
+            let _ = writeln!(output, "Deleted {} item(s):", deleted.len());
+            for item in &deleted {
+                let _ = writeln!(output, "  - {item}");
+            }
         }
-    }
-    if !errors.is_empty() {
-        if !output.is_empty() {
-            output.push('\n');
+        if !errors.is_empty() {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            let _ = writeln!(output, "Failed to delete {} item(s):", errors.len());
+            for error in &errors {
+                let _ = writeln!(output, "  - {error}");
+            }
         }
-        let _ = writeln!(output, "Failed to delete {} item(s):", errors.len());
-        for error in &errors {
-            let _ = writeln!(output, "  - {error}");
-        }
-    }
 
-    Ok(truncate_tool_output(&output))
+        Ok(truncate_tool_output(&output))
+    })
 }
 
 pub fn describe_delete_files_invocation(args: &DeleteFilesArgs) -> String {
