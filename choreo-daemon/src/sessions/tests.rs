@@ -88,7 +88,7 @@ fn test_state() -> SessionState {
         },
         next_turn_id: 1,
         next_stream_id: 1,
-        last_undo_turn_ids: None,
+        redo_stack: Vec::new(),
         turns,
         loaded_skill_bodies: Vec::new(),
         context_cache: None,
@@ -2106,6 +2106,38 @@ fn redo_turns_restores_undone_turns() {
 fn redo_turns_returns_none_when_nothing_to_redo() {
     let mut state = SessionState::empty();
     let _ = state.start_turn(Some("user".into()));
+    assert!(state.redo_turns().is_none());
+}
+
+#[test]
+fn undo_redo_are_lifo_batches() {
+    let mut state = SessionState::empty();
+    let _ = state.start_turn(Some("user 1".into()));
+    let _ = state.start_turn(Some("user 2".into()));
+    let _ = state.start_turn(Some("user 3".into()));
+
+    // First undo hides only turn 2.
+    assert_eq!(state.undo_turns(), Some(vec![2]));
+    // Second undo records only turn 1 — the already-hidden turn 2 is not
+    // re-recorded, so it is not swept into the same redo batch.
+    assert_eq!(state.undo_turns(), Some(vec![1]));
+    assert!(state.turns[&1].undone && state.turns[&2].undone);
+
+    // One redo restores exactly one batch (turn 1), NOT every hidden turn.
+    let restored = state.redo_turns().expect("redo succeeds");
+    assert_eq!(restored.keys().copied().collect::<Vec<_>>(), vec![1]);
+    assert!(!state.turns[&1].undone, "turn 1 is live again");
+    assert!(
+        state.turns[&2].undone,
+        "turn 2 stays hidden until its own redo batch is popped"
+    );
+
+    // The next redo restores the earlier batch (turn 2).
+    let restored = state.redo_turns().expect("second redo succeeds");
+    assert_eq!(restored.keys().copied().collect::<Vec<_>>(), vec![2]);
+    assert!(state.turns.values().all(|t| !t.undone));
+
+    // Nothing left to redo.
     assert!(state.redo_turns().is_none());
 }
 

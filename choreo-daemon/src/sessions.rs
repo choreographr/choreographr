@@ -805,7 +805,12 @@ pub struct SessionState {
     /// on a stream id. Starts at 1 so a real stream id is never the
     /// `CANCEL_ALL` sentinel (`0`).
     pub next_stream_id: u64,
-    last_undo_turn_ids: Option<Vec<u32>>,
+    /// Stack of undo batches, newest last: each entry is the set of turns one
+    /// `/undo` newly marked undone. `/redo` pops the most recent batch and
+    /// restores exactly it, so undo and redo are LIFO-symmetric rather than a
+    /// single redo collapsing every pending undo at once. A new user turn clears
+    /// the stack (nothing is redoable once the conversation has moved on).
+    redo_stack: Vec<Vec<u32>>,
     /// The session's conversation turns, keyed by turn id.
     pub turns: BTreeMap<u32, Turn>,
     subscribers: HashMap<ClientId, SubscriberSink>,
@@ -987,7 +992,7 @@ impl SessionState {
             // session thread assigns stream ids), so the counter only needs a
             // sentinel-safe starting value here.
             next_stream_id: 1,
-            last_undo_turn_ids: None,
+            redo_stack: Vec::new(),
             turns: snapshot.turns,
             subscribers,
             active_requests: BTreeMap::new(),
@@ -1047,9 +1052,9 @@ impl SessionState {
     /// Start a new turn, returning its `turn_id`.
     /// If the turn has user text, the redo stack is cleared.
     pub fn start_turn(&mut self, user_text: Option<String>) -> (u32, Turn) {
-        // New user input after an undo clears the redo opportunity.
+        // New user input after an undo clears the redo stack.
         if user_text.is_some() {
-            self.last_undo_turn_ids = None;
+            self.redo_stack.clear();
         }
         let turn_id = self.next_turn_id;
         self.next_turn_id += 1;
@@ -1227,9 +1232,15 @@ impl SessionState {
             .find_map(|turn| turn.token_usage.map(|u| u.input_tokens))
     }
 
-    /// Undo the most recent user-initiated turns: find the most recent
-    /// non-undone turn with `user_text: Some(...)`, mark it and all
-    /// higher-id turns as `undone = true`, store `turn_ids` for redo.
+    /// Undo the most recent user-initiated turn: find the most recent
+    /// non-undone turn with `user_text: Some(...)`, mark it and every higher-id
+    /// turn that is still live as `undone = true`, and push that batch onto the
+    /// redo stack.
+    ///
+    /// Only the turns this call actually flips (the live suffix) are recorded
+    /// for redo: turns already hidden by an earlier undo stay hidden until their
+    /// own batch is popped, so a single `/redo` re-applies exactly one `/undo`
+    /// rather than collapsing every pending undo at once.
     pub fn undo_turns(&mut self) -> Option<Vec<u32>> {
         let target = self
             .turns
@@ -1237,26 +1248,27 @@ impl SessionState {
             .rev()
             .find(|(_, t)| !t.undone && t.user_text.is_some())
             .map(|(&id, _)| id)?;
-        let to_undo: Vec<u32> = self.turns.range(target..).map(|(&id, _)| id).collect();
-        for &id in &to_undo {
-            if let Some(turn) = self.turns.get_mut(&id) {
+        let mut newly_undone = Vec::new();
+        for (&id, turn) in self.turns.range_mut(target..) {
+            if !turn.undone {
                 turn.undone = true;
+                newly_undone.push(id);
             }
         }
-        self.last_undo_turn_ids = Some(to_undo.clone());
+        self.redo_stack.push(newly_undone.clone());
         // The context size is a function of the live turn set, so it must be
         // re-derived whenever history mutates — not just refreshed by the next
         // completed request. Undoing turns shrinks the context.
         self.config.last_prompt_tokens = self.live_last_prompt_tokens();
-        Some(to_undo)
+        Some(newly_undone)
     }
 
-    /// Redo the most recent `/undo`, restoring exactly the turns that
-    /// were marked as undone.
+    /// Redo the most recent `/undo`: pop its batch and restore exactly those
+    /// turns, leaving any turns hidden by earlier undos still hidden.
     pub fn redo_turns(&mut self) -> Option<BTreeMap<u32, Turn>> {
-        let ids = self.last_undo_turn_ids.take()?;
+        let ids = self.redo_stack.pop()?;
         let mut restored = BTreeMap::new();
-        for &id in &ids {
+        for id in ids {
             if let Some(turn) = self.turns.get_mut(&id) {
                 turn.undone = false;
                 restored.insert(id, turn.clone());
@@ -1277,7 +1289,7 @@ impl SessionState {
             // Stream ids start at 1: 0 is the `CANCEL_ALL` sentinel, so a real
             // stream id must never be 0.
             next_stream_id: 1,
-            last_undo_turn_ids: None,
+            redo_stack: Vec::new(),
             turns: BTreeMap::new(),
             subscribers: HashMap::new(),
             active_requests: BTreeMap::new(),

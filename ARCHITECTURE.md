@@ -1408,6 +1408,16 @@ facts about that payload: the daemon strips it from every client-bound
 `DaemonMessage` (only its own request builder reads it), and the builder's
 same-model provenance check drops the artifact after a mid-session model switch.
 
+A single `/undo` hides the most recent user turn together with every still-live
+turn after it (a tool-loop iteration creates several turns per user turn), and
+records only the turns it actually flipped as one **redo batch** on a stack.
+`/redo` pops the newest batch and restores exactly it, so undo and redo are
+LIFO-symmetric — one redo re-applies one undo, never collapsing several pending
+undos at once. A new user turn clears the stack (redo is void once the
+conversation has moved on), and undo also clears the persisted
+`last_response_id` so a chained request cannot leak the hidden turns back into
+the model.
+
 ---
 
 
