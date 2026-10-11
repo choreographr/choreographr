@@ -154,9 +154,9 @@ impl InferenceProvider {
                     // `build_agent`. One construction point covers all
                     // accounts; tests and other callers keep `None`.
                     user_agent: Some(daemon_user_agent()),
-                    // Gzip the request body when the catalog overlay marks this
-                    // provider as accepting compressed request bodies (identity
-                    // otherwise — the safe default).
+                    // Compress the request body (gzip or zstd) when the catalog
+                    // overlay marks this provider as accepting compressed
+                    // request bodies (identity otherwise — the safe default).
                     request_compression: entry.request_compression,
                     ..Default::default()
                 };

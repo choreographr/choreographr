@@ -36,13 +36,14 @@
 #   display_name = "…"          # only needed for providers not in the base
 #   prompt_cache_short = 300     # provider default ephemeral tier TTL, seconds
 #   prompt_cache_long = 3600     # provider default extended tier TTL, seconds
-#   request_compression = "gzip"  # gzip | identity (default identity); gzip
-#                                # request bodies for providers whose endpoint
-#                                # accepts Content-Encoding: gzip. Opt-in only:
-#                                # the server must decompress, so leave it off
-#                                # unless support is known. A provider that
-#                                # rejects a gzip body with HTTP 415 is
-#                                # downgraded to identity for the process.
+#   request_compression = "gzip"  # gzip | zstd | identity (default identity);
+#                                # compress request bodies for providers whose
+#                                # endpoint accepts Content-Encoding: gzip/zstd.
+#                                # Opt-in only: the server must decompress, so
+#                                # leave it off unless support is known. A
+#                                # provider that rejects a compressed body with
+#                                # HTTP 415 is downgraded to identity for the
+#                                # process.
 #
 #   [provider.<slug>.models."<model>"]
 #   context_window = 123456

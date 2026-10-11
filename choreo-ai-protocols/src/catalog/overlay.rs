@@ -185,18 +185,23 @@ fn apply_provider_overlay(
             }
             "models" => apply_models_overlay(entry, value, models_touched),
             // Request-body compression: provider policy models.dev cannot
-            // express (it carries no encoding facts). `identity` (or any
+            // express (it carries no encoding facts).  The coding tokens are the
+            // `RequestCompression` overlay spellings; `identity` (or any
             // unrecognized value) leaves the body uncompressed, the safe
             // default since the server must decompress.
-            "request_compression" => match value.as_str() {
-                Some("gzip") => entry.request_compression = RequestCompression::Gzip,
-                Some("zstd") => entry.request_compression = RequestCompression::Zstd,
-                Some("identity") => entry.request_compression = RequestCompression::Identity,
-                _ => warn!(
-                    slug = %entry.slug,
-                    "overlay: request_compression must be \"gzip\", \"zstd\", or \"identity\"; skipping",
-                ),
-            },
+            "request_compression" => {
+                if let Some(coding) = value
+                    .as_str()
+                    .and_then(RequestCompression::from_overlay_str)
+                {
+                    entry.request_compression = coding;
+                } else {
+                    warn!(
+                        slug = %entry.slug,
+                        "overlay: request_compression must be \"gzip\", \"zstd\", or \"identity\"; skipping",
+                    );
+                }
+            }
             other => warn!(
                 slug = %entry.slug,
                 key = other,

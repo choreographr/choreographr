@@ -616,15 +616,21 @@ The compression is applied once, in `choreo-ai-protocols`'s
 retained plain bytes), so every retry attempt reuses the compressed
 `Arc<[u8]>` and the upload-complete hook — the v9 `Waiting` boundary, see the
 wire-protocol section — still fires on the last compressed byte: both the
-dispatch/upload boundary and the length-delimited send are unchanged. Two
-codings are supported, each chosen per provider by which its endpoint decodes:
-`gzip` (the broadly-supported one, via the same pure-Rust `flate2` backend ureq
-enables) and `zstd` (targeting endpoints known to decode it, via the same
-pure-Rust `structured-zstd` codec the DB uses). A provider that
+dispatch/upload boundary and the length-delimited send are unchanged. The
+coding and its codecs live in `retry/compression.rs`; two codings are
+supported, each chosen per provider by which its endpoint decodes: `gzip` (the
+broadly-supported one, via the same pure-Rust `flate2` backend ureq enables) and
+`zstd` (targeting endpoints known to decode it, via the same pure-Rust
+`structured-zstd` codec the DB uses). A provider that
 answers a compressed request with `415 Unsupported Media Type` is downgraded to
 identity in place and retried once uncompressed
 (`retry::retry_loop_with_compression`); the downgrade is then remembered per
-provider for the process, so later requests skip compression entirely.
+provider for the process, so later requests skip compression entirely. The
+memory is the process-wide `retry::compression::COMPRESSION_DOWNGRADED` set —
+the **thirteenth** sanctioned shared-state exception (see AGENTS.md), read under
+a shared lock on each request of a compression-opted-in provider (the identity
+default skips the lookup) and written once per provider on a 415, so it carries
+no protocol data and readers never contend.
 
 ### Runtime catalog refresh (S4)
 
@@ -2205,7 +2211,8 @@ cargo run -p choreo-im -- telegram
 | `subxt` | choreo-blockchain | Substrate/Polkadot blockchain tools (behind the `blockchain` feature) |
 | `rmcp` + `process-wrap` + `reqwest` | choreo-mcp | Official Model Context Protocol Rust SDK, its child-process wrappers, and the HTTP client — the MCP client protocol engine (behind the `mcp` feature; `process-wrap` places the stdio server child in its own process group, and `reqwest` (rustls) drives the Streamable HTTP transport and its deprecated-transport probe; the stdio read side uses a crate-local capped transport over `rmcp`'s `AsyncRwTransport`) |
 | `serde` + `rmp-serde` | proto, daemon | Wire protocol framing and DB value encoding (MessagePack, named mode) |
-| `structured-zstd` | daemon | Pure-Rust compression of `session_turns` DB values (a standard zstd frame around the MessagePack blob, level 6 — the tuned level maps onto C zstd numbering; see `db/codec.rs` `COMPRESSION_LEVEL`). Apache-2.0; no libzstd C build. |
+| `structured-zstd` | daemon, choreo-ai-protocols | Pure-Rust zstd: the daemon's `session_turns` DB values (a standard zstd frame around the MessagePack blob, level 6 — the tuned level maps onto C zstd numbering; see `db/codec.rs` `COMPRESSION_LEVEL`) and opted-in LLM request bodies (level 3; see `choreo-ai-protocols/src/retry/compression.rs`). Apache-2.0; no libzstd C build. |
+| `flate2` | choreo-ai-protocols | Pure-Rust gzip for opted-in LLM request bodies (the `rust_backend`/miniz_oxide backend `ureq` already enables; see `choreo-ai-protocols/src/retry/compression.rs`). |
 | `snow` | daemon, client-core, transport | Noise IK handshake and transport encryption |
 | `ureq` | daemon | HTTP client |
 | `pulldown-cmark` + `ammonia` | client-core | Markdown parsing, HTML sanitization |

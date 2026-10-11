@@ -6,10 +6,11 @@
 //! The retry decision is status + `Retry-After` only — never the response body.
 //!
 //! The module is split by concern: this file holds the retry/backoff policy and
-//! the retry loop, the serialized request body plus its upload-complete hook
+//! the retry loops, the serialized request body plus its upload-complete hook
 //! (the daemon's `Waiting` boundary) live in the `send_body` submodule, the
-//! provider HTTP error and its response-body mapping live in the `error`
-//! submodule, and the unit tests live in `tests.rs`.
+//! request-body compression policy and its codecs live in the `compression`
+//! submodule, the provider HTTP error and its response-body mapping live in the
+//! `error` submodule, and the unit tests live in `tests.rs`.
 
 use std::collections::HashSet;
 use std::io;
@@ -17,66 +18,17 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::Duration;
 
+mod compression;
 mod error;
 mod send_body;
 
+use compression::note_request_compression_downgraded;
 use error::{extract_error_message, status_to_error};
 
+pub use compression::RequestCompression;
+pub(crate) use compression::effective_request_compression;
 pub use error::ProviderHttpError;
 pub(crate) use send_body::HookedJsonBody;
-pub use send_body::RequestCompression;
-
-/// Provider slugs whose endpoint answered a gzip request body with HTTP 415 in
-/// this process, i.e. do not decompress compressed request bodies.
-///
-/// [`effective_request_compression`] consults this before compressing, and
-/// [`retry_loop_with_compression`] inserts into it on a 415, so one rejected
-/// request permanently (for the process) downgrades that provider to identity —
-/// retrying a body the server cannot decode can only waste attempts.  Logging-
-/// plus-dedup bookkeeping, not cross-thread communication (it carries no
-/// protocol data); the mutex is cold (touched only on a 415) and follows
-/// AGENTS.md's poisoned-lock recovery, with a lost entry an acceptable failure
-/// mode for a downgrade hint.
-static COMPRESSION_DOWNGRADED: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-
-/// The request compression to actually use for `slug`: `configured`, unless
-/// this process has already learned from a 415 that `slug` does not accept
-/// compressed request bodies.
-#[must_use]
-pub(crate) fn effective_request_compression(
-    slug: &str,
-    configured: RequestCompression,
-) -> RequestCompression {
-    if configured == RequestCompression::Identity {
-        return RequestCompression::Identity;
-    }
-    let downgraded = COMPRESSION_DOWNGRADED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(slug);
-    if downgraded {
-        RequestCompression::Identity
-    } else {
-        configured
-    }
-}
-
-/// Record that `slug` rejected a compressed request body, so future requests
-/// skip compression.  Warns once per slug.
-fn note_request_compression_downgraded(slug: &str) {
-    let fresh = COMPRESSION_DOWNGRADED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(slug.to_string());
-    if fresh {
-        tracing::warn!(
-            provider = %slug,
-            "provider rejected gzip request compression (HTTP 415); \
-             sending uncompressed bodies for the rest of this process",
-        );
-    }
-}
 
 /// Raw `(initial_backoff_ms, max_backoff_ms)` pairs [`RetryConfig::new`] has
 /// already warned about in this process.
@@ -538,13 +490,15 @@ where
 /// request body with HTTP 415 `Unsupported Media Type`: on that status the body
 /// is downgraded to identity in place, the provider is remembered as
 /// identity-only for the process (see [`effective_request_compression`]), and
-/// the request is sent once more uncompressed under the *same* retry budget.
+/// the request is sent once more uncompressed.
 ///
 /// The downgrade is handled here rather than in [`retry_loop`]'s decision logic
 /// because 415 is not a retryable status (resending the same compressed bytes
 /// would fail identically); only switching the body encoding can succeed.  A
 /// body already identity, or one that was already downgraded, falls straight
-/// through to [`retry_loop`] and a second 415 is terminal.
+/// through to [`retry_loop`] and a second 415 is terminal.  A 415 fails fast —
+/// the first [`retry_loop`] makes a single attempt — so the uncompressed resend
+/// runs with a fresh retry budget, not the remains of a burned one.
 ///
 /// # Errors
 ///
