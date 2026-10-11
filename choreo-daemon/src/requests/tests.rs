@@ -8,14 +8,15 @@ use crate::context::LoadedSkill;
 use crate::daemon::DaemonCommand;
 use crate::providers::InferenceProvider;
 use crate::providers::test_util::{
-    make_failing_provider, make_test_provider, make_truncating_provider,
-    make_truncating_provider_with_slug,
+    make_failing_provider, make_scripted_stream_provider, make_test_provider,
+    make_truncating_provider, make_truncating_provider_with_slug,
 };
 use crate::reasoning::{
     build_chat_request_messages, initial_prev_resp_id, warn_on_missing_reasoning_artifacts,
 };
 use crate::tools::context::ToolContext;
 use crate::tools::{Tool, ToolError, ToolExecError, ToolRegistry};
+use choreo_ai_protocols::StreamEvent;
 use choreo_ai_protocols::openai::{AssistantToolCall, AssistantToolFunction};
 use choreo_keystore::ServiceCredential;
 use choreo_proto::{ChatReasoningField, ReasoningArtifact};
@@ -1909,6 +1910,138 @@ fn agent_loop_failure_marks_and_finalizes_turn() {
     assert!(
         saw_error_appended,
         "expected a TurnAppended broadcast carrying the failure"
+    );
+}
+
+/// Drain every `SessionStatus` the loop broadcast on `cmd_rx`, in order, so a
+/// test can assert the status-phase progression one request produced.
+fn collect_status_broadcasts(
+    cmd_rx: &crossbeam_channel::Receiver<SessionCommand>,
+) -> Vec<SessionStatus> {
+    let mut statuses = Vec::new();
+    while let Ok(cmd) = cmd_rx.try_recv() {
+        if let SessionCommand::StatusChanged(status) = cmd {
+            statuses.push(status);
+        }
+    }
+    statuses
+}
+
+#[test]
+fn agent_loop_broadcasts_forward_only_streaming_phases() {
+    // Reasoning, then answer, then a trailing reasoning delta: the phase must
+    // reach `Responding` and STAY there (the later reasoning chunk must not
+    // demote it back to `Thinking`), and `Sending` must not be re-emitted.
+    let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+    let ctx = RequestContext {
+        cmd_tx,
+        session_id: 1,
+        db,
+        tool_registry: ToolRegistry::new().build().into_shared(),
+        daemon_tx,
+        max_turns: 0,
+        lag_limits: crate::broadcast::LagLimits::default(),
+        global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        substrate_credential: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
+    };
+    let provider = make_scripted_stream_provider(
+        vec![
+            StreamEvent::Reasoning("think".into()),
+            StreamEvent::Answer("hi".into()),
+            StreamEvent::Reasoning("more".into()),
+        ],
+        false,
+    );
+    let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+    let mut session = SessionState::empty();
+
+    let result = run_agent_loop(
+        &provider,
+        &mut session,
+        "test-model",
+        7,
+        &cancel_rx,
+        &ctx,
+        Some("hi"),
+    );
+    assert!(
+        !result.unwrap(),
+        "a final-answer turn completes without a tool call"
+    );
+
+    assert_eq!(
+        collect_status_broadcasts(&cmd_rx),
+        vec![
+            SessionStatus::Sending,
+            SessionStatus::Thinking,
+            SessionStatus::Responding,
+        ],
+        "exactly the forward-only Sending→Thinking→Responding phases, no demotion",
+    );
+}
+
+#[test]
+fn agent_loop_retry_then_stream_advances_phase_out_of_retrying() {
+    // A retry fires before the first delta (the only point a provider retries),
+    // so the phase is still `Sending` when `Retrying` is reported; the first
+    // post-retry chunk must then advance it to `Thinking`/`Responding` rather
+    // than leaving the status stuck on `Retrying`.
+    let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+    let ctx = RequestContext {
+        cmd_tx,
+        session_id: 1,
+        db,
+        tool_registry: ToolRegistry::new().build().into_shared(),
+        daemon_tx,
+        max_turns: 0,
+        lag_limits: crate::broadcast::LagLimits::default(),
+        global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        substrate_credential: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
+    };
+    let provider = make_scripted_stream_provider(
+        vec![
+            StreamEvent::Reasoning("think".into()),
+            StreamEvent::Answer("hi".into()),
+        ],
+        true,
+    );
+    let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+    let mut session = SessionState::empty();
+
+    let result = run_agent_loop(
+        &provider,
+        &mut session,
+        "test-model",
+        7,
+        &cancel_rx,
+        &ctx,
+        Some("hi"),
+    );
+    assert!(
+        !result.unwrap(),
+        "a final-answer turn completes without a tool call"
+    );
+
+    assert_eq!(
+        collect_status_broadcasts(&cmd_rx),
+        vec![
+            SessionStatus::Sending,
+            SessionStatus::Retrying {
+                attempt: 1,
+                max_attempts: 3,
+                delay_ms: 1,
+            },
+            SessionStatus::Thinking,
+            SessionStatus::Responding,
+        ],
     );
 }
 

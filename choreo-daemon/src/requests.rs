@@ -391,6 +391,78 @@ fn protocol_is_anthropic(slug: &str) -> bool {
     lookup_provider(slug).is_some_and(|p| matches!(p.protocol, ProviderProtocol::AnthropicMessages))
 }
 
+/// The forward-only streaming phase a single model call moves through, in
+/// order: `Sending` (the request is dispatched and we are awaiting the first
+/// token) → `Thinking` (the model's reasoning tokens are streaming) →
+/// `Responding` (the answer tokens are streaming).  Modeled as an ordered enum
+/// so "only ever move forward" is the derived `Ord` comparison rather than a
+/// pair of hand-written inverse guards that could drift apart.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StreamPhase {
+    Sending,
+    Thinking,
+    Responding,
+}
+
+impl StreamPhase {
+    /// The [`SessionStatus`] this phase broadcasts to clients.
+    fn status(self) -> SessionStatus {
+        match self {
+            StreamPhase::Sending => SessionStatus::Sending,
+            StreamPhase::Thinking => SessionStatus::Thinking,
+            StreamPhase::Responding => SessionStatus::Responding,
+        }
+    }
+}
+
+/// Advance a turn's live streaming phase to `target`, broadcasting the new
+/// status to subscribers — but only when it moves FORWARD along [`StreamPhase`].
+/// A later chunk of an earlier kind therefore never demotes the phase back (a
+/// trailing reasoning delta after the answer has begun does not flip
+/// `Responding` back to `Thinking`), so one model call emits at most two
+/// streaming-status broadcasts no matter how the provider interleaves its
+/// deltas.  `Sending` is broadcast once before the call, so it is the initial
+/// value here and this never re-emits it.
+fn advance_stream_phase(phase: &mut StreamPhase, target: StreamPhase, ctx: &RequestContext) {
+    if target > *phase {
+        *phase = target;
+        let _ = ctx
+            .cmd_tx
+            .send(SessionCommand::StatusChanged(target.status()));
+    }
+}
+
+/// Forward one streamed model chunk to subscribers: the chunk itself on its
+/// answer/reasoning stream, then the running output-token estimate so the UI's
+/// live token display refreshes on every chunk.
+fn broadcast_stream_chunk(
+    ctx: &RequestContext,
+    stream_id: u64,
+    stream: OutputStream,
+    text: String,
+    output_tokens: u32,
+) {
+    let _ = ctx
+        .cmd_tx
+        .send(SessionCommand::Broadcast(DaemonMessageType::Session {
+            session_id: Some(ctx.session_id),
+            event: SessionEvent::OutputChunk {
+                stream_id,
+                stream,
+                data: text.into_bytes(),
+            },
+        }));
+    let _ = ctx
+        .cmd_tx
+        .send(SessionCommand::Broadcast(DaemonMessageType::Session {
+            session_id: Some(ctx.session_id),
+            event: SessionEvent::LiveOutputTokenCount {
+                stream_id,
+                output_tokens,
+            },
+        }));
+}
+
 pub(crate) fn run_agent_loop(
     client: &InferenceProvider,
     session: &mut SessionState,
@@ -625,14 +697,14 @@ pub(crate) fn run_agent_loop(
         // Running count of output tokens produced by the current turn.
         let mut output_token_count: u32 = 0;
 
-        // The live status phase for this request.  `Sending` was already
+        // The live streaming phase for this turn.  `Sending` was already
         // broadcast before the loop; the streaming callback below advances it
-        // to `Thinking` (first reasoning chunk) or `Responding` (first answer
-        // chunk).  The phase only ever moves FORWARD — once a chunk kind has
-        // promoted it, a later chunk of the other kind does not flip it back —
-        // so a request emits at most two status broadcasts no matter how the
-        // provider interleaves reasoning and answer deltas.
-        let mut stream_phase = SessionStatus::Sending;
+        // via `advance_stream_phase`, which moves it forward only.  A retry
+        // (`Retrying`) always fires before the first delta — the provider's
+        // retry loop wraps the initial request send, before the response body
+        // is read — so the phase is still `Sending` when a retry is reported
+        // and the first post-retry chunk advances it correctly.
+        let mut stream_phase = StreamPhase::Sending;
 
         // Gateway routing identity for the opencode zen/go providers: the
         // session's real id plus this turn's request id, as strings (the
@@ -661,17 +733,10 @@ pub(crate) fn run_agent_loop(
             &mut |event| {
                 match event {
                     StreamEvent::Answer(text) => {
-                        // Advance to `Responding` on the first answer chunk so
-                        // the user sees the model has begun writing (rather
-                        // than still connecting or thinking).  Forward-only:
-                        // once responding, a later reasoning chunk does not
-                        // demote it.
-                        if !matches!(stream_phase, SessionStatus::Responding) {
-                            stream_phase = SessionStatus::Responding;
-                            let _ = ctx
-                                .cmd_tx
-                                .send(SessionCommand::StatusChanged(stream_phase.clone()));
-                        }
+                        // The first answer chunk moves the phase to `Responding`
+                        // (the model has begun writing); forward-only, so a
+                        // later reasoning chunk never demotes it.
+                        advance_stream_phase(&mut stream_phase, StreamPhase::Responding, ctx);
                         if let Some(enc) = &encoding {
                             // u128→u32 token counts, informational only.
                             let n = enc.count(&text);
@@ -680,40 +745,20 @@ pub(crate) fn run_agent_loop(
                                 output_token_count += n as u32;
                             }
                         }
-                        let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
-                            DaemonMessageType::Session {
-                                session_id: Some(ctx.session_id),
-                                event: SessionEvent::OutputChunk {
-                                    stream_id,
-                                    stream: OutputStream::Answer,
-                                    data: text.into_bytes(),
-                                },
-                            },
-                        ));
-                        // Let the UI update its live token display on every
-                        // chunk so the count feels responsive.
-                        let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
-                            DaemonMessageType::Session {
-                                session_id: Some(ctx.session_id),
-                                event: SessionEvent::LiveOutputTokenCount {
-                                    stream_id,
-                                    output_tokens: output_token_count,
-                                },
-                            },
-                        ));
+                        broadcast_stream_chunk(
+                            ctx,
+                            stream_id,
+                            OutputStream::Answer,
+                            text,
+                            output_token_count,
+                        );
                     }
                     StreamEvent::Reasoning(text) => {
-                        // Advance OUT of the initial `Sending` phase to
-                        // `Thinking` on the first reasoning chunk, so hidden
-                        // reasoning is distinguishable from the pre-token send
-                        // wait.  Forward-only: it never demotes a `Responding`
-                        // phase back to `Thinking`.
-                        if matches!(stream_phase, SessionStatus::Sending) {
-                            stream_phase = SessionStatus::Thinking;
-                            let _ = ctx
-                                .cmd_tx
-                                .send(SessionCommand::StatusChanged(stream_phase.clone()));
-                        }
+                        // The first reasoning chunk moves the phase out of
+                        // `Sending` to `Thinking` (hidden reasoning is now
+                        // distinct from the pre-token send wait); forward-only,
+                        // so it never demotes a `Responding` phase.
+                        advance_stream_phase(&mut stream_phase, StreamPhase::Thinking, ctx);
                         if let Some(enc) = &encoding {
                             // u128→u32 token counts, informational only.
                             let n = enc.count(&text);
@@ -722,25 +767,13 @@ pub(crate) fn run_agent_loop(
                                 output_token_count += n as u32;
                             }
                         }
-                        let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
-                            DaemonMessageType::Session {
-                                session_id: Some(ctx.session_id),
-                                event: SessionEvent::OutputChunk {
-                                    stream_id,
-                                    stream: OutputStream::Reasoning,
-                                    data: text.into_bytes(),
-                                },
-                            },
-                        ));
-                        let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
-                            DaemonMessageType::Session {
-                                session_id: Some(ctx.session_id),
-                                event: SessionEvent::LiveOutputTokenCount {
-                                    stream_id,
-                                    output_tokens: output_token_count,
-                                },
-                            },
-                        ));
+                        broadcast_stream_chunk(
+                            ctx,
+                            stream_id,
+                            OutputStream::Reasoning,
+                            text,
+                            output_token_count,
+                        );
                     }
                     // `StreamEvent` is #[non_exhaustive] — a future event kind
                     // this loop doesn't forward should be ignored, not crash

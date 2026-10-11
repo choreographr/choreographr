@@ -891,4 +891,85 @@ pub(crate) mod test_util {
         };
         (provider, client)
     }
+
+    /// Provider client that replays a scripted sequence of streaming `on_event`
+    /// deltas and then returns a fixed final answer, so a test can pin exactly
+    /// which `SessionStatus` phases the daemon broadcasts as the stream flows.
+    ///
+    /// When `retry_first` is set it fires the request's retry callback before
+    /// any delta — the only point a real provider retries, because the retry
+    /// loop wraps the initial request send, before the response body is read —
+    /// so a test can assert the phase still advances correctly out of the
+    /// `Retrying` status.
+    #[derive(Debug)]
+    pub(crate) struct ScriptedStreamProviderClient {
+        events: Vec<StreamEvent>,
+        retry_first: bool,
+    }
+
+    impl ProviderClient for ScriptedStreamProviderClient {
+        // &'static str is the trait's required lifetime, not an over-bound literal.
+        #[expect(clippy::unnecessary_literal_bound)]
+        fn provider_slug(&self) -> &str {
+            "openai"
+        }
+
+        fn chat_completion_turn(
+            &self,
+            _params: ChatTurnRequest<'_>,
+        ) -> Result<ChatTurnResult, InferenceError> {
+            // Streaming-only stub: the agent loop always drives the streaming
+            // path, so a non-streaming call here is a bug.
+            Err(InferenceError::ClientError {
+                status: 500,
+                detail: "ScriptedStreamProviderClient is streaming-only".to_string(),
+            })
+        }
+
+        fn chat_completion_turn_streaming(
+            &self,
+            params: ChatTurnRequest<'_>,
+            on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>,
+        ) -> Result<ChatTurnResult, InferenceError> {
+            if self.retry_first
+                && let Some(cb) = params.on_retry.as_mut()
+            {
+                cb(1, 3, std::time::Duration::from_millis(1));
+            }
+            for event in &self.events {
+                on_event(event.clone())?;
+            }
+            Ok(ChatTurnResult::FinalText(
+                choreo_ai_protocols::FinalTextResult {
+                    content: "done".to_string(),
+                    truncated: false,
+                    reasoning: None,
+                    usage: None,
+                    response_id: None,
+                    reasoning_artifact: None,
+                },
+            ))
+        }
+
+        fn list_models(&self) -> Result<Vec<String>, InferenceError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Build a provider that replays `events` through the streaming callback,
+    /// optionally firing the retry callback before any delta (see
+    /// [`ScriptedStreamProviderClient`]).
+    pub(crate) fn make_scripted_stream_provider(
+        events: Vec<StreamEvent>,
+        retry_first: bool,
+    ) -> InferenceProvider {
+        InferenceProvider {
+            client: Arc::new(ScriptedStreamProviderClient {
+                events,
+                retry_first,
+            }),
+            slug: "openai".to_string(),
+            image_client: None,
+        }
+    }
 }
