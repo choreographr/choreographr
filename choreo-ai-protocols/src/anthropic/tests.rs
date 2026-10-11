@@ -807,7 +807,12 @@ fn response_maps_cache_read_tokens_into_cached_tokens() {
     let ChatTurnResult::FinalText(ft) = turn else {
         panic!("expected FinalText");
     };
-    assert_eq!(ft.usage.expect("usage").cached_tokens, 64);
+    let usage = ft.usage.expect("usage");
+    assert_eq!(usage.cached_tokens, 64);
+    // `input_tokens` is the FULL prompt count (Anthropic's raw 10 plus the 64
+    // cache-read and 8 cache-write counts), matching the cross-provider
+    // convention that the cache counts are a subset of the input count.
+    assert_eq!(usage.input_tokens, 82);
 }
 
 #[test]

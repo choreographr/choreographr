@@ -599,21 +599,34 @@ struct UsageInfo {
 /// Assemble the canonical [`TokenUsage`] from Anthropic's split token counters.
 ///
 /// Anthropic reports input and output tokens separately (there is no
-/// `total_tokens`), so the total is summed here. `cache_read`/`cache_write` are
-/// the prompt-cache hit/write counts (`cache_read_input_tokens` /
-/// `cache_creation_input_tokens`); they are kept as separate fields because a
-/// cache write is priced differently from a read. Shared by the non-streaming
-/// and streaming response paths so a new counter is added in one place.
+/// `total_tokens`), so the total is summed here. Its `input_tokens` is the
+/// count of only the tokens after the last cache breakpoint, so the full
+/// prompt is `input_tokens + cache_read + cache_write`. [`TokenUsage::input_tokens`]
+/// is the FULL prompt token count for every provider (it matches `OpenAI`'s
+/// `prompt_tokens`, where the cache counts are a subset), so this folds the
+/// cache counts in and keeps them as the subset breakdown: `cache_read` /
+/// `cache_write` are the prompt-cache hit/write counts
+/// (`cache_read_input_tokens` / `cache_creation_input_tokens`), retained
+/// separately because a cache write is priced differently from a read.
+/// Shared by the non-streaming and streaming response paths so a new counter
+/// is added in one place.
 pub(super) fn anthropic_token_usage(
     input_tokens: u32,
     output_tokens: u32,
     cache_read: u32,
     cache_write: u32,
 ) -> TokenUsage {
+    // Anthropic's `input_tokens` counts only the tokens after the last cache
+    // breakpoint; the full prompt is `input_tokens + cache_read + cache_write`.
+    // `TokenUsage.input_tokens` is the full prompt count for every provider
+    // (it matches OpenAI's `prompt_tokens`, where the cache counts are a
+    // subset), so fold the cache counts in and keep them as the subset
+    // breakdown.
+    let prompt_tokens = input_tokens + cache_read + cache_write;
     TokenUsage {
-        input_tokens,
+        input_tokens: prompt_tokens,
         output_tokens,
-        total_tokens: input_tokens + output_tokens,
+        total_tokens: prompt_tokens + output_tokens,
         cached_tokens: cache_read,
         cache_write_tokens: cache_write,
     }

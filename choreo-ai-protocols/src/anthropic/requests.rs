@@ -1021,6 +1021,10 @@ mod tests {
         );
         assert_eq!(usage.cached_tokens, 128);
         assert_eq!(usage.cache_write_tokens, 4);
-        assert_eq!(usage.total_tokens, 29);
+        // `input_tokens` is the FULL prompt (20 + 128 + 4), not Anthropic's raw
+        // post-breakpoint count of 20, so the total is the full prompt plus the
+        // 9 output tokens.
+        assert_eq!(usage.input_tokens, 152);
+        assert_eq!(usage.total_tokens, 161);
     }
 }
