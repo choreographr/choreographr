@@ -188,7 +188,7 @@ fn model_switch_sends_no_reasoning_on_the_wire() {
                 tools: &[],
                 thinking_effort: "high".to_string(),
                 on_retry: &mut None,
-                on_accepted: &mut None,
+                on_accepted: None,
                 cancel_rx: None,
                 previous_response_id: None,
                 tool_results: &[],

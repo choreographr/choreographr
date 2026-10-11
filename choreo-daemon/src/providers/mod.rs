@@ -897,12 +897,12 @@ pub(crate) mod test_util {
     /// which `SessionStatus` phases the daemon broadcasts as the stream flows.
     ///
     /// It fires the request-accepted callback before any delta (a real provider
-    /// reports the boundary once the response headers are read), and when
-    /// `retry_first` is set it fires the retry callback even before that — the
-    /// only point a real provider retries, because the retry loop wraps the
-    /// initial request send, before the response body is read — so a test can
-    /// assert the phase advances correctly out of the `Retrying` status and
-    /// across the `Waiting` boundary.
+    /// reports the boundary once the request payload is fully uploaded), and
+    /// when `retry_first` is set it fires the retry callback even before that
+    /// — the only point a real provider retries, because the retry loop wraps
+    /// the initial request send, before the response body is read — so a test
+    /// can assert the phase advances correctly out of the `Retrying` status
+    /// and across the `Waiting` boundary.
     #[derive(Debug)]
     pub(crate) struct ScriptedStreamProviderClient {
         events: Vec<StreamEvent>,
@@ -938,10 +938,10 @@ pub(crate) mod test_util {
             {
                 cb(1, 3, std::time::Duration::from_millis(1));
             }
-            // The provider accepts the request (headers read) before it streams
-            // any delta, so the request-accepted boundary always precedes the
-            // events — matching a real provider call.
-            if let Some(cb) = params.on_accepted.as_mut() {
+            // The provider has received the full request (payload uploaded)
+            // before it streams any delta, so the request-accepted boundary
+            // always precedes the events — matching a real provider call.
+            if let Some(cb) = &params.on_accepted {
                 cb();
             }
             for event in &self.events {

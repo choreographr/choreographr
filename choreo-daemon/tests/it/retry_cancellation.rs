@@ -125,7 +125,7 @@ fn retry_succeeds_with_callback() {
         tools: &[], // no tools
         thinking_effort: "off".to_string(),
         on_retry: &mut cb,
-        on_accepted: &mut None,
+        on_accepted: None,
         cancel_rx: Some(&cancel_rx),
         previous_response_id: None,
         tool_results: &[],
@@ -200,7 +200,7 @@ fn retry_cancelled_during_backoff() {
         tools: &[], // no tools
         thinking_effort: "off".to_string(),
         on_retry: &mut cb,
-        on_accepted: &mut None,
+        on_accepted: None,
         cancel_rx: Some(&cancel_rx),
         previous_response_id: None,
         tool_results: &[],
@@ -266,7 +266,7 @@ fn hard_rate_limit_fails_without_retrying() {
         tools: &[], // no tools
         thinking_effort: "off".to_string(),
         on_retry: &mut cb,
-        on_accepted: &mut None,
+        on_accepted: None,
         cancel_rx: Some(&cancel_rx),
         previous_response_id: None,
         tool_results: &[],
@@ -339,7 +339,7 @@ fn server_503_with_long_retry_after_fails_without_retrying() {
         tools: &[],
         thinking_effort: "off".to_string(),
         on_retry: &mut cb,
-        on_accepted: &mut None,
+        on_accepted: None,
         cancel_rx: Some(&cancel_rx),
         previous_response_id: None,
         tool_results: &[],
@@ -411,7 +411,7 @@ fn retry_after_in_budget_is_honored_on_503() {
         tools: &[],
         thinking_effort: "off".to_string(),
         on_retry: &mut cb,
-        on_accepted: &mut None,
+        on_accepted: None,
         cancel_rx: Some(&cancel_rx),
         previous_response_id: None,
         tool_results: &[],
@@ -529,7 +529,7 @@ fn streaming_cancelled_during_sse_events() {
             tools: &[],
             thinking_effort: "off".to_string(),
             on_retry: &mut None,
-            on_accepted: &mut None,
+            on_accepted: None,
             cancel_rx: Some(&cancel_rx),
             previous_response_id: None,
             tool_results: &[],
@@ -574,7 +574,7 @@ fn streaming_cancelled_before_first_event() {
             tools: &[],
             thinking_effort: "off".to_string(),
             on_retry: &mut None,
-            on_accepted: &mut None,
+            on_accepted: None,
             cancel_rx: Some(&cancel_rx),
             previous_response_id: None,
             tool_results: &[],
@@ -619,9 +619,9 @@ fn non_streaming_fallback_fires_accepted_callback() {
 
     let accepted = Arc::new(AtomicU32::new(0));
     let seen = accepted.clone();
-    let mut cb: Option<RequestAcceptedCallback> = Some(Box::new(move || {
+    let cb: RequestAcceptedCallback = Arc::new(move || {
         seen.fetch_add(1, Ordering::SeqCst);
-    }));
+    });
 
     let messages = [ChatRequestMessage::simple("user", "hello".into())];
     let result = client.chat_completion_turn_streaming(
@@ -631,7 +631,7 @@ fn non_streaming_fallback_fires_accepted_callback() {
             tools: &[],
             thinking_effort: "off".to_string(),
             on_retry: &mut None,
-            on_accepted: &mut cb,
+            on_accepted: Some(cb),
             cancel_rx: None,
             previous_response_id: None,
             tool_results: &[],

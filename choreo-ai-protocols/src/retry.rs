@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -31,12 +31,99 @@ static WARNED_CLAMPS: LazyLock<Mutex<HashSet<(u64, u64)>>> =
 /// Called before each retry attempt with (`current_attempt`, `max_attempts`, delay).
 pub type RetryCallback = Box<dyn FnMut(u32, u32, Duration) + Send>;
 
-/// Called once when a provider accepts a request — the successful (2xx)
-/// attempt's HTTP response headers have been read and its body has not yet
-/// been streamed.  It marks the boundary between "the request is being sent"
-/// and "the model is now producing tokens", so a status bar can distinguish
-/// the dispatch/upload phase from the time-to-first-token wait.
-pub type RequestAcceptedCallback = Box<dyn FnMut() + Send>;
+/// Called once when a request's payload has been fully written to the
+/// transport — every byte of the body has been handed to the provider's
+/// connection, before the response is read.  It marks the boundary between
+/// "the request is being sent" and "the provider is now processing it", so a
+/// status bar can distinguish the upload phase from the time-to-first-token
+/// wait.
+///
+/// Anchoring the boundary at upload-completion (rather than at the response
+/// headers) is deliberate: a buffering gateway can withhold the response head
+/// until the model's first token is ready, which would collapse the
+/// "waiting-for-the-model" phase into "sending".  The client-side upload
+/// boundary is the last point every transport exposes before the opaque
+/// server-side wait, so it is the only anchor that is correct for both
+/// buffering and non-buffering providers.
+///
+/// `Arc` (not `Box`) so the callback can be cloned into the per-attempt request
+/// body reader on each retry; it carries no state of its own.
+pub type RequestAcceptedCallback = Arc<dyn Fn() + Send + Sync>;
+
+/// A serialized JSON request body plus the optional upload-complete hook.
+///
+/// The payload is serialized to compact JSON once; every retry attempt hands
+/// ureq a fresh [`UploadHookReader`] over a clone of those bytes.  The caller
+/// sets `Content-Length` explicitly (from [`Self::len`]) so the body is sent
+/// length-delimited rather than chunked — ureq only honours a caller-supplied
+/// length for a reader body, never the reader's own — and a known length is
+/// what lets a future request-body compressor run *before* this hook (compress
+/// to bytes, then hand those bytes to the same countdown reader).
+pub(crate) struct HookedJsonBody {
+    bytes: Vec<u8>,
+    on_uploaded: Option<RequestAcceptedCallback>,
+}
+
+impl HookedJsonBody {
+    /// Serialize `value` to compact JSON and remember the upload hook.
+    pub(crate) fn new(
+        value: &serde_json::Value,
+        on_uploaded: Option<RequestAcceptedCallback>,
+    ) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            bytes: serde_json::to_vec(value)?,
+            on_uploaded,
+        })
+    }
+
+    /// The wire length of the payload, for the `Content-Length` header.
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// A fresh body for one attempt.  The returned reader fires the upload hook
+    /// exactly once, the instant its final byte is handed to ureq.
+    pub(crate) fn send_body(&self) -> ureq::SendBody<'static> {
+        ureq::SendBody::from_owned_reader(UploadHookReader {
+            bytes: self.bytes.clone(),
+            pos: 0,
+            on_uploaded: self.on_uploaded.clone(),
+        })
+    }
+}
+
+/// A `Read` over an in-memory payload that fires its hook once, when the last
+/// byte has been read.
+///
+/// The hook counts bytes rather than waiting for a zero-length read because
+/// ureq's length-delimited send loop stops as soon as the declared
+/// `Content-Length` is satisfied (it never issues a terminating `read` that
+/// returns `0`).  Firing on the last real byte is what makes the boundary
+/// observable even when the provider withholds response headers until
+/// generation starts.  Returning `0` afterwards never re-fires (the hook is
+/// taken on first completion).
+struct UploadHookReader {
+    bytes: Vec<u8>,
+    pos: usize,
+    on_uploaded: Option<RequestAcceptedCallback>,
+}
+
+impl io::Read for UploadHookReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let remaining = self.bytes.get(self.pos..).unwrap_or_default();
+        let n = remaining.len().min(buf.len());
+        if let Some(dst) = buf.get_mut(..n) {
+            dst.copy_from_slice(remaining.get(..n).unwrap_or_default());
+        }
+        self.pos += n;
+        if self.pos == self.bytes.len()
+            && let Some(cb) = self.on_uploaded.take()
+        {
+            cb();
+        }
+        Ok(n)
+    }
+}
 
 /// Hard ceiling on a single retry delay, in milliseconds.
 ///
@@ -178,10 +265,6 @@ impl AttemptDeadline {
 pub struct AttemptContext<'a> {
     /// Invoked before each retry wait with (attempt, `max_attempts`, delay).
     pub on_retry: &'a mut Option<RetryCallback>,
-    /// Invoked once the provider has accepted a successful (2xx) attempt — its
-    /// response headers are in hand and its body is about to be read.  `None`
-    /// when no caller cares about the boundary.
-    pub on_accepted: Option<&'a mut Option<RequestAcceptedCallback>>,
     /// Cancellation channel; `None` when cancellation is not wired up.
     /// Crossbeam so waits can `select!` on it alongside a retry timer.
     pub cancel_rx: Option<&'a crossbeam_channel::Receiver<()>>,
@@ -191,8 +274,7 @@ pub struct AttemptContext<'a> {
 }
 
 impl<'a> AttemptContext<'a> {
-    /// Bundle the per-call retry context for [`retry_loop`].  The request-accepted
-    /// callback defaults to `None`; attach one with [`Self::with_on_accepted`].
+    /// Bundle the per-call retry context for [`retry_loop`].
     #[must_use]
     pub fn new(
         on_retry: &'a mut Option<RetryCallback>,
@@ -201,20 +283,8 @@ impl<'a> AttemptContext<'a> {
     ) -> Self {
         Self {
             on_retry,
-            on_accepted: None,
             cancel_rx,
             attempt_deadline,
-        }
-    }
-
-    /// Attach a request-accepted callback (see [`RequestAcceptedCallback`]).  A
-    /// builder rather than a fourth `new` parameter so the many call sites that
-    /// do not need the boundary keep their current signature.
-    #[must_use]
-    pub fn with_on_accepted(self, on_accepted: &'a mut Option<RequestAcceptedCallback>) -> Self {
-        Self {
-            on_accepted: Some(on_accepted),
-            ..self
         }
     }
 }
@@ -660,16 +730,6 @@ where
 
         let status: u16 = response.status().as_u16();
         if (200..300).contains(&status) {
-            // The provider accepted this attempt: headers are in hand and the
-            // body is about to stream.  Fire the request-accepted boundary before
-            // handing the response back to the caller's body reader.  The retry
-            // loop only reaches here on the successful attempt, so this fires
-            // exactly once even when earlier attempts were retried.
-            if let Some(slot) = ctx.on_accepted.as_deref_mut()
-                && let Some(cb) = slot.as_mut()
-            {
-                cb();
-            }
             return Ok(response);
         }
 
@@ -780,6 +840,7 @@ fn extract_error_message(body: &str) -> Option<String> {
 #[expect(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -1011,58 +1072,68 @@ mod tests {
         assert_eq!(observed.load(Ordering::Relaxed), MAX_BACKOFF_MS);
     }
 
-    // ── on_accepted firing (the daemon's `Waiting` boundary) ─────────────
+    // ── upload hook (the daemon's `Waiting` boundary) ───────────────────
 
-    /// A minimal `ureq` response for driving [`retry_loop`] in-process (no
-    /// socket): the builder's `data` supplies a readable body so a terminal
-    /// path that consumes the body still works.
-    fn http_response(status: u16, body: &str) -> ureq::http::Response<ureq::Body> {
-        ureq::http::Response::builder()
-            .status(status)
-            .body(ureq::Body::builder().data(body))
-            .expect("response builds")
+    /// A counting `RequestAcceptedCallback` plus the counter it increments, so
+    /// a test can assert exactly when the hook fires.
+    fn counting_hook() -> (RequestAcceptedCallback, Arc<AtomicU32>) {
+        let count = Arc::new(AtomicU32::new(0));
+        let seen = count.clone();
+        let hook: RequestAcceptedCallback = Arc::new(move || {
+            seen.fetch_add(1, Ordering::Relaxed);
+        });
+        (hook, count)
     }
 
     #[test]
-    fn retry_loop_fires_on_accepted_once_on_a_successful_attempt() {
-        // A provider that accepts the request (2xx) fires the request-accepted
-        // callback exactly once — it is the daemon's `Waiting` boundary.  Built
-        // through the public builder (the field is `pub` too; the terminal-error
-        // test below covers the direct-assignment path).
-        let sent = Arc::new(AtomicU32::new(0));
-        let seen = sent.clone();
-        let mut cb: Option<RequestAcceptedCallback> = Some(Box::new(move || {
-            seen.fetch_add(1, Ordering::Relaxed);
-        }));
-        let mut no_retry = None;
-        let mut ctx = AttemptContext::new(&mut no_retry, None, None).with_on_accepted(&mut cb);
-
-        let response = retry_loop(|| Ok(http_response(200, "ok")), &test_config(), &mut ctx);
-        assert!(response.is_ok());
-        assert_eq!(sent.load(Ordering::Relaxed), 1);
+    fn upload_hook_fires_once_on_the_last_byte_not_on_eof() {
+        // The hook must fire exactly when the payload's final byte is read, and
+        // not on a later zero-length read: ureq's length-delimited send loop
+        // stops as soon as `Content-Length` is satisfied, so it never issues a
+        // terminating `read` that returns 0.
+        let (hook, count) = counting_hook();
+        let mut reader = UploadHookReader {
+            bytes: b"hello".to_vec(),
+            pos: 0,
+            on_uploaded: Some(hook),
+        };
+        let mut buf = [0u8; 2];
+        assert_eq!(reader.read(&mut buf).expect("read"), 2);
+        assert_eq!(count.load(Ordering::Relaxed), 0, "not yet at the end");
+        assert_eq!(reader.read(&mut buf).expect("read"), 2);
+        assert_eq!(count.load(Ordering::Relaxed), 0, "not yet at the end");
+        assert_eq!(reader.read(&mut buf).expect("read"), 1);
+        assert_eq!(count.load(Ordering::Relaxed), 1, "fires on the last byte");
+        // A subsequent EOF read does not re-fire (the hook is taken once).
+        assert_eq!(reader.read(&mut buf).expect("read"), 0);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
     }
 
     #[test]
-    fn retry_loop_skips_on_accepted_on_a_terminal_error() {
-        // A non-retryable 4xx means the provider never accepted the request, so
-        // the request-accepted callback must NOT fire.  A 400 is non-retryable, so
-        // no backoff wait is entered (no time-based wait in this unit test).
-        let sent = Arc::new(AtomicU32::new(0));
-        let seen = sent.clone();
-        let mut cb: Option<RequestAcceptedCallback> = Some(Box::new(move || {
-            seen.fetch_add(1, Ordering::Relaxed);
-        }));
-        let mut no_retry = None;
-        let mut ctx = AttemptContext::new(&mut no_retry, None, None);
-        ctx.on_accepted = Some(&mut cb);
+    fn upload_hook_does_not_fire_before_the_payload_is_exhausted() {
+        // If a caller abandons the read (e.g. the request is dropped mid-send),
+        // the payload was not fully sent, so the hook must not fire.
+        let (hook, count) = counting_hook();
+        let mut reader = UploadHookReader {
+            bytes: vec![0u8; 10],
+            pos: 0,
+            on_uploaded: Some(hook),
+        };
+        let mut buf = [0u8; 4];
+        assert_eq!(reader.read(&mut buf).expect("read"), 4);
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
 
-        let result = retry_loop(
-            || Ok(http_response(400, "bad request")),
-            &test_config(),
-            &mut ctx,
-        );
-        assert!(result.is_err());
-        assert_eq!(sent.load(Ordering::Relaxed), 0);
+    #[test]
+    fn hooked_json_body_is_compact_and_len_matches_the_wire_bytes() {
+        // `len()` must equal the bytes handed to the reader so a caller-set
+        // `Content-Length` is exact, and the payload is compact JSON (no
+        // pretty-print whitespace) — smaller uploads, and the shape a future
+        // request-body compressor would consume.
+        let body = HookedJsonBody::new(&serde_json::json!({"a": 1, "b": [1, 2]}), None)
+            .expect("serialize");
+        assert_eq!(body.len(), body.bytes.len());
+        assert!(!body.bytes.contains(&b' '), "payload must be compact");
     }
 
     // ── parse_retry_after_secs (HTTP-date form) ───────────────────────

@@ -133,18 +133,20 @@ pub(super) fn generate_content_request(
     })
     .map_err(io::Error::other)?;
 
-    // The request-accepted callback fires on the successful attempt's headers
-    // (see `retry_loop`): a non-streaming provider still reports the
-    // accepted-but-still-generating `Waiting` boundary this way before its body
-    // is read, so its status sequence matches the streaming path.
-    let mut ctx =
-        retry::AttemptContext::new(on_retry, cancel_rx, None).with_on_accepted(on_accepted);
+    // The upload hook fires once the payload is fully sent, so a non-streaming
+    // provider reports the same `Waiting` boundary as the streaming path.
+    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, None);
+    // Compact body + explicit length + upload hook (see `retry::HookedJsonBody`).
+    let hooked = retry::HookedJsonBody::new(&body, on_accepted).map_err(io::Error::other)?;
+    let content_length = hooked.len().to_string();
     let response = retry::retry_loop(
         || {
             agent
                 .post(&url)
                 .header("x-goog-api-key", api_key.trim())
-                .send_json(body.clone())
+                .header("Content-Type", "application/json; charset=utf-8")
+                .header("Content-Length", content_length.as_str())
+                .send(hooked.send_body())
         },
         &retry_cfg,
         &mut ctx,
@@ -227,14 +229,18 @@ where
 
     // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
-    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline))
-        .with_on_accepted(on_accepted);
+    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));
+    // Compact body + explicit length + upload hook (see `retry::HookedJsonBody`).
+    let hooked = retry::HookedJsonBody::new(&body, on_accepted).map_err(io::Error::other)?;
+    let content_length = hooked.len().to_string();
     let response = retry::retry_loop(
         || {
             agent
                 .post(&url)
                 .header("x-goog-api-key", api_key.trim())
-                .send_json(body.clone())
+                .header("Content-Type", "application/json; charset=utf-8")
+                .header("Content-Length", content_length.as_str())
+                .send(hooked.send_body())
         },
         &retry_cfg,
         &mut ctx,

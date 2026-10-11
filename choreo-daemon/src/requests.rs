@@ -704,15 +704,16 @@ pub(crate) fn run_agent_loop(
             }
         }));
 
-        // Broadcast the `Waiting` boundary the instant the provider accepts the
-        // request (its response headers are read) and begins producing the
-        // first token.  A one-shot event fired from the retry layer BEFORE any
+        // Broadcast the `Waiting` boundary once the request payload has been
+        // fully uploaded (every body byte written, before the response is
+        // read).  A one-shot event fired from the transport layer BEFORE any
         // delta, so — unlike the per-delta `StreamPhase` advances below — it
         // does not participate in the forward-only phase comparison; it simply
-        // marks the handoff from "getting the request there" to "the model is
-        // thinking".
-        let mut accepted_cb: Option<choreo_ai_protocols::RequestAcceptedCallback> =
-            Some(Box::new({
+        // marks the handoff from "getting the request there" to "the provider
+        // is thinking".  The `Arc` lets the transport clone it into each retry
+        // attempt's request body.
+        let accepted_cb: Option<choreo_ai_protocols::RequestAcceptedCallback> =
+            Some(std::sync::Arc::new({
                 let cmd_tx = ctx.cmd_tx.clone();
                 move || {
                     let _ = cmd_tx.send(SessionCommand::StatusChanged(SessionStatus::Waiting));
@@ -745,7 +746,7 @@ pub(crate) fn run_agent_loop(
                 tools: &tools,
                 thinking_effort,
                 on_retry: &mut retry_cb,
-                on_accepted: &mut accepted_cb,
+                on_accepted: accepted_cb,
                 cancel_rx: Some(cancel_rx),
                 previous_response_id: prev_resp_id.as_deref(),
                 tool_results: &tool_results,

@@ -500,8 +500,7 @@ fn warm_request() -> WarmRequest {
 fn ping_request_shape_caps_output_no_retry_thinking_off() {
     let request = warm_request();
     let mut on_retry = None;
-    let mut on_accepted = None;
-    let ping = ping_request(&request, &mut on_retry, &mut on_accepted);
+    let ping = ping_request(&request, &mut on_retry);
     // The exact honoured shape: cap output, never retry, never think, never
     // share the loop's cancel receiver.
     assert_eq!(ping.max_output_tokens_override, Some(1));
@@ -526,7 +525,7 @@ fn ping_request_uses_the_per_protocol_cap() {
     };
     let mut on_retry = None;
     assert_eq!(
-        ping_request(&request, &mut on_retry, &mut None).max_output_tokens_override,
+        ping_request(&request, &mut on_retry).max_output_tokens_override,
         Some(0)
     );
 }

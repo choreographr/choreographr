@@ -451,7 +451,9 @@ pub(crate) fn responses_request(
     let mut no_retry = None;
     let mut ctx = retry::AttemptContext::new(&mut no_retry, cancel_rx, None);
     // No session identity on the plain prompt API — no gateway routing headers.
-    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx, None)?;
+    let response = retry::retry_send(
+        agent, &url, api_key, &body, config, &retry, &mut ctx, None, None,
+    )?;
     let payload: ResponsesResponse = response
         .into_body()
         .read_json()
@@ -510,7 +512,9 @@ where
     let mut no_retry = None;
     let mut ctx = retry::AttemptContext::new(&mut no_retry, cancel_rx, Some(&mut deadline));
     // No session identity on the plain prompt API — no gateway routing headers.
-    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx, None)?;
+    let response = retry::retry_send(
+        agent, &url, api_key, &body, config, &retry, &mut ctx, None, None,
+    )?;
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
     // Reader thread decouples the blocking socket read from cancellation
     // polling (see `crate::stream`); the abort flag on `sse` stops the thread
@@ -590,13 +594,20 @@ pub(crate) fn responses_request_with_tools(
     );
 
     let retry = retry::retry_config_from_config(config).with_no_retry(no_retry);
-    // The request-accepted callback fires on the successful attempt's headers
-    // (see `retry_loop`): a non-streaming provider still reports the
-    // accepted-but-still-generating `Waiting` boundary this way before its body
-    // is read, so its status sequence matches the streaming path.
-    let mut ctx =
-        retry::AttemptContext::new(on_retry, cancel_rx, None).with_on_accepted(on_accepted);
-    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx, route)?;
+    // The upload hook fires once the payload is fully sent, so a non-streaming
+    // provider reports the same `Waiting` boundary as the streaming path.
+    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, None);
+    let response = retry::retry_send(
+        agent,
+        &url,
+        api_key,
+        &body,
+        config,
+        &retry,
+        &mut ctx,
+        route,
+        on_accepted,
+    )?;
     let payload: ResponsesResponse = response
         .into_body()
         .read_json()
@@ -909,9 +920,18 @@ where
     let retry = retry::retry_config_from_config(config).with_no_retry(no_retry);
     // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
-    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline))
-        .with_on_accepted(on_accepted);
-    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx, route)?;
+    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));
+    let response = retry::retry_send(
+        agent,
+        &url,
+        api_key,
+        &body,
+        config,
+        &retry,
+        &mut ctx,
+        route,
+        on_accepted,
+    )?;
 
     let mut has_any_output = false;
     let mut full_content = String::new();
@@ -1261,7 +1281,7 @@ mod tests {
                 tools: &[],
                 reasoning_effort: effort,
                 on_retry: &mut no_retry,
-                on_accepted: &mut None,
+                on_accepted: None,
                 cancel_rx: None,
                 route: None,
                 previous_response_id: None,
@@ -2150,7 +2170,7 @@ mod tests {
                 tools: &[],
                 reasoning_effort: None,
                 on_retry: &mut no_retry,
-                on_accepted: &mut None,
+                on_accepted: None,
                 cancel_rx: None,
                 route: None,
                 previous_response_id: None,

@@ -66,9 +66,9 @@ pub(crate) struct TurnParams<'a> {
     pub tools: &'a [ChatToolDefinition],
     pub reasoning_effort: Option<&'a str>,
     pub on_retry: &'a mut Option<RetryCallback>,
-    /// Called once the provider accepts the request (see
+    /// Called once the request payload is fully uploaded (see
     /// [`RequestAcceptedCallback`]); `None` when the caller does not need it.
-    pub on_accepted: &'a mut Option<RequestAcceptedCallback>,
+    pub on_accepted: Option<RequestAcceptedCallback>,
     pub cancel_rx: Option<&'a crossbeam_channel::Receiver<()>>,
     /// Gateway routing identity (`session_id`, `request_id`) for the opencode
     /// zen/go providers; `None` when the caller has no session.
@@ -654,10 +654,9 @@ impl OpenAiClient {
     ///
     /// Returns [`OpenAiError`] on HTTP, provider, cancellation, or decoding
     /// failures.
-    // TEMP(`needless_pass_by_value`): the body moves `params`' borrowed
-    // parts straight into the request builders; taking a reference would
-    // ripple through every caller across the daemon and tests.
-    #[expect(clippy::needless_pass_by_value)]
+    // Passed by value: the body moves `params`' borrowed parts straight into
+    // the request builders; taking a reference would ripple through every
+    // caller across the daemon and tests.
     pub fn chat_completion_turn(
         &self,
         params: crate::ChatTurnRequest<'_>,

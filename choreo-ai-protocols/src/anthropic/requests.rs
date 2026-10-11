@@ -151,27 +151,29 @@ pub(super) fn messages_request(
     })
     .map_err(io::Error::other)?;
 
-    // The request-accepted callback fires on the successful attempt's headers
-    // (see `retry_loop`): a non-streaming provider still reports the
-    // accepted-but-still-generating `Waiting` boundary this way before its body
-    // is read, so its status sequence matches the streaming path.
-    let mut ctx =
-        retry::AttemptContext::new(on_retry, cancel_rx, None).with_on_accepted(on_accepted);
+    // The upload hook fires once the payload is fully sent, so a non-streaming
+    // provider reports the same `Waiting` boundary as the streaming path.
+    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, None);
     // Gateway headers (empty for non-gateway providers — see the shared
     // helper); applied alongside the auth headers inside the retry closure.
     let extra_headers = route.map_or_default(|(session_id, request_id)| {
         crate::shared::opencode_gateway_headers(&config.provider_slug, session_id, request_id)
     });
+    // Compact body + explicit length + upload hook (see `retry::HookedJsonBody`).
+    let hooked = retry::HookedJsonBody::new(&body, on_accepted).map_err(io::Error::other)?;
+    let content_length = hooked.len().to_string();
     let response = retry::retry_loop(
         || {
             let mut request = agent
                 .post(&url)
                 .header("x-api-key", api_key.trim())
-                .header("anthropic-version", &config.api_version);
+                .header("anthropic-version", &config.api_version)
+                .header("Content-Type", "application/json; charset=utf-8")
+                .header("Content-Length", content_length.as_str());
             for (name, value) in &extra_headers {
                 request = request.header(*name, value.as_str());
             }
-            request.send_json(body.clone())
+            request.send(hooked.send_body())
         },
         &retry_cfg,
         &mut ctx,
@@ -260,23 +262,27 @@ where
 
     // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
-    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline))
-        .with_on_accepted(on_accepted);
+    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));
     // Gateway headers (empty for non-gateway providers — see the shared
     // helper); applied alongside the auth headers inside the retry closure.
     let extra_headers = route.map_or_default(|(session_id, request_id)| {
         crate::shared::opencode_gateway_headers(&config.provider_slug, session_id, request_id)
     });
+    // Compact body + explicit length + upload hook (see `retry::HookedJsonBody`).
+    let hooked = retry::HookedJsonBody::new(&body, on_accepted).map_err(io::Error::other)?;
+    let content_length = hooked.len().to_string();
     let response = retry::retry_loop(
         || {
             let mut request = agent
                 .post(&url)
                 .header("x-api-key", api_key.trim())
-                .header("anthropic-version", &config.api_version);
+                .header("anthropic-version", &config.api_version)
+                .header("Content-Type", "application/json; charset=utf-8")
+                .header("Content-Length", content_length.as_str());
             for (name, value) in &extra_headers {
                 request = request.header(*name, value.as_str());
             }
-            request.send_json(body.clone())
+            request.send(hooked.send_body())
         },
         &retry_cfg,
         &mut ctx,

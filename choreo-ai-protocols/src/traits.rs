@@ -32,12 +32,12 @@ pub struct ChatTurnRequest<'a> {
     /// Optional callback invoked before each retry wait, for progress
     /// reporting; `None` disables the callback.
     pub on_retry: &'a mut Option<RetryCallback>,
-    /// Optional callback invoked once the provider has accepted the request
-    /// (a successful attempt's response headers have been read), marking the
-    /// boundary between dispatch/upload and the time-to-first-token wait;
-    /// `None` disables the callback.  See
+    /// Optional callback invoked once the request payload has been fully
+    /// uploaded to the provider (every body byte written, before the response
+    /// is read), marking the boundary between dispatch/upload and the
+    /// time-to-first-token wait; `None` disables the callback.  See
     /// [`RequestAcceptedCallback`](crate::RequestAcceptedCallback).
-    pub on_accepted: &'a mut Option<RequestAcceptedCallback>,
+    pub on_accepted: Option<RequestAcceptedCallback>,
     /// Cancellation channel.  A crossbeam receiver so the retry backoff and
     /// SSE waits can `select!` on it alongside their own channels instead of
     /// polling with `recv_timeout`.

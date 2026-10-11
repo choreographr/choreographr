@@ -264,7 +264,9 @@ pub(crate) fn chat_completions_request(
     let mut no_retry = None;
     let mut ctx = retry::AttemptContext::new(&mut no_retry, cancel_rx, None);
     // No session identity on the plain prompt API — no gateway routing headers.
-    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx, None)?;
+    let response = retry::retry_send(
+        agent, &url, api_key, &body, config, &retry, &mut ctx, None, None,
+    )?;
     let payload: ChatCompletionsResponse = response
         .into_body()
         .read_json()
@@ -323,13 +325,20 @@ pub(crate) fn chat_completions_request_with_tools(
         reasoning_effort,
     })
     .map_err(io::Error::other)?;
-    // The request-accepted callback fires on the successful attempt's headers
-    // (see `retry_loop`): a non-streaming provider still reports the
-    // accepted-but-still-generating `Waiting` boundary this way before its body
-    // is read, so its status sequence matches the streaming path.
-    let mut ctx =
-        retry::AttemptContext::new(on_retry, cancel_rx, None).with_on_accepted(on_accepted);
-    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx, route)?;
+    // The upload hook fires once the payload is fully sent, so a non-streaming
+    // provider reports the same `Waiting` boundary as the streaming path.
+    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, None);
+    let response = retry::retry_send(
+        agent,
+        &url,
+        api_key,
+        &body,
+        config,
+        &retry,
+        &mut ctx,
+        route,
+        on_accepted,
+    )?;
     let payload: ChatCompletionsResponse = response
         .into_body()
         .read_json()
@@ -534,7 +543,9 @@ where
     let mut no_retry = None;
     let mut ctx = retry::AttemptContext::new(&mut no_retry, cancel_rx, Some(&mut deadline));
     // No session identity on the plain prompt API — no gateway routing headers.
-    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx, None)?;
+    let response = retry::retry_send(
+        agent, &url, api_key, &body, config, &retry, &mut ctx, None, None,
+    )?;
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
     // The blocking socket read lives on a dedicated thread (see
     // `crate::stream`): `recv_sse_event` below is fully event-driven — it
@@ -935,9 +946,18 @@ where
     .map_err(io::Error::other)?;
     // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
-    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline))
-        .with_on_accepted(on_accepted);
-    let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx, route)?;
+    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));
+    let response = retry::retry_send(
+        agent,
+        &url,
+        api_key,
+        &body,
+        config,
+        &retry,
+        &mut ctx,
+        route,
+        on_accepted,
+    )?;
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
     let mut acc = ChatCompletionsStreamAccumulator::default();
     // Reader thread decouples the blocking socket read from cancellation
