@@ -8,7 +8,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use choreo_ai_protocols::openai::{
-    ChatRequestMessage, ChatToolDefinition, RequestSentCallback, RetryCallback,
+    ChatRequestMessage, ChatToolDefinition, RequestAcceptedCallback, RetryCallback,
 };
 use choreo_ai_protocols::{ChatTurnRequest, ChatTurnResult};
 use crossbeam_channel::{Receiver, Sender};
@@ -237,7 +237,7 @@ fn warmer_loop(
 pub(super) fn ping_request<'a>(
     request: &'a WarmRequest,
     on_retry: &'a mut Option<RetryCallback>,
-    on_sent: &'a mut Option<RequestSentCallback>,
+    on_accepted: &'a mut Option<RequestAcceptedCallback>,
 ) -> ChatTurnRequest<'a> {
     ChatTurnRequest {
         model: &request.model,
@@ -245,7 +245,7 @@ pub(super) fn ping_request<'a>(
         tools: &request.tools,
         thinking_effort: "off".to_string(),
         on_retry,
-        on_sent,
+        on_accepted,
         cancel_rx: None,
         previous_response_id: None,
         tool_results: &[],

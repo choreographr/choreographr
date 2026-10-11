@@ -399,7 +399,7 @@ fn protocol_is_anthropic(slug: &str) -> bool {
 /// pair of hand-written inverse guards that could drift apart.
 ///
 /// The `Waiting` boundary — the provider has accepted the request but the
-/// first token has not arrived — is broadcast directly by the request-sent
+/// first token has not arrived — is broadcast directly by the request-accepted
 /// callback rather than tracked here: it is a one-shot event that fires before
 /// any delta, so it never needs to participate in the forward-only comparison.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -711,12 +711,13 @@ pub(crate) fn run_agent_loop(
         // does not participate in the forward-only phase comparison; it simply
         // marks the handoff from "getting the request there" to "the model is
         // thinking".
-        let mut sent_cb: Option<choreo_ai_protocols::RequestSentCallback> = Some(Box::new({
-            let cmd_tx = ctx.cmd_tx.clone();
-            move || {
-                let _ = cmd_tx.send(SessionCommand::StatusChanged(SessionStatus::Waiting));
-            }
-        }));
+        let mut accepted_cb: Option<choreo_ai_protocols::RequestAcceptedCallback> =
+            Some(Box::new({
+                let cmd_tx = ctx.cmd_tx.clone();
+                move || {
+                    let _ = cmd_tx.send(SessionCommand::StatusChanged(SessionStatus::Waiting));
+                }
+            }));
 
         // Running count of output tokens produced by the current turn.
         let mut output_token_count: u32 = 0;
@@ -744,7 +745,7 @@ pub(crate) fn run_agent_loop(
                 tools: &tools,
                 thinking_effort,
                 on_retry: &mut retry_cb,
-                on_sent: &mut sent_cb,
+                on_accepted: &mut accepted_cb,
                 cancel_rx: Some(cancel_rx),
                 previous_response_id: prev_resp_id.as_deref(),
                 tool_results: &tool_results,

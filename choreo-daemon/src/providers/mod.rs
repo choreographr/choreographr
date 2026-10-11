@@ -896,7 +896,7 @@ pub(crate) mod test_util {
     /// deltas and then returns a fixed final answer, so a test can pin exactly
     /// which `SessionStatus` phases the daemon broadcasts as the stream flows.
     ///
-    /// It fires the request-sent callback before any delta (a real provider
+    /// It fires the request-accepted callback before any delta (a real provider
     /// reports the boundary once the response headers are read), and when
     /// `retry_first` is set it fires the retry callback even before that — the
     /// only point a real provider retries, because the retry loop wraps the
@@ -939,9 +939,9 @@ pub(crate) mod test_util {
                 cb(1, 3, std::time::Duration::from_millis(1));
             }
             // The provider accepts the request (headers read) before it streams
-            // any delta, so the request-sent boundary always precedes the
+            // any delta, so the request-accepted boundary always precedes the
             // events — matching a real provider call.
-            if let Some(cb) = params.on_sent.as_mut() {
+            if let Some(cb) = params.on_accepted.as_mut() {
                 cb();
             }
             for event in &self.events {

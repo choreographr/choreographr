@@ -36,7 +36,7 @@ pub type RetryCallback = Box<dyn FnMut(u32, u32, Duration) + Send>;
 /// been streamed.  It marks the boundary between "the request is being sent"
 /// and "the model is now producing tokens", so a status bar can distinguish
 /// the dispatch/upload phase from the time-to-first-token wait.
-pub type RequestSentCallback = Box<dyn FnMut() + Send>;
+pub type RequestAcceptedCallback = Box<dyn FnMut() + Send>;
 
 /// Hard ceiling on a single retry delay, in milliseconds.
 ///
@@ -181,7 +181,7 @@ pub struct AttemptContext<'a> {
     /// Invoked once the provider has accepted a successful (2xx) attempt — its
     /// response headers are in hand and its body is about to be read.  `None`
     /// when no caller cares about the boundary.
-    pub on_sent: Option<&'a mut Option<RequestSentCallback>>,
+    pub on_accepted: Option<&'a mut Option<RequestAcceptedCallback>>,
     /// Cancellation channel; `None` when cancellation is not wired up.
     /// Crossbeam so waits can `select!` on it alongside a retry timer.
     pub cancel_rx: Option<&'a crossbeam_channel::Receiver<()>>,
@@ -191,8 +191,8 @@ pub struct AttemptContext<'a> {
 }
 
 impl<'a> AttemptContext<'a> {
-    /// Bundle the per-call retry context for [`retry_loop`].  The request-sent
-    /// callback defaults to `None`; attach one with [`Self::with_on_sent`].
+    /// Bundle the per-call retry context for [`retry_loop`].  The request-accepted
+    /// callback defaults to `None`; attach one with [`Self::with_on_accepted`].
     #[must_use]
     pub fn new(
         on_retry: &'a mut Option<RetryCallback>,
@@ -201,19 +201,19 @@ impl<'a> AttemptContext<'a> {
     ) -> Self {
         Self {
             on_retry,
-            on_sent: None,
+            on_accepted: None,
             cancel_rx,
             attempt_deadline,
         }
     }
 
-    /// Attach a request-sent callback (see [`RequestSentCallback`]).  A builder
-    /// rather than a fourth `new` parameter so the many call sites that do not
-    /// need the boundary keep their current signature.
+    /// Attach a request-accepted callback (see [`RequestAcceptedCallback`]).  A
+    /// builder rather than a fourth `new` parameter so the many call sites that
+    /// do not need the boundary keep their current signature.
     #[must_use]
-    pub fn with_on_sent(self, on_sent: &'a mut Option<RequestSentCallback>) -> Self {
+    pub fn with_on_accepted(self, on_accepted: &'a mut Option<RequestAcceptedCallback>) -> Self {
         Self {
-            on_sent: Some(on_sent),
+            on_accepted: Some(on_accepted),
             ..self
         }
     }
@@ -661,11 +661,11 @@ where
         let status: u16 = response.status().as_u16();
         if (200..300).contains(&status) {
             // The provider accepted this attempt: headers are in hand and the
-            // body is about to stream.  Fire the request-sent boundary before
+            // body is about to stream.  Fire the request-accepted boundary before
             // handing the response back to the caller's body reader.  The retry
             // loop only reaches here on the successful attempt, so this fires
             // exactly once even when earlier attempts were retried.
-            if let Some(slot) = ctx.on_sent.as_deref_mut()
+            if let Some(slot) = ctx.on_accepted.as_deref_mut()
                 && let Some(cb) = slot.as_mut()
             {
                 cb();
@@ -1011,7 +1011,7 @@ mod tests {
         assert_eq!(observed.load(Ordering::Relaxed), MAX_BACKOFF_MS);
     }
 
-    // ── on_sent firing (the daemon's `Waiting` boundary) ─────────────
+    // ── on_accepted firing (the daemon's `Waiting` boundary) ─────────────
 
     /// A minimal `ureq` response for driving [`retry_loop`] in-process (no
     /// socket): the builder's `data` supplies a readable body so a terminal
@@ -1024,17 +1024,18 @@ mod tests {
     }
 
     #[test]
-    fn retry_loop_fires_on_sent_once_on_a_successful_attempt() {
-        // A provider that accepts the request (2xx) fires the request-sent
-        // callback exactly once — it is the daemon's `Waiting` boundary.
+    fn retry_loop_fires_on_accepted_once_on_a_successful_attempt() {
+        // A provider that accepts the request (2xx) fires the request-accepted
+        // callback exactly once — it is the daemon's `Waiting` boundary.  Built
+        // through the public builder (the field is `pub` too; the terminal-error
+        // test below covers the direct-assignment path).
         let sent = Arc::new(AtomicU32::new(0));
         let seen = sent.clone();
-        let mut cb: Option<RequestSentCallback> = Some(Box::new(move || {
+        let mut cb: Option<RequestAcceptedCallback> = Some(Box::new(move || {
             seen.fetch_add(1, Ordering::Relaxed);
         }));
         let mut no_retry = None;
-        let mut ctx = AttemptContext::new(&mut no_retry, None, None);
-        ctx.on_sent = Some(&mut cb);
+        let mut ctx = AttemptContext::new(&mut no_retry, None, None).with_on_accepted(&mut cb);
 
         let response = retry_loop(|| Ok(http_response(200, "ok")), &test_config(), &mut ctx);
         assert!(response.is_ok());
@@ -1042,18 +1043,18 @@ mod tests {
     }
 
     #[test]
-    fn retry_loop_skips_on_sent_on_a_terminal_error() {
+    fn retry_loop_skips_on_accepted_on_a_terminal_error() {
         // A non-retryable 4xx means the provider never accepted the request, so
-        // the request-sent callback must NOT fire.  A 400 is non-retryable, so
+        // the request-accepted callback must NOT fire.  A 400 is non-retryable, so
         // no backoff wait is entered (no time-based wait in this unit test).
         let sent = Arc::new(AtomicU32::new(0));
         let seen = sent.clone();
-        let mut cb: Option<RequestSentCallback> = Some(Box::new(move || {
+        let mut cb: Option<RequestAcceptedCallback> = Some(Box::new(move || {
             seen.fetch_add(1, Ordering::Relaxed);
         }));
         let mut no_retry = None;
         let mut ctx = AttemptContext::new(&mut no_retry, None, None);
-        ctx.on_sent = Some(&mut cb);
+        ctx.on_accepted = Some(&mut cb);
 
         let result = retry_loop(
             || Ok(http_response(400, "bad request")),

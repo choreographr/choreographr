@@ -896,7 +896,7 @@ where
         tools,
         reasoning_effort,
         on_retry,
-        on_sent,
+        on_accepted,
         cancel_rx,
         route,
         max_output_tokens_override,
@@ -929,8 +929,8 @@ where
     .map_err(io::Error::other)?;
     // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
-    let mut ctx =
-        retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline)).with_on_sent(on_sent);
+    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline))
+        .with_on_accepted(on_accepted);
     let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx, route)?;
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
     let mut acc = ChatCompletionsStreamAccumulator::default();
