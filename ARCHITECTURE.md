@@ -578,34 +578,28 @@ Two contracts cross that boundary and are public surfaces in their own right:
 
 Each client maps the account's `&str` reasoning-effort slug onto its own wire
 format (OpenAI-compatible `reasoning_effort`, Anthropic a `thinking` block with
-`budget_tokens`, Google `thinkingConfig`) — see each adapter module for its
-exact mapping. The catalog's own data pipeline is described under
-**models.dev + overlay**; the one-time slug migration under **Slug renames**.
-
-(Note: Mistral speaks the OpenAI wire format — `POST /v1/chat/completions` — so
-it is catalogued under `OpenAi`, not a protocol of its own.)
+`budget_tokens`, Google `thinkingConfig`); each adapter module documents its
+exact mapping. Mistral speaks the OpenAI wire format
+(`POST /v1/chat/completions`), so it is catalogued under `OpenAi`, not a
+protocol of its own.
 
 ### models.dev + overlay
 
 The catalog is a two-layer pipeline in `choreo-ai-protocols/src/catalog/`: a
-**normalized models.dev base** supplies the facts — provider slugs/names, base
-URLs, and per-model context/reasoning/cost data — and a **bundled policy
+**normalized models.dev base** supplies the facts (provider slugs/names, base
+URLs, and per-model context/reasoning/cost data), and a **bundled policy
 overlay** (`catalog/models-overlay.toml`) supplies everything models.dev cannot
-express: wire-protocol selection, endpoint and default-model policy, per-model
+express (wire-protocol selection, endpoint and default-model policy, per-model
 passback exceptions, the prompt-cache TTL tiers, and the wholesale overlay-only
-providers models.dev does not cover. `catalog/models.dev.json` is a **local,
-gitignored** snapshot (`catalog-gen` fetches it when missing), so the only
-committed catalog data file is the embedded postcard blob `catalog/catalog.bin`
-that `normalize_modelsdev` produces deterministically (its JSON object order is
-load-bearing: the derived default model is a provider's first model id). The
-overlay is merged **at load time** (`merge_overlay`), never baked into the blob,
-so S4 can re-merge the same base with a user overlay at runtime.
-
-The per-field normalization, the exact overlay schema, and the merge precedence
-(provider scalars field-wise replace, a named model overrides that entry's
-fields onto the base so "new keys add", and unknown keys warn and are skipped
-rather than failing the daemon) are documented in the `catalog` module and in
-`catalog/models-overlay.toml`.
+providers models.dev does not cover). The overlay is merged **at load time**,
+never baked into the committed blob `catalog/catalog.bin`, so the runtime
+refresh (S4) can re-merge the same base with a user overlay. The pipeline, the
+per-model normalization, the exact overlay schema, and the merge precedence
+(provider scalars field-wise replace; a named model overrides that entry's
+fields onto the base; unknown keys warn and are skipped rather than failing the
+daemon) are documented in-source (the `catalog` module and
+`catalog/models-overlay.toml`), held complete by the `#![warn(missing_docs)]` +
+`doc-check` gate.
 
 ### Runtime catalog refresh (S4)
 
@@ -615,40 +609,28 @@ One maintenance thread (`choreo-daemon/src/catalog.rs`) owns the whole pipeline
 but never mutates the catalog itself — every change is sent to the daemon
 command loop, the single writer of the `ArcSwap`, over a channel.
 
-- **Cache.** The normalized base is cached at
-  `$XDG_DATA_HOME/choreographr/catalog.bin` (postcard, same format as the
-  embedded blob, so one load path) and written atomically; the models.dev etag
-  is persisted in the DB *after* the bin is on disk, so a crash between the two
-  self-heals (a new etag over stale content would 304 forever). Startup loads a
-  valid cache first, else the embedded blob.
-- **Refresh pacing.** A models.dev fetch is attempted at most once per 25 h,
-  whatever the last outcome, anchored on a wall-clock attempt timestamp written
-  to the DB *before* the fetch starts — so the cadence survives restarts and a
-  crash mid-fetch cannot re-fetch. The 25 h period (not 24 h) makes each
-  daemon's fetch time drift +1 h/day, spreading load. `/refresh-models` bypasses
-  the cooldown but still records the attempt.
-- **Background refresh.** The conditional GET against
-  `https://models.dev/api.json` (`If-None-Match` with the DB etag) — the fetch
-  half lives in `choreo-ai-protocols` `catalog::refresh`, so the command loop
-  never does HTTP — normalizes a 200, validates it non-empty, and hands the new
-  base to the command loop, which merges overlays, atomically swaps the catalog,
-  persists cache + etag, and broadcasts `CatalogUpdated`.
-- **User overlay.** `$XDG_CONFIG_HOME/choreographr/models-overlay.toml`, the
-  same schema as the bundled layer, merged last (highest precedence). The
-  unified config transport watches the config *directory* and surfaces edits to
-  the maintenance thread, which reloads through a fingerprint gate so editor
-  save-event storms collapse; deleting the file falls back to bundled-only.
-- **`/refresh-models`.** TUI slash command → `ClientMessage::RefreshModels` →
-  handed to the maintenance thread over its channel (never blocking the command
-  loop on the download) → reply as `DaemonMessage::ModelsRefreshed` (with
-  `RefreshStatus`: `UpToDate`/`Updated`/`Forced`) or `ModelsRefreshFailed`. A
-  burst of requests is coalesced into one fetch (force flags OR-ed, each
-  requester's status reflecting its own flag). It also re-reads the user overlay
-  as the documented watch-fallback.
-- **`CatalogUpdated` broadcast.** Every catalog swap (startup, overlay reload,
-  `/refresh-models`) broadcasts the full provider list (slug + display name) to
-  all activity subscribers, and a freshly subscribed client is sent the current
-  list immediately, so the TUI's provider picker tracks the live catalog.
+The cross-cutting invariants: the normalized base is cached in the data dir in
+the same postcard format as the embedded blob, written atomically, with the
+models.dev etag persisted in the DB *after* the bin is on disk so a crash
+between the two self-heals (a new etag over stale content would 304 forever).
+A models.dev fetch is attempted at most once per 25 h, whatever the last
+outcome, anchored on a wall-clock attempt timestamp written *before* the fetch
+so the cadence survives restarts — the 25 h period (not 24 h) spreads load
+across the daemon population; `/refresh-models` bypasses the cooldown but still
+records the attempt. The user overlay (`$XDG_CONFIG_HOME/choreographr/
+models-overlay.toml`, the same schema as the bundled layer, merged last at
+highest precedence) is watched by the unified config transport, which surfaces
+edits to the maintenance thread through a fingerprint gate so editor save-event
+storms collapse; deleting the file falls back to bundled-only. Two wire surfaces
+ride the refresh: `/refresh-models` (TUI slash command →
+`ClientMessage::RefreshModels` → the maintenance thread → `DaemonMessage::
+ModelsRefreshed` with `RefreshStatus`, or `ModelsRefreshFailed`; a burst of
+requests is coalesced into one fetch) and `CatalogUpdated`, broadcast on every
+catalog swap to all activity subscribers so the TUI's provider picker tracks the
+live catalog. The cache/etag/cooldown mechanics, the conditional GET, and the
+fingerprint gate are documented in-source (`choreo-daemon`'s `catalog` module
+and `choreo-ai-protocols`'s `catalog::refresh`).
+
 - **`/mcp`.** The TUI's `/mcp` slash command (and the `choreographr mcp` CLI)
   surfaces the state of the configured MCP servers. `ClientMessage::McpStatusRequest`
   is translated by the connection thread into `DaemonCommand::McpStatus` (the
@@ -700,7 +682,7 @@ session and request worker) is read lock-free and swapped only by the command
 loop, on `DaemonCommand::McpListChanged` — a wholesale registry swap is what
 lets a live MCP list change reach in-flight sessions without a restart.
 
-#### Reasoning round-trip (capture → carry → re-emit)
+### Reasoning round-trip (capture → carry → re-emit)
 
 For Anthropic (thinking blocks + signatures), DeepSeek/Kimi
 (`reasoning_content`), Gemini (thought signatures), and OpenAI/xAI Responses
@@ -721,6 +703,8 @@ name-based heuristic), and the `previous_response_id` continuity chain. The
 artifact never leaves the daemon process — client-bound `SessionEvent`s carry it
 as `None`. The variant semantics and the resolver contracts are documented on
 `ReasoningPassback` and the resolver functions.
+
+### Supported providers
 
 Currently supports 208 providers (184 from the models.dev base + 24 overlay-only). Adding or refreshing a provider is a data change in `catalog/`: update the snapshot (or add an overlay entry) and re-run `cargo run --bin catalog-gen` — zero client code.
 
@@ -743,6 +727,8 @@ Currently supports 208 providers (184 from the models.dev base + 24 overlay-only
 > | `cursor` | t3code subprocess driver (spawns the Cursor CLI), not a direct HTTP provider. |
 >
 > Adding them requires daemon-side OAuth support and/or multi-field credentials, both out of scope for the current catalog model.
+
+### Daemon client & request topology
 
 **Per-client architecture (OS threads):**
 
@@ -785,118 +771,41 @@ RunInput received
 
 ## Token Usage & Context Window Tracking
 
-Token usage flows from providers through the daemon to all clients.
-Each session also tracks the model's **context window size**, resolved when the model
-is selected. The TUI displays context usage as a fraction
-(`last_prompt_tokens / context_window`), showing the actual context size sent in the
-most recent request rather than accumulated totals.
-
-Additionally, each session tracks `last_prompt_tokens: Option<u32>` — the `input_tokens`
-from the most recent API response. This is stored separately from `accumulated_usage`
-(the billing counter) and reflects the actual context payload the model sees on the
-latest turn. When an existing session is loaded from the database but has no stored
-`context_window`, the daemon re-resolves it from the provider catalog.
-
-```
-LLM provider (API response)
-  └► usage extracted per-turn in provider client
-     ├─ OpenAI non-streaming:    ChatCompletionsResponse.usage
-     ├─ OpenAI streaming:        final SSE chunk with usage (stream_options.include_usage=true)
-     ├─ Anthropic non-streaming: MessagesResponse.usage (input + output tokens,
-     │                           + cache_read_input_tokens → cached_tokens,
-     │                           + cache_creation_input_tokens → cache_write_tokens)
-     ├─ Anthropic streaming:     message_start (input + cache_read_input_tokens + cache_creation_input_tokens) + message_delta (output)
-     ├─ Mistral:                 ChatCompletionResponse.usage
-     └─ Google:                 Not yet supported (usage = None)
-       │
-       ▼
-     ChatTurnResult (FinalText | ToolUse).usage: Option<TokenUsage>
-       │
-       ▼
-      run_agent_loop (choreo-daemon/src/requests.rs)
-        ├─ embeds per-turn TokenUsage into SessionMessageKind::AssistantText / SessionMessageKind::AssistantToolUse
-        ├─ tracks last_prompt_tokens = Some(usage.input_tokens) for context-window display
-        └─ accumulates into SessionState.config.accumulated_usage (TokenUsage)
-        │    └─ on the worker's PRIVATE session clone; the main thread's config
-        │       is synced mid-turn via SessionCommand::SyncAccumulatedUsage (see below)
-        │
-        ▼
-      SessionState (choreo-daemon/src/sessions.rs)
-        ├─ persisted via SessionRecord.accumulated_usage (through SessionConfig)
-        ├─ sent to subscribers via SessionEvent::SessionState.token_usage
-        ├─ sent to clients via SessionEvent::Done.token_usage
-        ├─ included in SessionSummary.token_usage (listing / get-session)
-        ├─ last_prompt_tokens flows through the same channels (SessionRecord,
-        │  SessionState, SessionEvent::SessionState, SessionEvent::Done,
-        │  SessionSummary)
-        └─ status flows through SessionEvent::SessionState.status and
-           SessionEvent::SessionStatusChanged for live toolbar display.
-           Every status transition refreshes the daemon's session_metadata
-           index in handle_broadcast_session_status (daemon.rs) so a later
-           ListSessions never serves a stale status — but it does NOT bump
-           last_modified (status transitions are pipeline churn, not
-           modifications); the index is the source of truth for the sessions
-           list.
-        └─ the sessions list (ListSessions) is sorted newest-first by
-           last_modified (id-desc tiebreak) — see handle_list_sessions.
-        │
-        ▼
-     Clients (choreo-tui, choreo-gui, choreo-im)
-       ├─ choreo-tui: displays in session detail view (render/session_manager.rs:render_session_detail_view)
-       │  as "Context:  current / limit (pct%)"
-       └─ choreo-tui: terminal progress bar uses last_prompt_tokens vs context_window
-          for the OSC 9;4 percentage sequence
-```
-
-The request worker accumulates usage on a **private clone** of the session
-state and only merges it back at `RequestFinished`.  To keep every consumer
-fresh *mid-turn* (attach `SessionState` snapshots, session summaries, and
-`TokenUsageUpdate` broadcasts), `broadcast_token_usage` (requests/tool_execution.rs) routes the
-worker's cumulative total through `SessionCommand::SyncAccumulatedUsage` to the
-session's main thread, which (1) applies it to the authoritative
-`config.accumulated_usage` — as a per-field **max** (`TokenUsage::merge_max`,
-shared with the TUI's attach-snapshot merge), so an out-of-order or overlapping
-sync can never regress a total a client already saw — (2) re-broadcasts
-`TokenUsageUpdate` from the updated state so a client can never be ahead of the
-snapshot it receives on attach, and (3) refreshes the daemon's session-metadata
-index without a `last_modified` bump.  `apply_worker_snapshot` at
-`RequestFinished` applies the final (≥) value, so the two paths are idempotent.
-On the client side, `last_prompt_tokens` is not cumulative, so the TUI
-gap-fills it from snapshots (never overwriting a fresher value) instead of
-max-merging it.
-
 Token usage is the protocol-agnostic `TokenUsage` struct
 (`choreo-proto/src/types/common.rs`) — `input_tokens` / `output_tokens` /
 `total_tokens` plus the prompt-cache `cached_tokens` / `cache_write_tokens`
 counts — whose per-field-max `merge_max` is the merge policy shared by the
 daemon's mid-turn sync and the TUI's attach-snapshot merge.
 
-**Context window resolution chain (per session):**
+Two cross-cutting accounting contracts:
 
-```
-handle_set_model / handle_set_account
-  └► InferenceProvider::resolve_context_window(model)
-       ├─ ProviderClient::context_window_for_model(model)
-       │    ├─ model_context_windows (exact model name match)
-       │    └─ context_window (global fallback)
-       └─ catalog::lookup_context_window(provider_slug, model)
-             └─ model_context_windows (exact model slug match)
-       │
-       ▼
-     SessionConfig.context_window: Option<u32>
-       │
-       ▼
-     Re-resolved on session startup if None
-       (session_main + handle_run_input both call
-        SessionState::resolve_context_window_if_missing(),
-        handling sessions created before the model was
-        in the catalog or providers resolved after unlock)
-       │
-       ▼
-     Client display (e.g. "Context: 45,000 / 128,000 (35%)")
-```
+- **The billing counter vs. the context payload.** Each session tracks an
+  `accumulated_usage` billing total (persisted on the session record and
+  re-derived from per-turn usage on load) *and* a separate
+  `last_prompt_tokens` (`input_tokens` from the most recent response) — the
+  actual context size the model last saw, used for the context-window progress
+  display (`last_prompt_tokens / context_window`), never a cumulative sum.
+- **Mid-turn freshness.** The request worker accumulates on a **private clone**
+  of the session state and merges it back at `RequestFinished`; to keep every
+  consumer fresh *mid-turn*, the worker's cumulative total is routed through
+  `SessionCommand::SyncAccumulatedUsage` to the session's main thread, which
+  applies it as a per-field **max** (`TokenUsage::merge_max`) — so an
+  out-of-order or overlapping sync can never regress a total a client already
+  saw — re-broadcasts `TokenUsageUpdate` from the authoritative state, and
+  refreshes the daemon's metadata index without a `last_modified` bump.
+  `last_prompt_tokens` is not cumulative, so clients gap-fill it from snapshots
+  (never overwriting a fresher value) rather than max-merging it.
 
-All new fields use `#[serde(default)]` so old persisted sessions remain compatible (deserialize to zero usage).
+The per-turn extraction in each adapter, the `SessionState` →
+`SessionEvent`/`SessionSummary` field plumbing, the context-window resolution
+chain (`resolve_context_window` → per-model config → catalog fallback,
+re-resolved on load when absent), and the client displays are documented
+in-source (`choreo-daemon`'s `requests`, `sessions`, and `providers` modules and
+`choreo-proto`; `cargo doc -p choreo-daemon` / `just doc`), held complete by the
+`#![warn(missing_docs)]` + `doc-check` gate.
+
+All session fields use `#[serde(default)]` so old persisted sessions remain
+compatible (deserialize to zero usage).
 
 ---
 
