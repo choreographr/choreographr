@@ -267,6 +267,57 @@ fn reconstruct_accumulated_usage_includes_undone_turns() {
     assert_eq!(accumulated.input_tokens, 52);
 }
 
+/// A turn with distinctive nonzero counts on *every* usage field, cache
+/// included, so a summation that drops a field shows up in the assertion.
+fn turn_with_cache_usage(
+    input: u32,
+    output: u32,
+    cached: u32,
+    cache_write: u32,
+    undone: bool,
+) -> Turn {
+    Turn {
+        created_at: TimestampMs::now(),
+        undone,
+        error: None,
+        user_text: Some("u".into()),
+        assistant_text: Some("a".into()),
+        assistant_reasoning: None,
+        tool_calls: Vec::new(),
+        token_usage: Some(TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: input + output,
+            cached_tokens: cached,
+            cache_write_tokens: cache_write,
+        }),
+        tool_results: Vec::new(),
+        displayed_images: Vec::new(),
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    }
+}
+
+#[test]
+fn reconstruct_accumulated_usage_includes_cache_counts() {
+    // The reconstruction sums *every* usage field, not just the
+    // input/output/total triple: the prompt-cache read/write counts are billed
+    // separately, so dropping them silently under-reports a session's cache
+    // spend. The undone turn still counts — billing is a lifetime total.
+    let mut turns = BTreeMap::new();
+    turns.insert(0, turn_with_cache_usage(100, 20, 40, 5, false));
+    turns.insert(1, turn_with_cache_usage(200, 30, 150, 25, true));
+
+    let accumulated = reconstruct_accumulated_usage(&turns);
+    // input: 100 + 200, output: 20 + 30, total: 120 + 230
+    assert_eq!(accumulated.input_tokens, 300);
+    assert_eq!(accumulated.output_tokens, 50);
+    assert_eq!(accumulated.total_tokens, 350);
+    // The previously-dropped cache counts must survive the sum.
+    assert_eq!(accumulated.cached_tokens, 190);
+    assert_eq!(accumulated.cache_write_tokens, 30);
+}
+
 #[test]
 fn undo_and_redo_recompute_last_prompt_tokens_from_live_turns() {
     let mut state = SessionState::empty();
