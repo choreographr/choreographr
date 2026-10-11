@@ -206,8 +206,15 @@ pub enum SessionStatus {
     /// Default initial state — session is loaded and ready but not processing.
     #[default]
     Inactive,
-    /// The session is streaming an inference response.
-    Inference,
+    /// The session has dispatched its request to the provider and is awaiting
+    /// the first response token.  The wait spans connection setup, request
+    /// upload, and provider queueing — the transport performs all three in one
+    /// blocking send, so they are not separable into finer phases.
+    Sending,
+    /// The session is streaming the model's reasoning (display-only) tokens.
+    Thinking,
+    /// The session is streaming the model's answer tokens.
+    Responding,
     /// The session is running a tool call; the string is the tool name.
     ToolCall(String),
     /// The daemon received a retryable HTTP error (429/5xx/connection) and is
@@ -224,14 +231,18 @@ pub enum SessionStatus {
 }
 
 impl SessionStatus {
-    /// Returns `true` when the session is actively processing (inference,
-    /// tool call, or retrying).  Returns `false` for idle states (inactive,
-    /// sleeping).
+    /// Returns `true` when the session is actively processing (sending,
+    /// thinking, responding, running a tool call, or retrying).  Returns
+    /// `false` for idle states (inactive, sleeping).
     #[must_use]
     pub fn is_active(&self) -> bool {
         matches!(
             self,
-            SessionStatus::Inference | SessionStatus::ToolCall(_) | SessionStatus::Retrying { .. }
+            SessionStatus::Sending
+                | SessionStatus::Thinking
+                | SessionStatus::Responding
+                | SessionStatus::ToolCall(_)
+                | SessionStatus::Retrying { .. }
         )
     }
 

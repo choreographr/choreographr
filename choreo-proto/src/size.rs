@@ -134,7 +134,11 @@ fn session_status_size(status: &SessionStatus) -> usize {
     match status {
         SessionStatus::ToolCall(name) => 8 + name.len(),
         SessionStatus::Retrying { .. } => 16,
-        SessionStatus::Sleeping | SessionStatus::Inactive | SessionStatus::Inference => 4,
+        SessionStatus::Sleeping
+        | SessionStatus::Inactive
+        | SessionStatus::Sending
+        | SessionStatus::Thinking
+        | SessionStatus::Responding => 4,
     }
 }
 

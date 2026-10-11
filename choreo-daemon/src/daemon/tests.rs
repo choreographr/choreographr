@@ -800,7 +800,7 @@ fn handle_update_metadata() {
         created_at: 2000,
         last_modified: 2000,
         turn_count: 5,
-        status: SessionStatus::Inference,
+        status: SessionStatus::Responding,
         active_tool_groups: vec!["core".into(), "git".into()],
         account_name: None,
         accumulated_usage: TokenUsage::default(),
@@ -817,7 +817,7 @@ fn handle_update_metadata() {
     assert_eq!(stored.title.as_deref(), Some("updated"));
     assert_eq!(stored.selected_model.as_deref(), Some("gpt-4"));
     assert_eq!(stored.turn_count, 5);
-    assert_eq!(stored.status, SessionStatus::Inference);
+    assert_eq!(stored.status, SessionStatus::Responding);
 }
 
 #[test]
@@ -947,7 +947,7 @@ fn handle_broadcast_session_status() {
     });
     state.handle_command(DaemonCommand::BroadcastSessionStatus {
         session_id: 42,
-        status: SessionStatus::Inference,
+        status: SessionStatus::Responding,
     });
     let msg = rx.recv().unwrap();
     assert!(matches!(
@@ -955,7 +955,7 @@ fn handle_broadcast_session_status() {
         DaemonMessageType::Session {
             session_id: Some(42),
             event: SessionEvent::SessionStatusChanged {
-                status: SessionStatus::Inference,
+                status: SessionStatus::Responding,
                 ..
             },
         }
@@ -963,7 +963,7 @@ fn handle_broadcast_session_status() {
     // The metadata index must stay in sync so a later ListSessions serves
     // the fresh status (this is the stale-status bug fix).
     let meta = state.session_metadata.get(&42).expect("index updated");
-    assert_eq!(meta.status, SessionStatus::Inference);
+    assert_eq!(meta.status, SessionStatus::Responding);
     // Status transitions are internal churn, not modifications: the index
     // status refreshes but the timestamp must stay put so the sessions
     // list does not re-sort mid-request.
@@ -1043,7 +1043,7 @@ fn handle_broadcast_session_status_dedups_against_session_and_activity_subscribe
 
     state.handle_command(DaemonCommand::BroadcastSessionStatus {
         session_id: 42,
-        status: SessionStatus::Inference,
+        status: SessionStatus::Responding,
     });
 
     // Client 1 (session subscriber) and client 2 (activity subscriber) must
@@ -1063,7 +1063,7 @@ fn handle_broadcast_session_status_dedups_against_session_and_activity_subscribe
         DaemonMessageType::Session {
             session_id: Some(42),
             event: SessionEvent::SessionStatusChanged {
-                status: SessionStatus::Inference,
+                status: SessionStatus::Responding,
                 ..
             },
         }

@@ -12,7 +12,7 @@
 //! `SocketRegistry::shutdown_all()` on the ONE daemon-wide registry, which
 //! shuts down the registered provider socket and makes the blocked read
 //! return immediately. The worker then aborts the turn and the session
-//! leaves `Inference` — asserted via the prompt arrival of
+//! leaves the active states — asserted via the prompt arrival of
 //! `SessionEvent::Done`, well inside the configured 30 s request timeout.
 //!
 //! This binds real sockets and spawns the real daemon, so per AGENTS.md it
@@ -23,7 +23,7 @@
 // helper fns in this file need this file-level allowance.
 #![expect(clippy::expect_used)]
 use choreo_proto::{
-    ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent, SessionStatus,
+    ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent,
 };
 use std::fmt::Write as _;
 use std::io::{Read, Write};
@@ -261,8 +261,8 @@ fn mid_stream_cancel_finishes_promptly_via_registry_force_close() {
     // The cancel: decided in the daemon's handle_cancel_request, which must
     // force-close the registry's provider sockets so the wedged reader
     // unblocks NOW. Assert the turn aborts promptly: a `Done` (and the
-    // session leaving `Inference`) arrives within DONE_TIMEOUT — not after
-    // the 30 s request timeout.
+    // session leaving the active states) arrives within DONE_TIMEOUT — not
+    // after the 30 s request timeout.
     write_message(
         &mut stream,
         &ClientMessage::request(0, ClientMessageType::Cancel { stream_id: 1 }),
@@ -314,7 +314,7 @@ fn mid_stream_cancel_finishes_promptly_via_registry_force_close() {
                 event: SessionEvent::SessionStatusChanged { status, .. },
                 ..
             } => {
-                if !matches!(status, SessionStatus::Inference) {
+                if !status.is_active() {
                     left_inference = true;
                 }
             }
@@ -345,7 +345,7 @@ fn mid_stream_cancel_finishes_promptly_via_registry_force_close() {
     }
     assert!(
         left_inference,
-        "session status must leave Inference after the cancel"
+        "session status must leave the active states after the cancel"
     );
 
     daemon.shutdown();

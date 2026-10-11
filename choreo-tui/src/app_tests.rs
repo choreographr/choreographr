@@ -182,7 +182,7 @@ fn submitting_prompt_while_busy_is_rejected_and_preserves_input() {
     let mut app = test_app();
     app.attached_session_id = Some(42);
     // The attached session is mid-inference.
-    app.attached_status = Some(SessionStatus::Inference);
+    app.attached_status = Some(SessionStatus::Responding);
     app.input.text = "hello".to_string();
     app.input.cursor = 5;
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -268,7 +268,7 @@ fn slash_command_is_accepted_while_busy() {
     // daemon-reaching command for this check.)
     let mut app = test_app();
     app.attached_session_id = Some(42);
-    app.attached_status = Some(SessionStatus::Inference);
+    app.attached_status = Some(SessionStatus::Responding);
     app.input.text = "/ping ".to_string();
     let (tx, rx) = crossbeam_channel::unbounded();
 
@@ -287,7 +287,7 @@ fn empty_submission_while_busy_is_a_noop() {
     // the guard and must not set an error status.
     let mut app = test_app();
     app.attached_session_id = Some(42);
-    app.attached_status = Some(SessionStatus::Inference);
+    app.attached_status = Some(SessionStatus::Responding);
     app.input.text = String::new();
     let (tx, rx) = crossbeam_channel::unbounded();
 
@@ -369,7 +369,7 @@ fn continue_command_while_busy_is_rejected_by_the_same_guard() {
     // the same new-turn guard while the session is not idle.
     let mut app = test_app();
     app.attached_session_id = Some(42);
-    app.attached_status = Some(SessionStatus::Inference);
+    app.attached_status = Some(SessionStatus::Responding);
     app.input.text = "/continue ".to_string();
     let (tx, rx) = crossbeam_channel::unbounded();
 
@@ -920,7 +920,7 @@ mod unsent_draft_tests {
         // even though no session is attached at all.
         let mut app = test_app();
         app.attached_session_id = Some(1);
-        app.attached_status = Some(SessionStatus::Inference);
+        app.attached_status = Some(SessionStatus::Responding);
         app.attached_tool_groups = vec!["core".to_string()];
 
         app.handle_session_deleted(1);

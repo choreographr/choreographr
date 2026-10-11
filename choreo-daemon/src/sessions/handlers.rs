@@ -484,11 +484,11 @@ pub(super) fn validate_model_via_daemon(model: &str, ctx: &RequestContext) -> Re
 
 /// Update the session status and broadcast to subscribers and daemon.
 ///
-/// Status transitions (Inference, `ToolCall`, Retrying) are internal pipeline
-/// churn, NOT user-visible modifications — the status is refreshed everywhere
-/// but `last_modified` is deliberately left untouched so the sessions list
-/// does not re-sort on every tool call mid-request.  Only completed requests
-/// (`handle_request_finished`) and explicit metadata edits
+/// Status transitions (Sending/Thinking/Responding, `ToolCall`, Retrying) are
+/// internal pipeline churn, NOT user-visible modifications — the status is
+/// refreshed everywhere but `last_modified` is deliberately left untouched so
+/// the sessions list does not re-sort on every tool call mid-request.  Only
+/// completed requests (`handle_request_finished`) and explicit metadata edits
 /// (`persist_session_metadata`) bump the timestamp.  The message carries the
 /// session's *current* `last_modified`, so clients' monotonic `max()` guards
 /// keep the value stable.

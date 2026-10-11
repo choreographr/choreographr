@@ -424,7 +424,7 @@ fn render_session_list_shows_ids_parents_and_titles() {
             created_at: 1_705_314_000_000,
             last_modified: 1_705_314_000_001,
             turn_count: 12,
-            status: SessionStatus::Inference,
+            status: SessionStatus::Responding,
             active_tool_groups: vec![],
             account_name: None,
             token_usage: None,
@@ -469,7 +469,7 @@ fn render_session_list_shows_ids_parents_and_titles() {
     assert!(content.contains("alpha"));
     assert!(content.contains("beta"));
     assert!(
-        content.contains("inferring"),
+        content.contains("responding"),
         "status text from status_display"
     );
 

@@ -41,9 +41,11 @@ const MAX_MSG_BYTES: usize = 2048;
 pub(crate) fn state_for(status: &SessionStatus) -> &'static str {
     match status {
         SessionStatus::Inactive | SessionStatus::Sleeping => "idle",
-        SessionStatus::Inference | SessionStatus::ToolCall(_) | SessionStatus::Retrying { .. } => {
-            "working"
-        }
+        SessionStatus::Sending
+        | SessionStatus::Thinking
+        | SessionStatus::Responding
+        | SessionStatus::ToolCall(_)
+        | SessionStatus::Retrying { .. } => "working",
         // `SessionStatus` is `#[non_exhaustive]`; an unknown future variant is
         // reported as `idle` (the safe resting state) rather than omitted.
         _ => "idle",
@@ -219,7 +221,9 @@ mod tests {
     fn state_for_full_table() {
         assert_eq!(state_for(&SessionStatus::Inactive), "idle");
         assert_eq!(state_for(&SessionStatus::Sleeping), "idle");
-        assert_eq!(state_for(&SessionStatus::Inference), "working");
+        assert_eq!(state_for(&SessionStatus::Sending), "working");
+        assert_eq!(state_for(&SessionStatus::Thinking), "working");
+        assert_eq!(state_for(&SessionStatus::Responding), "working");
         assert_eq!(
             state_for(&SessionStatus::ToolCall("shell".into())),
             "working"

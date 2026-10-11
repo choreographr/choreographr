@@ -316,18 +316,18 @@ fn status_change_reorders_only_when_timestamp_advances() {
     app.session_mgr.select_down();
     assert_eq!(app.session_mgr.selection, Some(1));
 
-    // A pure status transition (Inference at request start) carries the
+    // A pure status transition (a streaming status mid-request) carries the
     // session's *current* last_modified — the daemon no longer bumps the
     // timestamp for internal pipeline churn, so the list must NOT re-sort.
     let ts = app.session_mgr.sessions[1].last_modified;
-    app.handle_session_status_changed(2, &SessionStatus::Inference, ts);
+    app.handle_session_status_changed(2, &SessionStatus::Responding, ts);
     assert_eq!(
         app.session_mgr.sessions[0].session_id, 1,
         "no reorder on status-only change"
     );
     assert_eq!(
         app.session_mgr.sessions[1].status,
-        SessionStatus::Inference,
+        SessionStatus::Responding,
         "status still updates without reordering"
     );
     assert_eq!(app.session_mgr.selection, Some(1));
@@ -352,8 +352,8 @@ fn status_change_timestamp_is_monotonic() {
     // Duplicate/out-of-order deliveries must never regress last_modified.
     let mut app = test_app();
     app.session_mgr.set_sessions(vec![make_session(1, "a")]);
-    app.handle_session_status_changed(1, &SessionStatus::Inference, 9000);
-    app.handle_session_status_changed(1, &SessionStatus::Inference, 5000);
+    app.handle_session_status_changed(1, &SessionStatus::Responding, 9000);
+    app.handle_session_status_changed(1, &SessionStatus::Responding, 5000);
     assert_eq!(app.session_mgr.sessions[0].last_modified, 9000);
 }
 

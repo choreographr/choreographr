@@ -9,11 +9,11 @@ use choreo_proto::SessionStatus;
 fn desired_records_include_attached_and_active_background_only() {
     let mut app = test_app();
     app.attached_session_id = Some(1);
-    app.attached_status = Some(SessionStatus::Inference);
+    app.attached_status = Some(SessionStatus::Responding);
     app.session_mgr.all = vec![
         {
             let mut s = make_session(1, "attached");
-            s.status = SessionStatus::Inference;
+            s.status = SessionStatus::Responding;
             s
         },
         {
@@ -52,16 +52,16 @@ fn a_finished_background_agent_keeps_its_done_record() {
     let mut app = test_app();
     // The attached session is unrelated; the background agent is the subject.
     app.attached_session_id = Some(1);
-    app.attached_status = Some(SessionStatus::Inference);
+    app.attached_status = Some(SessionStatus::Responding);
     app.session_mgr.all = vec![
         {
             let mut s = make_session(1, "attached");
-            s.status = SessionStatus::Inference;
+            s.status = SessionStatus::Responding;
             s
         },
         {
             let mut s = make_session(2, "background agent");
-            s.status = SessionStatus::Inference;
+            s.status = SessionStatus::Responding;
             s
         },
     ];
@@ -91,10 +91,10 @@ fn a_finished_background_agent_keeps_its_done_record() {
 fn done_override_wins_and_survives_the_trailing_idle() {
     let mut app = test_app();
     app.attached_session_id = Some(1);
-    app.attached_status = Some(SessionStatus::Inference);
+    app.attached_status = Some(SessionStatus::Responding);
     app.session_mgr.all = vec![{
         let mut s = make_session(1, "t");
-        s.status = SessionStatus::Inference;
+        s.status = SessionStatus::Responding;
         s
     }];
 
@@ -129,7 +129,7 @@ fn fresh_active_status_clears_the_override() {
     assert!(app.term_status_override.contains_key(&1));
 
     // A new turn began (status went active): the old outcome is dropped.
-    app.handle_session_status_changed(1, &SessionStatus::Inference, 2);
+    app.handle_session_status_changed(1, &SessionStatus::Responding, 2);
     assert!(!app.term_status_override.contains_key(&1));
 }
 
@@ -137,10 +137,10 @@ fn fresh_active_status_clears_the_override() {
 fn failed_and_cancelled_records() {
     let mut app = test_app();
     app.attached_session_id = Some(1);
-    app.attached_status = Some(SessionStatus::Inference);
+    app.attached_status = Some(SessionStatus::Responding);
     app.session_mgr.all = vec![{
         let mut s = make_session(1, "t");
-        s.status = SessionStatus::Inference;
+        s.status = SessionStatus::Responding;
         s
     }];
 

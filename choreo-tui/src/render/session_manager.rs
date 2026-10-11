@@ -185,7 +185,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
                     )),
                     Cell::from(truncate_str(&parent, parent_w as usize)),
                     // Keep the status colour even on the highlighted row so
-                    // active/inferring sessions stay recognisable at a glance.
+                    // active sessions stay recognisable at a glance.
                     Cell::from(truncate_str(&status_text, status_w as usize))
                         .style(status_cell_style),
                     Cell::from(truncate_str(&model_display, model_w as usize)),

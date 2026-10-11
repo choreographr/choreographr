@@ -1119,17 +1119,17 @@ fn handle_session_status_changed_updates_attached_status() {
     assert!(app.attached_status.is_none());
 
     // With no attached session, status should not be cached.
-    app.handle_session_status_changed(42, &SessionStatus::Inference, 1_705_314_000_000);
+    app.handle_session_status_changed(42, &SessionStatus::Responding, 1_705_314_000_000);
     assert!(app.attached_status.is_none());
 
     // Once attached, a status change for that session should be cached.
     app.attached_session_id = Some(42);
-    app.handle_session_status_changed(42, &SessionStatus::Inference, 1_705_314_000_000);
-    assert_eq!(app.attached_status, Some(SessionStatus::Inference));
+    app.handle_session_status_changed(42, &SessionStatus::Responding, 1_705_314_000_000);
+    assert_eq!(app.attached_status, Some(SessionStatus::Responding));
 
     // A status change for a different session should not overwrite.
     app.handle_session_status_changed(99, &SessionStatus::Sleeping, 1_705_314_000_000);
-    assert_eq!(app.attached_status, Some(SessionStatus::Inference));
+    assert_eq!(app.attached_status, Some(SessionStatus::Responding));
 
     // A subsequent change for the attached session should update.
     app.handle_session_status_changed(
@@ -1929,7 +1929,7 @@ fn session_created_broadcast_on_session_manager_refreshes_list_only() {
 fn make_subsession(id: u64, title: &str, parent_id: u64) -> choreo_proto::SessionSummary {
     let mut s = make_session(id, title, "m1", 0);
     s.parent_session_id = Some(parent_id);
-    s.status = choreo_proto::SessionStatus::Inference;
+    s.status = choreo_proto::SessionStatus::Responding;
     s
 }
 
@@ -1956,7 +1956,7 @@ fn attached_subsession_finished_detects_active_to_idle_only() {
     // The new status must be idle: a same-status re-broadcast of an active
     // status is not a finish.
     assert_eq!(
-        app.attached_subsession_finished(99, &SessionStatus::Inference),
+        app.attached_subsession_finished(99, &SessionStatus::Responding),
         None
     );
 

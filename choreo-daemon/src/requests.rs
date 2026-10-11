@@ -557,7 +557,7 @@ pub(crate) fn run_agent_loop(
         broadcast_turn_appended(&ctx.cmd_tx, session, ctx.session_id, current_turn_id);
         if ctx
             .cmd_tx
-            .send(SessionCommand::StatusChanged(SessionStatus::Inference))
+            .send(SessionCommand::StatusChanged(SessionStatus::Sending))
             .is_err()
         {
             return Ok(false);
@@ -625,6 +625,15 @@ pub(crate) fn run_agent_loop(
         // Running count of output tokens produced by the current turn.
         let mut output_token_count: u32 = 0;
 
+        // The live status phase for this request.  `Sending` was already
+        // broadcast before the loop; the streaming callback below advances it
+        // to `Thinking` (first reasoning chunk) or `Responding` (first answer
+        // chunk).  The phase only ever moves FORWARD — once a chunk kind has
+        // promoted it, a later chunk of the other kind does not flip it back —
+        // so a request emits at most two status broadcasts no matter how the
+        // provider interleaves reasoning and answer deltas.
+        let mut stream_phase = SessionStatus::Sending;
+
         // Gateway routing identity for the opencode zen/go providers: the
         // session's real id plus this turn's request id, as strings (the
         // gateway hashes the last 4 characters to pick an upstream bucket and
@@ -652,6 +661,17 @@ pub(crate) fn run_agent_loop(
             &mut |event| {
                 match event {
                     StreamEvent::Answer(text) => {
+                        // Advance to `Responding` on the first answer chunk so
+                        // the user sees the model has begun writing (rather
+                        // than still connecting or thinking).  Forward-only:
+                        // once responding, a later reasoning chunk does not
+                        // demote it.
+                        if !matches!(stream_phase, SessionStatus::Responding) {
+                            stream_phase = SessionStatus::Responding;
+                            let _ = ctx
+                                .cmd_tx
+                                .send(SessionCommand::StatusChanged(stream_phase.clone()));
+                        }
                         if let Some(enc) = &encoding {
                             // u128→u32 token counts, informational only.
                             let n = enc.count(&text);
@@ -683,6 +703,17 @@ pub(crate) fn run_agent_loop(
                         ));
                     }
                     StreamEvent::Reasoning(text) => {
+                        // Advance OUT of the initial `Sending` phase to
+                        // `Thinking` on the first reasoning chunk, so hidden
+                        // reasoning is distinguishable from the pre-token send
+                        // wait.  Forward-only: it never demotes a `Responding`
+                        // phase back to `Thinking`.
+                        if matches!(stream_phase, SessionStatus::Sending) {
+                            stream_phase = SessionStatus::Thinking;
+                            let _ = ctx
+                                .cmd_tx
+                                .send(SessionCommand::StatusChanged(stream_phase.clone()));
+                        }
                         if let Some(enc) = &encoding {
                             // u128→u32 token counts, informational only.
                             let n = enc.count(&text);
