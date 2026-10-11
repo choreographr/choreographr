@@ -1728,7 +1728,7 @@ on their own threads (`requests.rs`, "Phase 2: All remaining tools
 read-modify-write in `edit_file`, a `write_file` racing an `edit_file`, a
 `delete_files` racing either — would otherwise both read the original and
 silently lose one update; the per-path lock serializes them while mutations of
-different files stay parallel (pi's `withFileMutationQueue` is the same idea).
+different files stay parallel.
 The key is the target's canonical path — canonicalizing the parent directory
 and re-appending the file name when the target does not exist yet, so a create
 racing an edit of the now-existing file agrees on one key even through a
