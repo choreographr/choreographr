@@ -115,6 +115,26 @@ impl TokenUsage {
         self.cached_tokens = self.cached_tokens.max(other.cached_tokens);
         self.cache_write_tokens = self.cache_write_tokens.max(other.cache_write_tokens);
     }
+
+    /// Add `other`'s counts into `self`, a running session total.
+    ///
+    /// This is the summation counterpart to [`Self::merge_max`]: where
+    /// `merge_max` keeps a monotonic running maximum across repeated
+    /// snapshots of the *same* cumulative figure (the daemon's mid-turn sync),
+    /// `accumulate` folds one *turn's* usage into a total rebuilt from scratch
+    /// over the turn history. Every field is summed — including the prompt-cache
+    /// read (`cached_tokens`) and write (`cache_write_tokens`) counts — so a
+    /// session's accumulated usage carries the same cache accounting its
+    /// individual turns reported. Both the worker's per-turn accumulation and
+    /// the on-load reconstruction route through this one method, so the two can
+    /// never silently diverge on which fields they add.
+    pub fn accumulate(&mut self, other: TokenUsage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.total_tokens += other.total_tokens;
+        self.cached_tokens += other.cached_tokens;
+        self.cache_write_tokens += other.cache_write_tokens;
+    }
 }
 
 /// A tool call that was discarded because the provider sent truncated or
@@ -314,4 +334,50 @@ pub struct AccountInfo {
     pub provider: String,
     /// Whether a credential is stored for the account in the daemon keystore.
     pub has_credential: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TokenUsage;
+
+    #[test]
+    fn accumulate_sums_every_field_including_cache_counts() {
+        let mut total = TokenUsage::default();
+        total.accumulate(TokenUsage {
+            input_tokens: 10,
+            output_tokens: 20,
+            total_tokens: 30,
+            cached_tokens: 4,
+            cache_write_tokens: 3,
+        });
+        total.accumulate(TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            total_tokens: 150,
+            cached_tokens: 40,
+            cache_write_tokens: 30,
+        });
+
+        // Every field is summed — the cache read/write counts are the ones a
+        // partial accumulator would silently drop.
+        assert_eq!(total.input_tokens, 110);
+        assert_eq!(total.output_tokens, 70);
+        assert_eq!(total.total_tokens, 180);
+        assert_eq!(total.cached_tokens, 44);
+        assert_eq!(total.cache_write_tokens, 33);
+    }
+
+    #[test]
+    fn accumulate_from_default_is_a_noop() {
+        let mut total = TokenUsage {
+            input_tokens: 5,
+            output_tokens: 6,
+            total_tokens: 11,
+            cached_tokens: 1,
+            cache_write_tokens: 2,
+        };
+        let before = total;
+        total.accumulate(TokenUsage::default());
+        assert_eq!(total, before);
+    }
 }

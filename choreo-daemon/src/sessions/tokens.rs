@@ -33,14 +33,14 @@ impl SessionState {
 /// Every turn's `token_usage` is added, undone turns included: undo hides
 /// turns from the model but does not refund tokens already billed. This total
 /// is deliberately distinct from the context-size readout, which is live-only
-/// ([`SessionState::live_last_prompt_tokens`]).
+/// ([`SessionState::live_last_prompt_tokens`]). The per-field summation lives on
+/// [`TokenUsage::accumulate`], shared with the worker's incremental
+/// accumulation so the on-load reconstruction and the live path cannot diverge.
 pub(super) fn reconstruct_accumulated_usage(turns: &BTreeMap<u32, Turn>) -> TokenUsage {
     let mut accumulated = TokenUsage::default();
     for turn in turns.values() {
         if let Some(u) = turn.token_usage {
-            accumulated.input_tokens += u.input_tokens;
-            accumulated.output_tokens += u.output_tokens;
-            accumulated.total_tokens += u.total_tokens;
+            accumulated.accumulate(u);
         }
     }
     accumulated
