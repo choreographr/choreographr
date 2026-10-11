@@ -68,7 +68,7 @@ pub(crate) struct TurnParams<'a> {
     pub on_retry: &'a mut Option<RetryCallback>,
     /// Called once the request payload is fully uploaded (see
     /// [`RequestUploadedCallback`]); `None` when the caller does not need it.
-    pub on_accepted: Option<RequestUploadedCallback>,
+    pub on_uploaded: Option<RequestUploadedCallback>,
     pub cancel_rx: Option<&'a crossbeam_channel::Receiver<()>>,
     /// Gateway routing identity (`session_id`, `request_id`) for the opencode
     /// zen/go providers; `None` when the caller has no session.
@@ -684,7 +684,7 @@ impl OpenAiClient {
             tools: params.tools,
             reasoning_effort,
             on_retry: params.on_retry,
-            on_accepted: params.on_accepted,
+            on_uploaded: params.on_uploaded,
             cancel_rx: params.cancel_rx,
             route,
             previous_response_id: params.previous_response_id,
@@ -757,7 +757,7 @@ impl OpenAiClient {
             tools: params.tools,
             reasoning_effort,
             on_retry: params.on_retry,
-            on_accepted: params.on_accepted,
+            on_uploaded: params.on_uploaded,
             cancel_rx: params.cancel_rx,
             route,
             previous_response_id: params.previous_response_id,

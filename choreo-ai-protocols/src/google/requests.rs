@@ -90,7 +90,7 @@ pub(super) fn generate_content_request(
         tools,
         thinking_effort,
         on_retry,
-        on_accepted,
+        on_uploaded,
         cancel_rx,
         max_output_tokens_override,
         no_retry,
@@ -137,7 +137,7 @@ pub(super) fn generate_content_request(
     // provider reports the same `Waiting` boundary as the streaming path.
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, None);
     // Compact body + headers + upload hook (see `retry::HookedJsonBody`).
-    let hooked = retry::HookedJsonBody::new(&body, on_accepted).map_err(io::Error::other)?;
+    let hooked = retry::HookedJsonBody::new(&body, on_uploaded).map_err(io::Error::other)?;
     let response = retry::retry_loop(
         || {
             hooked
@@ -181,7 +181,7 @@ where
         tools,
         thinking_effort,
         on_retry,
-        on_accepted,
+        on_uploaded,
         cancel_rx,
         max_output_tokens_override,
         no_retry,
@@ -227,7 +227,7 @@ where
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));
     // Compact body + headers + upload hook (see `retry::HookedJsonBody`).
-    let hooked = retry::HookedJsonBody::new(&body, on_accepted).map_err(io::Error::other)?;
+    let hooked = retry::HookedJsonBody::new(&body, on_uploaded).map_err(io::Error::other)?;
     let response = retry::retry_loop(
         || {
             hooked

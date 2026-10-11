@@ -243,7 +243,7 @@ pub(super) fn ping_request<'a>(
         thinking_effort: "off".to_string(),
         on_retry,
         // The warm ping reports no status, so no upload hook.
-        on_accepted: None,
+        on_uploaded: None,
         cancel_rx: None,
         previous_response_id: None,
         tool_results: &[],

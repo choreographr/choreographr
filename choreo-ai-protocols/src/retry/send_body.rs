@@ -17,36 +17,41 @@ const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 ///
 /// The payload is serialized to compact JSON once; every retry attempt hands
 /// ureq a fresh [`UploadHookReader`] over a shared clone of those bytes.  The
-/// caller must apply [`Self::apply_headers`] to set `Content-Length` from
-/// [`Self::len`] explicitly, so the body is sent length-delimited rather than
-/// chunked — ureq only honours a caller-supplied length for a reader body,
-/// never the reader's own.  This is load-bearing, not cosmetic: with an
-/// explicit length ureq's send loop stops the instant the last byte is read
-/// (never issuing a terminating zero-length read), and a short body would spin
-/// that loop forever, so `len()` must always equal the bytes the reader
+/// caller must apply [`Self::apply_headers`] to set `Content-Length`
+/// explicitly, so the body is sent length-delimited rather than chunked — ureq
+/// only honours a caller-supplied length for a reader body, never the reader's
+/// own.  This is load-bearing, not cosmetic: with an explicit length ureq's
+/// send loop stops the instant the last byte is read (never issuing a
+/// terminating zero-length read), and a short body would spin that loop
+/// forever, so the declared length must always equal the bytes the reader
 /// yields.  A known length is also what lets a future request-body compressor
 /// run *before* this hook: compress to bytes, then hand those bytes to the
-/// same countdown reader (updating `bytes` and `len()` together).
+/// same countdown reader (updating `content_length` alongside `bytes`).
 pub(crate) struct HookedJsonBody {
     bytes: Arc<[u8]>,
+    /// The `Content-Length` value, rendered once here so a retry re-uses it
+    /// instead of allocating a fresh `String` per `apply_headers` call.
+    content_length: String,
     on_uploaded: Option<RequestUploadedCallback>,
 }
 
 impl HookedJsonBody {
     /// Serialize `value` to compact JSON and remember the upload hook.
-    pub(crate) fn new(
-        value: &serde_json::Value,
+    ///
+    /// Generic over [`serde::Serialize`] so a caller can pass a typed wire
+    /// struct (the image and video adapters) as readily as a built
+    /// [`serde_json::Value`].
+    pub(crate) fn new<T: serde::Serialize>(
+        value: &T,
         on_uploaded: Option<RequestUploadedCallback>,
     ) -> Result<Self, serde_json::Error> {
+        let bytes: Arc<[u8]> = serde_json::to_vec(value)?.into();
+        let content_length = bytes.len().to_string();
         Ok(Self {
-            bytes: serde_json::to_vec(value)?.into(),
+            bytes,
+            content_length,
             on_uploaded,
         })
-    }
-
-    /// The wire length of the payload, for the `Content-Length` header.
-    pub(crate) fn len(&self) -> usize {
-        self.bytes.len()
     }
 
     /// Apply the `Content-Type`/`Content-Length` headers every request body
@@ -59,7 +64,7 @@ impl HookedJsonBody {
     ) -> ureq::RequestBuilder<B> {
         request
             .header("Content-Type", JSON_CONTENT_TYPE)
-            .header("Content-Length", self.len().to_string())
+            .header("Content-Length", self.content_length.as_str())
     }
 
     /// A fresh body for one attempt.  The returned reader fires the upload hook

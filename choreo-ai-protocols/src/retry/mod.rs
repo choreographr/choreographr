@@ -5,12 +5,11 @@
 //! normalized [`ProviderHttpError`] each adapter maps into its own error type.
 //! The retry decision is status + `Retry-After` only — never the response body.
 //!
-//! The request-body send path — the serialized JSON payload plus the
-//! upload-complete hook that marks the daemon's `Waiting` boundary — lives in
-//! the `send_body` submodule.
-//!
-//! `retry.rs` is large; the split keeps the retry/backoff policy here and the
-//! send-body machinery in `send_body.rs`, with the unit tests in `tests.rs`.
+//! The module is split by concern: this file holds the retry/backoff policy and
+//! the retry loop, the serialized request body plus its upload-complete hook
+//! (the daemon's `Waiting` boundary) live in the `send_body` submodule, the
+//! provider HTTP error and its response-body mapping live in the `error`
+//! submodule, and the unit tests live in `tests.rs`.
 
 use std::collections::HashSet;
 use std::io;
@@ -18,8 +17,12 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::Duration;
 
+mod error;
 mod send_body;
 
+use error::{extract_error_message, status_to_error};
+
+pub use error::ProviderHttpError;
 pub(crate) use send_body::HookedJsonBody;
 
 /// Raw `(initial_backoff_ms, max_backoff_ms)` pairs [`RetryConfig::new`] has
@@ -226,87 +229,6 @@ impl<'a> AttemptContext<'a> {
             on_retry,
             cancel_rx,
             attempt_deadline,
-        }
-    }
-}
-
-/// Generic HTTP error produced by the retry layer.  Each provider maps this to
-/// its own error type via `From`.
-#[derive(Debug)]
-pub enum ProviderHttpError {
-    /// Authentication/authorization failure (HTTP 401/403).
-    Unauthorized {
-        /// HTTP status code.
-        status: u16,
-        /// Provider's human-readable error detail.
-        detail: String,
-    },
-    /// Rate limited (HTTP 429); the provider may name a cooldown.
-    RateLimited {
-        /// HTTP status code.
-        status: u16,
-        /// Parsed `Retry-After` cooldown, when the provider sent one.
-        retry_after_secs: Option<u64>,
-        /// Provider's human-readable error detail.
-        detail: String,
-    },
-    /// Server-side failure (HTTP 5xx).
-    ServerError {
-        /// HTTP status code.
-        status: u16,
-        /// Provider's human-readable error detail.
-        detail: String,
-    },
-    /// Non-retryable client error (4xx other than 401/403/429).
-    ClientError {
-        /// HTTP status code.
-        status: u16,
-        /// Provider's human-readable error detail.
-        detail: String,
-    },
-    /// The provider returned a success status but an empty body.
-    EmptyResponse,
-    /// The request was cancelled during a retry wait or pre-attempt check.
-    Cancelled,
-    /// A transport error, or a terminal status with no structured wrapper.
-    Io(io::Error),
-}
-
-impl std::fmt::Display for ProviderHttpError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unauthorized { status, detail } => {
-                write!(f, "unauthorized ({status}): {detail}")
-            }
-            Self::RateLimited {
-                status,
-                retry_after_secs,
-                detail,
-            } => {
-                if let Some(secs) = retry_after_secs {
-                    write!(f, "rate limited ({status}, retry after {secs}s): {detail}")
-                } else {
-                    write!(f, "rate limited ({status}): {detail}")
-                }
-            }
-            Self::ServerError { status, detail } => {
-                write!(f, "server error ({status}): {detail}")
-            }
-            Self::ClientError { status, detail } => {
-                write!(f, "client error ({status}): {detail}")
-            }
-            Self::EmptyResponse => f.write_str("empty response"),
-            Self::Cancelled => f.write_str("cancelled"),
-            Self::Io(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for ProviderHttpError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(e) => Some(e),
-            _ => None,
         }
     }
 }
@@ -529,29 +451,6 @@ pub fn wait_before_retry(
     sleep_or_cancel(delay, cancel_rx)
 }
 
-fn status_to_error(status: u16, detail: &str, retry_after_secs: Option<u64>) -> ProviderHttpError {
-    match status {
-        401 | 403 => ProviderHttpError::Unauthorized {
-            status,
-            detail: detail.to_string(),
-        },
-        429 => ProviderHttpError::RateLimited {
-            status,
-            retry_after_secs,
-            detail: detail.to_string(),
-        },
-        _ if (500..600).contains(&status) => ProviderHttpError::ServerError {
-            status,
-            detail: detail.to_string(),
-        },
-        _ if (400..500).contains(&status) => ProviderHttpError::ClientError {
-            status,
-            detail: detail.to_string(),
-        },
-        _ => ProviderHttpError::Io(io::Error::other(detail.to_string())),
-    }
-}
-
 /// Core retry loop: calls `send_request`, inspects the HTTP status and
 /// `Retry-After` header, and retries transient errors up to
 /// `retry.max_attempts` times.  Transient means transport errors, 5xx
@@ -741,38 +640,6 @@ where
         };
         return Err(status_to_error(status, &detail, retry_after_secs));
     }
-}
-
-/// Extract a concise human-readable message from a provider error body,
-/// unwrapping the standard JSON error envelopes used across providers:
-///
-/// - OpenAI-compatible APIs (`OpenAI`, `DeepSeek`, `OpenRouter`, Groq, …):
-///   `{"error": {"message": "…", "type": "…", "param": …,
-///   "code": …}}` — `error.message` is the standard human-readable field.
-/// - Anthropic: `{"type": "error", "error": {"type": "…",
-///   "message": "…"}}` — same `error.message` shape.
-/// - Gemini: `{"error": {"code": …, "message": "…", "status":
-///   "…"}}` — same `error.message` shape.
-/// - Some proxies: `{"message": "…"}` or `{"error": "plain string"}`.
-///
-/// Returns `None` (the caller keeps the verbatim body) when the body is not
-/// JSON or carries no recognizable string `message` — an unknown or hostile
-/// body is never mis-summarized, and the raw text still reaches the user.
-fn extract_error_message(body: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    let message = match value.get("error") {
-        // `{"error": {"message": "…"}}` — the standard envelope.
-        Some(serde_json::Value::Object(map)) => {
-            map.get("message").and_then(serde_json::Value::as_str)
-        }
-        // `{"error": "plain string"}` — rare compat-layer shape.
-        Some(serde_json::Value::String(s)) => Some(s.as_str()),
-        _ => None,
-    };
-    // Top-level `{"message": "…"}` (some reverse-proxies unwrap for you).
-    let message = message.or_else(|| value.get("message").and_then(serde_json::Value::as_str));
-    let message = message.map(str::trim).filter(|m| !m.is_empty())?;
-    Some(message.to_string())
 }
 
 #[cfg(test)]

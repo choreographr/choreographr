@@ -15,26 +15,43 @@ pub(crate) fn retry_config_from_config(config: &ServiceConfig) -> RetryConfig {
     )
 }
 
-/// The nine parameters are all per-call context — no struct threads them all,
-/// so an allowlist beat a parameter object here.
-#[expect(clippy::too_many_arguments)]
+/// One retried JSON send: the transport target, the serialized request body, the
+/// provider/retry config, and the per-call extras (the gateway route and the
+/// upload hook).  Bundled into a struct so `retry_send` reads as
+/// `(request, ctx)` rather than a nine-parameter positional list — the earlier
+/// list only grew, and a parameter object keeps a future field a one-line
+/// addition.
+pub(crate) struct RetrySend<'a> {
+    pub agent: &'a ureq::Agent,
+    pub url: &'a str,
+    pub api_key: &'a str,
+    pub body: &'a serde_json::Value,
+    pub config: &'a ServiceConfig,
+    pub retry_cfg: &'a RetryConfig,
+    /// Gateway routing identity for the opencode zen/go providers: the turn's
+    /// (`session_id`, `request_id`). `None` on paths without a session (model
+    /// listing, prompt helpers) — those then route by the gateway's workspace
+    /// id / IP fallback, which is fine for auxiliary traffic.
+    pub route: Option<(&'a str, &'a str)>,
+    /// Fires once when the request payload has been fully uploaded (see
+    /// [`RequestUploadedCallback`]); `None` on paths that do not report it.
+    pub on_uploaded: Option<RequestUploadedCallback>,
+}
+
 pub(crate) fn retry_send(
-    agent: &ureq::Agent,
-    url: &str,
-    api_key: &str,
-    body: &serde_json::Value,
-    config: &ServiceConfig,
-    retry_cfg: &RetryConfig,
+    request: RetrySend<'_>,
     ctx: &mut crate::retry::AttemptContext,
-    // Gateway routing identity for the opencode zen/go providers: the turn's
-    // (session_id, request_id). `None` on paths without a session (model
-    // listing, prompt helpers) — those then route by the gateway's workspace
-    // id / IP fallback, which is fine for auxiliary traffic.
-    route: Option<(&str, &str)>,
-    // Fires once when the request payload has been fully uploaded (see
-    // [`RequestUploadedCallback`]); `None` on paths that do not report it.
-    on_accepted: Option<RequestUploadedCallback>,
 ) -> Result<ureq::http::Response<ureq::Body>, OpenAiError> {
+    let RetrySend {
+        agent,
+        url,
+        api_key,
+        body,
+        config,
+        retry_cfg,
+        route,
+        on_uploaded,
+    } = request;
     let auth_header = zeroize::Zeroizing::new(format!("Bearer {}", api_key.trim()));
     // Provider-specific extra headers (the opencode gateway routing headers)
     // are derived from the config + route here, so every call site stays a
@@ -46,7 +63,7 @@ pub(crate) fn retry_send(
     // Serialize once and shape the send: a compact body plus the
     // `Content-Type`/`Content-Length` headers and the upload hook (see
     // `retry::HookedJsonBody`).
-    let hooked = crate::retry::HookedJsonBody::new(body, on_accepted)
+    let hooked = crate::retry::HookedJsonBody::new(body, on_uploaded)
         .map_err(|e| OpenAiError::Io(io::Error::other(e)))?;
     // The closure captures `auth_header`, `headers`, and `hooked` by reference
     // (it stays `Fn`); each attempt shares the payload (`Arc<[u8]>`) and clones

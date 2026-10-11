@@ -279,19 +279,20 @@ fn upload_hook_does_not_fire_before_the_payload_is_exhausted() {
 }
 
 #[test]
-fn hooked_json_body_is_compact_and_len_matches_the_wire_bytes() {
-    // `len()` must equal the bytes handed to ureq so a caller-set
-    // `Content-Length` is exact, and the payload is compact JSON (no
+fn hooked_json_body_is_compact_and_matches_the_serialized_bytes() {
+    // The reader must yield exactly the bytes whose length the body declares as
+    // `Content-Length` (a declared length that disagreed would spin ureq's
+    // length-delimited send loop), and the payload is compact JSON (no
     // pretty-print whitespace) — smaller uploads, and the shape a future
     // request-body compressor would consume.
-    let body =
-        HookedJsonBody::new(&serde_json::json!({"a": 1, "b": [1, 2]}), None).expect("serialize");
+    let value = serde_json::json!({"a": 1, "b": [1, 2]});
+    let body = HookedJsonBody::new(&value, None).expect("serialize");
     let mut wire = Vec::new();
     body.send_body()
         .into_reader()
         .read_to_end(&mut wire)
         .expect("read the send body");
-    assert_eq!(body.len(), wire.len());
+    assert_eq!(wire, serde_json::to_vec(&value).expect("serialize"));
     assert!(!wire.contains(&b' '), "payload must be compact");
 }
 

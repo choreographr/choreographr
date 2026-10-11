@@ -942,7 +942,7 @@ pub(crate) mod test_util {
             // the sequence is upload → retry → upload, matching a real retried
             // provider call.
             if self.retry_first {
-                if let Some(cb) = &params.on_accepted {
+                if let Some(cb) = &params.on_uploaded {
                     cb();
                 }
                 if let Some(cb) = params.on_retry.as_mut() {
@@ -952,7 +952,7 @@ pub(crate) mod test_util {
             // The provider has received the full request (payload uploaded)
             // before it streams any delta, so the upload boundary always
             // precedes the events — matching a real provider call.
-            if let Some(cb) = &params.on_accepted {
+            if let Some(cb) = &params.on_uploaded {
                 cb();
             }
             for event in &self.events {

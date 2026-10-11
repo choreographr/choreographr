@@ -713,7 +713,7 @@ pub(crate) fn run_agent_loop(
         // marks the handoff from "getting the request there" to "the provider
         // is thinking".  The `Arc` lets the transport clone it into each retry
         // attempt's request body.
-        let accepted_cb: Option<choreo_ai_protocols::RequestUploadedCallback> =
+        let uploaded_cb: Option<choreo_ai_protocols::RequestUploadedCallback> =
             Some(std::sync::Arc::new({
                 let cmd_tx = ctx.cmd_tx.clone();
                 move || {
@@ -747,7 +747,7 @@ pub(crate) fn run_agent_loop(
                 tools: &tools,
                 thinking_effort,
                 on_retry: &mut retry_cb,
-                on_accepted: accepted_cb,
+                on_uploaded: uploaded_cb,
                 cancel_rx: Some(cancel_rx),
                 previous_response_id: prev_resp_id.as_deref(),
                 tool_results: &tool_results,

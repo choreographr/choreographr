@@ -37,7 +37,7 @@ pub struct ChatTurnRequest<'a> {
     /// is read), marking the boundary between dispatch/upload and the
     /// time-to-first-token wait; `None` disables the callback.  See
     /// [`RequestUploadedCallback`](crate::RequestUploadedCallback).
-    pub on_accepted: Option<RequestUploadedCallback>,
+    pub on_uploaded: Option<RequestUploadedCallback>,
     /// Cancellation channel.  A crossbeam receiver so the retry backoff and
     /// SSE waits can `select!` on it alongside their own channels instead of
     /// polling with `recv_timeout`.

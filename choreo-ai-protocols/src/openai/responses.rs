@@ -452,7 +452,17 @@ pub(crate) fn responses_request(
     let mut ctx = retry::AttemptContext::new(&mut no_retry, cancel_rx, None);
     // No session identity on the plain prompt API — no gateway routing headers.
     let response = retry::retry_send(
-        agent, &url, api_key, &body, config, &retry, &mut ctx, None, None,
+        retry::RetrySend {
+            agent,
+            url: &url,
+            api_key,
+            body: &body,
+            config,
+            retry_cfg: &retry,
+            route: None,
+            on_uploaded: None,
+        },
+        &mut ctx,
     )?;
     let payload: ResponsesResponse = response
         .into_body()
@@ -513,7 +523,17 @@ where
     let mut ctx = retry::AttemptContext::new(&mut no_retry, cancel_rx, Some(&mut deadline));
     // No session identity on the plain prompt API — no gateway routing headers.
     let response = retry::retry_send(
-        agent, &url, api_key, &body, config, &retry, &mut ctx, None, None,
+        retry::RetrySend {
+            agent,
+            url: &url,
+            api_key,
+            body: &body,
+            config,
+            retry_cfg: &retry,
+            route: None,
+            on_uploaded: None,
+        },
+        &mut ctx,
     )?;
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
     // Reader thread decouples the blocking socket read from cancellation
@@ -576,7 +596,7 @@ pub(crate) fn responses_request_with_tools(
         messages,
         tools,
         on_retry,
-        on_accepted,
+        on_uploaded,
         cancel_rx,
         route,
         tool_results,
@@ -598,15 +618,17 @@ pub(crate) fn responses_request_with_tools(
     // provider reports the same `Waiting` boundary as the streaming path.
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, None);
     let response = retry::retry_send(
-        agent,
-        &url,
-        api_key,
-        &body,
-        config,
-        &retry,
+        retry::RetrySend {
+            agent,
+            url: &url,
+            api_key,
+            body: &body,
+            config,
+            retry_cfg: &retry,
+            route,
+            on_uploaded,
+        },
         &mut ctx,
-        route,
-        on_accepted,
     )?;
     let payload: ResponsesResponse = response
         .into_body()
@@ -901,7 +923,7 @@ where
         messages: _,
         tools,
         on_retry,
-        on_accepted,
+        on_uploaded,
         cancel_rx,
         route,
         tool_results,
@@ -922,15 +944,17 @@ where
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));
     let response = retry::retry_send(
-        agent,
-        &url,
-        api_key,
-        &body,
-        config,
-        &retry,
+        retry::RetrySend {
+            agent,
+            url: &url,
+            api_key,
+            body: &body,
+            config,
+            retry_cfg: &retry,
+            route,
+            on_uploaded,
+        },
         &mut ctx,
-        route,
-        on_accepted,
     )?;
 
     let mut has_any_output = false;
@@ -1281,7 +1305,7 @@ mod tests {
                 tools: &[],
                 reasoning_effort: effort,
                 on_retry: &mut no_retry,
-                on_accepted: None,
+                on_uploaded: None,
                 cancel_rx: None,
                 route: None,
                 previous_response_id: None,
@@ -2170,7 +2194,7 @@ mod tests {
                 tools: &[],
                 reasoning_effort: None,
                 on_retry: &mut no_retry,
-                on_accepted: None,
+                on_uploaded: None,
                 cancel_rx: None,
                 route: None,
                 previous_response_id: None,

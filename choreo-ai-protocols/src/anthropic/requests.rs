@@ -94,7 +94,7 @@ pub(super) fn messages_request(
         tools,
         thinking_effort,
         on_retry,
-        on_accepted,
+        on_uploaded,
         cancel_rx,
         session_id,
         request_id,
@@ -160,7 +160,7 @@ pub(super) fn messages_request(
         crate::shared::opencode_gateway_headers(&config.provider_slug, session_id, request_id)
     });
     // Compact body + headers + upload hook (see `retry::HookedJsonBody`).
-    let hooked = retry::HookedJsonBody::new(&body, on_accepted).map_err(io::Error::other)?;
+    let hooked = retry::HookedJsonBody::new(&body, on_uploaded).map_err(io::Error::other)?;
     let response = retry::retry_loop(
         || {
             let mut request = hooked.apply_headers(
@@ -204,7 +204,7 @@ where
         tools,
         thinking_effort,
         on_retry,
-        on_accepted,
+        on_uploaded,
         cancel_rx,
         session_id,
         request_id,
@@ -268,7 +268,7 @@ where
         crate::shared::opencode_gateway_headers(&config.provider_slug, session_id, request_id)
     });
     // Compact body + headers + upload hook (see `retry::HookedJsonBody`).
-    let hooked = retry::HookedJsonBody::new(&body, on_accepted).map_err(io::Error::other)?;
+    let hooked = retry::HookedJsonBody::new(&body, on_uploaded).map_err(io::Error::other)?;
     let response = retry::retry_loop(
         || {
             let mut request = hooked.apply_headers(
