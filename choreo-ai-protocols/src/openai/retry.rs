@@ -18,8 +18,8 @@ pub(crate) fn retry_config_from_config(config: &ServiceConfig) -> RetryConfig {
 /// One retried JSON send: the transport target, the serialized request body, the
 /// provider/retry config, and the per-call extras (the gateway route and the
 /// upload hook).  Bundled into a struct so `retry_send` reads as
-/// `(request, ctx)` rather than a nine-parameter positional list — the earlier
-/// list only grew, and a parameter object keeps a future field a one-line
+/// `(request, ctx)`: the call carries enough per-call context that a positional
+/// list is unreadable, and a parameter object keeps a future field a one-line
 /// addition.
 pub(crate) struct RetrySend<'a> {
     pub agent: &'a ureq::Agent,

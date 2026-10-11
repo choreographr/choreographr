@@ -118,7 +118,11 @@ impl io::Read for UploadHookReader {
             dst.copy_from_slice(remaining.get(..n).unwrap_or_default());
         }
         self.pos += n;
-        if self.pos == self.bytes.len()
+        // Guard on a non-empty read so the hook fires on the last real byte,
+        // never on the first read of an empty payload (which would report an
+        // upload that sent nothing).
+        if n > 0
+            && self.pos == self.bytes.len()
             && let Some(cb) = self.on_uploaded.take()
         {
             cb();

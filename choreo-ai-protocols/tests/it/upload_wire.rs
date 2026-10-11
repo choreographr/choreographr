@@ -2,11 +2,13 @@
 //! send path.
 //!
 //! Builds a real [`OpenAiClient`] against the scripted loopback HTTP provider and
-//! asserts the two load-bearing properties of [`retry::HookedJsonBody`] on the
-//! actual wire: the declared `Content-Length` equals the bytes the transport
-//! sent (a mismatch would spin ureq's length-delimited send loop), and the
-//! upload hook (`on_uploaded`, the daemon's `Waiting` boundary) fires exactly
-//! once.  The body must be compact JSON — pretty-printing would embed newlines.
+//! asserts the two load-bearing properties of the shared `retry::HookedJsonBody`
+//! send path on the actual wire: the declared `Content-Length` equals the bytes
+//! the transport sent (a mismatch would spin ureq's length-delimited send loop),
+//! and the upload hook (`on_uploaded`, the daemon's `Waiting` boundary) fires
+//! exactly once.  The body must be compact JSON — pretty-printing would embed
+//! newlines.  A second test covers the image adapter, which routes its body
+//! through the same `HookedJsonBody` path.
 //!
 //! These tests bind a real local TCP socket, so per AGENTS.md they live in
 //! `tests/` and are marked `#[ignore]` (run via `cargo test-integration`).
@@ -18,7 +20,10 @@ use choreo_ai_protocols::openai::{
     ChatRequestMessage, MaxTokensField, OpenAiClient, RequestUploadedCallback, ServiceConfig,
 };
 use choreo_ai_protocols::test_utils::MockProvider;
-use choreo_ai_protocols::{ChatTurnRequest, ChatTurnResult, SocketRegistry};
+use choreo_ai_protocols::{
+    ChatTurnRequest, ChatTurnResult, ImageGenerationClient, ImageGenerationRequest,
+    OpenAiImageClient, SocketRegistry,
+};
 
 #[test]
 #[ignore = "integration"]
@@ -111,5 +116,60 @@ fn uploaded_body_is_length_delimited_and_fires_the_hook_once() {
     assert!(
         !req.body.contains(&b'\n'),
         "request body must be compact (no pretty-print newlines)"
+    );
+}
+
+#[test]
+#[ignore = "integration"]
+fn image_generation_body_is_compact_and_length_delimited() {
+    let registry = SocketRegistry::new();
+    // Minimal Images API response: one inline b64 item, no revised_prompt.
+    let response = r#"{"data":[{"b64_json":"AAAA"}]}"#;
+    let mock = MockProvider::start(vec![(200, "application/json", response.to_string())]);
+
+    // The image adapter has no `Result` constructor (it fixes its own deadline
+    // and retry budget), so a plain config + key is all it needs.
+    let client = OpenAiImageClient::new(
+        ServiceConfig {
+            base_url: mock.base_url("v1"),
+            provider_slug: "openai".to_string(),
+            connect_timeout_secs: 5,
+            ..Default::default()
+        },
+        "test-key".to_string(),
+        &registry,
+    );
+
+    let req = ImageGenerationRequest::new("a cat", "gpt-image-1");
+    let result = client
+        .generate_image(&req, None)
+        .expect("image generation succeeds over the mock");
+    assert_eq!(result.image_b64, "AAAA");
+
+    let requests = mock.requests();
+    let captured = requests.first().expect("one captured request");
+    // The image adapter routes its body through the same compact,
+    // length-delimited `HookedJsonBody` path as the chat turn, so the declared
+    // length must equal the bytes sent (a mismatch would spin ureq's
+    // length-delimited send loop) and the payload must carry no pretty-print
+    // newlines.
+    let declared: usize = captured
+        .header("content-length")
+        .expect("Content-Length header present")
+        .parse()
+        .expect("Content-Length is a decimal");
+    assert_eq!(
+        declared,
+        captured.body.len(),
+        "declared Content-Length must match the sent body"
+    );
+    assert!(
+        !captured.body.contains(&b'\n'),
+        "request body must be compact (no pretty-print newlines)"
+    );
+    assert_eq!(
+        captured.header("content-type"),
+        Some("application/json; charset=utf-8"),
+        "the request body is sent as JSON"
     );
 }

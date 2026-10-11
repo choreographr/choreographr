@@ -23,9 +23,9 @@ fn test_config() -> RetryConfig {
 #[test]
 fn retry_decision_huge_retry_after_is_terminal() {
     // A malicious/broken provider could send Retry-After: u64::MAX; the
-    // merged gate+delay treats it as terminal — ~584bn years never even
-    // becomes a wait (the old cap-then-wait behavior was only reachable
-    // from the gate anyway).
+    // merged gate+delay treats it as terminal — ~584bn years never becomes a
+    // wait, because the budget ceiling rejects the cooldown outright instead
+    // of capping it into a (still enormous) sleep.
     let retry = test_config();
     assert_eq!(retry_decision(429, Some(u64::MAX), 1, &retry), None);
 }
@@ -279,6 +279,17 @@ fn upload_hook_does_not_fire_before_the_payload_is_exhausted() {
 }
 
 #[test]
+fn upload_hook_does_not_fire_on_an_empty_payload() {
+    // An empty payload has no final byte to fire on, so the hook must stay
+    // silent rather than report an upload that sent nothing.
+    let (hook, count) = counting_hook();
+    let mut reader = UploadHookReader::new(Vec::new().into(), Some(hook));
+    let mut buf = [0u8; 4];
+    assert_eq!(reader.read(&mut buf).expect("read"), 0);
+    assert_eq!(count.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn hooked_json_body_is_compact_and_matches_the_serialized_bytes() {
     // The reader must yield exactly the bytes whose length the body declares as
     // `Content-Length` (a declared length that disagreed would spin ureq's
@@ -411,10 +422,9 @@ fn extract_error_message_falls_back_for_non_envelope_bodies() {
 
 #[test]
 fn rate_limited_status_survives_the_whole_error_chain() {
-    // Regression: the pre-fix detail de-dup dropped the status for 429s
-    // because `RateLimited` carried no `status` field — a parseable body
-    // rendered as `rate limited: Quota exceeded` with the status silently
-    // lost.  The status must appear in the Display at every layer.
+    // `RateLimited` carries the status explicitly so it survives the whole
+    // error chain: a parseable body renders as `rate limited (429): …`, never
+    // a status-less `rate limited: …`, at every layer.
     let http = ProviderHttpError::RateLimited {
         status: 429,
         retry_after_secs: None,
