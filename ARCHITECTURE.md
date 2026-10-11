@@ -252,7 +252,7 @@ lands only in the release pipeline). Panic messages keep their `file:line`
 locations (compiled-in string constants via `#[track_caller]`); only
 `RUST_BACKTRACE=1` symbolization is lost, and the daemon emits no backtraces.
 `panic = "abort"` is deliberately NOT set: the daemon isolates
-request-worker panics with `catch_unwind` (sessions.rs), which abort would
+request-worker panics with `catch_unwind` (sessions/worker.rs), which abort would
 defeat. The RPM spec keeps `__os_install_post %{nil}` so rpm's brp scripts
 never re-process the already-stripped binaries.
 
