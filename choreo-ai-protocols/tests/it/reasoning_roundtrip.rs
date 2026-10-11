@@ -545,8 +545,8 @@ fn gemini_thought_signatures_reemitted() {
     );
 
     // Gemini attaches the FINAL captured signature to the LAST assistant part
-    // (here the functionCall part), exactly where pi attaches tool-call
-    // signatures — the wire must carry the encrypted blob back verbatim.
+    // (here the functionCall part) — the wire must carry the encrypted blob
+    // back verbatim.
     let body2 = reqs[1].body_json();
     let model_content = body2["contents"]
         .as_array()
@@ -796,7 +796,7 @@ fn opencode_provider_sends_per_session_gateway_headers() {
     // the per-session sticky id, so the headers must carry the REAL session
     // and request ids from the turn — never a fixed constant (a constant would
     // pin every choreographr session to one upstream bucket) — plus the client
-    // identifier, mirroring upstream's own client.
+    // identifier.
     for slug in ["opencode-go", "opencode"] {
         let req = chat_turn_request(ServiceConfig {
             provider_slug: slug.to_string(),

@@ -4,7 +4,7 @@
 //! once `EnableMouseCapture` is on, the terminal forwards drag events to the
 //! app instead of selecting natively, so the app must (a) track the drag,
 //! (b) map the screen rectangle back to the text it covers, and (c) hand the
-//! text to the clipboard itself.  This mirrors opencode's select-to-copy.
+//! text to the clipboard itself.
 //!
 //! Scope (v1): the chat *history pane* only — the input box and overlay
 //! popups are out.  The selection is stored in *content* coordinates — a

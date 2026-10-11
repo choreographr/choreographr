@@ -101,8 +101,7 @@ fn apply_edit_file_locked(
     // Match on LF-normalized text so a CRLF file — whose `read_file` view is
     // already LF-normalized — still matches the `old_text` the model copied,
     // then restore the file's original line ending on write. Without this,
-    // exact matching fails on *every* line of a Windows-style file. (opencode
-    // and pi do the same normalize-match / restore-on-write dance.)
+    // exact matching fails on *every* line of a Windows-style file.
     let line_ending = detect_line_ending(&original_content);
     let normalized = to_lf(&original_content);
     let edit_summary = apply_text_edits(&normalized, &args.edits).map_err(ToolExecError)?;

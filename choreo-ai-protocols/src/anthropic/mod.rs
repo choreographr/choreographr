@@ -785,7 +785,7 @@ fn anthropic_image_block(image: &ChatImagePart) -> Option<ContentBlockPayload<'_
 /// `thinking_enabled` gates the replay of thinking / `redacted_thinking` blocks
 /// from the round-trip artifact: Anthropic rejects thinking blocks sent
 /// without a matching thinking config, so they are dropped when thinking is
-/// off for this request (goose's `!thinking_disabled` gate).
+/// off for this request.
 fn build_message_payloads<'a>(
     messages: &'a [ChatRequestMessage],
     _tools: &'a [ChatToolDefinition],

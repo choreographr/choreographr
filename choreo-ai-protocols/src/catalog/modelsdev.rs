@@ -158,8 +158,8 @@ struct ModelLimit {
 /// a bare `true` can never be mistaken for a field name. The bool form
 /// ("supports interleaved thinking") carries no field name and is the
 /// models.dev schema's documented shape (`true | { field: ... }`); the plain
-/// string shorthand is accepted for forward compatibility the same way
-/// opencode's provider deserializer accepts it (a string IS the field name).
+/// string shorthand is accepted for forward compatibility (a string IS the
+/// field name).
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum RawInterleaved {

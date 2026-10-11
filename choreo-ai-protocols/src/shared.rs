@@ -308,7 +308,7 @@ pub(crate) fn build_agent(
 }
 
 /// `x-opencode-client` value sent to the opencode.ai zen/go gateway: names
-/// the calling agent, mirroring upstream's `x-opencode-client` flag.
+/// the calling client.
 pub(crate) const OPENCODE_CLIENT_ID: &str = "choreographr";
 
 /// Gateway routing headers for the opencode.ai zen/go providers.
@@ -320,7 +320,7 @@ pub(crate) const OPENCODE_CLIENT_ID: &str = "choreographr";
 /// `x-opencode-session` header when present, else the workspace id, else the
 /// caller IP. A sticky tracker then prefers the last provider that returned
 /// 200 for that (model, session) pair while it stays healthy. Sending the
-/// REAL per-session id — like upstream's own client does — spreads sessions
+/// REAL per-session id spreads sessions
 /// across buckets and lets the gateway's own health machinery route around
 /// broken upstreams; a fixed constant would pin every choreographr session
 /// to one bucket forever, which is why the old hardcoded value was removed.

@@ -115,9 +115,9 @@ pub(super) fn messages_request(
     .with_no_retry(no_retry);
 
     // Thinking blocks are replayed from the round-trip artifact only when
-    // thinking is enabled for this request (goose's `!thinking_disabled`
-    // gate) — Anthropic rejects thinking blocks sent without a thinking
-    // config. Compute the payload first so the builder sees the gate.
+    // thinking is enabled for this request — Anthropic rejects thinking blocks
+    // sent without a thinking config. Compute the payload first so the builder
+    // sees the gate.
     //
     // The thinking budget derives from the ORIGINAL `config.max_tokens`, not
     // the per-call override: a 1-token output cap (the cache-warming ping)

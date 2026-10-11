@@ -602,9 +602,9 @@ fn model_url(base_url: &str, model: &str, action: &str) -> String {
 /// The artifact stores signatures in wire order but NOT the part each came
 /// from, and this adapter does not re-emit thinking text (display-only), so
 /// the wire cannot attach them to their original thinking parts. Gemini
-/// allows `thoughtSignature` on ANY part (pi's google-shared.ts:199), so the
+/// allows `thoughtSignature` on ANY part, so the
 /// turn's FINAL signature is attached to the LAST part — in a tool loop that
-/// is the functionCall part, exactly where pi attaches a tool-call signature.
+/// is the functionCall part.
 /// Attaching the final signature keeps the most recent thinking step's
 /// continuity token on the wire.
 fn attach_thought_signatures(

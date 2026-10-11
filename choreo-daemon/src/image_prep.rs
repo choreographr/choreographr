@@ -48,9 +48,8 @@ use image::{DynamicImage, GenericImageView, ImageFormat, RgbaImage};
 use resvg::{tiny_skia, usvg};
 use tracing::{debug, warn};
 
-/// Longest-edge cap after normalization (px). Matches the common 2000px
-/// default across the surveyed agents and comfortably fits every provider's
-/// per-image limits.
+/// Longest-edge cap after normalization (px). A 2000px longest edge comfortably
+/// fits every provider's per-image limits.
 pub const MAX_IMAGE_DIMENSION: u32 = 2000;
 /// Hard cap on the source file size we are willing to read (MiB). Larger
 /// inputs are rejected before any decode attempt.

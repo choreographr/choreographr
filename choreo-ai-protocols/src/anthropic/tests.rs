@@ -627,7 +627,7 @@ fn build_message_payloads_drops_thinking_blocks_when_thinking_disabled() {
 
     // Same artifact, but the request has thinking OFF: Anthropic rejects
     // thinking blocks sent without a matching thinking config, so they must
-    // be dropped entirely (goose's `!thinking_disabled` gate).
+    // be dropped entirely.
     let msgs = vec![ChatRequestMessage {
         role: "assistant",
         content: Some("answer".to_string()),

@@ -66,7 +66,7 @@ fn output_format_mime(format: OutputFormat) -> &'static str {
 /// for a deliberate pass-through. Otherwise the choice is made ONLY among
 /// catalog-verified candidates (`image_models_for_provider`), never guessed:
 /// a model that is not in the provider's catalog entry is unlikely to be
-/// routable through the account. The priority ordering (ironclaw-style):
+/// routable through the account. The priority ordering:
 /// gpt-image > imagen > gemini-image > flux > dall-e — "best first" by
 /// fidelity/cost behavior, with the legacy dall-e family explicitly last.
 fn pick_image_model(
@@ -303,7 +303,7 @@ impl super::Tool for GenerateImage {
 
         // Text handle mirrors display_image's, plus the model and the
         // provider's revised prompt — the model benefits from seeing how the
-        // provider rewrote its request (codex pattern).
+        // provider rewrote its request.
         let revised = result
             .revised_prompt
             .as_deref()
@@ -538,7 +538,7 @@ mod tests {
             GenerateImage::new().extract_image(&ret).unwrap().width,
             ret.image.width
         );
-        // revised_prompt lands in the text handle (codex pattern) along with
+        // revised_prompt lands in the text handle along with
         // the model that produced the image.
         assert!(
             ret.text.contains("via gpt-image-1"),

@@ -9,7 +9,7 @@
 //!
 //! [`with_file_lock`] serializes mutations by canonical path so two writers of
 //! one file run one at a time, while writers of different files stay parallel.
-//! This mirrors pi's `withFileMutationQueue`. It is deliberately *not* applied
+//! It is deliberately *not* applied
 //! to readers (`read_file`, `grep`, …): the write is an atomic rename, so a
 //! reader always sees either the old or the new file, never a torn one.
 //!

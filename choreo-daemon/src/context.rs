@@ -97,7 +97,7 @@ pub fn discover_context(working_dir: &Path, config: &ContextConfig) -> io::Resul
 }
 
 // Global files load in a fixed precedence order — the config-dir `AGENTS.md`,
-// then the optional Claude Code prompt, then the shared `~/.agents` scope —
+// then the optional `~/.claude/CLAUDE.md`, then the shared `~/.agents` scope —
 // each contributing only when it exists and is non-empty. Neither loader can
 // fail (file loads degrade to skips), so they return () rather than a
 // transparent Ok(()) a caller would have to `?`.

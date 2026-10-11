@@ -114,7 +114,7 @@ pub(super) fn render_model_selector(frame: &mut Frame<'_>, app: &mut App) {
     for (i, model) in filtered.iter().enumerate().skip(scroll).take(count) {
         let is_current = selected.as_deref() == Some(model);
         let is_focused = i == focused;
-        // `●` marks the active model (mirrors opencode's modal); `>` marks
+        // `●` marks the active model; `>` marks
         // the highlight the user is about to select.
         let prefix = if is_focused { "> " } else { "  " };
         let marker = if is_current { "●" } else { " " };

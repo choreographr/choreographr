@@ -763,7 +763,7 @@ fn builder_injects_empty_reasoning_content_for_deepseek_without_artifact() {
     // DeepSeek chat requires `reasoning_content` to be present on every
     // assistant message even when the model produced no reasoning. A tool
     // turn with no artifact must therefore carry an explicit empty string on
-    // the wire (mirrors opencode's `{type:"reasoning", text:""}` injection).
+    // the wire.
     let mut session = SessionState::empty();
     add_turn(
         &mut session,

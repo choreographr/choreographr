@@ -80,8 +80,8 @@ pub fn build_chat_request_messages(
         // Reasoning round-trip (phase 4b): the artifact is replayed when BOTH
         // gates pass — (1) same-model provenance (artifacts are model-bound; a
         // turn produced by a different model must not have its encrypted
-        // payload replayed into this request, matching pi's isSameModel and
-        // Anthropic's strip-on-model-change rule) and (2) the provider's
+        // payload replayed into this request, matching Anthropic's
+        // strip-on-model-change rule) and (2) the provider's
         // passback policy for this request — OR the empty-message fallback
         // applies (see the reasoning_content comment below: a content-less,
         // tool-less turn must never ship bare under an echo-capable policy):
@@ -129,8 +129,7 @@ pub fn build_chat_request_messages(
                 // artifact re-emits its text (leave the explicit field None);
                 // on a DeepSeek/Kimi model that requires the field present
                 // and where nothing will be echoed, inject an EMPTY string so
-                // the wire always carries it (mirrors opencode's transform of
-                // `{type:"reasoning", text:""}` on every assistant message).
+                // the wire always carries the field.
                 // `include_reasoning_artifact` already forces the artifact
                 // in for a content-less, tool-less turn under an echo-capable
                 // policy (the "empty assistant message" 400), so the injected
@@ -298,8 +297,7 @@ fn turn_has_tool_involvement(turn: &Turn) -> bool {
 /// Two gates, both required:
 /// 1. **Same-model provenance** — artifacts are model-bound; a turn produced
 ///    by a different model (or with an unrecorded producer) must not have
-///    its payload replayed, matching pi's isSameModel and Anthropic's
-///    strip-on-model-change rule.
+///    its payload replayed, matching Anthropic's strip-on-model-change rule.
 /// 2. **The passback policy** for the request:
 ///    `ToolLoop`  → tool-involving turns only
 ///    `AllTurns` / Signature → every turn
