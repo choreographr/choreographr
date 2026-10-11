@@ -429,7 +429,8 @@ pub enum SessionEvent {
         /// context size being sent to the model), if available.
         #[serde(default)]
         last_prompt_tokens: Option<u32>,
-        /// Current session status (`Inactive`, `Inference`, `ToolCall`, etc.).
+        /// Current session status (`Inactive`, `Sending`/`Thinking`/`Responding`,
+        /// `ToolCall`, …).
         #[serde(default)]
         status: SessionStatus,
         /// The current reasoning-effort slug, when set.

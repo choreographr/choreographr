@@ -914,7 +914,7 @@ mod unsent_draft_tests {
     fn deleting_attached_session_clears_cached_status() {
         // The cached status/tool-groups describe the attachment; once the
         // attached session is deleted there is nothing left to describe, so
-        // they must be cleared.  Leaving `attached_status` set (e.g. Inference)
+        // they must be cleared.  Leaving `attached_status` set (e.g. Responding)
         // would render a stale status bar AND make the submit-time idle-guard
         // in `connection/chat.rs` reject a plain prompt as "session not idle"
         // even though no session is attached at all.

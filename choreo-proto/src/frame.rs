@@ -43,7 +43,10 @@ use std::io::Cursor;
 /// daemon can pick up `mcp.json` edits without a restart. The MCP
 /// trust-query request/reply variants (`ClientMessage::McpTrust`/`McpUntrust`/
 /// `McpTrustList` and `DaemonMessage::McpTrustUpdated`/`McpTrustList`) were
-/// added to 9 this way, before any release carried 9.
+/// added to 9 this way, before any release carried 9. Under the same policy the
+/// `SessionStatus` streaming phase was split in 9: the single `Inference` state
+/// became `Sending`/`Thinking`/`Responding`, so a client can tell the pre-token
+/// connection wait from reasoning from answer streaming.
 ///
 /// Policy: variants may be added to the **current, unreleased** wire version
 /// without a bump. Mixed-version peers do not exist until a release ships, and
