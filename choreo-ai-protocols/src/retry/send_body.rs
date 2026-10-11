@@ -82,13 +82,18 @@ impl HookedJsonBody {
     /// a single error type.  The zstd pass is infallible (see
     /// [`zstd_compress`](super::compression::zstd_compress)) and never
     /// contributes an error.
+    ///
+    /// When a body is compressed, one payload-free `debug!` event reports the
+    /// coding and the before/after byte counts (never the body), so the
+    /// compression win stays observable.
     pub(crate) fn new<T: serde::Serialize>(
         value: &T,
         on_uploaded: Option<RequestUploadedCallback>,
         compression: RequestCompression,
     ) -> Result<Self, io::Error> {
         let plain: Arc<[u8]> = serde_json::to_vec(value).map_err(io::Error::other)?.into();
-        let plain_len = plain.len().to_string();
+        let plain_bytes = plain.len();
+        let plain_len = plain_bytes.to_string();
         let compressed = match compression {
             RequestCompression::Identity => None,
             RequestCompression::Gzip => {
@@ -98,6 +103,18 @@ impl HookedJsonBody {
                 Some(CompressedBody::new(zstd_compress(&plain), compression))
             }
         };
+        // Payload-free upload-size telemetry: the coding and the before/after
+        // byte counts only — never the body — so the compression win (fewer
+        // bytes on the wire) is observable.  Same field discipline as the retry
+        // and downgrade logs.
+        if let Some(body) = &compressed {
+            tracing::debug!(
+                coding = body.coding.content_encoding().unwrap_or("identity"),
+                plain_bytes,
+                compressed_bytes = body.bytes.len(),
+                "compressed request body",
+            );
+        }
         let use_compression = Cell::new(compressed.is_some());
         Ok(Self {
             plain,
