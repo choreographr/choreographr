@@ -954,7 +954,7 @@ runs the command**, and `Esc` discards the line without cancelling anything.
 - `/reasoning <slug>` — set reasoning effort (e.g. `off`, `low`, `medium`, `high`, `on`, `xhigh`, `max`; available values depend on the model)
 - `Alt+R` — cycle reasoning effort through available slugs for the attached session's model (status message states: model reports no effort levels → "model does not support reasoning"; no model selected → "no model selected — pick one with Alt+M"; model selected but capability not yet reported → "reasoning capability not yet available")
 - `Alt+M` — open the model selector: list models available on the attached session's account, type to filter, `↑`/`↓`/`PgUp`/`PgDn` or the mouse wheel to navigate, click a row or press Enter to select, Esc to dismiss
-- `Alt+Up` / `Alt+Down` — undo / redo the most recent user turn (same as `/undo` and `/redo`)
+- `Alt+Up` / `Alt+Down` — undo / redo one undo batch (same as `/undo` and `/redo`; both require an idle session)
 - `Alt+H` — toggle the keyboard-shortcut help overlay (the two cyan lines at the bottom of the Chat page)
 - `Alt+Q` — quit the client from any page or open modal (same as `/quit`)
 - `Ctrl+Backspace` — clear the draft prompt in the input box (empties the whole draft wherever the cursor sits; `Ctrl+W` deletes the previous word and `Ctrl+U` clears only up to the cursor; inert while browsing prompt history with `↑`, where it can neither clear nor detach the recalled entry)
@@ -963,8 +963,8 @@ runs the command**, and `Esc` discards the line without cancelling anything.
 - Terminal window title and program status — the client sets the terminal's window/tab title (OSC 2) to `choreo-tui` and, once a session is attached, `choreo-tui — <session title>` (emitted only on change, cleared on job-control suspend and at exit), and reports each session's state to the terminal via the **Program Status Protocol** (OSC 7501): idle/working from the live session status, plus a `done`/`error` outcome (and `idle` after a cancel) that survives the prompt which follows it — so a background agent that just finished keeps its `done` record after its status drops to idle. The record's `title`/`msg` fields are stripped of control characters and capped to the protocol's byte limits. Every report is a per-session *child* record, so a terminal that maps the OSC 9;4 progress bar onto the status *root* record never has a progress update wipe a real status report.
 - `/continue` — continue a stopped/idle session by sending a "Please continue." prompt
 - `/stop` — cancel whatever request is currently active on the attached session (same as `/cancel 0`)
-- `/undo` — undo the most recent user turn and its entire assistant response subtree
-- `/redo` — redo the most recently undone turn (cleared if new input is sent)
+- `/undo` — undo the most recent user turn together with every still-live turn after it (the whole assistant response subtree); only honoured while the session is idle
+- `/redo` — redo the most recent undo batch (one batch per `/undo`, restored newest-first; cleared if new input is sent; only honoured while the session is idle)
 - any other input — sent as a prompt
 
 In `choreo-tui`, `Ctrl+C` is a deliberate no-op (raw mode has no copy/sigint,

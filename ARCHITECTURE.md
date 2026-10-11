@@ -836,7 +836,7 @@ Two cross-cutting accounting contracts:
 - **The billing counter vs. the context payload.** Each session tracks an
   `accumulated_usage` billing total (persisted on the session record and
   re-derived from per-turn usage on load) *and* a separate
-  `last_prompt_tokens` (`input_tokens` from the most recent response) — the
+  `last_prompt_tokens` (the latest live turn's `input_tokens`) — the
   actual context size the model last saw, used for the context-window progress
   display (`last_prompt_tokens / context_window`), never a cumulative sum.
   The two diverge under undo: `accumulated_usage` sums **every** turn (undo does
