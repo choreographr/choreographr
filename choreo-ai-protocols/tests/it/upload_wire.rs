@@ -13,6 +13,11 @@
 //! These tests bind a real local TCP socket, so per AGENTS.md they live in
 //! `tests/` and are marked `#[ignore]` (run via `cargo test-integration`).
 
+// AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
+// allow-*-in-tests config only recognizes #[test]-annotated functions —
+// helper fns in this file need this file-level allowance.
+#![expect(clippy::expect_used)]
+
 use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -20,54 +25,65 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use choreo_ai_protocols::openai::{
     ChatRequestMessage, MaxTokensField, OpenAiClient, RequestUploadedCallback, ServiceConfig,
 };
-use choreo_ai_protocols::test_utils::MockProvider;
+use choreo_ai_protocols::test_utils::{CapturedRequest, MockProvider};
 use choreo_ai_protocols::{
     ChatTurnRequest, ChatTurnResult, ImageGenerationClient, ImageGenerationRequest,
     OpenAiImageClient, RequestCompression, SocketRegistry,
 };
 
-#[test]
-#[ignore = "integration"]
-fn uploaded_body_is_length_delimited_and_fires_the_hook_once() {
-    let registry = SocketRegistry::new();
-    let response = r#"{
-        "choices":[{"message":{"content":"hello","tool_calls":[],"reasoning_content":null,"reasoning":null,"reasoning_text":null}}],
-        "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
-    }"#;
-    let mock = MockProvider::start(vec![(200, "application/json", response.to_string())]);
+/// The canned chat-completions success body the mock returns.  Its content is
+/// irrelevant to the wire assertions; the client only needs a well-formed turn.
+const CHAT_RESPONSE: &str = r#"{
+    "choices":[{"message":{"content":"hello","tool_calls":[],"reasoning_content":null,"reasoning":null,"reasoning_text":null}}],
+    "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+}"#;
 
-    let client = OpenAiClient::new(
+/// Build the `OpenAiClient` the wire tests exercise: one attempt (so a capture
+/// count is deterministic), a bounded timeout, and the caller's `compression`
+/// policy.  The registry is passed in so it outlives the client reference.
+fn chat_client(
+    mock: &MockProvider,
+    registry: &SocketRegistry,
+    slug: &str,
+    compression: RequestCompression,
+) -> OpenAiClient {
+    OpenAiClient::new(
         ServiceConfig {
             base_url: mock.base_url("v1"),
-            provider_slug: "deepseek".to_string(),
+            provider_slug: slug.to_string(),
             streaming: false,
             retry_max_attempts: 1,
             connect_timeout_secs: 5,
             request_timeout_secs: 30,
             total_timeout_secs: 60,
             chat_completions_max_tokens_field: MaxTokensField::MaxCompletionTokens,
+            request_compression: compression,
             ..Default::default()
         },
         "test-key".to_string(),
-        &registry,
+        registry,
     )
-    .expect("openai client");
+    .expect("openai client")
+}
 
-    let uploads = Arc::new(AtomicU32::new(0));
-    let seen = Arc::clone(&uploads);
-    let on_uploaded: RequestUploadedCallback = Arc::new(move || {
-        seen.fetch_add(1, Ordering::SeqCst);
-    });
-
-    let user_message = ChatRequestMessage::simple("user", "hi".to_string());
-    let result = client
+/// Send one minimal chat turn, returning the parsed result.  The `on_uploaded`
+/// hook is threaded through so the caller can count its firings.
+fn run_chat_turn(
+    client: &OpenAiClient,
+    on_uploaded: Option<RequestUploadedCallback>,
+) -> ChatTurnResult {
+    let message = ChatRequestMessage::simple("user", "hi".to_string());
+    // `on_retry` borrows a local slot so the whole request lives within this
+    // call; the tests never wire a retry callback.
+    let mut on_retry = None;
+    client
         .chat_completion_turn(ChatTurnRequest {
             model: "deepseek-v4-flash",
-            messages: &[user_message],
+            messages: std::slice::from_ref(&message),
             tools: &[],
             thinking_effort: "off".to_string(),
-            on_retry: &mut None,
-            on_uploaded: Some(on_uploaded),
+            on_retry: &mut on_retry,
+            on_uploaded,
             cancel_rx: None,
             previous_response_id: None,
             tool_results: &[],
@@ -77,7 +93,49 @@ fn uploaded_body_is_length_delimited_and_fires_the_hook_once() {
             max_output_tokens_override: None,
             no_retry: false,
         })
-        .expect("turn succeeds over the registered connection");
+        .expect("turn succeeds over the registered connection")
+}
+
+/// Parse the declared `Content-Length` of a captured request.
+fn declared_content_length(req: &CapturedRequest) -> usize {
+    req.header("content-length")
+        .expect("Content-Length header present")
+        .parse()
+        .expect("Content-Length is a decimal")
+}
+
+/// Gunzip a captured request body.
+fn gunzip(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(bytes)
+        .read_to_end(&mut out)
+        .expect("gunzip the request body");
+    out
+}
+
+/// Decode a captured zstd request body.
+fn unzstd(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    structured_zstd::decoding::StreamingDecoder::new(std::io::Cursor::new(bytes))
+        .read_to_end(&mut out)
+        .expect("decode the zstd request body");
+    out
+}
+
+#[test]
+#[ignore = "integration"]
+fn uploaded_body_is_length_delimited_and_fires_the_hook_once() {
+    let registry = SocketRegistry::new();
+    let mock = MockProvider::start(vec![(200, "application/json", CHAT_RESPONSE.to_string())]);
+    let client = chat_client(&mock, &registry, "deepseek", RequestCompression::Identity);
+
+    let uploads = Arc::new(AtomicU32::new(0));
+    let seen = Arc::clone(&uploads);
+    let on_uploaded: RequestUploadedCallback = Arc::new(move || {
+        seen.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let result = run_chat_turn(&client, Some(on_uploaded));
     assert!(matches!(result, ChatTurnResult::FinalText(_)));
 
     // The upload hook fires exactly once on this single (non-retried) attempt —
@@ -94,13 +152,8 @@ fn uploaded_body_is_length_delimited_and_fires_the_hook_once() {
     // The declared `Content-Length` must equal the bytes actually sent: a short
     // body would make ureq's length-delimited send loop spin forever (see
     // `retry::HookedJsonBody`).
-    let declared: usize = req
-        .header("content-length")
-        .expect("Content-Length header present")
-        .parse()
-        .expect("Content-Length is a decimal");
     assert_eq!(
-        declared,
+        declared_content_length(req),
         req.body.len(),
         "declared Content-Length must match the sent body"
     );
@@ -154,13 +207,8 @@ fn image_generation_body_is_compact_and_length_delimited() {
     // length must equal the bytes sent (a mismatch would spin ureq's
     // length-delimited send loop) and the payload must carry no pretty-print
     // newlines.
-    let declared: usize = captured
-        .header("content-length")
-        .expect("Content-Length header present")
-        .parse()
-        .expect("Content-Length is a decimal");
     assert_eq!(
-        declared,
+        declared_content_length(captured),
         captured.body.len(),
         "declared Content-Length must match the sent body"
     );
@@ -179,49 +227,15 @@ fn image_generation_body_is_compact_and_length_delimited() {
 #[ignore = "integration"]
 fn compressed_chat_body_is_gzip_and_length_delimited() {
     let registry = SocketRegistry::new();
-    let response = r#"{
-        "choices":[{"message":{"content":"hello","tool_calls":[],"reasoning_content":null,"reasoning":null,"reasoning_text":null}}],
-        "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
-    }"#;
-    let mock = MockProvider::start(vec![(200, "application/json", response.to_string())]);
-
-    let client = OpenAiClient::new(
-        ServiceConfig {
-            base_url: mock.base_url("v1"),
-            provider_slug: "deepseek-compress".to_string(),
-            streaming: false,
-            retry_max_attempts: 1,
-            connect_timeout_secs: 5,
-            request_timeout_secs: 30,
-            total_timeout_secs: 60,
-            chat_completions_max_tokens_field: MaxTokensField::MaxCompletionTokens,
-            request_compression: RequestCompression::Gzip,
-            ..Default::default()
-        },
-        "test-key".to_string(),
+    let mock = MockProvider::start(vec![(200, "application/json", CHAT_RESPONSE.to_string())]);
+    let client = chat_client(
+        &mock,
         &registry,
-    )
-    .expect("openai client");
+        "deepseek-compress",
+        RequestCompression::Gzip,
+    );
 
-    let user_message = ChatRequestMessage::simple("user", "hi".to_string());
-    let result = client
-        .chat_completion_turn(ChatTurnRequest {
-            model: "deepseek-v4-flash",
-            messages: &[user_message],
-            tools: &[],
-            thinking_effort: "off".to_string(),
-            on_retry: &mut None,
-            on_uploaded: None,
-            cancel_rx: None,
-            previous_response_id: None,
-            tool_results: &[],
-            programmatic_tool_calling: false,
-            session_id: "42".to_string(),
-            request_id: "7".to_string(),
-            max_output_tokens_override: None,
-            no_retry: false,
-        })
-        .expect("turn succeeds over the registered connection");
+    let result = run_chat_turn(&client, None);
     assert!(matches!(result, ChatTurnResult::FinalText(_)));
 
     let requests = mock.requests();
@@ -233,23 +247,14 @@ fn compressed_chat_body_is_gzip_and_length_delimited() {
     );
     // The declared `Content-Length` must equal the compressed bytes actually
     // sent (a mismatch would spin ureq's length-delimited send loop).
-    let declared: usize = req
-        .header("content-length")
-        .expect("Content-Length header present")
-        .parse()
-        .expect("Content-Length is a decimal");
     assert_eq!(
-        declared,
+        declared_content_length(req),
         req.body.len(),
         "declared Content-Length must match the compressed body"
     );
     // The compressed body must gunzip back to exactly the JSON a provider
     // would parse.
-    let mut decoded = Vec::new();
-    flate2::read::GzDecoder::new(&req.body[..])
-        .read_to_end(&mut decoded)
-        .expect("gunzip the request body");
-    let json = std::str::from_utf8(&decoded).expect("decompressed body is UTF-8 JSON");
+    let json = String::from_utf8(gunzip(&req.body)).expect("decompressed body is UTF-8 JSON");
     assert!(
         json.contains("\"messages\""),
         "decompressed body must be the chat-completions JSON"
@@ -260,49 +265,15 @@ fn compressed_chat_body_is_gzip_and_length_delimited() {
 #[ignore = "integration"]
 fn compressed_chat_body_is_zstd_and_length_delimited() {
     let registry = SocketRegistry::new();
-    let response = r#"{
-        "choices":[{"message":{"content":"hello","tool_calls":[],"reasoning_content":null,"reasoning":null,"reasoning_text":null}}],
-        "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
-    }"#;
-    let mock = MockProvider::start(vec![(200, "application/json", response.to_string())]);
-
-    let client = OpenAiClient::new(
-        ServiceConfig {
-            base_url: mock.base_url("v1"),
-            provider_slug: "deepseek-compress-zstd".to_string(),
-            streaming: false,
-            retry_max_attempts: 1,
-            connect_timeout_secs: 5,
-            request_timeout_secs: 30,
-            total_timeout_secs: 60,
-            chat_completions_max_tokens_field: MaxTokensField::MaxCompletionTokens,
-            request_compression: RequestCompression::Zstd,
-            ..Default::default()
-        },
-        "test-key".to_string(),
+    let mock = MockProvider::start(vec![(200, "application/json", CHAT_RESPONSE.to_string())]);
+    let client = chat_client(
+        &mock,
         &registry,
-    )
-    .expect("openai client");
+        "deepseek-compress-zstd",
+        RequestCompression::Zstd,
+    );
 
-    let user_message = ChatRequestMessage::simple("user", "hi".to_string());
-    let result = client
-        .chat_completion_turn(ChatTurnRequest {
-            model: "deepseek-v4-flash",
-            messages: &[user_message],
-            tools: &[],
-            thinking_effort: "off".to_string(),
-            on_retry: &mut None,
-            on_uploaded: None,
-            cancel_rx: None,
-            previous_response_id: None,
-            tool_results: &[],
-            programmatic_tool_calling: false,
-            session_id: "42".to_string(),
-            request_id: "7".to_string(),
-            max_output_tokens_override: None,
-            no_retry: false,
-        })
-        .expect("turn succeeds over the registered connection");
+    let result = run_chat_turn(&client, None);
     assert!(matches!(result, ChatTurnResult::FinalText(_)));
 
     let requests = mock.requests();
@@ -314,25 +285,13 @@ fn compressed_chat_body_is_zstd_and_length_delimited() {
     );
     // The declared `Content-Length` must equal the compressed bytes actually
     // sent (a mismatch would spin ureq's length-delimited send loop).
-    let declared: usize = req
-        .header("content-length")
-        .expect("Content-Length header present")
-        .parse()
-        .expect("Content-Length is a decimal");
     assert_eq!(
-        declared,
+        declared_content_length(req),
         req.body.len(),
         "declared Content-Length must match the compressed body"
     );
     // The compressed body must decode back to the JSON a provider would parse.
-    let mut decoder =
-        structured_zstd::decoding::StreamingDecoder::new(std::io::Cursor::new(&req.body[..]))
-            .expect("init zstd decoder");
-    let mut decoded = Vec::new();
-    decoder
-        .read_to_end(&mut decoded)
-        .expect("decode the zstd request body");
-    let json = std::str::from_utf8(&decoded).expect("decompressed body is UTF-8 JSON");
+    let json = String::from_utf8(unzstd(&req.body)).expect("decompressed body is UTF-8 JSON");
     assert!(
         json.contains("\"messages\""),
         "decompressed body must be the chat-completions JSON"
@@ -343,57 +302,23 @@ fn compressed_chat_body_is_zstd_and_length_delimited() {
 #[ignore = "integration"]
 fn rejected_gzip_body_downgrades_to_identity_and_retries() {
     let registry = SocketRegistry::new();
-    let response = r#"{
-        "choices":[{"message":{"content":"hello","tool_calls":[],"reasoning_content":null,"reasoning":null,"reasoning_text":null}}],
-        "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
-    }"#;
     // The provider rejects the gzip body with 415 first, then accepts the
     // identity retry (the mock repeats its last response for later requests).
     let mock = MockProvider::start(vec![
         (415, "application/json", "{}".to_string()),
-        (200, "application/json", response.to_string()),
+        (200, "application/json", CHAT_RESPONSE.to_string()),
     ]);
-
-    let client = OpenAiClient::new(
-        ServiceConfig {
-            base_url: mock.base_url("v1"),
-            provider_slug: "deepseek-compress-415".to_string(),
-            streaming: false,
-            // Even with no retry budget, the 415 downgrade re-sends once with
-            // an uncompressed body — a 415 is an encoding mismatch, not a
-            // transient failure.
-            retry_max_attempts: 1,
-            connect_timeout_secs: 5,
-            request_timeout_secs: 30,
-            total_timeout_secs: 60,
-            chat_completions_max_tokens_field: MaxTokensField::MaxCompletionTokens,
-            request_compression: RequestCompression::Gzip,
-            ..Default::default()
-        },
-        "test-key".to_string(),
+    // Even with no retry budget, the 415 downgrade re-sends once with an
+    // uncompressed body — a 415 is an encoding mismatch, not a transient
+    // failure.
+    let client = chat_client(
+        &mock,
         &registry,
-    )
-    .expect("openai client");
+        "deepseek-compress-415",
+        RequestCompression::Gzip,
+    );
 
-    let user_message = ChatRequestMessage::simple("user", "hi".to_string());
-    let result = client
-        .chat_completion_turn(ChatTurnRequest {
-            model: "deepseek-v4-flash",
-            messages: &[user_message],
-            tools: &[],
-            thinking_effort: "off".to_string(),
-            on_retry: &mut None,
-            on_uploaded: None,
-            cancel_rx: None,
-            previous_response_id: None,
-            tool_results: &[],
-            programmatic_tool_calling: false,
-            session_id: "42".to_string(),
-            request_id: "7".to_string(),
-            max_output_tokens_override: None,
-            no_retry: false,
-        })
-        .expect("turn succeeds after the identity downgrade");
+    let result = run_chat_turn(&client, None);
     assert!(matches!(result, ChatTurnResult::FinalText(_)));
 
     let requests = mock.requests();

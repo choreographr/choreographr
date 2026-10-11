@@ -13369,9 +13369,9 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "structured-zstd"
-version = "0.0.58"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a19112515370199811e7e499f32b633b93a2525ea2cf6f7aa3b1e758d65fd932"
+checksum = "82d260bb30bc7a95807e902b2f58917d6bd92500bdd5bf929ef559c417314bf1"
 dependencies = [
  "fastrand",
  "twox-hash 2.1.5",

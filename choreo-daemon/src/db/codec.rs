@@ -75,8 +75,8 @@ pub(super) fn zstd_decode(blob: &[u8]) -> io::Result<Vec<u8>> {
     zstd_decode_with_limit(blob, MAX_TURN_DECODED_BYTES)
 }
 
-/// Decompress a zstd frame into a buffer of at most `limit` bytes, then reject
-/// the blob unless it was consumed to EOF.
+/// Decompress a zstd frame into a buffer of at most `limit` bytes, rejecting a
+/// blob that is not exactly one frame.
 ///
 /// Two defenses, both load-bearing:
 ///
@@ -90,19 +90,36 @@ pub(super) fn zstd_decode(blob: &[u8]) -> io::Result<Vec<u8>> {
 ///    arrive. Reads stop at `limit + 1` bytes total, and a buffer that reached
 ///    the cap is rejected as undecodable. Never drop the `.take()` wrapper —
 ///    doing so re-opens the allocation-on-faith hole for a crafted row.
-/// 2. **Strict consumption.** A well-formed row is exactly ONE frame. The
-///    generic read loop stops at the end of the first frame and ignores
-///    whatever follows, so checking the source cursor reached true EOF turns
-///    trailing bytes or a second concatenated frame (a corrupt or foreign row)
-///    into a hard error instead of silently returning the truncated first
-///    frame. The old C libzstd decoder refused those at EOF too; this restores
-///    that fail-loud parity.
+/// 2. **Exactly one frame.** A well-formed row is exactly ONE frame. The
+///    frame-size query walks the first frame's block headers without decoding
+///    any body and reports its on-disk length; requiring that length to cover
+///    the whole blob turns a truncated frame, trailing bytes, or a second
+///    concatenated frame (a corrupt or foreign row) into a hard error up front.
+///    This check is needed because the streaming decoder follows the zstd
+///    stream spec (RFC 8878 §3: a stream is one or more frames) and would
+///    otherwise silently decode a concatenated second frame into the output.
 ///
 /// The limit is a parameter so the guard is unit-testable without allocating a
 /// huge buffer; production callers use [`MAX_TURN_DECODED_BYTES`].
 pub(super) fn zstd_decode_with_limit(blob: &[u8], limit: u64) -> io::Result<Vec<u8>> {
-    let decoder = structured_zstd::decoding::StreamingDecoder::new(std::io::Cursor::new(blob))
-        .map_err(|e| db_err(format!("zstd decode turn (init): {e}")))?;
+    // Reject anything that is not exactly one frame BEFORE decoding: the
+    // frame-size query returns the first frame's on-disk extent (magic, header,
+    // blocks, optional checksum), so a mismatch means trailing bytes or a
+    // second frame. This restores the "one row == one frame" contract and
+    // bounds the decode below to a single complete frame.
+    let frame_len = structured_zstd::decoding::find_frame_compressed_size(blob)
+        .map_err(|e| db_err(format!("zstd decode turn (frame size): {e:?}")))?;
+    if frame_len != blob.len() {
+        return Err(db_err(format!(
+            "turn row is not exactly one zstd frame: first frame spans {frame_len} of {} bytes",
+            blob.len()
+        )));
+    }
+
+    // `StreamingDecoder::new` is infallible (the first frame header is read by
+    // the first `read`/`read_to_end` below, which is where a corrupt frame
+    // reports its error), so there is no init error to map here.
+    let decoder = structured_zstd::decoding::StreamingDecoder::new(std::io::Cursor::new(blob));
     let mut buf = Vec::new();
     // `Read::take` truncates the read at limit+1 bytes, so we never allocate an
     // attacker-claimed size; buf ending at (or over) the limit means the frame
@@ -116,16 +133,6 @@ pub(super) fn zstd_decode_with_limit(blob: &[u8], limit: u64) -> io::Result<Vec<
     if buf.len() as u64 > limit {
         return Err(db_err(format!(
             "turn frame expands past {limit} bytes; refusing"
-        )));
-    }
-    // The bounded read stops at the end of the first frame; anything left over
-    // means the row is not exactly one frame (trailing garbage or a second
-    // concatenated frame) — refuse it rather than silently truncating.
-    let consumed = capped.into_inner().into_inner().position();
-    if consumed != blob.len() as u64 {
-        return Err(db_err(format!(
-            "turn frame left {} trailing bytes unconsumed; refusing",
-            blob.len() as u64 - consumed
         )));
     }
     Ok(buf)

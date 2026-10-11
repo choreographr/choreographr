@@ -358,8 +358,7 @@ fn hooked_json_body_zstd_compresses_and_round_trips_when_requested() {
     // The frame must carry the standard zstd magic (0xFD2FB528, little-endian).
     assert_eq!(wire.get(..4), Some([0x28, 0xB5, 0x2F, 0xFD].as_slice()));
     let mut decoder =
-        structured_zstd::decoding::StreamingDecoder::new(std::io::Cursor::new(&wire[..]))
-            .expect("init zstd decoder");
+        structured_zstd::decoding::StreamingDecoder::new(std::io::Cursor::new(&wire[..]));
     let mut decoded = Vec::new();
     decoder
         .read_to_end(&mut decoded)
