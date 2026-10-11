@@ -572,6 +572,7 @@ pub(crate) fn responses_request_with_tools(
         messages,
         tools,
         on_retry,
+        on_accepted,
         cancel_rx,
         route,
         tool_results,
@@ -589,7 +590,12 @@ pub(crate) fn responses_request_with_tools(
     );
 
     let retry = retry::retry_config_from_config(config).with_no_retry(no_retry);
-    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, None);
+    // The request-accepted callback fires on the successful attempt's headers
+    // (see `retry_loop`): a non-streaming provider still reports the
+    // accepted-but-still-generating `Waiting` boundary this way before its body
+    // is read, so its status sequence matches the streaming path.
+    let mut ctx =
+        retry::AttemptContext::new(on_retry, cancel_rx, None).with_on_accepted(on_accepted);
     let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx, route)?;
     let payload: ResponsesResponse = response
         .into_body()

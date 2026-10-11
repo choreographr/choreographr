@@ -94,6 +94,7 @@ pub(super) fn messages_request(
         tools,
         thinking_effort,
         on_retry,
+        on_accepted,
         cancel_rx,
         session_id,
         request_id,
@@ -150,7 +151,12 @@ pub(super) fn messages_request(
     })
     .map_err(io::Error::other)?;
 
-    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, None);
+    // The request-accepted callback fires on the successful attempt's headers
+    // (see `retry_loop`): a non-streaming provider still reports the
+    // accepted-but-still-generating `Waiting` boundary this way before its body
+    // is read, so its status sequence matches the streaming path.
+    let mut ctx =
+        retry::AttemptContext::new(on_retry, cancel_rx, None).with_on_accepted(on_accepted);
     // Gateway headers (empty for non-gateway providers — see the shared
     // helper); applied alongside the auth headers inside the retry closure.
     let extra_headers = route.map_or_default(|(session_id, request_id)| {

@@ -3,7 +3,8 @@
 // helper fns in this file need this file-level allowance.
 #![expect(clippy::expect_used, clippy::panic)]
 use choreo_ai_protocols::openai::{
-    ChatRequestMessage, OpenAiClient, OpenAiError, RetryCallback, ServiceConfig,
+    ChatRequestMessage, OpenAiClient, OpenAiError, RequestAcceptedCallback, RetryCallback,
+    ServiceConfig,
 };
 use choreo_ai_protocols::{ChatTurnRequest, ChatTurnResult, StreamEvent};
 use std::io::{Read, Write};
@@ -589,5 +590,67 @@ fn streaming_cancelled_before_first_event() {
     assert!(
         matches!(result, Err(OpenAiError::Cancelled)),
         "expected Cancelled, got {result:?}"
+    );
+}
+
+/// A provider configured non-streaming (`streaming: false`) still routes
+/// through `chat_completion_turn_streaming`'s fallback dispatch, and that
+/// fallback must fire the request-accepted callback too — the daemon's
+/// `Waiting` boundary — so the status sequence does not silently differ by
+/// transport mode.  A regression here would drop `Waiting` for every
+/// non-streaming provider.
+#[test]
+#[ignore = "integration"]
+fn non_streaming_fallback_fires_accepted_callback() {
+    let (port, _server) =
+        spawn_http_server(vec![http_response("HTTP/1.1 200 OK", &ok_body("hello"))]);
+    let config = ServiceConfig {
+        base_url: format!("http://127.0.0.1:{port}"),
+        default_request_format: choreo_ai_protocols::openai::RequestFormat::ChatCompletions,
+        streaming: false,
+        ..ServiceConfig::default()
+    };
+    let client = OpenAiClient::new(
+        config,
+        "test-key".into(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .expect("OpenAiClient");
+
+    let accepted = Arc::new(AtomicU32::new(0));
+    let seen = accepted.clone();
+    let mut cb: Option<RequestAcceptedCallback> = Some(Box::new(move || {
+        seen.fetch_add(1, Ordering::SeqCst);
+    }));
+
+    let messages = [ChatRequestMessage::simple("user", "hello".into())];
+    let result = client.chat_completion_turn_streaming(
+        ChatTurnRequest {
+            model: "test-model",
+            messages: &messages,
+            tools: &[],
+            thinking_effort: "off".to_string(),
+            on_retry: &mut None,
+            on_accepted: &mut cb,
+            cancel_rx: None,
+            previous_response_id: None,
+            tool_results: &[],
+            programmatic_tool_calling: false,
+            session_id: "42".to_string(),
+            request_id: "7".to_string(),
+            max_output_tokens_override: None,
+            no_retry: false,
+        },
+        |_event: StreamEvent| -> std::io::Result<()> { Ok(()) },
+    );
+
+    assert!(
+        result.is_ok(),
+        "non-streaming fallback should succeed: {result:?}"
+    );
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "the accepted callback fires exactly once for a non-streaming provider"
     );
 }

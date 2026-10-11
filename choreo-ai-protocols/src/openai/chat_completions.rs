@@ -300,6 +300,7 @@ pub(crate) fn chat_completions_request_with_tools(
         tools,
         reasoning_effort,
         on_retry,
+        on_accepted,
         cancel_rx,
         route,
         max_output_tokens_override,
@@ -322,7 +323,12 @@ pub(crate) fn chat_completions_request_with_tools(
         reasoning_effort,
     })
     .map_err(io::Error::other)?;
-    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, None);
+    // The request-accepted callback fires on the successful attempt's headers
+    // (see `retry_loop`): a non-streaming provider still reports the
+    // accepted-but-still-generating `Waiting` boundary this way before its body
+    // is read, so its status sequence matches the streaming path.
+    let mut ctx =
+        retry::AttemptContext::new(on_retry, cancel_rx, None).with_on_accepted(on_accepted);
     let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx, route)?;
     let payload: ChatCompletionsResponse = response
         .into_body()
