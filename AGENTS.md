@@ -141,6 +141,8 @@ Always write inline comments around new code explaining how it works. Focus on t
 
 Write comments as if the diff never happened: describe the code as it is now. Rationale is *current* design intent — "why it is this way", never "how it used to be" (no "previously…", "used to…", "the old behavior…", "this fixes the bug where…"). Change history lives in the commit message (which *is* the release note), not in the source. A warning against a tempting wrong approach is still welcome when it is current rationale, but phrase it present-tense and imperative ("Do not fall back to a sleep-poll here, because …") rather than as a narrative of what was changed or removed.
 
+Never name another agent harness in a `.rs` file — not in a comment, doc comment, string, or identifier. Do not attribute a design to an external tool ("mirrors pi's …", "goose's … gate", "(codex pattern)", "the surveyed agents converge on …"); state the rationale in the code's own terms instead. Cross-harness comparisons, prior-art citations, and provenance belong in `docs/plans/`, never in the source tree. This is a hard rule: no `.rs` file may contain such a reference.
+
 ## Commit Workflow
 
 Finishing an implementation run means the work is **not done until it is committed**. When a run of implementation turns completes, verify and commit it yourself, in the same run. Do not stop to ask the user whether to commit — the commit is part of the task, not a separate approval step.
