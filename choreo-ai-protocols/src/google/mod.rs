@@ -75,9 +75,9 @@ pub struct GoogleConfig {
     /// [`GoogleClient::provider_slug`], which reports the fixed `"google"`
     /// wire protocol for metrics and reasoning-capability gating.
     pub provider_slug: String,
-    /// Whether to gzip the JSON request body before upload (see
-    /// [`RequestCompression`]). Defaults to identity; the daemon sets it from
-    /// the provider catalog's overlay policy.
+    /// Whether to compress the JSON request body before upload, and with which
+    /// coding (`gzip` or `zstd`; see [`RequestCompression`]). Defaults to
+    /// identity; the daemon sets it from the provider catalog's overlay policy.
     pub request_compression: RequestCompression,
 }
 

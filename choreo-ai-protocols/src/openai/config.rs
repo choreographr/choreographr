@@ -88,10 +88,11 @@ pub struct ServiceConfig {
     /// User-Agent for inference requests. The daemon sets
     /// `choreographr/<version>`; `None` keeps ureq's default (tests).
     pub user_agent: Option<String>,
-    /// Whether to gzip the JSON request body before upload (see
-    /// [`RequestCompression`]). Defaults to identity; the daemon sets it from
-    /// the provider catalog's overlay policy. Only consulted for the chat-turn
-    /// paths — the image-generation paths always send identity.
+    /// Whether to compress the JSON request body before upload, and with which
+    /// coding (`gzip` or `zstd`; see [`RequestCompression`]). Defaults to
+    /// identity; the daemon sets it from the provider catalog's overlay policy.
+    /// Only consulted for the chat-turn paths — the image-generation paths
+    /// always send identity.
     pub request_compression: RequestCompression,
 }
 

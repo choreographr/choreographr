@@ -294,8 +294,7 @@ fn hooked_json_body_is_compact_and_matches_the_serialized_bytes() {
     // The reader must yield exactly the bytes whose length the body declares as
     // `Content-Length` (a declared length that disagreed would spin ureq's
     // length-delimited send loop), and the payload is compact JSON (no
-    // pretty-print whitespace) — smaller uploads, and the shape a future
-    // request-body compressor would consume.
+    // pretty-print whitespace) — smaller uploads.
     let value = serde_json::json!({"a": 1, "b": [1, 2]});
     let body = HookedJsonBody::new(&value, None, RequestCompression::Identity).expect("serialize");
     let mut wire = Vec::new();

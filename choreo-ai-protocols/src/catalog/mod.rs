@@ -283,13 +283,14 @@ pub struct ProviderEntry {
     /// still takes precedence when present (see [`prompt_cache_ttl`]).
     #[serde(default)]
     pub prompt_cache: Option<PromptCacheTtl>,
-    /// Whether this provider's endpoint accepts a gzip-compressed request body
-    /// (overlay policy; models.dev carries no such fact). Defaults to
-    /// [`RequestCompression::Identity`], so a provider the overlay does not pin
-    /// is sent an uncompressed body — the safe default, since the server must
-    /// decompress. A provider that rejects a compressed body with HTTP 415 is
-    /// downgraded to identity for the process (see the retry layer); this field
-    /// is the static per-provider policy that seeds that decision.
+    /// Whether this provider's endpoint accepts a compressed request body, and
+    /// with which coding (`gzip` or `zstd`) — overlay policy; models.dev carries
+    /// no such fact. Defaults to [`RequestCompression::Identity`], so a provider
+    /// the overlay does not pin is sent an uncompressed body — the safe default,
+    /// since the server must decompress. A provider that rejects a compressed
+    /// body with HTTP 415 is downgraded to identity for the process (see the
+    /// retry layer); this field is the static per-provider policy that seeds that
+    /// decision.
     #[serde(default)]
     pub request_compression: RequestCompression,
 }
