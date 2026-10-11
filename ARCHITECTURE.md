@@ -829,7 +829,16 @@ Token usage is the protocol-agnostic `TokenUsage` struct
 (`choreo-proto/src/types/common.rs`) — `input_tokens` / `output_tokens` /
 `total_tokens` plus the prompt-cache `cached_tokens` / `cache_write_tokens`
 counts — whose per-field-max `merge_max` is the merge policy shared by the
-daemon's mid-turn sync and the TUI's attach-snapshot merge.
+daemon's mid-turn sync and the TUI's attach-snapshot merge. For every provider
+`input_tokens` is the **full** prompt count: the prompt-cache `cached_tokens` /
+`cache_write_tokens` counts are a **subset** of it (priced separately, so
+tracked on their own), and a provider whose raw input counter excludes cache
+(Anthropic's post-breakpoint `input_tokens`) folds the cache counts in at the
+provider boundary — so `last_prompt_tokens` is the live turn's full prompt size.
+`TokenUsage::accumulate` is the per-turn **summation** counterpart to the
+per-field-max `merge_max`: it rebuilds the lifetime total from the turn history
+(on load) and is the same fold the worker uses for its incremental
+accumulation, so the two cannot diverge on which fields they add.
 
 Two cross-cutting accounting contracts:
 
