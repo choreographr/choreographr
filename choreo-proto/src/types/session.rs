@@ -303,8 +303,10 @@ pub struct SessionSummary {
     /// Model context window size for this session, if known.
     #[serde(default)]
     pub context_window: Option<u32>,
-    /// The `prompt_tokens` from the most recent API response (the actual
-    /// context size being sent to the model), if available.
+    /// The session's current context size — the `input_tokens` reported by the
+    /// latest live (non-undone) turn, i.e. the prompt size the model last saw.
+    /// Derived from the turn history, so it tracks undo/redo; `None` when no
+    /// live turn carries a measurement.
     #[serde(default)]
     pub last_prompt_tokens: Option<u32>,
     /// Whether this session is pinned (pinned sessions float to the top of
@@ -432,8 +434,10 @@ pub enum SessionEvent {
         /// Model context window size for this session, if known.
         #[serde(default)]
         context_window: Option<u32>,
-        /// The `prompt_tokens` from the most recent API response (the actual
-        /// context size being sent to the model), if available.
+        /// The session's current context size — the `input_tokens` reported by
+        /// the latest live (non-undone) turn, i.e. the prompt size the model
+        /// last saw. Derived from the turn history, so it tracks undo/redo;
+        /// `None` when no live turn carries a measurement.
         #[serde(default)]
         last_prompt_tokens: Option<u32>,
         /// Current session status (`Inactive`, `Sending`/`Thinking`/`Responding`,
@@ -532,7 +536,9 @@ pub enum SessionEvent {
     TokenUsageUpdate {
         /// The updated accumulated token usage.
         token_usage: TokenUsage,
-        /// The most recent `prompt_tokens`, if available.
+        /// The session's current context size after the update — the latest
+        /// live (non-undone) turn's `input_tokens`, or `None` when none carries
+        /// a measurement (every turn undone).
         last_prompt_tokens: Option<u32>,
     },
     /// Cumulative output-token estimate for the current turn, updated as
