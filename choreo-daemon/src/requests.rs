@@ -420,12 +420,17 @@ impl StreamPhase {
 /// A later chunk of an earlier kind therefore never demotes the phase back (a
 /// trailing reasoning delta after the answer has begun does not flip
 /// `Responding` back to `Thinking`), so one model call emits at most two
-/// streaming-status broadcasts no matter how the provider interleaves its
-/// deltas.  `Sending` is broadcast once before the call, so it is the initial
-/// value here and this never re-emits it.
+/// *advances* — two `StatusChanged` broadcasts on top of the initial `Sending`
+/// — no matter how the provider interleaves its deltas.  `Sending` is broadcast
+/// once before the call, so it is the initial value here and this never
+/// re-emits it.
 fn advance_stream_phase(phase: &mut StreamPhase, target: StreamPhase, ctx: &RequestContext) {
     if target > *phase {
         *phase = target;
+        // Best-effort: the `Sending` broadcast that began the turn already gated
+        // the loop (its failure ends the turn), so a dropped mid-stream phase
+        // update only means a client keeps the previous label until the next
+        // one — not worth aborting the model call over.
         let _ = ctx
             .cmd_tx
             .send(SessionCommand::StatusChanged(target.status()));
@@ -697,9 +702,8 @@ pub(crate) fn run_agent_loop(
         // Running count of output tokens produced by the current turn.
         let mut output_token_count: u32 = 0;
 
-        // The live streaming phase for this turn.  `Sending` was already
-        // broadcast before the loop; the streaming callback below advances it
-        // via `advance_stream_phase`, which moves it forward only.  A retry
+        // The live streaming phase for this turn, advanced forward-only by
+        // `advance_stream_phase` from the streaming callback below.  A retry
         // (`Retrying`) always fires before the first delta — the provider's
         // retry loop wraps the initial request send, before the response body
         // is read — so the phase is still `Sending` when a retry is reported
@@ -733,9 +737,8 @@ pub(crate) fn run_agent_loop(
             &mut |event| {
                 match event {
                     StreamEvent::Answer(text) => {
-                        // The first answer chunk moves the phase to `Responding`
-                        // (the model has begun writing); forward-only, so a
-                        // later reasoning chunk never demotes it.
+                        // An answer chunk means the model has begun writing the
+                        // reply, so promote the phase to `Responding`.
                         advance_stream_phase(&mut stream_phase, StreamPhase::Responding, ctx);
                         if let Some(enc) = &encoding {
                             // u128→u32 token counts, informational only.
@@ -754,10 +757,9 @@ pub(crate) fn run_agent_loop(
                         );
                     }
                     StreamEvent::Reasoning(text) => {
-                        // The first reasoning chunk moves the phase out of
-                        // `Sending` to `Thinking` (hidden reasoning is now
-                        // distinct from the pre-token send wait); forward-only,
-                        // so it never demotes a `Responding` phase.
+                        // A reasoning chunk means hidden reasoning is streaming,
+                        // so promote the phase to `Thinking` (distinct from the
+                        // pre-token send wait).
                         advance_stream_phase(&mut stream_phase, StreamPhase::Thinking, ctx);
                         if let Some(enc) = &encoding {
                             // u128→u32 token counts, informational only.
