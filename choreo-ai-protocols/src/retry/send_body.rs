@@ -51,8 +51,9 @@ pub(crate) struct HookedJsonBody {
     /// `Content-Length` for the plain payload, rendered once so a retry re-uses
     /// it instead of allocating a fresh `String` per `apply_headers` call.
     plain_len: String,
-    /// The compressed payload plus its rendered `Content-Length` and encoding
-    /// label, present only when compression was requested.
+    /// The compressed payload plus its rendered `Content-Length` and the coding
+    /// it carries (from which the `Content-Encoding` token is derived), present
+    /// only when compression was requested.
     compressed: Option<CompressedBody>,
     /// Whether the next send should use the compressed form.  Flipped once, by
     /// [`Self::downgrade`], when a 415 shows the provider cannot decode it.
