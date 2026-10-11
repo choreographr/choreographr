@@ -612,6 +612,10 @@ server must decompress, so compression is **opt-in policy**, and a provider the
 overlay does not pin is sent an uncompressed body. Because the coding is baked
 into the provider client at construction, an overlay edit reaches live sessions
 only through the catalog-swap client invalidation (see Runtime catalog refresh).
+The bundled overlay pins exactly one provider, `deepinfra` (`gzip`), the only
+in-catalog endpoint whose documentation states it decodes a compressed request
+body; models.dev carries no such fact, so the list is hand-curated in this
+overlay file.
 
 The compression is applied once, in `choreo-ai-protocols`'s
 `retry::HookedJsonBody` (after the compact-JSON serialize, alongside the

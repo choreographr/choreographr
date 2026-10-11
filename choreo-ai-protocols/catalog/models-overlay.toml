@@ -92,6 +92,11 @@
 # deepinfra -> deepinfra (policy from the pre-models.dev TOML)
 [provider.deepinfra]
   base_url = "https://api.deepinfra.com/v1/openai"
+  # Accepts gzip-compressed request bodies on every endpoint, streaming
+  # included; gzip is the only request coding it decodes: `deflate`/`br`/`zstd`
+  # are passed through undecoded and fail to parse
+  # (docs.deepinfra.com/request-compression).
+  request_compression = "gzip"
 
 # deepseek -> deepseek (policy from the pre-models.dev TOML)
 [provider.deepseek]
