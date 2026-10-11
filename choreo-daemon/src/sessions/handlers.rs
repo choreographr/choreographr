@@ -808,6 +808,33 @@ pub(super) fn handle_broadcast(
     false
 }
 
+/// Broadcast the session's current token state (cumulative billing total +
+/// last-prompt context size) and refresh the daemon's metadata index.
+///
+/// Shared by the mid-turn `SyncAccumulatedUsage` path and by undo/redo, whose
+/// recomputed context size must reach subscribed clients and the session
+/// list/detail exactly like a mid-turn update. No `last_modified` bump: this is
+/// a data refresh, not a session modification. The broadcast goes through the
+/// live subscriber map AFTER the state write so a client can never be ahead of
+/// the snapshot it receives on attach.
+fn broadcast_token_state(state: &mut SessionState, ctx: &RequestContext) {
+    broadcast(
+        &mut state.subscribers,
+        ctx,
+        &DaemonMessageType::Session {
+            session_id: Some(ctx.session_id),
+            event: SessionEvent::TokenUsageUpdate {
+                token_usage: state.config.accumulated_usage,
+                last_prompt_tokens: state.config.last_prompt_tokens,
+            },
+        },
+    );
+    let _ = ctx.daemon_tx.send(DaemonCommand::UpdateMetadata {
+        session_id: ctx.session_id,
+        metadata: SessionMetadata::from(&*state),
+    });
+}
+
 /// Apply the request worker's mid-turn cumulative token usage to the
 /// authoritative session config, then broadcast the update.
 ///
@@ -833,26 +860,7 @@ pub(super) fn handle_sync_accumulated_usage(
     if let Some(tokens) = last_prompt_tokens {
         state.config.last_prompt_tokens = Some(tokens);
     }
-    // Broadcast through the live subscriber map AFTER the state write so
-    // a client can never be ahead of the snapshot it receives on attach.
-    broadcast(
-        &mut state.subscribers,
-        ctx,
-        &DaemonMessageType::Session {
-            session_id: Some(ctx.session_id),
-            event: SessionEvent::TokenUsageUpdate {
-                token_usage: state.config.accumulated_usage,
-                last_prompt_tokens: state.config.last_prompt_tokens,
-            },
-        },
-    );
-    // Refresh the daemon's session-metadata index (no last_modified bump:
-    // this is a data refresh, not a modification) so session-list / detail
-    // token totals are accurate mid-turn on the next ListSessions.
-    let _ = ctx.daemon_tx.send(DaemonCommand::UpdateMetadata {
-        session_id: ctx.session_id,
-        metadata: SessionMetadata::from(&*state),
-    });
+    broadcast_token_state(state, ctx);
     false
 }
 
@@ -1378,6 +1386,11 @@ pub(super) fn handle_undo(
             event: SessionEvent::TurnsUndone { turn_ids },
         },
     );
+    // The context-size readout is derived from the live turns, so it shrank
+    // with this undo: push the recomputed value to clients (and metadata) just
+    // like a mid-turn token refresh, rather than leaving the pre-undo value on
+    // screen until the next request completes.
+    broadcast_token_state(state, ctx);
     if let Some(target) = reply {
         target.accept();
     }
@@ -1424,6 +1437,8 @@ pub(super) fn handle_redo(
             },
         },
     );
+    // Redo grew the context back; push the recomputed size (mirrors undo).
+    broadcast_token_state(state, ctx);
     if let Some(target) = reply {
         target.accept();
     }

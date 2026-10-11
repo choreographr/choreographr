@@ -839,6 +839,12 @@ Two cross-cutting accounting contracts:
   `last_prompt_tokens` (`input_tokens` from the most recent response) — the
   actual context size the model last saw, used for the context-window progress
   display (`last_prompt_tokens / context_window`), never a cumulative sum.
+  The two diverge under undo: `accumulated_usage` sums **every** turn (undo does
+  not refund billed tokens), while `last_prompt_tokens` is derived from the
+  **live** turn set — the last non-undone turn's `input_tokens` — so `undo`/`redo`
+  recompute it and re-broadcast a `TokenUsageUpdate` (a `None` when every turn is
+  undone, clearing the readout). A turn with no reported usage contributes
+  nothing; there is no local estimate fallback.
 - **Mid-turn freshness.** The request worker accumulates on a **private clone**
   of the session state and merges it back at `RequestFinished`; to keep every
   consumer fresh *mid-turn*, the worker's cumulative total is routed through
@@ -848,7 +854,9 @@ Two cross-cutting accounting contracts:
   saw — re-broadcasts `TokenUsageUpdate` from the authoritative state, and
   refreshes the daemon's metadata index without a `last_modified` bump.
   `last_prompt_tokens` is not cumulative, so clients gap-fill it from snapshots
-  (never overwriting a fresher value) rather than max-merging it.
+  (never overwriting a fresher value) rather than max-merging it, while the
+  authoritative `TokenUsageUpdate` path (mid-turn sync and undo/redo) overwrites
+  it unconditionally — including a `None` that clears a stale readout.
 
 The per-turn extraction in each adapter, the `SessionState` →
 `SessionEvent`/`SessionSummary` field plumbing, the context-window resolution

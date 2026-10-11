@@ -521,9 +521,12 @@ impl TurnEventHandler for App {
         );
         let display = self.display_for(session_id);
         display.token_usage = Some(token_usage);
-        if let Some(tokens) = last_prompt_tokens {
-            display.last_prompt_tokens = Some(tokens);
-        }
+        // Overwrite unconditionally: this event is the authoritative token
+        // refresh (a mid-turn sync, or the context size recomputed after an
+        // undo/redo), so a `None` — every turn undone, nothing left to measure
+        // — must CLEAR a stale readout rather than be ignored like the
+        // gap-filling attach-snapshot path.
+        display.last_prompt_tokens = last_prompt_tokens;
         display.live_input_estimate = 0;
         display.live_output_tokens = 0;
     }

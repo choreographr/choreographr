@@ -1208,6 +1208,25 @@ impl SessionState {
         Ok(())
     }
 
+    /// The exact context size the session currently stands on, read from the
+    /// turn history: the last non-undone turn's provider-reported prompt size.
+    ///
+    /// Each turn records the `input_tokens` its producing request billed
+    /// ([`Turn::token_usage`]), which is the exact size of the conversation
+    /// sent at that point. Reading the last *live* turn therefore makes the
+    /// context-size readout track undo/redo exactly, with no re-estimation:
+    /// undone turns and turns without usage (cancelled / user-only / providers
+    /// that report no usage) are skipped, and `None` means no live turn carries
+    /// a measurement, so there is nothing to display.
+    #[must_use]
+    pub fn live_last_prompt_tokens(&self) -> Option<u32> {
+        self.turns
+            .values()
+            .rev()
+            .filter(|turn| !turn.undone)
+            .find_map(|turn| turn.token_usage.map(|u| u.input_tokens))
+    }
+
     /// Undo the most recent user-initiated turns: find the most recent
     /// non-undone turn with `user_text: Some(...)`, mark it and all
     /// higher-id turns as `undone = true`, store `turn_ids` for redo.
@@ -1225,6 +1244,10 @@ impl SessionState {
             }
         }
         self.last_undo_turn_ids = Some(to_undo.clone());
+        // The context size is a function of the live turn set, so it must be
+        // re-derived whenever history mutates — not just refreshed by the next
+        // completed request. Undoing turns shrinks the context.
+        self.config.last_prompt_tokens = self.live_last_prompt_tokens();
         Some(to_undo)
     }
 
@@ -1239,6 +1262,9 @@ impl SessionState {
                 restored.insert(id, turn.clone());
             }
         }
+        // Redoing turns grows the context back; re-derive from the restored
+        // live set (mirrors `undo_turns`).
+        self.config.last_prompt_tokens = self.live_last_prompt_tokens();
         Some(restored)
     }
 
@@ -1564,6 +1590,24 @@ fn default_active_tool_groups() -> HashSet<String> {
     groups
 }
 
+/// Sum per-turn provider usage into the session's lifetime billing total.
+///
+/// Every turn's `token_usage` is added, undone turns included: undo hides
+/// turns from the model but does not refund tokens already billed. This total
+/// is deliberately distinct from the context-size readout, which is live-only
+/// ([`SessionState::live_last_prompt_tokens`]).
+fn reconstruct_accumulated_usage(turns: &BTreeMap<u32, Turn>) -> TokenUsage {
+    let mut accumulated = TokenUsage::default();
+    for turn in turns.values() {
+        if let Some(u) = turn.token_usage {
+            accumulated.input_tokens += u.input_tokens;
+            accumulated.output_tokens += u.output_tokens;
+            accumulated.total_tokens += u.total_tokens;
+        }
+    }
+    accumulated
+}
+
 /// The session control thread's entry point.
 ///
 /// Owns the authoritative [`SessionState`] for one session and processes
@@ -1655,27 +1699,18 @@ pub fn session_main(
                 state.turns.insert(turn_id, turn);
                 state.next_turn_id = state.next_turn_id.max(turn_id + 1);
             }
-            // Reconstruct accumulated_usage and last_prompt_tokens from
-            // per-turn token_usage so both the running total and the
-            // context-window display (e.g. "45k / 128k (35%)") survive
-            // daemon restarts without storing them redundantly in the
-            // session record.  Both are derived in a single pass over
-            // turns (ordered by turn_id) — the last turn with token_usage
-            // is the most recent one, giving us last_prompt_tokens.
-            let mut accumulated_usage = TokenUsage::default();
-            let mut last_prompt_tokens = None;
-            for turn in state.turns.values() {
-                if let Some(u) = turn.token_usage {
-                    accumulated_usage.input_tokens += u.input_tokens;
-                    accumulated_usage.output_tokens += u.output_tokens;
-                    accumulated_usage.total_tokens += u.total_tokens;
-                    last_prompt_tokens = Some(u.input_tokens);
-                }
-            }
+            // Reconstruct the lifetime billing total from per-turn usage, and
+            // derive the context-size readout from the live turns, so both the
+            // running total and the context-window display (e.g.
+            // "45k / 128k (35%)") survive daemon restarts without storing
+            // them redundantly in the session record. The two differ: billing
+            // sums every turn (undo does not refund tokens), while the context
+            // size reflects only non-undone turns.
+            let accumulated_usage = reconstruct_accumulated_usage(&state.turns);
             state.config.accumulated_usage = accumulated_usage;
-            state.config.last_prompt_tokens = last_prompt_tokens;
+            state.config.last_prompt_tokens = state.live_last_prompt_tokens();
             trace!(
-                last_prompt_tokens,
+                last_prompt_tokens = state.config.last_prompt_tokens,
                 ?accumulated_usage,
                 "reconstructed token state from turns after daemon restart"
             );

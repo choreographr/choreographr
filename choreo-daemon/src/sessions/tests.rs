@@ -10,6 +10,32 @@ fn cid(n: u32) -> ClientId {
     ClientId::from_raw(n)
 }
 
+/// A turn for the context-size tests: `usage` is the provider-reported prompt
+/// size (`None` models a cancelled / user-only / usage-less-provider turn),
+/// and `undone` marks it as hidden by a prior undo.
+fn turn_with_usage(usage: Option<u32>, undone: bool) -> Turn {
+    Turn {
+        created_at: TimestampMs::now(),
+        undone,
+        error: None,
+        user_text: Some("u".into()),
+        assistant_text: Some("a".into()),
+        assistant_reasoning: None,
+        tool_calls: Vec::new(),
+        token_usage: usage.map(|input| TokenUsage {
+            input_tokens: input,
+            output_tokens: 1,
+            total_tokens: input + 1,
+            cached_tokens: 0,
+            cache_write_tokens: 0,
+        }),
+        tool_results: Vec::new(),
+        displayed_images: Vec::new(),
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    }
+}
+
 /// A fresh in-memory database fixture for the session tests. In-memory (no
 /// filesystem path) keeps these unit tests off the system boundary — they
 /// exercise the session state machine, not redb's on-disk format — and needs
@@ -1205,18 +1231,8 @@ fn accumulated_usage_reconstructed_from_turns() {
     );
 
     // Run the same reconstruction logic from session_main
-    let mut accumulated_usage = TokenUsage::default();
-    let mut last_prompt_tokens = None;
-    for turn in state.turns.values() {
-        if let Some(u) = turn.token_usage {
-            accumulated_usage.input_tokens += u.input_tokens;
-            accumulated_usage.output_tokens += u.output_tokens;
-            accumulated_usage.total_tokens += u.total_tokens;
-            last_prompt_tokens = Some(u.input_tokens);
-        }
-    }
-    state.config.accumulated_usage = accumulated_usage;
-    state.config.last_prompt_tokens = last_prompt_tokens;
+    state.config.accumulated_usage = reconstruct_accumulated_usage(&state.turns);
+    state.config.last_prompt_tokens = state.live_last_prompt_tokens();
 
     // Expected: 10+100 = 110 input, 20+50 = 70 output, 30+150 = 180 total
     assert_eq!(state.config.accumulated_usage.input_tokens, 110);
@@ -1300,18 +1316,8 @@ fn last_prompt_tokens_from_latest_usage_turn() {
     );
 
     // Reconstruct
-    let mut accumulated_usage = TokenUsage::default();
-    let mut last_prompt_tokens = None;
-    for turn in state.turns.values() {
-        if let Some(u) = turn.token_usage {
-            accumulated_usage.input_tokens += u.input_tokens;
-            accumulated_usage.output_tokens += u.output_tokens;
-            accumulated_usage.total_tokens += u.total_tokens;
-            last_prompt_tokens = Some(u.input_tokens);
-        }
-    }
-    state.config.accumulated_usage = accumulated_usage;
-    state.config.last_prompt_tokens = last_prompt_tokens;
+    state.config.accumulated_usage = reconstruct_accumulated_usage(&state.turns);
+    state.config.last_prompt_tokens = state.live_last_prompt_tokens();
 
     // total usage: 5+42 = 47 input, 10+7 = 17 output, 15+49 = 64 total
     assert_eq!(state.config.accumulated_usage.input_tokens, 47);
@@ -1342,21 +1348,62 @@ fn last_prompt_tokens_none_when_no_turns_have_usage() {
         },
     );
 
-    let mut accumulated_usage = TokenUsage::default();
-    let mut last_prompt_tokens = None;
-    for turn in state.turns.values() {
-        if let Some(u) = turn.token_usage {
-            accumulated_usage.input_tokens += u.input_tokens;
-            accumulated_usage.output_tokens += u.output_tokens;
-            accumulated_usage.total_tokens += u.total_tokens;
-            last_prompt_tokens = Some(u.input_tokens);
-        }
-    }
-    state.config.accumulated_usage = accumulated_usage;
-    state.config.last_prompt_tokens = last_prompt_tokens;
+    state.config.accumulated_usage = reconstruct_accumulated_usage(&state.turns);
+    state.config.last_prompt_tokens = state.live_last_prompt_tokens();
 
     assert_eq!(state.config.accumulated_usage.input_tokens, 0);
     assert_eq!(state.config.last_prompt_tokens, None);
+}
+
+#[test]
+fn live_last_prompt_tokens_skips_undone_and_usage_less() {
+    let mut state = SessionState::empty();
+    state.turns.insert(0, turn_with_usage(Some(10), false));
+    state.turns.insert(1, turn_with_usage(Some(42), false));
+    // A newer turn with no usage (cancelled / user-only) contributes nothing.
+    state.turns.insert(2, turn_with_usage(None, false));
+    // The most recent turn is undone, so it is skipped.
+    state.turns.insert(3, turn_with_usage(Some(99), true));
+
+    assert_eq!(state.live_last_prompt_tokens(), Some(42));
+
+    // Undoing the newest live turn drops back to the earlier measurement.
+    state.turns.get_mut(&1).expect("turn 1 exists").undone = true;
+    assert_eq!(state.live_last_prompt_tokens(), Some(10));
+
+    // With nothing live left, there is no context size to show.
+    state.turns.get_mut(&0).expect("turn 0 exists").undone = true;
+    assert_eq!(state.live_last_prompt_tokens(), None);
+}
+
+#[test]
+fn reconstruct_accumulated_usage_includes_undone_turns() {
+    // Billing is a lifetime total: undo hides turns from the model but does not
+    // refund tokens already billed, so the reconstruction still sums them.
+    let mut turns = BTreeMap::new();
+    turns.insert(0, turn_with_usage(Some(10), false));
+    turns.insert(1, turn_with_usage(Some(42), true));
+
+    let accumulated = reconstruct_accumulated_usage(&turns);
+    assert_eq!(accumulated.input_tokens, 52);
+}
+
+#[test]
+fn undo_and_redo_recompute_last_prompt_tokens_from_live_turns() {
+    let mut state = SessionState::empty();
+    state.turns.insert(0, turn_with_usage(Some(10), false));
+    state.turns.insert(1, turn_with_usage(Some(42), false));
+    state.config.last_prompt_tokens = state.live_last_prompt_tokens();
+    assert_eq!(state.config.last_prompt_tokens, Some(42));
+
+    // Undo turn 1 → the context shrinks to turn 0's exact measurement.
+    let undone = state.undo_turns().expect("a user turn to undo");
+    assert_eq!(undone, vec![1]);
+    assert_eq!(state.config.last_prompt_tokens, Some(10));
+
+    // Redo restores turn 1 → the context grows back.
+    state.redo_turns().expect("turns to redo");
+    assert_eq!(state.config.last_prompt_tokens, Some(42));
 }
 
 #[test]
@@ -2556,6 +2603,42 @@ fn undo_success_acks_accepted_and_broadcasts_turns_undone() {
             ..
         }
     )));
+}
+
+#[test]
+fn undo_broadcasts_recomputed_context_size() {
+    let (mut state, ctx) = broadcast_setup();
+    // Two live turns with usage; the second carries the larger context.
+    state.turns.clear();
+    state.turns.insert(0, turn_with_usage(Some(10), false));
+    state.turns.insert(1, turn_with_usage(Some(42), false));
+    state.config.last_prompt_tokens = Some(42);
+    let (sink, rx) = test_sink();
+    state.subscribers.insert(cid(10), sink.clone());
+    let target = target_for(16, MessageKind::Undo, &sink, &ctx);
+
+    let _ = handle_undo(Some(target), &mut state, &ctx);
+
+    let broadcasts = one_reply(
+        &rx,
+        16,
+        &DaemonMessageType::Accepted {
+            kind: MessageKind::Undo,
+        },
+    );
+    assert!(
+        broadcasts.iter().any(|m| matches!(
+            &m.inner,
+            DaemonMessageType::Session {
+                event: SessionEvent::TokenUsageUpdate {
+                    last_prompt_tokens: Some(10),
+                    ..
+                },
+                ..
+            }
+        )),
+        "undo must broadcast the surviving turn's recomputed context size"
+    );
 }
 
 #[test]

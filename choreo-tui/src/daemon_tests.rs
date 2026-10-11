@@ -521,6 +521,64 @@ fn session_state_snapshot_fills_missing_last_prompt_tokens() {
     );
 }
 
+#[test]
+fn token_usage_update_overwrites_and_clears_last_prompt_tokens() {
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    app.attached_session_id = Some(7);
+
+    // A larger value is already shown (the pre-undo context).
+    app.display_for(7).last_prompt_tokens = Some(5000);
+
+    // The recomputed post-undo size lowers it. TokenUsageUpdate is the
+    // authoritative token refresh, so it overwrites unconditionally —
+    // unlike the gap-filling attach-snapshot path just above.
+    handle_daemon_message(
+        DaemonMessage::broadcast(DaemonMessageType::Session {
+            session_id: Some(7),
+            event: SessionEvent::TokenUsageUpdate {
+                token_usage: TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 0,
+                    total_tokens: 100,
+                    cached_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                last_prompt_tokens: Some(10),
+            },
+        }),
+        &mut app,
+        &tx,
+    )
+    .expect("handle_daemon_message should succeed");
+
+    assert_eq!(
+        app.display_for(7).last_prompt_tokens,
+        Some(10),
+        "a recomputed context size must overwrite the stale pre-undo value"
+    );
+
+    // Every turn undone → the update carries None, which must CLEAR the
+    // readout rather than being ignored.
+    handle_daemon_message(
+        DaemonMessage::broadcast(DaemonMessageType::Session {
+            session_id: Some(7),
+            event: SessionEvent::TokenUsageUpdate {
+                token_usage: TokenUsage::default(),
+                last_prompt_tokens: None,
+            },
+        }),
+        &mut app,
+        &tx,
+    )
+    .expect("handle_daemon_message should succeed");
+
+    assert!(
+        app.display_for(7).last_prompt_tokens.is_none(),
+        "a None (nothing left to measure) must clear the readout"
+    );
+}
+
 // ── Entry handling for Continue / Stop / Undo / Redo ──────────────────
 
 #[test]
