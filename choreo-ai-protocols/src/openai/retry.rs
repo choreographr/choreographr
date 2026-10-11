@@ -1,6 +1,6 @@
 pub(crate) use crate::retry::AttemptContext;
 pub(crate) use crate::retry::AttemptDeadline;
-pub use crate::retry::{RequestAcceptedCallback, RetryCallback, RetryConfig};
+pub use crate::retry::{RequestUploadedCallback, RetryCallback, RetryConfig};
 
 use super::{OpenAiError, ServiceConfig};
 use crate::retry;
@@ -32,8 +32,8 @@ pub(crate) fn retry_send(
     // id / IP fallback, which is fine for auxiliary traffic.
     route: Option<(&str, &str)>,
     // Fires once when the request payload has been fully uploaded (see
-    // [`RequestAcceptedCallback`]); `None` on paths that do not report it.
-    on_accepted: Option<RequestAcceptedCallback>,
+    // [`RequestUploadedCallback`]); `None` on paths that do not report it.
+    on_accepted: Option<RequestUploadedCallback>,
 ) -> Result<ureq::http::Response<ureq::Body>, OpenAiError> {
     let auth_header = zeroize::Zeroizing::new(format!("Bearer {}", api_key.trim()));
     // Provider-specific extra headers (the opencode gateway routing headers)
@@ -43,23 +43,22 @@ pub(crate) fn retry_send(
     let headers = route.map_or_default(|(session_id, request_id)| {
         crate::shared::opencode_gateway_headers(&config.provider_slug, session_id, request_id)
     });
-    // Serialize once and shape the send: a compact body, an explicit
-    // `Content-Length` (so ureq sends length-delimited rather than chunked and
-    // the upload hook fires on the last payload byte), and the upload hook.
+    // Serialize once and shape the send: a compact body plus the
+    // `Content-Type`/`Content-Length` headers and the upload hook (see
+    // `retry::HookedJsonBody`).
     let hooked = crate::retry::HookedJsonBody::new(body, on_accepted)
         .map_err(|e| OpenAiError::Io(io::Error::other(e)))?;
-    let content_length = hooked.len().to_string();
-    // The closure captures `auth_header`, `headers`, `hooked`, and
-    // `content_length` by reference (it stays `Fn`); each attempt clones the
-    // payload and the `Arc` upload hook. The Zeroizing wrapper ensures the
-    // temporary `Bearer …` string is wiped when it goes out of scope.
+    // The closure captures `auth_header`, `headers`, and `hooked` by reference
+    // (it stays `Fn`); each attempt shares the payload (`Arc<[u8]>`) and clones
+    // the `Arc` upload hook. The Zeroizing wrapper ensures the temporary
+    // `Bearer …` string is wiped when it goes out of scope.
     retry::retry_loop(
         || {
-            let mut request = agent
-                .post(url)
-                .header("Authorization", auth_header.as_str())
-                .header("Content-Type", "application/json; charset=utf-8")
-                .header("Content-Length", content_length.as_str());
+            let mut request = hooked.apply_headers(
+                agent
+                    .post(url)
+                    .header("Authorization", auth_header.as_str()),
+            );
             for (name, value) in &headers {
                 request = request.header(*name, value.as_str());
             }

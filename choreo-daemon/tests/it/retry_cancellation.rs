@@ -3,7 +3,7 @@
 // helper fns in this file need this file-level allowance.
 #![expect(clippy::expect_used, clippy::panic)]
 use choreo_ai_protocols::openai::{
-    ChatRequestMessage, OpenAiClient, OpenAiError, RequestAcceptedCallback, RetryCallback,
+    ChatRequestMessage, OpenAiClient, OpenAiError, RequestUploadedCallback, RetryCallback,
     ServiceConfig,
 };
 use choreo_ai_protocols::{ChatTurnRequest, ChatTurnResult, StreamEvent};
@@ -595,7 +595,7 @@ fn streaming_cancelled_before_first_event() {
 
 /// A provider configured non-streaming (`streaming: false`) still routes
 /// through `chat_completion_turn_streaming`'s fallback dispatch, and that
-/// fallback must fire the request-accepted callback too — the daemon's
+/// fallback must fire the request-uploaded callback too — the daemon's
 /// `Waiting` boundary — so the status sequence does not silently differ by
 /// transport mode.  A regression here would drop `Waiting` for every
 /// non-streaming provider.
@@ -619,7 +619,7 @@ fn non_streaming_fallback_fires_accepted_callback() {
 
     let accepted = Arc::new(AtomicU32::new(0));
     let seen = accepted.clone();
-    let cb: RequestAcceptedCallback = Arc::new(move || {
+    let cb: RequestUploadedCallback = Arc::new(move || {
         seen.fetch_add(1, Ordering::SeqCst);
     });
 

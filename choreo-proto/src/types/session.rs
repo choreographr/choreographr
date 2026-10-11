@@ -207,13 +207,15 @@ pub enum SessionStatus {
     #[default]
     Inactive,
     /// The session is dispatching its request to the provider — connection
-    /// setup and request upload — and is awaiting the provider's acceptance
-    /// (its HTTP response headers).
+    /// setup and request upload — but has not yet finished uploading the
+    /// request payload.
     Sending,
-    /// The provider has accepted the request (headers received) and is now
-    /// producing the first token; the session is awaiting that first streamed
-    /// delta.  This is the model's own cueing/latency, distinct from `Sending`
-    /// (getting the request delivered).
+    /// The request payload has been fully uploaded and the session is awaiting
+    /// the provider's first streamed token.  The boundary is anchored on the
+    /// client-side upload completion rather than the response headers, because
+    /// a buffering gateway can withhold the response head until the model's
+    /// first token is ready.  This is the model's own cueing/latency, distinct
+    /// from `Sending` (getting the request delivered).
     Waiting,
     /// The session is streaming the model's reasoning (display-only) tokens.
     Reasoning,

@@ -497,9 +497,10 @@ pub(super) fn handle_status_changed(
     state: &mut SessionState,
     ctx: &RequestContext,
 ) -> bool {
-    // The status enum carries no payload, so logging it is safe and gives the
-    // daemon log the `Sending → Waiting → Reasoning/Responding` transition
-    // sequence — otherwise every mid-turn phase change is invisible.
+    // The status enum carries no user content (a `ToolCall` names the tool,
+    // `Retrying` carries counts), so logging it is safe and gives the daemon
+    // log the `Sending → Waiting → Reasoning/Responding` transition sequence —
+    // otherwise every mid-turn phase change is invisible.
     debug!(session_id = ctx.session_id, ?new_status, "session status");
     state.config.status = new_status.clone();
     let last_modified = state.config.last_modified;

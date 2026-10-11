@@ -35,7 +35,7 @@ pub(crate) use sse::{ResponsesStreamEvent, parse_responses_stream_event};
 pub(crate) use crate::retry::{
     RetryConfig, backoff_duration, is_retryable_status, parse_retry_after_secs,
 };
-pub use retry::{RequestAcceptedCallback, RetryCallback};
+pub use retry::{RequestUploadedCallback, RetryCallback};
 
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -67,8 +67,8 @@ pub(crate) struct TurnParams<'a> {
     pub reasoning_effort: Option<&'a str>,
     pub on_retry: &'a mut Option<RetryCallback>,
     /// Called once the request payload is fully uploaded (see
-    /// [`RequestAcceptedCallback`]); `None` when the caller does not need it.
-    pub on_accepted: Option<RequestAcceptedCallback>,
+    /// [`RequestUploadedCallback`]); `None` when the caller does not need it.
+    pub on_accepted: Option<RequestUploadedCallback>,
     pub cancel_rx: Option<&'a crossbeam_channel::Receiver<()>>,
     /// Gateway routing identity (`session_id`, `request_id`) for the opencode
     /// zen/go providers; `None` when the caller has no session.

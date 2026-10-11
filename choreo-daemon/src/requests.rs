@@ -398,10 +398,11 @@ fn protocol_is_anthropic(slug: &str) -> bool {
 /// so "only ever move forward" is the derived `Ord` comparison rather than a
 /// pair of hand-written inverse guards that could drift apart.
 ///
-/// The `Waiting` boundary — the provider has accepted the request but the
-/// first token has not arrived — is broadcast directly by the request-accepted
-/// callback rather than tracked here: it is a one-shot event that fires before
-/// any delta, so it never needs to participate in the forward-only comparison.
+/// The `Waiting` boundary — the request payload has been fully uploaded but
+/// the first token has not arrived — is broadcast directly by the
+/// request-uploaded callback rather than tracked here: it is a one-shot event
+/// that fires before any delta, so it never needs to participate in the
+/// forward-only comparison.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum StreamPhase {
     Sending,
@@ -712,7 +713,7 @@ pub(crate) fn run_agent_loop(
         // marks the handoff from "getting the request there" to "the provider
         // is thinking".  The `Arc` lets the transport clone it into each retry
         // attempt's request body.
-        let accepted_cb: Option<choreo_ai_protocols::RequestAcceptedCallback> =
+        let accepted_cb: Option<choreo_ai_protocols::RequestUploadedCallback> =
             Some(std::sync::Arc::new({
                 let cmd_tx = ctx.cmd_tx.clone();
                 move || {

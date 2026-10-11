@@ -896,13 +896,15 @@ pub(crate) mod test_util {
     /// deltas and then returns a fixed final answer, so a test can pin exactly
     /// which `SessionStatus` phases the daemon broadcasts as the stream flows.
     ///
-    /// It fires the request-accepted callback before any delta (a real provider
-    /// reports the boundary once the request payload is fully uploaded), and
-    /// when `retry_first` is set it fires the retry callback even before that
-    /// — the only point a real provider retries, because the retry loop wraps
-    /// the initial request send, before the response body is read — so a test
-    /// can assert the phase advances correctly out of the `Retrying` status
-    /// and across the `Waiting` boundary.
+    /// It fires the upload callback before any delta (a real provider reports
+    /// the boundary once the request payload is fully uploaded), and when
+    /// `retry_first` is set it models one retried attempt: the failed attempt's
+    /// upload boundary fires first, then the retry callback, then the
+    /// successful attempt's upload boundary — the hook fires per attempt,
+    /// because the retry loop wraps the request send and the upload completes
+    /// before the response status is known.  A test can thus assert the phase
+    /// advances correctly out of the `Retrying` status and across the `Waiting`
+    /// boundary.
     #[derive(Debug)]
     pub(crate) struct ScriptedStreamProviderClient {
         events: Vec<StreamEvent>,
@@ -933,14 +935,23 @@ pub(crate) mod test_util {
             params: ChatTurnRequest<'_>,
             on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>,
         ) -> Result<ChatTurnResult, InferenceError> {
-            if self.retry_first
-                && let Some(cb) = params.on_retry.as_mut()
-            {
-                cb(1, 3, std::time::Duration::from_millis(1));
+            // The upload hook fires per attempt, on the client side, before
+            // the response status is known: a failed first attempt reports the
+            // `Waiting` boundary too, then the retry callback fires before the
+            // successful attempt's own upload boundary.  So with `retry_first`
+            // the sequence is upload → retry → upload, matching a real retried
+            // provider call.
+            if self.retry_first {
+                if let Some(cb) = &params.on_accepted {
+                    cb();
+                }
+                if let Some(cb) = params.on_retry.as_mut() {
+                    cb(1, 3, std::time::Duration::from_millis(1));
+                }
             }
             // The provider has received the full request (payload uploaded)
-            // before it streams any delta, so the request-accepted boundary
-            // always precedes the events — matching a real provider call.
+            // before it streams any delta, so the upload boundary always
+            // precedes the events — matching a real provider call.
             if let Some(cb) = &params.on_accepted {
                 cb();
             }

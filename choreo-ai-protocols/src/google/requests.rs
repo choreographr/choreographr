@@ -136,16 +136,12 @@ pub(super) fn generate_content_request(
     // The upload hook fires once the payload is fully sent, so a non-streaming
     // provider reports the same `Waiting` boundary as the streaming path.
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, None);
-    // Compact body + explicit length + upload hook (see `retry::HookedJsonBody`).
+    // Compact body + headers + upload hook (see `retry::HookedJsonBody`).
     let hooked = retry::HookedJsonBody::new(&body, on_accepted).map_err(io::Error::other)?;
-    let content_length = hooked.len().to_string();
     let response = retry::retry_loop(
         || {
-            agent
-                .post(&url)
-                .header("x-goog-api-key", api_key.trim())
-                .header("Content-Type", "application/json; charset=utf-8")
-                .header("Content-Length", content_length.as_str())
+            hooked
+                .apply_headers(agent.post(&url).header("x-goog-api-key", api_key.trim()))
                 .send(hooked.send_body())
         },
         &retry_cfg,
@@ -230,16 +226,12 @@ where
     // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));
-    // Compact body + explicit length + upload hook (see `retry::HookedJsonBody`).
+    // Compact body + headers + upload hook (see `retry::HookedJsonBody`).
     let hooked = retry::HookedJsonBody::new(&body, on_accepted).map_err(io::Error::other)?;
-    let content_length = hooked.len().to_string();
     let response = retry::retry_loop(
         || {
-            agent
-                .post(&url)
-                .header("x-goog-api-key", api_key.trim())
-                .header("Content-Type", "application/json; charset=utf-8")
-                .header("Content-Length", content_length.as_str())
+            hooked
+                .apply_headers(agent.post(&url).header("x-goog-api-key", api_key.trim()))
                 .send(hooked.send_body())
         },
         &retry_cfg,

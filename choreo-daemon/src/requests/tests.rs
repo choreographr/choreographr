@@ -1988,10 +1988,10 @@ fn agent_loop_broadcasts_forward_only_streaming_phases() {
 
 #[test]
 fn agent_loop_retry_then_stream_advances_phase_out_of_retrying() {
-    // A retry fires before the first delta (the only point a provider retries),
-    // so the phase is still `Sending` when `Retrying` is reported; the first
-    // post-retry acceptance (`Waiting`) and chunk must then advance it rather
-    // than leaving the status stuck on `Retrying`.
+    // The upload hook fires per attempt, so a retried turn reports the
+    // `Waiting` boundary for the failed attempt too, then `Retrying`, then the
+    // successful attempt's `Waiting` before its first delta — the phase must
+    // advance out of `Retrying` rather than leaving the status stuck there.
     let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
     let dir = tempfile::tempdir().unwrap();
@@ -2036,6 +2036,7 @@ fn agent_loop_retry_then_stream_advances_phase_out_of_retrying() {
         collect_status_broadcasts(&cmd_rx),
         vec![
             SessionStatus::Sending,
+            SessionStatus::Waiting,
             SessionStatus::Retrying {
                 attempt: 1,
                 max_attempts: 3,

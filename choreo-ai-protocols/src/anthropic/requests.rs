@@ -159,17 +159,16 @@ pub(super) fn messages_request(
     let extra_headers = route.map_or_default(|(session_id, request_id)| {
         crate::shared::opencode_gateway_headers(&config.provider_slug, session_id, request_id)
     });
-    // Compact body + explicit length + upload hook (see `retry::HookedJsonBody`).
+    // Compact body + headers + upload hook (see `retry::HookedJsonBody`).
     let hooked = retry::HookedJsonBody::new(&body, on_accepted).map_err(io::Error::other)?;
-    let content_length = hooked.len().to_string();
     let response = retry::retry_loop(
         || {
-            let mut request = agent
-                .post(&url)
-                .header("x-api-key", api_key.trim())
-                .header("anthropic-version", &config.api_version)
-                .header("Content-Type", "application/json; charset=utf-8")
-                .header("Content-Length", content_length.as_str());
+            let mut request = hooked.apply_headers(
+                agent
+                    .post(&url)
+                    .header("x-api-key", api_key.trim())
+                    .header("anthropic-version", &config.api_version),
+            );
             for (name, value) in &extra_headers {
                 request = request.header(*name, value.as_str());
             }
@@ -268,17 +267,16 @@ where
     let extra_headers = route.map_or_default(|(session_id, request_id)| {
         crate::shared::opencode_gateway_headers(&config.provider_slug, session_id, request_id)
     });
-    // Compact body + explicit length + upload hook (see `retry::HookedJsonBody`).
+    // Compact body + headers + upload hook (see `retry::HookedJsonBody`).
     let hooked = retry::HookedJsonBody::new(&body, on_accepted).map_err(io::Error::other)?;
-    let content_length = hooked.len().to_string();
     let response = retry::retry_loop(
         || {
-            let mut request = agent
-                .post(&url)
-                .header("x-api-key", api_key.trim())
-                .header("anthropic-version", &config.api_version)
-                .header("Content-Type", "application/json; charset=utf-8")
-                .header("Content-Length", content_length.as_str());
+            let mut request = hooked.apply_headers(
+                agent
+                    .post(&url)
+                    .header("x-api-key", api_key.trim())
+                    .header("anthropic-version", &config.api_version),
+            );
             for (name, value) in &extra_headers {
                 request = request.header(*name, value.as_str());
             }
