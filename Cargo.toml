@@ -323,7 +323,7 @@ opt-level = 3
 #   path disables brp post-install processing (__os_install_post %{nil}) so
 #   rpm never re-processes these already-stripped binaries.
 # - NO panic = "abort": the daemon isolates request-worker panics with
-#   catch_unwind (sessions.rs) — abort would turn any single request panic
+#   catch_unwind (sessions/worker.rs) — abort would turn any single request panic
 #   into a whole-daemon crash.
 #
 # rustflags: -Zunstable-options + --jobs-frontend=0 (same parallel-frontend
@@ -388,7 +388,7 @@ overflow-checks = false
 # one-shot builds but pinned anyway).
 incremental = false
 # unwind is LOAD-BEARING: the daemon isolates request-worker panics with
-# catch_unwind (sessions.rs) — panic = "abort" here would turn any single
+# catch_unwind (sessions/worker.rs) — panic = "abort" here would turn any single
 # request panic into a whole-daemon crash. Pinned so a future panic-strategy
 # experiment in [profile.release] can't inherit into shipped binaries.
 panic = "unwind"

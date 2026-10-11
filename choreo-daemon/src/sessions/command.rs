@@ -12,14 +12,6 @@ use super::{
     SubscriberSink, TokenUsage, ToolRegistry, WarmPolicy, io, mpsc,
 };
 
-// Named only by the [`SessionState`] intra-doc link on `SessionCommand`; rustc
-// cannot observe doc-link usage, so the import reads as unused to the lint.
-#[expect(
-    unused_imports,
-    reason = "referenced only by the [`SessionState`] intra-doc link in `SessionCommand`'s docs"
-)]
-use super::SessionState;
-
 #[expect(
     clippy::large_enum_variant,
     reason = "a control-plane channel message enum whose variants carry large payloads (`DaemonMessage` broadcasts, per-request snapshots) by nature; boxing every payload variant would churn every construction and match site for a human-rate channel where throughput is not the bottleneck"
@@ -27,7 +19,7 @@ use super::SessionState;
 /// Commands sent to a session's control thread over its crossbeam command
 /// channel.
 ///
-/// The session control thread owns the authoritative [`SessionState`]; every
+/// The session control thread owns the authoritative [`SessionState`](super::SessionState); every
 /// mutation of a session's model, account, title, working directory, tool
 /// groups, or turn history flows through one of these messages rather than a
 /// shared-lock write, so all cross-thread state changes serialize on the one

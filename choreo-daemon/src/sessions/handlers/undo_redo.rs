@@ -1,10 +1,10 @@
 //! Turn-history handlers: the idle-gated `handle_undo` / `handle_redo` pair
 //! and the `refuse_unless_idle` gate they share.
 
-use super::broadcast_token_state;
 use super::{
     DaemonMessageType, ReplyTarget, RequestContext, SessionEvent, SessionRecord, SessionState,
-    broadcast, debug, info, turn_for_client, write_session_retry, write_turn_retry,
+    broadcast, broadcast_token_state, debug, info, turn_for_client, write_session_retry,
+    write_turn_retry,
 };
 
 /// Refuse an undo/redo while the session is not idle.

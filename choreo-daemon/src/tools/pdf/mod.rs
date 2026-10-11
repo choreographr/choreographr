@@ -13,7 +13,7 @@
 //! `/Launch` actions, or external references, so the classic PDF malware
 //! *execution* vectors are excluded by construction. What remains — parser
 //! panics on hostile input — is contained by the daemon's existing
-//! `catch_unwind` boundary around the request worker (`sessions.rs`), and
+//! `catch_unwind` boundary around the request worker (`sessions/worker.rs`), and
 //! decompression-bomb memory blowup is bounded up front by the size/magic
 //! gates in [`read_validated_pdf`] (the hard `RLIMIT_AS` backstop is deferred
 //! to the planned sandbox phase).
