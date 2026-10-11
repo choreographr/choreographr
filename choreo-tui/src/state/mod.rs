@@ -578,13 +578,14 @@ impl App {
     /// The idle and locked cases are intentionally ordered idle-first: the
     /// busy case is the one the user hits during normal use, and it is the more
     /// actionable message.
+    ///
+    /// See [`Self::attached_is_busy`] for the idle signal every client-side
+    /// guard shares.
     pub(crate) fn new_turn_rejection(&self) -> Option<&'static str> {
         // Idle guard: a new turn can only begin from an idle (`Inactive`)
         // session.  See `SessionStatus::is_idle` for why `Sleeping` counts as
         // busy too.  `None` (no status known yet) fails open.
-        if let Some(status) = self.attached_status.as_ref()
-            && !status.is_idle()
-        {
+        if self.attached_is_busy() {
             return Some("Session is not idle, please wait before prompting.");
         }
         // Locked guard: with no credentials decrypted in memory the daemon
@@ -596,6 +597,31 @@ impl App {
                 "daemon keystore is locked — unlock with /unlock, or /unlock \
                  <base64 unlock-key> (a fresh daemon binds automatically)",
             );
+        }
+        None
+    }
+
+    /// Whether the attached session is known to be busy (not idle).  `None`
+    /// (no status heard yet) fails open, so a fresh client still reaches the
+    /// daemon — the daemon is the authority; this is only a local pre-empt.
+    ///
+    /// `Sleeping` counts as busy too (see `SessionStatus::is_idle`): its thread
+    /// has terminated, so it cannot accept a new turn or a history mutation.
+    fn attached_is_busy(&self) -> bool {
+        self.attached_status
+            .as_ref()
+            .is_some_and(|status| !status.is_idle())
+    }
+
+    /// Client-side submit-time guard for actions that need an idle session but
+    /// do NOT begin an inference turn — undo and redo.  Unlike
+    /// [`Self::new_turn_rejection`], the keystore-lock guard does not apply
+    /// (undo/redo need no credentials), so only the idle check runs.  Returns
+    /// `Some(message)` with the status line to show — and the caller must NOT
+    /// send — when the session is busy, or `None` when it may proceed.
+    pub(crate) fn idle_rejection(&self) -> Option<&'static str> {
+        if self.attached_is_busy() {
+            return Some("Session is not idle, please wait before undoing or redoing.");
         }
         None
     }

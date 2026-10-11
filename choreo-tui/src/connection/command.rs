@@ -409,16 +409,31 @@ pub(super) fn run_command(
             );
         }
         Command::Undo => {
-            if echo && let Some(text) = command_echo(&Command::Undo) {
-                app.status = Some(text);
+            // Undo/redo mutate the turn history, so they are only sent while
+            // the attached session is idle; the daemon re-checks and is the
+            // authority, this just skips the doomed round-trip.
+            if let Some(reason) = app.idle_rejection() {
+                tracing::debug!(reason, "[choreo-tui] undo rejected client-side");
+                app.status = Some(reason.to_string());
+                app.error = None;
+            } else {
+                if echo && let Some(text) = command_echo(&Command::Undo) {
+                    app.status = Some(text);
+                }
+                app.pending.send(client_tx, ClientMessageType::Undo);
             }
-            app.pending.send(client_tx, ClientMessageType::Undo);
         }
         Command::Redo => {
-            if echo && let Some(text) = command_echo(&Command::Redo) {
-                app.status = Some(text);
+            if let Some(reason) = app.idle_rejection() {
+                tracing::debug!(reason, "[choreo-tui] redo rejected client-side");
+                app.status = Some(reason.to_string());
+                app.error = None;
+            } else {
+                if echo && let Some(text) = command_echo(&Command::Redo) {
+                    app.status = Some(text);
+                }
+                app.pending.send(client_tx, ClientMessageType::Redo);
             }
-            app.pending.send(client_tx, ClientMessageType::Redo);
         }
         Command::Continue => {
             // `/continue` (or Alt+Enter) — same guard, same

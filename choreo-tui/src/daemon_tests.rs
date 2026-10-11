@@ -721,6 +721,82 @@ fn enter_redo_sends_redo() {
 }
 
 #[test]
+fn enter_undo_while_busy_is_rejected_client_side() {
+    // Undo mutates the turn history, so it is only sent when the attached
+    // session is idle. A busy session must be refused locally (no round-trip)
+    // with a status line, and must NOT echo `> undo` or send anything.
+    let mut app = test_app();
+    app.attached_status = Some(SessionStatus::Responding);
+    app.input.text = "/undo ".to_string();
+    let (tx, rx) = crossbeam_channel::unbounded();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle enter");
+
+    assert_eq!(
+        app.status.as_deref(),
+        Some("Session is not idle, please wait before undoing or redoing.")
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "no Undo may be sent while the session is busy"
+    );
+}
+
+#[test]
+fn enter_redo_while_busy_is_rejected_client_side() {
+    let mut app = test_app();
+    app.attached_status = Some(SessionStatus::ToolCall("shell".into()));
+    app.input.text = "/redo ".to_string();
+    let (tx, rx) = crossbeam_channel::unbounded();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle enter");
+
+    assert_eq!(
+        app.status.as_deref(),
+        Some("Session is not idle, please wait before undoing or redoing.")
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "no Redo may be sent while the session is busy"
+    );
+}
+
+#[test]
+fn alt_up_undo_while_busy_is_rejected_client_side() {
+    // The Alt+Up keybinding reaches the same `Command::Undo` arm as `/undo`,
+    // so it must share the idle guard.
+    let mut app = test_app();
+    app.attached_status = Some(SessionStatus::Waiting);
+    let (tx, rx) = crossbeam_channel::unbounded();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle alt+up");
+
+    assert_eq!(
+        app.status.as_deref(),
+        Some("Session is not idle, please wait before undoing or redoing.")
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "no Undo may be sent while the session is busy"
+    );
+}
+
+#[test]
 fn enter_stop_does_not_scroll() {
     let mut app = test_app();
     app.attached_session_id = Some(1);

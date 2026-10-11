@@ -1416,7 +1416,12 @@ LIFO-symmetric — one redo re-applies one undo, never collapsing several pendin
 undos at once. A new user turn clears the stack (redo is void once the
 conversation has moved on), and undo also clears the persisted
 `last_response_id` so a chained request cannot leak the hidden turns back into
-the model.
+the model. Both commands are gated to an **idle** session: an in-flight request
+worker holds the turn history on a private clone and merges it back at
+`RequestFinished`, so a history mutation underneath it would race that merge
+(and could resurrect the cleared chain). The daemon refuses a busy session with
+`Failed { error: "session is not idle" }`; the TUI applies the same idle check
+client-side to skip the doomed round-trip.
 
 ---
 

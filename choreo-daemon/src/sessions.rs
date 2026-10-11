@@ -386,17 +386,23 @@ pub enum SessionCommand {
         /// session's `io::Error` if it is currently inactive.
         reply: mpsc::Sender<io::Result<DaemonMessageType>>,
     },
-    /// Undo the most recent user-initiated turn(s).
+    /// Undo the most recent user-initiated turn(s). Only honoured while the
+    /// session is idle; a request in flight rejects it.
     Undo {
         /// The requester's reply target: `Accepted` when turns were undone,
         /// `Failed { kind: Undo, error: "nothing to undo" }` when there was
-        /// nothing to undo (closing the silent no-op gap).
+        /// nothing to undo (closing the silent no-op gap), or
+        /// `Failed { kind: Undo, error: "session is not idle" }` while a
+        /// request is in flight.
         reply: Option<ReplyTarget>,
     },
-    /// Redo the most recent undo, restoring exactly the turns it removed.
+    /// Redo the most recent undo, restoring exactly the turns it removed. Only
+    /// honoured while the session is idle; a request in flight rejects it.
     Redo {
         /// The requester's reply target: `Accepted` when turns were restored,
-        /// `Failed { kind: Redo, error: "nothing to redo" }` otherwise.
+        /// `Failed { kind: Redo, error: "nothing to redo" }` otherwise, or
+        /// `Failed { kind: Redo, error: "session is not idle" }` while a
+        /// request is in flight.
         reply: Option<ReplyTarget>,
     },
     /// Ask the session thread to persist its final state and exit. Sent by the

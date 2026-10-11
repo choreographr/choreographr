@@ -682,16 +682,20 @@ pub(super) fn handle_request_finished(
     shutdown_requested: bool,
     ctx: &RequestContext,
 ) -> bool {
-    // An undo processed while the request worker was in flight leaves the
-    // worker's snapshot stale in two ways: its turns carry no `undone` flags
-    // (the child session never saw the undo), and its `last_response_id`
-    // points at a response whose conversation includes the very turns being
-    // undone. Detect that race by comparing undone-ness: any turn the live
-    // state marks undone but the snapshot does not means the undo landed
-    // after the request started. Preserve the undo by dropping the stale
-    // response id before the snapshot's config is applied below (the undo
-    // already persisted the cleared record), and by refusing to overwrite
-    // those turns with the worker's pre-undo copies in the merge loop.
+    // Undo is gated to idle sessions (`handle_undo`), so the worker and the
+    // live state should never disagree about undone-ness. This branch is a
+    // defensive backstop against a regression in that gate, not an expected
+    // path: if an undo did slip through mid-request, the worker's snapshot is
+    // stale in two ways — its turns carry no `undone` flags (the child session
+    // never saw the undo), and its `last_response_id` points at a response
+    // whose conversation includes the very turns being undone — and applying
+    // it would resurrect the cleared chain (leaking hidden turns back to the
+    // model) and un-hide the turns. Detect that by comparing undone-ness: any
+    // turn the live state marks undone but the snapshot does not. Preserve the
+    // undo by dropping the stale response id before the snapshot's config is
+    // applied below (the undo already persisted the cleared record), and by
+    // refusing to overwrite those turns with the worker's pre-undo copies in
+    // the merge loop.
     let undo_during_request = snapshot.turns.iter().any(|(&turn_id, snap_turn)| {
         state
             .turns
@@ -1323,13 +1327,46 @@ fn handle_get_state(
     false
 }
 
+/// Refuse an undo/redo while the session is not idle.
+///
+/// Undo and redo mutate the turn history in ways the request worker cannot
+/// see: they flip `undone` flags, push/pop the redo stack, and re-derive the
+/// context size. A worker owns that history on a private clone for the whole
+/// request and merges it back at `RequestFinished`, so a history mutation
+/// underneath it would race the merge (resurrecting hidden turns and the
+/// cleared response chain). Both commands therefore run only on an idle
+/// session. The daemon is the authority — the TUI's identical client-side
+/// check just spares the user a round-trip. Answers the requester with
+/// `Failed { kind }` and returns `true` (caller must drop the command) when the
+/// session is busy.
+fn refuse_unless_idle(
+    reply: &mut Option<ReplyTarget>,
+    state: &SessionState,
+    ctx: &RequestContext,
+) -> bool {
+    if state.active_requests.is_empty() {
+        return false;
+    }
+    debug!(
+        session_id = ctx.session_id,
+        "undo/redo refused: session is not idle",
+    );
+    if let Some(target) = reply.take() {
+        target.fail("session is not idle");
+    }
+    true
+}
+
 /// Handle Undo: mark the most recent user turn's subtree as deleted.
-/// Uses a quick-reference `HashMap` to avoid an O(n) scan per ID.
+/// Only possible on an idle session (see [`refuse_unless_idle`]).
 pub(super) fn handle_undo(
-    reply: Option<ReplyTarget>,
+    mut reply: Option<ReplyTarget>,
     state: &mut SessionState,
     ctx: &RequestContext,
 ) -> bool {
+    if refuse_unless_idle(&mut reply, state, ctx) {
+        return false;
+    }
     let Some(turn_ids) = state.undo_turns() else {
         debug!(
             session_id = ctx.session_id,
@@ -1399,11 +1436,15 @@ pub(super) fn handle_undo(
 
 /// Reinstate the turns that were hidden by the preceding undo,
 /// persisting the restored state so it survives daemon restart.
+/// Only possible on an idle session (see [`refuse_unless_idle`]).
 pub(super) fn handle_redo(
-    reply: Option<ReplyTarget>,
+    mut reply: Option<ReplyTarget>,
     state: &mut SessionState,
     ctx: &RequestContext,
 ) -> bool {
+    if refuse_unless_idle(&mut reply, state, ctx) {
+        return false;
+    }
     let Some(turns) = state.redo_turns() else {
         debug!(
             session_id = ctx.session_id,

@@ -2713,6 +2713,84 @@ fn redo_nothing_to_redo_acks_failed() {
 }
 
 #[test]
+fn undo_refused_while_session_not_idle() {
+    // A request in flight means the worker owns the turn history on a private
+    // clone, so undo must be refused outright — and must not touch that
+    // history — rather than race the merge.
+    let (mut state, ctx) = broadcast_setup();
+    let (cancel_tx, _cancel_rx) = crossbeam_channel::unbounded::<()>();
+    state.active_requests.insert(
+        7,
+        ActiveRequest {
+            cancel_tx,
+            turn_id: 0,
+        },
+    );
+    let before = state.turns.clone();
+    let (sink, rx) = test_sink();
+    state.subscribers.insert(cid(10), sink.clone());
+    let target = target_for(17, MessageKind::Undo, &sink, &ctx);
+
+    let _ = handle_undo(Some(target), &mut state, &ctx);
+
+    one_reply(
+        &rx,
+        17,
+        &DaemonMessageType::Failed {
+            kind: MessageKind::Undo,
+            error: "session is not idle".to_string(),
+        },
+    );
+    assert_eq!(
+        state.turns, before,
+        "a refused undo must not mutate history"
+    );
+    assert!(
+        state.redo_stack.is_empty(),
+        "a refused undo must not push a batch"
+    );
+}
+
+#[test]
+fn redo_refused_while_session_not_idle() {
+    let (mut state, ctx) = broadcast_setup();
+    let (cancel_tx, _cancel_rx) = crossbeam_channel::unbounded::<()>();
+    state.active_requests.insert(
+        8,
+        ActiveRequest {
+            cancel_tx,
+            turn_id: 0,
+        },
+    );
+    // A redoable batch exists (turn 0 hidden), but the session is busy.
+    state.turns.get_mut(&0).expect("seeded turn").undone = true;
+    state.redo_stack.push(vec![0]);
+    let (sink, rx) = test_sink();
+    state.subscribers.insert(cid(10), sink.clone());
+    let target = target_for(18, MessageKind::Redo, &sink, &ctx);
+
+    let _ = handle_redo(Some(target), &mut state, &ctx);
+
+    one_reply(
+        &rx,
+        18,
+        &DaemonMessageType::Failed {
+            kind: MessageKind::Redo,
+            error: "session is not idle".to_string(),
+        },
+    );
+    assert!(
+        state.turns[&0].undone,
+        "a refused redo must leave the turn hidden"
+    );
+    assert_eq!(
+        state.redo_stack,
+        vec![vec![0]],
+        "a refused redo must not pop the stack"
+    );
+}
+
+#[test]
 fn set_title_success_acks_accepted_and_broadcasts_title_set() {
     let (mut state, ctx) = broadcast_setup();
     let (sink, rx) = test_sink();
