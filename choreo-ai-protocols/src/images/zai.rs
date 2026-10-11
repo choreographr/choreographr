@@ -283,11 +283,19 @@ impl ImageGenerationClient for ZaiImageClient {
             "sending z.ai image generation request"
         );
 
+        // Compact JSON plus an explicit `Content-Length` (see
+        // `retry::HookedJsonBody`); no upload hook — image generation has no
+        // `Waiting` boundary.
+        let hooked = retry::HookedJsonBody::new(&body, None)
+            .map_err(|e| InferenceError::Io(io::Error::other(e)))?;
         let response = retry::retry_loop(
             || {
-                http.post(&url)
-                    .header("Authorization", auth_header.as_str())
-                    .send_json(&body)
+                hooked
+                    .apply_headers(
+                        http.post(&url)
+                            .header("Authorization", auth_header.as_str()),
+                    )
+                    .send(hooked.send_body())
             },
             &retry_cfg,
             &mut ctx,

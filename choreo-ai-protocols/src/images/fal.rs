@@ -300,11 +300,20 @@ impl ImageGenerationClient for FalImageClient {
         // `retry_loop_raw` (not `retry_loop`): a terminal error response is
         // handed back with its body intact so `fal_error` can switch on the
         // `type`/`error_type` fields — see the module docs.
+        //
+        // Compact JSON plus an explicit `Content-Length` (see
+        // `retry::HookedJsonBody`); no upload hook — image generation has no
+        // `Waiting` boundary.
+        let hooked = retry::HookedJsonBody::new(&body, None)
+            .map_err(|e| InferenceError::Io(io::Error::other(e)))?;
         let response = retry::retry_loop_raw(
             || {
-                http.post(&url)
-                    .header("Authorization", auth_header.as_str())
-                    .send_json(&body)
+                hooked
+                    .apply_headers(
+                        http.post(&url)
+                            .header("Authorization", auth_header.as_str()),
+                    )
+                    .send(hooked.send_body())
             },
             &retry_cfg,
             &mut ctx,

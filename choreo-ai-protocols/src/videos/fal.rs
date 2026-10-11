@@ -445,12 +445,14 @@ impl VideoGenerationClient for FalVideoClient {
         let body = build_fal_video_body(&req.model, req);
         // The request body carries the prompt; log only the endpoint and model.
         tracing::debug!(url = %url, model = %req.model, "submitting fal video job");
-        // NO retry: a duplicate submit is a duplicate, billable job.
-        let response = self
-            .http
-            .post(&url)
-            .header("Authorization", auth.as_str())
-            .send_json(&body)
+        // NO retry: a duplicate submit is a duplicate, billable job.  Compact
+        // JSON plus an explicit `Content-Length` (see `retry::HookedJsonBody`);
+        // no upload hook — a video submit has no `Waiting` boundary.
+        let hooked = retry::HookedJsonBody::new(&body, None)
+            .map_err(|e| InferenceError::Io(io::Error::other(e)))?;
+        let response = hooked
+            .apply_headers(self.http.post(&url).header("Authorization", auth.as_str()))
+            .send(hooked.send_body())
             .map_err(|e| InferenceError::Io(io::Error::other(e)))?;
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {

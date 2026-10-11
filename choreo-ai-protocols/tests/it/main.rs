@@ -18,4 +18,5 @@ mod images_wire;
 mod modelsdev_refresh;
 mod reasoning_roundtrip;
 mod socket_registry_wire;
+mod upload_wire;
 mod videos_wire;
