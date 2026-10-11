@@ -17,7 +17,6 @@ use std::io;
 
 use choreo_proto::{ImageKey, Turn};
 use redb::{ReadOnlyTable, ReadableDatabase, ReadableTable, TableDefinition};
-use tracing::debug;
 
 use super::{db_err, session_range_end};
 
@@ -238,7 +237,9 @@ pub(super) fn reattach_turn_attachments(
             }
         }
     }
-    debug!(session_id, turn_id, "re-attached turn image attachments");
+    // No per-turn log here: this runs once for every turn of every session read,
+    // so a log line per call is pure noise at DEBUG. A genuine storage failure
+    // surfaces as an error from the `get` above.
     Ok(())
 }
 
