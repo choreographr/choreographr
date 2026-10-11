@@ -15,10 +15,29 @@ use std::sync::Arc;
 use choreo_ai_protocols::openai::{OpenAiClient, ServiceConfig};
 use choreo_ai_protocols::{
     AnthropicClient, AnthropicConfig, ChatTurnRequest, ChatTurnResult, GoogleClient, GoogleConfig,
-    ImageGenerationClient, OpenAiImageClient, ProviderClient, ProviderProtocol, StreamEvent,
-    ZaiImageClient, lookup_provider,
+    ImageGenerationClient, OpenAiImageClient, ProviderClient, ProviderEntry, ProviderProtocol,
+    StreamEvent, ZaiImageClient, lookup_provider,
 };
 use choreo_proto::InferenceError;
+
+/// Whether a catalog swap changed anything [`InferenceProvider::from_account_config`]
+/// bakes into a provider *client*.
+///
+/// The constructor reads exactly three catalog fields — the protocol (which
+/// selects the client type and carries the `OpenAI` `max_tokens_field`), the base
+/// URL, and the request-body compression coding. A change in any of them makes
+/// an already-built client for this slug stale, so a catalog swap must rebuild
+/// it. Everything else on the entry (the curated model list, contexts, costs,
+/// `default_model`, prompt-cache TTLs) is resolved live per request and is
+/// deliberately excluded here: those change on an ordinary models.dev refresh,
+/// and invalidating every session then would tear down warm connection pools
+/// for nothing. The slug is the map key, so it is not compared here.
+#[must_use]
+pub(crate) fn client_config_changed(before: &ProviderEntry, after: &ProviderEntry) -> bool {
+    before.protocol != after.protocol
+        || before.base_url != after.base_url
+        || before.request_compression != after.request_compression
+}
 
 /// A concrete, protocol-erased provider facade.
 ///

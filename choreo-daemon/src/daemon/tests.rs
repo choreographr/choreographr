@@ -3394,6 +3394,75 @@ context_window = 1024
 
 #[test]
 #[serial_test::serial(catalog)]
+fn catalog_swap_invalidates_sessions_of_changed_provider() {
+    // A catalog swap that changes a provider's CLIENT-relevant config (here
+    // `request_compression`) must invalidate the sessions bound to it: their
+    // cached client was built from the old entry, and `replace_catalog` alone
+    // never touches live clients — without the invalidation the overlay edit is
+    // masked until some unrelated trigger rebuilds the session.
+    let _restore = RestoreBundledCatalogOnDrop;
+    let (mut state, _rx) = make_daemon_state();
+    let dir = tempfile::tempdir().unwrap();
+    state.accounts = AccountManager::load(&dir.path().join("accounts.toml")).unwrap();
+    // The baseline catalog the session's client would have been built from.
+    replace_catalog(tiny_base());
+    seed_credentialed_account(&mut state, "tiny", "tiny-test");
+    let (cmd_rx, release) = insert_active_session_with_account(&mut state, 1, "tiny");
+
+    // The (overlay-driven) swap flips compression on the tiny provider.
+    let mut changed = tiny_base();
+    changed[0].request_compression = choreo_ai_protocols::RequestCompression::Gzip;
+    state.handle_command(DaemonCommand::CatalogBaseChanged {
+        base: changed,
+        etag: None,
+        user_overlay: None,
+        persist: false,
+        reply: Vec::new(),
+    });
+
+    assert!(
+        matches!(cmd_rx.try_recv(), Ok(SessionCommand::DropProvider)),
+        "a client-relevant catalog change must invalidate the provider's session clients"
+    );
+    drop(release);
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn catalog_swap_with_models_only_change_keeps_clients_warm() {
+    // A models-only change — exactly what an ordinary models.dev refresh
+    // produces — must NOT invalidate session clients: their connection pools
+    // stay warm. Only client-relevant fields (protocol, base URL, compression)
+    // warrant a rebuild.
+    let _restore = RestoreBundledCatalogOnDrop;
+    let (mut state, _rx) = make_daemon_state();
+    let dir = tempfile::tempdir().unwrap();
+    state.accounts = AccountManager::load(&dir.path().join("accounts.toml")).unwrap();
+    replace_catalog(tiny_base());
+    seed_credentialed_account(&mut state, "tiny", "tiny-test");
+    let (cmd_rx, release) = insert_active_session_with_account(&mut state, 1, "tiny");
+
+    let mut refreshed = tiny_base();
+    // Only the curated model list changes; protocol/base_url/compression are
+    // identical, so no client rebuild is warranted.
+    refreshed[0].models[0].context_window = 999_999;
+    state.handle_command(DaemonCommand::CatalogBaseChanged {
+        base: refreshed,
+        etag: None,
+        user_overlay: None,
+        persist: false,
+        reply: Vec::new(),
+    });
+
+    assert!(
+        cmd_rx.try_recv().is_err(),
+        "a models-only catalog change must leave session clients warm"
+    );
+    drop(release);
+}
+
+#[test]
+#[serial_test::serial(catalog)]
 fn catalog_base_changed_empty_base_still_yields_overlay_only_providers() {
     let _restore = RestoreBundledCatalogOnDrop;
     let (mut state, _rx) = make_daemon_state();

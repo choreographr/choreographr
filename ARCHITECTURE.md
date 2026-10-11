@@ -609,7 +609,9 @@ accepts a compressed request body can be opted in with
 `request_compression = "gzip"` or `"zstd"` on its `[provider.<slug>]` overlay
 entry (default is `identity`): models.dev carries no encoding fact and the
 server must decompress, so compression is **opt-in policy**, and a provider the
-overlay does not pin is sent an uncompressed body.
+overlay does not pin is sent an uncompressed body. Because the coding is baked
+into the provider client at construction, an overlay edit reaches live sessions
+only through the catalog-swap client invalidation (see Runtime catalog refresh).
 
 The compression is applied once, in `choreo-ai-protocols`'s
 `retry::HookedJsonBody` (after the compact-JSON serialize, alongside the
@@ -667,7 +669,15 @@ ride the refresh: `/refresh-models` (TUI slash command →
 ModelsRefreshed` with `RefreshStatus`, or `ModelsRefreshFailed`; a burst of
 requests is coalesced into one fetch) and `CatalogUpdated`, broadcast on every
 catalog swap to all activity subscribers so the TUI's provider picker tracks the
-live catalog. The cache/etag/cooldown mechanics, the conditional GET, and the
+live catalog. A swap is not a bare table replacement: because a provider client
+bakes its catalog entry's protocol, base URL, and `request_compression` in at
+construction (and caches itself on the session), the command loop compares the
+pre- and post-swap entries and sends `DropProvider` to every session whose
+account's provider had one of those change — or vanish — so an overlay edit
+reaches a live session's next request instead of being masked by a stale
+client. Only those client-relevant fields are compared: a models.dev refresh
+that merely rewrites model lists leaves warm clients (and their connection
+pools) untouched. The cache/etag/cooldown mechanics, the conditional GET, and the
 fingerprint gate are documented in-source (`choreo-daemon`'s `catalog` module
 and `choreo-ai-protocols`'s `catalog::refresh`).
 

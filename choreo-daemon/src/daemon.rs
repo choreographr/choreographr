@@ -1516,6 +1516,74 @@ impl DaemonState {
         }
     }
 
+    /// Invalidate the cached provider client of every active session whose
+    /// account's provider had its *client-relevant* catalog config changed — or
+    /// was removed — by the catalog swap just performed.
+    ///
+    /// A provider client is built once from the catalog entry
+    /// ([`InferenceProvider::from_account_config`]) and cached on the session;
+    /// `replace_catalog` only swaps the process-wide table, it never touches a
+    /// live client. Without this, an overlay edit that flips
+    /// `request_compression`, repoints `base_url`, or changes a provider's
+    /// protocol would silently not reach sessions already bound to it, leaving
+    /// them on the stale client until some unrelated trigger rebuilt it.
+    ///
+    /// Scoped to the changed providers, mirroring `handle_accounts_reload` —
+    /// never a blanket `drop_session_clients(None)`: a routine models.dev
+    /// refresh that only rewrites model lists must leave warm clients (and their
+    /// connection pools) alone.
+    fn invalidate_changed_provider_clients(
+        &self,
+        before: &[choreo_ai_protocols::ProviderEntry],
+        after: &[choreo_ai_protocols::ProviderEntry],
+    ) {
+        let before_by_slug: HashMap<&str, &choreo_ai_protocols::ProviderEntry> =
+            before.iter().map(|e| (e.slug.as_str(), e)).collect();
+        let after_slugs: HashSet<&str> = after.iter().map(|e| e.slug.as_str()).collect();
+
+        // Slugs whose client-relevant config changed, slugs that vanished from
+        // the catalog (their accounts would otherwise keep dialing a removed
+        // endpoint), and slugs new to the catalog. A new slug is harmless to
+        // include: no live session can hold a client for a provider that did not
+        // exist when it was built.
+        let mut changed: HashSet<&str> = HashSet::new();
+        for entry in after {
+            match before_by_slug.get(entry.slug.as_str()) {
+                // Unchanged client-relevant config: leave its clients (and their
+                // connection pools) warm.
+                Some(old) if !crate::providers::client_config_changed(old, entry) => {}
+                _ => {
+                    changed.insert(entry.slug.as_str());
+                }
+            }
+        }
+        for slug in before_by_slug.keys() {
+            if !after_slugs.contains(slug) {
+                changed.insert(slug);
+            }
+        }
+        if changed.is_empty() {
+            return;
+        }
+
+        // Map the changed slugs back to the accounts that use them and
+        // invalidate only those accounts' sessions.
+        let mut touched = 0usize;
+        for cfg in self.accounts.all_configs() {
+            if changed.contains(cfg.provider.as_str()) {
+                self.drop_session_clients(Some(&cfg.name));
+                touched += 1;
+            }
+        }
+        if touched > 0 {
+            info!(
+                providers = changed.len(),
+                accounts = touched,
+                "catalog swap changed provider client config; invalidated affected session clients"
+            );
+        }
+    }
+
     /// Push the account's (non-secret) provider slug to every active session
     /// bound to it, so slug-keyed static catalog facts stay exact immediately
     /// after an external account edit — instead of going stale until the next
@@ -2280,9 +2348,21 @@ impl DaemonState {
             return;
         }
 
+        // Snapshot the catalog the live clients were built against, so the swap
+        // below can invalidate the sessions whose provider's client-relevant
+        // config actually changed (see `invalidate_changed_provider_clients`).
+        let before = catalog_snapshot();
+
         // Single-writer point: the atomic swap. Readers are lock-free.
         replace_catalog(effective.clone());
         self.persist_catalog_cache(base, etag, persist);
+
+        // A swap only replaces the process-wide table; a session's provider
+        // client was built (and cached) from the OLD entry. Rebuild the affected
+        // ones so an overlay edit — e.g. `request_compression` or `base_url` —
+        // actually reaches live sessions instead of being masked by the stale
+        // client.
+        self.invalidate_changed_provider_clients(&before, &effective);
 
         // Broadcast the new provider list to all activity subscribers so the
         // TUI's provider picker tracks the live catalog.
