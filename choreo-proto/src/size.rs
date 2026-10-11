@@ -128,18 +128,30 @@ fn named_field_overhead(fields: usize) -> usize {
     40 + fields * 24
 }
 
-/// Byte length of a `SessionStatus` payload (a small enum; only the
-/// `ToolCall(String)` and `Retrying` variants carry data).
+/// Byte length of a `SessionStatus` payload.
+///
+/// Every arm must cover the msgpack named-mode encoding (`rmp_serde`), which
+/// renders a unit variant as its name string (`fixstr`), a newtype variant as a
+/// one-entry map `{name: value}`, and a struct variant as `{name: {fields}}` —
+/// so the variant *name* bytes count toward the size, not just the payload.
 fn session_status_size(status: &SessionStatus) -> usize {
     match status {
-        SessionStatus::ToolCall(name) => 8 + name.len(),
-        SessionStatus::Retrying { .. } => 16,
+        // `{ "ToolCall": <name> }`: fixmap (1) + the `"ToolCall"` name string
+        // (fixstr marker 1 + 8) + the value string marker (1) + `name`.
+        SessionStatus::ToolCall(name) => 12 + name.len(),
+        // `{ "Retrying": { attempt, max_attempts, delay_ms } }`: fixmap (1) +
+        // the `"Retrying"` name string (1 + 8) + the inner map (1) + three field
+        // keys (1+7, 1+12, 1+8) = 41 fixed bytes, plus <= 19 value bytes for the
+        // two u32 attempts and the u64 delay.
+        SessionStatus::Retrying { .. } => 64,
+        // Unit variants encode as their name string (fixstr marker 1 + name);
+        // the longest is `"Responding"` at 11 bytes, so 16 covers every arm.
         SessionStatus::Sleeping
         | SessionStatus::Inactive
         | SessionStatus::Sending
         | SessionStatus::Waiting
         | SessionStatus::Reasoning
-        | SessionStatus::Responding => 4,
+        | SessionStatus::Responding => 16,
     }
 }
 
@@ -165,8 +177,9 @@ fn reasoning_capability_size(cap: &ReasoningCapability) -> usize {
 /// overhead is added by the `Session` arm). Same accounting style: per-field
 /// named-mode key overhead via [`named_field_overhead`], variable-size
 /// strings/byte buffers/vecs/turn maps summed, fixed-size scalars (u32/u64
-/// ids, token counts, status enums without payload) ignored, and the generous
-/// fixed [`OVERHEAD`] for fieldless variants.
+/// ids, token counts) ignored, the [`session_status_size`] of any embedded
+/// status counted explicitly, and the generous fixed [`OVERHEAD`] for
+/// fieldless variants.
 fn session_event_size(event: &SessionEvent) -> usize {
     const OVERHEAD: usize = 96;
     match event {
@@ -521,5 +534,46 @@ impl DaemonMessage {
                 DaemonMessageType::Accepted { .. } => named_field_overhead(1),
                 DaemonMessageType::Failed { error, .. } => named_field_overhead(2) + error.len(),
             }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The lag gauge must never under-estimate a `SessionStatus` payload: an
+    /// under-count weakens the daemon's memory bound.  This is the tight
+    /// per-variant check the whole-message pin test
+    /// (`types::tests::approx_wire_size_never_underestimates_encoded_payload`)
+    /// glosses over — it sums enough other slack that a small status
+    /// under-count stays hidden — so encode each variant directly and assert
+    /// the estimate still covers it.  A dense `Retrying` (largest scalars) and
+    /// a long tool name are included so the newtype/struct arms are exercised.
+    #[test]
+    fn session_status_size_covers_encoded_len() {
+        let samples = [
+            SessionStatus::Sleeping,
+            SessionStatus::Inactive,
+            SessionStatus::Sending,
+            SessionStatus::Waiting,
+            SessionStatus::Reasoning,
+            SessionStatus::Responding,
+            SessionStatus::ToolCall("shell".into()),
+            SessionStatus::Retrying {
+                attempt: 5,
+                max_attempts: 5,
+                delay_ms: 30_000,
+            },
+        ];
+        for status in samples {
+            let encoded = rmp_serde::to_vec_named(&status).expect("encode");
+            assert!(
+                session_status_size(&status) >= encoded.len(),
+                "session_status_size({status:?}) = {} under-estimates the {}-byte \
+                 encoding",
+                session_status_size(&status),
+                encoded.len(),
+            );
+        }
     }
 }
