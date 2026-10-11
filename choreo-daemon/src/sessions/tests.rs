@@ -2200,92 +2200,16 @@ fn undo_without_response_id_leaves_session_untouched() {
     assert_eq!(state.config.last_response_id, None);
     assert_eq!(state.config.last_response_id_producer, None);
     // The most recent user turn was marked undone; the seeded turn 0 is
-    // older and stays visible (undo marks only the newest user subtree).
+    // older and stays visible (undo marks only the newest user turn).
     assert!(state.turns.get(&1).expect("turn exists").undone);
     assert!(!state.turns.get(&0).expect("turn exists").undone);
     assert!(!shutdown);
 }
 
 #[test]
-fn request_finished_after_in_flight_undo_preserves_chain_break_and_undone_turns() {
-    // Regression: an undo processed while a request worker is in flight
-    // must survive the worker's snapshot merge. The worker's child session
-    // never saw the undo, so its snapshot carries the stale response id
-    // AND copies of the undone turns without `undone` set; without the
-    // guard in `handle_request_finished`, applying it resurrected the
-    // chain (the leak the undo exists to prevent) and un-hid the turns.
-    let (mut state, ctx) = broadcast_setup();
-    state.config.last_response_id = Some("resp_9".into());
-    state.config.last_response_id_producer = Some(ReasoningProducer {
-        provider_slug: "openai".into(),
-        model: "gpt-5.4".into(),
-    });
-    // Turn 1 is the newest user turn the undo will target.
-    let _ = state.start_turn(Some("user 2".into()));
-    let mut shutdown = false;
-
-    // 1. The undo lands while the request is in flight: it clears the
-    //    chain id and marks the newest user subtree undone.
-    process_command(
-        SessionCommand::Undo { reply: None },
-        &mut state,
-        &mut shutdown,
-        &ctx,
-    );
-    assert_eq!(state.config.last_response_id, None);
-
-    // 2. The worker finishes; its snapshot predates the undo — the stale
-    //    id is back, its turn copies carry no `undone` flag, and it
-    //    created a genuinely new turn mid-flight (id 2).
-    let mut snapshot = state.snapshot();
-    snapshot.config.last_response_id = Some("resp_9".into());
-    snapshot.config.last_response_id_producer = Some(ReasoningProducer {
-        provider_slug: "openai".into(),
-        model: "gpt-5.4".into(),
-    });
-    for turn in snapshot.turns.values_mut() {
-        turn.undone = false;
-    }
-    let mut in_flight = snapshot.turns.get(&0).cloned().expect("seeded turn");
-    in_flight.user_text = Some("user 3 (in-flight)".into());
-    snapshot.turns.insert(2, in_flight);
-
-    process_command(
-        SessionCommand::RequestFinished {
-            stream_id: 1,
-            snapshot,
-        },
-        &mut state,
-        &mut shutdown,
-        &ctx,
-    );
-
-    // The stale chain must NOT be resurrected — in memory or on disk.
-    assert_eq!(state.config.last_response_id, None);
-    assert_eq!(state.config.last_response_id_producer, None);
-    let record = SessionRecord::from(&state);
-    assert_eq!(record.last_response_id, None);
-    // The undone turn stays undone (the worker's pre-undo copy is
-    // dropped, not merged back over the undo).
-    assert!(state.turns.get(&1).expect("turn exists").undone);
-    // The worker's genuinely-new turn still merges into the session.
-    assert_eq!(
-        state
-            .turns
-            .get(&2)
-            .expect("turn exists")
-            .user_text
-            .as_deref(),
-        Some("user 3 (in-flight)"),
-    );
-    assert!(!shutdown);
-}
-
-#[test]
 fn request_finished_without_undo_restores_chain_id() {
-    // Positive control: when no undo intervened, the worker's new response
-    // id must still survive the snapshot merge — the normal chaining path
-    // the undo guard must not disturb.
+    // The worker's new response id must survive the snapshot merge — the
+    // normal chaining path.
     let (mut state, ctx) = broadcast_setup();
     let mut snapshot = state.snapshot();
     snapshot.config.last_response_id = Some("resp_10".into());

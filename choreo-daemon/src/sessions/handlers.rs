@@ -677,40 +677,11 @@ pub(super) fn handle_get_summary(
 /// Apply the worker's snapshot (config only) and merge turn state.
 pub(super) fn handle_request_finished(
     stream_id: u64,
-    mut snapshot: SessionSnapshot,
+    snapshot: SessionSnapshot,
     state: &mut SessionState,
     shutdown_requested: bool,
     ctx: &RequestContext,
 ) -> bool {
-    // Undo is gated to idle sessions (`handle_undo`), so the worker and the
-    // live state should never disagree about undone-ness. This branch is a
-    // defensive backstop against a regression in that gate, not an expected
-    // path: if an undo did slip through mid-request, the worker's snapshot is
-    // stale in two ways — its turns carry no `undone` flags (the child session
-    // never saw the undo), and its `last_response_id` points at a response
-    // whose conversation includes the very turns being undone — and applying
-    // it would resurrect the cleared chain (leaking hidden turns back to the
-    // model) and un-hide the turns. Detect that by comparing undone-ness: any
-    // turn the live state marks undone but the snapshot does not. Preserve the
-    // undo by dropping the stale response id before the snapshot's config is
-    // applied below (the undo already persisted the cleared record), and by
-    // refusing to overwrite those turns with the worker's pre-undo copies in
-    // the merge loop.
-    let undo_during_request = snapshot.turns.iter().any(|(&turn_id, snap_turn)| {
-        state
-            .turns
-            .get(&turn_id)
-            .is_some_and(|state_turn| state_turn.undone && !snap_turn.undone)
-    });
-    if undo_during_request {
-        debug!(
-            session_id = ctx.session_id,
-            stream_id,
-            "undo landed while request was in flight; dropping stale response-id chain from worker snapshot",
-        );
-        snapshot.config.last_response_id = None;
-        snapshot.config.last_response_id_producer = None;
-    }
     // Apply config changes from the worker snapshot using the allowlist
     // on `SessionConfig` so that fields mutated mid-request through direct
     // SessionCommand calls (SetTitle, SetAccount, SetReasoningEffort) are
@@ -741,18 +712,6 @@ pub(super) fn handle_request_finished(
     // Merge turns from the worker snapshot into the main session state.
     for (&turn_id, turn) in &snapshot.turns {
         let is_new = !state.turns.contains_key(&turn_id);
-        // Preserve an undo that landed mid-request: the worker's copy of a
-        // turn the user hid carries no `undone` flag, so overwriting would
-        // resurrect the hidden turn — and re-persisting it would resurrect
-        // it on disk too. Keep the undone state instead (its content is
-        // skipped by the message builder anyway).
-        if !is_new
-            && let Some(state_turn) = state.turns.get(&turn_id)
-            && state_turn.undone
-            && !turn.undone
-        {
-            continue;
-        }
         state.turns.insert(turn_id, turn.clone());
         if is_new {
             // Persist the newly created turn. The turn was already broadcast
@@ -1357,7 +1316,8 @@ fn refuse_unless_idle(
     true
 }
 
-/// Handle Undo: mark the most recent user turn's subtree as deleted.
+/// Handle Undo: mark the newest live user turn and every higher-id live turn
+/// as `undone`, pushing the flipped set onto the redo stack.
 /// Only possible on an idle session (see [`refuse_unless_idle`]).
 pub(super) fn handle_undo(
     mut reply: Option<ReplyTarget>,
