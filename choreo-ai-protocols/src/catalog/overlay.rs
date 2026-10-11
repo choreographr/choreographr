@@ -190,10 +190,11 @@ fn apply_provider_overlay(
             // default since the server must decompress.
             "request_compression" => match value.as_str() {
                 Some("gzip") => entry.request_compression = RequestCompression::Gzip,
+                Some("zstd") => entry.request_compression = RequestCompression::Zstd,
                 Some("identity") => entry.request_compression = RequestCompression::Identity,
                 _ => warn!(
                     slug = %entry.slug,
-                    "overlay: request_compression must be \"gzip\" or \"identity\"; skipping",
+                    "overlay: request_compression must be \"gzip\", \"zstd\", or \"identity\"; skipping",
                 ),
             },
             other => warn!(
@@ -925,13 +926,24 @@ request_compression = "gzip"
         let acme = merged.iter().find(|e| e.slug == "acme").expect("acme");
         assert_eq!(acme.request_compression, RequestCompression::Gzip);
 
+        // `zstd` opts the provider into zstd request bodies.
+        let merged = merge_overlay(
+            &base(),
+            r#"
+[provider.acme]
+request_compression = "zstd"
+"#,
+        );
+        let acme = merged.iter().find(|e| e.slug == "acme").expect("acme");
+        assert_eq!(acme.request_compression, RequestCompression::Zstd);
+
         // An unknown coding is warned-and-skipped, leaving the safe identity
         // default (the server must decompress, so never guess a coding).
         let merged = merge_overlay(
             &base(),
             r#"
 [provider.acme]
-request_compression = "zstd"
+request_compression = "deflate"
 "#,
         );
         let acme = merged.iter().find(|e| e.slug == "acme").expect("acme");

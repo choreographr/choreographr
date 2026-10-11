@@ -343,6 +343,47 @@ fn hooked_json_body_downgrade_falls_back_to_plain() {
     assert_eq!(wire, serde_json::to_vec(&value).expect("serialize"));
 }
 
+#[test]
+fn hooked_json_body_zstd_compresses_and_round_trips_when_requested() {
+    // With zstd requested, the reader yields a standard zstd frame that decodes
+    // back to exactly the compact JSON a provider would parse.
+    let value = serde_json::json!({"a": 1, "b": [1, 2]});
+    let body = HookedJsonBody::new(&value, None, RequestCompression::Zstd).expect("serialize");
+    assert!(body.is_compressed());
+    let mut wire = Vec::new();
+    body.send_body()
+        .into_reader()
+        .read_to_end(&mut wire)
+        .expect("read the send body");
+    // The frame must carry the standard zstd magic (0xFD2FB528, little-endian).
+    assert_eq!(wire.get(..4), Some([0x28, 0xB5, 0x2F, 0xFD].as_slice()));
+    let mut decoder =
+        structured_zstd::decoding::StreamingDecoder::new(std::io::Cursor::new(&wire[..]))
+            .expect("init zstd decoder");
+    let mut decoded = Vec::new();
+    decoder
+        .read_to_end(&mut decoded)
+        .expect("decode the send body");
+    assert_eq!(decoded, serde_json::to_vec(&value).expect("serialize"));
+}
+
+#[test]
+fn hooked_json_body_downgrade_from_zstd_falls_back_to_plain() {
+    // A 415 downgrade drops zstd the same as gzip; the reader must then yield
+    // the retained plain bytes.
+    let value = serde_json::json!({"hello": "world"});
+    let body = HookedJsonBody::new(&value, None, RequestCompression::Zstd).expect("serialize");
+    assert!(body.is_compressed());
+    body.downgrade();
+    assert!(!body.is_compressed());
+    let mut wire = Vec::new();
+    body.send_body()
+        .into_reader()
+        .read_to_end(&mut wire)
+        .expect("read the send body");
+    assert_eq!(wire, serde_json::to_vec(&value).expect("serialize"));
+}
+
 // ── parse_retry_after_secs (HTTP-date form) ───────────────────────
 
 #[test]

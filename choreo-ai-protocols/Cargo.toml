@@ -46,6 +46,10 @@ crossbeam-channel.workspace = true
 # Default features = the pure-Rust `rust_backend` (miniz_oxide), matching what
 # `ureq` already enables so flate2 keeps a single active backend.
 flate2.workspace = true
+# zstd for outbound request bodies — the same pure-Rust codec the daemon's
+# `session_turns` table uses (no libzstd C build). Emits standard zstd frames,
+# so a provider expecting `Content-Encoding: zstd` decodes them.
+structured-zstd.workspace = true
 # Ordered maps for the models.dev normalization: the snapshot's JSON object
 # order is load-bearing (the `default_model` is the FIRST model in a
 # provider's models map), so providers and models must be deserialized in
@@ -103,6 +107,8 @@ choreo-ai-protocols = { path = ".", features = ["test-utils"] }
 # Gunzip an outbound compressed request body in the upload-path wire tests to
 # prove it round-trips to the JSON a provider would parse.
 flate2.workspace = true
+# zstd-decode an outbound compressed request body in the upload-path wire tests.
+structured-zstd.workspace = true
 # Serialize the catalog unit tests that read/mutate the `PROVIDER_CATALOG`
 # process global (the `replace_catalog` swap tests + direct catalog readers),
 # so they stay deterministic when the libtest runner shares one process.

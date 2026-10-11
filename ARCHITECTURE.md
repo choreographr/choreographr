@@ -605,21 +605,22 @@ daemon) are documented in-source (the `catalog` module and
 
 Every LLM turn re-sends the whole conversation plus the tool schemas as JSON,
 so the request body is the cheapest thing to shrink. A provider whose endpoint
-accepts a gzip-compressed request body can be opted in with
-`request_compression = "gzip"` on its `[provider.<slug>]` overlay entry
-(default is `identity`): models.dev carries no encoding fact and the server must
-decompress, so compression is **opt-in policy**, and a provider the overlay does
-not pin is sent an uncompressed body.
+accepts a compressed request body can be opted in with
+`request_compression = "gzip"` or `"zstd"` on its `[provider.<slug>]` overlay
+entry (default is `identity`): models.dev carries no encoding fact and the
+server must decompress, so compression is **opt-in policy**, and a provider the
+overlay does not pin is sent an uncompressed body.
 
 The compression is applied once, in `choreo-ai-protocols`'s
 `retry::HookedJsonBody` (after the compact-JSON serialize, alongside the
 retained plain bytes), so every retry attempt reuses the compressed
 `Arc<[u8]>` and the upload-complete hook — the v9 `Waiting` boundary, see the
 wire-protocol section — still fires on the last compressed byte: both the
-dispatch/upload boundary and the length-delimited send are unchanged. The
-coding is gzip only, the subset of the response codings ureq already
-handles (`gzip`/`br`) that providers accept on requests universally, and it
-reuses the same `flate2` pure-Rust backend ureq enables. A provider that
+dispatch/upload boundary and the length-delimited send are unchanged. Two
+codings are supported, each chosen per provider by which its endpoint decodes:
+`gzip` (the broadly-supported one, via the same pure-Rust `flate2` backend ureq
+enables) and `zstd` (targeting endpoints known to decode it, via the same
+pure-Rust `structured-zstd` codec the DB uses). A provider that
 answers a compressed request with `415 Unsupported Media Type` is downgraded to
 identity in place and retried once uncompressed
 (`retry::retry_loop_with_compression`); the downgrade is then remembered per

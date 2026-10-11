@@ -737,7 +737,8 @@ levels, the Responses-API flag, per-model token prices), and a bundled
 supplies everything models.dev can't express — wire-protocol selection,
 endpoint policy, per-model passback exceptions, the prompt-cache TTL policy
 (`prompt_cache_short`/`prompt_cache_long`), request-body compression
-(`request_compression = "gzip"`, opt-in since the server must decompress), and
+(`request_compression = "gzip"`/`"zstd"`, opt-in since the server must
+decompress), and
 the local/niche providers
 models.dev doesn't cover (ollama, kimi-code, custom-*, …). Highlights: OpenAI,
 Anthropic, Google Gemini, Mistral, DeepSeek, xAI Grok, Groq, Together AI,

@@ -7,12 +7,12 @@
 //! byte is read, the last client-side point before the opaque server-side wait.
 //!
 //! When a provider opts into request compression, the payload is additionally
-//! gzipped once (see [`RequestCompression`]); the reader then counts down the
+//! compressed once (see [`RequestCompression`]); the reader then counts down the
 //! *compressed* bytes exactly as it would the plain ones, so the upload boundary
 //! and the length-delimited send are unchanged.  A body can be downgraded to
 //! identity in place (see [`HookedJsonBody`] docs) so a provider that rejects
-//! `Content-Encoding: gzip` with a 415 can be retried uncompressed without a
-//! re-serialize.
+//! the chosen `Content-Encoding` with a 415 can be retried uncompressed without
+//! a re-serialize.
 
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -32,14 +32,21 @@ const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 /// for a real latency cost on large conversations.
 const GZIP_LEVEL: u32 = 6;
 
+/// zstd level for the compressed request body. 3 is zstd's usual default and
+/// already matches gzip's ratio for this kind of JSON at a fraction of the
+/// cost, so it is the right trade-off for the request path.
+const ZSTD_LEVEL: i32 = 3;
+
 /// Whether a provider request body is compressed on the wire.
 ///
 /// Request compression is opt-in per provider (the server must decompress), so
 /// the default is [`RequestCompression::Identity`] and only providers the
 /// catalog overlay marks as supporting it send a `Content-Encoding` header.
-/// The set of supported codings is deliberately a subset of what the HTTP stack
-/// accepts on responses (ureq decompresses gzip and brotli); gzip is the one
-/// coding universally supported by providers that accept compressed requests.
+/// The supported codings are a subset of what the HTTP stack accepts on
+/// responses (ureq decompresses gzip and brotli); in practice each coding is
+/// accepted by only some providers, so the choice is per provider:
+/// [`RequestCompression::Gzip`] is the broadly-supported one, and
+/// [`RequestCompression::Zstd`] targets endpoints known to decode zstd.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum RequestCompression {
     /// Send the JSON body uncompressed.
@@ -47,6 +54,8 @@ pub enum RequestCompression {
     Identity,
     /// Send the JSON body gzip-compressed with `Content-Encoding: gzip`.
     Gzip,
+    /// Send the JSON body zstd-compressed with `Content-Encoding: zstd`.
+    Zstd,
 }
 
 /// A serialized JSON request body plus the optional upload-complete hook.
@@ -62,13 +71,13 @@ pub enum RequestCompression {
 /// forever, so the declared length must always equal the bytes the reader
 /// yields.
 ///
-/// When `compression` is [`RequestCompression::Gzip`], the body is gzipped once
-/// here (alongside the plain bytes) and both `Content-Length` and
-/// `Content-Encoding` are set from that compressed form.  A body built
-/// compressed can be **[`Self::downgrade`]d** back to identity in place (the
-/// plain bytes are retained), which is what lets a provider that answers a
-/// compressed request with `415 Unsupported Media Type` be retried uncompressed
-/// without re-serializing the conversation.
+/// When `compression` is gzip or zstd, the body is compressed once here
+/// (alongside the plain bytes) and both `Content-Length` and `Content-Encoding`
+/// are set from that compressed form.  A body built compressed can be
+/// **[`Self::downgrade`]d** back to identity in place (the plain bytes are
+/// retained), which is what lets a provider that answers a compressed request
+/// with `415 Unsupported Media Type` be retried uncompressed without
+/// re-serializing the conversation.
 pub(crate) struct HookedJsonBody {
     /// The compact JSON payload, always retained so a downgrade can fall back
     /// to it.
@@ -76,26 +85,42 @@ pub(crate) struct HookedJsonBody {
     /// `Content-Length` for the plain payload, rendered once so a retry re-uses
     /// it instead of allocating a fresh `String` per `apply_headers` call.
     plain_len: String,
-    /// The gzipped payload plus its rendered `Content-Length`, present only
-    /// when compression was requested.
-    gzip: Option<GzippedBody>,
-    /// Whether the next send should use the gzipped form.  Flipped once, from a
-    /// send thread observing a 415, by [`Self::downgrade`] — a single-bit
-    /// control flag carrying no data (the sanctioned shared-state exception),
-    /// so [`Self::apply_headers`] and [`Self::send_body`] stay `&self`.
-    use_gzip: AtomicBool,
+    /// The compressed payload plus its rendered `Content-Length` and encoding
+    /// label, present only when compression was requested.
+    compressed: Option<CompressedBody>,
+    /// Whether the next send should use the compressed form.  Flipped once,
+    /// from a send thread observing a 415, by [`Self::downgrade`] — a
+    /// single-bit control flag carrying no data (the sanctioned shared-state
+    /// exception), so [`Self::apply_headers`] and [`Self::send_body`] stay
+    /// `&self`.
+    use_compression: AtomicBool,
     on_uploaded: Option<RequestUploadedCallback>,
 }
 
-/// The gzipped form of a request body plus its rendered `Content-Length`.
-struct GzippedBody {
+/// A compressed request body: its bytes, its rendered `Content-Length`, and the
+/// `Content-Encoding` token it is sent under.
+struct CompressedBody {
     bytes: Arc<[u8]>,
     len: String,
+    encoding: &'static str,
+}
+
+impl CompressedBody {
+    /// Wrap compressed `bytes` and its `Content-Encoding` token, rendering the
+    /// length once.
+    fn new(bytes: Vec<u8>, encoding: &'static str) -> Self {
+        let len = bytes.len().to_string();
+        Self {
+            bytes: bytes.into(),
+            len,
+            encoding,
+        }
+    }
 }
 
 impl HookedJsonBody {
-    /// Serialize `value` to compact JSON, gzip it when `compression` requests
-    /// it, and remember the upload hook.
+    /// Serialize `value` to compact JSON, compress it when `compression`
+    /// requests it, and remember the upload hook.
     ///
     /// Generic over [`serde::Serialize`] so a caller can pass a typed wire
     /// struct (the image and video adapters) as readily as a built
@@ -105,7 +130,8 @@ impl HookedJsonBody {
     ///
     /// Returns an [`io::Error`] if serialization or the gzip pass fails; the
     /// serialization failure is wrapped via [`io::Error::other`] so callers map
-    /// a single error type.
+    /// a single error type.  The zstd pass is infallible (see
+    /// [`zstd_compress`]) and never contributes an error.
     pub(crate) fn new<T: serde::Serialize>(
         value: &T,
         on_uploaded: Option<RequestUploadedCallback>,
@@ -113,30 +139,24 @@ impl HookedJsonBody {
     ) -> Result<Self, io::Error> {
         let plain: Arc<[u8]> = serde_json::to_vec(value).map_err(io::Error::other)?.into();
         let plain_len = plain.len().to_string();
-        let gzip = match compression {
+        let compressed = match compression {
             RequestCompression::Identity => None,
-            RequestCompression::Gzip => {
-                let compressed = gzip_compress(&plain)?;
-                let len = compressed.len().to_string();
-                Some(GzippedBody {
-                    bytes: compressed.into(),
-                    len,
-                })
-            }
+            RequestCompression::Gzip => Some(CompressedBody::new(gzip_compress(&plain)?, "gzip")),
+            RequestCompression::Zstd => Some(CompressedBody::new(zstd_compress(&plain), "zstd")),
         };
-        let use_gzip = AtomicBool::new(gzip.is_some());
+        let use_compression = AtomicBool::new(compressed.is_some());
         Ok(Self {
             plain,
             plain_len,
-            gzip,
-            use_gzip,
+            compressed,
+            use_compression,
             on_uploaded,
         })
     }
 
     /// Apply the `Content-Type`/`Content-Length` headers every request body
-    /// needs (see the type docs), plus `Content-Encoding: gzip` when the body
-    /// is currently sent compressed.  Kept here so the pairing cannot drift
+    /// needs (see the type docs), plus `Content-Encoding` when the body is
+    /// currently sent compressed.  Kept here so the pairing cannot drift
     /// between providers and so the length always matches the bytes the reader
     /// will yield.
     pub(crate) fn apply_headers<B>(
@@ -146,9 +166,9 @@ impl HookedJsonBody {
         let request = request.header("Content-Type", JSON_CONTENT_TYPE);
         match self.active() {
             Active::Plain => request.header("Content-Length", self.plain_len.as_str()),
-            Active::Gzip(GzippedBody { len, .. }) => request
-                .header("Content-Encoding", "gzip")
-                .header("Content-Length", len.as_str()),
+            Active::Compressed(c) => request
+                .header("Content-Encoding", c.encoding)
+                .header("Content-Length", c.len.as_str()),
         }
     }
 
@@ -159,27 +179,28 @@ impl HookedJsonBody {
     pub(crate) fn send_body(&self) -> ureq::SendBody<'static> {
         let bytes = match self.active() {
             Active::Plain => Arc::clone(&self.plain),
-            Active::Gzip(GzippedBody { bytes, .. }) => Arc::clone(bytes),
+            Active::Compressed(c) => Arc::clone(&c.bytes),
         };
         ureq::SendBody::from_owned_reader(UploadHookReader::new(bytes, self.on_uploaded.clone()))
     }
 
-    /// Whether the next send would be gzip-compressed.  `false` once downgraded.
+    /// Whether the next send would be compressed.  `false` once downgraded.
     pub(super) fn is_compressed(&self) -> bool {
-        self.use_gzip.load(Ordering::Relaxed) && self.gzip.is_some()
+        self.use_compression.load(Ordering::Relaxed) && self.compressed.is_some()
     }
 
-    /// Drop gzip and send the retained plain bytes on every subsequent attempt.
-    /// Idempotent; a no-op for a body built identity.
+    /// Drop compression and send the retained plain bytes on every subsequent
+    /// attempt.  Idempotent; a no-op for a body built identity.
     pub(super) fn downgrade(&self) {
-        self.use_gzip.store(false, Ordering::Relaxed);
+        self.use_compression.store(false, Ordering::Relaxed);
     }
 
-    /// The form the next send uses.  `Gzip` is unreachable when `gzip` is
-    /// `None`, because `use_gzip` is only ever set true when `gzip` is `Some`.
+    /// The form the next send uses.  `Compressed` is unreachable when
+    /// `compressed` is `None`, because `use_compression` is only ever set true
+    /// when `compressed` is `Some`.
     fn active(&self) -> Active<'_> {
-        match &self.gzip {
-            Some(g) if self.use_gzip.load(Ordering::Relaxed) => Active::Gzip(g),
+        match &self.compressed {
+            Some(c) if self.use_compression.load(Ordering::Relaxed) => Active::Compressed(c),
             _ => Active::Plain,
         }
     }
@@ -188,15 +209,28 @@ impl HookedJsonBody {
 /// The body form currently selected by a [`HookedJsonBody`].
 enum Active<'a> {
     Plain,
-    Gzip(&'a GzippedBody),
+    Compressed(&'a CompressedBody),
 }
 
 /// Compress `bytes` to a gzip stream (RFC 1952: zlib deflate plus the CRCs and
-/// length trailer ureq's gzip decoders and every provider's expect).
+/// length trailer every gzip decoder expects).
 fn gzip_compress(bytes: &[u8]) -> io::Result<Vec<u8>> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::new(GZIP_LEVEL));
     encoder.write_all(bytes)?;
     encoder.finish()
+}
+
+/// Compress `bytes` to a single standard zstd frame at [`ZSTD_LEVEL`].
+///
+/// Uses the same pure-Rust codec the daemon's `session_turns` table uses (no
+/// libzstd C build) and emits a standard zstd frame, so a provider expecting
+/// `Content-Encoding: zstd` decodes it.  Infallible — any input frames — so it
+/// returns the `Vec` directly rather than a `Result`.
+fn zstd_compress(bytes: &[u8]) -> Vec<u8> {
+    structured_zstd::encoding::compress_slice_to_vec(
+        bytes,
+        structured_zstd::encoding::CompressionLevel::from_level(ZSTD_LEVEL),
+    )
 }
 
 /// A `Read` over a shared in-memory payload that fires its hook once, when the
@@ -215,9 +249,9 @@ fn gzip_compress(bytes: &[u8]) -> io::Result<Vec<u8>> {
 /// failure on the last chunk still leaves the boundary already reported.  That
 /// is the intended granularity: the boundary tracks the client-side upload, the
 /// last point the transport exposes before the response is read.  When the
-/// payload is gzip-compressed this is the last compressed byte, which is the
-/// same boundary — compression only changes the bytes counted down, not where
-/// the count reaches zero.
+/// payload is compressed this is the last compressed byte, which is the same
+/// boundary — compression only changes the bytes counted down, not where the
+/// count reaches zero.
 pub(super) struct UploadHookReader {
     bytes: Arc<[u8]>,
     pos: usize,
