@@ -2,7 +2,7 @@ use std::fmt::Debug;
 use std::io;
 
 use crate::openai::{ChatRequestMessage, ChatToolDefinition};
-use crate::retry::RetryCallback;
+use crate::retry::{RequestSentCallback, RetryCallback};
 use crate::types::{CallerInfo, ChatTurnResult, StreamEvent};
 use choreo_proto::InferenceError;
 
@@ -32,6 +32,12 @@ pub struct ChatTurnRequest<'a> {
     /// Optional callback invoked before each retry wait, for progress
     /// reporting; `None` disables the callback.
     pub on_retry: &'a mut Option<RetryCallback>,
+    /// Optional callback invoked once the provider has accepted the request
+    /// (a successful attempt's response headers have been read), marking the
+    /// boundary between dispatch/upload and the time-to-first-token wait;
+    /// `None` disables the callback.  See
+    /// [`RequestSentCallback`](crate::RequestSentCallback).
+    pub on_sent: &'a mut Option<RequestSentCallback>,
     /// Cancellation channel.  A crossbeam receiver so the retry backoff and
     /// SSE waits can `select!` on it alongside their own channels instead of
     /// polling with `recv_timeout`.

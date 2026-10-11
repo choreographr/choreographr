@@ -137,7 +137,8 @@ fn session_status_size(status: &SessionStatus) -> usize {
         SessionStatus::Sleeping
         | SessionStatus::Inactive
         | SessionStatus::Sending
-        | SessionStatus::Thinking
+        | SessionStatus::Waiting
+        | SessionStatus::Reasoning
         | SessionStatus::Responding => 4,
     }
 }

@@ -1,6 +1,6 @@
 pub(crate) use crate::retry::AttemptContext;
 pub(crate) use crate::retry::AttemptDeadline;
-pub use crate::retry::{RetryCallback, RetryConfig};
+pub use crate::retry::{RequestSentCallback, RetryCallback, RetryConfig};
 
 use super::{OpenAiError, ServiceConfig};
 use crate::retry;

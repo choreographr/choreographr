@@ -177,6 +177,7 @@ where
         tools,
         thinking_effort,
         on_retry,
+        on_sent,
         cancel_rx,
         max_output_tokens_override,
         no_retry,
@@ -220,7 +221,8 @@ where
 
     // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
-    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));
+    let mut ctx =
+        retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline)).with_on_sent(on_sent);
     let response = retry::retry_loop(
         || {
             agent

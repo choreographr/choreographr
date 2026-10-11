@@ -942,7 +942,8 @@ pub(crate) fn status_display(status: &SessionStatus) -> (String, Color) {
         SessionStatus::Sleeping => ("sleeping".into(), Color::DarkGray),
         SessionStatus::Inactive => ("idle".into(), Color::Green),
         SessionStatus::Sending => ("sending".into(), Color::Blue),
-        SessionStatus::Thinking => ("thinking".into(), Color::Yellow),
+        SessionStatus::Waiting => ("waiting".into(), Color::LightBlue),
+        SessionStatus::Reasoning => ("reasoning".into(), Color::Yellow),
         SessionStatus::Responding => ("responding".into(), Color::LightGreen),
         SessionStatus::ToolCall(name) => (format!("tool call: {name}"), Color::Cyan),
         SessionStatus::Retrying {

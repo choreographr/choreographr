@@ -884,6 +884,7 @@ where
         messages: _,
         tools,
         on_retry,
+        on_sent,
         cancel_rx,
         route,
         tool_results,
@@ -902,7 +903,8 @@ where
     let retry = retry::retry_config_from_config(config).with_no_retry(no_retry);
     // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
-    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));
+    let mut ctx =
+        retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline)).with_on_sent(on_sent);
     let response = retry::retry_send(agent, &url, api_key, &body, config, &retry, &mut ctx, route)?;
 
     let mut has_any_output = false;
@@ -1253,6 +1255,7 @@ mod tests {
                 tools: &[],
                 reasoning_effort: effort,
                 on_retry: &mut no_retry,
+                on_sent: &mut None,
                 cancel_rx: None,
                 route: None,
                 previous_response_id: None,
@@ -2141,6 +2144,7 @@ mod tests {
                 tools: &[],
                 reasoning_effort: None,
                 on_retry: &mut no_retry,
+                on_sent: &mut None,
                 cancel_rx: None,
                 route: None,
                 previous_response_id: None,

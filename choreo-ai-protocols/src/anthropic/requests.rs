@@ -197,6 +197,7 @@ where
         tools,
         thinking_effort,
         on_retry,
+        on_sent,
         cancel_rx,
         session_id,
         request_id,
@@ -253,7 +254,8 @@ where
 
     // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
-    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));
+    let mut ctx =
+        retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline)).with_on_sent(on_sent);
     // Gateway headers (empty for non-gateway providers — see the shared
     // helper); applied alongside the auth headers inside the retry closure.
     let extra_headers = route.map_or_default(|(session_id, request_id)| {

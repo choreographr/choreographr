@@ -1931,7 +1931,8 @@ fn collect_status_broadcasts(
 fn agent_loop_broadcasts_forward_only_streaming_phases() {
     // Reasoning, then answer, then a trailing reasoning delta: the phase must
     // reach `Responding` and STAY there (the later reasoning chunk must not
-    // demote it back to `Thinking`), and `Sending` must not be re-emitted.
+    // demote it back to `Reasoning`), and neither `Sending` nor `Waiting` must
+    // be re-emitted.
     let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
     let dir = tempfile::tempdir().unwrap();
@@ -1977,10 +1978,11 @@ fn agent_loop_broadcasts_forward_only_streaming_phases() {
         collect_status_broadcasts(&cmd_rx),
         vec![
             SessionStatus::Sending,
-            SessionStatus::Thinking,
+            SessionStatus::Waiting,
+            SessionStatus::Reasoning,
             SessionStatus::Responding,
         ],
-        "exactly the forward-only Sending→Thinking→Responding phases, no demotion",
+        "exactly the forward-only Sending→Waiting→Reasoning→Responding phases, no demotion",
     );
 }
 
@@ -1988,7 +1990,7 @@ fn agent_loop_broadcasts_forward_only_streaming_phases() {
 fn agent_loop_retry_then_stream_advances_phase_out_of_retrying() {
     // A retry fires before the first delta (the only point a provider retries),
     // so the phase is still `Sending` when `Retrying` is reported; the first
-    // post-retry chunk must then advance it to `Thinking`/`Responding` rather
+    // post-retry acceptance (`Waiting`) and chunk must then advance it rather
     // than leaving the status stuck on `Retrying`.
     let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
@@ -2039,7 +2041,8 @@ fn agent_loop_retry_then_stream_advances_phase_out_of_retrying() {
                 max_attempts: 3,
                 delay_ms: 1,
             },
-            SessionStatus::Thinking,
+            SessionStatus::Waiting,
+            SessionStatus::Reasoning,
             SessionStatus::Responding,
         ],
     );

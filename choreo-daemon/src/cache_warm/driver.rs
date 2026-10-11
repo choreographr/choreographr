@@ -7,7 +7,9 @@
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use choreo_ai_protocols::openai::{ChatRequestMessage, ChatToolDefinition, RetryCallback};
+use choreo_ai_protocols::openai::{
+    ChatRequestMessage, ChatToolDefinition, RequestSentCallback, RetryCallback,
+};
 use choreo_ai_protocols::{ChatTurnRequest, ChatTurnResult};
 use crossbeam_channel::{Receiver, Sender};
 use tracing::{debug, trace, warn};
@@ -235,6 +237,7 @@ fn warmer_loop(
 pub(super) fn ping_request<'a>(
     request: &'a WarmRequest,
     on_retry: &'a mut Option<RetryCallback>,
+    on_sent: &'a mut Option<RequestSentCallback>,
 ) -> ChatTurnRequest<'a> {
     ChatTurnRequest {
         model: &request.model,
@@ -242,6 +245,7 @@ pub(super) fn ping_request<'a>(
         tools: &request.tools,
         thinking_effort: "off".to_string(),
         on_retry,
+        on_sent,
         cancel_rx: None,
         previous_response_id: None,
         tool_results: &[],
@@ -258,7 +262,7 @@ pub(super) fn ping_request<'a>(
 /// or turn state.
 fn do_ping(client: &InferenceProvider, request: &WarmRequest) {
     let mut on_retry: Option<RetryCallback> = None;
-    let result = client.chat_completion_turn(ping_request(request, &mut on_retry));
+    let result = client.chat_completion_turn(ping_request(request, &mut on_retry, &mut None));
     // Count the attempt regardless of outcome: the attempt is what costs money.
     crate::metrics::record_cache_warm_attempt();
     match result {

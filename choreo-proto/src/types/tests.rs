@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 #[test]
 fn session_status_idle_and_active_partition_busy_states() {
-    // `is_idle` is exactly `Inactive`; `is_active` covers the five
+    // `is_idle` is exactly `Inactive`; `is_active` covers the six
     // processing states.  `Sleeping` is neither — it is the exit marker of
     // a session whose thread has terminated, so it cannot begin a turn
     // (hence not idle) yet is not "actively processing" either (hence not
@@ -13,7 +13,8 @@ fn session_status_idle_and_active_partition_busy_states() {
 
     for busy in [
         SessionStatus::Sending,
-        SessionStatus::Thinking,
+        SessionStatus::Waiting,
+        SessionStatus::Reasoning,
         SessionStatus::Responding,
         SessionStatus::ToolCall("shell".into()),
         SessionStatus::Retrying {

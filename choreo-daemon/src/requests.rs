@@ -393,14 +393,19 @@ fn protocol_is_anthropic(slug: &str) -> bool {
 
 /// The forward-only streaming phase a single model call moves through, in
 /// order: `Sending` (the request is dispatched and we are awaiting the first
-/// token) → `Thinking` (the model's reasoning tokens are streaming) →
+/// token) → `Reasoning` (the model's reasoning tokens are streaming) →
 /// `Responding` (the answer tokens are streaming).  Modeled as an ordered enum
 /// so "only ever move forward" is the derived `Ord` comparison rather than a
 /// pair of hand-written inverse guards that could drift apart.
+///
+/// The `Waiting` boundary — the provider has accepted the request but the
+/// first token has not arrived — is broadcast directly by the request-sent
+/// callback rather than tracked here: it is a one-shot event that fires before
+/// any delta, so it never needs to participate in the forward-only comparison.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum StreamPhase {
     Sending,
-    Thinking,
+    Reasoning,
     Responding,
 }
 
@@ -409,7 +414,7 @@ impl StreamPhase {
     fn status(self) -> SessionStatus {
         match self {
             StreamPhase::Sending => SessionStatus::Sending,
-            StreamPhase::Thinking => SessionStatus::Thinking,
+            StreamPhase::Reasoning => SessionStatus::Reasoning,
             StreamPhase::Responding => SessionStatus::Responding,
         }
     }
@@ -419,7 +424,7 @@ impl StreamPhase {
 /// status to subscribers — but only when it moves FORWARD along [`StreamPhase`].
 /// A later chunk of an earlier kind therefore never demotes the phase back (a
 /// trailing reasoning delta after the answer has begun does not flip
-/// `Responding` back to `Thinking`), so one model call emits at most two
+/// `Responding` back to `Reasoning`), so one model call emits at most two
 /// *advances* — two `StatusChanged` broadcasts on top of the initial `Sending`
 /// — no matter how the provider interleaves its deltas.  `Sending` is broadcast
 /// once before the call, so it is the initial value here and this never
@@ -699,6 +704,20 @@ pub(crate) fn run_agent_loop(
             }
         }));
 
+        // Broadcast the `Waiting` boundary the instant the provider accepts the
+        // request (its response headers are read) and begins producing the
+        // first token.  A one-shot event fired from the retry layer BEFORE any
+        // delta, so — unlike the per-delta `StreamPhase` advances below — it
+        // does not participate in the forward-only phase comparison; it simply
+        // marks the handoff from "getting the request there" to "the model is
+        // thinking".
+        let mut sent_cb: Option<choreo_ai_protocols::RequestSentCallback> = Some(Box::new({
+            let cmd_tx = ctx.cmd_tx.clone();
+            move || {
+                let _ = cmd_tx.send(SessionCommand::StatusChanged(SessionStatus::Waiting));
+            }
+        }));
+
         // Running count of output tokens produced by the current turn.
         let mut output_token_count: u32 = 0;
 
@@ -725,6 +744,7 @@ pub(crate) fn run_agent_loop(
                 tools: &tools,
                 thinking_effort,
                 on_retry: &mut retry_cb,
+                on_sent: &mut sent_cb,
                 cancel_rx: Some(cancel_rx),
                 previous_response_id: prev_resp_id.as_deref(),
                 tool_results: &tool_results,
@@ -758,9 +778,9 @@ pub(crate) fn run_agent_loop(
                     }
                     StreamEvent::Reasoning(text) => {
                         // A reasoning chunk means hidden reasoning is streaming,
-                        // so promote the phase to `Thinking` (distinct from the
-                        // pre-token send wait).
-                        advance_stream_phase(&mut stream_phase, StreamPhase::Thinking, ctx);
+                        // so promote the phase to `Reasoning` (distinct from the
+                        // pre-token send/wait boundary).
+                        advance_stream_phase(&mut stream_phase, StreamPhase::Reasoning, ctx);
                         if let Some(enc) = &encoding {
                             // u128→u32 token counts, informational only.
                             let n = enc.count(&text);

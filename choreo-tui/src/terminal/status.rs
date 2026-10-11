@@ -42,7 +42,8 @@ pub(crate) fn state_for(status: &SessionStatus) -> &'static str {
     match status {
         SessionStatus::Inactive | SessionStatus::Sleeping => "idle",
         SessionStatus::Sending
-        | SessionStatus::Thinking
+        | SessionStatus::Waiting
+        | SessionStatus::Reasoning
         | SessionStatus::Responding
         | SessionStatus::ToolCall(_)
         | SessionStatus::Retrying { .. } => "working",
@@ -222,7 +223,8 @@ mod tests {
         assert_eq!(state_for(&SessionStatus::Inactive), "idle");
         assert_eq!(state_for(&SessionStatus::Sleeping), "idle");
         assert_eq!(state_for(&SessionStatus::Sending), "working");
-        assert_eq!(state_for(&SessionStatus::Thinking), "working");
+        assert_eq!(state_for(&SessionStatus::Waiting), "working");
+        assert_eq!(state_for(&SessionStatus::Reasoning), "working");
         assert_eq!(state_for(&SessionStatus::Responding), "working");
         assert_eq!(
             state_for(&SessionStatus::ToolCall("shell".into())),

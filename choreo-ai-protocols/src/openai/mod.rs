@@ -35,7 +35,7 @@ pub(crate) use sse::{ResponsesStreamEvent, parse_responses_stream_event};
 pub(crate) use crate::retry::{
     RetryConfig, backoff_duration, is_retryable_status, parse_retry_after_secs,
 };
-pub use retry::RetryCallback;
+pub use retry::{RequestSentCallback, RetryCallback};
 
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -66,6 +66,9 @@ pub(crate) struct TurnParams<'a> {
     pub tools: &'a [ChatToolDefinition],
     pub reasoning_effort: Option<&'a str>,
     pub on_retry: &'a mut Option<RetryCallback>,
+    /// Called once the provider accepts the request (see
+    /// [`RequestSentCallback`]); `None` when the caller does not need it.
+    pub on_sent: &'a mut Option<RequestSentCallback>,
     pub cancel_rx: Option<&'a crossbeam_channel::Receiver<()>>,
     /// Gateway routing identity (`session_id`, `request_id`) for the opencode
     /// zen/go providers; `None` when the caller has no session.
@@ -682,6 +685,7 @@ impl OpenAiClient {
             tools: params.tools,
             reasoning_effort,
             on_retry: params.on_retry,
+            on_sent: params.on_sent,
             cancel_rx: params.cancel_rx,
             route,
             previous_response_id: params.previous_response_id,
@@ -754,6 +758,7 @@ impl OpenAiClient {
             tools: params.tools,
             reasoning_effort,
             on_retry: params.on_retry,
+            on_sent: params.on_sent,
             cancel_rx: params.cancel_rx,
             route,
             previous_response_id: params.previous_response_id,

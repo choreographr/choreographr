@@ -51,6 +51,7 @@ fn provider_connection_is_registered_and_shutdown_all_does_not_panic() {
             tools: &[],
             thinking_effort: "off".to_string(),
             on_retry: &mut None,
+            on_sent: &mut None,
             cancel_rx: None,
             previous_response_id: None,
             tool_results: &[],

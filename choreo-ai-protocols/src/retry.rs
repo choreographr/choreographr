@@ -31,6 +31,13 @@ static WARNED_CLAMPS: LazyLock<Mutex<HashSet<(u64, u64)>>> =
 /// Called before each retry attempt with (`current_attempt`, `max_attempts`, delay).
 pub type RetryCallback = Box<dyn FnMut(u32, u32, Duration) + Send>;
 
+/// Called once when a provider accepts a request — the successful (2xx)
+/// attempt's HTTP response headers have been read and its body has not yet
+/// been streamed.  It marks the boundary between "the request is being sent"
+/// and "the model is now producing tokens", so a status bar can distinguish
+/// the dispatch/upload phase from the time-to-first-token wait.
+pub type RequestSentCallback = Box<dyn FnMut() + Send>;
+
 /// Hard ceiling on a single retry delay, in milliseconds.
 ///
 /// `retry_max_backoff_ms` is user-facing configuration with no upper bound of
@@ -171,6 +178,10 @@ impl AttemptDeadline {
 pub struct AttemptContext<'a> {
     /// Invoked before each retry wait with (attempt, `max_attempts`, delay).
     pub on_retry: &'a mut Option<RetryCallback>,
+    /// Invoked once the provider has accepted a successful (2xx) attempt — its
+    /// response headers are in hand and its body is about to be read.  `None`
+    /// when no caller cares about the boundary.
+    pub on_sent: Option<&'a mut Option<RequestSentCallback>>,
     /// Cancellation channel; `None` when cancellation is not wired up.
     /// Crossbeam so waits can `select!` on it alongside a retry timer.
     pub cancel_rx: Option<&'a crossbeam_channel::Receiver<()>>,
@@ -180,7 +191,8 @@ pub struct AttemptContext<'a> {
 }
 
 impl<'a> AttemptContext<'a> {
-    /// Bundle the per-call retry context for [`retry_loop`].
+    /// Bundle the per-call retry context for [`retry_loop`].  The request-sent
+    /// callback defaults to `None`; attach one with [`Self::with_on_sent`].
     #[must_use]
     pub fn new(
         on_retry: &'a mut Option<RetryCallback>,
@@ -189,8 +201,20 @@ impl<'a> AttemptContext<'a> {
     ) -> Self {
         Self {
             on_retry,
+            on_sent: None,
             cancel_rx,
             attempt_deadline,
+        }
+    }
+
+    /// Attach a request-sent callback (see [`RequestSentCallback`]).  A builder
+    /// rather than a fourth `new` parameter so the many call sites that do not
+    /// need the boundary keep their current signature.
+    #[must_use]
+    pub fn with_on_sent(self, on_sent: &'a mut Option<RequestSentCallback>) -> Self {
+        Self {
+            on_sent: Some(on_sent),
+            ..self
         }
     }
 }
@@ -636,6 +660,16 @@ where
 
         let status: u16 = response.status().as_u16();
         if (200..300).contains(&status) {
+            // The provider accepted this attempt: headers are in hand and the
+            // body is about to stream.  Fire the request-sent boundary before
+            // handing the response back to the caller's body reader.  The retry
+            // loop only reaches here on the successful attempt, so this fires
+            // exactly once even when earlier attempts were retried.
+            if let Some(slot) = ctx.on_sent.as_deref_mut()
+                && let Some(cb) = slot.as_mut()
+            {
+                cb();
+            }
             return Ok(response);
         }
 
@@ -747,7 +781,7 @@ fn extract_error_message(body: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
     fn test_config() -> RetryConfig {
         RetryConfig {
@@ -975,6 +1009,59 @@ mod tests {
         );
         assert!(matches!(result, Err(ProviderHttpError::Cancelled)));
         assert_eq!(observed.load(Ordering::Relaxed), MAX_BACKOFF_MS);
+    }
+
+    // ── on_sent firing (the daemon's `Waiting` boundary) ─────────────
+
+    /// A minimal `ureq` response for driving [`retry_loop`] in-process (no
+    /// socket): the builder's `data` supplies a readable body so a terminal
+    /// path that consumes the body still works.
+    fn http_response(status: u16, body: &str) -> ureq::http::Response<ureq::Body> {
+        ureq::http::Response::builder()
+            .status(status)
+            .body(ureq::Body::builder().data(body))
+            .expect("response builds")
+    }
+
+    #[test]
+    fn retry_loop_fires_on_sent_once_on_a_successful_attempt() {
+        // A provider that accepts the request (2xx) fires the request-sent
+        // callback exactly once — it is the daemon's `Waiting` boundary.
+        let sent = Arc::new(AtomicU32::new(0));
+        let seen = sent.clone();
+        let mut cb: Option<RequestSentCallback> = Some(Box::new(move || {
+            seen.fetch_add(1, Ordering::Relaxed);
+        }));
+        let mut no_retry = None;
+        let mut ctx = AttemptContext::new(&mut no_retry, None, None);
+        ctx.on_sent = Some(&mut cb);
+
+        let response = retry_loop(|| Ok(http_response(200, "ok")), &test_config(), &mut ctx);
+        assert!(response.is_ok());
+        assert_eq!(sent.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn retry_loop_skips_on_sent_on_a_terminal_error() {
+        // A non-retryable 4xx means the provider never accepted the request, so
+        // the request-sent callback must NOT fire.  A 400 is non-retryable, so
+        // no backoff wait is entered (no time-based wait in this unit test).
+        let sent = Arc::new(AtomicU32::new(0));
+        let seen = sent.clone();
+        let mut cb: Option<RequestSentCallback> = Some(Box::new(move || {
+            seen.fetch_add(1, Ordering::Relaxed);
+        }));
+        let mut no_retry = None;
+        let mut ctx = AttemptContext::new(&mut no_retry, None, None);
+        ctx.on_sent = Some(&mut cb);
+
+        let result = retry_loop(
+            || Ok(http_response(400, "bad request")),
+            &test_config(),
+            &mut ctx,
+        );
+        assert!(result.is_err());
+        assert_eq!(sent.load(Ordering::Relaxed), 0);
     }
 
     // ── parse_retry_after_secs (HTTP-date form) ───────────────────────

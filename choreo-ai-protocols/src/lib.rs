@@ -87,7 +87,7 @@ pub use openai::{AllowedCaller, OpenAiClient, RequestFormat, ServiceConfig};
 // registry type is part of this crate's client-construction surface.
 pub use choreo_sockreg::SocketRegistry;
 pub use overrides::ProviderOverrides;
-pub use retry::RetryCallback;
+pub use retry::{RequestSentCallback, RetryCallback};
 pub use shared::{MaxTokensField, ProviderError};
 pub use traits::{ChatTurnRequest, ProviderClient, ToolResultItem};
 pub use types::{

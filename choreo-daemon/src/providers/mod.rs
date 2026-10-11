@@ -896,11 +896,13 @@ pub(crate) mod test_util {
     /// deltas and then returns a fixed final answer, so a test can pin exactly
     /// which `SessionStatus` phases the daemon broadcasts as the stream flows.
     ///
-    /// When `retry_first` is set it fires the request's retry callback before
-    /// any delta — the only point a real provider retries, because the retry
-    /// loop wraps the initial request send, before the response body is read —
-    /// so a test can assert the phase still advances correctly out of the
-    /// `Retrying` status.
+    /// It fires the request-sent callback before any delta (a real provider
+    /// reports the boundary once the response headers are read), and when
+    /// `retry_first` is set it fires the retry callback even before that — the
+    /// only point a real provider retries, because the retry loop wraps the
+    /// initial request send, before the response body is read — so a test can
+    /// assert the phase advances correctly out of the `Retrying` status and
+    /// across the `Waiting` boundary.
     #[derive(Debug)]
     pub(crate) struct ScriptedStreamProviderClient {
         events: Vec<StreamEvent>,
@@ -935,6 +937,12 @@ pub(crate) mod test_util {
                 && let Some(cb) = params.on_retry.as_mut()
             {
                 cb(1, 3, std::time::Duration::from_millis(1));
+            }
+            // The provider accepts the request (headers read) before it streams
+            // any delta, so the request-sent boundary always precedes the
+            // events — matching a real provider call.
+            if let Some(cb) = params.on_sent.as_mut() {
+                cb();
             }
             for event in &self.events {
                 on_event(event.clone())?;

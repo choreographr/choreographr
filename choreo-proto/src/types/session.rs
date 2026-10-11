@@ -206,13 +206,17 @@ pub enum SessionStatus {
     /// Default initial state — session is loaded and ready but not processing.
     #[default]
     Inactive,
-    /// The session has dispatched its request to the provider and is awaiting
-    /// the first response token.  The wait spans connection setup, request
-    /// upload, and provider queueing — the transport performs all three in one
-    /// blocking send, so they are not separable into finer phases.
+    /// The session is dispatching its request to the provider — connection
+    /// setup and request upload — and is awaiting the provider's acceptance
+    /// (its HTTP response headers).
     Sending,
+    /// The provider has accepted the request (headers received) and is now
+    /// producing the first token; the session is awaiting that first streamed
+    /// delta.  This is the model's own cueing/latency, distinct from `Sending`
+    /// (getting the request delivered).
+    Waiting,
     /// The session is streaming the model's reasoning (display-only) tokens.
-    Thinking,
+    Reasoning,
     /// The session is streaming the model's answer tokens.
     Responding,
     /// The session is running a tool call; the string is the tool name.
@@ -232,14 +236,15 @@ pub enum SessionStatus {
 
 impl SessionStatus {
     /// Returns `true` when the session is actively processing (sending,
-    /// thinking, responding, running a tool call, or retrying).  Returns
-    /// `false` for idle states (inactive, sleeping).
+    /// waiting, reasoning, responding, running a tool call, or retrying).
+    /// Returns `false` for idle states (inactive, sleeping).
     #[must_use]
     pub fn is_active(&self) -> bool {
         matches!(
             self,
             SessionStatus::Sending
-                | SessionStatus::Thinking
+                | SessionStatus::Waiting
+                | SessionStatus::Reasoning
                 | SessionStatus::Responding
                 | SessionStatus::ToolCall(_)
                 | SessionStatus::Retrying { .. }
