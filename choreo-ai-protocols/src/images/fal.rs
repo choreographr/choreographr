@@ -304,8 +304,8 @@ impl ImageGenerationClient for FalImageClient {
         // Compact JSON plus an explicit `Content-Length` (see
         // `retry::HookedJsonBody`); no upload hook — image generation has no
         // `Waiting` boundary.
-        let hooked = retry::HookedJsonBody::new(&body, None)
-            .map_err(|e| InferenceError::Io(io::Error::other(e)))?;
+        let hooked = retry::HookedJsonBody::new(&body, None, retry::RequestCompression::Identity)
+            .map_err(InferenceError::Io)?;
         let response = retry::retry_loop_raw(
             || {
                 hooked

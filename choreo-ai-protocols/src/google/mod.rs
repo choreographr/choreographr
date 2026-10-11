@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::SocketRegistry;
 use crate::openai::{ChatImagePart, ChatRequestMessage, ChatToolDefinition};
 use crate::overrides::ProviderOverrides;
+use crate::retry::RequestCompression;
 use crate::types::{
     ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
 };
@@ -65,6 +66,10 @@ pub struct GoogleConfig {
     /// User-Agent for inference requests. The daemon sets
     /// `choreographr/<version>`; `None` keeps ureq's default (tests).
     pub user_agent: Option<String>,
+    /// Whether to gzip the JSON request body before upload (see
+    /// [`RequestCompression`]). Defaults to identity; the daemon sets it from
+    /// the provider catalog's overlay policy.
+    pub request_compression: RequestCompression,
 }
 
 impl Default for GoogleConfig {
@@ -80,6 +85,7 @@ impl Default for GoogleConfig {
             request_timeout_secs: 120,
             total_timeout_secs: 3600,
             user_agent: None,
+            request_compression: RequestCompression::Identity,
         }
     }
 }

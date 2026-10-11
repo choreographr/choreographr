@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::SocketRegistry;
 use crate::openai::{ChatImagePart, ChatRequestMessage, ChatToolDefinition};
 use crate::overrides::ProviderOverrides;
+use crate::retry::RequestCompression;
 use crate::types::{
     ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
 };
@@ -94,6 +95,10 @@ pub struct AnthropicConfig {
     /// `anthropic-beta: extended-cache-ttl-2025-04-11` header) is the future
     /// long-retention path and is not wired in this phase.
     pub prompt_cache: bool,
+    /// Whether to gzip the JSON request body before upload (see
+    /// [`RequestCompression`]). Defaults to identity; the daemon sets it from
+    /// the provider catalog's overlay policy.
+    pub request_compression: RequestCompression,
 }
 
 impl Default for AnthropicConfig {
@@ -113,6 +118,7 @@ impl Default for AnthropicConfig {
             request_timeout_secs: 120,
             total_timeout_secs: 3600,
             prompt_cache: true,
+            request_compression: RequestCompression::Identity,
         }
     }
 }

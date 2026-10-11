@@ -297,7 +297,7 @@ fn hooked_json_body_is_compact_and_matches_the_serialized_bytes() {
     // pretty-print whitespace) — smaller uploads, and the shape a future
     // request-body compressor would consume.
     let value = serde_json::json!({"a": 1, "b": [1, 2]});
-    let body = HookedJsonBody::new(&value, None).expect("serialize");
+    let body = HookedJsonBody::new(&value, None, RequestCompression::Identity).expect("serialize");
     let mut wire = Vec::new();
     body.send_body()
         .into_reader()
@@ -305,6 +305,42 @@ fn hooked_json_body_is_compact_and_matches_the_serialized_bytes() {
         .expect("read the send body");
     assert_eq!(wire, serde_json::to_vec(&value).expect("serialize"));
     assert!(!wire.contains(&b' '), "payload must be compact");
+}
+
+#[test]
+fn hooked_json_body_gzips_and_round_trips_when_requested() {
+    // With gzip requested, the reader yields the compressed stream, which must
+    // gunzip back to exactly the compact JSON a provider would parse.
+    let value = serde_json::json!({"a": 1, "b": [1, 2]});
+    let body = HookedJsonBody::new(&value, None, RequestCompression::Gzip).expect("serialize");
+    assert!(body.is_compressed());
+    let mut wire = Vec::new();
+    body.send_body()
+        .into_reader()
+        .read_to_end(&mut wire)
+        .expect("read the send body");
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(&wire[..])
+        .read_to_end(&mut decoded)
+        .expect("gunzip the send body");
+    assert_eq!(decoded, serde_json::to_vec(&value).expect("serialize"));
+}
+
+#[test]
+fn hooked_json_body_downgrade_falls_back_to_plain() {
+    // A 415 downgrade drops gzip; the reader must then yield the retained plain
+    // bytes (so the provider gets a body it can decode).
+    let value = serde_json::json!({"hello": "world"});
+    let body = HookedJsonBody::new(&value, None, RequestCompression::Gzip).expect("serialize");
+    assert!(body.is_compressed());
+    body.downgrade();
+    assert!(!body.is_compressed());
+    let mut wire = Vec::new();
+    body.send_body()
+        .into_reader()
+        .read_to_end(&mut wire)
+        .expect("read the send body");
+    assert_eq!(wire, serde_json::to_vec(&value).expect("serialize"));
 }
 
 // ── parse_retry_after_secs (HTTP-date form) ───────────────────────

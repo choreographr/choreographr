@@ -154,6 +154,10 @@ impl InferenceProvider {
                     // `build_agent`. One construction point covers all
                     // accounts; tests and other callers keep `None`.
                     user_agent: Some(daemon_user_agent()),
+                    // Gzip the request body when the catalog overlay marks this
+                    // provider as accepting compressed request bodies (identity
+                    // otherwise — the safe default).
+                    request_compression: entry.request_compression,
                     ..Default::default()
                 };
                 config.apply_overrides(&mut svc_config);
@@ -208,6 +212,8 @@ impl InferenceProvider {
                 // gating and metrics see e.g. "opencode-go-anthropic-compatible".
                 anthro_cfg.provider_slug.clone_from(&entry.slug);
                 anthro_cfg.user_agent = Some(daemon_user_agent());
+                // See the OpenAI arm: overlay-driven request-body compression.
+                anthro_cfg.request_compression = entry.request_compression;
                 let overrides = config.provider_overrides();
                 anthro_cfg.apply_overrides(&overrides);
                 let client = AnthropicClient::new(anthro_cfg, key, registry)
@@ -229,6 +235,8 @@ impl InferenceProvider {
                     google_cfg.base_url.clone_from(&entry.base_url);
                 }
                 google_cfg.user_agent = Some(daemon_user_agent());
+                // See the OpenAI arm: overlay-driven request-body compression.
+                google_cfg.request_compression = entry.request_compression;
                 let overrides = config.provider_overrides();
                 google_cfg.apply_overrides(&overrides);
                 let client = GoogleClient::new(google_cfg, key, registry)

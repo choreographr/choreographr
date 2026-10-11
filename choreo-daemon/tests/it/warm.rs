@@ -89,6 +89,7 @@ fn install_short_ttl_catalog() -> CatalogGuard {
             short_secs: Some(13),
             long_secs: None,
         }),
+        request_compression: choreo_ai_protocols::RequestCompression::Identity,
         models: vec![ModelEntry {
             model: MODEL.into(),
             context_window: 128_000,

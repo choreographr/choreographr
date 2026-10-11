@@ -736,7 +736,9 @@ levels, the Responses-API flag, per-model token prices), and a bundled
 **`models-overlay.toml`** policy layer
 supplies everything models.dev can't express — wire-protocol selection,
 endpoint policy, per-model passback exceptions, the prompt-cache TTL policy
-(`prompt_cache_short`/`prompt_cache_long`), and the local/niche providers
+(`prompt_cache_short`/`prompt_cache_long`), request-body compression
+(`request_compression = "gzip"`, opt-in since the server must decompress), and
+the local/niche providers
 models.dev doesn't cover (ollama, kimi-code, custom-*, …). Highlights: OpenAI,
 Anthropic, Google Gemini, Mistral, DeepSeek, xAI Grok, Groq, Together AI,
 OpenRouter, Hugging Face, GitHub Copilot, NVIDIA NIM, Cerebras, Fireworks AI,
@@ -765,7 +767,7 @@ ordering; a missing cache never sends `If-None-Match`). A **user overlay** at
 `$XDG_CONFIG_HOME/choreographr/models-overlay.toml` is merged on top of the
 bundled overlay with the same schema — provider scalars (`protocol`,
 `base_url`, `max_tokens_field`, `default_model`, `display_name`,
-`prompt_cache_short`, `prompt_cache_long`) and per-model
+`prompt_cache_short`, `prompt_cache_long`, `request_compression`) and per-model
 entries (`[provider.<slug>.models."<model>"]` with `context_window`,
 `reasoning_supported`, `reasoning_levels`, `responses`, `reasoning_passback`,
 `prompt_cache_short`, `prompt_cache_long`),

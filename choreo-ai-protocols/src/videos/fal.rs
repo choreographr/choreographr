@@ -448,8 +448,8 @@ impl VideoGenerationClient for FalVideoClient {
         // NO retry: a duplicate submit is a duplicate, billable job.  Compact
         // JSON plus an explicit `Content-Length` (see `retry::HookedJsonBody`);
         // no upload hook — a video submit has no `Waiting` boundary.
-        let hooked = retry::HookedJsonBody::new(&body, None)
-            .map_err(|e| InferenceError::Io(io::Error::other(e)))?;
+        let hooked = retry::HookedJsonBody::new(&body, None, retry::RequestCompression::Identity)
+            .map_err(InferenceError::Io)?;
         let response = hooked
             .apply_headers(self.http.post(&url).header("Authorization", auth.as_str()))
             .send(hooked.send_body())

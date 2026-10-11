@@ -9,11 +9,11 @@
 # snapshot:
 #
 #   1. Provider-level policy for models.dev-covered providers — protocol /
-#      max_tokens_field / base_url / default_model where the hand-curated
-#      TOML catalog set a value that differs from the derived default (the
-#      models.dev `api`, the first models.dev model, or the npm-derived
-#      protocol). The overlay is authoritative for endpoint policy; models.dev
-#      is authoritative for facts.
+#      max_tokens_field / base_url / default_model / request_compression where
+#      the hand-curated TOML catalog set a value that differs from the derived
+#      default (the models.dev `api`, the first models.dev model, or the
+#      npm-derived protocol). The overlay is authoritative for endpoint policy;
+#      models.dev is authoritative for facts.
 #   2. Per-model exceptions — passback pins (Anthropic last-turn-only
 #      models), Responses-API flags models.dev cannot express, and the two
 #      claude-opus-4-1 models the snapshot dropped (carried wholesale from the
@@ -36,6 +36,13 @@
 #   display_name = "…"          # only needed for providers not in the base
 #   prompt_cache_short = 300     # provider default ephemeral tier TTL, seconds
 #   prompt_cache_long = 3600     # provider default extended tier TTL, seconds
+#   request_compression = "gzip"  # gzip | identity (default identity); gzip
+#                                # request bodies for providers whose endpoint
+#                                # accepts Content-Encoding: gzip. Opt-in only:
+#                                # the server must decompress, so leave it off
+#                                # unless support is known. A provider that
+#                                # rejects a gzip body with HTTP 415 is
+#                                # downgraded to identity for the process.
 #
 #   [provider.<slug>.models."<model>"]
 #   context_window = 123456

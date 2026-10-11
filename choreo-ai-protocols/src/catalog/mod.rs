@@ -34,6 +34,7 @@ use tracing::debug;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
+use crate::retry::RequestCompression;
 use crate::shared::MaxTokensField;
 
 mod loader;
@@ -282,6 +283,15 @@ pub struct ProviderEntry {
     /// still takes precedence when present (see [`prompt_cache_ttl`]).
     #[serde(default)]
     pub prompt_cache: Option<PromptCacheTtl>,
+    /// Whether this provider's endpoint accepts a gzip-compressed request body
+    /// (overlay policy; models.dev carries no such fact). Defaults to
+    /// [`RequestCompression::Identity`], so a provider the overlay does not pin
+    /// is sent an uncompressed body — the safe default, since the server must
+    /// decompress. A provider that rejects a compressed body with HTTP 415 is
+    /// downgraded to identity for the process (see the retry layer); this field
+    /// is the static per-provider policy that seeds that decision.
+    #[serde(default)]
+    pub request_compression: RequestCompression,
 }
 
 /// Process-wide catalog of all known providers, backed by an [`ArcSwap`] so a
@@ -394,6 +404,7 @@ pub fn provider_slug_for_model(model: &str) -> Option<String> {
 // `replace_catalog`/`loader`) and are shared via `pub(crate)`.
 pub(crate) mod test_util {
     use super::ProviderEntry;
+    use super::RequestCompression;
     use super::loader;
     use super::replace_catalog;
     use crate::shared::MaxTokensField;
@@ -420,6 +431,7 @@ pub(crate) mod test_util {
             base_url: "https://tiny-test.example/v1".into(),
             default_model: "tiny-model".into(),
             prompt_cache: None,
+            request_compression: RequestCompression::Identity,
             models: vec![crate::catalog::ModelEntry {
                 model: "tiny-model".into(),
                 context_window: 4096,

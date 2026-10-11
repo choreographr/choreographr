@@ -160,8 +160,12 @@ pub(super) fn messages_request(
         crate::shared::opencode_gateway_headers(&config.provider_slug, session_id, request_id)
     });
     // Compact body + headers + upload hook (see `retry::HookedJsonBody`).
-    let hooked = retry::HookedJsonBody::new(&body, on_uploaded).map_err(io::Error::other)?;
-    let response = retry::retry_loop(
+    let compression =
+        retry::effective_request_compression(&config.provider_slug, config.request_compression);
+    let hooked = retry::HookedJsonBody::new(&body, on_uploaded, compression)?;
+    let response = retry::retry_loop_with_compression(
+        &hooked,
+        &config.provider_slug,
         || {
             let mut request = hooked.apply_headers(
                 agent
@@ -268,8 +272,12 @@ where
         crate::shared::opencode_gateway_headers(&config.provider_slug, session_id, request_id)
     });
     // Compact body + headers + upload hook (see `retry::HookedJsonBody`).
-    let hooked = retry::HookedJsonBody::new(&body, on_uploaded).map_err(io::Error::other)?;
-    let response = retry::retry_loop(
+    let compression =
+        retry::effective_request_compression(&config.provider_slug, config.request_compression);
+    let hooked = retry::HookedJsonBody::new(&body, on_uploaded, compression)?;
+    let response = retry::retry_loop_with_compression(
+        &hooked,
+        &config.provider_slug,
         || {
             let mut request = hooked.apply_headers(
                 agent

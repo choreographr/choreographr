@@ -590,8 +590,8 @@ The catalog is a two-layer pipeline in `choreo-ai-protocols/src/catalog/`: a
 URLs, and per-model context/reasoning/cost data), and a **bundled policy
 overlay** (`catalog/models-overlay.toml`) supplies everything models.dev cannot
 express (wire-protocol selection, endpoint and default-model policy, per-model
-passback exceptions, the prompt-cache TTL tiers, and the wholesale overlay-only
-providers models.dev does not cover). The overlay is merged **at load time**,
+passback exceptions, the prompt-cache TTL tiers, the request-body-compression
+opt-in, and the wholesale overlay-only providers models.dev does not cover). The overlay is merged **at load time**,
 never baked into the committed blob `catalog/catalog.bin`, so the runtime
 refresh (S4) can re-merge the same base with a user overlay. The pipeline, the
 per-model normalization, the exact overlay schema, and the merge precedence
@@ -600,6 +600,30 @@ fields onto the base; unknown keys warn and are skipped rather than failing the
 daemon) are documented in-source (the `catalog` module and
 `catalog/models-overlay.toml`), held complete by the `#![warn(missing_docs)]` +
 `doc-check` gate.
+
+### Request-body compression
+
+Every LLM turn re-sends the whole conversation plus the tool schemas as JSON,
+so the request body is the cheapest thing to shrink. A provider whose endpoint
+accepts a gzip-compressed request body can be opted in with
+`request_compression = "gzip"` on its `[provider.<slug>]` overlay entry
+(default is `identity`): models.dev carries no encoding fact and the server must
+decompress, so compression is **opt-in policy**, and a provider the overlay does
+not pin is sent an uncompressed body.
+
+The compression is applied once, in `choreo-ai-protocols`'s
+`retry::HookedJsonBody` (after the compact-JSON serialize, alongside the
+retained plain bytes), so every retry attempt reuses the compressed
+`Arc<[u8]>` and the upload-complete hook — the v9 `Waiting` boundary, see the
+wire-protocol section — still fires on the last compressed byte: both the
+dispatch/upload boundary and the length-delimited send are unchanged. The
+coding is gzip only, the subset of the response codings ureq already
+handles (`gzip`/`br`) that providers accept on requests universally, and it
+reuses the same `flate2` pure-Rust backend ureq enables. A provider that
+answers a compressed request with `415 Unsupported Media Type` is downgraded to
+identity in place and retried once uncompressed
+(`retry::retry_loop_with_compression`); the downgrade is then remembered per
+provider for the process, so later requests skip compression entirely.
 
 ### Runtime catalog refresh (S4)
 

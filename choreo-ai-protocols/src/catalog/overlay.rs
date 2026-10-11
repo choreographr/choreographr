@@ -49,6 +49,7 @@
 use tracing::{debug, trace, warn};
 
 use super::{ModelEntry, ProviderEntry, ProviderProtocol, ReasoningPassback};
+use crate::retry::RequestCompression;
 use crate::shared::MaxTokensField;
 
 /// Merge an overlay TOML document over a base catalog, returning a new
@@ -99,6 +100,7 @@ pub fn merge_overlay(base: &[ProviderEntry], overlay_src: &str) -> Vec<ProviderE
                 default_model: String::new(),
                 models: Vec::new(),
                 prompt_cache: None,
+                request_compression: RequestCompression::Identity,
             };
             apply_provider_overlay(&mut entry, table, &mut models_touched);
             merged.push(entry);
@@ -182,6 +184,18 @@ fn apply_provider_overlay(
                 }
             }
             "models" => apply_models_overlay(entry, value, models_touched),
+            // Request-body compression: provider policy models.dev cannot
+            // express (it carries no encoding facts). `identity` (or any
+            // unrecognized value) leaves the body uncompressed, the safe
+            // default since the server must decompress.
+            "request_compression" => match value.as_str() {
+                Some("gzip") => entry.request_compression = RequestCompression::Gzip,
+                Some("identity") => entry.request_compression = RequestCompression::Identity,
+                _ => warn!(
+                    slug = %entry.slug,
+                    "overlay: request_compression must be \"gzip\" or \"identity\"; skipping",
+                ),
+            },
             other => warn!(
                 slug = %entry.slug,
                 key = other,
@@ -470,6 +484,7 @@ mod tests {
                 base_url: "https://api.acme.dev/v1".into(),
                 default_model: "acme-base".into(),
                 prompt_cache: None,
+                request_compression: RequestCompression::Identity,
                 models: vec![
                     ModelEntry {
                         model: "acme-base".into(),
@@ -493,6 +508,7 @@ mod tests {
                 base_url: "https://api.zoocorp.dev".into(),
                 default_model: "zoo-1".into(),
                 prompt_cache: None,
+                request_compression: RequestCompression::Identity,
                 models: vec![ModelEntry {
                     model: "zoo-1".into(),
                     context_window: 200_000,
@@ -894,5 +910,31 @@ prompt_cache_long = true
             .find(|m| m.model == "acme-base")
             .expect("acme-base");
         assert!(base_model.prompt_cache.is_none());
+    }
+
+    #[test]
+    fn overlay_sets_request_compression_and_rejects_unknown_values() {
+        // `gzip` opts the provider into compressed request bodies.
+        let merged = merge_overlay(
+            &base(),
+            r#"
+[provider.acme]
+request_compression = "gzip"
+"#,
+        );
+        let acme = merged.iter().find(|e| e.slug == "acme").expect("acme");
+        assert_eq!(acme.request_compression, RequestCompression::Gzip);
+
+        // An unknown coding is warned-and-skipped, leaving the safe identity
+        // default (the server must decompress, so never guess a coding).
+        let merged = merge_overlay(
+            &base(),
+            r#"
+[provider.acme]
+request_compression = "zstd"
+"#,
+        );
+        let acme = merged.iter().find(|e| e.slug == "acme").expect("acme");
+        assert_eq!(acme.request_compression, RequestCompression::Identity);
     }
 }

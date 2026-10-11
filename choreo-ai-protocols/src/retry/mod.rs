@@ -24,6 +24,59 @@ use error::{extract_error_message, status_to_error};
 
 pub use error::ProviderHttpError;
 pub(crate) use send_body::HookedJsonBody;
+pub use send_body::RequestCompression;
+
+/// Provider slugs whose endpoint answered a gzip request body with HTTP 415 in
+/// this process, i.e. do not decompress compressed request bodies.
+///
+/// [`effective_request_compression`] consults this before compressing, and
+/// [`retry_loop_with_compression`] inserts into it on a 415, so one rejected
+/// request permanently (for the process) downgrades that provider to identity —
+/// retrying a body the server cannot decode can only waste attempts.  Logging-
+/// plus-dedup bookkeeping, not cross-thread communication (it carries no
+/// protocol data); the mutex is cold (touched only on a 415) and follows
+/// AGENTS.md's poisoned-lock recovery, with a lost entry an acceptable failure
+/// mode for a downgrade hint.
+static COMPRESSION_DOWNGRADED: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// The request compression to actually use for `slug`: `configured`, unless
+/// this process has already learned from a 415 that `slug` does not accept
+/// compressed request bodies.
+#[must_use]
+pub(crate) fn effective_request_compression(
+    slug: &str,
+    configured: RequestCompression,
+) -> RequestCompression {
+    if configured == RequestCompression::Identity {
+        return RequestCompression::Identity;
+    }
+    let downgraded = COMPRESSION_DOWNGRADED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(slug);
+    if downgraded {
+        RequestCompression::Identity
+    } else {
+        configured
+    }
+}
+
+/// Record that `slug` rejected a compressed request body, so future requests
+/// skip compression.  Warns once per slug.
+fn note_request_compression_downgraded(slug: &str) {
+    let fresh = COMPRESSION_DOWNGRADED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(slug.to_string());
+    if fresh {
+        tracing::warn!(
+            provider = %slug,
+            "provider rejected gzip request compression (HTTP 415); \
+             sending uncompressed bodies for the rest of this process",
+        );
+    }
+}
 
 /// Raw `(initial_backoff_ms, max_backoff_ms)` pairs [`RetryConfig::new`] has
 /// already warned about in this process.
@@ -479,6 +532,46 @@ where
     F: Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
 {
     retry_loop_impl(send_request, retry, ctx, Terminal::ConsumeIntoError)
+}
+
+/// Like [`retry_loop`], but tolerant of a provider that rejects a compressed
+/// request body with HTTP 415 `Unsupported Media Type`: on that status the body
+/// is downgraded to identity in place, the provider is remembered as
+/// identity-only for the process (see [`effective_request_compression`]), and
+/// the request is sent once more uncompressed under the *same* retry budget.
+///
+/// The downgrade is handled here rather than in [`retry_loop`]'s decision logic
+/// because 415 is not a retryable status (resending the same compressed bytes
+/// would fail identically); only switching the body encoding can succeed.  A
+/// body already identity, or one that was already downgraded, falls straight
+/// through to [`retry_loop`] and a second 415 is terminal.
+///
+/// # Errors
+///
+/// Same as [`retry_loop`].
+pub(crate) fn retry_loop_with_compression<F>(
+    body: &HookedJsonBody,
+    slug: &str,
+    send_request: F,
+    retry: &RetryConfig,
+    ctx: &mut AttemptContext,
+) -> Result<ureq::http::Response<ureq::Body>, ProviderHttpError>
+where
+    F: Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+{
+    let result = retry_loop(&send_request, retry, ctx);
+    if let Err(ProviderHttpError::ClientError { status: 415, .. }) = &result
+        && body.is_compressed()
+    {
+        body.downgrade();
+        note_request_compression_downgraded(slug);
+        tracing::warn!(
+            provider = %slug,
+            "retrying request with an uncompressed body after HTTP 415",
+        );
+        return retry_loop(&send_request, retry, ctx);
+    }
+    result
 }
 
 /// Like [`retry_loop`], but a terminal (non-2xx, non-retryable or

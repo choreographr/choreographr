@@ -5,8 +5,6 @@ pub use crate::retry::{RequestUploadedCallback, RetryCallback, RetryConfig};
 use super::{OpenAiError, ServiceConfig};
 use crate::retry;
 
-use std::io;
-
 pub(crate) fn retry_config_from_config(config: &ServiceConfig) -> RetryConfig {
     RetryConfig::new(
         config.retry_max_attempts,
@@ -61,15 +59,19 @@ pub(crate) fn retry_send(
         crate::shared::opencode_gateway_headers(&config.provider_slug, session_id, request_id)
     });
     // Serialize once and shape the send: a compact body plus the
-    // `Content-Type`/`Content-Length` headers and the upload hook (see
+    // `Content-Type`/`Content-Length` headers (and `Content-Encoding` when the
+    // provider opts into request compression) and the upload hook (see
     // `retry::HookedJsonBody`).
-    let hooked = crate::retry::HookedJsonBody::new(body, on_uploaded)
-        .map_err(|e| OpenAiError::Io(io::Error::other(e)))?;
+    let compression =
+        retry::effective_request_compression(&config.provider_slug, config.request_compression);
+    let hooked = crate::retry::HookedJsonBody::new(body, on_uploaded, compression)?;
     // The closure captures `auth_header`, `headers`, and `hooked` by reference
     // (it stays `Fn`); each attempt shares the payload (`Arc<[u8]>`) and clones
     // the `Arc` upload hook. The Zeroizing wrapper ensures the temporary
     // `Bearer …` string is wiped when it goes out of scope.
-    retry::retry_loop(
+    retry::retry_loop_with_compression(
+        &hooked,
+        &config.provider_slug,
         || {
             let mut request = hooked.apply_headers(
                 agent

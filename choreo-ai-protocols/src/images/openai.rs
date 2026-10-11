@@ -178,8 +178,12 @@ impl ImageGenerationClient for OpenAiImageClient {
         // Serialize once to compact JSON with an explicit `Content-Length`
         // (see `retry::HookedJsonBody`); every attempt reuses the shared bytes.
         // No upload hook — image generation has no `Waiting` boundary.
-        let hooked = retry::HookedJsonBody::new(&WireBody { req, n: 1 }, None)
-            .map_err(|e| InferenceError::Io(io::Error::other(e)))?;
+        let hooked = retry::HookedJsonBody::new(
+            &WireBody { req, n: 1 },
+            None,
+            retry::RequestCompression::Identity,
+        )
+        .map_err(InferenceError::Io)?;
         let response = retry::retry_loop(
             || {
                 hooked

@@ -2808,6 +2808,7 @@ dependencies = [
  "choreo-sockreg",
  "chrono",
  "crossbeam-channel",
+ "flate2",
  "indexmap 2.14.2",
  "itertools 0.15.0",
  "postcard",

@@ -728,6 +728,7 @@ mod tests {
                 base_url: "https://api.acme.dev/v1".into(),
                 default_model: "acme-1".into(),
                 prompt_cache: None,
+                request_compression: choreo_ai_protocols::RequestCompression::Identity,
                 models: vec![ModelEntry {
                     model: "acme-1".into(),
                     context_window: 8192,
@@ -744,6 +745,7 @@ mod tests {
                 base_url: "https://api.zoocorp.dev".into(),
                 default_model: "zoo-1".into(),
                 prompt_cache: None,
+                request_compression: choreo_ai_protocols::RequestCompression::Identity,
                 models: Vec::new(),
             },
         ]

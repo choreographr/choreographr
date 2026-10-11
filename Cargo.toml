@@ -498,6 +498,14 @@ postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 # levels 1–22 map to C zstd numbering (COMPRESSION_LEVEL=6 keeps the tuned
 # speed/ratio trade-off). Apache-2.0, matching the workspace license.
 structured-zstd = "0.0.58"
+# gzip for outbound LLM request bodies (see choreo-ai-protocols/src/retry/
+# send_body.rs). Used to compress the JSON body before upload when a provider
+# opts in via the catalog overlay. Default features select the pure-Rust
+# `rust_backend` (miniz_oxide) — no C toolchain, which the RISC-V/mips/Termux
+# targets require — and match what `ureq` already enables for its response
+# decompression, so flate2's single-backend invariant (exactly one backend
+# active across the graph) holds.
+flate2 = "1"
 # Atomic lock-free snapshot swap for process-wide state with a single writer
 # (the provider catalog in choreo-ai-protocols, the client ACL in
 # choreo-daemon — both read from many threads and swapped only from the

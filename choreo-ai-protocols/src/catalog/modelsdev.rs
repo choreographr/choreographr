@@ -25,6 +25,7 @@ use indexmap::IndexMap;
 use serde::Deserialize;
 
 use super::{ModelCost, ModelEntry, ProviderEntry, ProviderProtocol};
+use crate::retry::RequestCompression;
 use crate::shared::MaxTokensField;
 
 /// One provider as recorded by the models.dev snapshot.
@@ -287,6 +288,10 @@ fn normalize_provider(slug: String, raw: RawProvider) -> ProviderEntry {
         // Provider-level prompt-cache TTL is overlay policy, never a base
         // fact.
         prompt_cache: None,
+        // Request compression is overlay policy, never a base fact — models.dev
+        // carries nothing about request encodings, so every provider starts on
+        // the identity default.
+        request_compression: RequestCompression::Identity,
     }
 }
 
