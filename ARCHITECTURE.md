@@ -632,6 +632,15 @@ a shared lock on each request of a compression-opted-in provider (the identity
 default skips the lookup) and written once per provider on a 415, so it carries
 no protocol data and readers never contend.
 
+The downgrade triggers on `415` only, the spec-correct signal for an
+unsupported request coding: `400` is deliberately not treated as an encoding
+rejection, because it is also the status for a genuinely malformed request
+(bad JSON, unknown model, schema violation) that re-sending uncompressed cannot
+fix, and the retry layer never inspects the response body to disambiguate. A
+provider — or a gateway in front of one — that answers `400` for an unsupported
+`Content-Encoding` therefore keeps failing until its `request_compression` is
+removed by hand.
+
 ### Runtime catalog refresh (S4)
 
 The compiled-in catalog is only the *fallback*: at runtime the daemon layers a

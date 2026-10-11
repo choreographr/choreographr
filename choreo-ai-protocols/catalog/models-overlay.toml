@@ -43,7 +43,10 @@
 #                                # leave it off unless support is known. A
 #                                # provider that rejects a compressed body with
 #                                # HTTP 415 is downgraded to identity for the
-#                                # process.
+#                                # process; the downgrade triggers on 415 only,
+#                                # so a provider that rejects the encoding with
+#                                # another 4xx (e.g. a gateway answering 400)
+#                                # must be un-opted by hand.
 #
 #   [provider.<slug>.models."<model>"]
 #   context_window = 123456
