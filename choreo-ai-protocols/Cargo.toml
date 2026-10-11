@@ -41,8 +41,8 @@ choreo-sockreg = { workspace = true, features = ["ureq"] }
 # IMF-fixdate form the spec requires servers to send.
 chrono.workspace = true
 crossbeam-channel.workspace = true
-# gzip for outbound request bodies (see `retry/send_body.rs`): the JSON body is
-# compressed before upload when a provider opts in via the catalog overlay.
+# gzip for outbound request bodies (see `retry/compression.rs`): the JSON body
+# is compressed before upload when a provider opts in via the catalog overlay.
 # Default features = the pure-Rust `rust_backend` (miniz_oxide), matching what
 # `ureq` already enables so flate2 keeps a single active backend.
 flate2.workspace = true
@@ -104,11 +104,6 @@ test-utils = []
 # Enable the `test-utils` feature when building tests/examples/benchmarks for
 # this package (a package may depend on itself in dev-dependencies).
 choreo-ai-protocols = { path = ".", features = ["test-utils"] }
-# Gunzip an outbound compressed request body in the upload-path wire tests to
-# prove it round-trips to the JSON a provider would parse.
-flate2.workspace = true
-# zstd-decode an outbound compressed request body in the upload-path wire tests.
-structured-zstd.workspace = true
 # Serialize the catalog unit tests that read/mutate the `PROVIDER_CATALOG`
 # process global (the `replace_catalog` swap tests + direct catalog readers),
 # so they stay deterministic when the libtest runner shares one process.

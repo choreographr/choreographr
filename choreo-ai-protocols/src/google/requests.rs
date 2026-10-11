@@ -137,11 +137,12 @@ pub(super) fn generate_content_request(
     // provider reports the same `Waiting` boundary as the streaming path.
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, None);
     // Compact body + headers + upload hook (see `retry::HookedJsonBody`).
-    let compression = retry::effective_request_compression("google", config.request_compression);
+    let compression =
+        retry::effective_request_compression(&config.provider_slug, config.request_compression);
     let hooked = retry::HookedJsonBody::new(&body, on_uploaded, compression)?;
     let response = retry::retry_loop_with_compression(
         &hooked,
-        "google",
+        &config.provider_slug,
         || {
             hooked
                 .apply_headers(agent.post(&url).header("x-goog-api-key", api_key.trim()))
@@ -230,11 +231,12 @@ where
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));
     // Compact body + headers + upload hook (see `retry::HookedJsonBody`).
-    let compression = retry::effective_request_compression("google", config.request_compression);
+    let compression =
+        retry::effective_request_compression(&config.provider_slug, config.request_compression);
     let hooked = retry::HookedJsonBody::new(&body, on_uploaded, compression)?;
     let response = retry::retry_loop_with_compression(
         &hooked,
-        "google",
+        &config.provider_slug,
         || {
             hooked
                 .apply_headers(agent.post(&url).header("x-goog-api-key", api_key.trim()))

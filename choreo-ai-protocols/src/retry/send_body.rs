@@ -90,8 +90,12 @@ impl HookedJsonBody {
         let plain_len = plain.len().to_string();
         let compressed = match compression {
             RequestCompression::Identity => None,
-            RequestCompression::Gzip => Some(CompressedBody::new(gzip_compress(&plain)?, "gzip")),
-            RequestCompression::Zstd => Some(CompressedBody::new(zstd_compress(&plain), "zstd")),
+            RequestCompression::Gzip => {
+                Some(CompressedBody::new(gzip_compress(&plain)?, compression))
+            }
+            RequestCompression::Zstd => {
+                Some(CompressedBody::new(zstd_compress(&plain), compression))
+            }
         };
         let use_compression = Cell::new(compressed.is_some());
         Ok(Self {
@@ -115,9 +119,16 @@ impl HookedJsonBody {
         let request = request.header("Content-Type", JSON_CONTENT_TYPE);
         match self.active() {
             Active::Plain => request.header("Content-Length", self.plain_len.as_str()),
-            Active::Compressed(c) => request
-                .header("Content-Encoding", c.encoding)
-                .header("Content-Length", c.len.as_str()),
+            // A compressed body is never `Identity`, so the coding's token is
+            // always present; derive it from the coding rather than storing a
+            // second copy (see `RequestCompression::content_encoding`).
+            Active::Compressed(c) => {
+                let request = request.header("Content-Length", c.len.as_str());
+                match c.coding.content_encoding() {
+                    Some(encoding) => request.header("Content-Encoding", encoding),
+                    None => request,
+                }
+            }
         }
     }
 

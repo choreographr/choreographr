@@ -236,6 +236,9 @@ impl InferenceProvider {
                 }
                 google_cfg.user_agent = Some(daemon_user_agent());
                 // See the OpenAI arm: overlay-driven request-body compression.
+                // The catalog slug keys the compression downgrade registry so a
+                // gateway provider keeps its own state.
+                google_cfg.provider_slug.clone_from(&entry.slug);
                 google_cfg.request_compression = entry.request_compression;
                 let overrides = config.provider_overrides();
                 google_cfg.apply_overrides(&overrides);

@@ -66,6 +66,15 @@ pub struct GoogleConfig {
     /// User-Agent for inference requests. The daemon sets
     /// `choreographr/<version>`; `None` keeps ureq's default (tests).
     pub user_agent: Option<String>,
+    /// Catalog provider slug, used to key the process-wide request-compression
+    /// downgrade registry (see [`RequestCompression`]): a provider that rejects
+    /// a compressed body with HTTP 415 is remembered under this slug so later
+    /// requests skip compression. Defaults to `"google"`; the daemon sets it
+    /// from the catalog entry, so a gateway provider sharing the Google
+    /// protocol keeps its own downgrade state. Deliberately separate from
+    /// [`GoogleClient::provider_slug`], which reports the fixed `"google"`
+    /// wire protocol for metrics and reasoning-capability gating.
+    pub provider_slug: String,
     /// Whether to gzip the JSON request body before upload (see
     /// [`RequestCompression`]). Defaults to identity; the daemon sets it from
     /// the provider catalog's overlay policy.
@@ -85,6 +94,7 @@ impl Default for GoogleConfig {
             request_timeout_secs: 120,
             total_timeout_secs: 3600,
             user_agent: None,
+            provider_slug: "google".to_string(),
             request_compression: RequestCompression::Identity,
         }
     }

@@ -496,9 +496,13 @@ where
 /// because 415 is not a retryable status (resending the same compressed bytes
 /// would fail identically); only switching the body encoding can succeed.  A
 /// body already identity, or one that was already downgraded, falls straight
-/// through to [`retry_loop`] and a second 415 is terminal.  A 415 fails fast —
-/// the first [`retry_loop`] makes a single attempt — so the uncompressed resend
-/// runs with a fresh retry budget, not the remains of a burned one.
+/// through to [`retry_loop`] and a second 415 is terminal.  The uncompressed
+/// resend is a fresh [`retry_loop`] call, so it draws the full retry budget
+/// again rather than the remains of the first loop's: the two loops do not
+/// share one `max_attempts`, and a request whose earlier attempts burned budget
+/// on a retryable status before answering 415 still gets the whole budget for
+/// the uncompressed send (a first-attempt 415 spends a single send before the
+/// resend).
 ///
 /// # Errors
 ///

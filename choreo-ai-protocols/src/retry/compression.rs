@@ -63,27 +63,43 @@ impl RequestCompression {
             _ => None,
         }
     }
+
+    /// The `Content-Encoding` token this coding is sent under, or `None` for
+    /// [`Self::Identity`] (which sends no `Content-Encoding` header).  The
+    /// single source of truth for the wire token, so the coding, its codec, and
+    /// its label cannot drift apart.
+    #[must_use]
+    pub(super) fn content_encoding(self) -> Option<&'static str> {
+        match self {
+            Self::Identity => None,
+            Self::Gzip => Some("gzip"),
+            Self::Zstd => Some("zstd"),
+        }
+    }
 }
 
 /// A compressed request body: its bytes, its rendered `Content-Length`, and the
-/// `Content-Encoding` token it is sent under.  Owned here so
-/// [`super::send_body::HookedJsonBody`] can carry either coding behind one field
-/// and pair the length/encoding with the bytes it will actually read.
+/// coding it carries (from which the `Content-Encoding` token is derived).
+/// Owned here so [`super::send_body::HookedJsonBody`] can carry either coding
+/// behind one field and pair the length/encoding with the bytes it will
+/// actually read.
 pub(super) struct CompressedBody {
     pub(super) bytes: Arc<[u8]>,
     pub(super) len: String,
-    pub(super) encoding: &'static str,
+    /// The coding these bytes carry; [`RequestCompression::content_encoding`]
+    /// derives the `Content-Encoding` token from it.
+    pub(super) coding: RequestCompression,
 }
 
 impl CompressedBody {
-    /// Wrap compressed `bytes` and its `Content-Encoding` token, rendering the
-    /// length once.
-    pub(super) fn new(bytes: Vec<u8>, encoding: &'static str) -> Self {
+    /// Wrap compressed `bytes` together with the `coding` they were produced
+    /// by, rendering the length once.
+    pub(super) fn new(bytes: Vec<u8>, coding: RequestCompression) -> Self {
         let len = bytes.len().to_string();
         Self {
             bytes: bytes.into(),
             len,
-            encoding,
+            coding,
         }
     }
 }
