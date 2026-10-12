@@ -4,7 +4,7 @@
 //!
 //! The concern modules hold the pieces a session thread operates on:
 //! [`command`] the `SessionCommand` channel message and the request-pipeline
-//! context, [`config`] the persistent config / worker snapshot / metadata
+//! context, [`types`] the persistent config / worker snapshot / metadata
 //! types with their persistence conversions, and [`state`] the live
 //! `SessionState` with its per-request and per-subscriber substructures.
 //! `handlers` dispatches each `SessionCommand`, `tokens` does token
@@ -425,10 +425,10 @@ pub fn session_main(
 }
 
 mod command;
-mod config;
 mod handlers;
 mod state;
 mod tokens;
+mod types;
 mod worker;
 
 use handlers::process_command;
@@ -440,9 +440,9 @@ use worker::persist_and_exit;
 // (daemon.rs, requests.rs, lib.rs) name them through the same path, so the
 // re-exports preserve the pre-split module surface exactly.
 pub use command::{ChildResult, RequestContext, SessionCommand};
-pub use config::{SessionConfig, SessionMetadata, SessionSnapshot};
 pub(crate) use state::{ActiveRequest, turn_for_client};
 pub use state::{ActiveSessionEntry, AssistantResponse, SessionState};
+pub use types::{SessionConfig, SessionMetadata, SessionSnapshot};
 
 #[cfg(test)]
 mod tests;

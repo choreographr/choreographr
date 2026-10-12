@@ -168,7 +168,8 @@ impl DaemonState {
     ///
     /// This is the choke point that fixes stale statuses on the sessions page:
     /// the session thread broadcasts status changes (see `handle_status_changed`
-    /// in sessions.rs) but never updates the daemon's `session_metadata` index,
+    /// in `sessions/handlers/subscriptions.rs`) but never updates the daemon's
+    /// `session_metadata` index,
     /// so a subsequent `ListSessions` would serve an outdated status.  Updating
     /// the index here covers every status-transition path.
     ///

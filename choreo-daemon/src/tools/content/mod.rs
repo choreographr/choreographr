@@ -11,7 +11,7 @@
 //! The write tools need a signing [`ChainAccount`], built from the daemon's
 //! single Substrate credential. That credential travels through the `Tool`
 //! trait's `x_credentials` slot (see the `// TEMPORARY:` notes in
-//! `requests.rs`/`sessions.rs` — this single-slot reuse is a stopgap until a
+//! `requests.rs`/`sessions/command.rs` — this single-slot reuse is a stopgap until a
 //! proper tool→keystore credential-access system replaces it). Every write
 //! tool's `execute` builds the account from that credential and errors with a
 //! [`ToolExecError`] when no Substrate credential is present. The read tools

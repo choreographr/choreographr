@@ -230,10 +230,11 @@ impl SessionConfig {
     /// that the worker snapshot wouldn't know about.
     ///
     /// This is an allowlist — only fields the worker actually owns
-    /// (accumulated usage, context window, last prompt tokens) are
-    /// copied from the snapshot.  All other configuration (title,
-    /// account, model, working dir, etc.) is preserved so that
-    /// mid-request mutations are not silently clobbered.
+    /// (accumulated usage, context window, last prompt tokens, and the
+    /// `last_response_id` chain with its producer) are copied from the
+    /// snapshot.  All other configuration (title, account, model, working
+    /// dir, etc.) is preserved so that mid-request mutations are not
+    /// silently clobbered.
     pub(in crate::sessions) fn apply_worker_snapshot(&mut self, snapshot: &SessionConfig) {
         self.accumulated_usage = snapshot.accumulated_usage;
         self.context_window = snapshot.context_window;

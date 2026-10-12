@@ -20,7 +20,7 @@ sends it over the existing `AddCredential` path.
 **Temporary credential plumbing**: the content write tools currently receive the
 daemon's single Substrate credential through the `Tool` trait's one
 `x_credentials` slot (see `// TEMPORARY` comments in `requests.rs` and
-`sessions.rs`). This single-slot reuse is a stopgap until a proper
+`sessions/command.rs`). This single-slot reuse is a stopgap until a proper
 tool→keystore credential-access system replaces it; do not rely on it
 remaining as the permanent mechanism.
 
