@@ -1624,7 +1624,7 @@ the one place that consults the exception-#1 shutdown flag, on a bounded (1 s)
 
 ### Image flow (tool-triggered)
 
-An image a tool produces (a `display_image`/`generate_image` call, a
+An image a tool produces (a `display_image`/`generate_image`/`edit_image` call, a
 `retrieve_webpage` screenshot, an MCP image block) is delivered to subscribers
 out-of-band — a tool can emit several, so an image cannot ride the `ToolOutput`
 value — and is persisted to `session_attachments` at emit time, so a client's

@@ -195,6 +195,29 @@ pub fn image_models_for_provider(provider_slug: &str) -> Vec<String> {
         })
 }
 
+/// Return the model IDs on the given provider that can *edit* an input image
+/// (`supports_image_edit == true`), in the catalog's natural order. Unknown
+/// providers yield an empty list.
+///
+/// Mirror of [`image_models_for_provider`] over the edit flag; the edit tool
+/// uses it as its candidate set, so an un-pinned provider resolves to an empty
+/// list and the tool fails closed (rather than offering a generation model
+/// that has no edit endpoint).
+#[must_use]
+pub fn image_edit_models_for_provider(provider_slug: &str) -> Vec<String> {
+    let catalog = PROVIDER_CATALOG.load();
+    catalog
+        .iter()
+        .find(|e| e.slug == provider_slug)
+        .map_or_default(|e| {
+            e.models
+                .iter()
+                .filter(|m| m.supports_image_edit)
+                .map(|m| m.model.clone())
+                .collect()
+        })
+}
+
 /// Whether the model requires `reasoning_content` to be present on every
 /// assistant message (e.g. DeepSeek/GLM 5.x chat completions). Purely
 /// data-driven now: the ingested models.dev fact (`interleaved.field ==
@@ -948,6 +971,63 @@ mod tests {
             image_models_for_provider("no-such-provider"),
             [] as [String; 0]
         );
+    }
+
+    #[test]
+    fn image_edit_models_for_provider_lists_flagged_models_in_catalog_order() {
+        let _restore = RestoreBundledOnDrop;
+        // Only entries with the edit flag are listed, in insertion order —
+        // mirroring `image_models_for_provider` over the edit flag.
+        crate::catalog::replace_catalog({
+            let mut c = tiny_catalog();
+            let flagged = |id: &str| crate::catalog::ModelEntry {
+                model: id.to_string(),
+                supports_image_edit: true,
+                ..Default::default()
+            };
+            c[0].models = vec![
+                flagged("edit-a"),
+                crate::catalog::ModelEntry::default(), // unflagged
+                flagged("edit-b"),
+            ];
+            c
+        });
+        assert_eq!(
+            image_edit_models_for_provider("tiny-test"),
+            vec!["edit-a".to_string(), "edit-b".to_string()]
+        );
+        // Unknown provider → empty, never an error.
+        assert_eq!(
+            image_edit_models_for_provider("no-such-provider"),
+            [] as [String; 0]
+        );
+    }
+
+    #[test]
+    fn bundled_overlay_lists_edit_models_for_openai_and_fal() {
+        // Read-only against the REAL bundled catalog: the edit flag is
+        // overlay-only (models.dev has no edit modality), so these assertions
+        // pin the bundled overlay plumbing end to end. OpenAI gpt-image models
+        // and the wholesale fal provider both carry it.
+        assert!(
+            image_edit_models_for_provider("openai")
+                .iter()
+                .any(|m| m == "gpt-image-1")
+        );
+        assert!(
+            image_edit_models_for_provider("fal")
+                .iter()
+                .any(|m| m == "fal-ai/flux-2-pro")
+        );
+        // fal sets BOTH flags — the same models serve generation and editing.
+        assert!(
+            image_models_for_provider("fal")
+                .iter()
+                .any(|m| m == "fal-ai/flux-2-pro")
+        );
+        // An image-output provider with no edit pins (glm-image) resolves to an
+        // empty edit list — generation and editing are independent facts.
+        assert_eq!(image_edit_models_for_provider("zai"), [] as [String; 0]);
     }
 
     #[test]

@@ -190,6 +190,20 @@
   base_url = "https://api.openai.com/v1"
   default_model = "gpt-5.4"
 
+# gpt-image family: image editing (image-to-image). models.dev records the
+# image-OUTPUT modality for these models but has no "edit" modality, so the
+# edit capability is pinned here (overlay-only — never ingested, never
+# name-guessed). The OpenAI `/images/edits` endpoint accepts each of these; the
+# edit tool reads the flag via image_edit_models_for_provider("openai").
+[provider.openai.models."gpt-image-1"]
+  supports_image_edit = true
+[provider.openai.models."gpt-image-1-mini"]
+  supports_image_edit = true
+[provider.openai.models."gpt-image-1.5"]
+  supports_image_edit = true
+[provider.openai.models."gpt-image-2"]
+  supports_image_edit = true
+
 # opencode-go -> opencode-go (policy from the pre-models.dev TOML)
 [provider.opencode-go]
   max_tokens_field = "max_tokens"
@@ -339,6 +353,41 @@
 # image family, same endpoint shape (/api/paas/v4/images/generations).
 [provider.zhipuai.models."glm-image"]
   supports_image_output = true
+
+# fal.ai: image generation + editing (image-to-image). models.dev does not
+# cover fal at all, so the provider is defined WHOLESALE here (merge_overlay
+# adds a slug absent from the base). fal has no chat API — the provider exists
+# only to route the image tools to the dedicated FalImageClient (see
+# images::is_fal_image_provider_slug); the OpenAI protocol default is inert for
+# an image-only backend.
+#
+# Endpoint convention (images::FalImageClient): generation POSTs
+# `{base}/{model}` and editing POSTs `{base}/{model}/edit`, so each model id
+# below is the *generation* id and the adapter appends `/edit` (an id never
+# carries the suffix itself). Every listed model exposes a real `.../edit`
+# endpoint taking `image_urls` (which accepts data URIs) — verified against the
+# fal OpenAPI schema — and flux-2-pro is the default. Both flags are set: the
+# same model serves generation and editing on this provider.
+[provider.fal]
+  display_name = "fal.ai"
+  base_url = "https://fal.run"
+  default_model = "fal-ai/flux-2-pro"
+
+[provider.fal.models."fal-ai/flux-2-pro"]
+  supports_image_output = true
+  supports_image_edit = true
+[provider.fal.models."fal-ai/flux-2-flex"]
+  supports_image_output = true
+  supports_image_edit = true
+[provider.fal.models."fal-ai/nano-banana"]
+  supports_image_output = true
+  supports_image_edit = true
+[provider.fal.models."fal-ai/nano-banana-pro"]
+  supports_image_output = true
+  supports_image_edit = true
+[provider.fal.models."fal-ai/flux-2"]
+  supports_image_output = true
+  supports_image_edit = true
 
 # Anthropic last-turn-only models: echo reasoning only on tool-call turns
 [provider.anthropic.models."claude-sonnet-4-5"]

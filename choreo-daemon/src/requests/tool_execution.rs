@@ -335,11 +335,11 @@ pub(crate) fn determine_tool_timeout(name: &str, arguments_json: &str) -> Option
         // Shell commands may involve compilation, tests, or long-running
         // processes that need more time than the default.
         Duration::from_secs(300)
-    } else if name == "generate_image" {
-        // Image generation is slow BY PROVIDER CONTRACT, not slow because
-        // the process is stuck: the tool's adapters own a bounded worst case
-        // the generic 60 s default cannot cover without discarding a
-        // PAID-for generation. The floor is derived from the shared adapter
+    } else if matches!(name, "generate_image" | "edit_image") {
+        // Image generation/editing is slow BY PROVIDER CONTRACT, not slow
+        // because the process is stuck: the tool's adapters own a bounded worst
+        // case the generic 60 s default cannot cover without discarding a
+        // PAID-for request. The floor is derived from the shared adapter
         // constants — 2 frugal POST attempts × the 180 s per-attempt agent
         // deadline (gpt-image high renders minutes-long) plus the z.ai URL
         // download's own 3-fetch retry budget (bounded by the same

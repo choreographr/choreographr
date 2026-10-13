@@ -50,8 +50,8 @@ pub struct GenerateImageArgs {
 /// Map the requested output format to the MIME type the returned bytes are
 /// decoded with. The adapter requests the format explicitly and the API
 /// returns exactly it, so this mapping is exhaustive — there is nothing to
-/// sniff.
-fn output_format_mime(format: OutputFormat) -> &'static str {
+/// sniff. `pub(crate)` so `edit_image` reuses the same mapping.
+pub(crate) fn output_format_mime(format: OutputFormat) -> &'static str {
     match format {
         OutputFormat::Png => "image/png",
         OutputFormat::Jpeg => "image/jpeg",
@@ -64,12 +64,17 @@ fn output_format_mime(format: OutputFormat) -> &'static str {
 /// `explicit` (the tool's `model` arg) always wins — the model typed the name
 /// and the API reports bad names as a clean 4xx, which is the right failure
 /// for a deliberate pass-through. Otherwise the choice is made ONLY among
-/// catalog-verified candidates (`image_models_for_provider`), never guessed:
-/// a model that is not in the provider's catalog entry is unlikely to be
-/// routable through the account. The priority ordering:
+/// catalog-verified candidates (`image_models_for_provider` for generation,
+/// `image_edit_models_for_provider` for editing), never guessed: a model that
+/// is not in the provider's catalog entry is unlikely to be routable through
+/// the account. The priority ordering:
 /// gpt-image > imagen > gemini-image > flux > dall-e — "best first" by
 /// fidelity/cost behavior, with the legacy dall-e family explicitly last.
-fn pick_image_model(
+///
+/// `pub(crate)` so the `edit_image` tool reuses the identical pick over its own
+/// edit-capable candidate list (see `tools/image_edit.rs`), rather than
+/// duplicating the tiering.
+pub(crate) fn pick_image_model(
     slug: &str,
     candidates: &[String],
     explicit: Option<&str>,

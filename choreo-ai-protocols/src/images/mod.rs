@@ -336,6 +336,86 @@ impl ImageGenerationRequest {
     }
 }
 
+/// One input image for an image-editing request: its bytes plus the identity
+/// the provider needs to name it.
+///
+/// The daemon builds these from locally-normalized files (see
+/// `choreo-daemon`'s `image_prep`), so the bytes are always in a
+/// provider-allowlisted format (`image/png` or `image/jpeg`) and the filename
+/// is a sane display/suffix hint. The adapter never reads the filesystem — it
+/// only serializes these already-loaded bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageInput {
+    /// File name (with extension) the provider records for this input; used as
+    /// the upload's filename and, for providers with no separate MIME field, a
+    /// format hint.
+    pub filename: String,
+    /// MIME type of `data` (e.g. `image/png`).
+    pub mime_type: String,
+    /// Raw image bytes.
+    pub data: Vec<u8>,
+}
+
+/// A provider-agnostic image-editing (image-to-image) request.
+///
+/// Editing modifies one or more existing images according to a text prompt.
+/// `images` is a vector (v1 requires at least one entry) so a provider that
+/// accepts multiple references — e.g. an `OpenAI` `gpt-image` edit — can be
+/// driven with all of them; providers taking a single reference use the
+/// first. `mask` is carried for providers that accept an inpainting mask, but
+/// v1 defers masks end-to-end (the tool never sets it), so adapters treat it
+/// as best-effort.
+///
+/// The knob fields reuse the generation enums and the same minimal-body
+/// policy: a knob left at its default (`auto`/`png`) is omitted from the wire
+/// body rather than sent as an explicit default, because models reached
+/// through OpenAI-compatible proxies frequently reject parameters they do not
+/// implement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageEditRequest {
+    /// Text prompt describing the desired edit.
+    pub prompt: String,
+    /// Model id to edit with.
+    pub model: String,
+    /// Input images (at least one).
+    pub images: Vec<ImageInput>,
+    /// Optional inpainting mask (deferred in v1; providers ignoring masks
+    /// simply drop it).
+    pub mask: Option<ImageInput>,
+    /// Output canvas size; omitted from the wire body at the `auto` default.
+    pub size: ImageSize,
+    /// Render quality hint; omitted at the `auto` default.
+    pub quality: ImageQuality,
+    /// Encoded format of the returned bytes; omitted at the `png` default.
+    pub output_format: OutputFormat,
+    /// Background handling; omitted at the `auto` default.
+    pub background: Background,
+}
+
+impl ImageEditRequest {
+    /// Convenience constructor: every knob at its "auto" default and no mask.
+    /// `images` must be non-empty; the caller is responsible for that
+    /// invariant (the daemon rejects an empty list before building the
+    /// request).
+    #[must_use]
+    pub fn new(
+        prompt: impl Into<String>,
+        model: impl Into<String>,
+        images: Vec<ImageInput>,
+    ) -> Self {
+        Self {
+            prompt: prompt.into(),
+            model: model.into(),
+            images,
+            mask: None,
+            size: ImageSize::default(),
+            quality: ImageQuality::default(),
+            output_format: OutputFormat::default(),
+            background: Background::default(),
+        }
+    }
+}
+
 /// One generated image, decoded by the caller from the base64 payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageGenerationResult {
@@ -372,6 +452,33 @@ pub trait ImageGenerationClient: std::fmt::Debug + Send + Sync {
         req: &ImageGenerationRequest,
         cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
     ) -> Result<ImageGenerationResult, InferenceError>;
+
+    /// Edit one or more existing images.
+    ///
+    /// The default implementation is a capability gate: it returns
+    /// [`InferenceError::Unsupported`] naming the provider, so a client that
+    /// implements generation but not editing fails cleanly (never a panic,
+    /// never a half-built request) wherever the daemon routes an edit to it.
+    /// Adapters that support editing override this.
+    ///
+    /// `cancel_rx` follows the same convention as [`Self::generate_image`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError::Unsupported`] by default; an overriding
+    /// adapter returns the usual HTTP/provider/decoding/cancellation errors.
+    fn edit_image(
+        &self,
+        _req: &ImageEditRequest,
+        _cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
+    ) -> Result<ImageGenerationResult, InferenceError> {
+        Err(InferenceError::Unsupported {
+            detail: format!(
+                "provider `{}` does not support image editing",
+                self.provider_slug()
+            ),
+        })
+    }
 }
 
 #[cfg(test)]

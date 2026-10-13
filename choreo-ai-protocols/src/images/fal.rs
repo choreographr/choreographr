@@ -70,8 +70,8 @@ use crate::SocketRegistry;
 use crate::download;
 use crate::fal::error::fal_error_from_response;
 use crate::images::{
-    IMAGE_MAX_ATTEMPTS, IMAGE_TOTAL_TIMEOUT_SECS, ImageGenerationClient, ImageGenerationRequest,
-    ImageGenerationResult, ImageSize, OutputFormat,
+    IMAGE_MAX_ATTEMPTS, IMAGE_TOTAL_TIMEOUT_SECS, ImageEditRequest, ImageGenerationClient,
+    ImageGenerationRequest, ImageGenerationResult, ImageSize, OutputFormat,
 };
 use crate::openai::endpoint_url;
 use crate::openai::{OpenAiError, ServiceConfig};
@@ -253,6 +253,121 @@ impl FalImageClient {
         }
         body
     }
+
+    /// The outgoing **edit**-request body: `prompt` plus `image_urls` — each
+    /// input image as a `data:<mime>;base64,<...>` URI (the simplest transport,
+    /// and one the fal `.../edit` endpoints' `image_urls` field accepts).
+    /// `output_format` is included only when non-default, and `mask_url` only
+    /// when a mask is present (v1 never sets one). `quality`/`background`/
+    /// `image_size` are not documented for the edit endpoints and are omitted —
+    /// the documented best-effort contract, mirroring [`Self::request_body`].
+    fn edit_request_body(req: &ImageEditRequest) -> serde_json::Value {
+        let image_urls: Vec<String> = req
+            .images
+            .iter()
+            .map(|image| {
+                format!(
+                    "data:{};base64,{}",
+                    image.mime_type,
+                    BASE64.encode(&image.data)
+                )
+            })
+            .collect();
+        let mut body = serde_json::json!({ "prompt": req.prompt, "image_urls": image_urls });
+        if let Some(obj) = body.as_object_mut() {
+            if req.output_format != OutputFormat::default() {
+                obj.insert(
+                    "output_format".into(),
+                    output_format_wire(req.output_format).into(),
+                );
+            }
+            // Mask is deferred in v1, but handled defensively if a caller sets
+            // one: fal edit endpoints accept a `mask_url` alongside the inputs.
+            if let Some(mask) = &req.mask {
+                obj.insert(
+                    "mask_url".into(),
+                    format!(
+                        "data:{};base64,{}",
+                        mask.mime_type,
+                        BASE64.encode(&mask.data)
+                    )
+                    .into(),
+                );
+            }
+        }
+        body
+    }
+
+    /// Decode a fal image response (generation or edit) into a
+    /// [`ImageGenerationResult`]: a non-2xx goes through the shared two-shape
+    /// error mapper (with `context` naming the operation); otherwise the first
+    /// `images[0].url` is returned as bytes — an inline `data:` URI decoded in
+    /// place, anything else downloaded through the shared machinery. Shared by
+    /// [`Self::generate_image`] and [`Self::edit_image`] so the response
+    /// handling cannot drift between them. `context` is `&'static str` because
+    /// the shared error mapper keys its message on a static operation name.
+    fn finish_image(
+        &self,
+        response: ureq::http::Response<ureq::Body>,
+        model: &str,
+        context: &'static str,
+        cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
+    ) -> Result<ImageGenerationResult, InferenceError> {
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            // The shared mapper reads the classifier header, the Retry-After
+            // budget input, and the body, then applies the two-shape mapping.
+            return Err(crate::shared::provider_error_to_inference(
+                fal_error_from_response(response, context),
+            ));
+        }
+
+        let payload: FalResponse = response
+            .into_body()
+            .read_json()
+            .map_err(|e| OpenAiError::Io(io::Error::other(e)))
+            .map_err(crate::shared::provider_error_to_inference)?;
+
+        let image_ref = payload
+            .images
+            .into_iter()
+            .next()
+            .and_then(|image| image.url)
+            .filter(|u| !u.trim().is_empty())
+            .ok_or_else(|| {
+                tracing::warn!(
+                    model = %model,
+                    "fal image response carried no usable image url"
+                );
+                OpenAiError::EmptyResponse
+            })
+            .map_err(crate::shared::provider_error_to_inference)?;
+
+        // Handle BOTH url forms: an inline `data:` URI (sync_mode) is decoded
+        // in place, anything else is downloaded through the shared machinery.
+        let image_b64 = if let Some(b64) = data_uri_b64(&image_ref) {
+            tracing::debug!(model = %model, "fal image response carried an inline data URI");
+            b64.to_string()
+        } else {
+            BASE64.encode(
+                download::download_image_bytes(&self.http, &self.config, &image_ref, cancel_rx)
+                    .map_err(crate::shared::provider_error_to_inference)?,
+            )
+        };
+
+        tracing::info!(
+            model = %model,
+            image_b64_len = image_b64.len(),
+            "fal image request succeeded"
+        );
+
+        Ok(ImageGenerationResult {
+            image_b64,
+            // fal does not return a revised prompt.
+            revised_prompt: None,
+            model: model.to_string(),
+        })
+    }
 }
 
 impl ImageGenerationClient for FalImageClient {
@@ -321,68 +436,77 @@ impl ImageGenerationClient for FalImageClient {
         .map_err(OpenAiError::from)
         .map_err(crate::shared::provider_error_to_inference)?;
 
-        let status = response.status().as_u16();
-        if !(200..300).contains(&status) {
-            // The shared mapper reads the classifier header, the Retry-After
-            // budget input, and the body, then applies the two-shape mapping.
-            return Err(crate::shared::provider_error_to_inference(
-                fal_error_from_response(response, "image generation"),
-            ));
-        }
+        self.finish_image(response, &req.model, "image generation", cancel_rx)
+    }
 
-        let payload: FalResponse = response
-            .into_body()
-            .read_json()
-            .map_err(|e| OpenAiError::Io(io::Error::other(e)))
+    fn edit_image(
+        &self,
+        req: &ImageEditRequest,
+        cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
+    ) -> Result<ImageGenerationResult, InferenceError> {
+        // Editing appends `/edit` to the per-model generation path: fal serves
+        // `POST {base}/{model}/edit` for image-to-image, so the catalog model id
+        // is the *generation* id and the suffix is added here.
+        let url = endpoint_url(&self.config.base_url, &format!("/{}/edit", req.model))
+            .map_err(OpenAiError::Io)
             .map_err(crate::shared::provider_error_to_inference)?;
+        // Frugal budget identical to the other image adapters (2 attempts).
+        let retry_cfg = RetryConfig::new(
+            IMAGE_MAX_ATTEMPTS,
+            self.config.retry_initial_backoff_ms,
+            self.config.retry_max_backoff_ms,
+        );
+        // fal's auth header is `Key <key>`, NOT the Bearer scheme.
+        let auth_header = zeroize::Zeroizing::new(format!("Key {}", self.api_key.trim()));
+        let http = &self.http;
+        let body = Self::edit_request_body(req);
+        let mut on_retry: Option<retry::RetryCallback> = None;
+        let mut ctx = AttemptContext::new(&mut on_retry, cancel_rx, None);
 
-        let image_ref = payload
-            .images
-            .into_iter()
-            .next()
-            .and_then(|image| image.url)
-            .filter(|u| !u.trim().is_empty())
-            .ok_or_else(|| {
-                tracing::warn!(
-                    model = %req.model,
-                    "fal image generation response carried no usable image url"
-                );
-                OpenAiError::EmptyResponse
-            })
-            .map_err(crate::shared::provider_error_to_inference)?;
-
-        // Handle BOTH url forms: an inline `data:` URI (sync_mode) is decoded
-        // in place, anything else is downloaded through the shared machinery.
-        let image_b64 = if let Some(b64) = data_uri_b64(&image_ref) {
-            tracing::debug!(model = %req.model, "fal image response carried an inline data URI");
-            b64.to_string()
-        } else {
-            BASE64.encode(
-                download::download_image_bytes(http, &self.config, &image_ref, cancel_rx)
-                    .map_err(crate::shared::provider_error_to_inference)?,
-            )
-        };
-
-        tracing::info!(
+        tracing::debug!(
+            url = %url,
             model = %req.model,
-            image_b64_len = image_b64.len(),
-            "fal image generation succeeded"
+            image_count = req.images.len(),
+            total_input_bytes = req.images.iter().map(|i| i.data.len()).sum::<usize>(),
+            ?req.output_format,
+            has_mask = req.mask.is_some(),
+            // No `body`: the request carries the edit prompt.
+            max_attempts = retry_cfg.max_attempts,
+            "sending fal image edit request"
         );
 
-        Ok(ImageGenerationResult {
-            image_b64,
-            // fal does not return a revised prompt.
-            revised_prompt: None,
-            model: req.model.clone(),
-        })
+        // `retry_loop_raw` (not `retry_loop`): a terminal error response is
+        // handed back with its body intact so `fal_error` can switch on the
+        // `type`/`error_type` fields — see the module docs.
+        let hooked = retry::HookedJsonBody::new(&body, None, retry::RequestCompression::Identity)
+            .map_err(InferenceError::Io)?;
+        let response = retry::retry_loop_raw(
+            || {
+                hooked
+                    .apply_headers(
+                        http.post(&url)
+                            .header("Authorization", auth_header.as_str()),
+                    )
+                    .send(hooked.send_body())
+            },
+            &retry_cfg,
+            &mut ctx,
+        )
+        .map_err(OpenAiError::from)
+        .map_err(crate::shared::provider_error_to_inference)?;
+
+        self.finish_image(response, &req.model, "image editing", cancel_rx)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{FalImageClient, data_uri_b64, output_format_wire, size_wire};
-    use crate::images::{ImageGenerationRequest, ImageSize, OutputFormat};
+    use crate::images::{
+        ImageEditRequest, ImageGenerationRequest, ImageInput, ImageSize, OutputFormat,
+    };
     use crate::openai::ServiceConfig;
+    use base64::Engine as _;
 
     // ── request body / seed knob ─────────────────────────────────────────
 
@@ -406,6 +530,73 @@ mod tests {
         let without_seed = ImageGenerationRequest::new("p", "fal-ai/flux-2-pro");
         let body = FalImageClient::request_body(&without_seed);
         assert!(body.get("seed").is_none(), "{body}");
+    }
+
+    #[test]
+    fn edit_request_body_puts_inputs_as_data_uris_and_omits_default_knobs() {
+        // Each input becomes a `data:<mime>;base64,<...>` URI on `image_urls`;
+        // a default `output_format` and an absent mask are omitted (the
+        // minimal-body policy).
+        let req = ImageEditRequest {
+            images: vec![ImageInput {
+                filename: "a.png".to_string(),
+                mime_type: "image/png".to_string(),
+                data: vec![1, 2, 3],
+            }],
+            ..ImageEditRequest::new("add a hat", "fal-ai/flux-2-pro", Vec::new())
+        };
+        let body = FalImageClient::edit_request_body(&req);
+        assert_eq!(
+            body.get("prompt").and_then(serde_json::Value::as_str),
+            Some("add a hat"),
+            "{body}"
+        );
+        let urls = body
+            .get("image_urls")
+            .and_then(serde_json::Value::as_array)
+            .expect("image_urls array");
+        assert_eq!(urls.len(), 1);
+        let expected = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3])
+        );
+        assert_eq!(urls[0].as_str(), Some(expected.as_str()), "{body}");
+        assert!(body.get("output_format").is_none(), "{body}");
+        assert!(body.get("mask_url").is_none(), "{body}");
+
+        // A non-default output_format is mapped to fal's wire value; a present
+        // mask adds a `mask_url` data URI.
+        let req = ImageEditRequest {
+            output_format: OutputFormat::Webp,
+            mask: Some(ImageInput {
+                filename: "m.png".to_string(),
+                mime_type: "image/png".to_string(),
+                data: vec![7],
+            }),
+            ..ImageEditRequest::new(
+                "p",
+                "fal-ai/flux-2-pro",
+                vec![ImageInput {
+                    filename: "x.jpg".to_string(),
+                    mime_type: "image/jpeg".to_string(),
+                    data: vec![9],
+                }],
+            )
+        };
+        let body = FalImageClient::edit_request_body(&req);
+        // webp has no fal equivalent → lossless png fallback.
+        assert_eq!(
+            body.get("output_format")
+                .and_then(serde_json::Value::as_str),
+            Some("png"),
+            "{body}"
+        );
+        assert!(
+            body.get("mask_url")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|u| u.starts_with("data:image/png;base64,")),
+            "{body}"
+        );
     }
 
     // ── size mapper ──────────────────────────────────────────────────────

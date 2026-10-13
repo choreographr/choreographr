@@ -263,6 +263,12 @@ fn normalize_provider(slug: String, raw: RawProvider) -> ProviderEntry {
                 .modalities
                 .as_ref()
                 .is_some_and(|mods| mods.output.iter().any(|m| m == "image")),
+            // Image EDIT: overlay-only policy. models.dev records no "edit"
+            // modality, so the base never sets this — the overlay pins it for
+            // the models whose provider exposes an edit endpoint. Kept
+            // explicit (not `..Default`) so a future fact can be added here
+            // deliberately rather than silently inheriting false.
+            supports_image_edit: false,
             // Token prices (USD per million tokens): a fact from the snapshot's
             // `cost` object when present; `None` when the model records no cost.
             // Only the four flat prices are modelled — the aux/nested cost keys

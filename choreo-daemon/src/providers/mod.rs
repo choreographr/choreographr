@@ -14,9 +14,9 @@ use std::sync::Arc;
 
 use choreo_ai_protocols::openai::{OpenAiClient, ServiceConfig};
 use choreo_ai_protocols::{
-    AnthropicClient, AnthropicConfig, ChatTurnRequest, ChatTurnResult, GoogleClient, GoogleConfig,
-    ImageGenerationClient, OpenAiImageClient, ProviderClient, ProviderEntry, ProviderProtocol,
-    StreamEvent, ZaiImageClient, lookup_provider,
+    AnthropicClient, AnthropicConfig, ChatTurnRequest, ChatTurnResult, FalImageClient,
+    GoogleClient, GoogleConfig, ImageGenerationClient, OpenAiImageClient, ProviderClient,
+    ProviderEntry, ProviderProtocol, StreamEvent, ZaiImageClient, lookup_provider,
 };
 use choreo_proto::InferenceError;
 
@@ -199,16 +199,21 @@ impl InferenceProvider {
                 // route their Images API at a different endpoint than the
                 // generic OpenAI one (and z.ai's chat base — the `/coding`
                 // plan path — is not where images are served), so those two
-                // slugs get the dedicated [`ZaiImageClient`]; every other
-                // OpenAI-protocol provider keeps the default
+                // slugs get the dedicated [`ZaiImageClient`]; fal.ai accounts
+                // get the dedicated [`FalImageClient`] (its synchronous
+                // `{base}/{model}` Images contract has no OpenAI shape at all);
+                // every other OpenAI-protocol provider keeps the default
                 // [`OpenAiImageClient`]. `ZaiImageClient` itself rewrites the
-                // coding base to the plain PaaS-v4 base, so both slugs share
-                // one adapter with one documented endpoint convention.
+                // coding base to the plain PaaS-v4 base, so both Zhipu slugs
+                // share one adapter with one documented endpoint convention.
                 let image_client: Arc<dyn ImageGenerationClient> =
                     // The client crate owns the provider-family knowledge
-                    // (which slugs speak the Zhipu Images contract) — see
-                    // images::is_zhipu_image_provider_slug's doc comment.
-                    if choreo_ai_protocols::images::is_zhipu_image_provider_slug(&entry.slug) {
+                    // (which slugs speak the Zhipu vs fal Images contract) —
+                    // see images::is_zhipu_image_provider_slug /
+                    // is_fal_image_provider_slug.
+                    if choreo_ai_protocols::images::is_fal_image_provider_slug(&entry.slug) {
+                        Arc::new(FalImageClient::new(svc_config, key, registry))
+                    } else if choreo_ai_protocols::images::is_zhipu_image_provider_slug(&entry.slug) {
                         Arc::new(ZaiImageClient::new(svc_config, key, registry))
                     } else {
                         Arc::new(OpenAiImageClient::new(svc_config, key, registry))
@@ -577,6 +582,25 @@ mod tests {
             provider.image_client().expect("image client present")
         );
         assert!(debug.starts_with("OpenAiImageClient"), "{debug}");
+    }
+
+    #[test]
+    fn from_account_config_fal_routes_to_dedicated_image_client() {
+        // fal is a wholesale overlay provider with no chat API but a dedicated
+        // synchronous `{base}/{model}` Images contract, so its image backend
+        // must be the FalImageClient — not the generic OpenAI adapter.
+        let cfg = AccountConfig::simple("fal", "fal");
+        let provider = InferenceProvider::from_account_config(
+            &cfg,
+            Some("key".into()),
+            &choreo_ai_protocols::SocketRegistry::new(),
+        )
+        .expect("fal account constructs");
+        let debug = format!(
+            "{:?}",
+            provider.image_client().expect("image client present")
+        );
+        assert!(debug.starts_with("FalImageClient"), "{debug}");
     }
 
     #[test]

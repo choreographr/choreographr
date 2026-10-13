@@ -342,6 +342,20 @@ fn apply_model_overlay(model: &mut ModelEntry, table: &toml::Table) {
                     );
                 }
             }
+            // Image-EDIT override: models.dev carries no edit modality, so this
+            // flag is set ONLY here — the overlay is the sole source of
+            // "this model can edit an input image", by design (no name
+            // heuristic). Same shape as supports_image_output.
+            "supports_image_edit" => {
+                if let Some(support) = value.as_bool() {
+                    model.supports_image_edit = support;
+                } else {
+                    warn!(
+                        model = %model.model,
+                        "overlay: supports_image_edit is not a bool; skipping",
+                    );
+                }
+            }
             // Output-token ceiling: overrides the ingested `limit.output`
             // (0 = unknown, same convention as `context_window`).
             "max_output_tokens" => {

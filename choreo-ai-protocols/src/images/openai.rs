@@ -8,21 +8,29 @@
 //! body builder below for the why).
 
 use crate::SocketRegistry;
-use crate::images::{ImageGenerationClient, ImageGenerationRequest, ImageGenerationResult};
+use crate::images::{
+    ImageEditRequest, ImageGenerationClient, ImageGenerationRequest, ImageGenerationResult,
+    ImageQuality, ImageSize, OutputFormat,
+};
 use crate::openai::endpoint_url;
 use crate::openai::{OpenAiError, ServiceConfig};
 use crate::retry::{self, AttemptContext, RetryConfig};
 use choreo_proto::InferenceError;
 use serde::Deserialize;
 use std::io;
+use std::io::Read as _;
+use ureq::unversioned::multipart::{Form, Part};
 
 // The wall-clock deadline and retry budget live in [`super`] as shared
 // adapter policy constants (see super::IMAGE_TOTAL_TIMEOUT_SECS and
 // super::IMAGE_MAX_ATTEMPTS) — identical across every image adapter and
 // reused for the URL-download path too.
 
-/// Images API path under the configured base URL (`OpenAI`: `/v1`).
+/// Images API generation path under the configured base URL (`OpenAI`: `/v1`).
 const IMAGE_GENERATIONS_PATH: &str = "/images/generations";
+
+/// Images API editing path under the configured base URL (multipart edit).
+const IMAGE_EDITS_PATH: &str = "/images/edits";
 
 const IMAGE_MAX_ATTEMPTS: u32 = super::IMAGE_MAX_ATTEMPTS;
 const IMAGE_TOTAL_TIMEOUT_SECS: u64 = super::IMAGE_TOTAL_TIMEOUT_SECS;
@@ -135,6 +143,88 @@ struct WireBody<'a> {
     n: u32,
 }
 
+/// Extract the first image's `(b64_json, revised_prompt)` from a decoded
+/// Images response, or [`OpenAiError::EmptyResponse`] when the payload
+/// carried no usable image. Shared by generation and editing: both pin the
+/// output to one image (generation via `n: 1`, editing because the tool
+/// consumes exactly one), so "first and only" is the operative rule for
+/// both.
+fn first_image(
+    payload: ImagesResponse,
+    model: &str,
+) -> Result<(String, Option<String>), OpenAiError> {
+    payload
+        .data
+        .into_iter()
+        .next()
+        .and_then(|item| {
+            let revised_prompt = item.revised_prompt;
+            item.b64_json
+                .filter(|b64| !b64.is_empty())
+                .map(|b64| (b64, revised_prompt))
+        })
+        .ok_or_else(|| {
+            tracing::warn!(model = %model, "image response carried no image data");
+            OpenAiError::EmptyResponse
+        })
+}
+
+/// Serialize an [`ImageEditRequest`] into a `multipart/form-data` body plus
+/// its `Content-Type` (the boundary is ureq's random per-`Form` value).
+///
+/// Rendered eagerly to bytes rather than streaming the live `Form` through
+/// the retry loop: a `Form` is consumed by `send`, and rebuilding one per
+/// attempt would re-hash the (potentially multi-megabyte) image parts each
+/// time. Rendering once keeps the body reusable across attempts exactly like
+/// the JSON path's [`retry::HookedJsonBody`], so the shared retry/backoff/
+/// cancellation policy applies unchanged.
+///
+/// Field policy mirrors the generation body: `prompt` and `model` always;
+/// one `image` part (filename + MIME + bytes) per input; each knob sent ONLY
+/// when it is non-default, so a minimal edit is `{prompt, model, image}`.
+/// `response_format` is never sent (gpt-image rejects it and always returns
+/// `b64_json`, same as generation). The `mask` is deferred in v1 and never
+/// added here — a caller setting one is intentionally ignored by this adapter.
+fn edit_multipart(req: &ImageEditRequest) -> io::Result<(Vec<u8>, String)> {
+    let mut form = Form::new()
+        .text("prompt", req.prompt.as_str())
+        .text("model", req.model.as_str());
+    for image in &req.images {
+        let part = Part::bytes(&image.data)
+            .file_name(&image.filename)
+            // The daemon normalizes inputs to image/png or image/jpeg, so the
+            // MIME always parses; a malformed one surfaces as an I/O error
+            // rather than a panic.
+            .mime_str(&image.mime_type)
+            .map_err(io::Error::other)?;
+        form = form.part("image", part);
+    }
+    // Knobs are rendered to owned strings first (the `Form` borrows them) and
+    // only non-default values are attached — the minimal-body policy.
+    let size = (req.size != ImageSize::default()).then(|| req.size.to_string());
+    let quality = (req.quality != ImageQuality::default()).then(|| req.quality.to_string());
+    let output_format =
+        (req.output_format != OutputFormat::default()).then(|| req.output_format.to_string());
+    let background =
+        (req.background != super::Background::default()).then(|| req.background.to_string());
+    if let Some(value) = size.as_deref() {
+        form = form.text("size", value);
+    }
+    if let Some(value) = quality.as_deref() {
+        form = form.text("quality", value);
+    }
+    if let Some(value) = output_format.as_deref() {
+        form = form.text("output_format", value);
+    }
+    if let Some(value) = background.as_deref() {
+        form = form.text("background", value);
+    }
+    let content_type = format!("multipart/form-data; boundary={}", form.boundary());
+    let mut body = Vec::new();
+    form.read_to_end(&mut body)?;
+    Ok((body, content_type))
+}
+
 impl ImageGenerationClient for OpenAiImageClient {
     fn provider_slug(&self) -> &str {
         &self.config.provider_slug
@@ -210,18 +300,8 @@ impl ImageGenerationClient for OpenAiImageClient {
         // acknowledged the request but produced nothing usable — mapped to
         // the shared EmptyResponse so it joins the existing metrics label
         // instead of a new error variant.
-        let first = payload.data.into_iter().next().and_then(|item| {
-            let revised_prompt = item.revised_prompt;
-            item.b64_json
-                .filter(|b64| !b64.is_empty())
-                .map(|b64| (b64, revised_prompt))
-        })
-            .ok_or_else(|| {
-                tracing::warn!(model = %req.model, "image generation response carried no image data");
-                OpenAiError::EmptyResponse
-            })
-            .map_err(crate::shared::provider_error_to_inference)?;
-        let (image_b64, revised_prompt) = first;
+        let (image_b64, revised_prompt) =
+            first_image(payload, &req.model).map_err(crate::shared::provider_error_to_inference)?;
 
         tracing::info!(
             model = %req.model,
@@ -237,12 +317,89 @@ impl ImageGenerationClient for OpenAiImageClient {
             model: req.model.clone(),
         })
     }
+
+    fn edit_image(
+        &self,
+        req: &ImageEditRequest,
+        cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
+    ) -> Result<ImageGenerationResult, InferenceError> {
+        let url = endpoint_url(&self.config.base_url, IMAGE_EDITS_PATH)
+            .map_err(OpenAiError::Io)
+            .map_err(crate::shared::provider_error_to_inference)?;
+        // Same frugal budget as generation (see IMAGE_MAX_ATTEMPTS).
+        let retry_cfg = RetryConfig::new(
+            IMAGE_MAX_ATTEMPTS,
+            self.config.retry_initial_backoff_ms,
+            self.config.retry_max_backoff_ms,
+        );
+        let auth_header = zeroize::Zeroizing::new(format!("Bearer {}", self.api_key.trim()));
+        let http = &self.http;
+        // Render the multipart body once; the shared retry loop re-sends the
+        // same bytes on each attempt (see `edit_multipart` for why the body is
+        // materialized rather than streamed as a live `Form`).
+        let (body, content_type) = edit_multipart(req)
+            .map_err(OpenAiError::Io)
+            .map_err(crate::shared::provider_error_to_inference)?;
+        let mut on_retry: Option<retry::RetryCallback> = None;
+        let mut ctx = AttemptContext::new(&mut on_retry, cancel_rx, None);
+
+        tracing::debug!(
+            url = %url,
+            model = %req.model,
+            image_count = req.images.len(),
+            total_input_bytes = req.images.iter().map(|i| i.data.len()).sum::<usize>(),
+            ?req.size,
+            ?req.quality,
+            ?req.output_format,
+            ?req.background,
+            max_attempts = retry_cfg.max_attempts,
+            "sending image edit request"
+        );
+
+        let response = retry::retry_loop(
+            || {
+                http.post(&url)
+                    .header("Authorization", auth_header.as_str())
+                    .header("Content-Type", content_type.as_str())
+                    .send(body.as_slice())
+            },
+            &retry_cfg,
+            &mut ctx,
+        )
+        .map_err(OpenAiError::from)
+        .map_err(crate::shared::provider_error_to_inference)?;
+
+        let payload: ImagesResponse = response
+            .into_body()
+            .read_json()
+            .map_err(|e| OpenAiError::Io(io::Error::other(e)))
+            .map_err(crate::shared::provider_error_to_inference)?;
+
+        let (image_b64, revised_prompt) =
+            first_image(payload, &req.model).map_err(crate::shared::provider_error_to_inference)?;
+
+        tracing::info!(
+            model = %req.model,
+            image_b64_len = image_b64.len(),
+            revised_prompt_len = revised_prompt.as_deref().map_or(0, str::len),
+            "image edit succeeded"
+        );
+
+        Ok(ImageGenerationResult {
+            image_b64,
+            revised_prompt,
+            model: req.model.clone(),
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::WireBody;
-    use crate::images::ImageGenerationRequest;
+    use super::{WireBody, edit_multipart};
+    use crate::images::{
+        Background, ImageEditRequest, ImageGenerationRequest, ImageInput, ImageQuality, ImageSize,
+        OutputFormat,
+    };
 
     #[test]
     fn wire_body_never_carries_seed_even_when_the_request_sets_one() {
@@ -265,5 +422,71 @@ mod tests {
             Some("a lighthouse")
         );
         assert_eq!(value.get("n").and_then(serde_json::Value::as_u64), Some(1));
+    }
+
+    #[test]
+    fn edit_multipart_uses_image_fields_and_omits_default_knobs() {
+        // Two input images: one `image` part each, carrying filename + MIME +
+        // bytes; prompt and model always present; every default knob absent
+        // (the minimal-body policy), and response_format never sent.
+        let req = ImageEditRequest {
+            images: vec![
+                ImageInput {
+                    filename: "a.png".to_string(),
+                    mime_type: "image/png".to_string(),
+                    data: vec![1, 2, 3],
+                },
+                ImageInput {
+                    filename: "b.jpg".to_string(),
+                    mime_type: "image/jpeg".to_string(),
+                    data: vec![4, 5],
+                },
+            ],
+            ..ImageEditRequest::new("add a hat", "gpt-image-1", Vec::new())
+        };
+        let (body, content_type) = edit_multipart(&req).expect("multipart renders");
+        let text = String::from_utf8(body).expect("utf-8 body");
+        assert!(
+            content_type.starts_with("multipart/form-data; boundary="),
+            "{content_type}"
+        );
+        assert!(text.contains("name=\"prompt\""), "{text}");
+        assert!(text.contains("add a hat"));
+        assert!(text.contains("name=\"model\""));
+        assert!(text.contains("gpt-image-1"));
+        // One part per input image, each with the uploaded filename + MIME.
+        assert_eq!(text.matches("name=\"image\"").count(), 2);
+        assert!(text.contains("filename=\"a.png\""));
+        assert!(text.contains("filename=\"b.jpg\""));
+        assert!(text.contains("Content-Type: image/png"));
+        assert!(text.contains("Content-Type: image/jpeg"));
+        // Default knobs omitted entirely; response_format never sent.
+        for omitted in ["size", "quality", "output_format", "background"] {
+            assert!(!text.contains(&format!("name=\"{omitted}\"")), "{text}");
+        }
+        assert!(!text.contains("response_format"));
+
+        // Non-default knobs ARE included, verbatim wire strings.
+        let req = ImageEditRequest {
+            size: ImageSize::Square1024,
+            quality: ImageQuality::High,
+            output_format: OutputFormat::Webp,
+            background: Background::Transparent,
+            ..ImageEditRequest::new(
+                "p",
+                "gpt-image-1",
+                vec![ImageInput {
+                    filename: "x.png".to_string(),
+                    mime_type: "image/png".to_string(),
+                    data: vec![0],
+                }],
+            )
+        };
+        let (body, _) = edit_multipart(&req).expect("multipart renders");
+        let text = String::from_utf8(body).expect("utf-8 body");
+        assert!(text.contains("name=\"size\"") && text.contains("1024x1024"));
+        assert!(text.contains("name=\"quality\"") && text.contains("high"));
+        assert!(text.contains("name=\"output_format\"") && text.contains("webp"));
+        assert!(text.contains("name=\"background\"") && text.contains("transparent"));
     }
 }

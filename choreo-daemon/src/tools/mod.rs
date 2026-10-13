@@ -209,6 +209,7 @@ pub mod http;
 /// The `display_image` tool plus the shared image preparation pipeline
 /// (`prepare_image_from_bytes`).
 pub mod image;
+pub mod image_edit;
 pub mod image_gen;
 pub mod ios;
 pub mod ios_bridge;
@@ -742,7 +743,7 @@ pub fn static_groups() -> &'static [ToolGroup] {
             },
             ToolGroup {
                 name: "image".into(),
-                description: "Image generation (generate_image)".into(),
+                description: "Image generation and editing (generate_image, edit_image)".into(),
             },
             ToolGroup {
                 name: "vm".into(),
@@ -856,6 +857,7 @@ impl ToolRegistry {
         reg.register(fs::EditFile);
         reg.register(image::DisplayImage::new());
         reg.register(image_gen::GenerateImage::new());
+        reg.register(image_edit::EditImage::new());
         reg.register(git::GitStatus);
         reg.register(git::GitDiff);
         reg.register(git::GitLog);
@@ -1467,7 +1469,7 @@ mod tests {
     #[test]
     fn image_group_registers_generate_image() {
         // The new "image" group must appear in the registry's group catalog
-        // (so `load_tools image` works) and generate_image must be listed
+        // (so `load_tools image` works) and both image tools must be listed
         // under it; display_image stays in "core".
         let registry = ToolRegistry::new().build();
         let groups: Vec<String> = registry.groups().into_iter().map(|g| g.name).collect();
@@ -1477,9 +1479,13 @@ mod tests {
         let defs = registry.available_definitions(&active);
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert!(names.contains(&"generate_image"), "names: {names:?}");
-        // display_image stays in "core" (protected, always unioned into the
-        // definitions), so absence can't be asserted from the active-set
-        // listing; pin it via its group membership instead.
+        assert!(names.contains(&"edit_image"), "names: {names:?}");
+        // Both tools belong to the "image" group; display_image stays in
+        // "core" (protected, always unioned into the definitions), so absence
+        // can't be asserted from the active-set listing — pin group membership
+        // instead.
+        assert_eq!(Tool::group(&image_gen::GenerateImage::new()), "image");
+        assert_eq!(Tool::group(&image_edit::EditImage::new()), "image");
         assert_ne!("image", Tool::group(&image::DisplayImage::new()));
     }
 

@@ -530,15 +530,21 @@ after the model-side decay gate stops re-attaching it to later requests.
 Vision support is per-model: pick a vision-capable model (e.g.
 `deepseek-v4-flash-vision-exp`) and call `read_image` with a path.
 
-**Image generation.** The `generate_image` tool (in the `image` tool group,
-activated with `load_tools image`) produces an image from a text prompt via
-the session's image-capable provider account (OpenAI Images API in v1 —
-Anthropic/Gemini backends are deferred). When no explicit model is passed,
-the daemon picks among the provider's catalog-verified image models by
-priority (gpt-image > imagen > gemini-image > flux > dall-e). The generated
-bytes are displayed, persisted, and fed back to the model exactly like
-`display_image` images — so the model sees what it generated and can refine
-it on the next turn.
+**Image generation and editing.** The `image` tool group (activated with
+`load_tools image`) holds two tools. `generate_image` produces an image from a
+text prompt; `edit_image` modifies one or more existing images named by local
+file path according to a text prompt (image-to-image). Both go through the
+session's image-capable provider account — OpenAI Images API and fal.ai in v1;
+the Zhipu/z.ai Images backend is generation-only and Anthropic/Gemini backends
+are deferred. When no explicit model is passed, the daemon picks among the
+provider's catalog-verified *generation* models for `generate_image` and its
+catalog-verified *edit-capable* models for `edit_image`, by priority
+(gpt-image > imagen > gemini-image > flux > dall-e); edit capability is
+overlay-only policy (models.dev carries no edit modality), and `edit_image`
+fails closed when the resolved provider pins no edit-capable model. The
+returned bytes are displayed, persisted, and fed back to the model exactly like
+`display_image` images — so the model sees what it produced and can refine it
+on the next turn.
 
 **Tool group.** Tools are organized into groups (`core`, `git`, `shell`,
 `content`, `image`, `x`, `vm`, `db`, `mcp`, `blockchain`). Only `core`, `git`, and

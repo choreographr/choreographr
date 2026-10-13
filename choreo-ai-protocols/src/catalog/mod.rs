@@ -46,10 +46,10 @@ pub mod refresh;
 
 pub use loader::{bundled_overlay_src, load_bundled_base};
 pub use lookup::{
-    image_models_for_provider, lookup_context_window, lookup_max_output_tokens, model_cost,
-    model_reasoning_capability, model_reasoning_passback, model_request_format,
-    model_supports_image_output, model_supports_temperature, model_supports_vision,
-    prompt_cache_ttl, requires_reasoning_content,
+    image_edit_models_for_provider, image_models_for_provider, lookup_context_window,
+    lookup_max_output_tokens, model_cost, model_reasoning_capability, model_reasoning_passback,
+    model_request_format, model_supports_image_output, model_supports_temperature,
+    model_supports_vision, prompt_cache_ttl, requires_reasoning_content,
 };
 pub use modelsdev::normalize_modelsdev;
 pub use overlay::merge_overlay;
@@ -203,6 +203,15 @@ pub struct ModelEntry {
     /// `false` is the safe default for unknown models (text generation only).
     #[serde(default)]
     pub supports_image_output: bool,
+    /// Whether the model can *edit* an input image (image-to-image). This is
+    /// **overlay-only** policy: models.dev carries no "edit" modality, so the
+    /// flag is never ingested from the snapshot and there is NO name/prefix
+    /// heuristic — a model is edit-capable exactly when the bundled (or a
+    /// user) overlay sets `supports_image_edit = true`. `false` is the safe
+    /// default, so an un-pinned model is never offered to `edit_image` and the
+    /// tool fails closed rather than guessing.
+    #[serde(default)]
+    pub supports_image_edit: bool,
     /// Token prices (USD per million tokens) from the snapshot's `cost` object,
     /// or `None` when the model records no cost. Consumed by the cache-warming
     /// cost gate — currently recorded but unwired.
@@ -236,6 +245,7 @@ impl Default for ModelEntry {
             deprecated: false,
             supports_vision: false,
             supports_image_output: false,
+            supports_image_edit: false,
             cost: None,
             prompt_cache: None,
         }

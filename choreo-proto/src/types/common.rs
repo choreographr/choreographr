@@ -274,6 +274,18 @@ pub enum InferenceError {
         /// The provider's explanation (e.g. its finish-reason string).
         detail: String,
     },
+    /// The resolved provider has no capability for the requested operation —
+    /// e.g. its image client implements generation but not editing. Unlike a
+    /// 4xx, no HTTP exchange happened: this is a client-side capability miss
+    /// surfaced before (or instead of) a request. Terminal and never
+    /// retryable — re-sending an identical request cannot conjure the
+    /// capability — and distinct from [`InferenceError::ClientError`] (which
+    /// carries a status the provider actually returned).
+    #[error("provider does not support this operation: {detail}")]
+    Unsupported {
+        /// Which capability is missing and on which provider/client.
+        detail: String,
+    },
     /// The request was cancelled (or its daemon is shutting down) while it sat
     /// in the retry backoff, so no further attempt is made.
     #[error("request cancelled during retry backoff")]
@@ -313,6 +325,7 @@ impl InferenceError {
             InferenceError::NotReady { .. } => "not_ready",
             InferenceError::ContentFiltered { .. } => "content_filtered",
             InferenceError::ContextWindowExceeded { .. } => "context_window_exceeded",
+            InferenceError::Unsupported { .. } => "unsupported",
             InferenceError::Cancelled => "cancelled",
             InferenceError::DeadlineExceeded => "deadline_exceeded",
             InferenceError::TruncatedToolCall { .. } => "truncated_tool_call",
