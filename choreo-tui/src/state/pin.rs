@@ -14,6 +14,13 @@
 //! that can grow the response (the streaming fast path, a full rebuild after an
 //! interleaved `Done`/`TurnAppended`, a resize, a session switch-in) is covered
 //! by construction.  The fast path only keeps the anchor current; it never pins.
+//!
+//! A single agent run is a *tool loop*: the daemon appends several turns against
+//! one stream id before it is done, so the pin's target moves as the run
+//! advances.  `App::handle_started` re-targets an engaged pin to each new turn,
+//! releasing the viewport back to the bottom, so a multi-turn run ends pinned on
+//! its *final* turn rather than frozen on the first answer that happened to fill
+//! the viewport.
 
 use super::{HistoryViewport, SessionDisplayState};
 
@@ -25,11 +32,13 @@ use super::{HistoryViewport, SessionDisplayState};
 /// otherwise scroll above the viewport top; from then on the normal anchoring
 /// holds that row in place.  State is per display and survives session switches,
 /// so re-entering a session never re-pins a response that already pinned (or
-/// lets one that pinned reposition).  It is re-armed only by a *new* response
-/// (a different turn id), and cleared on completion.
+/// lets one that pinned reposition).  It is re-armed by a *new* response (a
+/// different turn id — `App::handle_started`, which re-targets the pin when a
+/// multi-turn agent run advances to its next turn), dropped by a manual scroll,
+/// and cleared on completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResponsePin {
-    /// No response is being output.
+    /// No response is being output, or the user has taken over the view.
     Idle,
     /// A response is streaming and has not pinned yet; pin it when its top
     /// row reaches the viewport top.  Carries the turn id it belongs to.
@@ -39,14 +48,18 @@ pub(crate) enum ResponsePin {
 }
 
 impl ResponsePin {
-    /// Disarm a not-yet-pinned response when the user scrolls manually, so a
-    /// later return to the bottom cannot yank the view back up to the response
-    /// top.  `Pinned` is left untouched (a manual scroll after pinning just
-    /// moves the view; it can never re-pin).
+    /// Drop the pin when the user scrolls manually.
+    ///
+    /// A manual scroll means the user has taken over the view, so the pin is
+    /// dropped in every state — a not-yet-pinned response so returning to the
+    /// bottom cannot yank the view up to the response top, and an already-pinned
+    /// response so a later turn in a multi-turn run does not release the
+    /// viewport back to the bottom over a user who chose to read elsewhere.
+    /// The same response can never re-pin (no second arming); a later turn can
+    /// still arm, but only ever engages from the bottom (see
+    /// [`SessionDisplayState::maybe_pin_response_top`]).
     pub(crate) fn disarm_on_manual_scroll(&mut self) {
-        if matches!(self, ResponsePin::Armed(_)) {
-            *self = ResponsePin::Idle;
-        }
+        *self = ResponsePin::Idle;
     }
 }
 

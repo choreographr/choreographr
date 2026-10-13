@@ -333,3 +333,152 @@ fn switching_into_a_background_streaming_response_pins_at_once() {
         "switch-in pins the response top at the viewport top"
     );
 }
+
+// ── multi-turn (tool-loop) runs ──────────────────────────────────────
+
+/// A continuation turn in an agent run: no user text (the run is continuing),
+/// no response yet.  The daemon appends these via its tool loop under the same
+/// stream id as the first turn.
+fn continuation_turn() -> Turn {
+    Turn {
+        created_at: choreo_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: None,
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![],
+        displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    }
+}
+
+#[test]
+fn a_new_turn_supersedes_the_pinned_response_and_the_run_ends_pinned_on_it() {
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 10;
+    {
+        let display = app.active_display().unwrap();
+        display.view.insert_or_replace(1, pending_turn("ask"));
+        display.view.request_to_turn.insert(7, 1);
+    }
+    app.rebuild_height_prefix();
+
+    // Turn 1 streams a long response and pins its top.
+    stream_answer(&mut app, 0, 7, &"first\n".repeat(60));
+    {
+        let display = app.active_display_ref().unwrap();
+        assert_eq!(display.response_pin, ResponsePin::Pinned(1));
+        assert!(
+            display.history_scroll.scroll > 0,
+            "turn 1 is pinned off the bottom"
+        );
+    }
+
+    // The run continues: the daemon appends turn 2 under the same stream id and
+    // starts it.  The engaged pin is re-targeted and the viewport released.
+    app.handle_turn_appended(0, 2, continuation_turn());
+    app.handle_started(0, 7, 2, 0);
+    {
+        let display = app.active_display_ref().unwrap();
+        assert_eq!(
+            display.response_pin,
+            ResponsePin::Idle,
+            "the superseded pin is released"
+        );
+        assert_eq!(
+            display.history_scroll.scroll, 0,
+            "the viewport is released back to the bottom for the new turn"
+        );
+    }
+
+    // Turn 2 streams its (final) response and pins in turn.
+    stream_answer(&mut app, 0, 7, &"final\n".repeat(60));
+    let (row, turn2_start) = {
+        let display = app.active_display_ref().unwrap();
+        assert_eq!(
+            display.response_pin,
+            ResponsePin::Pinned(2),
+            "the final turn is the one pinned"
+        );
+        (
+            display.turn_layouts[1]
+                .response_start_row
+                .expect("turn 2 has a response"),
+            // `height_prefix[0]` is turn 1's total height — turn 2's start.
+            display.height_prefix[0],
+        )
+    };
+    assert_eq!(
+        viewport_top_line(&app),
+        turn2_start + row,
+        "the final turn's top row sits at the viewport top"
+    );
+}
+
+#[test]
+fn a_manual_scroll_after_pinning_drops_the_pin() {
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 10;
+    {
+        let display = app.active_display().unwrap();
+        display.view.insert_or_replace(1, pending_turn("ask"));
+        display.view.request_to_turn.insert(7, 1);
+    }
+    app.rebuild_height_prefix();
+    stream_answer(&mut app, 0, 7, &"line\n".repeat(60));
+    assert_eq!(
+        app.active_display_ref().unwrap().response_pin,
+        ResponsePin::Pinned(1)
+    );
+
+    app.scroll_up(1);
+    assert_eq!(
+        app.active_display_ref().unwrap().response_pin,
+        ResponsePin::Idle,
+        "a manual scroll after pinning drops the engaged pin"
+    );
+}
+
+#[test]
+fn a_new_turn_after_a_manual_scroll_does_not_release_the_view() {
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 10;
+    {
+        let display = app.active_display().unwrap();
+        display.view.insert_or_replace(1, pending_turn("ask"));
+        display.view.request_to_turn.insert(7, 1);
+    }
+    app.rebuild_height_prefix();
+    stream_answer(&mut app, 0, 7, &"line\n".repeat(60));
+
+    // The user scrolls away from the pinned response — the pin is dropped, so
+    // the viewport is theirs.
+    app.scroll_up(2);
+    let user_scroll = app.active_display_ref().unwrap().history_scroll.scroll;
+    assert!(user_scroll > 0);
+
+    // A new turn must NOT release the viewport back to the bottom over them.
+    app.handle_turn_appended(0, 2, continuation_turn());
+    app.handle_started(0, 7, 2, 0);
+    assert_eq!(
+        app.active_display_ref().unwrap().history_scroll.scroll,
+        user_scroll,
+        "a user who scrolled away is not yanked by the next turn"
+    );
+
+    // The new turn arms, but only ever pins from the bottom — not while the
+    // user reads elsewhere.
+    stream_answer(&mut app, 0, 7, &"final\n".repeat(60));
+    assert_eq!(
+        app.active_display_ref().unwrap().response_pin,
+        ResponsePin::Armed(2),
+        "the new turn stays armed while the user reads elsewhere"
+    );
+}

@@ -1688,10 +1688,17 @@ interleaved `Done`/`TurnAppended`, a resize, or a session switch-in. The pin
 state lives on the per-session display and is deliberately **not** reset by
 `reset_for_session_switch`: a response that streamed in a background session
 pins on the first frame after the user switches to it, and one that already
-pinned keeps its position on every re-entry (it never re-pins). A manual scroll
-that actually moves the viewport before the pin fires disarms it, so returning
-to the bottom can never yank the view back up. The mechanics are documented
-in-source (see `choreo-tui`'s `state::pin`, `state::history`, and
+pinned keeps its position on every re-entry (it never re-pins).
+
+A single agent run is a *tool loop*: the daemon appends several turns against
+one stream id before it is done, so the pin's target moves as the run advances.
+`App::handle_started` re-targets an engaged pin to each new turn — releasing the
+viewport back to the bottom — so a multi-turn run ends pinned on its *final*
+turn, not frozen on the first answer that happened to fill the viewport. A
+manual scroll drops the pin entirely (armed or already pinned), so neither the
+current response nor a later turn releases the viewport over a user who chose to
+read elsewhere; the same response can then never re-pin. The mechanics are
+documented in-source (see `choreo-tui`'s `state::pin`, `state::history`, and
 `state::streaming`; `cargo doc -p choreo-tui` / `just doc`).
 
 The all-activity subscription is **sticky**: the daemon's activity broadcast

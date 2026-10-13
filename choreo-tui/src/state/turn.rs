@@ -206,11 +206,12 @@ impl TurnEventHandler for App {
 
         // Arm the response auto-pin on the first Answer chunk: the response is
         // about to fill the turn, and the pin should engage (once) if its top
-        // reaches the viewport top.  Arming for `turn_id` re-arms naturally for
-        // the next response; a response already pinned for this turn is left
-        // untouched.  Reaching this for a background session (the all-activity
-        // subscription) arms its display too, so a switch-in pins before the
-        // first frame.
+        // reaches the viewport top.  A response already pinned for this turn is
+        // left untouched; a different turn has already been re-targeted in
+        // `handle_started` (which drops an engaged pin and releases the viewport
+        // when a multi-turn run advances), so arming here is fresh.  Reaching
+        // this for a background session (the all-activity subscription) arms its
+        // display too, so a switch-in pins before the first frame.
         if first_answer
             && let Some(turn_id) = turn_id
             && display.response_pin != ResponsePin::Pinned(turn_id)
@@ -238,6 +239,24 @@ impl TurnEventHandler for App {
             .visible_turn_ids
             .iter()
             .position(|id| *id == turn_id);
+        // A new turn in the same agent run supersedes the previous response's
+        // pin: the daemon's tool loop starts each turn against the *same*
+        // stream id, so `Started` naming a turn other than the one currently
+        // pinned means the run is continuing.  Re-target the pin to the newest —
+        // and eventually final — turn, releasing the viewport back to the bottom
+        // so that turn's response can reach the top and pin in turn (otherwise
+        // the run stays frozen on the first answer that happened to fill the
+        // viewport).  Only an *engaged* pin for a different turn triggers this:
+        // a manual scroll has already dropped the pin, and an attach replay
+        // names the turn already pinned, so neither releases the viewport.  A
+        // turn with no response (a tool-only turn) simply leaves the pin Idle,
+        // so the tool output that streams next stays in view.
+        if let ResponsePin::Pinned(pinned_turn) = display.response_pin
+            && pinned_turn != turn_id
+        {
+            display.history_scroll.scroll = 0;
+            display.response_pin = ResponsePin::Idle;
+        }
     }
 
     fn handle_done(
