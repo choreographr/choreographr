@@ -339,6 +339,13 @@ test-libtest-ignored: _require-zig
 test-crate crate: _require-nextest _require-zig
     cargo nextest run {{ CARGO_FLAGS }} -p {{ crate }}
 
+# Unit tests for the GUI crate alone. `test-all` excludes `choreo-gui` because
+# its Blitz/wgpu renderer stack is too heavy to compile on every gate run — the
+# same rationale that keeps it out of `default-members`. Run this when touching
+# the GUI; its own crate declares no features, so no `--all-features` is needed.
+test-gui: _require-nextest _require-zig
+    cargo nextest run {{ CARGO_FLAGS }} -p choreo-gui
+
 # Run doc tests across the workspace
 test-doc: _require-zig
     cargo test {{ CARGO_FLAGS }} --workspace --doc

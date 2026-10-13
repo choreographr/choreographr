@@ -2168,7 +2168,10 @@ so this only narrows an already-discouraged path.
 **Test runner:** The recommended runner is cargo-nextest, configured in
 `.config/nextest.toml` (`fail-fast = false`; 120s `slow-timeout` that kills hung
 tests). Cargo aliases `test-fast` (unit tests), `test-integration` (the
-`#[ignore]` suite), and `test-all` (both) invoke it with `--workspace`; plain
+`#[ignore]` suite), and `test-all` (both) invoke it with `--workspace`
+(`test-all` additionally passes `--exclude choreo-gui` — the GUI's Blitz/wgpu
+stack is too heavy for the gate, matching its `default-members` exclusion; its
+tests run via `just test-gui`); plain
 `cargo test` / `cargo test -- --ignored` still work via libtest. Nextest runs
 every test in its own process — a large wall-time win for this 20-crate
 workspace, since libtest serializes test binaries and threads their tests

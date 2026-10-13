@@ -543,9 +543,18 @@ mod tests {
         assert!(out.contains("from=0"), "earlier-turns hint: {out}");
     }
 
+    // The two budget tests need each field to exceed the per-field character
+    // cap and the assembled window to overflow the shared byte budget — both
+    // hold with a few thousand chars per field, and every rendered block is
+    // truncated to `DEFAULT_MAX_FIELD_CHARS` before assembly anyway.  A fixture
+    // this size drives the same truncate/trim paths as a half-megabyte field at
+    // a small fraction of the CPU, so the test stays off the suite's critical
+    // path.
+    const BUDGET_FIXTURE_CHARS: usize = 10_000;
+
     #[test]
     fn output_stays_within_budget() {
-        let big = "x".repeat(500_000);
+        let big = "x".repeat(BUDGET_FIXTURE_CHARS);
         let turns: Vec<(u32, Turn)> = (0..50)
             .map(|i| (i, turn(Some(&big), Some(&big), Some(&big))))
             .collect();
@@ -559,7 +568,7 @@ mod tests {
         // A per-field *character* cap does not bound bytes: '€' is 3 bytes, so a
         // field near the character ceiling can occupy 3× its char count.  The
         // assembled body is byte-capped, so the shared budget holds regardless.
-        let big = "€".repeat(200_000);
+        let big = "€".repeat(BUDGET_FIXTURE_CHARS);
         let turns: Vec<(u32, Turn)> = (0..50)
             .map(|i| (i, turn(Some(&big), Some(&big), Some(&big))))
             .collect();

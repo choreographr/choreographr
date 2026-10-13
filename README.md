@@ -1173,7 +1173,10 @@ exercised by the iOS build instead (it consumes `choreo-daemon` with
 The nextest profile lives in `.config/nextest.toml`: `fail-fast = false` (run
 the whole suite even after a failure) and a 120s `slow-timeout` that aborts any
 hung test. On a 16-core machine a warm `cargo test-all` clears the entire suite
-(~3,400 tests, unit + integration) in ~13s wall. Nextest wins on two fronts: it
+(~4,100 tests, unit + integration) in ~10s wall. `test-all` excludes
+`choreo-gui` (its Blitz/wgpu stack is too heavy for every gate run, matching its
+`default-members` exclusion); run its tests with `just test-gui`. Nextest wins on
+two fronts: it
 parallelizes across test binaries (libtest runs them one at a time) and runs
 every test in its own process — which is also why the one-binary-per-crate
 layout above costs nothing in isolation. Useful raw nextest invocations:
@@ -1224,6 +1227,7 @@ just test-lean            # unit tests, every optional feature off (nextest)
 just test-integration     # integration tests (the #[ignore] suite) via nextest
 just test-libtest         # unit tests via libtest (no nextest required)
 just test-crate choreo-proto   # a single crate via nextest
+just test-gui             # the GUI crate alone (excluded from `test-all`/`test-fast`)
 
 just fmt                  # cargo fmt --all
 just clippy               # lint the workspace (all targets + features)

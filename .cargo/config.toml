@@ -35,7 +35,11 @@ test-integration = "nextest run --workspace --all-features --run-ignored only"
 # everything: unit + integration in one pass. `--all-targets` also covers
 # examples/benches (there are none with tests today, so the delta is ~zero — it
 # future-proofs coverage if such targets are added).
-test-all = "nextest run --workspace --all-targets --all-features --run-ignored all"
+# `--exclude choreo-gui` keeps the GUI's Blitz/wgpu stack off the commit gate:
+# it is a non-shipped stub (`publish = false`) with a tiny unit suite, and the
+# same "too heavy for casual builds" rationale that keeps it out of
+# `default-members` applies to the gate too.  Run its tests with `just test-gui`.
+test-all = "nextest run --workspace --all-targets --all-features --run-ignored all --exclude choreo-gui"
 
 # Clippy / fmt gate aliases — the single home of the AGENTS.md commit-gate flags
 # (see AGENTS.md → Commit Workflow), so the `justfile` recipes stay flag-free. The
