@@ -22,7 +22,11 @@
 //! [`SessionDisplayState::release_response_pin`]: a pinned response is dropped
 //! and the viewport returned to the bottom, so the following content is
 //! followed from the bottom.  The run's *final* response has nothing after it,
-//! so it is the one left pinned.
+//! so it is the one left pinned.  The release fires from every event that can
+//! be that first thing (`ToolCallStarted`, `ToolResultChunk`, a
+//! tool-call-carrying `TurnAppended`, and the next turn's `Started`); the calls
+//! overlap by design — any one may arrive first, broadcasts can be dropped, and
+//! each call is idempotent — so no dropped event can leave the pin held.
 
 use super::{HistoryViewport, SessionDisplayState};
 
@@ -86,11 +90,12 @@ impl SessionDisplayState {
     /// Fires only while the response is [`ResponsePin::Armed`] and the user is
     /// following the bottom.  It sets the scroll so the response block's top
     /// row (`height_prefix[turn - 1] + layout.response_start_row`) sits at the
-    /// top of the viewport, then records [`ResponsePin::Pinned`] so the response
-    /// can never pin again — not on a later chunk, not after the user scrolls,
-    /// and not after leaving and re-entering the session.  The normal
-    /// from-bottom anchoring holds the pinned row in place on every later
-    /// growth.
+    /// top of the viewport, then records [`ResponsePin::Pinned`].  The response
+    /// never pins again: only a *new* turn's first answer re-arms (this turn is
+    /// finished), and both a manual scroll and content that follows the response
+    /// drop the guard — so leaving and re-entering the session cannot re-pin it
+    /// either.  The normal from-bottom anchoring holds the pinned row in place
+    /// on every later growth.
     pub(crate) fn maybe_pin_response_top(&mut self, viewport: &HistoryViewport) {
         let ResponsePin::Armed(turn_id) = self.response_pin else {
             return;
@@ -163,6 +168,11 @@ impl SessionDisplayState {
     /// that its top would pass the viewport top — that would yank the viewport
     /// up onto a response that is already over.  [`ResponsePin::Idle`] is a
     /// no-op (the user already scrolled the pin away, or nothing was pinned).
+    ///
+    /// This is deliberately different from a *completed* request
+    /// (`App::finish_request`), which clears the guard but leaves the scroll
+    /// untouched: nothing follows a final response, so its pinned position is
+    /// kept, whereas here more content follows and is followed from the bottom.
     pub(crate) fn release_response_pin(&mut self) {
         match self.response_pin {
             ResponsePin::Pinned(_) => {
