@@ -35,7 +35,7 @@ use arc_swap::ArcSwap;
 // error without reaching into the private child module.
 pub use self::image_provider::ImageProviderError;
 // Re-export the session-image selector, resolved-image, and error types next to
-// the DaemonCommand that carries them, so senders of `GetSessionImage` (the
+// the DaemonCommand that carries them, so senders of `GetSessionImages` (the
 // `edit_image` tool) can name the selector and the reply payloads without
 // reaching into the private child module.
 pub use self::session_image::{ResolvedImage, SessionImageError, SessionImageSelector};
@@ -781,22 +781,25 @@ pub enum DaemonCommand {
         /// [`ImageProviderError`].
         reply: crossbeam_channel::Sender<Result<ImageProviderHandle, ImageProviderError>>,
     },
-    /// Fetch an image already stored in a session (a `read_image` result, or a
-    /// prior `generate_image`/`edit_image`/`display_image` output) as the raw
-    /// MIME + bytes, addressed by a [`SessionImageSelector`]. Backs
-    /// `edit_image`'s `@last` / `@display:` / `@result:` inputs. Like
+    /// Fetch images already stored in a session (a `read_image` result, or a
+    /// prior `generate_image`/`edit_image`/`display_image` output) as raw MIME +
+    /// bytes, each addressed by a [`SessionImageSelector`]. Backs `edit_image`'s
+    /// `@last` / `@display:` / `@result:` inputs, resolved as a BATCH: the daemon
+    /// reads the session's persisted turns ONCE for the whole selector list
+    /// (rather than once per selector) and replies with results positionally
+    /// aligned to `selectors` (same length, same order). Like
     /// `GetImageGenerationProvider`, the reply goes back to the TOOL thread
     /// directly over the crossbeam channel — it is a per-request value, not a
     /// client-visible event — and the command loop is the only thread that
     /// reads session state on the tool's behalf (no shared mutable state).
-    GetSessionImage {
+    GetSessionImages {
         /// The session whose turn attachments are read.
         session_id: u64,
-        /// Which stored image to resolve.
-        selector: SessionImageSelector,
-        /// Replies with the resolved image MIME + bytes, or a structured
-        /// [`SessionImageError`].
-        reply: crossbeam_channel::Sender<Result<ResolvedImage, SessionImageError>>,
+        /// Which stored images to resolve, in order.
+        selectors: Vec<SessionImageSelector>,
+        /// Replies with one `Result` per selector, in the same order; a whole-
+        /// batch storage failure yields an error at every position.
+        reply: crossbeam_channel::Sender<Vec<Result<ResolvedImage, SessionImageError>>>,
     },
     /// Check whether an account with the given name exists.
     AccountExists {
@@ -1219,11 +1222,11 @@ impl DaemonState {
                 account_name.as_deref(),
                 &reply,
             ),
-            DaemonCommand::GetSessionImage {
+            DaemonCommand::GetSessionImages {
                 session_id,
-                selector,
+                selectors,
                 reply,
-            } => self.handle_get_session_image(session_id, &selector, &reply),
+            } => self.handle_get_session_images(session_id, &selectors, &reply),
             DaemonCommand::AccountExists { name, reply } => {
                 self.handle_account_exists(&name, &reply);
             }

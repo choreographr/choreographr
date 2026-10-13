@@ -1,19 +1,24 @@
-//! Session-image resolution: the `DaemonCommand::GetSessionImage` handler and
+//! Session-image resolution: the `DaemonCommand::GetSessionImages` handler and
 //! its pure resolution logic.
 //!
-//! These are the `impl DaemonState` methods that turn a [`SessionImageSelector`]
-//! into the resolved image bytes (`ResolvedImage`) a tool thread can feed to an
-//! image-editing provider. They live in a child module (same pattern as
-//! `daemon/image_provider.rs`) so `daemon.rs` stays focused on core command
-//! handling; the handler is `pub(super)` because `handle_command` in the parent
-//! dispatches the corresponding `DaemonCommand` variant here.
+//! These are the `impl DaemonState` methods that turn a batch of
+//! [`SessionImageSelector`]s into the resolved image bytes (`ResolvedImage`) a
+//! tool thread can feed to an image-editing provider. They live in a child
+//! module (same pattern as `daemon/image_provider.rs`) so `daemon.rs` stays
+//! focused on core command handling; the handler is `pub(super)` because
+//! `handle_command` in the parent dispatches the corresponding `DaemonCommand`
+//! variant here.
 //!
 //! Resolution reads the session's persisted turns (the byte-less blobs plus
-//! their re-attached image bytes) to find the target attachment's slot and MIME
-//! type, then reads the raw bytes with [`crate::db::read_attachment`]. The
-//! command loop is the SOLE reader of session state on a tool's behalf — the
-//! tool never touches turns or the attachment store directly, so no session
-//! state is shared across threads (AGENTS.md "Thread Communication").
+//! their re-attached image bytes) ONCE for the whole batch to find each target
+//! attachment's slot and MIME type, then reads the raw bytes with
+//! [`crate::db::read_attachment`] per resolved selector. Reading once per batch
+//! (rather than once per selector) is the point of the batched command: an
+//! `edit_image` call with several `@…` inputs decodes and re-attaches the
+//! session's turns a single time. The command loop is the SOLE reader of session
+//! state on a tool's behalf — the tool never touches turns or the attachment
+//! store directly, so no session state is shared across threads (AGENTS.md
+//! "Thread Communication").
 //!
 //! As a CHILD of `crate::daemon`, this module reaches the parent's private
 //! items via `use super::…`.
@@ -26,7 +31,7 @@ use thiserror::Error;
 ///
 /// This is the parsed, typed form of an `edit_image` `images` entry that begins
 /// with `@` (the tool parses the `@…` grammar and sends the selector in a
-/// [`super::DaemonCommand::GetSessionImage`]; a non-`@` entry stays a
+/// [`super::DaemonCommand::GetSessionImages`]; a non-`@` entry stays a
 /// filesystem path and never becomes a selector).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionImageSelector {
@@ -66,12 +71,14 @@ impl std::fmt::Display for SessionImageSelector {
     }
 }
 
-/// A resolved session image: its MIME type and raw (already-normalized) bytes.
+/// A resolved session image: its MIME type and raw stored bytes.
 ///
-/// The bytes are exactly what was persisted when the image was produced
-/// (normalized to a provider-allowlisted format at that point), so the tool
-/// feeds them straight into an [`ImageInput`](choreo_ai_protocols::images::ImageInput)
-/// without re-normalizing.
+/// The bytes are exactly what was persisted when the image was produced, in
+/// whatever format that was (typically a provider-allowlisted png/jpeg, but a
+/// `display_image` or `output_format=webp` generation may have stored
+/// webp/gif/tiff). A consumer that needs an allowlisted format re-normalizes
+/// these bytes (`choreo-daemon`'s `image_prep`), which is what `edit_image`
+/// does before building an [`ImageInput`](choreo_ai_protocols::images::ImageInput).
 #[derive(Debug, Clone)]
 pub struct ResolvedImage {
     /// The stored image's MIME type (e.g. `image/png`).
@@ -117,62 +124,88 @@ pub enum SessionImageError {
 }
 
 impl DaemonState {
-    /// Resolve a `GetSessionImage` command and reply over the caller's crossbeam
+    /// Resolve a `GetSessionImages` command and reply over the caller's crossbeam
     /// channel.
     ///
-    /// Every path replies over the caller's crossbeam channel — never the
-    /// broadcast machinery — and logs the outcome so a bad reference leaves a
-    /// trace in the daemon log. The image BYTES are never logged; only the
+    /// The reply goes over the caller's crossbeam channel — never the broadcast
+    /// machinery — as one `Result` per selector in request order, with the same
+    /// length. Each selector's outcome is logged so a bad reference leaves a
+    /// trace in the daemon log; the image BYTES are never logged, only the
     /// selector, MIME type, and byte length.
-    pub(super) fn handle_get_session_image(
+    pub(super) fn handle_get_session_images(
         &self,
         session_id: u64,
-        selector: &SessionImageSelector,
-        reply: &crossbeam_channel::Sender<Result<ResolvedImage, SessionImageError>>,
+        selectors: &[SessionImageSelector],
+        reply: &crossbeam_channel::Sender<Vec<Result<ResolvedImage, SessionImageError>>>,
     ) {
-        let result = self.resolve_session_image(session_id, selector);
-        match &result {
-            Ok(image) => {
-                info!(
-                    session_id,
-                    selector = %selector,
-                    mime = %image.mime_type,
-                    bytes = image.data.len(),
-                    "resolved in-session image"
-                );
-            }
-            Err(err) => {
-                warn!(
-                    session_id,
-                    selector = %selector,
-                    error = %err,
-                    "in-session image resolution failed"
-                );
-            }
-        }
+        let results = self.resolve_session_images(session_id, selectors);
         // Best-effort send: a dropped receiver (tool cancelled mid-call) must
         // not panic the command loop.
-        let _ = reply.send(result);
+        let _ = reply.send(results);
     }
 
-    /// Pure resolution logic for [`Self::handle_get_session_image`], split out
-    /// so the selector→slot mapping is unit-testable through the real command
-    /// path without threading a channel through the test.
+    /// Resolve a batch of selectors against the session's persisted turns,
+    /// returning one `Result` per selector in order (length == `selectors.len()`).
     ///
-    /// The session's persisted turns are the source of the selector→slot
-    /// mapping: a displayed image's MIME comes from the turn's
-    /// `displayed_images[i].metadata` and a tool-result image's from its
-    /// `ImageReference`. The raw bytes are then read in a single `get` from the
-    /// attachment store ([`crate::db::read_attachment`]), so the already-
-    /// normalized bytes are handed back unchanged.
-    pub(super) fn resolve_session_image(
+    /// The session's turns are read EXACTLY ONCE for the whole batch
+    /// ([`crate::db::read_turns`] decodes every turn and re-attaches every
+    /// image's bytes), then each selector is mapped to its slot by the pure
+    /// [`resolve_slot`] and its bytes read in a single `get` from the attachment
+    /// store ([`crate::db::read_attachment`]). A failure to read the turns at all
+    /// fails every position identically (the storage error is per-image-slot but
+    /// the read that produced it is shared).
+    pub(super) fn resolve_session_images(
         &self,
         session_id: u64,
+        selectors: &[SessionImageSelector],
+    ) -> Vec<Result<ResolvedImage, SessionImageError>> {
+        let turns = match crate::db::read_turns(&self.db, session_id) {
+            Ok(turns) => turns,
+            Err(e) => {
+                let error = SessionImageError::Storage(e.to_string());
+                warn!(
+                    session_id,
+                    error = %error,
+                    "failed to read session turns for image resolution"
+                );
+                return selectors.iter().map(|_| Err(error.clone())).collect();
+            }
+        };
+        selectors
+            .iter()
+            .map(|selector| {
+                let result = self.resolve_session_image_with_turns(session_id, &turns, selector);
+                match &result {
+                    Ok(image) => info!(
+                        session_id,
+                        selector = %selector,
+                        mime = %image.mime_type,
+                        bytes = image.data.len(),
+                        "resolved in-session image"
+                    ),
+                    Err(err) => warn!(
+                        session_id,
+                        selector = %selector,
+                        error = %err,
+                        "in-session image resolution failed"
+                    ),
+                }
+                result
+            })
+            .collect()
+    }
+
+    /// Resolve one selector against already-decoded `turns` (`resolve_slot`
+    /// maps it to `(turn_id, attachment key, MIME type)`, then the bytes are
+    /// read in a single attachment-store `get`). Shared by every selector in a
+    /// batch so the session's turns are decoded only once.
+    fn resolve_session_image_with_turns(
+        &self,
+        session_id: u64,
+        turns: &[(u32, Turn)],
         selector: &SessionImageSelector,
     ) -> Result<ResolvedImage, SessionImageError> {
-        let turns = crate::db::read_turns(&self.db, session_id)
-            .map_err(|e| SessionImageError::Storage(e.to_string()))?;
-        let (turn_id, key, mime_type) = resolve_slot(&turns, selector)?;
+        let (turn_id, key, mime_type) = resolve_slot(turns, selector)?;
         let data = crate::db::read_attachment(&self.db, session_id, turn_id, &key)
             .map_err(|e| SessionImageError::Storage(e.to_string()))?
             .ok_or(SessionImageError::BytesMissing)?;
@@ -335,17 +368,28 @@ mod tests {
         }
     }
 
-    /// Send a `GetSessionImage` command and wait for the crossbeam reply (the
-    /// same channel shape the tool thread uses in production).
+    /// Send a `GetSessionImages` command for one selector and wait for the
+    /// crossbeam reply (the same channel shape the tool thread uses in
+    /// production), returning that selector's single result.
     fn send_get_session_image(
         state: &mut DaemonState,
         session_id: u64,
         selector: SessionImageSelector,
     ) -> Result<ResolvedImage, SessionImageError> {
+        let mut results = send_get_session_images(state, session_id, vec![selector]);
+        results.pop().unwrap()
+    }
+
+    /// Send a batched `GetSessionImages` command and wait for its reply Vec.
+    fn send_get_session_images(
+        state: &mut DaemonState,
+        session_id: u64,
+        selectors: Vec<SessionImageSelector>,
+    ) -> Vec<Result<ResolvedImage, SessionImageError>> {
         let (reply, rx) = crossbeam_channel::unbounded();
-        state.handle_command(super::super::DaemonCommand::GetSessionImage {
+        state.handle_command(super::super::DaemonCommand::GetSessionImages {
             session_id,
-            selector,
+            selectors,
             reply,
         });
         rx.recv().unwrap()
@@ -461,6 +505,53 @@ mod tests {
             matches!(err, SessionImageError::ResultNotFound { .. }),
             "{err}"
         );
+    }
+
+    #[test]
+    fn batched_selectors_resolve_in_one_command_in_order() {
+        let (mut state, _rx) = make_daemon_state();
+        let sid = 7;
+        // Turn 0: a displayed image (bytes 1,2,3,4). Turn 2: a tool-result image
+        // (bytes 9,8,7). A single command must resolve every selector against
+        // the same turn read, preserving order and reporting a missing selector
+        // in place without disturbing the others.
+        let mut t0 = empty_turn();
+        t0.displayed_images.push(displayed("image/png"));
+        crate::db::write_turn(&state.db, sid, 0, &t0).unwrap();
+        let mut t2 = empty_turn();
+        t2.tool_results
+            .push(result_with_image("call_abc", "image/jpeg"));
+        crate::db::write_turn(&state.db, sid, 2, &t2).unwrap();
+
+        let results = send_get_session_images(
+            &mut state,
+            sid,
+            vec![
+                SessionImageSelector::Display { turn: 0, index: 0 },
+                SessionImageSelector::Result {
+                    turn: 2,
+                    call_id: "call_abc".to_string(),
+                },
+                SessionImageSelector::Last,
+                SessionImageSelector::Display { turn: 9, index: 0 },
+            ],
+        );
+        // One result per selector, in request order.
+        assert_eq!(results.len(), 4);
+        let first = results.first().unwrap().as_ref().unwrap();
+        assert_eq!(first.mime_type, "image/png");
+        assert_eq!(first.data, vec![1, 2, 3, 4]);
+        let second = results.get(1).unwrap().as_ref().unwrap();
+        assert_eq!(second.mime_type, "image/jpeg");
+        assert_eq!(second.data, vec![9, 8, 7]);
+        // @last picks turn 2 (the highest turn with an attachment).
+        let third = results.get(2).unwrap().as_ref().unwrap();
+        assert_eq!(third.data, vec![9, 8, 7]);
+        // The missing display references nothing: its slot errors, others stand.
+        assert!(matches!(
+            results.get(3).unwrap(),
+            Err(SessionImageError::DisplayNotFound { turn: 9, .. })
+        ));
     }
 
     #[test]

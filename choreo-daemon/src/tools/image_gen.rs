@@ -2,17 +2,17 @@
 //! image-capable provider and hand it to the client through the same
 //! `PreparedImage` pipeline `display_image` uses.
 //!
-//! The tool is deliberately thin: provider resolution lives in the daemon
-//! command loop (`DaemonCommand::GetImageGenerationProvider`, so the
-//! credential never reaches a tool), model selection is a small pure
-//! catalog-driven function below, and the returned bytes re-enter the exact
-//! prepare pipeline of `display_image` (`prepare_image_from_bytes`) so the
-//! client's display/persistence/vision-feedback path is shared and cannot
-//! drift.
+//! The tool is deliberately thin: provider resolution, model selection, and
+//! the decode/prepare/return tail all live in the shared `image_common` spine
+//! (`super::image_common`), which keeps provider resolution in the daemon
+//! command loop (`DaemonCommand::GetImageGenerationProvider`, so the credential
+//! never reaches a tool) and re-enters the exact prepare pipeline of
+//! `display_image` (`prepare_image_from_bytes`) so the client's
+//! display/persistence/vision-feedback path is shared and cannot drift.
 
-use super::image::{DisplayImageReturn, prepare_image_from_bytes};
-use super::{PreparedImage, ToolExecError, context::ToolContext, truncate_tool_output};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use super::image::DisplayImageReturn;
+use super::image_common::{finish_provider_image, pick_image_model, resolve_image_provider};
+use super::{PreparedImage, ToolExecError, context::ToolContext};
 use choreo_ai_protocols::images::{
     Background, ImageGenerationRequest, ImageQuality, ImageSize, OutputFormat,
 };
@@ -45,80 +45,6 @@ pub struct GenerateImageArgs {
     background: Option<Background>,
     /// Alt text for the displayed image.
     alt: Option<String>,
-}
-
-/// Map the requested output format to the MIME type the returned bytes are
-/// decoded with. The adapter requests the format explicitly and the API
-/// returns exactly it, so this mapping is exhaustive — there is nothing to
-/// sniff. `pub(crate)` so `edit_image` reuses the same mapping.
-pub(crate) fn output_format_mime(format: OutputFormat) -> &'static str {
-    match format {
-        OutputFormat::Png => "image/png",
-        OutputFormat::Jpeg => "image/jpeg",
-        OutputFormat::Webp => "image/webp",
-    }
-}
-
-/// Pick the image model for a provider.
-///
-/// `explicit` (the tool's `model` arg) always wins — the model typed the name
-/// and the API reports bad names as a clean 4xx, which is the right failure
-/// for a deliberate pass-through. Otherwise the choice is made ONLY among
-/// catalog-verified candidates (`image_models_for_provider` for generation,
-/// `image_edit_models_for_provider` for editing), never guessed: a model that
-/// is not in the provider's catalog entry is unlikely to be routable through
-/// the account. The priority ordering:
-/// gpt-image > imagen > gemini-image > flux > dall-e — "best first" by
-/// fidelity/cost behavior, with the legacy dall-e family explicitly last.
-///
-/// `pub(crate)` so the `edit_image` tool reuses the identical pick over its own
-/// edit-capable candidate list (see `tools/image_edit.rs`), rather than
-/// duplicating the tiering.
-pub(crate) fn pick_image_model(
-    slug: &str,
-    candidates: &[String],
-    explicit: Option<&str>,
-) -> Result<String, String> {
-    if let Some(explicit) = explicit {
-        return Ok(explicit.to_string());
-    }
-    if candidates.is_empty() {
-        return Err(format!(
-            "provider `{slug}` has no image-output models in the catalog — pass `model` \
-             explicitly if your endpoint routes one, or add a `supports_image_output` \
-             overlay entry for it and /refresh-models"
-        ));
-    }
-
-    // Priority tiers by case-insensitive substring match, first match wins.
-    // Each candidate is lowercased once per tier comparison — simple and
-    // obviously correct; the catalog list is human-catalog-sized, so there
-    // is nothing to optimize here.
-    let tiers: [(&str, Option<&str>); 5] = [
-        ("gpt-image", None),
-        ("imagen", None),
-        ("gemini-", Some("image")),
-        ("flux", None),
-        ("dall-e", None),
-    ];
-    for (primary, secondary) in tiers {
-        for candidate in candidates {
-            let hay = candidate.to_ascii_lowercase();
-            if !hay.contains(primary) {
-                continue;
-            }
-            // "gemini-" + "image": both substrings must be present (a bare
-            // gemini chat model would otherwise match the tier).
-            if secondary.is_some_and(|sec| !hay.contains(sec)) {
-                continue;
-            }
-            return Ok(candidate.clone());
-        }
-    }
-    // No tier matched: the catalog's first listed image-capable model is the
-    // least-wrong default (catalog order is quality-curated upstream).
-    // Non-empty per the guard above; fallback is unreachable.
-    Ok(candidates.first().cloned().unwrap_or_default())
 }
 
 /// The `generate_image` tool handle. Stateless: the provider, model, and
@@ -210,29 +136,7 @@ impl super::Tool for GenerateImage {
             )
         })?;
 
-        let (tx, rx) = crossbeam_channel::unbounded();
-        ctx.daemon_tx
-            .send(crate::daemon::DaemonCommand::GetImageGenerationProvider {
-                // The requesting session scopes the image sockets: the daemon
-                // builds the client against THAT session's registry, so a
-                // cancel closes an in-flight image request too.
-                session_id: ctx.session_id,
-                account_name: ctx.account_name.clone(),
-                reply: tx,
-            })
-            .map_err(|e| {
-                ToolExecError(format!(
-                    "failed to reach the daemon command loop for image provider resolution: {e}"
-                ))
-            })?;
-        let handle = rx.recv().map_err(|e| {
-            ToolExecError(format!(
-                "daemon dropped the image provider reply channel: {e}"
-            ))
-        })?;
-        // Map the structured daemon error into its Display text so the model
-        // still sees the precise guidance (unlock / account / slug wording).
-        let handle = handle.map_err(|e| ToolExecError(e.to_string()))?;
+        let handle = resolve_image_provider(ctx)?;
 
         // Model resolution: explicit arg > catalog-priority pick. The
         // catalog is the source of truth for what this provider can route at
@@ -287,48 +191,23 @@ impl super::Tool for GenerateImage {
             return Err(ToolExecError("image generation cancelled".to_string()));
         }
 
-        let bytes = BASE64.decode(result.image_b64.trim()).map_err(|e| {
-            ToolExecError(format!(
-                "provider returned malformed base64 image data: {e}"
-            ))
-        })?;
-        let byte_len = bytes.len();
-        let mime_type = output_format_mime(output_format);
-        let (mime_type, width, height) = prepare_image_from_bytes(mime_type, &bytes)
-            .map_err(|e| ToolExecError(format!("generated image failed validation: {e}")))?;
+        // Decode, sniff the actual MIME, run the shared prepare pipeline, and
+        // build the text handle — the tail shared with `edit_image`.
+        let ret = finish_provider_image(&result, output_format, args.alt, "generated")?;
 
+        // The operation-specific log line: the shared tail deliberately does
+        // not log, so the provider slug and the final prepared size are
+        // reported here (bytes are already in the return value).
         info!(
             model = %result.model,
             slug = %handle.slug,
-            width,
-            height,
-            bytes = byte_len,
+            width = ret.image.width,
+            height = ret.image.height,
+            bytes = ret.image.data.len(),
             "generate_image: prepared generated image"
         );
 
-        // Text handle mirrors display_image's, plus the model and the
-        // provider's revised prompt — the model benefits from seeing how the
-        // provider rewrote its request.
-        let revised = result
-            .revised_prompt
-            .as_deref()
-            .map_or_default(|p| format!("\nrevised prompt: {p}"));
-        let text = truncate_tool_output(&format!(
-            "generated image ({mime_type}, {width}x{height}, {}) via {result_model}{revised}",
-            humfmt::bytes(byte_len as u64),
-            result_model = result.model,
-        ));
-
-        Ok(DisplayImageReturn {
-            text,
-            image: PreparedImage {
-                mime_type,
-                data: bytes,
-                width,
-                height,
-                alt: args.alt.filter(|alt| !alt.trim().is_empty()),
-            },
-        })
+        Ok(ret)
     }
 
     fn extract_image(&self, ret: &Self::Return) -> Option<PreparedImage> {
@@ -341,86 +220,14 @@ mod tests {
     use super::*;
     use crate::providers::ImageProviderHandle;
     use crate::tools::Tool;
+    use crate::tools::image::prepare_image_from_bytes;
+    use crate::tools::image_common::sample_png_b64;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
     use choreo_ai_protocols::images::ImageGenerationClient;
     use choreo_ai_protocols::images::ImageGenerationResult;
     use choreo_proto::InferenceError;
-    use image::ImageFormat;
-    use std::io::Cursor;
     use std::sync::Arc;
-
-    fn candidates(list: &[&str]) -> Vec<String> {
-        list.iter().map(std::string::ToString::to_string).collect()
-    }
-
-    #[test]
-    fn pick_image_model_explicit_wins() {
-        let list = candidates(&["gpt-image-1", "flux-1"]);
-        assert_eq!(
-            pick_image_model("openai", &list, Some("flux-1")).unwrap(),
-            "flux-1"
-        );
-        // Explicit wins even when the name is not in the catalog: the API
-        // gives a clean 4xx for bad names, which is the pass-through contract.
-        assert_eq!(
-            pick_image_model("openai", &list, Some("my-proxy-model")).unwrap(),
-            "my-proxy-model"
-        );
-    }
-
-    #[test]
-    fn pick_image_model_gpt_image_beats_flux() {
-        let list = candidates(&["flux-1.1-pro", "gpt-image-1"]);
-        assert_eq!(pick_image_model("x", &list, None).unwrap(), "gpt-image-1");
-    }
-
-    #[test]
-    fn pick_image_model_imagen_before_gemini_image() {
-        let list = candidates(&["gemini-2.0-flash-preview-image-generation", "imagen-3"]);
-        assert_eq!(pick_image_model("x", &list, None).unwrap(), "imagen-3");
-    }
-
-    #[test]
-    fn pick_image_model_gemini_image_requires_both_substrings() {
-        // A bare gemini chat model does not satisfy the gemini-image tier;
-        // the composite one does.
-        let list = candidates(&[
-            "gemini-2.0-flash",
-            "gemini-2.0-flash-preview-image-generation",
-        ]);
-        assert_eq!(
-            pick_image_model("x", &list, None).unwrap(),
-            "gemini-2.0-flash-preview-image-generation"
-        );
-    }
-
-    #[test]
-    fn pick_image_model_dall_e_last_and_fallback_first() {
-        let list = candidates(&["dall-e-3", "flux-schnell"]);
-        assert_eq!(pick_image_model("x", &list, None).unwrap(), "flux-schnell");
-        let only = candidates(&["dall-e-3"]);
-        assert_eq!(pick_image_model("x", &only, None).unwrap(), "dall-e-3");
-        // No tier matches at all → the catalog's first candidate.
-        let none = candidates(&["sdxl", "sd3"]);
-        assert_eq!(pick_image_model("x", &none, None).unwrap(), "sdxl");
-    }
-
-    #[test]
-    fn pick_image_model_case_insensitive_and_empty_candidates_error() {
-        let list = candidates(&["GPT-IMAGE-1"]);
-        assert_eq!(pick_image_model("x", &list, None).unwrap(), "GPT-IMAGE-1");
-        let err = pick_image_model("openai", &[], None).unwrap_err();
-        assert!(
-            err.contains("provider `openai` has no image-output models"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn output_format_mime_maps_all_variants() {
-        assert_eq!(output_format_mime(OutputFormat::Png), "image/png");
-        assert_eq!(output_format_mime(OutputFormat::Jpeg), "image/jpeg");
-        assert_eq!(output_format_mime(OutputFormat::Webp), "image/webp");
-    }
 
     #[test]
     fn args_deserialize_and_require_prompt() {
@@ -439,18 +246,6 @@ mod tests {
         assert_eq!(args.quality, Some(ImageQuality::High));
         assert_eq!(args.output_format, Some(OutputFormat::Webp));
         assert_eq!(args.background, Some(Background::Transparent));
-    }
-
-    /// Build a real 4x3 PNG like image.rs's tests do, return its base64.
-    fn sample_png_b64() -> String {
-        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(4, 3, |x, y| {
-            // u8 pixel coordinates (4×3 image): the arithmetic never exceeds u8.
-            #[expect(clippy::cast_possible_truncation)]
-            image::Rgba([x as u8 * 60, y as u8 * 80, 0, 255])
-        }));
-        let mut png = Cursor::new(Vec::new());
-        img.write_to(&mut png, ImageFormat::Png).unwrap();
-        BASE64.encode(png.into_inner())
     }
 
     /// Stub client: Debug-able, returns a fixed image generation result.

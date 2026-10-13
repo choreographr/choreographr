@@ -209,6 +209,9 @@ pub mod http;
 /// The `display_image` tool plus the shared image preparation pipeline
 /// (`prepare_image_from_bytes`).
 pub mod image;
+/// Shared spine of the `generate_image`/`edit_image` tools (provider
+/// resolution, model pick, and the decode/prepare/return tail).
+pub mod image_common;
 pub mod image_edit;
 pub mod image_gen;
 pub mod ios;

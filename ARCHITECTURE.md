@@ -1634,6 +1634,13 @@ plumbing (the `Tool::extract_image` hook, `emit_image`, and the mid-turn
 and `requests` modules, `cargo doc -p choreo-daemon` / `just doc`), held
 complete by the `#![warn(missing_docs)]` + `doc-check` gate.
 
+`edit_image` inputs may also be **session references** (`@last`,
+`@display:<turn>:<index>`, `@result:<turn>:<call_id>`) naming an image already
+stored in the session; they are resolved through the daemon command loop — a
+single batched `GetSessionImages` command reads the session's persisted
+turns/attachments once for the whole call — so the tool never reads session
+state directly and the command loop stays its sole reader.
+
 ### Vision input flow (`read_image` → model)
 
 Vision input is the mirror pipeline — images sent *to* the model rather than
