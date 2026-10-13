@@ -262,12 +262,13 @@ pub(crate) struct RenderedTurnLines {
     /// collapse state they were rendered with — the cache key (and the
     /// per-state `TurnLayout` ranges) guard against reuse across states.
     pub tool_result_header_idxs: Vec<usize>,
-    /// Semantic-line index of the first assistant-**response** content row
-    /// within `lines`, present iff the turn has non-whitespace response text
-    /// (`turn.assistant_text`).  The two structural margin rows `add_margin_lines`
-    /// prepends to the assistant block are skipped, so this indexes the first
-    /// *visible* response line.  `None` for a reasoning-only, tool-only, or
-    /// error turn — the streaming auto-pin anchors on the response, never on
+    /// Semantic-line index of the assistant response block's top row — its
+    /// top padding row — within `lines`, present iff the turn has
+    /// non-whitespace response text (`turn.assistant_text`).  The separator
+    /// row `add_margin_lines` prepends to the assistant block is skipped, so
+    /// this indexes the block's first *visible* row; the first text line sits
+    /// one row below it.  `None` for a reasoning-only, tool-only, or error
+    /// turn — the streaming auto-pin anchors on the response, never on
     /// reasoning or tool output.
     pub response_start_idx: Option<usize>,
 }

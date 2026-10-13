@@ -1,11 +1,12 @@
 //! The TUI's full application state: the `App` struct, per-session display
 //! state, input plumbing, and the page/overlay states.  The history pane's
 //! render model (height prefix-sum, markers, scroll, viewport, render cache),
-//! the provider catalog, text-input machinery, page states, picker geometry,
-//! displayed-image fetch plumbing, the turn-event handlers, and the session
-//! lifecycle live in sibling modules (`history`, `providers`, `input`, `pages`,
-//! `layout`, `images`, `turn`, `session`) and are re-exported here so the rest
-//! of the crate keeps referring to `crate::state::*` unchanged.
+//! the streaming response auto-pin, the provider catalog, text-input machinery,
+//! page states, picker geometry, displayed-image fetch plumbing, the turn-event
+//! handlers, and the session lifecycle live in sibling modules (`history`, `pin`,
+//! `providers`, `input`, `pages`, `layout`, `images`, `turn`, `session`) and are
+//! re-exported here so the rest of the crate keeps referring to
+//! `crate::state::*` unchanged.
 
 use crate::RenderedImage;
 use crate::image_worker::{ImageId, ImageJob};
@@ -26,6 +27,7 @@ mod input;
 mod keymap;
 mod layout;
 mod pages;
+mod pin;
 mod providers;
 mod session;
 mod session_manager;
@@ -45,6 +47,7 @@ pub(crate) use input::*;
 pub(crate) use keymap::*;
 pub(crate) use layout::*;
 pub(crate) use pages::*;
+pub(crate) use pin::*;
 pub(crate) use providers::*;
 pub(crate) use session::*;
 pub(crate) use session_manager::*;
@@ -124,9 +127,9 @@ pub(crate) struct SessionDisplayState {
     /// keyed to [`Self::streaming_turn_index`] (see [`StreamingResponseCache`]).
     pub(crate) streaming_response: Option<StreamingResponseCache>,
     /// Whether the streaming assistant response has pinned (or is armed to
-    /// pin) its first line at the viewport top.  Per display so it survives
+    /// pin) its top row at the viewport top.  Per display so it survives
     /// session switches — a response's single pin is never undone by leaving
-    /// and re-entering the session.  See [`ResponsePin`].
+    /// and re-entering the session.  See [`ResponsePin`] (in the `pin` module).
     pub(crate) response_pin: ResponsePin,
     pub(crate) active: HashSet<u64>,
     pub(crate) live_input_estimate: u32,

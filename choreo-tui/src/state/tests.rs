@@ -2,10 +2,10 @@
 //!
 //! Each child owns one concern of the display-state plumbing — input, the
 //! session switcher, the scroll/height model, the reasoning/tool-result
-//! collapse state, image layout, viewport-change classification, streaming,
-//! and the request lifecycle. This parent holds only the fixtures shared
-//! across children (`make_session`, `insert_turn`) and declares the modules;
-//! `terminal_status/tests.rs` reaches `make_session` as
+//! collapse state, image layout, viewport-change classification, streaming, the
+//! streaming response auto-pin, and the request lifecycle. This parent holds
+//! only the fixtures shared across children (`make_session`, `insert_turn`) and
+//! declares the modules; `terminal_status/tests.rs` reaches `make_session` as
 //! `crate::state::tests::make_session`.
 
 use crate::state::{App, SessionStatus};
@@ -20,6 +20,7 @@ mod markers;
 mod model_selector;
 mod reasoning;
 mod request_lifecycle;
+mod response_pin;
 mod scroll;
 mod session_manager;
 mod session_switch;

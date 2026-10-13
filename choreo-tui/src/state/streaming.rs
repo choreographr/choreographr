@@ -10,15 +10,19 @@
 //! This module owns the response cache and the fast-path method; the height
 //! prefix and render-cache plumbing it drives live in [`super`].
 //!
-//! The streaming auto-pin (which anchors the response's first line at the
+//! The streaming auto-pin (which anchors the response's top row at the
 //! viewport top) is *not* applied here: the fast path only keeps the height
 //! model and the [`TurnLayout::response_start_row`](super::TurnLayout::response_start_row)
-//! anchor current.  The pin itself is evaluated in one place — the end of
+//! anchor current.  The pin itself is evaluated in one place — the `pin`
+//! module's `SessionDisplayState::maybe_pin_response_top`, run at the end of
 //! [`super::SessionDisplayState::compute_total_height_and_markers`] — so every
 //! path that can grow the response (this fast path, a full rebuild, a resize,
 //! a session switch-in) is covered by construction.
 
-use super::{HistoryViewport, RenderCacheKey, RenderedCache, RenderedTurn, SessionDisplayState};
+use super::{
+    HistoryViewport, RenderCacheKey, RenderedCache, RenderedTurn, SessionDisplayState,
+    semantic_line_row_range, semantic_line_row_start,
+};
 use crate::markdown_render::{
     IncrementalMarkdown, compute_visual_offsets, lines_height, reasoning_expanded_default,
     render_turn_lines, render_turn_lines_streaming,
@@ -168,16 +172,9 @@ impl SessionDisplayState {
             // the growing response, so its position shifts on every chunk.
             // Rebuilds (via `rebuild_height_prefix`) recompute from scratch.
             if let Some(layout) = self.turn_layouts.get_mut(turn_idx) {
-                layout.reasoning_header_range = rendered.reasoning_header_idx.map(|idx| {
-                    // In-bounds by construction (see the rebuild path).
-                    let start = if idx == 0 {
-                        0
-                    } else {
-                        visual_offsets.get(idx - 1).copied().unwrap_or(0)
-                    };
-                    let end = visual_offsets.get(idx).copied().unwrap_or(0);
-                    (start, end)
-                });
+                layout.reasoning_header_range = rendered
+                    .reasoning_header_idx
+                    .map(|idx| semantic_line_row_range(&visual_offsets, idx));
                 layout.reasoning_default_expanded = reasoning_default_expanded;
                 // Same sync for tool result headers: they sit below the
                 // growing response too, and their own bodies grow when
@@ -185,29 +182,15 @@ impl SessionDisplayState {
                 layout.tool_result_header_ranges = rendered
                     .tool_result_header_idxs
                     .iter()
-                    .map(|&idx| {
-                        // In-bounds by construction (see the rebuild path).
-                        let start = if idx == 0 {
-                            0
-                        } else {
-                            visual_offsets.get(idx - 1).copied().unwrap_or(0)
-                        };
-                        let end = visual_offsets.get(idx).copied().unwrap_or(0);
-                        (start, end)
-                    })
+                    .map(|&idx| semantic_line_row_range(&visual_offsets, idx))
                     .collect();
-                // The response's first content row keeps its offset within the
+                // The response block's top row keeps its offset within the
                 // turn (only the response *below* it grows), but re-derive it
                 // from the freshly rendered lines so the auto-pin anchor can
                 // never drift from what is drawn.
-                layout.response_start_row = rendered.response_start_idx.map(|idx| {
-                    // In-bounds by construction (see the rebuild path).
-                    if idx == 0 {
-                        0
-                    } else {
-                        visual_offsets.get(idx - 1).copied().unwrap_or(0)
-                    }
-                });
+                layout.response_start_row = rendered
+                    .response_start_idx
+                    .map(|idx| semantic_line_row_start(&visual_offsets, idx));
             }
 
             // Replace the cache entry wholesale with the freshly rendered

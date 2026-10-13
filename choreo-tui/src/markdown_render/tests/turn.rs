@@ -504,8 +504,9 @@ fn response_start_idx_points_at_the_first_response_row() {
     // A user prompt renders as a 1-row message block wrapped in 4 margin
     // rows (separator + padding above, padding + timestamp below), so the
     // assistant block starts at row 5.  `add_margin_lines` prepends a
-    // separator + padding row to that block too, putting the response's
-    // first content row at 5 + 2 = 7.
+    // separator + padding row to that block too, so the block's top padding
+    // row is at 5 + 1 = 6 and its first text row at 5 + 2 = 7.  The pin
+    // anchors the padding row (6), leaving the text one row below the top.
     let turn = Turn {
         created_at: choreo_proto::TimestampMs::now(),
         undone: false,
@@ -523,14 +524,21 @@ fn response_start_idx_points_at_the_first_response_row() {
     let rendered = render_turn_lines(&turn, 80, 85, false, &[]);
     assert_eq!(
         rendered.response_start_idx,
-        Some(7),
-        "response top is the assistant block's first content row"
+        Some(6),
+        "response top is the assistant block's top padding row"
     );
-    // The indexed row must carry response text, not a blank margin row.
-    let row = rendered.lines.get(7).expect("index in bounds").to_string();
+    // The indexed row is the block's top padding (blank chrome), and the line
+    // below it is the response text — so pinning the index leaves the text one
+    // row below the viewport top, not flush against it.
+    let padding = rendered.lines.get(6).expect("index in bounds").to_string();
     assert!(
-        row.contains("Hello."),
-        "indexed row must be the response text, got {row:?}"
+        !padding.contains("Hello."),
+        "indexed row must be the block's padding, not the text, got {padding:?}"
+    );
+    let text = rendered.lines.get(7).expect("index in bounds").to_string();
+    assert!(
+        text.contains("Hello."),
+        "the response text sits one row below the anchor, got {text:?}"
     );
 }
 
