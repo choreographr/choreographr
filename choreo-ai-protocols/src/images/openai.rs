@@ -183,8 +183,9 @@ fn first_image(
 /// one `image` part (filename + MIME + bytes) per input; each knob sent ONLY
 /// when it is non-default, so a minimal edit is `{prompt, model, image}`.
 /// `response_format` is never sent (gpt-image rejects it and always returns
-/// `b64_json`, same as generation). The `mask` is deferred in v1 and never
-/// added here — a caller setting one is intentionally ignored by this adapter.
+/// `b64_json`, same as generation). When the request carries a `mask`, it is
+/// added as a `mask` part (filename + MIME + bytes) — the daemon normalizes it
+/// to PNG so the transparent region survives as the inpaint target.
 fn edit_multipart(req: &ImageEditRequest) -> io::Result<(Vec<u8>, String)> {
     let mut form = Form::new()
         .text("prompt", req.prompt.as_str())
@@ -198,6 +199,16 @@ fn edit_multipart(req: &ImageEditRequest) -> io::Result<(Vec<u8>, String)> {
             .mime_str(&image.mime_type)
             .map_err(io::Error::other)?;
         form = form.part("image", part);
+    }
+    // The optional inpainting mask rides as its own `mask` part, carrying the
+    // same filename + MIME + bytes shape as an `image` part (the daemon
+    // normalizes it to PNG, never JPEG, so alpha is preserved).
+    if let Some(mask) = &req.mask {
+        let part = Part::bytes(&mask.data)
+            .file_name(&mask.filename)
+            .mime_str(&mask.mime_type)
+            .map_err(io::Error::other)?;
+        form = form.part("mask", part);
     }
     // Knobs are rendered to owned strings first (the `Form` borrows them) and
     // only non-default values are attached — the minimal-body policy.
@@ -460,18 +471,26 @@ mod tests {
         assert!(text.contains("filename=\"b.jpg\""));
         assert!(text.contains("Content-Type: image/png"));
         assert!(text.contains("Content-Type: image/jpeg"));
-        // Default knobs omitted entirely; response_format never sent.
+        // Default knobs omitted entirely; response_format never sent; a
+        // request with no mask emits no `mask` part.
         for omitted in ["size", "quality", "output_format", "background"] {
             assert!(!text.contains(&format!("name=\"{omitted}\"")), "{text}");
         }
         assert!(!text.contains("response_format"));
+        assert!(!text.contains("name=\"mask\""), "{text}");
 
-        // Non-default knobs ARE included, verbatim wire strings.
+        // Non-default knobs ARE included, verbatim wire strings; a present
+        // mask adds a single `mask` part with its filename + MIME.
         let req = ImageEditRequest {
             size: ImageSize::Square1024,
             quality: ImageQuality::High,
             output_format: OutputFormat::Webp,
             background: Background::Transparent,
+            mask: Some(ImageInput {
+                filename: "mask.png".to_string(),
+                mime_type: "image/png".to_string(),
+                data: vec![7, 8],
+            }),
             ..ImageEditRequest::new(
                 "p",
                 "gpt-image-1",
@@ -488,5 +507,8 @@ mod tests {
         assert!(text.contains("name=\"quality\"") && text.contains("high"));
         assert!(text.contains("name=\"output_format\"") && text.contains("webp"));
         assert!(text.contains("name=\"background\"") && text.contains("transparent"));
+        // Exactly one `mask` part, carrying the mask's own filename + MIME.
+        assert_eq!(text.matches("name=\"mask\"").count(), 1, "{text}");
+        assert!(text.contains("filename=\"mask.png\""), "{text}");
     }
 }

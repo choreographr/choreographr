@@ -39,6 +39,11 @@
 //! instead of downscaling the whole image first. With no region the pipeline is
 //! byte-for-byte unchanged, and the crop lands *before* `finalize`, so a
 //! region smaller than [`MAX_IMAGE_DIMENSION`] bypasses the downscale entirely.
+//!
+//! Inpainting masks: [`load_and_normalize_mask`] runs the same pipeline but
+//! forces the output to PNG (never JPEG). A mask's transparent region is the
+//! region the provider regenerates, and JPEG cannot carry alpha, so a mask is
+//! always re-encoded losslessly even when its source is opaque.
 
 use std::io::{Cursor, Read};
 use std::path::Path;
@@ -178,8 +183,37 @@ pub fn load_and_normalize(
     path: &Path,
     region: Option<CropRegion>,
 ) -> std::io::Result<PreparedVisionImage> {
+    load_and_normalize_with(path, region, Encode::Auto)
+}
+
+/// Read `path` as an inpainting **mask** and normalize it, forcing a PNG
+/// re-encode.
+///
+/// Identical to [`load_and_normalize`] in every other respect (bounded read,
+/// decompression-bomb guard, EXIF baking, downscale), but the output is
+/// *always* `image/png` — never JPEG — because the mask's transparent region
+/// is the region the provider regenerates and JPEG cannot carry alpha. A mask
+/// whose source happens to be opaque still stays PNG (its alpha channel is
+/// intact, merely fully opaque), so the "transparent = editable region"
+/// convention survives the round trip whatever the source format.
+///
+/// # Errors
+///
+/// Returns Err if the file cannot be read (missing, unreadable, or over
+/// [`MAX_SOURCE_BYTES`]) or normalization fails (see [`normalize_bytes`]).
+pub fn load_and_normalize_mask(path: &Path) -> std::io::Result<PreparedVisionImage> {
+    load_and_normalize_with(path, None, Encode::Png)
+}
+
+/// The shared body of [`load_and_normalize`] and [`load_and_normalize_mask`]:
+/// read under the size bound, then normalize with the chosen re-encode policy.
+fn load_and_normalize_with(
+    path: &Path,
+    region: Option<CropRegion>,
+    encode: Encode,
+) -> std::io::Result<PreparedVisionImage> {
     let bytes = read_bounded(path)?;
-    normalize_bytes(&bytes, region)
+    normalize_bytes_with(&bytes, region, encode)
 }
 
 /// Read a file with a hard [`MAX_SOURCE_BYTES`] bound, guarding against a
@@ -220,12 +254,35 @@ pub fn normalize_bytes(
     bytes: &[u8],
     region: Option<CropRegion>,
 ) -> std::io::Result<PreparedVisionImage> {
+    normalize_bytes_with(bytes, region, Encode::Auto)
+}
+
+/// How a normalized image is re-encoded at the end of the pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Encode {
+    /// PNG when the image carries an alpha channel, JPEG when it is opaque —
+    /// the provider-allowlisted default for vision and edit inputs.
+    Auto,
+    /// Always PNG, whatever the source's alpha state. Used for edit masks: the
+    /// transparent region is the edit target, and JPEG has no alpha channel,
+    /// so a JPEG-encoded mask would silently lose the very region the inpaint
+    /// convention depends on.
+    Png,
+}
+
+/// Sniff the format and dispatch to the matching normalizer, threading the
+/// re-encode policy down to [`finalize`].
+fn normalize_bytes_with(
+    bytes: &[u8],
+    region: Option<CropRegion>,
+    encode: Encode,
+) -> std::io::Result<PreparedVisionImage> {
     if is_heic(bytes) {
-        normalize_heic(bytes, region)
+        normalize_heic(bytes, region, encode)
     } else if is_svg(bytes) {
-        normalize_svg(bytes, region)
+        normalize_svg(bytes, region, encode)
     } else {
-        normalize_raster(bytes, region)
+        normalize_raster(bytes, region, encode)
     }
 }
 
@@ -257,6 +314,7 @@ fn is_supported_raster(format: ImageFormat) -> bool {
 fn normalize_raster(
     bytes: &[u8],
     region: Option<CropRegion>,
+    encode: Encode,
 ) -> std::io::Result<PreparedVisionImage> {
     let format = image::guess_format(bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
@@ -275,7 +333,7 @@ fn normalize_raster(
         warn!(error = %e, "failed to decode image (unsupported or decompression-bomb source)");
         std::io::Error::new(std::io::ErrorKind::InvalidData, e)
     })?;
-    finalize_region(img, &format!("{format:?}"), region)
+    finalize_region(img, &format!("{format:?}"), region, encode)
 }
 
 /// Normalize a HEIC/HEIF image via the shared pure-Rust decoder.
@@ -287,18 +345,23 @@ fn normalize_raster(
 fn normalize_heic(
     bytes: &[u8],
     region: Option<CropRegion>,
+    encode: Encode,
 ) -> std::io::Result<PreparedVisionImage> {
     let img = choreo_image::decode_heic(bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    finalize_region(img, "heic", region)
+    finalize_region(img, "heic", region, encode)
 }
 
 /// Normalize an SVG by rasterizing it to an RGBA bitmap via `resvg`.
-fn normalize_svg(bytes: &[u8], region: Option<CropRegion>) -> std::io::Result<PreparedVisionImage> {
+fn normalize_svg(
+    bytes: &[u8],
+    region: Option<CropRegion>,
+    encode: Encode,
+) -> std::io::Result<PreparedVisionImage> {
     // The region is applied *during* rasterization (see `rasterize_svg`), so the
     // output here is already the crop and needs only the shared downscale/encode.
     let img = rasterize_svg(bytes, region)?;
-    finalize(img, "svg")
+    finalize(img, "svg", encode)
 }
 
 /// Crop a decoded image to `region`, returning the sub-image.
@@ -322,17 +385,22 @@ fn finalize_region(
     img: DynamicImage,
     source_label: &str,
     region: Option<CropRegion>,
+    encode: Encode,
 ) -> std::io::Result<PreparedVisionImage> {
     let img = match region {
         Some(region) => crop_decoded(&img, region)?,
         None => img,
     };
-    finalize(img, source_label)
+    finalize(img, source_label, encode)
 }
 
 /// Resize to [`MAX_IMAGE_DIMENSION`] and re-encode to PNG (alpha) or JPEG
 /// (opaque). Shared by every source so the wire bytes are consistent.
-fn finalize(img: DynamicImage, source_label: &str) -> std::io::Result<PreparedVisionImage> {
+fn finalize(
+    img: DynamicImage,
+    source_label: &str,
+    encode: Encode,
+) -> std::io::Result<PreparedVisionImage> {
     let (source_width, source_height) = img.dimensions();
 
     // Resize the longest edge down to MAX_IMAGE_DIMENSION, preserving aspect.
@@ -348,7 +416,11 @@ fn finalize(img: DynamicImage, source_label: &str) -> std::io::Result<PreparedVi
 
     // `ColorType::has_alpha` (image 0.25.6) rather than `DynamicImage::has_alpha`
     // (added in 0.25.8): blitz-dom pins image to =0.25.6 workspace-wide.
-    let (data, mime_type) = if resized.color().has_alpha() {
+    //
+    // `Encode::Png` (masks) forces PNG regardless of alpha: the transparent
+    // region is the edit target and JPEG would drop it. `Encode::Auto` picks
+    // PNG only when the image actually carries alpha.
+    let (data, mime_type) = if encode == Encode::Png || resized.color().has_alpha() {
         (encode_png(&resized)?, "image/png")
     } else {
         (encode_jpeg(&resized)?, "image/jpeg")
@@ -603,6 +675,38 @@ mod tests {
         assert_eq!(out.mime_type, "image/png");
         assert_eq!(out.width, 4);
         assert_eq!(out.height, 4);
+    }
+
+    #[test]
+    fn mask_normalization_always_yields_png() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // An OPAQUE source would normalize to JPEG under the default policy;
+        // the mask path must force PNG so a mask is never JPEG-encoded (JPEG
+        // has no alpha channel, so a JPEG'd mask loses the edit region).
+        let opaque = dir.path().join("opaque.png");
+        std::fs::write(&opaque, as_png(&opaque_rgb())).unwrap();
+        let out = load_and_normalize_mask(&opaque).unwrap();
+        assert_eq!(out.mime_type, "image/png");
+        assert_eq!((out.width, out.height), (3, 2));
+        assert_eq!(image::guess_format(&out.data).unwrap(), ImageFormat::Png);
+
+        // A source that already carries alpha stays PNG with its alpha channel
+        // intact — the "transparent = editable region" convention survives.
+        let buf: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_fn(4, 4, |x, y| {
+            #[expect(clippy::cast_possible_truncation)]
+            Rgba([x as u8, y as u8, 0, if x % 2 == 0 { 0 } else { 255 }])
+        });
+        let alpha = dir.path().join("alpha.png");
+        std::fs::write(&alpha, as_png(&DynamicImage::ImageRgba8(buf))).unwrap();
+        let out = load_and_normalize_mask(&alpha).unwrap();
+        assert_eq!(out.mime_type, "image/png");
+        assert!(
+            image::load_from_memory(&out.data)
+                .unwrap()
+                .color()
+                .has_alpha()
+        );
     }
 
     #[test]

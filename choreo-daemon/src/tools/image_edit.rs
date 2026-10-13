@@ -37,6 +37,10 @@ pub struct EditImageArgs {
     prompt: String,
     /// Paths to one or more input images to edit (at least one).
     images: Vec<String>,
+    /// Optional path to a PNG inpainting mask. The mask's **transparent**
+    /// region is the area to edit/regenerate; the opaque region is kept
+    /// unchanged. Send only on providers/models that support inpainting.
+    mask: Option<String>,
     /// Explicit image-editing model id. Optional — when omitted the provider's
     /// catalog edit-capable models are picked by priority. An invalid name
     /// yields the provider's clean 4xx.
@@ -94,6 +98,9 @@ impl super::Tool for EditImage {
         )];
         for path in &args.images {
             parts.push(format!(" Input: `{path}`."));
+        }
+        if let Some(ref mask) = args.mask {
+            parts.push(format!(" Mask: `{mask}`."));
         }
         if let Some(ref model) = args.model {
             parts.push(format!(" Model: `{model}`."));
@@ -217,6 +224,33 @@ impl super::Tool for EditImage {
         let input_count = inputs.len();
         let total_input_bytes: usize = inputs.iter().map(|i| i.data.len()).sum();
 
+        // Resolve the optional inpainting mask. Unlike the input images it is
+        // normalized with `load_and_normalize_mask`, which forces a PNG
+        // re-encode: the mask's transparent region is the edit target and JPEG
+        // has no alpha channel, so a JPEG'd mask would lose the very region
+        // the "transparent = editable" convention depends on.
+        let mask = match &args.mask {
+            Some(path) => {
+                let resolved = super::resolve_path(path, working_dir);
+                let prepared =
+                    crate::image_prep::load_and_normalize_mask(&resolved).map_err(|e| {
+                        ToolExecError(format!("edit_image: failed to load mask `{path}`: {e}"))
+                    })?;
+                let filename = resolved.file_name().map_or_else(
+                    || "mask.png".to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
+                Some(ImageInput {
+                    filename,
+                    mime_type: prepared.mime_type.to_string(),
+                    data: prepared.data,
+                })
+            }
+            None => None,
+        };
+        let has_mask = mask.is_some();
+        let mask_bytes = mask.as_ref().map_or(0, |m| m.data.len());
+
         let size = args.size.unwrap_or_default();
         let quality = args.quality.unwrap_or_default();
         let output_format = args.output_format.unwrap_or_default();
@@ -226,8 +260,7 @@ impl super::Tool for EditImage {
             prompt: args.prompt,
             model,
             images: inputs,
-            // Masks are Phase 2; the tool never sets one.
-            mask: None,
+            mask,
             size,
             quality,
             output_format,
@@ -265,6 +298,8 @@ impl super::Tool for EditImage {
             slug = %handle.slug,
             input_count,
             total_input_bytes,
+            has_mask,
+            mask_bytes,
             width,
             height,
             bytes = byte_len,
@@ -332,6 +367,10 @@ mod tests {
         /// Records the input count seen by the last edit call, so a test can
         /// assert the tool forwarded every path.
         last_input_count: std::sync::atomic::AtomicUsize,
+        /// Whether the last edit call carried a mask at all.
+        last_had_mask: std::sync::atomic::AtomicBool,
+        /// Whether that mask was normalized to `image/png` (it always must be).
+        last_mask_is_png: std::sync::atomic::AtomicBool,
     }
 
     impl ImageGenerationClient for StubEditClient {
@@ -355,6 +394,14 @@ mod tests {
         ) -> Result<ImageGenerationResult, InferenceError> {
             self.last_input_count
                 .store(req.images.len(), std::sync::atomic::Ordering::SeqCst);
+            self.last_had_mask
+                .store(req.mask.is_some(), std::sync::atomic::Ordering::SeqCst);
+            self.last_mask_is_png.store(
+                req.mask
+                    .as_ref()
+                    .is_some_and(|m| m.mime_type == "image/png"),
+                std::sync::atomic::Ordering::SeqCst,
+            );
             Ok(ImageGenerationResult {
                 image_b64: self.png_b64.clone(),
                 revised_prompt: self.revised_prompt.clone(),
@@ -372,12 +419,18 @@ mod tests {
         cancelled: bool,
     ) -> Result<DisplayImageReturn, ToolExecError> {
         let dir = tempfile::tempdir().expect("temp dir");
-        // Write a real PNG the tool can normalize + read.
+        // Write a real PNG the tool can normalize + read (RGBA, so the mask
+        // path keeps it as PNG).
         std::fs::write(
             dir.path().join("input.png"),
             BASE64.decode(sample_png_b64()).expect("valid png"),
         )
         .expect("write input");
+        std::fs::write(
+            dir.path().join("mask.png"),
+            BASE64.decode(sample_png_b64()).expect("valid png"),
+        )
+        .expect("write mask");
         let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
         let working_dir = dir.path().to_path_buf();
         let _dir_guard = dir;
@@ -402,6 +455,8 @@ mod tests {
             png_b64: sample_png_b64(),
             revised_prompt,
             last_input_count: std::sync::atomic::AtomicUsize::new(0),
+            last_had_mask: std::sync::atomic::AtomicBool::new(false),
+            last_mask_is_png: std::sync::atomic::AtomicBool::new(false),
         });
         let handle = ImageProviderHandle {
             slug: "openai".to_string(),
@@ -428,6 +483,12 @@ mod tests {
         assert_eq!(args.quality, Some(ImageQuality::High));
         assert_eq!(args.output_format, Some(OutputFormat::Webp));
         assert_eq!(args.background, Some(Background::Transparent));
+        // An optional mask path deserializes into the `mask` field.
+        assert!(args.mask.is_none());
+        let args: EditImageArgs =
+            serde_json::from_str(r#"{"prompt": "p", "images": ["a.png"], "mask": "m.png"}"#)
+                .unwrap();
+        assert_eq!(args.mask.as_deref(), Some("m.png"));
     }
 
     #[test]
@@ -494,6 +555,46 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("cancelled"), "{err}");
+    }
+
+    #[test]
+    fn execute_normalizes_mask_and_forwards_it_as_png() {
+        let (handle, client) = openai_handle(None);
+        execute_with_handle(
+            handle,
+            serde_json::from_str(
+                r#"{"prompt": "inpaint", "images": ["input.png"], "mask": "mask.png", "model": "gpt-image-1"}"#,
+            )
+            .unwrap(),
+            false,
+        )
+        .unwrap();
+        // The mask path was loaded, reached the adapter, and stayed PNG.
+        assert!(
+            client
+                .last_had_mask
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(
+            client
+                .last_mask_is_png
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn execute_rejects_a_bad_mask_path() {
+        let (handle, _client) = openai_handle(None);
+        let err = execute_with_handle(
+            handle,
+            serde_json::from_str(
+                r#"{"prompt": "p", "images": ["input.png"], "mask": "missing.png", "model": "gpt-image-1"}"#,
+            )
+            .unwrap(),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("failed to load mask"), "{err}");
     }
 
     #[test]

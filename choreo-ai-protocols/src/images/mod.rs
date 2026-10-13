@@ -362,9 +362,9 @@ pub struct ImageInput {
 /// `images` is a vector (v1 requires at least one entry) so a provider that
 /// accepts multiple references — e.g. an `OpenAI` `gpt-image` edit — can be
 /// driven with all of them; providers taking a single reference use the
-/// first. `mask` is carried for providers that accept an inpainting mask, but
-/// v1 defers masks end-to-end (the tool never sets it), so adapters treat it
-/// as best-effort.
+/// first. `mask`, when set, names the inpainting mask: a PNG whose transparent
+/// region is the area the provider regenerates. Providers that do not inpaint
+/// simply reject it, so it is sent only when the caller supplies one.
 ///
 /// The knob fields reuse the generation enums and the same minimal-body
 /// policy: a knob left at its default (`auto`/`png`) is omitted from the wire
@@ -379,8 +379,9 @@ pub struct ImageEditRequest {
     pub model: String,
     /// Input images (at least one).
     pub images: Vec<ImageInput>,
-    /// Optional inpainting mask (deferred in v1; providers ignoring masks
-    /// simply drop it).
+    /// Optional inpainting mask (a PNG whose transparent region is what the
+    /// provider regenerates). `None` when the caller requested no region
+    /// targeting; a provider that ignores masks drops it.
     pub mask: Option<ImageInput>,
     /// Output canvas size; omitted from the wire body at the `auto` default.
     pub size: ImageSize,

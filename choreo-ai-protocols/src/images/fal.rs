@@ -258,9 +258,9 @@ impl FalImageClient {
     /// input image as a `data:<mime>;base64,<...>` URI (the simplest transport,
     /// and one the fal `.../edit` endpoints' `image_urls` field accepts).
     /// `output_format` is included only when non-default, and `mask_url` only
-    /// when a mask is present (v1 never sets one). `quality`/`background`/
-    /// `image_size` are not documented for the edit endpoints and are omitted —
-    /// the documented best-effort contract, mirroring [`Self::request_body`].
+    /// when a mask is present. `quality`/`background`/`image_size` are not
+    /// documented for the edit endpoints and are omitted — the documented
+    /// best-effort contract, mirroring [`Self::request_body`].
     fn edit_request_body(req: &ImageEditRequest) -> serde_json::Value {
         let image_urls: Vec<String> = req
             .images
@@ -281,8 +281,9 @@ impl FalImageClient {
                     output_format_wire(req.output_format).into(),
                 );
             }
-            // Mask is deferred in v1, but handled defensively if a caller sets
-            // one: fal edit endpoints accept a `mask_url` alongside the inputs.
+            // A mask rides as `mask_url` — the mask as a `data:` URI — when
+            // present; the fal edit endpoints accept it alongside the inputs
+            // (the daemon normalizes it to PNG so alpha is preserved).
             if let Some(mask) = &req.mask {
                 obj.insert(
                     "mask_url".into(),

@@ -541,7 +541,10 @@ provider's catalog-verified *generation* models for `generate_image` and its
 catalog-verified *edit-capable* models for `edit_image`, by priority
 (gpt-image > imagen > gemini-image > flux > dall-e); edit capability is
 overlay-only policy (models.dev carries no edit modality), and `edit_image`
-fails closed when the resolved provider pins no edit-capable model. The
+fails closed when the resolved provider pins no edit-capable model. On
+providers and models that support inpainting, `edit_image` also accepts an
+optional `mask` (a PNG path whose **transparent** region is the area
+regenerated; the opaque region is preserved). The
 returned bytes are displayed, persisted, and fed back to the model exactly like
 `display_image` images — so the model sees what it produced and can refine it
 on the next turn.
