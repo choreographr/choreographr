@@ -532,8 +532,12 @@ Vision support is per-model: pick a vision-capable model (e.g.
 
 **Image generation and editing.** The `image` tool group (activated with
 `load_tools image`) holds two tools. `generate_image` produces an image from a
-text prompt; `edit_image` modifies one or more existing images named by local
-file path according to a text prompt (image-to-image). Both go through the
+text prompt; `edit_image` modifies one or more existing images according to a
+text prompt (image-to-image). Each `edit_image` input is either a local file
+path or a **session reference** to an image already in the conversation —
+`@last` (the most recent image, e.g. one the user just shared or a previous
+`generate_image`/`edit_image` produced), or `@display:<turn>:<index>` /
+`@result:<turn>:<call_id>` for an explicit one. Both tools go through the
 session's image-capable provider account — OpenAI Images API and fal.ai in v1;
 the Zhipu/z.ai Images backend is generation-only and Anthropic/Gemini backends
 are deferred. When no explicit model is passed, the daemon picks among the

@@ -34,6 +34,11 @@ use arc_swap::ArcSwap;
 // carries it, so senders of `GetImageGenerationProvider` can name the reply
 // error without reaching into the private child module.
 pub use self::image_provider::ImageProviderError;
+// Re-export the session-image selector, resolved-image, and error types next to
+// the DaemonCommand that carries them, so senders of `GetSessionImage` (the
+// `edit_image` tool) can name the selector and the reply payloads without
+// reaching into the private child module.
+pub use self::session_image::{ResolvedImage, SessionImageError, SessionImageSelector};
 use crate::sessions::{
     ActiveSessionEntry, CANCEL_ALL, RequestContext, SessionCommand, SessionMetadata, session_main,
 };
@@ -66,6 +71,7 @@ mod image_provider;
 mod keystore;
 mod mcp_commands;
 mod open;
+mod session_image;
 mod subscriber_handlers;
 
 // Re-export the state constructor's options type alongside DaemonState so
@@ -775,6 +781,23 @@ pub enum DaemonCommand {
         /// [`ImageProviderError`].
         reply: crossbeam_channel::Sender<Result<ImageProviderHandle, ImageProviderError>>,
     },
+    /// Fetch an image already stored in a session (a `read_image` result, or a
+    /// prior `generate_image`/`edit_image`/`display_image` output) as the raw
+    /// MIME + bytes, addressed by a [`SessionImageSelector`]. Backs
+    /// `edit_image`'s `@last` / `@display:` / `@result:` inputs. Like
+    /// `GetImageGenerationProvider`, the reply goes back to the TOOL thread
+    /// directly over the crossbeam channel — it is a per-request value, not a
+    /// client-visible event — and the command loop is the only thread that
+    /// reads session state on the tool's behalf (no shared mutable state).
+    GetSessionImage {
+        /// The session whose turn attachments are read.
+        session_id: u64,
+        /// Which stored image to resolve.
+        selector: SessionImageSelector,
+        /// Replies with the resolved image MIME + bytes, or a structured
+        /// [`SessionImageError`].
+        reply: crossbeam_channel::Sender<Result<ResolvedImage, SessionImageError>>,
+    },
     /// Check whether an account with the given name exists.
     AccountExists {
         /// The account name to test.
@@ -1196,6 +1219,11 @@ impl DaemonState {
                 account_name.as_deref(),
                 &reply,
             ),
+            DaemonCommand::GetSessionImage {
+                session_id,
+                selector,
+                reply,
+            } => self.handle_get_session_image(session_id, &selector, &reply),
             DaemonCommand::AccountExists { name, reply } => {
                 self.handle_account_exists(&name, &reply);
             }

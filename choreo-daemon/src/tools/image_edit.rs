@@ -11,13 +11,20 @@
 //! the client's display/persistence/vision-feedback path is shared and cannot
 //! drift.
 //!
-//! Unlike `generate_image`, the inputs are local file paths that are read and
-//! normalized here (`image_prep::load_and_normalize`) before the provider round
-//! trip — so the adapter only ever serializes provider-allowlisted bytes.
+//! Unlike `generate_image`, the inputs are either local file paths that are read
+//! and normalized here (`image_prep::load_and_normalize`) before the provider
+//! round trip, or **session references** (`@last`, `@display:<turn>:<index>`,
+//! `@result:<turn>:<call_id>`) that name an image already stored in this session
+//! — a prior `read_image` result or a `generate_image`/`edit_image`/`display_image`
+//! output. A session reference is resolved through the daemon command loop
+//! (`DaemonCommand::GetSessionImage`) and the returned bytes are used as-is
+//! (they were normalized when the image was produced), so the adapter only ever
+//! serializes provider-allowlisted bytes.
 
 use super::image::{DisplayImageReturn, prepare_image_from_bytes};
 use super::image_gen::{output_format_mime, pick_image_model};
 use super::{PreparedImage, ToolExecError, context::ToolContext, truncate_tool_output};
+use crate::daemon::SessionImageSelector;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use choreo_ai_protocols::images::{
     Background, ImageEditRequest, ImageInput, ImageQuality, ImageSize, OutputFormat,
@@ -35,7 +42,11 @@ pub struct EditImageArgs {
     /// What to change about the input image(s). Describe the edit, not the
     /// whole image ("add a red hat", "remove the background").
     prompt: String,
-    /// Paths to one or more input images to edit (at least one).
+    /// One or more input images to edit (at least one). Each entry is either a
+    /// local **file path** or a **session reference** to an image already in
+    /// this session — `@last` (the most recent image), `@display:<turn>:<index>`,
+    /// or `@result:<turn>:<call_id>`. Use `@last` to edit the image the user
+    /// just shared or that a previous `generate_image`/`edit_image` produced.
     images: Vec<String>,
     /// Optional path to a PNG inpainting mask. The mask's **transparent**
     /// region is the area to edit/regenerate; the opaque region is kept
@@ -76,6 +87,64 @@ impl EditImage {
     }
 }
 
+/// The error for an `images` entry that starts with `@` but is not a recognized
+/// session reference. Names the bad entry and the accepted grammar so the model
+/// can correct the call.
+fn invalid_selector(entry: &str) -> ToolExecError {
+    ToolExecError(format!(
+        "edit_image: unrecognized session image reference `{entry}` — use `@last`, \
+         `@display:<turn>:<index>`, or `@result:<turn>:<call_id>`, or pass a file path"
+    ))
+}
+
+/// Parse one `edit_image` `images` entry into a [`SessionImageSelector`] when it
+/// is a session reference (a leading `@`), or `None` when it is a filesystem
+/// path.
+///
+/// Grammar (the leading `@` is the discriminator; anything else is a path):
+///
+/// - `@last` — the most recent image attachment in this session.
+/// - `@display:<turn>:<index>` — a displayed image, by turn id and position.
+/// - `@result:<turn>:<call_id>` — a tool-result vision image, by turn id and
+///   the call id that produced it.
+///
+/// An unrecognized `@…` form is an error, not a filename: silently treating
+/// `@lst` (a typo for `@last`) as a path would send a confusing "file not
+/// found" instead of naming the bad selector.
+fn parse_session_selector(entry: &str) -> Result<Option<SessionImageSelector>, ToolExecError> {
+    let Some(rest) = entry.strip_prefix('@') else {
+        return Ok(None);
+    };
+    let selector = if rest == "last" {
+        SessionImageSelector::Last
+    } else if let Some(args) = rest.strip_prefix("display:") {
+        let (turn, index) = parse_two_u32(args).ok_or_else(|| invalid_selector(entry))?;
+        SessionImageSelector::Display { turn, index }
+    } else if let Some(args) = rest.strip_prefix("result:") {
+        let (turn, call_id) = args
+            .split_once(':')
+            .ok_or_else(|| invalid_selector(entry))?;
+        let turn = turn.parse::<u32>().map_err(|_| invalid_selector(entry))?;
+        if call_id.is_empty() {
+            return Err(invalid_selector(entry));
+        }
+        SessionImageSelector::Result {
+            turn,
+            call_id: call_id.to_string(),
+        }
+    } else {
+        return Err(invalid_selector(entry));
+    };
+    Ok(Some(selector))
+}
+
+/// Parse `<a>:<b>` where both parts are `u32`, or `None` when either is absent
+/// or malformed. Shared by the `@display:<turn>:<index>` form.
+fn parse_two_u32(args: &str) -> Option<(u32, u32)> {
+    let (a, b) = args.split_once(':')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
 impl super::Tool for EditImage {
     type Args = EditImageArgs;
     type Return = DisplayImageReturn;
@@ -88,7 +157,7 @@ impl super::Tool for EditImage {
         "image"
     }
     fn description(&self) -> &'static str {
-        "Edit an existing image (image-to-image): modify the image at a local file path (or several) according to a text prompt. Do NOT use to create an image from scratch (use generate_image) or to merely display one (use display_image)."
+        "Edit an existing image (image-to-image): modify the input image(s) according to a text prompt. Each input is either a local file path or a session reference to an image already in this session (`@last`, `@display:<turn>:<index>`, `@result:<turn>:<call_id>`) — use `@last` to edit the image the user just shared or that a previous generate_image/edit_image produced. Do NOT use to create an image from scratch (use generate_image) or to merely display one (use display_image)."
     }
     fn describe_invocation(&self, args: &Self::Args) -> String {
         let mut parts = vec![format!(
@@ -148,7 +217,7 @@ impl super::Tool for EditImage {
 
         if args.images.is_empty() {
             return Err(ToolExecError(
-                "edit_image requires at least one input image path".to_string(),
+                "edit_image requires at least one input image".to_string(),
             ));
         }
 
@@ -200,26 +269,64 @@ impl super::Tool for EditImage {
         let model = pick_image_model(&handle.slug, &candidates, args.model.as_deref())
             .map_err(ToolExecError)?;
 
-        // Read and normalize every input path up front. `load_and_normalize`
-        // re-encodes to a provider-allowlisted format (png/jpeg) and applies the
+        // Build every input up front. A `@…` entry is a session reference
+        // resolved through the daemon command loop (the daemon reads the
+        // session's stored image and replies with its MIME + already-normalized
+        // bytes, used as-is — no re-normalization); any other entry is a local
+        // path, read and normalized here. `load_and_normalize` re-encodes to a
+        // provider-allowlisted format (png/jpeg) and applies the
         // decompression-bomb guard, so the adapter serializes only bounded,
-        // known-good bytes.
+        // known-good bytes in either case.
         let mut inputs = Vec::with_capacity(args.images.len());
-        for path in &args.images {
-            let resolved = super::resolve_path(path, working_dir);
-            let prepared = crate::image_prep::load_and_normalize(&resolved, None).map_err(|e| {
-                ToolExecError(format!(
-                    "edit_image: failed to load input image `{path}`: {e}"
-                ))
-            })?;
-            let filename = resolved
-                .file_name()
-                .map_or_else(|| "image".to_string(), |n| n.to_string_lossy().into_owned());
-            inputs.push(ImageInput {
-                filename,
-                mime_type: prepared.mime_type.to_string(),
-                data: prepared.data,
-            });
+        for entry in &args.images {
+            if let Some(selector) = parse_session_selector(entry)? {
+                // The display filename the provider records is the selector
+                // text itself (e.g. "@last"), a sane suffix hint for the
+                // stored bytes' MIME.
+                let filename = selector.to_string();
+                let (tx, rx) = crossbeam_channel::unbounded();
+                ctx.daemon_tx
+                    .send(crate::daemon::DaemonCommand::GetSessionImage {
+                        session_id: ctx.session_id,
+                        selector,
+                        reply: tx,
+                    })
+                    .map_err(|e| {
+                        ToolExecError(format!(
+                            "failed to reach the daemon command loop for image `{entry}`: {e}"
+                        ))
+                    })?;
+                let resolved = rx.recv().map_err(|e| {
+                    ToolExecError(format!(
+                        "daemon dropped the session-image reply channel for `{entry}`: {e}"
+                    ))
+                })?;
+                // Map the structured daemon error into its Display text so the
+                // model sees the precise guidance (no-image / bad-reference
+                // wording).
+                let resolved = resolved.map_err(|e| ToolExecError(format!("edit_image: {e}")))?;
+                inputs.push(ImageInput {
+                    filename,
+                    mime_type: resolved.mime_type,
+                    data: resolved.data,
+                });
+            } else {
+                let resolved = super::resolve_path(entry, working_dir);
+                let prepared =
+                    crate::image_prep::load_and_normalize(&resolved, None).map_err(|e| {
+                        ToolExecError(format!(
+                            "edit_image: failed to load input image `{entry}`: {e}"
+                        ))
+                    })?;
+                let filename = resolved
+                    .file_name()
+                    .map_or_else(|| "image".to_string(), |n| n.to_string_lossy().into_owned());
+                inputs.push(ImageInput {
+                    filename,
+                    mime_type: prepared.mime_type.to_string(),
+                    data: prepared.data,
+                });
+            }
         }
         let input_count = inputs.len();
         let total_input_bytes: usize = inputs.iter().map(|i| i.data.len()).sum();
@@ -338,6 +445,7 @@ impl super::Tool for EditImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::{ResolvedImage, SessionImageError};
     use crate::providers::ImageProviderHandle;
     use crate::tools::Tool;
     use choreo_ai_protocols::images::{
@@ -371,6 +479,10 @@ mod tests {
         last_had_mask: std::sync::atomic::AtomicBool,
         /// Whether that mask was normalized to `image/png` (it always must be).
         last_mask_is_png: std::sync::atomic::AtomicBool,
+        /// The bytes of the first input image forwarded to the last edit call,
+        /// so a test can prove a session-referenced image is passed through
+        /// verbatim (not re-normalized).
+        last_first_input: std::sync::Mutex<Vec<u8>>,
     }
 
     impl ImageGenerationClient for StubEditClient {
@@ -402,6 +514,8 @@ mod tests {
                     .is_some_and(|m| m.mime_type == "image/png"),
                 std::sync::atomic::Ordering::SeqCst,
             );
+            *self.last_first_input.lock().unwrap() =
+                req.images.first().map_or_default(|i| i.data.clone());
             Ok(ImageGenerationResult {
                 image_b64: self.png_b64.clone(),
                 revised_prompt: self.revised_prompt.clone(),
@@ -457,12 +571,44 @@ mod tests {
             last_input_count: std::sync::atomic::AtomicUsize::new(0),
             last_had_mask: std::sync::atomic::AtomicBool::new(false),
             last_mask_is_png: std::sync::atomic::AtomicBool::new(false),
+            last_first_input: std::sync::Mutex::new(Vec::new()),
         });
         let handle = ImageProviderHandle {
             slug: "openai".to_string(),
             client: client.clone(),
         };
         (handle, client)
+    }
+
+    /// Run `EditImage::execute` against a mock daemon that answers BOTH the
+    /// provider resolution and every `GetSessionImage` — the latter with a fixed
+    /// resolved image (or error), so a session-reference test never touches real
+    /// session state.
+    #[expect(clippy::panic_in_result_fn)]
+    fn execute_with_session_image(
+        handle: ImageProviderHandle,
+        resolved: Result<ResolvedImage, SessionImageError>,
+        args: EditImageArgs,
+    ) -> Result<DisplayImageReturn, ToolExecError> {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+        let _dir_guard = dir;
+        let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<crate::daemon::DaemonCommand>();
+        std::thread::spawn(move || {
+            while let Ok(cmd) = daemon_rx.recv() {
+                match cmd {
+                    crate::daemon::DaemonCommand::GetImageGenerationProvider { reply, .. } => {
+                        let _ = reply.send(Ok(handle.clone()));
+                    }
+                    crate::daemon::DaemonCommand::GetSessionImage { reply, .. } => {
+                        let _ = reply.send(resolved.clone());
+                    }
+                    _ => panic!("mock daemon received unexpected command"),
+                }
+            }
+        });
+        let ctx = ToolContext::new(1, db, daemon_tx);
+        EditImage::new().execute(args, None, None, Some(&ctx))
     }
 
     #[test]
@@ -614,5 +760,99 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("no edit-capable models"), "{err}");
+    }
+
+    #[test]
+    fn parse_session_selector_distinguishes_refs_from_paths() {
+        assert_eq!(
+            parse_session_selector("@last").unwrap(),
+            Some(SessionImageSelector::Last)
+        );
+        // Non-`@` entries are paths, not selectors.
+        assert_eq!(parse_session_selector("input.png").unwrap(), None);
+        assert_eq!(parse_session_selector("/tmp/a b.png").unwrap(), None);
+        // Explicit references.
+        assert_eq!(
+            parse_session_selector("@display:2:1").unwrap(),
+            Some(SessionImageSelector::Display { turn: 2, index: 1 })
+        );
+        assert_eq!(
+            parse_session_selector("@result:3:call_abc").unwrap(),
+            Some(SessionImageSelector::Result {
+                turn: 3,
+                call_id: "call_abc".to_string()
+            })
+        );
+        // A malformed `@…` form is an error, not silently a path.
+        assert!(parse_session_selector("@lst").is_err());
+        assert!(parse_session_selector("@display:2").is_err());
+        assert!(parse_session_selector("@display:x:0").is_err());
+        assert!(parse_session_selector("@result:3").is_err());
+        assert!(parse_session_selector("@result:3:").is_err());
+    }
+
+    #[test]
+    fn execute_passes_a_session_image_through_unmodified() {
+        let (handle, client) = openai_handle(None);
+        // Deliberately NOT a valid image: if the tool re-normalized the bytes it
+        // would reject them — passing them straight to the adapter proves the
+        // daemon-returned (already-normalized) bytes are forwarded verbatim.
+        let raw = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let ret = execute_with_session_image(
+            handle,
+            Ok(ResolvedImage {
+                mime_type: "image/png".to_string(),
+                data: raw.clone(),
+            }),
+            serde_json::from_str(
+                r#"{"prompt": "make it blue", "images": ["@last"], "model": "gpt-image-1"}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            client
+                .last_input_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(*client.last_first_input.lock().unwrap(), raw);
+        assert_eq!((ret.image.width, ret.image.height), (4, 3));
+    }
+
+    #[test]
+    fn execute_surfaces_a_no_images_selector_error() {
+        let (handle, _client) = openai_handle(None);
+        let err = execute_with_session_image(
+            handle,
+            Err(SessionImageError::NoImages {
+                selector: "@last".to_string(),
+            }),
+            serde_json::from_str(r#"{"prompt": "p", "images": ["@last"], "model": "gpt-image-1"}"#)
+                .unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no images"), "{err}");
+    }
+
+    #[test]
+    fn execute_rejects_a_malformed_selector() {
+        let (handle, _client) = openai_handle(None);
+        let err = execute_with_session_image(
+            handle,
+            Ok(ResolvedImage {
+                mime_type: "image/png".to_string(),
+                data: vec![1, 2, 3],
+            }),
+            serde_json::from_str(r#"{"prompt": "p", "images": ["@lst"], "model": "gpt-image-1"}"#)
+                .unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unrecognized session image reference"),
+            "{err}"
+        );
     }
 }

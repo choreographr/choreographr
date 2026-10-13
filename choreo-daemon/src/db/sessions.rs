@@ -578,9 +578,14 @@ pub fn read_turns(db: &redb::Database, session_id: u64) -> io::Result<Vec<(u32, 
     let read_txn = db
         .begin_read()
         .map_err(|e| db_err(format!("redb read txn: {e}")))?;
-    let table = read_txn
-        .open_table(SESSION_TURNS)
-        .map_err(|e| db_err(format!("redb open turns: {e}")))?;
+    let table = match read_txn.open_table(SESSION_TURNS) {
+        Ok(t) => t,
+        // A fresh database that has never persisted a turn has no table yet:
+        // that is an empty session history, not an error (mirrors
+        // `read_all_sessions`'s missing-`sessions` handling).
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(db_err(format!("redb open turns: {e}"))),
+    };
     // The attachments table is opened in the SAME read transaction as the turns
     // table so both see a consistent snapshot — a turn and its attachment rows
     // were committed atomically, so re-attachment can never observe a half-
