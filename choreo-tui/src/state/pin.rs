@@ -15,12 +15,14 @@
 //! interleaved `Done`/`TurnAppended`, a resize, a session switch-in) is covered
 //! by construction.  The fast path only keeps the anchor current; it never pins.
 //!
-//! A single agent run is a *tool loop*: the daemon appends several turns against
-//! one stream id before it is done, so the pin's target moves as the run
-//! advances.  `App::handle_started` re-targets an engaged pin to each new turn,
-//! releasing the viewport back to the bottom, so a multi-turn run ends pinned on
-//! its *final* turn rather than frozen on the first answer that happened to fill
-//! the viewport.
+//! A single agent run is a *tool loop*: the daemon appends several turns —
+//! and their tool calls and output — against one stream id before it is done.
+//! Every response pins while it streams, but the first thing that streams
+//! *after* it (a tool call, tool output, or the next turn) releases the pin via
+//! [`SessionDisplayState::release_response_pin`]: a pinned response is dropped
+//! and the viewport returned to the bottom, so the following content is
+//! followed from the bottom.  The run's *final* response has nothing after it,
+//! so it is the one left pinned.
 
 use super::{HistoryViewport, SessionDisplayState};
 
@@ -32,10 +34,10 @@ use super::{HistoryViewport, SessionDisplayState};
 /// otherwise scroll above the viewport top; from then on the normal anchoring
 /// holds that row in place.  State is per display and survives session switches,
 /// so re-entering a session never re-pins a response that already pinned (or
-/// lets one that pinned reposition).  It is re-armed by a *new* response (a
-/// different turn id — `App::handle_started`, which re-targets the pin when a
-/// multi-turn agent run advances to its next turn), dropped by a manual scroll,
-/// and cleared on completion.
+/// lets one that pinned reposition).  It is armed by each response (a different
+/// turn id), released the moment content follows that response — a tool call,
+/// tool output, or the next turn (`App::handle_started`) — dropped by a manual
+/// scroll, and cleared on completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResponsePin {
     /// No response is being output, or the user has taken over the view.
@@ -48,6 +50,15 @@ pub(crate) enum ResponsePin {
 }
 
 impl ResponsePin {
+    /// The turn this pin belongs to, or `None` when no response is pending or
+    /// engaged ([`ResponsePin::Idle`]).
+    pub(crate) fn turn(self) -> Option<u32> {
+        match self {
+            ResponsePin::Idle => None,
+            ResponsePin::Armed(turn_id) | ResponsePin::Pinned(turn_id) => Some(turn_id),
+        }
+    }
+
     /// Drop the pin when the user scrolls manually.
     ///
     /// A manual scroll means the user has taken over the view, so the pin is
@@ -135,6 +146,33 @@ impl SessionDisplayState {
             // the armed turn *is* the streaming turn, so this is the fast path.
             Some(i) if self.visible_turn_ids.get(i) == Some(&turn_id) => Some(i),
             _ => self.visible_turn_ids.iter().position(|&t| t == turn_id),
+        }
+    }
+
+    /// Release the pin because content is streaming *after* the response — a
+    /// tool call, tool output, or a new turn.  This is what leaves only the
+    /// run's *final* response pinned: every response pins while it streams, but
+    /// the first thing that follows it releases the pin.
+    ///
+    /// A [`ResponsePin::Pinned`] response (whose top the viewport is holding)
+    /// is dropped **and the viewport returned to the bottom**, so the following
+    /// content is followed from the bottom as it streams.  A
+    /// [`ResponsePin::Armed`] response (whose trigger never fired) is dropped
+    /// without touching the scroll: it must not be left to fire later, once the
+    /// following content has grown the finished response's turn tall enough
+    /// that its top would pass the viewport top — that would yank the viewport
+    /// up onto a response that is already over.  [`ResponsePin::Idle`] is a
+    /// no-op (the user already scrolled the pin away, or nothing was pinned).
+    pub(crate) fn release_response_pin(&mut self) {
+        match self.response_pin {
+            ResponsePin::Pinned(_) => {
+                self.history_scroll.scroll = 0;
+                self.response_pin = ResponsePin::Idle;
+            }
+            ResponsePin::Armed(_) => {
+                self.response_pin = ResponsePin::Idle;
+            }
+            ResponsePin::Idle => {}
         }
     }
 }

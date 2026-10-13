@@ -1690,16 +1690,18 @@ state lives on the per-session display and is deliberately **not** reset by
 pins on the first frame after the user switches to it, and one that already
 pinned keeps its position on every re-entry (it never re-pins).
 
-A single agent run is a *tool loop*: the daemon appends several turns against
-one stream id before it is done, so the pin's target moves as the run advances.
-`App::handle_started` re-targets an engaged pin to each new turn — releasing the
-viewport back to the bottom — so a multi-turn run ends pinned on its *final*
-turn, not frozen on the first answer that happened to fill the viewport. A
-manual scroll drops the pin entirely (armed or already pinned), so neither the
-current response nor a later turn releases the viewport over a user who chose to
-read elsewhere; the same response can then never re-pin. The mechanics are
-documented in-source (see `choreo-tui`'s `state::pin`, `state::history`, and
-`state::streaming`; `cargo doc -p choreo-tui` / `just doc`).
+A single agent run is a *tool loop*: the daemon appends several turns — and
+their tool calls and output — against one stream id before it is done. Every
+response pins while it streams, but the first thing that streams *after* it (a
+tool call, tool output, or the next turn's `Started`) releases the pin: a pinned
+response is dropped and the viewport returned to the bottom, an armed one is
+just dropped (so its trigger can never fire later on a finished response), and
+so the following content is followed from the bottom. The run's *final* response
+has nothing after it and is the one left pinned. A manual scroll drops the pin
+entirely (armed or already pinned), so no release ever moves the viewport over a
+user who chose to read elsewhere; the same response can then never re-pin. The
+mechanics are documented in-source (see `choreo-tui`'s `state::pin`,
+`state::history`, and `state::streaming`; `cargo doc -p choreo-tui` / `just doc`).
 
 The all-activity subscription is **sticky**: the daemon's activity broadcast
 (`handle_broadcast_activity`) never drops a message for a subscriber —

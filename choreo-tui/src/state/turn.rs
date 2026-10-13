@@ -110,7 +110,17 @@ impl TurnEventHandler for App {
     fn handle_turn_appended(&mut self, session_id: u64, turn_id: u32, turn: Turn) {
         tracing::trace!(%turn_id, "handle_turn_appended");
         self.sync_turn_images(session_id, turn_id, &turn);
+        // A turn that carries tool calls means its response is finished and the
+        // run continues with those tools (and then another turn): release any
+        // pin the response took so the tool call and its output that follow are
+        // followed from the bottom.  This is the earliest "content after the
+        // response" signal — the seeded turn is broadcast just before the tool
+        // calls execute.
+        let response_finished = !turn.tool_calls.is_empty();
         let display = self.display_for(session_id);
+        if response_finished {
+            display.release_response_pin();
+        }
         invalidate_turn_cache(display, turn_id);
         display.view.insert_or_replace(turn_id, turn);
         // Replacement can change the rendered content even when the cache key's
@@ -206,12 +216,12 @@ impl TurnEventHandler for App {
 
         // Arm the response auto-pin on the first Answer chunk: the response is
         // about to fill the turn, and the pin should engage (once) if its top
-        // reaches the viewport top.  A response already pinned for this turn is
-        // left untouched; a different turn has already been re-targeted in
-        // `handle_started` (which drops an engaged pin and releases the viewport
-        // when a multi-turn run advances), so arming here is fresh.  Reaching
-        // this for a background session (the all-activity subscription) arms its
-        // display too, so a switch-in pins before the first frame.
+        // reaches the viewport top.  Any pin the *previous* response took was
+        // already released by the content that followed it (a tool call, tool
+        // output, or this turn's `Started`), so this arm is fresh; a response
+        // already pinned for this turn is left untouched.  Reaching this for a
+        // background session (the all-activity subscription) arms its display
+        // too, so a switch-in pins before the first frame.
         if first_answer
             && let Some(turn_id) = turn_id
             && display.response_pin != ResponsePin::Pinned(turn_id)
@@ -239,23 +249,16 @@ impl TurnEventHandler for App {
             .visible_turn_ids
             .iter()
             .position(|id| *id == turn_id);
-        // A new turn in the same agent run supersedes the previous response's
-        // pin: the daemon's tool loop starts each turn against the *same*
-        // stream id, so `Started` naming a turn other than the one currently
-        // pinned means the run is continuing.  Re-target the pin to the newest —
-        // and eventually final — turn, releasing the viewport back to the bottom
-        // so that turn's response can reach the top and pin in turn (otherwise
-        // the run stays frozen on the first answer that happened to fill the
-        // viewport).  Only an *engaged* pin for a different turn triggers this:
-        // a manual scroll has already dropped the pin, and an attach replay
-        // names the turn already pinned, so neither releases the viewport.  A
-        // turn with no response (a tool-only turn) simply leaves the pin Idle,
-        // so the tool output that streams next stays in view.
-        if let ResponsePin::Pinned(pinned_turn) = display.response_pin
-            && pinned_turn != turn_id
-        {
-            display.history_scroll.scroll = 0;
-            display.response_pin = ResponsePin::Idle;
+        // A new turn in the same agent run supersedes the previous response:
+        // content (this turn) is streaming after it, so release any pin it took
+        // — dropping a pinned response and returning the viewport to the bottom
+        // so the new turn is followed from the bottom.  A tool-less
+        // continuation (e.g. a truncation recovery) reaches here with no
+        // tool-call event in between, so this is its only release point.
+        // Guarded on a *different* turn so an attach replay — which re-sends
+        // `Started` for the turn already pinned — never releases it.
+        if display.response_pin.turn().is_some_and(|t| t != turn_id) {
+            display.release_response_pin();
         }
     }
 
@@ -375,6 +378,10 @@ impl TurnEventHandler for App {
                 arguments_json,
                 invocation_description,
             } => {
+                // A tool call is content streaming after the assistant response:
+                // release any pin the response took so the tool call and its
+                // output are followed from the bottom.
+                display.release_response_pin();
                 // Look up the turn before mutating so the version bump below
                 // can target the right turn (the start event may backfill the
                 // stub's name/description — both visible in the rendered
@@ -407,6 +414,9 @@ impl TurnEventHandler for App {
     ) {
         let text = String::from_utf8_lossy_owned(data);
         let display = self.display_for(session_id);
+        // Tool output is content streaming after the assistant response: release
+        // any pin the response took so the output is followed from the bottom.
+        display.release_response_pin();
         // The chunk appends to `turn.tool_results[i].content` (rendered
         // live); bump the turn's content version so a rebuild between chunks
         // recomputes instead of reusing the pre-chunk cached lines — the

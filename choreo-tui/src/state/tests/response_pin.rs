@@ -9,7 +9,8 @@ use super::insert_turn;
 use crate::state::{App, ResponsePin};
 use crate::test_util::test_app;
 use choreo_client_core::TurnEventHandler;
-use choreo_proto::{OutputStream, Turn};
+use choreo_client_core::dispatch::ToolCallEvent;
+use choreo_proto::{OutputStream, ToolResultRecord, Turn};
 use std::borrow::Cow;
 
 /// A turn with a user prompt and no response yet, matching what `start_turn`
@@ -480,5 +481,198 @@ fn a_new_turn_after_a_manual_scroll_does_not_release_the_view() {
         app.active_display_ref().unwrap().response_pin,
         ResponsePin::Armed(2),
         "the new turn stays armed while the user reads elsewhere"
+    );
+}
+
+// ── release on content that follows the response ─────────────────────
+
+/// A first turn whose tool result placeholder is already seeded, so a
+/// `handle_tool_result_chunk` for `call_id` appends to it — the shape the
+/// daemon broadcasts (`broadcast_turn_appended`) before the tools run.
+fn turn_with_tool_result(user_text: &str, call_id: &str) -> Turn {
+    Turn {
+        created_at: choreo_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: Some(user_text.into()),
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![ToolResultRecord {
+            call_id: call_id.into(),
+            // Not a quiet tool, so the result renders expanded by default and
+            // its streamed content actually grows the turn.
+            name: "find".into(),
+            content: String::new(),
+            is_error: false,
+            invocation_description: "Running `x`.".into(),
+            image: None,
+        }],
+        displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    }
+}
+
+fn tool_call_started(app: &mut App, call_id: &str) {
+    app.handle_tool_call_event(
+        0,
+        7,
+        ToolCallEvent::Started {
+            call_id: call_id.into(),
+            tool_name: "find".into(),
+            arguments_json: "{}".into(),
+            invocation_description: "Running `x`.".into(),
+        },
+    );
+}
+
+#[test]
+fn a_tool_call_releases_a_pinned_response_and_returns_to_the_bottom() {
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 10;
+    {
+        let display = app.active_display().unwrap();
+        display.view.insert_or_replace(1, pending_turn("ask"));
+        display.view.request_to_turn.insert(7, 1);
+    }
+    app.rebuild_height_prefix();
+
+    // A long response pins its top.
+    stream_answer(&mut app, 0, 7, &"line\n".repeat(60));
+    assert_eq!(
+        app.active_display_ref().unwrap().response_pin,
+        ResponsePin::Pinned(1)
+    );
+    assert!(
+        app.effective_scroll() > 0,
+        "the response is pinned off the bottom"
+    );
+
+    // The model then calls a tool: the pin is released and the viewport returns
+    // to the bottom so the tool call and its output stream into view.
+    tool_call_started(&mut app, "c1");
+    assert_eq!(
+        app.active_display_ref().unwrap().response_pin,
+        ResponsePin::Idle,
+        "a tool call releases the pinned response"
+    );
+    assert_eq!(
+        app.active_display_ref().unwrap().history_scroll.scroll,
+        0,
+        "the viewport returns to the bottom for the tool call"
+    );
+}
+
+#[test]
+fn a_tool_result_chunk_releases_a_pinned_response_and_follows_the_output() {
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 10;
+    {
+        let display = app.active_display().unwrap();
+        display
+            .view
+            .insert_or_replace(1, turn_with_tool_result("ask", "c1"));
+        display.view.request_to_turn.insert(7, 1);
+    }
+    app.rebuild_height_prefix();
+
+    stream_answer(&mut app, 0, 7, &"line\n".repeat(60));
+    assert_eq!(
+        app.active_display_ref().unwrap().response_pin,
+        ResponsePin::Pinned(1)
+    );
+
+    // Tool output arrives: the pin is released and the view follows the bottom
+    // as the output grows.
+    app.handle_tool_result_chunk(0, 7, "c1".into(), b"out\n".repeat(80));
+    app.compute_total_height_and_markers();
+    assert_eq!(
+        app.active_display_ref().unwrap().response_pin,
+        ResponsePin::Idle,
+        "tool output releases the pinned response"
+    );
+    assert_eq!(
+        app.effective_scroll(),
+        0,
+        "the view follows the tool output from the bottom"
+    );
+}
+
+#[test]
+fn an_armed_short_response_that_a_tool_follows_never_pins() {
+    // Regression: a short response never fills the viewport, so it stays
+    // `Armed`; when a tool follows and its output grows the turn tall enough
+    // that the finished response's top would pass the viewport top, a stale
+    // `Armed` would fire and yank the view up onto that finished response.  The
+    // tool content must release it instead.
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 8;
+    {
+        let display = app.active_display().unwrap();
+        display
+            .view
+            .insert_or_replace(1, turn_with_tool_result("ask", "c1"));
+        display.view.request_to_turn.insert(7, 1);
+    }
+    app.rebuild_height_prefix();
+
+    // A short response: armed, but never engaged (the viewport still follows
+    // the bottom).
+    app.handle_request_stream(0, 7, OutputStream::Answer, Cow::Borrowed("hi"));
+    app.compute_total_height_and_markers();
+    assert_eq!(
+        app.active_display_ref().unwrap().response_pin,
+        ResponsePin::Armed(1),
+        "a short response stays armed, never pinned"
+    );
+    assert_eq!(app.effective_scroll(), 0);
+
+    // A tool follows and its output grows the turn well past the viewport.
+    app.handle_tool_result_chunk(0, 7, "c1".into(), b"out\n".repeat(80));
+    app.compute_total_height_and_markers();
+    assert_eq!(
+        app.active_display_ref().unwrap().response_pin,
+        ResponsePin::Idle,
+        "the armed trigger must not fire on the finished response"
+    );
+    assert_eq!(
+        app.effective_scroll(),
+        0,
+        "the view follows the tool output from the bottom"
+    );
+}
+
+#[test]
+fn a_new_turn_releases_an_armed_response() {
+    // A tool-less continuation (e.g. a truncation recovery) has no tool-call
+    // event to release the pin; the new turn's `Started` must do it.
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 6;
+    {
+        let display = app.active_display().unwrap();
+        display.view.insert_or_replace(1, pending_turn("ask"));
+        display.view.request_to_turn.insert(7, 1);
+    }
+    app.rebuild_height_prefix();
+
+    app.handle_request_stream(0, 7, OutputStream::Answer, Cow::Borrowed("hi"));
+    app.compute_total_height_and_markers();
+    assert_eq!(
+        app.active_display_ref().unwrap().response_pin,
+        ResponsePin::Armed(1)
+    );
+
+    app.handle_turn_appended(0, 2, continuation_turn());
+    app.handle_started(0, 7, 2, 0);
+    assert_eq!(
+        app.active_display_ref().unwrap().response_pin,
+        ResponsePin::Idle,
+        "a new turn releases the armed trigger"
     );
 }
