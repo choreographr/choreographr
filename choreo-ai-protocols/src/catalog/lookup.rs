@@ -1031,6 +1031,27 @@ mod tests {
     }
 
     #[test]
+    fn bundled_overlay_lists_xai_edit_models() {
+        // The REAL bundled catalog: the xAI grok-imagine image models carry the
+        // edit flag solely from the bundled overlay (models.dev has no edit
+        // modality), so this pins the overlay plumbing end to end for xAI. The
+        // adapter routes this slug to a JSON `/images/edits` body
+        // (images::is_xai_image_provider_slug); the tool reads these through
+        // image_edit_models_for_provider("xai"). Read-only (no catalog swap),
+        // so no restore guard is needed.
+        let edit_models = image_edit_models_for_provider("xai");
+        assert!(edit_models.iter().any(|m| m == "grok-imagine-image"));
+        assert!(
+            edit_models
+                .iter()
+                .any(|m| m == "grok-imagine-image-quality")
+        );
+        // The grok-imagine video model is image-INPUT only and must not be an
+        // edit candidate.
+        assert!(!edit_models.iter().any(|m| m == "grok-imagine-video"));
+    }
+
+    #[test]
     fn bundled_overlay_flips_image_output_flag() {
         // The bundled overlay can override the flag like vision's. Swap in a
         // catalog with the flag ON and overlay it back OFF (and vice versa)

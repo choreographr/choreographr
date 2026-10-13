@@ -115,6 +115,27 @@ pub fn is_fal_image_provider_slug(slug: &str) -> bool {
     crate::shared::is_fal_provider_slug(slug)
 }
 
+/// Whether a catalog provider slug is the xAI image-provider slug (`"xai"`)
+/// whose Images **edit** endpoint takes a JSON body rather than the `OpenAI`
+/// multipart form.
+///
+/// xAI (`https://api.x.ai/v1`) is an OpenAI-protocol provider, so its
+/// *generation* requests share the generic [`OpenAiImageClient`] JSON path
+/// (`POST /images/generations`). Editing, however, is
+/// `POST {base}/images/edits` with `Content-Type: application/json` and an
+/// `images` field — and the endpoint rejects `multipart/form-data` outright
+/// (xAI documents that the `OpenAI` SDK's `images.edit()` is unsupported for
+/// exactly this reason), accepts no `mask`, and takes none of the
+/// `size`/`quality`/`background`/`output_format` knobs. So
+/// [`ImageGenerationClient::edit_image`] branches on this slug inside
+/// [`OpenAiImageClient`] to build the JSON body instead of the multipart one.
+/// The client crate owns this knowledge so the daemon's dispatch does not
+/// hardcode provider-family facts.
+#[must_use]
+pub fn is_xai_image_provider_slug(slug: &str) -> bool {
+    matches!(slug, "xai")
+}
+
 use choreo_proto::InferenceError;
 use serde::{Deserialize, Serialize};
 
@@ -484,7 +505,9 @@ pub trait ImageGenerationClient: std::fmt::Debug + Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_fal_image_provider_slug, is_zhipu_image_provider_slug};
+    use super::{
+        is_fal_image_provider_slug, is_xai_image_provider_slug, is_zhipu_image_provider_slug,
+    };
 
     #[test]
     fn zhipu_slug_allowlist_is_exact() {
@@ -526,6 +549,31 @@ mod tests {
             assert!(
                 !is_fal_image_provider_slug(slug),
                 "{slug:?} must NOT be a fal image-provider slug"
+            );
+        }
+    }
+
+    #[test]
+    fn xai_slug_allowlist_is_exact() {
+        // Exactly the one documented xAI slug routes to the dedicated JSON
+        // `/images/edits` body; near-misses and other families must not.
+        assert!(
+            is_xai_image_provider_slug("xai"),
+            "xai must be the xAI image-provider slug"
+        );
+        for slug in [
+            "xai-future",
+            "xai_image",
+            "x-ai",
+            "grok",
+            "openai",
+            "zai",
+            "",
+            "XAI",
+        ] {
+            assert!(
+                !is_xai_image_provider_slug(slug),
+                "{slug:?} must NOT be the xAI image-provider slug"
             );
         }
     }

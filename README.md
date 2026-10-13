@@ -538,8 +538,10 @@ path or a **session reference** to an image already in the conversation —
 `@last` (the most recent image, e.g. one the user just shared or a previous
 `generate_image`/`edit_image` produced), or `@display:<turn>:<index>` /
 `@result:<turn>:<call_id>` for an explicit one. Both tools go through the
-session's image-capable provider account — OpenAI Images API and fal.ai in v1;
-the Zhipu/z.ai Images backend is generation-only and Anthropic/Gemini backends
+session's image-capable provider account — the OpenAI Images API, xAI's
+`grok-imagine` Images API (OpenAI-protocol generation, but a JSON body on
+`/images/edits` for editing), and fal.ai in v1; the Zhipu/z.ai Images backend
+is generation-only and Anthropic/Gemini backends
 are deferred. When no explicit model is passed, the daemon picks among the
 provider's catalog-verified *generation* models for `generate_image` and its
 catalog-verified *edit-capable* models for `edit_image`, by priority

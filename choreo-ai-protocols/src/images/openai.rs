@@ -6,15 +6,27 @@
 //! gpt-image model family: they always return `b64_json` and **reject** the
 //! legacy `response_format` parameter, so that field is never sent (see the
 //! body builder below for the why).
+//!
+//! Editing has TWO body shapes on the same `/images/edits` path. The default
+//! is the gpt-image contract: `multipart/form-data` with an `image` part per
+//! input, an optional `mask`, and whichever knobs are non-default. xAI
+//! ([`is_xai_image_provider_slug`]) is the exception — it speaks the same
+//! `OpenAI` *generation* JSON for images, but its edit endpoint is
+//! `Content-Type: application/json` with an `images` field and rejects the
+//! multipart form outright, so [`OpenAiImageClient::edit_image`] branches to
+//! the JSON body for that slug.
 
 use crate::SocketRegistry;
+use crate::download;
 use crate::images::{
     ImageEditRequest, ImageGenerationClient, ImageGenerationRequest, ImageGenerationResult,
-    ImageQuality, ImageSize, OutputFormat,
+    ImageQuality, ImageSize, OutputFormat, is_xai_image_provider_slug,
 };
 use crate::openai::endpoint_url;
 use crate::openai::{OpenAiError, ServiceConfig};
 use crate::retry::{self, AttemptContext, RetryConfig};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use choreo_proto::InferenceError;
 use serde::Deserialize;
 use std::io;
@@ -37,13 +49,16 @@ const IMAGE_TOTAL_TIMEOUT_SECS: u64 = super::IMAGE_TOTAL_TIMEOUT_SECS;
 
 /// One `data[]` item of the Images API response.
 ///
-/// `b64_json` is `Option` rather than required so a *missing* field is
-/// detected as "no image data" (reported as [`OpenAiError::EmptyResponse`])
-/// instead of a deserialization failure whose message would not say what was
-/// actually wrong with the payload.
+/// `b64_json` and `url` are both `Option` rather than required so a *missing*
+/// field is detected as "no image data" (reported as
+/// [`OpenAiError::EmptyResponse`]) instead of a deserialization failure whose
+/// message would not say what was actually wrong with the payload. The
+/// gpt-image family returns inline `b64_json`; xAI returns a `url` (with
+/// `b64_json` null) the adapter must download.
 #[derive(Debug, Deserialize)]
 struct ImageDataItem {
     b64_json: Option<String>,
+    url: Option<String>,
     revised_prompt: Option<String>,
 }
 
@@ -116,6 +131,125 @@ impl OpenAiImageClient {
     pub fn config(&self) -> &ServiceConfig {
         &self.config
     }
+
+    /// Extract the first image's `(image_b64, revised_prompt)` from a decoded
+    /// Images response, or [`OpenAiError::EmptyResponse`] when the payload
+    /// carried no usable image. Shared by generation and editing: both pin the
+    /// output to one image (generation via `n: 1`, editing because the tool
+    /// consumes exactly one), so "first and only" is the operative rule for
+    /// both.
+    ///
+    /// A non-empty `b64_json` is used directly (the gpt-image contract);
+    /// otherwise a non-empty `url` is downloaded through the shared
+    /// [`crate::download`] machinery — the same one the fal adapter uses — so
+    /// the SSRF guard and the capped/retried/cancellable fetch cannot drift
+    /// between adapters. xAI's `/images/edits` returns `data[0].url` with
+    /// `b64_json` null, so it always takes the download path.
+    fn decode_first_image(
+        &self,
+        payload: ImagesResponse,
+        model: &str,
+        cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
+    ) -> Result<(String, Option<String>), InferenceError> {
+        let item = payload.data.into_iter().next().ok_or_else(|| {
+            tracing::warn!(model = %model, "image response carried no image data");
+            crate::shared::provider_error_to_inference(OpenAiError::EmptyResponse)
+        })?;
+        let revised_prompt = item.revised_prompt;
+        if let Some(b64) = item.b64_json.filter(|b64| !b64.is_empty()) {
+            return Ok((b64, revised_prompt));
+        }
+        if let Some(image_url) = item.url.filter(|u| !u.trim().is_empty()) {
+            tracing::debug!(model = %model, "image response carried a URL instead of inline bytes");
+            let bytes =
+                download::download_image_bytes(&self.http, &self.config, &image_url, cancel_rx)
+                    .map_err(crate::shared::provider_error_to_inference)?;
+            return Ok((BASE64.encode(bytes), revised_prompt));
+        }
+        tracing::warn!(model = %model, "image response carried no image data");
+        Err(crate::shared::provider_error_to_inference(
+            OpenAiError::EmptyResponse,
+        ))
+    }
+
+    /// Edit via the xAI JSON contract: `POST {base}/images/edits` with
+    /// `Content-Type: application/json` and a `{model, prompt, images}` body of
+    /// `data:` URIs (see [`edit_json_body`]). Shares the multipart edit's
+    /// retry/attempt machinery; only the body and `Content-Type` differ. The
+    /// response is decoded by [`Self::decode_first_image`], so an xAI `url`
+    /// (its `data[0]` carries `b64_json` null) is fetched through the shared
+    /// download machinery rather than assumed to be inline base64.
+    fn edit_image_json(
+        &self,
+        req: &ImageEditRequest,
+        cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
+    ) -> Result<ImageGenerationResult, InferenceError> {
+        let url = endpoint_url(&self.config.base_url, IMAGE_EDITS_PATH)
+            .map_err(OpenAiError::Io)
+            .map_err(crate::shared::provider_error_to_inference)?;
+        // Same frugal budget as generation (see IMAGE_MAX_ATTEMPTS).
+        let retry_cfg = RetryConfig::new(
+            IMAGE_MAX_ATTEMPTS,
+            self.config.retry_initial_backoff_ms,
+            self.config.retry_max_backoff_ms,
+        );
+        let auth_header = zeroize::Zeroizing::new(format!("Bearer {}", self.api_key.trim()));
+        let http = &self.http;
+        let body = edit_json_body(req);
+        let mut on_retry: Option<retry::RetryCallback> = None;
+        let mut ctx = AttemptContext::new(&mut on_retry, cancel_rx, None);
+
+        tracing::debug!(
+            url = %url,
+            model = %req.model,
+            image_count = req.images.len(),
+            total_input_bytes = req.images.iter().map(|i| i.data.len()).sum::<usize>(),
+            max_attempts = retry_cfg.max_attempts,
+            "sending xAI image edit request"
+        );
+
+        // Compact JSON plus an explicit `Content-Length` (see
+        // `retry::HookedJsonBody`); no upload hook — image editing has no
+        // `Waiting` boundary.
+        let hooked = retry::HookedJsonBody::new(&body, None, retry::RequestCompression::Identity)
+            .map_err(InferenceError::Io)?;
+        let response = retry::retry_loop(
+            || {
+                hooked
+                    .apply_headers(
+                        http.post(&url)
+                            .header("Authorization", auth_header.as_str()),
+                    )
+                    .send(hooked.send_body())
+            },
+            &retry_cfg,
+            &mut ctx,
+        )
+        .map_err(OpenAiError::from)
+        .map_err(crate::shared::provider_error_to_inference)?;
+
+        let payload: ImagesResponse = response
+            .into_body()
+            .read_json()
+            .map_err(|e| OpenAiError::Io(io::Error::other(e)))
+            .map_err(crate::shared::provider_error_to_inference)?;
+
+        let (image_b64, revised_prompt) =
+            self.decode_first_image(payload, &req.model, cancel_rx)?;
+
+        tracing::info!(
+            model = %req.model,
+            image_b64_len = image_b64.len(),
+            revised_prompt_len = revised_prompt.as_deref().map_or(0, str::len),
+            "image edit succeeded"
+        );
+
+        Ok(ImageGenerationResult {
+            image_b64,
+            revised_prompt,
+            model: req.model.clone(),
+        })
+    }
 }
 
 /// The outgoing JSON body: the request `flatten`ed with the pinned
@@ -143,30 +277,33 @@ struct WireBody<'a> {
     n: u32,
 }
 
-/// Extract the first image's `(b64_json, revised_prompt)` from a decoded
-/// Images response, or [`OpenAiError::EmptyResponse`] when the payload
-/// carried no usable image. Shared by generation and editing: both pin the
-/// output to one image (generation via `n: 1`, editing because the tool
-/// consumes exactly one), so "first and only" is the operative rule for
-/// both.
-fn first_image(
-    payload: ImagesResponse,
-    model: &str,
-) -> Result<(String, Option<String>), OpenAiError> {
-    payload
-        .data
-        .into_iter()
-        .next()
-        .and_then(|item| {
-            let revised_prompt = item.revised_prompt;
-            item.b64_json
-                .filter(|b64| !b64.is_empty())
-                .map(|b64| (b64, revised_prompt))
+/// The outgoing **xAI edit** JSON body: `{model, prompt, images}` where every
+/// input image is a `data:<mime>;base64,<...>` URI (xAI accepts a data URI
+/// anywhere it takes an image URL) and `images` is always the vector form —
+/// the single-input `image` field is the same shape with one element, so one
+/// field covers both. Only `model`/`prompt`/`images` are sent: xAI's edit
+/// endpoint accepts no `mask` and none of the `size`/`quality`/`background`/
+/// `output_format` knobs, which the multipart path would otherwise emit
+/// whenever a caller sets one.
+fn edit_json_body(req: &ImageEditRequest) -> serde_json::Value {
+    let images: Vec<String> = req
+        .images
+        .iter()
+        .map(|image| {
+            // Base64's alphabet contains no comma, so the MIME/payload
+            // boundary in a `data:` URI is unambiguous.
+            format!(
+                "data:{};base64,{}",
+                image.mime_type,
+                BASE64.encode(&image.data)
+            )
         })
-        .ok_or_else(|| {
-            tracing::warn!(model = %model, "image response carried no image data");
-            OpenAiError::EmptyResponse
-        })
+        .collect();
+    serde_json::json!({
+        "model": req.model,
+        "prompt": req.prompt,
+        "images": images,
+    })
 }
 
 /// Serialize an [`ImageEditRequest`] into a `multipart/form-data` body plus
@@ -310,9 +447,10 @@ impl ImageGenerationClient for OpenAiImageClient {
         // `request_body`); an empty or b64-less payload means the provider
         // acknowledged the request but produced nothing usable — mapped to
         // the shared EmptyResponse so it joins the existing metrics label
-        // instead of a new error variant.
+        // instead of a new error variant. A `url` instead of inline bytes is
+        // downloaded through the shared machinery.
         let (image_b64, revised_prompt) =
-            first_image(payload, &req.model).map_err(crate::shared::provider_error_to_inference)?;
+            self.decode_first_image(payload, &req.model, cancel_rx)?;
 
         tracing::info!(
             model = %req.model,
@@ -334,6 +472,12 @@ impl ImageGenerationClient for OpenAiImageClient {
         req: &ImageEditRequest,
         cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
     ) -> Result<ImageGenerationResult, InferenceError> {
+        // xAI rejects the `multipart/form-data` form its OpenAI-protocol
+        // sibling uses and takes a JSON body on the same `/images/edits` path
+        // instead; route there before building the multipart parts.
+        if is_xai_image_provider_slug(self.provider_slug()) {
+            return self.edit_image_json(req, cancel_rx);
+        }
         let url = endpoint_url(&self.config.base_url, IMAGE_EDITS_PATH)
             .map_err(OpenAiError::Io)
             .map_err(crate::shared::provider_error_to_inference)?;
@@ -387,7 +531,7 @@ impl ImageGenerationClient for OpenAiImageClient {
             .map_err(crate::shared::provider_error_to_inference)?;
 
         let (image_b64, revised_prompt) =
-            first_image(payload, &req.model).map_err(crate::shared::provider_error_to_inference)?;
+            self.decode_first_image(payload, &req.model, cancel_rx)?;
 
         tracing::info!(
             model = %req.model,
@@ -406,11 +550,12 @@ impl ImageGenerationClient for OpenAiImageClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{WireBody, edit_multipart};
+    use super::{WireBody, edit_json_body, edit_multipart};
     use crate::images::{
         Background, ImageEditRequest, ImageGenerationRequest, ImageInput, ImageQuality, ImageSize,
         OutputFormat,
     };
+    use base64::Engine as _;
 
     #[test]
     fn wire_body_never_carries_seed_even_when_the_request_sets_one() {
@@ -510,5 +655,83 @@ mod tests {
         // Exactly one `mask` part, carrying the mask's own filename + MIME.
         assert_eq!(text.matches("name=\"mask\"").count(), 1, "{text}");
         assert!(text.contains("filename=\"mask.png\""), "{text}");
+    }
+
+    #[test]
+    fn edit_json_body_carries_data_uris_and_omits_every_knob() {
+        // The xAI edit body is JSON: `{model, prompt, images}` where each input
+        // is a `data:<mime>;base64,<...>` URI. A `mask` and every non-default
+        // knob are present on the request but MUST NOT appear — xAI's edit
+        // endpoint accepts none of them (and no `mask` at all), unlike the
+        // multipart path which emits whichever knobs the caller set.
+        let req = ImageEditRequest {
+            size: ImageSize::Square1024,
+            quality: ImageQuality::High,
+            output_format: OutputFormat::Webp,
+            background: Background::Transparent,
+            mask: Some(ImageInput {
+                filename: "mask.png".to_string(),
+                mime_type: "image/png".to_string(),
+                data: vec![9, 9],
+            }),
+            ..ImageEditRequest::new(
+                "add a hat",
+                "grok-imagine-image",
+                vec![
+                    ImageInput {
+                        filename: "a.png".to_string(),
+                        mime_type: "image/png".to_string(),
+                        data: vec![1, 2, 3],
+                    },
+                    ImageInput {
+                        filename: "b.jpg".to_string(),
+                        mime_type: "image/jpeg".to_string(),
+                        data: vec![4, 5],
+                    },
+                ],
+            )
+        };
+        let body = edit_json_body(&req);
+        assert_eq!(
+            body.get("model").and_then(serde_json::Value::as_str),
+            Some("grok-imagine-image"),
+            "{body}"
+        );
+        assert_eq!(
+            body.get("prompt").and_then(serde_json::Value::as_str),
+            Some("add a hat"),
+            "{body}"
+        );
+        // `images` is always the vector form; each entry is a data URI whose
+        // MIME comes from the input and whose payload is that input's bytes.
+        let images = body
+            .get("images")
+            .and_then(serde_json::Value::as_array)
+            .expect("images array");
+        assert_eq!(images.len(), 2, "{body}");
+        let expected_png = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3])
+        );
+        let expected_jpeg = format!(
+            "data:image/jpeg;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode([4u8, 5])
+        );
+        assert_eq!(images[0].as_str(), Some(expected_png.as_str()), "{body}");
+        assert_eq!(images[1].as_str(), Some(expected_jpeg.as_str()), "{body}");
+        // No mask, no single-input `image`, no knobs.
+        for omitted in [
+            "mask",
+            "image",
+            "size",
+            "quality",
+            "output_format",
+            "background",
+        ] {
+            assert!(
+                body.get(omitted).is_none(),
+                "{omitted} must be absent from the xAI edit body: {body}"
+            );
+        }
     }
 }

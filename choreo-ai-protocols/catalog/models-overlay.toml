@@ -296,6 +296,18 @@
   base_url = "https://api.x.ai/v1"
   default_model = "grok-4.20-0309-reasoning"
 
+# xAI image editing (image-to-image). The grok-imagine-image family is in the
+# models.dev snapshot (image-OUTPUT modality), but models.dev has no "edit"
+# modality, so the edit capability is pinned here (overlay-only — never
+# ingested, never name-guessed). xAI's edit endpoint is JSON
+# `POST /images/edits` rather than the OpenAI multipart form, so the adapter
+# builds a JSON body for this slug (images::is_xai_image_provider_slug); the
+# edit tool reads these flags via image_edit_models_for_provider("xai").
+[provider.xai.models."grok-imagine-image"]
+  supports_image_edit = true
+[provider.xai.models."grok-imagine-image-quality"]
+  supports_image_edit = true
+
 # xiaomi-token-plan-cn -> xiaomi-token-plan-cn (policy from the pre-models.dev TOML)
 [provider.xiaomi-token-plan-cn]
   default_model = "mimo-v2.5-pro"
