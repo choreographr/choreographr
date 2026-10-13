@@ -77,9 +77,9 @@ pub use catalog::{
 pub use context_window::ContextWindowConfig;
 pub use google::{GoogleClient, GoogleConfig};
 pub use images::{
-    Background, FalImageClient, ImageEditRequest, ImageGenerationClient, ImageGenerationRequest,
-    ImageGenerationResult, ImageInput, ImageQuality, ImageSize, OpenAiImageClient, OutputFormat,
-    ZaiImageClient,
+    Background, FalImageClient, GoogleImageClient, ImageEditRequest, ImageGenerationClient,
+    ImageGenerationRequest, ImageGenerationResult, ImageInput, ImageQuality, ImageSize,
+    OpenAiImageClient, OutputFormat, ZaiImageClient,
 };
 pub use openai::{AllowedCaller, OpenAiClient, RequestFormat, ServiceConfig};
 // Re-export so downstream crates (choreo-daemon) can construct/handle the

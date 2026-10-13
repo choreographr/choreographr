@@ -4,7 +4,8 @@
 //! This mirrors the [`crate::ProviderClient`] split: a provider-agnostic
 //! trait plus per-provider adapters (the `OpenAI` Images API,
 //! [`OpenAiImageClient`]; the z.ai / Zhipu GLM Images API, [`ZaiImageClient`];
-//! and the fal.ai synchronous image API, [`FalImageClient`]). Errors reuse
+//! the fal.ai synchronous image API, [`FalImageClient`]; and the Gemini
+//! `generateContent` image path, [`GoogleImageClient`]). Errors reuse
 //! [`InferenceError`] so callers of the chat trait and of this trait share one
 //! error type and one metrics-label mapping — no new error taxonomy is
 //! invented for the image path. The URL-download machinery the URL-returning
@@ -12,6 +13,7 @@
 //! (reused by the video queue's URL downloads).
 
 mod fal;
+mod google;
 mod openai;
 mod zai;
 
@@ -75,6 +77,7 @@ pub(crate) const IMAGE_DOWNLOAD_CAP_BYTES: usize = 8 * 1024 * 1024;
 pub const IMAGE_DOWNLOAD_ATTEMPTS: u32 = 3;
 
 pub use fal::FalImageClient;
+pub use google::GoogleImageClient;
 pub use openai::OpenAiImageClient;
 pub use zai::ZaiImageClient;
 

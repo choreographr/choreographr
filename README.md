@@ -540,9 +540,11 @@ path or a **session reference** to an image already in the conversation —
 `@result:<turn>:<call_id>` for an explicit one. Both tools go through the
 session's image-capable provider account — the OpenAI Images API, xAI's
 `grok-imagine` Images API (OpenAI-protocol generation, but a JSON body on
-`/images/edits` for editing), and fal.ai in v1; the Zhipu/z.ai Images backend
-is generation-only and Anthropic/Gemini backends
-are deferred. When no explicit model is passed, the daemon picks among the
+`/images/edits` for editing), Google's Gemini image models (which generate and
+edit through the `generateContent` API, with the input images sent as
+`inlineData` parts of the request), and fal.ai in v1; the Zhipu/z.ai Images
+backend is generation-only and Anthropic has no image backend. When no
+explicit model is passed, the daemon picks among the
 provider's catalog-verified *generation* models for `generate_image` and its
 catalog-verified *edit-capable* models for `edit_image`, by priority
 (gpt-image > imagen > gemini-image > flux > dall-e); edit capability is

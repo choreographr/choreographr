@@ -132,6 +132,27 @@
   base_url = "https://generativelanguage.googleapis.com/v1beta"
   default_model = "gemini-flash-latest"
 
+# Gemini image models: image editing (image-to-image). These are in the
+# models.dev snapshot with an image-OUTPUT modality, but models.dev has no
+# "edit" modality, so the edit capability is pinned here (overlay-only — never
+# ingested, never name-guessed). Gemini generates AND edits through the
+# generateContent API (image parts in the request, an inlineData part in the
+# response; see images::GoogleImageClient) rather than a dedicated Images
+# endpoint, so the edit tool reads these flags via
+# image_edit_models_for_provider("google").
+[provider.google.models."gemini-2.5-flash-image"]
+  supports_image_edit = true
+[provider.google.models."gemini-3-pro-image"]
+  supports_image_edit = true
+[provider.google.models."gemini-3-pro-image-preview"]
+  supports_image_edit = true
+[provider.google.models."gemini-3.1-flash-image"]
+  supports_image_edit = true
+[provider.google.models."gemini-3.1-flash-image-preview"]
+  supports_image_edit = true
+[provider.google.models."gemini-3.1-flash-lite-image"]
+  supports_image_edit = true
+
 # groq -> groq (policy from the pre-models.dev TOML)
 [provider.groq]
   base_url = "https://api.groq.com/openai/v1"

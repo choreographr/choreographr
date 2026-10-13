@@ -601,7 +601,7 @@ pub(crate) struct GeminiErrorDetail {
 /// approach like `OpenAI`.  We append the action as a colon-delimited suffix to keep
 /// the endpoint self-describing for different capabilities (generateContent vs
 /// streamGenerateContent).
-fn model_url(base_url: &str, model: &str, action: &str) -> String {
+pub(crate) fn model_url(base_url: &str, model: &str, action: &str) -> String {
     let base = base_url.trim_end_matches('/');
     format!("{base}/models/{model}:{action}")
 }

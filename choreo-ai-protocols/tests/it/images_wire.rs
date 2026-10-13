@@ -1040,3 +1040,207 @@ fn zai_defaults_and_trait_accessors() {
     );
     assert_eq!(c.config().total_timeout_secs, 180);
 }
+
+// ── GoogleImageClient (Gemini generateContent image path) ─────────────────
+//
+// Gemini image models have no dedicated Images endpoint: generation and
+// editing both POST {base}/models/{model}:generateContent with the prompt in a
+// `contents` part list, and the rendered pixels come back as an `inlineData`
+// response part.
+
+use choreo_ai_protocols::{GoogleConfig, GoogleImageClient};
+
+fn google_client(mock: &MockProvider) -> GoogleImageClient {
+    let config = GoogleConfig {
+        base_url: mock.base_url("v1beta"),
+        ..Default::default()
+    };
+    GoogleImageClient::new(
+        config,
+        "google-test-key".to_string(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+}
+
+fn google_sample_request() -> ImageGenerationRequest {
+    ImageGenerationRequest::new("a lighthouse at dusk", "gemini-2.5-flash-image")
+}
+
+/// A generateContent response carrying one inline image part.
+fn google_success_body(b64: &str) -> String {
+    serde_json::json!({
+        "candidates": [{
+            "content": {
+                "role": "model",
+                "parts": [
+                    { "text": "here is your image" },
+                    { "inlineData": { "mimeType": "image/png", "data": b64 } }
+                ]
+            },
+            "finishReason": "STOP"
+        }]
+    })
+    .to_string()
+}
+
+#[test]
+#[ignore = "integration"]
+fn google_generate_maps_the_first_inline_data_part() {
+    let mock = MockProvider::start(vec![(
+        200,
+        "application/json",
+        google_success_body("aVNTaGVQclBuZ0J5dGVz"),
+    )]);
+    let result = google_client(&mock)
+        .generate_image(&google_sample_request(), None)
+        .expect("generation succeeds");
+    assert_eq!(result.image_b64, "aVNTaGVQclBuZ0J5dGVz");
+    assert_eq!(result.revised_prompt, None);
+    assert_eq!(result.model, "gemini-2.5-flash-image");
+
+    // One request, POSTed to the generateContent action on the configured base
+    // with the x-goog-api-key auth header.
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(
+        requests[0].path,
+        "/v1beta/models/gemini-2.5-flash-image:generateContent"
+    );
+    assert_eq!(
+        requests[0].header("x-goog-api-key"),
+        Some("google-test-key")
+    );
+}
+
+#[test]
+#[ignore = "integration"]
+fn google_generate_body_is_a_single_user_text_part() {
+    let mock = MockProvider::start(vec![(200, "application/json", google_success_body("aGk"))]);
+    google_client(&mock)
+        .generate_image(&google_sample_request(), None)
+        .expect("generation succeeds");
+    let body = mock.requests()[0].body_json();
+    assert_eq!(body["contents"][0]["role"], "user");
+    assert_eq!(
+        body["contents"][0]["parts"][0]["text"],
+        "a lighthouse at dusk"
+    );
+    assert_eq!(
+        body["contents"][0]["parts"].as_array().map(Vec::len),
+        Some(1)
+    );
+}
+
+#[test]
+#[ignore = "integration"]
+fn google_edit_body_appends_inline_data_parts_per_image() {
+    // Editing sends the prompt followed by one inlineData part per input image;
+    // the mask and every knob are dropped (Gemini's generateContent editing
+    // takes none of them).
+    let mock = MockProvider::start(vec![(200, "application/json", google_success_body("aGk"))]);
+    let req = choreo_ai_protocols::ImageEditRequest {
+        mask: Some(choreo_ai_protocols::ImageInput {
+            filename: "mask.png".to_string(),
+            mime_type: "image/png".to_string(),
+            data: vec![9, 9],
+        }),
+        ..choreo_ai_protocols::ImageEditRequest::new(
+            "add a hat",
+            "gemini-3-pro-image",
+            vec![
+                choreo_ai_protocols::ImageInput {
+                    filename: "a.png".to_string(),
+                    mime_type: "image/png".to_string(),
+                    data: vec![1, 2, 3],
+                },
+                choreo_ai_protocols::ImageInput {
+                    filename: "b.jpg".to_string(),
+                    mime_type: "image/jpeg".to_string(),
+                    data: vec![4, 5],
+                },
+            ],
+        )
+    };
+    google_client(&mock)
+        .edit_image(&req, None)
+        .expect("edit succeeds");
+    let body = mock.requests()[0].body_json();
+    let parts = body["contents"][0]["parts"].as_array().expect("parts");
+    assert_eq!(parts.len(), 3, "{body}");
+    assert_eq!(parts[0]["text"], "add a hat");
+    assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+    assert_eq!(
+        parts[1]["inlineData"]["data"],
+        base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3])
+    );
+    assert_eq!(parts[2]["inlineData"]["mimeType"], "image/jpeg");
+    // The POST path is the edit model's generateContent action.
+    assert_eq!(
+        mock.requests()[0].path,
+        "/v1beta/models/gemini-3-pro-image:generateContent"
+    );
+}
+
+#[test]
+#[ignore = "integration"]
+fn google_response_without_inline_data_is_empty_response() {
+    // A text-only response (no image part) is a generation that produced no
+    // usable image — EmptyResponse, not a deserialization crash.
+    let mock = MockProvider::start(vec![(
+        200,
+        "application/json",
+        serde_json::json!({
+            "candidates": [{ "content": { "role": "model", "parts": [{ "text": "I cannot do that" }] } }]
+        })
+        .to_string(),
+    )]);
+    let err = google_client(&mock)
+        .generate_image(&google_sample_request(), None)
+        .expect_err("no image part must error");
+    assert!(matches!(err, InferenceError::EmptyResponse), "{err:?}");
+}
+
+#[test]
+#[ignore = "integration"]
+fn google_400_error_body_message_surfaces() {
+    // Gemini's error envelope is {error:{code,message,status}}; the retry
+    // layer's `message` fallback must surface it as a terminal ClientError.
+    let mock = MockProvider::start(vec![(
+        400,
+        "application/json",
+        r#"{"error":{"code":400,"message":"API key not valid","status":"INVALID_ARGUMENT"}}"#
+            .to_string(),
+    )]);
+    let err = google_client(&mock)
+        .generate_image(&google_sample_request(), None)
+        .expect_err("400 is terminal");
+    match err {
+        InferenceError::ClientError { status, detail } => {
+            assert_eq!(status, 400);
+            assert!(detail.contains("API key not valid"), "{detail}");
+        }
+        other => panic!("expected ClientError, got {other:?}"),
+    }
+}
+
+#[test]
+#[ignore = "integration"]
+fn google_defaults_and_trait_accessors() {
+    let mock = MockProvider::start(vec![]);
+    let c = google_client(&mock);
+    assert_eq!(c.provider_slug(), "google");
+    // The 180 s attempt deadline + 2-attempt budget come from the shared
+    // adapter policy constants even when the chat config said otherwise.
+    let mut config = GoogleConfig {
+        base_url: mock.base_url("v1beta"),
+        ..Default::default()
+    };
+    config.total_timeout_secs = 3600;
+    let c = GoogleImageClient::new(
+        config,
+        "k".to_string(),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    );
+    assert_eq!(c.config().total_timeout_secs, 180);
+}

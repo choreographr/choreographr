@@ -1052,6 +1052,33 @@ mod tests {
     }
 
     #[test]
+    fn bundled_overlay_lists_google_edit_models() {
+        // The REAL bundled catalog: the Gemini image models carry the edit flag
+        // solely from the bundled overlay (models.dev has an image-OUTPUT
+        // modality but no edit modality), so this pins the overlay plumbing end
+        // to end for Google. Gemini generates AND edits through the
+        // generateContent API (images::GoogleImageClient); the tool reads these
+        // through image_edit_models_for_provider("google"). Read-only (no catalog
+        // swap), so no restore guard is needed.
+        let edit_models = image_edit_models_for_provider("google");
+        for model in [
+            "gemini-2.5-flash-image",
+            "gemini-3-pro-image",
+            "gemini-3-pro-image-preview",
+            "gemini-3.1-flash-image",
+            "gemini-3.1-flash-image-preview",
+            "gemini-3.1-flash-lite-image",
+        ] {
+            assert!(
+                edit_models.iter().any(|m| m == model),
+                "{model} must be a Google edit candidate: {edit_models:?}"
+            );
+        }
+        // A non-image Gemini model must never be an edit candidate.
+        assert!(!edit_models.iter().any(|m| m == "gemini-2.5-pro"));
+    }
+
+    #[test]
     fn bundled_overlay_flips_image_output_flag() {
         // The bundled overlay can override the flag like vision's. Swap in a
         // catalog with the flag ON and overlay it back OFF (and vice versa)

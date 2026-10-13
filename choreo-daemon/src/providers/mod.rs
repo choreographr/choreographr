@@ -15,8 +15,8 @@ use std::sync::Arc;
 use choreo_ai_protocols::openai::{OpenAiClient, ServiceConfig};
 use choreo_ai_protocols::{
     AnthropicClient, AnthropicConfig, ChatTurnRequest, ChatTurnResult, FalImageClient,
-    GoogleClient, GoogleConfig, ImageGenerationClient, OpenAiImageClient, ProviderClient,
-    ProviderEntry, ProviderProtocol, StreamEvent, ZaiImageClient, lookup_provider,
+    GoogleClient, GoogleConfig, GoogleImageClient, ImageGenerationClient, OpenAiImageClient,
+    ProviderClient, ProviderEntry, ProviderProtocol, StreamEvent, ZaiImageClient, lookup_provider,
 };
 use choreo_proto::InferenceError;
 
@@ -64,11 +64,12 @@ pub struct InferenceProvider {
     /// z.ai coding gateway, and `zhipuai`, the mainland bigmodel endpoint)
     /// get the dedicated [`ZaiImageClient`] since their Images API is a
     /// different endpoint contract (URL-returning glm-image, hd/standard
-    /// quality, no-n body). Anthropic and Gemini have no image-generation
-    /// backend in v1 (the Gemini/Responses-image paths are deferred), so
-    /// their constructors leave this `None` and image requests against
-    /// those accounts surface a precise "does not support" error instead of
-    /// a half-working client.
+    /// quality, no-n body). Gemini-protocol providers get the dedicated
+    /// [`GoogleImageClient`], whose image models generate and edit through the
+    /// `generateContent` API rather than a dedicated Images endpoint. Anthropic
+    /// has no image-generation backend, so its constructor leaves this `None`
+    /// and image requests against those accounts surface a precise "does not
+    /// support" error instead of a half-working client.
     image_client: Option<Arc<dyn ImageGenerationClient>>,
 }
 
@@ -130,8 +131,9 @@ impl InferenceProvider {
     }
 
     /// Construct a provider from an already-built [`GoogleClient`], tagged with
-    /// the catalog slug `"google"`. Gemini has no image-generation backend in
-    /// v1, so the image client is left unconfigured.
+    /// the catalog slug `"google"`. The image backend is left unconfigured —
+    /// [`from_account_config`](Self::from_account_config) attaches the
+    /// [`GoogleImageClient`] based on the account's protocol.
     #[must_use]
     pub fn from_google(client: GoogleClient) -> Self {
         Self {
@@ -266,15 +268,24 @@ impl InferenceProvider {
                 google_cfg.request_compression = entry.request_compression;
                 let overrides = config.provider_overrides();
                 google_cfg.apply_overrides(&overrides);
-                let client = GoogleClient::new(google_cfg, key, registry)
+                let client = GoogleClient::new(google_cfg.clone(), key.clone(), registry)
                     .map_err(|e| format!("failed to create Google client: {e}"))?;
+                // Same account, same key, same base_url/user_agent/slug as the
+                // chat client — the image client is built from a clone of the
+                // identical `GoogleConfig` (its constructor overrides only the
+                // attempt deadline + retry budget the image path needs).
+                // `config.provider_overrides` ran on `google_cfg` BEFORE the
+                // chat client was built, so the clone here sees every
+                // account-level override already applied. Gemini image models
+                // generate and edit through the `generateContent` API, so this
+                // is the dedicated [`GoogleImageClient`], not the OpenAI-shaped
+                // default.
+                let image_client: Arc<dyn ImageGenerationClient> =
+                    Arc::new(GoogleImageClient::new(google_cfg, key, registry));
                 Ok(Self {
                     client: Arc::new(client),
                     slug: entry.slug,
-                    // No image backend for Gemini in v1 — the Gemini image
-                    // backend is deferred; `None` keeps image requests against
-                    // these accounts failing with a precise error.
-                    image_client: None,
+                    image_client: Some(image_client),
                 })
             }
             // `ProviderProtocol` is #[non_exhaustive] — a new protocol added
@@ -530,6 +541,27 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("no API key"), "{err}");
+    }
+
+    #[test]
+    fn from_account_config_google_routes_to_dedicated_image_client() {
+        // Gemini image models generate and edit via the `generateContent` API,
+        // not a dedicated Images endpoint, so the image backend must be the
+        // dedicated GoogleImageClient — not the generic OpenAI adapter. Asserted
+        // via the redacted Debug (which names the concrete struct), because the
+        // trait object carries no type shape.
+        let cfg = AccountConfig::simple("gemini", "google");
+        let provider = InferenceProvider::from_account_config(
+            &cfg,
+            Some("key".into()),
+            &choreo_ai_protocols::SocketRegistry::new(),
+        )
+        .expect("google account constructs");
+        let image_client = provider
+            .image_client()
+            .expect("Google protocol gets an image client");
+        let debug = format!("{image_client:?}");
+        assert!(debug.starts_with("GoogleImageClient"), "{debug}");
     }
 
     #[test]
