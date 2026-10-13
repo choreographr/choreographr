@@ -9,6 +9,14 @@
 //!
 //! This module owns the response cache and the fast-path method; the height
 //! prefix and render-cache plumbing it drives live in [`super`].
+//!
+//! The streaming auto-pin (which anchors the response's first line at the
+//! viewport top) is *not* applied here: the fast path only keeps the height
+//! model and the [`TurnLayout::response_start_row`](super::TurnLayout::response_start_row)
+//! anchor current.  The pin itself is evaluated in one place — the end of
+//! [`super::SessionDisplayState::compute_total_height_and_markers`] — so every
+//! path that can grow the response (this fast path, a full rebuild, a resize,
+//! a session switch-in) is covered by construction.
 
 use super::{HistoryViewport, RenderCacheKey, RenderedCache, RenderedTurn, SessionDisplayState};
 use crate::markdown_render::{
@@ -188,6 +196,18 @@ impl SessionDisplayState {
                         (start, end)
                     })
                     .collect();
+                // The response's first content row keeps its offset within the
+                // turn (only the response *below* it grows), but re-derive it
+                // from the freshly rendered lines so the auto-pin anchor can
+                // never drift from what is drawn.
+                layout.response_start_row = rendered.response_start_idx.map(|idx| {
+                    // In-bounds by construction (see the rebuild path).
+                    if idx == 0 {
+                        0
+                    } else {
+                        visual_offsets.get(idx - 1).copied().unwrap_or(0)
+                    }
+                });
             }
 
             // Replace the cache entry wholesale with the freshly rendered
@@ -214,6 +234,7 @@ impl SessionDisplayState {
                     chrome_ranges,
                     reasoning_header_idx: rendered.reasoning_header_idx,
                     tool_result_header_idxs: rendered.tool_result_header_idxs,
+                    response_start_idx: rendered.response_start_idx,
                 },
             };
 

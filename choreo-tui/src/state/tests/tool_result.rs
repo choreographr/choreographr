@@ -96,6 +96,7 @@ fn toggle_tool_result_flips_override_and_invalidates_cache() {
             chrome_ranges: Arc::from([LineChrome::default()]),
             reasoning_header_idx: None,
             tool_result_header_idxs: vec![0],
+            response_start_idx: None,
         },
     })];
 

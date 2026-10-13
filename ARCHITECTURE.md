@@ -1666,6 +1666,25 @@ merge, and the per-session status/token routing) are documented in-source (see
 `choreo-tui`'s `state` and `connection` modules, `cargo doc -p choreo-tui` /
 `just doc`), held complete by the `#![warn(missing_docs)]` + `doc-check` gate.
 
+### Streaming response auto-scroll pin
+
+While the assistant response streams, the TUI's history pane follows the newest
+content from the bottom until the response's first line reaches the top of the
+viewport; at that point it pins that line at the top and the rest of the
+response grows below the fold. The anchor is the response's first content row —
+never the reasoning trace or tool output — and the pin fires at most once per
+response. The decision is made in the single pass every frame's height model
+runs through before rendering (`compute_total_height_and_markers`), so it holds
+identically across the streaming fast path, a full rebuild after an interleaved
+`Done`/`TurnAppended`, a resize, or a session switch-in. The pin state lives on
+the per-session display and is deliberately **not** reset by
+`reset_for_session_switch`: a response that streamed in a background session
+pins on the first frame after the user switches to it, and one that already
+pinned keeps its position on every re-entry (it never re-pins). A manual scroll
+before the pin fires disarms it, so returning to the bottom can never yank the
+view back up. The mechanics are documented in-source (see `choreo-tui`'s
+`state::history` and `state::streaming`, `cargo doc -p choreo-tui` / `just doc`).
+
 The all-activity subscription is **sticky**: the daemon's activity broadcast
 (`handle_broadcast_activity`) never drops a message for a subscriber —
 only a disconnected receiver is removed.  This matters because the TUI

@@ -358,6 +358,7 @@ fn render_turn_lines_impl(
             chrome_ranges: all_chrome,
             reasoning_header_idx: None,
             tool_result_header_idxs: Vec::new(),
+            response_start_idx: None,
         };
     }
 
@@ -376,6 +377,9 @@ fn render_turn_lines_impl(
     // The header is always the first reasoning line, so the index is
     // independent of the collapsed/expanded state.
     let mut reasoning_header_idx: Option<usize> = None;
+    // Semantic-line index of the first assistant-response content row, set
+    // only when the turn carries response text (see `RenderedTurnLines`).
+    let mut response_start_idx: Option<usize> = None;
     if has_assistant {
         let mut body: Vec<Line<'static>> = Vec::new();
         let mut body_joins: Vec<LineJoin> = Vec::new();
@@ -442,6 +446,15 @@ fn render_turn_lines_impl(
 
         // If we have content, wrap with margin lines (no timestamp).
         if !body.is_empty() {
+            // The assistant block's first content row sits
+            // `MARGIN_STRUCTURAL_ROWS / 2` margin rows below the block start
+            // (`add_margin_lines` prepends a separator + padding row).
+            // Record it as the streaming auto-pin anchor — only when the block
+            // actually carries response text, so a reasoning-only turn can
+            // never pin.
+            if response_present {
+                response_start_idx = Some(all_lines.len() + MARGIN_STRUCTURAL_ROWS / 2);
+            }
             let (margin_lines, _rows, margin_ranges, margin_joins, margin_chrome) =
                 add_margin_lines(
                     body,
@@ -664,5 +677,6 @@ fn render_turn_lines_impl(
         chrome_ranges: all_chrome,
         reasoning_header_idx,
         tool_result_header_idxs,
+        response_start_idx,
     }
 }

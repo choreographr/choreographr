@@ -4,11 +4,12 @@
 //! This module owns the machinery the history pane needs to map content to
 //! screen rows in O(log n) (click hit-testing) and to keep those mappings in
 //! lockstep with the per-turn rendered lines: [`HistoryViewport`] /
-//! [`HistoryScrollState`] / [`ScrollRestore`], the [`TurnLayout`] /
-//! [`RenderCacheKey`] / [`RenderedCache`] cache types and
+//! [`HistoryScrollState`] / [`ScrollRestore`] / [`ResponsePin`], the
+//! [`TurnLayout`] / [`RenderCacheKey`] / [`RenderedCache`] cache types and
 //! [`cached_or_compute_lines`], the `App` and [`SessionDisplayState`] methods
-//! that rebuild the height model, scroll it, and classify a viewport change
-//! ([`classify_viewport_change`]), and the row→turn mapping (`find_turn_at_row`).
+//! that rebuild the height model, scroll it, classify a viewport change
+//! ([`classify_viewport_change`]), and pin the streaming response's top
+//! (`maybe_pin_response_top`), and the row→turn mapping (`find_turn_at_row`).
 //! The `App` methods here are thin wrappers that forward to the active session's
 //! [`SessionDisplayState`] with the shared [`HistoryViewport`].
 //!
@@ -98,6 +99,12 @@ pub(crate) struct TurnLayout {
     /// short-circuits on the error block).  Populated in lockstep with
     /// `height_prefix` and kept in sync by the streaming fast path.
     pub tool_result_header_ranges: Vec<(usize, usize)>,
+    /// Visual-row offset of the assistant response's first content row,
+    /// relative to the turn's start.  `None` when the turn has no response
+    /// text (a reasoning-only, tool-only, or error turn).  The streaming
+    /// auto-pin reads this to compute the response's absolute content line and
+    /// pin it at the viewport top.  Kept in sync by the streaming fast path.
+    pub response_start_row: Option<usize>,
 }
 
 /// Everything that identifies a render-cache entry.  Two keys are equal iff
@@ -176,6 +183,11 @@ pub(crate) struct RenderedTurn {
     /// [`RenderedTurnLines`]), so click hit-testing never re-scans the
     /// rendered output.
     pub tool_result_header_idxs: Vec<usize>,
+    /// Semantic-line index of the first assistant-response content row within
+    /// `lines` (see [`RenderedTurnLines::response_start_idx`]), used by the
+    /// streaming auto-pin to anchor the response's top at the viewport top.
+    /// `None` for a reasoning-only, tool-only, or error turn.
+    pub response_start_idx: Option<usize>,
 }
 
 /// One slot of the render cache: the key the entry was rendered with plus the
@@ -241,6 +253,7 @@ pub(crate) fn cached_or_compute_lines(
         chrome_ranges,
         reasoning_header_idx: rendered.reasoning_header_idx,
         tool_result_header_idxs: rendered.tool_result_header_idxs,
+        response_start_idx: rendered.response_start_idx,
     };
     if let Some(slot) = cache.get_mut(index) {
         *slot = Some(RenderedCache {
@@ -336,6 +349,39 @@ impl HistoryScrollState {
         let remaining = amount.saturating_sub(compensation_reduction);
         self.scroll = self.scroll.saturating_sub(remaining);
         self.clamp(max_scroll);
+    }
+}
+
+/// Streaming response auto-pin state: whether the assistant response currently
+/// being output should, or already did, pin its first content row to the top of
+/// the viewport.
+///
+/// The pin fires at most once per response, when the response's first line
+/// would otherwise scroll above the viewport top; from then on the normal
+/// anchoring holds that line in place.  State is per display and survives
+/// session switches, so re-entering a session never re-pins a response that
+/// already pinned (or lets one that pinned reposition).  It is re-armed only by
+/// a *new* response (a different turn id), and cleared on completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResponsePin {
+    /// No response is being output.
+    Idle,
+    /// A response is streaming and has not pinned yet; pin it when its first
+    /// line reaches the viewport top.  Carries the turn id it belongs to.
+    Armed(u32),
+    /// This response already pinned once — it can never pin again.
+    Pinned(u32),
+}
+
+impl ResponsePin {
+    /// Disarm a not-yet-pinned response when the user scrolls manually, so a
+    /// later return to the bottom cannot yank the view back up to the response
+    /// top.  `Pinned` is left untouched (a manual scroll after pinning just
+    /// moves the view; it can never re-pin).
+    pub(crate) fn disarm_on_manual_scroll(&mut self) {
+        if matches!(self, ResponsePin::Armed(_)) {
+            *self = ResponsePin::Idle;
+        }
     }
 }
 
@@ -742,11 +788,26 @@ impl SessionDisplayState {
                 image_ranges.push((start, start + fallback_img_height));
                 total_img_height += fallback_img_height;
             }
+            // Visual-row offset of the response's first content row, for the
+            // streaming auto-pin.  Converted from the response's semantic-line
+            // index through `text_offsets` — the same mapping the reasoning
+            // header range uses above.
+            let response_start_row = rendered_turn.response_start_idx.map(|idx| {
+                // `idx` indexes a semantic line of the same render that
+                // produced `text_offsets`, so the lookup is in bounds; fall
+                // back to 0 (the turn start) on any drift.
+                if idx == 0 {
+                    0
+                } else {
+                    text_offsets.get(idx - 1).copied().unwrap_or(0)
+                }
+            });
             self.turn_layouts.push(TurnLayout {
                 reasoning_header_range,
                 reasoning_default_expanded,
                 image_ranges,
                 tool_result_header_ranges,
+                response_start_row,
             });
             let turn_height = text_height + total_img_height;
             self.turn_heights.push(turn_height);
@@ -922,8 +983,74 @@ impl SessionDisplayState {
             self.streaming_dirty = false;
         }
 
+        // After the height model and any restored position are settled, give
+        // the streaming response its one chance to pin its first line at the
+        // viewport top.  This is the single point every frame's model passes
+        // through before rendering, so the pin is correct on the very first
+        // frame after a session switch, a resize, a cache-miss rebuild, or an
+        // interleaved `Done` — not only on the streaming fast path.
+        self.maybe_pin_response_top(viewport);
+
         self.total_history_height().max(1)
     }
+
+    /// Pin the streaming response's first line to the viewport top, at most
+    /// once per response.
+    ///
+    /// Fires only while the response is [`ResponsePin::Armed`] and the user is
+    /// following the bottom.  It sets the scroll so the response's first
+    /// content row (`height_prefix[turn - 1] + layout.response_start_row`) sits
+    /// at the top of the viewport, then records [`ResponsePin::Pinned`] so the
+    /// response can never pin again — not on a later chunk, not after the user
+    /// scrolls, and not after leaving and re-entering the session.  The normal
+    /// from-bottom anchoring holds the pinned line in place on every later
+    /// growth.
+    fn maybe_pin_response_top(&mut self, viewport: &HistoryViewport) {
+        let ResponsePin::Armed(turn_id) = self.response_pin else {
+            return;
+        };
+        // Only ever engage from the following state: a user reading older
+        // content must not be yanked, and the "response top reached the
+        // viewport top" transition is defined relative to bottom-following.
+        if self.effective_scroll(viewport) != 0 {
+            return;
+        }
+        let Some(idx) = self.visible_turn_ids.iter().position(|&t| t == turn_id) else {
+            return;
+        };
+        let Some(row) = self
+            .turn_layouts
+            .get(idx)
+            .and_then(|layout| layout.response_start_row)
+        else {
+            return;
+        };
+        let turn_start = self
+            .height_prefix
+            .get(idx.wrapping_sub(1))
+            .copied()
+            .unwrap_or(0);
+        let response_top = turn_start.saturating_add(row);
+        let max_scroll = self
+            .total_history_height()
+            .saturating_sub(viewport.height as usize);
+        // Strict `>`: pin only once the response top would pass the viewport
+        // top.  At `max_scroll == response_top` the top is already flush with
+        // the viewport, and the next chunk would scroll it off — pinning here
+        // (rather than at equality) is what holds it in place afterwards.
+        if max_scroll > response_top {
+            self.history_scroll.scroll = max_scroll - response_top;
+            self.history_scroll.scroll_compensation = 0;
+            self.response_pin = ResponsePin::Pinned(turn_id);
+            tracing::debug!(
+                turn_id,
+                response_top,
+                scroll = self.history_scroll.scroll,
+                "pinned streaming response top to viewport top",
+            );
+        }
+    }
+
     pub(crate) fn rebuild_height_prefix_preserving_scroll(&mut self, viewport: &HistoryViewport) {
         let at_bottom = self.effective_scroll(viewport) == 0;
         let preserve_scroll = self.content_dirty && !at_bottom;
@@ -1086,16 +1213,22 @@ impl SessionDisplayState {
     }
 
     pub(crate) fn scroll_up(&mut self, amount: usize, viewport: &HistoryViewport) {
+        // A manual scroll takes the user out of the auto-follow; disarm a
+        // not-yet-pinned response so returning to the bottom cannot later yank
+        // the view up to the response top.
+        self.response_pin.disarm_on_manual_scroll();
         self.history_scroll
             .scroll_up(amount, self.max_scroll_offset(viewport));
     }
 
     pub(crate) fn scroll_down(&mut self, amount: usize, viewport: &HistoryViewport) {
+        self.response_pin.disarm_on_manual_scroll();
         self.history_scroll
             .scroll_down(amount, self.max_scroll_offset(viewport));
     }
 
     pub(crate) fn scroll_to(&mut self, row: usize, viewport: &HistoryViewport) {
+        self.response_pin.disarm_on_manual_scroll();
         let max_scroll = self.max_scroll_offset(viewport);
         let amount = row.min(max_scroll);
         self.history_scroll.scroll = amount;

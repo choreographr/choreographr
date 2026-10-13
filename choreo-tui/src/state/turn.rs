@@ -22,7 +22,7 @@ use choreo_client_core::dispatch::{SessionStateData, ToolCallEvent};
 use choreo_proto::{OutputStream, SessionStatus, TokenUsage, Turn};
 use std::borrow::Cow;
 
-use super::{App, SessionDisplayState, merge_token_usage};
+use super::{App, ResponsePin, SessionDisplayState, merge_token_usage};
 
 /// Invalidate the render cache entry for `turn_id`.
 fn invalidate_turn_cache(display: &mut SessionDisplayState, turn_id: u32) {
@@ -84,6 +84,11 @@ impl App {
         display.live_output_tokens = 0;
         display.streaming_turn_index = None;
         display.streaming_response = None;
+        // The response is over: clear any pending auto-pin so a later frame
+        // cannot pin a completed response whose top has since scrolled away.
+        // A response that already pinned keeps its scroll position (the pin
+        // state is only a guard, not the position itself).
+        display.response_pin = ResponsePin::Idle;
         display.mark_content_changed();
     }
 }
@@ -198,6 +203,21 @@ impl TurnEventHandler for App {
         }
 
         display.resolve_streaming_turn_index(stream_id);
+
+        // Arm the response auto-pin on the first Answer chunk: the response is
+        // about to fill the turn, and the pin should engage (once) if its top
+        // reaches the viewport top.  Arming for `turn_id` re-arms naturally for
+        // the next response; a response already pinned for this turn is left
+        // untouched.  Reaching this for a background session (the all-activity
+        // subscription) arms its display too, so a switch-in pins before the
+        // first frame.
+        if first_answer
+            && let Some(turn_id) = turn_id
+            && display.response_pin != ResponsePin::Pinned(turn_id)
+        {
+            display.response_pin = ResponsePin::Armed(turn_id);
+        }
+
         display.mark_streaming_changed();
     }
 

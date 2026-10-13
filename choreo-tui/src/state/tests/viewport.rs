@@ -59,6 +59,7 @@ fn dummy_cache_entry() -> RenderedCache {
             chrome_ranges: Arc::from([]),
             reasoning_header_idx: None,
             tool_result_header_idxs: vec![],
+            response_start_idx: None,
         },
     }
 }

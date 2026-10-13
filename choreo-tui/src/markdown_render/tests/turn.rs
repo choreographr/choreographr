@@ -496,3 +496,64 @@ fn tool_result_rows_start_flush_and_end_one_column_short_of_scrollbar() {
         rendered.content_ranges
     );
 }
+
+// ── response_start_idx (streaming auto-pin anchor) ───────────────────
+
+#[test]
+fn response_start_idx_points_at_the_first_response_row() {
+    // A user prompt renders as a 1-row message block wrapped in 4 margin
+    // rows (separator + padding above, padding + timestamp below), so the
+    // assistant block starts at row 5.  `add_margin_lines` prepends a
+    // separator + padding row to that block too, putting the response's
+    // first content row at 5 + 2 = 7.
+    let turn = Turn {
+        created_at: choreo_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: Some("ask".into()),
+        assistant_text: Some("Hello.".into()),
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![],
+        displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    };
+    let rendered = render_turn_lines(&turn, 80, 85, false, &[]);
+    assert_eq!(
+        rendered.response_start_idx,
+        Some(7),
+        "response top is the assistant block's first content row"
+    );
+    // The indexed row must carry response text, not a blank margin row.
+    let row = rendered.lines.get(7).expect("index in bounds").to_string();
+    assert!(
+        row.contains("Hello."),
+        "indexed row must be the response text, got {row:?}"
+    );
+}
+
+#[test]
+fn response_start_idx_is_none_for_a_reasoning_only_turn() {
+    // No response text yet: the pin must not arm on reasoning alone.
+    let turn = Turn {
+        created_at: choreo_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: Some("ask".into()),
+        assistant_text: None,
+        assistant_reasoning: Some("thinking hard".into()),
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![],
+        displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    };
+    let rendered = render_turn_lines(&turn, 80, 85, true, &[]);
+    assert_eq!(
+        rendered.response_start_idx, None,
+        "a reasoning-only turn has no response top to pin"
+    );
+}

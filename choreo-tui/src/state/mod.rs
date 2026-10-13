@@ -123,6 +123,11 @@ pub(crate) struct SessionDisplayState {
     /// Incremental assistant-response render cache for the streaming fast path,
     /// keyed to [`Self::streaming_turn_index`] (see [`StreamingResponseCache`]).
     pub(crate) streaming_response: Option<StreamingResponseCache>,
+    /// Whether the streaming assistant response has pinned (or is armed to
+    /// pin) its first line at the viewport top.  Per display so it survives
+    /// session switches — a response's single pin is never undone by leaving
+    /// and re-entering the session.  See [`ResponsePin`].
+    pub(crate) response_pin: ResponsePin,
     pub(crate) active: HashSet<u64>,
     pub(crate) live_input_estimate: u32,
     pub(crate) live_output_tokens: u32,
@@ -170,6 +175,7 @@ impl Default for SessionDisplayState {
             turn_versions: HashMap::new(),
             render_cache: Vec::new(),
             streaming_response: None,
+            response_pin: ResponsePin::Idle,
             active: HashSet::new(),
             live_input_estimate: 0,
             live_output_tokens: 0,

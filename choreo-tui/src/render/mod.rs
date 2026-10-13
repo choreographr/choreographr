@@ -1027,6 +1027,7 @@ mod tests {
             chrome_ranges,
             reasoning_header_idx: None,
             tool_result_header_idxs: Vec::new(),
+            response_start_idx: None,
         }
     }
 
@@ -1065,6 +1066,7 @@ mod tests {
                 chrome_ranges: Arc::from(chrome_ranges),
                 reasoning_header_idx: None,
                 tool_result_header_idxs: Vec::new(),
+                response_start_idx: None,
             },
         }
     }
@@ -1561,6 +1563,7 @@ mod tests {
                 chrome_ranges: Arc::from([LineChrome::default()]),
                 reasoning_header_idx: None,
                 tool_result_header_idxs: vec![0],
+                response_start_idx: None,
             },
         })];
         // Request with the result expanded — should be a miss.

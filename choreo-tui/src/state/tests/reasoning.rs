@@ -183,6 +183,7 @@ fn toggle_reasoning_flips_override_and_invalidates_cache() {
             chrome_ranges: Arc::from([LineChrome::default()]),
             reasoning_header_idx: None,
             tool_result_header_idxs: vec![],
+            response_start_idx: None,
         },
     })];
 
