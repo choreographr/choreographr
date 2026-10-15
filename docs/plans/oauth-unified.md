@@ -241,7 +241,8 @@ Rules:
 - Serialized with postcard; appending a variant is forward-compatible for new blobs.
 - Adapters to/from `rmcp::transport::auth::StoredCredentials` live **in the daemon**
   (no rmcp type enters the keystore).
-- Row key: `<account>` for providers, `mcp:<slug>` for MCP.
+- Row key: `<account>` for providers; `mcp:daemon:<slug>` or
+  `mcp:project:<canonical-root>:<slug>` for MCP (tier-scoped — see §8.1).
 - Keep OAuth as its own well-typed variant; the *other* deferred class — static
   multi-field credentials (Bedrock/Azure/GCP) — is a separate generalization
   (`ServiceCredential::Fields(HashMap<…>)`), not coupled here.
@@ -356,7 +357,7 @@ mcp login <slug>            (frontend)
   PKCE loopback (+ paste-URL fallback) → tokens + client registration
   → ServiceCredential::OAuth{ kind: Mcp, issuer, resource, authorization_server,
                               refresh_token, client_id, client_secret, granted_scopes }
-  → AddCredential(service = "mcp:<slug>", credential)
+  → AddCredential(service = "mcp:<tier-scope>", credential)     ← tier-scoped, §8.1
 daemon (choreo-mcp, sidecar tokio runtime)
   connect StreamableHttpClientTransport + AuthorizationManager + AuthClient
     discovery / DCR / refresh owned by rmcp
@@ -377,18 +378,72 @@ daemon (choreo-mcp, sidecar tokio runtime)
   serves it from the in-process cache; `token_received_at` is not persisted either.
 - Config gains an `oauth` block on remote servers; a server with no `oauth` simply
   gets no `Authorization` header (explicit `headers` still percolate).
-- MCP credentials live in the **same keystore**, row-keyed `mcp:<slug>`; the resource
-  URL + issuer inside the blob are validated on load (fail-closed, SEP-2352; a
-  mismatch quarantines and surfaces re-login). **This replaces the file-store design
-  (D7) of `mcp-modernization.md`.**
+- MCP credentials live in the **same keystore**, row-keyed by **tier scope**
+  (§8.1) — `mcp:daemon:<slug>` or `mcp:project:<canonical-root>:<slug>`, never a
+  bare `mcp:<slug>`. The resource URL + issuer inside the blob are validated on load
+  (fail-closed, SEP-2352; a mismatch quarantines and surfaces re-login). **This
+  replaces the file-store design (D7) of `mcp-modernization.md`.**
+
+### 8.1 Tier scoping — daemon-defined vs project-defined servers
+
+MCP servers come from two tiers, already implemented in the daemon: the daemon-tier
+`<config>/choreographr/mcp.json` (**trusted unconditionally** — the user authored it)
+and a per-session project-tier `<project_root>/.mcp.json` (found by walking up to the
+git root; **gated by the whole-project trust store** `<config>/choreographr/trust.toml`,
+keyed on the exact canonical root with no ancestor inheritance, fail-closed). A slug
+is therefore **not** globally unique: the identity is `(tier, project_root, slug)`, and
+a project server **shadows** a same-slug daemon server *for that session only* — the
+same scoping the connection pool uses (`SlotKey::Daemon(slug)` vs
+`SlotKey::Project(root, slug)`) and the per-server log identity uses.
+
+OAuth is tier-aware in four places:
+
+1. **The credential row key is tier-scoped** (mirroring the pool and log identity),
+   so a daemon `docs` and a project `docs`, or two projects each with a `docs`, cannot
+   collide or share a token:
+
+   | Tier | Credential row key | Connection pool key |
+   |---|---|---|
+   | daemon | `mcp:daemon:<slug>` | `SlotKey::Daemon(slug)` |
+   | project | `mcp:project:<canonical-root>:<slug>` | `SlotKey::Project(root, slug)` |
+
+2. **Login requires the project to be trusted.** A project `.mcp.json` is
+   repo-controlled, *including its `oauth` block* (issuer, client id, scopes, callback
+   URL). `mcp login <slug>` for a project server **refuses while the root is
+   untrusted** — the block is never expanded, dialed, or offered as a login option,
+   exactly as `${VAR}`/header expansion is already gated. The daemon tier has no gate.
+   Whole-project trust covers servers *and* credential expansion; there is no separate
+   per-server credential approval.
+3. **Load validation is fail-closed and matters more here.** The stored `resource`
+   (server URL) and `issuer` are checked against the *configured* values on load. A
+   repo-controlled URL that a `git pull` re-points must **not** receive the stored
+   token — mismatch → quarantine → re-login. A project credential is never blindly
+   reused after a fetch.
+4. **Lifecycle follows the pool, but connections and credentials diverge:**
+
+   | Event | Connection | Credential |
+   |---|---|---|
+   | session leaves the project (cwd change) | project slots drop | **kept** (the project is still trusted; leaving is transient) |
+   | project **untrusted** | project slots drop | **kept but unusable** — the blob stays encrypted and is never loaded, dialed, or sent while untrusted; usable again on re-trust, with no new login |
+   | daemon server removed from `mcp.json` | daemon slot drops | orphaned; reaped on the next reconcile |
+
+   Untrust never deletes the token: the gate is on **use**, not on **existence**.
+
+A session's effective set is `daemon ∪ own-project (project shadows same slug)`, and
+credential lookup follows the same shadowing: a session with a project `docs` uses
+`mcp:project:<root>:docs`, never `mcp:daemon:docs`; the daemon-wide catalogue
+(non-session fetches) uses the daemon-tier row only. `shared = false` is a
+*connection* attribute, not a credential attribute: a private per-session connection
+still shares the one `(tier, root, slug)` credential, because the URL and issuer are
+identical.
 
 ## 9. Refresh coordination & failure taxonomy
 
 **`OAuthRefreshLocks`** — `LazyLock<Mutex<HashMap<CredKey, Arc<Mutex<()>>>>>` (the
 `file_locks` pattern, AGENTS.md exception #12). Provider refresh keyed by account;
-rmcp's `acquire_refresh_guard` keyed by `mcp:<slug>`. One daemon per keystore → a
-process-local lock suffices (no cross-process file lock, unlike codex/pi which run
-many processes).
+rmcp's `acquire_refresh_guard` keyed by the tier-scoped MCP credential key (§8.1). One
+daemon per keystore → a process-local lock suffices (no cross-process file lock,
+unlike codex/pi which run many processes).
 
 **Rules:** take the lock → re-load + re-check freshness → exchange → persist →
 release. The loser of a race reuses the winner's rotation; a single-use token is
@@ -451,8 +506,8 @@ endpoint/redirect/PKCE hardening is adopted wholesale.
 | `choreo-keystore` | `ServiceCredential::OAuth { … }` (§4) + `as_oauth()` + expiry helpers; zeroize/redact. Crypto unchanged. |
 | `choreo-client-core` | OAuth login library (PKCE/loopback/device-code/paste-URL/JWT + MCP discovery/DCR/CIMD); `AddCredential` builder sends plaintext + `service` (no key); `/login`, `mcp login/logout`. |
 | `choreo-ai-protocols` | credential-derived `ProviderAuth` (bearer + extra headers), generalizing the header seam; OAuth provider parameter table. |
-| `choreo-daemon` | `handle_save_credential` rewritten (§5); `ResolveAccountCmd` carries `ProviderAuth`; `api_key_for` → auth accessor; `OAuthRefreshLocks`; provider refresh loop + rotation persistence (§6/§7); `CredentialBackend` impl + `DaemonCommand::OAuth*` for MCP; `oauth` catalog auth-kind; `AccountManager`/`drop_session_clients` extended. |
-| `choreo-mcp` | enable `rmcp` `auth`; `AuthorizationManager`/`AuthClient` wiring; `oauth` config; `CredentialStore` adapter (strips access token); `needs_auth` state. |
+| `choreo-daemon` | `handle_save_credential` rewritten (§5); `ResolveAccountCmd` carries `ProviderAuth`; `api_key_for` → auth accessor; `OAuthRefreshLocks`; provider refresh loop + rotation persistence (§6/§7); `CredentialBackend` impl + `DaemonCommand::OAuth*` for MCP; **tier-scoped MCP credential keys + trust-gated login (§8.1)**; `oauth` catalog auth-kind; `AccountManager`/`drop_session_clients` extended. |
+| `choreo-mcp` | enable `rmcp` `auth`; `AuthorizationManager`/`AuthClient` wiring; `oauth` config (expanded only for a trusted tier); `CredentialStore` adapter (strips access token, resolves the tier-scoped key); `needs_auth` state. |
 | `choreo-proto` | changed `AddCredential`; one `InferenceError` variant + re-login `DaemonMessage`; MCP auth state in `McpStatus`; `mcp login/logout` messages; version bump at release. |
 | `choreo-tui` / `choreo-cli` | login surfaces; GUI/IM are follow-ups. |
 | docs | `ARCHITECTURE.md`: replace the deferred-providers note and document the key model (no private key at rest, daemon-as-writer, binding, access-token-in-memory). `README.md`: OAuth feature row. |
@@ -488,7 +543,10 @@ Each phase is independently shippable, lands with tests + docs, and keeps
   discovered URLs (fail closed); **no redirects** on credential-bearing POSTs;
   **reserved auth params** not overridable.
 - Cap + redact error bodies (1 MiB; `error`/`error_description` only).
-- Validate MCP `issuer`/`resource` on load (fail-closed, SEP-2352).
+- Validate MCP `issuer`/`resource` on load (fail-closed, SEP-2352); a project
+  server's credential is unusable while its root is untrusted.
+- A project `.mcp.json` is untrusted input: its `oauth` block is not expanded, dialed,
+  or offered for login until the project root is trusted.
 - Zeroize all token fields; redact every field in `Display`/`Debug`.
 - **Honest residual:** the sealed box has **no sender authentication** — anything
   holding the public key (which is non-secret) could craft a blob. This is
@@ -517,7 +575,10 @@ crate.
   `AddCredential` round-trip for an OAuth blob (plaintext wire → daemon encrypts →
   persist → unlock re-read); a **rotation-persist → relock → re-unlock reads the
   rotated token** test; MCP OAuth against an in-repo mock authorization server
-  (scope step-up, refresh, revocation, issuer-mismatch quarantine).
+  (scope step-up, refresh, revocation, issuer-mismatch quarantine); a daemon and a
+  project server sharing a slug keep **distinct** credentials (tier scoping), a
+  project server cannot be signed into while untrusted, and its credential is
+  unusable while untrusted yet usable again after re-trust.
 - **MCP conformance**: move the OAuth `auth/*` scenarios out of the committed
   expected-failures baseline as they pass.
 - **Never** hit the real `auth.openai.com` in tests.
@@ -556,8 +617,12 @@ crate.
 2. **Exact ChatGPT request headers** beyond `Authorization`, `chatgpt-account-id`,
    `originator`, `X-OpenAI-Fedramp` — confirm `OpenAI-Beta`/`session_id` against a
    live token.
-3. **MCP row key:** `mcp:<slug>` (readable; slug-rename risk) vs URL-keyed
-   (rename-proof, one-URL-many-accounts edge). Leaning slug-with-validated-URL-inside.
+3. **MCP row key suffix within a tier scope:** `<slug>` (readable; slug-rename
+   risk) vs URL-keyed (rename-proof, one-URL-many-accounts edge). The scope prefix
+   (`mcp:daemon:` / `mcp:project:<root>:`) is settled (§8.1); the slug-vs-URL choice
+   applies to the suffix. Leaning slug-with-validated-URL-inside — but a
+   repo-controlled project URL argues for URL-keying the suffix, since a `git pull`
+   can re-point it.
 4. **GUI/IM login placement** (GUI modal vs loopback browser) — follow the
    provider-login precedent.
 
@@ -575,6 +640,9 @@ crate.
   surfaces a distinct **re-login required** state.
 - A locked daemon refuses `AddCredential`; no implicit unlock; the private key is
   never retained after the unlock instant.
+- MCP credentials are tier-scoped (`mcp:daemon:` / `mcp:project:<root>:`); a project
+  server cannot be signed into while its root is untrusted, and untrusting keeps its
+  credential unusable — usable again on re-trust with no new login.
 - The full gate passes: `just pre-commit` (clippy-strict + `test-all` + fmt) green in
   one pass; Conventional Commits (the commit message is the release note).
 - `ARCHITECTURE.md` and `README.md` describe the new credential type, the key model,
