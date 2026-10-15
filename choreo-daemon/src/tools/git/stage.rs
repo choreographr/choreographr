@@ -244,7 +244,7 @@ fn worktree_metadata(
         .workdir()
         .ok_or_else(|| ToolError::Other("repository has no worktree".to_string()))?;
     Ok(gix::index::fs::Metadata::from_path_no_follow(
-        &workdir.join(gix::path::from_bstr(path)),
+        &workdir.join(gix::path::from_bstr(path).map_err(io::Error::other)?),
     )?)
 }
 
