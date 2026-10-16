@@ -14,10 +14,13 @@
 # The suite is pinned to a specific version by the runner; these names are the
 # scenarios that version runs against our eras, minus the ones we pass.
 client:
-  # OAuth flows (out of scope until the post-ship auth work). choreo-mcp has no
-  # OAuth provider today: a remote server that answers `401` fails with the
-  # actionable auth-required error, and these scenarios never get past it. The
-  # first group runs at both eras; the second is stateless-era-only.
+  # OAuth flows. The daemon's remote-MCP OAuth path (rmcp's
+  # `AuthorizationManager` + the keystore credential backend) is implemented,
+  # but this bare conformance client connects with a static, unauthenticated
+  # transport and performs no interactive sign-in, so it never gets past the
+  # server's 401 challenge and these scenarios still fail here. They stay in
+  # the baseline until the harness drives a sign-in. The first group runs at
+  # both eras; the second is stateless-era-only.
   - auth/metadata-default
   - auth/metadata-var1
   - auth/metadata-var2

@@ -34,6 +34,7 @@ use choreo_mcp::{
 };
 use choreo_shared::ServiceCredential;
 use crossbeam_channel::Sender;
+use tracing::warn;
 
 use crate::daemon::DaemonCommand;
 
@@ -142,9 +143,17 @@ pub fn wiring_for(config: &McpServerConfig) -> Option<McpAuthWiring> {
     }
     let runtime = runtime()?;
     let key = credential_key_for(config)?;
+    let canonical_resource = match &config.transport {
+        McpTransport::Http { url, .. } => choreo_mcp::canonical_target(url),
+        McpTransport::Stdio { .. } => return None,
+    };
     Some(McpAuthWiring {
         key: key.clone(),
-        backend: Arc::new(McpOAuthBackend { key, runtime }),
+        backend: Arc::new(McpOAuthBackend {
+            key,
+            runtime,
+            canonical_resource,
+        }),
     })
 }
 
@@ -154,11 +163,32 @@ struct McpOAuthBackend {
     key: String,
     /// The shared runtime (snapshot + command sender).
     runtime: Arc<McpOAuthRuntime>,
+    /// The server's canonical resource URL, for fail-closed load validation.
+    canonical_resource: String,
 }
 
 impl CredentialBackend for McpOAuthBackend {
     fn load(&self) -> Result<Option<ServiceCredential>, String> {
-        Ok(self.runtime.load(&self.key))
+        match self.runtime.load(&self.key) {
+            // Fail-closed: a stored credential whose `resource` no longer matches
+            // the configured server URL (a re-pointed repo server) is treated as
+            // absent, so it is never sent. The issuer is not separately checked
+            // here (the `oauth` block carries no issuer; discovery validates it).
+            Some(credential)
+                if !choreo_mcp::credential_matches_target(
+                    &credential,
+                    &self.canonical_resource,
+                    None,
+                ) =>
+            {
+                warn!(
+                    key = %self.key,
+                    "stored MCP credential resource mismatch; treating as not logged in"
+                );
+                Ok(None)
+            }
+            other => Ok(other),
+        }
     }
 
     fn save(&self, credential: ServiceCredential) -> Result<(), String> {

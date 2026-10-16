@@ -92,8 +92,9 @@ pub enum McpError {
     ///
     /// A remote server that requires a credential this client did not send
     /// fails here. The message is actionable: it names the two supported
-    /// options — a static token in the server's `headers`, or waiting for
-    /// OAuth support — rather than leaving the raw status to be decoded.
+    /// options — a static token in the server's `headers`, or the `mcp login
+    /// <slug>` OAuth sign-in for a server with an `oauth` block — rather than
+    /// leaving the raw status to be decoded.
     #[error("authorization required by {server}: {hint}")]
     AuthRequired {
         /// The server slug whose endpoint rejected the request.

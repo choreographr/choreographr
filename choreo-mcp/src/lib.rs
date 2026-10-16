@@ -48,7 +48,7 @@ mod stdio;
 
 pub use auth::{
     CredentialBackend, CredentialStoreAdapter, McpAuthWiring, RefreshGuard, canonical_target,
-    credential_key, credential_key_for,
+    credential_key, credential_key_for, credential_matches_target,
 };
 pub use config::{
     DEFAULT_MAX_CONCURRENT_CALLS, DEFAULT_MAX_RESTARTS, DEFAULT_TIMEOUT, McpOAuthConfig,

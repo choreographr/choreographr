@@ -842,6 +842,47 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   (and without the `mcp` cargo feature); `choreographr mcp reconnect`/
   `reload` are minimal one-shot Unix-socket clients for a running daemon.
 
+- **MCP remote-server OAuth.** A remote server may declare an `oauth` block
+  (`{ clientId?, callbackPort?, scopes? }`; never a `clientSecret`) in `mcp.json`
+  or a trusted project `.mcp.json`. Sign-in is a standard OAuth 2.1 PKCE flow
+  owned by the frontend login library (`choreo-client-core`'s `oauth::mcp`): it
+  discovers the authorization server (RFC 9728 protected-resource metadata →
+  RFC 8414/OIDC), dynamically registers a client (SEP-837) when no `clientId` is
+  configured, runs PKCE over a loopback callback (paste-URL fallback; no device
+  code), and stores the durable grant as `ServiceCredential::OAuth { kind: Mcp }`.
+  `mcp login <slug>` reads the server's resolved identity, `oauth` block, and
+  credential key from the extended `McpStatus` and sends the grant over the
+  existing `AddCredential`; `mcp logout <slug>` removes it via
+  `RemoveCredential` and reconnects. Refresh at connect is owned by `rmcp`'s
+  `AuthorizationManager`, driven through a `CredentialStore` adapter in
+  `choreo-mcp` that strips the access token on `save` (serving it from an
+  in-process cache; a cold start returns no usable token so `rmcp` refreshes)
+  and maps to and from `ServiceCredential::OAuth`.
+
+  The credential row is **target-scoped**: `mcp:<slug>|<target-hash>`, where the
+  hash is the repo's stable FNV-1a over the canonicalized server URL joined to
+  the slug. The daemon computes the key (one authority for provisioning and
+  connect-time load) and exposes it, the resolved `oauth` block, and an auth
+  state (`NotApplicable`/`BearerToken`/`NotLoggedIn`/`OAuth`/`Reauthentication`/
+  `Unsupported`) per server in `McpServerStatus`. Load is **fail-closed**: a
+  stored credential whose `resource` no longer matches the configured URL is
+  treated as absent. Trust gates *use*, not existence — an untrusted project's
+  `oauth` block is never expanded or offered, and its stored credential is never
+  loaded or sent while untrusted, but survives un-trust and is usable again on
+  re-trust with no new login.
+
+  The `CredentialBackend` trait (`load`/`save`/`clear`/`acquire_refresh_guard`/
+  `mark_reauthentication`) is implemented by the daemon (`choreo-daemon`'s
+  `mcp::oauth`): no `rmcp` type crosses the crate boundary. Because a server can
+  connect while the command loop is blocked resolving a session overlay, the
+  backend never round-trips the loop for a read — the command loop publishes a
+  credential snapshot the backend reads lock-free — and its writes are
+  fire-and-forget `DaemonCommand`s (`OAuthSave`/`OAuthClear`/`McpAuthRejected`)
+  that persist to the binding public key when the loop is next free. The
+  single-flight refresh guard reuses `OAuthRefreshLocks`, keyed by the MCP
+  credential key, through an owned `Send` guard (a one-token crossbeam
+  semaphore) the async adapter can hold across an `await`.
+
 ### Slug renames (one-time migration)
 
 models.dev keys are canonical, so the old hand-curated slugs were renamed to

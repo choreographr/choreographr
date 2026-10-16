@@ -157,6 +157,34 @@ pub fn canonical_target(url: &str) -> String {
     out
 }
 
+/// Whether a stored MCP credential may be used for a server with the given
+/// canonical resource and optional expected issuer (fail-closed, SEP-2352).
+///
+/// On load the stored `resource` (the server URL) is compared with the
+/// currently-configured server URL and the stored `issuer` with the expected
+/// issuer (when known): a `git pull` that re-points a repo-controlled server
+/// URL must NOT receive the stored token, and an issuer that changed must not
+/// either. Any mismatch — or a missing/!MCP credential — returns `false`, so
+/// the caller treats it as no credential (quarantine → re-login).
+#[must_use]
+pub fn credential_matches_target(
+    credential: &ServiceCredential,
+    canonical_resource: &str,
+    expected_issuer: Option<&str>,
+) -> bool {
+    let Some(view) = credential.as_oauth() else {
+        return false;
+    };
+    if view.kind != OAuthKind::Mcp {
+        return false;
+    }
+    let resource_matches = view
+        .resource
+        .is_some_and(|r| canonical_target(r) == canonical_resource);
+    let issuer_matches = expected_issuer.is_none_or(|iss| view.issuer == Some(iss));
+    resource_matches && issuer_matches
+}
+
 /// Build the target-scoped credential key for a canonical target identity and
 /// slug: `mcp:<slug>|<short-hash>`.
 ///
@@ -492,6 +520,42 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn credential_matches_target_is_fail_closed() {
+        let cred = durable_oauth();
+        let resource = canonical_target("https://example.com/mcp");
+        // A matching resource (in any spelling) and no expected issuer passes.
+        assert!(credential_matches_target(&cred, &resource, None));
+        assert!(credential_matches_target(
+            &cred,
+            &canonical_target("HTTPS://Example.com/mcp/"),
+            None
+        ));
+        // A re-pointed resource is rejected.
+        assert!(!credential_matches_target(
+            &cred,
+            &canonical_target("https://other.example/mcp"),
+            None
+        ));
+        // A matching expected issuer passes; a mismatched one is rejected.
+        assert!(credential_matches_target(
+            &cred,
+            &resource,
+            Some("https://as.example")
+        ));
+        assert!(!credential_matches_target(
+            &cred,
+            &resource,
+            Some("https://evil.example")
+        ));
+        // A non-MCP credential never matches.
+        assert!(!credential_matches_target(
+            &ServiceCredential::ApiKey { key: "k".into() },
+            &resource,
+            None
+        ));
+    }
 
     #[test]
     fn canonical_target_normalizes_scheme_host_port_and_slash() {
