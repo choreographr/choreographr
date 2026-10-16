@@ -18,9 +18,10 @@ use zeroize::Zeroize;
 ///
 /// The variants discriminate the per-service secret material the daemon holds
 /// on a user's behalf. The whole enum is `zeroize`d on drop so secret bytes
-/// are not left in freed memory, and its [`Display`](fmt::Display) redacts
-/// every secret field so a credential can be logged without leaking.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize)]
+/// are not left in freed memory, and BOTH its [`Display`](fmt::Display) and
+/// its hand-written [`Debug`](fmt::Debug) redact every secret field, so a
+/// credential can be logged without leaking.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize)]
 #[zeroize(drop)]
 pub enum ServiceCredential {
     /// A plain API-key service (the provider is identified out-of-band).
@@ -61,27 +62,46 @@ pub enum ServiceCredential {
 /// Redacting display to prevent secret leakage in logs.
 impl fmt::Display for ServiceCredential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ServiceCredential::ApiKey { .. } => {
-                write!(f, "ApiKey {{ key: *** }}")
-            }
-            ServiceCredential::X { .. } => {
-                write!(
-                    f,
-                    "X {{ api_key: ***, api_key_secret: ***, \
-                     access_token: ***, access_token_secret: ***, \
-                     bearer_token: *** }}"
-                )
-            }
-            ServiceCredential::Substrate { .. } => {
-                write!(f, "Substrate {{ name: ***, account_id: ***, seed: *** }}")
-            }
+        // `Display` and `Debug` share one redaction shape (`fmt_redacted`).
+        fmt_redacted(self, f)
+    }
+}
+
+/// Redacting `Debug` to prevent secret leakage in logs. Hand-written (not
+/// derived) because the type travels inside protocol messages such as
+/// `ClientMessageType::AddCredential`: a derived `Debug` would print the raw
+/// secret whenever a containing message is `{:?}`-formatted, so this prints
+/// the same redacted shape as [`Display`](fmt::Display).
+impl fmt::Debug for ServiceCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt_redacted(self, f)
+    }
+}
+
+/// The single redaction shape shared by [`Display`](fmt::Display) and
+/// [`Debug`](fmt::Debug) for [`ServiceCredential`], so the two projections of
+/// a secret cannot drift into one of them leaking.
+fn fmt_redacted(credential: &ServiceCredential, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match credential {
+        ServiceCredential::ApiKey { .. } => {
+            write!(f, "ApiKey {{ key: *** }}")
+        }
+        ServiceCredential::X { .. } => {
+            write!(
+                f,
+                "X {{ api_key: ***, api_key_secret: ***, \
+                 access_token: ***, access_token_secret: ***, \
+                 bearer_token: *** }}"
+            )
+        }
+        ServiceCredential::Substrate { .. } => {
+            write!(f, "Substrate {{ name: ***, account_id: ***, seed: *** }}")
         }
     }
 }
 
 /// Borrowed view of X credential fields. Avoids allocating a separate struct.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct XCredentialView<'a> {
     /// OAuth 1.0a consumer key.
     pub api_key: &'a str,
@@ -95,9 +115,21 @@ pub struct XCredentialView<'a> {
     pub bearer_token: Option<&'a str>,
 }
 
+/// Redacting `Debug` so a logged view cannot expose the secret fields it
+/// borrows (mirrors [`ServiceCredential`]'s hand-written `Debug`).
+impl fmt::Debug for XCredentialView<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "XCredentialView {{ api_key: ***, api_key_secret: ***, \
+             access_token: ***, access_token_secret: ***, bearer_token: *** }}"
+        )
+    }
+}
+
 /// Borrowed view of a Substrate credential's fields. Mirrors the borrowed
 /// view used for the `X` variant; avoids allocating a separate struct.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct SubstrateCredentialView<'a> {
     /// Account name (matches the daemon's credential key).
     pub name: &'a str,
@@ -107,6 +139,18 @@ pub struct SubstrateCredentialView<'a> {
     pub secret: &'a [u8],
     /// Raw 32-byte public key (the account id bytes).
     pub public: &'a [u8],
+}
+
+/// Redacting `Debug` so a logged view cannot expose the secret fields it
+/// borrows (mirrors [`ServiceCredential`]'s hand-written `Debug`).
+impl fmt::Debug for SubstrateCredentialView<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "SubstrateCredentialView {{ name: ***, account_id: ***, \
+             secret: ***, public: *** }}"
+        )
+    }
 }
 
 impl ServiceCredential {
@@ -215,6 +259,70 @@ mod tests {
         assert!(!display_x.contains("ats"));
         assert!(!display_x.contains("bt"));
         assert_eq!(display_x.matches("***").count(), 5);
+    }
+
+    #[test]
+    fn service_credential_debug_redacts_secrets() {
+        // `Debug` is hand-written to redact: the type now travels inside
+        // protocol messages, so a `{:?}` on a containing message must not
+        // expose the secret. Pin that the derive was not reintroduced.
+        let cred = ServiceCredential::ApiKey {
+            key: "sk-supersecret".into(),
+        };
+        let debug = format!("{cred:?}");
+        assert!(!debug.contains("sk-supersecret"), "Debug leaked the key");
+        assert!(debug.contains("***"));
+
+        let cred_x = ServiceCredential::X {
+            api_key: "ak".into(),
+            api_key_secret: "aks".into(),
+            access_token: "at".into(),
+            access_token_secret: "ats".into(),
+            bearer_token: Some("bt".into()),
+        };
+        let debug_x = format!("{cred_x:?}");
+        assert!(!debug_x.contains("ak"));
+        assert!(!debug_x.contains("ats"));
+        assert!(!debug_x.contains("bt"));
+        assert_eq!(debug_x.matches("***").count(), 5);
+
+        let cred_substrate = ServiceCredential::Substrate {
+            name: "main".into(),
+            account_id: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY".into(),
+            secret: vec![0x11; 64],
+            public: vec![0x22; 32],
+        };
+        let debug_substrate = format!("{cred_substrate:?}");
+        assert!(!debug_substrate.contains("main"));
+        assert!(!debug_substrate.contains("5Grwva"));
+        assert_eq!(debug_substrate.matches("***").count(), 3);
+    }
+
+    #[test]
+    fn borrowed_credential_views_debug_redacts_secrets() {
+        let cred = ServiceCredential::X {
+            api_key: "ak".into(),
+            api_key_secret: "aks".into(),
+            access_token: "at".into(),
+            access_token_secret: "ats".into(),
+            bearer_token: Some("bt".into()),
+        };
+        let view = cred.as_x().expect("expected X view");
+        let debug = format!("{view:?}");
+        assert!(!debug.contains("ak"));
+        assert!(!debug.contains("ats"));
+        assert!(!debug.contains("bt"));
+
+        let substrate = ServiceCredential::Substrate {
+            name: "main".into(),
+            account_id: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY".into(),
+            secret: vec![0x11; 64],
+            public: vec![0x22; 32],
+        };
+        let sub_view = substrate.as_substrate().expect("expected Substrate view");
+        let sub_debug = format!("{sub_view:?}");
+        assert!(!sub_debug.contains("main"));
+        assert!(!sub_debug.contains("5Grwva"));
     }
 
     #[test]
