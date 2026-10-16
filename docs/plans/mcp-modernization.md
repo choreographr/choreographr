@@ -7,8 +7,9 @@ Commits: `ab3dc2e` (hardening), `976edf6` (the rmcp engine swap), `9f6209a`
 (Streamable HTTP), `274f736` (progress/MRTR/resources), `1d7d239` (stdio frame cap
 + concurrency cap), `15aa3ff` (`subscriptions/listen` + registry hot-swap),
 `f037383`/`8d27006`/`a348c89` (P5: name hygiene, config, surfaces, logs),
-`0a85184` (D9 flip + P6 hardening), and the 2026-07-28-era conformance run. What
-remains is **post-ship**: OAuth (P3) and the fast-follows. See §1.2 and §7.
+`0a85184` (D9 flip + P6 hardening), and the 2026-07-28-era conformance run. M1 and
+M2/D13 have landed; the originally-deferred OAuth work (P3/D7) now lives in
+`docs/plans/oauth-unified.md`. See §1.2 and §7.
 **Lifecycle:** this file is **deleted once the plan is fully implemented**. Nothing
 written during implementation may reference it — rustdoc, `ARCHITECTURE.md`,
 `README.md`, release notes, and commit messages must stand on their own, because a
@@ -56,8 +57,9 @@ P5), the justfile (`doc_crates` stays current), `ARCHITECTURE.md`, `README.md`,
 > dispatcher facade, with cancellation, restart, pagination, content mapping,
 > live tool-list refresh, bounds, tool-name hygiene, config layers, a `/mcp`
 > status surface + `choreographr mcp` CLI, per-server logs, and the official
-> conformance suite running both protocol eras in CI. **M1 is complete**; what
-> remains is **post-ship**: OAuth (P3) and the fast-follows. See §1.2 and §7.
+> conformance suite running both protocol eras in CI. **M1 is complete**; the
+> deferred OAuth work (P3/D7) has moved to `docs/plans/oauth-unified.md`. See §1.2
+> and §7.
 
 ---
 
@@ -694,18 +696,15 @@ queues the excess, promoting each as a slot frees and waking on commands or
 completions via `select!` (no polling). A session cancel reaches queued calls
 too. Nothing remains open in this decision.
 
-### D7 — Credentials
+### D7 — Credentials (superseded)
 
-OAuth tokens are stored per (issuer, resource) under
-`<state>/choreographr/mcp-auth/` (0600 files, one per credential), never in the
-DB, never in logs, never shared across issuers (SEP-2352). Config-file
-`headers`/`env` secrets are redacted in logs and `session_inspect` output.
-Remote-server auth is opt-in per server; a server without `oauth` simply gets no
-`Authorization` header (explicit `headers` percolate as configured).
-
-Status: **post-ship (P3)**. M1 has no `oauth` key and no credential store — the
-supported credential path is an explicit `Authorization` (or other) header in
-`mcp_servers.json`, `${VAR}`-expanded. This D7 design is what P3 implements.
+The original MCP credential design — OAuth tokens in a `mcp-auth/` file store keyed
+by (issuer, resource) — is **superseded by `docs/plans/oauth-unified.md`**: MCP
+credentials live in the **daemon keystore** (the same store as every other
+credential), row-keyed `mcp:<slug>|<target-hash>`, and MCP OAuth is built on
+`rmcp`'s `auth` feature. Until that ships, the supported path is an explicit
+`Authorization` (or other) header in `mcp.json`, `${VAR}`-expanded, and an
+OAuth-requiring server fails with the actionable `AuthRequired` error (P5).
 
 ### D8 — Elicitation: advertise only with a UI
 
@@ -1303,23 +1302,13 @@ Post-ship (fast-follow, around P3):
       stubborn-server fixture backs both a `choreo-mcp` and a daemon test
       proving shutdown returns within its bounded wait.
 
-### P3 — OAuth for remote servers (post-ship, deferred)
+### P3 — OAuth for remote servers (superseded)
 
-**Not part of M1.** This is the natural first post-ship phase: it closes the last
-S1 gap (the auth half of G2) and unlocks managed remote servers. Until it lands,
-a static token in `headers` is the supported credential path and an
-OAuth-requiring server fails with the P5 actionable error.
-
-- [ ] rmcp `auth`; protected-resource metadata discovery (RFC 9728) + AS
-      metadata (RFC 8414) + `iss` validation (RFC 9207).
-- [ ] Client registration: DCR per SEP-837 with `application_type`, CIMD support,
-      pre-registered client config, callback on loopback with paste-URL fallback.
-- [ ] Credential store (D7) + refresh + logout; keyed by issuer/resource.
-- [ ] TUI/CLI: `mcp login <slug>`, `mcp logout <slug>`, plus auth state in the
-      `/mcp` status surface (the surface itself ships in M1).
-- [ ] Tests: in-repo mock authorization server (borrow the shape of pi's
-      `mcp-oauth-server.ts` and hermes' e2e fixtures), scope step-up, refresh,
-      revocation.
+**Moved to `docs/plans/oauth-unified.md`** (§8/§8.1), which replaces this phase and
+D7: MCP credentials go to the daemon keystore, MCP OAuth is built on `rmcp`'s `auth`
+feature, login is loopback + paste-URL, and credentials are target-scoped and
+trust-gated. Until that ships, the supported path is a static token in `headers`,
+with the P5 actionable `AuthRequired` error for an OAuth-requiring server.
 
 ## 8. Testing strategy
 
@@ -1549,8 +1538,9 @@ The feature-row flip (D9) still waits on the default-on change.
    escape hatch gives a stateful server a private connection per session that
    uses it.
 3. *(Post-ship, P3)* Where does `mcp login` live for the GUI (embedded daemon) —
-   GUI modal or loopback browser? Follow the existing provider-OAuth plan
-   (`docs/plans/provider-oauth.md`) precedent.
+   GUI modal or loopback browser? Resolved with the unified OAuth plan
+   (`docs/plans/oauth-unified.md`): GUI modal over the shared login library; TUI/CLI
+   land first.
 4. Is the 2 s startup budget right, or should server availability be fully lazy
    (tools appear when connected)? P1 shipped the 2 s batch budget (stragglers
    skipped and logged); revisit if real configs routinely miss it.
@@ -1607,12 +1597,12 @@ P0–P6 and D9 are complete.
 ### Post-ship
 
 - [ ] Remote OAuth server sign-in works end-to-end with refresh and logout
-      (P3).
+      (P3) — **now tracked in `docs/plans/oauth-unified.md`**.
 - [ ] The remaining fast-follows land: `exposure` + deferred tool search, and
       the config-watcher auto-reload for `mcp_servers.json` (D12).
 - [ ] The two deferred robustness items land — or are reconfirmed deferred with
       their rationale — turn-level rejection recovery and mediated egress for
       MCP servers (§13).
-- [ ] **This plan document is deleted** once everything above — including P3 —
-      is implemented. No source file, doc, comment, or commit message in the
-      tree references it (grep for `mcp-modernization` returns nothing).
+- [ ] **This plan document is deleted** once everything above is implemented. No
+      source file, doc, comment, or commit message in the tree references it (grep
+      for `mcp-modernization` returns nothing).

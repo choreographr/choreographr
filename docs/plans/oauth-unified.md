@@ -6,8 +6,8 @@ encrypts it to its binding, the add requires an unlocked keystore, and no implic
 unlock remains (`9c10043`, `a886de7`, `8a03a08`, `c8bcb9c`); the credential type and
 its redacting `Display`/`Debug` now live in `choreo-shared`. The OAuth credential
 variant, the provider login library, and MCP OAuth are **not yet implemented**.
-Supersedes the credential-model, refresh, and provisioning sections of
-`docs/plans/provider-oauth.md` and the post-ship **P3 / D7** of
+Supersedes the earlier provider-OAuth plan (`provider-oauth.md`, now removed — its
+verified wire facts are inlined at §7.2) and the post-ship **P3 / D7** of
 `docs/plans/mcp-modernization.md`.
 **Lifecycle:** this file is **deleted once the plan is fully implemented**. Nothing
 written during implementation may reference it — rustdoc, `ARCHITECTURE.md`,
@@ -478,6 +478,41 @@ subscription (the goose/t3code/zero-clean path); (c) optionally **import an exis
 official Claude Code credential (`~/.claude/.credentials.json` /
 `CLAUDE_CODE_OAUTH_TOKEN`). Status is recorded as **unverified and moving** — do not
 rely on the borrowed route.
+
+### 7.2 ChatGPT/Codex wire facts (verified)
+
+Read from upstream `openai/codex` (`codex-rs/login/…`,
+`codex-rs/model-provider-info/src/lib.rs`). The request headers for both routes are
+the §18 table.
+
+**Codex subscription route** (Responses API at `https://chatgpt.com/backend-api/codex`):
+- Issuer `https://auth.openai.com`; authorize `{issuer}/oauth/authorize`; token
+  `{issuer}/oauth/token`.
+- Redirect `http://localhost:{port}/auth/callback`, port **1455** (fallback **1457**;
+  must stay on the Codex CLI's redirect allow-list).
+- Client id `app_EMoamEEZ73f0CkXaXp7hrann` (borrowed; overridable by env in Codex).
+- PKCE **S256** + a random `state`.
+- Scopes `openid profile email offline_access api.connectors.read
+  api.connectors.invoke`.
+- Extra authorize params: `id_token_add_organizations=true`,
+  `codex_cli_simplified_flow=true`, `originator=<value>` (optional
+  `allowed_workspace_id`).
+- **Code exchange is form-encoded; refresh is JSON** — the grant encoding is
+  **per-endpoint**, not global (`oauth/client.rs::TokenEncoding`).
+- **Device-code** (headless/SSH): `POST {issuer}/deviceauth/usercode`, poll
+  `{issuer}/deviceauth/token`, verify at `{issuer}/codex/device`, exchange with
+  `redirect_uri = {issuer}/deviceauth/callback`; pi's variant lives under
+  `/api/accounts/deviceauth/*` and the poll returns `{authorization_code,
+  code_verifier}` (not tokens). **Verify both generations at build time**; keep both
+  in the OAuth table.
+- **Identity claims** (id_token JWT): `chatgpt_account_id`, `chatgpt_user_id`,
+  `chatgpt_plan_type`, `email` — under `https://api.openai.com/auth` (and
+  `…/profile` for email). `account_id` is `…/auth.chatgpt_account_id` (§18).
+
+**ChatGPT "token sharing" route** (`https://api.openai.com/v1` Responses):
+- Authorize `{issuer}/api/accounts/authorize`; token `{issuer}/api/accounts/oauth/token`.
+- `client_id=dynamic_agent_client` (OpenAI issues an `oaiapp_…` id on the callback —
+  §7.1); scope `chatgpt.tokens.use.direct`; resource `https://api.openai.com/v1`.
 
 ## 8. MCP runtime
 
@@ -993,13 +1028,13 @@ None — every design question is settled.
 
 ## 20. Interaction with other plans
 
-- **`provider-oauth.md`** — this plan supersedes its credential model (§5), refresh
-  design (its D3/D4), and the `AddCredential` shape. Its verified ChatGPT wire facts
-  (§3) and cross-harness survey remain the source.
-- **`mcp-modernization.md`** — this plan **replaces P3/D7**: MCP credentials go to
+- **`provider-oauth.md`** — **superseded and removed.** Its credential model, refresh
+  design (D3/D4), and `AddCredential` shape are folded in here; its verified ChatGPT
+  wire facts are inlined at §7.2. Nothing in the tree references it.
+- **`mcp-modernization.md`** — this plan **replaces its P3/D7** (MCP credentials go to
   the **keystore**, not a `mcp-auth/` file store; MCP OAuth is built on `rmcp`'s
-  `auth` feature (that plan already named `rmcp` as the engine). Everything else in
-  M1 (shipped) is untouched.
+  `auth` feature). P3 and D7 there are now marked superseded; the rest of M1/M2
+  (shipped) is untouched.
 
 ## 21. References
 
@@ -1117,10 +1152,10 @@ server's `oauth` config block schema follows `mcp-modernization.md` §10.
 
 ### Required reading / verification
 
-- **ChatGPT flow:** `provider-oauth.md` §3 (the verified wire facts — issuer
+- **ChatGPT flow:** §7.2 (the verified wire facts — issuer
   `auth.openai.com`, `/oauth/authorize`, `/oauth/token`, redirect `localhost:1455` /
   fallback `1457`, client id `app_EMoam…`, scopes, **form** code-exchange vs **JSON**
-  refresh, device-code paths) and §16 (prior art). The ChatGPT token-sharing route:
+  refresh, device-code paths) and §11 (prior art). The ChatGPT token-sharing route:
   `/api/accounts/authorize` ⇄ `/api/accounts/oauth/token`, `client_id=dynamic_agent_client`.
 - **Live checks before shipping:** ChatGPT refresh-rotation behavior and the disputed
   headers (`OpenAI-Beta`, `session-id`) against a real 4xx; Anthropic's current ToS.
