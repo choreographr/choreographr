@@ -338,7 +338,7 @@ and keeps the stored one when omitted**, so a single provider-parameterized engi
 covers rotating *and* non-rotating providers with no branch. The `id_token` is
 likewise replaced only when the response carries one (otherwise the
 `chatgpt_account_id` claim would be dropped). "Does provider X rotate?" is therefore
-a **verification** item (§18), not a code path. An optional per-provider
+an **assumption** (§18), not a code path. An optional per-provider
 `rotates_refresh_token` flag (default: rotate-if-present) covers a provider that turns
 out to be strict — **declared in the provider table, never detected at runtime, and
 never used to *discard* a returned token**. Do **not** default to the "assume rotation,
@@ -842,20 +842,57 @@ crate.
 - **Proactive refresh scheduler** — an optional follow-up once on-demand is proven.
 - **GUI / IM login surfaces** — follow-ups after TUI + CLI.
 
-## 18. Open questions
+## 18. Assumptions, verification & open questions
 
-1. **Does ChatGPT/Codex rotate refresh tokens, and what is their lifetime?** The
-   plan assumes rotation; confirm against a live token in phase 4. If it does not
-   rotate, §6 is belt-and-suspenders for that provider (every other provider still
-   needs it).
-2. **Exact ChatGPT request headers** beyond `Authorization`, `chatgpt-account-id`,
-   `originator`, `X-OpenAI-Fedramp` — confirm `OpenAI-Beta`/`session_id` against a
-   live token.
-3. **Re-login / auth-state surfacing.** Extend `AccountInfo` (auth kind +
-   needs-relogin) and `McpServerStatus` (auth state), and/or add a one-shot
-   "re-login required" broadcast on a terminal failure. Leaning both: a resting
-   status field plus a broadcast nudge.
-4. **GUI/IM login placement** (GUI modal vs loopback browser) — follow the
+### Assumptions (non-behavioral)
+
+- **Refresh rotation / refresh-token optionality.** Whether a given provider rotates,
+  and whether it issues a refresh token at all, does **not** affect the engine —
+  rotate-if-present plus `refresh_token: Option` (§6) covers both. Record a live
+  provider's actual behavior only for **risk framing** (single-flight is load-bearing
+  *iff* rotation + reuse-detection) and to decide whether the optional per-provider
+  `rotates_refresh_token` flag is ever needed. **No code path depends on it.**
+
+### Verification (behavioral)
+
+- **Anthropic's current policy.** The Claude posture (§7.1 — API key or delegate,
+  never mint) rests on secondary news sources about a Jan–Apr 2026 lockdown. Confirm
+  against Anthropic's live Consumer ToS + Claude Code legal/compliance docs, and check
+  for any sanctioned third-party registration path. The conservative stance is safe
+  either way; this only refines the provider-table row.
+
+#### Resolved: ChatGPT/Codex request headers
+
+A survey of the peer harnesses (and the upstream `openai/codex` source) pinned the
+headers; store them as provider-table data:
+
+| Backend | Required | Optional / conditional | Not sent |
+|---|---|---|---|
+| Codex subscription (`chatgpt.com/backend-api/codex/responses`) | `Authorization: Bearer <access>`, `chatgpt-account-id: <id>`, `originator: <non-empty app id>`, `content-type: application/json`, `accept: text/event-stream` | `User-Agent`; `session-id` + `x-client-request-id` (cache affinity); `X-OpenAI-Fedramp: true` (FedRAMP only); `x-openai-internal-codex-residency: us` (residency only) | — |
+| Token-sharing (`api.openai.com/v1/responses`) | `Authorization: Bearer <access>` | `User-Agent`; `session_id` + `x-client-request-id` | **no** `chatgpt-account-id`, `originator`, `OpenAI-Beta` |
+
+- **`chatgpt-account-id`** = the JWT claim `https://api.openai.com/auth.chatgpt_account_id`;
+  harnesses read it from the **id_token** (codex, jcode, goose) *or* the
+  **access_token** (pi, hermes, fx) — Choreographr tries the id_token first, then the
+  access_token.
+- **`originator`** is a per-app string, `codex_cli_rs` by default; Choreographr sends
+  its own (e.g. `choreographr`) — non-empty and stable.
+- **Disputed / unverified:** `OpenAI-Beta` (`responses=experimental`) is sent by every
+  non-official harness but **omitted by the official Codex CLI on HTTP** (its value is
+  WebSocket-only) — treat as optional. The session header name varies
+  (`session-id`/`session_id`), and `chatgpt-account-id` casing varies (headers are
+  case-insensitive). The token-sharing route's header set is inferred from two
+  implementations (pi, opencode) — less verified than the Codex route.
+- Pin the current known set in a unit test and re-check against a real 4xx before
+  relying on the disputed headers.
+
+### Open design questions
+
+1. **Re-login / auth-state surfacing.** Extend `AccountInfo` (auth kind + needs-relogin)
+   and `McpServerStatus` (auth state), and/or add a one-shot "re-login required"
+   broadcast on a terminal failure. Leaning both: a resting status field plus a
+   broadcast nudge.
+2. **GUI/IM login placement** (GUI modal vs loopback browser) — follow the
    provider-login precedent; TUI/CLI land first.
 
 ## 19. Definition of done
