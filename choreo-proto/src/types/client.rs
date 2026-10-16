@@ -150,8 +150,8 @@ pub enum ClientMessageType {
     /// `KEYSTORE BOUND` log), runs the shared unlock tail, and replies
     /// [`DaemonMessageType::Bound`](crate::DaemonMessageType::Bound). On an ALREADY-bound keystore the key is
     /// verified against the binding — a mismatch is rejected with the usual
-    /// wrong-key semantics (no unlock, no overwrite). Unlock and `AddCredential`
-    /// are strictly VERIFY-ONLY and cannot create a binding.
+    /// wrong-key semantics (no unlock, no overwrite). Unlock is strictly
+    /// VERIFY-ONLY and cannot create a binding.
     BindKeystore {
         /// The 32-byte X25519 private unlock key to adopt (or verify) as the
         /// daemon's keystore binding.

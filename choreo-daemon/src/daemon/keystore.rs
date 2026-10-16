@@ -346,9 +346,9 @@ fn handle_unlock_inner(
     // public key differs (surfaces as LockedError).
     verify_keystore_binding(state, &key)?;
 
-    // Shared bulk-decrypt + accounts-load + provider-resolve tail — the same
-    // code path `AddCredential` runs as its implicit unlock, so the two
-    // paths cannot drift.
+    // Shared bulk-decrypt + accounts-load + provider-resolve tail — also run
+    // by `handle_bind_keystore_inner`, so the unlock and bind paths cannot
+    // drift.
     unlock_tail(state, &key).map_err(|e| KeystoreOpError::Other(e.to_string()))
 }
 
@@ -373,8 +373,8 @@ fn handle_bind_keystore_inner(
     // Adopt-if-unbound-else-verify: the ONLY adopt path in the daemon.
     bind_keystore(state, &key)?;
 
-    // Same tail as Unlock/AddCredential-implicit-unlock: loads accounts and
-    // clears `locked`, so a successful bind leaves the daemon unlocked.
+    // Same tail as `Unlock`: loads accounts and clears `locked`, so a
+    // successful bind leaves the daemon unlocked.
     unlock_tail(state, &key).map_err(|e| KeystoreOpError::Other(e.to_string()))
 }
 
@@ -398,10 +398,10 @@ fn zeroized_key_or_wipe(key: &mut Vec<u8>) -> Result<Zeroizing<[u8; 32]>, Keysto
     }
 }
 
-/// Map a [`KeystoreOpError`] to the wire reply the Unlock/Bind paths send.
-/// The three call sites (unlock, bind, save-credential) used to each spell
-/// this match out — one shared mapping so the `Unbound` → `KeystoreUnbound`
-/// guidance text and the wrong-key → error-message shape cannot drift.
+/// Map a [`KeystoreOpError`] to the wire reply the Unlock/Bind paths send —
+/// one shared mapping for both call sites, so the `Unbound` →
+/// `KeystoreUnbound` guidance text and the wrong-key → error-message shape
+/// cannot drift.
 fn unlock_error_reply(e: &KeystoreOpError) -> DaemonMessageType {
     match e {
         KeystoreOpError::Unbound => DaemonMessageType::KeystoreUnbound {
@@ -420,7 +420,7 @@ fn bind_keystore(state: &mut DaemonState, key: &[u8; 32]) -> Result<(), Keystore
     let binding = db::get_keystore_binding(&state.db)
         .map_err(|e| KeystoreOpError::Other(format!("failed to read keystore binding: {e}")))?;
     // x25519_dalek: the public key is what the binding stores (and what the
-    // CLIENT used to encrypt credential blobs), never the private key itself.
+    // daemon encrypts credential blobs to), never the private key itself.
     let derived = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*key));
     match binding {
         None => {
@@ -432,8 +432,8 @@ fn bind_keystore(state: &mut DaemonState, key: &[u8; 32]) -> Result<(), Keystore
             // key (any later unlock requires exactly that key).
             info!(
                 "KEYSTORE BOUND: adopted unlock key via BindKeystore (TOFU); \
-                 public key (hex) = {} — all future Unlock/AddCredential \
-                 attempts must present this key, others are rejected",
+                 public key (hex) = {} — all future Unlock attempts must \
+                 present this key, others are rejected",
                 hex::encode(derived.as_bytes())
             );
             // Flip the cached status flag the command loop reads to derive the
@@ -474,7 +474,7 @@ pub(crate) fn verify_keystore_binding(
     let binding = db::get_keystore_binding(&state.db)
         .map_err(|e| KeystoreOpError::Other(format!("failed to read keystore binding: {e}")))?;
     // x25519_dalek: the public key is what the binding stores (and what the
-    // CLIENT used to encrypt credential blobs), never the private key itself.
+    // daemon encrypts credential blobs to), never the private key itself.
     let derived = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*key));
     match binding {
         None => {
@@ -579,8 +579,8 @@ fn finish_unlock(
 
     // The keystore is now fully decrypted into memory (credentials,
     // accounts): commit ALL of it to daemon state in one shot — this is the
-    // single authoritative unlocked point shared by the `Unlock` path and
-    // the `AddCredential` implicit-unlock path.
+    // single authoritative unlocked point shared by the `Unlock` and
+    // `BindKeystore` paths.
     state.x_credentials = credentials
         .get("twitter")
         .filter(|c| matches!(c, ServiceCredential::X { .. }))

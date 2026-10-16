@@ -3179,7 +3179,6 @@ dependencies = [
  "mimalloc",
  "mio",
  "nix 0.31.3",
- "postcard",
  "ratatui",
  "ratatui-image",
  "resvg",

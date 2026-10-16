@@ -1,8 +1,8 @@
 //! Connect-time keystore handshake and credential-message building.
 //!
 //! A daemon's credential keystore is TOFU: it adopts a key only through
-//! `ClientMessageType::BindKeystore`, and `Unlock`/`AddCredential` are verify-only
-//! against that adopted key. This module owns the client half of that design —
+//! `ClientMessageType::BindKeystore`; `Unlock` is verify-only against that
+//! adopted key. This module owns the client half of that design —
 //! resolving the unlock key already associated with an address
 //! ([`resolve_private_key`], [`try_auto_unlock_key`]), minting and
 //! pre-send-recording a fresh binding key for an unbound daemon
