@@ -53,6 +53,11 @@ use zeroize::Zeroizing;
 /// client-encrypted `encrypted_payload` plus an `unlock_key`: no key rides the
 /// wire, the daemon encrypts the credential to its own binding public key, and
 /// the add path requires an already-unlocked keystore (no implicit unlock).
+/// Also under the same policy, 9 gained the provider OAuth login surface: the
+/// `ClientMessage::ListOAuthProviders` request and its
+/// `DaemonMessage::OAuthProviders(Vec<OAuthProviderDescriptor>)` reply, so a
+/// frontend learns each provider's issuer, scopes, redirect ports, encodings,
+/// and client-identity posture from the daemon instead of embedding a copy.
 ///
 /// Policy: variants may be added to the **current, unreleased** wire version
 /// without a bump. Mixed-version peers do not exist until a release ships, and

@@ -433,6 +433,23 @@ impl DaemonMessage {
                             .map(|a| 48 + a.name.len() + a.provider.len())
                             .sum::<usize>()
                 }
+                // One descriptor per OAuth-capable provider: 11 named fields,
+                // each with a variable-size string/list payload, so a generous
+                // per-entry allowance keeps the gauge conservative.
+                DaemonMessageType::OAuthProviders { providers } => {
+                    named_field_overhead(1)
+                        + providers
+                            .iter()
+                            .map(|p| {
+                                256 + p.provider.len()
+                                    + p.issuer.len()
+                                    + p.authorize_path.len()
+                                    + p.token_path.len()
+                                    + option_str_len(p.client_id.as_ref())
+                                    + p.scopes.iter().map(String::len).sum::<usize>()
+                            })
+                            .sum::<usize>()
+                }
                 DaemonMessageType::AccountListFailed { error } => {
                     named_field_overhead(1) + error.len()
                 }

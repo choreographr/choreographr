@@ -247,6 +247,13 @@ pub enum ClientMessageType {
     },
     /// Request every configured account as [`AccountInfo`](crate::AccountInfo).
     ListAccounts,
+    /// Request the OAuth sign-in parameters for every provider that supports
+    /// OAuth. The daemon assembles one [`OAuthProviderDescriptor`](crate::OAuthProviderDescriptor)
+    /// per such provider from the catalog profile data plus the compiled
+    /// client-identity policy, withholding a borrowed client id unless the
+    /// per-install opt-in is enabled. Replies with
+    /// [`DaemonMessageType::OAuthProviders`](crate::DaemonMessageType::OAuthProviders).
+    ListOAuthProviders,
     /// Bind the attached session to a provider account.
     SetSessionAccount {
         /// The account name to bind the session to.
@@ -407,6 +414,8 @@ pub enum MessageKind {
     RemoveAccount,
     /// List the configured provider accounts.
     ListAccounts,
+    /// List the OAuth sign-in parameters for every OAuth-capable provider.
+    ListOAuthProviders,
     /// Bind the attached session to a provider account.
     SetSessionAccount,
     /// Set the reasoning effort.
@@ -475,6 +484,7 @@ impl From<&ClientMessageType> for MessageKind {
             ClientMessageType::AddAccount { .. } => Self::AddAccount,
             ClientMessageType::RemoveAccount { .. } => Self::RemoveAccount,
             ClientMessageType::ListAccounts => Self::ListAccounts,
+            ClientMessageType::ListOAuthProviders => Self::ListOAuthProviders,
             ClientMessageType::SetSessionAccount { .. } => Self::SetSessionAccount,
             ClientMessageType::SetReasoningEffort { .. } => Self::SetReasoningEffort,
             ClientMessageType::GetReasoningEffort => Self::GetReasoningEffort,

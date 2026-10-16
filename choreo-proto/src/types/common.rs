@@ -73,6 +73,85 @@ fn default_context_file_max_bytes() -> usize {
     32 * 1024
 }
 
+/// Per-endpoint OAuth grant encoding, as carried on the wire.
+///
+/// A descriptor exposes the two encodings separately because the code exchange
+/// and the refresh can differ (e.g. the `ChatGPT`/Codex backend accepts a
+/// form-encoded code exchange but a JSON refresh), so the login library must
+/// serialize each request according to its own endpoint. The variants mirror
+/// the catalog's `GrantEncoding` one-for-one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthGrantEncoding {
+    /// `application/x-www-form-urlencoded`.
+    Form,
+    /// `application/json`.
+    Json,
+}
+
+/// The client-identity posture a provider's OAuth flow uses: register our own
+/// client, borrow the vendor CLI's client id behind an opt-in, or delegate to
+/// the vendor's tooling.
+///
+/// It mirrors the compiled client-identity policy one-for-one; the wire enum
+/// exists so a frontend learns the posture without embedding a copy of the
+/// daemon-side policy table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthClientIdentity {
+    /// The provider registers (or dynamically obtains) its own client id.
+    Registered,
+    /// The provider borrows the vendor CLI's public client id; the daemon only
+    /// releases the borrowed id when the per-install opt-in is enabled.
+    Borrowed,
+    /// The provider does not run the flow itself and delegates to the vendor's
+    /// CLI/SDK.
+    Delegate,
+}
+
+/// A provider's OAuth sign-in parameters, as served by the daemon.
+///
+/// The daemon assembles one of these per provider from the catalog's OAuth
+/// profile data plus the compiled client-identity policy, so a frontend runs a
+/// sign-in without embedding a copy of the issuer, scopes, redirect ports,
+/// encodings, or client identity.
+/// The borrowed vendor client id is withheld (`client_id: None`) unless the
+/// per-install opt-in is enabled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthProviderDescriptor {
+    /// The provider slug (the catalog key the account names, e.g. `openai`).
+    pub provider: String,
+    /// Authorization-server issuer (e.g. `https://auth.openai.com`).
+    pub issuer: String,
+    /// Path of the authorization endpoint, relative to `issuer`.
+    pub authorize_path: String,
+    /// Path of the token endpoint, relative to `issuer`.
+    pub token_path: String,
+    /// The PUBLIC client id to send at the authorize endpoint, or `None` when
+    /// the flow must obtain its own (dynamic registration) or the borrowed id
+    /// is withheld because the opt-in is off. Never a client secret.
+    pub client_id: Option<String>,
+    /// Scopes requested at login.
+    pub scopes: Vec<String>,
+    /// Loopback redirect ports to try, in order (the first free one wins).
+    pub redirect_ports: Vec<u16>,
+    /// Encoding for the authorization-code exchange request body.
+    pub code_exchange_encoding: OAuthGrantEncoding,
+    /// Encoding for the refresh request body.
+    pub refresh_encoding: OAuthGrantEncoding,
+    /// The client-identity posture for this provider.
+    pub client_identity: OAuthClientIdentity,
+    /// Whether the provider offers a device-code (headless) flow.
+    pub device_code: bool,
+    /// Path of the RFC 8628 device-authorization endpoint (the `usercode`
+    /// request), relative to `issuer`. `None` when the provider has no
+    /// device-code flow.
+    pub device_authorization_path: Option<String>,
+    /// Path of the device-code token-poll endpoint, relative to `issuer`.
+    /// `None` when the provider has no device-code flow.
+    pub device_token_path: Option<String>,
+}
+
 /// Token usage for a single LLM turn or accumulated for a session.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TokenUsage {

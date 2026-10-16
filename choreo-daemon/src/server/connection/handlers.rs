@@ -402,6 +402,15 @@ pub(super) fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -
                 |e: String| DaemonMessageType::AccountListFailed { error: e },
             );
         }
+        ClientMessageType::ListOAuthProviders => {
+            // Pure read of the process-global catalog + client-identity policy,
+            // so it is answered on the connection thread with no daemon
+            // round-trip: the descriptors are the same for every connection.
+            debug!("client {}: ListOAuthProviders", ctx.client_id);
+            let providers = choreo_ai_protocols::oauth_provider_descriptors();
+            ctx.reply_handle()
+                .send(DaemonMessageType::OAuthProviders { providers });
+        }
         ClientMessageType::SetSessionAccount { name } => {
             handle_client_set_session_account(name, kind, ctx);
         }

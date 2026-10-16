@@ -855,6 +855,28 @@ fn approx_wire_size_never_underestimates_encoded_payload() {
             },
         ),
         (
+            "OAuthProviders",
+            DaemonMessageType::OAuthProviders {
+                providers: (0..5)
+                    .map(|i| OAuthProviderDescriptor {
+                        provider: format!("provider-{i}"),
+                        issuer: "https://auth.example.com".into(),
+                        authorize_path: "/oauth/authorize".into(),
+                        token_path: "/oauth/token".into(),
+                        client_id: Some(format!("client-{i}")),
+                        scopes: vec!["openid".into(), "offline_access".into()],
+                        redirect_ports: vec![1455, 1457],
+                        code_exchange_encoding: OAuthGrantEncoding::Form,
+                        refresh_encoding: OAuthGrantEncoding::Json,
+                        client_identity: OAuthClientIdentity::Registered,
+                        device_code: i % 2 == 0,
+                        device_authorization_path: None,
+                        device_token_path: None,
+                    })
+                    .collect(),
+            },
+        ),
+        (
             "AccountListFailed",
             DaemonMessageType::AccountListFailed {
                 error: "failed to list accounts".into(),
@@ -1136,5 +1158,49 @@ fn daemon_message_and_session_event_kinds_are_payload_free_tags() {
         }
         .kind(),
         "ToolCallStarted"
+    );
+}
+
+/// The OAuth login surface rides v9: the request round-trips, its `MessageKind`
+/// tag is payload-free, and the descriptor reply round-trips through the frame
+/// codec unchanged.
+#[test]
+fn oauth_providers_request_and_reply_round_trip() {
+    let request = ClientMessage::request(3, ClientMessageType::ListOAuthProviders);
+    assert_eq!(request.inner.kind(), MessageKind::ListOAuthProviders);
+    let decoded: ClientMessage =
+        crate::decode_frame(&crate::encode_payload(&request).expect("encode")).expect("decode");
+    assert_eq!(decoded, request);
+
+    let descriptor = OAuthProviderDescriptor {
+        provider: "openai".into(),
+        issuer: "https://auth.openai.com".into(),
+        authorize_path: "/api/accounts/authorize".into(),
+        token_path: "/api/accounts/oauth/token".into(),
+        client_id: Some("dynamic_agent_client".into()),
+        scopes: vec!["chatgpt.tokens.use.direct".into()],
+        redirect_ports: vec![1455, 1457],
+        code_exchange_encoding: OAuthGrantEncoding::Form,
+        refresh_encoding: OAuthGrantEncoding::Json,
+        client_identity: OAuthClientIdentity::Registered,
+        device_code: false,
+        device_authorization_path: None,
+        device_token_path: None,
+    };
+    let reply = DaemonMessage::reply(
+        3,
+        DaemonMessageType::OAuthProviders {
+            providers: vec![descriptor.clone()],
+        },
+    );
+    let decoded: DaemonMessage =
+        crate::decode_frame(&crate::encode_payload(&reply).expect("encode")).expect("decode");
+    assert_eq!(decoded, reply);
+    assert!(
+        matches!(
+            &decoded.inner,
+            DaemonMessageType::OAuthProviders { providers } if providers == &vec![descriptor]
+        ),
+        "descriptor survives the frame round-trip"
     );
 }

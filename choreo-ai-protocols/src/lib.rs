@@ -74,8 +74,8 @@ pub use catalog::{
     lookup_context_window, lookup_max_output_tokens, lookup_provider, merge_overlay, model_cost,
     model_reasoning_capability, model_reasoning_passback, model_request_format,
     model_supports_image_output, model_supports_temperature, model_supports_vision,
-    normalize_modelsdev, prompt_cache_ttl, provider_slug_for_model, replace_catalog,
-    requires_reasoning_content, write_file_atomic,
+    normalize_modelsdev, oauth_provider_descriptors, prompt_cache_ttl, provider_slug_for_model,
+    replace_catalog, requires_reasoning_content, write_file_atomic,
 };
 pub use context_window::ContextWindowConfig;
 pub use google::{GoogleClient, GoogleConfig};

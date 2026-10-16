@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::client::MessageKind;
-use super::common::AccountInfo;
+use super::common::{AccountInfo, OAuthProviderDescriptor};
 use super::session::{SessionEvent, SessionSummary};
 
 /// Which stream an [`SessionEvent::OutputChunk`](crate::SessionEvent::OutputChunk) belongs to: the model's visible
@@ -411,6 +411,13 @@ pub enum DaemonMessageType {
         /// Every configured account.
         accounts: Vec<AccountInfo>,
     },
+    /// Reply to [`ClientMessageType::ListOAuthProviders`](crate::ClientMessageType::ListOAuthProviders): the OAuth
+    /// sign-in parameters for every provider that supports OAuth, each with a
+    /// borrowed vendor client id withheld unless the opt-in is enabled.
+    OAuthProviders {
+        /// One descriptor per OAuth-capable provider.
+        providers: Vec<OAuthProviderDescriptor>,
+    },
     /// The account list could not be produced.
     AccountListFailed {
         /// Why the account list could not be produced.
@@ -588,6 +595,7 @@ impl DaemonMessageType {
             Self::AccountRemoved { .. } => "AccountRemoved",
             Self::AccountRemoveFailed { .. } => "AccountRemoveFailed",
             Self::Accounts { .. } => "Accounts",
+            Self::OAuthProviders { .. } => "OAuthProviders",
             Self::AccountListFailed { .. } => "AccountListFailed",
             Self::ModelsRefreshed { .. } => "ModelsRefreshed",
             Self::ModelsRefreshFailed { .. } => "ModelsRefreshFailed",

@@ -11,8 +11,8 @@
 //! rather than being silently swallowed.
 
 use choreo_proto::{
-    DaemonMessage, DaemonMessageType, OutputStream, ReasoningCapability, SessionEvent,
-    SessionStatus, TokenUsage, Turn,
+    DaemonMessage, DaemonMessageType, OAuthProviderDescriptor, OutputStream, ReasoningCapability,
+    SessionEvent, SessionStatus, TokenUsage, Turn,
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -149,6 +149,10 @@ pub trait TurnEventHandler {
     fn handle_status_text(&mut self, text: String);
     /// An error message arrived for display.
     fn handle_error(&mut self, error: String);
+    /// The daemon's OAuth sign-in parameters for every OAuth-capable provider
+    /// arrived (the reply to `ListOAuthProviders`). Most front-ends ignore
+    /// this; the login surface consumes it to drive a sign-in.
+    fn handle_oauth_providers(&mut self, _providers: Vec<OAuthProviderDescriptor>) {}
     /// This client became attached to `session_id`.
     fn handle_session_attached(&mut self, session_id: u64);
     /// A session this client created was confirmed, with its initial
@@ -446,6 +450,13 @@ fn dispatch_flat_message(msg: DaemonMessageType, handler: &mut impl TurnEventHan
                 }
                 handler.handle_status_text(lines.join("\n"));
             }
+        }
+        DaemonMessageType::OAuthProviders { providers } => {
+            debug!(
+                count = providers.len(),
+                "oauth provider descriptors arrived"
+            );
+            handler.handle_oauth_providers(providers);
         }
         // On-demand turn-attachment reply (displayed image or tool-result
         // vision image). The connection layer does NOT intercept this (unlike

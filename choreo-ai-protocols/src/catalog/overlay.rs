@@ -544,6 +544,8 @@ const OAUTH_KEYS: &[&str] = &[
     "code_exchange_encoding",
     "refresh_encoding",
     "device_code",
+    "device_authorization_path",
+    "device_token_path",
     "client_id",
 ];
 
@@ -585,6 +587,14 @@ fn parse_oauth_profile(slug: &str, value: &toml::Value) -> Option<OAuthProfile> 
         .and_then(toml::Value::as_str)
         .and_then(parse_grant_encoding);
     let device_code = table.get("device_code").and_then(toml::Value::as_bool);
+    let device_authorization_path = table
+        .get("device_authorization_path")
+        .and_then(toml::Value::as_str)
+        .map(str::to_string);
+    let device_token_path = table
+        .get("device_token_path")
+        .and_then(toml::Value::as_str)
+        .map(str::to_string);
     let client_id = table
         .get("client_id")
         .and_then(toml::Value::as_str)
@@ -618,6 +628,8 @@ fn parse_oauth_profile(slug: &str, value: &toml::Value) -> Option<OAuthProfile> 
             code_exchange_encoding,
             refresh_encoding,
             device_code,
+            device_authorization_path,
+            device_token_path,
             client_id,
         })
     } else {

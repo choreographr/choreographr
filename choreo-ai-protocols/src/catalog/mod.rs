@@ -310,6 +310,15 @@ pub struct OAuthProfile {
     pub refresh_encoding: GrantEncoding,
     /// Whether the provider offers a device-code (headless) flow.
     pub device_code: bool,
+    /// Path of the RFC 8628 device-authorization endpoint (the `usercode`
+    /// request), relative to `issuer`. Required only when `device_code` is
+    /// true.
+    #[serde(default)]
+    pub device_authorization_path: Option<String>,
+    /// Path of the device-code token-poll endpoint, relative to `issuer`.
+    /// Required only when `device_code` is true.
+    #[serde(default)]
+    pub device_token_path: Option<String>,
     /// A PUBLIC client id only (PKCE). Never a secret; a confidential client
     /// reads its secret from config/env at login.
     pub client_id: Option<String>,
@@ -479,6 +488,97 @@ pub fn provider_slug_for_model(model: &str) -> Option<String> {
         .iter()
         .find(|e| e.models.iter().any(|m| m.model == model))
         .map(|e| e.slug.clone())
+}
+
+/// Assemble the OAuth login descriptors for every provider that carries an
+/// OAuth profile, applying the compiled client-identity policy.
+///
+/// This is the daemon's single source for the `ListOAuthProviders` reply: it
+/// pairs each catalog [`OAuthProfile`] with the compiled client-identity
+/// policy, so a frontend learns the issuer, scopes, redirect ports, encodings,
+/// and client-identity posture from one place instead of embedding a copy. A
+/// provider whose posture is `Borrowed` yields no `client_id` unless the
+/// per-install opt-in is enabled.
+#[must_use]
+pub fn oauth_provider_descriptors() -> Vec<choreo_proto::OAuthProviderDescriptor> {
+    let borrowed_enabled = crate::identity::borrowed_ids_enabled();
+    catalog_snapshot()
+        .iter()
+        .filter_map(|entry| assemble_oauth_descriptor(entry, borrowed_enabled))
+        .collect()
+}
+
+/// Assemble one provider's OAuth descriptor, or `None` when the provider has
+/// no [`OAuthProfile`].
+///
+/// Split from [`oauth_provider_descriptors`] so the assembly — including the
+/// borrowed-id withholding — is unit-testable without reading process-global
+/// state: the opt-in flag is passed in, and the identity policy is resolved
+/// per entry.
+#[must_use]
+fn assemble_oauth_descriptor(
+    entry: &ProviderEntry,
+    borrowed_enabled: bool,
+) -> Option<choreo_proto::OAuthProviderDescriptor> {
+    let profile = entry.oauth.as_ref()?;
+    let policy = crate::identity::oauth_client_identity(&entry.slug);
+    // A provider with an OAuth profile but no explicit policy entry registers
+    // its own client: the profile's public id is authoritative.
+    let posture = policy
+        .as_ref()
+        .map_or(crate::identity::ClientIdentity::Registered, |p| p.posture);
+    let client_id = match posture {
+        crate::identity::ClientIdentity::Registered => profile.client_id.clone(),
+        // A borrowed id is the vendor's, not ours, so it is released only when
+        // the per-install opt-in is on; otherwise the client is told nothing
+        // and must obtain its own (dynamic registration) or fall back.
+        crate::identity::ClientIdentity::Borrowed => {
+            if borrowed_enabled {
+                policy
+                    .as_ref()
+                    .and_then(|p| p.borrowed_client_id.clone())
+                    .or_else(|| profile.client_id.clone())
+            } else {
+                None
+            }
+        }
+        // A delegate flow does not run in-process, so it carries no client id.
+        crate::identity::ClientIdentity::Delegate => None,
+    };
+    Some(choreo_proto::OAuthProviderDescriptor {
+        provider: entry.slug.clone(),
+        issuer: profile.issuer.clone(),
+        authorize_path: profile.authorize_path.clone(),
+        token_path: profile.token_path.clone(),
+        client_id,
+        scopes: profile.scopes.clone(),
+        redirect_ports: profile.redirect_ports.clone(),
+        code_exchange_encoding: grant_encoding(profile.code_exchange_encoding),
+        refresh_encoding: grant_encoding(profile.refresh_encoding),
+        client_identity: client_identity(posture),
+        device_code: profile.device_code,
+        device_authorization_path: profile.device_authorization_path.clone(),
+        device_token_path: profile.device_token_path.clone(),
+    })
+}
+
+/// Map the catalog's grant encoding to its wire twin, one-for-one.
+fn grant_encoding(encoding: GrantEncoding) -> choreo_proto::OAuthGrantEncoding {
+    match encoding {
+        GrantEncoding::Form => choreo_proto::OAuthGrantEncoding::Form,
+        GrantEncoding::Json => choreo_proto::OAuthGrantEncoding::Json,
+    }
+}
+
+/// Map the compiled client-identity policy to its wire twin, one-for-one.
+fn client_identity(posture: crate::identity::ClientIdentity) -> choreo_proto::OAuthClientIdentity {
+    match posture {
+        crate::identity::ClientIdentity::Registered => {
+            choreo_proto::OAuthClientIdentity::Registered
+        }
+        crate::identity::ClientIdentity::Borrowed => choreo_proto::OAuthClientIdentity::Borrowed,
+        crate::identity::ClientIdentity::Delegate => choreo_proto::OAuthClientIdentity::Delegate,
+    }
 }
 
 #[cfg(test)]
@@ -825,5 +925,84 @@ mod tests {
         assert_eq!(cost.output, 15.0);
         assert_eq!(cost.cache_read, Some(0.3));
         assert_eq!(cost.cache_write, None);
+    }
+
+    /// A provider entry carrying an OAuth profile, for the assembly tests.
+    fn entry_with_oauth(slug: &str, client_id: Option<&str>) -> ProviderEntry {
+        let mut entry = test_util::tiny_catalog().remove(0);
+        entry.slug = slug.into();
+        entry.oauth = Some(OAuthProfile {
+            issuer: "https://auth.example".into(),
+            authorize_path: "/authorize".into(),
+            token_path: "/token".into(),
+            scopes: vec!["openid".into(), "offline_access".into()],
+            redirect_ports: vec![1455, 1457],
+            code_exchange_encoding: GrantEncoding::Form,
+            refresh_encoding: GrantEncoding::Json,
+            device_code: true,
+            device_authorization_path: Some("/deviceauth/usercode".into()),
+            device_token_path: Some("/deviceauth/token".into()),
+            client_id: client_id.map(str::to_string),
+        });
+        entry
+    }
+
+    #[test]
+    fn descriptor_absent_without_an_oauth_profile() {
+        let entry = test_util::tiny_catalog().remove(0);
+        assert!(entry.oauth.is_none());
+        assert!(assemble_oauth_descriptor(&entry, false).is_none());
+    }
+
+    #[test]
+    fn registered_posture_releases_the_profile_client_id() {
+        // `openai` is a Registered policy entry; the profile's public id is
+        // authoritative and released regardless of the opt-in.
+        let entry = entry_with_oauth("openai", Some("dynamic_agent_client"));
+        let descriptor = assemble_oauth_descriptor(&entry, false).expect("descriptor");
+        assert_eq!(descriptor.provider, "openai");
+        assert_eq!(
+            descriptor.client_id.as_deref(),
+            Some("dynamic_agent_client")
+        );
+        assert_eq!(
+            descriptor.client_identity,
+            choreo_proto::OAuthClientIdentity::Registered
+        );
+        assert_eq!(descriptor.redirect_ports, vec![1455, 1457]);
+        assert!(descriptor.device_code);
+    }
+
+    #[test]
+    fn borrowed_posture_withholds_the_client_id_when_opted_out() {
+        // `chatgpt` borrows the vendor CLI's public id; with the opt-in off the
+        // daemon must release no client id at all.
+        let entry = entry_with_oauth("chatgpt", None);
+        let withheld = assemble_oauth_descriptor(&entry, false).expect("descriptor");
+        assert_eq!(
+            withheld.client_identity,
+            choreo_proto::OAuthClientIdentity::Borrowed
+        );
+        assert!(withheld.client_id.is_none(), "borrowed id must be withheld");
+
+        let released = assemble_oauth_descriptor(&entry, true).expect("descriptor");
+        assert_eq!(
+            released.client_id.as_deref(),
+            Some("app_EMoamEEZ73f0CkXaXp7hrann"),
+            "opt-in releases the borrowed vendor id"
+        );
+    }
+
+    #[test]
+    fn unknown_slug_defaults_to_registered() {
+        // A provider with an OAuth profile but no policy entry registers its
+        // own client, so the profile id flows through unchanged.
+        let entry = entry_with_oauth("acme", Some("acme-public-client"));
+        let descriptor = assemble_oauth_descriptor(&entry, false).expect("descriptor");
+        assert_eq!(
+            descriptor.client_identity,
+            choreo_proto::OAuthClientIdentity::Registered
+        );
+        assert_eq!(descriptor.client_id.as_deref(), Some("acme-public-client"));
     }
 }
