@@ -240,6 +240,9 @@ pub struct CredentialStoreAdapter {
     key: String,
     /// The daemon backend that owns the durable credential.
     backend: Arc<dyn CredentialBackend>,
+    /// The authorization-server issuer re-discovered at connect, when known.
+    /// A stored credential naming a different issuer is withheld on `load`.
+    expected_issuer: Option<String>,
     /// The in-process access-token cache (never persisted).
     cache: Mutex<Option<CachedToken>>,
     /// The durable non-token fields from the last `load`, used by `save`.
@@ -253,9 +256,26 @@ impl CredentialStoreAdapter {
         Self {
             key,
             backend,
+            expected_issuer: None,
             cache: Mutex::new(None),
             seed: Mutex::new(None),
         }
+    }
+
+    /// Fail the credential closed against a re-discovered authorization-server
+    /// issuer.
+    ///
+    /// The issuer is only known after connect-time discovery, so the adapter is
+    /// told it once discovery has run. With it set, a stored credential whose
+    /// issuer differs (or is absent) is withheld on `load`, so a server whose
+    /// `oauth` config — or the resource it points at — was re-pointed never
+    /// receives a token minted by the previous authorization server. The
+    /// resulting unauthenticated connect surfaces a re-login, never a silent
+    /// reuse.
+    #[must_use]
+    pub fn with_expected_issuer(mut self, issuer: Option<String>) -> Self {
+        self.expected_issuer = issuer;
+        self
     }
 
     /// The credential key this adapter serves (for logging).
@@ -316,10 +336,6 @@ pub(crate) async fn build_auth_client(
     let mut manager = AuthorizationManager::new(url).await.map_err(|e| {
         crate::error::McpError::InitializeFailed(format!("OAuth discovery init failed: {e}"))
     })?;
-    manager.set_credential_store(CredentialStoreAdapter::new(
-        wiring.key.clone(),
-        wiring.backend.clone(),
-    ));
 
     let backend = wiring.backend.clone();
     let loaded = tokio::task::spawn_blocking(move || backend.load())
@@ -344,6 +360,13 @@ pub(crate) async fn build_auth_client(
                 ))
             })?
             .metadata;
+        // Arm the adapter to withhold the stored grant when its issuer no longer
+        // matches the one discovered here (a re-pointed server), so the token is
+        // never sent; the connect then surfaces a re-login.
+        manager.set_credential_store(
+            CredentialStoreAdapter::new(wiring.key.clone(), wiring.backend.clone())
+                .with_expected_issuer(metadata.issuer.clone()),
+        );
         manager.set_metadata(metadata);
         // The redirect URI only needs to be a valid loopback URL for a token
         // refresh; a full interactive login supplies its own callback.
@@ -363,6 +386,13 @@ pub(crate) async fn build_auth_client(
                 "OAuth client configuration failed: {e}"
             ))
         })?;
+    } else {
+        // No usable stored grant: install the adapter anyway so a later
+        // connect-time `save` (a fresh interactive grant) is persisted.
+        manager.set_credential_store(CredentialStoreAdapter::new(
+            wiring.key.clone(),
+            wiring.backend.clone(),
+        ));
     }
 
     Ok(AuthClient::new(client, manager))
@@ -385,6 +415,20 @@ impl CredentialStore for CredentialStoreAdapter {
             return Ok(None);
         };
         if view.kind != OAuthKind::Mcp {
+            return Ok(None);
+        }
+        // Fail closed on an authorization-server change: when the issuer was
+        // re-discovered at connect and the stored credential names a different
+        // one (or none), withhold the grant. The caller then connects
+        // unauthenticated, which 401s and surfaces a re-login, rather than
+        // sending a token minted by the previous authorization server.
+        if let Some(expected) = self.expected_issuer.as_deref()
+            && view.issuer != Some(expected)
+        {
+            tracing::warn!(
+                key = %self.key,
+                "stored MCP credential issuer does not match discovery; withholding it (re-login required)"
+            );
             return Ok(None);
         }
         let issuer = view.issuer.map(str::to_string);
@@ -693,6 +737,42 @@ mod tests {
             granted_scopes: vec!["openid".into()],
             token_type: Some("Bearer".into()),
         }
+    }
+
+    #[test]
+    fn issuer_mismatch_withholds_the_stored_credential() {
+        crate::runtime::init().expect("runtime init");
+        let backend = FakeBackend::new(Some(durable_oauth()));
+        // An expected issuer that differs from the stored one withholds the
+        // grant, so a re-pointed server never receives the stored token.
+        let mismatched = CredentialStoreAdapter::new("mcp:docs|x".into(), backend.clone())
+            .with_expected_issuer(Some("https://evil.example".into()));
+        assert!(
+            crate::runtime::block_on(mismatched.load())
+                .expect("block_on")
+                .expect("load ok")
+                .is_none(),
+            "a mismatched issuer must withhold the credential"
+        );
+        // The matching issuer serves it.
+        let matched = CredentialStoreAdapter::new("mcp:docs|x".into(), backend.clone())
+            .with_expected_issuer(Some("https://as.example".into()));
+        assert!(
+            crate::runtime::block_on(matched.load())
+                .expect("block_on")
+                .expect("load ok")
+                .is_some(),
+            "a matching issuer must serve the credential"
+        );
+        // With no issuer expected (discovery found none), the credential is
+        // served unchanged — there is nothing to compare against.
+        let unchecked = CredentialStoreAdapter::new("mcp:docs|x".into(), backend);
+        assert!(
+            crate::runtime::block_on(unchecked.load())
+                .expect("block_on")
+                .expect("load ok")
+                .is_some()
+        );
     }
 
     #[test]

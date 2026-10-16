@@ -172,8 +172,11 @@ impl CredentialBackend for McpOAuthBackend {
         match self.runtime.load(&self.key) {
             // Fail-closed: a stored credential whose `resource` no longer matches
             // the configured server URL (a re-pointed repo server) is treated as
-            // absent, so it is never sent. The issuer is not separately checked
-            // here (the `oauth` block carries no issuer; discovery validates it).
+            // absent, so it is never sent. The issuer is enforced separately at
+            // connect: the `oauth` block carries no issuer, so the connect-path
+            // adapter compares the stored issuer against the one re-discovered
+            // during discovery and withholds a mismatch (see `choreo-mcp`'s
+            // `CredentialStoreAdapter::with_expected_issuer`).
             Some(credential)
                 if !choreo_mcp::credential_matches_target(
                     &credential,
