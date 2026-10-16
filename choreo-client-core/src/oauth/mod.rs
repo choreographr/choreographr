@@ -24,9 +24,11 @@
 mod callback;
 mod http;
 mod jwt;
+mod mcp;
 mod pkce;
 
 pub use jwt::{chatgpt_account_id, chatgpt_plan_type, decode_claims, email};
+pub use mcp::{McpLoginInfo, McpLoginOptions, start_mcp_login};
 pub use pkce::{challenge_s256, generate_state, generate_verifier, state_matches};
 
 use std::sync::Arc;

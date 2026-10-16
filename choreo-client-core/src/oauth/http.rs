@@ -83,7 +83,7 @@ pub(crate) fn join_url(issuer: &str, path: &str) -> String {
 /// `http` URL (the in-repo mock server and a local test issuer), so a
 /// misconfigured descriptor can never leak a code or token over cleartext to a
 /// remote host.
-fn ensure_secure(url: &str) -> Result<(), OAuthLoginError> {
+pub(crate) fn ensure_secure(url: &str) -> Result<(), OAuthLoginError> {
     if url.starts_with("https://") {
         return Ok(());
     }
@@ -182,7 +182,7 @@ fn post(
 
 /// Interpret a token endpoint's response body, mapping an OAuth `error` to a
 /// categorized failure and an absent `access_token` to a protocol error.
-fn read_token_response(
+pub(crate) fn read_token_response(
     response: ureq::http::Response<ureq::Body>,
 ) -> Result<TokenSet, OAuthLoginError> {
     let status = response.status();

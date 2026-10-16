@@ -222,6 +222,9 @@ pub(crate) fn handle_shell_command(
             McpCommand::TrustList => {
                 send_client_message(state, daemon_tx, ClientMessageType::McpTrustList);
             }
+            // Interactive sign-in is not yet wired into the GUI; the login
+            // surface is a stub (see AGENTS.md).
+            McpCommand::Login { .. } | McpCommand::Logout { .. } => {}
         },
         // TODO(task 3): the unified command model's local-UI variants
         // (open session manager / accounts / model picker, reasoning

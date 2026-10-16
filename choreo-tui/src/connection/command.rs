@@ -523,6 +523,17 @@ pub(super) fn run_command(
                 McpCommand::TrustList => {
                     app.pending.send(client_tx, ClientMessageType::McpTrustList);
                 }
+                McpCommand::Login { slug } => {
+                    // Resolve the server's oauth block/key from the daemon's
+                    // status (requesting it if not yet cached), then open the
+                    // MCP sign-in modal.
+                    app.begin_mcp_login(slug, client_tx);
+                }
+                McpCommand::Logout { slug } => {
+                    // Remove the stored credential, then reconnect so the
+                    // connection drops its cached token.
+                    app.logout_mcp(&slug, client_tx);
+                }
             }
         }
         // Local-UI commands (the unified command model's non-daemon variants).

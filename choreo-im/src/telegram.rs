@@ -221,6 +221,12 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
                 McpCommand::Trust => ClientMessageType::McpTrust,
                 McpCommand::Untrust => ClientMessageType::McpUntrust,
                 McpCommand::TrustList => ClientMessageType::McpTrustList,
+                // Interactive sign-in is a TUI concern; the headless IM bridge
+                // has no login surface, so these are no-ops.
+                McpCommand::Login { .. } | McpCommand::Logout { .. } => {
+                    debug!("telegram stub ignores mcp login/logout");
+                    return;
+                }
             };
             if let Err(e) = state.bridge_tx.send(msg) {
                 warn!("failed to send mcp command to bridge: {e}");

@@ -142,6 +142,17 @@ pub enum McpCommand {
     Untrust,
     /// `/mcp trust list` — list the trusted project MCP roots.
     TrustList,
+    /// `/mcp login <slug>` — start the OAuth sign-in for a remote server that
+    /// declares an `oauth` block.
+    Login {
+        /// The server's config key (its tool-name prefix).
+        slug: String,
+    },
+    /// `/mcp logout <slug>` — remove a remote server's stored OAuth credential.
+    Logout {
+        /// The server's config key (its tool-name prefix).
+        slug: String,
+    },
 }
 
 /// Returns `true` if `name` is a valid account name: non-empty and matching
@@ -351,8 +362,20 @@ fn parse_mcp_command(rest: &str) -> Option<Command> {
                 (None, None) => Command::Mcp(McpCommand::Untrust),
                 _ => Command::UnknownCommand("usage: /mcp untrust".to_string()),
             },
+            Some("login") => match (parts.next(), parts.next()) {
+                (Some(slug), None) => Command::Mcp(McpCommand::Login {
+                    slug: slug.to_string(),
+                }),
+                _ => Command::UnknownCommand("usage: /mcp login <slug>".to_string()),
+            },
+            Some("logout") => match (parts.next(), parts.next()) {
+                (Some(slug), None) => Command::Mcp(McpCommand::Logout {
+                    slug: slug.to_string(),
+                }),
+                _ => Command::UnknownCommand("usage: /mcp logout <slug>".to_string()),
+            },
             other => Command::UnknownCommand(format!(
-                "usage: /mcp [reload | reconnect <slug> | trust [list] | untrust] (got '{}')",
+                "usage: /mcp [reload | reconnect <slug> | login <slug> | logout <slug> | trust [list] | untrust] (got '{}')",
                 other.unwrap_or("")
             )),
         });
@@ -690,6 +713,8 @@ pub fn command_echo(command: &Command) -> Option<String> {
         Command::Mcp(McpCommand::Trust) => Some("> /mcp trust".to_string()),
         Command::Mcp(McpCommand::Untrust) => Some("> /mcp untrust".to_string()),
         Command::Mcp(McpCommand::TrustList) => Some("> /mcp trust list".to_string()),
+        Command::Mcp(McpCommand::Login { slug }) => Some(format!("> /mcp login {slug}")),
+        Command::Mcp(McpCommand::Logout { slug }) => Some(format!("> /mcp logout {slug}")),
         _ => None,
     }
 }
@@ -741,6 +766,30 @@ mod tests {
     #[test]
     fn mcp_parses_bare_as_status() {
         assert_eq!(parse_input_line("/mcp"), Command::Mcp(McpCommand::Status),);
+    }
+
+    #[test]
+    fn mcp_parses_login_and_logout() {
+        assert_eq!(
+            parse_input_line("/mcp login docs"),
+            Command::Mcp(McpCommand::Login {
+                slug: "docs".to_string(),
+            }),
+        );
+        assert_eq!(
+            parse_input_line("/mcp logout docs"),
+            Command::Mcp(McpCommand::Logout {
+                slug: "docs".to_string(),
+            }),
+        );
+        assert!(matches!(
+            parse_input_line("/mcp login"),
+            Command::UnknownCommand(_)
+        ));
+        assert!(matches!(
+            parse_input_line("/mcp logout a b"),
+            Command::UnknownCommand(_)
+        ));
     }
 
     #[test]

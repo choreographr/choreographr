@@ -678,6 +678,13 @@ pub(crate) fn handle_daemon_message(
                 ));
             }
             app.status = Some(lines.join("\n"));
+            // Cache the statuses so `mcp login`/`mcp logout` can read a
+            // server's oauth block, resource URL, and credential key, and
+            // start any login waiting on this reply.
+            app.mcp_servers.clone_from(servers);
+            if let Some(slug) = app.pending_mcp_login.take() {
+                app.begin_mcp_login(slug, client_tx);
+            }
             return Ok(());
         }
         DaemonMessageType::McpTrustUpdated {
