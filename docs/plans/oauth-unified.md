@@ -1,9 +1,14 @@
 # Plan: unified OAuth — inference providers and MCP servers on one keystore
 
-**Status:** proposed. Design complete through several rounds of review; nothing
-implemented (no source changes in this change). Supersedes the credential-model,
-refresh, and provisioning sections of `docs/plans/provider-oauth.md` and the
-post-ship **P3 / D7** of `docs/plans/mcp-modernization.md`.
+**Status:** partially implemented. The **provisioning model** (§5) has landed —
+`AddCredential` now carries a typed plaintext `ServiceCredential`, the daemon
+encrypts it to its binding, the add requires an unlocked keystore, and no implicit
+unlock remains (`9c10043`, `a886de7`, `8a03a08`, `c8bcb9c`); the credential type and
+its redacting `Display`/`Debug` now live in `choreo-shared`. The OAuth credential
+variant, the provider login library, and MCP OAuth are **not yet implemented**.
+Supersedes the credential-model, refresh, and provisioning sections of
+`docs/plans/provider-oauth.md` and the post-ship **P3 / D7** of
+`docs/plans/mcp-modernization.md`.
 **Lifecycle:** this file is **deleted once the plan is fully implemented**. Nothing
 written during implementation may reference it — rustdoc, `ARCHITECTURE.md`,
 `README.md`, release notes, and commit messages must stand on their own, because a
@@ -72,18 +77,17 @@ cannot be connected at all.
 
 Verified against this tree:
 
-- `choreo_keystore::ServiceCredential` is `ApiKey { key }` | `X { … }` |
-  `Substrate { … }` (`choreo-keystore/src/lib.rs`), with `#[zeroize(drop)]` and a
-  redacting `Display`, serialized with **postcard**.
-- The client encrypts the serialized credential to the X25519 public key derived
-  from the daemon's unlock key and sends
-  `ClientMessageType::AddCredential { service, encrypted_payload, unlock_key }`
-  (`choreo-client-core/src/credentials.rs`).
-- The daemon **verifies the binding**, **test-decrypts** the blob, persists it
-  (`db::set_credential_blob`), and runs the shared `unlock_tail` which bulk-decrypts
-  *every* blob into `DaemonState.credentials: HashMap<String, ServiceCredential>`
-  keyed by the `service` string (`choreo-daemon/src/daemon/keystore.rs`). A valid
-  `AddCredential` to a locked daemon **implicitly unlocks** it.
+- `ServiceCredential` is `ApiKey { key }` | `X { … }` | `Substrate { … }`, with
+  `#[zeroize(drop)]` and redacting `Display` **and** `Debug`. It now lives in
+  `choreo-shared` (`choreo-shared/src/credential.rs`) — re-exported by
+  `choreo-keystore` — so the wire crate can type the credential (§5). *(Landed.)*
+- `ClientMessageType::AddCredential { service, credential: ServiceCredential }`
+  carries the credential as **typed plaintext**; the daemon **encrypts** it to its
+  stored binding public key before `db::set_credential_blob`, inserts it into
+  `DaemonState.credentials: HashMap<String, ServiceCredential>` keyed by the
+  `service` string (`choreo-daemon/src/daemon/keystore.rs`), and **requires an
+  unlocked keystore** — a locked daemon rejects the add and does **not** implicitly
+  unlock. *(Landed: `9c10043` + follow-ups.)*
 - The daemon **drops the 32-byte unlock key** after unlock; no `DaemonState` field
   holds it.
 - Provider auth is **key-only**: `DaemonCommand::ResolveAccountCmd` replies with
@@ -260,7 +264,9 @@ Rules:
   carries one (otherwise the stored claim is kept). Store the raw JWT only if a
   provider ever needs it verbatim — e.g. OIDC RP-initiated logout (`id_token_hint`) or
   RFC 8693 token exchange — none of which is in scope.
-- Serialized with postcard; appending a variant is forward-compatible for new blobs.
+- Serialized with postcard for the **at-rest blob**; on the **wire** the credential
+  travels as a typed value inside `ClientMessageType::AddCredential` (§5). Appending
+  a variant is forward-compatible for new blobs.
 - Adapters to/from `rmcp::transport::auth::StoredCredentials` live **in the daemon**
   (no rmcp type enters the keystore).
 - Row key: `<account>` for providers; `mcp:<slug>|<target-hash>` for MCP
@@ -274,9 +280,9 @@ Rules:
 
 ## 5. Provisioning — `AddCredential` changes
 
-The unlock key is **removed from the wire**. Because the daemon does not retain the
-private key, it cannot decrypt a client-encrypted blob — so the daemon becomes the
-encryptor.
+**Landed** (`9c10043`, `a886de7`, `8a03a08`, `c8bcb9c`) — see §1. The unlock key is
+**removed from the wire**. Because the daemon does not retain the private key, it
+cannot decrypt a client-encrypted blob — so the daemon becomes the encryptor.
 
 ```rust
 // OLD (removed)
@@ -739,7 +745,8 @@ store is shared.
 
 | Crate | Change |
 |---|---|
-| `choreo-keystore` | `ServiceCredential::OAuth { … }` (§4) + `as_oauth()` + expiry helpers; zeroize/redact. Crypto unchanged. |
+| `choreo-shared` | hosts `ServiceCredential` (moved from keystore), its borrowed views, and redacting `Display`/`Debug`; gains the `OAuth` variant + `as_oauth` in the OAuth slice. **Landed** (`9c10043`, `a886de7`). |
+| `choreo-keystore` | re-exports the credential from `choreo-shared`; crypto unchanged. **Landed** (`9c10043`). |
 | `choreo-client-core` | OAuth login library (PKCE/loopback/device-code/paste-URL/JWT + MCP discovery/DCR/CIMD); **OpenAI dynamic client registration (persist the issued `oaiapp_` id) and import of an existing CLI credential**; `AddCredential` builder sends plaintext + `service` (no key); `/login`, `mcp login/logout`. |
 | `choreo-ai-protocols` | credential-derived `ProviderAuth` (bearer + extra headers), generalizing the header seam; OAuth provider parameter table; **provider client-identity table (registered / borrowed / delegate) + the borrowed-id opt-in flag (§7.1)**. |
 | `choreo-daemon` | `handle_save_credential` rewritten (§5); `ResolveAccountCmd` carries `ProviderAuth`; `api_key_for` → auth accessor; `OAuthRefreshLocks`; provider refresh loop + rotation persistence (§6/§7); `CredentialBackend` impl + `DaemonCommand::OAuth*` for MCP; **target-scoped MCP credential keys (`mcp:<slug>\|<target-hash>`) + trust-gated login (§8.1)**; `oauth` catalog auth-kind; `AccountManager`/`drop_session_clients` extended. |
@@ -754,7 +761,9 @@ Each phase is independently shippable, lands with tests + docs, and keeps
 `just pre-commit` green. **Provider OAuth (ChatGPT/Codex) ships first; MCP second.**
 
 1. **Keystore foundation.** OAuth variant; `AddCredential` change (§5); daemon as
-   sole blob writer; `OAuthRefreshLocks`. Unit tests. No network.
+   sole blob writer; `OAuthRefreshLocks`. Unit tests. No network. *(The
+   `AddCredential` change and the daemon-as-writer half of this have **landed**;
+   the `OAuth` variant and `OAuthRefreshLocks` remain.)*
 2. **Provider layer.** Credential-derived bearer + extra headers; `oauth` catalog
    auth-kind; `ResolveAccountCmd` carries `ProviderAuth`.
 3. **Provider interactive login (PKCE).** `choreo-client-core` login library;
@@ -954,10 +963,11 @@ None — every decision is settled.
 
 ## 21. References
 
-- **This tree:** `choreo-keystore/src/{lib,crypto}.rs` (`ServiceCredential`, the
+- **This tree:** `choreo-shared/src/credential.rs` (`ServiceCredential`, its
+  borrowed views, redacting `Display`/`Debug`), `choreo-keystore/src/crypto.rs` (the
   sealed-box envelope); `choreo-client-core/src/credentials.rs` (`AddCredential`
-  build, key resolution); `choreo-daemon/src/daemon/keystore.rs` (unlock tail,
-  binding, test-decrypt, implicit unlock); `choreo-daemon/src/daemon.rs`
+  build); `choreo-daemon/src/daemon/keystore.rs` (unlock tail, binding, the
+  daemon-side encrypt-on-add); `choreo-daemon/src/daemon.rs`
   (`ResolvedAccount`, `api_key_for`); `choreo-daemon/src/sessions/state.rs`
   (`resolve_provider`); `choreo-daemon/src/providers/mod.rs`
   (`from_account_config`); `choreo-ai-protocols/src/shared.rs`
