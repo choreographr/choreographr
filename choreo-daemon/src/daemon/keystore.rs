@@ -197,6 +197,9 @@ impl DaemonState {
         self.drop_session_clients(None);
         self.x_credentials = None;
         self.locked = true;
+        // The MCP OAuth snapshot is a view over the just-cleared credentials,
+        // so it is emptied in the same step.
+        self.publish_mcp_oauth_snapshot();
         info!(
             credentials_cleared,
             access_tokens_cleared,
@@ -270,6 +273,7 @@ impl DaemonState {
         self.access_tokens.remove(&service);
         self.dead_oauth.remove(&service);
         self.credentials.insert(service.clone(), credential);
+        self.publish_mcp_oauth_snapshot();
 
         info!(
             service = %service,
@@ -420,6 +424,74 @@ impl DaemonState {
             "OAuth grant terminally rejected; re-login required"
         );
         self.broadcast_oauth_relogin_required(account);
+    }
+
+    /// Persist a rotated MCP OAuth credential (a fire-and-forget
+    /// [`DaemonCommand::OAuthSave`](crate::daemon::DaemonCommand::OAuthSave)).
+    ///
+    /// Re-encrypts the updated durable subset to the binding public key and
+    /// persists it (the daemon is the sole blob writer; the access token was
+    /// stripped by the adapter), then updates the in-memory map and the MCP
+    /// OAuth snapshot, dropping any cached token or quarantine for the key.
+    pub(super) fn handle_oauth_save(&mut self, key: &str, credential: ServiceCredential) {
+        if self.locked {
+            warn!(%key, "OAuthSave ignored: keystore is locked");
+            return;
+        }
+        if let Err(e) = self.encrypt_and_persist_credential(key, &credential) {
+            warn!(%key, error = %e, "failed to persist rotated MCP OAuth credential");
+            return;
+        }
+        self.credentials.insert(key.to_string(), credential);
+        self.access_tokens.remove(key);
+        self.dead_oauth.remove(key);
+        self.publish_mcp_oauth_snapshot();
+        info!(%key, "persisted rotated MCP OAuth credential");
+    }
+
+    /// Delete a stored MCP OAuth credential (a fire-and-forget
+    /// [`DaemonCommand::OAuthClear`](crate::daemon::DaemonCommand::OAuthClear)).
+    pub(super) fn handle_oauth_clear(&mut self, key: &str) {
+        if let Err(e) = db::remove_credential_blob(&self.db, key) {
+            warn!(%key, error = %e, "failed to remove MCP OAuth credential");
+            return;
+        }
+        self.credentials.remove(key);
+        self.access_tokens.remove(key);
+        self.dead_oauth.remove(key);
+        self.publish_mcp_oauth_snapshot();
+        info!(%key, "cleared MCP OAuth credential");
+    }
+
+    /// Quarantine an MCP credential after a terminal refresh rejection (a
+    /// fire-and-forget
+    /// [`DaemonCommand::McpAuthRejected`](crate::daemon::DaemonCommand::McpAuthRejected)),
+    /// so the `/mcp` status shows a re-authentication request.
+    pub(super) fn handle_mcp_auth_rejected(&mut self, key: &str) {
+        if self.dead_oauth.insert(key.to_string()) {
+            self.publish_mcp_oauth_snapshot();
+            info!(%key, "MCP OAuth grant terminally rejected; re-authentication required");
+        }
+    }
+
+    /// Republish the MCP OAuth snapshot — the read view the connect path uses
+    /// so a credential load never round-trips the (possibly blocked) command
+    /// loop. The command loop is the snapshot's sole writer; it calls this
+    /// after every mutation of the MCP-keyed credentials.
+    pub(super) fn publish_mcp_oauth_snapshot(&self) {
+        #[cfg(feature = "mcp")]
+        if let Some(runtime) = crate::mcp::oauth::runtime() {
+            let creds: HashMap<String, ServiceCredential> = self
+                .credentials
+                .iter()
+                .filter(|(k, _)| k.starts_with("mcp:"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            runtime.publish(creds);
+        }
+        // Without the `mcp` feature there is no connect path to feed.
+        #[cfg(not(feature = "mcp"))]
+        let _ = self;
     }
 }
 
@@ -680,6 +752,9 @@ fn finish_unlock(
     state.credentials = credentials;
     state.accounts = accounts;
     state.locked = false;
+    // Publish the freshly decrypted MCP OAuth credentials to the connect-path
+    // snapshot so a server reconnecting against them finds them.
+    state.publish_mcp_oauth_snapshot();
 
     // Log the accounts summary AFTER the assignment (the credential decrypt
     // summary is logged by `decrypt_credential_blobs`, before publishing).
@@ -747,5 +822,83 @@ mod tests {
         assert!(state.x_credentials.is_none(), "X creds must stay empty");
         assert!(state.locked, "a failed tail must not unlock the daemon");
         assert!(state.accounts.is_empty(), "accounts must stay as they were");
+    }
+
+    fn mcp_oauth_credential(refresh: &str) -> ServiceCredential {
+        ServiceCredential::OAuth {
+            kind: choreo_shared::OAuthKind::Mcp,
+            issuer: Some("https://as.example".into()),
+            resource: Some("https://example.com/mcp".into()),
+            authorization_server: Some("https://as.example".into()),
+            refresh_token: Some(refresh.to_string()),
+            account_id: None,
+            client_id: Some("client-1".into()),
+            client_secret: None,
+            granted_scopes: vec!["openid".into()],
+            token_type: Some("Bearer".into()),
+        }
+    }
+
+    #[test]
+    fn oauth_save_is_refused_while_locked() {
+        let (mut state, _rx) = make_daemon_state();
+        assert!(state.locked);
+        state.handle_oauth_save("mcp:docs|abc", mcp_oauth_credential("r"));
+        // A locked daemon holds no cleartext: the save is dropped, not published.
+        assert!(state.credentials.is_empty());
+    }
+
+    #[test]
+    fn mcp_auth_rejected_quarantines_idempotently() {
+        let (mut state, _rx) = make_daemon_state();
+        assert!(!state.dead_oauth.contains("mcp:docs|abc"));
+        state.handle_mcp_auth_rejected("mcp:docs|abc");
+        assert!(state.dead_oauth.contains("mcp:docs|abc"));
+        // A second rejection is a no-op.
+        state.handle_mcp_auth_rejected("mcp:docs|abc");
+        assert!(state.dead_oauth.contains("mcp:docs|abc"));
+    }
+
+    #[test]
+    fn auth_state_mapping_refines_from_the_store() {
+        let (mut state, _rx) = make_daemon_state();
+        let key = "mcp:docs|abc".to_string();
+        let status = crate::mcp::McpServerStatus {
+            slug: "docs".into(),
+            tier: "daemon".into(),
+            transport: "http".into(),
+            target: "https://example.com/mcp".into(),
+            connected: false,
+            tool_count: 0,
+            server_name: None,
+            server_version: None,
+            last_error: None,
+            credential_key: Some(key.clone()),
+            oauth: Some(choreo_proto::McpOAuthConfig {
+                client_id: None,
+                callback_port: None,
+                scopes: vec![],
+            }),
+            auth: choreo_proto::McpAuthState::NotLoggedIn,
+        };
+        // No stored credential: stays NotLoggedIn.
+        assert_eq!(
+            state.mcp_auth_state(&status),
+            choreo_proto::McpAuthState::NotLoggedIn
+        );
+        // A stored grant: OAuth.
+        state
+            .credentials
+            .insert(key.clone(), mcp_oauth_credential("r"));
+        assert_eq!(
+            state.mcp_auth_state(&status),
+            choreo_proto::McpAuthState::OAuth
+        );
+        // A terminal rejection overrides to Reauthentication.
+        state.dead_oauth.insert(key);
+        assert_eq!(
+            state.mcp_auth_state(&status),
+            choreo_proto::McpAuthState::Reauthentication
+        );
     }
 }

@@ -35,6 +35,7 @@
 // `-D warnings`.
 #![warn(missing_docs)]
 
+mod auth;
 pub mod config;
 mod engine;
 pub mod error;
@@ -45,9 +46,13 @@ pub mod runtime;
 pub mod session;
 mod stdio;
 
+pub use auth::{
+    CredentialBackend, CredentialStoreAdapter, McpAuthWiring, RefreshGuard, canonical_target,
+    credential_key, credential_key_for,
+};
 pub use config::{
-    DEFAULT_MAX_CONCURRENT_CALLS, DEFAULT_MAX_RESTARTS, DEFAULT_TIMEOUT, McpProtocolMode,
-    McpServerConfig, McpTransport, McpTransportKind,
+    DEFAULT_MAX_CONCURRENT_CALLS, DEFAULT_MAX_RESTARTS, DEFAULT_TIMEOUT, McpOAuthConfig,
+    McpProtocolMode, McpServerConfig, McpTransport, McpTransportKind,
 };
 pub use error::McpError;
 pub use naming::{

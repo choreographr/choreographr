@@ -971,6 +971,13 @@ fn approx_wire_size_never_underestimates_encoded_payload() {
                         server_name: Some(format!("server-{i}-name")),
                         server_version: Some("1.2.3".into()),
                         last_error: (i % 2 == 1).then(|| "connect timed out".to_string()),
+                        credential_key: Some(format!("mcp:server-{i}|deadbeef")),
+                        auth: McpAuthState::OAuth,
+                        oauth: Some(McpOAuthConfig {
+                            client_id: Some(format!("client-{i}")),
+                            callback_port: Some(8765),
+                            scopes: vec!["openid".into(), "offline_access".into()],
+                        }),
                     })
                     .collect(),
                 project_root: Some("/home/u/work/my-project".into()),
@@ -1018,6 +1025,13 @@ fn approx_wire_size_never_underestimates_encoded_payload() {
                         server_name: Some(format!("server-{i}-name")),
                         server_version: Some("1.2.3".into()),
                         last_error: (i % 2 == 1).then(|| "connect timed out".to_string()),
+                        credential_key: Some(format!("mcp:server-{i}|deadbeef")),
+                        auth: McpAuthState::OAuth,
+                        oauth: Some(McpOAuthConfig {
+                            client_id: Some(format!("client-{i}")),
+                            callback_port: Some(8765),
+                            scopes: vec!["openid".into(), "offline_access".into()],
+                        }),
                     })
                     .collect(),
             },

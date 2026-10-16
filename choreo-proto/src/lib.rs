@@ -22,10 +22,11 @@ pub use types::{
     AccountInfo, AssistantToolCallRecord, CatalogProvider, ChatReasoningField, ClientMessage,
     ClientMessageType, ContextConfig, DaemonMessage, DaemonMessageType, DiscardedToolCall,
     DisplayedImageRecord, ImageKey, ImageMetadata, ImageReference, InferenceError, KeystoreState,
-    McpServerStatus, MessageKind, OAuthClientIdentity, OAuthGrantEncoding, OAuthProviderDescriptor,
-    OutputStream, ReasoningArtifact, ReasoningCapability, ReasoningProducer, RefreshStatus,
-    SessionEvent, SessionStatus, SessionSummary, TimestampMs, TokenUsage, ToolResultRecord, Turn,
-    is_models_warming_error, models_warming_error,
+    McpAuthState, McpOAuthConfig, McpServerStatus, MessageKind, OAuthClientIdentity,
+    OAuthGrantEncoding, OAuthProviderDescriptor, OutputStream, ReasoningArtifact,
+    ReasoningCapability, ReasoningProducer, RefreshStatus, SessionEvent, SessionStatus,
+    SessionSummary, TimestampMs, TokenUsage, ToolResultRecord, Turn, is_models_warming_error,
+    models_warming_error,
 };
 
 #[cfg(test)]

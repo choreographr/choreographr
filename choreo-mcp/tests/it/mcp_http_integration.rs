@@ -27,6 +27,7 @@ fn http_config(url: &str, protocol: McpProtocolMode) -> McpServerConfig {
         transport: McpTransport::Http {
             url: url.to_string(),
             headers: HashMap::new(),
+            oauth: None,
         },
         enabled: true,
         timeout: Some(Duration::from_secs(10)),

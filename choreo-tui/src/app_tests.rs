@@ -4,7 +4,8 @@ use crate::state::*;
 use crate::test_util::{make_session, test_app};
 use choreo_proto::{
     AccountInfo, CatalogProvider, ClientMessage, ClientMessageType, DaemonMessage,
-    DaemonMessageType, McpServerStatus, ReasoningCapability, RefreshStatus, SessionStatus, Turn,
+    DaemonMessageType, McpAuthState, McpServerStatus, ReasoningCapability, RefreshStatus,
+    SessionStatus, Turn,
 };
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
@@ -1188,6 +1189,9 @@ mod unsent_draft_tests {
                         server_name: Some("docs".to_string()),
                         server_version: Some("1.0.0".to_string()),
                         last_error: None,
+                        credential_key: None,
+                        auth: McpAuthState::NotApplicable,
+                        oauth: None,
                     },
                     McpServerStatus {
                         slug: "fs".to_string(),
@@ -1199,6 +1203,9 @@ mod unsent_draft_tests {
                         server_name: None,
                         server_version: None,
                         last_error: Some("connect timed out".to_string()),
+                        credential_key: None,
+                        auth: McpAuthState::NotApplicable,
+                        oauth: None,
                     },
                 ],
                 project_root: None,
@@ -1294,6 +1301,9 @@ mod unsent_draft_tests {
                     server_name: Some("docs".to_string()),
                     server_version: Some("1.0.0".to_string()),
                     last_error: None,
+                    credential_key: None,
+                    auth: McpAuthState::NotApplicable,
+                    oauth: None,
                 }],
             }),
             &mut app,

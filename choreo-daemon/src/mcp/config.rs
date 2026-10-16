@@ -43,6 +43,11 @@ struct ServerEntry {
     /// Explicit transport selector: `"http"`/`"stdio"`/`"auto"` (default).
     #[serde(default)]
     transport: Option<String>,
+    /// OAuth parameters for a remote server, when configured. A project
+    /// entry's block is honoured only when its root is trusted (an untrusted
+    /// repo-controlled block is never expanded or offered).
+    #[serde(default)]
+    oauth: Option<OAuthEntry>,
     /// Working directory for a stdio subprocess. A leading `~`/`~/` is expanded
     /// to the user's home directory.
     #[serde(default)]
@@ -87,6 +92,34 @@ struct ServerEntry {
 
 fn default_true() -> bool {
     true
+}
+
+/// One server's `oauth` block. Every field is optional; a pre-registered client
+/// id is the only one the interactive sign-in cannot discover. Deliberately no
+/// `clientSecret`: a confidential client reads its secret from the environment,
+/// never a repo-controlled config file.
+#[derive(Deserialize, Debug, Clone)]
+struct OAuthEntry {
+    /// A pre-registered client id (`clientId`).
+    #[serde(default, rename = "clientId", alias = "client_id")]
+    client_id: Option<String>,
+    /// The loopback callback port to prefer (`callbackPort`).
+    #[serde(default, rename = "callbackPort", alias = "callback_port")]
+    callback_port: Option<u16>,
+    /// The scopes to request at sign-in.
+    #[serde(default)]
+    scopes: Vec<String>,
+}
+
+impl OAuthEntry {
+    /// Convert to the resolved [`McpOAuthConfig`](choreo_mcp::McpOAuthConfig).
+    fn into_config(self) -> choreo_mcp::McpOAuthConfig {
+        choreo_mcp::McpOAuthConfig {
+            client_id: self.client_id,
+            callback_port: self.callback_port,
+            scopes: self.scopes,
+        }
+    }
 }
 
 /// Map the optional `protocol` config value onto a [`McpProtocolMode`].
@@ -170,6 +203,14 @@ fn resolve_transport(
             Some(McpTransport::Http {
                 url,
                 headers: maybe_expand_env_map(&entry.headers, expand_env),
+                // An untrusted project's `oauth` block is never honoured: it is
+                // repo-controlled input, so it is dropped rather than expanded,
+                // dialed, or offered as a login option.
+                oauth: if expand_env {
+                    entry.oauth.as_ref().map(|o| o.clone().into_config())
+                } else {
+                    None
+                },
             })
         }
         // `Auto` is resolved to a concrete kind above.

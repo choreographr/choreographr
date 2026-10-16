@@ -33,6 +33,8 @@ pub mod trust;
 // as child modules; the items other modules use are re-exported here so every
 // `crate::mcp::…` path is unchanged.
 #[cfg(feature = "mcp")]
+pub mod oauth;
+#[cfg(feature = "mcp")]
 mod overlay;
 mod paths;
 mod pool;

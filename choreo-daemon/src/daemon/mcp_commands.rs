@@ -11,7 +11,9 @@
 
 use super::{DaemonState, SessionMcpProject};
 use crate::mcp::trust::McpTrustStore;
-use crate::mcp::{McpReloadOutcome, McpStatusReport, McpTrustOutcome, SessionMcpOverlay};
+use crate::mcp::{
+    McpReloadOutcome, McpServerStatus, McpStatusReport, McpTrustOutcome, SessionMcpOverlay,
+};
 use crate::sessions::SessionCommand;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -340,7 +342,33 @@ impl DaemonState {
             }
         }
         report.servers = servers;
+        // Refine each server's auth state from the daemon's credential store
+        // (the manager cannot see it): a stored grant is `OAuth`, a quarantined
+        // key is `Reauthentication`, otherwise the baseline (`NotLoggedIn` for
+        // an oauth server, `BearerToken`/`NotApplicable` otherwise).
+        for server in &mut report.servers {
+            server.auth = self.mcp_auth_state(server);
+        }
         report
+    }
+
+    /// The auth state of one server, refined against the daemon's credential
+    /// store. A server with no `oauth` block keeps its baseline (it is
+    /// authenticated by a static header, or not at all).
+    pub(super) fn mcp_auth_state(&self, status: &McpServerStatus) -> choreo_proto::McpAuthState {
+        let Some(key) = status.credential_key.as_deref() else {
+            return status.auth;
+        };
+        if status.oauth.is_none() {
+            return status.auth;
+        }
+        if self.dead_oauth.contains(key) {
+            choreo_proto::McpAuthState::Reauthentication
+        } else if self.credentials.contains_key(key) {
+            choreo_proto::McpAuthState::OAuth
+        } else {
+            choreo_proto::McpAuthState::NotLoggedIn
+        }
     }
 
     /// The slugs an untrusted project root's `.mcp.json` declares (read so

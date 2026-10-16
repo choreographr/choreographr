@@ -114,6 +114,31 @@ fn option_str_len(s: Option<&String>) -> usize {
     s.map_or(0, String::len)
 }
 
+/// Conservative byte estimate of one [`McpServerStatus`] payload.
+///
+/// Shared by the `McpStatus` and `McpReloaded` arms so the two cannot drift.
+/// The fixed 272 B base covers the map header, the twelve field-name keys, and
+/// the scalar fields (the `connected` bool, `tool_count` usize, and `auth`
+/// enum); only the variable string payloads are added on top. The `oauth`
+/// block contributes its own field-name keys and scalar allowance plus the
+/// variable strings.
+fn mcp_server_status_len(s: &crate::McpServerStatus) -> usize {
+    let oauth = s.oauth.as_ref().map_or(0, |o| {
+        named_field_overhead(3)
+            + option_str_len(o.client_id.as_ref())
+            + o.scopes.iter().map(String::len).sum::<usize>()
+    });
+    272 + s.slug.len()
+        + s.tier.len()
+        + s.transport.len()
+        + s.target.len()
+        + option_str_len(s.server_name.as_ref())
+        + option_str_len(s.server_version.as_ref())
+        + option_str_len(s.last_error.as_ref())
+        + option_str_len(s.credential_key.as_ref())
+        + oauth
+}
+
 /// Estimated `MessagePack` named-mode overhead for a struct variant with `n`
 /// fields: the variant tag, map headers, and one field-name key per field.
 /// The allowance is ~24 bytes per field (the longest field-name keys in use
@@ -481,13 +506,13 @@ impl DaemonMessage {
                             ImageKey::ToolResult { call_id } => call_id.len(),
                         }
                 }
-                // One `McpServerStatus` per configured server: 9 named fields plus
-                // the variable strings. The 220 B per-record allowance covers the
-                // map header, variant tag, nine field-name keys, and the
-                // `connected` bool / `tool_count` usize scalars; only the string
-                // payloads are added on top. The envelope carries the project-root
-                // context: four named fields plus the root string and the ignored
-                // project slugs.
+                // One `McpServerStatus` per configured server: 12 named fields plus
+                // the variable strings. The 256 B per-record allowance covers the
+                // map header, variant tag, twelve field-name keys, and the
+                // `connected` bool / `tool_count` usize / `auth` enum scalars; only
+                // the string payloads are added on top. The envelope carries the
+                // project-root context: four named fields plus the root string and
+                // the ignored project slugs.
                 DaemonMessageType::McpStatus {
                     servers,
                     project_root,
@@ -500,18 +525,7 @@ impl DaemonMessage {
                             .iter()
                             .map(String::len)
                             .sum::<usize>()
-                        + servers
-                            .iter()
-                            .map(|s| {
-                                220 + s.slug.len()
-                                    + s.tier.len()
-                                    + s.transport.len()
-                                    + s.target.len()
-                                    + option_str_len(s.server_name.as_ref())
-                                    + option_str_len(s.server_version.as_ref())
-                                    + option_str_len(s.last_error.as_ref())
-                            })
-                            .sum::<usize>()
+                        + servers.iter().map(mcp_server_status_len).sum::<usize>()
                 }
                 DaemonMessageType::McpReconnectFailed { slug, error } => {
                     named_field_overhead(2) + slug.len() + error.len()
@@ -521,18 +535,7 @@ impl DaemonMessage {
                 DaemonMessageType::McpReloaded { summary, servers } => {
                     named_field_overhead(2)
                         + summary.len()
-                        + servers
-                            .iter()
-                            .map(|s| {
-                                220 + s.slug.len()
-                                    + s.tier.len()
-                                    + s.transport.len()
-                                    + s.target.len()
-                                    + option_str_len(s.server_name.as_ref())
-                                    + option_str_len(s.server_version.as_ref())
-                                    + option_str_len(s.last_error.as_ref())
-                            })
-                            .sum::<usize>()
+                        + servers.iter().map(mcp_server_status_len).sum::<usize>()
                 }
                 DaemonMessageType::McpReloadFailed { error } => {
                     named_field_overhead(1) + error.len()

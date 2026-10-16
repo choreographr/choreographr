@@ -101,6 +101,24 @@ impl McpTransportKind {
     }
 }
 
+/// OAuth parameters for a remote (HTTP) MCP server.
+///
+/// A server's `oauth` block supplies only what the interactive sign-in cannot
+/// discover on its own; discovery (RFC 9728/8414), dynamic client registration
+/// (SEP-837), and client-metadata documents (SEP-991) are driven by the
+/// login flow. Deliberately **no** `client_secret`: a confidential client reads
+/// its secret from the environment, never a repo-controlled config file.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct McpOAuthConfig {
+    /// A pre-registered client id, for an authorization server that supports
+    /// neither dynamic client registration nor a client-metadata document.
+    pub client_id: Option<String>,
+    /// The loopback callback port to prefer.
+    pub callback_port: Option<u16>,
+    /// The scopes to request at sign-in.
+    pub scopes: Vec<String>,
+}
+
 /// A resolved transport for one MCP server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpTransport {
@@ -128,6 +146,9 @@ pub enum McpTransport {
         url: String,
         /// Extra HTTP headers sent with every request (e.g. `Authorization`).
         headers: HashMap<String, String>,
+        /// The server's `oauth` block, when configured. A remote server with
+        /// no `oauth` block authenticates with `headers` only (or not at all).
+        oauth: Option<McpOAuthConfig>,
     },
 }
 
@@ -287,6 +308,7 @@ mod tests {
         let http = McpTransport::Http {
             url: "https://example.com/mcp".into(),
             headers: HashMap::new(),
+            oauth: None,
         };
         assert_eq!(http.label(), "http");
         assert_eq!(http.target(), "https://example.com/mcp");

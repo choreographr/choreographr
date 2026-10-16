@@ -14,7 +14,7 @@ use rmcp::service::ClientInitializeError;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::common::client_side_sse::SseRetryPolicy;
 use rmcp::transport::streamable_http_client::{
-    StreamableHttpClientTransportConfig, StreamableHttpError,
+    StreamableHttpClient, StreamableHttpClientTransportConfig, StreamableHttpError,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,11 +47,14 @@ pub(super) fn http_client(config: &McpServerConfig) -> Result<reqwest::Client, M
 /// request. rmcp generates `Mcp-*` routing headers from the request body; user
 /// headers ride alongside them (`MCP-Protocol-Version` is also generated, so it
 /// is not user-settable).
-pub(super) fn build_http_transport(
+pub(super) fn build_http_transport<C>(
     config: &McpServerConfig,
-    client: reqwest::Client,
-) -> Result<StreamableHttpClientTransport<reqwest::Client>, McpError> {
-    let McpTransport::Http { url, headers } = &config.transport else {
+    client: C,
+) -> Result<StreamableHttpClientTransport<C>, McpError>
+where
+    C: StreamableHttpClient,
+{
+    let McpTransport::Http { url, headers, .. } = &config.transport else {
         return Err(McpError::ProtocolError(
             "build_http_transport called for a non-HTTP server".into(),
         ));

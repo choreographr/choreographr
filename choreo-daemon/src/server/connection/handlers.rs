@@ -813,6 +813,9 @@ pub(super) fn wire_mcp_status(
         server_name: status.server_name,
         server_version: status.server_version,
         last_error: status.last_error,
+        credential_key: status.credential_key,
+        auth: status.auth,
+        oauth: status.oauth,
     }
 }
 

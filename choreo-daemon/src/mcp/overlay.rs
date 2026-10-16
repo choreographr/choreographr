@@ -261,6 +261,7 @@ impl super::McpManager {
                 groups,
             ) {
                 Ok(count) => {
+                    let (credential_key, oauth, auth) = crate::mcp::oauth::status_auth(&config);
                     statuses.push(McpServerStatus {
                         slug: slug.clone(),
                         tier: if root.is_some() {
@@ -275,6 +276,9 @@ impl super::McpManager {
                         server_name: Some(handle.name().to_string()),
                         server_version: Some(handle.version().to_string()),
                         last_error: None,
+                        credential_key,
+                        oauth,
+                        auth,
                     });
                     connected.push(slug);
                 }

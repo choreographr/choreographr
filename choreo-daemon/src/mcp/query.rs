@@ -43,6 +43,10 @@ impl super::McpManager {
         let config = self.configs.get(slug).map(|e| &e.config);
         let transport = config.map_or_else(String::new, |c| c.transport.label().to_string());
         let target = config.map_or_else(String::new, |c| c.transport.target().to_string());
+        let (credential_key, oauth, auth) = config.map_or(
+            (None, None, choreo_proto::McpAuthState::NotApplicable),
+            crate::mcp::oauth::status_auth,
+        );
         match self.servers.get(slug) {
             Some(slot) => McpServerStatus {
                 slug: slug.to_string(),
@@ -54,6 +58,9 @@ impl super::McpManager {
                 server_name: Some(slot.handle.name().to_string()),
                 server_version: Some(slot.handle.version().to_string()),
                 last_error: None,
+                credential_key,
+                oauth,
+                auth,
             },
             None => McpServerStatus {
                 slug: slug.to_string(),
@@ -65,6 +72,9 @@ impl super::McpManager {
                 server_name: None,
                 server_version: None,
                 last_error: self.failures.get(slug).cloned(),
+                credential_key,
+                oauth,
+                auth,
             },
         }
     }
@@ -92,6 +102,7 @@ impl super::McpManager {
     }
 
     fn slot_status(slug: &str, tier: &str, slot: &ServerSlot) -> McpServerStatus {
+        let (credential_key, oauth, auth) = crate::mcp::oauth::status_auth(&slot.config);
         McpServerStatus {
             slug: slug.to_string(),
             tier: tier.to_string(),
@@ -102,6 +113,9 @@ impl super::McpManager {
             server_name: Some(slot.handle.name().to_string()),
             server_version: Some(slot.handle.version().to_string()),
             last_error: None,
+            credential_key,
+            oauth,
+            auth,
         }
     }
 

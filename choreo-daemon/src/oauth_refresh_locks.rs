@@ -10,6 +10,17 @@
 //! only one exchange is ever in flight and a loser re-reads the winner's
 //! persisted rotation instead of spending a stale token.
 //!
+//! The provider and MCP engines reach the lock differently because they run in
+//! different worlds: the provider loop is a blocking thread and takes the plain
+//! [`std::sync::Mutex`] from [`OAuthRefreshLocks::acquire`], while the MCP
+//! adapter runs on the async sidecar and needs an *owned*, `Send + 'static`
+//! guard it can hold across an `await`. A `std::sync::MutexGuard` is `!Send`, so
+//! [`OAuthRefreshLocks::acquire_owned`] instead hands out a lock built on a
+//! one-token [`crossbeam_channel`] semaphore: acquiring consumes the token and
+//! the owned guard returns it on drop. Two maps (one per primitive) keep each
+//! engine's guard type honest while the registry stays one place keyed the same
+//! way.
+//!
 //! This is a process-global registry of per-key locks, in the spirit of the
 //! daemon's other single-purpose shared-state exceptions: it carries no
 //! protocol data, the map lock is held only for the brief get-or-insert, and
@@ -27,6 +38,68 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use tracing::{debug, trace};
 
+/// An owned single-flight lock over a one-token crossbeam semaphore.
+///
+/// `std::sync::MutexGuard` is `!Send`, so it cannot be handed to `rmcp`'s
+/// refresh guard, which is held across an `await` on the sidecar runtime. A
+/// bounded channel seeded with one token gives an owned guard whose `Drop`
+/// returns the token: acquiring blocks on `recv`, releasing `try_send`s the
+/// token back. The guard owns only a `Sender<()>`, so it is `Send + 'static`.
+pub struct OwnedRefreshLock {
+    /// The semaphore whose single token guards the credential.
+    semaphore: ChannelSemaphore,
+}
+
+impl OwnedRefreshLock {
+    /// Block until the credential's token is free, returning the owned guard.
+    ///
+    /// Must not be called from within an async task (it blocks the thread);
+    /// the MCP adapter calls it from a `spawn_blocking` task.
+    pub fn lock(&self) -> OwnedRefreshGuard {
+        // A `recv` error means the registry (the sole sender owner) is gone;
+        // treat that as acquired so a shutdown cannot wedge the guard.
+        let _ = self.semaphore.rx.recv();
+        OwnedRefreshGuard {
+            release: self.semaphore.tx.clone(),
+        }
+    }
+}
+
+/// The one-token crossbeam semaphore backing an [`OwnedRefreshLock`].
+struct ChannelSemaphore {
+    /// Returns a token on guard drop.
+    tx: crossbeam_channel::Sender<()>,
+    /// Consumes a token to acquire.
+    rx: crossbeam_channel::Receiver<()>,
+}
+
+impl ChannelSemaphore {
+    /// A semaphore holding exactly one token.
+    fn new() -> Self {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        // Seed the single token; the channel is empty until a guard returns it.
+        let _ = tx.try_send(());
+        Self { tx, rx }
+    }
+}
+
+/// The owned guard returned by [`OwnedRefreshLock::lock`]; returns the token on
+/// drop, releasing the lock.
+#[must_use = "dropping the guard releases the refresh lock"]
+pub struct OwnedRefreshGuard {
+    /// The semaphore sender the token is returned to on drop.
+    release: crossbeam_channel::Sender<()>,
+}
+
+impl Drop for OwnedRefreshGuard {
+    fn drop(&mut self) {
+        // `try_send` never blocks: the channel is empty at this point (the
+        // token was consumed on acquire), and a full channel would only mean
+        // the token was already returned.
+        let _ = self.release.try_send(());
+    }
+}
+
 /// A registry of per-credential OAuth refresh locks.
 ///
 /// The map holds strong `Arc`s (not `Weak`): a weak handle would let two
@@ -34,8 +107,10 @@ use tracing::{debug, trace};
 /// fail to serialize. Entries are pruned once no other thread holds or awaits
 /// them (see [`OAuthRefreshLocks::prune`]).
 pub struct OAuthRefreshLocks {
-    /// Credential key → the lock guarding refresh of that credential.
+    /// Credential key → the lock guarding a blocking (provider) refresh.
     map: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Credential key → the lock guarding an async (MCP) refresh.
+    owned: Mutex<HashMap<String, Arc<OwnedRefreshLock>>>,
 }
 
 impl Default for OAuthRefreshLocks {
@@ -50,6 +125,7 @@ impl OAuthRefreshLocks {
     pub fn new() -> Self {
         Self {
             map: Mutex::new(HashMap::new()),
+            owned: Mutex::new(HashMap::new()),
         }
     }
 
@@ -67,26 +143,46 @@ impl OAuthRefreshLocks {
         lock
     }
 
+    /// Return the single-flight async lock for `key`, for the MCP adapter.
+    ///
+    /// The caller takes the owned guard with [`OwnedRefreshLock::lock`] (from a
+    /// blocking task); the guard is `Send + 'static` and released on drop, so
+    /// it can be held across the refresh `await`.
+    #[must_use]
+    pub fn acquire_owned(&self, key: &str) -> Arc<OwnedRefreshLock> {
+        let mut owned = self.owned.lock().unwrap_or_else(PoisonError::into_inner);
+        let lock = Arc::clone(owned.entry(key.to_string()).or_insert_with(|| {
+            Arc::new(OwnedRefreshLock {
+                semaphore: ChannelSemaphore::new(),
+            })
+        }));
+        trace!(key, "acquired OAuth refresh lock (owned)");
+        lock
+    }
+
     /// Drop entries no thread currently holds or awaits.
     ///
-    /// Called after a refresh completes so the map does not grow one entry per
-    /// credential ever refreshed. An entry is retained while any other owner
-    /// exists — the map plus a live holder (or waiter) make `strong_count`
-    /// greater than one — and removed only when the map is its sole owner. The
-    /// check runs under the map lock so it cannot race a concurrent reserve.
+    /// Called after a refresh completes so the registry does not grow one entry
+    /// per credential ever refreshed. An entry is retained while any other
+    /// owner exists — the map plus a live holder (or waiter) make
+    /// `strong_count` greater than one — and removed only when the map is its
+    /// sole owner. The check runs under each map lock so it cannot race a
+    /// concurrent reserve.
     pub fn prune(&self) {
-        let mut map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
-        let before = map.len();
-        map.retain(|_, lock| Arc::strong_count(lock) > 1);
-        let removed = before - map.len();
+        let removed = prune_map(&self.map) + prune_map(&self.owned);
         if removed > 0 {
-            debug!(
-                removed,
-                remaining = map.len(),
-                "pruned idle OAuth refresh locks"
-            );
+            debug!(removed, "pruned idle OAuth refresh locks");
         }
     }
+}
+
+/// Retain only the entries another owner still holds or awaits; return the
+/// count removed.
+fn prune_map<T: Send + Sync + 'static>(map: &Mutex<HashMap<String, Arc<T>>>) -> usize {
+    let mut guard = map.lock().unwrap_or_else(PoisonError::into_inner);
+    let before = guard.len();
+    guard.retain(|_, lock| Arc::strong_count(lock) > 1);
+    before - guard.len()
 }
 
 /// The process-global registry the provider and MCP refresh engines share.
@@ -99,6 +195,14 @@ static OAUTH_REFRESH_LOCKS: LazyLock<OAuthRefreshLocks> = LazyLock::new(OAuthRef
 #[must_use]
 pub fn acquire(key: &str) -> Arc<Mutex<()>> {
     OAUTH_REFRESH_LOCKS.acquire(key)
+}
+
+/// Return the process-global single-flight async refresh lock for `key`.
+///
+/// See [`OAuthRefreshLocks::acquire_owned`].
+#[must_use]
+pub fn acquire_owned(key: &str) -> Arc<OwnedRefreshLock> {
+    OAUTH_REFRESH_LOCKS.acquire_owned(key)
 }
 
 /// Prune idle entries from the process-global refresh-lock registry.
@@ -171,5 +275,28 @@ mod tests {
         // Keep both alive past the prune so a concurrent test's prune cannot
         // drop this key mid-assert.
         prune();
+    }
+
+    #[test]
+    fn owned_acquire_is_single_flight_and_distinct_from_the_blocking_map() {
+        let registry = OAuthRefreshLocks::new();
+        let a = registry.acquire_owned("mcp:docs|abc");
+        let b = registry.acquire_owned("mcp:docs|abc");
+        assert!(Arc::ptr_eq(&a, &b), "one key maps to one owned lock");
+        // An owned guard is Send + 'static and released on drop.
+        let guard = a.lock();
+        assert!(Arc::strong_count(&a) > 1);
+        drop(guard);
+        // A second acquisition succeeds once the first guard is dropped.
+        let _again = a.lock();
+    }
+
+    #[test]
+    fn owned_guard_is_send_and_static() {
+        fn assert_send_static<T: Send + 'static>(_: T) {}
+        let registry = OAuthRefreshLocks::new();
+        let lock = registry.acquire_owned("k");
+        let guard = lock.lock();
+        assert_send_static(guard);
     }
 }

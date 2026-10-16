@@ -528,6 +528,29 @@ pub enum DaemonCommand {
         /// Replies `Ok`, or an error string on failure.
         reply: mpsc::Sender<Result<(), String>>,
     },
+    /// Persist a rotated MCP OAuth credential. Sent FIRE-AND-FORGET by the MCP
+    /// credential backend (which runs on the sidecar and must not block the
+    /// command loop): the loop writes the blob, updates the in-memory map and
+    /// the MCP OAuth snapshot, and clears any quarantine for the key.
+    OAuthSave {
+        /// The target-scoped credential key (`mcp:<slug>|<target-hash>`).
+        key: String,
+        /// The durable credential to persist (access token already stripped).
+        credential: ServiceCredential,
+    },
+    /// Delete a stored MCP OAuth credential (fire-and-forget logout), removing
+    /// the blob and the in-memory/quarantine state for the key.
+    OAuthClear {
+        /// The target-scoped credential key.
+        key: String,
+    },
+    /// Record that an MCP server's refresh token was terminally rejected
+    /// (fire-and-forget), so the `/mcp` status surfaces a re-authentication
+    /// request instead of retrying a dead grant.
+    McpAuthRejected {
+        /// The target-scoped credential key.
+        key: String,
+    },
     /// Enroll a client key in the ACL (from a LOCAL connection only — the
     /// transport check lives in the connection dispatch). The handler
     /// validates, appends to `authorized_clients.toml` under the advisory
@@ -1178,6 +1201,11 @@ impl DaemonState {
             DaemonCommand::RemoveCredentialCmd { service, reply } => {
                 self.handle_remove_credential(&service, &reply);
             }
+            DaemonCommand::OAuthSave { key, credential } => {
+                self.handle_oauth_save(&key, credential);
+            }
+            DaemonCommand::OAuthClear { key } => self.handle_oauth_clear(&key),
+            DaemonCommand::McpAuthRejected { key } => self.handle_mcp_auth_rejected(&key),
             DaemonCommand::AclAddCmd { pubkey, reply } => self.handle_acl_add(&pubkey, &reply),
             DaemonCommand::ListModels { session_id, reply } => {
                 self.handle_list_models(session_id, &reply);
@@ -2464,6 +2492,7 @@ impl DaemonState {
         if service == "twitter" {
             self.x_credentials = None;
         }
+        self.publish_mcp_oauth_snapshot();
         let _ = reply.send(Ok(()));
     }
 

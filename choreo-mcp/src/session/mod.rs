@@ -123,8 +123,28 @@ impl McpServer {
         config: &McpServerConfig,
         list_changes: Option<crossbeam_channel::Sender<McpListChange>>,
     ) -> Result<Self, McpError> {
+        Self::connect_with_auth(config, list_changes, None)
+    }
+
+    /// Connect to the configured server with optional OAuth wiring.
+    ///
+    /// A remote server with an `oauth` block is connected through `rmcp`'s
+    /// `AuthorizationManager` so the durable grant is refreshed on connect; the
+    /// daemon supplies the target-scoped key and the keystore backend as
+    /// [`McpAuthWiring`](crate::McpAuthWiring). Every other server (stdio, or a
+    /// remote server with no `oauth` block) connects exactly as
+    /// [`connect_with_list_changes`](Self::connect_with_list_changes).
+    ///
+    /// # Errors
+    ///
+    /// As [`connect_with_list_changes`](Self::connect_with_list_changes).
+    pub fn connect_with_auth(
+        config: &McpServerConfig,
+        list_changes: Option<crossbeam_channel::Sender<McpListChange>>,
+        auth: Option<crate::McpAuthWiring>,
+    ) -> Result<Self, McpError> {
         crate::runtime::init()?;
-        let engine = crate::engine::connect(config, list_changes.clone())?;
+        let engine = crate::engine::connect(config, list_changes.clone(), auth.clone())?;
         let name = engine.name().to_string();
         let version = engine.version().to_string();
 
@@ -137,7 +157,7 @@ impl McpServer {
             resources: engine.supports_resources(),
         };
 
-        let factory = crate::engine::factory(config.clone(), list_changes);
+        let factory = crate::engine::factory(config.clone(), list_changes, auth);
         let max_concurrent_calls = config.max_concurrent_calls();
         let max_restarts = config.max_restarts();
         let join = std::thread::Builder::new()

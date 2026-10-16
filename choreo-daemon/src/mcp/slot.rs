@@ -140,7 +140,11 @@ pub(super) fn connect_and_list(
     config: &McpServerConfig,
     list_changes: Option<crossbeam_channel::Sender<McpListChange>>,
 ) -> Result<(McpServer, Vec<McpTool>), choreo_mcp::McpError> {
-    let server = McpServer::connect_with_list_changes(config, list_changes)?;
+    // A remote server with an `oauth` block connects through the OAuth client
+    // when the daemon's credential runtime is installed; otherwise (no oauth
+    // block, or no running daemon) it connects unauthenticated.
+    let auth = crate::mcp::oauth::wiring_for(config);
+    let server = McpServer::connect_with_auth(config, list_changes, auth)?;
     let tools = server.handle().list_tools()?;
     Ok((server, tools))
 }

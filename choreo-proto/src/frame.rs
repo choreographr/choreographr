@@ -61,7 +61,14 @@ use zeroize::Zeroizing;
 /// Also under the same policy, 9 gained the OAuth re-login notice: the
 /// `DaemonMessage::OAuthReloginRequired { account }` broadcast, emitted once
 /// per terminal provider-refresh failure so a client can prompt the user to
-/// sign in again.
+/// sign in again. Also under the same policy, 9's `McpServerStatus` gained the
+/// per-server OAuth surface: a target-scoped `credential_key`, an `auth`
+/// [`McpAuthState`](crate::McpAuthState), and the resolved `oauth` block
+/// (client id, callback port,
+/// scopes) a frontend needs to drive `mcp login` and `mcp logout` without a
+/// copy of the server's config. No new request/reply variants are needed: sign
+/// in rides the existing `AddCredential`, and sign out rides
+/// `RemoveCredential`, both keyed by the daemon-supplied `credential_key`.
 ///
 /// Policy: variants may be added to the **current, unreleased** wire version
 /// without a bump. Mixed-version peers do not exist until a release ships, and

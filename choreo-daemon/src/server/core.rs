@@ -198,6 +198,12 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: CoreOptions) -> Daemon
     let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
     state.daemon_tx = daemon_tx.clone();
 
+    // Install the MCP OAuth runtime (the read snapshot + command sender the
+    // connect path uses) now that the real command channel exists. Before this
+    // the snapshot is absent, so an MCP server connects unauthenticated.
+    #[cfg(feature = "mcp")]
+    crate::mcp::oauth::install(daemon_tx.clone());
+
     // Pump the MCP servers' list-changed events into the command loop. The
     // servers' `subscriptions/listen` streams feed one shared channel (see
     // `McpManager::take_list_change_rx`); a dedicated forwarder thread

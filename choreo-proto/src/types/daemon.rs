@@ -100,6 +100,48 @@ pub struct CatalogProvider {
     pub display_name: String,
 }
 
+/// Which credential a remote MCP server authenticates with, as surfaced in
+/// [`McpServerStatus::auth`] so a frontend can offer the right sign-in action.
+///
+/// A server with no authentication at all (a stdio subprocess, or a remote
+/// server with neither an `oauth` block nor a static `Authorization` header)
+/// reports [`Self::NotApplicable`]. A remote server whose `oauth` block is
+/// configured but which this build cannot drive reports [`Self::Unsupported`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum McpAuthState {
+    /// The server needs no authentication.
+    NotApplicable,
+    /// The server authenticates with a static bearer token in its `headers`.
+    BearerToken,
+    /// The server has an `oauth` block but no usable credential is stored.
+    NotLoggedIn,
+    /// The server has a stored OAuth credential that is usable.
+    OAuth,
+    /// The server's stored OAuth credential was terminally rejected (a
+    /// revoked or expired grant); the user must sign in again.
+    Reauthentication,
+    /// The server's authentication cannot be driven by this build.
+    Unsupported,
+}
+
+/// A remote MCP server's `oauth` configuration, supplied to a frontend so it
+/// can run the interactive sign-in (discovery, dynamic client registration,
+/// PKCE) without a copy of the server's config.
+///
+/// Deliberately carries **no** `client_secret`: a confidential client reads its
+/// secret from the environment, never a repo-controlled `.mcp.json`. A server
+/// with no `oauth` block has no [`McpServerStatus::oauth`] entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpOAuthConfig {
+    /// A pre-registered client id, for an authorization server that supports
+    /// neither dynamic client registration nor a client-metadata document.
+    pub client_id: Option<String>,
+    /// The loopback callback port to prefer.
+    pub callback_port: Option<u16>,
+    /// The scopes to request.
+    pub scopes: Vec<String>,
+}
+
 /// The state of one configured MCP server, as carried in
 /// [`DaemonMessageType::McpStatus`].
 ///
@@ -131,6 +173,18 @@ pub struct McpServerStatus {
     /// The last connect/refresh error, when the server is not connected (or a
     /// refresh failed).
     pub last_error: Option<String>,
+    /// The target-scoped keystore credential key (`mcp:<slug>|<target-hash>`)
+    /// this server's OAuth grant is stored under, when the server is remote.
+    /// Computed by the daemon (the sole authority), so provisioning
+    /// (`mcp login`) and connect-time load derive the identical key.
+    pub credential_key: Option<String>,
+    /// The authentication this server uses, so a frontend can render the right
+    /// sign-in / sign-out action.
+    pub auth: McpAuthState,
+    /// The server's `oauth` block, when one is configured and the server is
+    /// trusted. Carries no secret; it lets a frontend run the interactive
+    /// sign-in without re-reading the server's config.
+    pub oauth: Option<McpOAuthConfig>,
 }
 
 impl McpServerStatus {

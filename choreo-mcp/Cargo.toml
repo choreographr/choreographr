@@ -34,7 +34,15 @@ rmcp = { workspace = true, features = [
     "client",
     "transport-child-process",
     "transport-streamable-http-client-reqwest",
+    "auth",
 ] }
+# Implementing rmcp's async `CredentialStore` trait requires its attribute
+# macro. Pinned to the version rmcp's `auth` feature uses.
+async-trait = "0.1"
+# The token types the `CredentialStore` adapter maps to/from the durable
+# credential. Declared directly (rmcp does not re-export them) and pinned to
+# the version rmcp's `auth` feature pulls, so the two share one build.
+oauth2 = { version = "5.0", default-features = false }
 # Place the server child in its own process group on Unix so a launcher's
 # grandchild dies with it (the rmcp transport uses these wrappers' kill).
 process-wrap.workspace = true

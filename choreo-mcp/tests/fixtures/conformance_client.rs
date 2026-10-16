@@ -72,6 +72,7 @@ fn config(url: &str, protocol: McpProtocolMode) -> McpServerConfig {
         transport: McpTransport::Http {
             url: url.into(),
             headers: HashMap::new(),
+            oauth: None,
         },
         enabled: true,
         timeout: Some(Duration::from_secs(20)),

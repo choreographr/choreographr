@@ -8,6 +8,8 @@
 
 use std::path::PathBuf;
 
+use choreo_proto::{McpAuthState, McpOAuthConfig};
+
 /// A read-only snapshot of one configured server's state, for the `/mcp`
 /// status surface and `session_inspect`.
 ///
@@ -35,6 +37,18 @@ pub struct McpServerStatus {
     /// The last connect/refresh error, when the server is not connected (or a
     /// refresh failed).
     pub last_error: Option<String>,
+    /// The target-scoped keystore credential key for a remote server, computed
+    /// by the daemon (the sole authority) so provisioning and connect-time load
+    /// agree. `None` for a stdio server.
+    pub credential_key: Option<String>,
+    /// The authentication this server uses (see [`McpAuthState`]). Filled by
+    /// the daemon from its credential store; the manager leaves the default and
+    /// the status handler overrides it.
+    pub auth: McpAuthState,
+    /// The server's resolved `oauth` block (no secret), when one is configured
+    /// and the server is trusted — so a frontend can run `mcp login` without a
+    /// copy of the config.
+    pub oauth: Option<McpOAuthConfig>,
 }
 
 impl McpServerStatus {

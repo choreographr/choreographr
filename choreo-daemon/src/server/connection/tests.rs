@@ -824,6 +824,9 @@ fn sample_mcp_status() -> crate::mcp::McpServerStatus {
         server_name: Some("docs".to_string()),
         server_version: Some("1.0.0".to_string()),
         last_error: None,
+        credential_key: None,
+        auth: choreo_proto::McpAuthState::NotApplicable,
+        oauth: None,
     }
 }
 

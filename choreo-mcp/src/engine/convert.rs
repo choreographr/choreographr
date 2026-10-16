@@ -166,12 +166,12 @@ pub(super) fn map_service_error(error: ServiceError, slug: &str) -> McpError {
 /// The actionable guidance attached to an authorization-required error.
 ///
 /// Names both supported paths: a static token in the server's `headers`, and
-/// the OAuth support that is not yet shipped.
+/// the `mcp login <slug>` OAuth sign-in for a server with an `oauth` block.
 pub(super) fn auth_hint(status: u16) -> String {
     format!(
-        "the server answered HTTP {status}; configure a static token in this server's \
-         \"headers\" (for example \"Authorization\": \"Bearer ${{TOKEN}}\"), or wait \
-         for OAuth support, which is not yet available"
+        "the server answered HTTP {status}; either configure a static token in this \
+         server's \"headers\" (for example \"Authorization\": \"Bearer ${{TOKEN}}\"), or \
+         sign in with `mcp login <slug>` when the server has an \"oauth\" block"
     )
 }
 

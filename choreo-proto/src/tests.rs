@@ -162,6 +162,9 @@ fn mcp_status_reply_serde_round_trip() {
                     server_name: Some("docs-server".to_string()),
                     server_version: Some("1.0.0".to_string()),
                     last_error: None,
+                    credential_key: None,
+                    auth: McpAuthState::NotApplicable,
+                    oauth: None,
                 },
                 McpServerStatus {
                     slug: "fs".to_string(),
@@ -173,6 +176,13 @@ fn mcp_status_reply_serde_round_trip() {
                     server_name: None,
                     server_version: None,
                     last_error: Some("connect timed out".to_string()),
+                    credential_key: Some("mcp:fs|deadbeef".to_string()),
+                    auth: McpAuthState::NotLoggedIn,
+                    oauth: Some(McpOAuthConfig {
+                        client_id: Some("choreographr".to_string()),
+                        callback_port: Some(8765),
+                        scopes: vec!["openid".to_string()],
+                    }),
                 },
             ],
             project_root: Some("/home/u/proj".to_string()),

@@ -42,6 +42,7 @@ use rmcp::model::{
     ServerPeerInfo, SubscriptionFilter,
 };
 use rmcp::service::{Peer, RoleClient, RunningService};
+use rmcp::transport::streamable_http_client::StreamableHttpClient;
 use rmcp::{ClientLifecycleMode, serve_client_with_lifecycle};
 use std::sync::Arc;
 use std::time::Duration;
@@ -114,6 +115,7 @@ pub(crate) struct RmcpEngine {
 pub(crate) fn connect(
     config: &McpServerConfig,
     list_changes: Option<crossbeam_channel::Sender<McpListChange>>,
+    auth: Option<crate::auth::McpAuthWiring>,
 ) -> Result<Arc<dyn McpEngine>, McpError> {
     let timeout = config.request_timeout();
 
@@ -124,7 +126,7 @@ pub(crate) fn connect(
     // the progress-forwarding transport wrapper can hold its sender; the engine
     // keeps the same sender so call tasks can subscribe.
     let (events, _rx) = tokio::sync::broadcast::channel(SERVER_EVENT_BUFFER);
-    let running = crate::runtime::block_on(connect_transport(config, &events))??;
+    let running = crate::runtime::block_on(connect_transport(config, &events, auth))??;
 
     let peer = running.peer().clone();
     let (name, version) = server_identity(&running);
@@ -157,8 +159,9 @@ pub(crate) fn connect(
 pub(crate) fn factory(
     config: McpServerConfig,
     list_changes: Option<crossbeam_channel::Sender<McpListChange>>,
+    auth: Option<crate::auth::McpAuthWiring>,
 ) -> EngineFactory {
-    Box::new(move || connect(&config, list_changes.clone()))
+    Box::new(move || connect(&config, list_changes.clone(), auth.clone()))
 }
 
 /// Spawn the `subscriptions/listen` reader for a server that supports it.
@@ -274,6 +277,7 @@ async fn listen_for_changes(
 async fn connect_transport(
     config: &McpServerConfig,
     events: &tokio::sync::broadcast::Sender<transport::ServerEvent>,
+    auth: Option<crate::auth::McpAuthWiring>,
 ) -> Result<RunningService<RoleClient, ServerHandler>, McpError> {
     let handler = ServerHandler::new(client_config(config.protocol));
     match &config.transport {
@@ -288,7 +292,9 @@ async fn connect_transport(
                 .await
                 .map_err(|e| McpError::InitializeFailed(e.to_string()))
         }
-        McpTransport::Http { url, .. } => connect_http(config, url, handler, events.clone()).await,
+        McpTransport::Http { url, .. } => {
+            connect_http(config, url, handler, events.clone(), auth).await
+        }
     }
 }
 
@@ -306,8 +312,42 @@ async fn connect_http(
     url: &str,
     handler: ServerHandler,
     events: tokio::sync::broadcast::Sender<transport::ServerEvent>,
+    auth: Option<crate::auth::McpAuthWiring>,
 ) -> Result<RunningService<RoleClient, ServerHandler>, McpError> {
     let client = http_client(config)?;
+    // A remote server with OAuth wiring connects through `rmcp`'s
+    // `AuthorizationManager` (its `AuthClient` implements the Streamable HTTP
+    // client), so the durable grant is refreshed on connect; otherwise the plain
+    // reqwest client is used. The two clients are distinct types, so the shared
+    // retry/classify loop is generic over them.
+    match auth {
+        Some(wiring) => {
+            let auth_client =
+                crate::auth::build_auth_client(config, url, &wiring, client.clone()).await?;
+            serve_http_with_retry(handler, auth_client, config, &client, url, events).await
+        }
+        None => serve_http_with_retry(handler, client.clone(), config, &client, url, events).await,
+    }
+}
+
+/// Serve one HTTP transport, retrying transient connect failures and
+/// distinguishing the removed HTTP+SSE transport from a genuine error.
+///
+/// Generic over the Streamable HTTP client so the plain `reqwest` client and
+/// `rmcp`'s OAuth `AuthClient` share one retry/classify loop. `probe_client` is
+/// the plain reqwest client the legacy-SSE probe uses (the probe is an
+/// unauthenticated GET, so it never rides the auth client).
+async fn serve_http_with_retry<C>(
+    handler: ServerHandler,
+    client: C,
+    config: &McpServerConfig,
+    probe_client: &reqwest::Client,
+    url: &str,
+    events: tokio::sync::broadcast::Sender<transport::ServerEvent>,
+) -> Result<RunningService<RoleClient, ServerHandler>, McpError>
+where
+    C: StreamableHttpClient,
+{
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -352,7 +392,7 @@ async fn connect_http(
                 // already produced the typed auth error above, so a deprecated
                 // endpoint is reported as an unsupported transport rather than
                 // masked by the generic fallback.
-                if looks_like_legacy_sse(&client, url).await {
+                if looks_like_legacy_sse(probe_client, url).await {
                     return Err(McpError::UnsupportedTransport(format!(
                         "{url} answers GET with an SSE `endpoint` event, i.e. the \
                          2024-11-05 HTTP+SSE transport, which was removed from the \
