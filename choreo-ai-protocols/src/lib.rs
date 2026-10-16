@@ -40,6 +40,8 @@ pub mod anthropic;
 pub mod catalog;
 pub mod google;
 pub mod images;
+// Provider OAuth refresh client (the token-endpoint exchange).
+pub mod oauth;
 pub mod openai;
 pub mod retry;
 pub mod videos;
@@ -87,6 +89,10 @@ pub use images::{
     Background, FalImageClient, GoogleImageClient, ImageEditRequest, ImageGenerationClient,
     ImageGenerationRequest, ImageGenerationResult, ImageInput, ImageQuality, ImageSize,
     OpenAiImageClient, OutputFormat, ZaiImageClient,
+};
+pub use oauth::{
+    OAuthRefreshError, OAuthRefreshRequest, OAuthTokenResponse, chatgpt_account_id_from_id_token,
+    refresh_oauth_token,
 };
 pub use openai::{AllowedCaller, OpenAiClient, RequestFormat, ServiceConfig};
 // Re-export so downstream crates (choreo-daemon) can construct/handle the
