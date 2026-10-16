@@ -17,3 +17,4 @@
 mod connection_autostart;
 mod connection_shutdown;
 mod first_contact;
+mod oauth_login;

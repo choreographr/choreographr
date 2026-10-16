@@ -439,6 +439,15 @@ choreo-markdown = { path = "choreo-markdown", version = "0.2" }
 choreo-mcp = { path = "choreo-mcp", version = "0.2" }
 choreo-transport = { path = "choreo-transport", version = "0.2" }
 ureq = { version = "3", features = ["json", "brotli", "multipart"] }
+# Loopback OAuth callback server: a `recv_timeout` accept loop that polls a
+# cancel flag, the same pattern as the daemon's metrics server. Hoisted to the
+# workspace so the daemon (metrics, optional) and choreo-client-core (the
+# login library) share one version.
+tiny_http = "0.12"
+# Best-effort default-browser opener for the authorize URL. Only ever called on
+# the client host, never the daemon; a headless/SSH host falls back to the
+# printed URL / device-code / paste-URL paths.
+webbrowser = "1.2"
 ammonia = "4"
 base64 = "0.23"
 dirs = "7"

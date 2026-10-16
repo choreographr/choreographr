@@ -47,6 +47,7 @@ pub mod dispatch;
 pub mod error;
 pub mod history;
 pub mod known_servers;
+pub mod oauth;
 pub mod pending;
 pub mod shell;
 
@@ -76,6 +77,7 @@ pub use dispatch::{SessionStateData, ToolCallEvent, TurnEventHandler, dispatch_d
 pub use error::{ClientError, broken_pipe};
 pub use history::SessionView;
 pub use known_servers::{KnownServerEntry, KnownServers, known_servers_path};
+pub use oauth::{LoginEvent, LoginOptions, LoginSession, OAuthLoginError, start_login};
 pub use pending::{Pending, PendingContext, PendingReplies, Timeout, deadline_for};
 pub use shell::{
     Command, McpCommand, UnlockMethod, command_echo, is_valid_account_name, parse_input_line,

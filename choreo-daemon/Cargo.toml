@@ -98,7 +98,7 @@ unicode-segmentation.workspace = true
 # Both are optional, pulled in by the `metrics` feature (off by default) so a
 # plain build drops the whole prometheus/tiny_http tree.
 prometheus = { version = "0.14", features = ["process"], optional = true }
-tiny_http = { version = "0.12", optional = true }
+tiny_http = { workspace = true, optional = true }
 # Blockchain tools (EVM via alloy, Substrate/Polkadot via subxt). The tool
 # implementations — and the tokio sidecar runtime they need — live in the
 # `choreo-blockchain` crate, so tokio/alloy/subxt are never direct deps here.

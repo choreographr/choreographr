@@ -37,6 +37,16 @@ crossbeam-channel.workspace = true
 tempfile = { workspace = true, optional = true }
 # The auto-bind path mints a fresh CSPRNG keystore binding key with `rand`.
 rand.workspace = true
+# Provider OAuth login library (src/oauth/): PKCE S256 uses `sha2`; the
+# loopback callback server uses `tiny_http` (a `recv_timeout` accept loop that
+# polls the cancel flag); `webbrowser` opens the authorize URL best-effort; the
+# blocking HTTPS token / device-code exchanges use `ureq` (already in the
+# tree); `serde_json` reads the token response and the JWT identity claims.
+tiny_http.workspace = true
+webbrowser.workspace = true
+sha2.workspace = true
+ureq.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 # Own tests also use tempfile directly; duplicated with the optional dep
