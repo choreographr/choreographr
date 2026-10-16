@@ -219,11 +219,13 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
                 Some(shutdown_rx),
             ),
         };
-        if result.is_ok() {
-            // ReaderClosed must always be delivered — blocking is safe here
-            // because no more daemon messages are coming after this.
-            let _ = connection_ui_tx.send(UiEvent::ReaderClosed);
-        }
+        // ReaderClosed must always be delivered — blocking is safe here
+        // because no more daemon messages are coming after this. It is sent
+        // on failure too (a dial, autostart, or handshake error): the TUI
+        // then exits at once and prints the real reason, which `run_app`
+        // reads from this thread's result, instead of idling on a page that
+        // can never reach the daemon.
+        let _ = connection_ui_tx.send(UiEvent::ReaderClosed);
         result
     });
 
@@ -521,14 +523,6 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     app.term_status.clear_all();
     title::clear();
 
-    // Surface why the TUI exited (daemon eviction / graceful shutdown / a
-    // dropped connection) once the alternate screen is gone and the message
-    // is visible on the restored terminal. A normal user quit (Alt+Q)
-    // leaves `quit_message` None and prints nothing.
-    if let Some(message) = &app.quit_message {
-        println!("{message}");
-    }
-
     // The connection task's result is NEVER surfaced as an error: a failed
     // dial/handshake is a condition the user needs a readable explanation
     // for, not a crash. Returning it from run_app would escape main as a
@@ -549,6 +543,16 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
             app.quit_message
                 .get_or_insert_with(|| "daemon connection thread panicked".to_string());
         }
+    }
+
+    // Surface why the TUI exited (daemon eviction / graceful shutdown / a
+    // failed or dropped connection) once the alternate screen is gone and
+    // the message is visible on the restored terminal. Printed only after
+    // the join above, which is what replaces the generic "connection
+    // closed" text with the connection thread's actual error. A normal user
+    // quit (Alt+Q) leaves `quit_message` None and prints nothing.
+    if let Some(message) = &app.quit_message {
+        println!("{message}");
     }
 
     result

@@ -434,6 +434,9 @@ Then type a message and press Enter. Accounts can also be configured by hand in
 `~/.config/choreographr/accounts.toml` (see [Configuration](#configuration)),
 with a key added via `/add-key <service> <api_key>`.
 
+If the TUI cannot reach or start the daemon, it exits right away and prints
+the reason.
+
 ```
 ┌──────────────┐   Unix socket /     ┌──────────────┐   HTTP/SSE     ┌────────────────────┐
 │  choreo-tui  │◄───────────────────►│              │◄──────────────►│  OpenAI-compatible │
