@@ -940,13 +940,13 @@ as `None`. The variant semantics and the resolver contracts are documented on
 
 ### Supported providers
 
-Currently supports 208 providers (184 from the models.dev base + 24 overlay-only). Adding or refreshing a provider is a data change in `catalog/`: update the snapshot (or add an overlay entry) and re-run `cargo run --bin catalog-gen` — zero client code.
+Currently supports 209 providers (184 from the models.dev base + 25 overlay-only). Adding or refreshing a provider is a data change in `catalog/`: update the snapshot (or add an overlay entry) and re-run `cargo run --bin catalog-gen` — zero client code.
 
 **Supported providers by protocol:**
 
 | Protocol | Providers (overlay-only providers in *italics*) |
 |---|---|
-| OpenAI-compatible | OpenAI, DeepSeek, Mistral, xAI, Groq, Together AI, OpenRouter, Hugging Face, GitHub Copilot, NVIDIA NIM, Cerebras, Fireworks AI, Xiaomi MiMo, Alibaba (Qwen), Moonshot AI, Perplexity, Z.AI, Qwen Token Plan, Venice AI, Novita AI, LM Studio, Ollama Cloud, OpenCode Zen/Go, DeepInfra, Upstage, StepFun, Inception, Meta, NEAR AI, OrcaRouter, Routstr, Sakana, SaladCloud, Scaleway, OVHcloud, FuturMix, EmpirioLabs, Friendli, Atomic Chat, custom OpenAI-compatible — plus the overlay-only providers that keep their pre-models.dev slugs: *aimlapi, GitLawb OpenGateway, Kilo Gateway, OpenAI Codex, iFlytek, Nous, Arcee, GMI, Zhipu, Bankr, Atlas Cloud, Ant Ling, oMLX, Qwen Token Plan (CN), Tensorix, Tanzu, Llama Swap, kimi-code, ollama, openai-compatible, …* |
+| OpenAI-compatible | OpenAI, DeepSeek, Mistral, xAI, Groq, Together AI, OpenRouter, Hugging Face, GitHub Copilot, NVIDIA NIM, Cerebras, Fireworks AI, Xiaomi MiMo, Alibaba (Qwen), Moonshot AI, Perplexity, Z.AI, Qwen Token Plan, Venice AI, Novita AI, LM Studio, Ollama Cloud, OpenCode Zen/Go, DeepInfra, Upstage, StepFun, Inception, Meta, NEAR AI, OrcaRouter, Routstr, Sakana, SaladCloud, Scaleway, OVHcloud, FuturMix, EmpirioLabs, Friendli, Atomic Chat, custom OpenAI-compatible — plus the overlay-only providers that keep their pre-models.dev slugs: *aimlapi, GitLawb OpenGateway, Kilo Gateway, ChatGPT (Codex subscription), iFlytek, Nous, Arcee, GMI, Zhipu, Bankr, Atlas Cloud, Ant Ling, oMLX, Qwen Token Plan (CN), Tensorix, Tanzu, Llama Swap, kimi-code, ollama, openai-compatible, …* |
 | Anthropic Messages | Anthropic Claude, MiniMax, Vercel AI Gateway, Kimi Code, Fireworks (Anthropic mode), OpenCode Go (Anthropic-compatible), custom Anthropic-compatible |
 | Google Generative AI | Google Gemini |
 
@@ -957,7 +957,7 @@ Currently supports 208 providers (184 from the models.dev base + 24 overlay-only
 > | Provider(s) | Reason deferred |
 > |---|---|
 > | `amazon-bedrock`, `google-vertex`, `azure-foundry`, `azure-openai-responses` | Multi-field credentials (AWS keys/region, GCP service account, Azure resource + key). The daemon's single-API-key credential model cannot represent them yet. |
-> | `chatgpt` (Codex), `copilot`/`copilot-acp`, `qwen-oauth`, `kimi-code` OAuth, `github-copilot` OAuth, `radius` | OAuth-only / dynamic-catalog auth — no static API-key path. The catalog carries an `oauth` profile mechanism and a per-slug client-identity table (see Provider auth above), and the provider OAuth **sign-in and refresh** flow (buffer + 401 refresh, rotation persistence, terminal/transient taxonomy) ships for the OpenAI routes (the token-sharing `openai` route and the borrowed-id `chatgpt` Codex route); the others are added as data. |
+> | `copilot`/`copilot-acp`, `qwen-oauth`, `kimi-code` OAuth, `github-copilot` OAuth, `radius` | OAuth-only / dynamic-catalog auth — no static API-key path. The catalog carries an `oauth` profile mechanism and a per-slug client-identity table (see Provider auth above), and the provider OAuth **sign-in and refresh** flow ships for the `chatgpt` (Codex) and token-sharing `openai` routes; these remaining providers are added through the catalog `oauth` profile and the client-identity table as data. |
 > | `cursor` | t3code subprocess driver (spawns the Cursor CLI), not a direct HTTP provider. |
 >
 > Adding the multi-field-credential providers requires a credential generalization (a `Fields` credential variant); the OAuth providers are added through the catalog `oauth` profile and the client-identity table, not a code change.
@@ -1258,7 +1258,8 @@ data, never as instructions or configuration:
   keeps the same broadcast/visibility semantics as every other tool.
 - **Egress.** A remote server is contacted only when explicitly configured; there is no
   discovery of servers from arbitrary content. Credentials are a static token in
-  `headers` (OAuth is a post-ship addition), never shared across issuers.
+  `headers` or a keystore-stored OAuth grant (see the MCP remote-server OAuth
+  section), never shared across issuers.
 
 Two values inside the `rmcp` engine are sanctioned shared-state exceptions (see
 AGENTS.md). The live `RunningService` handle sits in a

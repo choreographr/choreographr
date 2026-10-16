@@ -8,8 +8,9 @@ Commits: `ab3dc2e` (hardening), `976edf6` (the rmcp engine swap), `9f6209a`
 + concurrency cap), `15aa3ff` (`subscriptions/listen` + registry hot-swap),
 `f037383`/`8d27006`/`a348c89` (P5: name hygiene, config, surfaces, logs),
 `0a85184` (D9 flip + P6 hardening), and the 2026-07-28-era conformance run. M1 and
-M2/D13 have landed; the originally-deferred OAuth work (P3/D7) now lives in
-`docs/plans/oauth-unified.md`. See §1.2 and §7.
+M2/D13 have landed; the originally-deferred OAuth work (P3/D7) also **shipped**:
+MCP credentials live in the daemon keystore (not a separate file store) and MCP
+OAuth is built on `rmcp`'s `auth` feature. See §1.2 and §7.
 **Lifecycle:** this file is **deleted once the plan is fully implemented**. Nothing
 written during implementation may reference it — rustdoc, `ARCHITECTURE.md`,
 `README.md`, release notes, and commit messages must stand on their own, because a
@@ -21,11 +22,11 @@ surface), root `Cargo.toml` + `Cargo.lock` (new dependencies; `mcp` moves into
 the default feature set for M1 — D9).
 **Touches (when implemented):** `choreo-mcp` (rewritten around `rmcp`; new
 `runtime.rs` / `session.rs` / `engine.rs` / `config.rs` / `stdio.rs` / `naming.rs`
-modules landed through P5; `auth.rs` and the OAuth glue are post-ship),
+modules landed through P5; `auth.rs` and the OAuth glue also landed),
 `choreo-daemon` (`src/mcp/{mod,config,tool}.rs` and `src/daemon.rs` cancel
 plumbing landed through P1–P5; `src/daemon/open.rs`, `src/server/core.rs` carry
 the registry swap; the CLI lives in `cli.rs`), `choreo-tui` (`/mcp` status +
-reconnect landed; sign-in post-ship), `choreo-proto` (the
+reconnect landed; sign-in landed), `choreo-proto` (the
 `McpStatusRequest`/`McpReconnect` client request and `McpStatus` reply landed in
 P5), the justfile (`doc_crates` stays current), `ARCHITECTURE.md`, `README.md`,
 `packaging/`.
@@ -58,7 +59,8 @@ P5), the justfile (`doc_crates` stays current), `ARCHITECTURE.md`, `README.md`,
 > live tool-list refresh, bounds, tool-name hygiene, config layers, a `/mcp`
 > status surface + `choreographr mcp` CLI, per-server logs, and the official
 > conformance suite running both protocol eras in CI. **M1 is complete**; the
-> deferred OAuth work (P3/D7) has moved to `docs/plans/oauth-unified.md`. See §1.2
+> deferred OAuth work (P3/D7) has since shipped — MCP credentials live in the
+> daemon keystore and MCP OAuth is built on `rmcp`'s `auth` feature. See §1.2
 > and §7.
 
 ---
@@ -699,12 +701,13 @@ too. Nothing remains open in this decision.
 ### D7 — Credentials (superseded)
 
 The original MCP credential design — OAuth tokens in a `mcp-auth/` file store keyed
-by (issuer, resource) — is **superseded by `docs/plans/oauth-unified.md`**: MCP
+by (issuer, resource) — was **replaced by the shipped design**: MCP
 credentials live in the **daemon keystore** (the same store as every other
 credential), row-keyed `mcp:<slug>|<target-hash>`, and MCP OAuth is built on
-`rmcp`'s `auth` feature. Until that ships, the supported path is an explicit
-`Authorization` (or other) header in `mcp.json`, `${VAR}`-expanded, and an
-OAuth-requiring server fails with the actionable `AuthRequired` error (P5).
+`rmcp`'s `auth` feature. The other supported path is an explicit
+`Authorization` (or other) header in `mcp.json`, `${VAR}`-expanded; an
+OAuth-requiring server that has not been signed into fails with the actionable
+`AuthRequired` error (P5).
 
 ### D8 — Elicitation: advertise only with a UI
 
@@ -1302,13 +1305,13 @@ Post-ship (fast-follow, around P3):
       stubborn-server fixture backs both a `choreo-mcp` and a daemon test
       proving shutdown returns within its bounded wait.
 
-### P3 — OAuth for remote servers (superseded)
+### P3 — OAuth for remote servers (shipped)
 
-**Moved to `docs/plans/oauth-unified.md`** (§8/§8.1), which replaces this phase and
-D7: MCP credentials go to the daemon keystore, MCP OAuth is built on `rmcp`'s `auth`
-feature, login is loopback + paste-URL, and credentials are target-scoped and
-trust-gated. Until that ships, the supported path is a static token in `headers`,
-with the P5 actionable `AuthRequired` error for an OAuth-requiring server.
+**Shipped**, replacing this phase and D7: MCP credentials go to the daemon
+keystore, MCP OAuth is built on `rmcp`'s `auth` feature, login is loopback +
+paste-URL, and credentials are target-scoped and trust-gated. The other supported
+path is a static token in `headers`, with the P5 actionable `AuthRequired` error
+for an OAuth-requiring server that has not been signed into.
 
 ## 8. Testing strategy
 
@@ -1538,9 +1541,8 @@ The feature-row flip (D9) still waits on the default-on change.
    escape hatch gives a stateful server a private connection per session that
    uses it.
 3. *(Post-ship, P3)* Where does `mcp login` live for the GUI (embedded daemon) —
-   GUI modal or loopback browser? Resolved with the unified OAuth plan
-   (`docs/plans/oauth-unified.md`): GUI modal over the shared login library; TUI/CLI
-   land first.
+   GUI modal or loopback browser? Resolved: GUI modal over the shared login library;
+   TUI/CLI land first.
 4. Is the 2 s startup budget right, or should server availability be fully lazy
    (tools appear when connected)? P1 shipped the 2 s batch budget (stragglers
    skipped and logged); revisit if real configs routinely miss it.
@@ -1596,8 +1598,8 @@ P0–P6 and D9 are complete.
 
 ### Post-ship
 
-- [ ] Remote OAuth server sign-in works end-to-end with refresh and logout
-      (P3) — **now tracked in `docs/plans/oauth-unified.md`**.
+- [x] Remote OAuth server sign-in works end-to-end with refresh and logout
+      (P3) — **shipped** (keystore-backed, target-scoped credentials).
 - [ ] The remaining fast-follows land: `exposure` + deferred tool search, and
       the config-watcher auto-reload for `mcp_servers.json` (D12).
 - [ ] The two deferred robustness items land — or are reconfirmed deferred with

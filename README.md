@@ -423,7 +423,9 @@ itself off as you go, and names the keys for each step:
 1. **Add an account** — `Alt+A`, then `n`. Pick a provider (the most common
    ones are listed first; type to filter), keep the suggested account name or
    type your own, and paste the API key. The key is encrypted before it leaves
-   the TUI.
+   the TUI. A provider that signs in with OAuth instead (e.g. a ChatGPT/Codex
+   subscription) takes no key — create the account, then run
+   `/login <account>` to sign in.
 2. **Use it in this session** — automatic for a session that has no account
    yet: once the daemon confirms the key, the TUI selects the account and
    opens the model picker. Otherwise select an account on the `Alt+A` page and
@@ -736,6 +738,17 @@ providers for accounts that disappeared and rebuilds them for ones whose config
 changed, and pushes the fresh list to connected clients); the daemon's own
 `/add-key` writes are detected and ignored as no-ops.
 
+An account authenticates with an API key (`/add-key <account> <key>`), or — for
+a provider whose catalog entry carries an OAuth profile, such as `chatgpt` —
+with an OAuth sign-in (`/login <account>`, alias `/add-oauth`; add `--device`
+for the headless device-code flow). An account holds **one** credential, so
+signing in replaces an existing key for that account (and vice versa). The
+durable grant (refresh token + client registration + identity claim) is
+encrypted at rest in the keystore; the short-lived access token lives in daemon
+memory only, is refreshed and rotated transparently as it expires (a proactive
+buffer refresh, and a force-once refresh on a `401`), and a terminal rejection
+surfaces a re-login notice.
+
 ```toml
 [[account]]
 name = "main"
@@ -911,10 +924,37 @@ A remote server that needs credentials uses a static token in `headers`:
 }
 ```
 
-**OAuth is not yet supported.** A server that insists on an interactive OAuth
-sign-in and has no static token fails with a clear, actionable error naming both
-the static-token path above and the pending OAuth support, rather than a raw
-status string.
+**OAuth.** A remote server that requires an interactive OAuth sign-in declares
+an `oauth` block (all fields optional: `clientId` for an authorization server
+with neither dynamic client registration nor a client-metadata document,
+`callbackPort`, and `scopes`) — never a `clientSecret`, which a confidential
+client reads from the environment, not a repo-controlled config file:
+
+```json
+{
+  "mcpServers": {
+    "docs": {
+      "url": "https://example.com/mcp",
+      "oauth": { "scopes": ["mcp.read"] }
+    }
+  }
+}
+```
+
+`mcp login <slug>` runs a PKCE sign-in: it discovers the authorization server
+(RFC 9728 protected-resource metadata → RFC 8414/OIDC), registers a client
+dynamically when no `clientId` is configured, and drives a loopback callback
+(with a paste-URL fallback for a headless/remote host — there is no device-code
+flow here). The durable grant is stored in the same encrypted keystore as
+provider credentials, keyed by the server's target (`mcp:<slug>|<target-hash>`) so
+a same-slug server on a different endpoint keeps its own credential; `mcp logout
+<slug>` removes it. A project server's `oauth` block is repo-controlled, so
+sign-in for it refuses while the project root is untrusted, and a stored grant
+whose issuer or resource no longer matches the configured server is treated as
+absent (fail-closed) and surfaces a re-login. Token refresh at connect is owned
+by the `rmcp` client's authorization manager. A server that requires
+authorization and has neither a static token nor a completed sign-in fails with
+a clear, actionable error naming both paths rather than a raw status string.
 
 Manage servers from the command line:
 
@@ -980,6 +1020,7 @@ runs the command**, and `Esc` discards the line without cancelling anything.
 - `/account list` — list configured AI provider accounts
 - `/account remove <name>` — remove an AI provider account
 - `/account <name>` — set the session's AI provider account
+- `/login <account>` — sign in to an existing account's provider with OAuth (alias `/add-oauth`). Opens the provider's consent screen in a browser via a loopback callback; pass `--device` for the headless device-code flow on a remote/SSH host. Stores the grant in the keystore exactly like an API key (and, like a key, selects the account and opens the model picker on success)
 - `Alt+A` — open the AI provider accounts page (list accounts; `Enter` sets the highlighted account on the active session and returns to chat, `r` removes, `c` opens the API-key modal, `n` starts the new-account wizard; a click on an account row does the same as selecting it and pressing `Enter`, and the mouse wheel scrolls the highlight)
 - `Alt+S` — open the session manager page (list sessions; `j`/`k` or the mouse wheel navigate, `Enter` attaches to the highlighted session and returns to chat, `i` opens details, `n` creates a new session and switches this client to it, `d` deletes, `p` pins/unpins the highlighted session, `a` archives it, `Tab` toggles between the live session list and the archived list (`a` unarchives on the archived list); a click on a session row does the same as selecting it and pressing `Enter`, and `Esc` returns to chat). Pinned sessions sort to the top of both lists; archiving a session moves it out of the live list and into the archived list. The pin/archive keys only *ask* the daemon — the change is applied when the daemon broadcasts the new flag state, and a failure is shown on the page
 - New-account wizard (`n` on the accounts page) — centered modal windows: a **searchable provider picker** (type to filter by provider name, `↑`/`↓`/`PgUp`/`PgDn` or the mouse wheel navigate, `Enter` or a click on a row picks — the list is alphabetical), then a separate **slug modal** (enter the account's unique name, e.g. `/account <slug>`); `Enter` creates the account and jumps straight to the **API-key modal**
@@ -1220,8 +1261,10 @@ expected-failures baseline at
 `choreo-mcp/tests/conformance/expected-failures.yml` (it needs Node.js and
 network access, so it is a CI/release-time gate, not part of `pre-commit`). Every
 non-auth client scenario passes on both wires; the baseline records the OAuth
-scenarios (unimplemented until the post-ship auth work) and the un-advertised
-elicitation scenario. A new regression fails the run; so does a baseline entry
+scenarios (the bare conformance client connects with a static, unauthenticated
+transport and drives no sign-in, so it never gets past the server's 401
+challenge) and the un-advertised elicitation scenario. A new regression fails the
+run; so does a baseline entry
 that has started passing, which is how the baseline shrinks as gaps are fixed.
 
 ### justfile
