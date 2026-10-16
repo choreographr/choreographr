@@ -14,6 +14,24 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
+/// Which OAuth profile an [`ServiceCredential::OAuth`] credential serves.
+///
+/// The kind selects the refresh client and the request-header policy: a
+/// `Provider` grant refreshes through the daemon's own provider OAuth client,
+/// while an `Mcp` grant refreshes through the MCP authorization manager. It is
+/// a fieldless discriminator (no secret), so `Debug` is safely derived; the
+/// `Zeroize` derive is a no-op here but keeps the whole credential enum
+/// uniformly zeroizable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Zeroize)]
+pub enum OAuthKind {
+    /// An inference-provider OAuth grant (e.g. `ChatGPT`/`Codex`).
+    #[serde(rename = "provider")]
+    Provider,
+    /// A remote MCP server's OAuth grant.
+    #[serde(rename = "mcp")]
+    Mcp,
+}
+
 /// A stored service credential.
 ///
 /// The variants discriminate the per-service secret material the daemon holds
@@ -57,6 +75,41 @@ pub enum ServiceCredential {
         /// Raw 32-byte public key (=== account id bytes).
         public: Vec<u8>,
     },
+    /// An OAuth credential: the durable grant a provider's or an MCP
+    /// authorization server issued at login, refreshed by the daemon when the
+    /// access token expires or a request is rejected with 401.
+    ///
+    /// It carries only the irreducible, durable subset — the refresh token,
+    /// the client registration, and the extracted identity claims. The access
+    /// token is derived, ephemeral, and lives in daemon memory only; the raw
+    /// `id_token` is never stored (only the claim extracted from it).
+    #[serde(rename = "oauth")]
+    OAuth {
+        /// Which OAuth profile this serves (provider versus MCP).
+        kind: OAuthKind,
+        /// Authorization-server issuer, validated against discovery.
+        issuer: Option<String>,
+        /// RFC 8707 resource indicator — the MCP server URL (MCP only).
+        resource: Option<String>,
+        /// Authorization-server base URL, so refresh needs no re-discovery
+        /// (MCP).
+        authorization_server: Option<String>,
+        /// Long-lived token that mints a new access token: the durable grant
+        /// root, rewritten when a refresh rotates it.
+        refresh_token: Option<String>,
+        /// Identity claim extracted from the `id_token` at login (for `ChatGPT`,
+        /// its `chatgpt_account_id`). The raw JWT is not stored.
+        account_id: Option<String>,
+        /// The client id actually used at login, recorded so refresh does not
+        /// depend on the catalog table matching.
+        client_id: Option<String>,
+        /// Client secret, for confidential clients (MCP).
+        client_secret: Option<String>,
+        /// The scopes granted at login.
+        granted_scopes: Vec<String>,
+        /// Bearer token type; almost always "Bearer".
+        token_type: Option<String>,
+    },
 }
 
 /// Redacting display to prevent secret leakage in logs.
@@ -96,6 +149,18 @@ fn fmt_redacted(credential: &ServiceCredential, f: &mut fmt::Formatter<'_>) -> f
         }
         ServiceCredential::Substrate { .. } => {
             write!(f, "Substrate {{ name: ***, account_id: ***, seed: *** }}")
+        }
+        ServiceCredential::OAuth { kind, .. } => {
+            // Every OAuth field is redacted — the refresh token, the client
+            // secret, and the identity/issuer strings are all sensitive. Only
+            // the fieldless `kind` discriminator is printed plainly.
+            write!(
+                f,
+                "OAuth {{ kind: {kind:?}, issuer: ***, resource: ***, \
+                 authorization_server: ***, refresh_token: ***, account_id: ***, \
+                 client_id: ***, client_secret: ***, granted_scopes: ***, \
+                 token_type: *** }}"
+            )
         }
     }
 }
@@ -153,6 +218,48 @@ impl fmt::Debug for SubstrateCredentialView<'_> {
     }
 }
 
+/// Borrowed view of an OAuth credential's fields. Mirrors the borrowed views
+/// used for the `X` and `Substrate` variants; avoids allocating a separate
+/// struct. Like them it redacts every secret in [`Debug`](fmt::Debug).
+#[derive(Clone, Copy)]
+pub struct OAuthCredentialView<'a> {
+    /// Which OAuth profile this serves.
+    pub kind: OAuthKind,
+    /// Authorization-server issuer.
+    pub issuer: Option<&'a str>,
+    /// RFC 8707 resource indicator (MCP only).
+    pub resource: Option<&'a str>,
+    /// Authorization-server base URL (MCP).
+    pub authorization_server: Option<&'a str>,
+    /// Long-lived refresh token (the durable grant root).
+    pub refresh_token: Option<&'a str>,
+    /// Identity claim extracted from the `id_token` at login.
+    pub account_id: Option<&'a str>,
+    /// The client id used at login.
+    pub client_id: Option<&'a str>,
+    /// Client secret, for confidential clients.
+    pub client_secret: Option<&'a str>,
+    /// The scopes granted at login.
+    pub granted_scopes: &'a [String],
+    /// Bearer token type.
+    pub token_type: Option<&'a str>,
+}
+
+/// Redacting `Debug` so a logged view cannot expose the secret fields it
+/// borrows (mirrors [`ServiceCredential`]'s hand-written `Debug`).
+impl fmt::Debug for OAuthCredentialView<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "OAuthCredentialView {{ kind: {:?}, issuer: ***, resource: ***, \
+             authorization_server: ***, refresh_token: ***, account_id: ***, \
+             client_id: ***, client_secret: ***, granted_scopes: ***, \
+             token_type: *** }}",
+            self.kind
+        )
+    }
+}
+
 impl ServiceCredential {
     /// Returns a view of the X credential fields if this is the X variant.
     #[must_use]
@@ -190,6 +297,38 @@ impl ServiceCredential {
                 account_id,
                 secret,
                 public,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Returns a view of the OAuth credential fields if this is the OAuth
+    /// variant.
+    #[must_use]
+    pub fn as_oauth(&self) -> Option<OAuthCredentialView<'_>> {
+        match self {
+            ServiceCredential::OAuth {
+                kind,
+                issuer,
+                resource,
+                authorization_server,
+                refresh_token,
+                account_id,
+                client_id,
+                client_secret,
+                granted_scopes,
+                token_type,
+            } => Some(OAuthCredentialView {
+                kind: *kind,
+                issuer: issuer.as_deref(),
+                resource: resource.as_deref(),
+                authorization_server: authorization_server.as_deref(),
+                refresh_token: refresh_token.as_deref(),
+                account_id: account_id.as_deref(),
+                client_id: client_id.as_deref(),
+                client_secret: client_secret.as_deref(),
+                granted_scopes,
+                token_type: token_type.as_deref(),
             }),
             _ => None,
         }
@@ -440,6 +579,148 @@ mod tests {
                 assert!(public.iter().all(|&b| b == 0));
             }
             _ => panic!("expected Substrate variant"),
+        }
+    }
+
+    /// A fully-populated OAuth credential, for the redaction/zeroize tests.
+    fn oauth_credential() -> ServiceCredential {
+        ServiceCredential::OAuth {
+            kind: OAuthKind::Provider,
+            issuer: Some("https://auth.openai.com".into()),
+            resource: Some("https://api.example/v1".into()),
+            authorization_server: Some("https://as.example".into()),
+            refresh_token: Some("refresh-supersecret".into()),
+            account_id: Some("acct-supersecret".into()),
+            client_id: Some("client-supersecret".into()),
+            client_secret: Some("clientsecret-supersecret".into()),
+            granted_scopes: vec!["openid".into(), "offline_access".into()],
+            token_type: Some("Bearer".into()),
+        }
+    }
+
+    #[test]
+    fn service_credential_as_oauth_returns_view() {
+        let cred = oauth_credential();
+        let view = cred.as_oauth().expect("expected OAuth view");
+        assert_eq!(view.kind, OAuthKind::Provider);
+        assert_eq!(view.issuer, Some("https://auth.openai.com"));
+        assert_eq!(view.resource, Some("https://api.example/v1"));
+        assert_eq!(view.authorization_server, Some("https://as.example"));
+        assert_eq!(view.refresh_token, Some("refresh-supersecret"));
+        assert_eq!(view.account_id, Some("acct-supersecret"));
+        assert_eq!(view.client_id, Some("client-supersecret"));
+        assert_eq!(view.client_secret, Some("clientsecret-supersecret"));
+        assert_eq!(view.granted_scopes, ["openid", "offline_access"]);
+        assert_eq!(view.token_type, Some("Bearer"));
+    }
+
+    #[test]
+    fn service_credential_as_oauth_returns_mcp_kind() {
+        let mut cred = oauth_credential();
+        if let ServiceCredential::OAuth { kind, .. } = &mut cred {
+            *kind = OAuthKind::Mcp;
+        }
+        let view = cred.as_oauth().expect("expected OAuth view");
+        assert_eq!(view.kind, OAuthKind::Mcp);
+    }
+
+    #[test]
+    fn service_credential_as_oauth_none_for_other_variant() {
+        let cred = ServiceCredential::ApiKey {
+            key: "sk-test".into(),
+        };
+        assert!(cred.as_oauth().is_none());
+    }
+
+    #[test]
+    fn service_credential_oauth_display_redacts_secrets() {
+        let display = format!("{}", oauth_credential());
+        for secret in [
+            "auth.openai.com",
+            "api.example",
+            "as.example",
+            "refresh-supersecret",
+            "acct-supersecret",
+            "client-supersecret",
+            "clientsecret-supersecret",
+            "openid",
+            "offline_access",
+            "Bearer",
+        ] {
+            assert!(!display.contains(secret), "Display leaked {secret}");
+        }
+        // Nine redacted fields; the fieldless `kind` is printed plainly.
+        assert_eq!(display.matches("***").count(), 9);
+        assert!(display.contains("kind: Provider"));
+    }
+
+    #[test]
+    fn service_credential_oauth_debug_redacts_secrets() {
+        let debug = format!("{:?}", oauth_credential());
+        for secret in [
+            "auth.openai.com",
+            "refresh-supersecret",
+            "clientsecret-supersecret",
+            "offline_access",
+        ] {
+            assert!(!debug.contains(secret), "Debug leaked {secret}");
+        }
+        assert_eq!(debug.matches("***").count(), 9);
+    }
+
+    #[test]
+    fn oauth_credential_view_debug_redacts_secrets() {
+        let cred = oauth_credential();
+        let view = cred.as_oauth().expect("expected OAuth view");
+        let debug = format!("{view:?}");
+        for secret in [
+            "auth.openai.com",
+            "refresh-supersecret",
+            "clientsecret-supersecret",
+            "openid",
+        ] {
+            assert!(!debug.contains(secret), "view Debug leaked {secret}");
+        }
+        assert_eq!(debug.matches("***").count(), 9);
+    }
+
+    #[test]
+    fn service_credential_oauth_zeroize_clears_fields() {
+        let mut cred = oauth_credential();
+        cred.zeroize();
+        match &cred {
+            ServiceCredential::OAuth {
+                issuer,
+                resource,
+                authorization_server,
+                refresh_token,
+                account_id,
+                client_id,
+                client_secret,
+                granted_scopes,
+                token_type,
+                // The fieldless discriminator carries no bytes to wipe.
+                kind: _,
+            } => {
+                let cleared = |v: &Option<String>| {
+                    v.as_ref()
+                        .is_none_or(|s| s.as_bytes().iter().all(|&b| b == 0))
+                };
+                assert!(cleared(issuer));
+                assert!(cleared(resource));
+                assert!(cleared(authorization_server));
+                assert!(cleared(refresh_token));
+                assert!(cleared(account_id));
+                assert!(cleared(client_id));
+                assert!(cleared(client_secret));
+                assert!(cleared(token_type));
+                assert!(
+                    granted_scopes
+                        .iter()
+                        .all(|s| s.as_bytes().iter().all(|&b| b == 0))
+                );
+            }
+            _ => panic!("expected OAuth variant"),
         }
     }
 }

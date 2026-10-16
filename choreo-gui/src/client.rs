@@ -337,7 +337,7 @@ fn trigger_keystore_auto_bind(state: &mut AppState, daemon_tx: Option<DaemonHand
             // Same pending-confirm flow as Unlock: the `Bound` reply records
             // the minted key.
             state.pending_unlock_key = Some(key.to_vec());
-            send_client_message(state, daemon_tx, msg);
+            send_client_message(state, daemon_tx, *msg);
             true
         }
         // Bind-loop guard: already attempted on this connection.

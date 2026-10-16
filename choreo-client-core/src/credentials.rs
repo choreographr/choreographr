@@ -430,8 +430,11 @@ pub enum AutoBindAttempt {
         /// The freshly-minted binding key, recorded into `known_servers`
         /// before the message is sent.
         key: [u8; 32],
-        /// The `BindKeystore` message carrying that same key.
-        msg: ClientMessageType,
+        /// The `BindKeystore` message carrying that same key. Boxed so this
+        /// variant does not bloat every `AutoBindAttempt` value — a
+        /// `ClientMessageType` is large (it inlines a credential), and this
+        /// one-shot outcome is small and moved, not copied.
+        msg: Box<ClientMessageType>,
     },
     /// Bind-loop guard: a `BindKeystore` was already minted on this
     /// connection. The caller must NOT re-mint; it surfaces its own
@@ -465,7 +468,10 @@ pub fn attempt_keystore_auto_bind(bind: &mut KeystoreAutoBind, addr: &str) -> Au
     match bind.on_unbound(addr) {
         Ok(Some((key, msg))) => {
             info!(addr, "auto-binding unbound daemon with a fresh key");
-            AutoBindAttempt::Bind { key, msg }
+            AutoBindAttempt::Bind {
+                key,
+                msg: Box::new(msg),
+            }
         }
         // The warn log for the suppression already happened in `on_unbound`.
         Ok(None) => AutoBindAttempt::Suppressed,
@@ -961,12 +967,11 @@ mod tests {
 
         let mut bind = KeystoreAutoBind::new();
         let first = attempt_keystore_auto_bind(&mut bind, "attempt-test:1");
-        let AutoBindAttempt::Bind {
-            key,
-            msg: ClientMessageType::BindKeystore { key: wire_key },
-        } = &first
-        else {
+        let AutoBindAttempt::Bind { key, msg } = &first else {
             panic!("first attempt must bind, got {first:?}");
+        };
+        let ClientMessageType::BindKeystore { key: wire_key } = msg.as_ref() else {
+            panic!("bind attempt must carry a BindKeystore message, got {msg:?}");
         };
         assert_eq!(
             wire_key,

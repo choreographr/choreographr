@@ -951,7 +951,7 @@ fn trigger_keystore_auto_bind(
             // The minted key rides the request's pending context so the `Bound`
             // confirmation records it through the SAME path as an `Unlocked` —
             // one confirm flow for all senders.
-            let id = app.pending.send(client_tx, msg);
+            let id = app.pending.send(client_tx, *msg);
             app.pending
                 .set_context(id, PendingContext::UnlockKey(key.to_vec()));
             true

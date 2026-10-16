@@ -39,4 +39,6 @@ pub mod paths;
 pub mod release_name;
 
 pub use clap_styles::clap_styles;
-pub use credential::{ServiceCredential, SubstrateCredentialView, XCredentialView};
+pub use credential::{
+    OAuthCredentialView, OAuthKind, ServiceCredential, SubstrateCredentialView, XCredentialView,
+};

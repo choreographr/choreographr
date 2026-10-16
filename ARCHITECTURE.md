@@ -946,6 +946,12 @@ startup              connect→unbound?        /unlock [key]            AddCrede
   own stored binding before persisting it (one key per keystore).
 - The unlock key is sent over the channel (by `Unlock`/`BindKeystore`); zeroized after use
   by the daemon
+- A credential is one of `ApiKey`, `X`, `Substrate`, or `OAuth`. The `OAuth` variant
+  carries only the durable grant (the refresh token, the client registration, and the
+  identity claim extracted from the id_token — never the raw JWT or the ephemeral
+  access token), discriminated by `OAuthKind` (`Provider` or `Mcp`); every variant
+  participates in `#[zeroize(drop)]` and redacts every secret field in both `Display`
+  and `Debug`
 - `/lock` destroys all in-memory credentials, returning to locked state
 - **The locked state is authoritative and broadcast.** `DaemonState` keeps a single
   `locked: bool` (starts `true`; `false` after a successful Unlock or BindKeystore
