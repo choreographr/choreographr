@@ -13,7 +13,7 @@ mod sse;
 #[cfg(test)]
 mod tests;
 mod zhipu;
-pub use crate::shared::MaxTokensField;
+pub use crate::shared::{MaxTokensField, RequestAuth};
 use crate::types::{ChatTurnResult, StreamEvent};
 use tracing::{debug, info, warn};
 
@@ -471,18 +471,21 @@ impl ChatToolDefinition {
 #[derive(Clone)]
 pub struct OpenAiClient {
     config: ServiceConfig,
-    api_key: zeroize::Zeroizing<String>,
+    /// The request auth (an API key or an OAuth access token plus its derived
+    /// extra headers) consumed per request. Zeroizing is inside `RequestAuth`,
+    /// so the bearer bytes are wiped when the client drops.
+    auth: RequestAuth,
     http: ureq::Agent,
 }
 
 // Manual Debug impl: derived Debug would print the raw API key if a client is
-// ever logged.  Redact the key (`***`) while still delegating the other fields
+// ever logged.  Redact the auth (`***`) while still delegating the other fields
 // (config, http) so the struct stays useful in logs.
 impl std::fmt::Debug for OpenAiClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenAiClient")
             .field("config", &self.config)
-            .field("api_key", &"***")
+            .field("auth", &"***")
             .field("http", &self.http)
             .finish()
     }
@@ -497,7 +500,7 @@ impl OpenAiClient {
     /// the registry/timeouts.
     pub fn new(
         config: ServiceConfig,
-        api_key: String,
+        auth: RequestAuth,
         registry: &SocketRegistry,
     ) -> io::Result<Self> {
         let http = crate::shared::build_agent(
@@ -507,13 +510,7 @@ impl OpenAiClient {
             config.total_timeout_secs,
             config.user_agent.as_deref(),
         );
-        // Zeroizing<String> wipes the key bytes from memory when the client is
-        // dropped; `new` keeps its `String` signature so callers are unaffected.
-        Ok(Self {
-            config,
-            api_key: zeroize::Zeroizing::new(api_key),
-            http,
-        })
+        Ok(Self { config, auth, http })
     }
 
     /// The client's configuration.
@@ -522,12 +519,15 @@ impl OpenAiClient {
         &self.config
     }
 
-    /// The API key, for callers that must rebuild a client or inspect it. Kept
-    /// as a borrowed `&str` so the zeroizing owner stays inside the client.
+    /// The API key when this client authenticates with one; `None` for an OAuth
+    /// client. Kept as a borrowed `&str` so the zeroizing owner stays inside the
+    /// client.
     #[must_use]
-    pub fn api_key(&self) -> &str {
-        // `Zeroizing<String>` derefs to `String`, so `as_str()` works directly.
-        self.api_key.as_str()
+    pub fn api_key(&self) -> Option<&str> {
+        match &self.auth {
+            RequestAuth::ApiKey(key) => Some(key.as_str()),
+            RequestAuth::OAuth { .. } => None,
+        }
     }
 
     // ── High-level dispatch methods ────────────────────────────────────
@@ -551,14 +551,8 @@ impl OpenAiClient {
         // temporary would be dropped before the retry call below (E0716).
         let mut no_retry = None;
         let mut ctx = retry::AttemptContext::new(&mut no_retry, None, None);
-        let response = retry::retry_send_get(
-            &self.http,
-            &url,
-            &self.api_key,
-            &self.config,
-            &retry,
-            &mut ctx,
-        )?;
+        let response =
+            retry::retry_send_get(&self.http, &url, &self.auth, &self.config, &retry, &mut ctx)?;
         let payload: ModelListResponse = response
             .into_body()
             .read_json()
@@ -579,7 +573,7 @@ impl OpenAiClient {
             RequestFormat::Responses => responses::responses_request(
                 &self.http,
                 &self.config,
-                &self.api_key,
+                &self.auth,
                 model,
                 prompt,
                 None,
@@ -587,7 +581,7 @@ impl OpenAiClient {
             RequestFormat::ChatCompletions => chat_completions::chat_completions_request(
                 &self.http,
                 &self.config,
-                &self.api_key,
+                &self.auth,
                 model,
                 prompt,
                 None,
@@ -623,7 +617,7 @@ impl OpenAiClient {
             RequestFormat::Responses => responses::responses_request_streaming(
                 &self.http,
                 &self.config,
-                &self.api_key,
+                &self.auth,
                 SimpleParams {
                     model,
                     prompt,
@@ -635,7 +629,7 @@ impl OpenAiClient {
             RequestFormat::ChatCompletions => chat_completions::chat_completions_request_streaming(
                 &self.http,
                 &self.config,
-                &self.api_key,
+                &self.auth,
                 SimpleParams {
                     model,
                     prompt,
@@ -694,17 +688,14 @@ impl OpenAiClient {
             no_retry: params.no_retry,
         };
         let result = match self.config.request_format_for_model(model) {
-            RequestFormat::Responses => responses::responses_request_with_tools(
-                &self.http,
-                &self.config,
-                &self.api_key,
-                turn,
-            ),
+            RequestFormat::Responses => {
+                responses::responses_request_with_tools(&self.http, &self.config, &self.auth, turn)
+            }
             RequestFormat::ChatCompletions => {
                 chat_completions::chat_completions_request_with_tools(
                     &self.http,
                     &self.config,
-                    &self.api_key,
+                    &self.auth,
                     turn,
                 )
             }
@@ -770,7 +761,7 @@ impl OpenAiClient {
             RequestFormat::Responses => responses::responses_request_streaming_with_tools(
                 &self.http,
                 &self.config,
-                &self.api_key,
+                &self.auth,
                 turn,
                 &mut on_event,
             ),
@@ -778,7 +769,7 @@ impl OpenAiClient {
                 chat_completions::chat_completions_request_streaming_with_tools(
                     &self.http,
                     &self.config,
-                    &self.api_key,
+                    &self.auth,
                     turn,
                     &mut on_event,
                 )

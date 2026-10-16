@@ -92,6 +92,7 @@ pub(super) fn make_daemon_state() -> (DaemonState, crossbeam_channel::Receiver<D
         session_registries: HashMap::new(),
         session_mcp_projects: HashMap::new(),
         credentials: HashMap::new(),
+        access_tokens: HashMap::new(),
         x_credentials: None,
         // Test states start locked, matching the production daemon.
         locked: true,
@@ -3238,6 +3239,7 @@ fn tiny_base() -> Vec<choreo_ai_protocols::ProviderEntry> {
         default_model: "tiny-1".into(),
         prompt_cache: None,
         request_compression: choreo_ai_protocols::RequestCompression::Identity,
+        oauth: None,
         models: vec![choreo_ai_protocols::ModelEntry {
             model: "tiny-1".into(),
             context_window: 4096,
@@ -3689,6 +3691,16 @@ fn handle_lock_clears_credentials_latches_locked_and_broadcasts() {
     state.x_credentials = Some(ServiceCredential::ApiKey {
         key: "x-secret".to_string(),
     });
+    // A cached OAuth access token must be wiped on /lock alongside the
+    // credentials it was derived from.
+    state.access_tokens.insert(
+        "openai".to_string(),
+        crate::daemon::AccessTokenCache {
+            access_token: zeroize::Zeroizing::new("at-secret".to_string()),
+            expires_at: Some(1_700_000_000),
+            received_at: 1_699_999_000,
+        },
+    );
 
     let (reply, reply_rx) = mpsc::channel();
     state.handle_command(DaemonCommand::Lock { reply });
@@ -3699,6 +3711,10 @@ fn handle_lock_clears_credentials_latches_locked_and_broadcasts() {
     assert!(reply_rx.recv().unwrap().is_ok());
     assert!(state.locked, "/lock must latch the locked state");
     assert!(state.credentials.is_empty(), "credentials cleared");
+    assert!(
+        state.access_tokens.is_empty(),
+        "/lock must clear cached OAuth access tokens"
+    );
     assert!(state.x_credentials.is_none(), "x credential cleared");
     assert!(
         matches!(cmd_rx.try_recv(), Ok(SessionCommand::DropProvider)),
@@ -3735,6 +3751,61 @@ fn handle_lock_when_already_locked_does_not_rebroadcast() {
         writer_rx.try_recv().is_err(),
         "locking an already-locked daemon must not re-broadcast the Locked state"
     );
+}
+
+#[test]
+fn auth_for_resolves_api_key_and_oauth_grants() {
+    let (mut state, _rx) = make_daemon_state();
+    state.credentials.insert(
+        "api-acct".to_string(),
+        ServiceCredential::ApiKey {
+            key: "sk-1".to_string(),
+        },
+    );
+    state.credentials.insert(
+        "oauth-acct".to_string(),
+        ServiceCredential::OAuth {
+            kind: choreo_keystore::OAuthKind::Provider,
+            issuer: Some("https://auth.openai.com".to_string()),
+            resource: None,
+            authorization_server: None,
+            refresh_token: Some("refresh-1".to_string()),
+            account_id: Some("acct-1".to_string()),
+            client_id: None,
+            client_secret: None,
+            granted_scopes: Vec::new(),
+            token_type: None,
+        },
+    );
+    state.access_tokens.insert(
+        "oauth-acct".to_string(),
+        AccessTokenCache {
+            access_token: zeroize::Zeroizing::new("at-1".to_string()),
+            expires_at: None,
+            received_at: 0,
+        },
+    );
+
+    // An API-key credential projects straight through.
+    match state.auth_for("api-acct").expect("api key resolves") {
+        ProviderAuth::ApiKey { key } => assert_eq!(key.as_str(), "sk-1"),
+        other @ ProviderAuth::OAuth { .. } => panic!("expected ApiKey, got {other:?}"),
+    }
+    // An OAuth credential carries its grant plus the cached access token.
+    match state.auth_for("oauth-acct").expect("oauth resolves") {
+        ProviderAuth::OAuth {
+            access_token: Some(token),
+            credential,
+        } => {
+            assert_eq!(token.as_str(), "at-1");
+            assert!(credential.as_oauth().is_some(), "grant data must survive");
+        }
+        other => panic!("expected OAuth with a token, got {other:?}"),
+    }
+    // No credential → no grant.
+    assert!(state.auth_for("missing").is_none());
+    assert!(!state.has_credential("missing"));
+    assert!(state.has_credential("api-acct"));
 }
 
 // ── Background model prefetch ────────────────────────────────────────────

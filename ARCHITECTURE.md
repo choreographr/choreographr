@@ -609,6 +609,59 @@ daemon) are documented in-source (the `catalog` module and
 `catalog/models-overlay.toml`), held complete by the `#![warn(missing_docs)]` +
 `doc-check` gate.
 
+### Provider auth: grant versus request material
+
+Provider authentication is a **two-layer** model, split so the durable grant
+never leaves the daemon and the wire crate never learns about refresh. The
+daemon resolves an account to a `ProviderAuth` (`choreo-daemon/src/providers/auth.rs`):
+either an API-key grant (`ApiKey { key }`) or an OAuth grant
+(`OAuth { credential, access_token }`), where the OAuth arm carries the whole
+`ServiceCredential::OAuth` (the refresh token, client registration, and identity
+claims) plus any cached ephemeral access token. A client consumes a
+`RequestAuth` (`choreo-ai-protocols/src/shared.rs`): the bearer material plus any
+credential-derived extra headers, and nothing else. `ProviderAuth::into_request_auth`
+is the projection between them, and it is the one place a not-yet-signed-in OAuth
+account (a grant with no cached access token) becomes a clean error rather than a
+request with an empty bearer. `choreo-ai-protocols` gains no `choreo-shared`
+dependency: only the already-derived `RequestAuth` crosses into it.
+
+`from_account_config` stays the single protocol dispatch. For the OpenAI protocol
+it converts the grant to `RequestAuth` and builds the chat client from it, while
+image generation — API-key-only — gets an image backend only for an API-key
+grant (an OAuth account simply has none). The Anthropic and Google protocols have
+no OAuth path in this stack, so they extract the API key and reject an OAuth grant
+with the existing "no API key" guidance. `RequestAuth` is threaded through the
+OpenAI request path to the retry layer (`openai/retry.rs`), which builds the
+`Authorization: Bearer …` value from it and **merges** its credential-derived
+extra headers with the opencode gateway routing headers (both apply to one
+request).
+
+The credential-derived headers are policy, kept in one function
+(`auth.rs::derive_headers`) so a later provider is added as data: the
+`ChatGPT`/Codex `chatgpt-account-id` header (the `account_id` claim extracted at
+login, sent only when present) and a stable `originator` app id. An API-key grant
+sends none of them.
+
+Two facts drive the auth shape, and each lives in exactly one place. The
+**catalog `oauth` profile** (`choreo-ai-protocols/src/catalog/`) is user-editable
+**data** — an optional `[provider.<slug>.oauth]` overlay block carrying the
+issuer, endpoint paths, scopes, redirect ports, per-endpoint grant encodings
+(form versus JSON), a device-code flag, and a public client id. A provider's auth
+kind is **derived** from it (`ProviderEntry::auth_kind`: an `oauth` profile means
+OAuth, its absence API key), never a separate attribute, so models.dev stays the
+one fact source and the overlay the one policy layer. The **client-identity
+table** (`choreo-ai-protocols/src/identity.rs`) is compiled **policy** — which
+posture (register our own client, borrow the vendor CLI's id, or delegate) applies
+per provider slug — and is deliberately not overlay-overridable. Shipping or
+using a borrowed vendor client id is gated behind an explicit per-install opt-in
+(`borrowed_ids_enabled`, default off).
+
+The **token cache** (`DaemonState::access_tokens`, keyed by account) holds the
+ephemeral access token plus its expiry and receipt time, in daemon memory only —
+never persisted, since the refresh token in the credential blob is the durable
+root. It is owned by the command loop (single writer) and wiped on `/lock`
+alongside the credentials map.
+
 ### Request-body compression
 
 Every LLM turn re-sends the whole conversation plus the tool schemas as JSON,
@@ -785,10 +838,10 @@ Currently supports 208 providers (184 from the models.dev base + 24 overlay-only
 > | Provider(s) | Reason deferred |
 > |---|---|
 > | `amazon-bedrock`, `google-vertex`, `azure-foundry`, `azure-openai-responses` | Multi-field credentials (AWS keys/region, GCP service account, Azure resource + key). The daemon's single-API-key credential model cannot represent them yet. |
-> | `chatgpt` (Codex), `openai-codex` OAuth, `copilot`/`copilot-acp`, `qwen-oauth`, `kimi-code` OAuth, `github-copilot` OAuth, `radius` | OAuth-only / dynamic-catalog auth — no static API-key path. The slugs above that do have an API-key path (`openai-codex`, `kimi-code`, `github-copilot`) are catalogued; the pure-OAuth ones are not. |
+> | `chatgpt` (Codex), `copilot`/`copilot-acp`, `qwen-oauth`, `kimi-code` OAuth, `github-copilot` OAuth, `radius` | OAuth-only / dynamic-catalog auth — no static API-key path. The catalog now carries an `oauth` profile mechanism and a per-slug client-identity table (see Provider auth above); the OpenAI routes (the token-sharing `openai` route and the borrowed-id `chatgpt` Codex route) are the first proof, with the others added as data. |
 > | `cursor` | t3code subprocess driver (spawns the Cursor CLI), not a direct HTTP provider. |
 >
-> Adding them requires daemon-side OAuth support and/or multi-field credentials, both out of scope for the current catalog model.
+> Adding the multi-field-credential providers requires a credential generalization (a `Fields` credential variant); the OAuth providers are added through the catalog `oauth` profile and the client-identity table, not a code change.
 
 ### Daemon client & request topology
 

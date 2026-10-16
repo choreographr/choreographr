@@ -19,6 +19,20 @@
 //! reasoning_passback = "response_id"
 //! prompt_cache_short = 300             # per-model TTL override
 //! prompt_cache_long = 3600
+//!
+//! # OAuth profile (overlay-only policy). All fields except `client_id` are
+//! # required; a partial block is warned and skipped, leaving the provider's
+//! # API-key default in place.
+//! [provider.chatgpt.oauth]
+//! issuer = "https://auth.openai.com"
+//! authorize_path = "/oauth/authorize"
+//! token_path = "/oauth/token"
+//! scopes = ["openid", "profile", "email", "offline_access"]
+//! redirect_ports = [1455, 1457]
+//! code_exchange_encoding = "form"      # form | json
+//! refresh_encoding = "json"
+//! device_code = false
+//! client_id = "app_EMoamEEZ73f0CkXaXp7hrann"   # public id only, optional
 //! ```
 //!
 //! Merge semantics, lowest → highest wins:
@@ -48,7 +62,9 @@
 
 use tracing::{debug, trace, warn};
 
-use super::{ModelEntry, ProviderEntry, ProviderProtocol, ReasoningPassback};
+use super::{
+    GrantEncoding, ModelEntry, OAuthProfile, ProviderEntry, ProviderProtocol, ReasoningPassback,
+};
 use crate::retry::RequestCompression;
 use crate::shared::MaxTokensField;
 
@@ -101,6 +117,7 @@ pub fn merge_overlay(base: &[ProviderEntry], overlay_src: &str) -> Vec<ProviderE
                 models: Vec::new(),
                 prompt_cache: None,
                 request_compression: RequestCompression::Identity,
+                oauth: None,
             };
             apply_provider_overlay(&mut entry, table, &mut models_touched);
             merged.push(entry);
@@ -184,6 +201,14 @@ fn apply_provider_overlay(
                 }
             }
             "models" => apply_models_overlay(entry, value, models_touched),
+            // OAuth profile: overlay-only policy (models.dev carries no OAuth
+            // facts). Parsed all-or-nothing — a partial block is warned and
+            // skipped, leaving the provider's API-key default in place.
+            "oauth" => {
+                if let Some(profile) = parse_oauth_profile(&entry.slug, value) {
+                    entry.oauth = Some(profile);
+                }
+            }
             // Request-body compression: provider policy models.dev cannot
             // express (it carries no encoding facts).  The coding tokens are the
             // `RequestCompression` overlay spellings; `identity` (or any
@@ -488,6 +513,122 @@ fn parse_string_array(array: &[toml::Value]) -> Vec<String> {
         .collect()
 }
 
+/// Parse a `code_exchange_encoding` / `refresh_encoding` scalar.
+fn parse_grant_encoding(value: &str) -> Option<GrantEncoding> {
+    match value {
+        "form" => Some(GrantEncoding::Form),
+        "json" => Some(GrantEncoding::Json),
+        _ => None,
+    }
+}
+
+/// Convert a TOML array of integers into loopback redirect ports, dropping
+/// non-integer and out-of-range entries (a bad port is worse than a missing
+/// one).
+fn parse_port_array(array: &[toml::Value]) -> Vec<u16> {
+    array
+        .iter()
+        .filter_map(toml::Value::as_integer)
+        .filter_map(|n| u16::try_from(n).ok())
+        .collect()
+}
+
+/// The keys [`parse_oauth_profile`] recognizes; anything else is warned and
+/// skipped, matching the overlay's unknown-key contract.
+const OAUTH_KEYS: &[&str] = &[
+    "issuer",
+    "authorize_path",
+    "token_path",
+    "scopes",
+    "redirect_ports",
+    "code_exchange_encoding",
+    "refresh_encoding",
+    "device_code",
+    "client_id",
+];
+
+/// Parse the `[provider.<slug>.oauth]` sub-table into an [`OAuthProfile`],
+/// all-or-nothing: every field except `client_id` must be present and correctly
+/// typed, or the whole block is warned and skipped so the provider keeps its
+/// API-key default. Unknown keys inside the block are warned and skipped.
+fn parse_oauth_profile(slug: &str, value: &toml::Value) -> Option<OAuthProfile> {
+    let Some(table) = value.as_table() else {
+        warn!(slug, "overlay: oauth is not a table; skipping");
+        return None;
+    };
+    for key in table.keys() {
+        if !OAUTH_KEYS.contains(&key.as_str()) {
+            warn!(
+                slug,
+                key = key.as_str(),
+                "overlay: unknown oauth key; skipping"
+            );
+        }
+    }
+    let issuer = table.get("issuer").and_then(toml::Value::as_str);
+    let authorize_path = table.get("authorize_path").and_then(toml::Value::as_str);
+    let token_path = table.get("token_path").and_then(toml::Value::as_str);
+    let scopes = table
+        .get("scopes")
+        .and_then(toml::Value::as_array)
+        .map(|array| parse_string_array(array));
+    let redirect_ports = table
+        .get("redirect_ports")
+        .and_then(toml::Value::as_array)
+        .map(|array| parse_port_array(array));
+    let code_exchange_encoding = table
+        .get("code_exchange_encoding")
+        .and_then(toml::Value::as_str)
+        .and_then(parse_grant_encoding);
+    let refresh_encoding = table
+        .get("refresh_encoding")
+        .and_then(toml::Value::as_str)
+        .and_then(parse_grant_encoding);
+    let device_code = table.get("device_code").and_then(toml::Value::as_bool);
+    let client_id = table
+        .get("client_id")
+        .and_then(toml::Value::as_str)
+        .map(str::to_string);
+
+    if let (
+        Some(issuer),
+        Some(authorize_path),
+        Some(token_path),
+        Some(scopes),
+        Some(redirect_ports),
+        Some(code_exchange_encoding),
+        Some(refresh_encoding),
+        Some(device_code),
+    ) = (
+        issuer,
+        authorize_path,
+        token_path,
+        scopes,
+        redirect_ports,
+        code_exchange_encoding,
+        refresh_encoding,
+        device_code,
+    ) {
+        Some(OAuthProfile {
+            issuer: issuer.to_string(),
+            authorize_path: authorize_path.to_string(),
+            token_path: token_path.to_string(),
+            scopes,
+            redirect_ports,
+            code_exchange_encoding,
+            refresh_encoding,
+            device_code,
+            client_id,
+        })
+    } else {
+        warn!(
+            slug,
+            "overlay: oauth profile is missing a required field; skipping"
+        );
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,6 +646,7 @@ mod tests {
                 default_model: "acme-base".into(),
                 prompt_cache: None,
                 request_compression: RequestCompression::Identity,
+                oauth: None,
                 models: vec![
                     ModelEntry {
                         model: "acme-base".into(),
@@ -529,6 +671,7 @@ mod tests {
                 default_model: "zoo-1".into(),
                 prompt_cache: None,
                 request_compression: RequestCompression::Identity,
+                oauth: None,
                 models: vec![ModelEntry {
                     model: "zoo-1".into(),
                     context_window: 200_000,
@@ -967,5 +1110,77 @@ request_compression = "deflate"
         );
         let acme = merged.iter().find(|e| e.slug == "acme").expect("acme");
         assert_eq!(acme.request_compression, RequestCompression::Identity);
+    }
+
+    #[test]
+    fn oauth_profile_parsed_from_overlay() {
+        let merged = merge_overlay(
+            &base(),
+            r#"
+[provider.acme.oauth]
+issuer = "https://auth.acme.dev"
+authorize_path = "/oauth/authorize"
+token_path = "/oauth/token"
+scopes = ["openid", "offline_access"]
+redirect_ports = [1455, 1457]
+code_exchange_encoding = "form"
+refresh_encoding = "json"
+device_code = true
+client_id = "acme-public-client"
+"#,
+        );
+        let acme = merged.iter().find(|e| e.slug == "acme").expect("acme");
+        let oauth = acme.oauth.as_ref().expect("oauth profile parsed");
+        assert_eq!(oauth.issuer, "https://auth.acme.dev");
+        assert_eq!(oauth.authorize_path, "/oauth/authorize");
+        assert_eq!(oauth.token_path, "/oauth/token");
+        assert_eq!(oauth.scopes, ["openid", "offline_access"]);
+        assert_eq!(oauth.redirect_ports, [1455, 1457]);
+        assert_eq!(oauth.code_exchange_encoding, GrantEncoding::Form);
+        assert_eq!(oauth.refresh_encoding, GrantEncoding::Json);
+        assert!(oauth.device_code);
+        assert_eq!(oauth.client_id.as_deref(), Some("acme-public-client"));
+        // The derived kind flips to OAuth with the profile present.
+        assert_eq!(acme.auth_kind(), crate::catalog::AuthKind::OAuth);
+        // The untouched provider keeps the API-key default.
+        let zoo = merged
+            .iter()
+            .find(|e| e.slug == "zoocorp")
+            .expect("zoocorp");
+        assert!(zoo.oauth.is_none());
+        assert_eq!(zoo.auth_kind(), crate::catalog::AuthKind::ApiKey);
+    }
+
+    #[test]
+    fn partial_oauth_profile_is_skipped() {
+        // Missing required fields (`token_path`, encodings, `device_code`) —
+        // the whole block is dropped, leaving the API-key default.
+        let merged = merge_overlay(
+            &base(),
+            r#"
+[provider.acme.oauth]
+issuer = "https://auth.acme.dev"
+authorize_path = "/oauth/authorize"
+"#,
+        );
+        let acme = merged.iter().find(|e| e.slug == "acme").expect("acme");
+        assert!(
+            acme.oauth.is_none(),
+            "a partial oauth profile must be skipped, not half-applied"
+        );
+        assert_eq!(acme.auth_kind(), crate::catalog::AuthKind::ApiKey);
+    }
+
+    #[test]
+    fn non_table_oauth_block_is_skipped() {
+        let merged = merge_overlay(
+            &base(),
+            r#"
+[provider.acme]
+oauth = "nope"
+"#,
+        );
+        let acme = merged.iter().find(|e| e.slug == "acme").expect("acme");
+        assert!(acme.oauth.is_none());
     }
 }

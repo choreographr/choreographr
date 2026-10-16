@@ -3,8 +3,8 @@
 // helper fns in this file need this file-level allowance.
 #![expect(clippy::expect_used, clippy::panic)]
 use choreo_ai_protocols::openai::{
-    ChatRequestMessage, OpenAiClient, OpenAiError, RequestUploadedCallback, RetryCallback,
-    ServiceConfig,
+    ChatRequestMessage, OpenAiClient, OpenAiError, RequestAuth, RequestUploadedCallback,
+    RetryCallback, ServiceConfig,
 };
 use choreo_ai_protocols::{ChatTurnRequest, ChatTurnResult, StreamEvent};
 use std::io::{Read, Write};
@@ -105,7 +105,7 @@ fn retry_succeeds_with_callback() {
     };
     let client = OpenAiClient::new(
         config,
-        "test-key".into(),
+        RequestAuth::api_key("test-key"),
         &choreo_ai_protocols::SocketRegistry::new(),
     )
     .expect("OpenAiClient");
@@ -178,7 +178,7 @@ fn retry_cancelled_during_backoff() {
     };
     let client = OpenAiClient::new(
         config,
-        "test-key".into(),
+        RequestAuth::api_key("test-key"),
         &choreo_ai_protocols::SocketRegistry::new(),
     )
     .expect("OpenAiClient");
@@ -246,7 +246,7 @@ fn hard_rate_limit_fails_without_retrying() {
     };
     let client = OpenAiClient::new(
         config,
-        "test-key".into(),
+        RequestAuth::api_key("test-key"),
         &choreo_ai_protocols::SocketRegistry::new(),
     )
     .expect("OpenAiClient");
@@ -319,7 +319,7 @@ fn server_503_with_long_retry_after_fails_without_retrying() {
     };
     let client = OpenAiClient::new(
         config,
-        "test-key".into(),
+        RequestAuth::api_key("test-key"),
         &choreo_ai_protocols::SocketRegistry::new(),
     )
     .expect("OpenAiClient");
@@ -390,7 +390,7 @@ fn retry_after_in_budget_is_honored_on_503() {
     };
     let client = OpenAiClient::new(
         config,
-        "test-key".into(),
+        RequestAuth::api_key("test-key"),
         &choreo_ai_protocols::SocketRegistry::new(),
     )
     .expect("OpenAiClient");
@@ -506,7 +506,7 @@ fn streaming_cancelled_during_sse_events() {
     let (port, event_tx, _server) = spawn_sse_server();
     let client = OpenAiClient::new(
         sse_test_config(port),
-        "test-key".into(),
+        RequestAuth::api_key("test-key"),
         &choreo_ai_protocols::SocketRegistry::new(),
     )
     .expect("OpenAiClient");
@@ -556,7 +556,7 @@ fn streaming_cancelled_before_first_event() {
     let (port, _event_tx, _server) = spawn_sse_server();
     let client = OpenAiClient::new(
         sse_test_config(port),
-        "test-key".into(),
+        RequestAuth::api_key("test-key"),
         &choreo_ai_protocols::SocketRegistry::new(),
     )
     .expect("OpenAiClient");
@@ -612,7 +612,7 @@ fn non_streaming_fallback_fires_accepted_callback() {
     };
     let client = OpenAiClient::new(
         config,
-        "test-key".into(),
+        RequestAuth::api_key("test-key"),
         &choreo_ai_protocols::SocketRegistry::new(),
     )
     .expect("OpenAiClient");

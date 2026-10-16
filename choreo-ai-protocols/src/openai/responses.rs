@@ -7,7 +7,7 @@ use super::{
     messages_to_responses_input, parse_responses_stream_event, validate_tool_call_arguments,
 };
 use crate::ToolResultItem;
-use crate::shared::MAX_TOOL_CALLS;
+use crate::shared::{MAX_TOOL_CALLS, RequestAuth};
 use crate::types::{
     CallerInfo, ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
 };
@@ -439,7 +439,7 @@ fn build_simple_responses_body(
 pub(crate) fn responses_request(
     agent: &ureq::Agent,
     config: &super::ServiceConfig,
-    api_key: &str,
+    auth: &RequestAuth,
     model: &str,
     prompt: &str,
     cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
@@ -455,7 +455,7 @@ pub(crate) fn responses_request(
         retry::RetrySend {
             agent,
             url: &url,
-            api_key,
+            auth,
             body: &body,
             config,
             retry_cfg: &retry,
@@ -500,7 +500,7 @@ pub(crate) fn responses_request(
 pub(crate) fn responses_request_streaming<F>(
     agent: &ureq::Agent,
     config: &super::ServiceConfig,
-    api_key: &str,
+    auth: &RequestAuth,
     params: super::SimpleParams<'_>,
     on_event: &mut F,
 ) -> Result<(), super::OpenAiError>
@@ -526,7 +526,7 @@ where
         retry::RetrySend {
             agent,
             url: &url,
-            api_key,
+            auth,
             body: &body,
             config,
             retry_cfg: &retry,
@@ -585,7 +585,7 @@ where
 pub(crate) fn responses_request_with_tools(
     agent: &ureq::Agent,
     config: &super::ServiceConfig,
-    api_key: &str,
+    auth: &RequestAuth,
     params: super::TurnParams<'_>,
 ) -> Result<ChatTurnResult, super::OpenAiError> {
     let start = std::time::Instant::now();
@@ -621,7 +621,7 @@ pub(crate) fn responses_request_with_tools(
         retry::RetrySend {
             agent,
             url: &url,
-            api_key,
+            auth,
             body: &body,
             config,
             retry_cfg: &retry,
@@ -910,7 +910,7 @@ impl AccCall {
 pub(crate) fn responses_request_streaming_with_tools<F>(
     agent: &ureq::Agent,
     config: &super::ServiceConfig,
-    api_key: &str,
+    auth: &RequestAuth,
     params: super::TurnParams<'_>,
     on_event: &mut F,
 ) -> Result<ChatTurnResult, super::OpenAiError>
@@ -947,7 +947,7 @@ where
         retry::RetrySend {
             agent,
             url: &url,
-            api_key,
+            auth,
             body: &body,
             config,
             retry_cfg: &retry,

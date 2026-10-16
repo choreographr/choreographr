@@ -50,6 +50,8 @@ pub mod videos;
 pub mod test_utils;
 
 mod context_window;
+// Provider OAuth client-identity policy (compiled, keyed by slug).
+mod identity;
 // Shared URL-download machinery (SSRF guard + capped/retried/cancellable
 // fetch) used by the image adapters and the video queue's result
 // downloads — crate-internal, never part of the public surface.
@@ -65,17 +67,22 @@ mod types;
 
 pub use anthropic::{AnthropicClient, AnthropicConfig};
 pub use catalog::{
-    ModelCost, ModelEntry, PROVIDER_CATALOG, PromptCacheTtl, ProviderEntry, ProviderProtocol,
-    ReasoningPassback, RefreshError, RefreshOutcome, all_display_names, all_slugs,
-    bundled_overlay_src, catalog_snapshot, fetch_modelsdev, image_edit_models_for_provider,
-    image_models_for_provider, load_bundled_base, lookup_context_window, lookup_max_output_tokens,
-    lookup_provider, merge_overlay, model_cost, model_reasoning_capability,
-    model_reasoning_passback, model_request_format, model_supports_image_output,
-    model_supports_temperature, model_supports_vision, normalize_modelsdev, prompt_cache_ttl,
-    provider_slug_for_model, replace_catalog, requires_reasoning_content, write_file_atomic,
+    AuthKind, GrantEncoding, ModelCost, ModelEntry, OAuthProfile, PROVIDER_CATALOG, PromptCacheTtl,
+    ProviderEntry, ProviderProtocol, ReasoningPassback, RefreshError, RefreshOutcome,
+    all_display_names, all_slugs, bundled_overlay_src, catalog_snapshot, fetch_modelsdev,
+    image_edit_models_for_provider, image_models_for_provider, load_bundled_base,
+    lookup_context_window, lookup_max_output_tokens, lookup_provider, merge_overlay, model_cost,
+    model_reasoning_capability, model_reasoning_passback, model_request_format,
+    model_supports_image_output, model_supports_temperature, model_supports_vision,
+    normalize_modelsdev, prompt_cache_ttl, provider_slug_for_model, replace_catalog,
+    requires_reasoning_content, write_file_atomic,
 };
 pub use context_window::ContextWindowConfig;
 pub use google::{GoogleClient, GoogleConfig};
+pub use identity::{
+    BORROWED_IDS_ENV, ClientIdentity, OAuthClientIdentity, borrowed_ids_enabled,
+    oauth_client_identity,
+};
 pub use images::{
     Background, FalImageClient, GoogleImageClient, ImageEditRequest, ImageGenerationClient,
     ImageGenerationRequest, ImageGenerationResult, ImageInput, ImageQuality, ImageSize,
@@ -88,7 +95,7 @@ pub use openai::{AllowedCaller, OpenAiClient, RequestFormat, ServiceConfig};
 pub use choreo_sockreg::SocketRegistry;
 pub use overrides::ProviderOverrides;
 pub use retry::{RequestCompression, RequestUploadedCallback, RetryCallback};
-pub use shared::{MaxTokensField, ProviderError};
+pub use shared::{MaxTokensField, ProviderError, RequestAuth};
 pub use traits::{ChatTurnRequest, ProviderClient, ToolResultItem};
 pub use types::{
     CallerInfo, ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,

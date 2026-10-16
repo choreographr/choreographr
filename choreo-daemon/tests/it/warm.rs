@@ -29,7 +29,7 @@
 // helper fns in this file need this file-level allowance.
 #![expect(clippy::expect_used, clippy::panic)]
 use choreo_ai_protocols::catalog::{ModelCost, ModelEntry, PromptCacheTtl, ProviderEntry};
-use choreo_ai_protocols::openai::{MaxTokensField, OpenAiClient, ServiceConfig};
+use choreo_ai_protocols::openai::{MaxTokensField, OpenAiClient, RequestAuth, ServiceConfig};
 use choreo_ai_protocols::test_utils::MockProvider;
 use choreo_ai_protocols::{ProviderProtocol, catalog_snapshot, replace_catalog};
 use choreo_daemon::broadcast::{ClientId, LagLimits, SubscriberSink};
@@ -90,6 +90,7 @@ fn install_short_ttl_catalog() -> CatalogGuard {
             long_secs: None,
         }),
         request_compression: choreo_ai_protocols::RequestCompression::Identity,
+        oauth: None,
         models: vec![ModelEntry {
             model: MODEL.into(),
             context_window: 128_000,
@@ -127,7 +128,7 @@ fn mock_openai_provider(base_url: String) -> InferenceProvider {
             chat_completions_max_tokens_field: MaxTokensField::MaxCompletionTokens,
             ..Default::default()
         },
-        "test-key".to_string(),
+        RequestAuth::api_key("test-key"),
         &choreo_ai_protocols::SocketRegistry::new(),
     )
     .expect("openai client");

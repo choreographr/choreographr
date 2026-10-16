@@ -20,6 +20,10 @@ use choreo_ai_protocols::{
 };
 use choreo_proto::InferenceError;
 
+mod auth;
+
+pub use auth::ProviderAuth;
+
 /// Whether a catalog swap changed anything [`InferenceProvider::from_account_config`]
 /// bakes into a provider *client*.
 ///
@@ -143,17 +147,18 @@ impl InferenceProvider {
         }
     }
 
-    /// Create a provider from an account config + credential key.
+    /// Create a provider from an account config + resolved auth grant.
     /// Applies all account-level overrides (`base_url`, streaming, timeouts)
     /// onto the service config before constructing the client.
     ///
     /// # Errors
     ///
-    /// Returns Err if the account's provider protocol is not supported or
-    /// the client construction fails (e.g. missing credential).
+    /// Returns Err if the account's provider protocol is not supported, the
+    /// grant is missing/unsuitable (no credential, an OAuth grant with no
+    /// access token yet), or the client construction fails.
     pub fn from_account_config(
         config: &crate::accounts::AccountConfig,
-        api_key: Option<String>,
+        auth: ProviderAuth,
         // The daemon-wide registry (one per process, created in
         // `DaemonState::open`). Every client this account produces registers
         // its sockets here, so cancel/suspend force-closes reach all of them
@@ -182,12 +187,18 @@ impl InferenceProvider {
                     ..Default::default()
                 };
                 config.apply_overrides(&mut svc_config);
-                let key = api_key
-                    .ok_or_else(|| format!("no API key for '{}' provider", config.provider))?;
-                let client = OpenAiClient::new(svc_config.clone(), key.clone(), registry)
+                // Image generation is API-key-only, so capture the key (if any)
+                // BEFORE consuming the grant: an OAuth-only account simply has
+                // no image backend. The daemon-side grant is then projected
+                // into the client-side request material — this is where a
+                // not-yet-signed-in OAuth account becomes a clean error before
+                // any client is built.
+                let image_key = auth.api_key_cloned();
+                let request_auth = auth.into_request_auth()?;
+                let client = OpenAiClient::new(svc_config.clone(), request_auth, registry)
                     .map_err(|e| format!("failed to create OpenAI client: {e}"))?;
-                // Same account, same key, same base_url/user_agent/slug as the
-                // chat client — the image client is built from a clone of the
+                // Same account, same base_url/user_agent/slug as the chat
+                // client — the image client is built from a clone of the
                 // identical `ServiceConfig` (its constructor overrides only the
                 // attempt deadline + retry budget the image path needs).
                 // `config.apply_overrides` ran on `svc_config` BEFORE the chat
@@ -196,6 +207,10 @@ impl InferenceProvider {
                 // applied. An image client is constructed even when the
                 // account's models later fail a catalog image-capability
                 // check — the tool gates model choice at request time.
+                //
+                // Image generation is API-key-only: an OAuth account carries no
+                // key, so it gets no image backend and an image request against
+                // it fails with a precise "does not support" error.
                 //
                 // Zhipu (z.ai coding + mainland zhipuai/bigmodel) accounts
                 // route their Images API at a different endpoint than the
@@ -208,26 +223,34 @@ impl InferenceProvider {
                 // [`OpenAiImageClient`]. `ZaiImageClient` itself rewrites the
                 // coding base to the plain PaaS-v4 base, so both Zhipu slugs
                 // share one adapter with one documented endpoint convention.
-                let image_client: Arc<dyn ImageGenerationClient> =
-                    // The client crate owns the provider-family knowledge
-                    // (which slugs speak the Zhipu vs fal Images contract) —
-                    // see images::is_zhipu_image_provider_slug /
-                    // is_fal_image_provider_slug.
-                    if choreo_ai_protocols::images::is_fal_image_provider_slug(&entry.slug) {
-                        Arc::new(FalImageClient::new(svc_config, key, registry))
-                    } else if choreo_ai_protocols::images::is_zhipu_image_provider_slug(&entry.slug) {
-                        Arc::new(ZaiImageClient::new(svc_config, key, registry))
-                    } else {
-                        Arc::new(OpenAiImageClient::new(svc_config, key, registry))
-                    };
+                let image_client: Option<Arc<dyn ImageGenerationClient>> =
+                    image_key.map(|key| -> Arc<dyn ImageGenerationClient> {
+                        // The client crate owns the provider-family knowledge
+                        // (which slugs speak the Zhipu vs fal Images contract) —
+                        // see images::is_zhipu_image_provider_slug /
+                        // is_fal_image_provider_slug.
+                        if choreo_ai_protocols::images::is_fal_image_provider_slug(&entry.slug) {
+                            Arc::new(FalImageClient::new(svc_config, key, registry))
+                        } else if choreo_ai_protocols::images::is_zhipu_image_provider_slug(
+                            &entry.slug,
+                        ) {
+                            Arc::new(ZaiImageClient::new(svc_config, key, registry))
+                        } else {
+                            Arc::new(OpenAiImageClient::new(svc_config, key, registry))
+                        }
+                    });
                 Ok(Self {
                     client: Arc::new(client),
                     slug: entry.slug,
-                    image_client: Some(image_client),
+                    image_client,
                 })
             }
             ProviderProtocol::AnthropicMessages => {
-                let key = api_key
+                // Anthropic is API-key-only in this stack (no OAuth path), so a
+                // grant that is not an API key is rejected with the existing
+                // "no API key" guidance.
+                let key = auth
+                    .api_key_cloned()
                     .ok_or_else(|| format!("no API key for '{}' provider", config.provider))?;
                 let mut anthro_cfg = AnthropicConfig::default();
                 // If the account doesn't specify a base_url, use the catalog default.
@@ -253,7 +276,11 @@ impl InferenceProvider {
                 })
             }
             ProviderProtocol::GoogleGenerativeAi => {
-                let key = api_key
+                // Google is API-key-only in this stack (no OAuth path), so a
+                // grant that is not an API key is rejected with the existing
+                // "no API key" guidance.
+                let key = auth
+                    .api_key_cloned()
                     .ok_or_else(|| format!("no API key for '{}' provider", config.provider))?;
                 let mut google_cfg = GoogleConfig::default();
                 // If the account doesn't specify a base_url, use the catalog default.
@@ -421,14 +448,39 @@ impl InferenceProvider {
 mod tests {
     use super::*;
     use crate::accounts::AccountConfig;
-    use choreo_ai_protocols::openai::ServiceConfig;
+    use choreo_ai_protocols::openai::{RequestAuth, ServiceConfig};
 
+    /// An API-key grant for the happy-path constructions.
+    fn api_key_auth() -> ProviderAuth {
+        ProviderAuth::ApiKey {
+            key: zeroize::Zeroizing::new("key".to_string()),
+        }
+    }
+
+    /// An OAuth grant with no cached access token — the not-signed-in case.
+    fn oauth_without_token_auth() -> ProviderAuth {
+        ProviderAuth::OAuth {
+            credential: Box::new(choreo_keystore::ServiceCredential::OAuth {
+                kind: choreo_keystore::OAuthKind::Provider,
+                issuer: None,
+                resource: None,
+                authorization_server: None,
+                refresh_token: None,
+                account_id: None,
+                client_id: None,
+                client_secret: None,
+                granted_scopes: Vec::new(),
+                token_type: None,
+            }),
+            access_token: None,
+        }
+    }
     #[test]
     fn from_openai_constructs_provider() {
         let config = ServiceConfig::default();
         let client = OpenAiClient::new(
             config,
-            "test-key".into(),
+            RequestAuth::api_key("test-key"),
             &choreo_ai_protocols::SocketRegistry::new(),
         )
         .unwrap();
@@ -467,7 +519,7 @@ mod tests {
         let cfg = AccountConfig::simple("unknown", "nonexistent");
         let err = InferenceProvider::from_account_config(
             &cfg,
-            Some("key".into()),
+            api_key_auth(),
             &choreo_ai_protocols::SocketRegistry::new(),
         )
         .unwrap_err();
@@ -479,7 +531,7 @@ mod tests {
         let cfg = AccountConfig::simple("claude", "anthropic");
         let err = InferenceProvider::from_account_config(
             &cfg,
-            None,
+            oauth_without_token_auth(),
             &choreo_ai_protocols::SocketRegistry::new(),
         )
         .unwrap_err();
@@ -487,15 +539,18 @@ mod tests {
     }
 
     #[test]
-    fn from_account_config_openai_missing_key_errors() {
+    fn from_account_config_openai_not_signed_in_errors() {
+        // An OAuth grant with no cached access token: the OpenAI path fails
+        // with the not-signed-in guidance, not a generic missing-credential
+        // message.
         let cfg = AccountConfig::simple("openai", "openai");
         let err = InferenceProvider::from_account_config(
             &cfg,
-            None,
+            oauth_without_token_auth(),
             &choreo_ai_protocols::SocketRegistry::new(),
         )
         .unwrap_err();
-        assert!(err.contains("no API key"), "{err}");
+        assert!(err.contains("sign in first"), "{err}");
     }
 
     #[test]
@@ -503,7 +558,7 @@ mod tests {
         let cfg = AccountConfig::simple("openai", "openai");
         let result = InferenceProvider::from_account_config(
             &cfg,
-            Some("key".into()),
+            api_key_auth(),
             &choreo_ai_protocols::SocketRegistry::new(),
         );
         assert!(result.is_ok(), "{:?}", result.err());
@@ -514,7 +569,7 @@ mod tests {
         let cfg = AccountConfig::simple("claude", "anthropic");
         let result = InferenceProvider::from_account_config(
             &cfg,
-            Some("key".into()),
+            api_key_auth(),
             &choreo_ai_protocols::SocketRegistry::new(),
         );
         assert!(result.is_ok(), "{:?}", result.err());
@@ -525,7 +580,7 @@ mod tests {
         let cfg = AccountConfig::simple("gemini", "google");
         let result = InferenceProvider::from_account_config(
             &cfg,
-            Some("key".into()),
+            api_key_auth(),
             &choreo_ai_protocols::SocketRegistry::new(),
         );
         assert!(result.is_ok(), "{:?}", result.err());
@@ -536,7 +591,7 @@ mod tests {
         let cfg = AccountConfig::simple("gemini", "google");
         let err = InferenceProvider::from_account_config(
             &cfg,
-            None,
+            oauth_without_token_auth(),
             &choreo_ai_protocols::SocketRegistry::new(),
         )
         .unwrap_err();
@@ -553,7 +608,7 @@ mod tests {
         let cfg = AccountConfig::simple("gemini", "google");
         let provider = InferenceProvider::from_account_config(
             &cfg,
-            Some("key".into()),
+            api_key_auth(),
             &choreo_ai_protocols::SocketRegistry::new(),
         )
         .expect("google account constructs");
@@ -574,7 +629,7 @@ mod tests {
         let cfg = AccountConfig::simple("zai", "zai");
         let provider = InferenceProvider::from_account_config(
             &cfg,
-            Some("key".into()),
+            api_key_auth(),
             &choreo_ai_protocols::SocketRegistry::new(),
         )
         .expect("zai account constructs");
@@ -587,7 +642,7 @@ mod tests {
         let cfg = AccountConfig::simple("zhipu", "zhipuai");
         let provider = InferenceProvider::from_account_config(
             &cfg,
-            Some("key".into()),
+            api_key_auth(),
             &choreo_ai_protocols::SocketRegistry::new(),
         )
         .expect("zhipuai account constructs");
@@ -605,7 +660,7 @@ mod tests {
         let cfg = AccountConfig::simple("openai", "openai");
         let provider = InferenceProvider::from_account_config(
             &cfg,
-            Some("key".into()),
+            api_key_auth(),
             &choreo_ai_protocols::SocketRegistry::new(),
         )
         .expect("openai account constructs");
@@ -624,7 +679,7 @@ mod tests {
         let cfg = AccountConfig::simple("fal", "fal");
         let provider = InferenceProvider::from_account_config(
             &cfg,
-            Some("key".into()),
+            api_key_auth(),
             &choreo_ai_protocols::SocketRegistry::new(),
         )
         .expect("fal account constructs");
@@ -657,7 +712,7 @@ mod tests {
         cfg.context_window_config.context_window = Some(128_000);
         let client = OpenAiClient::new(
             cfg,
-            "test-key".into(),
+            RequestAuth::api_key("test-key"),
             &choreo_ai_protocols::SocketRegistry::new(),
         )
         .unwrap();

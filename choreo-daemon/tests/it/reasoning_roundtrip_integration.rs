@@ -14,7 +14,7 @@
 
 use choreo_ai_protocols::ChatTurnRequest;
 use choreo_ai_protocols::openai::{
-    ChatRequestMessage, MaxTokensField, OpenAiClient, ServiceConfig,
+    ChatRequestMessage, MaxTokensField, OpenAiClient, RequestAuth, ServiceConfig,
 };
 use choreo_ai_protocols::test_utils::MockProvider;
 use choreo_daemon::{AssistantResponse, SessionState, build_chat_request_messages};
@@ -175,7 +175,7 @@ fn model_switch_sends_no_reasoning_on_the_wire() {
             chat_completions_max_tokens_field: MaxTokensField::MaxCompletionTokens,
             ..Default::default()
         },
-        "test-key".to_string(),
+        RequestAuth::api_key("test-key"),
         &choreo_ai_protocols::SocketRegistry::new(),
     )
     .expect("openai client");

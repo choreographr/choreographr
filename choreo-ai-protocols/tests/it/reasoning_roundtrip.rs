@@ -26,7 +26,7 @@ use choreo_ai_protocols::anthropic::{AnthropicClient, AnthropicConfig};
 use choreo_ai_protocols::google::{GoogleClient, GoogleConfig};
 use choreo_ai_protocols::openai::{
     AssistantToolCall, AssistantToolFunction, ChatRequestMessage, ChatToolDefinition,
-    MaxTokensField, OpenAiClient, ServiceConfig,
+    MaxTokensField, OpenAiClient, RequestAuth, ServiceConfig,
 };
 use choreo_ai_protocols::test_utils::{CapturedRequest, MockProvider};
 use choreo_ai_protocols::{ChatAssistantToolUse, ChatTurnRequest, ChatTurnResult};
@@ -160,7 +160,7 @@ fn deepseek_tool_loop_echoes_reasoning_content_verbatim() {
             chat_completions_max_tokens_field: MaxTokensField::MaxCompletionTokens,
             ..Default::default()
         },
-        "test-key".to_string(),
+        RequestAuth::api_key("test-key"),
         &choreo_ai_protocols::SocketRegistry::new(),
     )
     .expect("openai client");
@@ -628,7 +628,7 @@ fn responses_chains_reasoning_continuity_via_response_id() {
             default_request_format: choreo_ai_protocols::openai::RequestFormat::Responses,
             ..Default::default()
         },
-        "test-key".to_string(),
+        RequestAuth::api_key("test-key"),
         &choreo_ai_protocols::SocketRegistry::new(),
     )
     .expect("openai client");
@@ -763,7 +763,7 @@ fn chat_turn_request(config: ServiceConfig) -> CapturedRequest {
             retry_max_attempts: 1,
             ..config
         },
-        "test-key".to_string(),
+        RequestAuth::api_key("test-key"),
         &choreo_ai_protocols::SocketRegistry::new(),
     )
     .expect("openai client");

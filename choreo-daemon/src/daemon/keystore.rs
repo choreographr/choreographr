@@ -182,6 +182,11 @@ impl DaemonState {
         // was actually wiped, not a hardcoded zero.
         let credentials_cleared = self.credentials.len();
         self.credentials.clear();
+        // The cached OAuth access tokens are derived from the credentials
+        // being wiped, so they are cleared in the same step: a locked daemon
+        // holds no cleartext bearer either.
+        let access_tokens_cleared = self.access_tokens.len();
+        self.access_tokens.clear();
         // No daemon-side provider cache to wipe anymore — instead invalidate
         // every live session's cached client so it rebuilds (against fresh
         // credentials) on its next request. Sessions stay browsable; only
@@ -191,7 +196,8 @@ impl DaemonState {
         self.locked = true;
         info!(
             credentials_cleared,
-            "keystore locked: in-memory credentials cleared"
+            access_tokens_cleared,
+            "keystore locked: in-memory credentials and access tokens cleared"
         );
         // The acting client gets its `send_to_writer` `Locked` reply from the
         // connection layer; this transition broadcast reaches every connected
@@ -311,6 +317,10 @@ impl DaemonState {
         if matches!(&credential, ServiceCredential::ApiKey { .. }) {
             self.drop_session_clients(Some(&service));
         }
+        // A new credential replaces any previous one for this account, so any
+        // cached access token derived from the old credential is stale and
+        // must be dropped before the replacement is stored.
+        self.access_tokens.remove(&service);
         self.credentials.insert(service.clone(), credential);
 
         info!(

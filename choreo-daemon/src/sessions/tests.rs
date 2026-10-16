@@ -154,7 +154,9 @@ fn resolve_provider_rebuilds_lazily_after_client_drop() {
             // same reply, so resolving the account also refreshes warming.
             let _ = reply.send(Some(crate::daemon::ResolvedAccount {
                 config,
-                api_key: Some(Zeroizing::new("test-key".to_string())),
+                auth: Some(crate::providers::ProviderAuth::ApiKey {
+                    key: Zeroizing::new("test-key".to_string()),
+                }),
                 warm_policy: crate::cache_warm::WarmPolicy {
                     mode: crate::cache_warm::CacheWarmingMode::Streaming,
                     meter: crate::cache_warm::MeterKind::Tokens,
@@ -520,7 +522,7 @@ fn set_account_switches_slug_and_drops_stale_client_when_locked() {
     // client dropped — `resolve_provider` returns a cached client
     // unconditionally, so keeping it would dial the old provider under the new
     // account name.
-    use choreo_ai_protocols::openai::{OpenAiClient, ServiceConfig};
+    use choreo_ai_protocols::openai::{OpenAiClient, RequestAuth, ServiceConfig};
 
     let db = test_db();
     let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
@@ -545,7 +547,7 @@ fn set_account_switches_slug_and_drops_stale_client_when_locked() {
             let config = crate::accounts::AccountConfig::simple("new-account", "anthropic");
             let _ = reply.send(Some(crate::daemon::ResolvedAccount {
                 config,
-                api_key: None,
+                auth: None,
                 warm_policy: crate::cache_warm::WarmPolicy::default(),
             }));
         }
@@ -553,8 +555,12 @@ fn set_account_switches_slug_and_drops_stale_client_when_locked() {
 
     // Pre-existing client for a DIFFERENT account.
     let mut state = SessionState::empty();
-    let client =
-        OpenAiClient::new(ServiceConfig::default(), "old-key".into(), &state.registry).unwrap();
+    let client = OpenAiClient::new(
+        ServiceConfig::default(),
+        RequestAuth::api_key("old-key"),
+        &state.registry,
+    )
+    .unwrap();
     state.provider = Some(InferenceProvider::from_openai(client));
     state.provider_slug = Some("openai".into());
     state.config.account_name = Some("old-account".into());
@@ -582,7 +588,7 @@ fn set_account_clears_slug_and_client_when_new_account_unknown() {
     // The new account can't be resolved at all (unknown): both the stale
     // client and the stale slug must be cleared so neither keeps serving the
     // old account's facts.
-    use choreo_ai_protocols::openai::{OpenAiClient, ServiceConfig};
+    use choreo_ai_protocols::openai::{OpenAiClient, RequestAuth, ServiceConfig};
 
     let db = test_db();
     let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
@@ -608,8 +614,12 @@ fn set_account_clears_slug_and_client_when_new_account_unknown() {
     });
 
     let mut state = SessionState::empty();
-    let client =
-        OpenAiClient::new(ServiceConfig::default(), "old-key".into(), &state.registry).unwrap();
+    let client = OpenAiClient::new(
+        ServiceConfig::default(),
+        RequestAuth::api_key("old-key"),
+        &state.registry,
+    )
+    .unwrap();
     state.provider = Some(InferenceProvider::from_openai(client));
     state.provider_slug = Some("openai".into());
     state.config.account_name = Some("old-account".into());

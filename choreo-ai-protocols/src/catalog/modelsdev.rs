@@ -298,6 +298,9 @@ fn normalize_provider(slug: String, raw: RawProvider) -> ProviderEntry {
         // carries nothing about request encodings, so every provider starts on
         // the identity default.
         request_compression: RequestCompression::Identity,
+        // OAuth profiles are overlay policy, never a base fact — models.dev
+        // carries nothing about authorization servers.
+        oauth: None,
     }
 }
 

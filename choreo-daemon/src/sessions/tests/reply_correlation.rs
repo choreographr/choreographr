@@ -412,7 +412,7 @@ fn run_input_empty_acks_failed_and_broadcasts_stream_failure() {
 
 #[test]
 fn run_input_accept_acks_targeted_started_and_broadcasts_started() {
-    use choreo_ai_protocols::openai::{OpenAiClient, ServiceConfig};
+    use choreo_ai_protocols::openai::{OpenAiClient, RequestAuth, ServiceConfig};
 
     let (mut state, ctx) = broadcast_setup();
     // A closed local endpoint: the spawned worker fails fast without touching
@@ -423,7 +423,7 @@ fn run_input_accept_acks_targeted_started_and_broadcasts_started() {
             base_url: "http://127.0.0.1:9/v1".to_string(),
             ..ServiceConfig::default()
         },
-        "k".into(),
+        RequestAuth::api_key("k"),
         &state.registry,
     )
     .expect("build a client against the dead endpoint");
@@ -460,7 +460,7 @@ fn run_input_accept_acks_targeted_started_and_broadcasts_started() {
 
 #[test]
 fn two_clients_same_session_get_distinct_daemon_assigned_stream_ids() {
-    use choreo_ai_protocols::openai::{OpenAiClient, ServiceConfig};
+    use choreo_ai_protocols::openai::{OpenAiClient, RequestAuth, ServiceConfig};
 
     let (mut state, ctx) = broadcast_setup();
     // A dead local endpoint so each accepted run's worker fails fast without
@@ -471,7 +471,7 @@ fn two_clients_same_session_get_distinct_daemon_assigned_stream_ids() {
             base_url: "http://127.0.0.1:9/v1".to_string(),
             ..ServiceConfig::default()
         },
-        "k".into(),
+        RequestAuth::api_key("k"),
         &state.registry,
     )
     .expect("build a client against the dead endpoint");

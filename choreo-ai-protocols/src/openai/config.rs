@@ -1,4 +1,4 @@
-use super::{MaxTokensField, OpenAiClient, RequestFormat};
+use super::{MaxTokensField, OpenAiClient, RequestAuth, RequestFormat};
 use crate::retry::RequestCompression;
 use choreo_proto::ContextConfig;
 use std::{collections::HashMap, io};
@@ -316,7 +316,7 @@ pub fn validate_and_list_models(config: &ServiceConfig, api_key: &str) -> io::Re
     // throwaway registry — callers wanting force-close coverage should use
     // `OpenAiClient::new` with a shared registry instead.
     let registry = crate::SocketRegistry::new();
-    let client = OpenAiClient::new(config.clone(), api_key.to_string(), &registry)?;
+    let client = OpenAiClient::new(config.clone(), RequestAuth::api_key(api_key), &registry)?;
     Ok(client.validate_and_list_models()?)
 }
 
@@ -333,7 +333,7 @@ pub fn completion(
     prompt: &str,
 ) -> io::Result<String> {
     let registry = crate::SocketRegistry::new();
-    let client = OpenAiClient::new(config.clone(), api_key.to_string(), &registry)?;
+    let client = OpenAiClient::new(config.clone(), RequestAuth::api_key(api_key), &registry)?;
     Ok(client.completion(model, prompt)?)
 }
 

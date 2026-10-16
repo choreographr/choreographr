@@ -5,7 +5,7 @@ use super::retry;
 use super::{
     ChatRequestMessage, ChatToolDefinition, SseReader, endpoint_url, validate_tool_call_arguments,
 };
-use crate::shared::MAX_TOOL_CALLS;
+use crate::shared::{MAX_TOOL_CALLS, RequestAuth};
 use crate::types::{
     ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
 };
@@ -239,7 +239,7 @@ impl<'de> Deserialize<'de> for FinishReason {
 pub(crate) fn chat_completions_request(
     agent: &ureq::Agent,
     config: &super::ServiceConfig,
-    api_key: &str,
+    auth: &RequestAuth,
     model: &str,
     prompt: &str,
     cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
@@ -268,7 +268,7 @@ pub(crate) fn chat_completions_request(
         retry::RetrySend {
             agent,
             url: &url,
-            api_key,
+            auth,
             body: &body,
             config,
             retry_cfg: &retry,
@@ -303,7 +303,7 @@ pub(crate) fn chat_completions_request(
 pub(crate) fn chat_completions_request_with_tools(
     agent: &ureq::Agent,
     config: &super::ServiceConfig,
-    api_key: &str,
+    auth: &RequestAuth,
     params: super::TurnParams<'_>,
 ) -> Result<ChatTurnResult, super::OpenAiError> {
     let super::TurnParams {
@@ -342,7 +342,7 @@ pub(crate) fn chat_completions_request_with_tools(
         retry::RetrySend {
             agent,
             url: &url,
-            api_key,
+            auth,
             body: &body,
             config,
             retry_cfg: &retry,
@@ -518,7 +518,7 @@ fn chat_completions_response_to_turn(
 pub(crate) fn chat_completions_request_streaming<F>(
     agent: &ureq::Agent,
     config: &super::ServiceConfig,
-    api_key: &str,
+    auth: &RequestAuth,
     params: super::SimpleParams<'_>,
     on_event: &mut F,
 ) -> Result<(), super::OpenAiError>
@@ -559,7 +559,7 @@ where
         retry::RetrySend {
             agent,
             url: &url,
-            api_key,
+            auth,
             body: &body,
             config,
             retry_cfg: &retry,
@@ -922,7 +922,7 @@ impl ChatCompletionsStreamAccumulator {
 pub(crate) fn chat_completions_request_streaming_with_tools<F>(
     agent: &ureq::Agent,
     config: &super::ServiceConfig,
-    api_key: &str,
+    auth: &RequestAuth,
     params: super::TurnParams<'_>,
     on_event: &mut F,
 ) -> Result<ChatTurnResult, super::OpenAiError>
@@ -973,7 +973,7 @@ where
         retry::RetrySend {
             agent,
             url: &url,
-            api_key,
+            auth,
             body: &body,
             config,
             retry_cfg: &retry,

@@ -545,10 +545,10 @@ impl SessionState {
     ///
     /// Sessions can be created while the keystore is locked, so no provider
     /// exists at creation time; instead the first request asks the daemon
-    /// command loop for the account's config + API key (the daemon is the
-    /// sole owner of the credential map — the cleartext key never leaves it)
-    /// and builds the client HERE, on the session thread, so every socket it
-    /// dials lands in `self.registry`.
+    /// command loop for the account's config + resolved auth grant (the daemon
+    /// is the sole owner of the credential map — the cleartext grant never
+    /// leaves it) and builds the client HERE, on the session thread, so every
+    /// socket it dials lands in `self.registry`.
     ///
     /// Error strings are the SAME user-facing messages the old daemon-side
     /// cache produced, so clients see identical guidance.
@@ -574,11 +574,12 @@ impl SessionState {
         // hid behind the same reply shape: unknown account, keystore locked,
         // or no credential stored. Keep the exact wording those paths used.
         // (Crossbeam per AGENTS.md: this reply may outlive the quick path —
-        // e.g. a dropped channel when the session dies mid-request — and
-        // Zeroizing wipes any unconsumed key from the queue on drop.)
+        // e.g. a dropped channel when the session dies mid-request — and the
+        // `Zeroizing` wrappers inside `ProviderAuth` wipe any unconsumed grant
+        // from the queue on drop.)
         let Some(ResolvedAccount {
             config,
-            api_key,
+            auth,
             warm_policy,
         }) = rx.recv().ok().flatten()
         else {
@@ -590,25 +591,20 @@ impl SessionState {
             ));
         };
         // The warm policy and provider slug are non-secret facts the daemon
-        // resolved for this account; record them BEFORE the key check so
+        // resolved for this account; record them BEFORE the auth check so
         // warming and static catalog lookups (context window, reasoning
         // capability) stay correct even on this failed resolution.
         self.warm_policy = warm_policy;
         self.provider_slug = Some(config.provider.clone());
-        let Some(api_key) = api_key else {
+        let Some(auth) = auth else {
             return Err(format!(
                 "no credential stored for account '{name}' — add one via the AI Providers page or /add-key"
             ));
         };
-        // The client constructor retains the key inside its HTTP config
-        // anyway, so unwrapping the Zeroizing here is the ownership
-        // transfer into the client's own zeroize-free storage — the wipe
-        // protected the in-transit copy.
-        let provider = InferenceProvider::from_account_config(
-            &config,
-            Some((*api_key).clone()),
-            &self.registry,
-        )
+        // The client constructor takes the resolved grant (API key or OAuth);
+        // the refresh token rides inside `ProviderAuth` but is consumed to build
+        // only the request material, so it never reaches the client.
+        let provider = InferenceProvider::from_account_config(&config, auth, &self.registry)
             .map_err(|e| {
                 tracing::warn!(
                     session = ctx.session_id,
@@ -616,10 +612,11 @@ impl SessionState {
                     error = %e,
                     "failed to build provider client for session"
                 );
-                // Same user-facing message as the old unresolvable-cache path.
-                format!(
-                    "no credential stored for account '{name}' — add one via the AI Providers page or /add-key"
-                )
+                // Surface the specific reason (no API key for this protocol,
+                // an OAuth account with no access token yet, an unsupported
+                // protocol) — it is more actionable than the old generic line,
+                // and for an OAuth account it names the sign-in step.
+                e
             })?;
         debug!(session = ctx.session_id, account = %name, "resolved session provider lazily");
         self.provider = Some(provider.clone());

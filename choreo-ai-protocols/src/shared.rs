@@ -5,6 +5,7 @@ use choreo_sockreg::{RegisteringTcpConnector, SocketRegistry};
 use serde::{Deserialize, Serialize};
 use ureq::unversioned::resolver::DefaultResolver;
 use ureq::unversioned::transport::{ConnectProxyConnector, Connector, RustlsConnector};
+use zeroize::Zeroizing;
 
 use crate::types::{ChatTurnResult, StreamEvent};
 
@@ -21,6 +22,78 @@ pub enum MaxTokensField {
     MaxTokens,
     /// Use the `max_completion_tokens` field.
     MaxCompletionTokens,
+}
+
+/// The request auth a provider client consumes: the bearer material plus any
+/// credential-derived extra headers. No refresh token here.
+///
+/// This is the client-side projection of the daemon's auth grant. The daemon
+/// owns the durable grant (the refresh token) and any refresh machinery; a
+/// client is handed only the already-derived request material, so the refresh
+/// token never enters this crate. `Zeroizing` wipes the bearer bytes when the
+/// value drops, and [`Debug`](std::fmt::Debug) is hand-written to redact them.
+#[derive(Clone)]
+pub enum RequestAuth {
+    /// A plain API key, sent as `Authorization: Bearer <key>`.
+    ApiKey(Zeroizing<String>),
+    /// An OAuth access token plus the credential-derived extra headers its
+    /// provider requires (e.g. the `ChatGPT` account id and originator
+    /// headers).
+    OAuth {
+        /// The ephemeral bearer access token.
+        access_token: Zeroizing<String>,
+        /// Extra request headers the credential's provider requires. Empty when
+        /// the credential derives none.
+        extra_headers: Vec<(String, String)>,
+    },
+}
+
+impl RequestAuth {
+    /// Convenience constructor for an API-key client.
+    #[must_use]
+    pub fn api_key(key: impl Into<String>) -> Self {
+        RequestAuth::ApiKey(Zeroizing::new(key.into()))
+    }
+
+    /// The bearer token value, without the `Bearer ` scheme prefix.
+    #[must_use]
+    pub fn bearer_token(&self) -> &str {
+        match self {
+            RequestAuth::ApiKey(key) => key.as_str(),
+            RequestAuth::OAuth { access_token, .. } => access_token.as_str(),
+        }
+    }
+
+    /// Build the `Authorization: Bearer <...>` header value. Wrapped in
+    /// `Zeroizing` so the temporary string is wiped when it drops.
+    #[must_use]
+    pub fn authorization_header(&self) -> Zeroizing<String> {
+        Zeroizing::new(format!("Bearer {}", self.bearer_token().trim()))
+    }
+
+    /// The credential-derived extra headers (empty for an API key).
+    #[must_use]
+    pub fn extra_headers(&self) -> &[(String, String)] {
+        match self {
+            RequestAuth::ApiKey(_) => &[],
+            RequestAuth::OAuth { extra_headers, .. } => extra_headers,
+        }
+    }
+}
+
+/// Hand-written so a logged request auth cannot expose the bearer token
+/// (`Zeroizing<String>`'s own `Debug` would print the secret inside).
+impl std::fmt::Debug for RequestAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RequestAuth::ApiKey(_) => f.write_str("RequestAuth::ApiKey(***)"),
+            RequestAuth::OAuth { extra_headers, .. } => f
+                .debug_struct("RequestAuth::OAuth")
+                .field("access_token", &"***")
+                .field("extra_headers", extra_headers)
+                .finish(),
+        }
+    }
 }
 
 /// Unified error type for all API providers.

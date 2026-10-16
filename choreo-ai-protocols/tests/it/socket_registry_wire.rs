@@ -10,7 +10,7 @@
 //! These tests bind a real local TCP socket, so per AGENTS.md they live in
 //! `tests/` and are marked `#[ignore]` (run via `cargo test-integration`).
 
-use choreo_ai_protocols::openai::{MaxTokensField, OpenAiClient, ServiceConfig};
+use choreo_ai_protocols::openai::{MaxTokensField, OpenAiClient, RequestAuth, ServiceConfig};
 use choreo_ai_protocols::test_utils::MockProvider;
 use choreo_ai_protocols::{ChatTurnRequest, ChatTurnResult, SocketRegistry};
 
@@ -37,7 +37,7 @@ fn provider_connection_is_registered_and_shutdown_all_does_not_panic() {
             chat_completions_max_tokens_field: MaxTokensField::MaxCompletionTokens,
             ..Default::default()
         },
-        "test-key".to_string(),
+        RequestAuth::api_key("test-key"),
         &registry,
     )
     .expect("openai client");

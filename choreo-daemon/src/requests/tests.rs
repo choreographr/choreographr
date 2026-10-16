@@ -2252,7 +2252,7 @@ fn resolve_reasoning_effort_openai_supported_model_preserves() {
     let config = choreo_ai_protocols::openai::ServiceConfig::default();
     let client = choreo_ai_protocols::openai::OpenAiClient::new(
         config,
-        "test-key".into(),
+        choreo_ai_protocols::RequestAuth::api_key("test-key"),
         &choreo_ai_protocols::SocketRegistry::new(),
     )
     .unwrap();
@@ -2267,7 +2267,7 @@ fn resolve_reasoning_effort_openai_unsupported_model_disables() {
     let config = choreo_ai_protocols::openai::ServiceConfig::default();
     let client = choreo_ai_protocols::openai::OpenAiClient::new(
         config,
-        "test-key".into(),
+        choreo_ai_protocols::RequestAuth::api_key("test-key"),
         &choreo_ai_protocols::SocketRegistry::new(),
     )
     .unwrap();

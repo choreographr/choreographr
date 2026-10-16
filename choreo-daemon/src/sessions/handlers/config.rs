@@ -439,20 +439,12 @@ pub(in crate::sessions) fn handle_set_account(
     state.warm_policy = resolved
         .as_ref()
         .map_or_else(WarmPolicy::default, |a| a.warm_policy);
-    // Build the client when a credential is present. Held in a local so the
-    // immutable borrow of `state.registry` is released before the assignment
-    // below (a let-chain condition would otherwise keep it live into the body).
-    let new_provider = resolved.as_ref().and_then(|a| {
-        let key = a.api_key.as_ref()?;
-        InferenceProvider::from_account_config(
-            &a.config,
-            // See resolve_provider: the Zeroizing wrapper protects the
-            // in-transit key; the client constructor takes ownership from here
-            // and stores the credential in its own config.
-            Some((**key).clone()),
-            &state.registry,
-        )
-        .ok()
+    // Build the client when a credential is present. The resolved grant is
+    // consumed here (the reply is not reused past this point); `None` (unknown
+    // account) or a `None` grant (no credential stored) leaves the provider
+    // unset so the next request retries lazily.
+    let new_provider = resolved.and_then(|a| {
+        InferenceProvider::from_account_config(&a.config, a.auth?, &state.registry).ok()
     });
     if let Some(provider) = new_provider {
         state.provider = Some(provider);

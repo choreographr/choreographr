@@ -23,7 +23,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use choreo_ai_protocols::openai::{
-    ChatRequestMessage, MaxTokensField, OpenAiClient, RequestUploadedCallback, ServiceConfig,
+    ChatRequestMessage, MaxTokensField, OpenAiClient, RequestAuth, RequestUploadedCallback,
+    ServiceConfig,
 };
 use choreo_ai_protocols::test_utils::{CapturedRequest, MockProvider};
 use choreo_ai_protocols::{
@@ -60,7 +61,7 @@ fn chat_client(
             request_compression: compression,
             ..Default::default()
         },
-        "test-key".to_string(),
+        RequestAuth::api_key("test-key"),
         registry,
     )
     .expect("openai client")

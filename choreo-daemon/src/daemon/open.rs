@@ -270,6 +270,7 @@ impl DaemonState {
             session_registries: HashMap::new(),
             session_mcp_projects: HashMap::new(),
             credentials: HashMap::new(),
+            access_tokens: HashMap::new(),
             x_credentials: None,
             // The daemon starts locked: credentials are only decrypted into
             // memory once a client presents the valid unlock key.

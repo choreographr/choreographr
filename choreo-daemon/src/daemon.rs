@@ -27,7 +27,7 @@ use crate::catalog::{CatalogPaths, MaintenanceEvent, RefreshReport, RefreshReque
 use crate::db::{self, SessionRecord};
 use crate::mcp::trust::McpTrustStore;
 use crate::mcp::{McpManager, McpReloadOutcome, McpStatusReport, McpTrustOutcome};
-use crate::providers::{ImageProviderHandle, InferenceProvider};
+use crate::providers::{ImageProviderHandle, InferenceProvider, ProviderAuth};
 use arc_swap::ArcSwap;
 
 // Re-export the image-resolution error type next to the DaemonCommand that
@@ -94,20 +94,34 @@ pub(super) type ListModelsReply =
 type ResolveAccountReply = crossbeam_channel::Sender<Option<ResolvedAccount>>;
 
 /// The daemon's reply to `ResolveAccountCmd`: the resolved account config, its
-/// API key wrapped in `Zeroizing` (wipe-on-drop — the single hop where cleartext
-/// leaves the daemon), and the cache-warming policy resolved for that account
-/// (the global `[cache_warming]` merged with the account overrides). Grouping
-/// them means the session learns its warm policy exactly when it learns its
+/// resolved auth grant (wipe-on-drop — the single hop where cleartext leaves
+/// the daemon), and the cache-warming policy resolved for that account (the
+/// global `[cache_warming]` merged with the account overrides). Grouping them
+/// means the session learns its auth and warm policy exactly when it learns its
 /// account config: the lazy first resolve, an account switch, and an accounts
 /// reload all flow through this reply.
 pub struct ResolvedAccount {
     /// The account's configuration.
     pub config: crate::accounts::AccountConfig,
-    /// The account's API key, wipe-on-drop. `None` when no credential is stored
-    /// (the config is still valid for slug/warm-policy resolution).
-    pub api_key: Option<Zeroizing<String>>,
+    /// The account's resolved auth grant, wipe-on-drop. `None` when no
+    /// credential is stored (the config is still valid for slug/warm-policy
+    /// resolution).
+    pub auth: Option<ProviderAuth>,
     /// The cache-warming policy resolved for this account.
     pub warm_policy: WarmPolicy,
+}
+
+/// A cached ephemeral OAuth access token for an account, held in daemon memory
+/// only and wiped on `/lock`. The refresh token and the rest of the durable
+/// grant stay in the credential blob; only this derived, expiring token lives
+/// here.
+pub struct AccessTokenCache {
+    /// The bearer access token, wipe-on-drop.
+    pub access_token: Zeroizing<String>,
+    /// The provider-reported expiry (Unix seconds), when it reported one.
+    pub expires_at: Option<i64>,
+    /// When the daemon obtained the token (Unix seconds).
+    pub received_at: i64,
 }
 
 /// A session's last-resolved MCP project: the project root its overlay was
@@ -233,6 +247,11 @@ pub struct DaemonState {
     /// Decrypted credentials held in memory while the keystore is unlocked,
     /// keyed by service name. Empty while locked; cleared by `/lock`.
     pub credentials: HashMap<String, ServiceCredential>,
+    /// Cached ephemeral OAuth access tokens, keyed by account name, while the
+    /// keystore is unlocked. Memory-only, never persisted, and cleared by
+    /// `/lock` exactly like `credentials` — an access token is a derived,
+    /// expiring value whose durable root is the refresh token in the blob.
+    pub access_tokens: HashMap<String, AccessTokenCache>,
     /// The X/Twitter credential, mirrored out of `credentials` for the `x_*`
     /// tools' single `x_credentials` slot.
     pub x_credentials: Option<ServiceCredential>,
@@ -1455,12 +1474,41 @@ impl DaemonState {
     }
 
     /// Extract the decrypted API key for an account, if one is held in
-    /// memory. `None` covers both "keystore locked" and "no credential
-    /// stored" — callers that must distinguish them check `self.locked`.
+    /// memory. `None` covers both "keystore locked", "no credential stored",
+    /// and "the stored credential is not an API key" — callers that must
+    /// distinguish them check `self.locked` / [`Self::has_credential`].
     fn api_key_for(&self, name: &str) -> Option<String> {
         self.credentials.get(name).and_then(|c| match c {
             ServiceCredential::ApiKey { key } => Some(key.clone()),
             _ => None,
+        })
+    }
+
+    /// Whether any credential (API key or OAuth grant) is stored for `name`.
+    /// The non-secret gate for the daemon paths that only need "can this
+    /// account resolve a provider at all" — a fact a credential of either kind
+    /// satisfies.
+    fn has_credential(&self, name: &str) -> bool {
+        self.credentials.contains_key(name)
+    }
+
+    /// Resolve the auth grant for an account, if a credential is stored. API
+    /// keys project straight through; an OAuth credential carries its whole
+    /// grant plus any cached access token, so the future refresh path has the
+    /// refresh token to work with.
+    fn auth_for(&self, name: &str) -> Option<ProviderAuth> {
+        let credential = self.credentials.get(name)?;
+        Some(match credential {
+            ServiceCredential::ApiKey { key } => ProviderAuth::ApiKey {
+                key: Zeroizing::new(key.clone()),
+            },
+            other => ProviderAuth::OAuth {
+                credential: Box::new(other.clone()),
+                access_token: self
+                    .access_tokens
+                    .get(name)
+                    .map(|cache| cache.access_token.clone()),
+            },
         })
     }
 
@@ -1472,12 +1520,8 @@ impl DaemonState {
     /// (see `SessionState::resolve_provider`).
     fn build_daemon_provider(&self, name: &str) -> Option<InferenceProvider> {
         let config = self.accounts.get(name)?;
-        InferenceProvider::from_account_config(
-            config,
-            self.api_key_for(name),
-            &self.daemon_registry,
-        )
-        .ok()
+        InferenceProvider::from_account_config(config, self.auth_for(name)?, &self.daemon_registry)
+            .ok()
     }
 
     /// The account's provider slug (catalog key, e.g. "opencode-go"), if the
@@ -1637,7 +1681,7 @@ impl DaemonState {
     /// assert the gate independently of thread spawning.
     fn should_prefetch_models(&self, account: &str) -> bool {
         if !self.accounts.contains(account)
-            || self.api_key_for(account).is_none()
+            || !self.has_credential(account)
             || self.model_prefetch_in_flight.contains(account)
         {
             return false;
@@ -1737,7 +1781,7 @@ impl DaemonState {
                 // (AccountsReload invalidates sessions) while the fetch was
                 // in flight, and inserting then would serve a dead
                 // provider's model list for a full TTL.
-                if !self.accounts.contains(&account) || self.api_key_for(&account).is_none() {
+                if !self.accounts.contains(&account) || !self.has_credential(&account) {
                     debug!(
                         account = %account,
                         "discarding background model prefetch result; \
@@ -2281,6 +2325,9 @@ impl DaemonState {
         // invalidate the cached client of every session bound to this
         // account so it rebuilds (and fails with clean guidance) on next use.
         self.credentials.remove(service);
+        // A cached access token is derived from the credential being removed;
+        // drop it so no stale bearer survives a credential swap.
+        self.access_tokens.remove(service);
         self.drop_session_clients(Some(service));
         if service == "twitter" {
             self.x_credentials = None;
@@ -2497,7 +2544,7 @@ impl DaemonState {
         // or account unknown) → reject so the user knows they must unlock
         // first (or configure a credential) rather than silently accepting an
         // unvalidated model.
-        if !self.accounts.contains(&account_name) || self.api_key_for(&account_name).is_none() {
+        if !self.accounts.contains(&account_name) || !self.has_credential(&account_name) {
             debug!(
                 "ValidateModel: no provider for account '{account_name}', \
                  rejecting model '{model}'"
@@ -2542,16 +2589,14 @@ impl DaemonState {
         });
     }
 
-    /// Get the API key for a stored credential (returns None if not found).
+    /// Get the API key for a stored credential (returns None if not found, or
+    /// if the stored credential is not an API key).
     fn handle_get_credential(
         &mut self,
         service: &str,
         reply: &std::sync::mpsc::Sender<Option<String>>,
     ) {
-        let key = self.credentials.get(service).and_then(|c| match c {
-            ServiceCredential::ApiKey { key } => Some(key.clone()),
-            _ => None,
-        });
+        let key = self.api_key_for(service);
         let _ = reply.send(key);
     }
 
@@ -3211,18 +3256,17 @@ impl DaemonState {
     }
 
     /// Reply to a session's lazy provider-resolution request with the raw
-    /// ingredients (config + API key) plus the resolved warm policy. The session
-    /// thread builds the client itself, against its own socket registry. The key
-    /// is wrapped in `Zeroizing` here — the single hop where the daemon hands
-    /// cleartext across a thread boundary — so unconsumed replies are wiped on
-    /// drop.
+    /// ingredients (config + resolved auth grant) plus the resolved warm policy.
+    /// The session thread builds the client itself, against its own socket
+    /// registry. The grant is wipe-on-drop (`ProviderAuth` wraps every secret in
+    /// `Zeroizing`) — the single hop where cleartext crosses a thread boundary —
+    /// so an unconsumed reply is wiped on drop.
     fn handle_resolve_account(&mut self, account: &str, reply: &ResolveAccountReply) {
         let resolved = self.accounts.get(account).map(|config| ResolvedAccount {
             config: config.clone(),
-            // api_key_for returns an inert String for internal gates
-            // (prefetch/validate checks); this reply is the credential
-            // EXIT point, so the wipe-on-drop wrapper goes on here.
-            api_key: self.api_key_for(account).map(Zeroizing::new),
+            // `auth_for` is the credential EXIT point; the `Zeroizing` wrappers
+            // ride inside `ProviderAuth`.
+            auth: self.auth_for(account),
             warm_policy: self.warm_policy_for(Some(account)),
         });
         let _ = reply.send(resolved);
@@ -3389,7 +3433,7 @@ fn handle_list_models_inner(
     // Existence + credential check only — no provider instance is needed
     // below, because the actual fetch (if any) runs on the detached
     // background thread.
-    if !state.accounts.contains(&account_name) || state.api_key_for(&account_name).is_none() {
+    if !state.accounts.contains(&account_name) || !state.has_credential(&account_name) {
         return Err(if state.accounts.is_empty() {
             "no accounts configured".to_string()
         } else {

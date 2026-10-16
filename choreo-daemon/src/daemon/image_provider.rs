@@ -141,8 +141,8 @@ impl DaemonState {
             self.accounts
                 .get(name)
                 .and_then(|config| {
-                    InferenceProvider::from_account_config(config, self.api_key_for(name), registry)
-                        .ok()
+                    let auth = self.auth_for(name)?;
+                    InferenceProvider::from_account_config(config, auth, registry).ok()
                 })
                 .ok_or_else(|| ImageProviderError::AccountNotConfigured {
                     name: name.to_string(),

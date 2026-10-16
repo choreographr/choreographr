@@ -4,6 +4,7 @@ pub use crate::retry::{RequestUploadedCallback, RetryCallback, RetryConfig};
 
 use super::{OpenAiError, ServiceConfig};
 use crate::retry;
+use crate::shared::RequestAuth;
 
 pub(crate) fn retry_config_from_config(config: &ServiceConfig) -> RetryConfig {
     RetryConfig::new(
@@ -22,7 +23,10 @@ pub(crate) fn retry_config_from_config(config: &ServiceConfig) -> RetryConfig {
 pub(crate) struct RetrySend<'a> {
     pub agent: &'a ureq::Agent,
     pub url: &'a str,
-    pub api_key: &'a str,
+    /// The request auth: an API key or an OAuth access token plus its derived
+    /// extra headers. The bearer value and the extra headers are both applied
+    /// here, so every call site stays a plain "send with retry".
+    pub auth: &'a RequestAuth,
     pub body: &'a serde_json::Value,
     pub config: &'a ServiceConfig,
     pub retry_cfg: &'a RetryConfig,
@@ -43,21 +47,30 @@ pub(crate) fn retry_send(
     let RetrySend {
         agent,
         url,
-        api_key,
+        auth,
         body,
         config,
         retry_cfg,
         route,
         on_uploaded,
     } = request;
-    let auth_header = zeroize::Zeroizing::new(format!("Bearer {}", api_key.trim()));
-    // Provider-specific extra headers (the opencode gateway routing headers)
-    // are derived from the config + route here, so every call site stays a
-    // plain "send with retry" and cannot forget or duplicate them. Empty for
-    // non-gateway providers, so the closure loop is a no-op there.
-    let headers = route.map_or_default(|(session_id, request_id)| {
+    // The bearer value is built from the request auth (an API key or an OAuth
+    // access token); `Zeroizing` wipes the temporary `Bearer …` string on drop.
+    let auth_header = auth.authorization_header();
+    // Provider-specific extra headers are derived here: the credential-derived
+    // headers (e.g. the `ChatGPT` account id and originator) come from the auth
+    // itself, and the opencode gateway routing headers from the config + route.
+    // Both apply to the same request, so they are merged into one list; every
+    // call site stays a plain "send with retry" and cannot forget or duplicate
+    // either set. Empty lists on both sides make the loop a no-op (the merged
+    // order does not matter unless a name collides, which they never do).
+    let mut headers: Vec<(String, String)> = route.map_or_default(|(session_id, request_id)| {
         crate::shared::opencode_gateway_headers(&config.provider_slug, session_id, request_id)
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value))
+            .collect()
     });
+    headers.extend(auth.extra_headers().iter().cloned());
     // Serialize once and shape the send: a compact body plus the
     // `Content-Type`/`Content-Length` headers (and `Content-Encoding` when the
     // provider opts into request compression) and the upload hook (see
@@ -79,7 +92,7 @@ pub(crate) fn retry_send(
                     .header("Authorization", auth_header.as_str()),
             );
             for (name, value) in &headers {
-                request = request.header(*name, value.as_str());
+                request = request.header(name.as_str(), value.as_str());
             }
             request.send(hooked.send_body())
         },
@@ -92,16 +105,17 @@ pub(crate) fn retry_send(
 pub(crate) fn retry_send_get(
     agent: &ureq::Agent,
     url: &str,
-    api_key: &str,
+    auth: &RequestAuth,
     _config: &ServiceConfig,
     retry_cfg: &RetryConfig,
     ctx: &mut crate::retry::AttemptContext,
 ) -> Result<ureq::http::Response<ureq::Body>, OpenAiError> {
-    let auth_header = zeroize::Zeroizing::new(format!("Bearer {}", api_key.trim()));
+    let auth_header = auth.authorization_header();
     // Model listing carries no session identity, so no opencode gateway
     // routing headers are sent here — the gateway does not route model
-    // listings to inference upstreams anyway.
-    let headers: Vec<(&'static str, String)> = Vec::new();
+    // listings to inference upstreams anyway. Credential-derived headers still
+    // apply, because they belong to the account, not the route.
+    let headers: Vec<(String, String)> = auth.extra_headers().to_vec();
     // The closure captures `auth_header` and `headers` by reference (it stays
     // `Fn`); the Zeroizing wrapper ensures the temporary `Bearer …` string is
     // wiped when it goes out of scope.
@@ -109,7 +123,7 @@ pub(crate) fn retry_send_get(
         || {
             let mut request = agent.get(url).header("Authorization", auth_header.as_str());
             for (name, value) in &headers {
-                request = request.header(*name, value.as_str());
+                request = request.header(name.as_str(), value.as_str());
             }
             request.call()
         },

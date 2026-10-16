@@ -273,6 +273,62 @@ pub enum ProviderProtocol {
     GoogleGenerativeAi,
 }
 
+/// Per-endpoint OAuth grant encoding: how the authorization server expects a
+/// token-request body to be serialized. The code exchange and the refresh can
+/// differ (e.g. the `ChatGPT`/Codex backend accepts a form-encoded code
+/// exchange but a JSON refresh), so a profile carries one per endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantEncoding {
+    /// `application/x-www-form-urlencoded`.
+    Form,
+    /// `application/json`.
+    Json,
+}
+
+/// The OAuth profile for a provider: the authorization-server parameters the
+/// daemon and the login library need to run a sign-in and to refresh a grant.
+///
+/// This is **overlay-only policy** — models.dev carries no OAuth facts — and it
+/// is parsed all-or-nothing: a profile missing a required field is warned and
+/// skipped rather than half applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthProfile {
+    /// Authorization-server issuer (e.g. `https://auth.openai.com`).
+    pub issuer: String,
+    /// Path of the authorization endpoint, relative to `issuer`.
+    pub authorize_path: String,
+    /// Path of the token endpoint, relative to `issuer`.
+    pub token_path: String,
+    /// Scopes requested at login.
+    pub scopes: Vec<String>,
+    /// Loopback redirect ports to try, in order (the first free one wins).
+    pub redirect_ports: Vec<u16>,
+    /// Grant encoding for the authorization-code exchange.
+    pub code_exchange_encoding: GrantEncoding,
+    /// Grant encoding for the refresh exchange.
+    pub refresh_encoding: GrantEncoding,
+    /// Whether the provider offers a device-code (headless) flow.
+    pub device_code: bool,
+    /// A PUBLIC client id only (PKCE). Never a secret; a confidential client
+    /// reads its secret from config/env at login.
+    pub client_id: Option<String>,
+}
+
+/// How a provider authenticates a request, derived from its catalog entry.
+///
+/// There is deliberately no separate `auth` attribute on the entry: an
+/// [`OAuthProfile`] means OAuth and its absence means API key, so the overlay
+/// `oauth` block is the single policy source while models.dev remains the fact
+/// source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthKind {
+    /// API-key authentication (the default).
+    ApiKey,
+    /// OAuth, when the entry carries an [`OAuthProfile`].
+    OAuth,
+}
+
 /// A provider and its curated model list, loaded from `<slug>.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderEntry {
@@ -303,6 +359,24 @@ pub struct ProviderEntry {
     /// decision.
     #[serde(default)]
     pub request_compression: RequestCompression,
+    /// The provider's OAuth profile, when it can be signed into with OAuth.
+    /// Overlay-only policy (models.dev carries no OAuth facts); its presence is
+    /// what makes [`ProviderEntry::auth_kind`] report [`AuthKind::OAuth`].
+    #[serde(default)]
+    pub oauth: Option<OAuthProfile>,
+}
+
+impl ProviderEntry {
+    /// The provider's auth kind, derived from whether it carries an OAuth
+    /// profile.
+    #[must_use]
+    pub fn auth_kind(&self) -> AuthKind {
+        if self.oauth.is_some() {
+            AuthKind::OAuth
+        } else {
+            AuthKind::ApiKey
+        }
+    }
 }
 
 /// Process-wide catalog of all known providers, backed by an [`ArcSwap`] so a
@@ -443,6 +517,7 @@ pub(crate) mod test_util {
             default_model: "tiny-model".into(),
             prompt_cache: None,
             request_compression: RequestCompression::Identity,
+            oauth: None,
             models: vec![crate::catalog::ModelEntry {
                 model: "tiny-model".into(),
                 context_window: 4096,
