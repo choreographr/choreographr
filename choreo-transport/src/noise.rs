@@ -11,6 +11,7 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use zeroize::Zeroize;
 
 use crate::error::TransportError;
 use crate::handshake::{at, at_mut, slice, slice_mut};
@@ -46,10 +47,12 @@ const FRAG_BUF_LEN: usize = FRAGMENT_HEADER_LEN + MAX_PLAINTEXT_CHUNK;
 
 /// Resets the single-writer flag when a `send_message` finishes — on every
 /// exit path, including early `?` returns. Without the guard a concurrent
-/// sender that errored would leave the flag set and wedge the stream.
-struct SendGuard<'a>(&'a AtomicBool);
+/// sender that errored would leave the flag set and wedge the stream. It owns a
+/// clone of the shared `Arc` (rather than borrowing the field) so it does not
+/// hold a borrow of `self` across the send body.
+struct SendGuard(Arc<AtomicBool>);
 
-impl Drop for SendGuard<'_> {
+impl Drop for SendGuard {
     fn drop(&mut self) {
         // Relaxed is sufficient: the flag publishes no data (the TransportState
         // mutex provides its own ordering for the cipher state, and socket bytes
@@ -196,10 +199,6 @@ impl NoiseStream {
     /// concurrently sending on this stream or the plaintext exceeds
     /// [`MAX_FRAME_SIZE`], [`TransportError::ConnectionClosed`]/I/O errors
     /// from the socket, or snow errors from encryption.
-    // The `usize` ciphertext length `n` is snow's plaintext-plus-tag output
-    // and is bounded by the [`MAX_FRAME_SIZE`] check above, far under
-    // `u32::MAX`; keeping the plain cast preserves exact wire behavior.
-    #[expect(clippy::cast_possible_truncation)]
     pub fn send_message(&mut self, plaintext: &[u8]) -> Result<(), TransportError> {
         // The single-writer-per-connection invariant is load-bearing:
         // fragments of one logical message must never interleave with
@@ -212,8 +211,23 @@ impl NoiseStream {
                 "concurrent send_message on one NoiseStream".to_string(),
             ));
         }
-        let _guard = SendGuard(&self.sender_active);
+        let _guard = SendGuard(Arc::clone(&self.sender_active));
+        let result = self.send_message_inner(plaintext);
+        // Wipe the reusable plaintext staging buffer: it holds a copy of this
+        // (possibly secret) message until the next send would overwrite it, so
+        // it is zeroized on every exit — success or failure — to close that
+        // window. `zeroize` clears the length; the next call regrows it. The
+        // `Zeroizing` payload a typed caller holds is wiped independently on
+        // its own drop.
+        self.send_frag.zeroize();
+        result
+    }
 
+    // The `usize` ciphertext length `n` is snow's plaintext-plus-tag output
+    // and is bounded by the [`MAX_FRAME_SIZE`] check below, far under
+    // `u32::MAX`; keeping the plain cast preserves exact wire behavior.
+    #[expect(clippy::cast_possible_truncation)]
+    fn send_message_inner(&mut self, plaintext: &[u8]) -> Result<(), TransportError> {
         // Mirror the receiver's reassembly cap so an over-limit message is
         // rejected at the source instead of by the peer's recv_message.
         if plaintext.len() > MAX_FRAME_SIZE {

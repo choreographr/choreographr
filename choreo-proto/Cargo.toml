@@ -15,6 +15,7 @@ rmp-serde.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 
 # Windows Unix domain sockets: std::os::windows::net::UnixStream is still
 # unstable, so the crate's `UnixStream` re-export / `connect_unix` dial uses

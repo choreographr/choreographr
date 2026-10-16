@@ -17,6 +17,9 @@ tracing.workspace = true
 snow.workspace = true
 x25519-dalek.workspace = true
 rand.workspace = true
+# Zeroize the reusable plaintext staging buffer after each send, so a sent
+# message's plaintext does not linger in the reused buffer until the next send.
+zeroize.workspace = true
 # Fingerprint rendering of transport public keys (base64, standard alphabet —
 # the same encoding the daemon's ACL uses for pubkeys, so one convention).
 base64.workspace = true

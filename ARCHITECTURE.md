@@ -542,6 +542,14 @@ I/O (that scope is what prevents the bidirectional large-message deadlock), and
 the guard is a single-bit flag in the spirit of the cooperative-cancellation
 flag; the full rationale is in `choreo-transport`'s `noise` module docs.
 
+The plaintext side of the transport is zeroized. `choreo-proto`'s
+`encode_payload`/`encode_frame` return a `zeroize::Zeroizing<Vec<u8>>`, and
+`choreo-transport` holds that buffer until the Noise encryption call returns
+(and clears its reused per-fragment plaintext staging buffer after each send),
+so an encoded frame — which may carry a secret such as a credential riding
+`AddCredential`, or the unlock key — is wiped from memory on drop instead of
+lingering in freed or reused buffers.
+
 ## Provider Architecture
 
 Provider support is layered across two crates, and the seam between them is the

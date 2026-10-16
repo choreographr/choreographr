@@ -1,6 +1,7 @@
 use crate::ProtoError;
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
+use zeroize::Zeroizing;
 
 /// Wire protocol version.
 ///
@@ -83,9 +84,18 @@ pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 /// [`MAX_FRAME_SIZE`]. Shared by [`encode_payload`] (transport-provided
 /// framing) and [`encode_frame`] (4-byte length prefix added by the caller),
 /// so the codec and the size policy live in exactly one place.
-fn encode_inner<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtoError> {
-    let payload = rmp_serde::to_vec_named(&(PROTOCOL_VERSION, message))
-        .map_err(|e| ProtoError::Codec(e.to_string()))?;
+///
+/// The returned buffer is wrapped in [`Zeroizing`] so the plaintext frame —
+/// which may carry a secret, e.g. a credential riding `AddCredential` — is
+/// wiped from memory when the caller drops it, rather than left in freed
+/// memory after the transport has encrypted and sent it.
+fn encode_inner<T: Serialize>(message: &T) -> Result<Zeroizing<Vec<u8>>, ProtoError> {
+    // Wrap immediately after serialization so the buffer is zeroized on every
+    // exit path, including the over-limit `FrameTooLarge` return below.
+    let payload = Zeroizing::new(
+        rmp_serde::to_vec_named(&(PROTOCOL_VERSION, message))
+            .map_err(|e| ProtoError::Codec(e.to_string()))?,
+    );
 
     if payload.len() > MAX_FRAME_SIZE {
         return Err(ProtoError::FrameTooLarge);
@@ -97,26 +107,30 @@ fn encode_inner<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtoError> {
 ///
 /// This is used when the transport layer already provides its own
 /// framing (e.g. `NoiseStream`), so only the raw `MessagePack` payload is needed.
+/// The returned buffer is [`Zeroizing`]: the plaintext is wiped on drop.
 ///
 /// # Errors
 ///
 /// Returns [`ProtoError::Codec`] when serialization fails and
 /// [`ProtoError::FrameTooLarge`] when the payload exceeds [`MAX_FRAME_SIZE`].
-pub fn encode_payload<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtoError> {
+pub fn encode_payload<T: Serialize>(message: &T) -> Result<Zeroizing<Vec<u8>>, ProtoError> {
     encode_inner(message)
 }
 
 /// Encode a message with the 4-byte big-endian length prefix.
+///
+/// The returned frame is [`Zeroizing`], so its plaintext payload is wiped on
+/// drop.
 ///
 /// # Errors
 ///
 /// Returns [`ProtoError::Codec`] when serialization fails,
 /// [`ProtoError::FrameTooLarge`] when the payload exceeds [`MAX_FRAME_SIZE`],
 /// and the same error if the length prefix itself would overflow `u32`.
-pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtoError> {
+pub fn encode_frame<T: Serialize>(message: &T) -> Result<Zeroizing<Vec<u8>>, ProtoError> {
     let payload = encode_inner(message)?;
 
-    let mut frame = Vec::with_capacity(4 + payload.len());
+    let mut frame = Zeroizing::new(Vec::with_capacity(4 + payload.len()));
     // `encode_inner` already bounds `payload.len()` to MAX_FRAME_SIZE (64 MiB),
     // far below u32::MAX, but go through `try_from` so the length prefix can
     // never silently truncate if the limit is ever raised past 4 GiB.
