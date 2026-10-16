@@ -743,7 +743,7 @@ store is shared.
 | `choreo-daemon` | `handle_save_credential` rewritten (§5); `ResolveAccountCmd` carries `ProviderAuth`; `api_key_for` → auth accessor; `OAuthRefreshLocks`; provider refresh loop + rotation persistence (§6/§7); `CredentialBackend` impl + `DaemonCommand::OAuth*` for MCP; **target-scoped MCP credential keys (`mcp:<slug>\|<target-hash>`) + trust-gated login (§8.1)**; `oauth` catalog auth-kind; `AccountManager`/`drop_session_clients` extended. |
 | `choreo-mcp` | enable `rmcp` `auth`; `AuthorizationManager`/`AuthClient` wiring; `oauth` config (expanded only for a trusted tier); `CredentialStore` adapter (strips access token, resolves the target-scoped key); `needs_auth` state. |
 | `choreo-proto` | changed `AddCredential`; one `InferenceError` variant + re-login `DaemonMessage`; MCP auth state in `McpStatus`; `mcp login/logout` messages; version bump at release. |
-| `choreo-tui` / `choreo-cli` | login surfaces; GUI/IM are follow-ups. |
+| `choreo-tui` / `choreo-cli` | login surfaces (TUI/CLI); GUI/IM are **compile stubs** only. |
 | docs | `ARCHITECTURE.md`: replace the deferred-providers note and document the key model (no private key at rest, daemon-as-writer, binding, access-token-in-memory). `README.md`: OAuth feature row. |
 
 ## 13. Phasing
@@ -840,7 +840,7 @@ crate.
 - **Per-account credential pools / failover** (README "Credential rotation/fallback")
   — orthogonal.
 - **Proactive refresh scheduler** — an optional follow-up once on-demand is proven.
-- **GUI / IM login surfaces** — follow-ups after TUI + CLI.
+- **GUI / IM login surfaces** — out; GUI/IM stay **compile stubs**.
 
 ## 18. Assumptions, verification & open questions
 
@@ -886,14 +886,29 @@ headers; store them as provider-table data:
 - Pin the current known set in a unit test and re-check against a real 4xx before
   relying on the disputed headers.
 
+### Decided in review
+
+- **Auth-state surfacing:** on a terminal failure the daemon **broadcasts the error**
+  (§9) only. Extending `AccountInfo`/`McpServerStatus` and the re-login *flow* are
+  **deferred**.
+- **GUI / IM:** **compile stubs only** — the bare minimum to build; no login surface
+  now.
+- **Proactive refresh scheduler:** **out** of scope for v1 (§17).
+- **Provider logout (`/logout <account>`):** **out** for now (account removal
+  suffices).
+- **Client ids:** **obtained later**; ship first on the OpenAI dynamic-registration
+  route plus the gated borrowed id (§7.1).
+
 ### Open design questions
 
-1. **Re-login / auth-state surfacing.** Extend `AccountInfo` (auth kind + needs-relogin)
-   and `McpServerStatus` (auth state), and/or add a one-shot "re-login required"
-   broadcast on a terminal failure. Leaning both: a resting status field plus a
-   broadcast nudge.
-2. **GUI/IM login placement** (GUI modal vs loopback browser) — follow the
-   provider-login precedent; TUI/CLI land first.
+1. **id_token storage** — the raw JWT *and* the extracted `account_id`/claims, or
+   claims only.
+2. **Provider OAuth scope step-up** — in or out for v1.
+3. **Refresh buffer default** — 60 s, or align with the peers' 30 s / 5 min.
+4. **Catalog `auth` attribute** — needed? models.dev carries only `env` (API-key var
+   names) and no auth/oauth field, and does not cover the OAuth providers.
+5. **MCP login transports** — confirm loopback + paste-URL only (no device-code).
+6. **Sequencing vs `keystore-identity-keying.md`.**
 
 ## 19. Definition of done
 
