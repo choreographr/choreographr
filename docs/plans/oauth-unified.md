@@ -677,6 +677,18 @@ persistence).
   descriptor also carries the provider's **client-identity mode** (§7.1) and the
   public client id (or an instruction to register/import one), so the client never
   embeds a copy of the policy.
+- **First-run onboarding is the primary sign-in entry point.** The merged onboarding
+  work added a welcome checklist to the TUI — "Add an AI provider account and its API
+  key" → use it in the session → pick a model
+  (`choreo-tui/src/state/onboarding.rs`, `render/welcome.rs`), whose follow-through
+  **selects the account and opens the model picker on the `CredentialAdded`
+  confirmation** (`SetupFollow::AwaitCredential`). The sign-in UX integrates **here**:
+  the first step becomes "…an API key **or sign in**", and an OAuth `AddCredential`
+  keeps emitting `CredentialAdded` so the existing follow-through (and account
+  selection) works for an OAuth credential too. *(Sequencing: that work already
+  reshaped `connection/ai_providers.rs`, `connection/command.rs`, `state/pages.rs`,
+  `state/providers.rs`, and `render/ai_providers.rs` — the login slice rebases onto
+  it.)*
 
 ## 11. Prior art (`~/agents`)
 
@@ -827,6 +839,10 @@ crate.
 - **MCP conformance**: move the OAuth `auth/*` scenarios out of the committed
   expected-failures baseline as they pass.
 - **Never** hit the real `auth.openai.com` in tests.
+- **Gate scope:** `just pre-commit`'s `test-all` now runs `--exclude choreo-gui`
+  (`clippy-strict`/`doc-check` still cover it; the GUI's tests run via
+  `just test-gui`). So the OAuth slice's GUI changes are lint/doc-checked in the gate
+  but its GUI tests are validated separately.
 
 ## 16. Risks & mitigations
 
