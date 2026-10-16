@@ -61,7 +61,7 @@ reference to this plan would go stale the moment it is removed.
 15. [Testing strategy](#15-testing-strategy)
 16. [Risks & mitigations](#16-risks--mitigations)
 17. [Out of scope / future work](#17-out-of-scope--future-work)
-18. [Open questions](#18-open-questions)
+18. [Assumptions, verification & open questions](#18-assumptions-verification--open-questions)
 19. [Definition of done](#19-definition-of-done)
 20. [Interaction with other plans](#20-interaction-with-other-plans)
 21. [References](#21-references)
@@ -689,6 +689,19 @@ persistence).
   reshaped `connection/ai_providers.rs`, `connection/command.rs`, `state/pages.rs`,
   `state/providers.rs`, and `render/ai_providers.rs` — the login slice rebases onto
   it.)*
+- **Login-library dependencies (decided).** The OAuth login library in
+  `choreo-client-core` adds exactly three crates: **`tiny_http`** for the loopback
+  callback server (a `recv_timeout` accept loop — the same pattern as the daemon's
+  metrics server, because a channel cannot interrupt a blocking accept; **promote it
+  to `[workspace.dependencies]`**, referenced by both `choreo-daemon` and
+  `choreo-client-core`); **`webbrowser`** to open the authorize URL in the default
+  browser (best-effort, on the TUI host only, never the daemon; dual MIT/Apache-2.0,
+  Linux deps `log`+`url` already in the tree); and **`sha2`** for the PKCE **S256**
+  challenge (already a workspace dep — add `sha2.workspace = true`; encode the digest
+  with `base64::engine::general_purpose::URL_SAFE_NO_PAD`). `rand` and `base64` are
+  already `choreo-client-core` deps. **No id_token signature verification** (the JWT
+  is trusted by TLS provenance from the token endpoint and only its claims are read),
+  so SHA-256 is the login library's whole crypto surface.
 
 ## 11. Prior art (`~/agents`)
 
@@ -938,10 +951,21 @@ headers; store them as provider-table data:
   (`account_id`) at login, **not** the raw JWT. No known in-scope flow needs the raw
   id_token later (OIDC logout with `id_token_hint` and RFC 8693 token exchange are
   out of scope); revisit only if one is added.
+- **Login-library dependencies:** `tiny_http` (loopback callback server, promoted to
+  workspace deps), `webbrowser` (browser opener), `sha2` (PKCE S256, already a
+  workspace dep). No id_token signature verification.
+
+### Open item (security)
+
+- **Transport frame zeroization.** With the typed `AddCredential` (landed), the
+  credential struct zeroizes on drop, but `choreo-proto`'s `encode_inner` still builds
+  a **plaintext `Vec<u8>` rmp frame** that is not wiped — as it also was for the old
+  `unlock_key` copy. Decide whether the send path / transport wipes the encoded frame
+  (and how), or accepts the residual. **Undecided.**
 
 ### Open design questions
 
-None — every decision is settled.
+None — every design question is settled.
 
 ## 19. Definition of done
 
