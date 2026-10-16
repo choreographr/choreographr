@@ -1,9 +1,11 @@
 //! The pulldown-cmark event → AST parser and its block/inline context stack.
 
+use std::ops::Range;
+
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::math::normalize_math_event;
-use crate::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline};
+use crate::{ListItem, MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline};
 
 #[derive(Debug)]
 enum BlockContext {
@@ -11,9 +13,12 @@ enum BlockContext {
     List {
         ordered: bool,
         start: usize,
-        items: Vec<Vec<MarkdownBlock>>,
+        items: Vec<ListItem>,
     },
-    Item(Vec<MarkdownBlock>),
+    Item {
+        number: Option<usize>,
+        blocks: Vec<MarkdownBlock>,
+    },
     Paragraph(Vec<MarkdownInline>),
     Heading {
         level: u8,
@@ -54,12 +59,14 @@ impl MarkdownDocument {
     /// Uses `pulldown-cmark` with a curated set of extensions enabled.
     /// The returned document can be inspected, modified, and re-serialized.
     pub fn parse(input: &str) -> Self {
-        let parser = Parser::new_ext(input, markdown_options()).map(normalize_math_event);
+        let parser = Parser::new_ext(input, markdown_options())
+            .into_offset_iter()
+            .map(|(event, range)| (normalize_math_event(event), range));
         let mut blocks = Vec::new();
         let mut block_stack = Vec::<BlockContext>::new();
         let mut inline_stack = Vec::<InlineContext>::new();
 
-        for event in parser {
+        for (event, range) in parser {
             match event {
                 Event::Start(tag) => match tag {
                     Tag::Paragraph => block_stack.push(BlockContext::Paragraph(Vec::new())),
@@ -75,7 +82,16 @@ impl MarkdownDocument {
                             .unwrap_or(1),
                         items: Vec::new(),
                     }),
-                    Tag::Item => block_stack.push(BlockContext::Item(Vec::new())),
+                    Tag::Item => {
+                        // pulldown-cmark reports only the list start, so the
+                        // item's own marker number is recovered from its source
+                        // range (see `item_marker_number`).
+                        let number = item_marker_number(input, &range);
+                        block_stack.push(BlockContext::Item {
+                            number,
+                            blocks: Vec::new(),
+                        });
+                    }
                     Tag::CodeBlock(kind) => block_stack.push(BlockContext::CodeBlock {
                         language: match kind {
                             CodeBlockKind::Indented => None,
@@ -162,10 +178,10 @@ impl MarkdownDocument {
                         }
                     }
                     TagEnd::Item => {
-                        if let Some(BlockContext::Item(item_blocks)) = block_stack.pop()
+                        if let Some(BlockContext::Item { number, blocks }) = block_stack.pop()
                             && let Some(BlockContext::List { items, .. }) = block_stack.last_mut()
                         {
-                            items.push(item_blocks);
+                            items.push(ListItem { number, blocks });
                         }
                     }
                     TagEnd::CodeBlock => {
@@ -363,9 +379,37 @@ fn heading_level(level: HeadingLevel) -> u8 {
 
 fn push_block(root: &mut Vec<MarkdownBlock>, stack: &mut [BlockContext], block: MarkdownBlock) {
     match stack.last_mut() {
-        Some(BlockContext::Quote(blocks) | BlockContext::Item(blocks)) => blocks.push(block),
+        Some(BlockContext::Quote(blocks) | BlockContext::Item { blocks, .. }) => blocks.push(block),
         _ => root.push(block),
     }
+}
+
+/// Recover the literal ordered-list number from an item's source range.
+///
+/// pulldown-cmark reports only a list's start number and drops every item's own
+/// marker, so the item's source range — whose start is the marker's line prefix
+/// (horizontal whitespace only) — is the only place the written number survives.
+/// Skipping that whitespace and reading the leading ASCII digits recovers the
+/// number; an unordered marker (`-`/`*`/`+`) or any non-numeric first token
+/// yields `None`.  Requiring a `.` or `)` delimiter after the digits rejects a
+/// stray in-prose number that happens to begin a line.
+fn item_marker_number(input: &str, range: &Range<usize>) -> Option<usize> {
+    let slice = input.get(range.start..range.end)?;
+    let marker = slice.trim_start_matches([' ', '\t']);
+    let digits_len = marker
+        .as_bytes()
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits_len == 0
+        || !matches!(
+            marker.as_bytes().get(digits_len).copied(),
+            Some(b'.' | b')')
+        )
+    {
+        return None;
+    }
+    marker.get(..digits_len)?.parse().ok()
 }
 
 fn push_text(block_stack: &mut [BlockContext], inline_stack: &mut [InlineContext], text: &str) {
@@ -395,7 +439,7 @@ fn push_text(block_stack: &mut [BlockContext], inline_stack: &mut [InlineContext
             BlockContext::Paragraph(content)
             | BlockContext::Heading { content, .. }
             | BlockContext::TableCell(content) => push_text_content(content, text),
-            BlockContext::Item(blocks) => {
+            BlockContext::Item { blocks, .. } => {
                 if !matches!(blocks.last(), Some(MarkdownBlock::Paragraph(_))) {
                     blocks.push(MarkdownBlock::Paragraph(Vec::new()));
                 }
@@ -461,7 +505,7 @@ fn push_inline(
             BlockContext::Paragraph(content)
             | BlockContext::Heading { content, .. }
             | BlockContext::TableCell(content) => push_inline_content(content, inline),
-            BlockContext::Item(blocks) => {
+            BlockContext::Item { blocks, .. } => {
                 // List items wrap inline content in a Paragraph block.
                 // Ensure one exists so we have somewhere to push.
                 if !matches!(blocks.last(), Some(MarkdownBlock::Paragraph(_))) {

@@ -12,7 +12,7 @@ fn item_plain_text(blocks: &[MarkdownBlock]) -> String {
             MarkdownBlock::BlockQuote(content) => text.push_str(&item_plain_text(content)),
             MarkdownBlock::List { items, .. } => {
                 for item in items {
-                    text.push_str(&item_plain_text(item));
+                    text.push_str(&item_plain_text(&item.blocks));
                 }
             }
             MarkdownBlock::Table { .. } | MarkdownBlock::Rule => {}
@@ -39,8 +39,8 @@ fn markdown_parser_supports_common_llm_output() {
         panic!("expected list block");
     };
     assert_eq!(items.len(), 2);
-    assert_eq!(item_plain_text(&items[0]), "one");
-    assert_eq!(item_plain_text(&items[1]), "two");
+    assert_eq!(item_plain_text(&items[0].blocks), "one");
+    assert_eq!(item_plain_text(&items[1].blocks), "two");
 }
 
 #[test]
@@ -51,8 +51,8 @@ fn markdown_parser_preserves_task_list_item_text() {
         panic!("expected list block");
     };
 
-    assert_eq!(item_plain_text(&items[0]), "[x] done");
-    assert_eq!(item_plain_text(&items[1]), "[ ] todo");
+    assert_eq!(item_plain_text(&items[0].blocks), "[x] done");
+    assert_eq!(item_plain_text(&items[1].blocks), "[ ] todo");
 }
 
 #[test]
@@ -63,17 +63,86 @@ fn markdown_parser_preserves_nested_tight_list_text() {
         panic!("expected top-level list block");
     };
 
-    assert_eq!(item_plain_text(&items[0]), "parentchildchild 2");
+    assert_eq!(item_plain_text(&items[0].blocks), "parentchildchild 2");
 
     let nested_list = items[0]
+        .blocks
         .iter()
         .find_map(|block| match block {
             MarkdownBlock::List { items, .. } => Some(items),
             _ => None,
         })
         .expect("expected nested list");
-    assert_eq!(item_plain_text(&nested_list[0]), "child");
-    assert_eq!(item_plain_text(&nested_list[1]), "child 2");
+    assert_eq!(item_plain_text(&nested_list[0].blocks), "child");
+    assert_eq!(item_plain_text(&nested_list[1].blocks), "child 2");
+}
+
+#[test]
+fn markdown_parser_captures_repeated_ordered_markers() {
+    // A common LLM idiom: every item marked `1.`.  Each item's own number is
+    // captured so the renderer never renumbers the sequence 1/2/3.
+    let document = MarkdownDocument::parse("1. one\n1. two\n1. three");
+    let MarkdownBlock::List { items, .. } = &document.blocks[0] else {
+        panic!("expected list block");
+    };
+    let numbers: Vec<_> = items.iter().map(|item| item.number).collect();
+    assert_eq!(numbers, vec![Some(1), Some(1), Some(1)]);
+}
+
+#[test]
+fn markdown_parser_captures_non_sequential_ordered_markers() {
+    let document = MarkdownDocument::parse("1. a\n3. b\n7. c");
+    let MarkdownBlock::List { items, .. } = &document.blocks[0] else {
+        panic!("expected list block");
+    };
+    let numbers: Vec<_> = items.iter().map(|item| item.number).collect();
+    assert_eq!(numbers, vec![Some(1), Some(3), Some(7)]);
+}
+
+#[test]
+fn markdown_parser_captures_parenthesised_ordered_markers() {
+    let document = MarkdownDocument::parse("1) a\n2) b");
+    let MarkdownBlock::List { items, .. } = &document.blocks[0] else {
+        panic!("expected list block");
+    };
+    let numbers: Vec<_> = items.iter().map(|item| item.number).collect();
+    assert_eq!(numbers, vec![Some(1), Some(2)]);
+}
+
+#[test]
+fn markdown_parser_unordered_items_have_no_number() {
+    let document = MarkdownDocument::parse("- a\n- b");
+    let MarkdownBlock::List { ordered, items, .. } = &document.blocks[0] else {
+        panic!("expected list block");
+    };
+    assert!(!ordered);
+    assert!(items.iter().all(|item| item.number.is_none()));
+}
+
+#[test]
+fn markdown_parser_captures_nested_ordered_markers() {
+    let document = MarkdownDocument::parse("1. parent\n   1. child\n   4. child two");
+    let MarkdownBlock::List { items, .. } = &document.blocks[0] else {
+        panic!("expected top-level list");
+    };
+    assert_eq!(items[0].number, Some(1));
+    let nested = items[0]
+        .blocks
+        .iter()
+        .find_map(|block| match block {
+            MarkdownBlock::List { items, .. } => Some(items),
+            _ => None,
+        })
+        .expect("expected nested list");
+    let numbers: Vec<_> = nested.iter().map(|item| item.number).collect();
+    assert_eq!(numbers, vec![Some(1), Some(4)]);
+}
+
+#[test]
+fn markdown_round_trip_preserves_non_sequential_numbers() {
+    let source = "1. one\n1. two\n5. three";
+    let document = MarkdownDocument::parse(source);
+    assert_eq!(document.to_markdown(), source);
 }
 
 #[test]

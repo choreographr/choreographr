@@ -74,10 +74,14 @@ pub enum MarkdownBlock {
     List {
         /// Whether the list uses numeric ordering.
         ordered: bool,
-        /// The starting index for an ordered list (1-based).
+        /// The starting index for an ordered list (1-based).  This is the
+        /// CommonMark start (the first item's number); it is the fallback for
+        /// any item whose own literal number was not captured, so a list whose
+        /// source numbers are non-sequential still renders faithfully from
+        /// each [`ListItem`]'s own number.
         start: usize,
-        /// The list items, each a sequence of blocks.
-        items: Vec<Vec<MarkdownBlock>>,
+        /// The list items, each a marker and a sequence of blocks.
+        items: Vec<ListItem>,
     },
     /// A table with optional column alignment.
     Table {
@@ -90,6 +94,26 @@ pub enum MarkdownBlock {
     },
     /// A thematic break (`---`, `***`, `___`).
     Rule,
+}
+
+/// One item of a [`MarkdownBlock::List`]: an optional literal marker number
+/// plus the item's block content.
+///
+/// The number is captured from the source so the renderer and serializer can
+/// reproduce the exact numbering the author wrote.  CommonMark only preserves a
+/// list's *start* number and auto-increments every later item, so recovering the
+/// per-item marker is what keeps a displayed ordered list identical to its
+/// source (repeated `1.` markers, gaps such as `1. 3. 5.`, and a `N)` delimiter
+/// all survive).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListItem {
+    /// The literal 1-based number written for an ordered item (`3` for
+    /// `3. text`), or `None` for an unordered item or one built
+    /// programmatically without a captured marker.  When `None`, consumers
+    /// fall back to the enclosing `List`'s `start`.
+    pub number: Option<usize>,
+    /// The item's block content (paragraphs, nested lists, code blocks, …).
+    pub blocks: Vec<MarkdownBlock>,
 }
 
 /// Column alignment for a table cell.

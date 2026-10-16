@@ -38,7 +38,9 @@ mod syntax;
 mod terminal;
 
 pub use choreo_client_core::{ClientError, Command, parse_input_line};
-pub use choreo_markdown::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline};
+pub use choreo_markdown::{
+    ListItem, MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline,
+};
 use choreo_proto::ImageMetadata;
 use image::imageops::FilterType;
 use ratatui::layout::Size;

@@ -30,6 +30,46 @@ fn markdown_lines_ordered_list_simple() {
 }
 
 #[test]
+fn ordered_list_preserves_repeated_markers() {
+    // Faithfulness to the source: an LLM that marks every item `1.` must not
+    // have its list silently renumbered 1/2/3.
+    let md = "1. first\n1. second\n1. third";
+    let text: Vec<String> = markdown_lines(md, 80)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(text[0], "1. first");
+    assert_eq!(text[1], "1. second");
+    assert_eq!(text[2], "1. third");
+}
+
+#[test]
+fn ordered_list_preserves_non_sequential_numbers() {
+    let md = "1. one\n3. three\n7. seven";
+    let text: Vec<String> = markdown_lines(md, 80)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(text[0], "1. one");
+    assert_eq!(text[1], "3. three");
+    assert_eq!(text[2], "7. seven");
+}
+
+#[test]
+fn ordered_list_aligns_to_widest_actual_number() {
+    // The digit column is sized from the numbers actually rendered, so a list
+    // that jumps 1 -> 100 still lines up every marker and every first-line
+    // content at the same column.
+    let md = "1. a\n100. b";
+    let text: Vec<String> = markdown_lines(md, 80)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(text[0], "  1. a");
+    assert_eq!(text[1], "100. b");
+}
+
+#[test]
 fn ordered_list_items_share_content_column() {
     // The reported repro: a list spanning the 9/10/11 digit boundary must
     // render every item's content at the same column (the widest marker's

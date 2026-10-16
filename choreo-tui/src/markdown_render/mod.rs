@@ -1,4 +1,4 @@
-use crate::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline};
+use crate::{ListItem, MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline};
 use choreo_markdown::render_math_pretty;
 use choreo_proto::{ToolResultRecord, Turn};
 use choreo_sanitize::is_unsafe_unicode;
@@ -624,7 +624,7 @@ fn first_heading_level(blocks: &[MarkdownBlock]) -> Option<u8> {
             }
             MarkdownBlock::List { items, .. } => {
                 for item in items {
-                    if let Some(level) = first_heading_level(item) {
+                    if let Some(level) = first_heading_level(&item.blocks) {
                         return Some(level);
                     }
                 }
