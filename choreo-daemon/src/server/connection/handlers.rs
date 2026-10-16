@@ -12,6 +12,7 @@ use super::{
     MessageKind, ReplyHandle, SessionCommand, SessionEvent, debug, info, io, mpsc,
     switch_attached_session, warn,
 };
+use choreo_keystore::ServiceCredential;
 
 /// Dispatch a decoded `ClientMessage` through the shared handler functions.
 /// Returns an error only when the daemon has disconnected (caller should
@@ -240,14 +241,13 @@ pub(super) fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -
         }
         ClientMessageType::AddCredential {
             service,
-            encrypted_payload,
-            unlock_key,
+            credential,
         } => {
             info!(
                 "client {}: AddCredential service={}",
                 ctx.client_id, service
             );
-            handle_add_credential_sync(&mut *ctx, kind, &service, encrypted_payload, unlock_key);
+            handle_add_credential_sync(&mut *ctx, kind, &service, credential);
         }
         ClientMessageType::RemoveCredential { service } => {
             info!(
@@ -1059,20 +1059,16 @@ pub(super) fn handle_add_credential_sync(
     ctx: &mut ClientCtx,
     kind: MessageKind,
     service: &str,
-    encrypted_payload: Vec<u8>,
-    // REQUIRED since the per-daemon keystore TOFU design (Task 1 made the
-    // proto field non-optional): the credential must be usable immediately.
-    unlock_key: Vec<u8>,
+    credential: ServiceCredential,
 ) {
-    // The daemon command loop enqueues the targeted replies (Unlocked +
-    // CredentialAdded, or the failure variant) through the minted reply target
-    // DIRECTLY onto this client's writer queue BEFORE its lock-state broadcast —
-    // see ORDERING INVARIANT in `DaemonState::handle_unlock`. This thread only
-    // waits for the ack.
+    // The daemon command loop enqueues the targeted reply (CredentialAdded or
+    // the failure variant) through the minted reply target DIRECTLY onto this
+    // client's writer queue BEFORE anything else touches it — see ORDERING
+    // INVARIANT in `DaemonState::handle_unlock`. This thread only waits for the
+    // ack.
     let result = request_daemon(ctx.daemon_tx, |ack| DaemonCommand::SaveCredential {
         service: service.to_string(),
-        encrypted_blob: encrypted_payload,
-        unlock_key,
+        credential,
         reply: Some(ctx.reply_target(kind)),
         ack,
     });

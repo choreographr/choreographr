@@ -79,13 +79,17 @@ fn write_markdown_block(block: &MarkdownBlock, markdown: &mut String) {
             items,
         } => {
             for (index, item) in items.iter().enumerate() {
+                // The item's own captured number round-trips a non-sequential
+                // source (repeated `1.`, gaps) unchanged; otherwise fall back
+                // to the CommonMark start plus the item's offset.
                 let marker = if *ordered {
-                    format!("{}. ", start + index)
+                    let number = item.effective_number(*start, index);
+                    format!("{number}. ")
                 } else {
                     "- ".to_string()
                 };
                 let mut item_markdown = String::new();
-                for (block_index, block) in item.iter().enumerate() {
+                for (block_index, block) in item.blocks.iter().enumerate() {
                     if block_index > 0 {
                         item_markdown.push_str("\n\n");
                     }

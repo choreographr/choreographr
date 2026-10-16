@@ -15,9 +15,13 @@
 //! - [`paths`] — the one filesystem-layout resolver: the XDG config/data/
 //!   runtime/state locations and the `--base-dir` override that relocates an
 //!   entire instance under a single root.
+//! - [`credential`] — the workspace's shared serializable credential domain
+//!   type ([`ServiceCredential`]) and its borrowed views, hosted here (not in
+//!   `choreo-keystore`) so both `choreo-proto` and `choreo-keystore` can carry
+//!   it without a dependency cycle or a new crate.
 //!
-//! It is deliberately a *leaf* (deps: `clap`, `dirs`, `tracing`, and
-//! `tracing-subscriber` only) and holds no protocol or transport logic —
+//! It is deliberately a *leaf* (deps: `clap`, `dirs`, `serde`, `tracing`,
+//! `tracing-subscriber`, and `zeroize`) and holds no transport logic —
 //! `choreo-proto` stays the wire protocol.
 //!
 //! Logging precedence follows the Unix convention: **explicit CLI flags win
@@ -29,8 +33,10 @@
 #![warn(missing_docs)]
 
 pub mod clap_styles;
+pub mod credential;
 pub mod logging;
 pub mod paths;
 pub mod release_name;
 
 pub use clap_styles::clap_styles;
+pub use credential::{ServiceCredential, SubstrateCredentialView, XCredentialView};

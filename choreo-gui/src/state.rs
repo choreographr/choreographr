@@ -21,11 +21,12 @@ pub(crate) struct AppState {
     pub(crate) status_texts: Vec<String>,
     pub(crate) pending_cancel: String,
     pub(crate) attached_session_id: Option<u64>,
-    /// The strengthen-unlock key sent in the most recent `Unlock` or
-    /// `AddCredential`, held until the daemon CONFIRMS it (an `Unlocked` or
-    /// `CredentialAdded` reply) and then recorded via
+    /// The strengthen-unlock key sent in the most recent `Unlock` (or the
+    /// auto-bind), held until the daemon CONFIRMS it (an `Unlocked` or `Bound`
+    /// reply) and then recorded via
     /// [`choreo_client_core::record_unlock_key`]. Never persisted on send —
     /// only on confirmed success. Cleared once recorded (or on any send).
+    /// `AddCredential` no longer carries a key, so it never populates this.
     pub(crate) pending_unlock_key: Option<Vec<u8>>,
     /// Once-per-connection keystore auto-bind state machine (shared policy in
     /// `choreo_client_core`, so TUI and GUI cannot drift): the first

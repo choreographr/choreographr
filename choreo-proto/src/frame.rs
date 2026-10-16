@@ -46,7 +46,12 @@ use std::io::Cursor;
 /// added to 9 this way, before any release carried 9. Under the same policy the
 /// `SessionStatus` streaming phase was split in 9: the single `Inference` state
 /// became `Sending`/`Thinking`/`Responding`, so a client can tell the pre-token
-/// connection wait from reasoning from answer streaming.
+/// connection wait from reasoning from answer streaming. Also under the same
+/// policy, `ClientMessage::AddCredential` was reshaped in 9 to carry a typed
+/// plaintext `ServiceCredential` (`service` + `credential`) instead of a
+/// client-encrypted `encrypted_payload` plus an `unlock_key`: no key rides the
+/// wire, the daemon encrypts the credential to its own binding public key, and
+/// the add path requires an already-unlocked keystore (no implicit unlock).
 ///
 /// Policy: variants may be added to the **current, unreleased** wire version
 /// without a bump. Mixed-version peers do not exist until a release ships, and

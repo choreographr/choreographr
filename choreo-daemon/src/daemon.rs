@@ -239,8 +239,8 @@ pub struct DaemonState {
     /// Whether the credential keystore is currently locked (no decrypted
     /// credentials in memory). Starts `true` at daemon startup — the keystore
     /// is only decrypted into memory once a valid unlock key is presented —
-    /// flips to `false` on a successful Unlock / `AddCredential` implicit
-    /// unlock, and back to `true` on `/lock`. This is the authoritative
+    /// flips to `false` on a successful Unlock / `BindKeystore`, and back to
+    /// `true` on `/lock`. This is the authoritative
     /// daemon-side lock state: it is broadcast to all activity subscribers on
     /// every transition and pushed to each fresh activity subscriber at
     /// subscribe time, so client UIs latch the real state instead of guessing.
@@ -479,21 +479,16 @@ pub enum DaemonCommand {
         /// sent, or `Err` on failure.
         reply: mpsc::Sender<Result<(), String>>,
     },
-    /// Persist an encrypted credential blob and run the implicit unlock tail.
-    /// Verify-only against the binding — rebinding happens only via
-    /// [`DaemonCommand::BindKeystore`].
+    /// Encrypt a credential to the binding public key, persist it, and update
+    /// the in-memory map. Requires an UNLOCKED keystore — a locked daemon
+    /// rejects the request (there is no implicit unlock here).
     SaveCredential {
         /// The service name the credential is stored under.
         service: String,
-        /// The credential blob, already encrypted client-side.
-        encrypted_blob: Vec<u8>,
-        /// REQUIRED (per-daemon keystore design): the raw X25519 private
-        /// key the credential blob was encrypted with. The daemon VERIFY-ONLY
-        /// checks it against the stored binding (an unbound keystore is
-        /// rejected — binding happens exclusively via `BindKeystore`), uses
-        /// it to test-decrypt + persist the blob, and then performs the
-        /// implicit unlock (same tail as `Unlock`).
-        unlock_key: Vec<u8>,
+        /// The typed credential to store, carried as plaintext from the
+        /// client. The daemon encrypts it to its own binding public key; no
+        /// key rides the request.
+        credential: ServiceCredential,
         /// See `Unlock.reply` for why the targeted replies ride here.
         reply: Option<ReplyTarget>,
         /// One-shot ACK back to the blocked connection thread; see `Unlock.ack`.
@@ -1106,11 +1101,10 @@ impl DaemonState {
             DaemonCommand::Lock { reply } => self.handle_lock(&reply),
             DaemonCommand::SaveCredential {
                 service,
-                encrypted_blob,
-                unlock_key,
+                credential,
                 reply,
                 ack,
-            } => self.handle_save_credential(service, &encrypted_blob, unlock_key, reply, &ack),
+            } => self.handle_save_credential(service, credential, reply, &ack),
             DaemonCommand::RemoveCredentialCmd { service, reply } => {
                 self.handle_remove_credential(&service, &reply);
             }

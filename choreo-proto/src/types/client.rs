@@ -2,6 +2,7 @@
 //! [`ClientMessageType`] request payloads, and the payload-free
 //! [`MessageKind`] tag that names them.
 
+use choreo_shared::ServiceCredential;
 use serde::{Deserialize, Serialize};
 
 use super::common::ContextConfig;
@@ -146,32 +147,28 @@ pub enum ClientMessageType {
     /// Establish (TOFU-bind) the daemon's keystore binding with the 32-byte
     /// X25519 private unlock key. This is the ONLY wire path that can create
     /// the binding: on an unbound keystore the daemon adopts the key (loud
-    /// `KEYSTORE BOUND` log), runs the shared unlock tail (same code path as
-    /// `AddCredential`'s implicit unlock), and replies
+    /// `KEYSTORE BOUND` log), runs the shared unlock tail, and replies
     /// [`DaemonMessageType::Bound`](crate::DaemonMessageType::Bound). On an ALREADY-bound keystore the key is
     /// verified against the binding — a mismatch is rejected with the usual
-    /// wrong-key semantics (no unlock, no overwrite). Unlock and `AddCredential`
-    /// are strictly VERIFY-ONLY and cannot create a binding.
+    /// wrong-key semantics (no unlock, no overwrite). Unlock is strictly
+    /// VERIFY-ONLY and cannot create a binding.
     BindKeystore {
         /// The 32-byte X25519 private unlock key to adopt (or verify) as the
         /// daemon's keystore binding.
         key: Vec<u8>,
     },
-    /// Store a client-side-encrypted credential, implicitly unlocking the
-    /// daemon on receipt.
+    /// Store a credential for a service, carried as a TYPED plaintext value.
+    ///
+    /// No key rides this request and nothing is encrypted client-side: the
+    /// daemon MUST already be UNLOCKED (the request is rejected otherwise) and
+    /// encrypts the credential to its own binding public key before persisting
+    /// it. This keeps the unlock key off the wire entirely.
     AddCredential {
         /// The service key the credential is stored under.
         service: String,
-        /// The client-side-encrypted credential blob to persist.
-        encrypted_payload: Vec<u8>,
-        // Required (not Option): the credential blob is encrypted with the
-        // unlock key client-side, so the daemon must be able to
-        // test-decrypt + implicitly unlock on receipt (TOFU per-daemon
-        // keystore binding). An omitted key would leave an undecryptable
-        // blob persisted, breaking the whole keystore.
-        /// The 32-byte unlock key the blob was encrypted with, required so the
-        /// daemon can test-decrypt and implicitly unlock on receipt.
-        unlock_key: Vec<u8>,
+        /// The typed credential to store. It zeroizes on drop; the daemon
+        /// encrypts it to the binding public key and never echoes it back.
+        credential: ServiceCredential,
     },
     /// Remove the stored credential for one service.
     RemoveCredential {
@@ -349,8 +346,8 @@ pub enum ClientMessageType {
 /// It is deliberately NOT the payload enum reused as a tag. The ack rides the
 /// wire back to the client (and into logs), and several request payloads carry
 /// SECRET material — `Unlock { private_key }`, `BindKeystore { key }`,
-/// `AddCredential { unlock_key, encrypted_payload }` — so echoing the request
-/// back would put key material on the wire and in client logs. `MessageKind`
+/// `AddCredential { credential }` — so echoing the request
+/// back would put secret material on the wire and in client logs. `MessageKind`
 /// is the payload-free projection, `Copy` for cheap logging/timeout keys.
 ///
 /// The two enums cannot silently drift: the [`From<&ClientMessageType>`](From)

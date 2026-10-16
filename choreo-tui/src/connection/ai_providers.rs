@@ -2,7 +2,7 @@ use crate::state::{
     AccountWizardStep, App, Page, PolkadotImportStep, ai_providers_list_click_index,
     apply_selector_left_click,
 };
-use choreo_client_core::{ClientError, PendingContext, is_valid_account_name};
+use choreo_client_core::{ClientError, is_valid_account_name};
 use choreo_proto::{ClientMessage, ClientMessageType};
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use tui_prompts::State;
@@ -215,35 +215,31 @@ pub(super) fn handle_credential_modal_event(
 
             app.ai_providers.credential.error = None;
 
-            // Build and send the encrypted credential, auto-unlocking
-            // the daemon so the credential is immediately usable. The unlock
-            // key is held pending and recorded only once the daemon CONFIRMS
-            // (`CredentialAdded`).
+            // Build and send the credential as a TYPED plaintext value: no key
+            // rides the request, the daemon encrypts it to its own binding key.
+            // The add requires an UNLOCKED keystore — a locked daemon replies
+            // `CredentialAddFailed`, which the daemon-message handler surfaces
+            // in the status bar.
             match choreo_client_core::build_add_credential_message(
-                &app.connection_addr,
                 account_name.clone(),
                 "api_key".to_string(),
                 vec![api_key],
             ) {
-                Ok((msg, key)) => {
-                    // The unlock key rides the request's pending context so the
-                    // daemon's confirmation (`CredentialAdded`/`Unlocked`)
-                    // records it per-daemon.
-                    tracing::info!(account_name, "credential encrypted and sent");
+                Ok(msg) => {
+                    tracing::info!(account_name, "credential sent to daemon");
                     // On a session with no account yet, carry the user on to
                     // selecting this account and a model once the daemon
                     // confirms the key (see `SetupFollow`).
                     app.arm_setup_follow(&account_name);
-                    let id = app.pending.send(client_tx, msg);
-                    app.pending.set_context(id, PendingContext::UnlockKey(key));
+                    app.pending.send(client_tx, msg);
                     app.status = Some(format!(
                         "[daemon] credential stored for account: {account_name}"
                     ));
                 }
                 Err(e) => {
-                    tracing::warn!(account_name, %e, "failed to encrypt API key");
+                    tracing::warn!(account_name, %e, "failed to build API-key credential message");
                     app.status = Some(format!(
-                        "[warning] failed to encrypt API key for {account_name}: {e}"
+                        "[warning] failed to build credential for {account_name}: {e}"
                     ));
                 }
             }
@@ -374,27 +370,20 @@ fn submit_polkadot_import(app: &mut App, client_tx: &crossbeam_channel::Sender<C
         // outliving it.
         let account_id = view.account_id.to_string();
 
-        // Encrypt the serialized Substrate credential with the daemon's
-        // keystore public key (derived from the unlock key) and send it over
-        // the same `AddCredential` path as the API-key modal — the daemon
-        // decrypts it into memory immediately (implicit unlock) and we record
-        // the key per-daemon once it confirms.
-        let (msg, key) = choreo_client_core::build_add_credential_from_credential(
-            &app.connection_addr,
-            name.clone(),
-            credential,
-        )
-        .map_err(|e| format!("failed to build AddCredential: {e}"))?;
+        // Send the Substrate credential as a TYPED plaintext value over the
+        // same `AddCredential` path as the API-key modal — the daemon encrypts
+        // it to its own binding key. The add requires an unlocked keystore; a
+        // locked daemon replies `CredentialAddFailed`.
+        let msg =
+            choreo_client_core::build_add_credential_from_credential(name.clone(), credential)
+                .map_err(|e| format!("failed to build AddCredential: {e}"))?;
 
         tracing::info!(
             account_id = %account_id,
             name,
-            "sent encrypted Substrate credential to daemon"
+            "sent Substrate credential to daemon"
         );
-        // The unlock key rides the request's pending context so the daemon's
-        // confirmation records it per-daemon.
-        let id = app.pending.send(client_tx, msg);
-        app.pending.set_context(id, PendingContext::UnlockKey(key));
+        app.pending.send(client_tx, msg);
         Ok(format!(
             "[daemon] Substrate account '{name}' stored ({account_id}); unlock the daemon to sign with it"
         ))

@@ -441,9 +441,9 @@ fn parse_command(rest: &str) -> Command {
             return Command::UnknownCommand(INVALID_ACCOUNT_NAME.to_string());
         }
         let key = parts.get(1).copied().unwrap_or_default().to_string();
-        // The unlock key is always resolved per-addr by
-        // `build_add_credential_message` (stored → legacy → fresh), so the
-        // shell takes no `unlock` argument anymore.
+        // The add carries a typed plaintext credential and no unlock key:
+        // the daemon encrypts it to its own binding, so the shell takes no
+        // `unlock` argument.
         return Command::AddCredential {
             service,
             credential_type: "api_key".to_string(),
@@ -484,9 +484,9 @@ fn parse_command(rest: &str) -> Command {
         let access_token = access_token.copied().unwrap_or_default().to_string();
         let access_token_secret = access_token_secret.copied().unwrap_or_default().to_string();
         let bearer_token = bearer_token.copied().unwrap_or_default().to_string();
-        // The unlock key is always resolved per-addr by
-        // `build_add_credential_message` (stored → legacy → fresh), so the
-        // shell takes no `unlock` argument anymore.
+        // The add carries a typed plaintext credential and no unlock key:
+        // the daemon encrypts it to its own binding, so the shell takes no
+        // `unlock` argument.
         return Command::AddCredential {
             service,
             credential_type: "x".to_string(),

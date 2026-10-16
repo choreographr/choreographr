@@ -2855,7 +2855,6 @@ dependencies = [
  "choreo-sanitize",
  "choreo-transport",
  "crossbeam-channel",
- "postcard",
  "rand 0.10.3",
  "serde",
  "tempfile",
@@ -3118,9 +3117,11 @@ dependencies = [
  "clap",
  "dirs",
  "rustix 1.1.5",
+ "serde",
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -3178,7 +3179,6 @@ dependencies = [
  "mimalloc",
  "mio",
  "nix 0.31.3",
- "postcard",
  "ratatui",
  "ratatui-image",
  "resvg",

@@ -470,7 +470,7 @@ match enumerates it fully.
 └──────────────────┴────────────────────────────────────────┘
 ```
 
-- Protocol version: `9` (v9 = live MCP config reload: the new `ClientMessage::McpReload` request and its `DaemonMessage::McpReloaded`/`McpReloadFailed` replies, so a running daemon can pick up `mcp.json` edits (added/removed/changed servers) without a restart; v8 = per-session `pinned`/`archived` flags: the new `ClientMessage::SetSessionPinned`/`SetSessionArchived` requests, the daemon-GENERATED broadcast `SessionEvent::SessionFlagsChanged` (rides `DaemonState::broadcast()`, so a client learns of a flag change via the broadcast rather than a targeted reply), and the `SessionSummary::pinned`/`archived_at` fields they surface. v7 = the create-session reply is split from the create-session broadcast: `SessionEvent::SessionCreatedForRequester` is the direct reply to the creating connection and is the ONLY create event a frontend may auto-attach to, while `SessionEvent::SessionCreated` is notification-only (broadcast to every subscriber) and must never move a client's view — fixing a client hijacking its own view when ANOTHER client created a session. Delete/status lifecycle messages are unaffected: `SessionDeleted` was already broadcast-only with the requester already knowing the id it deleted; v6 = displayed-image bytes are no longer shipped in session-scoped snapshots (`SessionState`/`TurnAppended`/`TurnsRedone`) — they carry only `ImageMetadata` — and are instead fetched on demand via the new `ClientMessage::GetImage` ⇄ `DaemonMessage::Image` pair, keyed by `(session_id, turn_id, image_index)` and served from the durable `session_attachments` store; v5 = the two-state `Locked`/`Unlocked` status *broadcasts* were replaced by `DaemonMessage::Keystore { state: KeystoreState }` (`Unbound`/`Locked`/`Unlocked`), pushed at subscribe time and on every transition so a first-run client learns it must BIND; `Locked`/`Unlocked` remain targeted operation replies. v4 = the 29 session-scoped events were moved into `SessionEvent` and now ride the `DaemonMessage::Session { session_id: Option<u64>, event }` envelope; v3 had removed `TurnFinalized` — the final-turn snapshot rides `TurnAppended` — and added `Evicted`, a best-effort lag-eviction advisory; mixed-version peers fail fast at the version gate). The v4 shape was amended in place before the first release — the `session_id: 0` sentinel became `Option<u64>` (`None` for connection-level replies) — so the wire version stayed `4` with no bump at that point. The MCP trust-query request/reply variants (`ClientMessage::McpTrust`/`McpUntrust`/`McpTrustList`, `DaemonMessage::McpTrustUpdated`/`McpTrustList`) were added to v9 the same way, before any release carried v9; the policy is that variants may be added to the **current, unreleased** wire version without a bump, because mixed-version peers do not exist until a release ships and the version gate fails fast on a mismatch either way. A bump is required only once a version has shipped in a release. Under the same pre-release policy, the v6 `GetImage`/`Image` pair was reshaped for v9 before any release carried v9: its positional `image_index: u32` became a tagged `key: ImageKey` (`Displayed { index }` or `ToolResult { call_id }`), so one fetch protocol now serves both displayed images and tool-result vision images from the shared `session_attachments` store. Under the same pre-release policy, the v9 frame was amended in place to the uniform correlation envelope: `ClientMessage` = `{ id: u64, inner: ClientMessageType }`, `DaemonMessage` = `{ id: Option<u64>, inner: DaemonMessageType }` (a broadcast is `id: None`; a reply stamps the request's id), the payload enums were renamed `ClientMessageType`/`DaemonMessageType`, the streaming `request_id` was renamed `stream_id` and widened to `u64`, and the `MessageKind` tag plus the `Accepted`/`Failed` acknowledgement replies were added. No bump — no release has shipped v9. Under the same pre-release policy, the v9 streaming axis was made daemon-owned: the session thread assigns a run's `stream_id` (a per-session, monotonic counter) when it accepts a `RunInput`/`ContinueGeneration` and reports it on the acceptance `Started` reply/broadcast, so those requests no longer carry a client-chosen `stream_id` (the client learns it from `Started`, which also fixes the cross-client collision where two clients fanned one session could each claim the same id); the `CANCEL_ALL` sentinel (`stream_id = 0`) remains for a pre-`Started` cancel. Under the same pre-release policy, the `SessionStatus` streaming phase was split in v9: the single `Inference` state became `Sending`/`Waiting`/`Reasoning`/`Responding`, so a status bar can tell the request dispatch from the provider's time-to-first-token wait from reasoning from answer streaming. The `Waiting` boundary is anchored on client-side request-upload completion (the last byte of the request body handed to the transport), not on the provider's response headers: a buffering gateway (e.g. opencode.ai behind Cloudflare) withholds the response head until the model begins generating, so anchoring on the headers would collapse `Waiting` into `Sending` for those providers. The upload hook fires once per attempt, so a retried turn reports `Waiting` for the failed attempt too, before `Retrying`.
+- Protocol version: `9` (v9 = live MCP config reload: the new `ClientMessage::McpReload` request and its `DaemonMessage::McpReloaded`/`McpReloadFailed` replies, so a running daemon can pick up `mcp.json` edits (added/removed/changed servers) without a restart; v8 = per-session `pinned`/`archived` flags: the new `ClientMessage::SetSessionPinned`/`SetSessionArchived` requests, the daemon-GENERATED broadcast `SessionEvent::SessionFlagsChanged` (rides `DaemonState::broadcast()`, so a client learns of a flag change via the broadcast rather than a targeted reply), and the `SessionSummary::pinned`/`archived_at` fields they surface. v7 = the create-session reply is split from the create-session broadcast: `SessionEvent::SessionCreatedForRequester` is the direct reply to the creating connection and is the ONLY create event a frontend may auto-attach to, while `SessionEvent::SessionCreated` is notification-only (broadcast to every subscriber) and must never move a client's view — fixing a client hijacking its own view when ANOTHER client created a session. Delete/status lifecycle messages are unaffected: `SessionDeleted` was already broadcast-only with the requester already knowing the id it deleted; v6 = displayed-image bytes are no longer shipped in session-scoped snapshots (`SessionState`/`TurnAppended`/`TurnsRedone`) — they carry only `ImageMetadata` — and are instead fetched on demand via the new `ClientMessage::GetImage` ⇄ `DaemonMessage::Image` pair, keyed by `(session_id, turn_id, image_index)` and served from the durable `session_attachments` store; v5 = the two-state `Locked`/`Unlocked` status *broadcasts* were replaced by `DaemonMessage::Keystore { state: KeystoreState }` (`Unbound`/`Locked`/`Unlocked`), pushed at subscribe time and on every transition so a first-run client learns it must BIND; `Locked`/`Unlocked` remain targeted operation replies. v4 = the 29 session-scoped events were moved into `SessionEvent` and now ride the `DaemonMessage::Session { session_id: Option<u64>, event }` envelope; v3 had removed `TurnFinalized` — the final-turn snapshot rides `TurnAppended` — and added `Evicted`, a best-effort lag-eviction advisory; mixed-version peers fail fast at the version gate). The v4 shape was amended in place before the first release — the `session_id: 0` sentinel became `Option<u64>` (`None` for connection-level replies) — so the wire version stayed `4` with no bump at that point. The MCP trust-query request/reply variants (`ClientMessage::McpTrust`/`McpUntrust`/`McpTrustList`, `DaemonMessage::McpTrustUpdated`/`McpTrustList`) were added to v9 the same way, before any release carried v9; the policy is that variants may be added to the **current, unreleased** wire version without a bump, because mixed-version peers do not exist until a release ships and the version gate fails fast on a mismatch either way. A bump is required only once a version has shipped in a release. Under the same pre-release policy, the v6 `GetImage`/`Image` pair was reshaped for v9 before any release carried v9: its positional `image_index: u32` became a tagged `key: ImageKey` (`Displayed { index }` or `ToolResult { call_id }`), so one fetch protocol now serves both displayed images and tool-result vision images from the shared `session_attachments` store. Under the same pre-release policy, the v9 frame was amended in place to the uniform correlation envelope: `ClientMessage` = `{ id: u64, inner: ClientMessageType }`, `DaemonMessage` = `{ id: Option<u64>, inner: DaemonMessageType }` (a broadcast is `id: None`; a reply stamps the request's id), the payload enums were renamed `ClientMessageType`/`DaemonMessageType`, the streaming `request_id` was renamed `stream_id` and widened to `u64`, and the `MessageKind` tag plus the `Accepted`/`Failed` acknowledgement replies were added. No bump — no release has shipped v9. Under the same pre-release policy, the v9 streaming axis was made daemon-owned: the session thread assigns a run's `stream_id` (a per-session, monotonic counter) when it accepts a `RunInput`/`ContinueGeneration` and reports it on the acceptance `Started` reply/broadcast, so those requests no longer carry a client-chosen `stream_id` (the client learns it from `Started`, which also fixes the cross-client collision where two clients fanned one session could each claim the same id); the `CANCEL_ALL` sentinel (`stream_id = 0`) remains for a pre-`Started` cancel. Under the same pre-release policy, the `SessionStatus` streaming phase was split in v9: the single `Inference` state became `Sending`/`Waiting`/`Reasoning`/`Responding`, so a status bar can tell the request dispatch from the provider's time-to-first-token wait from reasoning from answer streaming. The `Waiting` boundary is anchored on client-side request-upload completion (the last byte of the request body handed to the transport), not on the provider's response headers: a buffering gateway (e.g. opencode.ai behind Cloudflare) withholds the response head until the model begins generating, so anchoring on the headers would collapse `Waiting` into `Sending` for those providers. The upload hook fires once per attempt, so a retried turn reports `Waiting` for the failed attempt too, before `Retrying`. Under the same pre-release policy, `ClientMessage::AddCredential` was reshaped in v9 to carry a typed plaintext `ServiceCredential` (`{ service, credential }`) instead of a client-encrypted `encrypted_payload` plus an `unlock_key`: no key rides the wire, the daemon encrypts the credential to its own binding public key, and the add path requires an already-unlocked keystore (no implicit unlock).
 - Max frame size: 64 MiB
 - Lag-eviction byte gauge: `DaemonMessage::approx_wire_size` / `Turn::approx_size` (in `choreo-proto/src/size.rs`) — a deliberate over-estimate used by the daemon's lag accounting, pinned by `types::tests::approx_wire_size_never_underestimates_encoded_payload` (see the daemon's `broadcast` module docs for the lag accounting)
 
@@ -892,10 +892,10 @@ exactly ONE wire path, `ClientMessage::BindKeystore` (TOFU): on an unbound
 keystore it ADOPTS the presented key (loud `KEYSTORE BOUND` log), runs the shared
 unlock tail, and replies the targeted `DaemonMessage::Bound` — bind implies
 unlock; on an already-bound keystore it verifies only (a mismatch is the usual
-wrong-key rejection, never an overwrite). `Unlock` and `AddCredential` are
-strictly VERIFY-ONLY: against an unbound keystore they answer the targeted
+wrong-key rejection, never an overwrite). `Unlock` is strictly VERIFY-ONLY:
+against an unbound keystore it answers the targeted
 `DaemonMessage::KeystoreUnbound` (deliberately distinct from `LockedError`,
-which means "bound but wrong key") and never adopt anything. Binding keys are
+which means "bound but wrong key") and never adopts anything. Binding keys are
 ALWAYS freshly generated by the client's CSPRNG at bind time (auto-bind — there
 is no `/bind-key` command); pre-held keys (stored known_servers key or the
 legacy raw `identity.pk` file) verify existing bindings and never create new
@@ -905,44 +905,51 @@ A client sends `ClientMessage::Unlock { private_key }` (resolved verify-only as
 its stored per-daemon unlock key, else the legacy raw `identity.pk` file —
 copied into the store on first use; a caller-supplied base64 key from
 `/unlock <key>` is decoded WRITE-FREE — recording happens only on the daemon's
-targeted confirmation). `AddCredential` REQUIRES the unlock key and, on a valid
-blob, **implicitly unlocks** the daemon (decrypts all blobs into memory). The
-client records the key per-daemon ONLY after the daemon's targeted confirmation
-(`Unlocked` / `Bound` / `CredentialAdded`) — except the auto-bind key, which is
+targeted confirmation). `AddCredential` carries the credential as a TYPED
+plaintext value and no key at all (`AddCredential { service, credential }`):
+the client neither resolves nor transmits an unlock key, and the daemon
+ENCRYPTS the credential to its own binding public key before persisting it. The
+add path requires an already-UNLOCKED keystore — a locked daemon rejects it with
+`CredentialAddFailed` ("unlock the keystore first") and does NOT change lock
+state (there is no implicit unlock). The
+client records an unlock key per-daemon only after the daemon's targeted
+confirmation (`Unlocked` / `Bound`) — except the auto-bind key, which is
 recorded PRE-SEND (mandatory: an unbound daemon adopts whatever key arrives
 first, so even a lost confirmation leaves the recorded key matching the
 binding). Nothing is ever auto-deleted; `KnownServers::remove(addr)` re-pair is
 the only removal path.
 
-**ORDERING INVARIANT:** the targeted reply to Unlock/BindKeystore/AddCredential
-is enqueued by the daemon command loop into the acting client's writer sink
-BEFORE any lock-state transition broadcast — both travel the same per-client
-FIFO writer queue, so the broadcast can never overtake the reply. Client
+**ORDERING INVARIANT:** the targeted reply to Unlock/BindKeystore is enqueued by
+the daemon command loop into the acting client's writer sink BEFORE any
+lock-state transition broadcast — both travel the same per-client FIFO writer
+queue, so the broadcast can never overtake the reply. (AddCredential also
+enqueues its targeted `CredentialAdded`/`CredentialAddFailed` reply on this
+thread, though the handler never produces a lock-state broadcast.) Client
 key-recording correctness keys on this (implemented via `DaemonCommand`
 carrying the client's `SubscriberSink`; pinned by the integration test
 `unix_targeted_reply_precedes_lock_state_broadcast`).
 
 ```
-startup              connect→unbound?        /unlock [key]            AddCredential{... unlock_key}
+startup              connect→unbound?        /unlock [key]            AddCredential{service, credential}
    │                       │                       │                          │
-   │  locked               │  AUTO-BIND (once per  │ verify-only resolve      │ verify = binding;
-   │  (no credentials)     │  connection): mint    │ unlock key; unbound →    │ test-decrypt the blob
-   │                       │  fresh key, record    │ KeystoreUnbound →        │ (reject if bad); unbound
-   │                       │  PRE-SEND, BindKeystore│ auto-bind; match →      │ → KeystoreUnbound;
-   │                       │  → Bound (implies     │ decrypt all credential   │ then run the SAME unlock
-   │                       │  unlock)              │ blobs, load accounts     │ tail → Unlock + CredentialAdded
-   ▼                       ▼                       ▼                          ▼
+   │  locked               │  AUTO-BIND (once per  │ verify-only resolve      │ requires an UNLOCKED
+   │  (no credentials)     │  connection): mint    │ unlock key; unbound →    │ keystore (locked →
+   │                       │  fresh key, record    │ KeystoreUnbound →        │ CredentialAddFailed, no
+   │                       │  PRE-SEND, BindKeystore│ auto-bind; match →      │ state change); encrypt
+   │                       │  → Bound (implies     │ decrypt all credential   │ the credential to the
+   │                       │  unlock)              │ blobs, load accounts     │ binding pubkey, persist
+   ▼                       ▼                       ▼                          ▼ (no lock-state change)
 ```
 
 - Credentials are encrypted per-credential with ECDH (X25519) + HKDF + AES-256-GCM, keyed
-  to the daemon's unlock-key pubkey; the daemon test-decrypts every incoming blob with its
-  bound key and refuses to persist one that does not decrypt (one key per keystore).
-- The unlock key is sent over the channel; zeroized after use by the daemon
+  to the daemon's binding public key; the daemon ENCRYPTS each incoming credential to its
+  own stored binding before persisting it (one key per keystore).
+- The unlock key is sent over the channel (by `Unlock`/`BindKeystore`); zeroized after use
+  by the daemon
 - `/lock` destroys all in-memory credentials, returning to locked state
 - **The locked state is authoritative and broadcast.** `DaemonState` keeps a single
-  `locked: bool` (starts `true`; `false` after a successful Unlock, BindKeystore,
-  or AddCredential implicit unlock — the shared `unlock_tail` is the one place it is
-  cleared; `true`
+  `locked: bool` (starts `true`; `false` after a successful Unlock or BindKeystore
+  — the shared `unlock_tail` is the one place it is cleared; `true`
   again on `/lock`, which clears in-memory credentials/providers). On a REAL
   lock-state transition the daemon broadcasts the current state to ALL activity
   subscribers (`DaemonMessage::Unlocked` / `DaemonMessage::Locked` — the existing
@@ -1469,7 +1476,7 @@ touches session or turn state. Status is observable through the
 metrics and `tracing` logs only — no `SessionEvent` is emitted (a status
 event is a deliberate follow-up).
 
-**Credential storage:** Credentials are encrypted per-credential in the `redb` database (`state.redb`). Each daemon's keystore is bound to one client-held unlock key (the daemon stores only the derived public binding, created once via the `BindKeystore` wire path — TOFU-once, no rotation); the legacy `identity.pk` / `public.pk` pair is removed, and the legacy raw `identity.pk` file is an unlock-verification fallback that is copied into `known_servers.toml` on first use (never deleted, never binds).
+**Credential storage:** Credentials are encrypted per-credential in the `redb` database (`state.redb`). Each daemon's keystore is bound to one client-held unlock key (the daemon stores only the derived public binding, created once via the `BindKeystore` wire path — TOFU-once, no rotation); the legacy `identity.pk` / `public.pk` pair is removed, and the legacy raw `identity.pk` file is an unlock-verification fallback that is copied into `known_servers.toml` on first use (never deleted, never binds). `AddCredential` carries the credential as typed plaintext with no key: the DAEMON encrypts it to its own stored binding public key before persisting, so the client never holds or transmits the encryption key on the add path (which requires an already-unlocked keystore).
 
 **Database:** `~/.local/share/choreographr/state.redb` (override via `CHOREOGRAPHR_DB_PATH` env var)
 
@@ -1828,7 +1835,7 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
 
 3. **Lock/Unlock security** — the daemon starts without credentials in memory. The unlock key travels
    only over authenticated transport and is zeroized after use. Credentials are encrypted per-credential so
-   they can be stored in the database without a global passphrase. The keystore binding is established once (TOFU) via the `BindKeystore` wire path — the only message that can create it; Unlock/AddCredential are verify-only.
+   they can be stored in the database without a global passphrase. The keystore binding is established once (TOFU) via the `BindKeystore` wire path — the only message that can create it; `Unlock` is verify-only. `AddCredential` carries the credential as typed plaintext with no key — the daemon encrypts it to its own binding and requires an already-unlocked keystore.
 
 4. **Sessions, not per-client state** — sessions are independent from client connections. A
     session has its own model, working directory, and messages. Clients subscribe/unsubscribe from sessions

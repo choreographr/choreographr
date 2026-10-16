@@ -2,8 +2,8 @@
 //! rendering, the tight/spaced decision, and the delimited-list margins.
 
 use super::{
-    Line, LineChrome, LineJoin, MarkdownBlock, Span, Style, display_width,
-    ensure_blank_line_joined, indented_line, ordered_marker, render_markdown_blocks,
+    Line, LineChrome, LineJoin, ListItem, Span, Style, display_width, ensure_blank_line_joined,
+    indented_line, ordered_marker, render_markdown_blocks,
 };
 
 /// One rendered list item: its padded marker, its rendered rows, and the
@@ -12,13 +12,14 @@ use super::{
 /// `clippy::type_complexity` bar) and gives the tuple one place to evolve.
 type RenderedItem = (String, Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>);
 
-/// Render a list block (`ordered` with item numbers running `start..`, or a
-/// bullet list) into fresh `(lines, joins, chrome)` buffers, which the caller
-/// appends to its own.
+/// Render a list block (a bullet list, or an ordered list whose item numbers
+/// come from each item's own captured marker, numbering from `start` when an
+/// item carries no marker) into fresh `(lines, joins, chrome)` buffers, which
+/// the caller appends to its own.
 pub(crate) fn render_list(
     ordered: bool,
     start: usize,
-    items: &[Vec<MarkdownBlock>],
+    items: &[ListItem],
     indent: usize,
     width: usize,
     heading_shift: usize,
@@ -39,7 +40,7 @@ pub(crate) fn render_list(
     // lopsided gap in an otherwise tight list).
     //
     // The list shares a single indentation unit: the width of the
-    // *widest* number plus the fixed ". " suffix for an ordered list
+    // *widest* item number plus the fixed ". " suffix for an ordered list
     // (4 columns for a list reaching "10. "), or the bullet marker's
     // width for an unordered list.  Ordered markers are right-aligned
     // within that digit column — the number is left-padded with spaces
@@ -48,17 +49,19 @@ pub(crate) fn render_list(
     // the content that follows stay at a fixed column.  Every
     // continuation line is indented to that same column, so first lines
     // and wrapped lines all line up as one block.
+    //
+    // The width is scanned from the items' *actual* numbers rather than
+    // assumed to be `start + len - 1`: a source list may number its items
+    // non-sequentially, and the digit column must still fit the widest one
+    // actually rendered.
     let (max_number_width, max_marker_width) = if ordered {
-        // Item numbers run start..=start + len - 1, so the widest number
-        // is always the last one — O(1) per list, no per-item scan.
-        // `saturating_add` is cheap overflow hardening: CommonMark caps an
-        // ordered-list marker at nine digits (so `start` is at most
-        // 999,999,999 today), but the marker arithmetic must never be able to
-        // overflow (and panic in debug) if a parser or future input ever
-        // allows a larger start.
-        let number_width = items.len().checked_sub(1).map_or(1, |last| {
-            display_width(&start.saturating_add(last).to_string())
-        });
+        let number_width = items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| item.effective_number(start, index))
+            .map(|number| display_width(&number.to_string()))
+            .max()
+            .unwrap_or(1);
         // ". " is two fixed columns after the number column.
         (number_width, number_width + 2)
     } else {
@@ -67,9 +70,7 @@ pub(crate) fn render_list(
     let mut rendered_items: Vec<RenderedItem> = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
         let marker = if ordered {
-            // saturating_add: a huge literal list start must render,
-            // not overflow (see max_number_width above).
-            ordered_marker(start.saturating_add(index), max_number_width)
+            ordered_marker(item.effective_number(start, index), max_number_width)
         } else {
             "• ".to_string()
         };
@@ -85,7 +86,7 @@ pub(crate) fn render_list(
         // exactly `width`, and continuation lines (indented to the same
         // column) fit as well.
         render_markdown_blocks(
-            item,
+            &item.blocks,
             &mut rendered,
             &mut rendered_joins,
             &mut rendered_chrome,

@@ -63,13 +63,13 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// than a Ping/Pong: every ~64 KiB wire fragment is separately AES-GCM
 /// encrypted on the sender and decrypted on the receiver under the shared
 /// `TransportState` lock, and the `AddCredential` path additionally
-/// test-decrypts the 1 MiB blob and persists it to redb. Under
+/// encrypts the 1 MiB credential to the binding and persists it to redb. Under
 /// `cargo test-all`, nextest runs one test process per core AND several other
 /// integration tests run at the same time, so the daemon+client threads
 /// INSIDE this test's process are heavily oversubscribed. Measured under 4×
 /// concurrent full-suite load (16 cores), the 1 MiB `AddCredential` round trip
 /// took ~6.4 s end to end (client transmit ~2.7 s, daemon reassembly ~1.7 s,
-/// keystore verify+decrypt ~1.8 s) — the daemon completes CORRECTLY, just
+/// daemon encrypt+persist ~1.8 s) — the daemon completes CORRECTLY, just
 /// slowly. The small-message [`TIMEOUT`] above is a latency assumption that
 /// does not hold for this path, so using it here races normal load rather than
 /// detecting a real fault. This larger bound keeps the test honest (a truly
@@ -616,14 +616,14 @@ fn noise_shutdown_notifies_client() {
 }
 
 /// Test that a >64 KiB message survives the FULL daemon round trip. The
-/// client's 1 MiB `AddCredential` payload must fragment on the wire (snow's
+/// client's 1 MiB `AddCredential` credential must fragment on the wire (snow's
 /// single-fragment cap is 65518 plaintext bytes); the daemon's
 /// `tcp_client_thread` reassembles it via `recv_client_message`, the command
-/// loop stores the blob (`handle_add_credential_sync`), and the `CredentialAdded`
-/// reply travels back through the same encrypted channel. This proves the
-/// framing change is invisible above the transport: typed proto messages can
-/// now be as large as the codec's 64 MiB `MAX_FRAME_SIZE`, not just 65518
-/// bytes.
+/// loop encrypts and stores it (`handle_add_credential_sync`), and the
+/// `CredentialAdded` reply travels back through the same encrypted channel. This
+/// proves the framing change is invisible above the transport: typed proto
+/// messages can now be as large as the codec's 64 MiB `MAX_FRAME_SIZE`, not
+/// just 65518 bytes.
 #[test]
 #[ignore = "integration"]
 fn noise_large_message_through_daemon() {
@@ -635,19 +635,17 @@ fn noise_large_message_through_daemon() {
         key_dir.path().to_path_buf(),
     );
 
-    // 1 MiB encrypted credential blob — 17 wire fragments — far beyond the
-    // 65518-byte single-fragment cap, so the sender must split it and
-    // the daemon's reader must glue the fragments back before the command
-    // loop ever sees the message. The blob is genuinely encrypted with a
-    // throwaway unlock key (AddCredential now test-decrypts the blob and
-    // REJECTS anything that does not decrypt), so it must decrypt cleanly
-    // for the CredentialAdded reply to come back.
+    // 1 MiB credential — 17 wire fragments — far beyond the 65518-byte
+    // single-fragment cap, so the sender must split it and the daemon's reader
+    // must glue the fragments back before the command loop ever sees the
+    // message. AddCredential now carries the TYPED credential as plaintext (the
+    // daemon encrypts it to its own binding), so a 1 MiB API-key value keeps the
+    // wire message far above the single-fragment cap.
     let unlock_key: [u8; 32] = std::array::from_fn(|i| (i * 7) as u8);
-    let derived_pub = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(unlock_key));
 
-    // BIND first: the daemon's keystore starts unbound and AddCredential is
-    // verify-only, so the fresh daemon must be bound (the ONLY adopt path)
-    // before any credential can be added.
+    // BIND first: the daemon's keystore starts unbound and AddCredential now
+    // requires an UNLOCKED keystore, so the fresh daemon must be bound (the
+    // ONLY adopt path) before any credential can be added.
     client.send(ClientMessageType::BindKeystore {
         key: unlock_key.to_vec(),
     });
@@ -657,25 +655,14 @@ fn noise_large_message_through_daemon() {
     }
     // (No lock-state broadcast is expected here: this Noise client is not an
     // activity subscriber, so the bind's transition broadcast has no route.)
-    // AddCredential test-decrypts the blob AND expects the plaintext to
-    // decode as a ServiceCredential, so encrypt a real (postcard-serialized)
-    // credential padded with filler bytes to keep the 1 MiB wire size.
-    let mut plaintext = postcard::to_allocvec(&choreo_keystore::ServiceCredential::ApiKey {
-        key: "sk-test".into(),
-    })
-    .expect("test credential must serialize");
-    plaintext.resize(1024 * 1024, 0x42);
-    let blob = choreo_keystore::crypto::encrypt_with_public_key(derived_pub.as_bytes(), &plaintext)
-        .expect("test blob must encrypt");
+    let big_key = "A".repeat(1024 * 1024);
     client.send(ClientMessageType::AddCredential {
         service: "big-blob".into(),
-        encrypted_payload: blob,
-        unlock_key: unlock_key.to_vec(),
+        credential: choreo_keystore::ServiceCredential::ApiKey { key: big_key },
     });
     // A successful AddCredential yields exactly ONE targeted reply — the
-    // `CredentialAdded`. The implicit-unlock transition is a `Keystore { state:
-    // Unlocked }` BROADCAST, and this client is not an activity subscriber, so
-    // nothing precedes the targeted reply.
+    // `CredentialAdded`. The handler never changes lock state, so no lock-state
+    // broadcast precedes the targeted reply.
     match client.recv_within(LARGE_MESSAGE_TIMEOUT) {
         DaemonMessageType::CredentialAdded { service } => assert_eq!(service, "big-blob"),
         other => panic!("expected CredentialAdded, got {other:?}"),

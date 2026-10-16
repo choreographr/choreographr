@@ -332,7 +332,7 @@ impl DaemonState {
     ///
     /// Called on a REAL status TRANSITION (unbound→bound+unlocked after a
     /// successful `BindKeystore`; locked→unlocked after a successful `Unlock` /
-    /// `AddCredential` implicit unlock; unlocked→locked on `/lock`) so every
+    /// `BindKeystore`; unlocked→locked on `/lock`) so every
     /// connected client re-latches its banner — client B unlocking updates
     /// client A's status bar. `None` provenance (a flat, empty-variant control
     /// message) rides the standard lossless activity fan-out; the acting

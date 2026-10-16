@@ -436,8 +436,8 @@ fn drain_subscribe_push(client: &Client) {
 }
 
 /// `BindKeystore` on an unbound daemon adopts the key, replies the targeted
-/// `Bound`, and the daemon is unlocked afterwards (a follow-up `AddCredential`
-/// succeeds without any adoption).
+/// `Bound`, and the daemon is unlocked afterwards (no adoption happens on any
+/// other path).
 #[test]
 #[ignore = "integration"]
 fn unix_bind_keystore_adopts_and_replies_bound() {
@@ -479,8 +479,9 @@ fn unix_bind_keystore_adopts_and_replies_bound() {
 }
 
 /// Unlock on an unbound daemon is VERIFY-ONLY: it must NOT adopt the key.
-/// The client gets the distinct `KeystoreUnbound` (not `LockedError`), and a
-/// subsequent `AddCredential` is refused too — proving no binding was created.
+/// The client gets the distinct `KeystoreUnbound` (not `LockedError`), a
+/// subsequent `AddCredential` is refused too (the locked keystore rejects it),
+/// and a later explicit bind still succeeds — proving no binding was created.
 #[test]
 #[ignore = "integration"]
 fn unix_unlock_on_unbound_keystore_is_refused_without_adopting() {
@@ -501,23 +502,30 @@ fn unix_unlock_on_unbound_keystore_is_refused_without_adopting() {
         other => panic!("expected KeystoreUnbound, got {other:?}"),
     }
 
-    // AddCredential on the still-unbound keystore is refused as well: the
-    // unlock above must not have adopted the key.
-    let derived = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(key));
-    let blob = choreo_keystore::crypto::encrypt_with_public_key(
-        derived.as_bytes(),
-        &postcard::to_allocvec(&choreo_keystore::ServiceCredential::ApiKey { key: "sk".into() })
-            .unwrap(),
-    )
-    .unwrap();
+    // AddCredential on the still-unbound (and locked) keystore is refused as
+    // well: the unlock above must not have adopted the key, and the add path
+    // now requires an unlocked keystore.
     client.send(ClientMessageType::AddCredential {
         service: "svc".into(),
-        encrypted_payload: blob,
-        unlock_key: key.to_vec(),
+        credential: choreo_keystore::ServiceCredential::ApiKey { key: "sk".into() },
     });
     match client.recv() {
-        DaemonMessageType::KeystoreUnbound { .. } => {}
-        other => panic!("expected KeystoreUnbound, got {other:?}"),
+        DaemonMessageType::CredentialAddFailed { error, .. } => {
+            assert!(
+                error.contains("unlock the keystore first"),
+                "the add must be refused for a locked keystore, got: {error}"
+            );
+        }
+        other => panic!("expected CredentialAddFailed, got {other:?}"),
+    }
+
+    // The keystore is STILL unbound: the explicit bind below (the sole adopt
+    // path) succeeds, which it could only do if nothing above had created a
+    // binding.
+    client.send(ClientMessageType::BindKeystore { key: key.to_vec() });
+    match client.recv() {
+        DaemonMessageType::Bound => {}
+        other => panic!("expected Bound, got {other:?}"),
     }
 
     daemon.shutdown();
@@ -562,7 +570,7 @@ fn unix_targeted_reply_precedes_lock_state_broadcast() {
     // targeted `Locked` reply only AFTER the command returns. That is harmless
     // — a lock carries no key to record — so accept the broadcast FIRST, then
     // the reply. (The strict reply-first ordering matters only for the
-    // key-carrying ops — Unlock/Bind/AddCredential — which `handle_unlock`/
+    // key-carrying ops — Unlock/Bind — which `handle_unlock`/
     // `handle_bind_keystore` satisfy by enqueuing the targeted reply before the
     // transition broadcast.)
     client.send(ClientMessageType::Lock);
