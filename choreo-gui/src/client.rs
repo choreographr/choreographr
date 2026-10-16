@@ -119,6 +119,9 @@ pub(crate) fn handle_shell_command(
             .status_texts
             .push(format!("invalid request id: {value}")),
         Command::UnknownCommand(error) => state.status_texts.push(error),
+        Command::Login { .. } => state
+            .status_texts
+            .push("OAuth sign-in is not available in the GUI yet".to_string()),
         Command::Send(message) => send_client_message(state, daemon_tx, message),
         Command::Unlock { method } => match resolve_private_key(&method, &connection_addr()) {
             Ok(private_key) => {

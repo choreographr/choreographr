@@ -140,6 +140,17 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
                 warn!("failed to send error message to telegram: {e}");
             }
         }
+        Command::Login { .. } => {
+            // The OAuth interactive sign-in surface is TUI-only in this
+            // release; a chat bridge cannot drive a browser/loopback flow.
+            if let Err(e) = bot.send_message(
+                chat_id_val,
+                "OAuth sign-in is not available from Telegram; use the TUI's /login",
+                None,
+            ) {
+                warn!("failed to send unsupported-login notice: {e}");
+            }
+        }
         Command::Unlock { method } => match resolve_private_key(&method, &socket_path()) {
             Ok(private_key) => {
                 if let Err(e) = state

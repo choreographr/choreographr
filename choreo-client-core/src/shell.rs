@@ -56,6 +56,18 @@ pub enum Command {
         /// The service whose credential is removed.
         service: String,
     },
+    /// `/login <account>` (alias `/add-oauth`): sign an existing account into
+    /// its provider with OAuth. The front-end drives the login library (which
+    /// builds the credential) and stores the result under `account`; the
+    /// account's provider selects the OAuth flow. Not a message to the daemon
+    /// by itself — the front-end issues the `ListOAuthProviders` request and,
+    /// on completion, the `AddCredential`.
+    Login {
+        /// The existing account to sign in (its provider selects the flow).
+        account: String,
+        /// Whether to use the RFC 8628 device-code flow (`--device`).
+        device: bool,
+    },
     /// `/acl add <base64-pubkey>` — enroll a new client in the daemon's
     /// ACL. Rejected by the daemon unless this connection is local (Unix
     /// socket): the approver must be physically at the machine.
@@ -429,6 +441,29 @@ fn parse_command(rest: &str) -> Command {
         };
     }
 
+    // `/login <account> [--device]` and its alias `/add-oauth`. The account
+    // must already exist (its provider selects the OAuth flow); the front-end
+    // drives the library. `--device` requests the headless device-code flow.
+    if rest == "login" || rest == "add-oauth" {
+        return Command::UnknownCommand("usage: /login <account> [--device]".to_string());
+    }
+    for verb in ["login ", "add-oauth "] {
+        if let Some(args) = rest.strip_prefix(verb) {
+            let mut tokens = args.split_whitespace();
+            let Some(account) = tokens.next() else {
+                return Command::UnknownCommand("usage: /login <account> [--device]".to_string());
+            };
+            if !is_valid_account_name(account) {
+                return Command::UnknownCommand(INVALID_ACCOUNT_NAME.to_string());
+            }
+            let device = tokens.any(|t| t == "--device");
+            return Command::Login {
+                account: account.to_string(),
+                device,
+            };
+        }
+    }
+
     if let Some(args) = rest.strip_prefix("add-key ") {
         let parts: Vec<&str> = args.split_whitespace().collect();
         if parts.len() < 2 {
@@ -634,6 +669,11 @@ pub fn command_echo(command: &Command) -> Option<String> {
         // what they typed even though no ClientMessageType is sent.
         Command::Unlock { .. } => Some("> /unlock".to_string()),
         Command::AddCredential { service, .. } => Some(format!("> /add-key {service}")),
+        Command::Login { account, device } => Some(if *device {
+            format!("> /login {account} --device")
+        } else {
+            format!("> /login {account}")
+        }),
         Command::RemoveCredential { service } => Some(format!("> /remove-key {service}")),
         Command::AclAdd { pubkey } => Some(format!("> /acl add {pubkey}")),
         Command::Undo => Some("> undo".to_string()),
@@ -769,6 +809,52 @@ mod tests {
         assert_eq!(
             command_echo(&Command::Mcp(McpCommand::Reload)).as_deref(),
             Some("> /mcp reload"),
+        );
+    }
+
+    #[test]
+    fn login_and_add_oauth_alias_parse() {
+        assert_eq!(
+            parse_input_line("/login work"),
+            Command::Login {
+                account: "work".to_string(),
+                device: false,
+            }
+        );
+        assert_eq!(
+            parse_input_line("/add-oauth work --device"),
+            Command::Login {
+                account: "work".to_string(),
+                device: true,
+            }
+        );
+    }
+
+    #[test]
+    fn login_without_an_account_is_a_usage_error() {
+        assert!(matches!(
+            parse_input_line("/login"),
+            Command::UnknownCommand(msg) if msg.contains("usage")
+        ));
+    }
+
+    #[test]
+    fn login_echo_round_trips() {
+        assert_eq!(
+            command_echo(&Command::Login {
+                account: "work".to_string(),
+                device: false,
+            })
+            .as_deref(),
+            Some("> /login work"),
+        );
+        assert_eq!(
+            command_echo(&Command::Login {
+                account: "work".to_string(),
+                device: true,
+            })
+            .as_deref(),
+            Some("> /login work --device"),
         );
     }
 }

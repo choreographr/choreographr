@@ -662,6 +662,37 @@ never persisted, since the refresh token in the credential blob is the durable
 root. It is owned by the command loop (single writer) and wiped on `/lock`
 alongside the credentials map.
 
+#### Provider OAuth login (frontend)
+
+The interactive sign-in runs in the **frontend**, not the daemon. The shared
+login library in `choreo-client-core` (`src/oauth/`) performs PKCE **S256** plus
+a random `state`, a loopback callback server bound to `127.0.0.1` only (ports
+1455 then 1457, falling back on `AddrInUse`), or an RFC 8628 device-code poll
+for headless hosts, then builds the durable `ServiceCredential::OAuth` and
+returns the `ClientMessageType::AddCredential` frame that carries it — no render
+crate constructs an OAuth credential. The flow runs on a **worker thread** and
+streams progress (`AuthUrl`, `DeviceCode`, `Prompt`, `Progress`, `Done`,
+`Error`) over a crossbeam channel; a single-bit cancel flag (polled by the
+loopback accept loop via `tiny_http`'s `recv_timeout`, since a blocking accept
+cannot be interrupted by a channel message) and a stop channel end it. The
+`id_token`'s identity claim (`chatgpt_account_id`) is read **without signature
+verification** — the token arrived over TLS from the token endpoint — with the
+access token as a fallback; the access token is then dropped and only the
+refresh token, client registration, and extracted claims persist.
+
+The daemon serves each provider's sign-in parameters over a
+`ClientMessage::ListOAuthProviders` ⇄
+`DaemonMessage::OAuthProviders(Vec<OAuthProviderDescriptor>)` pair, so the
+frontend embeds no copy of the issuer, scopes, redirect ports, encodings, or
+client identity. The daemon assembles the descriptors
+(`choreo-ai-protocols::oauth_provider_descriptors`) from the catalog `oauth`
+profile (data) paired with the compiled client-identity table (policy), and
+**withholds** a borrowed vendor client id unless the per-install opt-in is
+enabled. `/login <account>` (alias `/add-oauth`, `--device` for the headless
+flow) targets an **existing** account whose provider selects the flow; the TUI
+renders the streamed progress in a cancelable modal. The two wire variants amend
+the unreleased v9 changelog in `choreo-proto/src/frame.rs` (no version bump).
+
 ### Request-body compression
 
 Every LLM turn re-sends the whole conversation plus the tool schemas as JSON,

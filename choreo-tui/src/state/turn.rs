@@ -588,6 +588,13 @@ impl TurnEventHandler for App {
         self.error = Some(error);
     }
 
+    fn handle_oauth_providers(&mut self, providers: Vec<choreo_proto::OAuthProviderDescriptor>) {
+        // Cache the descriptors and start any `/login` that was waiting on
+        // them; starting the flow needs no client sender (only the later
+        // `AddCredential` does, and that is sent from the UI loop).
+        self.handle_oauth_providers_reply(providers);
+    }
+
     fn handle_session_attached(&mut self, session_id: u64) {
         self.active_session_id = Some(session_id);
         self.attached_session_id = Some(session_id);

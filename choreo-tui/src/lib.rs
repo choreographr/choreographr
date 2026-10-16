@@ -725,6 +725,8 @@ mod input_tests;
 #[cfg(test)]
 mod lib_tests;
 #[cfg(test)]
+mod login_tests;
+#[cfg(test)]
 mod model_selector_tests;
 #[cfg(test)]
 mod render_tests;

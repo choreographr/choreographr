@@ -35,9 +35,9 @@ struct Step {
 fn steps(progress: SetupProgress, has_accounts: bool) -> [Step; 3] {
     [
         Step {
-            label: "Add an AI provider account and its API key",
+            label: "Add an AI provider account and its API key or sign in",
             keys: if has_accounts && !progress.has_keyed_account {
-                "alt+a, select it, c"
+                "alt+a, select it, c (key) or /login <account>"
             } else {
                 "alt+a, then n"
             },

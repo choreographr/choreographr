@@ -387,6 +387,22 @@ pub(super) fn run_command(
                 }
             }
         }
+        Command::Login {
+            ref account,
+            device,
+        } => {
+            if echo
+                && let Some(text) = command_echo(&Command::Login {
+                    account: account.clone(),
+                    device,
+                })
+            {
+                app.status = Some(text);
+            }
+            // The login library builds the credential; on completion the UI
+            // loop sends the `AddCredential` it produced.
+            app.begin_login(account.clone(), device, client_tx);
+        }
         Command::AclAdd { ref pubkey } => {
             if echo
                 && let Some(text) = command_echo(&Command::AclAdd {

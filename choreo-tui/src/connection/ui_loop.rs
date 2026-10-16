@@ -10,10 +10,10 @@ use crate::backend::TuiBackend;
 use crate::build_picker;
 use crate::image_worker::{ImageResult, ImageWorker};
 use crate::render::render;
-use crate::state::{App, Page, UiEvent};
+use crate::state::{App, LoginModal, Page, UiEvent};
 use crate::terminal::{progress, title};
 use choreo_client_core::{
-    ClientError, ConnectionMode, PendingContext, run_daemon_connection_with_autostart,
+    ClientError, ConnectionMode, LoginEvent, PendingContext, run_daemon_connection_with_autostart,
     run_daemon_connection_with_mode,
 };
 use choreo_proto::{ClientMessage, ClientMessageType};
@@ -583,6 +583,9 @@ fn run_ui_loop(
     // Stand-in for the model selector's retry timer while none is armed, so
     // the select below always has the arm.
     let no_retry = channel::never::<std::time::Instant>();
+    // Stand-in for the login worker's event receiver while no login is running,
+    // so the select below always has the arm.
+    let no_login = channel::never::<LoginEvent>();
 
     while !app.should_quit {
         // Cloned out so the select's receiver borrow does not overlap the
@@ -592,6 +595,13 @@ fn run_ui_loop(
             .retry_timer
             .clone()
             .unwrap_or_else(|| no_retry.clone());
+        // The login worker's event receiver, or the never channel when no
+        // login is active.
+        let login_rx = app
+            .login
+            .as_ref()
+            .and_then(LoginModal::events)
+            .unwrap_or_else(|| no_login.clone());
         // Wait for an event from any source.  The thread is blocked in the
         // kernel here — zero CPU usage while idle.
         select! {
@@ -630,6 +640,13 @@ fn run_ui_loop(
                 }
                 dirty = true;
             }
+            recv(login_rx) -> msg => {
+                if let Ok(event) = msg
+                    && app.apply_login_event(event, client_tx)
+                {
+                    dirty = true;
+                }
+            }
             recv(resume_rx) -> msg => {
                 if let Ok(cmd) = msg {
                     // A stale selection must not survive a suspend/resume
@@ -663,6 +680,14 @@ fn run_ui_loop(
             }
             while let Ok(result) = image_result_rx.try_recv() {
                 app.apply_image_result(result);
+                progress = true;
+                dirty = true;
+            }
+            while let Some(login_rx) = app.login.as_ref().and_then(LoginModal::events) {
+                let Ok(event) = login_rx.try_recv() else {
+                    break;
+                };
+                app.apply_login_event(event, client_tx);
                 progress = true;
                 dirty = true;
             }

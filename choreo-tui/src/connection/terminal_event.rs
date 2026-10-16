@@ -182,6 +182,19 @@ pub(crate) fn handle_terminal_event(
         handle_fullscreen_event(&event, app, client_tx);
         return Ok(());
     }
+    // The OAuth login modal takes overlay priority over page content: while a
+    // sign-in is in progress it swallows every key, and Esc cancels the flow
+    // (tripping the worker's cancel flag). Alt+Q is handled above so the user
+    // can always quit.
+    if app.login.is_some() {
+        if let Event::Key(key) = &event
+            && key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Esc
+        {
+            app.cancel_login();
+        }
+        return Ok(());
+    }
     // The model selector overlay (Chat page) also takes priority over page
     // content, mirroring the fullscreen guard above.  Alt+Q is handled
     // before this point so the user can always quit while it is open.

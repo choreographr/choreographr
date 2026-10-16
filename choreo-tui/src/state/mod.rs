@@ -26,6 +26,7 @@ mod images;
 mod input;
 mod keymap;
 mod layout;
+mod login;
 mod onboarding;
 mod pages;
 mod pin;
@@ -47,6 +48,7 @@ pub(crate) use images::{
 pub(crate) use input::*;
 pub(crate) use keymap::*;
 pub(crate) use layout::*;
+pub(crate) use login::*;
 pub(crate) use onboarding::*;
 pub(crate) use pages::*;
 pub(crate) use pin::*;
@@ -325,6 +327,20 @@ pub(crate) struct App {
     /// confirms the key, and then the model picker opened once the selection
     /// lands. `None` outside that chain (see [`SetupFollow`]).
     pub(crate) setup_follow: Option<SetupFollow>,
+    /// The active OAuth login modal, when a `/login` flow is running. Holds the
+    /// worker session; dropped (which cancels) when the flow ends or the user
+    /// cancels.
+    pub(crate) login: Option<LoginModal>,
+    /// The OAuth sign-in parameters served by the daemon, cached from the last
+    /// `ListOAuthProviders` reply, keyed by provider slug in `provider`.
+    pub(crate) oauth_providers: Vec<choreo_proto::OAuthProviderDescriptor>,
+    /// Whether the descriptor list has been fetched once, so `/login` does not
+    /// re-request it on every invocation.
+    pub(crate) oauth_providers_fetched: bool,
+    /// A `/login` awaiting the descriptor reply: `(account, provider, device)`.
+    /// The account is resolved to its provider when the command arrives, so the
+    /// reply need only start the flow.
+    pub(crate) pending_login: Option<(String, String, bool)>,
 }
 
 pub(crate) enum UiEvent {
@@ -406,6 +422,10 @@ impl App {
             active_session_id: None,
             connection_addr: socket_path(),
             setup_follow: None,
+            login: None,
+            oauth_providers: Vec::new(),
+            oauth_providers_fetched: false,
+            pending_login: None,
         }
     }
 

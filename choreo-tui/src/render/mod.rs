@@ -31,12 +31,14 @@ use std::sync::Arc;
 // geometry.
 mod ai_providers;
 mod command_palette;
+mod login;
 mod model_selector;
 mod session_manager;
 mod welcome;
 
 use self::ai_providers::render_ai_providers;
 use self::command_palette::render_command_palette;
+use self::login::render_login_modal;
 use self::model_selector::render_model_selector;
 use self::session_manager::render_session_manager;
 use self::welcome::render_welcome;
@@ -107,6 +109,12 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
         && app.command_palette_active()
     {
         render_command_palette(frame, app, input_rect);
+    }
+
+    // The OAuth login modal is the topmost overlay: it covers whatever page is
+    // beneath and swallows input until the flow ends or the user cancels.
+    if app.login.is_some() {
+        render_login_modal(frame, app);
     }
 }
 
