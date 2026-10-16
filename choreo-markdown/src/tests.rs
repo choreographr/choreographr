@@ -146,6 +146,37 @@ fn markdown_round_trip_preserves_non_sequential_numbers() {
 }
 
 #[test]
+fn list_item_effective_number_prefers_captured_marker() {
+    // A captured marker wins over the start+index fallback.
+    let captured = ListItem {
+        number: Some(7),
+        blocks: Vec::new(),
+    };
+    assert_eq!(captured.effective_number(1, 3), 7);
+}
+
+#[test]
+fn list_item_effective_number_falls_back_to_start_plus_index() {
+    // No captured marker (a programmatically built item, or an unordered
+    // item) numbers from the enclosing list's start plus its own offset.
+    let uncaptured = ListItem {
+        number: None,
+        blocks: Vec::new(),
+    };
+    assert_eq!(uncaptured.effective_number(10, 2), 12);
+}
+
+#[test]
+fn list_item_effective_number_saturates_on_overflow() {
+    // An extreme start must not overflow the offset arithmetic in debug.
+    let uncaptured = ListItem {
+        number: None,
+        blocks: Vec::new(),
+    };
+    assert_eq!(uncaptured.effective_number(usize::MAX, 4), usize::MAX);
+}
+
+#[test]
 fn markdown_parser_supports_tables() {
     let document =
         MarkdownDocument::parse("| Name | Role |\n|:--|--:|\n| Ada | Math |\n| Grace | CS |");

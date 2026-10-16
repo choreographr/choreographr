@@ -12,18 +12,10 @@ use super::{
 /// `clippy::type_complexity` bar) and gives the tuple one place to evolve.
 type RenderedItem = (String, Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>);
 
-/// The number to render for an ordered item: its own captured marker when the
-/// parser recovered one, otherwise the CommonMark start plus the item's offset.
-/// The fallback keeps a programmatically built list (no captured numbers) and a
-/// mixed list numbering from `start` as before; `saturating_add` guards the
-/// offset arithmetic against overflow on an extreme start.
-fn effective_number(item: &ListItem, start: usize, index: usize) -> usize {
-    item.number.unwrap_or_else(|| start.saturating_add(index))
-}
-
 /// Render a list block (a bullet list, or an ordered list whose item numbers
-/// come from each item's own captured marker with `start` as the fallback) into
-/// fresh `(lines, joins, chrome)` buffers, which the caller appends to its own.
+/// come from each item's own captured marker, numbering from `start` when an
+/// item carries no marker) into fresh `(lines, joins, chrome)` buffers, which
+/// the caller appends to its own.
 pub(crate) fn render_list(
     ordered: bool,
     start: usize,
@@ -66,7 +58,7 @@ pub(crate) fn render_list(
         let number_width = items
             .iter()
             .enumerate()
-            .map(|(index, item)| effective_number(item, start, index))
+            .map(|(index, item)| item.effective_number(start, index))
             .map(|number| display_width(&number.to_string()))
             .max()
             .unwrap_or(1);
@@ -78,7 +70,7 @@ pub(crate) fn render_list(
     let mut rendered_items: Vec<RenderedItem> = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
         let marker = if ordered {
-            ordered_marker(effective_number(item, start, index), max_number_width)
+            ordered_marker(item.effective_number(start, index), max_number_width)
         } else {
             "• ".to_string()
         };

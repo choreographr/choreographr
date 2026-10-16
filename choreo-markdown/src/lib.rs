@@ -109,11 +109,26 @@ pub enum MarkdownBlock {
 pub struct ListItem {
     /// The literal 1-based number written for an ordered item (`3` for
     /// `3. text`), or `None` for an unordered item or one built
-    /// programmatically without a captured marker.  When `None`, consumers
-    /// fall back to the enclosing `List`'s `start`.
+    /// programmatically without a captured marker.  When `None`,
+    /// [`ListItem::effective_number`] falls back to the enclosing `List`'s
+    /// `start`.
     pub number: Option<usize>,
     /// The item's block content (paragraphs, nested lists, code blocks, …).
     pub blocks: Vec<MarkdownBlock>,
+}
+
+impl ListItem {
+    /// The 1-based number to render or serialize for this item: its own
+    /// captured marker when the parser recovered one, otherwise the enclosing
+    /// list's `start` advanced by the item's position.
+    ///
+    /// The fallback keeps a programmatically built list (no captured numbers)
+    /// numbering from `start`; `saturating_add` guards the arithmetic against
+    /// overflow on an extreme start so the marker can never panic in debug.
+    #[must_use]
+    pub fn effective_number(&self, start: usize, index: usize) -> usize {
+        self.number.unwrap_or_else(|| start.saturating_add(index))
+    }
 }
 
 /// Column alignment for a table cell.
