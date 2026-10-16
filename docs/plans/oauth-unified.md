@@ -332,6 +332,18 @@ private key, no re-login; works unattended **while the daemon is unlocked** (whi
 the only time it serves). A crash between the network exchange and the persist leaves
 a spent token → the next refresh is terminal → re-login: the correct safe failure.
 
+**Rotate-if-present — one engine, every provider (rotation-agnostic).** The refresh
+exchange returns an *optional* `refresh_token`. The engine **adopts it when present
+and keeps the stored one when omitted**, so a single provider-parameterized engine
+covers rotating *and* non-rotating providers with no branch. The `id_token` is
+likewise replaced only when the response carries one (otherwise the
+`chatgpt_account_id` claim would be dropped). "Does provider X rotate?" is therefore
+a **verification** item (§18), not a code path. An optional per-provider
+`rotates_refresh_token` flag (default: rotate-if-present) covers a provider that turns
+out to be strict — **declared in the provider table, never detected at runtime, and
+never used to *discard* a returned token**. Do **not** default to the "assume rotation,
+fail if absent" behavior some harnesses use.
+
 ## 7. Provider runtime
 
 ```text
@@ -708,6 +720,18 @@ ships its **own registered GitHub OAuth App** while most borrow `Iv1.b507…`. T
 conservative converged alternative for Claude specifically is to **delegate** to the
 real `claude` CLI/Agent SDK (goose, t3code, buzz, open-dots, oar). §7.1 adopts these:
 register where a path exists, borrow only behind a gate, delegate for Claude.
+
+**Refresh posture.** A fourth survey (provider refresh-token rotation) found
+**rotate-if-present** to be the near-universal rule — even the per-provider
+implementations repeat `response.refresh_token ?? stored` rather than branching on
+provider identity — so the rotation *rule* is generic while only wire details are
+per-provider. **No harness probes rotation at runtime**; the nearest is ironclaw's
+declarative `RefreshRecipe.rotates_refresh_token` flag (configured, not detected).
+Serialized refresh with a **reload-under-lock that adopts a peer's rotation** is
+canonical, held across the network exchange and the persist. **id_token preservation
+is rare** (only codex and zero); this plan requires it. Buffers cluster 30 s–5 min;
+the single-flight lock is in-process almost everywhere and cross-process only where a
+store is shared.
 
 ## 12. Cross-crate change inventory
 
