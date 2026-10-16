@@ -380,11 +380,11 @@ pub(crate) fn apply_daemon_message(
         // daemon). Record the pending key per-daemon NOW — the whole point of
         // the per-daemon keystore design is that a key is only trusted/recorded
         // after the daemon accepts it (TOFU adopt, or a binding match). A
-        // rejected key never reaches here. (An AddCredential confirmation no
-        // longer carries a key, so its arm is a no-op on the pending slot.)
-        DaemonMessageType::Unlocked
-        | DaemonMessageType::Bound
-        | DaemonMessageType::CredentialAdded { .. } => {
+        // rejected key never reaches here. `AddCredential` carries no key and
+        // never populates the pending slot, so its confirmation is deliberately
+        // NOT in this arm — including it could misattribute an unrelated
+        // in-flight Unlock key to the add.
+        DaemonMessageType::Unlocked | DaemonMessageType::Bound => {
             if let Some(key) = state.pending_unlock_key.take()
                 && let Err(e) = record_unlock_key(&connection_addr(), &key)
             {
