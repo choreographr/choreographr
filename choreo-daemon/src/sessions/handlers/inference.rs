@@ -127,6 +127,10 @@ pub(in crate::sessions) fn handle_run_input(
     // are routed through SessionCommand::Broadcast to this main
     // session thread which holds the live subscriber set.
     let mut worker_session = SessionState::from_snapshot(state.snapshot(), HashMap::new());
+    // Hand the worker this session's registry so a client it REBUILDS (an OAuth
+    // 401 refresh re-resolves the provider on the worker thread) registers its
+    // sockets in the same cancellable scope as the one built at spawn.
+    worker_session.registry = state.registry.clone();
     let ctx = ctx.clone();
     let user_text = Some(text);
     std::thread::spawn(move || {
@@ -205,6 +209,9 @@ pub(in crate::sessions) fn handle_run_child_input(
         },
     );
     let mut worker_session = SessionState::from_snapshot(state.snapshot(), HashMap::new());
+    // See `handle_run_input`: a rebuilt client must share the session's
+    // cancellable socket scope.
+    worker_session.registry = state.registry.clone();
     let ctx = ctx.clone();
     let provider = provider.clone();
     std::thread::spawn(move || {

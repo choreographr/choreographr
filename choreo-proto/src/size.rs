@@ -550,6 +550,10 @@ impl DaemonMessage {
                 // allowance); `Failed` adds the error string.
                 DaemonMessageType::Accepted { .. } => named_field_overhead(1),
                 DaemonMessageType::Failed { error, .. } => named_field_overhead(2) + error.len(),
+                // The re-login notice carries the account name only.
+                DaemonMessageType::OAuthReloginRequired { account } => {
+                    named_field_overhead(1) + account.len()
+                }
             }
     }
 }

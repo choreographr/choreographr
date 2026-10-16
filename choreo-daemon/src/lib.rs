@@ -49,6 +49,7 @@ pub mod image_prep;
 pub mod mcp;
 pub mod metrics;
 pub mod migrate;
+pub mod oauth_refresh;
 pub mod oauth_refresh_locks;
 pub mod providers;
 mod reasoning;

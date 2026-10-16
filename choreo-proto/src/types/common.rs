@@ -381,6 +381,17 @@ pub enum InferenceError {
         /// provider sent (see [`DiscardedToolCall`]).
         discarded: Vec<DiscardedToolCall>,
     },
+    /// The account's OAuth grant is dead: a refresh was rejected terminally
+    /// (`invalid_grant` / `invalid_token` / `refresh_token_reused`) and cannot
+    /// be recovered without the user signing in again. Terminal and never
+    /// retryable — distinct from [`InferenceError::Unauthorized`] (a 401 the
+    /// daemon can still transparently refresh) so the UI can prompt re-login
+    /// instead of showing a generic auth failure.
+    #[error("re-login required: {detail}")]
+    OAuthReloginRequired {
+        /// A short, token-free reason (the authorization server's error code).
+        detail: String,
+    },
     /// An underlying I/O error (connect/socket failure, read timeout, …).
     #[error("{0}")]
     Io(#[from] std::io::Error),
@@ -408,6 +419,7 @@ impl InferenceError {
             InferenceError::Cancelled => "cancelled",
             InferenceError::DeadlineExceeded => "deadline_exceeded",
             InferenceError::TruncatedToolCall { .. } => "truncated_tool_call",
+            InferenceError::OAuthReloginRequired { .. } => "oauth_relogin_required",
             InferenceError::Io(_) => "other",
         }
     }

@@ -187,6 +187,9 @@ impl DaemonState {
         // holds no cleartext bearer either.
         let access_tokens_cleared = self.access_tokens.len();
         self.access_tokens.clear();
+        // Quarantine is a memory-only flag over the in-memory credential; a
+        // relock wipes both, so a re-unlock starts every account unquarantined.
+        self.dead_oauth.clear();
         // No daemon-side provider cache to wipe anymore — instead invalidate
         // every live session's cached client so it rebuilds (against fresh
         // credentials) on its next request. Sessions stay browsable; only
@@ -243,67 +246,10 @@ impl DaemonState {
             return;
         }
 
-        // The binding public key is what the daemon encrypts to. An unbound
-        // keystore cannot have reached the unlocked state (bind is the sole
-        // adopt path and leaves it unlocked), so this is a defensive branch,
-        // not a reachable first-run path.
-        let binding = match db::get_keystore_binding(&self.db) {
-            Ok(Some(pk)) => pk,
-            Ok(None) => {
-                Self::send_credential_add_failed(
-                    &service,
-                    "keystore is not bound; bind it before adding credentials".to_string(),
-                    reply,
-                    ack,
-                );
-                return;
-            }
-            Err(e) => {
-                Self::send_credential_add_failed(
-                    &service,
-                    format!("failed to read keystore binding: {e}"),
-                    reply,
-                    ack,
-                );
-                return;
-            }
-        };
-
-        // Serialize then encrypt to the binding. The plaintext is wrapped in
-        // `Zeroizing` so the serialized secret bytes are wiped on every exit
-        // path (the typed credential also zeroizes on drop).
-        let plaintext = match postcard::to_allocvec(&credential) {
-            Ok(p) => Zeroizing::new(p),
-            Err(e) => {
-                Self::send_credential_add_failed(
-                    &service,
-                    format!("failed to serialize credential: {e}"),
-                    reply,
-                    ack,
-                );
-                return;
-            }
-        };
-        let blob = match choreo_keystore::crypto::encrypt_with_public_key(&binding, &plaintext) {
-            Ok(b) => b,
-            Err(e) => {
-                Self::send_credential_add_failed(
-                    &service,
-                    format!("failed to encrypt credential: {e}"),
-                    reply,
-                    ack,
-                );
-                return;
-            }
-        };
-
-        if let Err(e) = db::set_credential_blob(&self.db, &service, &blob) {
-            Self::send_credential_add_failed(
-                &service,
-                format!("failed to save credential: {e}"),
-                reply,
-                ack,
-            );
+        // Encrypt to the binding and persist — the one blob-write path the
+        // daemon shares between provisioning and refresh rotation.
+        if let Err(e) = self.encrypt_and_persist_credential(&service, &credential) {
+            Self::send_credential_add_failed(&service, e, reply, ack);
             return;
         }
 
@@ -319,8 +265,10 @@ impl DaemonState {
         }
         // A new credential replaces any previous one for this account, so any
         // cached access token derived from the old credential is stale and
-        // must be dropped before the replacement is stored.
+        // must be dropped before the replacement is stored. A fresh credential
+        // also clears any terminal quarantine: the grant is a new one.
         self.access_tokens.remove(&service);
+        self.dead_oauth.remove(&service);
         self.credentials.insert(service.clone(), credential);
 
         info!(
@@ -338,6 +286,140 @@ impl DaemonState {
             warn!("no reply target for the targeted AddCredential reply; dropping reply");
         }
         let _ = ack.send(());
+    }
+
+    /// Encrypt `credential` to the daemon's binding public key and persist the
+    /// blob under `service`.
+    ///
+    /// The single blob-write path shared by provisioning and refresh rotation:
+    /// the daemon is the sole writer, and neither caller needs the private key
+    /// (the envelope is a sealed box — only the recipient public key is used).
+    /// Requires an UNLOCKED, BOUND keystore.
+    ///
+    /// # Errors
+    ///
+    /// Returns a user-facing reason when the keystore is locked or unbound, or
+    /// when the serialize/encrypt/persist step fails.
+    fn encrypt_and_persist_credential(
+        &self,
+        service: &str,
+        credential: &ServiceCredential,
+    ) -> Result<(), String> {
+        if self.locked {
+            return Err("unlock the keystore first".to_string());
+        }
+        // An unbound keystore cannot have reached the unlocked state (bind is
+        // the sole adopt path and leaves it unlocked), so this is a defensive
+        // branch, not a reachable first-run path.
+        let binding = match db::get_keystore_binding(&self.db) {
+            Ok(Some(pk)) => pk,
+            Ok(None) => {
+                return Err("keystore is not bound; bind it before adding credentials".to_string());
+            }
+            Err(e) => return Err(format!("failed to read keystore binding: {e}")),
+        };
+        // The serialized plaintext is wrapped in `Zeroizing` so the secret bytes
+        // are wiped on every exit path (the typed credential also zeroizes on
+        // drop).
+        let plaintext = postcard::to_allocvec(credential)
+            .map(Zeroizing::new)
+            .map_err(|e| format!("failed to serialize credential: {e}"))?;
+        let blob = choreo_keystore::crypto::encrypt_with_public_key(&binding, &plaintext)
+            .map_err(|e| format!("failed to encrypt credential: {e}"))?;
+        db::set_credential_blob(&self.db, service, &blob)
+            .map_err(|e| format!("failed to save credential: {e}"))?;
+        Ok(())
+    }
+
+    /// Persist a refreshed OAuth token: update the in-memory access-token cache
+    /// and, when the exchange rotated the refresh token or refreshed the
+    /// identity claim, re-encrypt the updated durable credential to the binding
+    /// and persist it (rotate-if-present — the stored value is kept when the
+    /// exchange carried no new one).
+    pub(super) fn handle_save_oauth_token(
+        &mut self,
+        save: crate::oauth_refresh::SaveToken<'_>,
+        reply: &mpsc::Sender<Result<(), String>>,
+    ) {
+        if self.locked {
+            let _ = reply.send(Err("unlock the keystore first".to_string()));
+            return;
+        }
+        // The account must hold an OAuth credential to rotate; an API key has
+        // no refresh token and is refused rather than silently mis-updated.
+        let Some(current) = self.credentials.get(save.account).cloned() else {
+            let _ = reply.send(Err(format!(
+                "no credential stored for account '{}'",
+                save.account
+            )));
+            return;
+        };
+        if !matches!(current, ServiceCredential::OAuth { .. }) {
+            let _ = reply.send(Err(format!(
+                "account '{}' is not an OAuth credential",
+                save.account
+            )));
+            return;
+        }
+        let mut updated = current;
+        if let ServiceCredential::OAuth {
+            refresh_token,
+            account_id,
+            ..
+        } = &mut updated
+        {
+            if let Some(rotated) = save.rotated_refresh_token {
+                *refresh_token = Some(rotated.to_string());
+            }
+            if let Some(new_id) = save.new_account_id {
+                *account_id = Some(new_id.to_string());
+            }
+        }
+        if let Err(e) = self.encrypt_and_persist_credential(save.account, &updated) {
+            let _ = reply.send(Err(e));
+            return;
+        }
+        self.credentials.insert(save.account.to_string(), updated);
+        self.access_tokens.insert(
+            save.account.to_string(),
+            super::AccessTokenCache {
+                access_token: save.access_token.clone(),
+                expires_at: save.expires_at,
+                received_at: save.received_at,
+            },
+        );
+        // A successful refresh means the grant is alive again.
+        self.dead_oauth.remove(save.account);
+        info!(
+            account = %save.account,
+            rotated = save.rotated_refresh_token.is_some(),
+            "OAuth token refreshed and persisted"
+        );
+        let _ = reply.send(Ok(()));
+    }
+
+    /// Quarantine an account after a terminal OAuth refresh failure and
+    /// broadcast a single re-login-required notice.
+    ///
+    /// Idempotent by design: the broadcast fires only on the FIRST transition
+    /// into the quarantined state, so concurrent sessions and retries cannot
+    /// produce a duplicate re-login notice. The dead grant's cached token is
+    /// dropped — it can only 401 again.
+    pub(super) fn handle_mark_oauth_dead(&mut self, account: &str) {
+        if !self.dead_oauth.insert(account.to_string()) {
+            debug!(
+                account,
+                "OAuth account already quarantined; suppressing duplicate re-login notice"
+            );
+            return;
+        }
+        self.access_tokens.remove(account);
+        info!(
+            account,
+            provider = %self.account_provider_slug(account).unwrap_or_default(),
+            "OAuth grant terminally rejected; re-login required"
+        );
+        self.broadcast_oauth_relogin_required(account);
     }
 }
 

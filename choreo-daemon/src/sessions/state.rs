@@ -565,11 +565,6 @@ impl SessionState {
                     .to_string(),
             );
         };
-        let (reply, rx) = crossbeam_channel::unbounded();
-        let _ = ctx.daemon_tx.send(DaemonCommand::ResolveAccountCmd {
-            account: name.clone(),
-            reply,
-        });
         // `None` from the daemon covers every failure the old provider cache
         // hid behind the same reply shape: unknown account, keystore locked,
         // or no credential stored. Keep the exact wording those paths used.
@@ -581,7 +576,7 @@ impl SessionState {
             config,
             auth,
             warm_policy,
-        }) = rx.recv().ok().flatten()
+        }) = Self::send_resolve_account(ctx, &name)
         else {
             // Unknown/locked account: reset to the conservative policy so a
             // removed account cannot keep warming on a stale meter.
@@ -596,6 +591,45 @@ impl SessionState {
         // capability) stay correct even on this failed resolution.
         self.warm_policy = warm_policy;
         self.provider_slug = Some(config.provider.clone());
+        // Proactive OAuth refresh: an OAuth account whose cached access token is
+        // absent or within the expiry buffer is refreshed BEFORE the client is
+        // built — the client needs a live bearer, and the constructor would
+        // otherwise fail with "sign in first". A successful refresh persists the
+        // token via the daemon, so re-resolve to pick it up.
+        let (config, auth) = if matches!(auth, Some(crate::providers::ProviderAuth::OAuth { .. })) {
+            match self.refresh_oauth_token(false, ctx) {
+                Ok(crate::oauth_refresh::RefreshOutcome::Refreshed) => {
+                    match Self::send_resolve_account(ctx, &name) {
+                        Some(ResolvedAccount {
+                            config,
+                            auth,
+                            warm_policy,
+                        }) => {
+                            self.warm_policy = warm_policy;
+                            self.provider_slug = Some(config.provider.clone());
+                            (config, auth)
+                        }
+                        None => (config, auth),
+                    }
+                }
+                Ok(_) => (config, auth),
+                Err(failure) => {
+                    // Surface a friendly, actionable message; a dead grant names
+                    // re-login (the daemon already broadcast the notice).
+                    let msg = match failure {
+                        crate::oauth_refresh::RefreshFailure::Terminal => {
+                            format!("OAuth grant for account '{name}' was rejected; sign in again")
+                        }
+                        crate::oauth_refresh::RefreshFailure::Transient { detail } => {
+                            format!("OAuth refresh for account '{name}' failed: {detail}")
+                        }
+                    };
+                    return Err(msg);
+                }
+            }
+        } else {
+            (config, auth)
+        };
         let Some(auth) = auth else {
             return Err(format!(
                 "no credential stored for account '{name}' — add one via the AI Providers page or /add-key"
@@ -622,6 +656,57 @@ impl SessionState {
         self.provider = Some(provider.clone());
         Ok(provider)
     }
+
+    /// Ask the daemon to resolve `name`'s config + auth grant, blocking for the
+    /// reply. `None` covers unknown account, locked keystore, and no credential.
+    fn send_resolve_account(ctx: &RequestContext, name: &str) -> Option<ResolvedAccount> {
+        let (reply, rx) = crossbeam_channel::unbounded();
+        let _ = ctx.daemon_tx.send(DaemonCommand::ResolveAccountCmd {
+            account: name.to_string(),
+            reply,
+        });
+        rx.recv().ok().flatten()
+    }
+
+    /// Refresh this session's OAuth access token when it is absent or within the
+    /// expiry buffer (or unconditionally when `force`), serialized against other
+    /// refreshes of the same account by the daemon's single-flight registry.
+    ///
+    /// The blocking exchange runs on THIS thread; the daemon owns the cache and
+    /// the blob write (see `crate::oauth_refresh`). On a successful refresh the
+    /// cached client is dropped so the next resolve rebuilds it with the new
+    /// token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::oauth_refresh::RefreshFailure`] on a terminal (re-login
+    /// required) or transient failure.
+    pub(crate) fn refresh_oauth_token(
+        &mut self,
+        force: bool,
+        ctx: &RequestContext,
+    ) -> Result<crate::oauth_refresh::RefreshOutcome, crate::oauth_refresh::RefreshFailure> {
+        let Some(account) = self.config.account_name.clone() else {
+            return Ok(crate::oauth_refresh::RefreshOutcome::NotApplicable);
+        };
+        let source = crate::oauth_refresh::DaemonTokenSource::new(ctx.daemon_tx.clone());
+        let outcome =
+            crate::oauth_refresh::refresh_single_flight(&source, &account, force, unix_secs_now())?;
+        if outcome == crate::oauth_refresh::RefreshOutcome::Refreshed {
+            // The cached client holds the old token; drop it so the next resolve
+            // rebuilds with the refreshed one.
+            self.provider = None;
+        }
+        Ok(outcome)
+    }
+}
+
+/// The current time as Unix seconds, saturating rather than wrapping on a
+/// clock set before the epoch.
+fn unix_secs_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// Client-bound copy of a turn with the opaque reasoning round-trip payload

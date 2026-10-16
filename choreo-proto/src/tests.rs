@@ -1093,6 +1093,10 @@ fn inference_error_metric_labels_are_stable() {
         "truncated_tool_call"
     );
     assert_eq!(
+        InferenceError::OAuthReloginRequired { detail: "x".into() }.metric_label(),
+        "oauth_relogin_required"
+    );
+    assert_eq!(
         InferenceError::Io(std::io::Error::other("oops")).metric_label(),
         "other"
     );
@@ -1166,13 +1170,14 @@ fn inference_error_metric_labels_are_distinct() {
         InferenceError::Cancelled.metric_label(),
         InferenceError::DeadlineExceeded.metric_label(),
         InferenceError::TruncatedToolCall { discarded: vec![] }.metric_label(),
+        InferenceError::OAuthReloginRequired { detail: "x".into() }.metric_label(),
         InferenceError::Io(std::io::Error::other("oops")).metric_label(),
     ]
     .into_iter()
     .collect();
     assert_eq!(
         labels.len(),
-        11,
+        12,
         "each InferenceError variant must have a distinct metric label"
     );
 }

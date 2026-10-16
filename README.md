@@ -188,7 +188,7 @@ after Choreographr.
 | Daemon + multi-client | ✅ | ✅ | — | server | — | — | server | — | ✅ | ✅ | ✅ | — | ✅ daemon | — | ✅ | — | server |
 | Concurrent sessions | ✅ daemon | ✅ gateway | ✅ capped | ✅ server | ✅ threads | — | ✅ server | ✅ framework | ✅ | — | ✅ | — | ✅ | — | ✅ | ✅ pool | ✅ |
 | Providers | 208/3 proto | 40+ | 34 | 15 | 1 (OpenAI) | 42/9 proto | 39 | agnostic | agnostic | agnostic | 5 (drives) | 8 | 6 | 28 | multi | 36 | 5 |
-| OAuth | sign-in (PKCE/device) | ✅ | ✅ 6× | ✅ | ✅ ChatGPT | ✅ | — | — | — | ✅ | — | ✅ | ✅ device | ✅ | ✅ subs | ✅ | ✅ MCP |
+| OAuth | sign-in + refresh + rotation (PKCE/device) | ✅ | ✅ 6× | ✅ | ✅ ChatGPT | ✅ | — | — | — | ✅ | — | ✅ | ✅ device | ✅ | ✅ subs | ✅ | ✅ MCP |
 | Credential rotation/fallback | retry only | ✅ failover | ✅ pool | — | — | — | — | — | — | — | — | ✅ fallback | ✅ | — | — | — | ✅ |
 | Tool permission gating | coming | ✅ | env-only | ✅ | ✅ | — | ✅ | — | — | — | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ judge |
 | Compaction | coming | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | — | — | ✅ | — | ✅ | ✅ | ✅ | ✅ |

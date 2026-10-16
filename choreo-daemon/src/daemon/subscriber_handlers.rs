@@ -345,6 +345,17 @@ impl DaemonState {
         self.handle_broadcast_activity(None, &msg);
     }
 
+    /// Broadcast a re-login-required notice for `account` to every activity
+    /// subscriber. Called exactly once per terminal refresh failure (the caller
+    /// deduplicates on the account's quarantine transition), so a client can
+    /// prompt the user to sign in again. Carries the account name only.
+    pub(super) fn broadcast_oauth_relogin_required(&mut self, account: &str) {
+        let msg = DaemonMessage::broadcast(DaemonMessageType::OAuthReloginRequired {
+            account: account.to_string(),
+        });
+        self.handle_broadcast_activity(None, &msg);
+    }
+
     /// Register a connection's writer channel so the shutdown path can route
     /// `ShuttingDown` through that connection's single writer thread, and so
     /// the client's entry exists before any subscription or membership command

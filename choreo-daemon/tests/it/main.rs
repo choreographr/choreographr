@@ -42,6 +42,7 @@ mod mcp_integration;
 mod mcp_project_trust;
 mod metrics_integration;
 mod nu_tool_integration;
+mod oauth_refresh;
 mod pdf_tool_integration;
 mod reasoning_roundtrip_integration;
 mod retrieve_webpage_integration;

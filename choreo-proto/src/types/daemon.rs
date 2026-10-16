@@ -526,6 +526,15 @@ pub enum DaemonMessageType {
         /// The trusted project MCP roots, in stable (sorted) order.
         roots: Vec<String>,
     },
+    /// Broadcast when an OAuth account's grant was rejected terminally
+    /// (`invalid_grant` / `invalid_token` / `refresh_token_reused`) and cannot
+    /// be refreshed. The daemon emits this exactly ONCE per terminal event
+    /// (deduplicated across sessions and retries): the user must sign in again
+    /// for `account`. Carries the account name only — never a token.
+    OAuthReloginRequired {
+        /// The account whose OAuth grant is dead and must be re-authorized.
+        account: String,
+    },
     /// Broadcast immediately before the daemon exits, so clients can shut down
     /// cleanly instead of treating the dropped connection as a crash.
     ShuttingDown,
@@ -607,6 +616,7 @@ impl DaemonMessageType {
             Self::McpReloadFailed { .. } => "McpReloadFailed",
             Self::McpTrustUpdated { .. } => "McpTrustUpdated",
             Self::McpTrustList { .. } => "McpTrustList",
+            Self::OAuthReloginRequired { .. } => "OAuthReloginRequired",
             Self::ShuttingDown => "ShuttingDown",
             Self::Evicted => "Evicted",
             Self::Accepted { .. } => "Accepted",

@@ -83,6 +83,7 @@ pub fn test_daemon_state_with_limits(limits: LagLimits) -> DaemonState {
         session_mcp_projects: HashMap::new(),
         credentials: HashMap::new(),
         access_tokens: HashMap::new(),
+        dead_oauth: HashSet::new(),
         x_credentials: None,
         // Test daemons start locked, matching the production daemon.
         locked: true,

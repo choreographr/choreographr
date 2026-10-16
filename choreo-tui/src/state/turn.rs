@@ -595,6 +595,14 @@ impl TurnEventHandler for App {
         self.handle_oauth_providers_reply(providers);
     }
 
+    fn handle_oauth_relogin_required(&mut self, account: String) {
+        // The daemon emits this exactly once per terminal refresh failure, so
+        // no local dedup is needed — surface the actionable re-login prompt.
+        self.status = Some(format!(
+            "OAuth sign-in expired for account '{account}' — run /login to sign in again"
+        ));
+    }
+
     fn handle_session_attached(&mut self, session_id: u64) {
         self.active_session_id = Some(session_id);
         self.attached_session_id = Some(session_id);

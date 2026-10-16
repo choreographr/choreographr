@@ -43,8 +43,8 @@ use crate::sessions::{
     ActiveSessionEntry, CANCEL_ALL, RequestContext, SessionCommand, SessionMetadata, session_main,
 };
 use choreo_ai_protocols::{
-    SocketRegistry, bundled_overlay_src, catalog_snapshot, lookup_context_window, merge_overlay,
-    replace_catalog,
+    SocketRegistry, bundled_overlay_src, catalog_snapshot, lookup_context_window, lookup_provider,
+    merge_overlay, replace_catalog,
 };
 use choreo_keystore::ServiceCredential;
 use choreo_power_events::SuspendEvent;
@@ -252,6 +252,13 @@ pub struct DaemonState {
     /// `/lock` exactly like `credentials` — an access token is a derived,
     /// expiring value whose durable root is the refresh token in the blob.
     pub access_tokens: HashMap<String, AccessTokenCache>,
+    /// Accounts whose OAuth grant was rejected terminally (`invalid_grant` /
+    /// `invalid_token` / `refresh_token_reused`): the durable credential is
+    /// quarantined so no further refresh is attempted (a hot-loop guard) and a
+    /// re-login is required. Cleared when a fresh credential is stored for the
+    /// account, and on unlock/lock (the whole credential map is re-read). Keyed
+    /// by account name; a member of the provider grant keyspace only.
+    pub dead_oauth: std::collections::HashSet<String>,
     /// The X/Twitter credential, mirrored out of `credentials` for the `x_*`
     /// tools' single `x_credentials` slot.
     pub x_credentials: Option<ServiceCredential>,
@@ -777,6 +784,50 @@ pub enum DaemonCommand {
         /// unknown, the keystore is locked, or no credential is stored.
         reply: crossbeam_channel::Sender<Option<ResolvedAccount>>,
     },
+    /// Read an OAuth account's cached access token and durable refresh material,
+    /// so a session can run a refresh exchange. The daemon is the sole owner of
+    /// the credential, so the material (the refresh token and client
+    /// registration) is handed back for exactly this one exchange; a one-shot
+    /// reply rides `std::sync::mpsc` (per the AGENTS.md channel rule).
+    LoadOAuthToken {
+        /// The account whose token state is requested.
+        account: String,
+        /// Replies with the cached token, the refresh material, and the
+        /// quarantine flag.
+        reply: mpsc::Sender<crate::oauth_refresh::TokenLoad>,
+    },
+    /// Persist a refreshed OAuth token: update the in-memory access-token cache
+    /// and, when the exchange rotated the refresh token or refreshed the
+    /// identity claim, re-encrypt the updated durable credential to the binding
+    /// public key (the daemon is the sole blob writer). Requires an unlocked
+    /// keystore.
+    SaveOAuthToken {
+        /// The account whose token was refreshed.
+        account: String,
+        /// The new access token (memory-only; never persisted).
+        access_token: Zeroizing<String>,
+        /// The provider-reported expiry (Unix seconds), when reported.
+        expires_at: Option<i64>,
+        /// When the daemon obtained the token (Unix seconds).
+        received_at: i64,
+        /// The rotated refresh token, when the exchange issued one (adopted
+        /// when present; the stored one is kept when absent).
+        rotated_refresh_token: Option<Zeroizing<String>>,
+        /// A refreshed identity claim, when a new `id_token` carried one
+        /// (adopted when present; the stored claim is kept when absent).
+        new_account_id: Option<String>,
+        /// Replies `Ok` once the cache and (on rotation) the durable blob are
+        /// updated, or an error string on failure.
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    /// Quarantine an account after a terminal OAuth refresh failure and
+    /// broadcast a single re-login-required notice. Idempotent: the broadcast
+    /// fires only on the first transition into the quarantined state, so
+    /// concurrent sessions and retries cannot produce a duplicate notice.
+    MarkOAuthDead {
+        /// The account whose grant is dead.
+        account: String,
+    },
     /// Fetch an opaque image-generation client (plus the provider slug) for
     /// an account. The reply goes back to the TOOL thread directly over the
     /// crossbeam channel — not through the broadcast machinery — because the
@@ -1226,6 +1277,31 @@ impl DaemonState {
             DaemonCommand::ResolveAccountCmd { account, reply } => {
                 self.handle_resolve_account(&account, &reply);
             }
+            DaemonCommand::LoadOAuthToken { account, reply } => {
+                let _ = reply.send(self.oauth_token_load(&account));
+            }
+            DaemonCommand::SaveOAuthToken {
+                account,
+                access_token,
+                expires_at,
+                received_at,
+                rotated_refresh_token,
+                new_account_id,
+                reply,
+            } => self.handle_save_oauth_token(
+                crate::oauth_refresh::SaveToken {
+                    account: &account,
+                    access_token: &access_token,
+                    expires_at,
+                    received_at,
+                    rotated_refresh_token: rotated_refresh_token.as_ref().map(|t| t.as_str()),
+                    new_account_id: new_account_id.as_deref(),
+                },
+                &reply,
+            ),
+            DaemonCommand::MarkOAuthDead { account } => {
+                self.handle_mark_oauth_dead(&account);
+            }
             DaemonCommand::GetImageGenerationProvider {
                 session_id,
                 account_name,
@@ -1509,6 +1585,60 @@ impl DaemonState {
                     .get(name)
                     .map(|cache| cache.access_token.clone()),
             },
+        })
+    }
+
+    /// Read an OAuth account's token state for a session-side refresh: the
+    /// cached access token, the durable refresh material, and the quarantine
+    /// flag. A locked keystore yields no material (no credential in memory).
+    pub(crate) fn oauth_token_load(&self, account: &str) -> crate::oauth_refresh::TokenLoad {
+        let dead = self.dead_oauth.contains(account);
+        let cached =
+            self.access_tokens
+                .get(account)
+                .map(|c| crate::oauth_refresh::CachedAccessToken {
+                    access_token: c.access_token.clone(),
+                    expires_at: c.expires_at,
+                    received_at: c.received_at,
+                });
+        let material = self.oauth_refresh_material(account);
+        crate::oauth_refresh::TokenLoad {
+            cached,
+            material,
+            dead,
+        }
+    }
+
+    /// Build the durable refresh material for a **provider** OAuth account, or
+    /// `None` when the account is not an OAuth provider grant (an API key, an
+    /// MCP grant, or no credential).
+    ///
+    /// The token endpoint is the credential's recorded issuer (so refresh does
+    /// not depend on the catalog still matching) plus the catalog profile's
+    /// token path; the encoding is the profile's `refresh_encoding`. A provider
+    /// with no profile cannot be refreshed.
+    fn oauth_refresh_material(
+        &self,
+        account: &str,
+    ) -> Option<crate::oauth_refresh::RefreshMaterial> {
+        let credential = self.credentials.get(account)?;
+        let oauth = credential.as_oauth()?;
+        // Only a provider grant refreshes here; an MCP grant is owned by the MCP
+        // authorization manager (a later phase).
+        if oauth.kind != choreo_keystore::OAuthKind::Provider {
+            return None;
+        }
+        let refresh_token = oauth.refresh_token?.to_string();
+        let profile = lookup_provider(&self.accounts.get(account)?.provider)?.oauth?;
+        let issuer = oauth.issuer.unwrap_or(profile.issuer.as_str());
+        let token_endpoint = format!("{}{}", issuer.trim_end_matches('/'), profile.token_path);
+        Some(crate::oauth_refresh::RefreshMaterial {
+            token_endpoint,
+            encoding: profile.refresh_encoding,
+            client_id: oauth.client_id.map(str::to_string),
+            client_secret: oauth.client_secret.map(str::to_string),
+            refresh_token,
+            granted_scopes: oauth.granted_scopes.to_vec(),
         })
     }
 
@@ -2326,8 +2456,10 @@ impl DaemonState {
         // account so it rebuilds (and fails with clean guidance) on next use.
         self.credentials.remove(service);
         // A cached access token is derived from the credential being removed;
-        // drop it so no stale bearer survives a credential swap.
+        // drop it so no stale bearer survives a credential swap. Clear any
+        // quarantine too — there is no grant left to be dead.
         self.access_tokens.remove(service);
+        self.dead_oauth.remove(service);
         self.drop_session_clients(Some(service));
         if service == "twitter" {
             self.x_credentials = None;

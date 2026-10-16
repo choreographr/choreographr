@@ -487,7 +487,13 @@ pub(crate) fn run_agent_loop(
     // `max_turns == 0` means *unlimited* — the loop runs until the model
     // produces a final answer, is cancelled, or hits an error.
     let limited = max_turns > 0;
-    let provider_slug = client.provider_slug();
+    // Own the slug (rather than borrowing the client) so the client can be
+    // REBUILT in place on an OAuth 401 refresh below; a refresh does not change
+    // the account's provider slug, so the owned copy stays correct.
+    let provider_slug = client.provider_slug().to_string();
+    // The active client: a clone of the resolved provider that a 401 refresh
+    // replaces with a freshly-built client carrying the new access token.
+    let mut active_client = client.clone();
 
     // Cache warmer: spawn the per-request thread only in Streaming mode (the
     // common default is Off, which must cost nothing). It owns a clone of the
@@ -524,7 +530,7 @@ pub(crate) fn run_agent_loop(
     // user request continues the chain instead of resetting it. All other
     // policies reset to None — the id is meaningless outside Responses-style
     // APIs and must not leak across requests.
-    let mut prev_resp_id = initial_prev_resp_id(session, provider_slug, model);
+    let mut prev_resp_id = initial_prev_resp_id(session, &provider_slug, model);
     let mut tool_results: Vec<ToolResultItem> = Vec::new();
     let mut known_hint_paths: Vec<PathBuf> = Vec::new();
     let mut pending_hints: Vec<String> = Vec::new();
@@ -546,7 +552,7 @@ pub(crate) fn run_agent_loop(
     // before the artifact was captured (e.g. a pre-migration session) would
     // otherwise produce a mysterious 400 from the provider; surface it as a
     // diagnosable warning.
-    warn_on_missing_reasoning_artifacts(session, ctx.session_id, provider_slug, model);
+    warn_on_missing_reasoning_artifacts(session, ctx.session_id, &provider_slug, model);
 
     // Lazily cache discovered skills — they don't change during a session.
     // Global skills are always discoverable; discovery handles the optional
@@ -584,7 +590,7 @@ pub(crate) fn run_agent_loop(
         );
         let configured = session.config.reasoning_effort.as_deref().unwrap_or("off");
         let thinking_effort =
-            resolve_reasoning_effort(client, model, ctx.session_id, turn_iter, configured);
+            resolve_reasoning_effort(&active_client, model, ctx.session_id, turn_iter, configured);
         // Snapshot the reasoning gate before `thinking_effort` is moved into the
         // request below: the warmer's replayability check needs it (an Anthropic
         // request with thinking enabled cannot be replayed with a 1-token cap).
@@ -667,7 +673,7 @@ pub(crate) fn run_agent_loop(
         let messages = build_chat_request_messages(
             session,
             Some(&system_content),
-            provider_slug,
+            &provider_slug,
             model,
             Some(request_first_turn_id),
         );
@@ -740,74 +746,116 @@ pub(crate) fn run_agent_loop(
         let oc_session_id = ctx.session_id.to_string();
         let oc_request_id = stream_id.to_string();
 
-        match client.chat_completion_turn_streaming(
-            ChatTurnRequest {
-                model,
-                messages: &messages,
-                tools: &tools,
-                thinking_effort,
-                on_retry: &mut retry_cb,
-                on_uploaded: uploaded_cb,
-                cancel_rx: Some(cancel_rx),
-                previous_response_id: prev_resp_id.as_deref(),
-                tool_results: &tool_results,
-                programmatic_tool_calling: client.supports_programmatic_tool_calling(model),
-                session_id: oc_session_id,
-                request_id: oc_request_id,
-                max_output_tokens_override: None,
-                no_retry: false,
-            },
-            &mut |event| {
-                match event {
-                    StreamEvent::Answer(text) => {
-                        // An answer chunk means the model has begun writing the
-                        // reply, so promote the phase to `Responding`.
-                        advance_stream_phase(&mut stream_phase, StreamPhase::Responding, ctx);
-                        if let Some(enc) = &encoding {
-                            // u128→u32 token counts, informational only.
-                            let n = enc.count(&text);
-                            #[expect(clippy::cast_possible_truncation)]
-                            {
-                                output_token_count += n as u32;
+        // Wrap the provider call so a 401 from an OAuth account can refresh the
+        // token, rebuild the client, and retry the request ONCE (never a loop).
+        let mut oauth_refresh_attempted = false;
+        let turn_result = loop {
+            let result = active_client.chat_completion_turn_streaming(
+                ChatTurnRequest {
+                    model,
+                    messages: &messages,
+                    tools: &tools,
+                    thinking_effort: thinking_effort.clone(),
+                    on_retry: &mut retry_cb,
+                    on_uploaded: uploaded_cb.clone(),
+                    cancel_rx: Some(cancel_rx),
+                    previous_response_id: prev_resp_id.as_deref(),
+                    tool_results: &tool_results,
+                    programmatic_tool_calling: active_client
+                        .supports_programmatic_tool_calling(model),
+                    session_id: oc_session_id.clone(),
+                    request_id: oc_request_id.clone(),
+                    max_output_tokens_override: None,
+                    no_retry: false,
+                },
+                &mut |event| {
+                    match event {
+                        StreamEvent::Answer(text) => {
+                            // An answer chunk means the model has begun writing the
+                            // reply, so promote the phase to `Responding`.
+                            advance_stream_phase(&mut stream_phase, StreamPhase::Responding, ctx);
+                            if let Some(enc) = &encoding {
+                                // u128→u32 token counts, informational only.
+                                let n = enc.count(&text);
+                                #[expect(clippy::cast_possible_truncation)]
+                                {
+                                    output_token_count += n as u32;
+                                }
+                            }
+                            broadcast_stream_chunk(
+                                ctx,
+                                stream_id,
+                                OutputStream::Answer,
+                                text,
+                                output_token_count,
+                            );
+                        }
+                        StreamEvent::Reasoning(text) => {
+                            // A reasoning chunk means hidden reasoning is streaming,
+                            // so promote the phase to `Reasoning` (distinct from the
+                            // pre-token send/wait boundary).
+                            advance_stream_phase(&mut stream_phase, StreamPhase::Reasoning, ctx);
+                            if let Some(enc) = &encoding {
+                                // u128→u32 token counts, informational only.
+                                let n = enc.count(&text);
+                                #[expect(clippy::cast_possible_truncation)]
+                                {
+                                    output_token_count += n as u32;
+                                }
+                            }
+                            broadcast_stream_chunk(
+                                ctx,
+                                stream_id,
+                                OutputStream::Reasoning,
+                                text,
+                                output_token_count,
+                            );
+                        }
+                        // `StreamEvent` is #[non_exhaustive] — a future event kind
+                        // this loop doesn't forward should be ignored, not crash
+                        // the agent loop.
+                        _ => {}
+                    }
+                    Ok(())
+                },
+            );
+            // On a 401 for an OAuth account, force-refresh (ignoring the expiry
+            // buffer), rebuild the client with the new token, and retry the
+            // request ONCE. A terminal failure becomes a re-login-required error
+            // (the source has already broadcast the notice); a transient failure
+            // or a non-OAuth account falls through with the original 401.
+            if matches!(
+                &result,
+                Err(choreo_proto::InferenceError::Unauthorized { .. })
+            ) && !oauth_refresh_attempted
+            {
+                oauth_refresh_attempted = true;
+                match session.refresh_oauth_token(true, ctx) {
+                    Ok(crate::oauth_refresh::RefreshOutcome::Refreshed) => {
+                        match session.resolve_provider(ctx) {
+                            Ok(rebuilt) => {
+                                active_client = rebuilt;
+                                continue;
+                            }
+                            Err(e) => {
+                                break Err(choreo_proto::InferenceError::OAuthReloginRequired {
+                                    detail: e,
+                                });
                             }
                         }
-                        broadcast_stream_chunk(
-                            ctx,
-                            stream_id,
-                            OutputStream::Answer,
-                            text,
-                            output_token_count,
-                        );
                     }
-                    StreamEvent::Reasoning(text) => {
-                        // A reasoning chunk means hidden reasoning is streaming,
-                        // so promote the phase to `Reasoning` (distinct from the
-                        // pre-token send/wait boundary).
-                        advance_stream_phase(&mut stream_phase, StreamPhase::Reasoning, ctx);
-                        if let Some(enc) = &encoding {
-                            // u128→u32 token counts, informational only.
-                            let n = enc.count(&text);
-                            #[expect(clippy::cast_possible_truncation)]
-                            {
-                                output_token_count += n as u32;
-                            }
-                        }
-                        broadcast_stream_chunk(
-                            ctx,
-                            stream_id,
-                            OutputStream::Reasoning,
-                            text,
-                            output_token_count,
-                        );
+                    Ok(_) => break result,
+                    Err(crate::oauth_refresh::RefreshFailure::Terminal) => {
+                        break Err(choreo_proto::InferenceError::OAuthReloginRequired {
+                            detail: "oauth grant rejected; sign in again".to_string(),
+                        });
                     }
-                    // `StreamEvent` is #[non_exhaustive] — a future event kind
-                    // this loop doesn't forward should be ignored, not crash
-                    // the agent loop.
-                    _ => {}
+                    Err(crate::oauth_refresh::RefreshFailure::Transient { .. }) => break result,
                 }
-                Ok(())
-            },
-        ) {
+            }
+            break result;
+        };
+        match turn_result {
             Ok(ChatTurnResult::FinalText(final_text)) => {
                 debug!(
                     session_id = ctx.session_id,
@@ -845,7 +893,7 @@ pub(crate) fn run_agent_loop(
                 // Record the producing provider+model once: it feeds both the
                 // turn's provenance and the persisted response-id provenance.
                 let producer = ReasoningProducer {
-                    provider_slug: provider_slug.to_string(),
+                    provider_slug: provider_slug.clone(),
                     model: model.to_string(),
                 };
                 session.set_assistant_response(
@@ -926,7 +974,7 @@ pub(crate) fn run_agent_loop(
                 // Record the producing provider+model once: it feeds both the
                 // turn's provenance and the persisted response-id provenance.
                 let producer = ReasoningProducer {
-                    provider_slug: provider_slug.to_string(),
+                    provider_slug: provider_slug.clone(),
                     model: model.to_string(),
                 };
                 session.set_assistant_response(
@@ -972,12 +1020,12 @@ pub(crate) fn run_agent_loop(
                 // blocks. No arm happens on a `FinalText` result (the loop
                 // returns).
                 if let Some(warmer) = &warmer {
-                    let is_anthropic = protocol_is_anthropic(provider_slug);
+                    let is_anthropic = protocol_is_anthropic(&provider_slug);
                     let facts = WarmFacts {
-                        cache_ttl: prompt_cache_ttl(provider_slug, model),
+                        cache_ttl: prompt_cache_ttl(&provider_slug, model),
                         retention: RetentionTier::Short,
                         prefix_tokens: estimated_prompt_tokens,
-                        cost: model_cost(provider_slug, model),
+                        cost: model_cost(&provider_slug, model),
                         replayable: is_replayable(is_anthropic, thinking_enabled),
                     };
                     warmer.arm(WarmRequest {

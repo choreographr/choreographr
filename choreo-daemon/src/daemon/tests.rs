@@ -93,6 +93,7 @@ pub(super) fn make_daemon_state() -> (DaemonState, crossbeam_channel::Receiver<D
         session_mcp_projects: HashMap::new(),
         credentials: HashMap::new(),
         access_tokens: HashMap::new(),
+        dead_oauth: HashSet::new(),
         x_credentials: None,
         // Test states start locked, matching the production daemon.
         locked: true,

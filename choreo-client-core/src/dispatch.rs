@@ -153,6 +153,10 @@ pub trait TurnEventHandler {
     /// arrived (the reply to `ListOAuthProviders`). Most front-ends ignore
     /// this; the login surface consumes it to drive a sign-in.
     fn handle_oauth_providers(&mut self, _providers: Vec<OAuthProviderDescriptor>) {}
+    /// An OAuth account's grant was rejected terminally and the user must sign
+    /// in again. The daemon emits this exactly once per terminal event. Most
+    /// front-ends surface a status line; the default is a no-op.
+    fn handle_oauth_relogin_required(&mut self, _account: String) {}
     /// This client became attached to `session_id`.
     fn handle_session_attached(&mut self, session_id: u64);
     /// A session this client created was confirmed, with its initial
@@ -457,6 +461,12 @@ fn dispatch_flat_message(msg: DaemonMessageType, handler: &mut impl TurnEventHan
                 "oauth provider descriptors arrived"
             );
             handler.handle_oauth_providers(providers);
+        }
+        DaemonMessageType::OAuthReloginRequired { account } => {
+            // The account name is not secret, but the notice is a user-facing
+            // event; log the id-free shape and hand the account to the handler.
+            debug!(account = %account, "oauth re-login required");
+            handler.handle_oauth_relogin_required(account);
         }
         // On-demand turn-attachment reply (displayed image or tool-result
         // vision image). The connection layer does NOT intercept this (unlike

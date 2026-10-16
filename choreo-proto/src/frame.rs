@@ -58,6 +58,10 @@ use zeroize::Zeroizing;
 /// `DaemonMessage::OAuthProviders(Vec<OAuthProviderDescriptor>)` reply, so a
 /// frontend learns each provider's issuer, scopes, redirect ports, encodings,
 /// and client-identity posture from the daemon instead of embedding a copy.
+/// Also under the same policy, 9 gained the OAuth re-login notice: the
+/// `DaemonMessage::OAuthReloginRequired { account }` broadcast, emitted once
+/// per terminal provider-refresh failure so a client can prompt the user to
+/// sign in again.
 ///
 /// Policy: variants may be added to the **current, unreleased** wire version
 /// without a bump. Mixed-version peers do not exist until a release ships, and

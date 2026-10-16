@@ -693,6 +693,49 @@ flow) targets an **existing** account whose provider selects the flow; the TUI
 renders the streamed progress in a cancelable modal. The two wire variants amend
 the unreleased v9 changelog in `choreo-proto/src/frame.rs` (no version bump).
 
+#### Provider OAuth refresh (runtime)
+
+The access token is refreshed on demand, in the **session thread** — the
+blocking exchange stays in `choreo-ai-protocols`
+(`oauth::refresh_oauth_token`, a synchronous `ureq` POST that is the provider
+crate's only OAuth responsibility), while the daemon remains the sole owner of
+the token cache and the sole writer of the credential blob. The seam between
+them is `choreo-daemon/src/oauth_refresh.rs`: an `OAuthTokenSource` the session
+implements over its command channel (`DaemonTokenSource` sends
+`DaemonCommand::LoadOAuthToken` / `SaveOAuthToken` / `MarkOAuthDead`) and a
+single `refresh_single_flight` driver. A source hands back the durable material
+(the token endpoint, encoding, client id/secret, refresh token, scopes) and the
+cached token, and takes back a `RefreshedTokens`; the daemon's handlers update
+`access_tokens` and re-encrypt the rotated durable subset to the binding public
+key (the same `set_credential_blob` path as provisioning — no private key, no
+re-login).
+
+Two rules make it correct under rotation. **Single-flight**: the whole
+`load → re-check → exchange → persist` runs under the account's lock in
+`OAuthRefreshLocks`, so the loser of a race re-reads the winner's persisted
+token (the load happens *under* the lock) and reuses it instead of spending a
+single-use refresh token twice. **Rotate-if-present**: the engine adopts a
+returned `refresh_token` when one is present and keeps the stored one when it is
+omitted — one code path for rotating and non-rotating providers — and replaces
+the `account_id` claim only when a new `id_token` carries it.
+
+A request refreshes proactively when the cached token is absent or within a
+hardcoded **60 s** buffer of expiry (`oauth_refresh::REFRESH_BUFFER_SECS`), and
+force-refreshes once on a `401` (ignoring the buffer), rebuilding the client
+from the daemon's fresh token and retrying the request **once** — never a loop.
+The **failure taxonomy** classifies the token-endpoint response in
+`choreo-ai-protocols`: `invalid_grant` / `invalid_token` /
+`refresh_token_reused` (or any other non-retryable rejection) is **terminal** —
+the daemon quarantines the account (`DaemonState::dead_oauth`) so no further
+refresh is attempted, and broadcasts a single `OAuthReloginRequired` notice; a
+transport error, `429`, or `5xx` is **transient** and the request fails with the
+original error. The terminal notice is emitted exactly once per event because
+the daemon broadcasts only on the quarantine *transition*, deduplicating across
+concurrent sessions and retries. The new `InferenceError::OAuthReloginRequired`
+variant and the `DaemonMessage::OAuthReloginRequired` broadcast amend the
+unreleased v9 changelog in `choreo-proto/src/frame.rs` (no version bump); the
+TUI surfaces the notice as a status line, GUI/IM as no-ops.
+
 ### Request-body compression
 
 Every LLM turn re-sends the whole conversation plus the tool schemas as JSON,
@@ -869,7 +912,7 @@ Currently supports 208 providers (184 from the models.dev base + 24 overlay-only
 > | Provider(s) | Reason deferred |
 > |---|---|
 > | `amazon-bedrock`, `google-vertex`, `azure-foundry`, `azure-openai-responses` | Multi-field credentials (AWS keys/region, GCP service account, Azure resource + key). The daemon's single-API-key credential model cannot represent them yet. |
-> | `chatgpt` (Codex), `copilot`/`copilot-acp`, `qwen-oauth`, `kimi-code` OAuth, `github-copilot` OAuth, `radius` | OAuth-only / dynamic-catalog auth — no static API-key path. The catalog now carries an `oauth` profile mechanism and a per-slug client-identity table (see Provider auth above); the OpenAI routes (the token-sharing `openai` route and the borrowed-id `chatgpt` Codex route) are the first proof, with the others added as data. |
+> | `chatgpt` (Codex), `copilot`/`copilot-acp`, `qwen-oauth`, `kimi-code` OAuth, `github-copilot` OAuth, `radius` | OAuth-only / dynamic-catalog auth — no static API-key path. The catalog carries an `oauth` profile mechanism and a per-slug client-identity table (see Provider auth above), and the provider OAuth **sign-in and refresh** flow (buffer + 401 refresh, rotation persistence, terminal/transient taxonomy) ships for the OpenAI routes (the token-sharing `openai` route and the borrowed-id `chatgpt` Codex route); the others are added as data. |
 > | `cursor` | t3code subprocess driver (spawns the Cursor CLI), not a direct HTTP provider. |
 >
 > Adding the multi-field-credential providers requires a credential generalization (a `Fields` credential variant); the OAuth providers are added through the catalog `oauth` profile and the client-identity table, not a code change.
