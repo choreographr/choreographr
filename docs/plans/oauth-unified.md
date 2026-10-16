@@ -135,7 +135,7 @@ private key.
 | **Ephemeral X25519 + AES data key + salt/nonce** | per message | in the blob only | regenerated per encrypt |
 | **Refresh token** | opaque | **keystore blob** (ciphertext) | the durable grant root |
 | **Access token** | opaque | **daemon memory only** | never persisted |
-| **id_token / claims** | JWT | **keystore blob** | identity for request headers |
+| **identity claims** | strings (`account_id`, plan, email) | **keystore blob** | extracted from the id_token at login — the raw JWT is **not** stored |
 | **client registration** (client_id/secret) | public / secret | **keystore blob** | provider: table value recorded; MCP: DCR/CIMD-issued |
 | **PKCE verifier / state / code** | transient | client memory | per login, never persisted |
 
@@ -233,9 +233,8 @@ OAuth {
     /// Long-lived token that mints a new access token. The durable grant root;
     /// a rotated value is rewritten. `None` for flows that issue none.
     refresh_token: Option<String>,
-    /// OIDC id_token (JWT) — identity claims; preserved across refresh.
-    id_token: Option<String>,
-    /// Identity used as the `chatgpt-account-id` header (provider; parsed at login).
+    /// Identity claim extracted from the id_token at login (its `chatgpt_account_id`),
+    /// used as the `chatgpt-account-id` header. The raw JWT is **not** stored.
     account_id: Option<String>,
     /// The client id actually used at login (recorded so refresh does not depend
     /// on the catalog table matching).
@@ -255,9 +254,12 @@ Rules:
   field.
 - **The access token is never in the variant.** It lives in a per-credential
   in-memory cache: `access_token: String`, `expires_at: Option<i64>`, `received_at`.
-- **The id_token must survive a refresh.** A refresh commonly returns a new access
-  token without a new id_token; the parser replaces `id_token` only when the response
-  carries one.
+- **The extracted identity claims must survive a refresh.** The variant stores the
+  claim (`account_id`), **not** the raw id_token. A refresh commonly returns a new
+  access token without a new id_token; the claims are replaced only when the response
+  carries one (otherwise the stored claim is kept). Store the raw JWT only if a
+  provider ever needs it verbatim — e.g. OIDC RP-initiated logout (`id_token_hint`) or
+  RFC 8693 token exchange — none of which is in scope.
 - Serialized with postcard; appending a variant is forward-compatible for new blobs.
 - Adapters to/from `rmcp::transport::auth::StoredCredentials` live **in the daemon**
   (no rmcp type enters the keystore).
@@ -334,9 +336,9 @@ a spent token → the next refresh is terminal → re-login: the correct safe fa
 **Rotate-if-present — one engine, every provider (rotation-agnostic).** The refresh
 exchange returns an *optional* `refresh_token`. The engine **adopts it when present
 and keeps the stored one when omitted**, so a single provider-parameterized engine
-covers rotating *and* non-rotating providers with no branch. The `id_token` is
-likewise replaced only when the response carries one (otherwise the
-`chatgpt_account_id` claim would be dropped). "Does provider X rotate?" is therefore
+covers rotating *and* non-rotating providers with no branch. The extracted identity
+claims are likewise refreshed only when the response carries a new `id_token` (otherwise
+the stored `chatgpt_account_id` claim is kept). "Does provider X rotate?" is therefore
 an **assumption** (§18), not a code path. An optional per-provider
 `rotates_refresh_token` flag (default: rotate-if-present) covers a provider that turns
 out to be strict — **declared in the provider table, never detected at runtime, and
@@ -727,8 +729,9 @@ provider identity — so the rotation *rule* is generic while only wire details 
 per-provider. **No harness probes rotation at runtime**; the nearest is ironclaw's
 declarative `RefreshRecipe.rotates_refresh_token` flag (configured, not detected).
 Serialized refresh with a **reload-under-lock that adopts a peer's rotation** is
-canonical, held across the network exchange and the persist. **id_token preservation
-is rare** (only codex and zero); this plan requires it. Buffers cluster 30 s–5 min;
+canonical, held across the network exchange and the persist. **raw-id_token preservation
+is rare** (codex, zero); this plan stores only the extracted claims. Buffers cluster
+30 s–5 min;
 the single-flight lock is in-process almost everywhere and cross-process only where a
 store is shared.
 
@@ -906,11 +909,14 @@ headers; store them as provider-table data:
 - **MCP login transports:** **loopback + paste-URL only** (rmcp has no device-code);
   a pre-registered client via the per-server `oauth` config covers an AS with neither
   DCR nor CIMD.
+- **id_token storage: claims-only.** The variant stores the extracted identity claim
+  (`account_id`) at login, **not** the raw JWT. No known in-scope flow needs the raw
+  id_token later (OIDC logout with `id_token_hint` and RFC 8693 token exchange are
+  out of scope); revisit only if one is added.
 
 ### Open design questions
 
-1. **id_token storage** — the raw JWT *and* the extracted `account_id`/claims, or
-   claims only.
+None — every decision is settled.
 
 ## 19. Definition of done
 
