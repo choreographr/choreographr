@@ -3,8 +3,7 @@
 **Status:** proposed. Design complete through several rounds of review; nothing
 implemented (no source changes in this change). Supersedes the credential-model,
 refresh, and provisioning sections of `docs/plans/provider-oauth.md` and the
-post-ship **P3 / D7** of `docs/plans/mcp-modernization.md`. Interacts with
-`docs/plans/keystore-identity-keying.md` (see §20).
+post-ship **P3 / D7** of `docs/plans/mcp-modernization.md`.
 **Lifecycle:** this file is **deleted once the plan is fully implemented**. Nothing
 written during implementation may reference it — rustdoc, `ARCHITECTURE.md`,
 `README.md`, release notes, and commit messages must stand on their own, because a
@@ -898,17 +897,20 @@ headers; store them as provider-table data:
   suffices).
 - **Client ids:** **obtained later**; ship first on the OpenAI dynamic-registration
   route plus the gated borrowed id (§7.1).
+- **Provider OAuth scope step-up:** **skipped** for v1 — a fixed scope set at login;
+  a scope challenge surfaces a re-login hint, not an automatic step-up.
+- **Refresh buffer:** **hardcoded 60 s** for now (per-provider later if needed).
+- **Catalog `auth` attribute: not added.** Derive the kind — models.dev `env` ⇒
+  api_key, an overlay `oauth` profile ⇒ oauth — so there is one source of facts
+  (models.dev) and one policy layer (the overlay), with no redundant field.
+- **MCP login transports:** **loopback + paste-URL only** (rmcp has no device-code);
+  a pre-registered client via the per-server `oauth` config covers an AS with neither
+  DCR nor CIMD.
 
 ### Open design questions
 
 1. **id_token storage** — the raw JWT *and* the extracted `account_id`/claims, or
    claims only.
-2. **Provider OAuth scope step-up** — in or out for v1.
-3. **Refresh buffer default** — 60 s, or align with the peers' 30 s / 5 min.
-4. **Catalog `auth` attribute** — needed? models.dev carries only `env` (API-key var
-   names) and no auth/oauth field, and does not cover the OAuth providers.
-5. **MCP login transports** — confirm loopback + paste-URL only (no device-code).
-6. **Sequencing vs `keystore-identity-keying.md`.**
 
 ## 19. Definition of done
 
@@ -943,14 +945,6 @@ headers; store them as provider-table data:
   the **keystore**, not a `mcp-auth/` file store; MCP OAuth is built on `rmcp`'s
   `auth` feature (that plan already named `rmcp` as the engine). Everything else in
   M1 (shipped) is untouched.
-- **`keystore-identity-keying.md`** — orthogonal but adjacent. That plan re-keys the
-  client's per-daemon unlock key by the daemon's **Noise transport identity** rather
-  than the dial address, and touches `build_add_credential_message` in
-  `choreo-client-core/src/credentials.rs`. Because this plan removes the key from
-  `AddCredential` entirely, the two must be sequenced: land identity-keying for the
-  **unlock/lookup** path (which still needs the key), and drop any key-threading this
-  plan renders moot in the **add** path. Coordinate before touching
-  `credentials.rs`.
 
 ## 21. References
 
