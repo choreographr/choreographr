@@ -54,14 +54,6 @@ pub enum ClientError {
     /// credential type; the string explains which field or type was wrong.
     #[error("{0}")]
     CredentialParse(String),
-    /// The credential blob could not be postcard-serialized; the string is
-    /// the serializer's error.
-    #[error("postcard serialization failed: {0}")]
-    Postcard(String),
-    /// The credential blob could not be encrypted to the daemon's unlock
-    /// public key; the string is the crypto error.
-    #[error("encryption failed: {0}")]
-    Encryption(String),
     /// Daemon autostart (the caller-provided `ensure_daemon` hook of
     /// `run_daemon_connection_with_autostart`) failed. The string carries the
     /// full anyhow cause chain so the TUI can surface the daemon's log path.
@@ -89,8 +81,6 @@ impl From<ClientError> for io::Error {
             | ClientError::PublicKeyRead(_)
             | ClientError::PublicKeyInvalid
             | ClientError::CredentialParse(_)
-            | ClientError::Postcard(_)
-            | ClientError::Encryption(_)
             | ClientError::DaemonStart(_) => io::Error::new(io::ErrorKind::InvalidData, error),
         }
     }

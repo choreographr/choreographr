@@ -360,18 +360,17 @@ pub(super) fn run_command(
             ref credential_type,
             ref fields,
         } => {
+            // The add carries a TYPED plaintext credential and no key: the
+            // daemon encrypts it to its own binding. It requires an UNLOCKED
+            // keystore; a locked daemon replies `CredentialAddFailed`, which
+            // the daemon-message handler surfaces in the status bar.
             match build_add_credential_message(
-                &app.connection_addr,
                 service.clone(),
                 credential_type.clone(),
                 fields.clone(),
             ) {
-                Ok((msg, key)) => {
-                    // Record only after the daemon CONFIRMS (CredentialAdded /
-                    // Unlocked): the key rides the request's pending context
-                    // (see `record_confirmed_unlock_key`).
-                    let id = app.pending.send(client_tx, msg);
-                    app.pending.set_context(id, PendingContext::UnlockKey(key));
+                Ok(msg) => {
+                    app.pending.send(client_tx, msg);
                 }
                 Err(e) => {
                     tracing::warn!("[choreo-tui] add credential failed: {e}");

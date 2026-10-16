@@ -11,14 +11,17 @@ rust-version.workspace = true
 
 # A deliberately tiny, *leaf* crate: the small binary-facing helpers that every
 # CLI crate in the workspace used to duplicate (release-name metadata, the
-# shared clap styling, the `-v`/`-q` verbosity handling). It holds no protocol
-# or transport logic — `choreo-proto` remains the wire protocol — so it stays
-# cheap to depend on from every binary.
+# shared clap styling, the `-v`/`-q` verbosity handling) plus the shared
+# serializable domain type `ServiceCredential`. It holds no transport logic —
+# `choreo-proto` remains the wire protocol — so it stays cheap to depend on
+# from every binary.
 [dependencies]
 clap.workspace = true
 dirs.workspace = true
+serde.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zeroize.workspace = true
 
 # The hardened log-file opener (O_NOFOLLOW + euid check) is Unix-only; Windows
 # builds inherit the parent directory's ACLs instead and pull no rustix.

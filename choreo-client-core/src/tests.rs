@@ -240,7 +240,7 @@ fn parses_add_key() {
 #[test]
 fn ignores_trailing_unlock_arg_for_add_key() {
     // The `[unlock]` argument was removed with the per-daemon unlock-key
-    // design: key resolution is per-addr inside build_add_credential_message.
+    // design: the add carries no key (the daemon encrypts to its own binding).
     assert_eq!(
         parse_input_line("/add-key openai sk-abc123 unlock"),
         Command::AddCredential {

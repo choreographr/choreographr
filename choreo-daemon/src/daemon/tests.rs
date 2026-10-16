@@ -4214,44 +4214,12 @@ fn unlock_on_unbound_keystore_is_refused_and_does_not_adopt() {
 }
 
 #[test]
-fn add_credential_on_unbound_keystore_is_refused_without_binding_or_persist() {
+fn add_credential_while_locked_is_rejected() {
     let (mut state, _rx) = make_daemon_state();
-    let key: [u8; 32] = [6u8; 32];
-
-    let (writer, writer_rx) = test_sink();
-    let (reply, reply_rx) = mpsc::channel();
-    state.handle_command(DaemonCommand::SaveCredential {
-        service: "svc".to_string(),
-        encrypted_blob: vec![1, 2, 3],
-        unlock_key: key.to_vec(),
-        reply: Some(test_reply_target(writer)),
-        ack: reply,
-    });
-
-    reply_rx.recv().unwrap();
-    // The distinct Unbound reply (verify-only — no adoption).
-    assert!(matches!(
-        writer_rx.recv().unwrap().inner,
-        DaemonMessageType::KeystoreUnbound { .. }
-    ));
-    // Nothing was adopted and nothing was persisted.
-    assert_eq!(db::get_keystore_binding(&state.db).unwrap(), None);
-    assert!(db::get_all_credential_blobs(&state.db).unwrap().is_empty());
-    assert!(state.locked);
-}
-
-#[test]
-fn add_credential_verify_only_implicitly_unlocks_bound_keystore() {
-    let (mut state, _rx) = make_daemon_state();
-    // The REGISTERED activity subscriber (a separate sink from the acting
-    // client's client_writer below) receives the transition broadcasts.
-    let (sub_writer, sub_rx) = test_sink();
-    state.handle_register_activity_subscriber(cid(1), &sub_writer);
-    drain_send_on_subscribe(&sub_rx);
-
     let key: [u8; 32] = [7u8; 32];
 
-    // Establish the binding via the bind path (the only adopt path).
+    // Bind establishes the keystore (unlocked); re-lock it so the add below
+    // hits the locked guard.
     let (reply, reply_rx) = mpsc::channel();
     state.handle_command(DaemonCommand::BindKeystore {
         key: key.to_vec(),
@@ -4259,43 +4227,58 @@ fn add_credential_verify_only_implicitly_unlocks_bound_keystore() {
         ack: reply,
     });
     reply_rx.recv().unwrap();
-    // The bind's implicit-unlock transition broadcast reached the subscriber.
-    assert!(matches!(
-        sub_rx.recv().unwrap().inner,
-        DaemonMessageType::Keystore {
-            state: choreo_proto::KeystoreState::Unlocked
-        }
-    ));
-
-    // Re-lock so the AddCredential implicit unlock below is a REAL
-    // locked→unlocked transition (the bind already left the daemon unlocked,
-    // and a no-op state would produce no transition broadcast to assert on).
     state.locked = true;
-
-    // A blob encrypted to the binding's public key must pass verify-only
-    // AddCredential and implicitly unlock.
-    let derived = test_pub(key);
-    let blob = choreo_keystore::crypto::encrypt_with_public_key(
-        &derived,
-        &postcard::to_allocvec(&TestCred::ApiKey { key: "k".into() }).unwrap(),
-    )
-    .unwrap();
 
     let (writer, writer_rx) = test_sink();
     let (reply, reply_rx) = mpsc::channel();
     state.handle_command(DaemonCommand::SaveCredential {
         service: "svc".to_string(),
-        encrypted_blob: blob,
-        unlock_key: key.to_vec(),
+        credential: TestCred::ApiKey { key: "k".into() },
+        reply: Some(test_reply_target(writer)),
+        ack: reply,
+    });
+    reply_rx.recv().unwrap();
+    // A locked keystore rejects the add with a CredentialAddFailed carrying the
+    // "unlock first" guidance — never an implicit unlock.
+    assert!(
+        matches!(&writer_rx.recv().unwrap().inner,
+            DaemonMessageType::CredentialAddFailed { error, .. } if error.contains("unlock the keystore first")),
+        "an add on a locked keystore must be rejected with unlock guidance"
+    );
+    // Nothing was persisted and the lock state is unchanged.
+    assert!(db::get_all_credential_blobs(&state.db).unwrap().is_empty());
+    assert!(state.credentials.is_empty());
+    assert!(state.locked, "a rejected add must not change lock state");
+}
+
+#[test]
+fn add_credential_encrypts_to_binding_persists_and_populates_map() {
+    let (mut state, _rx) = make_daemon_state();
+    let key: [u8; 32] = [7u8; 32];
+
+    // Bind establishes the binding (the only adopt path) and leaves the
+    // daemon unlocked, which the add path requires.
+    let (reply, reply_rx) = mpsc::channel();
+    state.handle_command(DaemonCommand::BindKeystore {
+        key: key.to_vec(),
+        reply: None,
+        ack: reply,
+    });
+    reply_rx.recv().unwrap();
+    assert!(!state.locked, "bind leaves the daemon unlocked");
+
+    let (writer, writer_rx) = test_sink();
+    let (reply, reply_rx) = mpsc::channel();
+    state.handle_command(DaemonCommand::SaveCredential {
+        service: "svc".to_string(),
+        credential: TestCred::ApiKey { key: "k".into() },
         reply: Some(test_reply_target(writer)),
         ack: reply,
     });
     reply_rx.recv().unwrap();
     // The reply axis is one request → exactly one terminal reply: a single
-    // targeted CredentialAdded. The implicit unlock's state transition rides
-    // the `Keystore { Unlocked }` broadcast below, NOT a second id-bearing
-    // reply (the old Unlocked+CredentialAdded sequence violated the contract and
-    // made the client's pending table log a spurious resolve miss).
+    // targeted CredentialAdded, with no lock-state broadcast (the handler never
+    // changes lock state).
     assert!(matches!(
         writer_rx.recv().unwrap().inner,
         DaemonMessageType::CredentialAdded { .. }
@@ -4304,57 +4287,23 @@ fn add_credential_verify_only_implicitly_unlocks_bound_keystore() {
         writer_rx.try_recv().is_err(),
         "AddCredential must yield exactly one targeted reply, not a sequence"
     );
-    assert!(!state.locked, "valid AddCredential implicitly unlocks");
+    assert!(!state.locked, "an unlocked add leaves the daemon unlocked");
+
+    // The credential is in the in-memory map.
     assert!(matches!(
         state.credentials.get("svc"),
         Some(TestCred::ApiKey { key }) if key == "k"
     ));
-    // The implicit-unlock transition was broadcast to the activity subscriber.
-    assert!(matches!(
-        sub_rx.recv().unwrap().inner,
-        DaemonMessageType::Keystore {
-            state: choreo_proto::KeystoreState::Unlocked
-        }
-    ));
-}
 
-#[test]
-fn add_credential_on_bound_keystore_rejects_wrong_key_blob() {
-    let (mut state, _rx) = make_daemon_state();
-    let key: [u8; 32] = [8u8; 32];
-
-    let (reply, reply_rx) = mpsc::channel();
-    state.handle_command(DaemonCommand::BindKeystore {
-        key: key.to_vec(),
-        reply: None,
-        ack: reply,
-    });
-    reply_rx.recv().unwrap();
-
-    // Re-lock so the assertion below ("a refused op leaves it locked") is
-    // meaningful — the bind above already unlocked the daemon.
-    state.locked = true;
-
-    // A key that does not match the binding: verify-only rejects BEFORE any
-    // blob decrypt/persist.
-    let other: [u8; 32] = [9u8; 32];
-    let (writer, writer_rx) = test_sink();
-    let (reply, reply_rx) = mpsc::channel();
-    state.handle_command(DaemonCommand::SaveCredential {
-        service: "svc".to_string(),
-        encrypted_blob: vec![1, 2, 3],
-        unlock_key: other.to_vec(),
-        reply: Some(test_reply_target(writer)),
-        ack: reply,
-    });
-    reply_rx.recv().unwrap();
-    assert!(
-        matches!(&writer_rx.recv().unwrap().inner,
-            DaemonMessageType::CredentialAddFailed { error, .. } if error.contains("does not match")),
-        "mismatched key must be rejected with CredentialAddFailed"
-    );
-    assert!(db::get_all_credential_blobs(&state.db).unwrap().is_empty());
-    assert!(state.locked);
+    // The persisted blob was encrypted by the DAEMON to the binding public key,
+    // so it decrypts with the binding's PRIVATE key and decodes back to the
+    // typed credential the client sent.
+    let blobs = db::get_all_credential_blobs(&state.db).unwrap();
+    let blob = blobs.get("svc").expect("credential must be persisted");
+    let plaintext = choreo_keystore::crypto::decrypt_with_private_key(&key, blob)
+        .expect("the persisted blob must decrypt with the binding key");
+    let restored: TestCred = postcard::from_bytes(&plaintext).unwrap();
+    assert!(matches!(restored, TestCred::ApiKey { ref key } if key == "k"));
 }
 
 /// An MCP list-changed event must rebuild and atomically swap the shared tool

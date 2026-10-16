@@ -200,9 +200,9 @@ pub(crate) fn handle_daemon_message(
         // pre-credential state until the user leaves and re-enters the page.
         DaemonMessageType::CredentialAdded { service } => {
             app.status = Some(format!("[daemon] credential added: {service}"));
-            // The daemon accepted the unlock key this credential carried —
-            // record it per-daemon on CONFIRMED success only (never on send).
-            record_confirmed_unlock_key(app, resolved.as_ref());
+            // The add carries no unlock key, so there is nothing to record
+            // per-daemon here; refresh the account list so the page reflects
+            // the new credential's `has_credential` state.
             app.pending.send(client_tx, ClientMessageType::ListAccounts);
         }
         DaemonMessageType::CredentialRemoved { service } => {
@@ -915,13 +915,12 @@ fn trigger_keystore_auto_bind(
 /// Record the daemon-confirmed unlock key per-daemon, exactly once.
 ///
 /// The key rides the request's pending context ([`PendingContext::UnlockKey`]),
-/// attached when the `Unlock`/`AddCredential`/`BindKeystore` is SENT (see
-/// `run_app`'s auto-unlock, the chat/credential handlers, and the auto-bind
-/// path). A daemon that accepts the key replies `Unlocked` / `CredentialAdded`
-/// / `Bound`, resolving that slot — and only then do we persist the key into
-/// the daemon's `known_servers` entry. This is the TOFU core of the per-daemon
-/// keystore design: a key the daemon REJECTS (misbound keystore) is never
-/// recorded.
+/// attached when `Unlock`/`BindKeystore` is SENT (see `run_app`'s auto-unlock
+/// and the auto-bind path; `AddCredential` carries no key). A daemon that
+/// accepts the key replies `Unlocked` / `Bound`, resolving that slot — and only
+/// then do we persist the key into the daemon's `known_servers` entry. This is
+/// the TOFU core of the per-daemon keystore design: a key the daemon REJECTS
+/// (misbound keystore) is never recorded.
 fn record_confirmed_unlock_key(app: &mut App, resolved: Option<&Pending>) {
     // The key lives in the resolved slot's context. A reply with no UnlockKey
     // context (a broadcast, or a request that carried no key) records nothing.
@@ -941,15 +940,15 @@ fn record_confirmed_unlock_key(app: &mut App, resolved: Option<&Pending>) {
     }
 }
 
-/// The daemon REJECTED the pending unlock key (an `Unlock` or `AddCredential`
-/// failure). Drop the in-flight key — zeroized, since it is secret material —
-/// so a later, unrelated confirmation cannot attribute it. Deliberately does
-/// NOT delete the `known_servers` record: see the survivor-semantics rationale
-/// in `choreo-client-core` (`resolve_keystore_key`) — the stored key may be a
-/// valid confirmed key (the daemon reports transient failures through the
-/// same error), and manual re-pair (`remove(addr)`) is the recovery path for
-/// a genuinely wrong one. Takes the key out of the resolved slot so an
-/// in-process reply cannot linger after the rejection.
+/// The daemon REJECTED a presented unlock key (an `Unlock` failure; the
+/// `CredentialAddFailed` arm also routes here, though the add carries no key, so
+/// there is nothing to discard). Drop the in-flight key — zeroized, since it is
+/// secret material — so a later, unrelated confirmation cannot attribute it.
+/// Deliberately does NOT delete the `known_servers` record: the stored key may
+/// be a valid confirmed key (the daemon reports transient failures through the
+/// same error), and manual re-pair (`remove(addr)`) is the recovery path for a
+/// genuinely wrong one. Takes the key out of the resolved slot so an in-process
+/// reply cannot linger after the rejection.
 fn discard_rejected_unlock_key(app: &mut App, resolved: &mut Option<Pending>) {
     // Take the slot out so it is dropped HERE; `PendingContext::drop` zeroizes
     // the held UnlockKey, so the secret is wiped on the rejection path exactly

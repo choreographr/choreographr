@@ -91,7 +91,7 @@ pub(crate) fn submit_input(state: &mut Signal<AppState>, daemon_tx: Option<Daemo
 /// The address string used to key per-daemon unlock keys in `known_servers`:
 /// the actual dial address for TCP, the unix socket path otherwise. This is
 /// the same address the daemon's keystore binding is recorded against, so
-/// every `Unlock`/`AddCredential`/record must use it consistently.
+/// every `Unlock`/record must use it consistently.
 pub(crate) fn connection_addr() -> String {
     match crate::CONNECTION_MODE.get() {
         Some(ConnectionMode::UnixSocket(path)) => path.clone(),
@@ -136,16 +136,12 @@ pub(crate) fn handle_shell_command(
             credential_type,
             fields,
         } => {
-            match build_add_credential_message(&connection_addr(), service, credential_type, fields)
-            {
-                Ok((msg, key)) => {
-                    // Record the key only after the daemon CONFIRMS it
-                    // (CredentialAdded / Unlocked); the daemon may reject the
-                    // key (misbound keystore) and we must not persist a rejected
-                    // key. Hold it pending here, clear on error/confirmation.
-                    state.pending_unlock_key = Some(key);
-                    send_client_message(state, daemon_tx, msg);
-                }
+            // The add carries a TYPED plaintext credential and no key: the
+            // daemon encrypts it to its own binding. It requires an UNLOCKED
+            // keystore; a locked daemon replies `CredentialAddFailed`, which
+            // the daemon-message handler surfaces.
+            match build_add_credential_message(service, credential_type, fields) {
+                Ok(msg) => send_client_message(state, daemon_tx, msg),
                 Err(e) => state.status_texts.push(format!("[error] {e}")),
             }
         }
@@ -338,8 +334,8 @@ fn handle_session_message(
 fn trigger_keystore_auto_bind(state: &mut AppState, daemon_tx: Option<DaemonHandle>) -> bool {
     match attempt_keystore_auto_bind(&mut state.keystore_auto_bind, &connection_addr()) {
         AutoBindAttempt::Bind { key, msg } => {
-            // Same pending-confirm flow as Unlock/AddCredential: the `Bound`
-            // reply records the minted key.
+            // Same pending-confirm flow as Unlock: the `Bound` reply records
+            // the minted key.
             state.pending_unlock_key = Some(key.to_vec());
             send_client_message(state, daemon_tx, msg);
             true
@@ -376,16 +372,16 @@ pub(crate) fn apply_daemon_message(
         return;
     }
 
-    // Unlock/AddCredential outcome (per-daemon keystore): resolve what the
-    // daemon did with the pending key — the key carried by the most recent
-    // `Unlock`/`AddCredential` — and reconcile the client-side record with it.
+    // Unlock outcome (per-daemon keystore): resolve what the daemon did with
+    // the pending key — the key carried by the most recent `Unlock` (or the
+    // auto-bind) — and reconcile the client-side record with it.
     match &message.inner {
-        // CONFIRMED success (explicit Unlock, an AddCredential that
-        // implicitly unlocked, or our auto-bind of an unbound daemon).
-        // Record the pending key per-daemon NOW — the whole point of the
-        // per-daemon keystore design is that a key is only trusted/recorded
+        // CONFIRMED success (explicit Unlock or our auto-bind of an unbound
+        // daemon). Record the pending key per-daemon NOW — the whole point of
+        // the per-daemon keystore design is that a key is only trusted/recorded
         // after the daemon accepts it (TOFU adopt, or a binding match). A
-        // rejected key never reaches here.
+        // rejected key never reaches here. (An AddCredential confirmation no
+        // longer carries a key, so its arm is a no-op on the pending slot.)
         DaemonMessageType::Unlocked
         | DaemonMessageType::Bound
         | DaemonMessageType::CredentialAdded { .. } => {
@@ -451,7 +447,8 @@ pub(crate) fn apply_daemon_message(
                 }
             }
         },
-        // REJECTED (Unlock/AddCredential failure). Drop the pending key
+        // REJECTED (an Unlock failure; a `CredentialAddFailed` also routes
+        // here, though the add carries no key). Drop the pending key
         // (zeroized — it is secret material) so a later, unrelated
         // confirmation cannot attribute the rejection back. Deliberately does
         // NOT delete the known_servers record: a rejection is not proof the

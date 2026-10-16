@@ -496,8 +496,8 @@ impl AccountWizardState {
 /// The API-key modal (AI providers page).  Open ⇔ `target` is `Some(account
 /// name)`.  Reached from `c` on an existing account or auto-opened right after
 /// the new-account wizard creates one.  The key is masked while typing and
-/// encrypted with the daemon's identity key on save (see
-/// `build_add_credential_message`).
+/// sent as typed plaintext on save (the daemon encrypts it to its own binding
+/// key; see `build_add_credential_message`).
 pub(crate) struct CredentialModalState {
     /// The account the key is for; `Some` means the modal is open.
     pub(crate) target: Option<String>,

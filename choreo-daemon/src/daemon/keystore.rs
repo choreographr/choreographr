@@ -20,7 +20,7 @@ use choreo_proto::DaemonMessageType;
 use std::collections::HashMap;
 use std::io;
 use std::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Failure of a keystore unlock/bind/add-credential operation, with the
@@ -31,8 +31,8 @@ use zeroize::{Zeroize, Zeroizing};
 /// such distinctions silently rot.
 #[derive(Debug, thiserror::Error)]
 pub enum KeystoreOpError {
-    /// The daemon's keystore has no binding at all: verify-only operations
-    /// (Unlock / `AddCredential`) must not adopt a key, so they fail with this.
+    /// The daemon's keystore has no binding at all: the verify-only `Unlock`
+    /// path must not adopt a key, so it fails with this.
     #[error(
         "keystore not initialized — no key is bound to this daemon yet; it will be bound automatically on next client connect"
     )]
@@ -206,109 +206,56 @@ impl DaemonState {
         let _ = reply.send(Ok(()));
     }
 
-    /// Save an encrypted credential blob for a service.
+    /// Encrypt a credential to the daemon's binding public key, persist it,
+    /// and update the in-memory credential map.
     ///
-    /// `unlock_key` is REQUIRED (per-daemon keystore design): the flow is
-    /// VERIFY-ONLY against the keystore binding (an unbound keystore is
-    /// rejected — binding happens exclusively via `BindKeystore`),
-    /// TEST-DECRYPT the incoming blob with the key (a blob that does not
-    /// decrypt is rejected and never persisted — this enforces "the
-    /// credential was encrypted with the same key as the rest of the
-    /// keystore"), persist, then run the IMPLICIT UNLOCK (shared tail) — so a
-    /// valid `AddCredential` to a locked daemon unlocks it. The caller
-    /// (connection layer) replies `CredentialAdded` and emits `Unlocked`
-    /// exactly like a successful `Unlock`.
+    /// The keystore must already be UNLOCKED: a locked daemon REJECTS the
+    /// request ("unlock the keystore first") rather than implicitly unlocking
+    /// — the add path no longer has any lock-state side effect. The credential
+    /// arrives as typed plaintext (no key rides the request); the daemon reads
+    /// its stored binding public key and encrypts the serialized credential to
+    /// it before persisting, so the on-disk blob is readable only by an unlock
+    /// that presents the binding's private key.
     pub(super) fn handle_save_credential(
         &mut self,
         service: String,
-        encrypted_blob: &[u8],
-        mut unlock_key: Vec<u8>,
+        credential: ServiceCredential,
         reply: Option<ReplyTarget>,
         ack: &mpsc::Sender<()>,
     ) {
-        // Capture the pre-operations lock state so the implicit-unlock
-        // transition broadcast below fires only on a REAL locked→unlocked
-        // change (`unlock_tail` clears `locked` on a successful save tail).
-        let was_locked = self.locked;
-        // Reject anything that is not exactly 32 bytes up front: the X25519
-        // key derivation (and every crypto helper below) needs [u8; 32], and
-        // a shorter/longer key can never be a valid unlock key. Zeroizing
-        // makes the wipe structural: the array is zeroed on EVERY exit — the
-        // early-return error paths below, `?`, even a panic — so no per-path
-        // zeroize call can be forgotten by a future edit (this mirrors
-        // handle_unlock_inner).
-        let key = Zeroizing::new(if let Ok(k) = unlock_key.as_slice().try_into() {
-            k
-        } else {
-            // The rejected bytes are still secret material — wipe them so
-            // a failed add does not leave the key in a freed allocation.
-            unlock_key.zeroize();
+        // Require an unlocked keystore. Adding while locked is refused so the
+        // handler never changes lock state and never publishes a decrypted
+        // credential into a keystore the operator believes is locked.
+        if self.locked {
+            info!(service = %service, "AddCredential rejected: keystore is locked");
             Self::send_credential_add_failed(
                 &service,
-                "invalid unlock_key: expected exactly 32 bytes".to_string(),
+                "unlock the keystore first".to_string(),
                 reply,
                 ack,
             );
             return;
-        });
-        // Wipe the heap `Vec` copy; only the stack `key` array is used below
-        // and the Zeroizing wrapper wipes it on every exit path.
-        unlock_key.zeroize();
-
-        // VERIFY-ONLY check BEFORE anything is written: a wrong key must not
-        // persist a blob, and an UNBOUND keystore must not be adopted here —
-        // binding happens exclusively via BindKeystore. (This used to
-        // adopt-or-verify; the adopt half moved to the bind path so Unlock
-        // and AddCredential can never silently create a binding.)
-        if let Err(e) = verify_keystore_binding(self, &key) {
-            // ORDERING INVARIANT (see handle_unlock): the targeted error
-            // reply is enqueued by THIS thread before anything else touches
-            // the client's writer queue.
-            let reply_msg = match e {
-                KeystoreOpError::Unbound => DaemonMessageType::KeystoreUnbound {
-                    error: KeystoreOpError::Unbound.to_string(),
-                },
-                KeystoreOpError::Other(e) => DaemonMessageType::CredentialAddFailed {
-                    service: service.clone(),
-                    error: e,
-                },
-            };
-            Self::send_targeted_ack(reply, reply_msg, ack);
-            return;
         }
 
-        // TEST-DECRYPT the incoming blob. A blob that fails to decrypt (or
-        // whose plaintext does not decode as a ServiceCredential) is REJECTED
-        // and never persisted: storing an unreadable blob would poison the
-        // keystore — the next unlock's bulk decrypt would log a failure
-        // forever, and the credential would look saved but be unusable.
-        let plaintext =
-            match choreo_keystore::crypto::decrypt_with_private_key(&key, encrypted_blob) {
-                Ok(pt) => pt,
-                Err(e) => {
-                    warn!(
-                        service = %service,
-                        error = %e,
-                        "AddCredential: blob failed test-decrypt with the presented unlock key; \
-                         rejecting without persisting"
-                    );
-                    Self::send_credential_add_failed(
-                        &service,
-                        format!(
-                            "credential blob failed to decrypt with the provided unlock key: {e}"
-                        ),
-                        reply,
-                        ack,
-                    );
-                    return;
-                }
-            };
-        let cred: ServiceCredential = match postcard::from_bytes(&plaintext) {
-            Ok(c) => c,
+        // The binding public key is what the daemon encrypts to. An unbound
+        // keystore cannot have reached the unlocked state (bind is the sole
+        // adopt path and leaves it unlocked), so this is a defensive branch,
+        // not a reachable first-run path.
+        let binding = match db::get_keystore_binding(&self.db) {
+            Ok(Some(pk)) => pk,
+            Ok(None) => {
+                Self::send_credential_add_failed(
+                    &service,
+                    "keystore is not bound; bind it before adding credentials".to_string(),
+                    reply,
+                    ack,
+                );
+                return;
+            }
             Err(e) => {
                 Self::send_credential_add_failed(
                     &service,
-                    format!("credential payload is not a valid ServiceCredential: {e}"),
+                    format!("failed to read keystore binding: {e}"),
                     reply,
                     ack,
                 );
@@ -316,8 +263,35 @@ impl DaemonState {
             }
         };
 
-        // Persist to DB only after both checks passed.
-        if let Err(e) = db::set_credential_blob(&self.db, &service, encrypted_blob) {
+        // Serialize then encrypt to the binding. The plaintext is wrapped in
+        // `Zeroizing` so the serialized secret bytes are wiped on every exit
+        // path (the typed credential also zeroizes on drop).
+        let plaintext = match postcard::to_allocvec(&credential) {
+            Ok(p) => Zeroizing::new(p),
+            Err(e) => {
+                Self::send_credential_add_failed(
+                    &service,
+                    format!("failed to serialize credential: {e}"),
+                    reply,
+                    ack,
+                );
+                return;
+            }
+        };
+        let blob = match choreo_keystore::crypto::encrypt_with_public_key(&binding, &plaintext) {
+            Ok(b) => b,
+            Err(e) => {
+                Self::send_credential_add_failed(
+                    &service,
+                    format!("failed to encrypt credential: {e}"),
+                    reply,
+                    ack,
+                );
+                return;
+            }
+        };
+
+        if let Err(e) = db::set_credential_blob(&self.db, &service, &blob) {
             Self::send_credential_add_failed(
                 &service,
                 format!("failed to save credential: {e}"),
@@ -327,66 +301,33 @@ impl DaemonState {
             return;
         }
 
-        // Update in-memory state (same bookkeeping the old optional-key path
-        // did), then run the shared implicit-unlock tail: bulk-decrypt ALL
-        // blobs, load accounts, clear `locked`. The just-tested blob is
-        // passed in — `unlock_tail_skip` does NOT re-decrypt it from the DB
-        // (the TEST-DECRYPT above already proved it decodes with this key,
-        // so the second decrypt would be pure redundant work) and the tail
-        // seeds its credential map with the parsed value instead.
-        if matches!(&cred, ServiceCredential::X { .. }) && service == "twitter" {
-            self.x_credentials = Some(cred.clone());
+        // In-memory bookkeeping: mirror an X credential for the `twitter`
+        // service into the single `x_credentials` slot, and invalidate sessions
+        // bound to an ApiKey service so they rebuild their client against the
+        // new key lazily on their next request.
+        if matches!(&credential, ServiceCredential::X { .. }) && service == "twitter" {
+            self.x_credentials = Some(credential.clone());
         }
-        if matches!(&cred, ServiceCredential::ApiKey { .. }) {
-            // Invalidate sessions bound to this account so they drop any
-            // client built with the OLD key (or none) and rebuild lazily —
-            // the tail no longer bulk-resolves providers.
+        if matches!(&credential, ServiceCredential::ApiKey { .. }) {
             self.drop_session_clients(Some(&service));
         }
-        let result = unlock_tail_skip(self, &key, &service, cred.clone());
-        if let Err(e) = result {
-            // The blob IS persisted and the binding holds — only the tail
-            // (accounts load / bulk decrypt) failed. Report it rather than
-            // lying with a silent success: the caller surfaces the error to
-            // the client even though the credential was stored.
-            error!(
-                service = %service,
-                error = %e,
-                "AddCredential: persisted credential but implicit unlock failed"
-            );
-            Self::send_credential_add_failed(
-                &service,
-                format!("credential saved but unlock failed: {e}"),
-                reply,
-                ack,
-            );
-            return;
-        }
+        self.credentials.insert(service.clone(), credential);
+
         info!(
             service = %service,
-            "AddCredential: persisted, tested, and implicitly unlocked the keystore"
+            "AddCredential: encrypted to the binding public key and persisted"
         );
-        // ORDERING INVARIANT: the targeted CredentialAdded reply is enqueued
-        // HERE, by this thread, BEFORE the lock-state broadcast (see
-        // handle_unlock) — the acting client keys its key-recording on the
-        // CredentialAdded confirmation, so the broadcast must never overtake it
-        // on the same writer queue. AddCredential yields exactly ONE terminal
-        // reply (the reply axis is one request → one reply): the implicit
-        // unlock's state transition rides the `Keystore { state: Unlocked }`
-        // broadcast below (it fires whenever the daemon was locked), not a
-        // second id-bearing reply.
+        // ORDERING INVARIANT (see handle_unlock): the targeted CredentialAdded
+        // reply is enqueued by THIS thread, so it precedes any other message to
+        // this client's writer queue. AddCredential yields exactly ONE terminal
+        // reply; there is no lock-state broadcast because the handler never
+        // changes lock state.
         if let Some(target) = reply {
             target.send(DaemonMessageType::CredentialAdded { service });
         } else {
             warn!("no reply target for the targeted AddCredential reply; dropping reply");
         }
         let _ = ack.send(());
-        // A valid AddCredential to a locked daemon IS a lock-state transition
-        // (implicit unlock): fan out the newly-unlocked state to ALL activity
-        // subscribers so every connected UI clears its lock banner.
-        if was_locked && !self.locked {
-            self.broadcast_keystore_state();
-        }
     }
 }
 
@@ -516,9 +457,8 @@ fn bind_keystore(state: &mut DaemonState, key: &[u8; 32]) -> Result<(), Keystore
     }
 }
 
-/// VERIFY-ONLY keystore-binding enforcement, shared by `Unlock` and
-/// `AddCredential` (factored into one helper so the two paths cannot drift).
-/// Neither path may CREATE a binding anymore:
+/// VERIFY-ONLY keystore-binding enforcement for the `Unlock` path. `Unlock`
+/// may never CREATE a binding:
 ///
 /// * Unbound keystore (no stored binding): `KeystoreOpError::Unbound` — the
 ///   connection layer answers `KeystoreUnbound` and the client auto-binds
@@ -526,7 +466,7 @@ fn bind_keystore(state: &mut DaemonState, key: &[u8; 32]) -> Result<(), Keystore
 ///   presented.
 /// * Bound keystore: derive the presented key's public key and compare
 ///   against the binding; a mismatch is `KeystoreOpError::Other`
-///   (`LockedError` for Unlock, `CredentialAddFailed` for `AddCredential`).
+///   (`LockedError`).
 pub(crate) fn verify_keystore_binding(
     state: &DaemonState,
     key: &[u8; 32],
@@ -550,46 +490,22 @@ pub(crate) fn verify_keystore_binding(
     }
 }
 
-/// The unlock TAIL shared by `handle_unlock_inner` and the implicit unlock
-/// in `handle_save_credential`: bulk-decrypt every stored credential blob
+/// The unlock TAIL run by `handle_unlock_inner` and
+/// `handle_bind_keystore_inner`: bulk-decrypt every stored credential blob
 /// with `key`, load accounts from TOML, and flip `locked` to `false`
-/// (in-memory only). Factored out so the Unlock path and the
-/// AddCredential-implicit-unlock path cannot drift.
+/// (in-memory only). Factored out so the unlock and bind paths cannot drift.
 pub(crate) fn unlock_tail(state: &mut DaemonState, key: &[u8; 32]) -> io::Result<()> {
-    let credentials = decrypt_credential_blobs(state, key, None)?;
-    finish_unlock(state, credentials)
-}
-
-/// The `AddCredential` variant of [`unlock_tail`]: identical semantics, but
-/// the just-tested blob for `skip_service` is NOT re-decrypted from the DB —
-/// the caller already TEST-DECRYPTed and parsed it, and passes the decoded
-/// credential in as `seeded`, so the tail's second decrypt of the same blob
-/// is pure redundant work (an eliminated allocation + crypto round-trip in
-/// the default case).
-pub(crate) fn unlock_tail_skip(
-    state: &mut DaemonState,
-    key: &[u8; 32],
-    skip_service: &str,
-    seeded: ServiceCredential,
-) -> io::Result<()> {
-    let mut credentials = decrypt_credential_blobs(state, key, Some(skip_service))?;
-    // Seeded last, so if a STALE blob for the same service somehow persisted,
-    // the JUST-TESTED value wins — the seed is the credential the client
-    // actually sent and we verified.
-    credentials.insert(skip_service.to_string(), seeded);
+    let credentials = decrypt_credential_blobs(state, key)?;
     finish_unlock(state, credentials)
 }
 
 /// Read every credential blob from the DB and decrypt them all with `key`.
-/// `skip` is the service whose blob should be passed over (its plaintext is
-/// supplied by the caller — the `AddCredential` test-decrypt — instead).
 /// Failure-tolerant per blob: a bad decrypt/decode is logged and skipped, not
 /// fatal (see the bulk-unlock design: a poisoned blob must not lock out the
 /// whole keystore).
 fn decrypt_credential_blobs(
     state: &DaemonState,
     key: &[u8; 32],
-    skip: Option<&str>,
 ) -> io::Result<HashMap<String, ServiceCredential>> {
     let blobs = db::get_all_credential_blobs(&state.db)
         .map_err(|e| io::Error::other(format!("failed to read credentials from database: {e}")))?;
@@ -598,10 +514,6 @@ fn decrypt_credential_blobs(
     let mut credentials = HashMap::new();
     let mut decrypt_failures = 0usize;
     for (service, blob) in &blobs {
-        if skip == Some(service.as_str()) {
-            // The caller supplies this one pre-decoded (see `unlock_tail_skip`).
-            continue;
-        }
         match choreo_keystore::crypto::decrypt_with_private_key(key, blob) {
             Ok(plaintext) => match postcard::from_bytes::<ServiceCredential>(&plaintext) {
                 Ok(cred) => {
@@ -619,14 +531,11 @@ fn decrypt_credential_blobs(
         }
     }
     // Summary here (not in `finish_unlock`, which may never run on a DB
-    // error and, after the atomicity change, owns no blob-count knowledge):
-    // the log reports what this pass actually decrypted, and the skipped
-    // service is accounted so blob-count and decrypted-count reconcile.
-    let skipped = usize::from(skip.is_some());
+    // error): the log reports what this pass actually decrypted.
     info!(
         "Unlock: decrypted {}/{} credentials ({} failures): {:?}",
         credentials.len(),
-        blobs.len() - skipped,
+        blobs.len(),
         decrypt_failures,
         credentials.keys().collect::<Vec<_>>()
     );
@@ -746,36 +655,5 @@ mod tests {
         assert!(state.x_credentials.is_none(), "X creds must stay empty");
         assert!(state.locked, "a failed tail must not unlock the daemon");
         assert!(state.accounts.is_empty(), "accounts must stay as they were");
-    }
-
-    #[test]
-    fn unlock_tail_skip_seeds_the_tested_credential_over_the_db_blob() {
-        let (mut state, _rx) = make_daemon_state();
-        let key: [u8; 32] = [9u8; 32];
-        // A DIFFERENT (stale) value persisted for the same service: the
-        // skip-seed must WIN over whatever the DB still holds, because the
-        // seed is the credential the client actually sent and we verified.
-        let db_blob = choreo_keystore::crypto::encrypt_with_public_key(
-            &test_pub(key),
-            &postcard::to_allocvec(&ServiceCredential::ApiKey {
-                key: "stale-db-value".to_string(),
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        db::set_credential_blob(&state.db, "openai", &db_blob).unwrap();
-
-        let seeded = ServiceCredential::ApiKey {
-            key: "fresh-tested-value".to_string(),
-        };
-        unlock_tail_skip(&mut state, &key, "openai", seeded).unwrap();
-
-        assert!(!state.locked, "the skip tail still unlocks");
-        match state.credentials.get("openai") {
-            Some(ServiceCredential::ApiKey { key }) => {
-                assert_eq!(key, "fresh-tested-value", "the seed wins");
-            }
-            other => panic!("expected the seeded openai credential, got {other:?}"),
-        }
     }
 }

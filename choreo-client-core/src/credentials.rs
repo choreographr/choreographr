@@ -6,16 +6,20 @@
 //! resolving the unlock key already associated with an address
 //! ([`resolve_private_key`], [`try_auto_unlock_key`]), minting and
 //! pre-send-recording a fresh binding key for an unbound daemon
-//! ([`bind_fresh_daemon`], [`KeystoreAutoBind`]), and building the encrypted
+//! ([`bind_fresh_daemon`], [`KeystoreAutoBind`]), and building the
 //! `AddCredential` message ([`build_add_credential_message`]). The invariant
 //! running through all of it: the store is written only on a daemon
 //! confirmation (or, for a bind, before send), never optimistically.
+//!
+//! The add path carries a TYPED plaintext `ServiceCredential` and no key: the
+//! daemon encrypts it to its own binding, so the client neither resolves nor
+//! transmits an unlock key here. The add still requires the daemon to be
+//! unlocked; a locked daemon rejects it.
 
 use base64::Engine as _;
 use choreo_keystore::ServiceCredential;
 use choreo_proto::ClientMessageType;
 use tracing::{debug, info, warn};
-use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::ClientError;
@@ -252,20 +256,6 @@ fn parse_credential(
     }
 }
 
-/// Resolve the per-daemon keystore unlock key for `addr` — VERIFY-ONLY
-/// resolution: the stored `known_servers` key for `addr`, falling back to the
-/// legacy raw `identity.pk` file (which `stored_or_adopted_unlock_key` copies
-/// into the store).
-///
-/// There is NO fresh-mint fallback anymore: a new design reserves key
-/// creation for the explicit bind flow ([`bind_fresh_daemon`]) — stored and
-/// legacy keys are unlock-VERIFICATION keys only and must never be used to
-/// establish a binding. When neither source has a key the caller gets
-/// [`ClientError::NoUnlockKey`] and the frontend surfaces it.
-fn resolve_keystore_key(addr: &str) -> Result<[u8; 32], ClientError> {
-    stored_or_adopted_unlock_key(addr)?.ok_or_else(|| ClientError::NoUnlockKey(addr.to_string()))
-}
-
 /// Prepare an AUTO-BIND of a freshly connected daemon whose keystore is
 /// unbound (learned from the subscribe-time lock state, or from a
 /// `KeystoreUnbound` reply to an auto-unlock attempt).
@@ -308,36 +298,30 @@ pub fn bind_fresh_daemon(addr: &str) -> Result<([u8; 32], ClientMessageType), Cl
 }
 
 /// Build an `AddCredential` message from typed field strings: parse the
-/// credential, then delegate to the shared builder (see
-/// [`build_add_credential_from_credential`] for the full key-resolution and
-/// encryption semantics). The caller-supplied field strings (which may hold a
-/// secret, e.g. the API key) are zeroized once parsing has consumed them.
+/// credential, then delegate to [`build_add_credential_from_credential`].
+/// The caller-supplied field strings (which may hold a secret, e.g. the API
+/// key) are zeroized once parsing has consumed them.
 ///
 /// # Errors
 ///
 /// Returns [`ClientError::CredentialParse`] if the credential fields do
-/// not parse for `credential_type`, and store/keystore errors bubbled up
-/// by the shared builder.
+/// not parse for `credential_type`.
 // needless_pass_by_value waived: pub API — TUI/GUI/IM callers pass owned
 // field strings (which get zeroized) and rely on this signature.
 #[expect(clippy::needless_pass_by_value)]
 pub fn build_add_credential_message(
-    addr: &str,
     service: String,
     credential_type: String,
     fields: Vec<String>,
-) -> Result<(ClientMessageType, Vec<u8>), ClientError> {
-    debug!(
-        addr,
-        service, credential_type, "building add credential message"
-    );
+) -> Result<ClientMessageType, ClientError> {
+    debug!(service, credential_type, "building add credential message");
     let credential = parse_credential(&credential_type, &fields)?;
     // Parse first, then hand off to the shared builder. The caller's field
     // strings (which may hold a typed secret, e.g. an API key) are zeroized
     // here once parsing is done — the parsed credential zeroizes itself on
-    // drop via `#[zeroize(drop)]` in choreo-keystore.
+    // drop via `#[zeroize(drop)]` in choreo-shared.
     let mut fields = fields;
-    let result = build_add_credential_from_credential(addr, service, credential);
+    let result = build_add_credential_from_credential(service, credential);
     for field in &mut fields {
         field.zeroize();
     }
@@ -492,63 +476,30 @@ pub fn attempt_keystore_auto_bind(bind: &mut KeystoreAutoBind, addr: &str) -> Au
     }
 }
 
-/// Build an `AddCredential` message from an already-parsed credential, by
-/// resolving the daemon's unlock key and encrypting the serialized blob to the
-/// public key derived from that key.
+/// Build an `AddCredential` message carrying an already-parsed credential.
 ///
-/// VERIFY-ONLY key resolution: the stored per-daemon key or the legacy file —
-/// NEVER a fresh key (fresh keys are minted exclusively by [`bind_fresh_daemon`]).
-/// When neither source has a key this errors with [`ClientError::NoUnlockKey`]
-/// and the frontend surfaces it (the daemon's keystore is either unbound —
-/// in which case the client auto-binds first — or bound to a key this client
-/// does not hold).
-///
-/// Returns the message AND the unlock key used, so the caller can call
-/// [`record_unlock_key`] once the daemon CONFIRMS success (`CredentialAdded` /
-/// `Unlocked` reply) — never on send.
+/// The credential is moved onto the wire as a TYPED plaintext value — no key
+/// is resolved and nothing is encrypted client-side: the daemon encrypts it to
+/// its own binding public key. The daemon must already be UNLOCKED; a locked
+/// daemon rejects the request and the frontend surfaces the error.
 ///
 /// # Errors
 ///
-/// Returns [`ClientError::Io`] if the keystore unlock key cannot be
-/// resolved or the encrypted credential cannot be built.
-// needless_pass_by_value waived: pub API — callers move the parsed
-// credential in; taking a reference would complicate every call site.
-#[expect(clippy::needless_pass_by_value)]
+/// This builder is infallible today (it neither resolves a key nor encrypts),
+/// but keeps the [`Result`] return so callers (and the typos surface) do not
+/// change if a fallible step is added later.
 pub fn build_add_credential_from_credential(
-    addr: &str,
     service: String,
     credential: ServiceCredential,
-) -> Result<(ClientMessageType, Vec<u8>), ClientError> {
+) -> Result<ClientMessageType, ClientError> {
     debug!(
-        addr,
-        service, "building add credential message from parsed credential"
-    );
-    let mut unlock_key = resolve_keystore_key(addr)?;
-    let derived_pub = PublicKey::from(&StaticSecret::from(unlock_key));
-
-    let mut plaintext =
-        postcard::to_allocvec(&credential).map_err(|e| ClientError::Postcard(e.to_string()))?;
-
-    let encrypted_payload =
-        choreo_keystore::crypto::encrypt_with_public_key(derived_pub.as_bytes(), &plaintext)
-            .map_err(|e| ClientError::Encryption(e.to_string()))?;
-
-    // Wipe the plaintext bytes (the credential value zeroizes itself on drop
-    // via `#[zeroize(drop)]` in choreo-keystore, and the daemon zeroizes its
-    // own stored copy, so this closes the remaining gap on the send path).
-    plaintext.zeroize();
-
-    let msg = ClientMessageType::AddCredential {
         service,
-        encrypted_payload,
-        unlock_key: unlock_key.to_vec(),
-    };
-    // Wipe the stack key after building: the two `Vec` copies (in `msg` and
-    // the returned key) are the ones that travel on, and the local array is
-    // then redundant.
-    let result = (msg, unlock_key.to_vec());
-    unlock_key.zeroize();
-    Ok(result)
+        "building add credential message from parsed credential"
+    );
+    Ok(ClientMessageType::AddCredential {
+        service,
+        credential,
+    })
 }
 
 #[cfg(test)]
@@ -760,102 +711,59 @@ mod tests {
 
     // ── build_add_credential_message tests ─────────────────────────
 
-    /// A helper to pull the key back out of the built message (tests may
-    /// unwrap; production code may not).
-    fn msg_unlock_key(msg: &ClientMessageType) -> Vec<u8> {
+    /// The builder no longer resolves a key, encrypts, or takes an address:
+    /// it parses the field strings into a TYPED credential and puts it on the
+    /// wire verbatim. Pin the exact `AddCredential { service, credential }`
+    /// shape so a future change cannot silently reintroduce a ciphertext
+    /// field or a key.
+    #[test]
+    fn build_add_credential_carries_typed_api_key_without_a_key() {
+        let msg =
+            build_add_credential_message("svc".into(), "api_key".into(), vec!["k".into()]).unwrap();
         match msg {
-            ClientMessageType::AddCredential { unlock_key, .. } => unlock_key.clone(),
+            ClientMessageType::AddCredential {
+                service,
+                credential,
+            } => {
+                assert_eq!(service, "svc");
+                assert!(
+                    matches!(credential, ServiceCredential::ApiKey { ref key } if key == "k"),
+                    "the credential must travel typed and unencrypted, got {credential:?}"
+                );
+            }
             other => panic!("expected AddCredential, got {other:?}"),
         }
     }
 
     #[test]
-    fn build_add_credential_uses_stored_key_first() {
-        let dir = tempfile::tempdir().unwrap();
-        let _guard =
-            choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
-        std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
-
-        let stored: [u8; 32] = [4u8; 32];
-        let mut store = KnownServers::load().unwrap();
-        store.set_unlock_key("d:1", &stored).unwrap();
-
-        let (msg, key) =
-            build_add_credential_message("d:1", "svc".into(), "api_key".into(), vec!["k".into()])
-                .unwrap();
-        assert_eq!(key, stored.to_vec());
-        assert_eq!(msg_unlock_key(&msg), stored.to_vec());
-    }
-
-    #[test]
-    fn build_add_credential_falls_back_to_legacy_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let _guard =
-            choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
-        std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
-
-        let (_, sk) = choreo_keystore::crypto::generate_keypair();
-        std::fs::write(dir.path().join("choreographr/identity.pk"), sk).unwrap();
-
-        let (_msg, key) =
-            build_add_credential_message("d:1", "svc".into(), "api_key".into(), vec!["k".into()])
-                .unwrap();
-        assert_eq!(key, sk.to_vec());
-    }
-
-    /// Verify-only resolution: with nothing stored and no legacy files, the
-    /// add FAILS with `NoUnlockKey` — no fresh key is minted on the add path
-    /// (fresh keys are minted exclusively by `bind_fresh_daemon`).
-    #[test]
-    fn build_add_credential_without_any_key_is_a_clear_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let _guard =
-            choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
-        std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
-
-        assert!(matches!(
-            build_add_credential_message("d:1", "svc".into(), "api_key".into(), vec!["k".into()]),
-            Err(ClientError::NoUnlockKey(_))
-        ));
-        // And nothing was optimistically recorded by the failed attempt.
-        assert_eq!(
-            KnownServers::load().unwrap().unlock_key("d:1").unwrap(),
-            None
-        );
-    }
-
-    /// The blob encrypts to the pubkey derived from the RESOLVED (stored)
-    /// key — the daemon-side test-decrypt contract — and the returned key
-    /// equals the stored one.
-    #[test]
-    fn build_add_credential_blob_decrypts_with_stored_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let _guard =
-            choreo_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
-        std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
-
-        let stored: [u8; 32] = [4u8; 32];
-        let mut store = KnownServers::load().unwrap();
-        store.set_unlock_key("d:1", &stored).unwrap();
-
-        let (msg, key) =
-            build_add_credential_message("d:1", "svc".into(), "api_key".into(), vec!["k".into()])
-                .unwrap();
-        assert_eq!(key, stored.to_vec());
+    fn build_add_credential_carries_typed_x_credential() {
+        let fields = vec![
+            "ak".into(),
+            "aks".into(),
+            "at".into(),
+            "ats".into(),
+            "-".into(),
+        ];
+        let msg = build_add_credential_message("twitter".into(), "x".into(), fields).unwrap();
         let ClientMessageType::AddCredential {
             service,
-            encrypted_payload,
-            ..
-        } = &msg
+            credential,
+        } = msg
         else {
             panic!("expected AddCredential");
         };
-        assert_eq!(service, "svc");
-        let plaintext =
-            choreo_keystore::crypto::decrypt_with_private_key(&stored, encrypted_payload)
-                .expect("blob must decrypt with the stored unlock key");
-        let cred: ServiceCredential = postcard::from_bytes(&plaintext).unwrap();
-        assert!(matches!(cred, ServiceCredential::ApiKey { ref key, .. } if key == "k"));
+        assert_eq!(service, "twitter");
+        let view = credential.as_x().expect("expected X credential");
+        assert_eq!(view.api_key, "ak");
+        assert!(view.bearer_token.is_none());
+    }
+
+    #[test]
+    fn build_add_credential_rejects_unparseable_fields() {
+        assert!(matches!(
+            build_add_credential_message("svc".into(), "api_key".into(), vec![]),
+            Err(ClientError::CredentialParse(_))
+        ));
     }
 
     /// `bind_fresh_daemon`: mints a FRESH CSPRNG key (never the stored or

@@ -15,7 +15,6 @@ choreo-proto.workspace = true
 choreo-sanitize.workspace = true
 choreo-transport.workspace = true
 choreo-keystore.workspace = true
-postcard.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
@@ -36,9 +35,7 @@ crossbeam-channel.workspace = true
 # dependency (not a dev-dependency) because other crates' test builds consume
 # it through their dev-dependency feature request on this crate.
 tempfile = { workspace = true, optional = true }
-# Keystore unlock-key derivation (TOFU design): the AddCredential unlock key's
-# X25519 public key is what credential blobs are encrypted with.
-x25519-dalek.workspace = true
+# The auto-bind path mints a fresh CSPRNG keystore binding key with `rand`.
 rand.workspace = true
 
 [dev-dependencies]

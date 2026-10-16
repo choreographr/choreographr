@@ -1004,13 +1004,16 @@ BOUND` log), replies `Bound`, and is unlocked. There is no `/bind-key`
 command — binding is never user-triggered. Once bound, clients resolve their
 per-daemon unlock key (the stored per-daemon key, else the legacy raw
 `identity.pk` file, which is copied into the store on first use) and send it
-via `ClientMessageType::Unlock`. Unlock and `AddCredential` are strictly
-VERIFY-ONLY — they verify against the binding (`KeystoreUnbound` means
-"no binding yet"; `LockedError` means "bound but wrong key") and never create
-one — and the daemon decrypts all stored credential blobs into memory on a
-match. `AddCredential` also carries the unlock key and implicitly unlocks on
-a valid blob. Keys are recorded into `known_servers.toml` only on the
-daemon's targeted confirmation (`Unlocked` / `Bound` / `CredentialAdded`);
+via `ClientMessageType::Unlock`. Unlock is strictly VERIFY-ONLY — it verifies
+against the binding (`KeystoreUnbound` means "no binding yet"; `LockedError`
+means "bound but wrong key") and never creates one — and the daemon decrypts
+all stored credential blobs into memory on a match. `AddCredential` carries
+the credential as a TYPED plaintext value and no key at all: the daemon
+ENCRYPTS it to its own binding public key before persisting it, and the add
+REQUIRES an already-unlocked keystore (a locked daemon rejects it with
+`CredentialAddFailed` and does not change lock state — there is no implicit
+unlock). Keys are recorded into `known_servers.toml` only on the
+daemon's targeted confirmation (`Unlocked` / `Bound`);
 nothing is ever auto-deleted (`KnownServers::remove(addr)` re-pair is the
 only removal path).
 
@@ -1021,8 +1024,8 @@ use `/unlock <base64-key>`). Resetting the daemon's database invalidates its
 binding; the next connect auto-binds a fresh key.
 
 - Credentials are encrypted per-credential with ECDH (X25519) + HKDF +
-  AES-256-GCM to the daemon's keystore pubkey; the daemon refuses to persist a
-  blob it cannot test-decrypt with its bound key.
+  AES-256-GCM to the daemon's keystore pubkey; the daemon ENCRYPTS each
+  incoming `AddCredential` plaintext to its own binding before persisting it.
 - `/lock` destroys all in-memory credentials and returns the daemon to the
   locked state.
 - **Keystore status is broadcast to every client.** The daemon tracks its
