@@ -592,7 +592,19 @@ pub(crate) fn handle_daemon_message(
                     error_len = error.len(),
                     "model selector: failed to list models"
                 );
-                app.model_selector.apply_error(error.clone());
+                // A fresh account has no cached list yet: the daemon starts a
+                // background fetch and says so. Ask again shortly rather than
+                // showing that as a failure.
+                if choreo_proto::is_models_warming_error(error) {
+                    if app.model_selector.schedule_warming_retry(error.clone()) {
+                        tracing::debug!(
+                            retries = app.model_selector.retries,
+                            "model selector: list still warming, retry scheduled"
+                        );
+                    }
+                } else {
+                    app.model_selector.apply_error(error.clone());
+                }
                 return Ok(());
             }
             // Not our reply: fall through to the generic error handling.

@@ -8,6 +8,7 @@
 use super::{InputBuffer, ProviderInfo};
 use choreo_proto::AccountInfo;
 use crossterm::event::KeyEvent;
+use std::time::{Duration, Instant};
 use tui_prompts::{State, TextState};
 use zeroize::Zeroize;
 
@@ -778,7 +779,25 @@ pub(crate) struct ModelSelectorState {
     pub(crate) viewport_height: usize,
     /// Popup-scoped error text (e.g. the daemon failed to list models).
     pub(crate) error: Option<String>,
+    /// Fires when the list should be requested again: armed while the daemon
+    /// reports the account's list as still warming (a fresh account's first
+    /// fetch runs in the background). A `crossbeam_channel::after` timer, so
+    /// the UI loop waits on it like any other event instead of polling.
+    pub(crate) retry_timer: Option<crossbeam_channel::Receiver<Instant>>,
+    /// Warming retries spent since the popup opened, capped at
+    /// [`MODEL_LIST_MAX_RETRIES`] so a fetch that never lands ends in the
+    /// daemon's own message instead of a spinner that never stops.
+    pub(crate) retries: u32,
 }
+
+/// Delay between model-list requests while the daemon's background fetch is
+/// still running. A provider's model endpoint usually answers in well under
+/// a second.
+pub(crate) const MODEL_LIST_RETRY_DELAY: Duration = Duration::from_millis(750);
+
+/// Most warming retries per popup opening (about 15 s in total) — longer
+/// than the daemon's own fetch takes to succeed or fall back.
+pub(crate) const MODEL_LIST_MAX_RETRIES: u32 = 20;
 
 impl ModelSelectorState {
     pub(crate) fn new() -> Self {
@@ -792,11 +811,35 @@ impl ModelSelectorState {
             scroll: 0,
             viewport_height: 0,
             error: None,
+            retry_timer: None,
+            retries: 0,
         }
     }
 
     pub(crate) fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Handle a `ModelsFailed` reply that says the list is still warming:
+    /// keep showing "loading" and arm the retry timer, or — once the retry
+    /// budget is spent — show the error like any other failure. Returns
+    /// whether a retry was scheduled.
+    pub(crate) fn schedule_warming_retry(&mut self, error: impl Into<String>) -> bool {
+        if !self.open || self.retries >= MODEL_LIST_MAX_RETRIES {
+            self.apply_error(error);
+            return false;
+        }
+        self.retries += 1;
+        self.loading = true;
+        self.error = None;
+        self.retry_timer = Some(crossbeam_channel::after(MODEL_LIST_RETRY_DELAY));
+        true
+    }
+
+    /// Take the fired retry timer. Returns whether the list should be
+    /// requested again — only while the popup is still open.
+    pub(crate) fn take_retry(&mut self) -> bool {
+        self.retry_timer.take().is_some() && self.open
     }
 
     /// Open the selector and request a fresh model list.
@@ -808,6 +851,8 @@ impl ModelSelectorState {
         self.open = true;
         self.loading = true;
         self.error = None;
+        self.retry_timer = None;
+        self.retries = 0;
         self.filter.clear();
         self.focused = 0;
         self.scroll = 0;
@@ -819,6 +864,7 @@ impl ModelSelectorState {
         self.open = false;
         self.loading = false;
         self.error = None;
+        self.retry_timer = None;
     }
 
     /// Populate the model list from a `Models` reply and preselect the

@@ -428,7 +428,8 @@ itself off as you go, and names the keys for each step:
    yet: once the daemon confirms the key, the TUI selects the account and
    opens the model picker. Otherwise select an account on the `Alt+A` page and
    press Enter, or run `/account <name>`.
-3. **Choose a model** — `Alt+M` (opened for you after step 2).
+3. **Choose a model** — `Alt+M` (opened for you after step 2). The list fills
+   in on its own while the daemon fetches it for a new account.
 
 Then type a message and press Enter. Accounts can also be configured by hand in
 `~/.config/choreographr/accounts.toml` (see [Configuration](#configuration)),

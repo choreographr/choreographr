@@ -606,3 +606,41 @@ impl DaemonMessageType {
         }
     }
 }
+
+/// The fixed tail of a [`DaemonMessageType::ModelsFailed`] error that means
+/// "nothing is cached yet, a background fetch is running — ask again
+/// shortly", as opposed to a real failure. Shared so the daemon that writes
+/// the message and the clients that retry on it cannot drift apart.
+const MODELS_WARMING_SUFFIX: &str = "is warming in the background; retry in a moment";
+
+/// The [`DaemonMessageType::ModelsFailed`] error for an account whose model
+/// list is still being fetched in the background.
+#[must_use]
+pub fn models_warming_error(account: &str) -> String {
+    format!("model list for account '{account}' {MODELS_WARMING_SUFFIX}")
+}
+
+/// Whether a [`DaemonMessageType::ModelsFailed`] error is the transient
+/// "still warming" case built by [`models_warming_error`], which a client
+/// should retry rather than show as a failure.
+#[must_use]
+pub fn is_models_warming_error(error: &str) -> bool {
+    error.ends_with(MODELS_WARMING_SUFFIX)
+}
+
+#[cfg(test)]
+mod warming_tests {
+    use super::{is_models_warming_error, models_warming_error};
+
+    #[test]
+    fn warming_error_round_trips() {
+        assert!(is_models_warming_error(&models_warming_error("anthropic")));
+    }
+
+    #[test]
+    fn other_errors_are_not_warming() {
+        assert!(!is_models_warming_error(
+            "no credential stored for account 'anthropic'"
+        ));
+    }
+}
