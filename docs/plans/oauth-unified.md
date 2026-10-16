@@ -776,7 +776,8 @@ store is shared.
 | `choreo-ai-protocols` | credential-derived `ProviderAuth` (bearer + extra headers), generalizing the header seam; OAuth provider parameter table; **provider client-identity table (registered / borrowed / delegate) + the borrowed-id opt-in flag (§7.1)**. |
 | `choreo-daemon` | `handle_save_credential` rewritten (§5); `ResolveAccountCmd` carries `ProviderAuth`; `api_key_for` → auth accessor; `OAuthRefreshLocks`; provider refresh loop + rotation persistence (§6/§7); `CredentialBackend` impl + `DaemonCommand::OAuth*` for MCP; **target-scoped MCP credential keys (`mcp:<slug>\|<target-hash>`) + trust-gated login (§8.1)**; `oauth` catalog auth-kind; `AccountManager`/`drop_session_clients` extended. |
 | `choreo-mcp` | enable `rmcp` `auth`; `AuthorizationManager`/`AuthClient` wiring; `oauth` config (expanded only for a trusted tier); `CredentialStore` adapter (strips access token, resolves the target-scoped key); `needs_auth` state. |
-| `choreo-proto` | changed `AddCredential`; one `InferenceError` variant + re-login `DaemonMessage`; MCP auth state in `McpStatus`; `mcp login/logout` messages; version bump at release. |
+| `choreo-proto` | changed `AddCredential`; one `InferenceError` variant + re-login `DaemonMessage`; MCP auth state in `McpStatus`; `mcp login/logout` messages; wrap the `encode_inner` frame in `Zeroizing` (§18); version bump at release. |
+| `choreo-transport` | hold the `Zeroizing` plaintext frame until after Noise encryption so it is wiped on drop (§18). |
 | `choreo-tui` / `choreo-cli` | login surfaces (TUI/CLI); GUI/IM are **compile stubs** only. |
 | docs | `ARCHITECTURE.md`: replace the deferred-providers note and document the key model (no private key at rest, daemon-as-writer, binding, access-token-in-memory). `README.md`: OAuth feature row. |
 
@@ -786,9 +787,10 @@ Each phase is independently shippable, lands with tests + docs, and keeps
 `just pre-commit` green. **Provider OAuth (ChatGPT/Codex) ships first; MCP second.**
 
 1. **Keystore foundation.** OAuth variant; `AddCredential` change (§5); daemon as
-   sole blob writer; `OAuthRefreshLocks`. Unit tests. No network. *(The
-   `AddCredential` change and the daemon-as-writer half of this have **landed**;
-   the `OAuth` variant and `OAuthRefreshLocks` remain.)*
+   sole blob writer; `OAuthRefreshLocks`; the transport frame zeroization (§18). Unit
+   tests. No network. *(The `AddCredential` change and the daemon-as-writer half have
+   **landed**; the `OAuth` variant, `OAuthRefreshLocks`, and the frame zeroization
+   remain.)*
 2. **Provider layer.** Credential-derived bearer + extra headers; `oauth` catalog
    auth-kind; `ResolveAccountCmd` carries `ProviderAuth`.
 3. **Provider interactive login (PKCE).** `choreo-client-core` login library;
@@ -954,14 +956,11 @@ headers; store them as provider-table data:
 - **Login-library dependencies:** `tiny_http` (loopback callback server, promoted to
   workspace deps), `webbrowser` (browser opener), `sha2` (PKCE S256, already a
   workspace dep). No id_token signature verification.
-
-### Open item (security)
-
-- **Transport frame zeroization.** With the typed `AddCredential` (landed), the
-  credential struct zeroizes on drop, but `choreo-proto`'s `encode_inner` still builds
-  a **plaintext `Vec<u8>` rmp frame** that is not wiped — as it also was for the old
-  `unlock_key` copy. Decide whether the send path / transport wipes the encoded frame
-  (and how), or accepts the residual. **Undecided.**
+- **Transport frame zeroization: wipe it.** Wrap the encoded frame in
+  `zeroize::Zeroizing` — `choreo-proto`'s `encode_inner` (and thus `encode_payload` /
+  `encode_frame`) returns `Zeroizing<Vec<u8>>`, and `choreo-transport` holds it until
+  after Noise encrypts the frame, so the plaintext bytes are wiped on drop. This also
+  covers the pre-existing `unlock_key` copy and every other plaintext frame.
 
 ### Open design questions
 
