@@ -1344,7 +1344,7 @@ mod unsent_draft_tests {
         let mut app = test_app();
         let (tx, _rx) = crossbeam_channel::unbounded();
 
-        // The default list starts from PROVIDER_OPTIONS (208 entries); park
+        // The default list starts from PROVIDER_OPTIONS (209 entries); park
         // the wizard highlight deep in the list.
         let default_len = app.providers.len();
         assert!(default_len > 10, "default provider list is large");
@@ -1404,7 +1404,7 @@ mod unsent_draft_tests {
         .expect("handle CatalogUpdated");
 
         assert_eq!(app.status.as_deref(), Some("busy"), "status preserved");
-        assert_eq!(app.providers.len(), 208);
+        assert_eq!(app.providers.len(), 209);
     }
 
     #[test]
@@ -1500,7 +1500,7 @@ mod unsent_draft_tests {
     #[test]
     fn catalog_refresh_clamps_wizard_highlight() {
         let mut app = test_app();
-        // Open the wizard and park the highlight deep in the (208-entry)
+        // Open the wizard and park the highlight deep in the (209-entry)
         // list.
         app.ai_providers.wizard.open();
         app.ai_providers.wizard.focused = app.providers.len() - 1;

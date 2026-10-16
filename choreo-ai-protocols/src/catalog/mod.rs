@@ -1005,4 +1005,91 @@ mod tests {
         );
         assert_eq!(descriptor.client_id.as_deref(), Some("acme-public-client"));
     }
+
+    #[test]
+    fn chatgpt_overlay_entry_is_the_oauth_provider() {
+        // The bundled overlay's `chatgpt` entry is the first real OAuth
+        // provider: its `oauth` block parses into an `OAuthProfile` (issuer,
+        // paths, scopes, ports, per-endpoint encodings, device-code paths), the
+        // derived auth kind flips to OAuth, and its curated model list — the
+        // ChatGPT backend has no `/models` endpoint — is non-empty.
+        let entry = lookup_provider("chatgpt").expect("chatgpt is in the bundled catalog");
+        assert_eq!(entry.base_url, "https://chatgpt.com/backend-api/codex");
+        let oauth = entry
+            .oauth
+            .as_ref()
+            .expect("chatgpt carries an oauth profile");
+        assert_eq!(oauth.issuer, "https://auth.openai.com");
+        assert_eq!(oauth.authorize_path, "/oauth/authorize");
+        assert_eq!(oauth.token_path, "/oauth/token");
+        assert_eq!(
+            oauth.scopes,
+            [
+                "openid",
+                "profile",
+                "email",
+                "offline_access",
+                "api.connectors.read",
+                "api.connectors.invoke",
+            ]
+        );
+        assert_eq!(oauth.redirect_ports, [1455, 1457]);
+        assert_eq!(oauth.code_exchange_encoding, GrantEncoding::Form);
+        assert_eq!(oauth.refresh_encoding, GrantEncoding::Json);
+        assert!(oauth.device_code);
+        assert_eq!(
+            oauth.device_authorization_path.as_deref(),
+            Some("/deviceauth/usercode")
+        );
+        assert_eq!(
+            oauth.device_token_path.as_deref(),
+            Some("/deviceauth/token")
+        );
+        // The borrowed vendor id lives in the compiled identity table, never in
+        // the overlay — a profile `client_id` is for a registered client.
+        assert!(oauth.client_id.is_none());
+        assert_eq!(entry.auth_kind(), AuthKind::OAuth);
+        assert!(
+            !entry.models.is_empty(),
+            "chatgpt's curated model list is its only model source"
+        );
+    }
+
+    #[test]
+    fn chatgpt_descriptor_withholds_the_borrowed_id_by_default() {
+        // `ListOAuthProviders` assembles the chatgpt descriptor from the
+        // overlay profile paired with the compiled `Borrowed` identity: the
+        // vendor client id is released only under the per-install opt-in.
+        let entry = lookup_provider("chatgpt").expect("chatgpt");
+        let withheld = assemble_oauth_descriptor(&entry, false).expect("descriptor");
+        assert_eq!(withheld.provider, "chatgpt");
+        assert_eq!(
+            withheld.client_identity,
+            choreo_proto::OAuthClientIdentity::Borrowed
+        );
+        assert!(withheld.client_id.is_none(), "borrowed id must be withheld");
+        assert!(withheld.device_code);
+        assert_eq!(withheld.redirect_ports, vec![1455, 1457]);
+
+        let released = assemble_oauth_descriptor(&entry, true).expect("descriptor");
+        assert_eq!(
+            released.client_id.as_deref(),
+            Some("app_EMoamEEZ73f0CkXaXp7hrann"),
+            "the opt-in releases the borrowed vendor id"
+        );
+    }
+
+    #[test]
+    fn oauth_provider_descriptors_include_chatgpt() {
+        // The daemon's single `ListOAuthProviders` source must serve the
+        // chatgpt descriptor end-to-end. The client_id is not asserted here:
+        // it depends on the process-wide opt-in flag, which per-environment
+        // may be set — the withholding is pinned by the explicit-parameter
+        // test above.
+        let descriptors = oauth_provider_descriptors();
+        assert!(
+            descriptors.iter().any(|d| d.provider == "chatgpt"),
+            "ListOAuthProviders must serve the chatgpt descriptor"
+        );
+    }
 }

@@ -525,6 +525,84 @@
   base_url = "https://api.bankr.bot/v1"
   default_model = "bankr-large"
 
+# ChatGPT (Codex subscription) — the first OAuth provider, and the reference
+# for the overlay `oauth` profile. It speaks the OpenAI Responses protocol at
+# the ChatGPT backend (`https://chatgpt.com/backend-api/codex/responses`); that
+# backend has no `/models` endpoint, so this curated list is the only model
+# source. The `[provider.chatgpt.oauth]` block is what makes `auth_kind()`
+# report OAuth and what the daemon serves over `ListOAuthProviders`; the
+# client-identity policy (a borrowed vendor CLI id, released only behind the
+# per-install opt-in) lives in the compiled table
+# (`choreo-ai-protocols/src/identity.rs`), so the id is deliberately NOT
+# repeated here — a profile `client_id` is for a registered client.
+#
+# Curated list — SEEDED 2026-10 and deliberately provisional: the ChatGPT
+# backend is undocumented and unversioned, so re-verify these ids and their
+# context windows against the Codex CLI at release rather than treating this
+# list as authoritative.
+[provider.chatgpt]
+  display_name = "ChatGPT (Codex subscription)"
+  base_url = "https://chatgpt.com/backend-api/codex"
+  default_model = "gpt-5.5"
+
+# Wire facts verified against the Codex CLI: issuer auth.openai.com, the
+# device-code flow under /deviceauth, a form-encoded code exchange against a
+# JSON refresh, and the loopback ports the Codex CLI's redirect allow-list
+# requires. `client_id` is intentionally omitted: `chatgpt` is a `Borrowed`
+# identity, so the daemon supplies the borrowed id only when the opt-in is on.
+[provider.chatgpt.oauth]
+  issuer = "https://auth.openai.com"
+  authorize_path = "/oauth/authorize"
+  token_path = "/oauth/token"
+  scopes = [
+    "openid",
+    "profile",
+    "email",
+    "offline_access",
+    "api.connectors.read",
+    "api.connectors.invoke",
+  ]
+  redirect_ports = [1455, 1457]
+  code_exchange_encoding = "form"
+  refresh_encoding = "json"
+  device_code = true
+  device_authorization_path = "/deviceauth/usercode"
+  device_token_path = "/deviceauth/token"
+
+[provider.chatgpt.models."gpt-5.6-sol"]
+  responses = true
+  context_window = 272000
+  reasoning_supported = true
+  reasoning_levels = ["off", "low", "medium", "high", "xhigh"]
+[provider.chatgpt.models."gpt-5.6-terra"]
+  responses = true
+  context_window = 272000
+  reasoning_supported = true
+  reasoning_levels = ["off", "low", "medium", "high", "xhigh"]
+[provider.chatgpt.models."gpt-5.6-luna"]
+  responses = true
+  context_window = 272000
+  reasoning_supported = true
+  reasoning_levels = ["off", "low", "medium", "high", "xhigh"]
+[provider.chatgpt.models."gpt-5.5"]
+  responses = true
+  context_window = 272000
+[provider.chatgpt.models."gpt-5.4"]
+  responses = true
+  context_window = 272000
+[provider.chatgpt.models."gpt-5.4-mini"]
+  responses = true
+  context_window = 400000
+[provider.chatgpt.models."gpt-5.3-codex"]
+  responses = true
+  context_window = 400000
+[provider.chatgpt.models."gpt-5.3-codex-spark"]
+  responses = true
+  context_window = 400000
+[provider.chatgpt.models."gpt-5.2"]
+  responses = true
+  context_window = 400000
+
 # Custom Anthropic-Compatible (not covered by models.dev; defined wholesale)
 [provider.custom-anthropic]
   display_name = "Custom Anthropic-Compatible"
@@ -653,36 +731,6 @@
   display_name = "oMLX"
   base_url = "http://localhost:8000/v1"
   default_model = "local-model"
-
-# OpenAI Codex subscription (not covered by models.dev; defined wholesale)
-[provider.openai-codex]
-  display_name = "OpenAI Codex subscription"
-  base_url = "https://chatgpt.com/backend-api"
-  default_model = "gpt-5.5"
-[provider.openai-codex.models."gpt-5.6-sol"]
-  context_window = 272000
-  reasoning_supported = true
-  reasoning_levels = ["off", "low", "medium", "high", "xhigh"]
-[provider.openai-codex.models."gpt-5.6-terra"]
-  context_window = 272000
-  reasoning_supported = true
-  reasoning_levels = ["off", "low", "medium", "high", "xhigh"]
-[provider.openai-codex.models."gpt-5.6-luna"]
-  context_window = 272000
-  reasoning_supported = true
-  reasoning_levels = ["off", "low", "medium", "high", "xhigh"]
-[provider.openai-codex.models."gpt-5.5"]
-  context_window = 272000
-[provider.openai-codex.models."gpt-5.4"]
-  context_window = 272000
-[provider.openai-codex.models."gpt-5.4-mini"]
-  context_window = 400000
-[provider.openai-codex.models."gpt-5.3-codex"]
-  context_window = 400000
-[provider.openai-codex.models."gpt-5.3-codex-spark"]
-  context_window = 400000
-[provider.openai-codex.models."gpt-5.2"]
-  context_window = 400000
 
 # OpenAI Compatible (not covered by models.dev; defined wholesale)
 [provider.openai_compatible]

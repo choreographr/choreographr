@@ -1,5 +1,5 @@
 //! Provider catalog data for the new-account wizard's provider picker
-//! (S4): the static default `PROVIDER_OPTIONS` table (208 entries), the
+//! (S4): the static default `PROVIDER_OPTIONS` table (209 entries), the
 //! `ProviderInfo` snapshot type, and `sort_providers` (featured providers
 //! first, then alphabetical) applied wherever a provider list enters `App`.
 
@@ -54,7 +54,7 @@ pub(crate) fn sort_providers(providers: &mut [ProviderInfo]) {
 }
 
 /// The static default provider picker list for the new-account wizard
-/// (phase 1) — 208 entries.
+/// (phase 1) — 209 entries.
 ///
 /// Generated from the merged catalog (models.dev base + bundled overlay) by
 /// `cargo run --bin catalog-gen` — regenerate and paste the printed list when
@@ -260,8 +260,10 @@ pub(crate) const PROVIDER_OPTIONS: &[(&str, &str)] = &[
     ("arcee", "Arcee AI"),
     ("atlascloud", "Atlas Cloud"),
     ("bankr", "Bankr"),
+    ("chatgpt", "ChatGPT (Codex subscription)"),
     ("custom-anthropic", "Custom Anthropic-Compatible"),
     ("custom-openai", "Custom OpenAI-Compatible"),
+    ("fal", "fal.ai"),
     ("futurmix", "FuturMix"),
     ("gitlawb-opengateway", "GitLawb OpenGateway"),
     ("iflytek", "iFlytek Spark"),
@@ -271,7 +273,6 @@ pub(crate) const PROVIDER_OPTIONS: &[(&str, &str)] = &[
     ("nous", "Nous Research"),
     ("ollama", "Ollama (Local)"),
     ("omlx", "oMLX"),
-    ("openai-codex", "OpenAI Codex subscription"),
     ("openai_compatible", "OpenAI Compatible"),
     (
         "opencode-go-anthropic-compatible",
