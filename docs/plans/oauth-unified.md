@@ -65,6 +65,7 @@ reference to this plan would go stale the moment it is removed.
 19. [Definition of done](#19-definition-of-done)
 20. [Interaction with other plans](#20-interaction-with-other-plans)
 21. [References](#21-references)
+22. [Implementation notes (session context)](#22-implementation-notes-session-context)
 
 ---
 
@@ -1024,3 +1025,103 @@ None — every design question is settled.
   `opencode/packages/opencode/src/auth/`, `jcode/OAUTH.md`,
   `codex/codex-rs/rmcp-client/src/oauth/`, `hermes-agent` (MCP OAuth + credential
   pool).
+
+## 22. Implementation notes (session context)
+
+Context a fresh implementer needs that is **not** derivable from the code alone.
+
+### Repo constraints that drove the decisions
+
+- **No new workspace crates.** Every member is published to crates.io, so the
+  credential/domain type goes into **`choreo-shared`** — the one leaf that both
+  `choreo-proto` and `choreo-keystore` already depend on — not a new crate. A
+  dependency used by ≥2 members is declared in `[workspace.dependencies]` and
+  referenced with `.workspace = true` (that is why `tiny_http` is promoted when
+  `choreo-client-core` adopts it).
+- Keep `ARCHITECTURE.md`/`README.md` in step; **the commit message is the release
+  note** (Conventional Commits; `feat`→Added, `fix`→Fixed, `perf`/`refactor`→Changed,
+  plus the deliberate `remove`/`security` types).
+- The gate is `just pre-commit` = `clippy-strict` (`--workspace`) + `doc-check` +
+  `test-all` (**`--exclude choreo-gui`**, run separately via `just test-gui`) + `fmt`
+  (last). `doc_crates` lists every crate this plan touches, so `missing_docs`/rustdoc
+  must stay clean.
+
+### `ServiceCredential` shape (the landed move)
+
+- It lives in `choreo-shared/src/credential.rs`, re-exported by `choreo-keystore`.
+  It derives `Zeroize` (`#[zeroize(drop)]`), `Clone`, `Serialize`, `Deserialize`, and
+  **`PartialEq, Eq`** — the last two are required because it is now a field of
+  `ClientMessageType`, and it carries hand-written redacting `Display` **and** `Debug`
+  impls (a `Debug` derive would print raw secrets through a `{:?}` on the message).
+- Add `OAuthKind { Provider, Mcp }` — derive `Zeroize` (a fieldless enum is handled
+  by `zeroize-derive`; otherwise `#[zeroize(skip)]` the `kind` field). Add
+  `OAuthCredentialView` + `as_oauth()` mirroring `as_x`/`as_substrate`, in the OAuth
+  slice.
+
+### Frontend layering (decided)
+
+`choreo-client-core` **is** the frontend logic crate (it already depends on
+`choreo-keystore`). The render crates (`choreo-tui`/`gui`/`im`) should treat
+`ServiceCredential` as **opaque**: the login library constructs the credential and
+returns the `ClientMessageType`, so no render crate builds one for OAuth. (The TUI's
+Polkadot import is the one pre-existing exception; not OAuth's job to change it.)
+
+### Login-library mechanics
+
+- Run the interactive flow on a **worker thread**; stream progress to the UI over a
+  channel (`AuthUrl`, `DeviceCode{code,uri}`, `Prompt`, `Progress`, `Done`, `Error`)
+  rendered in a **cancelable modal overlay**. Cancellation is a single-bit
+  `AtomicBool`/abort signal (AGENTS.md exception #1); the loopback accept polls it.
+- Loopback server: bind `127.0.0.1:1455`; on `AddrInUse` retry `1457`; use `tiny_http`
+  `recv_timeout` to poll the cancel flag (a channel cannot interrupt a blocking
+  accept — the daemon's `metrics.rs` is the reference); **400** any non-callback path
+  (favicon/preconnect); serve one fixed success page and stop once `code`+`state` are
+  captured. Opening the browser is **best-effort** (headless/SSH → print the URL /
+  device-code / paste-URL fallback).
+
+### New wire messages to define (shapes)
+
+- `ClientMessage::ListOAuthProviders` ⇄ `DaemonMessage::OAuthProviders(Vec<OAuthProviderDescriptor>)`
+  where the descriptor carries `{ provider, issuer, client_id: Option<String>,
+  scopes, redirect_ports, code_exchange_encoding, refresh_encoding,
+  client_identity: Registered|Borrowed|Delegate, device_code: bool }` — the daemon
+  **withholds** the borrowed `client_id` when the opt-in is off.
+- `McpStatus` gains: the resolved server identity, the target-scoped credential key,
+  and an auth state (`OAuth`/`BearerToken`/`NotLoggedIn`/`Reauthentication`/
+  `Unsupported`).
+- `ClientMessage::McpLogin`/`McpLogout`; one **re-login-required** `DaemonMessage`.
+- Wire changes **amend the current unreleased version's changelog in
+  `choreo-proto/src/frame.rs`** — no `PROTOCOL_VERSION` bump (that is a release-time
+  act).
+
+### MCP backend adapter
+
+`choreo-mcp` owns a `CredentialBackend` trait (`load`/`save`/`clear`/
+`acquire_refresh_guard`) that the **daemon** implements over the keystore via
+`DaemonCommand::OAuth{Load,Save,Clear}` (crossbeam send; the reply crosses the
+async↔thread boundary with `tokio::task::spawn_blocking` — **no rmcp type crosses the
+crate boundary**). The `CredentialStore` adapter maps rmcp's `StoredCredentials
+{ client_id, token_response, granted_scopes, token_received_at, issuer }` to/from
+`ServiceCredential::OAuth` and **strips the access token on `save`** (serves it from
+an in-process cache; a cold start returns no token so rmcp refreshes on connect). The
+server's `oauth` config block schema follows `mcp-modernization.md` §10.
+
+### Gotchas surfaced while landing `AddCredential`
+
+- Adding an `InferenceError` variant breaks **~116 exhaustive match sites** across
+  `choreo-daemon`/`choreo-ai-protocols`/`choreo-tui` — audit them.
+- `choreo-mcp/src/engine/convert.rs`'s `AuthRequired` hint still says OAuth is *"not
+  yet available"* — flip it to name the login path.
+- `AccountInfo` cannot distinguish api_key vs oauth (fine per §18's broadcast-only
+  decision, but the AI-providers label becomes ambiguous).
+
+### Required reading / verification
+
+- **ChatGPT flow:** `provider-oauth.md` §3 (the verified wire facts — issuer
+  `auth.openai.com`, `/oauth/authorize`, `/oauth/token`, redirect `localhost:1455` /
+  fallback `1457`, client id `app_EMoam…`, scopes, **form** code-exchange vs **JSON**
+  refresh, device-code paths) and §16 (prior art). The ChatGPT token-sharing route:
+  `/api/accounts/authorize` ⇄ `/api/accounts/oauth/token`, `client_id=dynamic_agent_client`.
+- **Live checks before shipping:** ChatGPT refresh-rotation behavior and the disputed
+  headers (`OpenAI-Beta`, `session-id`) against a real 4xx; Anthropic's current ToS.
+  Tests **never** hit real `auth.openai.com`.
