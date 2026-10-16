@@ -482,6 +482,14 @@ impl AccountWizardState {
         self.slug.focus();
     }
 
+    /// Seed the name field with a suggested account name, cursor at the end
+    /// so typing extends it and Backspace edits it.
+    pub(crate) fn prefill_slug(&mut self, suggestion: String) {
+        self.slug = TextState::default().with_value(suggestion);
+        self.slug.move_end();
+        self.slug.focus();
+    }
+
     /// Back out of step 2 (slug entry) to step 1 (provider picker), keeping
     /// the previously picked provider highlighted (re-clamped in case a
     /// catalog refresh changed the list while the slug modal was up).

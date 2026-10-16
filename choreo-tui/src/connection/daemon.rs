@@ -1,5 +1,5 @@
 use super::route_session_update;
-use crate::state::{App, Page, ProviderInfo, merge_token_usage};
+use crate::state::{App, Page, ProviderInfo, SetupFollow, merge_token_usage};
 use crate::terminal::progress;
 use choreo_client_core::{
     AutoBindAttempt, ClientError, Pending, PendingContext, attempt_keystore_auto_bind,
@@ -204,6 +204,21 @@ pub(crate) fn handle_daemon_message(
             // record it per-daemon on CONFIRMED success only (never on send).
             record_confirmed_unlock_key(app, resolved.as_ref());
             app.pending.send(client_tx, ClientMessageType::ListAccounts);
+            // First-run follow-through, first stage: the key for the account
+            // the user just set up is confirmed, and the attached session has
+            // no account yet — select it and return to the chat, so the user
+            // is not left to discover `/account <name>` on their own.
+            if app.setup_follow == Some(SetupFollow::AwaitCredential(service.clone())) {
+                tracing::info!(%service, "setup: selecting the new account for the session");
+                app.pending.send(
+                    client_tx,
+                    ClientMessageType::SetSessionAccount {
+                        name: service.clone(),
+                    },
+                );
+                app.setup_follow = Some(SetupFollow::AwaitAccountSet(service.clone()));
+                app.set_page(Page::Chat);
+            }
         }
         DaemonMessageType::CredentialRemoved { service } => {
             app.status = Some(format!("[daemon] credential removed: {service}"));
@@ -483,6 +498,16 @@ pub(crate) fn handle_daemon_message(
                     "suppressing status feedback for background session's account change",
                 );
                 return Ok(());
+            }
+            // First-run follow-through, second stage: the account picked up
+            // from a just-saved key is now on the attached session, so open
+            // the model picker — the last step before the user can chat.
+            if *session_id == app.attached_session_id
+                && app.setup_follow == Some(SetupFollow::AwaitAccountSet(account.clone()))
+            {
+                tracing::info!(%account, "setup: account selected, opening the model picker");
+                app.setup_follow = None;
+                super::command::open_model_selector(app, client_tx)?;
             }
             // Attached session (or a targeted/connection-level reply): fall
             // through so the user's own `/account` command still prints
@@ -774,6 +799,9 @@ pub(crate) fn handle_daemon_message(
         // in-flight key, leave the store alone.
         DaemonMessageType::CredentialAddFailed { .. } => {
             discard_rejected_unlock_key(app, &mut resolved);
+            // A rejected key ends the first-run follow-through: selecting an
+            // account the daemon cannot use would only add a second error.
+            app.setup_follow = None;
         }
         // Verify-only operation against a daemon whose keystore has NO
         // binding yet (either the subscribe-time lock-state push or the reply
@@ -831,6 +859,18 @@ pub(crate) fn handle_daemon_message(
             }
             KeystoreState::Locked => {
                 app.keystore_locked = true;
+                // With no stored key for this daemon there is nothing to
+                // auto-unlock with: it was bound by another client. Say how to
+                // get in rather than leaving only the lock icon. Shown as an
+                // error because the generic dispatch below overwrites the
+                // status line with the plain "keystore locked" text.
+                if choreo_client_core::try_auto_unlock_key(&app.connection_addr).is_none() {
+                    app.error = Some(
+                        "this daemon's keystore was set up by another client — run \
+                         /unlock <base64 unlock-key> with that client's unlock key"
+                            .to_string(),
+                    );
+                }
             }
             KeystoreState::Unlocked => {
                 app.keystore_locked = false;

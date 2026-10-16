@@ -295,7 +295,10 @@ fn render_wizard_slug_shows_picked_provider_and_slug_prompt() {
         content.contains("OpenAI"),
         "picked provider is shown for context"
     );
-    assert!(content.contains("Slug:"), "slug prompt is drawn");
+    assert!(
+        content.contains("Account name:"),
+        "account-name prompt is drawn"
+    );
     assert!(content.contains("create account"), "footer hint is drawn");
 }
 

@@ -455,18 +455,14 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
             .set_context(id, PendingContext::UnlockKey(private_key));
     } else {
         tracing::info!("[choreo-tui] no unlock key available — awaiting keystore status");
-        // Startup feedback while the daemon's authoritative keystore status
-        // push is in flight (sent at subscribe time, a moment after connect).
-        // A FRESH daemon (no binding) reports `Unbound` and the message handler
-        // AUTO-BINDS it with a minted key — no user action. A daemon already
-        // bound to ANOTHER client's key reports `Locked` and cannot be unlocked
-        // without that key: /unlock <base64-key> supplies it (bare /unlock has
-        // nothing stored to use).
-        app.status = Some(
-            "daemon is locked — if it is bound to another key, supply it with \
-             /unlock <base64 unlock-key> (a fresh daemon binds automatically)"
-                .to_string(),
-        );
+        // Neutral startup feedback while the daemon's authoritative keystore
+        // status push is in flight (sent at subscribe time, a moment after
+        // connect). A FRESH daemon (no binding) reports `Unbound` and the
+        // message handler AUTO-BINDS it with a minted key — no user action,
+        // so nothing here may suggest something is wrong. A daemon already
+        // bound to ANOTHER client's key reports `Locked`, and that handler
+        // explains how to supply the key.
+        app.status = Some("connecting to the daemon…".to_string());
     }
 
     app.pending

@@ -72,10 +72,20 @@ fn send_continue_generation(
 /// open must not leave a dangling gesture that swallows the first click after
 /// the selector closes.
 #[expect(clippy::unnecessary_wraps)]
-fn open_model_selector(
+pub(super) fn open_model_selector(
     app: &mut App,
     client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
+    // The model list is fetched through the session's account, so without
+    // one the daemon can only answer with a credential error naming an empty
+    // account. Say what is actually missing and how to fix it instead.
+    if app.attached_session_id.is_some() && app.attached_account_slug.is_none() {
+        tracing::debug!("[choreo-tui] model selector needs an account first");
+        app.error = Some(
+            "choose an account first — press alt+a to add one or pick one with Enter".to_string(),
+        );
+        return Ok(());
+    }
     tracing::debug!("[choreo-tui] opening model selector");
     app.text_selection = None;
     app.model_selector.open();

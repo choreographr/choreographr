@@ -417,9 +417,22 @@ and ACP adapter mirror only on a terminal.
 
 ### First conversation
 
-1. **Configure an account** in `~/.config/choreographr/accounts.toml` (see
-   [Configuration](#configuration)) and add an API key with `/add-key <service> <api_key>`.
-2. Select the account with `/account <name>` and start prompting.
+Start `choreo-tui`. An empty session shows a **welcome checklist** that ticks
+itself off as you go, and names the keys for each step:
+
+1. **Add an account** — `Alt+A`, then `n`. Pick a provider (the most common
+   ones are listed first; type to filter), keep the suggested account name or
+   type your own, and paste the API key. The key is encrypted before it leaves
+   the TUI.
+2. **Use it in this session** — automatic for a session that has no account
+   yet: once the daemon confirms the key, the TUI selects the account and
+   opens the model picker. Otherwise select an account on the `Alt+A` page and
+   press Enter, or run `/account <name>`.
+3. **Choose a model** — `Alt+M` (opened for you after step 2).
+
+Then type a message and press Enter. Accounts can also be configured by hand in
+`~/.config/choreographr/accounts.toml` (see [Configuration](#configuration)),
+with a key added via `/add-key <service> <api_key>`.
 
 ```
 ┌──────────────┐   Unix socket /     ┌──────────────┐   HTTP/SSE     ┌────────────────────┐

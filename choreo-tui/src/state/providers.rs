@@ -1,7 +1,7 @@
 //! Provider catalog data for the new-account wizard's provider picker
 //! (S4): the static default `PROVIDER_OPTIONS` table (208 entries), the
-//! `ProviderInfo` snapshot type, and the alphabetical `sort_providers`
-//! applied wherever a provider list enters `App`.
+//! `ProviderInfo` snapshot type, and `sort_providers` (featured providers
+//! first, then alphabetical) applied wherever a provider list enters `App`.
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProviderInfo {
@@ -9,10 +9,28 @@ pub(crate) struct ProviderInfo {
     pub(crate) display_name: String,
 }
 
-/// Sort a provider list for the new-account wizard's picker (step 1):
-/// alphabetical by display name. The picker shows display names only (the
+/// Providers pinned to the top of the new-account picker, in this order.
+/// These are the ones most people arrive with a key for; listing them first
+/// means a first-time user sees a familiar name on the opening screen instead
+/// of a page of aggregators that happen to sort early. Slugs absent from the
+/// live catalog are simply skipped.
+pub(crate) const FEATURED_PROVIDERS: &[&str] = &[
+    "anthropic",
+    "openai",
+    "google",
+    "openrouter",
+    "xai",
+    "deepseek",
+    "mistral",
+    "groq",
+    "ollama",
+];
+
+/// Sort a provider list for the new-account wizard's picker (step 1): the
+/// [`FEATURED_PROVIDERS`] first, in their listed order, then everything else
+/// alphabetically by display name. The picker shows display names only (the
 /// canonical slug is deliberately hidden — it is easily confused with the
-/// account slug entered in step 2), so display-name order is what the user
+/// account name entered in step 2), so display-name order is what the user
 /// perceives. Case-insensitive so mixed-case names ("abliteration.ai",
 /// "Alibaba Coding Plan", "NEAR AI Cloud") sit next to their letter peers
 /// instead of being split by ASCII case. Applied wherever a provider list
@@ -20,11 +38,19 @@ pub(crate) struct ProviderInfo {
 /// `CatalogUpdated`), because the catalog itself is deliberately ordered by
 /// provenance, not alphabetically.
 pub(crate) fn sort_providers(providers: &mut [ProviderInfo]) {
-    // `sort_by_cached_key` lowercases each display name once (O(n) allocations)
-    // instead of per comparison (O(n log n)).  The list is re-sorted at
-    // `App::new` and on every `CatalogUpdated`, so the one-time key cache is
-    // the cheaper path at both call sites.  Stable, like `sort_by`.
-    providers.sort_by_cached_key(|p| p.display_name.to_lowercase());
+    // `sort_by_cached_key` computes each key once (O(n) allocations) instead
+    // of per comparison (O(n log n)).  The list is re-sorted at `App::new`
+    // and on every `CatalogUpdated`, so the one-time key cache is the cheaper
+    // path at both call sites.  Stable, like `sort_by`.  Non-featured entries
+    // share the rank `FEATURED_PROVIDERS.len()`, so they fall back to the
+    // name order among themselves.
+    providers.sort_by_cached_key(|p| {
+        let rank = FEATURED_PROVIDERS
+            .iter()
+            .position(|f| *f == p.slug)
+            .unwrap_or(FEATURED_PROVIDERS.len());
+        (rank, p.display_name.to_lowercase())
+    });
 }
 
 /// The static default provider picker list for the new-account wizard

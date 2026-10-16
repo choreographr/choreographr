@@ -33,11 +33,13 @@ mod ai_providers;
 mod command_palette;
 mod model_selector;
 mod session_manager;
+mod welcome;
 
 use self::ai_providers::render_ai_providers;
 use self::command_palette::render_command_palette;
 use self::model_selector::render_model_selector;
 use self::session_manager::render_session_manager;
+use self::welcome::render_welcome;
 
 pub(crate) const BG_SHADE: Color = Color::Rgb(53, 53, 53);
 
@@ -266,7 +268,13 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
     // Layout::horizontal([Min(1), Length(1)]) always yields exactly 2 chunks;
     // a zero-area fallback rect is harmless to render into.
     let history_area = history_chunks.first().copied().unwrap_or_default();
-    render_history(frame, history_area, app);
+    // An empty session shows the setup checklist instead of a blank pane, so
+    // a first-time user is told what to do before their first message.
+    if app.show_welcome() {
+        render_welcome(frame, history_area, app);
+    } else {
+        render_history(frame, history_area, app);
+    }
 
     // ── Scrollbar ────────────────────────────────────────────
     let viewport_height = app.history_viewport.height as usize;

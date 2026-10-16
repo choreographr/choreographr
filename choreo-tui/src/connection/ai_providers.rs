@@ -230,6 +230,10 @@ pub(super) fn handle_credential_modal_event(
                     // daemon's confirmation (`CredentialAdded`/`Unlocked`)
                     // records it per-daemon.
                     tracing::info!(account_name, "credential encrypted and sent");
+                    // On a session with no account yet, carry the user on to
+                    // selecting this account and a model once the daemon
+                    // confirms the key (see `SetupFollow`).
+                    app.arm_setup_follow(&account_name);
                     let id = app.pending.send(client_tx, msg);
                     app.pending.set_context(id, PendingContext::UnlockKey(key));
                     app.status = Some(format!(
@@ -441,10 +445,7 @@ pub(super) fn handle_account_wizard_event(
                     // Enter picks the highlighted provider and advances to the slug
                     // modal (a no-op when the filtered list is empty).
                     if key.code == KeyCode::Enter {
-                        app.ai_providers.wizard.confirm_provider(&app.providers);
-                        if let Some(slug) = app.ai_providers.wizard.picked_slug.as_deref() {
-                            tracing::debug!(slug, "provider picked in account wizard");
-                        }
+                        app.confirm_wizard_provider();
                         return Ok(());
                     }
                     match key.code {
@@ -481,13 +482,13 @@ pub(super) fn handle_account_wizard_event(
                         if slug.is_empty() {
                             tracing::debug!("slug rejected: empty");
                             app.ai_providers.wizard.error =
-                                Some("Account slug is required".to_string());
+                                Some("Account name is required".to_string());
                             return Ok(());
                         }
                         if !is_valid_account_name(&slug) {
                             tracing::debug!(%slug, "slug rejected: invalid characters");
                             app.ai_providers.wizard.error = Some(
-                                "slug must be lowercase alphanumeric, hyphens, or underscores"
+                                "account name must be lowercase letters, digits, hyphens, or underscores"
                                     .to_string(),
                             );
                             return Ok(());
@@ -547,10 +548,7 @@ pub(super) fn handle_account_wizard_event(
                         // Click in the list body: move the highlight to
                         // the clicked row and pick it, exactly like Enter.
                         app.ai_providers.wizard.focused = idx;
-                        app.ai_providers.wizard.confirm_provider(&app.providers);
-                        if let Some(slug) = app.ai_providers.wizard.picked_slug.as_deref() {
-                            tracing::debug!(slug, "provider picked in account wizard");
-                        }
+                        app.confirm_wizard_provider();
                     }
                 }
                 _ => {}
