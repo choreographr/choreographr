@@ -330,6 +330,38 @@ fn advance_to_slug_phase(
         tx,
     )
     .expect("enter selects provider");
+    // The name step opens pre-filled with a suggestion; clear it so each test
+    // types its own name from an empty field.
+    app.ai_providers.wizard.prefill_slug(String::new());
+}
+
+#[test]
+fn ai_providers_new_account_name_is_prefilled_from_the_provider() {
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    setup_providers_new_account(&mut app);
+    app.ai_providers.wizard.focused = app
+        .providers
+        .iter()
+        .position(|p| p.slug == "openai")
+        .expect("openai in options");
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("enter selects provider");
+
+    assert_eq!(app.ai_providers.wizard.step, AccountWizardStep::Slug);
+    assert_eq!(app.ai_providers.wizard.slug.value(), "openai");
+    // Typing extends the suggestion (the cursor sits at its end).
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("char 2 on name");
+    assert_eq!(app.ai_providers.wizard.slug.value(), "openai2");
 }
 
 // fn-level #[allow]: clippy's assert_is_empty rewrite is worse than the
@@ -675,7 +707,7 @@ fn ai_providers_new_account_slug_validation_empty() {
     );
     assert_eq!(
         app.ai_providers.wizard.error.as_deref(),
-        Some("Account slug is required"),
+        Some("Account name is required"),
     );
 }
 
@@ -706,7 +738,7 @@ fn ai_providers_new_account_slug_validation_invalid() {
     );
     assert_eq!(
         app.ai_providers.wizard.error.as_deref(),
-        Some("slug must be lowercase alphanumeric, hyphens, or underscores"),
+        Some("account name must be lowercase letters, digits, hyphens, or underscores"),
     );
 }
 

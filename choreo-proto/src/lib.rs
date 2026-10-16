@@ -24,7 +24,7 @@ pub use types::{
     DisplayedImageRecord, ImageKey, ImageMetadata, ImageReference, InferenceError, KeystoreState,
     McpServerStatus, MessageKind, OutputStream, ReasoningArtifact, ReasoningCapability,
     ReasoningProducer, RefreshStatus, SessionEvent, SessionStatus, SessionSummary, TimestampMs,
-    TokenUsage, ToolResultRecord, Turn,
+    TokenUsage, ToolResultRecord, Turn, is_models_warming_error, models_warming_error,
 };
 
 #[cfg(test)]

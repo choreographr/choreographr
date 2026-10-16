@@ -1,5 +1,5 @@
 use super::route_session_update;
-use crate::state::{App, Page, ProviderInfo, merge_token_usage};
+use crate::state::{App, Page, ProviderInfo, SetupFollow, merge_token_usage};
 use crate::terminal::progress;
 use choreo_client_core::{
     AutoBindAttempt, ClientError, Pending, PendingContext, attempt_keystore_auto_bind,
@@ -144,6 +144,12 @@ pub(crate) fn handle_daemon_message(
             ..
         } => {
             app.error = Some(format!("[daemon] {operation} failed: {error}"));
+            // A rejected account selection ends the first-run follow-through:
+            // the model picker will never open, and leaving the chain armed
+            // would only mis-fire on a later, unrelated `SessionAccountSet`.
+            if operation == "set_account" {
+                app.setup_follow = None;
+            }
             // If we're on the Session Manager page, also show the error
             // right on that page so the user has immediate feedback — for the
             // create flow and for the pin/archive flow (both of which are
@@ -204,6 +210,21 @@ pub(crate) fn handle_daemon_message(
             // per-daemon here; refresh the account list so the page reflects
             // the new credential's `has_credential` state.
             app.pending.send(client_tx, ClientMessageType::ListAccounts);
+            // First-run follow-through, first stage: the key for the account
+            // the user just set up is confirmed, and the attached session has
+            // no account yet — select it and return to the chat, so the user
+            // is not left to discover `/account <name>` on their own.
+            if app.setup_follow == Some(SetupFollow::AwaitCredential(service.clone())) {
+                tracing::info!(%service, "setup: selecting the new account for the session");
+                app.pending.send(
+                    client_tx,
+                    ClientMessageType::SetSessionAccount {
+                        name: service.clone(),
+                    },
+                );
+                app.setup_follow = Some(SetupFollow::AwaitAccountSet(service.clone()));
+                app.set_page(Page::Chat);
+            }
         }
         DaemonMessageType::CredentialRemoved { service } => {
             app.status = Some(format!("[daemon] credential removed: {service}"));
@@ -484,6 +505,16 @@ pub(crate) fn handle_daemon_message(
                 );
                 return Ok(());
             }
+            // First-run follow-through, second stage: the account picked up
+            // from a just-saved key is now on the attached session, so open
+            // the model picker — the last step before the user can chat.
+            if *session_id == app.attached_session_id
+                && app.setup_follow == Some(SetupFollow::AwaitAccountSet(account.clone()))
+            {
+                tracing::info!(%account, "setup: account selected, opening the model picker");
+                app.setup_follow = None;
+                super::command::open_model_selector(app, client_tx)?;
+            }
             // Attached session (or a targeted/connection-level reply): fall
             // through so the user's own `/account` command still prints
             // its confirmation to the status line.
@@ -567,7 +598,19 @@ pub(crate) fn handle_daemon_message(
                     error_len = error.len(),
                     "model selector: failed to list models"
                 );
-                app.model_selector.apply_error(error.clone());
+                // A fresh account has no cached list yet: the daemon starts a
+                // background fetch and says so. Ask again shortly rather than
+                // showing that as a failure.
+                if choreo_proto::is_models_warming_error(error) {
+                    if app.model_selector.schedule_warming_retry(error.clone()) {
+                        tracing::debug!(
+                            retries = app.model_selector.retries,
+                            "model selector: list still warming, retry scheduled"
+                        );
+                    }
+                } else {
+                    app.model_selector.apply_error(error.clone());
+                }
                 return Ok(());
             }
             // Not our reply: fall through to the generic error handling.
@@ -774,6 +817,9 @@ pub(crate) fn handle_daemon_message(
         // in-flight key, leave the store alone.
         DaemonMessageType::CredentialAddFailed { .. } => {
             discard_rejected_unlock_key(app, &mut resolved);
+            // A rejected key ends the first-run follow-through: selecting an
+            // account the daemon cannot use would only add a second error.
+            app.setup_follow = None;
         }
         // Verify-only operation against a daemon whose keystore has NO
         // binding yet (either the subscribe-time lock-state push or the reply
@@ -831,6 +877,18 @@ pub(crate) fn handle_daemon_message(
             }
             KeystoreState::Locked => {
                 app.keystore_locked = true;
+                // With no stored key for this daemon there is nothing to
+                // auto-unlock with: it was bound by another client. Say how to
+                // get in rather than leaving only the lock icon. Shown as an
+                // error because the generic dispatch below overwrites the
+                // status line with the plain "keystore locked" text.
+                if choreo_client_core::try_auto_unlock_key(&app.connection_addr).is_none() {
+                    app.error = Some(
+                        "this daemon's keystore was set up by another client — run \
+                         /unlock <base64 unlock-key> with that client's unlock key"
+                            .to_string(),
+                    );
+                }
             }
             KeystoreState::Unlocked => {
                 app.keystore_locked = false;

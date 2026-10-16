@@ -1,7 +1,7 @@
 //! `ModelSelectorState`: open/close, filtering, focus movement, windowing,
 //! submit, and key handling.
 
-use crate::state::ModelSelectorState;
+use crate::state::{MODEL_LIST_MAX_RETRIES, ModelSelectorState};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 // ── ModelSelectorState ──
@@ -213,4 +213,53 @@ fn model_selector_apply_error_records_and_clears_loading() {
     sel.apply_error("no credential".to_string());
     assert!(!sel.loading);
     assert_eq!(sel.error.as_deref(), Some("no credential"));
+}
+
+#[test]
+fn warming_retries_stop_at_the_budget() {
+    let mut selector = ModelSelectorState::new();
+    selector.open();
+    for _ in 0..MODEL_LIST_MAX_RETRIES {
+        assert!(selector.schedule_warming_retry("warming"));
+        assert!(selector.take_retry());
+    }
+    // Budget spent: the daemon's message is shown and nothing is re-armed.
+    assert!(!selector.schedule_warming_retry("warming"));
+    assert_eq!(selector.error.as_deref(), Some("warming"));
+    assert!(selector.retry_timer.is_none());
+}
+
+#[test]
+fn a_closed_selector_does_not_retry() {
+    let mut selector = ModelSelectorState::new();
+    selector.open();
+    assert!(selector.schedule_warming_retry("warming"));
+    selector.close();
+    assert!(!selector.take_retry());
+}
+
+#[test]
+fn a_landed_list_disarms_an_armed_warming_retry() {
+    let mut selector = ModelSelectorState::new();
+    selector.open();
+    assert!(selector.schedule_warming_retry("warming"));
+
+    // A `Models` reply that raced the timer must cancel it: otherwise the UI
+    // loop fires one redundant `ListModels` after the list already landed.
+    selector.apply_models(vec!["m".to_string()], None);
+    assert!(selector.retry_timer.is_none());
+    assert!(!selector.take_retry());
+}
+
+#[test]
+fn a_terminal_error_disarms_an_armed_warming_retry() {
+    let mut selector = ModelSelectorState::new();
+    selector.open();
+    assert!(selector.schedule_warming_retry("warming"));
+
+    // A real failure replaces the warming state, so the retry must stop.
+    selector.apply_error("no credential");
+    assert_eq!(selector.error.as_deref(), Some("no credential"));
+    assert!(selector.retry_timer.is_none());
+    assert!(!selector.take_retry());
 }

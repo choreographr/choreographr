@@ -3421,12 +3421,7 @@ fn handle_list_models_inner(
                 .get(&account_name)
                 .map(|(models, _)| models.clone());
             state.maybe_spawn_model_prefetch(&account_name);
-            stale.ok_or_else(|| {
-                format!(
-                    "model list for account '{account_name}' is warming in the \
-                     background; retry in a moment"
-                )
-            })?
+            stale.ok_or_else(|| choreo_proto::models_warming_error(&account_name))?
         }
     };
 

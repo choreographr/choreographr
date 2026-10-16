@@ -76,7 +76,9 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
     let total_items = app.ai_providers.accounts.len();
 
     if total_items == 0 {
-        let msg = Paragraph::new("No AI provider accounts configured. Press 'n' to add one.");
+        let msg = Paragraph::new(
+            "No AI provider accounts yet. Press 'n' to add one — you will need an API key from your provider.",
+        );
         frame.render_widget(msg, list_inner);
     } else {
         let mut lines: Vec<Line> = Vec::new();
@@ -155,7 +157,7 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
         Paragraph::new(Line::from(format!(" Remove \"{name}\"? (y/N)  ")))
     } else {
         Paragraph::new(Line::from(format!(
-            " <j/k nav>  <r remove>  <c credential>  <n new>  <Esc back>  —  {total_items} accounts"
+            " <j/k nav>  <Enter use>  <n new>  <c set key>  <r remove>  <Esc back>  —  {total_items} accounts"
         )))
     };
     frame.render_widget(status, status_area);
@@ -222,7 +224,7 @@ fn render_credential_modal(frame: &mut Frame<'_>, app: &mut App) {
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "  Paste the API key for this account:",
+            "  Paste the API key (encrypted before it is sent):",
             dim,
         ))),
         prompt_row,
@@ -445,14 +447,14 @@ fn render_wizard_slug(frame: &mut Frame<'_>, app: &mut App) {
     let lines: Vec<Line> = vec![
         Line::from(Span::styled(format!("  Provider: {provider_name}"), accent)),
         Line::from(Span::styled(
-            "  Slug is the account name, e.g. /account <slug>.",
+            "  Name this account — keep the suggestion or type your own.",
             dim,
         )),
     ];
     frame.render_widget(Paragraph::new(lines), header_row);
 
     let border_style = Style::default().fg(Color::Cyan);
-    let slug_prompt = TextPrompt::new(std::borrow::Cow::Borrowed("Slug:"))
+    let slug_prompt = TextPrompt::new(std::borrow::Cow::Borrowed("Account name:"))
         .with_block(Block::bordered().border_style(border_style));
     (&slug_prompt).draw(frame, slug_row, &mut app.ai_providers.wizard.slug);
 

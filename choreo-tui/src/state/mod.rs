@@ -26,6 +26,7 @@ mod images;
 mod input;
 mod keymap;
 mod layout;
+mod onboarding;
 mod pages;
 mod pin;
 mod providers;
@@ -46,6 +47,7 @@ pub(crate) use images::{
 pub(crate) use input::*;
 pub(crate) use keymap::*;
 pub(crate) use layout::*;
+pub(crate) use onboarding::*;
 pub(crate) use pages::*;
 pub(crate) use pin::*;
 pub(crate) use providers::*;
@@ -318,6 +320,11 @@ pub(crate) struct App {
     /// the socket path so tests (which bypass `run_app`) still have a valid
     /// value.
     pub(crate) connection_addr: String,
+    /// First-run follow-through in flight: the account whose API key was just
+    /// saved, to be selected for the attached session once the daemon
+    /// confirms the key, and then the model picker opened once the selection
+    /// lands. `None` outside that chain (see [`SetupFollow`]).
+    pub(crate) setup_follow: Option<SetupFollow>,
 }
 
 pub(crate) enum UiEvent {
@@ -370,8 +377,9 @@ impl App {
             model_selector: ModelSelectorState::new(),
             command_palette: CommandPaletteState::new(),
             // Start from the static default; the daemon's CatalogUpdated
-            // broadcast replaces it with the live list.  The picker must be
-            // alphabetical, so sort the default here too (see `sort_providers`
+            // broadcast replaces it with the live list.  The picker has a
+            // fixed order (featured, then alphabetical), so sort the default
+            // here too (see `sort_providers`
             // and `set_providers`).
             providers: {
                 let mut providers: Vec<ProviderInfo> = PROVIDER_OPTIONS
@@ -397,6 +405,7 @@ impl App {
             session_displays: HashMap::new(),
             active_session_id: None,
             connection_addr: socket_path(),
+            setup_follow: None,
         }
     }
 
@@ -417,7 +426,8 @@ impl App {
     /// actually changed (identical payloads — e.g. the send-on-subscribe
     /// welcome — do not churn the status line).
     pub(crate) fn set_providers(&mut self, mut providers: Vec<ProviderInfo>) -> bool {
-        // The wizard's picker is a flat alphabetical list; the daemon sends
+        // The wizard's picker has a fixed order (featured providers, then
+        // alphabetical); the daemon sends
         // the catalog in provenance order (see `sort_providers`), so re-sort
         // every incoming list before comparing/storing. Sorting first also
         // means a provider reorder alone never registers as a "change".

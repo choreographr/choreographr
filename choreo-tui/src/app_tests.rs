@@ -1360,8 +1360,8 @@ mod unsent_draft_tests {
         .expect("handle CatalogUpdated");
 
         assert_eq!(app.providers.len(), 2);
-        // The picker is always alphabetical, so the daemon's provenance order
-        // is re-sorted: Anthropic leads.
+        // The picker has a fixed order, so the daemon's provenance order is
+        // re-sorted: Anthropic leads.
         assert_eq!(app.providers[0].slug, "anthropic");
         assert_eq!(app.providers[0].display_name, "Anthropic");
         assert_eq!(app.providers[1].slug, "openai");
@@ -1421,21 +1421,30 @@ mod unsent_draft_tests {
     }
 
     #[test]
-    fn provider_picker_is_always_alphabetical() {
+    fn provider_picker_is_featured_then_alphabetical() {
         // The static PROVIDER_OPTIONS default is in catalog (provenance)
-        // order, not alphabetical; App::new must sort it by display name so
-        // the wizard's picker reads A→Z from the very first frame.
+        // order; App::new must sort it so the wizard's picker leads with the
+        // featured providers and reads A→Z after them from the first frame.
         let app = test_app();
+        let featured = FEATURED_PROVIDERS.len();
+        let leading = app
+            .providers
+            .iter()
+            .take(featured)
+            .map(|p| p.slug.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(leading, FEATURED_PROVIDERS, "featured providers lead");
         let display_names = app
             .providers
             .iter()
+            .skip(featured)
             .map(|p| p.display_name.to_lowercase())
             .collect::<Vec<_>>();
         let mut sorted = display_names.clone();
         sorted.sort();
         assert_eq!(
             display_names, sorted,
-            "default provider list must be alphabetical by display name"
+            "the rest of the provider list must be alphabetical by display name"
         );
 
         // Live catalog updates arrive in provenance order too; set_providers

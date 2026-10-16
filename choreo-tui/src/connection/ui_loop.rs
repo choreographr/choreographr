@@ -219,11 +219,13 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
                 Some(shutdown_rx),
             ),
         };
-        if result.is_ok() {
-            // ReaderClosed must always be delivered — blocking is safe here
-            // because no more daemon messages are coming after this.
-            let _ = connection_ui_tx.send(UiEvent::ReaderClosed);
-        }
+        // ReaderClosed must always be delivered — blocking is safe here
+        // because no more daemon messages are coming after this. It is sent
+        // on failure too (a dial, autostart, or handshake error): the TUI
+        // then exits at once and prints the real reason, which `run_app`
+        // reads from this thread's result, instead of idling on a page that
+        // can never reach the daemon.
+        let _ = connection_ui_tx.send(UiEvent::ReaderClosed);
         result
     });
 
@@ -455,18 +457,14 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
             .set_context(id, PendingContext::UnlockKey(private_key));
     } else {
         tracing::info!("[choreo-tui] no unlock key available — awaiting keystore status");
-        // Startup feedback while the daemon's authoritative keystore status
-        // push is in flight (sent at subscribe time, a moment after connect).
-        // A FRESH daemon (no binding) reports `Unbound` and the message handler
-        // AUTO-BINDS it with a minted key — no user action. A daemon already
-        // bound to ANOTHER client's key reports `Locked` and cannot be unlocked
-        // without that key: /unlock <base64-key> supplies it (bare /unlock has
-        // nothing stored to use).
-        app.status = Some(
-            "daemon is locked — if it is bound to another key, supply it with \
-             /unlock <base64 unlock-key> (a fresh daemon binds automatically)"
-                .to_string(),
-        );
+        // Neutral startup feedback while the daemon's authoritative keystore
+        // status push is in flight (sent at subscribe time, a moment after
+        // connect). A FRESH daemon (no binding) reports `Unbound` and the
+        // message handler AUTO-BINDS it with a minted key — no user action,
+        // so nothing here may suggest something is wrong. A daemon already
+        // bound to ANOTHER client's key reports `Locked`, and that handler
+        // explains how to supply the key.
+        app.status = Some("connecting to the daemon…".to_string());
     }
 
     app.pending
@@ -525,14 +523,6 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     app.term_status.clear_all();
     title::clear();
 
-    // Surface why the TUI exited (daemon eviction / graceful shutdown / a
-    // dropped connection) once the alternate screen is gone and the message
-    // is visible on the restored terminal. A normal user quit (Alt+Q)
-    // leaves `quit_message` None and prints nothing.
-    if let Some(message) = &app.quit_message {
-        println!("{message}");
-    }
-
     // The connection task's result is NEVER surfaced as an error: a failed
     // dial/handshake is a condition the user needs a readable explanation
     // for, not a crash. Returning it from run_app would escape main as a
@@ -553,6 +543,16 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
             app.quit_message
                 .get_or_insert_with(|| "daemon connection thread panicked".to_string());
         }
+    }
+
+    // Surface why the TUI exited (daemon eviction / graceful shutdown / a
+    // failed or dropped connection) once the alternate screen is gone and
+    // the message is visible on the restored terminal. Printed only after
+    // the join above, which is what replaces the generic "connection
+    // closed" text with the connection thread's actual error. A normal user
+    // quit (Alt+Q) leaves `quit_message` None and prints nothing.
+    if let Some(message) = &app.quit_message {
+        println!("{message}");
     }
 
     result
@@ -580,8 +580,18 @@ fn run_ui_loop(
     app.flush_image_fetches(client_tx);
 
     let mut dirty = false;
+    // Stand-in for the model selector's retry timer while none is armed, so
+    // the select below always has the arm.
+    let no_retry = channel::never::<std::time::Instant>();
 
     while !app.should_quit {
+        // Cloned out so the select's receiver borrow does not overlap the
+        // arm bodies' `&mut app` (crossbeam receivers are cheap handles).
+        let model_retry_rx = app
+            .model_selector
+            .retry_timer
+            .clone()
+            .unwrap_or_else(|| no_retry.clone());
         // Wait for an event from any source.  The thread is blocked in the
         // kernel here — zero CPU usage while idle.
         select! {
@@ -612,6 +622,13 @@ fn run_ui_loop(
                     app.apply_image_result(result);
                     dirty = true;
                 }
+            }
+            recv(model_retry_rx) -> _ => {
+                // The model list was still warming; ask the daemon again.
+                if app.model_selector.take_retry() {
+                    app.pending.send(client_tx, ClientMessageType::ListModels);
+                }
+                dirty = true;
             }
             recv(resume_rx) -> msg => {
                 if let Ok(cmd) = msg {
