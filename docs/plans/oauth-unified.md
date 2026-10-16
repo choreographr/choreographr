@@ -181,6 +181,11 @@ The binding row's **presence** is what drives `keystore_bound` /
   (extend `McpStatus`), so provisioning and connect-time load agree.
 - **Provider OAuth descriptor is served by the daemon** (`ListOAuthProviders`),
   keeping the table in one place and the client-id opt-in server-side — see §10.
+- **Provider client identity is register > borrow > delegate** (§7.1): use the
+  provider's own registration where one exists (OpenAI `oaiapp_`/dynamic, GitHub
+  Copilot OAuth App), borrow the vendor CLI id only behind an explicit opt-in, and
+  delegate to the vendor CLI for flows that are prohibited to reimplement
+  (Anthropic).
 
 ## 3. Keystore lifecycle
 
@@ -364,6 +369,95 @@ daemon
   created first (its `accounts.toml` row carries the provider); `/login` names the
   account and inserts the credential into it, exactly as `/add-key <account>` does —
   it does not auto-create an account named after the provider.
+
+### 7.1 Provider client identity — register, borrow, or delegate
+
+Every provider OAuth flow needs a **`client_id`** identifying the application. There
+are three postures, applied in this priority order:
+
+1. **Register our own** — preferred wherever the provider offers a path.
+2. **Borrow the vendor CLI's id** — only where the provider tolerates it, and only
+   behind an explicit opt-in (default off / kill-switchable).
+3. **Delegate** to the vendor's CLI/SDK — for flows that are prohibited to
+   reimplement.
+
+#### Per-provider client identity
+
+| Provider / route | Client identity | Verdict |
+|---|---|---|
+| **OpenAI** — ChatGPT token-sharing | `client_id=dynamic_agent_client`; OpenAI issues an **`oaiapp_…`** id on the callback | **Register (own id)** — persist the issued id |
+| **OpenAI** — Codex subscription | borrowed `app_EMoamEEZ73f0CkXaXp7hrann` | **Borrow**, opt-in (only for the subscription backend) |
+| **OpenAI** — "Sign in with ChatGPT" (web/app) | partner-gated `oaiapp_…` via Request-a-client-ID | **Register** if accepted into the program |
+| **GitHub Copilot** | **own GitHub OAuth App** (or GitHub App), device flow + `copilot` scope | **Register (own id)**; else import the user's `gh auth token` |
+| **Anthropic (Claude)** | no registration path; consumer OAuth prohibited in third-party tools | **API key or delegate** to the `claude` CLI/SDK (never mint) |
+| **xAI / Kimi / Qwen / Meta / Radius** | borrowed preset | **Borrow**, opt-in |
+| **MCP servers** | own (DCR/CIMD) or a per-server pre-registered client | **Register/own** (no opt-in) |
+
+#### How to obtain our own client ids
+
+- **OpenAI (ChatGPT route)** — no portal step: send `client_id=dynamic_agent_client`
+  to `https://auth.openai.com/api/accounts/authorize`; OpenAI **registers a fresh
+  app-owned client and returns the issued `oaiapp_…` id on the callback**. Persist it
+  and reuse it for refresh (pi `openai-chatgpt.ts`, opencode, t3code).
+- **OpenAI (partner program)** — apply for an OAuth client via the "Sign in with
+  ChatGPT" program (`developers.openai.com/siwc`); currently a **gated limited trial
+  (waitlist via an OpenAI representative)**, so not self-serve today.
+- **GitHub Copilot** — self-serve: GitHub **Settings → Developer settings → OAuth
+  Apps → New OAuth App** (or a GitHub App); note the client id, generate a client
+  secret, enable the device flow, request the `copilot` scope. Reaching Copilot
+  depends on the account's entitlement (test before relying on it).
+- **Borrowed ids** — copied from the vendor CLI's public client and gated (below).
+- **MCP** — the server's authorization server issues the client via DCR (SEP-837) or
+  accepts a CIMD/HTTPS URL (SEP-991); otherwise the server's `oauth` config carries a
+  user-registered `clientId`/`clientSecret`.
+
+#### The secret rule
+
+A **public** client (PKCE, no secret — OpenAI public clients, Copilot device flow)
+has a non-secret `client_id` that may be compiled into the binary. A **confidential**
+client (a GitHub OAuth App secret, an OpenAI confidential client) must keep its
+**secret out of source** — read it from config/env like every other secret.
+
+#### Gating borrowed ids
+
+Every borrowed vendor id is behind an explicit, per-install gate:
+
+- **default off** with a global allow flag (zero's `ZERO_OAUTH_ALLOW_PRESETS`), or
+- **default on with a kill switch** (maka-agent's `…_EXPERIMENTAL`), and
+- **overridable** per provider by an env var (codex's
+  `CODEX_APP_SERVER_LOGIN_CLIENT_ID`, goose's `GITHUB_COPILOT_CLIENT_ID`).
+
+Base64 obfuscation (`decode(...)`) is cosmetic and **not** a gate. Any active
+subscription-OAuth route shows a **suppressible in-UI billing warning** (pi's
+`warnings.anthropicExtraUsage` pattern: subscribing does not meter a third-party
+harness like the vendor's own tool), and each borrowed identity carries a short
+**provenance/policy note** (whose id it is, that the consent screen names the
+*vendor's* app, that the authorization basis is not established, the flag, and the
+supported default).
+
+#### Explicit fallback order (never silent)
+
+When a provider is used, Choreographr resolves auth **explicitly**, in order, and
+**never silently swaps a blocked OAuth token for an API key**:
+
+1. an explicit env token (`ANTHROPIC_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, …);
+2. the provider **API key** (a first-class, independently configured route);
+3. **Choreographr's own OAuth grant** (registered id);
+4. a **borrowed or imported** CLI credential (opt-in).
+
+A blocked/failed OAuth attempt surfaces a **categorized error** (extra-usage billing
+vs auth vs quota) with a clear hint, not a generic failure.
+
+#### Anthropic posture
+
+The Claude consumer-subscription OAuth flow is **prohibited in third-party tools and
+server-enforced** (ToS + spoofing detection, Jan–Apr 2026). Choreographr **does not
+mint** a borrowed Claude sub-token. It offers, in order: (a) `ANTHROPIC_API_KEY`;
+(b) **delegate** to the `claude` CLI / Agent SDK for users who want their
+subscription (the goose/t3code/zero-clean path); (c) optionally **import an existing**
+official Claude Code credential (`~/.claude/.credentials.json` /
+`CLAUDE_CODE_OAUTH_TOKEN`). Status is recorded as **unverified and moving** — do not
+rely on the borrowed route.
 
 ## 8. MCP runtime
 
@@ -560,7 +654,10 @@ persistence).
   rather than embedding a copy, so the table stays in one place and the
   third-party-client-id opt-in is enforced server-side. Adding the message amends the
   current unreleased wire version's changelog in `choreo-proto/src/frame.rs`; the
-  `PROTOCOL_VERSION` bump is a release-time act, not part of the change.
+  `PROTOCOL_VERSION` bump is a release-time act, not part of the change. The
+  descriptor also carries the provider's **client-identity mode** (§7.1) and the
+  public client id (or an instruction to register/import one), so the client never
+  embeds a copy of the policy.
 
 ## 11. Prior art (`~/agents`)
 
@@ -595,13 +692,30 @@ endpoint, not the project. §8.1 adopts this shape:
 `mcp:<slug>|<target-hash>`, with the in-blob `resource`/`issuer` validation as zero's
 guard.
 
+**Provider-OAuth posture.** A third survey (how the harnesses reacted to Anthropic's
+OAuth lockdown) found that the ecosystem **did not drop** Claude-subscription OAuth:
+pi, hermes-agent, jcode, OpenMinis, and tau still ship the borrowed Claude client id,
+reclassified from "plan-metered" to **"metered extra-usage, at the user's own risk"**
+(pi's `warnings.anthropicExtraUsage`; hermes requires Max + extra-usage credits and
+handles `400 "Third-party apps now draw from extra usage"`). Only pi attempted a
+removal — reverted within the hour. **No harness auto-degrades** Claude OAuth to an
+API key. Gating splits into "ship it, obfuscated only" (pi, jcode, goose, ironclaw)
+and **explicit opt-in / kill-switch** (zero's `ZERO_OAUTH_ALLOW_PRESETS`, maka-agent's
+`…_EXPERIMENTAL`); zero's `docs/oauth-subscriptions.md` is the explicit "do not spoof"
+policy statement. For OpenAI, harnesses use **both** routes, and t3code consumes the
+formal registration program (persists an issued `^oaiapp_` id). For Copilot, opencode
+ships its **own registered GitHub OAuth App** while most borrow `Iv1.b507…`. The
+conservative converged alternative for Claude specifically is to **delegate** to the
+real `claude` CLI/Agent SDK (goose, t3code, buzz, open-dots, oar). §7.1 adopts these:
+register where a path exists, borrow only behind a gate, delegate for Claude.
+
 ## 12. Cross-crate change inventory
 
 | Crate | Change |
 |---|---|
 | `choreo-keystore` | `ServiceCredential::OAuth { … }` (§4) + `as_oauth()` + expiry helpers; zeroize/redact. Crypto unchanged. |
-| `choreo-client-core` | OAuth login library (PKCE/loopback/device-code/paste-URL/JWT + MCP discovery/DCR/CIMD); `AddCredential` builder sends plaintext + `service` (no key); `/login`, `mcp login/logout`. |
-| `choreo-ai-protocols` | credential-derived `ProviderAuth` (bearer + extra headers), generalizing the header seam; OAuth provider parameter table. |
+| `choreo-client-core` | OAuth login library (PKCE/loopback/device-code/paste-URL/JWT + MCP discovery/DCR/CIMD); **OpenAI dynamic client registration (persist the issued `oaiapp_` id) and import of an existing CLI credential**; `AddCredential` builder sends plaintext + `service` (no key); `/login`, `mcp login/logout`. |
+| `choreo-ai-protocols` | credential-derived `ProviderAuth` (bearer + extra headers), generalizing the header seam; OAuth provider parameter table; **provider client-identity table (registered / borrowed / delegate) + the borrowed-id opt-in flag (§7.1)**. |
 | `choreo-daemon` | `handle_save_credential` rewritten (§5); `ResolveAccountCmd` carries `ProviderAuth`; `api_key_for` → auth accessor; `OAuthRefreshLocks`; provider refresh loop + rotation persistence (§6/§7); `CredentialBackend` impl + `DaemonCommand::OAuth*` for MCP; **target-scoped MCP credential keys (`mcp:<slug>\|<target-hash>`) + trust-gated login (§8.1)**; `oauth` catalog auth-kind; `AccountManager`/`drop_session_clients` extended. |
 | `choreo-mcp` | enable `rmcp` `auth`; `AuthorizationManager`/`AuthClient` wiring; `oauth` config (expanded only for a trusted tier); `CredentialStore` adapter (strips access token, resolves the target-scoped key); `needs_auth` state. |
 | `choreo-proto` | changed `AddCredential`; one `InferenceError` variant + re-login `DaemonMessage`; MCP auth state in `McpStatus`; `mcp login/logout` messages; version bump at release. |
@@ -713,15 +827,11 @@ crate.
 2. **Exact ChatGPT request headers** beyond `Authorization`, `chatgpt-account-id`,
    `originator`, `X-OpenAI-Fedramp` — confirm `OpenAI-Beta`/`session_id` against a
    live token.
-3. **Client-id opt-in mechanism.** How the user authorizes using OpenAI's public
-   Codex CLI client id: an env var (zero's `ZERO_OAUTH_ALLOW_PRESETS` style), a config
-   key, or a per-login confirmation. Leaning a config/env flag, default off, with the
-   descriptor request withholding the preset when off.
-4. **Re-login / auth-state surfacing.** Extend `AccountInfo` (auth kind +
+3. **Re-login / auth-state surfacing.** Extend `AccountInfo` (auth kind +
    needs-relogin) and `McpServerStatus` (auth state), and/or add a one-shot
    "re-login required" broadcast on a terminal failure. Leaning both: a resting
    status field plus a broadcast nudge.
-5. **GUI/IM login placement** (GUI modal vs loopback browser) — follow the
+4. **GUI/IM login placement** (GUI modal vs loopback browser) — follow the
    provider-login precedent; TUI/CLI land first.
 
 ## 19. Definition of done
