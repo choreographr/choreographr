@@ -1517,6 +1517,57 @@ fn a_rejected_key_ends_the_follow_through() {
 }
 
 #[test]
+fn a_failed_account_selection_ends_the_follow_through() {
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    app.attached_session_id = Some(0);
+    app.setup_follow = Some(SetupFollow::AwaitAccountSet("anthropic".to_string()));
+
+    handle_daemon_message(
+        DaemonMessage::broadcast(DaemonMessageType::Session {
+            session_id: Some(0),
+            event: SessionEvent::SessionFailed {
+                operation: "set_account".to_string(),
+                error: "account 'anthropic' not found".to_string(),
+            },
+        }),
+        &mut app,
+        &tx,
+    )
+    .expect("handle SessionFailed");
+
+    // The selection the follow-through was waiting on was rejected, so the
+    // chain must not stay armed for a later, unrelated `SessionAccountSet`.
+    assert_eq!(app.setup_follow, None);
+}
+
+#[test]
+fn an_unrelated_session_failure_keeps_the_follow_through() {
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    app.attached_session_id = Some(0);
+    app.setup_follow = Some(SetupFollow::AwaitAccountSet("anthropic".to_string()));
+
+    handle_daemon_message(
+        DaemonMessage::broadcast(DaemonMessageType::Session {
+            session_id: Some(0),
+            event: SessionEvent::SessionFailed {
+                operation: "set_session_pinned".to_string(),
+                error: "boom".to_string(),
+            },
+        }),
+        &mut app,
+        &tx,
+    )
+    .expect("handle SessionFailed");
+
+    assert_eq!(
+        app.setup_follow,
+        Some(SetupFollow::AwaitAccountSet("anthropic".to_string()))
+    );
+}
+
+#[test]
 fn selected_account_opens_the_model_picker() {
     let mut app = test_app();
     let (tx, rx) = crossbeam_channel::unbounded();

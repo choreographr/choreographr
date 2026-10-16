@@ -237,3 +237,29 @@ fn a_closed_selector_does_not_retry() {
     selector.close();
     assert!(!selector.take_retry());
 }
+
+#[test]
+fn a_landed_list_disarms_an_armed_warming_retry() {
+    let mut selector = ModelSelectorState::new();
+    selector.open();
+    assert!(selector.schedule_warming_retry("warming"));
+
+    // A `Models` reply that raced the timer must cancel it: otherwise the UI
+    // loop fires one redundant `ListModels` after the list already landed.
+    selector.apply_models(vec!["m".to_string()], None);
+    assert!(selector.retry_timer.is_none());
+    assert!(!selector.take_retry());
+}
+
+#[test]
+fn a_terminal_error_disarms_an_armed_warming_retry() {
+    let mut selector = ModelSelectorState::new();
+    selector.open();
+    assert!(selector.schedule_warming_retry("warming"));
+
+    // A real failure replaces the warming state, so the retry must stop.
+    selector.apply_error("no credential");
+    assert_eq!(selector.error.as_deref(), Some("no credential"));
+    assert!(selector.retry_timer.is_none());
+    assert!(!selector.take_retry());
+}

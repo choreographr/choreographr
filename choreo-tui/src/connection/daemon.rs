@@ -144,6 +144,12 @@ pub(crate) fn handle_daemon_message(
             ..
         } => {
             app.error = Some(format!("[daemon] {operation} failed: {error}"));
+            // A rejected account selection ends the first-run follow-through:
+            // the model picker will never open, and leaving the chain armed
+            // would only mis-fire on a later, unrelated `SessionAccountSet`.
+            if operation == "set_account" {
+                app.setup_follow = None;
+            }
             // If we're on the Session Manager page, also show the error
             // right on that page so the user has immediate feedback — for the
             // create flow and for the pin/archive flow (both of which are

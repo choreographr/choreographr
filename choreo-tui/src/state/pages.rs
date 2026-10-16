@@ -875,6 +875,10 @@ impl ModelSelectorState {
         self.selected = selected;
         self.loading = false;
         self.error = None;
+        // The list landed, so any armed warming retry is moot: disarming it
+        // here stops the UI loop from firing one more `ListModels` after a
+        // success that raced the timer.
+        self.retry_timer = None;
         // Preselect the active model when it survives the current filter;
         // otherwise the highlight stays at the top of the list.
         if let Some(sel) = &self.selected
@@ -890,6 +894,9 @@ impl ModelSelectorState {
     pub(crate) fn apply_error(&mut self, error: impl Into<String>) {
         self.loading = false;
         self.error = Some(error.into());
+        // A terminal error ends the warming retry: an armed timer here would
+        // re-request a list the daemon has already refused.
+        self.retry_timer = None;
     }
 
     /// Models matching the current filter (case-insensitive substring).

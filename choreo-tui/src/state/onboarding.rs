@@ -83,8 +83,23 @@ impl App {
     /// the session's display state (the same fields the status bar shows).
     pub(crate) fn setup_progress(&self) -> SetupProgress {
         let display = self.active_display_ref();
+        // Step 1 is judged against the account the session will actually use:
+        // the selected one when there is one, otherwise any keyed account the
+        // user could select next. A global "some account has a key" would tick
+        // the box for an account this session is NOT using, while the model
+        // list is fetched through the session's own account — so a session
+        // pointed at a key-less account would look ready and then fail at
+        // step 3.
+        let has_keyed_account = match self.attached_account_slug.as_deref() {
+            Some(slug) => self
+                .ai_providers
+                .accounts
+                .iter()
+                .any(|a| a.name == slug && a.has_credential),
+            None => self.ai_providers.accounts.iter().any(|a| a.has_credential),
+        };
         SetupProgress {
-            has_keyed_account: self.ai_providers.accounts.iter().any(|a| a.has_credential),
+            has_keyed_account,
             session_has_account: self.attached_account_slug.is_some(),
             session_has_model: display.is_some_and(|d| d.selected_model.is_some()),
         }
@@ -130,13 +145,18 @@ pub(crate) fn suggest_account_name(provider_slug: &str, existing: &[&str]) -> St
     if !taken(&base) {
         return base;
     }
-    // `existing.len() + 1` candidates cannot all be taken by `existing.len()`
-    // names, so this range always holds a free one; the fallback is only for
-    // totality.
-    (2..=existing.len() + 2)
-        .map(|n| format!("{base}-{n}"))
-        .find(|candidate| !taken(candidate))
-        .unwrap_or(base)
+    // `base` is taken here, so strip to a `-N` suffix (N from 2). `existing`
+    // is finite, so this search always terminates on a free name; returning it
+    // directly (rather than an `unwrap_or` fallback) keeps the result a name
+    // the caller does not already hold.
+    let mut suffix = 2;
+    loop {
+        let candidate = format!("{base}-{suffix}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +198,16 @@ mod tests {
     }
 
     #[test]
+    fn suggestion_skips_every_taken_suffix() {
+        // The suffix search must advance past an unbroken run of taken names
+        // rather than stop at some bound.
+        assert_eq!(
+            suggest_account_name("svc", &["svc", "svc-2", "svc-3", "svc-4"]),
+            "svc-5"
+        );
+    }
+
+    #[test]
     fn fresh_app_has_no_setup_progress() {
         let app = App::new();
         assert_eq!(app.setup_progress(), SetupProgress::default());
@@ -199,6 +229,28 @@ mod tests {
         let mut app = App::new();
         app.attached_account_slug = Some("anthropic".to_string());
         assert!(app.setup_progress().session_has_account);
+    }
+
+    #[test]
+    fn step_one_is_judged_against_the_sessions_account() {
+        let mut app = App::new();
+        // No session account yet: any keyed account satisfies step 1.
+        app.ai_providers.set_accounts(vec![account("a", true)]);
+        assert!(app.setup_progress().has_keyed_account);
+
+        // The session uses an account with NO key: step 1 is not done even
+        // though another account has one, because the model list is fetched
+        // through the session's own account.
+        app.attached_session_id = Some(1);
+        app.attached_account_slug = Some("b".to_string());
+        app.ai_providers
+            .set_accounts(vec![account("a", true), account("b", false)]);
+        assert!(!app.setup_progress().has_keyed_account);
+
+        // The session's own account is keyed: step 1 is done.
+        app.ai_providers
+            .set_accounts(vec![account("a", true), account("b", true)]);
+        assert!(app.setup_progress().has_keyed_account);
     }
 
     #[test]
