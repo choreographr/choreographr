@@ -51,25 +51,31 @@ impl DaemonState {
             )));
             return;
         }
-        let mut updated = current;
-        if let ServiceCredential::OAuth {
-            refresh_token,
-            account_id,
-            ..
-        } = &mut updated
-        {
-            if let Some(rotated) = save.rotated_refresh_token {
-                *refresh_token = Some(rotated.to_string());
+        // A rotation of the refresh token or a refreshed identity claim is the
+        // only thing that changes the durable blob; a plain expiry refresh
+        // updates the in-memory access-token cache alone, so it costs no
+        // re-encryption and no disk write.
+        if save.rotated_refresh_token.is_some() || save.new_account_id.is_some() {
+            let mut updated = current;
+            if let ServiceCredential::OAuth {
+                refresh_token,
+                account_id,
+                ..
+            } = &mut updated
+            {
+                if let Some(rotated) = save.rotated_refresh_token {
+                    *refresh_token = Some(rotated.to_string());
+                }
+                if let Some(new_id) = save.new_account_id {
+                    *account_id = Some(new_id.to_string());
+                }
             }
-            if let Some(new_id) = save.new_account_id {
-                *account_id = Some(new_id.to_string());
+            if let Err(e) = self.encrypt_and_persist_credential(save.account, &updated) {
+                let _ = reply.send(Err(e));
+                return;
             }
+            self.credentials.insert(save.account.to_string(), updated);
         }
-        if let Err(e) = self.encrypt_and_persist_credential(save.account, &updated) {
-            let _ = reply.send(Err(e));
-            return;
-        }
-        self.credentials.insert(save.account.to_string(), updated);
         self.access_tokens.insert(
             save.account.to_string(),
             super::AccessTokenCache {

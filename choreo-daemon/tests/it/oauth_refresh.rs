@@ -27,7 +27,7 @@ use choreo_daemon::broadcast::{ClientId, LagLimits, SubscriberSink};
 use choreo_daemon::cache_warm::WarmPolicy;
 use choreo_daemon::daemon::{DaemonCommand, ResolvedAccount};
 use choreo_daemon::oauth_refresh::{
-    CachedAccessToken, OAuthTokenSource, RefreshMaterial, RefreshOutcome, RefreshedTokens,
+    CachedAccessToken, OAuthTokenSource, RefreshMaterial, RefreshTokenOutcome, RefreshedTokens,
     TokenLoad, refresh_single_flight,
 };
 use choreo_daemon::providers::ProviderAuth;
@@ -136,7 +136,7 @@ fn concurrent_refreshes_spend_the_refresh_token_once() {
             encoding: GrantEncoding::Json,
             client_id: Some("client-abc".into()),
             client_secret: None,
-            refresh_token: "rt-original".into(),
+            refresh_token: Zeroizing::new("rt-original".into()),
             granted_scopes: vec!["openid".into()],
         },
         cached: Mutex::new(None),
@@ -153,7 +153,7 @@ fn concurrent_refreshes_spend_the_refresh_token_once() {
             refresh_single_flight(source.as_ref(), "acct", false, now)
         }));
     }
-    let outcomes: Vec<RefreshOutcome> = handles
+    let outcomes: Vec<RefreshTokenOutcome> = handles
         .into_iter()
         .map(|h| h.join().expect("refresh thread").expect("refresh succeeds"))
         .collect();
@@ -162,7 +162,7 @@ fn concurrent_refreshes_spend_the_refresh_token_once() {
     assert_eq!(
         outcomes
             .iter()
-            .filter(|o| **o == RefreshOutcome::Refreshed)
+            .filter(|o| **o == RefreshTokenOutcome::Refreshed)
             .count(),
         1,
         "exactly one refresh must occur: {outcomes:?}"
@@ -170,7 +170,7 @@ fn concurrent_refreshes_spend_the_refresh_token_once() {
     assert!(
         outcomes
             .iter()
-            .filter(|o| **o == RefreshOutcome::NotNeeded)
+            .filter(|o| **o == RefreshTokenOutcome::NotNeeded)
             .count()
             == 7,
         "the seven losers must reuse the winner's token: {outcomes:?}"
@@ -378,7 +378,7 @@ fn spawn_fake_daemon(
                             encoding: GrantEncoding::Json,
                             client_id: Some("client-abc".into()),
                             client_secret: None,
-                            refresh_token: "rt-original".into(),
+                            refresh_token: Zeroizing::new("rt-original".into()),
                             granted_scopes: vec!["openid".into()],
                         }),
                         dead: false,

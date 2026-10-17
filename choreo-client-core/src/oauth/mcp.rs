@@ -115,7 +115,7 @@ fn run(
     // see the same string, including the port actually bound (which may be the
     // fallback, not the preferred one).
     let ports = preferred_ports(info.oauth.callback_port);
-    let (callback_server, port) = callback::bind(&ports)?;
+    let (callback_server, port) = callback::bind("127.0.0.1", &ports)?;
     let bound = BoundCallback {
         server: callback_server,
         redirect_uri: format!("http://127.0.0.1:{port}{}", callback::CALLBACK_PATH),
@@ -360,7 +360,7 @@ fn authorize(
     });
 
     let callback = if let Some(callback_url) = options.callback_url.as_deref() {
-        super::parse_callback_url(callback_url)?
+        callback::parse_callback_url(callback_url)?
     } else {
         if options.no_browser {
             let _ = tx.send(LoginEvent::Prompt {
@@ -434,13 +434,7 @@ fn build_authorize_url(
         ("scope".to_string(), scopes.join(" ")),
         ("resource".to_string(), resource.to_string()),
     ];
-    let query = super::http::form_encode(&params);
-    let sep = if server.authorization_endpoint.contains('?') {
-        '&'
-    } else {
-        '?'
-    };
-    format!("{}{sep}{query}", server.authorization_endpoint)
+    super::http::authorize_url(&server.authorization_endpoint, &params)
 }
 
 /// Exchange the authorization code at the token endpoint (form-encoded).

@@ -16,9 +16,13 @@ rust-version.workspace = true
 # `choreo-proto` remains the wire protocol — so it stays cheap to depend on
 # from every binary.
 [dependencies]
+# The OAuth claim decoders (`oauth_claims`): base64url-decoding an `id_token`
+# payload and reading its JSON claims. Both are already in every binary's tree.
+base64.workspace = true
 clap.workspace = true
 dirs.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zeroize.workspace = true

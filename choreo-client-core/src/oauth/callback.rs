@@ -47,7 +47,12 @@ pub(crate) struct Callback {
     pub(crate) client_id: Option<String>,
 }
 
-/// Bind the callback server on the first free `127.0.0.1` port from `ports`.
+/// Bind the callback server on the first free port from `ports`, on `host`.
+///
+/// `host` is the same name the caller advertises in the `redirect_uri`
+/// (`localhost` for the provider flow, `127.0.0.1` for MCP), so the server binds
+/// the address the browser will actually dial — a host whose `localhost`
+/// prefers `::1` cannot leave the server bound on `127.0.0.1` alone.
 ///
 /// Falls back to the next port when one is in use (`AddrInUse`) — the
 /// `:1455` then `:1457` sequence — and returns the port actually bound so the
@@ -57,10 +62,10 @@ pub(crate) struct Callback {
 ///
 /// Returns [`OAuthLoginError::CallbackBind`] when no port could be bound (an
 /// empty list, or every port in use).
-pub(crate) fn bind(ports: &[u16]) -> Result<(tiny_http::Server, u16), OAuthLoginError> {
+pub(crate) fn bind(host: &str, ports: &[u16]) -> Result<(tiny_http::Server, u16), OAuthLoginError> {
     first_bound(ports, |port| {
-        let server = tiny_http::Server::http(("127.0.0.1", port))
-            .map_err(|e| format!("127.0.0.1:{port}: {e}"))?;
+        let server =
+            tiny_http::Server::http((host, port)).map_err(|e| format!("{host}:{port}: {e}"))?;
         // Report the ACTUAL bound port: a request for port 0 binds an ephemeral
         // port, and the redirect_uri must carry that real port (a literal `:0`
         // would be unreachable).
@@ -115,6 +120,41 @@ pub(crate) fn wait_for_callback(
             Ok(None) => {}
             Err(e) => return Err(OAuthLoginError::Callback(e.to_string())),
         }
+    }
+}
+
+/// Parse a pasted callback URL (or a bare `code=..&state=..` query) into a
+/// [`Callback`]. Also captures an optional provider-issued `client_id`.
+///
+/// Shared by the provider flow's paste-URL path and MCP's, so both accept the
+/// same shapes.
+///
+/// # Errors
+///
+/// Returns [`OAuthLoginError::CallbackUrl`] when the URL carries no `code`/`state`
+/// pair.
+pub(crate) fn parse_callback_url(url: &str) -> Result<Callback, OAuthLoginError> {
+    let query = url.split_once('?').map_or(url, |(_, query)| query);
+    let mut code = None;
+    let mut state = None;
+    let mut client_id = None;
+    for (key, value) in parse_query(query) {
+        match key.as_str() {
+            "code" => code = Some(value),
+            "state" => state = Some(value),
+            "client_id" => client_id = Some(value),
+            _ => {}
+        }
+    }
+    match (code, state) {
+        (Some(code), Some(state)) => Ok(Callback {
+            code,
+            state,
+            client_id,
+        }),
+        _ => Err(OAuthLoginError::CallbackUrl(
+            "the URL has no code/state parameters".to_string(),
+        )),
     }
 }
 
@@ -185,6 +225,22 @@ fn handle_request(request: tiny_http::Request) -> Result<Option<Callback>, OAuth
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_callback_url_extracts_code_state_and_client_id() {
+        let callback = parse_callback_url(
+            "http://localhost:1455/auth/callback?code=abc&state=xyz&client_id=oaiapp_1",
+        )
+        .expect("parse");
+        assert_eq!(callback.code, "abc");
+        assert_eq!(callback.state, "xyz");
+        assert_eq!(callback.client_id.as_deref(), Some("oaiapp_1"));
+    }
+
+    #[test]
+    fn parse_callback_url_rejects_a_missing_code() {
+        assert!(parse_callback_url("http://localhost/cb?state=xyz").is_err());
+    }
 
     #[test]
     fn first_bound_skips_a_busy_port_and_reports_the_next() {

@@ -19,10 +19,13 @@
 //!   type ([`ServiceCredential`]) and its borrowed views, hosted here (not in
 //!   `choreo-keystore`) so both `choreo-proto` and `choreo-keystore` can carry
 //!   it without a dependency cycle or a new crate.
+//! - [`oauth_claims`] — the OIDC `id_token` claim extraction that fills an OAuth
+//!   credential's durable identity fields, shared so the provider login library
+//!   and the runtime refresh client decode the same claims the same way.
 //!
-//! It is deliberately a *leaf* (deps: `clap`, `dirs`, `serde`, `tracing`,
-//! `tracing-subscriber`, and `zeroize`) and holds no transport logic —
-//! `choreo-proto` stays the wire protocol.
+//! It is deliberately a *leaf* (deps: `base64`, `clap`, `dirs`, `serde`,
+//! `serde_json`, `tracing`, `tracing-subscriber`, and `zeroize`) and holds no
+//! transport logic — `choreo-proto` stays the wire protocol.
 //!
 //! Logging precedence follows the Unix convention: **explicit CLI flags win
 //! over the ambient environment** (see [`logging`]).
@@ -35,6 +38,7 @@
 pub mod clap_styles;
 pub mod credential;
 pub mod logging;
+pub mod oauth_claims;
 pub mod paths;
 pub mod release_name;
 

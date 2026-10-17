@@ -26,6 +26,7 @@ use std::sync::PoisonError;
 
 use choreo_ai_protocols::catalog::GrantEncoding;
 use choreo_ai_protocols::oauth::{OAuthRefreshError, OAuthRefreshRequest, refresh_oauth_token};
+use tracing::warn;
 use zeroize::Zeroizing;
 
 use crate::oauth_refresh_locks;
@@ -56,10 +57,13 @@ pub struct RefreshMaterial {
     pub encoding: GrantEncoding,
     /// The client id recorded at login.
     pub client_id: Option<String>,
-    /// The client secret, for a confidential client.
-    pub client_secret: Option<String>,
-    /// The refresh token to present.
-    pub refresh_token: String,
+    /// The client secret, for a confidential client (wipe-on-drop like the
+    /// refresh token — it is never persisted in this transport form).
+    pub client_secret: Option<Zeroizing<String>>,
+    /// The refresh token to present (the durable grant root; wipe-on-drop, since
+    /// it is the one secret the daemon hands the session thread for the
+    /// exchange).
+    pub refresh_token: Zeroizing<String>,
     /// The scopes to request.
     pub granted_scopes: Vec<String>,
 }
@@ -131,7 +135,7 @@ pub trait OAuthTokenSource: Send + Sync {
 
 /// The outcome of a refresh attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefreshOutcome {
+pub enum RefreshTokenOutcome {
     /// A refresh ran and the new token was persisted.
     Refreshed,
     /// No refresh was needed: the cached token is still usable.
@@ -248,7 +252,7 @@ pub fn token_is_usable(cached: &CachedAccessToken, now: i64) -> bool {
 ///
 /// The whole `load → re-check → exchange → persist` runs under the account's
 /// single-flight lock, so the loser of a race observes the winner's persisted
-/// token and reuses it (returning [`RefreshOutcome::NotNeeded`]) rather than
+/// token and reuses it (returning [`RefreshTokenOutcome::NotNeeded`]) rather than
 /// spending a single-use refresh token twice.
 ///
 /// # Errors
@@ -261,7 +265,7 @@ pub fn refresh_single_flight(
     account: &str,
     force: bool,
     now: i64,
-) -> Result<RefreshOutcome, RefreshFailure> {
+) -> Result<RefreshTokenOutcome, RefreshFailure> {
     // The lock and its guard are scoped to this block so BOTH drop before the
     // opportunistic prune below: the prune removes an entry only when the map
     // is its sole owner, so pruning after the release is what actually bounds
@@ -285,27 +289,27 @@ fn refresh_under_lock(
     account: &str,
     force: bool,
     now: i64,
-) -> Result<RefreshOutcome, RefreshFailure> {
+) -> Result<RefreshTokenOutcome, RefreshFailure> {
     let load = source.load(account);
     if load.dead {
         return Err(RefreshFailure::Terminal);
     }
     let Some(material) = load.material else {
-        return Ok(RefreshOutcome::NotApplicable);
+        return Ok(RefreshTokenOutcome::NotApplicable);
     };
     if !force
         && let Some(cached) = &load.cached
         && token_is_usable(cached, now)
     {
-        return Ok(RefreshOutcome::NotNeeded);
+        return Ok(RefreshTokenOutcome::NotNeeded);
     }
 
     let request = OAuthRefreshRequest {
         token_endpoint: &material.token_endpoint,
         encoding: material.encoding,
         client_id: material.client_id.as_deref(),
-        client_secret: material.client_secret.as_deref(),
-        refresh_token: &material.refresh_token,
+        client_secret: material.client_secret.as_deref().map(String::as_str),
+        refresh_token: material.refresh_token.as_str(),
         scopes: &material.granted_scopes,
     };
     match refresh_oauth_token(&request) {
@@ -323,13 +327,21 @@ fn refresh_under_lock(
                 account_id: tokens.account_id,
             };
             match source.save(account, &refreshed) {
-                Ok(()) => Ok(RefreshOutcome::Refreshed),
+                Ok(()) => Ok(RefreshTokenOutcome::Refreshed),
                 Err(detail) => Err(RefreshFailure::Transient {
                     detail: format!("failed to persist refreshed token: {detail}"),
                 }),
             }
         }
         Err(OAuthRefreshError::Terminal { .. }) => {
+            source.report_terminal(account);
+            Err(RefreshFailure::Terminal)
+        }
+        // A cleartext token endpoint is a permanent fault of the stored
+        // credential, not a retryable one: quarantine it and require a fresh
+        // sign-in against a secure endpoint, exactly like a rejected grant.
+        Err(OAuthRefreshError::InsecureEndpoint { endpoint }) => {
+            warn!(account, endpoint = %endpoint, "OAuth token endpoint is insecure; quarantining");
             source.report_terminal(account);
             Err(RefreshFailure::Terminal)
         }
@@ -456,7 +468,7 @@ mod tests {
         let none = StubSource::new(None, None);
         assert_eq!(
             refresh_single_flight(&none, "acct", false, 1_000).expect("ok"),
-            RefreshOutcome::NotApplicable
+            RefreshTokenOutcome::NotApplicable
         );
 
         // Material present but a fresh cached token: no refresh.
@@ -466,14 +478,14 @@ mod tests {
                 encoding: GrantEncoding::Json,
                 client_id: None,
                 client_secret: None,
-                refresh_token: "rt".into(),
+                refresh_token: Zeroizing::new("rt".into()),
                 granted_scopes: Vec::new(),
             }),
             Some(cached(Some(9_999), 1_000)),
         );
         assert_eq!(
             refresh_single_flight(&fresh, "acct", false, 1_000).expect("ok"),
-            RefreshOutcome::NotNeeded
+            RefreshTokenOutcome::NotNeeded
         );
     }
 
@@ -485,7 +497,7 @@ mod tests {
                 encoding: GrantEncoding::Json,
                 client_id: None,
                 client_secret: None,
-                refresh_token: "rt".into(),
+                refresh_token: Zeroizing::new("rt".into()),
                 granted_scopes: Vec::new(),
             }),
             None,

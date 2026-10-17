@@ -831,7 +831,7 @@ pub(crate) fn run_agent_loop(
             {
                 oauth_refresh_attempted = true;
                 match session.refresh_oauth_token(true, ctx) {
-                    Ok(crate::oauth_refresh::RefreshOutcome::Refreshed) => {
+                    Ok(crate::oauth_refresh::RefreshTokenOutcome::Refreshed) => {
                         match session.resolve_provider(ctx) {
                             Ok(rebuilt) => {
                                 active_client = rebuilt;

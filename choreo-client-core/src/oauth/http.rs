@@ -82,6 +82,17 @@ pub(crate) fn join_url(issuer: &str, path: &str) -> String {
     }
 }
 
+/// Append a form-encoded query to an authorization endpoint, choosing `&` when
+/// the endpoint already carries a query string. The one place the
+/// provider and MCP flows build an authorize URL, so the separator and encoding
+/// rules cannot drift between them.
+#[must_use]
+pub(crate) fn authorize_url(endpoint: &str, params: &[(String, String)]) -> String {
+    let query = form_encode(params);
+    let separator = if endpoint.contains('?') { '&' } else { '?' };
+    format!("{endpoint}{separator}{query}")
+}
+
 /// Reject any authorization-server URL that is not `https`, except a loopback
 /// `http` URL (the in-repo mock server and a local test issuer), so a
 /// misconfigured descriptor can never leak a code or token over cleartext to a
@@ -220,7 +231,7 @@ pub(crate) fn read_token_response(
 pub(crate) fn exchange_code(
     issuer: &str,
     token_path: &str,
-    encoding: super::Encoding,
+    encoding: choreo_proto::OAuthGrantEncoding,
     client_id: &str,
     code: &str,
     redirect_uri: &str,
@@ -236,7 +247,7 @@ pub(crate) fn exchange_code(
     ];
     let agent = agent();
     let response = match encoding {
-        super::Encoding::Form => {
+        choreo_proto::OAuthGrantEncoding::Form => {
             let pairs: Vec<(String, String)> = params
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
@@ -248,7 +259,7 @@ pub(crate) fn exchange_code(
                 &form_encode(&pairs),
             )?
         }
-        super::Encoding::Json => {
+        choreo_proto::OAuthGrantEncoding::Json => {
             let object = serde_json::json!({
                 "grant_type": "authorization_code",
                 "code": code,
@@ -386,6 +397,19 @@ pub(crate) fn device_poll(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorize_url_appends_query_with_the_right_separator() {
+        let params = vec![("state".to_string(), "s".to_string())];
+        assert_eq!(
+            authorize_url("https://as.example/authorize", &params),
+            "https://as.example/authorize?state=s"
+        );
+        assert_eq!(
+            authorize_url("https://as.example/authorize?keep=1", &params),
+            "https://as.example/authorize?keep=1&state=s"
+        );
+    }
 
     #[test]
     fn join_url_handles_slashes() {

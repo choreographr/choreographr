@@ -79,8 +79,9 @@ pub struct OAuthTokenResponse {
     /// The rotated refresh token, when the server issued one.
     pub refresh_token: Option<Zeroizing<String>>,
     /// The raw OIDC `id_token`, when the server issued one. Not stored by the
-    /// caller — only the extracted claim is.
-    pub id_token: Option<String>,
+    /// caller — only the extracted claim is — and wipe-on-drop like the other
+    /// token fields.
+    pub id_token: Option<Zeroizing<String>>,
     /// The access token's lifetime in seconds, when the server reported one.
     pub expires_in: Option<u64>,
     /// The bearer token type (almost always `Bearer`).
@@ -126,6 +127,15 @@ pub enum OAuthRefreshError {
         /// A short description of the transient failure.
         detail: String,
     },
+    /// The token endpoint is neither `https` nor a loopback `http` address, so
+    /// the refresh token would be sent in cleartext. This is a permanent fault
+    /// of the stored credential (retrying cannot fix the scheme), so the caller
+    /// treats it as terminal: the user must re-login against a secure endpoint.
+    #[error("refusing an insecure OAuth token endpoint: {endpoint}")]
+    InsecureEndpoint {
+        /// The offending endpoint URL (routing information, not a secret).
+        endpoint: String,
+    },
 }
 
 /// Refresh an OAuth access token against `request.token_endpoint`.
@@ -138,6 +148,16 @@ pub enum OAuthRefreshError {
 pub fn refresh_oauth_token(
     request: &OAuthRefreshRequest<'_>,
 ) -> Result<OAuthTokenResponse, OAuthRefreshError> {
+    // Never send the durable refresh token over cleartext. The login library
+    // enforces the same rule when it first obtains the grant; enforcing it here
+    // too means a credential whose stored issuer is a non-https URL (the daemon
+    // derives the endpoint from it, and `AddCredential` does not vet the issuer)
+    // cannot silently leak the token on every runtime refresh.
+    if !endpoint_is_secure(request.token_endpoint) {
+        return Err(OAuthRefreshError::InsecureEndpoint {
+            endpoint: request.token_endpoint.to_string(),
+        });
+    }
     // A dedicated agent: the refresh is a one-shot blocking POST with a
     // bounded global timeout, and statuses are handled here (not by ureq) so a
     // 4xx body can be classified without an exception path. No socket registry:
@@ -261,11 +281,11 @@ fn parse_token_response(status: u16, body: &str) -> Result<OAuthTokenResponse, O
         let account_id = parsed
             .id_token
             .as_deref()
-            .and_then(chatgpt_account_id_from_id_token);
+            .and_then(choreo_shared::oauth_claims::chatgpt_account_id_from_id_token);
         return Ok(OAuthTokenResponse {
             access_token: Zeroizing::new(access_token),
             refresh_token: parsed.refresh_token.map(Zeroizing::new),
-            id_token: parsed.id_token,
+            id_token: parsed.id_token.map(Zeroizing::new),
             expires_in: parsed.expires_in,
             token_type: parsed.token_type,
             account_id,
@@ -308,29 +328,37 @@ fn classify_error_detail(error: Option<&str>, description: Option<&str>) -> Stri
 ///
 /// No signature verification: the token arrived over TLS directly from the
 /// token endpoint, and only the claim is read (the raw JWT is never stored).
-/// This mirrors the login library's claim read — both decode the same
-/// namespace, and neither trusts the signature.
+/// The decode is shared with the login library (`choreo_shared::oauth_claims`),
+/// so both read the same namespace the same way and neither trusts the
+/// signature.
 #[must_use]
 pub fn chatgpt_account_id_from_id_token(id_token: &str) -> Option<String> {
-    let mut segments = id_token.split('.');
-    let _header = segments.next()?;
-    let payload = segments.next()?;
-    // A JWT has exactly three segments; a fourth means the input is not one.
-    segments.next()?;
-    if segments.next().is_some() {
-        return None;
+    choreo_shared::oauth_claims::chatgpt_account_id_from_id_token(id_token)
+}
+
+/// Whether a token endpoint may be used to send the refresh token: `https`, or a
+/// loopback `http` URL (the in-repo mock server and a local test issuer).
+///
+/// A credential-bearing POST must never go to a plain-`http` remote host, since
+/// the refresh token in the body would travel in cleartext. This mirrors the
+/// login library's endpoint rule (`choreo-client-core`'s `ensure_secure`) so
+/// login and refresh share one policy.
+fn endpoint_is_secure(url: &str) -> bool {
+    if url.starts_with("https://") {
+        return true;
     }
-    let decoded = base64::Engine::decode(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        payload.as_bytes(),
-    )
-    .ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-    claims
-        .get("https://api.openai.com/auth")?
-        .get("chatgpt_account_id")?
-        .as_str()
-        .map(str::to_string)
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    // The authority is everything before the first `/`; a bracketed IPv6 host
+    // (`[::1]:port`) is unwrapped, otherwise the host is up to the port colon.
+    let authority = rest.split('/').next().unwrap_or_default();
+    let host = if let Some(after_bracket) = authority.strip_prefix('[') {
+        after_bracket.split(']').next().unwrap_or_default()
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
 #[cfg(test)]

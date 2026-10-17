@@ -1600,8 +1600,8 @@ impl DaemonState {
 
     /// Resolve the auth grant for an account, if a credential is stored. API
     /// keys project straight through; an OAuth credential carries its whole
-    /// grant plus any cached access token, so the future refresh path has the
-    /// refresh token to work with.
+    /// grant plus any cached access token, so the refresh path has the refresh
+    /// token to work with.
     fn auth_for(&self, name: &str) -> Option<ProviderAuth> {
         let credential = self.credentials.get(name)?;
         Some(match credential {
@@ -1658,16 +1658,25 @@ impl DaemonState {
         if oauth.kind != choreo_keystore::OAuthKind::Provider {
             return None;
         }
-        let refresh_token = oauth.refresh_token?.to_string();
+        let refresh_token = oauth.refresh_token?;
         let profile = lookup_provider(&self.accounts.get(account)?.provider)?.oauth?;
         let issuer = oauth.issuer.unwrap_or(profile.issuer.as_str());
-        let token_endpoint = format!("{}{}", issuer.trim_end_matches('/'), profile.token_path);
+        // Join the issuer and the token path tolerating either side's slash, so
+        // a profile path that omits the leading `/` still yields a valid URL.
+        let token_endpoint = if profile.token_path.starts_with('/') {
+            format!("{}{}", issuer.trim_end_matches('/'), profile.token_path)
+        } else {
+            format!("{}/{}", issuer.trim_end_matches('/'), profile.token_path)
+        };
         Some(crate::oauth_refresh::RefreshMaterial {
             token_endpoint,
             encoding: profile.refresh_encoding,
             client_id: oauth.client_id.map(str::to_string),
-            client_secret: oauth.client_secret.map(str::to_string),
-            refresh_token,
+            // The durable grant root and the client secret are secrets the
+            // session thread needs only for this one exchange, so they travel
+            // wipe-on-drop.
+            client_secret: oauth.client_secret.map(|s| Zeroizing::new(s.to_string())),
+            refresh_token: Zeroizing::new(refresh_token.to_string()),
             granted_scopes: oauth.granted_scopes.to_vec(),
         })
     }

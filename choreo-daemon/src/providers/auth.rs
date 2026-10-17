@@ -24,8 +24,8 @@ const ORIGINATOR: &str = "choreographr";
 
 /// The auth material for an account, resolved by the daemon: the durable grant
 /// plus any cached ephemeral access token. `OAuth` carries the whole
-/// `ServiceCredential` so the future refresh path has the grant; the client
-/// never sees it.
+/// `ServiceCredential` so the refresh path has the grant; the client never sees
+/// it.
 pub enum ProviderAuth {
     /// A plain API-key credential.
     ApiKey {

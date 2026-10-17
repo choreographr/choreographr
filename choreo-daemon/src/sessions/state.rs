@@ -598,7 +598,7 @@ impl SessionState {
         // token via the daemon, so re-resolve to pick it up.
         let (config, auth) = if matches!(auth, Some(crate::providers::ProviderAuth::OAuth { .. })) {
             match self.refresh_oauth_token(false, ctx) {
-                Ok(crate::oauth_refresh::RefreshOutcome::Refreshed) => {
+                Ok(crate::oauth_refresh::RefreshTokenOutcome::Refreshed) => {
                     match Self::send_resolve_account(ctx, &name) {
                         Some(ResolvedAccount {
                             config,
@@ -685,14 +685,15 @@ impl SessionState {
         &mut self,
         force: bool,
         ctx: &RequestContext,
-    ) -> Result<crate::oauth_refresh::RefreshOutcome, crate::oauth_refresh::RefreshFailure> {
+    ) -> Result<crate::oauth_refresh::RefreshTokenOutcome, crate::oauth_refresh::RefreshFailure>
+    {
         let Some(account) = self.config.account_name.clone() else {
-            return Ok(crate::oauth_refresh::RefreshOutcome::NotApplicable);
+            return Ok(crate::oauth_refresh::RefreshTokenOutcome::NotApplicable);
         };
         let source = crate::oauth_refresh::DaemonTokenSource::new(ctx.daemon_tx.clone());
         let outcome =
             crate::oauth_refresh::refresh_single_flight(&source, &account, force, unix_secs_now())?;
-        if outcome == crate::oauth_refresh::RefreshOutcome::Refreshed {
+        if outcome == crate::oauth_refresh::RefreshTokenOutcome::Refreshed {
             // The cached client holds the old token; drop it so the next resolve
             // rebuilds with the refreshed one.
             self.provider = None;

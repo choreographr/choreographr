@@ -666,19 +666,23 @@ alongside the credentials map.
 
 The interactive sign-in runs in the **frontend**, not the daemon. The shared
 login library in `choreo-client-core` (`src/oauth/`) performs PKCE **S256** plus
-a random `state`, a loopback callback server bound to `127.0.0.1` only (ports
-1455 then 1457, falling back on `AddrInUse`), or an RFC 8628 device-code poll
-for headless hosts, then builds the durable `ServiceCredential::OAuth` and
-returns the `ClientMessageType::AddCredential` frame that carries it — no render
-crate constructs an OAuth credential. The flow runs on a **worker thread** and
-streams progress (`AuthUrl`, `DeviceCode`, `Prompt`, `Progress`, `Done`,
-`Error`) over a crossbeam channel; a single-bit cancel flag (polled by the
-loopback accept loop via `tiny_http`'s `recv_timeout`, since a blocking accept
-cannot be interrupted by a channel message) and a stop channel end it. The
-`id_token`'s identity claim (`chatgpt_account_id`) is read **without signature
-verification** — the token arrived over TLS from the token endpoint — with the
-access token as a fallback; the access token is then dropped and only the
-refresh token, client registration, and extracted claims persist.
+a random `state`, a loopback callback server bound to the loopback name the
+`redirect_uri` advertises (`localhost` for a provider, `127.0.0.1` for an MCP
+server; ports 1455 then 1457, falling back on `AddrInUse`), or an RFC 8628
+device-code poll for headless hosts, then builds the durable
+`ServiceCredential::OAuth` and returns the `ClientMessageType::AddCredential`
+frame that carries it — no render crate constructs an OAuth credential. The flow
+runs on a **worker thread** and streams progress (`AuthUrl`, `DeviceCode`,
+`Prompt`, `Progress`, `Done`, `Error`) over a crossbeam channel; a single-bit
+cancel flag (polled by the loopback accept loop via `tiny_http`'s
+`recv_timeout`, since a blocking accept cannot be interrupted by a channel
+message) and a stop channel end it. The `id_token`'s identity claim
+(`chatgpt_account_id`) is read **without signature verification** — the token
+arrived over TLS from the token endpoint — with the access token as a fallback;
+the access token is then dropped and only the refresh token, client
+registration, and extracted claims persist. The claim decode is shared with the
+runtime refresh path (`choreo-shared`'s `oauth_claims`), so login and refresh
+read the same namespace one way.
 
 The daemon serves each provider's sign-in parameters over a
 `ClientMessage::ListOAuthProviders` ⇄
@@ -698,17 +702,25 @@ the unreleased v9 changelog in `choreo-proto/src/frame.rs` (no version bump).
 The access token is refreshed on demand, in the **session thread** — the
 blocking exchange stays in `choreo-ai-protocols`
 (`oauth::refresh_oauth_token`, a synchronous `ureq` POST that is the provider
-crate's only OAuth responsibility), while the daemon remains the sole owner of
-the token cache and the sole writer of the credential blob. The seam between
+crate's only OAuth responsibility), and it refuses to send the durable refresh
+token to any endpoint that is not `https` (a loopback `http` address is the sole
+exception, for the in-repo test issuer), so a credential whose stored issuer is
+a cleartext URL cannot leak the token at refresh time — the login library
+enforces the same rule. The daemon remains the sole owner of the token cache and
+the sole writer of the credential blob. The seam between
 them is `choreo-daemon/src/oauth_refresh.rs`: an `OAuthTokenSource` the session
 implements over its command channel (`DaemonTokenSource` sends
 `DaemonCommand::LoadOAuthToken` / `SaveOAuthToken` / `MarkOAuthDead`) and a
 single `refresh_single_flight` driver. A source hands back the durable material
 (the token endpoint, encoding, client id/secret, refresh token, scopes) and the
-cached token, and takes back a `RefreshedTokens`; the daemon's handlers update
-`access_tokens` and re-encrypt the rotated durable subset to the binding public
-key (the same `set_credential_blob` path as provisioning — no private key, no
-re-login).
+cached token, and takes back a `RefreshedTokens`; the refresh token and client
+secret travel wipe-on-drop (`RefreshMaterial` wraps them in `Zeroizing`, like
+the credential itself), since the session thread holds them only for the one
+exchange. The daemon's handlers update `access_tokens` and, **only when the
+exchange actually rotated** the refresh token or refreshed the identity claim,
+re-encrypt the durable subset to the binding public key (the same
+`set_credential_blob` path as provisioning — no private key, no re-login); a
+plain expiry refresh writes no blob.
 
 Two rules make it correct under rotation. **Single-flight**: the whole
 `load → re-check → exchange → persist` runs under the account's lock in
@@ -719,7 +731,9 @@ opportunistically (`OAuthRefreshLocks::prune`) once a refresh releases its guard
 and no other thread holds the entry — the provider path prunes after
 `refresh_single_flight`, the MCP path after a credential save/clear — so it does
 not grow one lock per credential ever refreshed; a held guard pins its entry so
-a prune can never evict a lock that is in use. **Rotate-if-present**: the engine
+a prune can never evict a lock that is in use. `OAuthRefreshLocks` is the
+**fourteenth** sanctioned shared-state exception (see AGENTS.md).
+**Rotate-if-present**: the engine
 adopts a returned `refresh_token` when one is present and keeps the stored one
 when it is omitted — one code path for rotating and non-rotating providers — and
 replaces the `account_id` claim only when a new `id_token` carries it.
@@ -912,7 +926,8 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   `mcp::oauth`): no `rmcp` type crosses the crate boundary. Because a server can
   connect while the command loop is blocked resolving a session overlay, the
   backend never round-trips the loop for a read — the command loop publishes a
-  credential snapshot the backend reads lock-free — and its writes are
+  credential snapshot the backend reads lock-free (the **fifteenth** sanctioned
+  shared-state exception, see AGENTS.md) — and its writes are
   fire-and-forget `DaemonCommand`s (`OAuthSave`/`OAuthClear`/`McpAuthRejected`)
   that persist to the binding public key when the loop is next free. The
   single-flight refresh guard reuses `OAuthRefreshLocks`, keyed by the MCP

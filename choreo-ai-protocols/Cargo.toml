@@ -22,6 +22,9 @@ name = "choreo_ai_protocols"
 # ArcSwap global is a declared direct dependency.
 anyhow.workspace = true
 arc-swap.workspace = true
+# Shared OIDC `id_token` claim extraction (the `chatgpt_account_id` re-extracted
+# from a rotated `id_token`); the same helper the login library uses.
+choreo-shared.workspace = true
 # Iterator adaptors (`.format()`) for joining system-message parts with
 # newline separators — replaces hand-rolled fold-with-separator bookkeeping.
 itertools.workspace = true

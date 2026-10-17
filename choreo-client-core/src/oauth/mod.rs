@@ -2,8 +2,9 @@
 //!
 //! This module turns a provider's OAuth sign-in parameters (an
 //! [`OAuthProviderDescriptor`] the daemon serves) plus a few options into a
-//! ready-to-store [`ServiceCredential`] and the [`ClientMessageType::AddCredential`]
-//! frame that carries it. It runs the frontend half of the flow — PKCE S256, a
+//! ready-to-store [`ServiceCredential`](choreo_keystore::ServiceCredential) and
+//! the [`ClientMessageType::AddCredential`] frame that carries it. It runs the
+//! frontend half of the flow — PKCE S256, a
 //! loopback callback server, or an RFC 8628 device-code poll for headless hosts
 //! — and hands the durable result (refresh token + client registration +
 //! extracted identity claims) back to the caller. The access token is derived
@@ -17,11 +18,22 @@
 //! polls (a blocking accept cannot be interrupted by a channel message), plus a
 //! stop channel for the device-code wait.
 //!
+//! The module is split by responsibility: this file owns the public types (the
+//! [`OAuthLoginError`] taxonomy, [`LoginOptions`], the [`LoginEvent`] stream, and
+//! the [`LoginSession`] handle) and the worker-thread driver ([`start_login`] /
+//! `run`); the private `flow` module owns the two interactive flows (loopback
+//! PKCE and RFC 8628 device-code); the private `credential` module builds the
+//! durable [`ServiceCredential`](choreo_keystore::ServiceCredential) and its
+//! `AddCredential` frame from the exchanged tokens. The `pkce`, `jwt`, `url`, and
+//! `http` modules are the small primitives those two shells compose.
+//!
 //! The render crates never build an OAuth credential themselves: this library
 //! returns the `AddCredential` message so the credential's shape stays in one
 //! place.
 
 mod callback;
+mod credential;
+mod flow;
 mod http;
 mod jwt;
 mod mcp;
@@ -33,20 +45,14 @@ pub use mcp::{McpLoginInfo, McpLoginOptions, start_mcp_login};
 pub use pkce::{challenge_s256, generate_state, generate_verifier, state_matches};
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
 
-use choreo_keystore::{OAuthKind, ServiceCredential};
 use choreo_proto::{ClientMessageType, OAuthProviderDescriptor};
-use crossbeam_channel::{Receiver, Sender, after, select};
+use crossbeam_channel::{Receiver, Sender};
 use tracing::warn;
 
-use crate::credentials::build_add_credential_from_credential;
-
-/// How many consecutive transient network failures the device-code poll
-/// tolerates before giving up. A one-off blip is retried; a persistently
-/// unreachable token endpoint still fails rather than looping forever.
-const MAX_DEVICE_POLL_ERRORS: u8 = 5;
+use flow::{run_device, run_loopback};
 
 /// A failure from the login flow. Each variant is a distinct recovery class
 /// (bind failure vs. CSRF mismatch vs. provider error), so the UI can hint at
@@ -98,26 +104,6 @@ pub enum OAuthLoginError {
     /// The `--callback-url` value could not be parsed into a code/state.
     #[error("could not parse the callback URL: {0}")]
     CallbackUrl(String),
-}
-
-/// How the flow serializes a token request body. Mirrors the descriptor's
-/// per-endpoint encoding (the code exchange and the refresh can differ).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Encoding {
-    /// `application/x-www-form-urlencoded`.
-    Form,
-    /// `application/json`.
-    Json,
-}
-
-impl Encoding {
-    /// Map a descriptor's grant encoding to this module's encoding.
-    fn from_proto(encoding: choreo_proto::OAuthGrantEncoding) -> Self {
-        match encoding {
-            choreo_proto::OAuthGrantEncoding::Form => Encoding::Form,
-            choreo_proto::OAuthGrantEncoding::Json => Encoding::Json,
-        }
-    }
 }
 
 /// Options controlling how the sign-in runs.
@@ -197,7 +183,8 @@ impl LoginSession {
     /// Request cancellation. Best-effort: the loopback accept loop observes it
     /// within one poll interval, the device-code wait immediately.
     pub fn cancel(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         // The device wait selects on this channel so a cancel is observed
         // without waiting out the poll interval. A closed receiver is fine.
         let _ = self.stop.send(());
@@ -279,459 +266,5 @@ fn run(
     } else {
         run_loopback(descriptor, options, tx, cancel)?
     };
-    finish(descriptor, options, tx, &tokens, &client_id)
-}
-
-/// Build the credential from the exchanged tokens and emit `Done`.
-fn finish(
-    descriptor: &OAuthProviderDescriptor,
-    options: &LoginOptions,
-    tx: &Sender<LoginEvent>,
-    tokens: &http::TokenSet,
-    client_id: &str,
-) -> Result<(), OAuthLoginError> {
-    let credential = build_credential(descriptor, tokens, client_id);
-    let message = build_add_credential_from_credential(options.account.clone(), credential)
-        .map_err(|e| OAuthLoginError::Decode(e.to_string()))?;
-    let _ = tx.send(LoginEvent::Done {
-        service: options.account.clone(),
-        message: Box::new(message),
-    });
-    Ok(())
-}
-
-/// The PKCE loopback flow: authorize URL → browser/manual → callback → code
-/// exchange.
-fn run_loopback(
-    descriptor: &OAuthProviderDescriptor,
-    options: &LoginOptions,
-    tx: &Sender<LoginEvent>,
-    cancel: &AtomicBool,
-) -> Result<(http::TokenSet, String), OAuthLoginError> {
-    let client_id = effective_client_id(descriptor)?;
-    let verifier = generate_verifier();
-    let challenge = challenge_s256(&verifier);
-    let state = generate_state();
-
-    // Bind before building the URL so the redirect port is known.
-    let (server, port) = callback::bind(&descriptor.redirect_ports)?;
-    let redirect_uri = format!("http://localhost:{port}{}", callback::CALLBACK_PATH);
-    let auth_url = build_authorize_url(descriptor, &client_id, &redirect_uri, &challenge, &state);
-    // The URL carries the request parameters only; it never carries a code.
-    let _ = tx.send(LoginEvent::AuthUrl {
-        url: auth_url.clone(),
-    });
-
-    let callback = if let Some(callback_url) = options.callback_url.as_deref() {
-        // Paste-URL path: the caller supplied the redirect URL a remote browser
-        // landed on, so the loopback server is unused.
-        parse_callback_url(callback_url)?
-    } else {
-        if options.no_browser || options.print_auth_url {
-            let _ = tx.send(LoginEvent::Prompt {
-                message: format!("Open this URL to sign in: {auth_url}"),
-            });
-        } else {
-            // Best-effort: a headless/SSH host has no browser, so a failed open
-            // falls back to the emitted URL + the prompt below.
-            match webbrowser::open(&auth_url) {
-                Ok(()) => {
-                    let _ = tx.send(LoginEvent::Progress {
-                        message: "Opened the sign-in page in your browser.".to_string(),
-                    });
-                }
-                Err(e) => {
-                    let _ = tx.send(LoginEvent::Prompt {
-                        message: format!("Open this URL to sign in: {auth_url} ({e})"),
-                    });
-                }
-            }
-        }
-        callback::wait_for_callback(&server, cancel)?
-    };
-
-    // CSRF guard: never exchange a code whose `state` does not match.
-    if !state_matches(&state, &callback.state) {
-        return Err(OAuthLoginError::StateMismatch);
-    }
-    let _ = tx.send(LoginEvent::Progress {
-        message: "Authorization received; exchanging the code for tokens…".to_string(),
-    });
-    let tokens = http::exchange_code(
-        &descriptor.issuer,
-        &descriptor.token_path,
-        Encoding::from_proto(descriptor.code_exchange_encoding),
-        &client_id,
-        &callback.code,
-        &redirect_uri,
-        &verifier,
-    )?;
-    // A provider on the dynamic-registration route returns the client id it
-    // registered on the callback; persist it so refresh does not depend on the
-    // catalog value. Otherwise persist the id actually sent.
-    let persisted_client_id = callback
-        .client_id
-        .clone()
-        .unwrap_or_else(|| client_id.clone());
-    Ok((tokens, persisted_client_id))
-}
-
-/// The RFC 8628 device-code flow: usercode request → poll → tokens. Returns the
-/// tokens and the client id to persist (the descriptor's).
-fn run_device(
-    descriptor: &OAuthProviderDescriptor,
-    tx: &Sender<LoginEvent>,
-    cancel: &AtomicBool,
-    stop: &Receiver<()>,
-) -> Result<(http::TokenSet, String), OAuthLoginError> {
-    if !descriptor.device_code {
-        return Err(OAuthLoginError::Unsupported(
-            "the provider has no device-code flow".to_string(),
-        ));
-    }
-    let (Some(device_authorization_path), Some(device_token_path)) = (
-        descriptor.device_authorization_path.as_deref(),
-        descriptor.device_token_path.as_deref(),
-    ) else {
-        return Err(OAuthLoginError::Unsupported(
-            "the provider's device-code endpoints are not configured".to_string(),
-        ));
-    };
-    let client_id = effective_client_id(descriptor)?;
-    let scope = descriptor.scopes.join(" ");
-    let code = http::device_authorize(
-        &descriptor.issuer,
-        device_authorization_path,
-        &client_id,
-        &scope,
-    )?;
-    let _ = tx.send(LoginEvent::DeviceCode {
-        code: code.user_code.clone(),
-        uri: code.verification_uri.clone(),
-    });
-    // The interval starts at the server's suggestion (defaulting to 5s) and is
-    // bumped by 5s on each `slow_down`, per RFC 8628 §3.5.
-    let mut interval = std::time::Duration::from_secs(code.interval.unwrap_or(5).max(1));
-    // A transient transport error during the (minutes-long) poll must not abort
-    // the flow: tolerate a short run of them before giving up, so a one-off blip
-    // is retried but a permanently unreachable endpoint still fails.
-    let mut transient_errors: u8 = 0;
-    loop {
-        wait_interval(stop, interval, cancel)?;
-        match http::device_poll(
-            &descriptor.issuer,
-            device_token_path,
-            &client_id,
-            &code.device_code,
-        ) {
-            Ok(http::PollOutcome::Tokens(tokens)) => return Ok((tokens, client_id)),
-            Ok(http::PollOutcome::Pending) => {}
-            Ok(http::PollOutcome::SlowDown) => {
-                transient_errors = 0;
-                interval = interval.saturating_add(std::time::Duration::from_secs(5));
-                let _ = tx.send(LoginEvent::Progress {
-                    message: "The provider asked to slow down; waiting a little longer…"
-                        .to_string(),
-                });
-            }
-            Ok(http::PollOutcome::Expired(reason)) => {
-                return Err(OAuthLoginError::DeviceFlow(reason));
-            }
-            // A transient network failure: report progress and keep polling.
-            Err(OAuthLoginError::Network(e)) if transient_errors < MAX_DEVICE_POLL_ERRORS => {
-                transient_errors += 1;
-                let _ = tx.send(LoginEvent::Progress {
-                    message: format!(
-                        "transient error while waiting for authorization; retrying ({e})"
-                    ),
-                });
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// Wait one device-code poll interval, waking immediately on cancel.
-fn wait_interval(
-    stop: &Receiver<()>,
-    interval: std::time::Duration,
-    cancel: &AtomicBool,
-) -> Result<(), OAuthLoginError> {
-    if cancel.load(Ordering::Relaxed) {
-        return Err(OAuthLoginError::Cancelled);
-    }
-    // The timer IS the event here, so `after` (a timer channel) is the wait;
-    // the stop channel wins the race so a cancel is observed instantly rather
-    // than after up to a full interval.
-    select! {
-        recv(stop) -> _ => Err(OAuthLoginError::Cancelled),
-        recv(after(interval)) -> _ => {
-            if cancel.load(Ordering::Relaxed) {
-                Err(OAuthLoginError::Cancelled)
-            } else {
-                Ok(())
-            }
-        }
-    }
-}
-
-/// The client id to send at the authorize endpoint, or an error explaining why
-/// none is usable (a withheld borrowed id, or a provider requiring dynamic
-/// registration that the descriptor did not resolve to a concrete id).
-fn effective_client_id(descriptor: &OAuthProviderDescriptor) -> Result<String, OAuthLoginError> {
-    descriptor.client_id.clone().ok_or_else(|| {
-        OAuthLoginError::NoClientId(format!(
-            "{} has no client id (a borrowed id is withheld until the opt-in is enabled, \
-             or the provider needs dynamic registration)",
-            descriptor.provider
-        ))
-    })
-}
-
-/// Build the provider authorization URL with PKCE and the `state`.
-///
-/// The request carries only the parameters (never a code); the callback returns
-/// the code. Query parameters are percent-encoded by the same rules as the form
-/// encoder.
-fn build_authorize_url(
-    descriptor: &OAuthProviderDescriptor,
-    client_id: &str,
-    redirect_uri: &str,
-    code_challenge: &str,
-    state: &str,
-) -> String {
-    let mut params: Vec<(String, String)> = vec![
-        ("response_type".to_string(), "code".to_string()),
-        ("client_id".to_string(), client_id.to_string()),
-        ("redirect_uri".to_string(), redirect_uri.to_string()),
-        ("scope".to_string(), descriptor.scopes.join(" ")),
-        ("state".to_string(), state.to_string()),
-        ("code_challenge".to_string(), code_challenge.to_string()),
-        ("code_challenge_method".to_string(), "S256".to_string()),
-    ];
-    params.retain(|(_, value)| !value.is_empty());
-    let query = http::form_encode(&params);
-    http::join_url(&descriptor.issuer, &descriptor.authorize_path)
-        + if descriptor.authorize_path.contains('?') {
-            "&"
-        } else {
-            "?"
-        }
-        + &query
-}
-
-/// Parse a pasted callback URL (or a bare `code=..&state=..` query) into a
-/// [`callback::Callback`]. Also captures an optional provider-issued
-/// `client_id`.
-fn parse_callback_url(url: &str) -> Result<callback::Callback, OAuthLoginError> {
-    let query = url.split_once('?').map_or(url, |(_, query)| query);
-    let mut code = None;
-    let mut state = None;
-    let mut client_id = None;
-    for (key, value) in url::parse_query(query) {
-        match key.as_str() {
-            "code" => code = Some(value),
-            "state" => state = Some(value),
-            "client_id" => client_id = Some(value),
-            _ => {}
-        }
-    }
-    match (code, state) {
-        (Some(code), Some(state)) => Ok(callback::Callback {
-            code,
-            state,
-            client_id,
-        }),
-        _ => Err(OAuthLoginError::CallbackUrl(
-            "the URL has no code/state parameters".to_string(),
-        )),
-    }
-}
-
-/// Build the durable OAuth credential from the token response.
-///
-/// Only the durable subset is kept (refresh token, client registration,
-/// extracted claims); the access token is dropped. The identity claim is read
-/// from the `id_token` first, then the access token.
-fn build_credential(
-    descriptor: &OAuthProviderDescriptor,
-    tokens: &http::TokenSet,
-    client_id: &str,
-) -> ServiceCredential {
-    ServiceCredential::OAuth {
-        kind: OAuthKind::Provider,
-        issuer: Some(descriptor.issuer.clone()),
-        resource: None,
-        authorization_server: None,
-        refresh_token: tokens.refresh_token.clone(),
-        account_id: extract_account_id(tokens),
-        client_id: Some(client_id.to_string()),
-        client_secret: None,
-        granted_scopes: granted_scopes(tokens, descriptor),
-        token_type: tokens
-            .token_type
-            .clone()
-            .or_else(|| Some("Bearer".to_string())),
-    }
-}
-
-/// The account id, preferring the `id_token`'s claim, falling back to the
-/// access token's (some providers carry it only in the access token).
-fn extract_account_id(tokens: &http::TokenSet) -> Option<String> {
-    if let Some(id_token) = tokens.id_token.as_deref()
-        && let Some(claims) = decode_claims(id_token)
-        && let Some(account_id) = chatgpt_account_id(&claims)
-    {
-        return Some(account_id);
-    }
-    let claims = decode_claims(tokens.access_token.as_str())?;
-    chatgpt_account_id(&claims)
-}
-
-/// The granted scopes: the token response's `scope` when present, else the
-/// descriptor's requested scopes.
-fn granted_scopes(tokens: &http::TokenSet, descriptor: &OAuthProviderDescriptor) -> Vec<String> {
-    match tokens.scope.as_deref() {
-        Some(scope) if !scope.trim().is_empty() => {
-            scope.split_whitespace().map(str::to_string).collect()
-        }
-        _ => descriptor.scopes.clone(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use choreo_proto::{OAuthClientIdentity, OAuthGrantEncoding};
-
-    fn descriptor() -> OAuthProviderDescriptor {
-        OAuthProviderDescriptor {
-            provider: "mock".into(),
-            issuer: "https://auth.example".into(),
-            authorize_path: "/authorize".into(),
-            token_path: "/token".into(),
-            client_id: Some("client-abc".into()),
-            scopes: vec!["openid".into(), "offline_access".into()],
-            redirect_ports: vec![1455],
-            code_exchange_encoding: OAuthGrantEncoding::Form,
-            refresh_encoding: OAuthGrantEncoding::Json,
-            client_identity: OAuthClientIdentity::Registered,
-            device_code: false,
-            device_authorization_path: None,
-            device_token_path: None,
-        }
-    }
-
-    fn tokens(id_token: Option<&str>, access_token: &str, scope: Option<&str>) -> http::TokenSet {
-        http::TokenSet {
-            access_token: access_token.to_string(),
-            refresh_token: Some("refresh".into()),
-            id_token: id_token.map(str::to_string),
-            token_type: Some("Bearer".into()),
-            scope: scope.map(str::to_string),
-        }
-    }
-
-    fn jwt(claims: &serde_json::Value) -> String {
-        use base64::Engine as _;
-        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{}");
-        let payload =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
-        format!("{header}.{payload}.sig")
-    }
-
-    #[test]
-    fn authorize_url_carries_pkce_and_state() {
-        let url = build_authorize_url(
-            &descriptor(),
-            "client-abc",
-            "http://localhost:1455/auth/callback",
-            "CHALLENGE",
-            "STATE123",
-        );
-        assert!(url.starts_with("https://auth.example/authorize?"));
-        assert!(url.contains("response_type=code"));
-        assert!(url.contains("client_id=client-abc"));
-        assert!(url.contains("code_challenge=CHALLENGE"));
-        assert!(url.contains("code_challenge_method=S256"));
-        assert!(url.contains("state=STATE123"));
-        // The redirect URI is percent-encoded.
-        assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"));
-        assert!(url.contains("scope=openid%20offline_access"));
-    }
-
-    #[test]
-    fn parse_callback_url_extracts_code_state_and_client_id() {
-        let callback = parse_callback_url(
-            "http://localhost:1455/auth/callback?code=abc&state=xyz&client_id=oaiapp_1",
-        )
-        .expect("parse");
-        assert_eq!(callback.code, "abc");
-        assert_eq!(callback.state, "xyz");
-        assert_eq!(callback.client_id.as_deref(), Some("oaiapp_1"));
-    }
-
-    #[test]
-    fn parse_callback_url_rejects_a_missing_code() {
-        assert!(parse_callback_url("http://localhost/cb?state=xyz").is_err());
-    }
-
-    #[test]
-    fn effective_client_id_errors_when_withheld() {
-        let mut desc = descriptor();
-        desc.client_id = None;
-        assert!(matches!(
-            effective_client_id(&desc),
-            Err(OAuthLoginError::NoClientId(_))
-        ));
-        assert_eq!(
-            effective_client_id(&descriptor()).expect("id"),
-            "client-abc"
-        );
-    }
-
-    #[test]
-    fn account_id_prefers_the_id_token_then_falls_back_to_the_access_token() {
-        let acct = serde_json::json!({
-            "https://api.openai.com/auth": { "chatgpt_account_id": "from-id" }
-        });
-        let from_id = tokens(Some(&jwt(&acct)), "opaque-access", None);
-        assert_eq!(extract_account_id(&from_id).as_deref(), Some("from-id"));
-
-        // No id_token: the access token itself is a JWT carrying the claim.
-        let from_access = tokens(None, &jwt(&acct), None);
-        assert_eq!(extract_account_id(&from_access).as_deref(), Some("from-id"));
-
-        // Neither carries the claim.
-        let none = tokens(None, "opaque", None);
-        assert!(extract_account_id(&none).is_none());
-    }
-
-    #[test]
-    fn granted_scopes_prefers_the_response_then_the_descriptor() {
-        let with_scope = tokens(None, "opaque", Some("a b"));
-        assert_eq!(granted_scopes(&with_scope, &descriptor()), ["a", "b"]);
-
-        let without = tokens(None, "opaque", None);
-        assert_eq!(
-            granted_scopes(&without, &descriptor()),
-            ["openid", "offline_access"]
-        );
-    }
-
-    #[test]
-    fn build_credential_drops_the_access_token_and_keeps_the_grant() {
-        let cred = build_credential(
-            &descriptor(),
-            &tokens(None, "opaque-access", Some("openid")),
-            "client-abc",
-        );
-        let oauth = cred.as_oauth().expect("OAuth credential");
-        assert_eq!(oauth.kind, OAuthKind::Provider);
-        assert_eq!(oauth.refresh_token, Some("refresh"));
-        assert_eq!(oauth.client_id, Some("client-abc"));
-        assert_eq!(oauth.issuer, Some("https://auth.example"));
-        // The access token is not a field of the credential at all.
-        assert_eq!(format!("{cred:?}").matches("opaque-access").count(), 0);
-    }
+    credential::finish(descriptor, options, tx, &tokens, &client_id)
 }

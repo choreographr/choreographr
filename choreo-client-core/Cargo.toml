@@ -15,6 +15,9 @@ choreo-proto.workspace = true
 choreo-sanitize.workspace = true
 choreo-transport.workspace = true
 choreo-keystore.workspace = true
+# Shared OIDC `id_token` claim extraction (`choreo_shared::oauth_claims`), reused
+# under the `oauth` namespace so login and refresh decode claims one way.
+choreo-shared.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
