@@ -934,7 +934,7 @@ A remote server that needs credentials uses a static token in `headers`:
 
 **OAuth.** A remote server that requires an interactive OAuth sign-in declares
 an `oauth` block (all fields optional: `clientId` for an authorization server
-with neither dynamic client registration nor a client-metadata document,
+with no dynamic client registration,
 `callbackPort`, `scopes`, `authorizationServer` to name the authorization
 server explicitly when it is not reachable through the resource's well-known
 paths, and `clientSecretEnv`, which names an **environment variable** holding a
@@ -981,8 +981,9 @@ metadata → RFC 8414 or OpenID Connect Discovery, including the appended
 `authorizationServer` when set), registers a client
 dynamically when no `clientId` is configured, and drives a loopback callback
 (with a paste-URL fallback for a headless/remote host — there is no device-code
-flow here). A confidential client's secret is sent at the token endpoint
-(`client_secret_post`) and stored in the grant, so connect-time refresh
+flow here). A confidential client's secret is sent at the token endpoint —
+HTTP Basic, or `client_secret_post` when the server advertises only that — and
+stored in the grant, so connect-time refresh
 re-authenticates the token endpoint; the authorization response's `iss` is
 validated against the discovered issuer when the server advertises RFC 9207
 support. The durable grant is stored in the same encrypted keystore as

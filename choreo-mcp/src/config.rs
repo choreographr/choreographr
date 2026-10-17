@@ -104,9 +104,11 @@ impl McpTransportKind {
 /// OAuth parameters for a remote (HTTP) MCP server.
 ///
 /// A server's `oauth` block supplies only what the interactive sign-in cannot
-/// discover on its own; discovery (RFC 9728/8414), dynamic client registration
-/// (SEP-837), and client-metadata documents (SEP-991) are driven by the
-/// login flow. Deliberately **no** literal `client_secret`: a confidential
+/// discover on its own; discovery (RFC 9728/8414) and dynamic client
+/// registration (SEP-837) are driven by the login flow. A URL-based
+/// client-id (SEP-991) is passed through verbatim as the configured
+/// [`Self::client_id`]; there is no separate client-metadata-document step.
+/// Deliberately **no** literal `client_secret`: a confidential
 /// client reads its secret from the environment, never a repo-controlled config
 /// file — [`Self::client_secret_env`] names the variable to read instead.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
