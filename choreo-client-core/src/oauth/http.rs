@@ -13,10 +13,11 @@
 //! re-vetting each with the endpoint policy (see `mcp::discovery::get_json`).
 //!
 //! Every credential-bearing endpoint is vetted with the shared `https`-or-
-//! loopback rule. The provider flow and the mock-server tests keep the loopback
-//! allowance; the MCP flow passes `allow_loopback_http = false` whenever its
-//! resource was remote, so a fetched document cannot steer a hop onto
-//! `http://127.0.0.1`.
+//! loopback rule, and the MCP flow additionally refuses a private/link-local
+//! IP-literal host whenever its resource was remote (see [`HopPolicy`]), so a
+//! fetched document cannot steer a hop onto `http://127.0.0.1` or an internal
+//! service. The provider flow and the mock-server tests keep the loopback
+//! allowance.
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -146,6 +147,72 @@ pub(crate) fn ensure_secure_with(
     }
 }
 
+/// The endpoint policy one login hop is vetted under.
+///
+/// The provider flow's endpoints come from the trusted catalog descriptor, so
+/// its policy allows a loopback `http` endpoint and imposes no IP-literal
+/// restriction. The MCP flow's endpoints come from a document a remote server
+/// served, so its policy additionally refuses a private/link-local IP literal
+/// unless the flow itself began at such a resource (see [`Self::for_resource`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HopPolicy {
+    /// Allow a loopback `http` endpoint (the flow began at a loopback resource,
+    /// or the provider flow's trusted descriptor).
+    pub(crate) allow_loopback_http: bool,
+    /// Allow an endpoint whose host is a private/link-local IP literal (the
+    /// flow's own resource is one, so it is expected to discover internal
+    /// endpoints).
+    pub(crate) allow_private_hosts: bool,
+}
+
+impl HopPolicy {
+    /// The provider flow's policy: endpoints come from the trusted descriptor,
+    /// so neither a loopback `http` endpoint nor a private host is restricted.
+    pub(crate) fn provider() -> Self {
+        Self {
+            allow_loopback_http: true,
+            allow_private_hosts: true,
+        }
+    }
+
+    /// The MCP flow's policy for a starting `resource` URL.
+    ///
+    /// A resource reached by hostname (the common remote case) is treated as
+    /// untrusted, so a document it served may not steer a hop onto a loopback
+    /// `http` endpoint or a private/link-local IP literal. A resource that is
+    /// itself a loopback or private IP literal — an in-repo mock, or a LAN
+    /// self-hosted server — keeps the local allowance, because its own
+    /// documents legitimately name internal endpoints.
+    pub(crate) fn for_resource(resource: &str) -> Self {
+        let loopback = choreo_shared::oauth_endpoint::is_loopback_endpoint(resource);
+        Self {
+            allow_loopback_http: loopback,
+            allow_private_hosts: loopback || host_is_blocked_ip(resource),
+        }
+    }
+
+    /// Vet one hop under this policy: the shared `https`-or-loopback rule,
+    /// plus the SSRF IP-literal refusal when a private host is not allowed.
+    pub(crate) fn check(self, url: &str) -> Result<(), OAuthLoginError> {
+        ensure_secure_with(url, self.allow_loopback_http)?;
+        if !self.allow_private_hosts && host_is_blocked_ip(url) {
+            return Err(OAuthLoginError::InsecureEndpoint(url.to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// Whether `url`'s host is a loopback/private/link-local IP literal. The
+/// classifier itself is shared (`choreo_shared::net`); this is only the
+/// URL-to-host projection, kept here because `choreo-shared` is a leaf with no
+/// URL dependency.
+fn host_is_blocked_ip(url: &str) -> bool {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_owned))
+        .is_some_and(|host| choreo_shared::net::is_blocked_ip_literal(&host))
+}
+
 /// Build the shared agent: status responses are returned verbatim (a 400 token
 /// response is a normal, readable outcome), a global timeout bounds a hung
 /// provider, and redirects are never followed — on the credential-bearing POSTs
@@ -172,9 +239,9 @@ pub(crate) fn post(
     url: &str,
     content_type: &str,
     body: &str,
-    allow_loopback_http: bool,
+    policy: HopPolicy,
 ) -> Result<ureq::http::Response<ureq::Body>, OAuthLoginError> {
-    ensure_secure_with(url, allow_loopback_http)?;
+    policy.check(url)?;
     agent
         .post(url)
         .header("Content-Type", content_type)
@@ -283,7 +350,7 @@ pub(crate) fn exchange_code(
             )
         }
     };
-    let response = post(&agent, &url, content_type, &body, true)?;
+    let response = post(&agent, &url, content_type, &body, HopPolicy::provider())?;
     read_token_response(response)
 }
 
@@ -312,7 +379,7 @@ pub(crate) fn device_authorize(
         &url,
         "application/x-www-form-urlencoded",
         &body,
-        true,
+        HopPolicy::provider(),
     )?;
     let status = response.status();
     // The response carries the opaque `device_code` (a short-lived secret), so
@@ -392,7 +459,7 @@ pub(crate) fn device_poll(
         &url,
         "application/x-www-form-urlencoded",
         &body,
-        true,
+        HopPolicy::provider(),
     )?;
     // The response body carries the freshly minted tokens on the authorized
     // poll, so it is wipe-on-drop.

@@ -93,16 +93,17 @@ fn run(
     tx: &Sender<LoginEvent>,
     cancel: &AtomicBool,
 ) -> Result<(), OAuthLoginError> {
-    // The loopback `http` allowance is available only when the flow already
-    // began at a loopback resource (the in-repo mock server). A remote resource
-    // must not be able to steer any later hop — a metadata GET redirect, a
-    // discovered endpoint — onto `http://127.0.0.1`, so a hostile document
-    // cannot probe the host's local services.
-    let allow_loopback = choreo_shared::oauth_endpoint::is_loopback_endpoint(&info.resource);
+    // The local allowances are available only when the flow already began at a
+    // loopback (in-repo mock) or private IP-literal (LAN self-hosted) resource.
+    // A resource reached by hostname is remote, so a document it served must
+    // not steer any later hop — a metadata GET redirect, a discovered endpoint
+    // — onto `http://127.0.0.1` or an internal private/link-local address, which
+    // would let a hostile document probe the host's local services.
+    let policy = http::HopPolicy::for_resource(&info.resource);
     let _ = tx.send(LoginEvent::Progress {
         message: "Discovering the authorization server…".to_string(),
     });
-    let server = discover(&http::agent(), &info.resource, allow_loopback)?;
+    let server = discover(&http::agent(), &info.resource, policy)?;
     // Bind the loopback callback FIRST so the redirect URI is known, then use
     // that exact URI for both dynamic registration and the authorize request.
     // A server that validates `redirect_uri` against the registered value must
@@ -121,7 +122,7 @@ fn run(
             &server,
             &bound.redirect_uri,
             &info.oauth.scopes,
-            allow_loopback,
+            policy,
             tx,
         )?,
     };
@@ -131,7 +132,7 @@ fn run(
         server: &server,
         client_id: &client_id,
         bound: &bound,
-        allow_loopback_http: allow_loopback,
+        policy,
     };
     let tokens = authorize(&ctx, tx, cancel)?;
     finish(info, &server, &client_id, &tokens, tx)?;

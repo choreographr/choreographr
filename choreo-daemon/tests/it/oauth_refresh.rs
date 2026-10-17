@@ -232,7 +232,7 @@ fn rotation_persists_through_a_lock_unlock_cycle() {
         new_account_id: Some("acct-new".into()),
         // The refresh presented the stored credential's token, so the rotation
         // applies rather than being dropped as a superseded grant.
-        expected_refresh_token: Some("rt-original".into()),
+        expected_refresh_token: Some(Zeroizing::new("rt-original".into())),
         reply: save_reply,
     });
     save_rx.recv().expect("save reply").expect("save ok");

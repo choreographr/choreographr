@@ -69,21 +69,18 @@ impl DaemonState {
             )));
             return;
         }
-        // A rotation of the refresh token or a refreshed identity claim is the
-        // only thing that changes the durable blob; a plain expiry refresh
-        // updates the in-memory access-token cache alone, so it costs no
-        // re-encryption and no disk write.
-        let rotation_requested =
-            save.rotated_refresh_token.is_some() || save.new_account_id.is_some();
         // Guard against a credential replaced under us between the load and
         // this save (a re-login or logout landing mid-exchange): the stored
-        // grant is a newer one, so rotating the refresh token onto it would
-        // clobber that grant with a value minted from the superseded token.
-        // Rotate only onto the credential the exchange actually loaded.
-        if rotation_requested && !refresh_token_unchanged(&current, save.expected_refresh_token) {
+        // grant is a newer one, so the access token obtained here — minted from
+        // the superseded refresh token — must not overwrite the cache, and any
+        // rotation must not clobber the newer grant. The guard is unconditional
+        // (it must fire even for a non-rotating refresh), and
+        // `refresh_token_unchanged` is true when no expectation was recorded, so
+        // a save with no `expected_refresh_token` skips it.
+        if !refresh_token_unchanged(&current, save.expected_refresh_token) {
             warn!(
                 account = %save.account,
-                "OAuth credential changed under the refresh; dropping the rotation"
+                "OAuth credential changed under the refresh; dropping the save"
             );
             // The newer grant owns the cache and the quarantine state: the
             // access token obtained here was minted from the superseded refresh
@@ -92,7 +89,20 @@ impl DaemonState {
             let _ = reply.send(Ok(()));
             return;
         }
-        if rotation_requested {
+        // A refresh changes the durable blob only when it carries a refresh
+        // token or an identity claim that DIFFERS from the stored one — an OIDC
+        // provider that re-issues an identical `id_token`, or echoes the same
+        // refresh token, must not force a re-encrypt and disk write. Compare
+        // VALUES, not presence; a plain expiry refresh then updates the
+        // in-memory access-token cache alone.
+        let stored = current.as_oauth();
+        let durable_change = save
+            .rotated_refresh_token
+            .is_some_and(|rotated| stored.and_then(|v| v.refresh_token) != Some(rotated))
+            || save
+                .new_account_id
+                .is_some_and(|id| stored.and_then(|v| v.account_id) != Some(id));
+        if durable_change {
             let mut updated = current;
             if let ServiceCredential::OAuth {
                 refresh_token,
@@ -125,7 +135,7 @@ impl DaemonState {
         self.dead_oauth.remove(save.account);
         info!(
             account = %save.account,
-            rotated = save.rotated_refresh_token.is_some(),
+            rotated = durable_change,
             "OAuth token refreshed and persisted"
         );
         let _ = reply.send(Ok(()));
@@ -446,6 +456,84 @@ mod tests {
                 .and_then(ServiceCredential::as_oauth)
                 .and_then(|v| v.refresh_token),
             Some("rotated-B")
+        );
+    }
+
+    #[test]
+    fn save_oauth_token_drops_a_stale_non_rotating_refresh() {
+        // A credential replaced mid-exchange (stored "old" != the presented
+        // "stale") whose refresh carried NO rotation must still be dropped: the
+        // access token was minted from the superseded refresh token, so it must
+        // not reach the cache even though nothing durable would have changed.
+        let (mut state, _rx) = make_daemon_state();
+        bind_for_test(&mut state);
+        state
+            .credentials
+            .insert("acct".into(), provider_oauth_credential("old"));
+        let access = Zeroizing::new("at".to_string());
+        let (reply, rx) = mpsc::channel();
+        state.handle_save_oauth_token(
+            SaveToken {
+                account: "acct",
+                access_token: &access,
+                expires_at: Some(9_999),
+                received_at: 1,
+                rotated_refresh_token: None,
+                new_account_id: None,
+                expected_refresh_token: Some("stale"),
+            },
+            &reply,
+        );
+        assert!(rx.recv().expect("a reply").is_ok());
+        assert!(
+            !state.access_tokens.contains_key("acct"),
+            "a superseded grant's access token must not reach the cache"
+        );
+        assert!(
+            db::get_all_credential_blobs(&state.db)
+                .expect("read blobs")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn save_oauth_token_skips_the_reencrypt_when_nothing_durable_changed() {
+        // An OIDC provider that echoes the SAME refresh token must not force a
+        // re-encrypt: the fresh access token is cached, but the durable grant is
+        // left untouched (no blob write).
+        let (mut state, _rx) = make_daemon_state();
+        bind_for_test(&mut state);
+        state
+            .credentials
+            .insert("acct".into(), provider_oauth_credential("same"));
+        let access = Zeroizing::new("at".to_string());
+        let (reply, rx) = mpsc::channel();
+        state.handle_save_oauth_token(
+            SaveToken {
+                account: "acct",
+                access_token: &access,
+                expires_at: Some(9_999),
+                received_at: 1,
+                rotated_refresh_token: Some("same"),
+                new_account_id: None,
+                expected_refresh_token: Some("same"),
+            },
+            &reply,
+        );
+        assert!(rx.recv().expect("a reply").is_ok());
+        assert_eq!(
+            state
+                .access_tokens
+                .get("acct")
+                .map(|c| c.access_token.as_str()),
+            Some("at"),
+            "the fresh access token is still cached"
+        );
+        assert!(
+            db::get_all_credential_blobs(&state.db)
+                .expect("read blobs")
+                .is_empty(),
+            "an unchanged refresh token must not re-encrypt the durable grant"
         );
     }
 

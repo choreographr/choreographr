@@ -77,6 +77,28 @@ pub fn is_loopback_endpoint(url: &str) -> bool {
     loopback_http_host(&url.to_ascii_lowercase()).is_some()
 }
 
+/// Whether two authorization-server issuer strings identify the same issuer,
+/// tolerating a single trailing-slash difference.
+///
+/// An issuer is discovered, recorded on a credential at login, and re-discovered
+/// at connect; the RFC 8414 §3.3 issuer-identity check compares the metadata's
+/// `issuer` against the authorization-server URL it was fetched from, and the
+/// MCP connect path compares a stored credential's issuer against the one it
+/// re-discovers. A server that spells its issuer with or without a trailing
+/// slash must not be treated as two issuers — that only forces a needless
+/// re-login — so one trailing slash is ignored on each side. Both sides are
+/// compared verbatim otherwise (issuer identity is otherwise exact).
+#[must_use]
+pub fn issuers_match(expected: &str, actual: &str) -> bool {
+    strip_one_trailing_slash(expected) == strip_one_trailing_slash(actual)
+}
+
+/// Strip at most one trailing slash, so a single trailing-slash difference
+/// between two otherwise-identical issuer URLs is tolerated.
+fn strip_one_trailing_slash(url: &str) -> &str {
+    url.strip_suffix('/').unwrap_or(url)
+}
+
 /// The loopback host of an `http://` URL (`127.0.0.1`, `localhost`, or `::1`),
 /// or `None` when the URL is not a loopback `http` URL.
 ///
@@ -182,6 +204,24 @@ mod tests {
         assert!(!is_secure_endpoint_with("http://evil.example/token", false));
         // The permissive default keeps accepting loopback http.
         assert!(is_secure_endpoint_with("http://127.0.0.1/token", true));
+    }
+
+    #[test]
+    fn issuers_match_tolerates_at_most_one_trailing_slash() {
+        assert!(issuers_match("https://as.example", "https://as.example"));
+        assert!(issuers_match("https://as.example/", "https://as.example"));
+        assert!(issuers_match("https://as.example", "https://as.example/"));
+        assert!(issuers_match(
+            "https://as.example/a",
+            "https://as.example/a/"
+        ));
+        // Two trailing slashes (or any other textual difference) are distinct.
+        assert!(!issuers_match("https://as.example//", "https://as.example"));
+        assert!(!issuers_match("https://as.example", "https://evil.example"));
+        assert!(!issuers_match(
+            "https://as.example/a",
+            "https://as.example/b"
+        ));
     }
 
     #[test]

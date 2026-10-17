@@ -8,6 +8,8 @@
 //! Each reply rides a one-shot `std::sync::mpsc` channel (AGENTS.md: a
 //! per-request reply is the sanctioned use).
 
+use zeroize::Zeroizing;
+
 use super::{OAuthTokenSource, RefreshedTokens, TokenLoad};
 
 /// An [`OAuthTokenSource`] that drives the daemon command loop over the
@@ -64,7 +66,9 @@ impl OAuthTokenSource for DaemonTokenSource {
                 received_at: tokens.received_at,
                 rotated_refresh_token: tokens.refresh_token.clone(),
                 new_account_id: tokens.account_id.clone(),
-                expected_refresh_token: expected_refresh_token.map(str::to_string),
+                // Wipe-on-drop across the command channel.
+                expected_refresh_token: expected_refresh_token
+                    .map(|t| Zeroizing::new(t.to_string())),
                 reply,
             })
             .is_err()

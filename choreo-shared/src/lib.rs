@@ -37,6 +37,10 @@
 //!   decoder ([`form::form_encode`] / [`form::parse_query`]) the login and
 //!   refresh paths share, so an OAuth request body or query is escaped — and
 //!   decoded — the same way on every path.
+//! - [`net`] — the IP-literal safety classifier ([`net::is_blocked_ip`] /
+//!   [`net::is_blocked_ip_literal`]) the workspace's peer-URL fetchers share, so
+//!   "a blocked range" means the same thing to the media download and the MCP
+//!   discovery hop (a request must never be steered onto an internal service).
 //!
 //! It is deliberately a *leaf* (deps: `base64`, `clap`, `dirs`, `serde`,
 //! `serde_json`, `tracing`, `tracing-subscriber`, and `zeroize`) and holds no
@@ -54,6 +58,7 @@ pub mod clap_styles;
 pub mod credential;
 pub mod form;
 pub mod logging;
+pub mod net;
 pub mod oauth_claims;
 pub mod oauth_endpoint;
 pub mod oauth_token;

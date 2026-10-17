@@ -10,7 +10,7 @@
 //! between adapters:
 //!
 //! - **Scheme + SSRF guard** ([`is_downloadable_url`], [`is_http_url`],
-//!   [`is_blocked_ip_literal`]) — the response's `url` field is
+//!   [`choreo_shared::net::is_blocked_ip_literal`]) — the response's `url` field is
 //!   provider-controlled text, so it must never be dereferenced as
 //!   `file://`/etc., and an IP-literal host in a loopback/private/link-local
 //!   range is refused (the URL arrives over an authenticated provider TLS
@@ -34,7 +34,6 @@
 
 use std::io;
 use std::io::Read as _;
-use std::net::IpAddr;
 
 use crate::images::{IMAGE_DOWNLOAD_ATTEMPTS, IMAGE_DOWNLOAD_CAP_BYTES};
 use crate::openai::ServiceConfig;
@@ -64,10 +63,7 @@ pub(crate) fn is_downloadable_url(url: &str) -> Result<(), String> {
     let blocked = url::Url::parse(url)
         .ok()
         .and_then(|parsed| parsed.host_str().map(str::to_owned))
-        .is_some_and(|host| {
-            let host = host.trim_start_matches('[').trim_end_matches(']');
-            host.parse::<IpAddr>().is_ok_and(is_blocked_ip_literal)
-        });
+        .is_some_and(|host| choreo_shared::net::is_blocked_ip_literal(&host));
     if blocked {
         return Err(format!(
             "media URL host is a private/loopback/link-local IP literal, refusing to fetch: {url}"
@@ -92,25 +88,6 @@ pub(crate) fn is_http_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether a parsed IP literal falls in a range this adapter must never
-/// fetch: loopback, private (RFC 1918 for v4, unique-local `fc00::/7` for
-/// v6), or link-local (169.254/16 for v4, `fe80::/10` for v6).
-pub(crate) fn is_blocked_ip_literal(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                // `is_unique_local` is still unstable on std Ipv6Addr —
-                // test the RFC 4193 prefix bits directly.
-                || (u16::from_be_bytes([v6.octets()[0], v6.octets()[1]]) & 0xfe00) == 0xfc00
-                // fe80::/10 link-local: the top 10 bits are 0xfe80..0xfebf.
-                || (u16::from_be_bytes([v6.octets()[0], v6.octets()[1]]) & 0xffc0) == 0xfe80
-                // IPv4-mapped (::ffff:10.0.0.1 etc.) — judge the embedded v4.
-                || matches!(v6.to_ipv4_mapped(), Some(v4) if v4.is_loopback() || v4.is_private() || v4.is_link_local())
-        }
-    }
-}
-
 /// Whether the SSRF IP-literal host guard may be RELAXED for this client's
 /// CDN downloads: true only when the daemon is itself configured against a
 /// loopback/private base (a local mock provider or dev proxy — recorded
@@ -123,10 +100,7 @@ pub(crate) fn host_guard_relaxed(base_url: &str) -> bool {
     url::Url::parse(base_url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_owned))
-        .is_some_and(|host| {
-            let host = host.trim_start_matches('[').trim_end_matches(']');
-            host.parse::<IpAddr>().is_ok_and(is_blocked_ip_literal)
-        })
+        .is_some_and(|host| choreo_shared::net::is_blocked_ip_literal(&host))
 }
 
 /// Download the generated **image** bytes from a provider-returned URL.
@@ -365,10 +339,8 @@ fn fetch_once(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        content_type_allowed, content_type_mismatch_detail, is_blocked_ip_literal,
-        is_downloadable_url,
-    };
+    use super::{content_type_allowed, content_type_mismatch_detail, is_downloadable_url};
+    use choreo_shared::net::{is_blocked_ip, is_blocked_ip_literal};
 
     // ── content-type guards (shared image/video path) ───────────────────
 
@@ -464,20 +436,23 @@ mod tests {
             "169.254.0.1",
         ] {
             assert!(
-                is_blocked_ip_literal(blocked.parse().unwrap()),
+                is_blocked_ip(blocked.parse().unwrap()),
                 "{blocked} must be classified blocked"
             );
         }
         for allowed in ["8.8.8.8", "1.1.1.1", "203.0.113.9"] {
             assert!(
-                !is_blocked_ip_literal(allowed.parse().unwrap()),
+                !is_blocked_ip(allowed.parse().unwrap()),
                 "{allowed} must be classified allowed"
             );
         }
         // fc00::/7: both fc and fd prefixes, and fe80::/10 link-local.
-        assert!(is_blocked_ip_literal("fc00::1".parse().unwrap()));
-        assert!(is_blocked_ip_literal("fd00::1".parse().unwrap()));
-        assert!(is_blocked_ip_literal("fe80::1".parse().unwrap()));
-        assert!(!is_blocked_ip_literal("2606:4700::1111".parse().unwrap()));
+        assert!(is_blocked_ip("fc00::1".parse().unwrap()));
+        assert!(is_blocked_ip("fd00::1".parse().unwrap()));
+        assert!(is_blocked_ip("fe80::1".parse().unwrap()));
+        assert!(!is_blocked_ip("2606:4700::1111".parse().unwrap()));
+        // The literal-string form strips IPv6 brackets and ignores hostnames.
+        assert!(is_blocked_ip_literal("[::1]"));
+        assert!(!is_blocked_ip_literal("fal.media"));
     }
 }

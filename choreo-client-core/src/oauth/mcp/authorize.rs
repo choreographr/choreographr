@@ -30,9 +30,8 @@ pub(super) struct AuthorizeContext<'a> {
     pub(super) client_id: &'a str,
     /// The bound loopback callback server and its `redirect_uri`.
     pub(super) bound: &'a BoundCallback,
-    /// Whether a loopback `http` endpoint is allowed (the flow began at a
-    /// loopback resource).
-    pub(super) allow_loopback_http: bool,
+    /// The flow's endpoint policy (discovered endpoints are vetted under it).
+    pub(super) policy: http::HopPolicy,
 }
 
 /// The per-request inputs both the authorize URL and the token exchange carry:
@@ -43,7 +42,7 @@ struct CodeRequest<'a> {
     client_id: &'a str,
     redirect_uri: &'a str,
     resource: &'a str,
-    allow_loopback_http: bool,
+    policy: http::HopPolicy,
 }
 
 /// Run the PKCE loopback (or paste-URL) authorization-code flow over the
@@ -62,7 +61,7 @@ pub(super) fn authorize(
         client_id: ctx.client_id,
         redirect_uri: &ctx.bound.redirect_uri,
         resource: &ctx.info.resource,
-        allow_loopback_http: ctx.allow_loopback_http,
+        policy: ctx.policy,
     };
 
     let auth_url = build_authorize_url(ctx.server, &request, &challenge, &state, &scopes)?;
@@ -95,16 +94,16 @@ pub(super) fn authorize(
 /// Build the authorization URL with PKCE S256 and the resource indicator.
 ///
 /// The authorization endpoint (taken from discovered metadata) is vetted with
-/// the shared `https`-or-loopback rule first, under the flow's endpoint policy,
-/// so an `http://` remote endpoint a hostile or misconfigured server advertises
-/// can never be opened in the browser — and, when the resource was remote, a
-/// loopback endpoint the document names is refused too.
+/// the flow's [`http::HopPolicy`] first, so an `http://` remote endpoint a
+/// hostile or misconfigured server advertises can never be opened in the
+/// browser — and, when the resource was remote, a loopback or private IP-literal
+/// endpoint the document names is refused too.
 ///
 /// # Errors
 ///
 /// Returns [`OAuthLoginError::InsecureEndpoint`] when the discovered
 /// authorization endpoint is neither `https` nor (when allowed) a loopback
-/// `http` address.
+/// `http` address, or is a private/link-local IP literal under a strict policy.
 fn build_authorize_url(
     server: &AuthServer,
     request: &CodeRequest<'_>,
@@ -112,7 +111,7 @@ fn build_authorize_url(
     state: &str,
     scopes: &[String],
 ) -> Result<String, OAuthLoginError> {
-    http::ensure_secure_with(&server.authorization_endpoint, request.allow_loopback_http)?;
+    request.policy.check(&server.authorization_endpoint)?;
     let scope = scopes.join(" ");
     let params = [
         ("response_type", "code"),
@@ -153,7 +152,7 @@ fn exchange_code(
         token_endpoint,
         "application/x-www-form-urlencoded",
         &body,
-        request.allow_loopback_http,
+        request.policy,
     )?;
     http::read_token_response(response)
 }
@@ -177,7 +176,12 @@ mod tests {
             client_id: "client-1",
             redirect_uri: "http://127.0.0.1:1455/auth/callback",
             resource,
-            allow_loopback_http,
+            // A loopback resource keeps both allowances; a remote one keeps
+            // neither, which is what the strict-policy tests exercise.
+            policy: http::HopPolicy {
+                allow_loopback_http,
+                allow_private_hosts: allow_loopback_http,
+            },
         }
     }
 
@@ -223,6 +227,28 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn authorize_url_refuses_a_private_ip_literal_under_the_strict_policy() {
+        // A remote resource's document must not steer the browser at an
+        // internal https service either: under the strict policy a
+        // private/link-local IP-literal endpoint is refused.
+        for endpoint in ["https://10.0.0.5/authorize", "https://169.254.169.254/auth"] {
+            assert!(
+                matches!(
+                    build_authorize_url(
+                        &server(endpoint),
+                        &request("https://example.com/mcp", false),
+                        "challenge",
+                        "state-1",
+                        &["openid".to_string()],
+                    ),
+                    Err(OAuthLoginError::InsecureEndpoint(_))
+                ),
+                "{endpoint} must be refused under the strict policy"
+            );
+        }
     }
 
     #[test]

@@ -41,21 +41,21 @@ pub(super) struct AuthServer {
 /// remote host.
 const MAX_DISCOVERY_REDIRECTS: usize = 5;
 
-/// Fetch and parse an `https` (or, when `allow_loopback_http`, a loopback
+/// Fetch and parse an `https` (or, when the flow's policy allows, a loopback
 /// `http`) JSON document, following a small, bounded number of redirects —
-/// **re-vetting every hop** with [`http::ensure_secure_with`] before it is
+/// **re-vetting every hop** with [`http::HopPolicy::check`] before it is
 /// dialed, so a redirect can neither downgrade the fetch to cleartext nor (from
-/// a remote resource) steer it onto `http://127.0.0.1`. The caller's agent
-/// follows no redirects itself, which is what lets this loop police each
-/// target.
+/// a remote resource) steer it onto `http://127.0.0.1` or a private/link-local
+/// address. The caller's agent follows no redirects itself, which is what lets
+/// this loop police each target.
 fn get_json(
     agent: &ureq::Agent,
     url: &str,
-    allow_loopback_http: bool,
+    policy: http::HopPolicy,
 ) -> Result<Value, OAuthLoginError> {
     let mut current = parse_url(url, "discovery")?;
     for _ in 0..=MAX_DISCOVERY_REDIRECTS {
-        http::ensure_secure_with(current.as_str(), allow_loopback_http)?;
+        policy.check(current.as_str())?;
         let response = agent
             .get(current.as_str())
             .header("Accept", "application/json")
@@ -156,22 +156,18 @@ fn authorization_server_candidates(issuer: &Url) -> Vec<Url> {
     ])
 }
 
-/// Strip at most one trailing slash, so a single trailing-slash difference
-/// between two otherwise-identical URLs is tolerated.
-fn strip_one_trailing_slash(url: &str) -> &str {
-    url.strip_suffix('/').unwrap_or(url)
-}
-
 /// Reject a metadata document whose `issuer` does not identify the
 /// authorization-server URL it was fetched from (RFC 8414 §3.3), tolerating a
-/// single trailing-slash difference. This is the standard defence against an
-/// issuer mix-up, where a hostile document names a different issuer than the
-/// one the client asked.
+/// single trailing-slash difference (see
+/// [`choreo_shared::oauth_endpoint::issuers_match`]). This is the standard
+/// defence against an issuer mix-up, where a hostile document names a different
+/// issuer than the one the client asked.
 fn validate_issuer(issuer: &str, authorization_server: &Url) -> Result<(), OAuthLoginError> {
     let issuer_url = parse_url(issuer, "metadata issuer")?;
-    if strip_one_trailing_slash(issuer_url.as_str())
-        == strip_one_trailing_slash(authorization_server.as_str())
-    {
+    if choreo_shared::oauth_endpoint::issuers_match(
+        issuer_url.as_str(),
+        authorization_server.as_str(),
+    ) {
         Ok(())
     } else {
         Err(OAuthLoginError::Decode(format!(
@@ -182,20 +178,20 @@ fn validate_issuer(issuer: &str, authorization_server: &Url) -> Result<(), OAuth
 
 /// Discover the authorization server from the server URL (RFC 9728 → 8414).
 ///
-/// `allow_loopback_http` is the endpoint policy the whole flow runs under: it is
-/// set only when the starting resource is itself loopback, so a remote resource
-/// cannot steer discovery onto a local endpoint.
+/// `policy` is the endpoint policy the whole flow runs under (see
+/// [`http::HopPolicy::for_resource`]), so a remote resource cannot steer
+/// discovery onto a loopback or private/link-local endpoint.
 pub(super) fn discover(
     agent: &ureq::Agent,
     resource: &str,
-    allow_loopback_http: bool,
+    policy: http::HopPolicy,
 ) -> Result<AuthServer, OAuthLoginError> {
     let resource_url = parse_url(resource, "resource")?;
     // RFC 9728 protected-resource metadata: try the path-inserted document,
     // then the origin-rooted form.
     let mut resource_metadata = None;
     for candidate in protected_resource_candidates(&resource_url) {
-        if let Ok(value) = get_json(agent, candidate.as_str(), allow_loopback_http) {
+        if let Ok(value) = get_json(agent, candidate.as_str(), policy) {
             resource_metadata = Some(value);
             break;
         }
@@ -212,7 +208,7 @@ pub(super) fn discover(
         // No protected-resource metadata: assume the resource host is the AS.
         None => origin_url(&resource_url),
     };
-    fetch_as_metadata(agent, &authorization_server, allow_loopback_http)
+    fetch_as_metadata(agent, &authorization_server, policy)
 }
 
 /// Whether an authorization-server metadata document carries the two endpoints
@@ -225,16 +221,16 @@ fn has_required_endpoints(metadata: &Value) -> bool {
 }
 
 /// Fetch RFC 8414 / OIDC authorization-server metadata under the flow's
-/// endpoint policy (`allow_loopback_http`).
+/// endpoint policy (`policy`).
 pub(super) fn fetch_as_metadata(
     agent: &ureq::Agent,
     authorization_server: &Url,
-    allow_loopback_http: bool,
+    policy: http::HopPolicy,
 ) -> Result<AuthServer, OAuthLoginError> {
     let mut metadata = None;
     let mut last_error = OAuthLoginError::Decode("no metadata candidate".to_string());
     for candidate in authorization_server_candidates(authorization_server) {
-        match get_json(agent, candidate.as_str(), allow_loopback_http) {
+        match get_json(agent, candidate.as_str(), policy) {
             Ok(value) => {
                 // A well-known document that exists but omits the required
                 // endpoints must not stop the search: some servers serve an

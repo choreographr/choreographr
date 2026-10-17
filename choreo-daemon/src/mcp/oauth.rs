@@ -35,6 +35,7 @@ use choreo_mcp::{
 use choreo_shared::ServiceCredential;
 use crossbeam_channel::Sender;
 use tracing::warn;
+use zeroize::Zeroizing;
 
 use crate::daemon::DaemonCommand;
 
@@ -207,7 +208,8 @@ impl CredentialBackend for McpOAuthBackend {
             .send(DaemonCommand::OAuthSave {
                 key: self.key.clone(),
                 credential,
-                expected_refresh_token,
+                // Wipe-on-drop across the command channel.
+                expected_refresh_token: expected_refresh_token.map(Zeroizing::new),
             })
             .map_err(|e| e.to_string())
     }

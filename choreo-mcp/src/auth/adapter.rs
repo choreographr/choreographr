@@ -154,9 +154,15 @@ impl CredentialStore for CredentialStoreAdapter {
         // re-discovered at connect and the stored credential names a different
         // one (or none), withhold the grant. The caller then connects
         // unauthenticated, which 401s and surfaces a re-login, rather than
-        // sending a token minted by the previous authorization server.
+        // sending a token minted by the previous authorization server. The
+        // comparison tolerates a single trailing-slash difference (the issuer
+        // is otherwise exact), so a server that spells its issuer either way is
+        // not mistaken for a re-pointed one and does not force a needless
+        // re-login.
         if let Some(expected) = self.expected_issuer.as_deref()
-            && view.issuer != Some(expected)
+            && !view
+                .issuer
+                .is_some_and(|iss| choreo_shared::oauth_endpoint::issuers_match(iss, expected))
         {
             tracing::warn!(
                 key = %self.key,
@@ -412,6 +418,17 @@ mod tests {
                 .expect("load ok")
                 .is_some(),
             "a matching issuer must serve the credential"
+        );
+        // A trailing-slash-only difference is the SAME issuer, so it is served
+        // rather than withheld (no needless re-login).
+        let tolerant = CredentialStoreAdapter::new("mcp:docs|x".into(), backend.clone())
+            .with_expected_issuer(Some("https://as.example/".into()));
+        assert!(
+            crate::runtime::block_on(tolerant.load())
+                .expect("block_on")
+                .expect("load ok")
+                .is_some(),
+            "a trailing-slash-only issuer difference must not withhold the credential"
         );
         // With no issuer expected (discovery found none), the credential is
         // served unchanged — there is nothing to compare against.

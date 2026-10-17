@@ -733,11 +733,14 @@ login, and stored on the credential (`ServiceCredential::OAuth`'s
 `token_endpoint` / `refresh_encoding`), so a runtime refresh reuses the exact
 endpoint and encoding the grant was issued against — an overlay edit or a
 catalog change cannot repoint or re-encode it. The daemon's handlers update
-`access_tokens` and, **only when the
-exchange actually rotated** the refresh token or refreshed the identity claim,
-re-encrypt the durable subset to the binding public key (the same
-`set_credential_blob` path as provisioning — no private key, no re-login); a
-plain expiry refresh writes no blob.
+`access_tokens` and, **only when a
+returned refresh token or identity claim differs from the stored one** (an
+identical value echoed back is not a rotation), re-encrypt the durable subset to
+the binding public key (the same `set_credential_blob` path as provisioning —
+no private key, no re-login); a plain expiry refresh writes no blob. A save whose
+credential was replaced mid-exchange (a re-login or logout) is dropped
+wholesale, so an access token minted from the superseded grant never reaches the
+cache either.
 
 Two rules make it correct under rotation. **Single-flight**: the whole
 `load → re-check → exchange → persist` runs under the account's lock in
@@ -914,27 +917,32 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   building each well-known URL with the segment inserted *before* a path-bearing
   issuer/resource (the root document remains the fallback) and rejecting a
   metadata document whose `issuer` does not match the authorization-server URL
-  it was fetched from (RFC 8414 §3.3); each discovery GET follows a small,
-  bounded number of redirects, re-vetting every hop with the `https`-or-loopback
-  predicate so a redirect cannot steer discovery onto a cleartext host. It
+  it was fetched from (RFC 8414 §3.3), tolerating a single trailing-slash
+  difference (one shared `issuers_match`); each discovery GET follows a small,
+  bounded number of redirects, re-vetting every hop so a redirect cannot steer
+  discovery onto a cleartext or internal host. It
   dynamically registers a client
   (SEP-837) when no `clientId` is configured, runs PKCE over a loopback callback
   (paste-URL fallback; no device code), and stores the durable grant as
   `ServiceCredential::OAuth { kind: Mcp }`. The authorization endpoint taken from
-  the discovered metadata is vetted with the same `https`-or-loopback predicate
+  the discovered metadata is vetted with the same policy
   before the browser is opened, so a server advertising a cleartext remote
   endpoint is refused.
 
-  The loopback side of that predicate is **earned by the resource**: the flow
-  computes the endpoint policy once from the resource URL (`is_loopback_endpoint`)
-  and permits a loopback `http` hop only when the resource itself is loopback
-  (the in-repo mock server). A remote resource's discovery GETs, redirects, and
-  discovered endpoints must all be `https`, so a hostile protected-resource or
-  authorization-server document cannot steer a hop — a metadata fetch or the
-  code exchange — onto `http://127.0.0.1:<port>` and probe the host's local
-  services. The provider login and the runtime refresh keep the permissive
-  default, since their endpoints come from the trusted descriptor/credential
-  rather than a fetched document.
+  The policy is **earned by the resource**: the flow computes a `HopPolicy` once
+  from the resource URL and permits a loopback `http` hop only when the resource
+  itself is loopback (the in-repo mock server), and a private/link-local
+  IP-literal hop only when the resource is itself loopback or such an IP literal
+  (a LAN self-hosted server). Every hop a fetched document chooses — a discovery
+  GET or its redirect, the dynamic-registration endpoint, the discovered
+  authorization and token endpoints — is vetted under that policy, so a hostile
+  protected-resource or authorization-server document cannot steer a hop onto
+  `http://127.0.0.1:<port>` or an internal `10/8`/`192.168/16`/link-local
+  address and probe the host's own network. The IP-literal range check is the
+  one shared classifier in `choreo-shared`'s `net` module (the same one the
+  provider media download uses). The provider login and the runtime refresh keep
+  the permissive default, since their endpoints come from the trusted
+  descriptor/credential rather than a fetched document.
   `mcp login <slug>` reads the server's resolved identity, `oauth` block, and
   credential key from the extended `McpStatus` and sends the grant over the
   existing `AddCredential`; `mcp logout <slug>` removes it via
@@ -955,7 +963,9 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   per server in `McpServerStatus`. Load is **fail-closed**: a
   stored credential whose `resource` no longer matches the configured URL is
   treated as absent, and — once the authorization server has been re-discovered
-  at connect — so is one whose `issuer` differs from that server. A re-pointed
+  at connect — so is one whose `issuer` differs from that server (compared with
+  the shared `issuers_match`, which tolerates a trailing slash so a spelling
+  difference does not force a needless re-login). A re-pointed
   server therefore never receives a token minted by the previous authorization
   server; the connect surfaces a re-login instead. Trust gates *use*, not
   existence — an untrusted project's

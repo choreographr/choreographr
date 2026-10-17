@@ -546,8 +546,9 @@ pub enum DaemonCommand {
         credential: ServiceCredential,
         /// The refresh token the adapter loaded and presented, so the loop can
         /// refuse to rotate onto a credential replaced (logout/re-login)
-        /// while the refresh was in flight. `None` skips that guard.
-        expected_refresh_token: Option<String>,
+        /// while the refresh was in flight. `None` skips that guard. Wipe-on-drop
+        /// so an unconsumed command does not leave the token in freed memory.
+        expected_refresh_token: Option<Zeroizing<String>>,
     },
     /// Delete a stored MCP OAuth credential (fire-and-forget logout), removing
     /// the blob and the in-memory/quarantine state for the key.
@@ -853,7 +854,9 @@ pub enum DaemonCommand {
         /// The refresh token the exchange loaded and presented, so the handler
         /// can refuse to rotate onto a credential replaced (re-login/logout)
         /// while the exchange was in flight. `None` skips that guard.
-        expected_refresh_token: Option<String>,
+        /// Wipe-on-drop so an unconsumed command does not leave the token in
+        /// freed memory.
+        expected_refresh_token: Option<Zeroizing<String>>,
         /// Replies `Ok` once the cache and (on rotation) the durable blob are
         /// updated, or an error string on failure.
         reply: mpsc::Sender<Result<(), String>>,
@@ -1221,7 +1224,11 @@ impl DaemonState {
                 credential,
                 expected_refresh_token,
             } => {
-                self.handle_oauth_save(&key, credential, expected_refresh_token.as_deref());
+                self.handle_oauth_save(
+                    &key,
+                    credential,
+                    expected_refresh_token.as_deref().map(String::as_str),
+                );
             }
             DaemonCommand::OAuthClear { key } => self.handle_oauth_clear(&key),
             DaemonCommand::McpAuthRejected { key } => self.handle_mcp_auth_rejected(&key),
@@ -1344,7 +1351,7 @@ impl DaemonState {
                     received_at,
                     rotated_refresh_token: rotated_refresh_token.as_ref().map(|t| t.as_str()),
                     new_account_id: new_account_id.as_deref(),
-                    expected_refresh_token: expected_refresh_token.as_deref(),
+                    expected_refresh_token: expected_refresh_token.as_deref().map(String::as_str),
                 },
                 &reply,
             ),
