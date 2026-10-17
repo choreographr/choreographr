@@ -43,7 +43,7 @@ mod mcp;
 mod pkce;
 mod url;
 
-pub use jwt::{chatgpt_account_id, chatgpt_plan_type, decode_claims, email};
+pub use jwt::{chatgpt_account_id, decode_claims};
 pub use mcp::{McpLoginInfo, McpLoginOptions, start_mcp_login};
 pub use pkce::{challenge_s256, generate_state, generate_verifier, state_matches};
 

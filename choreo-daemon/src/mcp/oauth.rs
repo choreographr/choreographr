@@ -194,7 +194,11 @@ impl CredentialBackend for McpOAuthBackend {
         }
     }
 
-    fn save(&self, credential: ServiceCredential) -> Result<(), String> {
+    fn save(
+        &self,
+        credential: ServiceCredential,
+        expected_refresh_token: Option<String>,
+    ) -> Result<(), String> {
         // Fire-and-forget: an unbounded send never blocks, so the connect-time
         // refresh proceeds even while the command loop is busy. Persistence
         // happens on the loop.
@@ -203,6 +207,7 @@ impl CredentialBackend for McpOAuthBackend {
             .send(DaemonCommand::OAuthSave {
                 key: self.key.clone(),
                 credential,
+                expected_refresh_token,
             })
             .map_err(|e| e.to_string())
     }

@@ -12,11 +12,13 @@ use zeroize::Zeroizing;
 use crate::catalog::GrantEncoding;
 
 /// A provider OAuth refresh request: everything the exchange needs, derived
-/// from the stored credential and the provider's catalog `oauth` profile.
+/// from the stored credential's durable grant fields (the token endpoint and
+/// refresh encoding recorded at login, the client registration, and the
+/// refresh token), never from the live catalog profile.
 ///
-/// The `token_endpoint` is the absolute token URL (issuer + token path); the
-/// `encoding` is the profile's `refresh_encoding`. `client_secret` is present
-/// only for a confidential client.
+/// The `token_endpoint` is the absolute token URL recorded at login; the
+/// `encoding` is the credential's recorded `refresh_encoding`. `client_secret`
+/// is present only for a confidential client.
 #[derive(Clone)]
 pub struct OAuthRefreshRequest<'a> {
     /// The absolute token endpoint URL.
@@ -61,19 +63,26 @@ pub(super) fn encode_refresh_body(request: &OAuthRefreshRequest<'_>) -> Zeroizin
     let scope = request.scopes.join(" ");
     match request.encoding {
         GrantEncoding::Form => {
-            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-            serializer.append_pair("grant_type", "refresh_token");
-            serializer.append_pair("refresh_token", request.refresh_token);
+            // Build the pairs and hand them to the shared encoder, the same one
+            // the login path uses, so form escaping cannot drift between the
+            // two paths.
+            let mut params: Vec<(String, String)> = vec![
+                ("grant_type".to_string(), "refresh_token".to_string()),
+                (
+                    "refresh_token".to_string(),
+                    request.refresh_token.to_string(),
+                ),
+            ];
             if let Some(client_id) = request.client_id {
-                serializer.append_pair("client_id", client_id);
+                params.push(("client_id".to_string(), client_id.to_string()));
             }
             if let Some(client_secret) = request.client_secret {
-                serializer.append_pair("client_secret", client_secret);
+                params.push(("client_secret".to_string(), client_secret.to_string()));
             }
             if !scope.is_empty() {
-                serializer.append_pair("scope", &scope);
+                params.push(("scope".to_string(), scope.clone()));
             }
-            Zeroizing::new(serializer.finish().into_bytes())
+            Zeroizing::new(choreo_shared::form::form_encode(&params).into_bytes())
         }
         GrantEncoding::Json => {
             // Build the JSON object field-by-field; `serde_json::json!` would

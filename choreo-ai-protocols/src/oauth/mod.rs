@@ -3,9 +3,9 @@
 //! A provider OAuth grant is refreshed by presenting its refresh token to the
 //! authorization server's token endpoint (RFC 6749 §6). This module owns that
 //! one exchange, split by concern: the `request` submodule carries the
-//! request parameters and their serialization (form vs JSON, per the catalog
-//! profile's `refresh_encoding`), the `response` submodule carries the token
-//! set and the parse plus the **failure classification** that drives the
+//! request parameters and their serialization (form vs JSON, per the
+//! credential's recorded `refresh_encoding`), the `response` submodule carries
+//! the token set and the parse plus the **failure classification** that drives the
 //! caller's terminal-vs-transient decision, and this file holds
 //! [`refresh_oauth_token`] — the `ureq` agent, the endpoint vetting, the POST,
 //! and the call into the parse — plus the public re-exports. It stays
@@ -72,17 +72,24 @@ pub fn refresh_oauth_token(
         .into();
 
     let body = encode_refresh_body(request);
-    let mut call = agent.post(request.token_endpoint);
-    call = match request.encoding {
+    // `Accept` mirrors the login path; `Cache-Control: no-store` keeps a proxy
+    // from caching a body that carries the durable refresh token (and whose
+    // response carries a fresh one).
+    let call = agent.post(request.token_endpoint);
+    let call = match request.encoding {
         GrantEncoding::Form => call.header("Content-Type", "application/x-www-form-urlencoded"),
         GrantEncoding::Json => call.header("Content-Type", "application/json"),
     };
-    let response = call.send(body.as_slice()).map_err(|e| {
-        // Transport errors (connect/read/timeout) are transient: retry.
-        OAuthRefreshError::Transient {
-            detail: e.to_string(),
-        }
-    })?;
+    let response = call
+        .header("Accept", "application/json")
+        .header("Cache-Control", "no-store")
+        .send(body.as_slice())
+        .map_err(|e| {
+            // Transport errors (connect/read/timeout) are transient: retry.
+            OAuthRefreshError::Transient {
+                detail: e.to_string(),
+            }
+        })?;
 
     let status = response.status().as_u16();
     let body_text = response.into_body().read_to_string().unwrap_or_default();

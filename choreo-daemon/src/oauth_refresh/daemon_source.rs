@@ -48,7 +48,12 @@ impl OAuthTokenSource for DaemonTokenSource {
         rx.recv().unwrap_or_else(|_| empty())
     }
 
-    fn save(&self, account: &str, tokens: &RefreshedTokens) -> Result<(), String> {
+    fn save(
+        &self,
+        account: &str,
+        expected_refresh_token: Option<&str>,
+        tokens: &RefreshedTokens,
+    ) -> Result<(), String> {
         let (reply, rx) = std::sync::mpsc::channel();
         if self
             .daemon_tx
@@ -59,6 +64,7 @@ impl OAuthTokenSource for DaemonTokenSource {
                 received_at: tokens.received_at,
                 rotated_refresh_token: tokens.refresh_token.clone(),
                 new_account_id: tokens.account_id.clone(),
+                expected_refresh_token: expected_refresh_token.map(str::to_string),
                 reply,
             })
             .is_err()

@@ -10,6 +10,4 @@
 //! only the claims are needed. The raw JWT is never stored (see the credential
 //! model); only the extracted claim values are.
 
-pub use choreo_shared::oauth_claims::{
-    chatgpt_account_id, chatgpt_plan_type, decode_claims, email,
-};
+pub use choreo_shared::oauth_claims::{chatgpt_account_id, decode_claims};

@@ -103,7 +103,7 @@ pub struct RefreshedTokens {
 }
 
 /// A borrowed view of the fields a save needs, so the daemon command handler
-/// takes one grouped value instead of six positional arguments.
+/// takes one grouped value instead of seven positional arguments.
 #[derive(Clone, Copy)]
 pub struct SaveToken<'a> {
     /// The account whose token was refreshed.
@@ -118,6 +118,11 @@ pub struct SaveToken<'a> {
     pub rotated_refresh_token: Option<&'a str>,
     /// The refreshed identity claim, when a new `id_token` carried one.
     pub new_account_id: Option<&'a str>,
+    /// The refresh token this exchange actually loaded and presented, so the
+    /// daemon can refuse to rotate onto a credential that was replaced
+    /// (re-login or logout) while the exchange was in flight — the stored
+    /// grant is a newer one and must not be clobbered.
+    pub expected_refresh_token: Option<&'a str>,
 }
 
 /// The destination a refresh drives: it loads the durable material, persists a
@@ -129,11 +134,20 @@ pub trait OAuthTokenSource: Send + Sync {
     fn load(&self, account: &str) -> TokenLoad;
     /// Persist a refreshed token for `account`.
     ///
+    /// `expected_refresh_token` is the durable refresh token this exchange
+    /// loaded and presented, so the daemon can refuse to rotate onto a
+    /// credential replaced mid-refresh; `None` skips that guard.
+    ///
     /// # Errors
     ///
     /// Returns an error string when the persist failed (e.g. a locked
     /// keystore), which the caller treats as transient.
-    fn save(&self, account: &str, tokens: &RefreshedTokens) -> Result<(), String>;
+    fn save(
+        &self,
+        account: &str,
+        expected_refresh_token: Option<&str>,
+        tokens: &RefreshedTokens,
+    ) -> Result<(), String>;
     /// Report that `account`'s grant is terminally dead (quarantine + one
     /// re-login notice).
     fn report_terminal(&self, account: &str);
@@ -255,7 +269,7 @@ fn refresh_under_lock(
                 refresh_token: tokens.refresh_token,
                 account_id: tokens.account_id,
             };
-            match source.save(account, &refreshed) {
+            match source.save(account, Some(material.refresh_token.as_str()), &refreshed) {
                 Ok(()) => Ok(RefreshTokenOutcome::Refreshed),
                 Err(detail) => Err(RefreshFailure::Transient {
                     detail: format!("failed to persist refreshed token: {detail}"),
@@ -364,7 +378,12 @@ mod tests {
             }
         }
 
-        fn save(&self, _account: &str, tokens: &RefreshedTokens) -> Result<(), String> {
+        fn save(
+            &self,
+            _account: &str,
+            _expected_refresh_token: Option<&str>,
+            tokens: &RefreshedTokens,
+        ) -> Result<(), String> {
             self.saves
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)

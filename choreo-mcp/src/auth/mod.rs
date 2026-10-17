@@ -75,10 +75,19 @@ pub trait CredentialBackend: Send + Sync + 'static {
     fn load(&self) -> Result<Option<ServiceCredential>, String>;
     /// Persist the durable OAuth credential (the access token stripped).
     ///
+    /// `expected_refresh_token` is the refresh token the adapter loaded and
+    /// presented for this refresh, so the backend can refuse to overwrite a
+    /// credential that was replaced (logout or re-login) mid-refresh; `None`
+    /// skips that guard.
+    ///
     /// # Errors
     ///
     /// Returns a message when the backend cannot write its store.
-    fn save(&self, credential: ServiceCredential) -> Result<(), String>;
+    fn save(
+        &self,
+        credential: ServiceCredential,
+        expected_refresh_token: Option<String>,
+    ) -> Result<(), String>;
     /// Delete the stored credential (logout).
     ///
     /// # Errors

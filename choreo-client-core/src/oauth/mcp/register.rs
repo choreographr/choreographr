@@ -48,6 +48,9 @@ pub(super) fn register_client(
         .post(endpoint)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json")
+        // Anonymous dynamic registration carries no secret, but match the other
+        // credential-free OAuth POSTs' no-store policy.
+        .header("Cache-Control", "no-store")
         .send(body.to_string())
         .map_err(|e| OAuthLoginError::Network(e.to_string()))?;
     let value: Value = response

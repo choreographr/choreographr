@@ -65,25 +65,40 @@ impl DaemonState {
         // updates the in-memory access-token cache alone, so it costs no
         // re-encryption and no disk write.
         if save.rotated_refresh_token.is_some() || save.new_account_id.is_some() {
-            let mut updated = current;
-            if let ServiceCredential::OAuth {
-                refresh_token,
-                account_id,
-                ..
-            } = &mut updated
-            {
-                if let Some(rotated) = save.rotated_refresh_token {
-                    *refresh_token = Some(rotated.to_string());
+            // Guard against a credential replaced under us between the load and
+            // this save (a re-login or logout landing mid-exchange): the stored
+            // grant is a newer one, so rotating the refresh token onto it would
+            // clobber that grant with a value minted from the superseded token.
+            // Rotate only onto the credential the exchange actually loaded.
+            let unchanged = save.expected_refresh_token.is_none_or(|expected| {
+                current.as_oauth().and_then(|v| v.refresh_token) == Some(expected)
+            });
+            if unchanged {
+                let mut updated = current;
+                if let ServiceCredential::OAuth {
+                    refresh_token,
+                    account_id,
+                    ..
+                } = &mut updated
+                {
+                    if let Some(rotated) = save.rotated_refresh_token {
+                        *refresh_token = Some(rotated.to_string());
+                    }
+                    if let Some(new_id) = save.new_account_id {
+                        *account_id = Some(new_id.to_string());
+                    }
                 }
-                if let Some(new_id) = save.new_account_id {
-                    *account_id = Some(new_id.to_string());
+                if let Err(e) = self.encrypt_and_persist_credential(save.account, &updated) {
+                    let _ = reply.send(Err(e));
+                    return;
                 }
+                self.credentials.insert(save.account.to_string(), updated);
+            } else {
+                warn!(
+                    account = %save.account,
+                    "OAuth credential changed under the refresh; dropping the rotation"
+                );
             }
-            if let Err(e) = self.encrypt_and_persist_credential(save.account, &updated) {
-                let _ = reply.send(Err(e));
-                return;
-            }
-            self.credentials.insert(save.account.to_string(), updated);
         }
         self.access_tokens.insert(
             save.account.to_string(),
@@ -134,7 +149,12 @@ impl DaemonState {
     /// persists it (the daemon is the sole blob writer; the access token was
     /// stripped by the adapter), then updates the in-memory map and the MCP
     /// OAuth snapshot, dropping any cached token or quarantine for the key.
-    pub(super) fn handle_oauth_save(&mut self, key: &str, credential: ServiceCredential) {
+    pub(super) fn handle_oauth_save(
+        &mut self,
+        key: &str,
+        credential: ServiceCredential,
+        expected_refresh_token: Option<&str>,
+    ) {
         if self.locked {
             warn!(%key, "OAuthSave ignored: keystore is locked");
             return;
@@ -147,6 +167,20 @@ impl DaemonState {
         // credential the user just deleted. Drop it instead.
         if !self.credentials.contains_key(key) {
             warn!(%key, "OAuthSave dropped: credential already removed (logout/clear)");
+            return;
+        }
+        // Guard against a credential replaced under the refresh (a re-login
+        // landing between the connect-path load and this save): the stored grant
+        // is newer, so persisting the rotated refresh token would clobber it.
+        // Only apply the save when the stored refresh token is still the one the
+        // refresh presented.
+        let current_token = self
+            .credentials
+            .get(key)
+            .and_then(ServiceCredential::as_oauth)
+            .and_then(|view| view.refresh_token);
+        if expected_refresh_token.is_some_and(|expected| current_token != Some(expected)) {
+            warn!(%key, "OAuthSave dropped: credential changed under the refresh");
             return;
         }
         if let Err(e) = self.encrypt_and_persist_credential(key, &credential) {
@@ -229,6 +263,7 @@ impl DaemonState {
 mod tests {
     use super::super::tests::make_daemon_state;
     use super::*;
+    use crate::daemon::DaemonCommand;
     use zeroize::Zeroizing;
 
     fn mcp_oauth_credential(refresh: &str) -> ServiceCredential {
@@ -248,11 +283,40 @@ mod tests {
         }
     }
 
+    fn provider_oauth_credential(refresh: &str) -> ServiceCredential {
+        ServiceCredential::OAuth {
+            kind: OAuthKind::Provider,
+            issuer: Some("https://auth.example".into()),
+            resource: None,
+            authorization_server: None,
+            token_endpoint: Some("https://auth.example/token".into()),
+            refresh_encoding: Some(choreo_keystore::OAuthGrantEncoding::Json),
+            refresh_token: Some(refresh.to_string()),
+            account_id: None,
+            client_id: None,
+            client_secret: None,
+            granted_scopes: Vec::new(),
+            token_type: Some("Bearer".into()),
+        }
+    }
+
+    /// Bind the keystore so a durable write can actually persist.
+    fn bind_for_test(state: &mut DaemonState) {
+        let key: [u8; 32] = [9u8; 32];
+        let (ack, ack_rx) = mpsc::channel();
+        state.handle_command(DaemonCommand::BindKeystore {
+            key: key.to_vec(),
+            reply: None,
+            ack,
+        });
+        ack_rx.recv().unwrap();
+    }
+
     #[test]
     fn oauth_save_is_refused_while_locked() {
         let (mut state, _rx) = make_daemon_state();
         assert!(state.locked);
-        state.handle_oauth_save("mcp:docs|abc", mcp_oauth_credential("r"));
+        state.handle_oauth_save("mcp:docs|abc", mcp_oauth_credential("r"), None);
         // A locked daemon holds no cleartext: the save is dropped, not published.
         assert!(state.credentials.is_empty());
     }
@@ -263,13 +327,109 @@ mod tests {
         state.locked = false;
         // No credential stored for the key: the save is a late write landing
         // after a logout/clear, so it must not resurrect the credential.
-        state.handle_oauth_save("mcp:docs|abc", mcp_oauth_credential("r"));
+        state.handle_oauth_save("mcp:docs|abc", mcp_oauth_credential("r"), Some("r"));
         assert!(state.credentials.is_empty());
         assert!(
             db::get_all_credential_blobs(&state.db)
                 .expect("read blobs")
                 .is_empty(),
             "nothing durable must be written for a credential that was removed"
+        );
+    }
+
+    #[test]
+    fn oauth_save_guard_applies_only_onto_the_presented_credential() {
+        let (mut state, _rx) = make_daemon_state();
+        bind_for_test(&mut state);
+        let key = "mcp:docs|abc";
+        state
+            .credentials
+            .insert(key.into(), mcp_oauth_credential("old"));
+
+        // A stale expected token (a credential replaced by a re-login mid-
+        // refresh) drops the save rather than clobbering the newer grant.
+        state.handle_oauth_save(key, mcp_oauth_credential("new-A"), Some("stale"));
+        assert_eq!(
+            state
+                .credentials
+                .get(key)
+                .and_then(ServiceCredential::as_oauth)
+                .and_then(|v| v.refresh_token),
+            Some("old"),
+            "the newer grant must be preserved"
+        );
+
+        // The presented token matches the stored one → the rotation is applied.
+        state.handle_oauth_save(key, mcp_oauth_credential("new-B"), Some("old"));
+        assert_eq!(
+            state
+                .credentials
+                .get(key)
+                .and_then(ServiceCredential::as_oauth)
+                .and_then(|v| v.refresh_token),
+            Some("new-B"),
+            "a matching save rotates the durable grant"
+        );
+    }
+
+    #[test]
+    fn save_oauth_token_guard_rotates_only_onto_the_loaded_credential() {
+        let (mut state, _rx) = make_daemon_state();
+        bind_for_test(&mut state);
+        state
+            .credentials
+            .insert("acct".into(), provider_oauth_credential("old"));
+        let access = Zeroizing::new("at".to_string());
+
+        // A mismatching expected token drops the durable rotation (but the
+        // access-token cache is still refreshed — the token is valid).
+        let (reply, rx) = mpsc::channel();
+        state.handle_save_oauth_token(
+            SaveToken {
+                account: "acct",
+                access_token: &access,
+                expires_at: None,
+                received_at: 1,
+                rotated_refresh_token: Some("rotated-A"),
+                new_account_id: None,
+                expected_refresh_token: Some("stale"),
+            },
+            &reply,
+        );
+        assert!(rx.recv().expect("a reply").is_ok());
+        assert_eq!(
+            state
+                .credentials
+                .get("acct")
+                .and_then(ServiceCredential::as_oauth)
+                .and_then(|v| v.refresh_token),
+            Some("old"),
+            "the superseded grant must not be clobbered"
+        );
+        assert!(state.access_tokens.contains_key("acct"));
+
+        // The matching expected token rotates the durable grant.
+        let (reply, rx) = mpsc::channel();
+        state.handle_save_oauth_token(
+            SaveToken {
+                account: "acct",
+                access_token: &access,
+                expires_at: None,
+                received_at: 2,
+                rotated_refresh_token: Some("rotated-B"),
+                new_account_id: None,
+                expected_refresh_token: Some("old"),
+            },
+            &reply,
+        );
+        assert!(rx.recv().expect("a reply").is_ok());
+        assert_eq!(
+            state
+                .credentials
+                .get("acct")
+                .and_then(ServiceCredential::as_oauth)
+                .and_then(|v| v.refresh_token),
+            Some("rotated-B")
         );
     }
 
@@ -292,6 +452,7 @@ mod tests {
                 received_at: 0,
                 rotated_refresh_token: None,
                 new_account_id: None,
+                expected_refresh_token: None,
             },
             &reply,
         );

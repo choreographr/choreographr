@@ -384,7 +384,8 @@ pub enum InferenceError {
     /// instead of showing a generic auth failure.
     #[error("re-login required: {detail}")]
     OAuthReloginRequired {
-        /// A short, token-free reason (the authorization server's error code).
+        /// A short, token-free reason (a fixed re-login message, or the
+        /// account-resolution error) — never a token or a provider payload.
         detail: String,
     },
     /// An underlying I/O error (connect/socket failure, read timeout, …).

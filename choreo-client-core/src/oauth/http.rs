@@ -14,6 +14,12 @@
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+// The one OAuth form/query encoder lives in `choreo-shared` so the login path
+// and the runtime refresh client escape request bodies identically; re-exported
+// here so `http::form_encode` stays the call site for both this module and the
+// MCP login submodules.
+pub(crate) use choreo_shared::form::form_encode;
+
 use super::OAuthLoginError;
 
 /// The token endpoint's success/error body.
@@ -153,45 +159,6 @@ pub(crate) fn discovery_agent() -> ureq::Agent {
         .max_redirects(5)
         .build();
     ureq::Agent::new_with_config(config)
-}
-
-/// Percent-encode form parameters into `application/x-www-form-urlencoded`,
-/// leaving the RFC 3986 unreserved set untouched and encoding a space as
-/// `%20`.
-#[must_use]
-pub(crate) fn form_encode(params: &[(String, String)]) -> String {
-    let mut out = String::new();
-    for (i, (key, value)) in params.iter().enumerate() {
-        if i > 0 {
-            out.push('&');
-        }
-        encode_into(&mut out, key);
-        out.push('=');
-        encode_into(&mut out, value);
-    }
-    out
-}
-
-/// Append `value` percent-encoded per `application/x-www-form-urlencoded`.
-fn encode_into(out: &mut String, value: &str) {
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(char::from(byte));
-            }
-            b' ' => out.push_str("%20"),
-            _ => {
-                out.push('%');
-                out.push(hex_digit(byte >> 4));
-                out.push(hex_digit(byte & 0x0f));
-            }
-        }
-    }
-}
-
-/// The uppercase hex digit for a nibble.
-fn hex_digit(nibble: u8) -> char {
-    char::from_digit(u32::from(nibble & 0x0f), 16).map_or('0', |c| c.to_ascii_uppercase())
 }
 
 /// Send a POST body with the given content type, returning the raw response.
@@ -458,23 +425,5 @@ mod tests {
         assert!(ensure_secure("http://localhost:8080/token").is_ok());
         assert!(ensure_secure("http://[::1]:8080/token").is_ok());
         assert!(ensure_secure("http://evil.example/token").is_err());
-    }
-
-    #[test]
-    fn form_encoding_matches_urlencoded_rules() {
-        let pairs = vec![
-            ("grant_type".to_string(), "authorization_code".to_string()),
-            ("scope".to_string(), "openid offline_access".to_string()),
-        ];
-        assert_eq!(
-            form_encode(&pairs),
-            "grant_type=authorization_code&scope=openid%20offline_access"
-        );
-    }
-
-    #[test]
-    fn form_encoding_escapes_reserved_bytes() {
-        let pairs = vec![("state".to_string(), "a+b/c=d".to_string())];
-        assert_eq!(form_encode(&pairs), "state=a%2Bb%2Fc%3Dd");
     }
 }

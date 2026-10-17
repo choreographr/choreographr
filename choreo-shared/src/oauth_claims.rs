@@ -1,9 +1,9 @@
 //! OIDC `id_token` claim extraction for the OAuth identity fields.
 //!
-//! An OAuth grant's durable identity fields (the `ChatGPT` account id, the plan
-//! type, the email) are read from a small, fixed set of claims in an `id_token`
-//! (or, as a fallback, the `access_token` when it is itself a JWT). This module
-//! is that read: it decodes a JWT's JSON payload and projects the claims.
+//! An OAuth grant's durable identity field (the `ChatGPT` account id) is read
+//! from a small, fixed set of claims in an `id_token` (or, as a fallback, the
+//! `access_token` when it is itself a JWT). This module is that read: it decodes
+//! a JWT's JSON payload and projects the claim.
 //!
 //! It lives here, beside the [`ServiceCredential`](crate::credential::ServiceCredential)
 //! whose OAuth variant it populates, so the provider login library
@@ -30,9 +30,6 @@ use serde_json::Value;
 /// providers carry it only in the access token rather than the `id_token`, which
 /// is why the caller tries the `id_token` first and this fallback second.
 const OPENAI_AUTH_NAMESPACE: &str = "https://api.openai.com/auth";
-
-/// The `OpenAI` profile namespace carrying the email claim.
-const OPENAI_PROFILE_NAMESPACE: &str = "https://api.openai.com/profile";
 
 /// Decode a JWT's JSON claims payload (`header.payload.signature`), or `None`
 /// when the token is malformed. The signature segment is ignored.
@@ -61,28 +58,6 @@ pub fn chatgpt_account_id(claims: &Value) -> Option<String> {
         .get(OPENAI_AUTH_NAMESPACE)?
         .get("chatgpt_account_id")?
         .as_str()
-        .map(str::to_string)
-}
-
-/// Extract the `ChatGPT` plan type (`chatgpt_plan_type`), e.g. `plus`/`pro`.
-#[must_use]
-pub fn chatgpt_plan_type(claims: &Value) -> Option<String> {
-    claims
-        .get(OPENAI_AUTH_NAMESPACE)?
-        .get("chatgpt_plan_type")?
-        .as_str()
-        .map(str::to_string)
-}
-
-/// Extract the account email: the profile namespace's `email` when present,
-/// else a top-level `email` claim (OIDC providers place it at the root).
-#[must_use]
-pub fn email(claims: &Value) -> Option<String> {
-    claims
-        .get(OPENAI_PROFILE_NAMESPACE)
-        .and_then(|profile| profile.get("email"))
-        .or_else(|| claims.get("email"))
-        .and_then(Value::as_str)
         .map(str::to_string)
 }
 
@@ -120,19 +95,10 @@ mod tests {
         let token = jwt_with_claims(&claims);
         let decoded = decode_claims(&token).expect("claims decode");
         assert_eq!(chatgpt_account_id(&decoded).as_deref(), Some("acct_123"));
-        assert_eq!(chatgpt_plan_type(&decoded).as_deref(), Some("plus"));
-        assert_eq!(email(&decoded).as_deref(), Some("user@example.com"));
         assert_eq!(
             chatgpt_account_id_from_id_token(&token).as_deref(),
             Some("acct_123")
         );
-    }
-
-    #[test]
-    fn top_level_email_is_a_fallback() {
-        let token = jwt_with_claims(&serde_json::json!({ "email": "root@example.com" }));
-        let decoded = decode_claims(&token).expect("claims decode");
-        assert_eq!(email(&decoded).as_deref(), Some("root@example.com"));
     }
 
     #[test]
@@ -157,8 +123,6 @@ mod tests {
         let token = jwt_with_claims(&serde_json::json!({ "sub": "x" }));
         let decoded = decode_claims(&token).expect("claims decode");
         assert!(chatgpt_account_id(&decoded).is_none());
-        assert!(chatgpt_plan_type(&decoded).is_none());
-        assert!(email(&decoded).is_none());
     }
 
     #[test]

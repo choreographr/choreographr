@@ -1,11 +1,12 @@
-//! The `rmcp`-facing [`CredentialStore`] adapter and the connect-time auth
-//! client.
+//! The `rmcp`-facing [`CredentialStore`] adapter: the durable↔`StoredCredentials`
+//! mapping over a [`CredentialBackend`].
 //!
-//! This is the one place in the crate that names `rmcp`'s OAuth types; it maps
-//! the daemon's durable [`ServiceCredential`] to and from `rmcp`'s
-//! `StoredCredentials` and never leaks an `rmcp` type past its own boundary.
-//! The access token is served from an in-process cache and stripped on `save`,
-//! so it never reaches the keystore.
+//! With [`connect`](super::connect) (which owns the connect-time `rmcp`
+//! `AuthClient` wiring) this is one of the two modules that name `rmcp`'s OAuth
+//! types; it maps the daemon's durable [`ServiceCredential`] to and from
+//! `rmcp`'s `StoredCredentials` and never leaks an `rmcp` type past its own
+//! boundary. The access token is served from an in-process cache and stripped
+//! on `save`, so it never reaches the keystore.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -274,7 +275,7 @@ impl CredentialStore for CredentialStoreAdapter {
             token_type: seed.token_type,
         };
         let backend = self.backend.clone();
-        tokio::task::spawn_blocking(move || backend.save(durable))
+        tokio::task::spawn_blocking(move || backend.save(durable, seed_refresh))
             .await
             .map_err(|e| AuthError::CredentialStoreError(format!("save task failed: {e}")))?
             .map_err(AuthError::CredentialStoreError)
@@ -342,7 +343,11 @@ mod tests {
         fn load(&self) -> Result<Option<ServiceCredential>, String> {
             Ok(self.stored.lock().unwrap().clone())
         }
-        fn save(&self, credential: ServiceCredential) -> Result<(), String> {
+        fn save(
+            &self,
+            credential: ServiceCredential,
+            _expected_refresh_token: Option<String>,
+        ) -> Result<(), String> {
             self.saves.fetch_add(1, Ordering::SeqCst);
             *self.stored.lock().unwrap() = Some(credential);
             Ok(())

@@ -29,6 +29,9 @@
 //! - [`url`] — the slash-tolerant base-plus-path join ([`url::join_path`]) the
 //!   login library, the MCP login, and the runtime refresh material share, so
 //!   the same issuer/path pair cannot join to different URLs in each path.
+//! - [`form`] — the `application/x-www-form-urlencoded` encoder
+//!   ([`form::form_encode`]) the login and refresh paths share, so an OAuth
+//!   request body or query is escaped the same way on every path.
 //!
 //! It is deliberately a *leaf* (deps: `base64`, `clap`, `dirs`, `serde`,
 //! `serde_json`, `tracing`, `tracing-subscriber`, and `zeroize`) and holds no
@@ -44,6 +47,7 @@
 
 pub mod clap_styles;
 pub mod credential;
+pub mod form;
 pub mod logging;
 pub mod oauth_claims;
 pub mod oauth_endpoint;

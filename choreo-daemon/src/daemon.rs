@@ -13,12 +13,14 @@
 //! Replies travel back per-request over a channel the sender placed in the
 //! command (a one-shot `std::sync::mpsc` or a crossbeam sender), never through
 //! the broadcast fan-outs unless the message is a genuine client-visible event.
-//! The subscriber broadcast fan-outs, the keystore handlers, the MCP command
-//! handlers, and per-session overlay resolution live in child modules
+//! The subscriber broadcast fan-outs, the keystore handlers, the OAuth-store
+//! handlers, the account→auth resolution, the MCP command handlers, and
+//! per-session overlay resolution live in child modules
 //! (`daemon/subscriber_handlers.rs`, `daemon/keystore.rs`,
-//! `daemon/mcp_commands.rs`, `daemon/image_provider.rs`); this module keeps the
-//! state and command types plus the core command handling. `DaemonState` is
-//! constructed by `daemon/open.rs`.
+//! `daemon/oauth_store.rs`, `daemon/provider_auth.rs`, `daemon/mcp_commands.rs`,
+//! `daemon/image_provider.rs`); this module keeps the state and command types
+//! plus the core command handling. `DaemonState` is constructed by
+//! `daemon/open.rs`.
 
 use crate::accounts::{AccountConfig, AccountManager, AccountOverrides};
 use crate::broadcast::{ClientId, FanoutTarget, LagLimits, ReplyTarget, SubscriberSink};
@@ -72,6 +74,9 @@ mod keystore;
 mod mcp_commands;
 mod oauth_store;
 mod open;
+/// Account → provider auth-grant resolution and the durable OAuth refresh
+/// material — see `daemon/provider_auth.rs`.
+mod provider_auth;
 mod session_image;
 mod subscriber_handlers;
 
@@ -539,6 +544,10 @@ pub enum DaemonCommand {
         key: String,
         /// The durable credential to persist (access token already stripped).
         credential: ServiceCredential,
+        /// The refresh token the adapter loaded and presented, so the loop can
+        /// refuse to rotate onto a credential replaced (logout/re-login)
+        /// while the refresh was in flight. `None` skips that guard.
+        expected_refresh_token: Option<String>,
     },
     /// Delete a stored MCP OAuth credential (fire-and-forget logout), removing
     /// the blob and the in-memory/quarantine state for the key.
@@ -841,6 +850,10 @@ pub enum DaemonCommand {
         /// A refreshed identity claim, when a new `id_token` carried one
         /// (adopted when present; the stored claim is kept when absent).
         new_account_id: Option<String>,
+        /// The refresh token the exchange loaded and presented, so the handler
+        /// can refuse to rotate onto a credential replaced (re-login/logout)
+        /// while the exchange was in flight. `None` skips that guard.
+        expected_refresh_token: Option<String>,
         /// Replies `Ok` once the cache and (on rotation) the durable blob are
         /// updated, or an error string on failure.
         reply: mpsc::Sender<Result<(), String>>,
@@ -1203,8 +1216,12 @@ impl DaemonState {
             DaemonCommand::RemoveCredentialCmd { service, reply } => {
                 self.handle_remove_credential(&service, &reply);
             }
-            DaemonCommand::OAuthSave { key, credential } => {
-                self.handle_oauth_save(&key, credential);
+            DaemonCommand::OAuthSave {
+                key,
+                credential,
+                expected_refresh_token,
+            } => {
+                self.handle_oauth_save(&key, credential, expected_refresh_token.as_deref());
             }
             DaemonCommand::OAuthClear { key } => self.handle_oauth_clear(&key),
             DaemonCommand::McpAuthRejected { key } => self.handle_mcp_auth_rejected(&key),
@@ -1317,6 +1334,7 @@ impl DaemonState {
                 received_at,
                 rotated_refresh_token,
                 new_account_id,
+                expected_refresh_token,
                 reply,
             } => self.handle_save_oauth_token(
                 crate::oauth_refresh::SaveToken {
@@ -1326,6 +1344,7 @@ impl DaemonState {
                     received_at,
                     rotated_refresh_token: rotated_refresh_token.as_ref().map(|t| t.as_str()),
                     new_account_id: new_account_id.as_deref(),
+                    expected_refresh_token: expected_refresh_token.as_deref(),
                 },
                 &reply,
             ),
@@ -1596,89 +1615,6 @@ impl DaemonState {
     /// satisfies.
     fn has_credential(&self, name: &str) -> bool {
         self.credentials.contains_key(name)
-    }
-
-    /// Resolve the auth grant for an account, if a credential is stored. API
-    /// keys project straight through; an OAuth credential carries its whole
-    /// grant plus any cached access token, so the refresh path has the refresh
-    /// token to work with.
-    fn auth_for(&self, name: &str) -> Option<ProviderAuth> {
-        let credential = self.credentials.get(name)?;
-        Some(match credential {
-            ServiceCredential::ApiKey { key } => ProviderAuth::ApiKey {
-                key: Zeroizing::new(key.clone()),
-            },
-            other => ProviderAuth::OAuth {
-                credential: Box::new(other.clone()),
-                access_token: self
-                    .access_tokens
-                    .get(name)
-                    .map(|cache| cache.access_token.clone()),
-            },
-        })
-    }
-
-    /// Read an OAuth account's token state for a session-side refresh: the
-    /// cached access token, the durable refresh material, and the quarantine
-    /// flag. A locked keystore yields no material (no credential in memory).
-    pub(crate) fn oauth_token_load(&self, account: &str) -> crate::oauth_refresh::TokenLoad {
-        let dead = self.dead_oauth.contains(account);
-        let cached =
-            self.access_tokens
-                .get(account)
-                .map(|c| crate::oauth_refresh::CachedAccessToken {
-                    access_token: c.access_token.clone(),
-                    expires_at: c.expires_at,
-                    received_at: c.received_at,
-                });
-        let material = self.oauth_refresh_material(account);
-        crate::oauth_refresh::TokenLoad {
-            cached,
-            material,
-            dead,
-        }
-    }
-
-    /// Build the durable refresh material for a **provider** OAuth account, or
-    /// `None` when the account is not an OAuth provider grant (an API key, an
-    /// MCP grant, or no credential).
-    ///
-    /// The token endpoint is the credential's recorded issuer (so the
-    /// authorization host is pinned at login and does not depend on the catalog
-    /// still matching) joined with the current catalog profile's token path; the
-    /// encoding is the profile's `refresh_encoding`. A provider with no profile
-    /// — or one removed from the catalog — cannot be refreshed here, so its
-    /// requests fall back to the cached access token until a 401.
-    fn oauth_refresh_material(
-        &self,
-        account: &str,
-    ) -> Option<crate::oauth_refresh::RefreshMaterial> {
-        let credential = self.credentials.get(account)?;
-        let oauth = credential.as_oauth()?;
-        // Only a provider grant refreshes here; an MCP grant is owned by the MCP
-        // authorization manager (a later phase).
-        if oauth.kind != choreo_keystore::OAuthKind::Provider {
-            return None;
-        }
-        let refresh_token = oauth.refresh_token?;
-        // The token endpoint and refresh encoding were recorded on the credential
-        // at login, so a runtime refresh reuses the exact endpoint and body
-        // encoding it was issued against and does not depend on the catalog
-        // profile still matching (an overlay edit or a catalog change cannot
-        // redirect or re-encode the refresh).
-        let token_endpoint = oauth.token_endpoint?;
-        let encoding = oauth.refresh_encoding?;
-        Some(crate::oauth_refresh::RefreshMaterial {
-            token_endpoint: token_endpoint.to_string(),
-            encoding,
-            client_id: oauth.client_id.map(str::to_string),
-            // The durable grant root and the client secret are secrets the
-            // session thread needs only for this one exchange, so they travel
-            // wipe-on-drop.
-            client_secret: oauth.client_secret.map(|s| Zeroizing::new(s.to_string())),
-            refresh_token: Zeroizing::new(refresh_token.to_string()),
-            granted_scopes: oauth.granted_scopes.to_vec(),
-        })
     }
 
     /// Build a provider client for an account against the DAEMON-owned

@@ -96,7 +96,11 @@ impl CredentialBackend for FileBackend {
         Ok(Self::read(&self.path))
     }
 
-    fn save(&self, credential: ServiceCredential) -> Result<(), String> {
+    fn save(
+        &self,
+        credential: ServiceCredential,
+        _expected_refresh_token: Option<String>,
+    ) -> Result<(), String> {
         let bytes = serde_json::to_vec(&credential).map_err(|e| e.to_string())?;
         std::fs::write(&self.path, bytes).map_err(|e| e.to_string())
     }
