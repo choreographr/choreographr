@@ -55,12 +55,19 @@ impl OwnedRefreshLock {
     ///
     /// Must not be called from within an async task (it blocks the thread);
     /// the MCP adapter calls it from a `spawn_blocking` task.
-    pub fn lock(&self) -> OwnedRefreshGuard {
+    pub fn lock(self: &Arc<Self>) -> OwnedRefreshGuard {
         // A `recv` error means the registry (the sole sender owner) is gone;
         // treat that as acquired so a shutdown cannot wedge the guard.
         let _ = self.semaphore.rx.recv();
         OwnedRefreshGuard {
             release: self.semaphore.tx.clone(),
+            // PIN the lock for the guard's whole life: `prune` retains an entry
+            // only while another owner holds it (`strong_count > 1`), so without
+            // this the registry could evict a lock that is *currently held* and
+            // let a concurrent acquirer mint a second semaphore for the same
+            // credential — breaking single-flight. The prune map check counts
+            // this strong handle.
+            _lock: Arc::clone(self),
         }
     }
 }
@@ -87,8 +94,12 @@ impl ChannelSemaphore {
 /// drop, releasing the lock.
 #[must_use = "dropping the guard releases the refresh lock"]
 pub struct OwnedRefreshGuard {
-    /// The semaphore sender the token is returned to on drop.
+    /// The semaphore sender the token is returned to on drop. Dropped first.
     release: crossbeam_channel::Sender<()>,
+    /// A strong handle keeping the locked registry entry alive while the guard
+    /// exists, so [`OAuthRefreshLocks::prune`] cannot evict a held lock. The
+    /// leading underscore marks it as held-only (never read); dropped last.
+    _lock: Arc<OwnedRefreshLock>,
 }
 
 impl Drop for OwnedRefreshGuard {
@@ -298,5 +309,37 @@ mod tests {
         let lock = registry.acquire_owned("k");
         let guard = lock.lock();
         assert_send_static(guard);
+    }
+
+    #[test]
+    fn prune_keeps_an_entry_with_a_live_owned_guard() {
+        // Regression: the owned guard must PIN its entry even after the caller's
+        // Arc is dropped, so a concurrent prune cannot evict a HELD lock and let
+        // a racing acquirer mint a second semaphore for the same credential.
+        let registry = OAuthRefreshLocks::new();
+        let lock = registry.acquire_owned("mcp:docs|pin");
+        let held_ptr = Arc::as_ptr(&lock);
+        let guard = lock.lock();
+        // Drop the caller's handle: only the held guard keeps the entry alive.
+        drop(lock);
+        registry.prune();
+        let while_held = registry.acquire_owned("mcp:docs|pin");
+        assert_eq!(
+            Arc::as_ptr(&while_held),
+            held_ptr,
+            "a held guard must keep its entry alive across a prune"
+        );
+
+        // Once every owner is gone the entry is pruned, so the registry cannot
+        // grow one entry per credential ever refreshed.
+        drop(while_held);
+        drop(guard);
+        registry.prune();
+        let after = registry.acquire_owned("mcp:docs|pin");
+        assert_ne!(
+            Arc::as_ptr(&after),
+            held_ptr,
+            "an idle entry is pruned once released"
+        );
     }
 }

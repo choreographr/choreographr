@@ -262,14 +262,30 @@ pub fn refresh_single_flight(
     force: bool,
     now: i64,
 ) -> Result<RefreshOutcome, RefreshFailure> {
-    // The lock is held for the entire sequence. It is a plain `Mutex<()>`; a
-    // poisoned lock (a panic while holding it) is recovered so a prior panic
-    // cannot wedge every later refresh.
-    let lock = oauth_refresh_locks::acquire(account);
-    let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    // The lock and its guard are scoped to this block so BOTH drop before the
+    // opportunistic prune below: the prune removes an entry only when the map
+    // is its sole owner, so pruning after the release is what actually bounds
+    // the registry. The whole `load → re-check → exchange → persist` sequence
+    // runs under the lock (see `refresh_under_lock`), so a loser re-reads the
+    // winner's persisted token rather than spending a single-use one twice.
+    let result = {
+        let lock = oauth_refresh_locks::acquire(account);
+        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        refresh_under_lock(source, account, force, now)
+    };
+    oauth_refresh_locks::prune();
+    result
+}
 
-    // The load happens UNDER the lock: a loser re-reads the winner's rotation
-    // rather than using a stale in-memory copy.
+/// The lock-protected body of [`refresh_single_flight`]: the load happens UNDER
+/// the lock so a loser re-reads the winner's rotation rather than using a stale
+/// in-memory copy.
+fn refresh_under_lock(
+    source: &dyn OAuthTokenSource,
+    account: &str,
+    force: bool,
+    now: i64,
+) -> Result<RefreshOutcome, RefreshFailure> {
     let load = source.load(account);
     if load.dead {
         return Err(RefreshFailure::Terminal);
