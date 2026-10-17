@@ -105,8 +105,7 @@ pub struct CatalogProvider {
 ///
 /// A server with no authentication at all (a stdio subprocess, or a remote
 /// server with neither an `oauth` block nor a static `Authorization` header)
-/// reports [`Self::NotApplicable`]. A remote server whose `oauth` block is
-/// configured but which this build cannot drive reports [`Self::Unsupported`].
+/// reports [`Self::NotApplicable`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum McpAuthState {
     /// The server needs no authentication.
@@ -120,8 +119,6 @@ pub enum McpAuthState {
     /// The server's stored OAuth credential was terminally rejected (a
     /// revoked or expired grant); the user must sign in again.
     Reauthentication,
-    /// The server's authentication cannot be driven by this build.
-    Unsupported,
 }
 
 /// A remote MCP server's `oauth` configuration, supplied to a frontend so it

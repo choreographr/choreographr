@@ -12,7 +12,7 @@ use choreo_client_core::{
     LoginEvent, LoginOptions, LoginSession, McpLoginInfo, McpLoginOptions, start_login,
     start_mcp_login,
 };
-use choreo_proto::{ClientMessageType, McpAuthState, OAuthProviderDescriptor};
+use choreo_proto::{ClientMessageType, OAuthProviderDescriptor};
 
 use super::App;
 
@@ -204,7 +204,7 @@ impl App {
     }
 
     /// Start the MCP sign-in worker for `slug`, or surface why it cannot be
-    /// signed into (no `oauth` block, unsupported, or untrusted).
+    /// signed into (no `oauth` block, or not a remote server).
     fn start_mcp_login_for(&mut self, slug: &str) {
         let Some(server) = self.mcp_servers.iter().find(|s| s.slug == slug) else {
             self.status = Some(format!("no MCP server '{slug}'"));
@@ -216,10 +216,6 @@ impl App {
             ));
             return;
         };
-        if server.auth == McpAuthState::Unsupported {
-            self.status = Some(format!("MCP server '{slug}' sign-in is unsupported"));
-            return;
-        }
         let Some(credential_key) = server.credential_key.clone() else {
             self.status = Some(format!("MCP server '{slug}' is not a remote server"));
             return;
