@@ -17,8 +17,8 @@
 
 use crate::common::watchdog;
 use choreo_mcp::{
-    CredentialBackend, McpAuthWiring, McpError, McpProtocolMode, McpServer, McpServerConfig,
-    McpTransport, RefreshGuard, credential_key_for,
+    CredentialBackend, McpAuthWiring, McpError, McpOAuthConfig, McpProtocolMode, McpServer,
+    McpServerConfig, McpTransport, RefreshGuard, credential_key_for,
 };
 use choreo_shared::{OAuthKind, ServiceCredential};
 use std::collections::HashMap;
@@ -299,10 +299,27 @@ fn handle_connection(mut stream: TcpStream, state: &MockState) {
             .to_string();
             write_response(&mut stream, "200 OK", "application/json", "", &body);
         }
+        // An authorization server advertised only at an explicitly-named subpath
+        // (the OpenID Connect appended form `{issuer}/.well-known/openid-configuration`)
+        // — the shape the `authorizationServer` override exists for. Nothing at
+        // the resource's paths leads here, so a connect can reach it only through
+        // the override.
+        ("GET", "/as/.well-known/openid-configuration") => {
+            let body = serde_json::json!({
+                "issuer": format!("{}/as", state.issuer),
+                "authorization_endpoint": format!("{}/as/authorize", state.issuer),
+                "token_endpoint": format!("{}/as/token", state.issuer),
+                "registration_endpoint": format!("{}/as/register", state.issuer),
+                "scopes_supported": ["openid"],
+            })
+            .to_string();
+            write_response(&mut stream, "200 OK", "application/json", "", &body);
+        }
         // Any other GET (the protected-resource probes, the OIDC candidates,
         // the resource endpoint itself) is absent, so discovery moves on.
         ("GET", _) => write_response(&mut stream, "404 Not Found", "text/plain", "", "no"),
         ("POST", "/token") => handle_token(&mut stream, state),
+        ("POST", "/as/token") => handle_token(&mut stream, state),
         ("POST", "/mcp") => handle_mcp(&mut stream, state, &request),
         _ => write_response(&mut stream, "404 Not Found", "text/plain", "", "no"),
     }
@@ -484,6 +501,57 @@ fn connect_refreshes_and_persists_without_the_access_token() {
     assert!(
         !raw.contains("at-1"),
         "the access token must never be persisted: {raw}"
+    );
+}
+
+/// A stored grant whose authorization server is reachable ONLY through the
+/// configured `authorizationServer` override refreshes at connect: discovery
+/// from the resource URL leads nowhere, so the refresh must resolve the AS from
+/// the override, send the refreshed bearer, and persist the rotation.
+#[test]
+#[ignore = "integration: binds a local mock authorization server"]
+fn connect_honors_the_authorization_server_override() {
+    watchdog();
+    let mock = MockAuthServer::start(TokenMode::Rotate, false);
+    let as_url = format!("{}/as", mock.issuer);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("credential.json");
+    // The stored grant names the subpath issuer, so a connect that instead
+    // discovered the resource's root AS would withhold it.
+    seed_mcp_grant(&path, &as_url, &mock.mcp_url);
+    let backend = FileBackend::new(path.clone());
+
+    let mut config = http_config("docs", &mock.mcp_url);
+    if let McpTransport::Http { oauth, .. } = &mut config.transport {
+        *oauth = Some(McpOAuthConfig {
+            authorization_server: Some(as_url.clone()),
+            ..McpOAuthConfig::default()
+        });
+    }
+    let wiring = McpAuthWiring {
+        key: credential_key_for(&config).expect("key"),
+        backend: backend.clone(),
+    };
+
+    let server = McpServer::connect_with_auth(&config, None, Some(wiring))
+        .expect("connect through the authorizationServer override");
+    assert_eq!(server.name(), "oauth-fixture");
+    assert_eq!(
+        mock.token_hits(),
+        1,
+        "the cold start refreshes exactly once"
+    );
+    assert!(
+        mock.mcp_auth_headers().iter().any(|h| h == "Bearer at-1"),
+        "the refreshed access token must reach the MCP endpoint: {:?}",
+        mock.mcp_auth_headers()
+    );
+    let stored = FileBackend::read(&path).expect("credential persisted");
+    assert_eq!(
+        stored.as_oauth().expect("oauth credential").refresh_token,
+        Some("rt-rotated"),
+        "the refresh completed and rotated the durable grant"
     );
 }
 

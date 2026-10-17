@@ -9,6 +9,7 @@
 //! [`super::adapter`], so each module owns one concern.
 
 use choreo_shared::{OAuthKind, ServiceCredential};
+use rmcp::transport::auth::{AuthorizationManager, AuthorizationMetadata};
 
 use super::McpAuthWiring;
 use super::adapter::CredentialStoreAdapter;
@@ -34,7 +35,7 @@ pub(crate) async fn build_auth_client(
     wiring: &McpAuthWiring,
     client: reqwest::Client,
 ) -> Result<rmcp::transport::auth::AuthClient<reqwest::Client>, crate::error::McpError> {
-    use rmcp::transport::auth::{AuthClient, AuthorizationManager, OAuthClientConfig};
+    use rmcp::transport::auth::{AuthClient, OAuthClientConfig};
 
     let mut manager = AuthorizationManager::new(url).await.map_err(|e| {
         crate::error::McpError::InitializeFailed(format!("OAuth discovery init failed: {e}"))
@@ -48,21 +49,24 @@ pub(crate) async fn build_auth_client(
         })?
         .map_err(crate::error::McpError::InitializeFailed)?;
 
+    // A configured `authorizationServer` overrides discovery at connect exactly
+    // as it does at sign-in: the server names its authorization server explicitly
+    // rather than relying on the resource's well-known paths or the
+    // `WWW-Authenticate` challenge.
+    let explicit_as = match &config.transport {
+        McpTransport::Http { oauth, .. } => {
+            oauth.as_ref().and_then(|o| o.authorization_server.clone())
+        }
+        McpTransport::Stdio { .. } => None,
+    };
+
     if let Some(view) = loaded.as_ref().and_then(ServiceCredential::as_oauth)
         && view.kind == OAuthKind::Mcp
     {
         let client_id = view.client_id.map(str::to_string);
         let client_secret = view.client_secret.map(str::to_string);
         let granted_scopes = view.granted_scopes.to_vec();
-        let metadata = manager
-            .resolve_metadata()
-            .await
-            .map_err(|e| {
-                crate::error::McpError::InitializeFailed(format!(
-                    "OAuth metadata discovery failed: {e}"
-                ))
-            })?
-            .metadata;
+        let metadata = resolve_metadata(&manager, explicit_as.as_deref()).await?;
         // Arm the adapter to withhold the stored grant when its issuer no longer
         // matches the one discovered here (a re-pointed server), so the token is
         // never sent; the connect then surfaces a re-login.
@@ -101,4 +105,37 @@ pub(crate) async fn build_auth_client(
     }
 
     Ok(AuthClient::new(client, manager))
+}
+
+/// Resolve the authorization-server metadata the connect-time refresh uses.
+///
+/// With no `authorizationServer` override, rmcp discovers the authorization
+/// server from the resource URL (RFC 9728 protected-resource metadata, the
+/// `WWW-Authenticate` challenge, then the RFC 8414 / OIDC well-known paths).
+/// rmcp's `AuthorizationManager` has no explicit-issuer setter, so a configured
+/// `authorizationServer` — the case where the AS is not reachable through the
+/// resource at all — is resolved by running rmcp's own discovery against the
+/// override URL (its candidate set includes the `OpenID` Connect appended form)
+/// and seeding the result back onto this manager. The manager's base URL stays
+/// the resource, so the RFC 8707 `resource` parameter the refresh sends remains
+/// the MCP endpoint rather than the authorization server.
+async fn resolve_metadata(
+    manager: &AuthorizationManager,
+    explicit_as: Option<&str>,
+) -> Result<AuthorizationMetadata, crate::error::McpError> {
+    let resolution = match explicit_as {
+        Some(as_url) => {
+            let resolver = AuthorizationManager::new(as_url).await.map_err(|e| {
+                crate::error::McpError::InitializeFailed(format!(
+                    "OAuth discovery init failed: {e}"
+                ))
+            })?;
+            resolver.resolve_metadata().await
+        }
+        None => manager.resolve_metadata().await,
+    }
+    .map_err(|e| {
+        crate::error::McpError::InitializeFailed(format!("OAuth metadata discovery failed: {e}"))
+    })?;
+    Ok(resolution.metadata)
 }
