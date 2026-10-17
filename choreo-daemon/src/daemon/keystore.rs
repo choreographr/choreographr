@@ -61,8 +61,11 @@ impl DaemonState {
         if let Some(target) = reply {
             target.send(inner);
         } else {
+            // Log the payload-free variant tag, never `?inner`: the message
+            // can carry a session payload (turn text, tool arguments/results)
+            // that must not reach a log line.
             warn!(
-                ?inner,
+                kind = inner.kind(),
                 "no reply target for targeted keystore reply; dropping reply"
             );
         }
