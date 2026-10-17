@@ -118,11 +118,11 @@ fn run(
     tx: &Sender<LoginEvent>,
     cancel: &AtomicBool,
 ) -> Result<(), OAuthLoginError> {
-    let agent = http::agent();
+    let discovery_agent = http::discovery_agent();
     let _ = tx.send(LoginEvent::Progress {
         message: "Discovering the authorization server…".to_string(),
     });
-    let server = discover(&agent, &info.resource)?;
+    let server = discover(&discovery_agent, &info.resource)?;
     // Bind the loopback callback FIRST so the redirect URI is known, then use
     // that exact URI for both dynamic registration and the authorize request.
     // A server that validates `redirect_uri` against the registered value must
@@ -136,7 +136,13 @@ fn run(
     };
     let client_id = match info.oauth.client_id.clone() {
         Some(id) => id,
-        None => register_client(&agent, &server, &bound.redirect_uri, &info.oauth.scopes, tx)?,
+        None => register_client(
+            &http::agent(),
+            &server,
+            &bound.redirect_uri,
+            &info.oauth.scopes,
+            tx,
+        )?,
     };
     let tokens = authorize(info, options, &server, &client_id, &bound, tx, cancel)?;
     finish(info, &server, &client_id, &tokens, tx)?;

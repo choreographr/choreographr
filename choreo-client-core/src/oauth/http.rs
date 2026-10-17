@@ -7,7 +7,9 @@
 //! is serialized as form-encoded or JSON according to the descriptor's
 //! per-endpoint encoding — the code exchange and the refresh can differ (the
 //! `ChatGPT`/Codex backend accepts a form-encoded code exchange but a JSON
-//! refresh). No redirects are followed on these credential-bearing POSTs.
+//! refresh). No redirects are followed on these credential-bearing POSTs; the
+//! credential-free discovery GETs use a separate agent that follows a small,
+//! bounded number of redirects (see [`discovery_agent`]).
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -133,6 +135,22 @@ pub(crate) fn agent() -> ureq::Agent {
         .timeout_global(Some(std::time::Duration::from_secs(30)))
         .http_status_as_error(false)
         .max_redirects(0)
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
+/// Build the agent for the credential-free **discovery** GETs (the RFC 9728 /
+/// 8414 well-known metadata fetches). Unlike [`agent`] it follows a small,
+/// bounded number of redirects, because an authorization server may redirect a
+/// well-known document (e.g. to a tenant host) and no secret rides a GET. Only
+/// the initial URL is vetted with the endpoint policy; redirect targets are
+/// bounded but not re-vetted, which is acceptable because a metadata document
+/// carries no credential.
+pub(crate) fn discovery_agent() -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(30)))
+        .http_status_as_error(false)
+        .max_redirects(5)
         .build();
     ureq::Agent::new_with_config(config)
 }
