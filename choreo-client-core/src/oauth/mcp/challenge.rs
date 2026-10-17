@@ -36,12 +36,35 @@ pub(super) fn scope(header: &str) -> Option<Vec<String>> {
 /// The value of an `auth-param` in a challenge header, matched
 /// case-insensitively and read as a quoted-string or a bare token (unquoted,
 /// terminated by a comma or whitespace).
+///
+/// The parameter name must begin an `auth-param` — at the header start or just
+/// after one of the separators that bound parameters (a comma, whitespace, or a
+/// semicolon). Without that boundary check a `name=` occurring inside another
+/// parameter's value (a `scope=` inside a `resource_metadata` URL) or as the
+/// tail of a longer name (`insufficient_scope=`) would be misread as the
+/// parameter itself.
 fn param_value(header: &str, name: &str) -> Option<String> {
     let needle = format!("{name}=");
     // `to_ascii_lowercase` maps ASCII letters 1:1 (leaving other bytes
     // untouched), so a byte offset found in the lowercased copy is valid in the
     // original; the ASCII needle's offset is a char boundary.
-    let at = header.to_ascii_lowercase().find(&needle)?;
+    let lower = header.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut from = 0;
+    let at = loop {
+        let rel = lower.get(from..)?.find(&needle)?;
+        let idx = from + rel;
+        let boundary = idx == 0
+            || bytes
+                .get(idx - 1)
+                .is_some_and(|b| matches!(*b, b' ' | b'\t' | b',' | b';'));
+        if boundary {
+            break idx;
+        }
+        // Not a parameter boundary: skip past this occurrence and keep looking,
+        // so a `name=` inside a value cannot shadow the real parameter.
+        from = idx + 1;
+    };
     let after = header.get(at + needle.len()..)?;
     let after = after.trim_start();
     if let Some(quoted) = after.strip_prefix('"') {
@@ -129,5 +152,35 @@ mod tests {
         assert_eq!(scope(r#"Bearer realm="OAuth""#), None);
         assert_eq!(scope(r#"Bearer scope="""#), None);
         assert_eq!(scope(r#"Bearer scope="   ""#), None);
+    }
+
+    #[test]
+    fn parameter_name_inside_a_value_is_not_a_parameter() {
+        // A `resource_metadata=` appearing inside another parameter's value must
+        // not shadow the real parameter that follows.
+        assert_eq!(
+            resource_metadata_url(
+                r#"Bearer scope="resource_metadata=https://evil", resource_metadata="https://good""#
+            )
+            .as_deref(),
+            Some("https://good")
+        );
+        // A `scope=` inside a `resource_metadata` URL must not be read as the
+        // parameter when the real `scope` follows.
+        assert_eq!(
+            scope(r#"Bearer resource_metadata="https://x/scope=a", scope="read""#),
+            Some(vec!["read".to_string()])
+        );
+    }
+
+    #[test]
+    fn parameter_name_suffix_is_not_a_parameter() {
+        // `x_scope=` is not the `scope` parameter (the preceding `_` is not a
+        // boundary); the tail of a longer name is not the parameter.
+        assert_eq!(scope(r#"Bearer x_scope="admin""#), None);
+        assert_eq!(
+            resource_metadata_url(r#"Bearer not_resource_metadata="https://x""#),
+            None
+        );
     }
 }
