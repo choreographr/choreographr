@@ -48,6 +48,10 @@ rand.workspace = true
 tiny_http.workspace = true
 webbrowser.workspace = true
 sha2.workspace = true
+# Constant-time equality for the OAuth login flow's CSRF `state` check
+# (src/oauth/pkce.rs): `subtle::ConstantTimeEq` rather than a hand-rolled
+# byte loop.
+subtle.workspace = true
 ureq.workspace = true
 serde_json.workspace = true
 # MCP OAuth discovery (src/oauth/mcp/discovery.rs): parse the issuer/resource

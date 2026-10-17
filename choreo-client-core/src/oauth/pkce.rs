@@ -11,6 +11,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq as _;
 
 /// Bytes of CSPRNG entropy in a PKCE verifier or a `state` value. 32 bytes
 /// (256 bits) comfortably clears RFC 7636's 32-character minimum for the
@@ -45,25 +46,12 @@ pub fn generate_state() -> String {
 ///
 /// A mismatch is a CSRF signal (an attacker-supplied callback), so the caller
 /// treats it as a hard failure and never exchanges the accompanying code. The
-/// comparison is constant-time to avoid leaking the expected value byte by
-/// byte; `state` is not a secret, but the cost is negligible.
+/// comparison is constant-time (`subtle`'s [`ConstantTimeEq`](subtle::ConstantTimeEq),
+/// which also fails an unequal-length pair) to avoid leaking the expected value
+/// byte by byte; `state` is not a secret, but the cost is negligible.
 #[must_use]
 pub fn state_matches(expected: &str, returned: &str) -> bool {
-    subtle_eq(expected.as_bytes(), returned.as_bytes())
-}
-
-/// Length-checked, branch-minimal byte equality. `expected` and `returned`
-/// differing in length already fails; equal-length inputs are compared with a
-/// running XOR so the number of differing bytes never short-circuits.
-fn subtle_eq(expected: &[u8], returned: &[u8]) -> bool {
-    if expected.len() != returned.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (a, b) in expected.iter().zip(returned.iter()) {
-        diff |= a ^ b;
-    }
-    diff == 0
+    bool::from(expected.as_bytes().ct_eq(returned.as_bytes()))
 }
 
 #[cfg(test)]

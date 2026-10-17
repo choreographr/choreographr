@@ -492,6 +492,11 @@ lru = "0.18"
 chrono = "0.4"
 zeroize = { version = "1", features = ["derive"] }
 rand_core = "0.10"
+# Constant-time comparison for the OAuth login flow's CSRF `state` check
+# (`choreo-client-core`). Already in the tree via the dalek crates, declared
+# directly so the comparison uses the audited primitive rather than a
+# hand-rolled loop.
+subtle = "2"
 sha2 = "0.11"
 hkdf = "0.13"
 x25519-dalek = { version = "3", features = ["static_secrets"] }
