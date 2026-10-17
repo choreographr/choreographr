@@ -207,6 +207,9 @@ impl CredentialStore for CredentialStoreAdapter {
 
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
         let received_at = credentials.token_received_at.unwrap_or_else(now_secs);
+        // The in-process cache update is unconditional: the access token is
+        // never part of the durable grant, so a plain expiry refresh updates it
+        // here and touches nothing on disk.
         if let Some(response) = credentials.token_response.clone() {
             *self.cache.lock().await = Some(CachedToken {
                 response,
@@ -219,15 +222,12 @@ impl CredentialStore for CredentialStoreAdapter {
             return Ok(());
         };
         // Strip the access token: the durable grant is the refresh token plus
-        // the client registration and identity. A rotated refresh token is
-        // adopted; when the exchange omitted one, the seed's is kept.
+        // the client registration and identity. A returned refresh token is
+        // adopted; when the exchange omitted one, the seed's is kept rather than
+        // dropping the durable grant root.
         let seed_refresh = seed.refresh_token.as_ref().map(|t| t.as_str().to_string());
         let (refresh_token, granted_scopes) = match &credentials.token_response {
             Some(response) => (
-                // Adopt a rotated refresh token; when the exchange returned
-                // none (rmcp rewrites the previous one onto the response on
-                // refresh), fall back to the seed's rather than dropping the
-                // durable grant root.
                 response
                     .refresh_token()
                     .map(|t| t.secret().clone())
@@ -239,6 +239,24 @@ impl CredentialStore for CredentialStoreAdapter {
             ),
             None => (seed_refresh.clone(), credentials.granted_scopes.clone()),
         };
+        // The durable grant changes only when the exchange ROTATED the refresh
+        // token. `rmcp` rewrites the previous refresh token back onto the
+        // response on refresh, so "the response carries a refresh token" does
+        // NOT imply rotation — compare the adopted value against the seed's, not
+        // its presence. A non-rotating refresh (the access token lives only in
+        // the in-process cache) is persisted nowhere, so it costs no
+        // re-encryption and no blob write, matching the provider path. One
+        // consequence: the daemon's `OAuthSave` handler also prunes the
+        // single-flight refresh-lock registry, so a skipped save leaves that
+        // key's entry lingering until the next save or clear — harmless, it is
+        // an idle lock the next refresh reuses.
+        if refresh_token.as_deref() == seed_refresh.as_deref() {
+            tracing::debug!(
+                key = %self.key,
+                "MCP token refresh carried no rotation; skipping the durable re-encrypt"
+            );
+            return Ok(());
+        }
         let durable = ServiceCredential::OAuth {
             kind: OAuthKind::Mcp,
             issuer: credentials.issuer.clone().or(seed.issuer),
@@ -295,12 +313,15 @@ impl CredentialStore for CredentialStoreAdapter {
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    /// A scripted backend holding one durable credential in memory.
+    /// A scripted backend holding one durable credential in memory, counting
+    /// how many times `save` was called so a test can prove a non-rotating
+    /// refresh does not re-encrypt.
     struct FakeBackend {
         stored: StdMutex<Option<ServiceCredential>>,
         rejected: AtomicBool,
+        saves: AtomicUsize,
     }
 
     impl FakeBackend {
@@ -308,6 +329,7 @@ mod tests {
             Arc::new(Self {
                 stored: StdMutex::new(credential),
                 rejected: AtomicBool::new(false),
+                saves: AtomicUsize::new(0),
             })
         }
     }
@@ -317,6 +339,7 @@ mod tests {
             Ok(self.stored.lock().unwrap().clone())
         }
         fn save(&self, credential: ServiceCredential) -> Result<(), String> {
+            self.saves.fetch_add(1, Ordering::SeqCst);
             *self.stored.lock().unwrap() = Some(credential);
             Ok(())
         }
@@ -443,6 +466,53 @@ mod tests {
         assert!(!format!("{stored:?}").contains("access-secret"));
         // The client secret survives the save (it is not in the token response).
         assert_eq!(view.client_secret, Some("client-secret"));
+        // A rotated refresh token IS a durable change, so the blob is written.
+        assert_eq!(backend.saves.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn save_skips_the_reencrypt_when_not_rotated() {
+        crate::runtime::init().expect("runtime init");
+        let backend = FakeBackend::new(Some(durable_oauth()));
+        let adapter = CredentialStoreAdapter::new("mcp:docs|x".into(), backend.clone());
+        crate::runtime::block_on(async {
+            let _ = adapter.load().await.expect("load ok");
+            // A response carrying the SAME refresh token as the loaded
+            // credential (rmcp rewrites it back onto the response on refresh),
+            // so only the access token changed.
+            let mut response: OAuthTokenResponse = StandardTokenResponse::new(
+                AccessToken::new("new-access".into()),
+                BasicTokenType::Bearer,
+                VendorExtraTokenFields::default(),
+            );
+            response.set_refresh_token(Some(RefreshToken::new("refresh-secret".into())));
+            let stored = StoredCredentials::new(
+                "client-1".into(),
+                Some(response),
+                vec!["openid".into()],
+                Some(2_000),
+            )
+            .with_issuer(Some("https://as.example".into()));
+            adapter.save(stored).await.expect("save ok");
+            // The cache still reflects the fresh access token.
+            let cached = adapter.cache.lock().await.clone().expect("a cached token");
+            assert_eq!(cached.response.access_token().secret(), "new-access");
+        })
+        .expect("block_on");
+        assert_eq!(
+            backend.saves.load(Ordering::SeqCst),
+            0,
+            "a non-rotating refresh must not re-encrypt the durable grant"
+        );
+        // The durable credential is unchanged.
+        let stored = backend
+            .stored
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a durable credential");
+        let view = stored.as_oauth().expect("oauth");
+        assert_eq!(view.refresh_token, Some("refresh-secret"));
     }
 
     #[test]
