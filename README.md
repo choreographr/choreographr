@@ -985,7 +985,8 @@ flow here). A confidential client's secret is sent at the token endpoint —
 HTTP Basic, or `client_secret_post` when the server advertises only that — and
 stored in the grant, so connect-time refresh
 re-authenticates the token endpoint; the authorization response's `iss` is
-validated against the discovered issuer when the server advertises RFC 9207
+validated against the discovered issuer (with the shared tolerant comparison, so
+a trailing-slash difference is accepted) when the server advertises RFC 9207
 support. The durable grant is stored in the same encrypted keystore as
 provider credentials, keyed by the server's target (`mcp:<slug>|<target-hash>`) so
 a same-slug server on a different endpoint keeps its own credential; `mcp logout

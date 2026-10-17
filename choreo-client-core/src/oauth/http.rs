@@ -64,6 +64,23 @@ impl std::fmt::Debug for TokenSet {
     }
 }
 
+impl TokenSet {
+    /// Build a token set from the shared token-response parse, or `None` when
+    /// the reply carried no access token (an OAuth error body, or an empty
+    /// one). The one `TokenResponse`→`TokenSet` projection, so the code
+    /// exchange and the device poll read the shared parse identically.
+    fn from_response(parsed: TokenResponse) -> Option<Self> {
+        let access_token = parsed.access_token?;
+        Some(Self {
+            access_token: Zeroizing::new(access_token),
+            refresh_token: parsed.refresh_token.map(Zeroizing::new),
+            id_token: parsed.id_token.map(Zeroizing::new),
+            token_type: parsed.token_type,
+            scope: parsed.scope,
+        })
+    }
+}
+
 /// The device-authorization (`usercode`) response.
 ///
 /// The opaque `device_code` is a short-lived secret the token poll exchanges,
@@ -309,22 +326,21 @@ pub(crate) fn read_token_response(
             .read_to_string()
             .map_err(|e| OAuthLoginError::Decode(e.to_string()))?,
     );
-    let parsed: TokenResponse = parse(body.as_str());
-    if let Some(error) = parsed.error {
-        let description = parsed.error_description.unwrap_or_default();
-        return Err(OAuthLoginError::TokenEndpoint { error, description });
+    let mut parsed: TokenResponse = parse(body.as_str());
+    // Pull the non-secret error fields out with `take` so `parsed` is not
+    // partially moved and no secret `String` (the tokens) is cloned.
+    let error = parsed.error.take();
+    let error_description = parsed.error_description.take();
+    if let Some(error) = error {
+        return Err(OAuthLoginError::TokenEndpoint {
+            error,
+            description: error_description.unwrap_or_default(),
+        });
     }
-    let Some(access_token) = parsed.access_token else {
-        return Err(OAuthLoginError::Decode(format!(
+    TokenSet::from_response(parsed).ok_or_else(|| {
+        OAuthLoginError::Decode(format!(
             "token endpoint returned no access_token (status {status})"
-        )));
-    };
-    Ok(TokenSet {
-        access_token: Zeroizing::new(access_token),
-        refresh_token: parsed.refresh_token.map(Zeroizing::new),
-        id_token: parsed.id_token.map(Zeroizing::new),
-        token_type: parsed.token_type,
-        scope: parsed.scope,
+        ))
     })
 }
 
@@ -503,6 +519,16 @@ pub(crate) fn device_poll(
         &body,
         HopPolicy::provider(),
     )?;
+    let status = response.status().as_u16();
+    // A refused redirect (the agent follows none), 429, or 5xx is TRANSIENT: the
+    // caller tolerates a short run of transient failures before giving up, so a
+    // one-off server error does not abort the (minutes-long) device flow. This
+    // mirrors the runtime refresh classifier's terminal-vs-transient rule.
+    if (300..400).contains(&status) || status == 429 || (500..600).contains(&status) {
+        return Err(OAuthLoginError::Network(format!(
+            "device token endpoint returned transient status {status}"
+        )));
+    }
     // The response body carries the freshly minted tokens on the authorized
     // poll, so it is wipe-on-drop.
     let body = Zeroizing::new(
@@ -511,22 +537,20 @@ pub(crate) fn device_poll(
             .read_to_string()
             .map_err(|e| OAuthLoginError::Decode(e.to_string()))?,
     );
-    let parsed: TokenResponse = parse(body.as_str());
-    if let Some(access_token) = parsed.access_token {
-        return Ok(PollOutcome::Tokens(TokenSet {
-            access_token: Zeroizing::new(access_token),
-            refresh_token: parsed.refresh_token.map(Zeroizing::new),
-            id_token: parsed.id_token.map(Zeroizing::new),
-            token_type: parsed.token_type,
-            scope: parsed.scope,
-        }));
+    let mut parsed: TokenResponse = parse(body.as_str());
+    // Pull the non-secret error fields out with `take` so `parsed` is not
+    // partially moved and no secret `String` (the tokens) is cloned.
+    let error = parsed.error.take();
+    let error_description = parsed.error_description.take();
+    if let Some(tokens) = TokenSet::from_response(parsed) {
+        return Ok(PollOutcome::Tokens(tokens));
     }
-    match parsed.error.as_deref() {
+    match error.as_deref() {
         Some("authorization_pending") => Ok(PollOutcome::Pending),
         Some("slow_down") => Ok(PollOutcome::SlowDown),
         Some(other) => Ok(PollOutcome::Expired(format!(
             "{other}: {}",
-            parsed.error_description.unwrap_or_default()
+            error_description.unwrap_or_default()
         ))),
         None => Err(OAuthLoginError::Decode(
             "device poll returned neither tokens nor an error".to_string(),
@@ -591,6 +615,37 @@ mod tests {
         assert!(ensure_secure("http://localhost:8080/token").is_ok());
         assert!(ensure_secure("http://[::1]:8080/token").is_ok());
         assert!(ensure_secure("http://evil.example/token").is_err());
+    }
+
+    #[test]
+    fn token_set_from_response_projects_the_shared_parse() {
+        // A reply with an access token projects to a token set carrying every
+        // field the shared parse read.
+        let parsed = TokenResponse {
+            access_token: Some("access".to_string()),
+            refresh_token: Some("refresh".to_string()),
+            id_token: Some("id".to_string()),
+            token_type: Some("Bearer".to_string()),
+            scope: Some("openid".to_string()),
+            ..TokenResponse::default()
+        };
+        let tokens = TokenSet::from_response(parsed).expect("access token present");
+        assert_eq!(tokens.access_token.as_str(), "access");
+        assert_eq!(
+            tokens.refresh_token.as_deref().map(String::as_str),
+            Some("refresh")
+        );
+        assert_eq!(tokens.id_token.as_deref().map(String::as_str), Some("id"));
+        assert_eq!(tokens.token_type.as_deref(), Some("Bearer"));
+        assert_eq!(tokens.scope.as_deref(), Some("openid"));
+        // A reply with no access token (an OAuth error body, or an empty one)
+        // yields no token set.
+        let error_only = TokenResponse {
+            error: Some("invalid_grant".to_string()),
+            ..TokenResponse::default()
+        };
+        assert!(TokenSet::from_response(error_only).is_none());
+        assert!(TokenSet::from_response(TokenResponse::default()).is_none());
     }
 
     #[test]

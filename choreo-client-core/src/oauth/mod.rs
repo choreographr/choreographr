@@ -85,7 +85,10 @@ pub enum OAuthLoginError {
     /// A URL was not `https` and not a loopback `http` address.
     #[error("refusing an insecure OAuth endpoint: {0}")]
     InsecureEndpoint(String),
-    /// A network-level failure talking to the provider.
+    /// A network-level failure talking to the provider, or a retryable HTTP
+    /// status the endpoint returned (a refused redirect, `429`, or `5xx`) —
+    /// either way, a condition worth retrying rather than a terminal protocol
+    /// error.
     #[error("network error: {0}")]
     Network(String),
     /// The provider's response could not be decoded.

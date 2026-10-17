@@ -6,6 +6,10 @@
 //! keys a different one. [`credential_matches_target`] is the fail-closed check
 //! the daemon applies on load, so a `git pull` that re-points a repo-controlled
 //! server URL never receives the stored token.
+//!
+//! The `mcp:` prefix is **reserved** for these target-scoped MCP keys: a provider
+//! account must never be named `mcp:<slug>|…`, because a name in that form would
+//! be read as an MCP credential key and could collide with a server's key.
 
 use choreo_shared::{OAuthKind, ServiceCredential};
 
@@ -73,12 +77,19 @@ pub fn credential_matches_target(
     let resource_matches = view
         .resource
         .is_some_and(|r| canonical_target(r) == canonical_resource);
-    let issuer_matches = expected_issuer.is_none_or(|iss| view.issuer == Some(iss));
+    let issuer_matches = expected_issuer.is_none_or(|iss| {
+        view.issuer
+            .is_some_and(|stored| choreo_shared::oauth_endpoint::issuers_match(stored, iss))
+    });
     resource_matches && issuer_matches
 }
 
 /// Build the target-scoped credential key for a canonical target identity and
 /// slug: `mcp:<slug>|<short-hash>`.
+///
+/// The `mcp:` prefix is **reserved** for these target-scoped MCP keys: a provider
+/// account must never be named `mcp:<slug>|…`, because a name in that form is
+/// read as an MCP credential key and could collide with a server's key.
 ///
 /// The hash is the repo's stable FNV-1a ([`short_hash`]) of the canonical
 /// identity joined to the slug with a `\0`, so two servers of one slug pointing
@@ -148,6 +159,13 @@ mod tests {
             &cred,
             &resource,
             Some("https://as.example")
+        ));
+        // A trailing-slash-only difference in the expected issuer is tolerated
+        // (the shared comparison), so it does not force a needless re-login.
+        assert!(credential_matches_target(
+            &cred,
+            &resource,
+            Some("https://as.example/")
         ));
         assert!(!credential_matches_target(
             &cred,

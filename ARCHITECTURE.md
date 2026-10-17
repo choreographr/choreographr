@@ -944,7 +944,9 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   re-authenticates the token endpoint; the authorization response's `iss` is
   validated against the discovered issuer when the server advertises RFC 9207
   support (or whenever the parameter is present), rejecting a mix-up before the
-  code is exchanged. The scopes requested follow the spec's precedence — the
+  code is exchanged. The check uses the same shared `issuers_match` as
+  discovery, so a trailing-slash difference in how the server spells its issuer
+  does not force a needless re-login. The scopes requested follow the spec's precedence — the
   configured `scopes`, else the challenge's `scope`, else the protected
   resource's `scopes_supported`, else the authorization server's advertised
   scopes — and the `scope` parameter is omitted when nothing applies. The

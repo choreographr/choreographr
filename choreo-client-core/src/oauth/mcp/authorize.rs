@@ -85,21 +85,43 @@ pub(super) fn authorize(
         return Err(OAuthLoginError::StateMismatch);
     }
     // RFC 9207: validate the authorization-server issuer before the code reaches
-    // the token endpoint — a mix-up defence. Required when the server advertises
-    // `iss` support; a present `iss` is compared even when support is not
-    // advertised (the spec's local-policy provision).
-    match callback.iss.as_deref() {
-        Some(iss) if iss == ctx.server.issuer => {}
-        Some(_) => return Err(OAuthLoginError::IssuerMismatch),
-        None if ctx.server.authorization_response_iss_parameter_supported => {
-            return Err(OAuthLoginError::IssuerMismatch);
-        }
-        None => {}
-    }
+    // the token endpoint — a mix-up defence.
+    validate_auth_response_iss(callback.iss.as_deref(), ctx.server)?;
     let _ = tx.send(LoginEvent::Progress {
         message: "Authorization received; exchanging the code for tokens…".to_string(),
     });
     exchange_code(&agent, ctx.server, &request, &callback.code, &verifier)
+}
+
+/// Validate the RFC 9207 authorization-response `iss` against the discovered
+/// authorization server (a mix-up defence).
+///
+/// A present `iss` is compared with the shared tolerant comparison
+/// ([`choreo_shared::oauth_endpoint::issuers_match`]) — the same rule discovery's
+/// `validate_issuer` and the MCP connect path apply — so a single trailing-slash
+/// difference in how the server spells its issuer does not force a needless
+/// re-login. A present `iss` is required to match even when the server does not
+/// advertise `iss` support (the spec's local-policy provision); an absent `iss`
+/// is a mismatch only when the server advertises
+/// `authorization_response_iss_parameter_supported`.
+///
+/// # Errors
+///
+/// Returns [`OAuthLoginError::IssuerMismatch`] when a present `iss` does not
+/// identify the server, or when `iss` is absent but the server advertised
+/// support for it.
+fn validate_auth_response_iss(
+    iss: Option<&str>,
+    server: &AuthServer,
+) -> Result<(), OAuthLoginError> {
+    match iss {
+        Some(iss) if choreo_shared::oauth_endpoint::issuers_match(iss, &server.issuer) => Ok(()),
+        Some(_) => Err(OAuthLoginError::IssuerMismatch),
+        None if server.authorization_response_iss_parameter_supported => {
+            Err(OAuthLoginError::IssuerMismatch)
+        }
+        None => Ok(()),
+    }
 }
 
 /// How the token endpoint authenticates the client (RFC 6749 §2.3.1).
@@ -278,6 +300,29 @@ mod tests {
                 allow_private_hosts: allow_loopback_http,
             },
         }
+    }
+
+    #[test]
+    fn auth_response_issuer_tolerates_one_trailing_slash_and_rejects_a_mismatch() {
+        let srv = server("https://as.example/authorize");
+        // An exact issuer matches.
+        assert!(validate_auth_response_iss(Some("https://as.example"), &srv).is_ok());
+        // A single trailing-slash difference is tolerated by the shared
+        // comparison, so a differently-spelled issuer does not force a re-login.
+        assert!(validate_auth_response_iss(Some("https://as.example/"), &srv).is_ok());
+        // A genuinely different issuer is refused.
+        assert!(matches!(
+            validate_auth_response_iss(Some("https://evil.example"), &srv),
+            Err(OAuthLoginError::IssuerMismatch)
+        ));
+        // An absent `iss` is accepted unless the server advertised support.
+        assert!(validate_auth_response_iss(None, &srv).is_ok());
+        let mut required = server("https://as.example/authorize");
+        required.authorization_response_iss_parameter_supported = true;
+        assert!(matches!(
+            validate_auth_response_iss(None, &required),
+            Err(OAuthLoginError::IssuerMismatch)
+        ));
     }
 
     #[test]
