@@ -43,8 +43,8 @@ use crate::sessions::{
     ActiveSessionEntry, CANCEL_ALL, RequestContext, SessionCommand, SessionMetadata, session_main,
 };
 use choreo_ai_protocols::{
-    SocketRegistry, bundled_overlay_src, catalog_snapshot, lookup_context_window, lookup_provider,
-    merge_overlay, replace_catalog,
+    SocketRegistry, bundled_overlay_src, catalog_snapshot, lookup_context_window, merge_overlay,
+    replace_catalog,
 };
 use choreo_keystore::ServiceCredential;
 use choreo_power_events::SuspendEvent;
@@ -1661,15 +1661,16 @@ impl DaemonState {
             return None;
         }
         let refresh_token = oauth.refresh_token?;
-        let profile = lookup_provider(&self.accounts.get(account)?.provider)?.oauth?;
-        let issuer = oauth.issuer.unwrap_or(profile.issuer.as_str());
-        // Join the issuer and the token path with the shared slash-tolerant
-        // helper, so a profile path that omits the leading `/` still yields a
-        // valid URL.
-        let token_endpoint = choreo_shared::url::join_path(issuer, &profile.token_path);
+        // The token endpoint and refresh encoding were recorded on the credential
+        // at login, so a runtime refresh reuses the exact endpoint and body
+        // encoding it was issued against and does not depend on the catalog
+        // profile still matching (an overlay edit or a catalog change cannot
+        // redirect or re-encode the refresh).
+        let token_endpoint = oauth.token_endpoint?;
+        let encoding = oauth.refresh_encoding?;
         Some(crate::oauth_refresh::RefreshMaterial {
-            token_endpoint,
-            encoding: profile.refresh_encoding,
+            token_endpoint: token_endpoint.to_string(),
+            encoding,
             client_id: oauth.client_id.map(str::to_string),
             // The durable grant root and the client secret are secrets the
             // session thread needs only for this one exchange, so they travel

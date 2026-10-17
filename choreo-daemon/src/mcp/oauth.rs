@@ -252,6 +252,8 @@ mod tests {
             issuer: None,
             resource: None,
             authorization_server: None,
+            token_endpoint: None,
+            refresh_encoding: None,
             refresh_token: Some("r".into()),
             account_id: None,
             client_id: None,

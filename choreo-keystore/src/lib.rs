@@ -11,8 +11,8 @@
 //! secret-redacting `Display` and `zeroize`-on-drop — lives in `choreo-shared`
 //! (the one leaf crate both this crate and `choreo-proto` depend on), and is
 //! re-exported here so the [`ServiceCredential`], [`XCredentialView`],
-//! [`SubstrateCredentialView`], [`OAuthKind`], and [`OAuthCredentialView`]
-//! paths under `choreo_keystore` keep working.
+//! [`SubstrateCredentialView`], [`OAuthKind`], [`OAuthGrantEncoding`], and
+//! [`OAuthCredentialView`] paths under `choreo_keystore` keep working.
 
 // Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
 // every public item carries docs, enforced as a hard error by clippy-strict's
@@ -28,7 +28,8 @@ pub use error::KeystoreError;
 // The credential value type and its borrowed views now live in `choreo-shared`;
 // re-exported here so the long-standing `choreo_keystore::…` paths are stable.
 pub use choreo_shared::{
-    OAuthCredentialView, OAuthKind, ServiceCredential, SubstrateCredentialView, XCredentialView,
+    OAuthCredentialView, OAuthGrantEncoding, OAuthKind, ServiceCredential, SubstrateCredentialView,
+    XCredentialView,
 };
 
 #[cfg(test)]

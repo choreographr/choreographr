@@ -45,6 +45,14 @@ fn build_credential(
         issuer: Some(descriptor.issuer.clone()),
         resource: None,
         authorization_server: None,
+        // Record the resolved token endpoint and refresh encoding at login, so a
+        // runtime refresh reuses them instead of re-deriving from the catalog
+        // profile (which an overlay edit or a catalog change could alter).
+        token_endpoint: Some(choreo_shared::url::join_path(
+            &descriptor.issuer,
+            &descriptor.token_path,
+        )),
+        refresh_encoding: Some(descriptor.refresh_encoding),
         refresh_token: tokens.refresh_token.as_ref().map(|t| t.to_string()),
         account_id: extract_account_id(tokens),
         client_id: Some(client_id.to_string()),
@@ -163,6 +171,16 @@ mod tests {
         assert_eq!(oauth.refresh_token, Some("refresh"));
         assert_eq!(oauth.client_id, Some("client-abc"));
         assert_eq!(oauth.issuer, Some("https://auth.example"));
+        assert_eq!(
+            oauth.token_endpoint,
+            Some("https://auth.example/token"),
+            "the resolved token endpoint is recorded at login"
+        );
+        assert_eq!(
+            oauth.refresh_encoding,
+            Some(choreo_shared::OAuthGrantEncoding::Json),
+            "the refresh encoding is recorded at login"
+        );
         // The access token is not a field of the credential at all.
         assert_eq!(format!("{cred:?}").matches("opaque-access").count(), 0);
     }

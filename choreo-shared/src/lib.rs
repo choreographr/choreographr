@@ -53,5 +53,6 @@ pub mod url;
 
 pub use clap_styles::clap_styles;
 pub use credential::{
-    OAuthCredentialView, OAuthKind, ServiceCredential, SubstrateCredentialView, XCredentialView,
+    OAuthCredentialView, OAuthGrantEncoding, OAuthKind, ServiceCredential, SubstrateCredentialView,
+    XCredentialView,
 };

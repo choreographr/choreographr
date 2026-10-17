@@ -113,6 +113,8 @@ fn untrusting_a_project_keeps_the_stored_credential_row() {
             issuer: Some("https://as.example".into()),
             resource: Some("https://example.com/mcp".into()),
             authorization_server: Some("https://as.example".into()),
+            token_endpoint: None,
+            refresh_encoding: None,
             refresh_token: Some("rt".into()),
             account_id: None,
             client_id: Some("client-1".into()),

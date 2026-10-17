@@ -123,6 +123,8 @@ fn seed_mcp_grant(path: &std::path::Path, issuer: &str, resource: &str) {
         issuer: Some(issuer.to_string()),
         resource: Some(resource.to_string()),
         authorization_server: Some(issuer.to_string()),
+        token_endpoint: None,
+        refresh_encoding: None,
         refresh_token: Some("rt-initial".to_string()),
         account_id: None,
         client_id: Some("client-1".to_string()),

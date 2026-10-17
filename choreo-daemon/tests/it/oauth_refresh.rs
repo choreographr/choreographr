@@ -32,7 +32,7 @@ use choreo_daemon::oauth_refresh::{
 };
 use choreo_daemon::providers::ProviderAuth;
 use choreo_daemon::{DaemonState, RequestContext, SessionCommand, session_main};
-use choreo_keystore::{OAuthKind, ServiceCredential};
+use choreo_keystore::{OAuthGrantEncoding, OAuthKind, ServiceCredential};
 use choreo_proto::{DaemonMessage, DaemonMessageType, OutputStream, SessionEvent};
 use zeroize::Zeroizing;
 
@@ -58,6 +58,11 @@ fn oauth_credential(account_id: Option<&str>, refresh_token: &str) -> ServiceCre
         issuer: Some("http://127.0.0.1:1".into()),
         resource: None,
         authorization_server: None,
+        // The refresh path reads these recorded fields directly; a bogus token
+        // endpoint is fine because these tests drive the exchange through a stub
+        // `OAuthTokenSource`, not this credential.
+        token_endpoint: Some("http://127.0.0.1:1/token".into()),
+        refresh_encoding: Some(OAuthGrantEncoding::Json),
         refresh_token: Some(refresh_token.into()),
         account_id: account_id.map(str::to_string),
         client_id: Some("client-abc".into()),

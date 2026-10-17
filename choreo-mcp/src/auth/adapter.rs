@@ -262,6 +262,10 @@ impl CredentialStore for CredentialStoreAdapter {
             issuer: credentials.issuer.clone().or(seed.issuer),
             resource: seed.resource,
             authorization_server: seed.authorization_server,
+            // MCP grants carry no provider token endpoint or refresh encoding;
+            // their refresh re-discovers through `rmcp`.
+            token_endpoint: None,
+            refresh_encoding: None,
             refresh_token,
             account_id: seed.account_id,
             client_id: Some(credentials.client_id.clone()),
@@ -362,6 +366,8 @@ mod tests {
             issuer: Some("https://as.example".into()),
             resource: Some("https://example.com/mcp".into()),
             authorization_server: Some("https://as.example".into()),
+            token_endpoint: None,
+            refresh_encoding: None,
             refresh_token: Some("refresh-secret".into()),
             account_id: None,
             client_id: Some("client-1".into()),

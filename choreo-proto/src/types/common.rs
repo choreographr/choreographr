@@ -78,16 +78,11 @@ fn default_context_file_max_bytes() -> usize {
 /// A descriptor exposes the two encodings separately because the code exchange
 /// and the refresh can differ (e.g. the `ChatGPT`/Codex backend accepts a
 /// form-encoded code exchange but a JSON refresh), so the login library must
-/// serialize each request according to its own endpoint. The variants mirror
-/// the catalog's `GrantEncoding` one-for-one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OAuthGrantEncoding {
-    /// `application/x-www-form-urlencoded`.
-    Form,
-    /// `application/json`.
-    Json,
-}
+/// serialize each request according to its own endpoint. The type is defined
+/// once in `choreo-shared` (re-exported from the catalog as `GrantEncoding` and
+/// persisted inside an OAuth credential), so this is the same type the catalog
+/// and the credential name rather than a one-for-one copy.
+pub use choreo_shared::OAuthGrantEncoding;
 
 /// The client-identity posture a provider's OAuth flow uses: register our own
 /// client, borrow the vendor CLI's client id behind an opt-in, or delegate to

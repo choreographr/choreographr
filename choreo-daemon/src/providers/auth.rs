@@ -128,6 +128,8 @@ mod tests {
             issuer: Some("https://auth.openai.com".into()),
             resource: None,
             authorization_server: None,
+            token_endpoint: Some("https://auth.openai.com/oauth/token".into()),
+            refresh_encoding: Some(choreo_keystore::OAuthGrantEncoding::Json),
             refresh_token: Some("refresh-token".into()),
             account_id: account_id.map(str::to_string),
             client_id: Some("client-id".into()),

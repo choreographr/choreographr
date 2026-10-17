@@ -173,6 +173,10 @@ fn finish(
         issuer: Some(server.issuer.clone()),
         resource: Some(info.resource.clone()),
         authorization_server: Some(server.issuer.clone()),
+        // MCP refresh re-discovers through `rmcp`, so no token endpoint or
+        // refresh encoding is recorded (those are provider-grant fields).
+        token_endpoint: None,
+        refresh_encoding: None,
         refresh_token: tokens.refresh_token.as_ref().map(|t| t.to_string()),
         account_id: None,
         client_id: Some(client_id.to_string()),

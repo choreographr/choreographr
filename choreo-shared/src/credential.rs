@@ -32,6 +32,25 @@ pub enum OAuthKind {
     Mcp,
 }
 
+/// The request-body encoding an OAuth token endpoint expects.
+///
+/// This is the workspace's single definition, re-exported as
+/// `choreo_proto::OAuthGrantEncoding` (the wire type on a provider's OAuth
+/// descriptor) and as `choreo_ai_protocols::catalog::GrantEncoding` (the
+/// catalog profile's per-endpoint encoding), so the descriptor, the catalog
+/// data, the login library, and the runtime refresh client all name one type
+/// instead of three one-for-one copies. It is also persisted inside a provider
+/// OAuth credential, so a runtime refresh reuses the encoding recorded at login
+/// rather than the current catalog profile's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Zeroize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthGrantEncoding {
+    /// `application/x-www-form-urlencoded`.
+    Form,
+    /// `application/json`.
+    Json,
+}
+
 /// A stored service credential.
 ///
 /// The variants discriminate the per-service secret material the daemon holds
@@ -94,6 +113,15 @@ pub enum ServiceCredential {
         /// Authorization-server base URL, so refresh needs no re-discovery
         /// (MCP).
         authorization_server: Option<String>,
+        /// The absolute token endpoint (issuer + token path) recorded at login,
+        /// so a runtime refresh reuses the exact endpoint instead of re-deriving
+        /// it from the current catalog profile. Provider grants only; `None` for
+        /// MCP, whose refresh re-discovers through `rmcp`.
+        token_endpoint: Option<String>,
+        /// The request-body encoding the token endpoint expects for a refresh,
+        /// recorded at login so a refresh does not depend on the catalog profile
+        /// still matching. Provider grants only; `None` for MCP.
+        refresh_encoding: Option<OAuthGrantEncoding>,
         /// Long-lived token that mints a new access token: the durable grant
         /// root, rewritten when a refresh rotates it.
         refresh_token: Option<String>,
@@ -157,7 +185,8 @@ fn fmt_redacted(credential: &ServiceCredential, f: &mut fmt::Formatter<'_>) -> f
             write!(
                 f,
                 "OAuth {{ kind: {kind:?}, issuer: ***, resource: ***, \
-                 authorization_server: ***, refresh_token: ***, account_id: ***, \
+                 authorization_server: ***, token_endpoint: ***, \
+                 refresh_encoding: ***, refresh_token: ***, account_id: ***, \
                  client_id: ***, client_secret: ***, granted_scopes: ***, \
                  token_type: *** }}"
             )
@@ -231,6 +260,10 @@ pub struct OAuthCredentialView<'a> {
     pub resource: Option<&'a str>,
     /// Authorization-server base URL (MCP).
     pub authorization_server: Option<&'a str>,
+    /// The absolute token endpoint recorded at login (provider grants).
+    pub token_endpoint: Option<&'a str>,
+    /// The refresh request-body encoding recorded at login (provider grants).
+    pub refresh_encoding: Option<OAuthGrantEncoding>,
     /// Long-lived refresh token (the durable grant root).
     pub refresh_token: Option<&'a str>,
     /// Identity claim extracted from the `id_token` at login.
@@ -252,7 +285,8 @@ impl fmt::Debug for OAuthCredentialView<'_> {
         write!(
             f,
             "OAuthCredentialView {{ kind: {:?}, issuer: ***, resource: ***, \
-             authorization_server: ***, refresh_token: ***, account_id: ***, \
+             authorization_server: ***, token_endpoint: ***, \
+             refresh_encoding: ***, refresh_token: ***, account_id: ***, \
              client_id: ***, client_secret: ***, granted_scopes: ***, \
              token_type: *** }}",
             self.kind
@@ -312,6 +346,8 @@ impl ServiceCredential {
                 issuer,
                 resource,
                 authorization_server,
+                token_endpoint,
+                refresh_encoding,
                 refresh_token,
                 account_id,
                 client_id,
@@ -323,6 +359,8 @@ impl ServiceCredential {
                 issuer: issuer.as_deref(),
                 resource: resource.as_deref(),
                 authorization_server: authorization_server.as_deref(),
+                token_endpoint: token_endpoint.as_deref(),
+                refresh_encoding: *refresh_encoding,
                 refresh_token: refresh_token.as_deref(),
                 account_id: account_id.as_deref(),
                 client_id: client_id.as_deref(),
@@ -589,6 +627,8 @@ mod tests {
             issuer: Some("https://auth.openai.com".into()),
             resource: Some("https://api.example/v1".into()),
             authorization_server: Some("https://as.example".into()),
+            token_endpoint: Some("https://auth.openai.com/oauth/token".into()),
+            refresh_encoding: Some(OAuthGrantEncoding::Json),
             refresh_token: Some("refresh-supersecret".into()),
             account_id: Some("acct-supersecret".into()),
             client_id: Some("client-supersecret".into()),
@@ -606,6 +646,11 @@ mod tests {
         assert_eq!(view.issuer, Some("https://auth.openai.com"));
         assert_eq!(view.resource, Some("https://api.example/v1"));
         assert_eq!(view.authorization_server, Some("https://as.example"));
+        assert_eq!(
+            view.token_endpoint,
+            Some("https://auth.openai.com/oauth/token")
+        );
+        assert_eq!(view.refresh_encoding, Some(OAuthGrantEncoding::Json));
         assert_eq!(view.refresh_token, Some("refresh-supersecret"));
         assert_eq!(view.account_id, Some("acct-supersecret"));
         assert_eq!(view.client_id, Some("client-supersecret"));
@@ -649,8 +694,8 @@ mod tests {
         ] {
             assert!(!display.contains(secret), "Display leaked {secret}");
         }
-        // Nine redacted fields; the fieldless `kind` is printed plainly.
-        assert_eq!(display.matches("***").count(), 9);
+        // Eleven redacted fields; the fieldless `kind` is printed plainly.
+        assert_eq!(display.matches("***").count(), 11);
         assert!(display.contains("kind: Provider"));
     }
 
@@ -665,7 +710,7 @@ mod tests {
         ] {
             assert!(!debug.contains(secret), "Debug leaked {secret}");
         }
-        assert_eq!(debug.matches("***").count(), 9);
+        assert_eq!(debug.matches("***").count(), 11);
     }
 
     #[test]
@@ -681,7 +726,7 @@ mod tests {
         ] {
             assert!(!debug.contains(secret), "view Debug leaked {secret}");
         }
-        assert_eq!(debug.matches("***").count(), 9);
+        assert_eq!(debug.matches("***").count(), 11);
     }
 
     #[test]
@@ -693,14 +738,17 @@ mod tests {
                 issuer,
                 resource,
                 authorization_server,
+                token_endpoint,
                 refresh_token,
                 account_id,
                 client_id,
                 client_secret,
                 granted_scopes,
                 token_type,
-                // The fieldless discriminator carries no bytes to wipe.
+                // The fieldless discriminator and the encoding enum carry no
+                // bytes to wipe.
                 kind: _,
+                refresh_encoding: _,
             } => {
                 let cleared = |v: &Option<String>| {
                     v.as_ref()
@@ -709,6 +757,7 @@ mod tests {
                 assert!(cleared(issuer));
                 assert!(cleared(resource));
                 assert!(cleared(authorization_server));
+                assert!(cleared(token_endpoint));
                 assert!(cleared(refresh_token));
                 assert!(cleared(account_id));
                 assert!(cleared(client_id));

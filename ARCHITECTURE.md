@@ -724,7 +724,12 @@ single `refresh_single_flight` driver. A source hands back the durable material
 cached token, and takes back a `RefreshedTokens`; the refresh token and client
 secret travel wipe-on-drop (`RefreshMaterial` wraps them in `Zeroizing`, like
 the credential itself), since the session thread holds them only for the one
-exchange. The daemon's handlers update `access_tokens` and, **only when the
+exchange. The token endpoint and the refresh body encoding are resolved once, at
+login, and stored on the credential (`ServiceCredential::OAuth`'s
+`token_endpoint` / `refresh_encoding`), so a runtime refresh reuses the exact
+endpoint and encoding the grant was issued against — an overlay edit or a
+catalog change cannot repoint or re-encode it. The daemon's handlers update
+`access_tokens` and, **only when the
 exchange actually rotated** the refresh token or refreshed the identity claim,
 re-encrypt the durable subset to the binding public key (the same
 `set_credential_blob` path as provisioning — no private key, no re-login); a
@@ -1201,8 +1206,10 @@ startup              connect→unbound?        /unlock [key]            AddCrede
 - The unlock key is sent over the channel (by `Unlock`/`BindKeystore`); zeroized after use
   by the daemon
 - A credential is one of `ApiKey`, `X`, `Substrate`, or `OAuth`. The `OAuth` variant
-  carries only the durable grant (the refresh token, the client registration, and the
-  identity claim extracted from the id_token — never the raw JWT or the ephemeral
+  carries only the durable grant (the refresh token, the client registration, the
+  identity claim extracted from the id_token, and — for a provider grant — the
+  token endpoint and refresh body encoding resolved at login, so a runtime refresh
+  does not depend on the catalog profile; never the raw JWT or the ephemeral
   access token), discriminated by `OAuthKind` (`Provider` or `Mcp`); every variant
   participates in `#[zeroize(drop)]` and redacts every secret field in both `Display`
   and `Debug`

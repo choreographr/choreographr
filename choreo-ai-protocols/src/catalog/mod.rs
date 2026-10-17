@@ -277,14 +277,12 @@ pub enum ProviderProtocol {
 /// token-request body to be serialized. The code exchange and the refresh can
 /// differ (e.g. the `ChatGPT`/Codex backend accepts a form-encoded code
 /// exchange but a JSON refresh), so a profile carries one per endpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GrantEncoding {
-    /// `application/x-www-form-urlencoded`.
-    Form,
-    /// `application/json`.
-    Json,
-}
+///
+/// The type is defined once in `choreo-shared` (and re-exported by
+/// `choreo-proto` for the wire descriptor and persisted inside an OAuth
+/// credential), aliased here so the catalog data names the same type rather
+/// than a one-for-one copy.
+pub use choreo_shared::OAuthGrantEncoding as GrantEncoding;
 
 /// The OAuth profile for a provider: the authorization-server parameters the
 /// daemon and the login library need to run a sign-in and to refresh a grant.
@@ -553,21 +551,13 @@ fn assemble_oauth_descriptor(
         client_id,
         scopes: profile.scopes.clone(),
         redirect_ports: profile.redirect_ports.clone(),
-        code_exchange_encoding: grant_encoding(profile.code_exchange_encoding),
-        refresh_encoding: grant_encoding(profile.refresh_encoding),
+        code_exchange_encoding: profile.code_exchange_encoding,
+        refresh_encoding: profile.refresh_encoding,
         client_identity: client_identity(posture),
         device_code: profile.device_code,
         device_authorization_path: profile.device_authorization_path.clone(),
         device_token_path: profile.device_token_path.clone(),
     })
-}
-
-/// Map the catalog's grant encoding to its wire twin, one-for-one.
-fn grant_encoding(encoding: GrantEncoding) -> choreo_proto::OAuthGrantEncoding {
-    match encoding {
-        GrantEncoding::Form => choreo_proto::OAuthGrantEncoding::Form,
-        GrantEncoding::Json => choreo_proto::OAuthGrantEncoding::Json,
-    }
 }
 
 /// Map the compiled client-identity policy to its wire twin, one-for-one.

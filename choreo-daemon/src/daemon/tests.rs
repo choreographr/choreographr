@@ -3770,6 +3770,8 @@ fn auth_for_resolves_api_key_and_oauth_grants() {
             issuer: Some("https://auth.openai.com".to_string()),
             resource: None,
             authorization_server: None,
+            token_endpoint: Some("https://auth.openai.com/oauth/token".to_string()),
+            refresh_encoding: Some(choreo_keystore::OAuthGrantEncoding::Json),
             refresh_token: Some("refresh-1".to_string()),
             account_id: Some("acct-1".to_string()),
             client_id: None,
@@ -3807,6 +3809,81 @@ fn auth_for_resolves_api_key_and_oauth_grants() {
     assert!(state.auth_for("missing").is_none());
     assert!(!state.has_credential("missing"));
     assert!(state.has_credential("api-acct"));
+}
+
+#[test]
+fn oauth_refresh_material_reads_the_recorded_endpoint_and_encoding() {
+    let (mut state, _rx) = make_daemon_state();
+    // A provider grant records its token endpoint and refresh encoding at login,
+    // so the runtime refresh reads them straight off the credential and never
+    // consults the catalog (which an overlay edit or a catalog change could
+    // repoint or re-encode).
+    state.credentials.insert(
+        "oauth-acct".to_string(),
+        ServiceCredential::OAuth {
+            kind: choreo_keystore::OAuthKind::Provider,
+            issuer: Some("https://auth.openai.com".to_string()),
+            resource: None,
+            authorization_server: None,
+            token_endpoint: Some("https://auth.openai.com/oauth/token".to_string()),
+            refresh_encoding: Some(choreo_keystore::OAuthGrantEncoding::Json),
+            refresh_token: Some("refresh-1".to_string()),
+            account_id: None,
+            client_id: Some("client-1".to_string()),
+            client_secret: None,
+            granted_scopes: vec!["openid".to_string()],
+            token_type: None,
+        },
+    );
+    let material = state
+        .oauth_refresh_material("oauth-acct")
+        .expect("a provider grant yields refresh material");
+    assert_eq!(
+        material.token_endpoint,
+        "https://auth.openai.com/oauth/token"
+    );
+    assert_eq!(
+        material.encoding,
+        choreo_ai_protocols::catalog::GrantEncoding::Json
+    );
+
+    // A provider grant that recorded no endpoint/encoding cannot be refreshed.
+    let mut missing = state
+        .credentials
+        .get("oauth-acct")
+        .cloned()
+        .expect("present");
+    if let ServiceCredential::OAuth {
+        token_endpoint,
+        refresh_encoding,
+        ..
+    } = &mut missing
+    {
+        *token_endpoint = None;
+        *refresh_encoding = None;
+    }
+    state.credentials.insert("no-endpoint".to_string(), missing);
+    assert!(state.oauth_refresh_material("no-endpoint").is_none());
+
+    // An MCP grant refreshes through the MCP authorization manager, never here.
+    state.credentials.insert(
+        "mcp:docs|x".to_string(),
+        ServiceCredential::OAuth {
+            kind: choreo_keystore::OAuthKind::Mcp,
+            issuer: Some("https://as.example".to_string()),
+            resource: Some("https://example.com/mcp".to_string()),
+            authorization_server: Some("https://as.example".to_string()),
+            token_endpoint: None,
+            refresh_encoding: None,
+            refresh_token: Some("rt".to_string()),
+            account_id: None,
+            client_id: None,
+            client_secret: None,
+            granted_scopes: Vec::new(),
+            token_type: None,
+        },
+    );
+    assert!(state.oauth_refresh_material("mcp:docs|x").is_none());
 }
 
 // ── Background model prefetch ────────────────────────────────────────────
