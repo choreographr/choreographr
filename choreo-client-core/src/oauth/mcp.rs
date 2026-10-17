@@ -357,7 +357,7 @@ fn authorize(
         &state,
         &scopes,
         &info.resource,
-    );
+    )?;
     // The shared scaffold emits the URL, opens the browser (or prompts), and
     // captures the callback from the loopback server or a pasted URL.
     let callback = callback::capture_loopback_callback(
@@ -401,6 +401,16 @@ fn preferred_ports(preferred: Option<u16>) -> Vec<u16> {
 }
 
 /// Build the authorization URL with PKCE S256 and the resource indicator.
+///
+/// The authorization endpoint (taken from discovered metadata) is vetted with
+/// the shared `https`-or-loopback rule first, so an `http://` remote endpoint a
+/// hostile or misconfigured server advertises can never be opened in the
+/// browser.
+///
+/// # Errors
+///
+/// Returns [`OAuthLoginError::InsecureEndpoint`] when the discovered
+/// authorization endpoint is neither `https` nor a loopback `http` address.
 fn build_authorize_url(
     server: &AuthServer,
     client_id: &str,
@@ -409,7 +419,8 @@ fn build_authorize_url(
     state: &str,
     scopes: &[String],
     resource: &str,
-) -> String {
+) -> Result<String, OAuthLoginError> {
+    super::http::ensure_secure(&server.authorization_endpoint)?;
     let params = vec![
         ("response_type".to_string(), "code".to_string()),
         ("client_id".to_string(), client_id.to_string()),
@@ -420,7 +431,10 @@ fn build_authorize_url(
         ("scope".to_string(), scopes.join(" ")),
         ("resource".to_string(), resource.to_string()),
     ];
-    super::http::authorize_url(&server.authorization_endpoint, &params)
+    Ok(super::http::authorize_url(
+        &server.authorization_endpoint,
+        &params,
+    ))
 }
 
 /// Exchange the authorization code at the token endpoint (form-encoded).
@@ -524,13 +538,44 @@ mod tests {
             "state-1",
             &["openid".to_string(), "offline_access".to_string()],
             "https://example.com/mcp",
-        );
+        )
+        .expect("secure endpoint");
         assert!(url.starts_with("https://as.example/authorize?"));
         assert!(url.contains("code_challenge=challenge"));
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("state=state-1"));
         assert!(url.contains("resource=https%3A%2F%2Fexample.com%2Fmcp"));
         assert!(url.contains("scope=openid%20offline_access"));
+    }
+
+    #[test]
+    fn authorize_url_refuses_a_cleartext_remote_endpoint() {
+        // A discovered `http://` remote authorize endpoint must be refused
+        // before the browser is pointed at it; an `https://` one is accepted.
+        assert!(matches!(
+            build_authorize_url(
+                &server("http://evil.example/authorize"),
+                "client-1",
+                "http://127.0.0.1:1455/auth/callback",
+                "challenge",
+                "state-1",
+                &["openid".to_string()],
+                "https://example.com/mcp",
+            ),
+            Err(OAuthLoginError::InsecureEndpoint(_))
+        ));
+        assert!(
+            build_authorize_url(
+                &server("https://as.example/authorize"),
+                "client-1",
+                "http://127.0.0.1:1455/auth/callback",
+                "challenge",
+                "state-1",
+                &["openid".to_string()],
+                "https://example.com/mcp",
+            )
+            .is_ok()
+        );
     }
 
     #[test]

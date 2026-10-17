@@ -685,7 +685,10 @@ runtime refresh path (`choreo-shared`'s `oauth_claims`), so login and refresh
 read the same namespace one way; the endpoint-security rule (`https`, or a
 loopback `http` address) is likewise one shared predicate
 (`choreo-shared`'s `oauth_endpoint`) that both the login and the refresh path
-apply, so the two cannot drift.
+apply, so the two cannot drift. The login path applies it to every endpoint it
+sends a credential to — the token and device calls, and the authorization
+endpoint before the URL is opened in the browser — refusing a URL whose
+authority carries userinfo outright, since the real host sits after the `@`.
 
 The daemon serves each provider's sign-in parameters over a
 `ClientMessage::ListOAuthProviders` ⇄
@@ -901,6 +904,9 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   RFC 8414/OIDC), dynamically registers a client (SEP-837) when no `clientId` is
   configured, runs PKCE over a loopback callback (paste-URL fallback; no device
   code), and stores the durable grant as `ServiceCredential::OAuth { kind: Mcp }`.
+  The authorization endpoint taken from the discovered metadata is vetted with
+  the same `https`-or-loopback predicate before the browser is opened, so a
+  server advertising a cleartext remote endpoint is refused.
   `mcp login <slug>` reads the server's resolved identity, `oauth` block, and
   credential key from the extended `McpStatus` and sends the grant over the
   existing `AddCredential`; `mcp logout <slug>` removes it via

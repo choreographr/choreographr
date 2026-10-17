@@ -20,6 +20,9 @@
 /// case-insensitive by RFC 3986, so `HTTPS://…` is accepted just like
 /// `https://…`. An unparseable prefix (any scheme other than http/https) is
 /// refused, so a misconfigured endpoint can never leak a secret over cleartext.
+/// A URL whose authority carries userinfo (an `@`, as in `user:pass@host`) is
+/// refused outright: RFC 3986 places the host *after* the `@`, so the real host
+/// is remote even when the text before the `@` names a loopback host.
 #[must_use]
 pub fn is_secure_endpoint(url: &str) -> bool {
     // Lowercase only enough to normalize the scheme and host; the path's case is
@@ -32,9 +35,16 @@ pub fn is_secure_endpoint(url: &str) -> bool {
     let Some(rest) = lower.strip_prefix("http://") else {
         return false;
     };
-    // The authority is everything before the first `/`; a bracketed IPv6 host
-    // (`[::1]:port`) is unwrapped, otherwise the host is up to the port colon.
+    // The authority is everything before the first `/`. Userinfo (`user:pass@host`)
+    // decodes to a remote host, so reading the host from before the `@` would
+    // select a loopback name for a URL that actually targets a remote host;
+    // refuse the whole URL rather than trying to parse past the userinfo.
     let authority = rest.split('/').next().unwrap_or_default();
+    if authority.contains('@') {
+        return false;
+    }
+    // A bracketed IPv6 host (`[::1]:port`) is unwrapped, otherwise the host is up
+    // to the port colon.
     let host = if let Some(after_bracket) = authority.strip_prefix('[') {
         after_bracket.split(']').next().unwrap_or_default()
     } else {
@@ -82,7 +92,20 @@ mod tests {
     #[test]
     fn userinfo_before_the_host_does_not_select_a_loopback_host() {
         // `http://localhost@evil.example/` has host `evil.example`, not
-        // `localhost`; the naive split must not be fooled into accepting it.
+        // `localhost`, so the real host is remote; every spelling that carries
+        // userinfo (with or without a port, and the bracketed-IPv6 form) must be
+        // refused, not read as a loopback host.
         assert!(!is_secure_endpoint("http://localhost@evil.example/token"));
+        assert!(!is_secure_endpoint(
+            "http://127.0.0.1:80@evil.example/token"
+        ));
+        assert!(!is_secure_endpoint("http://localhost:1@evil.example/t"));
+        assert!(!is_secure_endpoint("http://[::1]@evil.example/t"));
+    }
+
+    #[test]
+    fn loopback_with_a_port_is_still_secure() {
+        assert!(is_secure_endpoint("http://localhost:8080/token"));
+        assert!(is_secure_endpoint("http://[::1]:8080/token"));
     }
 }

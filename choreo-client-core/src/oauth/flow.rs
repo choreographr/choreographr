@@ -38,7 +38,7 @@ pub(super) fn run_loopback(
     // leave the callback bound on `127.0.0.1` alone and unreachable.
     let (server, port) = callback::bind("localhost", &descriptor.redirect_ports)?;
     let redirect_uri = format!("http://localhost:{port}{}", callback::CALLBACK_PATH);
-    let auth_url = build_authorize_url(descriptor, &client_id, &redirect_uri, &challenge, &state);
+    let auth_url = build_authorize_url(descriptor, &client_id, &redirect_uri, &challenge, &state)?;
     // The shared scaffold emits the URL, opens the browser (or prompts), and
     // captures the callback from the loopback server or a pasted URL.
     let callback = callback::capture_loopback_callback(
@@ -191,14 +191,24 @@ fn effective_client_id(descriptor: &OAuthProviderDescriptor) -> Result<String, O
 /// Build the provider authorization URL with PKCE and the `state`.
 ///
 /// The request carries only the parameters (never a code); the callback returns
-/// the code. Query parameters are percent-encoded by the shared form encoder.
+/// the code. The authorization endpoint is vetted with the shared `https`-or-
+/// loopback rule first, so a discovery/config-driven `http://` remote endpoint
+/// can never be opened in the browser. Query parameters are percent-encoded by
+/// the shared form encoder.
+///
+/// # Errors
+///
+/// Returns [`OAuthLoginError::InsecureEndpoint`] when the authorization endpoint
+/// is neither `https` nor a loopback `http` address.
 fn build_authorize_url(
     descriptor: &OAuthProviderDescriptor,
     client_id: &str,
     redirect_uri: &str,
     code_challenge: &str,
     state: &str,
-) -> String {
+) -> Result<String, OAuthLoginError> {
+    let endpoint = http::join_url(&descriptor.issuer, &descriptor.authorize_path);
+    http::ensure_secure(&endpoint)?;
     let mut params: Vec<(String, String)> = vec![
         ("response_type".to_string(), "code".to_string()),
         ("client_id".to_string(), client_id.to_string()),
@@ -209,10 +219,7 @@ fn build_authorize_url(
         ("code_challenge_method".to_string(), "S256".to_string()),
     ];
     params.retain(|(_, value)| !value.is_empty());
-    http::authorize_url(
-        &http::join_url(&descriptor.issuer, &descriptor.authorize_path),
-        &params,
-    )
+    Ok(http::authorize_url(&endpoint, &params))
 }
 
 #[cfg(test)]
@@ -246,7 +253,8 @@ mod tests {
             "http://localhost:1455/auth/callback",
             "CHALLENGE",
             "STATE123",
-        );
+        )
+        .expect("secure endpoint");
         assert!(url.starts_with("https://auth.example/authorize?"));
         assert!(url.contains("response_type=code"));
         assert!(url.contains("client_id=client-abc"));
@@ -256,6 +264,28 @@ mod tests {
         // The redirect URI is percent-encoded.
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"));
         assert!(url.contains("scope=openid%20offline_access"));
+    }
+
+    #[test]
+    fn authorize_url_refuses_a_cleartext_remote_endpoint() {
+        // A `http://` remote authorize endpoint must be refused before the
+        // browser is pointed at it; an `https://` one is accepted.
+        let mut desc = descriptor();
+        desc.issuer = "http://evil.example".into();
+        assert!(matches!(
+            build_authorize_url(&desc, "client-abc", "http://localhost:1455/cb", "C", "S"),
+            Err(OAuthLoginError::InsecureEndpoint(_))
+        ));
+        assert!(
+            build_authorize_url(
+                &descriptor(),
+                "client-abc",
+                "http://localhost:1455/cb",
+                "C",
+                "S"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
