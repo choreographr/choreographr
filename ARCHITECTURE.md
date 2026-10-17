@@ -909,13 +909,19 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   `reload` are minimal one-shot Unix-socket clients for a running daemon.
 
 - **MCP remote-server OAuth.** A remote server may declare an `oauth` block
-  (`{ clientId?, callbackPort?, scopes? }`; never a `clientSecret`) in `mcp.json`
+  (`{ clientId?, callbackPort?, scopes?, authorizationServer?, clientSecretEnv? }`;
+  never a literal `clientSecret` — `clientSecretEnv` names the environment
+  variable holding a confidential client's secret) in `mcp.json`
   or a trusted project `.mcp.json`. Sign-in is a standard OAuth 2.1 PKCE flow
   owned by the frontend login library (`choreo-client-core`'s `oauth::mcp`,
   split into `mcp::{mod,discovery,register,authorize}`): it discovers the
-  authorization server (RFC 9728 protected-resource metadata → RFC 8414/OIDC),
-  building each well-known URL with the segment inserted *before* a path-bearing
-  issuer/resource (the root document remains the fallback) and rejecting a
+  authorization server (RFC 9728 protected-resource metadata → RFC 8414 or
+  OpenID Connect Discovery), building each well-known URL with the segment
+  inserted *before* a path-bearing issuer/resource and also appending it
+  *after* (the `{issuer}/.well-known/openid-configuration` form a path-issuer
+  provider such as Entra/Keycloak/Okta serves — the root document remains the
+  fallback); an explicit `authorizationServer` names the issuer directly,
+  skipping protected-resource probing. It rejects a
   metadata document whose `issuer` does not match the authorization-server URL
   it was fetched from (RFC 8414 §3.3), tolerating a single trailing-slash
   difference (one shared `issuers_match`); each discovery GET follows a small,
@@ -924,7 +930,13 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   dynamically registers a client
   (SEP-837) when no `clientId` is configured, runs PKCE over a loopback callback
   (paste-URL fallback; no device code), and stores the durable grant as
-  `ServiceCredential::OAuth { kind: Mcp }`. The authorization endpoint taken from
+  `ServiceCredential::OAuth { kind: Mcp }`. A confidential client's secret is
+  read from the `clientSecretEnv` variable, sent at the token endpoint
+  (`client_secret_post`), and stored in the grant so connect-time refresh
+  re-authenticates the token endpoint; the authorization response's `iss` is
+  validated against the discovered issuer when the server advertises RFC 9207
+  support (or whenever the parameter is present), rejecting a mix-up before the
+  code is exchanged. The authorization endpoint taken from
   the discovered metadata is vetted with the same policy
   before the browser is opened, so a server advertising a cleartext remote
   endpoint is refused.

@@ -935,8 +935,12 @@ A remote server that needs credentials uses a static token in `headers`:
 **OAuth.** A remote server that requires an interactive OAuth sign-in declares
 an `oauth` block (all fields optional: `clientId` for an authorization server
 with neither dynamic client registration nor a client-metadata document,
-`callbackPort`, and `scopes`) — never a `clientSecret`, which a confidential
-client reads from the environment, not a repo-controlled config file:
+`callbackPort`, `scopes`, `authorizationServer` to name the authorization
+server explicitly when it is not reachable through the resource's well-known
+paths, and `clientSecretEnv`, which names an **environment variable** holding a
+confidential client's secret) — never a literal `clientSecret`, which a
+confidential client reads from the environment, not a repo-controlled config
+file:
 
 ```json
 {
@@ -949,11 +953,37 @@ client reads from the environment, not a repo-controlled config file:
 }
 ```
 
+A confidential-client server (one whose authorization server requires client
+authentication, e.g. Shopify Customer Accounts) names its secret's environment
+variable, so the secret itself never lands in the file:
+
+```json
+{
+  "mcpServers": {
+    "shopify": {
+      "url": "https://shopify.com/<shop-id>/account/customer/api/mcp",
+      "oauth": {
+        "clientId": "<app-id>",
+        "authorizationServer": "https://shopify.com/authentication/<shop-id>",
+        "clientSecretEnv": "SHOPIFY_MCP_SECRET",
+        "scopes": ["customer-account-mcp-api:full"]
+      }
+    }
+  }
+}
+```
+
 `mcp login <slug>` runs a PKCE sign-in: it discovers the authorization server
-(RFC 9728 protected-resource metadata → RFC 8414/OIDC), registers a client
+(RFC 9728 protected-resource metadata → RFC 8414 or OpenID Connect Discovery,
+including the appended `{issuer}/.well-known/openid-configuration` form, or the
+explicit `authorizationServer` when set), registers a client
 dynamically when no `clientId` is configured, and drives a loopback callback
 (with a paste-URL fallback for a headless/remote host — there is no device-code
-flow here). The durable grant is stored in the same encrypted keystore as
+flow here). A confidential client's secret is sent at the token endpoint
+(`client_secret_post`) and stored in the grant, so connect-time refresh
+re-authenticates the token endpoint; the authorization response's `iss` is
+validated against the discovered issuer when the server advertises RFC 9207
+support. The durable grant is stored in the same encrypted keystore as
 provider credentials, keyed by the server's target (`mcp:<slug>|<target-hash>`) so
 a same-slug server on a different endpoint keeps its own credential; `mcp logout
 <slug>` removes it. A project server's `oauth` block is repo-controlled, so

@@ -157,10 +157,12 @@ fn untrusting_a_project_keeps_the_stored_credential_row() {
 
 // ── A mock authorization server ──────────────────────────────────────────
 
-/// One parsed HTTP/1.1 request (the body is drained but not needed).
+/// One parsed HTTP/1.1 request (the body is captured so the token endpoint can
+/// inspect the form it carries).
 struct Request {
     method: String,
     path: String,
+    body: String,
 }
 
 /// Read one HTTP/1.1 request off `stream`.
@@ -192,7 +194,11 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
     if length > 0 {
         reader.read_exact(&mut body).ok()?;
     }
-    Some(Request { method, path })
+    Some(Request {
+        method,
+        path,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    })
 }
 
 /// Write an HTTP/1.1 JSON response and close.
@@ -213,7 +219,11 @@ struct MockAuthorizationServer {
 }
 
 impl MockAuthorizationServer {
-    fn start() -> Self {
+    /// Start the mock; when `require_client_secret` is true the token endpoint
+    /// accepts a code exchange only when it carries `client_secret=right-secret`
+    /// (`client_secret_post`), modelling a confidential-client authorization
+    /// server (Shopify Customer Accounts, Entra, Keycloak).
+    fn start(require_client_secret: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock AS");
         let origin = format!("http://{}", listener.local_addr().expect("addr"));
         let state = origin.clone();
@@ -221,7 +231,7 @@ impl MockAuthorizationServer {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
                 let origin = state.clone();
-                std::thread::spawn(move || handle(stream, &origin));
+                std::thread::spawn(move || handle(stream, &origin, require_client_secret));
             }
         });
         Self {
@@ -232,8 +242,11 @@ impl MockAuthorizationServer {
     }
 }
 
-/// Serve one mock-authorization-server request.
-fn handle(mut stream: TcpStream, origin: &str) {
+/// Serve one mock-authorization-server request. When `require_client_secret` is
+/// set, a token exchange without the expected `client_secret` is rejected
+/// (`401 invalid_client`), so a client that cannot authenticate a confidential
+/// client fails loudly.
+fn handle(mut stream: TcpStream, origin: &str, require_client_secret: bool) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
     let Some(request) = read_request(&stream) else {
         return;
@@ -268,8 +281,17 @@ fn handle(mut stream: TcpStream, origin: &str) {
                 &serde_json::json!({"client_id": "dcr-client-1"}).to_string(),
             );
         }
-        // The PKCE code exchange; returns the durable grant.
+        // The PKCE code exchange; returns the durable grant. A confidential
+        // mode rejects an exchange that omits the client secret.
         ("POST", "/token") => {
+            if require_client_secret && !request.body.contains("client_secret=right-secret") {
+                write_json(
+                    &mut stream,
+                    "401 Unauthorized",
+                    &serde_json::json!({"error": "invalid_client"}).to_string(),
+                );
+                return;
+            }
             let body = serde_json::json!({
                 "access_token": "access-token-secret",
                 "token_type": "Bearer",
@@ -291,7 +313,7 @@ fn handle(mut stream: TcpStream, origin: &str) {
 #[test]
 #[ignore = "integration: binds a local mock authorization server"]
 fn mcp_login_discovers_registers_and_exchanges_pkce() {
-    let mock = MockAuthorizationServer::start();
+    let mock = MockAuthorizationServer::start(false);
     let credential_key = "mcp:docs|abc123".to_string();
 
     let info = McpLoginInfo {
@@ -412,4 +434,124 @@ fn mcp_login_discovers_registers_and_exchanges_pkce() {
         !format!("{credential:?}").contains("access-token-secret"),
         "the access token must not be stored"
     );
+}
+
+/// A confidential-client sign-in: the authorization server is named explicitly
+/// (no protected-resource probing), the client is pre-registered (no dynamic
+/// registration), and the token endpoint accepts the exchange only when it
+/// carries the secret from the configured environment variable — which is sent
+/// (`client_secret_post`) and stored in the durable grant.
+#[test]
+#[ignore = "integration: binds a local mock authorization server"]
+fn mcp_login_confidential_client_sends_secret() {
+    let mock = MockAuthorizationServer::start(true);
+    let credential_key = "mcp:shopify|abc123".to_string();
+    // SAFETY: nextest runs each test in its own process, and this is the only
+    // setter of this variable, so no other test observes the mutation.
+    unsafe { std::env::set_var("CHOREO_MCP_TEST_CLIENT_SECRET", "right-secret") };
+
+    let info = McpLoginInfo {
+        slug: "shopify".to_string(),
+        resource: mock.mcp_url.clone(),
+        credential_key: credential_key.clone(),
+        oauth: WireOAuthConfig {
+            // A pre-registered client id (no dynamic registration) and an
+            // explicit authorization-server issuer (no protected-resource
+            // probing) — the Shopify Customer Accounts shape.
+            client_id: Some("app-1".to_string()),
+            callback_port: Some(0),
+            scopes: vec!["customer-account-mcp-api:full".to_string()],
+            authorization_server: Some(mock.origin.clone()),
+            client_secret_env: Some("CHOREO_MCP_TEST_CLIENT_SECRET".to_string()),
+        },
+    };
+    let session = start_mcp_login(
+        info,
+        McpLoginOptions {
+            no_browser: true,
+            callback_url: None,
+        },
+    );
+
+    // Wait for the authorize URL, capturing the state and redirect port.
+    let (state, port) = loop {
+        let event = session
+            .events
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .unwrap_or_else(|e| panic!("timed out waiting for the authorize URL: {e:?}"));
+        match event {
+            LoginEvent::AuthUrl { url } => {
+                assert!(
+                    url.contains("client_id=app-1"),
+                    "the pre-registered client id is sent: {url}"
+                );
+                let query = url.split_once('?').map_or("", |(_, q)| q);
+                let params: HashMap<&str, &str> = query
+                    .split('&')
+                    .filter_map(|pair| pair.split_once('='))
+                    .collect();
+                let state = params.get("state").expect("state param").to_string();
+                let redirect = params.get("redirect_uri").expect("redirect_uri param");
+                let redirect = redirect.replace("%3A", ":").replace("%2F", "/");
+                let port = redirect
+                    .rsplit_once(':')
+                    .and_then(|(_, tail)| tail.split('/').next())
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .expect("redirect port");
+                break (state, port);
+            }
+            LoginEvent::Error { message } => panic!("login failed: {message}"),
+            _ => {}
+        }
+    };
+
+    // Simulate the browser landing on the loopback callback.
+    {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect callback");
+        let request = format!(
+            "GET /auth/callback?code=test-code&state={state} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .expect("write callback request");
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+    }
+
+    // The token endpoint requires the secret, so completion proves it was sent.
+    let (service, message) = loop {
+        let event = session
+            .events
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .unwrap_or_else(|e| panic!("timed out waiting for login completion: {e:?}"));
+        match event {
+            LoginEvent::Done { service, message } => break (service, message),
+            LoginEvent::Error { message } => panic!("login failed: {message}"),
+            _ => {}
+        }
+    };
+    session.join();
+    assert_eq!(service, credential_key);
+
+    let choreo_proto::ClientMessageType::AddCredential { credential, .. } = *message else {
+        panic!("expected an AddCredential request");
+    };
+    let view = credential.as_oauth().expect("an OAuth credential");
+    assert_eq!(view.kind, OAuthKind::Mcp);
+    assert_eq!(
+        view.issuer,
+        Some(mock.origin.as_str()),
+        "the explicit authorization-server issuer is recorded"
+    );
+    assert_eq!(
+        view.client_id,
+        Some("app-1"),
+        "the pre-registered client id is recorded"
+    );
+    assert_eq!(
+        view.client_secret,
+        Some("right-secret"),
+        "the confidential client's secret is sent and stored for refresh"
+    );
+    assert_eq!(view.refresh_token, Some("rt-mock"));
 }
