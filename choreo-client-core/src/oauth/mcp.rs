@@ -109,13 +109,31 @@ fn run(
         message: "Discovering the authorization server…".to_string(),
     });
     let server = discover(&agent, &info.resource)?;
+    // Bind the loopback callback FIRST so the redirect URI is known, then use
+    // that exact URI for both dynamic registration and the authorize request.
+    // A server that validates `redirect_uri` against the registered value must
+    // see the same string, including the port actually bound (which may be the
+    // fallback, not the preferred one).
+    let ports = preferred_ports(info.oauth.callback_port);
+    let (callback_server, port) = callback::bind(&ports)?;
+    let bound = BoundCallback {
+        server: callback_server,
+        redirect_uri: format!("http://127.0.0.1:{port}{}", callback::CALLBACK_PATH),
+    };
     let client_id = match info.oauth.client_id.clone() {
         Some(id) => id,
-        None => register_client(&agent, &server, &info.resource, tx)?,
+        None => register_client(&agent, &server, &bound.redirect_uri, tx)?,
     };
-    let tokens = authorize(&agent, info, options, &server, &client_id, tx, cancel)?;
+    let tokens = authorize(info, options, &server, &client_id, &bound, tx, cancel)?;
     finish(info, &server, &client_id, &tokens, tx)?;
     Ok(())
+}
+
+/// The bound loopback callback server and the redirect URI it answers on, so
+/// the authorize path takes one argument instead of two.
+struct BoundCallback {
+    server: tiny_http::Server,
+    redirect_uri: String,
 }
 
 /// One discovered authorization server.
@@ -251,10 +269,14 @@ fn fetch_as_metadata(
 }
 
 /// Dynamically register a client (SEP-837), returning its `client_id`.
+///
+/// `redirect_uri` is the URI the flow will actually use (the callback is already
+/// bound), so the registered `redirect_uris` matches the authorize request
+/// exactly.
 fn register_client(
     agent: &ureq::Agent,
     server: &AuthServer,
-    resource: &str,
+    redirect_uri: &str,
     tx: &Sender<LoginEvent>,
 ) -> Result<String, OAuthLoginError> {
     let Some(endpoint) = server.registration_endpoint.as_deref() else {
@@ -267,18 +289,13 @@ fn register_client(
         message: "Registering this client with the authorization server…".to_string(),
     });
     super::http::ensure_secure(endpoint)?;
-    let redirect = format!(
-        "http://127.0.0.1:{}{}",
-        CALLBACK_PORTS[0],
-        callback::CALLBACK_PATH
-    );
     let body = json!({
         "client_name": "Choreographr",
-        "redirect_uris": [redirect],
+        "redirect_uris": [redirect_uri],
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": "none",
-        "scope": default_scopes(resource, server, &[]).join(" "),
+        "scope": default_scopes(server, &[]).join(" "),
     });
     let response = agent
         .post(endpoint)
@@ -299,10 +316,9 @@ fn register_client(
         })
 }
 
-/// The scopes to request: the configured set, else the AS-advertised set,
-/// filtered to drop `offline_access` duplication.
-fn default_scopes(resource: &str, server: &AuthServer, configured: &[String]) -> Vec<String> {
-    let _ = resource;
+/// The scopes to request: the configured set when non-empty, else the
+/// authorization server's advertised `scopes_supported`, else `openid`.
+fn default_scopes(server: &AuthServer, configured: &[String]) -> Vec<String> {
     if !configured.is_empty() {
         return configured.to_vec();
     }
@@ -313,29 +329,27 @@ fn default_scopes(resource: &str, server: &AuthServer, configured: &[String]) ->
     }
 }
 
-/// Run the PKCE loopback (or paste-URL) authorization-code flow.
+/// Run the PKCE loopback (or paste-URL) authorization-code flow over the
+/// already-bound callback server and its `redirect_uri`.
 fn authorize(
-    agent: &ureq::Agent,
     info: &McpLoginInfo,
     options: &McpLoginOptions,
     server: &AuthServer,
     client_id: &str,
+    bound: &BoundCallback,
     tx: &Sender<LoginEvent>,
     cancel: &AtomicBool,
 ) -> Result<super::http::TokenSet, OAuthLoginError> {
+    let agent = agent();
     let verifier = pkce::generate_verifier();
     let challenge = pkce::challenge_s256(&verifier);
     let state = pkce::generate_state();
-    let scopes = default_scopes(&info.resource, server, &info.oauth.scopes);
+    let scopes = default_scopes(server, &info.oauth.scopes);
 
-    // Bind first so the redirect port is known; the preferred port leads.
-    let ports = preferred_ports(info.oauth.callback_port);
-    let (server_handle, port) = callback::bind(&ports)?;
-    let redirect_uri = format!("http://127.0.0.1:{port}{}", callback::CALLBACK_PATH);
     let auth_url = build_authorize_url(
         server,
         client_id,
-        &redirect_uri,
+        &bound.redirect_uri,
         &challenge,
         &state,
         &scopes,
@@ -366,7 +380,7 @@ fn authorize(
                 }
             }
         }
-        callback::wait_for_callback(&server_handle, cancel)?
+        callback::wait_for_callback(&bound.server, cancel)?
     };
 
     if !pkce::state_matches(&state, &callback.state) {
@@ -376,11 +390,11 @@ fn authorize(
         message: "Authorization received; exchanging the code for tokens…".to_string(),
     });
     exchange_code(
-        agent,
+        &agent,
         &server.token_endpoint,
         client_id,
         &callback.code,
-        &redirect_uri,
+        &bound.redirect_uri,
         &verifier,
         &info.resource,
     )

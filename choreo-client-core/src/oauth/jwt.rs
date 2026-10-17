@@ -18,9 +18,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::Value;
 
 /// The `OpenAI` auth namespace that carries the `ChatGPT` identity claims. The
-/// `chatgpt_account_id` lives under `https://api.openai.com/auth` (per the
-/// `openai/codex` flow); some harnesses read it from the access token instead,
-/// which is why the caller tries the `id_token` first and this fallback second.
+/// `chatgpt_account_id` lives under `https://api.openai.com/auth`; some
+/// providers carry it only in the access token rather than the `id_token`, which
+/// is why the caller tries the `id_token` first and this fallback second.
 const OPENAI_AUTH_NAMESPACE: &str = "https://api.openai.com/auth";
 
 /// The `OpenAI` profile namespace carrying the email claim.

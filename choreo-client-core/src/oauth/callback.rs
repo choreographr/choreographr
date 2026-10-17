@@ -17,9 +17,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use super::OAuthLoginError;
+use super::url::parse_query;
 
-/// The callback path the provider redirects to (`<issuer redirect>:/auth/callback`
-/// per the `ChatGPT`/Codex allow-list).
+/// The callback path the provider redirects to (the `ChatGPT`/Codex backend
+/// allow-lists `/auth/callback`).
 pub(crate) const CALLBACK_PATH: &str = "/auth/callback";
 
 /// How long each `recv_timeout` waits before the loop re-checks the cancel
@@ -57,20 +58,32 @@ pub(crate) struct Callback {
 /// Returns [`OAuthLoginError::CallbackBind`] when no port could be bound (an
 /// empty list, or every port in use).
 pub(crate) fn bind(ports: &[u16]) -> Result<(tiny_http::Server, u16), OAuthLoginError> {
+    first_bound(ports, |port| {
+        let server = tiny_http::Server::http(("127.0.0.1", port))
+            .map_err(|e| format!("127.0.0.1:{port}: {e}"))?;
+        // Report the ACTUAL bound port: a request for port 0 binds an ephemeral
+        // port, and the redirect_uri must carry that real port (a literal `:0`
+        // would be unreachable).
+        let bound = server
+            .server_addr()
+            .to_ip()
+            .map_or(port, |addr| addr.port());
+        Ok((server, bound))
+    })
+}
+
+/// Try each port in order, returning the first one `attempt` accepts and the
+/// port it reported. Extracted from [`bind`] (which is the only caller) so the
+/// fallback policy is unit-testable without binding a socket.
+fn first_bound<T>(
+    ports: &[u16],
+    mut attempt: impl FnMut(u16) -> Result<(T, u16), String>,
+) -> Result<(T, u16), OAuthLoginError> {
     let mut last_error = String::from("no redirect ports configured");
     for &port in ports {
-        match tiny_http::Server::http(("127.0.0.1", port)) {
-            Ok(server) => {
-                // Report the ACTUAL bound port: a request for port 0 binds an
-                // ephemeral port, and the redirect_uri must carry that real
-                // port (a literal `:0` would be unreachable).
-                let bound = server
-                    .server_addr()
-                    .to_ip()
-                    .map_or(port, |addr| addr.port());
-                return Ok((server, bound));
-            }
-            Err(e) => last_error = format!("127.0.0.1:{port}: {e}"),
+        match attempt(port) {
+            Ok(bound) => return Ok(bound),
+            Err(e) => last_error = e,
         }
     }
     Err(OAuthLoginError::CallbackBind(last_error))
@@ -169,108 +182,45 @@ fn handle_request(request: tiny_http::Request) -> Result<Option<Callback>, OAuth
     }
 }
 
-/// Parse an `application/x-www-form-urlencoded` query string into decoded
-/// key/value pairs. Invalid percent-escapes are dropped rather than failing the
-/// whole parse.
-fn parse_query(query: &str) -> Vec<(String, String)> {
-    query
-        .split('&')
-        .filter(|pair| !pair.is_empty())
-        .filter_map(|pair| {
-            let (key, value) = pair.split_once('=')?;
-            Some((percent_decode(key), percent_decode(value)))
-        })
-        .collect()
-}
-
-/// Percent-decode one URL component, mapping `+` to a space and an invalid
-/// escape to a literal `%` (the byte sequence is kept as-is).
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let byte = bytes.get(i).copied().unwrap_or(0);
-        match byte {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < bytes.len() => {
-                if let (Some(hi), Some(lo)) = (
-                    bytes.get(i + 1).and_then(|b| hex_value(*b)),
-                    bytes.get(i + 2).and_then(|b| hex_value(*b)),
-                ) {
-                    out.push((hi << 4) | lo);
-                    i += 3;
-                } else {
-                    out.push(b'%');
-                    i += 1;
-                }
-            }
-            byte => {
-                out.push(byte);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// The value of one hex digit, or `None` for a non-hex byte.
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn percent_decode_handles_escapes_and_plus() {
-        assert_eq!(percent_decode("a%20b"), "a b");
-        assert_eq!(percent_decode("a+b"), "a b");
-        assert_eq!(percent_decode("code%2Fwith%2Fslashes"), "code/with/slashes");
-        // A stray `%` without two following hex digits is kept literally.
-        assert_eq!(percent_decode("50%"), "50%");
-        assert_eq!(percent_decode("%zz"), "%zz");
+    fn first_bound_skips_a_busy_port_and_reports_the_next() {
+        // The binder tries each port in order; a busy port falls through to the
+        // next, and the port reported is the one that actually bound.
+        let mut tried = Vec::new();
+        let (payload, port) = first_bound(&[1455, 1457], |port| {
+            tried.push(port);
+            if port == 1455 {
+                Err(format!("127.0.0.1:{port}: in use"))
+            } else {
+                Ok(("server", port))
+            }
+        })
+        .expect("the second port binds");
+        assert_eq!(payload, "server");
+        assert_eq!(port, 1457);
+        assert_eq!(tried, [1455, 1457], "ports are tried in order");
     }
 
     #[test]
-    fn query_parsing_extracts_code_and_state() {
-        let pairs = parse_query("code=abc123&state=xyz&scope=openid%20profile");
-        assert_eq!(
-            pairs,
-            vec![
-                ("code".to_string(), "abc123".to_string()),
-                ("state".to_string(), "xyz".to_string()),
-                ("scope".to_string(), "openid profile".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn bind_falls_back_and_binds_loopback() {
-        // Bind on an ephemeral first port, hold it, and confirm the binder
-        // moves to the second when the first is in use.
-        let held = tiny_http::Server::http("127.0.0.1:0").expect("ephemeral bind");
-        let busy = held.server_addr().to_ip().expect("ip addr").port();
-        let (server, port) = bind(&[busy, 0]).expect("falls back to port 0");
-        assert_ne!(port, busy, "must move past the busy port");
-        assert_eq!(
-            server
-                .server_addr()
-                .to_ip()
-                .expect("ip addr")
-                .ip()
-                .to_string(),
-            "127.0.0.1",
-            "must bind loopback only"
-        );
+    fn first_bound_reports_the_last_error_when_no_port_binds() {
+        let error = first_bound(&[1455, 1457], |port| {
+            Err::<((), u16), _>(format!("busy {port}"))
+        })
+        .expect_err("no port binds");
+        match error {
+            OAuthLoginError::CallbackBind(detail) => assert!(detail.contains("1457"), "{detail}"),
+            other => panic!("expected CallbackBind, got {other:?}"),
+        }
+        // An empty port list reports the distinct "none configured" message.
+        assert!(matches!(
+            first_bound::<()>(&[], |_| Err::<((), u16), String>(
+                "never called".to_string()
+            )),
+            Err(OAuthLoginError::CallbackBind(_))
+        ));
     }
 }

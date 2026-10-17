@@ -63,6 +63,9 @@ pub(crate) enum PollOutcome {
     Tokens(TokenSet),
     /// The authorization is still pending; poll again after the interval.
     Pending,
+    /// The server asked the client to poll less often (`slow_down`); the caller
+    /// increases its interval and keeps polling.
+    SlowDown,
     /// The device code expired (or was denied); the flow is terminal.
     Expired(String),
 }
@@ -322,9 +325,10 @@ struct DeviceCodeResponse {
     error_description: Option<String>,
 }
 
-/// Poll the device token endpoint once. A `authorization_pending` error is the
-/// normal still-waiting case (returns [`PollOutcome::Pending`]); any other
-/// OAuth error is terminal.
+/// Poll the device token endpoint once. `authorization_pending` (still waiting)
+/// and `slow_down` (poll less often) are the two non-terminal OAuth errors and
+/// are returned as [`PollOutcome::Pending`] / [`PollOutcome::SlowDown`]; any
+/// other OAuth error is terminal.
 ///
 /// # Errors
 ///
@@ -368,6 +372,7 @@ pub(crate) fn device_poll(
     }
     match parsed.error.as_deref() {
         Some("authorization_pending") => Ok(PollOutcome::Pending),
+        Some("slow_down") => Ok(PollOutcome::SlowDown),
         Some(other) => Ok(PollOutcome::Expired(format!(
             "{other}: {}",
             parsed.error_description.unwrap_or_default()

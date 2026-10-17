@@ -26,6 +26,7 @@ mod http;
 mod jwt;
 mod mcp;
 mod pkce;
+mod url;
 
 pub use jwt::{chatgpt_account_id, chatgpt_plan_type, decode_claims, email};
 pub use mcp::{McpLoginInfo, McpLoginOptions, start_mcp_login};
@@ -41,6 +42,11 @@ use crossbeam_channel::{Receiver, Sender, after, select};
 use tracing::warn;
 
 use crate::credentials::build_add_credential_from_credential;
+
+/// How many consecutive transient network failures the device-code poll
+/// tolerates before giving up. A one-off blip is retried; a persistently
+/// unreachable token endpoint still fails rather than looping forever.
+const MAX_DEVICE_POLL_ERRORS: u8 = 5;
 
 /// A failure from the login flow. Each variant is a distinct recovery class
 /// (bind failure vs. CSRF mismatch vs. provider error), so the UI can hint at
@@ -265,13 +271,14 @@ fn run(
     cancel: &AtomicBool,
     stop: &Receiver<()>,
 ) -> Result<(), OAuthLoginError> {
-    let tokens = if options.device {
-        run_device(descriptor, options, tx, cancel, stop)?
+    // Both flows return the tokens plus the client id to persist, so `finish`
+    // stays one path: the loopback flow may adopt a client id the provider
+    // returned on the callback, and the device flow uses the descriptor's.
+    let (tokens, client_id) = if options.device {
+        run_device(descriptor, tx, cancel, stop)?
     } else {
-        let (tokens, client_id) = run_loopback(descriptor, options, tx, cancel)?;
-        return finish(descriptor, options, tx, &tokens, &client_id);
+        run_loopback(descriptor, options, tx, cancel)?
     };
-    let client_id = descriptor.client_id.clone().unwrap_or_default();
     finish(descriptor, options, tx, &tokens, &client_id)
 }
 
@@ -369,14 +376,14 @@ fn run_loopback(
     Ok((tokens, persisted_client_id))
 }
 
-/// The RFC 8628 device-code flow: usercode request → poll → tokens.
+/// The RFC 8628 device-code flow: usercode request → poll → tokens. Returns the
+/// tokens and the client id to persist (the descriptor's).
 fn run_device(
     descriptor: &OAuthProviderDescriptor,
-    options: &LoginOptions,
     tx: &Sender<LoginEvent>,
     cancel: &AtomicBool,
     stop: &Receiver<()>,
-) -> Result<http::TokenSet, OAuthLoginError> {
+) -> Result<(http::TokenSet, String), OAuthLoginError> {
     if !descriptor.device_code {
         return Err(OAuthLoginError::Unsupported(
             "the provider has no device-code flow".to_string(),
@@ -402,10 +409,13 @@ fn run_device(
         code: code.user_code.clone(),
         uri: code.verification_uri.clone(),
     });
-    let _ = tx.send(LoginEvent::Prompt {
-        message: options.account.clone(),
-    });
-    let interval = std::time::Duration::from_secs(code.interval.unwrap_or(5).max(1));
+    // The interval starts at the server's suggestion (defaulting to 5s) and is
+    // bumped by 5s on each `slow_down`, per RFC 8628 §3.5.
+    let mut interval = std::time::Duration::from_secs(code.interval.unwrap_or(5).max(1));
+    // A transient transport error during the (minutes-long) poll must not abort
+    // the flow: tolerate a short run of them before giving up, so a one-off blip
+    // is retried but a permanently unreachable endpoint still fails.
+    let mut transient_errors: u8 = 0;
     loop {
         wait_interval(stop, interval, cancel)?;
         match http::device_poll(
@@ -413,14 +423,30 @@ fn run_device(
             device_token_path,
             &client_id,
             &code.device_code,
-        )? {
-            http::PollOutcome::Tokens(tokens) => {
-                return Ok(tokens);
+        ) {
+            Ok(http::PollOutcome::Tokens(tokens)) => return Ok((tokens, client_id)),
+            Ok(http::PollOutcome::Pending) => {}
+            Ok(http::PollOutcome::SlowDown) => {
+                transient_errors = 0;
+                interval = interval.saturating_add(std::time::Duration::from_secs(5));
+                let _ = tx.send(LoginEvent::Progress {
+                    message: "The provider asked to slow down; waiting a little longer…"
+                        .to_string(),
+                });
             }
-            http::PollOutcome::Pending => {}
-            http::PollOutcome::Expired(reason) => {
+            Ok(http::PollOutcome::Expired(reason)) => {
                 return Err(OAuthLoginError::DeviceFlow(reason));
             }
+            // A transient network failure: report progress and keep polling.
+            Err(OAuthLoginError::Network(e)) if transient_errors < MAX_DEVICE_POLL_ERRORS => {
+                transient_errors += 1;
+                let _ = tx.send(LoginEvent::Progress {
+                    message: format!(
+                        "transient error while waiting for authorization; retrying ({e})"
+                    ),
+                });
+            }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -502,11 +528,11 @@ fn parse_callback_url(url: &str) -> Result<callback::Callback, OAuthLoginError> 
     let mut code = None;
     let mut state = None;
     let mut client_id = None;
-    for (key, value) in query.split('&').filter_map(|pair| pair.split_once('=')) {
-        match key {
-            "code" => code = Some(percent_decode_loose(value)),
-            "state" => state = Some(percent_decode_loose(value)),
-            "client_id" => client_id = Some(percent_decode_loose(value)),
+    for (key, value) in url::parse_query(query) {
+        match key.as_str() {
+            "code" => code = Some(value),
+            "state" => state = Some(value),
+            "client_id" => client_id = Some(value),
             _ => {}
         }
     }
@@ -519,50 +545,6 @@ fn parse_callback_url(url: &str) -> Result<callback::Callback, OAuthLoginError> 
         _ => Err(OAuthLoginError::CallbackUrl(
             "the URL has no code/state parameters".to_string(),
         )),
-    }
-}
-
-/// Percent-decode a URL component, mapping `+` to space and leaving an
-/// invalid escape literal.
-fn percent_decode_loose(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let byte = bytes.get(i).copied().unwrap_or(0);
-        match byte {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < bytes.len() => {
-                if let (Some(hi), Some(lo)) = (
-                    bytes.get(i + 1).and_then(|b| hex(*b)),
-                    bytes.get(i + 2).and_then(|b| hex(*b)),
-                ) {
-                    out.push((hi << 4) | lo);
-                    i += 3;
-                } else {
-                    out.push(b'%');
-                    i += 1;
-                }
-            }
-            byte => {
-                out.push(byte);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// The value of one hex digit, or `None`.
-fn hex(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
     }
 }
 
