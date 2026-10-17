@@ -129,17 +129,21 @@ fn build_authorize_url(
     scopes: &[String],
 ) -> Result<String, OAuthLoginError> {
     request.policy.check(&server.authorization_endpoint)?;
-    let scope = scopes.join(" ");
-    let params = [
+    let mut params = vec![
         ("response_type", "code"),
         ("client_id", request.client_id),
         ("redirect_uri", request.redirect_uri),
         ("code_challenge", challenge),
         ("code_challenge_method", "S256"),
         ("state", state),
-        ("scope", scope.as_str()),
         ("resource", request.resource),
     ];
+    // Request only the resolved scopes; omit the parameter entirely when there
+    // are none (per the spec's scope-selection strategy).
+    let scope = scopes.join(" ");
+    if !scope.is_empty() {
+        params.push(("scope", scope.as_str()));
+    }
     Ok(http::authorize_url(&server.authorization_endpoint, &params))
 }
 
@@ -201,6 +205,8 @@ mod tests {
             token_endpoint: "https://as.example/token".to_string(),
             registration_endpoint: None,
             scopes_supported: vec!["openid".to_string()],
+            challenge_scope: None,
+            resource_scopes_supported: Vec::new(),
             authorization_response_iss_parameter_supported: false,
         }
     }

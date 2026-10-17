@@ -42,14 +42,21 @@ pub(super) fn register_client(
         message: "Registering this client with the authorization server…".to_string(),
     });
     policy.check(endpoint)?;
-    let body = json!({
+    let mut body = json!({
         "client_name": "Choreographr",
         "redirect_uris": [redirect_uri],
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": "none",
-        "scope": default_scopes(server, scopes).join(" "),
     });
+    // Omit `scope` entirely when there is nothing to request (per the spec's
+    // scope-selection strategy), rather than registering an empty scope set.
+    let scope = default_scopes(server, scopes).join(" ");
+    if !scope.is_empty()
+        && let Some(object) = body.as_object_mut()
+    {
+        object.insert("scope".to_string(), serde_json::Value::String(scope));
+    }
     let response = agent
         .post(endpoint)
         .header("Content-Type", "application/json")
@@ -72,15 +79,72 @@ pub(super) fn register_client(
         })
 }
 
-/// The scopes to request: the configured set when non-empty, else the
-/// authorization server's advertised `scopes_supported`, else `openid`.
+/// The scopes to request, in the spec's scope-selection precedence: the
+/// client-configured set when non-empty, else the challenge's scopes (RFC 6750
+/// §3), else the protected resource's `scopes_supported`, else the authorization
+/// server's own advertised scopes (a compatibility fallback for a server that
+/// advertises them only on itself). An empty result means "request no scope" —
+/// the callers omit the `scope` parameter rather than inventing a default.
 pub(super) fn default_scopes(server: &AuthServer, configured: &[String]) -> Vec<String> {
     if !configured.is_empty() {
         return configured.to_vec();
     }
-    if server.scopes_supported.is_empty() {
-        vec!["openid".to_string()]
-    } else {
-        server.scopes_supported.clone()
+    if let Some(challenge) = &server.challenge_scope {
+        return challenge.clone();
+    }
+    if !server.resource_scopes_supported.is_empty() {
+        return server.resource_scopes_supported.clone();
+    }
+    server.scopes_supported.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server(challenge: Option<&[&str]>, resource: &[&str], advertised: &[&str]) -> AuthServer {
+        AuthServer {
+            issuer: "https://as.example".to_string(),
+            authorization_endpoint: "https://as.example/authorize".to_string(),
+            token_endpoint: "https://as.example/token".to_string(),
+            registration_endpoint: Some("https://as.example/register".to_string()),
+            scopes_supported: advertised.iter().map(ToString::to_string).collect(),
+            challenge_scope: challenge.map(|s| s.iter().map(ToString::to_string).collect()),
+            resource_scopes_supported: resource.iter().map(ToString::to_string).collect(),
+            authorization_response_iss_parameter_supported: false,
+        }
+    }
+
+    #[test]
+    fn default_scopes_follow_the_selection_precedence() {
+        let owned = |scopes: &[&str]| scopes.iter().map(ToString::to_string).collect::<Vec<_>>();
+        // Configured scopes win over every source.
+        assert_eq!(
+            default_scopes(
+                &server(Some(&["c"]), &["r"], &["a"]),
+                &owned(&["configured"])
+            ),
+            owned(&["configured"])
+        );
+        // Else the challenge's scope.
+        assert_eq!(
+            default_scopes(&server(Some(&["c"]), &["r"], &["a"]), &[]),
+            owned(&["c"])
+        );
+        // Else the resource's scopes.
+        assert_eq!(
+            default_scopes(&server(None, &["r"], &["a"]), &[]),
+            owned(&["r"])
+        );
+        // Else the AS's advertised scopes (compatibility fallback).
+        assert_eq!(
+            default_scopes(&server(None, &[], &["a"]), &[]),
+            owned(&["a"])
+        );
+        // Else nothing — the callers omit `scope`.
+        assert_eq!(
+            default_scopes(&server(None, &[], &[]), &[]),
+            Vec::<String>::new()
+        );
     }
 }

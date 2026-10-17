@@ -35,6 +35,14 @@ pub(super) struct AuthServer {
     pub(super) registration_endpoint: Option<String>,
     /// The scopes the server advertises support for.
     pub(super) scopes_supported: Vec<String>,
+    /// The scopes named by the `WWW-Authenticate` challenge (`scope="…"`, RFC
+    /// 6750 §3), when the server demanded them. Preferred over every other
+    /// source in the scope-selection strategy.
+    pub(super) challenge_scope: Option<Vec<String>>,
+    /// The `scopes_supported` of the protected-resource metadata document, when
+    /// one was read. The resource's scopes express the resource requirement;
+    /// the authorization server's own `scopes_supported` is a last resort.
+    pub(super) resource_scopes_supported: Vec<String>,
     /// Whether the server advertises RFC 9207 `iss` support
     /// (`authorization_response_iss_parameter_supported`). When true the
     /// authorization response's `iss` is required and validated; when false it
@@ -212,42 +220,56 @@ pub(super) fn discover(
     authorization_server: Option<&str>,
     policy: http::HopPolicy,
 ) -> Result<AuthServer, OAuthLoginError> {
-    // An explicit override names the AS directly: fetch its metadata at once.
+    // An explicit override names the AS directly, so the resource's metadata
+    // (and thus its scopes) is not consulted.
     if let Some(server) = authorization_server {
         let as_url = parse_url(server, "authorization server")?;
         return fetch_as_metadata(agent, &as_url, policy);
     }
     let resource_url = parse_url(resource, "resource")?;
     // RFC 9728 §5.1: an unauthenticated request's `WWW-Authenticate` challenge
-    // names the authoritative protected-resource metadata URL. Prefer it over
-    // guessing the well-known path, which is the fallback for a challenge that
-    // omits the parameter.
-    if let Some(header) = http::probe_www_authenticate(agent, resource, policy)
-        && let Some(metadata_url) = challenge::resource_metadata_url(&header)
-        && let Ok(metadata_url) = parse_url(&metadata_url, "resource metadata")
-        && let Ok(value) = get_json(agent, metadata_url.as_str(), policy)
-        && let Some(server) = first_authorization_server(&value)
-    {
-        return fetch_as_metadata(agent, &parse_url(&server, "authorization server")?, policy);
-    }
-    // RFC 9728 protected-resource metadata: try the path-inserted document,
-    // then the origin-rooted form.
-    let mut resource_metadata = None;
-    for candidate in protected_resource_candidates(&resource_url) {
-        if let Ok(value) = get_json(agent, candidate.as_str(), policy) {
-            resource_metadata = Some(value);
-            break;
-        }
-    }
-    let authorization_server = resource_metadata
+    // names the authoritative protected-resource metadata URL and the scopes the
+    // operation needs. Prefer them over guessing the resource's well-known path,
+    // which is the fallback for a challenge that omits `resource_metadata`.
+    let challenge = http::probe_www_authenticate(agent, resource, policy);
+    let challenge_scope = challenge.as_deref().and_then(challenge::scope);
+    let resource_metadata = challenge
+        .as_deref()
+        .and_then(challenge::resource_metadata_url)
+        .and_then(|url| parse_url(&url, "resource metadata").ok())
+        .and_then(|url| get_json(agent, url.as_str(), policy).ok())
+        .or_else(|| {
+            protected_resource_candidates(&resource_url)
+                .into_iter()
+                .find_map(|candidate| get_json(agent, candidate.as_str(), policy).ok())
+        });
+    let resource_scopes = resource_metadata
         .as_ref()
-        .and_then(first_authorization_server);
-    let authorization_server = match authorization_server {
+        .map_or_else(Vec::new, scopes_from);
+    let authorization_server = match resource_metadata
+        .as_ref()
+        .and_then(first_authorization_server)
+    {
         Some(server) => parse_url(&server, "authorization server")?,
         // No protected-resource metadata: assume the resource host is the AS.
         None => origin_url(&resource_url),
     };
-    fetch_as_metadata(agent, &authorization_server, policy)
+    let mut server = fetch_as_metadata(agent, &authorization_server, policy)?;
+    server.challenge_scope = challenge_scope;
+    server.resource_scopes_supported = resource_scopes;
+    Ok(server)
+}
+
+/// The `scopes_supported` list of a metadata document, as strings.
+fn scopes_from(value: &Value) -> Vec<String> {
+    value
+        .get("scopes_supported")
+        .and_then(|v| v.as_array())
+        .map_or_else(Vec::new, |a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
 }
 
 /// The first `authorization_servers` entry of a protected-resource metadata
@@ -319,14 +341,7 @@ pub(super) fn fetch_as_metadata(
     // as the server we asked for.
     let issuer = string("issuer").unwrap_or_else(|| authorization_server.to_string());
     validate_issuer(&issuer, authorization_server)?;
-    let scopes_supported = metadata
-        .get("scopes_supported")
-        .and_then(|v| v.as_array())
-        .map_or_else(Vec::new, |a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        });
+    let scopes_supported = scopes_from(&metadata);
     let authorization_response_iss_parameter_supported = metadata
         .get("authorization_response_iss_parameter_supported")
         .and_then(serde_json::Value::as_bool)
@@ -337,6 +352,9 @@ pub(super) fn fetch_as_metadata(
         token_endpoint,
         registration_endpoint: string("registration_endpoint"),
         scopes_supported,
+        // Filled by `discover` from the resource's metadata / the challenge.
+        challenge_scope: None,
+        resource_scopes_supported: Vec::new(),
         authorization_response_iss_parameter_supported,
     })
 }

@@ -1,11 +1,13 @@
-//! The `WWW-Authenticate` challenge reader (RFC 9728 §5.1).
+//! The `WWW-Authenticate` challenge reader (RFC 9728 §5.1 / RFC 6750 §3).
 //!
 //! An MCP server that requires authorization answers an unauthenticated request
 //! with `401 Unauthorized` and a `WWW-Authenticate: Bearer …` challenge. RFC
 //! 9728 §5.1 defines a `resource_metadata="…"` parameter naming the
 //! protected-resource metadata document — the authoritative location of that
-//! document. Reading it is what lets a client discover a server whose metadata
-//! is not served at the resource's well-known path; the well-known probing in
+//! document — and RFC 6750 §3 defines a `scope="…"` parameter naming the scopes
+//! the operation needs. Reading them lets a client discover a server whose
+//! metadata is not served at the resource's well-known path, and request the
+//! scopes the server actually wants; the well-known probing in
 //! [`super::discovery`] is only the fallback for a challenge that omits the
 //! parameter.
 
@@ -13,31 +15,41 @@
 /// challenge, if present.
 ///
 /// The parameter name is matched case-insensitively; its value may be a
-/// quoted-string (the norm) or a bare token (unquoted, terminated by a comma or
-/// whitespace). A challenge that carries no such parameter — e.g. a bare
-/// metadata URL with no `Bearer` scheme — yields `None`, so the caller falls
-/// back to well-known discovery.
+/// quoted-string (the norm) or a bare token. A challenge that carries no such
+/// parameter — e.g. a bare metadata URL with no `Bearer` scheme — yields `None`,
+/// so the caller falls back to well-known discovery.
 #[must_use]
 pub(super) fn resource_metadata_url(header: &str) -> Option<String> {
-    // `to_ascii_lowercase` leaves non-ASCII bytes untouched and maps ASCII
-    // letters 1:1, so a byte offset found in the lowercased copy is valid in
-    // the original. The needle is pure ASCII, so its offset is a char boundary.
-    let needle = header.to_ascii_lowercase().find("resource_metadata=")?;
-    let after = header.get(needle + "resource_metadata=".len()..)?;
+    param_value(header, "resource_metadata").filter(|value| !value.is_empty())
+}
+
+/// Extract the space-delimited `scope` list from a `WWW-Authenticate` challenge
+/// (RFC 6750 §3), if present. An absent, empty, or whitespace-only scope yields
+/// `None`.
+#[must_use]
+pub(super) fn scope(header: &str) -> Option<Vec<String>> {
+    let value = param_value(header, "scope")?;
+    let scopes: Vec<String> = value.split_whitespace().map(str::to_string).collect();
+    (!scopes.is_empty()).then_some(scopes)
+}
+
+/// The value of an `auth-param` in a challenge header, matched
+/// case-insensitively and read as a quoted-string or a bare token (unquoted,
+/// terminated by a comma or whitespace).
+fn param_value(header: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=");
+    // `to_ascii_lowercase` maps ASCII letters 1:1 (leaving other bytes
+    // untouched), so a byte offset found in the lowercased copy is valid in the
+    // original; the ASCII needle's offset is a char boundary.
+    let at = header.to_ascii_lowercase().find(&needle)?;
+    let after = header.get(at + needle.len()..)?;
     let after = after.trim_start();
     if let Some(quoted) = after.strip_prefix('"') {
         let end = quoted.find('"')?;
-        return quoted
-            .get(..end)
-            .map(str::to_string)
-            .filter(|value| !value.is_empty());
+        return quoted.get(..end).map(str::to_string);
     }
-    // An unquoted token value ends at the next comma or whitespace.
     let end = after.find([',', ' ']).unwrap_or(after.len());
-    after
-        .get(..end)
-        .map(str::to_string)
-        .filter(|value| !value.is_empty())
+    after.get(..end).map(str::to_string)
 }
 
 #[cfg(test)]
@@ -105,5 +117,17 @@ mod tests {
             resource_metadata_url(r#"Bearer resource_metadata="""#),
             None
         );
+    }
+
+    #[test]
+    fn extracts_the_scope_list() {
+        assert_eq!(
+            scope(r#"Bearer resource_metadata="https://x.example/meta", scope="read write""#),
+            Some(vec!["read".to_string(), "write".to_string()])
+        );
+        // An absent, empty, or whitespace-only scope yields `None`.
+        assert_eq!(scope(r#"Bearer realm="OAuth""#), None);
+        assert_eq!(scope(r#"Bearer scope="""#), None);
+        assert_eq!(scope(r#"Bearer scope="   ""#), None);
     }
 }
