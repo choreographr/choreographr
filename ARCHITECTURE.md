@@ -682,7 +682,10 @@ arrived over TLS from the token endpoint — with the access token as a fallback
 the access token is then dropped and only the refresh token, client
 registration, and extracted claims persist. The claim decode is shared with the
 runtime refresh path (`choreo-shared`'s `oauth_claims`), so login and refresh
-read the same namespace one way.
+read the same namespace one way; the endpoint-security rule (`https`, or a
+loopback `http` address) is likewise one shared predicate
+(`choreo-shared`'s `oauth_endpoint`) that both the login and the refresh path
+apply, so the two cannot drift.
 
 The daemon serves each provider's sign-in parameters over a
 `ClientMessage::ListOAuthProviders` ⇄
@@ -706,7 +709,9 @@ crate's only OAuth responsibility), and it refuses to send the durable refresh
 token to any endpoint that is not `https` (a loopback `http` address is the sole
 exception, for the in-repo test issuer), so a credential whose stored issuer is
 a cleartext URL cannot leak the token at refresh time — the login library
-enforces the same rule. The daemon remains the sole owner of the token cache and
+applies the same rule through the one shared policy (`choreo-shared`'s
+`oauth_endpoint`), so login and refresh share one implementation rather than two
+copies that could drift. The daemon remains the sole owner of the token cache and
 the sole writer of the credential blob. The seam between
 them is `choreo-daemon/src/oauth_refresh.rs`: an `OAuthTokenSource` the session
 implements over its command channel (`DaemonTokenSource` sends
@@ -901,9 +906,12 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   existing `AddCredential`; `mcp logout <slug>` removes it via
   `RemoveCredential` and reconnects. Refresh at connect is owned by `rmcp`'s
   `AuthorizationManager`, driven through a `CredentialStore` adapter in
-  `choreo-mcp` that strips the access token on `save` (serving it from an
-  in-process cache; a cold start returns no usable token so `rmcp` refreshes)
-  and maps to and from `ServiceCredential::OAuth`.
+  `choreo-mcp`'s `auth` module that strips the access token on `save` (serving
+  it from an in-process cache; a cold start returns no usable token so `rmcp`
+  refreshes) and maps to and from `ServiceCredential::OAuth`. The module splits
+  the durable↔`StoredCredentials` mapping (`auth::adapter`) from the connect-time
+  `rmcp` `AuthClient`/`AuthorizationManager` wiring (`auth::connect`), so each
+  `rmcp`-facing concern owns one module.
 
   The credential row is **target-scoped**: `mcp:<slug>|<target-hash>`, where the
   hash is the repo's stable FNV-1a over the canonicalized server URL joined to
@@ -927,7 +935,11 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   connect while the command loop is blocked resolving a session overlay, the
   backend never round-trips the loop for a read — the command loop publishes a
   credential snapshot the backend reads lock-free (the **fifteenth** sanctioned
-  shared-state exception, see AGENTS.md) — and its writes are
+  shared-state exception, see AGENTS.md). The snapshot **withholds a quarantined
+  grant** (`dead_oauth`): a terminally rejected refresh token is not served
+  again, so the connect proceeds unauthenticated and surfaces a re-login rather
+  than re-spending a spent token, while the `/mcp` status still reports the
+  quarantine. The backend's writes are
   fire-and-forget `DaemonCommand`s (`OAuthSave`/`OAuthClear`/`McpAuthRejected`)
   that persist to the binding public key when the loop is next free. The
   single-flight refresh guard reuses `OAuthRefreshLocks`, keyed by the MCP

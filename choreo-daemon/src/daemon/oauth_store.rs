@@ -171,20 +171,34 @@ impl DaemonState {
         }
     }
 
+    /// The MCP-keyed credentials the connect path may see: every `mcp:`-keyed
+    /// credential that is not quarantined. A terminally rejected grant
+    /// (`dead_oauth`) is withheld — the server already refused that refresh
+    /// token, so serving it again would only re-spend a single-use token and
+    /// fail again. Kept separate from [`Self::publish_mcp_oauth_snapshot`] so
+    /// the filter is unit-testable without the process-global runtime.
+    #[cfg(feature = "mcp")]
+    fn mcp_oauth_snapshot(&self) -> std::collections::HashMap<String, ServiceCredential> {
+        self.credentials
+            .iter()
+            .filter(|(k, _)| k.starts_with("mcp:") && !self.dead_oauth.contains(k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
     /// Republish the MCP OAuth snapshot — the read view the connect path uses
     /// so a credential load never round-trips the (possibly blocked) command
     /// loop. The command loop is the snapshot's sole writer; it calls this
     /// after every mutation of the MCP-keyed credentials.
+    ///
+    /// A quarantined grant is withheld (see [`Self::mcp_oauth_snapshot`]): the
+    /// connect then proceeds unauthenticated and surfaces a re-login. The `/mcp`
+    /// status reads `dead_oauth` directly, so the quarantine is still reported
+    /// there even though the snapshot omits the credential.
     pub(super) fn publish_mcp_oauth_snapshot(&self) {
         #[cfg(feature = "mcp")]
         if let Some(runtime) = crate::mcp::oauth::runtime() {
-            let creds: std::collections::HashMap<String, ServiceCredential> = self
-                .credentials
-                .iter()
-                .filter(|(k, _)| k.starts_with("mcp:"))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            runtime.publish(creds);
+            runtime.publish(self.mcp_oauth_snapshot());
         }
         // Without the `mcp` feature there is no connect path to feed.
         #[cfg(not(feature = "mcp"))]
@@ -231,6 +245,37 @@ mod tests {
         // A second rejection is a no-op.
         state.handle_mcp_auth_rejected("mcp:docs|abc");
         assert!(state.dead_oauth.contains("mcp:docs|abc"));
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn snapshot_withholds_a_quarantined_grant_but_keeps_live_ones() {
+        let (mut state, _rx) = make_daemon_state();
+        let live = "mcp:docs|live".to_string();
+        let dead = "mcp:docs|dead".to_string();
+        state
+            .credentials
+            .insert(live.clone(), mcp_oauth_credential("r-live"));
+        state
+            .credentials
+            .insert(dead.clone(), mcp_oauth_credential("r-dead"));
+        // A provider-keyed credential is never part of the MCP snapshot.
+        state.credentials.insert(
+            "acct-provider".to_string(),
+            mcp_oauth_credential("r-provider"),
+        );
+        state.dead_oauth.insert(dead.clone());
+
+        let snapshot = state.mcp_oauth_snapshot();
+        assert!(snapshot.contains_key(&live), "a live MCP grant is exposed");
+        assert!(
+            !snapshot.contains_key(&dead),
+            "a quarantined grant is withheld so the connect surfaces a re-login"
+        );
+        assert!(
+            !snapshot.contains_key("acct-provider"),
+            "only `mcp:`-keyed credentials belong in the MCP snapshot"
+        );
     }
 
     #[test]

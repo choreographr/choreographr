@@ -60,6 +60,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# Wipe-on-drop for the refresh token and client secret the connect-time adapter
+# copies into its durable seed, matching the credential they come from.
+zeroize.workspace = true
 
 # The per-server stderr log's hardened open (O_NOFOLLOW + euid check) and the
 # unix fcntl that returns the child's non-blocking stderr pipe to blocking mode

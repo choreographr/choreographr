@@ -22,6 +22,10 @@
 //! - [`oauth_claims`] — the OIDC `id_token` claim extraction that fills an OAuth
 //!   credential's durable identity fields, shared so the provider login library
 //!   and the runtime refresh client decode the same claims the same way.
+//! - [`oauth_endpoint`] — the one endpoint-security policy (`https`, or a
+//!   loopback `http` address) both the login library and the runtime refresh
+//!   client apply before sending a code or token, so the two cannot drift into
+//!   different rules for the same request shape.
 //!
 //! It is deliberately a *leaf* (deps: `base64`, `clap`, `dirs`, `serde`,
 //! `serde_json`, `tracing`, `tracing-subscriber`, and `zeroize`) and holds no
@@ -39,6 +43,7 @@ pub mod clap_styles;
 pub mod credential;
 pub mod logging;
 pub mod oauth_claims;
+pub mod oauth_endpoint;
 pub mod paths;
 pub mod release_name;
 

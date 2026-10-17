@@ -66,8 +66,6 @@ const CALLBACK_PORTS: [u16; 2] = [1455, 1457];
 #[must_use]
 pub fn start_mcp_login(info: McpLoginInfo, options: McpLoginOptions) -> LoginSession {
     let (tx, rx) = crossbeam_channel::unbounded();
-    let (stop, stop_rx) = crossbeam_channel::unbounded();
-    let _ = &stop_rx; // MCP has no device-code wait; the stop channel is unused.
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_worker = Arc::clone(&cancel);
     let worker_tx = tx.clone();
@@ -92,7 +90,9 @@ pub fn start_mcp_login(info: McpLoginInfo, options: McpLoginOptions) -> LoginSes
     LoginSession {
         events: rx,
         cancel,
-        stop,
+        // MCP has no device-code interval wait; cancellation rides the flag the
+        // loopback accept loop polls.
+        stop: None,
         handle,
     }
 }
@@ -122,7 +122,7 @@ fn run(
     };
     let client_id = match info.oauth.client_id.clone() {
         Some(id) => id,
-        None => register_client(&agent, &server, &bound.redirect_uri, tx)?,
+        None => register_client(&agent, &server, &bound.redirect_uri, &info.oauth.scopes, tx)?,
     };
     let tokens = authorize(info, options, &server, &client_id, &bound, tx, cancel)?;
     finish(info, &server, &client_id, &tokens, tx)?;
@@ -272,11 +272,14 @@ fn fetch_as_metadata(
 ///
 /// `redirect_uri` is the URI the flow will actually use (the callback is already
 /// bound), so the registered `redirect_uris` matches the authorize request
-/// exactly.
+/// exactly. `scopes` is the same configured set the authorize request will ask
+/// for (falling back to the server's advertised scopes), so the registered
+/// client and the authorization request never disagree on scope.
 fn register_client(
     agent: &ureq::Agent,
     server: &AuthServer,
     redirect_uri: &str,
+    scopes: &[String],
     tx: &Sender<LoginEvent>,
 ) -> Result<String, OAuthLoginError> {
     let Some(endpoint) = server.registration_endpoint.as_deref() else {
@@ -295,7 +298,7 @@ fn register_client(
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": "none",
-        "scope": default_scopes(server, &[]).join(" "),
+        "scope": default_scopes(server, scopes).join(" "),
     });
     let response = agent
         .post(endpoint)
@@ -355,33 +358,16 @@ fn authorize(
         &scopes,
         &info.resource,
     );
-    let _ = tx.send(LoginEvent::AuthUrl {
-        url: auth_url.clone(),
-    });
-
-    let callback = if let Some(callback_url) = options.callback_url.as_deref() {
-        callback::parse_callback_url(callback_url)?
-    } else {
-        if options.no_browser {
-            let _ = tx.send(LoginEvent::Prompt {
-                message: format!("Open this URL to sign in: {auth_url}"),
-            });
-        } else {
-            match webbrowser::open(&auth_url) {
-                Ok(()) => {
-                    let _ = tx.send(LoginEvent::Progress {
-                        message: "Opened the sign-in page in your browser.".to_string(),
-                    });
-                }
-                Err(e) => {
-                    let _ = tx.send(LoginEvent::Prompt {
-                        message: format!("Open this URL to sign in: {auth_url} ({e})"),
-                    });
-                }
-            }
-        }
-        callback::wait_for_callback(&bound.server, cancel)?
-    };
+    // The shared scaffold emits the URL, opens the browser (or prompts), and
+    // captures the callback from the loopback server or a pasted URL.
+    let callback = callback::capture_loopback_callback(
+        &auth_url,
+        options.no_browser,
+        options.callback_url.as_deref(),
+        &bound.server,
+        cancel,
+        tx,
+    )?;
 
     if !pkce::state_matches(&state, &callback.state) {
         return Err(OAuthLoginError::StateMismatch);

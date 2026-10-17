@@ -19,17 +19,21 @@
 //!   [`ServiceCredential`]; the adapter (which does name `rmcp` types) lives in
 //!   [`adapter`] and never leaks out.
 //!
-//! The module is split three ways: this file owns the crate-boundary types (the
+//! The module is split four ways: this file owns the crate-boundary types (the
 //! [`CredentialBackend`] trait, the [`McpAuthWiring`] bundle, and the
 //! [`RefreshGuard`]); [`keying`] owns target canonicalization and the
-//! target-scoped credential key; [`adapter`] owns the `rmcp` adapter and the
-//! connect-time auth-client construction.
+//! target-scoped credential key; [`adapter`] owns the `rmcp` `CredentialStore`
+//! adapter and the durable↔`StoredCredentials` mapping; [`connect`] owns the
+//! connect-time `rmcp` auth-client construction (discovery + wiring), the other
+//! place that names `rmcp` types. Both `rmcp`-facing modules keep every `rmcp`
+//! type inside the crate.
 
 mod adapter;
+mod connect;
 mod keying;
 
 pub use adapter::CredentialStoreAdapter;
-pub(crate) use adapter::build_auth_client;
+pub(crate) use connect::build_auth_client;
 pub use keying::{canonical_target, credential_key, credential_key_for, credential_matches_target};
 
 use std::sync::Arc;

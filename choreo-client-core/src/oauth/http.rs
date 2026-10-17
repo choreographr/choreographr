@@ -96,32 +96,15 @@ pub(crate) fn authorize_url(endpoint: &str, params: &[(String, String)]) -> Stri
 /// Reject any authorization-server URL that is not `https`, except a loopback
 /// `http` URL (the in-repo mock server and a local test issuer), so a
 /// misconfigured descriptor can never leak a code or token over cleartext to a
-/// remote host.
+/// remote host. The predicate itself is the one shared policy
+/// (`choreo_shared::oauth_endpoint`), the same rule the runtime refresh client
+/// applies, so login and refresh cannot drift.
 pub(crate) fn ensure_secure(url: &str) -> Result<(), OAuthLoginError> {
-    if url.starts_with("https://") {
-        return Ok(());
-    }
-    if is_loopback_http(url) {
-        return Ok(());
-    }
-    Err(OAuthLoginError::InsecureEndpoint(url.to_string()))
-}
-
-/// Whether `url` is a plain-`http` URL on a loopback host (`127.0.0.1`,
-/// `localhost`, or `[::1]`), which is exempt from the https-only rule.
-fn is_loopback_http(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("http://") else {
-        return false;
-    };
-    // The authority is everything before the first `/`; a bracketed IPv6 host
-    // (`[::1]:port`) is unwrapped, otherwise the host is up to the port colon.
-    let authority = rest.split('/').next().unwrap_or_default();
-    let host = if let Some(after_bracket) = authority.strip_prefix('[') {
-        after_bracket.split(']').next().unwrap_or_default()
+    if choreo_shared::oauth_endpoint::is_secure_endpoint(url) {
+        Ok(())
     } else {
-        authority.split(':').next().unwrap_or_default()
-    };
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
+        Err(OAuthLoginError::InsecureEndpoint(url.to_string()))
+    }
 }
 
 /// Build the shared agent: status responses are returned verbatim (a 400 token

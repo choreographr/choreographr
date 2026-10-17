@@ -19,21 +19,26 @@ use rmcp::transport::auth::{
     VendorExtraTokenFields,
 };
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
-use super::{CredentialBackend, McpAuthWiring};
-use crate::config::{McpServerConfig, McpTransport};
+use super::CredentialBackend;
 
 /// The durable (non-token) OAuth fields, remembered across a `load`/`save`
 /// pair so a refresh can re-persist them (the token response `rmcp` hands back
 /// carries no client secret, issuer, or resource).
+///
+/// The refresh token and client secret are wipe-on-drop (`Zeroizing`), matching
+/// the credential they are copied from: this seed is a second copy of those
+/// secrets that lives for the connection's lifetime, so it must not linger in
+/// freed memory when the adapter drops.
 #[derive(Clone)]
 struct DurableSeed {
     issuer: Option<String>,
     resource: Option<String>,
     authorization_server: Option<String>,
     account_id: Option<String>,
-    refresh_token: Option<String>,
-    client_secret: Option<String>,
+    refresh_token: Option<Zeroizing<String>>,
+    client_secret: Option<Zeroizing<String>>,
     token_type: Option<String>,
 }
 
@@ -125,95 +130,6 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Build `rmcp`'s OAuth HTTP client for one remote server.
-///
-/// Discovers the authorization-server metadata, wires the
-/// [`CredentialStoreAdapter`] to `wiring`, and — when a durable credential is
-/// already stored — configures the OAuth client (client id, optional secret,
-/// granted scopes) so `rmcp` can refresh the access token on connect. A cold
-/// start (no stored credential) leaves the client unconfigured; the connection
-/// then fails with an actionable authorization error so the user can sign in.
-///
-/// # Errors
-///
-/// Returns [`McpError::InitializeFailed`](crate::error::McpError::InitializeFailed)
-/// when discovery, credential loading,
-/// or client configuration fails.
-pub(crate) async fn build_auth_client(
-    config: &McpServerConfig,
-    url: &str,
-    wiring: &McpAuthWiring,
-    client: reqwest::Client,
-) -> Result<rmcp::transport::auth::AuthClient<reqwest::Client>, crate::error::McpError> {
-    use rmcp::transport::auth::{AuthClient, AuthorizationManager, OAuthClientConfig};
-
-    let mut manager = AuthorizationManager::new(url).await.map_err(|e| {
-        crate::error::McpError::InitializeFailed(format!("OAuth discovery init failed: {e}"))
-    })?;
-
-    let backend = wiring.backend.clone();
-    let loaded = tokio::task::spawn_blocking(move || backend.load())
-        .await
-        .map_err(|e| {
-            crate::error::McpError::InitializeFailed(format!("credential load task failed: {e}"))
-        })?
-        .map_err(crate::error::McpError::InitializeFailed)?;
-
-    if let Some(view) = loaded.as_ref().and_then(ServiceCredential::as_oauth)
-        && view.kind == OAuthKind::Mcp
-    {
-        let client_id = view.client_id.map(str::to_string);
-        let client_secret = view.client_secret.map(str::to_string);
-        let granted_scopes = view.granted_scopes.to_vec();
-        let metadata = manager
-            .resolve_metadata()
-            .await
-            .map_err(|e| {
-                crate::error::McpError::InitializeFailed(format!(
-                    "OAuth metadata discovery failed: {e}"
-                ))
-            })?
-            .metadata;
-        // Arm the adapter to withhold the stored grant when its issuer no longer
-        // matches the one discovered here (a re-pointed server), so the token is
-        // never sent; the connect then surfaces a re-login.
-        manager.set_credential_store(
-            CredentialStoreAdapter::new(wiring.key.clone(), wiring.backend.clone())
-                .with_expected_issuer(metadata.issuer.clone()),
-        );
-        manager.set_metadata(metadata);
-        // The redirect URI is only used to build a token refresh; a refresh-token
-        // grant does not send `redirect_uri`, but this matches the URI the
-        // interactive login registers (`/auth/callback`) so the two never
-        // disagree if a server does validate it.
-        let port = match &config.transport {
-            McpTransport::Http { oauth, .. } => oauth.as_ref().and_then(|o| o.callback_port),
-            McpTransport::Stdio { .. } => None,
-        }
-        .unwrap_or(1455);
-        let redirect = format!("http://127.0.0.1:{port}/auth/callback");
-        let mut oauth_config = OAuthClientConfig::new(client_id.unwrap_or_default(), redirect)
-            .with_scopes(granted_scopes);
-        if let Some(secret) = client_secret {
-            oauth_config = oauth_config.with_client_secret(secret);
-        }
-        manager.configure_client(oauth_config).map_err(|e| {
-            crate::error::McpError::InitializeFailed(format!(
-                "OAuth client configuration failed: {e}"
-            ))
-        })?;
-    } else {
-        // No usable stored grant: install the adapter anyway so a later
-        // connect-time `save` (a fresh interactive grant) is persisted.
-        manager.set_credential_store(CredentialStoreAdapter::new(
-            wiring.key.clone(),
-            wiring.backend.clone(),
-        ));
-    }
-
-    Ok(AuthClient::new(client, manager))
-}
-
 #[async_trait]
 impl CredentialStore for CredentialStoreAdapter {
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
@@ -252,14 +168,16 @@ impl CredentialStore for CredentialStoreAdapter {
         let refresh_token = view.refresh_token.map(str::to_string);
         let granted_scopes = view.granted_scopes.to_vec();
         // Remember the durable non-token fields so a later `save` can re-persist
-        // them (the token response carries none of these).
+        // them (the token response carries none of these). The refresh token and
+        // client secret are copied wipe-on-drop, so this second copy does not
+        // outlive the adapter's life in freed memory.
         *self.seed.lock().await = Some(DurableSeed {
             issuer: issuer.clone(),
             resource: view.resource.map(str::to_string),
             authorization_server: view.authorization_server.map(str::to_string),
             account_id: view.account_id.map(str::to_string),
-            refresh_token: view.refresh_token.map(str::to_string),
-            client_secret: view.client_secret.map(str::to_string),
+            refresh_token: view.refresh_token.map(|t| Zeroizing::new(t.to_string())),
+            client_secret: view.client_secret.map(|t| Zeroizing::new(t.to_string())),
             token_type: view.token_type.map(str::to_string),
         });
         let cached = self.cache.lock().await.clone();
@@ -303,6 +221,7 @@ impl CredentialStore for CredentialStoreAdapter {
         // Strip the access token: the durable grant is the refresh token plus
         // the client registration and identity. A rotated refresh token is
         // adopted; when the exchange omitted one, the seed's is kept.
+        let seed_refresh = seed.refresh_token.as_ref().map(|t| t.as_str().to_string());
         let (refresh_token, granted_scopes) = match &credentials.token_response {
             Some(response) => (
                 // Adopt a rotated refresh token; when the exchange returned
@@ -312,16 +231,13 @@ impl CredentialStore for CredentialStoreAdapter {
                 response
                     .refresh_token()
                     .map(|t| t.secret().clone())
-                    .or(seed.refresh_token.clone()),
+                    .or_else(|| seed_refresh.clone()),
                 response.scopes().map_or_else(
                     || credentials.granted_scopes.clone(),
                     |scopes| scopes.iter().map(|s| s.as_ref().to_owned()).collect(),
                 ),
             ),
-            None => (
-                seed.refresh_token.clone(),
-                credentials.granted_scopes.clone(),
-            ),
+            None => (seed_refresh.clone(), credentials.granted_scopes.clone()),
         };
         let durable = ServiceCredential::OAuth {
             kind: OAuthKind::Mcp,
@@ -331,7 +247,7 @@ impl CredentialStore for CredentialStoreAdapter {
             refresh_token,
             account_id: seed.account_id,
             client_id: Some(credentials.client_id.clone()),
-            client_secret: seed.client_secret,
+            client_secret: seed.client_secret.as_ref().map(|s| s.as_str().to_string()),
             granted_scopes,
             token_type: seed.token_type,
         };

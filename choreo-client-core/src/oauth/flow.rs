@@ -39,38 +39,16 @@ pub(super) fn run_loopback(
     let (server, port) = callback::bind("localhost", &descriptor.redirect_ports)?;
     let redirect_uri = format!("http://localhost:{port}{}", callback::CALLBACK_PATH);
     let auth_url = build_authorize_url(descriptor, &client_id, &redirect_uri, &challenge, &state);
-    // The URL carries the request parameters only; it never carries a code.
-    let _ = tx.send(LoginEvent::AuthUrl {
-        url: auth_url.clone(),
-    });
-
-    let callback = if let Some(callback_url) = options.callback_url.as_deref() {
-        // Paste-URL path: the caller supplied the redirect URL a remote browser
-        // landed on, so the loopback server is unused.
-        callback::parse_callback_url(callback_url)?
-    } else {
-        if options.no_browser || options.print_auth_url {
-            let _ = tx.send(LoginEvent::Prompt {
-                message: format!("Open this URL to sign in: {auth_url}"),
-            });
-        } else {
-            // Best-effort: a headless/SSH host has no browser, so a failed open
-            // falls back to the emitted URL + the prompt below.
-            match webbrowser::open(&auth_url) {
-                Ok(()) => {
-                    let _ = tx.send(LoginEvent::Progress {
-                        message: "Opened the sign-in page in your browser.".to_string(),
-                    });
-                }
-                Err(e) => {
-                    let _ = tx.send(LoginEvent::Prompt {
-                        message: format!("Open this URL to sign in: {auth_url} ({e})"),
-                    });
-                }
-            }
-        }
-        callback::wait_for_callback(&server, cancel)?
-    };
+    // The shared scaffold emits the URL, opens the browser (or prompts), and
+    // captures the callback from the loopback server or a pasted URL.
+    let callback = callback::capture_loopback_callback(
+        &auth_url,
+        options.no_browser || options.print_auth_url,
+        options.callback_url.as_deref(),
+        &server,
+        cancel,
+        tx,
+    )?;
 
     // CSRF guard: never exchange a code whose `state` does not match.
     if !pkce::state_matches(&state, &callback.state) {

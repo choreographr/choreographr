@@ -175,7 +175,11 @@ pub struct LoginSession {
     /// worker finishes.
     pub events: Receiver<LoginEvent>,
     cancel: Arc<AtomicBool>,
-    stop: Sender<()>,
+    /// The device-code wait's stop channel; `None` for the MCP flow, which has
+    /// no interval wait and cancels through the cancel flag alone. Optional so a
+    /// flow without a stop channel carries none rather than a sender whose
+    /// receiver was already dropped.
+    stop: Option<Sender<()>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -186,8 +190,11 @@ impl LoginSession {
         self.cancel
             .store(true, std::sync::atomic::Ordering::Relaxed);
         // The device wait selects on this channel so a cancel is observed
-        // without waiting out the poll interval. A closed receiver is fine.
-        let _ = self.stop.send(());
+        // without waiting out the poll interval. A flow with no interval wait
+        // (MCP) carries no stop channel and cancels on the flag alone.
+        if let Some(stop) = &self.stop {
+            let _ = stop.send(());
+        }
     }
 
     /// Block until the worker thread finishes.
@@ -244,7 +251,7 @@ pub fn start_login(descriptor: OAuthProviderDescriptor, options: LoginOptions) -
     LoginSession {
         events: rx,
         cancel,
-        stop,
+        stop: Some(stop),
         handle,
     }
 }

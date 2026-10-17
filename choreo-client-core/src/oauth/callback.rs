@@ -1,9 +1,10 @@
 //! The loopback OAuth callback server.
 //!
-//! The interactive flow redirects the browser to a `127.0.0.1` server the
-//! library owns, which captures the authorization `code` and `state` and then
-//! stops. The server binds `127.0.0.1` only (never a routable interface), tries
-//! the descriptor's ports in order (falling back on `AddrInUse`), answers any
+//! The interactive flow redirects the browser to a loopback server the library
+//! owns — bound to the same name the `redirect_uri` advertises (`localhost` for
+//! a provider, `127.0.0.1` for MCP) — which captures the authorization `code`
+//! and `state` and then stops. The server never binds a routable interface, tries
+//! the caller's ports in order (falling back on `AddrInUse`), answers any
 //! non-callback path with `400` (a browser's `favicon.ico`/preconnect probe must
 //! not be mistaken for a callback), and serves one fixed success page.
 //!
@@ -16,6 +17,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crossbeam_channel::Sender;
+
+use super::LoginEvent;
 use super::OAuthLoginError;
 use super::url::parse_query;
 
@@ -123,6 +127,42 @@ pub(crate) fn wait_for_callback(
     }
 }
 
+/// The parsed parameters of a provider's redirect: the authorization `code` and
+/// `state`, an optional provider-issued `client_id` (dynamic registration), and
+/// the OAuth `error`/`error_description` pair a denial carries. One shape read
+/// by both the pasted-URL parser and the loopback request handler, so the two
+/// decode the same keys the same way.
+#[derive(Debug, Default)]
+pub(crate) struct CallbackParams {
+    /// The authorization code to exchange.
+    pub(crate) code: Option<String>,
+    /// The `state` value the flow sent, to validate against a CSRF mismatch.
+    pub(crate) state: Option<String>,
+    /// A client id the provider returned on the callback, when it issues one.
+    pub(crate) client_id: Option<String>,
+    /// The OAuth error code on a denied authorization.
+    pub(crate) error: Option<String>,
+    /// The human-readable error description, when supplied.
+    pub(crate) error_description: Option<String>,
+}
+
+/// Parse the redirect's query into [`CallbackParams`].
+#[must_use]
+fn parse_callback_params(query: &str) -> CallbackParams {
+    let mut params = CallbackParams::default();
+    for (key, value) in parse_query(query) {
+        match key.as_str() {
+            "code" => params.code = Some(value),
+            "state" => params.state = Some(value),
+            "client_id" => params.client_id = Some(value),
+            "error" => params.error = Some(value),
+            "error_description" => params.error_description = Some(value),
+            _ => {}
+        }
+    }
+    params
+}
+
 /// Parse a pasted callback URL (or a bare `code=..&state=..` query) into a
 /// [`Callback`]. Also captures an optional provider-issued `client_id`.
 ///
@@ -135,27 +175,73 @@ pub(crate) fn wait_for_callback(
 /// pair.
 pub(crate) fn parse_callback_url(url: &str) -> Result<Callback, OAuthLoginError> {
     let query = url.split_once('?').map_or(url, |(_, query)| query);
-    let mut code = None;
-    let mut state = None;
-    let mut client_id = None;
-    for (key, value) in parse_query(query) {
-        match key.as_str() {
-            "code" => code = Some(value),
-            "state" => state = Some(value),
-            "client_id" => client_id = Some(value),
-            _ => {}
-        }
-    }
-    match (code, state) {
+    let params = parse_callback_params(query);
+    match (params.code, params.state) {
         (Some(code), Some(state)) => Ok(Callback {
             code,
             state,
-            client_id,
+            client_id: params.client_id,
         }),
         _ => Err(OAuthLoginError::CallbackUrl(
             "the URL has no code/state parameters".to_string(),
         )),
     }
+}
+
+/// Surface the authorize URL and capture the redirect callback, shared by the
+/// provider and MCP loopback flows.
+///
+/// Emits the [`LoginEvent::AuthUrl`], opens the browser unless `prompt_only`
+/// (then it emits the URL as a [`LoginEvent::Prompt`] instead), and returns the
+/// captured [`Callback`] — from a pasted URL when one was supplied, otherwise
+/// from the already-bound `server`. The `state` check and the code exchange stay
+/// with the caller (they differ per flow). Keeping this one scaffold means the
+/// two loopback flows cannot drift in how they present the URL or wait for the
+/// redirect.
+///
+/// # Errors
+///
+/// Returns [`OAuthLoginError::Cancelled`] when `cancel` is set, and
+/// [`OAuthLoginError::Callback`]/[`OAuthLoginError::CallbackUrl`] on a loopback
+/// failure or an unparseable pasted URL.
+pub(crate) fn capture_loopback_callback(
+    auth_url: &str,
+    prompt_only: bool,
+    callback_url: Option<&str>,
+    server: &tiny_http::Server,
+    cancel: &AtomicBool,
+    tx: &Sender<LoginEvent>,
+) -> Result<Callback, OAuthLoginError> {
+    // The URL carries the request parameters only; it never carries a code.
+    let _ = tx.send(LoginEvent::AuthUrl {
+        url: auth_url.to_string(),
+    });
+    if let Some(callback_url) = callback_url {
+        // Paste-URL path: the caller supplied the redirect URL a remote browser
+        // landed on, so the loopback server is unused.
+        return parse_callback_url(callback_url);
+    }
+    if prompt_only {
+        let _ = tx.send(LoginEvent::Prompt {
+            message: format!("Open this URL to sign in: {auth_url}"),
+        });
+    } else {
+        // Best-effort: a headless/SSH host has no browser, so a failed open
+        // falls back to the emitted URL + prompt.
+        match webbrowser::open(auth_url) {
+            Ok(()) => {
+                let _ = tx.send(LoginEvent::Progress {
+                    message: "Opened the sign-in page in your browser.".to_string(),
+                });
+            }
+            Err(e) => {
+                let _ = tx.send(LoginEvent::Prompt {
+                    message: format!("Open this URL to sign in: {auth_url} ({e})"),
+                });
+            }
+        }
+    }
+    wait_for_callback(server, cancel)
 }
 
 /// Handle one HTTP request: answer a non-callback path with `400` and a
@@ -174,41 +260,27 @@ fn handle_request(request: tiny_http::Request) -> Result<Option<Callback>, OAuth
         let _ = request.respond(response);
         return Ok(None);
     }
-    let mut code = None;
-    let mut state = None;
-    let mut client_id = None;
-    let mut error = None;
-    let mut error_description = None;
-    for (key, value) in parse_query(query) {
-        match key.as_str() {
-            "code" => code = Some(value),
-            "state" => state = Some(value),
-            "client_id" => client_id = Some(value),
-            "error" => error = Some(value),
-            "error_description" => error_description = Some(value),
-            _ => {}
-        }
-    }
+    let params = parse_callback_params(query);
     // The success page is served for the callback regardless of outcome so the
     // user's browser tab settles; the library still reports a provider error.
     let mut response = tiny_http::Response::from_string(SUCCESS_PAGE).with_status_code(200);
     if let Ok(header) = tiny_http::Header::from_bytes("Content-Type", "text/html; charset=utf-8") {
         response = response.with_header(header);
     }
-    match (code, state, error) {
+    match (params.code, params.state, params.error) {
         (Some(code), Some(state), _) => {
             let _ = request.respond(response);
             Ok(Some(Callback {
                 code,
                 state,
-                client_id,
+                client_id: params.client_id,
             }))
         }
         (_, _, Some(error)) => {
             let _ = request.respond(response);
             Err(OAuthLoginError::Callback(format!(
                 "provider returned error: {error} {}",
-                error_description.unwrap_or_default()
+                params.error_description.unwrap_or_default()
             )))
         }
         _ => {
