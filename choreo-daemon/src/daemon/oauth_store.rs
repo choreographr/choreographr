@@ -16,7 +16,7 @@
 use super::DaemonState;
 use crate::db;
 use crate::oauth_refresh::SaveToken;
-use choreo_keystore::ServiceCredential;
+use choreo_keystore::{OAuthKind, ServiceCredential};
 use std::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -44,9 +44,18 @@ impl DaemonState {
             )));
             return;
         };
-        if !matches!(current, ServiceCredential::OAuth { .. }) {
+        // The provider refresh path rotates ONLY a provider grant: an MCP grant
+        // stored under a same-named key refreshes through the MCP authorization
+        // manager, so its refresh token must never be rewritten here.
+        if !matches!(
+            current,
+            ServiceCredential::OAuth {
+                kind: OAuthKind::Provider,
+                ..
+            }
+        ) {
             let _ = reply.send(Err(format!(
-                "account '{}' is not an OAuth credential",
+                "account '{}' is not a provider OAuth credential",
                 save.account
             )));
             return;
@@ -130,6 +139,16 @@ impl DaemonState {
             warn!(%key, "OAuthSave ignored: keystore is locked");
             return;
         }
+        // A save is always the terminal step of a refresh of a credential the
+        // connect path just loaded, so the key must still be present. The save
+        // is fire-and-forget (an in-flight refresh cannot round-trip the command
+        // loop), so a save enqueued just before a logout/clear can be processed
+        // AFTER the credential was removed; persisting it then would resurrect a
+        // credential the user just deleted. Drop it instead.
+        if !self.credentials.contains_key(key) {
+            warn!(%key, "OAuthSave dropped: credential already removed (logout/clear)");
+            return;
+        }
         if let Err(e) = self.encrypt_and_persist_credential(key, &credential) {
             warn!(%key, error = %e, "failed to persist rotated MCP OAuth credential");
             return;
@@ -210,7 +229,7 @@ impl DaemonState {
 mod tests {
     use super::super::tests::make_daemon_state;
     use super::*;
-    use choreo_shared::OAuthKind;
+    use zeroize::Zeroizing;
 
     fn mcp_oauth_credential(refresh: &str) -> ServiceCredential {
         ServiceCredential::OAuth {
@@ -234,6 +253,55 @@ mod tests {
         state.handle_oauth_save("mcp:docs|abc", mcp_oauth_credential("r"));
         // A locked daemon holds no cleartext: the save is dropped, not published.
         assert!(state.credentials.is_empty());
+    }
+
+    #[test]
+    fn oauth_save_is_dropped_when_the_credential_was_removed() {
+        let (mut state, _rx) = make_daemon_state();
+        state.locked = false;
+        // No credential stored for the key: the save is a late write landing
+        // after a logout/clear, so it must not resurrect the credential.
+        state.handle_oauth_save("mcp:docs|abc", mcp_oauth_credential("r"));
+        assert!(state.credentials.is_empty());
+        assert!(
+            db::get_all_credential_blobs(&state.db)
+                .expect("read blobs")
+                .is_empty(),
+            "nothing durable must be written for a credential that was removed"
+        );
+    }
+
+    #[test]
+    fn save_oauth_token_rejects_a_non_provider_kind() {
+        let (mut state, _rx) = make_daemon_state();
+        state.locked = false;
+        // An MCP-kind grant under a same-named key must not be rotated by the
+        // provider refresh path.
+        state
+            .credentials
+            .insert("acct".into(), mcp_oauth_credential("r"));
+        let access = Zeroizing::new("at".to_string());
+        let (reply, rx) = mpsc::channel();
+        state.handle_save_oauth_token(
+            SaveToken {
+                account: "acct",
+                access_token: &access,
+                expires_at: None,
+                received_at: 0,
+                rotated_refresh_token: None,
+                new_account_id: None,
+            },
+            &reply,
+        );
+        assert!(rx.recv().expect("a reply").is_err());
+        // The MCP grant is left untouched.
+        assert!(matches!(
+            state.credentials.get("acct"),
+            Some(ServiceCredential::OAuth {
+                kind: OAuthKind::Mcp,
+                ..
+            })
+        ));
     }
 
     #[test]

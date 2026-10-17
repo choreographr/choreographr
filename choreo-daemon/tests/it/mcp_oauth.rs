@@ -100,10 +100,14 @@ fn untrusting_a_project_keeps_the_stored_credential_row() {
     });
     assert!(!state.locked, "bind leaves the keystore unlocked");
 
-    // A signed-in MCP grant stored under its target-scoped key.
+    // A signed-in MCP grant stored under its target-scoped key, persisted
+    // through the interactive-login path (`SaveCredential`, the realistic
+    // first write — `OAuthSave` is reserved for a refresh of an
+    // already-stored grant).
     let credential_key = "mcp:docs|abc123".to_string();
-    state.handle_command(DaemonCommand::OAuthSave {
-        key: credential_key.clone(),
+    let (save_ack, _save_rx) = std::sync::mpsc::channel();
+    state.handle_command(DaemonCommand::SaveCredential {
+        service: credential_key.clone(),
         credential: ServiceCredential::OAuth {
             kind: OAuthKind::Mcp,
             issuer: Some("https://as.example".into()),
@@ -116,6 +120,8 @@ fn untrusting_a_project_keeps_the_stored_credential_row() {
             granted_scopes: vec!["openid".into()],
             token_type: Some("Bearer".into()),
         },
+        reply: None,
+        ack: save_ack,
     });
     assert!(
         state.credentials.contains_key(&credential_key),
