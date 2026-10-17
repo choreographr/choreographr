@@ -53,6 +53,10 @@ pub struct McpServerStatus {
 
 impl McpServerStatus {
     /// A one-line human-readable summary of this server's state.
+    ///
+    /// This renders the identical string to the wire type's summary in
+    /// `choreo-proto` (`<McpServerStatus>::summary`), so a server reads the same
+    /// in `/mcp` whether the daemon CLI or a connected front-end renders it.
     #[must_use]
     pub fn summary(&self) -> String {
         let base = if self.connected {
@@ -150,10 +154,10 @@ pub struct McpTrustOutcome {
 mod tests {
     use super::*;
 
-    /// The daemon-side summary appends the same auth label as the wire type, so
-    /// a server needing a re-login is visible in `/mcp`. `choreo-proto`'s
-    /// `types/tests.rs` pins the wire rendering; this pins the daemon one so the
-    /// two cannot silently drift.
+    /// The daemon-side summary renders the identical string to the wire type's
+    /// (including the appended auth label, so a server needing a re-login is
+    /// visible in `/mcp`). `choreo-proto`'s `types/tests.rs` pins the wire
+    /// rendering; this pins the daemon one so the two cannot silently drift.
     #[test]
     fn summary_renders_the_auth_label() {
         fn status(auth: McpAuthState) -> McpServerStatus {

@@ -1233,8 +1233,8 @@ fn mcp_summary_renders_the_auth_label() {
             target: "https://example.com/mcp".into(),
             connected: true,
             tool_count: 3,
-            server_name: None,
-            server_version: None,
+            server_name: Some("docs-server".into()),
+            server_version: Some("1.0.0".into()),
             last_error: None,
             credential_key: Some("mcp:docs|abc".into()),
             auth,
@@ -1242,15 +1242,26 @@ fn mcp_summary_renders_the_auth_label() {
         }
     }
 
-    // A plain, unauthenticated server carries no trailing auth suffix.
+    // A plain, unauthenticated server carries no trailing auth suffix. The
+    // connected base mirrors the daemon-side summary (name, version, tool
+    // count), so the same server reads the same in every front-end.
     assert_eq!(
         status(McpAuthState::NotApplicable).summary(),
-        "docs [http → https://example.com/mcp] connected: 3 tool(s)"
+        "docs [http → https://example.com/mcp] connected: docs-server 1.0.0, 3 tool(s)"
     );
     // A terminally rejected grant must read as a re-login prompt.
     assert_eq!(
         status(McpAuthState::Reauthentication).summary(),
-        "docs [http → https://example.com/mcp] connected: 3 tool(s) [re-authentication required]"
+        "docs [http → https://example.com/mcp] connected: docs-server 1.0.0, 3 tool(s) [re-authentication required]"
+    );
+    // A connected server that reported neither a name nor a version renders the
+    // same placeholders the daemon-side summary uses, so the two cannot diverge.
+    let mut unnamed = status(McpAuthState::NotApplicable);
+    unnamed.server_name = None;
+    unnamed.server_version = None;
+    assert_eq!(
+        unnamed.summary(),
+        "docs [http → https://example.com/mcp] connected: unknown ?, 3 tool(s)"
     );
     assert_eq!(McpAuthState::NotLoggedIn.label(), "not signed in");
 }

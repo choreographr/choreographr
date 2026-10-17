@@ -207,12 +207,19 @@ pub struct McpServerStatus {
 
 impl McpServerStatus {
     /// A one-line human-readable summary of this server's state, shared by
-    /// every front-end so the rendering cannot drift between them.
+    /// every front-end so the rendering cannot drift between them — the
+    /// daemon-side summary in `choreo-daemon` renders the identical string, so a
+    /// server reads the same wherever `/mcp` is shown.
     #[must_use]
     pub fn summary(&self) -> String {
         let base = if self.connected {
+            // Mirror the daemon-side rendering byte-for-byte: the self-reported
+            // name and version, with placeholders when a connected server
+            // reported neither, so the two summaries cannot diverge.
+            let name = self.server_name.as_deref().unwrap_or("unknown");
+            let version = self.server_version.as_deref().unwrap_or("?");
             format!(
-                "{} [{} → {}] connected: {} tool(s)",
+                "{} [{} → {}] connected: {name} {version}, {} tool(s)",
                 self.slug, self.transport, self.target, self.tool_count
             )
         } else {
