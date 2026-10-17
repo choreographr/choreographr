@@ -685,7 +685,11 @@ runtime refresh path (`choreo-shared`'s `oauth_claims`), so login and refresh
 read the same namespace one way; the endpoint-security rule (`https`, or a
 loopback `http` address) is likewise one shared predicate
 (`choreo-shared`'s `oauth_endpoint`) that both the login and the refresh path
-apply, so the two cannot drift. The login path applies it to every endpoint it
+apply, so the two cannot drift; and the token-endpoint response body is parsed
+by one shared reader (`choreo-shared`'s `oauth_token`), so a token reply —
+success or error, and with a `expires_in` a lenient provider emits as a string —
+is interpreted identically by both paths. The login path applies the endpoint
+rule to every endpoint it
 sends a credential to — the token and device calls, and the authorization
 endpoint before the URL is opened in the browser — refusing a URL whose
 authority carries userinfo outright, since the real host sits after the `@`.
@@ -910,7 +914,10 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   building each well-known URL with the segment inserted *before* a path-bearing
   issuer/resource (the root document remains the fallback) and rejecting a
   metadata document whose `issuer` does not match the authorization-server URL
-  it was fetched from (RFC 8414 §3.3). It dynamically registers a client
+  it was fetched from (RFC 8414 §3.3); each discovery GET follows a small,
+  bounded number of redirects, re-vetting every hop with the `https`-or-loopback
+  predicate so a redirect cannot steer discovery onto a cleartext host. It
+  dynamically registers a client
   (SEP-837) when no `clientId` is configured, runs PKCE over a loopback callback
   (paste-URL fallback; no device code), and stores the durable grant as
   `ServiceCredential::OAuth { kind: Mcp }`. The authorization endpoint taken from
