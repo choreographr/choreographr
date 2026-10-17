@@ -1643,10 +1643,12 @@ impl DaemonState {
     /// `None` when the account is not an OAuth provider grant (an API key, an
     /// MCP grant, or no credential).
     ///
-    /// The token endpoint is the credential's recorded issuer (so refresh does
-    /// not depend on the catalog still matching) plus the catalog profile's
-    /// token path; the encoding is the profile's `refresh_encoding`. A provider
-    /// with no profile cannot be refreshed.
+    /// The token endpoint is the credential's recorded issuer (so the
+    /// authorization host is pinned at login and does not depend on the catalog
+    /// still matching) joined with the current catalog profile's token path; the
+    /// encoding is the profile's `refresh_encoding`. A provider with no profile
+    /// — or one removed from the catalog — cannot be refreshed here, so its
+    /// requests fall back to the cached access token until a 401.
     fn oauth_refresh_material(
         &self,
         account: &str,

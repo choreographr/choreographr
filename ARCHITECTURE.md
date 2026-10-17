@@ -716,7 +716,7 @@ applies the same rule through the one shared policy (`choreo-shared`'s
 `oauth_endpoint`), so login and refresh share one implementation rather than two
 copies that could drift. The daemon remains the sole owner of the token cache and
 the sole writer of the credential blob. The seam between
-them is `choreo-daemon/src/oauth_refresh.rs`: an `OAuthTokenSource` the session
+them is `choreo-daemon/src/oauth_refresh/`: an `OAuthTokenSource` the session
 implements over its command channel (`DaemonTokenSource` sends
 `DaemonCommand::LoadOAuthToken` / `SaveOAuthToken` / `MarkOAuthDead`) and a
 single `refresh_single_flight` driver. A source hands back the durable material
