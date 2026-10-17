@@ -50,6 +50,10 @@ webbrowser.workspace = true
 sha2.workspace = true
 ureq.workspace = true
 serde_json.workspace = true
+# MCP OAuth discovery (src/oauth/mcp/discovery.rs): parse the issuer/resource
+# URLs and build the RFC 8414/9728 well-known metadata URLs, inserting the
+# well-known segment before a path-bearing issuer rather than appending it.
+url.workspace = true
 
 [dev-dependencies]
 # Own tests also use tempfile directly; duplicated with the optional dep

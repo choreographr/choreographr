@@ -34,9 +34,7 @@ pub(super) fn finish(
 
 /// Build the durable OAuth credential from the token response.
 ///
-/// Only the durable subset is kept (refresh token, client registration,
-/// extracted claims); the access token is dropped. The identity claim is read
-/// from the `id_token` first, then the access token.
+/// The identity claim is read from the `id_token` first, then the access token.
 fn build_credential(
     descriptor: &OAuthProviderDescriptor,
     tokens: &http::TokenSet,
@@ -47,7 +45,7 @@ fn build_credential(
         issuer: Some(descriptor.issuer.clone()),
         resource: None,
         authorization_server: None,
-        refresh_token: tokens.refresh_token.clone(),
+        refresh_token: tokens.refresh_token.as_ref().map(|t| t.to_string()),
         account_id: extract_account_id(tokens),
         client_id: Some(client_id.to_string()),
         client_secret: None,
@@ -108,9 +106,9 @@ mod tests {
 
     fn tokens(id_token: Option<&str>, access_token: &str, scope: Option<&str>) -> http::TokenSet {
         http::TokenSet {
-            access_token: access_token.to_string(),
-            refresh_token: Some("refresh".into()),
-            id_token: id_token.map(str::to_string),
+            access_token: zeroize::Zeroizing::new(access_token.to_string()),
+            refresh_token: Some(zeroize::Zeroizing::new("refresh".to_string())),
+            id_token: id_token.map(|t| zeroize::Zeroizing::new(t.to_string())),
             token_type: Some("Bearer".into()),
             scope: scope.map(str::to_string),
         }

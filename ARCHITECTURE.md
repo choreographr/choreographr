@@ -899,14 +899,19 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
 - **MCP remote-server OAuth.** A remote server may declare an `oauth` block
   (`{ clientId?, callbackPort?, scopes? }`; never a `clientSecret`) in `mcp.json`
   or a trusted project `.mcp.json`. Sign-in is a standard OAuth 2.1 PKCE flow
-  owned by the frontend login library (`choreo-client-core`'s `oauth::mcp`): it
-  discovers the authorization server (RFC 9728 protected-resource metadata →
-  RFC 8414/OIDC), dynamically registers a client (SEP-837) when no `clientId` is
-  configured, runs PKCE over a loopback callback (paste-URL fallback; no device
-  code), and stores the durable grant as `ServiceCredential::OAuth { kind: Mcp }`.
-  The authorization endpoint taken from the discovered metadata is vetted with
-  the same `https`-or-loopback predicate before the browser is opened, so a
-  server advertising a cleartext remote endpoint is refused.
+  owned by the frontend login library (`choreo-client-core`'s `oauth::mcp`,
+  split into `mcp::{mod,discovery,register,authorize}`): it discovers the
+  authorization server (RFC 9728 protected-resource metadata → RFC 8414/OIDC),
+  building each well-known URL with the segment inserted *before* a path-bearing
+  issuer/resource (the root document remains the fallback) and rejecting a
+  metadata document whose `issuer` does not match the authorization-server URL
+  it was fetched from (RFC 8414 §3.3). It dynamically registers a client
+  (SEP-837) when no `clientId` is configured, runs PKCE over a loopback callback
+  (paste-URL fallback; no device code), and stores the durable grant as
+  `ServiceCredential::OAuth { kind: Mcp }`. The authorization endpoint taken from
+  the discovered metadata is vetted with the same `https`-or-loopback predicate
+  before the browser is opened, so a server advertising a cleartext remote
+  endpoint is refused.
   `mcp login <slug>` reads the server's resolved identity, `oauth` block, and
   credential key from the extended `McpStatus` and sends the grant over the
   existing `AddCredential`; `mcp logout <slug>` removes it via

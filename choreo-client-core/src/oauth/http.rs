@@ -9,7 +9,8 @@
 //! `ChatGPT`/Codex backend accepts a form-encoded code exchange but a JSON
 //! refresh). No redirects are followed on these credential-bearing POSTs.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use super::OAuthLoginError;
 
@@ -30,31 +31,60 @@ struct TokenResponse {
 }
 
 /// The tokens returned by an authorization-code or device-code exchange.
-#[derive(Debug)]
+///
+/// The access, refresh, and id tokens are wipe-on-drop ([`Zeroizing`]); the
+/// `Debug` impl reports only their presence, never their value, so a token can
+/// never reach a log line by way of a `{:?}`.
 pub(crate) struct TokenSet {
     /// The bearer access token.
-    pub(crate) access_token: String,
+    pub(crate) access_token: Zeroizing<String>,
     /// The refresh token, when the provider issued one.
-    pub(crate) refresh_token: Option<String>,
+    pub(crate) refresh_token: Option<Zeroizing<String>>,
     /// The OIDC `id_token` (JWT), when the provider issued one.
-    pub(crate) id_token: Option<String>,
+    pub(crate) id_token: Option<Zeroizing<String>>,
     /// The bearer token type (almost always `Bearer`).
     pub(crate) token_type: Option<String>,
     /// The scopes the provider granted.
     pub(crate) scope: Option<String>,
 }
 
+impl std::fmt::Debug for TokenSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenSet")
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &self.refresh_token.is_some())
+            .field("id_token", &self.id_token.is_some())
+            .field("token_type", &self.token_type)
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
 /// The device-authorization (`usercode`) response.
-#[derive(Debug, Deserialize)]
+///
+/// The opaque `device_code` is a short-lived secret the token poll exchanges,
+/// so it is wipe-on-drop ([`Zeroizing`]); the `Debug` impl reports only its
+/// presence, never its value.
 pub(crate) struct DeviceCode {
     /// The opaque device code the token poll exchanges.
-    pub(crate) device_code: String,
+    pub(crate) device_code: Zeroizing<String>,
     /// The short human code the user enters at `verification_uri`.
     pub(crate) user_code: String,
     /// The URL the user visits to enter `user_code`.
     pub(crate) verification_uri: String,
     /// The minimum seconds between token polls, when the server specifies one.
     pub(crate) interval: Option<u64>,
+}
+
+impl std::fmt::Debug for DeviceCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCode")
+            .field("device_code", &"<redacted>")
+            .field("user_code", &self.user_code)
+            .field("verification_uri", &self.verification_uri)
+            .field("interval", &self.interval)
+            .finish()
+    }
 }
 
 /// The outcome of one device token poll.
@@ -110,7 +140,7 @@ pub(crate) fn ensure_secure(url: &str) -> Result<(), OAuthLoginError> {
 /// Build the shared agent: status responses are returned verbatim (a 400 token
 /// response is a normal, readable outcome), a global timeout bounds a hung
 /// provider, and redirects are never followed on these POSTs.
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(30)))
         .http_status_as_error(false)
@@ -159,7 +189,11 @@ fn hex_digit(nibble: u8) -> char {
 }
 
 /// Send a POST body with the given content type, returning the raw response.
-fn post(
+///
+/// The shared POST for every credential-bearing call: it vets the endpoint,
+/// sends `Accept: application/json`, and sets `Cache-Control: no-store` so a
+/// proxy never caches a body carrying a code or token.
+pub(crate) fn post(
     agent: &ureq::Agent,
     url: &str,
     content_type: &str,
@@ -197,12 +231,27 @@ pub(crate) fn read_token_response(
         )));
     };
     Ok(TokenSet {
-        access_token,
-        refresh_token: parsed.refresh_token,
-        id_token: parsed.id_token,
+        access_token: Zeroizing::new(access_token),
+        refresh_token: parsed.refresh_token.map(Zeroizing::new),
+        id_token: parsed.id_token.map(Zeroizing::new),
         token_type: parsed.token_type,
         scope: parsed.scope,
     })
+}
+
+/// The JSON authorization-code-exchange body.
+///
+/// A typed struct (rather than a `serde_json::Value`) serializes straight to
+/// the request body, so the authorization `code` and the `code_verifier` are
+/// never copied into an intermediate owned map that would hold a second copy of
+/// the secrets in memory.
+#[derive(Serialize)]
+struct CodeExchangeBody<'a> {
+    grant_type: &'static str,
+    code: &'a str,
+    redirect_uri: &'a str,
+    client_id: &'a str,
+    code_verifier: &'a str,
 }
 
 /// Exchange an authorization `code` for tokens (the PKCE code exchange).
@@ -243,14 +292,16 @@ pub(crate) fn exchange_code(
             )?
         }
         choreo_proto::OAuthGrantEncoding::Json => {
-            let object = serde_json::json!({
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": redirect_uri,
-                "client_id": client_id,
-                "code_verifier": code_verifier,
-            });
-            post(&agent, &url, "application/json", &object.to_string())?
+            let body = CodeExchangeBody {
+                grant_type: "authorization_code",
+                code,
+                redirect_uri,
+                client_id,
+                code_verifier,
+            };
+            let body =
+                serde_json::to_string(&body).map_err(|e| OAuthLoginError::Decode(e.to_string()))?;
+            post(&agent, &url, "application/json", &body)?
         }
     };
     read_token_response(response)
@@ -301,7 +352,7 @@ pub(crate) fn device_authorize(
         )));
     };
     Ok(DeviceCode {
-        device_code,
+        device_code: Zeroizing::new(device_code),
         user_code,
         verification_uri,
         interval: parsed.interval,
@@ -357,9 +408,9 @@ pub(crate) fn device_poll(
         .map_err(|e| OAuthLoginError::Decode(e.to_string()))?;
     if let Some(access_token) = parsed.access_token {
         return Ok(PollOutcome::Tokens(TokenSet {
-            access_token,
-            refresh_token: parsed.refresh_token,
-            id_token: parsed.id_token,
+            access_token: Zeroizing::new(access_token),
+            refresh_token: parsed.refresh_token.map(Zeroizing::new),
+            id_token: parsed.id_token.map(Zeroizing::new),
             token_type: parsed.token_type,
             scope: parsed.scope,
         }));

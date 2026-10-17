@@ -24,8 +24,11 @@
 //! `run`); the private `flow` module owns the two interactive flows (loopback
 //! PKCE and RFC 8628 device-code); the private `credential` module builds the
 //! durable [`ServiceCredential`](choreo_keystore::ServiceCredential) and its
-//! `AddCredential` frame from the exchanged tokens. The `pkce`, `jwt`, `url`, and
-//! `http` modules are the small primitives those two shells compose.
+//! `AddCredential` frame from the exchanged tokens; the private `mcp` module
+//! (split into `mcp::{mod,discovery,register,authorize}`) owns the remote
+//! MCP-server sign-in — RFC 9728/8414 discovery, dynamic client registration,
+//! and the same loopback PKCE flow. The `pkce`, `jwt`, `url`, and `http` modules
+//! are the small primitives those shells compose.
 //!
 //! The render crates never build an OAuth credential themselves: this library
 //! returns the `AddCredential` message so the credential's shape stays in one
