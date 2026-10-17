@@ -23,6 +23,15 @@
 /// A URL whose authority carries userinfo (an `@`, as in `user:pass@host`) is
 /// refused outright: RFC 3986 places the host *after* the `@`, so the real host
 /// is remote even when the text before the `@` names a loopback host.
+///
+/// The parse is deliberately conservative — it over-refuses rather than
+/// under-refuses, because a false negative only blocks a legitimate endpoint
+/// while a false positive would leak a secret. A loopback `http` URL whose
+/// authority is not immediately followed by a `/` (e.g. `http://localhost?x=1`,
+/// a query with no path) is therefore refused rather than accepted: the host is
+/// read from the text before the first `/`, and without one that text is the
+/// whole authority-plus-query. Real token and device endpoints carry a path, so
+/// this only ever affects a hand-written test endpoint.
 #[must_use]
 pub fn is_secure_endpoint(url: &str) -> bool {
     // Lowercase only enough to normalize the scheme and host; the path's case is
@@ -119,5 +128,15 @@ mod tests {
     fn loopback_with_a_port_is_still_secure() {
         assert!(is_secure_endpoint("http://localhost:8080/token"));
         assert!(is_secure_endpoint("http://[::1]:8080/token"));
+    }
+
+    #[test]
+    fn a_loopback_url_without_a_path_is_conservatively_refused() {
+        // The host is read before the first `/`; with no `/` the whole
+        // authority-and-query string is inspected, so a path-less loopback URL
+        // is refused rather than accepted. Over-refusal is the safe direction
+        // (it cannot leak a secret), and every real endpoint carries a path.
+        assert!(!is_secure_endpoint("http://localhost?x=1"));
+        assert!(!is_secure_endpoint("http://127.0.0.1?a=@b"));
     }
 }

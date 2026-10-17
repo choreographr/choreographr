@@ -57,7 +57,7 @@ fn build_credential(
         account_id: extract_account_id(tokens),
         client_id: Some(client_id.to_string()),
         client_secret: None,
-        granted_scopes: granted_scopes(tokens, descriptor),
+        granted_scopes: granted_scopes(tokens.scope.as_deref(), &descriptor.scopes),
         token_type: tokens
             .token_type
             .clone()
@@ -78,14 +78,15 @@ fn extract_account_id(tokens: &http::TokenSet) -> Option<String> {
     chatgpt_account_id(&claims)
 }
 
-/// The granted scopes: the token response's `scope` when present, else the
-/// descriptor's requested scopes.
-fn granted_scopes(tokens: &http::TokenSet, descriptor: &OAuthProviderDescriptor) -> Vec<String> {
-    match tokens.scope.as_deref() {
+/// The granted scopes: the token response's `scope` when present and non-empty,
+/// else the requested scopes. The one rule shared by the provider and MCP flows,
+/// so their credentials cannot disagree on how a response scope is read.
+pub(super) fn granted_scopes(scope: Option<&str>, fallback: &[String]) -> Vec<String> {
+    match scope {
         Some(scope) if !scope.trim().is_empty() => {
             scope.split_whitespace().map(str::to_string).collect()
         }
-        _ => descriptor.scopes.clone(),
+        _ => fallback.to_vec(),
     }
 }
 
@@ -150,11 +151,20 @@ mod tests {
     #[test]
     fn granted_scopes_prefers_the_response_then_the_descriptor() {
         let with_scope = tokens(None, "opaque", Some("a b"));
-        assert_eq!(granted_scopes(&with_scope, &descriptor()), ["a", "b"]);
+        assert_eq!(
+            granted_scopes(with_scope.scope.as_deref(), &descriptor().scopes),
+            ["a", "b"]
+        );
 
         let without = tokens(None, "opaque", None);
         assert_eq!(
-            granted_scopes(&without, &descriptor()),
+            granted_scopes(without.scope.as_deref(), &descriptor().scopes),
+            ["openid", "offline_access"]
+        );
+
+        // An empty/whitespace response scope falls back to the requested set.
+        assert_eq!(
+            granted_scopes(Some("  "), &descriptor().scopes),
             ["openid", "offline_access"]
         );
     }

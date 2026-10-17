@@ -11,7 +11,7 @@
 //! and ephemeral; it is deliberately dropped here and never placed in the
 //! credential (the daemon mints a fresh one when it needs it).
 //!
-//! The interactive flow runs on a **worker thread** and streams progress over a
+//! The interaction runs on a **worker thread** and streams progress over a
 //! crossbeam channel as [`LoginEvent`]s, so a UI can render a cancelable modal
 //! (the auth URL, a device code, a prompt) without blocking its own loop.
 //! Cancellation is a single lock-free [`AtomicBool`] the loopback accept loop
@@ -27,8 +27,8 @@
 //! `AddCredential` frame from the exchanged tokens; the private `mcp` module
 //! (split into `mcp::{mod,discovery,register,authorize}`) owns the remote
 //! MCP-server sign-in — RFC 9728/8414 discovery, dynamic client registration,
-//! and the same loopback PKCE flow. The `pkce`, `jwt`, `url`, and `http` modules
-//! are the small primitives those shells compose.
+//! and the same loopback PKCE flow. The `pkce` and `http` modules are the small
+//! primitives those shells compose.
 //!
 //! The render crates never build an OAuth credential themselves: this library
 //! returns the `AddCredential` message so the credential's shape stays in one
@@ -38,12 +38,10 @@ mod callback;
 mod credential;
 mod flow;
 mod http;
-mod jwt;
 mod mcp;
 mod pkce;
-mod url;
 
-pub use jwt::{chatgpt_account_id, decode_claims};
+pub use choreo_shared::oauth_claims::{chatgpt_account_id, decode_claims};
 pub use mcp::{McpLoginInfo, McpLoginOptions, start_mcp_login};
 pub use pkce::{challenge_s256, generate_state, generate_verifier, state_matches};
 

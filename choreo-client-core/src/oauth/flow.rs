@@ -8,6 +8,7 @@
 //! the API.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use choreo_proto::OAuthProviderDescriptor;
 use crossbeam_channel::{Receiver, Sender, after, select_biased};
@@ -112,11 +113,25 @@ pub(super) fn run_device(
     // The interval starts at the server's suggestion (defaulting to 5s) and is
     // bumped by 5s on each `slow_down`, per RFC 8628 §3.5.
     let mut interval = std::time::Duration::from_secs(code.interval.unwrap_or(5).max(1));
+    // The device code's own lifetime, when the server reported one, so the poll
+    // stops once it lapses even if the server never answers `expired_token`
+    // (otherwise a server that only ever replies `authorization_pending` would
+    // loop forever until the user cancels).
+    let deadline = code
+        .expires_in
+        .map(|secs| Instant::now() + std::time::Duration::from_secs(secs));
     // A transient transport error during the (minutes-long) poll must not abort
     // the flow: tolerate a short run of them before giving up, so a one-off blip
     // is retried but a permanently unreachable endpoint still fails.
     let mut transient_errors: u8 = 0;
     loop {
+        if let Some(deadline) = deadline
+            && Instant::now() >= deadline
+        {
+            return Err(OAuthLoginError::DeviceFlow(
+                "the device code expired before authorization".to_string(),
+            ));
+        }
         wait_interval(stop, interval, cancel)?;
         match http::device_poll(
             &descriptor.issuer,
@@ -211,14 +226,16 @@ fn build_authorize_url(
 ) -> Result<String, OAuthLoginError> {
     let endpoint = choreo_shared::url::join_path(&descriptor.issuer, &descriptor.authorize_path);
     http::ensure_secure(&endpoint)?;
-    let mut params: Vec<(String, String)> = vec![
-        ("response_type".to_string(), "code".to_string()),
-        ("client_id".to_string(), client_id.to_string()),
-        ("redirect_uri".to_string(), redirect_uri.to_string()),
-        ("scope".to_string(), descriptor.scopes.join(" ")),
-        ("state".to_string(), state.to_string()),
-        ("code_challenge".to_string(), code_challenge.to_string()),
-        ("code_challenge_method".to_string(), "S256".to_string()),
+    // The value pairs are borrowed, so the PKCE `state` is not copied.
+    let scope = descriptor.scopes.join(" ");
+    let mut params: Vec<(&str, &str)> = vec![
+        ("response_type", "code"),
+        ("client_id", client_id),
+        ("redirect_uri", redirect_uri),
+        ("scope", scope.as_str()),
+        ("state", state),
+        ("code_challenge", code_challenge),
+        ("code_challenge_method", "S256"),
     ];
     params.retain(|(_, value)| !value.is_empty());
     Ok(http::authorize_url(&endpoint, &params))

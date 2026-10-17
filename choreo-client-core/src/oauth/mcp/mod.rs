@@ -30,7 +30,7 @@ use choreo_proto::McpOAuthConfig;
 use crossbeam_channel::Sender;
 use tracing::warn;
 
-use super::{LoginEvent, LoginSession, OAuthLoginError, callback, http};
+use super::{LoginEvent, LoginSession, OAuthLoginError, callback, credential, http};
 use crate::credentials::build_add_credential_from_credential;
 
 mod authorize;
@@ -164,10 +164,7 @@ fn finish(
     tokens: &http::TokenSet,
     tx: &Sender<LoginEvent>,
 ) -> Result<(), OAuthLoginError> {
-    let granted_scopes = tokens.scope.as_deref().map_or_else(
-        || info.oauth.scopes.clone(),
-        |s| s.split_whitespace().map(str::to_string).collect(),
-    );
+    let granted_scopes = credential::granted_scopes(tokens.scope.as_deref(), &info.oauth.scopes);
     let credential = ServiceCredential::OAuth {
         kind: OAuthKind::Mcp,
         issuer: Some(server.issuer.clone()),

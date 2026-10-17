@@ -90,15 +90,16 @@ fn build_authorize_url(
     resource: &str,
 ) -> Result<String, OAuthLoginError> {
     http::ensure_secure(&server.authorization_endpoint)?;
-    let params = vec![
-        ("response_type".to_string(), "code".to_string()),
-        ("client_id".to_string(), client_id.to_string()),
-        ("redirect_uri".to_string(), redirect_uri.to_string()),
-        ("code_challenge".to_string(), challenge.to_string()),
-        ("code_challenge_method".to_string(), "S256".to_string()),
-        ("state".to_string(), state.to_string()),
-        ("scope".to_string(), scopes.join(" ")),
-        ("resource".to_string(), resource.to_string()),
+    let scope = scopes.join(" ");
+    let params = [
+        ("response_type", "code"),
+        ("client_id", client_id),
+        ("redirect_uri", redirect_uri),
+        ("code_challenge", challenge),
+        ("code_challenge_method", "S256"),
+        ("state", state),
+        ("scope", scope.as_str()),
+        ("resource", resource),
     ];
     Ok(http::authorize_url(&server.authorization_endpoint, &params))
 }
@@ -117,13 +118,13 @@ fn exchange_code(
     verifier: &str,
     resource: &str,
 ) -> Result<http::TokenSet, OAuthLoginError> {
-    let params = vec![
-        ("grant_type".to_string(), "authorization_code".to_string()),
-        ("code".to_string(), code.to_string()),
-        ("redirect_uri".to_string(), redirect_uri.to_string()),
-        ("client_id".to_string(), client_id.to_string()),
-        ("code_verifier".to_string(), verifier.to_string()),
-        ("resource".to_string(), resource.to_string()),
+    let params = [
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", redirect_uri),
+        ("client_id", client_id),
+        ("code_verifier", verifier),
+        ("resource", resource),
     ];
     let body = http::form_encode(&params);
     let response = http::post(

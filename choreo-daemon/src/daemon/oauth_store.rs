@@ -20,6 +20,15 @@ use choreo_keystore::{OAuthKind, ServiceCredential};
 use std::sync::mpsc;
 use tracing::{debug, info, warn};
 
+/// Whether the stored grant's refresh token still equals the one a refresh
+/// presented (or no expectation was recorded). Shared by the provider and MCP
+/// save handlers so their stale-rotation guards cannot drift.
+fn refresh_token_unchanged(stored: &ServiceCredential, expected: Option<&str>) -> bool {
+    expected.is_none_or(|expected| {
+        stored.as_oauth().and_then(|view| view.refresh_token) == Some(expected)
+    })
+}
+
 impl DaemonState {
     /// Persist a refreshed OAuth token: update the in-memory access-token cache
     /// and, when the exchange rotated the refresh token or refreshed the
@@ -64,41 +73,45 @@ impl DaemonState {
         // only thing that changes the durable blob; a plain expiry refresh
         // updates the in-memory access-token cache alone, so it costs no
         // re-encryption and no disk write.
-        if save.rotated_refresh_token.is_some() || save.new_account_id.is_some() {
-            // Guard against a credential replaced under us between the load and
-            // this save (a re-login or logout landing mid-exchange): the stored
-            // grant is a newer one, so rotating the refresh token onto it would
-            // clobber that grant with a value minted from the superseded token.
-            // Rotate only onto the credential the exchange actually loaded.
-            let unchanged = save.expected_refresh_token.is_none_or(|expected| {
-                current.as_oauth().and_then(|v| v.refresh_token) == Some(expected)
-            });
-            if unchanged {
-                let mut updated = current;
-                if let ServiceCredential::OAuth {
-                    refresh_token,
-                    account_id,
-                    ..
-                } = &mut updated
-                {
-                    if let Some(rotated) = save.rotated_refresh_token {
-                        *refresh_token = Some(rotated.to_string());
-                    }
-                    if let Some(new_id) = save.new_account_id {
-                        *account_id = Some(new_id.to_string());
-                    }
+        let rotation_requested =
+            save.rotated_refresh_token.is_some() || save.new_account_id.is_some();
+        // Guard against a credential replaced under us between the load and
+        // this save (a re-login or logout landing mid-exchange): the stored
+        // grant is a newer one, so rotating the refresh token onto it would
+        // clobber that grant with a value minted from the superseded token.
+        // Rotate only onto the credential the exchange actually loaded.
+        if rotation_requested && !refresh_token_unchanged(&current, save.expected_refresh_token) {
+            warn!(
+                account = %save.account,
+                "OAuth credential changed under the refresh; dropping the rotation"
+            );
+            // The newer grant owns the cache and the quarantine state: the
+            // access token obtained here was minted from the superseded refresh
+            // token, so do not overwrite the cache with it, and do not
+            // un-quarantine the account.
+            let _ = reply.send(Ok(()));
+            return;
+        }
+        if rotation_requested {
+            let mut updated = current;
+            if let ServiceCredential::OAuth {
+                refresh_token,
+                account_id,
+                ..
+            } = &mut updated
+            {
+                if let Some(rotated) = save.rotated_refresh_token {
+                    *refresh_token = Some(rotated.to_string());
                 }
-                if let Err(e) = self.encrypt_and_persist_credential(save.account, &updated) {
-                    let _ = reply.send(Err(e));
-                    return;
+                if let Some(new_id) = save.new_account_id {
+                    *account_id = Some(new_id.to_string());
                 }
-                self.credentials.insert(save.account.to_string(), updated);
-            } else {
-                warn!(
-                    account = %save.account,
-                    "OAuth credential changed under the refresh; dropping the rotation"
-                );
             }
+            if let Err(e) = self.encrypt_and_persist_credential(save.account, &updated) {
+                let _ = reply.send(Err(e));
+                return;
+            }
+            self.credentials.insert(save.account.to_string(), updated);
         }
         self.access_tokens.insert(
             save.account.to_string(),
@@ -174,12 +187,11 @@ impl DaemonState {
         // is newer, so persisting the rotated refresh token would clobber it.
         // Only apply the save when the stored refresh token is still the one the
         // refresh presented.
-        let current_token = self
-            .credentials
-            .get(key)
-            .and_then(ServiceCredential::as_oauth)
-            .and_then(|view| view.refresh_token);
-        if expected_refresh_token.is_some_and(|expected| current_token != Some(expected)) {
+        let changed = match self.credentials.get(key) {
+            Some(current) => !refresh_token_unchanged(current, expected_refresh_token),
+            None => false,
+        };
+        if changed {
             warn!(%key, "OAuthSave dropped: credential changed under the refresh");
             return;
         }
@@ -381,8 +393,9 @@ mod tests {
             .insert("acct".into(), provider_oauth_credential("old"));
         let access = Zeroizing::new("at".to_string());
 
-        // A mismatching expected token drops the durable rotation (but the
-        // access-token cache is still refreshed — the token is valid).
+        // A mismatching expected token means the credential was replaced by a
+        // re-login mid-refresh. The durable rotation is dropped AND the cache is
+        // left alone — the fresh token was minted from the superseded grant.
         let (reply, rx) = mpsc::channel();
         state.handle_save_oauth_token(
             SaveToken {
@@ -406,7 +419,10 @@ mod tests {
             Some("old"),
             "the superseded grant must not be clobbered"
         );
-        assert!(state.access_tokens.contains_key("acct"));
+        assert!(
+            !state.access_tokens.contains_key("acct"),
+            "the cache must not adopt a token from the superseded grant"
+        );
 
         // The matching expected token rotates the durable grant.
         let (reply, rx) = mpsc::channel();

@@ -251,6 +251,9 @@ impl CredentialStore for CredentialStoreAdapter {
         // single-flight refresh-lock registry, so a skipped save leaves that
         // key's entry lingering until the next save or clear — harmless, it is
         // an idle lock the next refresh reuses.
+        // A plain `==` (not constant-time) is deliberate: both operands are
+        // in-process secrets already resident in this task's memory, so there
+        // is no timing oracle for an attacker who could not already read them.
         if refresh_token.as_deref() == seed_refresh.as_deref() {
             tracing::debug!(
                 key = %self.key,

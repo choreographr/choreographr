@@ -170,6 +170,15 @@ pub(super) fn discover(agent: &ureq::Agent, resource: &str) -> Result<AuthServer
     fetch_as_metadata(agent, &authorization_server)
 }
 
+/// Whether an authorization-server metadata document carries the two endpoints
+/// the flow needs, as strings (a document that omits or mistypes them cannot be
+/// used, and the caller should try the next well-known candidate).
+fn has_required_endpoints(metadata: &Value) -> bool {
+    ["authorization_endpoint", "token_endpoint"]
+        .iter()
+        .all(|key| metadata.get(key).and_then(Value::as_str).is_some())
+}
+
 /// Fetch RFC 8414 / OIDC authorization-server metadata.
 pub(super) fn fetch_as_metadata(
     agent: &ureq::Agent,
@@ -180,8 +189,18 @@ pub(super) fn fetch_as_metadata(
     for candidate in authorization_server_candidates(authorization_server) {
         match get_json(agent, candidate.as_str()) {
             Ok(value) => {
-                metadata = Some(value);
-                break;
+                // A well-known document that exists but omits the required
+                // endpoints must not stop the search: some servers serve an
+                // empty RFC 8414 path-inserted document and the real endpoints
+                // only at the OIDC or root form, so continue to the next
+                // candidate rather than failing on the first 200.
+                if has_required_endpoints(&value) {
+                    metadata = Some(value);
+                    break;
+                }
+                last_error = OAuthLoginError::Decode(format!(
+                    "{candidate}: metadata has no authorization_endpoint/token_endpoint"
+                ));
             }
             Err(error) => last_error = error,
         }

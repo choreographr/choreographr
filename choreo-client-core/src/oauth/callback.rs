@@ -21,7 +21,7 @@ use crossbeam_channel::Sender;
 
 use super::LoginEvent;
 use super::OAuthLoginError;
-use super::url::parse_query;
+use choreo_shared::form::parse_query;
 
 /// The callback path the provider redirects to (the `ChatGPT`/Codex backend
 /// allow-lists `/auth/callback`).

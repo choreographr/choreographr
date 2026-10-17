@@ -7,6 +7,7 @@
 //! kept apart from the HTTP call so the form-vs-JSON contract is unit testable
 //! without a socket.
 
+use serde::Serialize;
 use zeroize::Zeroizing;
 
 use crate::catalog::GrantEncoding;
@@ -51,58 +52,64 @@ impl std::fmt::Debug for OAuthRefreshRequest<'_> {
     }
 }
 
+/// The JSON refresh body. A typed struct with borrowed fields serializes
+/// straight to the request body, so the refresh token and client secret are
+/// never copied into an intermediate owned `Value`/map that would hold a second
+/// copy of the secrets in memory. Mirrors the login path's `CodeExchangeBody`.
+#[derive(Serialize)]
+struct RefreshBody<'a> {
+    grant_type: &'static str,
+    refresh_token: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_secret: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<&'a str>,
+}
+
 /// Serialize a refresh request body per the endpoint's encoding.
 ///
 /// Kept separate from the HTTP call so the form-vs-JSON contract is unit
 /// testable without a socket. The returned body holds the refresh token, so it
-/// is wipe-on-drop. Visible to the parent module so `refresh_oauth_token` can
-/// build the POST body.
+/// is wipe-on-drop; both branches borrow the secrets straight from `request`,
+/// so no non-zeroizing copy of the refresh token or client secret exists at any
+/// point. Visible to the parent module so `refresh_oauth_token` can build the
+/// POST body.
 pub(super) fn encode_refresh_body(request: &OAuthRefreshRequest<'_>) -> Zeroizing<Vec<u8>> {
     // The spec's `scope` parameter is a space-delimited list; omitted when empty
     // (an empty scope asks for none and some servers reject it).
     let scope = request.scopes.join(" ");
+    let scope = (!scope.is_empty()).then_some(scope.as_str());
     match request.encoding {
         GrantEncoding::Form => {
-            // Build the pairs and hand them to the shared encoder, the same one
-            // the login path uses, so form escaping cannot drift between the
-            // two paths.
-            let mut params: Vec<(String, String)> = vec![
-                ("grant_type".to_string(), "refresh_token".to_string()),
-                (
-                    "refresh_token".to_string(),
-                    request.refresh_token.to_string(),
-                ),
+            // Build borrowed pairs and hand them to the shared encoder, the same
+            // one the login path uses, so form escaping cannot drift between the
+            // two paths — and no secret is copied to a temporary `String`.
+            let mut params: Vec<(&str, &str)> = vec![
+                ("grant_type", "refresh_token"),
+                ("refresh_token", request.refresh_token),
             ];
             if let Some(client_id) = request.client_id {
-                params.push(("client_id".to_string(), client_id.to_string()));
+                params.push(("client_id", client_id));
             }
             if let Some(client_secret) = request.client_secret {
-                params.push(("client_secret".to_string(), client_secret.to_string()));
+                params.push(("client_secret", client_secret));
             }
-            if !scope.is_empty() {
-                params.push(("scope".to_string(), scope.clone()));
+            if let Some(scope) = scope {
+                params.push(("scope", scope));
             }
             Zeroizing::new(choreo_shared::form::form_encode(&params).into_bytes())
         }
         GrantEncoding::Json => {
-            // Build the JSON object field-by-field; `serde_json::json!` would
-            // copy the secrets into an intermediate `Value`, so a small manual
-            // map keeps them in one place that zeroizes.
-            let mut map = serde_json::Map::new();
-            map.insert("grant_type".into(), "refresh_token".into());
-            map.insert("refresh_token".into(), request.refresh_token.into());
-            if let Some(client_id) = request.client_id {
-                map.insert("client_id".into(), client_id.into());
-            }
-            if let Some(client_secret) = request.client_secret {
-                map.insert("client_secret".into(), client_secret.into());
-            }
-            if !scope.is_empty() {
-                map.insert("scope".into(), scope.into());
-            }
-            Zeroizing::new(
-                serde_json::to_vec(&serde_json::Value::Object(map)).unwrap_or_else(|_| Vec::new()),
-            )
+            let body = RefreshBody {
+                grant_type: "refresh_token",
+                refresh_token: request.refresh_token,
+                client_id: request.client_id,
+                client_secret: request.client_secret,
+                scope,
+            };
+            Zeroizing::new(serde_json::to_vec(&body).unwrap_or_default())
         }
     }
 }

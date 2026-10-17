@@ -82,6 +82,9 @@ pub(crate) struct DeviceCode {
     pub(crate) verification_uri: String,
     /// The minimum seconds between token polls, when the server specifies one.
     pub(crate) interval: Option<u64>,
+    /// The lifetime of `device_code` in seconds, when the server specifies one;
+    /// the poll stops once it elapses even if the server never reports expiry.
+    pub(crate) expires_in: Option<u64>,
 }
 
 impl std::fmt::Debug for DeviceCode {
@@ -91,6 +94,7 @@ impl std::fmt::Debug for DeviceCode {
             .field("user_code", &self.user_code)
             .field("verification_uri", &self.verification_uri)
             .field("interval", &self.interval)
+            .field("expires_in", &self.expires_in)
             .finish()
     }
 }
@@ -111,9 +115,10 @@ pub(crate) enum PollOutcome {
 /// Append a form-encoded query to an authorization endpoint, choosing `&` when
 /// the endpoint already carries a query string. The one place the
 /// provider and MCP flows build an authorize URL, so the separator and encoding
-/// rules cannot drift between them.
+/// rules cannot drift between them. The parameters are borrowed, so a secret
+/// (the `state`) is never copied to a temporary owned string.
 #[must_use]
-pub(crate) fn authorize_url(endpoint: &str, params: &[(String, String)]) -> String {
+pub(crate) fn authorize_url(endpoint: &str, params: &[(&str, &str)]) -> String {
     let query = form_encode(params);
     let separator = if endpoint.contains('?') { '&' } else { '?' };
     format!("{endpoint}{separator}{query}")
@@ -253,15 +258,13 @@ pub(crate) fn exchange_code(
     let agent = agent();
     let response = match encoding {
         choreo_proto::OAuthGrantEncoding::Form => {
-            let pairs: Vec<(String, String)> = params
-                .iter()
-                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-                .collect();
+            // The pairs are borrowed straight from the caller, so the `code` and
+            // `code_verifier` are never copied into a temporary owned string.
             post(
                 &agent,
                 &url,
                 "application/x-www-form-urlencoded",
-                &form_encode(&pairs),
+                &form_encode(&params),
             )?
         }
         choreo_proto::OAuthGrantEncoding::Json => {
@@ -293,10 +296,7 @@ pub(crate) fn device_authorize(
     scope: &str,
 ) -> Result<DeviceCode, OAuthLoginError> {
     let url = choreo_shared::url::join_path(issuer, device_authorization_path);
-    let pairs = vec![
-        ("client_id".to_string(), client_id.to_string()),
-        ("scope".to_string(), scope.to_string()),
-    ];
+    let pairs = [("client_id", client_id), ("scope", scope)];
     let agent = agent();
     let response = post(
         &agent,
@@ -329,6 +329,7 @@ pub(crate) fn device_authorize(
         user_code,
         verification_uri,
         interval: parsed.interval,
+        expires_in: parsed.expires_in,
     })
 }
 
@@ -339,6 +340,7 @@ struct DeviceCodeResponse {
     user_code: Option<String>,
     verification_uri: Option<String>,
     interval: Option<u64>,
+    expires_in: Option<u64>,
     error: Option<String>,
     error_description: Option<String>,
 }
@@ -360,13 +362,10 @@ pub(crate) fn device_poll(
     device_code: &str,
 ) -> Result<PollOutcome, OAuthLoginError> {
     let url = choreo_shared::url::join_path(issuer, device_token_path);
-    let pairs = vec![
-        (
-            "grant_type".to_string(),
-            "urn:ietf:params:oauth:grant-type:device_code".to_string(),
-        ),
-        ("device_code".to_string(), device_code.to_string()),
-        ("client_id".to_string(), client_id.to_string()),
+    let pairs = [
+        ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+        ("device_code", device_code),
+        ("client_id", client_id),
     ];
     let agent = agent();
     let response = post(
@@ -407,7 +406,7 @@ mod tests {
 
     #[test]
     fn authorize_url_appends_query_with_the_right_separator() {
-        let params = vec![("state".to_string(), "s".to_string())];
+        let params = [("state", "s")];
         assert_eq!(
             authorize_url("https://as.example/authorize", &params),
             "https://as.example/authorize?state=s"
