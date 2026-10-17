@@ -166,7 +166,10 @@ impl CredentialStore for CredentialStoreAdapter {
         }
         let issuer = view.issuer.map(str::to_string);
         let client_id = view.client_id.map(str::to_string);
-        let refresh_token = view.refresh_token.map(str::to_string);
+        // The refresh token is a secret handed to `rmcp` below; keep our own
+        // handle to it wipe-on-drop (rmcp's `oauth2` token type does not
+        // zeroize, so that copy is out of our hands).
+        let refresh_token = view.refresh_token.map(|t| Zeroizing::new(t.to_string()));
         let granted_scopes = view.granted_scopes.to_vec();
         // Remember the durable non-token fields so a later `save` can re-persist
         // them (the token response carries none of these). The refresh token and
