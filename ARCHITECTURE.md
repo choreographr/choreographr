@@ -773,8 +773,8 @@ session proceeds on that cached bearer (the first request `401`s and drives the
 force-refresh path if it has actually expired) and only surfaces the refresh
 error when no cached token is available. The terminal notice is emitted exactly
 once per event because the daemon broadcasts only on the quarantine *transition*,
-deduplicating across
-concurrent sessions and retries. The new `InferenceError::OAuthReloginRequired`
+deduplicating across concurrent sessions and retries. The new
+`InferenceError::OAuthReloginRequired`
 variant and the `DaemonMessage::OAuthReloginRequired` broadcast amend the
 unreleased v9 changelog in `choreo-proto/src/frame.rs` (no version bump); the
 TUI surfaces the notice as a status line, GUI/IM as no-ops.
@@ -946,14 +946,13 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   support (or whenever the parameter is present), rejecting a mix-up before the
   code is exchanged. The check uses the same shared `issuers_match` as
   discovery, so a trailing-slash difference in how the server spells its issuer
-  does not force a needless re-login. The scopes requested follow the spec's precedence — the
-  configured `scopes`, else the challenge's `scope`, else the protected
-  resource's `scopes_supported`, else the authorization server's advertised
-  scopes — and the `scope` parameter is omitted when nothing applies. The
-  authorization endpoint taken from
-  the discovered metadata is vetted with the same policy
-  before the browser is opened, so a server advertising a cleartext remote
-  endpoint is refused.
+  does not force a needless re-login. The scopes requested follow the spec's
+  precedence — the configured `scopes`, else the challenge's `scope`, else the
+  protected resource's `scopes_supported`, else the authorization server's
+  advertised scopes — and the `scope` parameter is omitted when nothing
+  applies. The authorization endpoint taken from the discovered metadata is
+  vetted with the same policy before the browser is opened, so a server
+  advertising a cleartext remote endpoint is refused.
 
   The policy is **earned by the resource**: the flow computes a `HopPolicy` once
   from the resource URL and permits a loopback `http` hop only when the resource
