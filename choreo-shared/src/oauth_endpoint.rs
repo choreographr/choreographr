@@ -43,10 +43,13 @@ pub fn is_secure_endpoint(url: &str) -> bool {
     if authority.contains('@') {
         return false;
     }
-    // A bracketed IPv6 host (`[::1]:port`) is unwrapped, otherwise the host is up
-    // to the port colon.
+    // A bracketed IPv6 host (`[::1]:port`) is unwrapped; a bracket with no
+    // closing `]` is malformed and refused rather than read as the host.
     let host = if let Some(after_bracket) = authority.strip_prefix('[') {
-        after_bracket.split(']').next().unwrap_or_default()
+        match after_bracket.split_once(']') {
+            Some((inner, _rest)) => inner,
+            None => return false,
+        }
     } else {
         authority.split(':').next().unwrap_or_default()
     };
@@ -87,6 +90,15 @@ mod tests {
         assert!(!is_secure_endpoint("file:///etc/passwd"));
         assert!(!is_secure_endpoint(""));
         assert!(!is_secure_endpoint("auth.openai.com/token"));
+    }
+
+    #[test]
+    fn malformed_bracketed_host_is_refused() {
+        // A bracketed IPv6 authority with no closing `]` is malformed; it must
+        // not be read as the host `::1` and accepted.
+        assert!(!is_secure_endpoint("http://[::1/token"));
+        assert!(!is_secure_endpoint("http://[::1"));
+        assert!(!is_secure_endpoint("http://[localhost/token"));
     }
 
     #[test]
