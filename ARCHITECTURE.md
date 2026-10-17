@@ -767,9 +767,13 @@ The **failure taxonomy** classifies the token-endpoint response in
 `refresh_token_reused` (or any other non-retryable rejection) is **terminal** —
 the daemon quarantines the account (`DaemonState::dead_oauth`) so no further
 refresh is attempted, and broadcasts a single `OAuthReloginRequired` notice; a
-transport error, `429`, or `5xx` is **transient** and the request fails with the
-original error. The terminal notice is emitted exactly once per event because
-the daemon broadcasts only on the quarantine *transition*, deduplicating across
+transport error, `429`, or `5xx` is **transient** — a transient proactive
+failure does not fail the request when a cached access token is present: the
+session proceeds on that cached bearer (the first request `401`s and drives the
+force-refresh path if it has actually expired) and only surfaces the refresh
+error when no cached token is available. The terminal notice is emitted exactly
+once per event because the daemon broadcasts only on the quarantine *transition*,
+deduplicating across
 concurrent sessions and retries. The new `InferenceError::OAuthReloginRequired`
 variant and the `DaemonMessage::OAuthReloginRequired` broadcast amend the
 unreleased v9 changelog in `choreo-proto/src/frame.rs` (no version bump); the

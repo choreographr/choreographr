@@ -550,6 +550,12 @@ impl SessionState {
     /// leaves it) and builds the client HERE, on the session thread, so every
     /// socket it dials lands in `self.registry`.
     ///
+    /// A proactive OAuth refresh that fails transiently does not fail the
+    /// request when a cached access token is still available: the client is
+    /// built with that token and the normal 401 → force-refresh path takes
+    /// over if it has expired. Only a terminally dead grant, or a transient
+    /// failure with no cached token to fall back on, surfaces an error.
+    ///
     /// Error strings are the SAME user-facing messages the old daemon-side
     /// cache produced, so clients see identical guidance.
     pub(crate) fn resolve_provider(
@@ -613,19 +619,43 @@ impl SessionState {
                     }
                 }
                 Ok(_) => (config, auth),
-                Err(failure) => {
-                    // Surface a friendly, actionable message; a dead grant names
-                    // re-login (the daemon already broadcast the notice).
-                    let msg = match failure {
-                        crate::oauth_refresh::RefreshFailure::Terminal => {
-                            format!("OAuth grant for account '{name}' was rejected; sign in again")
+                Err(failure) => match failure {
+                    // A terminally dead grant names re-login (the daemon already
+                    // broadcast the notice): no token can revive it.
+                    crate::oauth_refresh::RefreshFailure::Terminal => {
+                        return Err(format!(
+                            "OAuth grant for account '{name}' was rejected; sign in again"
+                        ));
+                    }
+                    crate::oauth_refresh::RefreshFailure::Transient { detail } => {
+                        // A transient blip is not fatal while a cached access token
+                        // is still in hand: the refresh only fires when the token is
+                        // absent or within the expiry buffer, so a within-buffer
+                        // token is usually still valid server-side. Proceed with it —
+                        // the first request 401s and drives the force-refresh path if
+                        // it is genuinely expired. With no cached token there is no
+                        // bearer to try, so surface the refresh error instead.
+                        if matches!(
+                            auth,
+                            Some(crate::providers::ProviderAuth::OAuth {
+                                access_token: Some(_),
+                                ..
+                            })
+                        ) {
+                            tracing::warn!(
+                                session = ctx.session_id,
+                                account = %name,
+                                detail = %detail,
+                                "proactive OAuth refresh failed transiently; trying the cached access token"
+                            );
+                            (config, auth)
+                        } else {
+                            return Err(format!(
+                                "OAuth refresh for account '{name}' failed: {detail}"
+                            ));
                         }
-                        crate::oauth_refresh::RefreshFailure::Transient { detail } => {
-                            format!("OAuth refresh for account '{name}' failed: {detail}")
-                        }
-                    };
-                    return Err(msg);
-                }
+                    }
+                },
             }
         } else {
             (config, auth)

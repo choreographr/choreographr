@@ -558,3 +558,120 @@ fn unauthorized_refreshes_rebuilds_and_retries_once() {
     session_handle.join().expect("session thread panicked");
     daemon_handle.join().expect("fake daemon thread");
 }
+
+// ── Test 4: a transient proactive refresh falls back to the cached token ──
+
+#[test]
+#[ignore = "integration"]
+fn transient_proactive_refresh_falls_back_to_the_cached_token() {
+    // A cached access token that is inside the expiry buffer drives the
+    // proactive, pre-request refresh. The token endpoint answers 500 — a
+    // transient failure — so the session must fall through with the cached
+    // bearer rather than failing the whole request. The provider accepts it,
+    // proving the request proceeded on the cached token.
+    let _catalog = install_catalog();
+    let provider = MockProvider::start(vec![(
+        200,
+        "text/event-stream",
+        sse_text_stream("final answer"),
+    )]);
+    // Every token-endpoint call transiently fails (a 5xx is retryable, so it
+    // classifies as a `Transient` refresh failure, never a dead grant).
+    let token_stub = MockProvider::start(vec![(
+        500,
+        "application/json",
+        r#"{"error":"server_error"}"#.to_string(),
+    )]);
+
+    let provider_base = provider.base_url("v1");
+    let state = Arc::new(FakeDaemon {
+        provider_base: provider_base.clone(),
+        token_endpoint: token_stub.base_url("token"),
+        // A cached token whose reported expiry is already past: the proactive
+        // refresh fires, yet a bearer is still present to fall back on.
+        access_token: Mutex::new(Some("old-token".into())),
+        expires_at: Mutex::new(Some(0)),
+    });
+    let (daemon_tx, daemon_handle) = spawn_fake_daemon(Arc::clone(&state));
+
+    let (session_tx, session_rx) = crossbeam_channel::unbounded();
+    let cmd_tx = session_tx.clone();
+    let db = Arc::new(common::test_db());
+    let tool_registry = choreo_daemon::tools::ToolRegistry::new()
+        .build()
+        .into_shared();
+    let session_handle = std::thread::spawn(move || {
+        session_main(
+            &session_rx,
+            None,
+            choreo_ai_protocols::SocketRegistry::default(),
+            Some("oauth-acct".to_string()),
+            Some("openai".to_string()),
+            None,
+            &RequestContext {
+                cmd_tx,
+                session_id: 1,
+                db,
+                tool_registry,
+                daemon_tx,
+                max_turns: 0,
+                lag_limits: LagLimits::default(),
+                global_lag: Arc::new(AtomicUsize::new(0)),
+                substrate_credential: None,
+                warm_policy: WarmPolicy::default(),
+            },
+        );
+    });
+
+    let (tx, rx) = crossbeam_channel::unbounded::<DaemonMessage>();
+    session_tx
+        .send(SessionCommand::Attach {
+            client_id: ClientId::from_raw(11),
+            tx: SubscriberSink::new(tx),
+        })
+        .expect("attach");
+    session_tx
+        .send(SessionCommand::SetModel {
+            model: OAUTH_MODEL.to_string(),
+            reply: None,
+        })
+        .expect("set model");
+    session_tx
+        .send(SessionCommand::RunInput {
+            input: b"hello".to_vec(),
+            reply: None,
+        })
+        .expect("run input");
+
+    let answer = drain_answer(&rx);
+    assert_eq!(
+        answer, b"final answer",
+        "the request must proceed on the cached token despite the refresh blip"
+    );
+
+    // The provider saw exactly one request, carrying the CACHED bearer: the
+    // failed proactive refresh did not fail the request and did not rebuild the
+    // client with a fresh token.
+    let provider_requests = provider.requests();
+    assert_eq!(
+        provider_requests.len(),
+        1,
+        "the request must not be retried: the cached token was accepted"
+    );
+    assert_eq!(
+        provider_requests[0].header("authorization").unwrap_or(""),
+        "Bearer old-token",
+        "the request must carry the cached access token"
+    );
+    // The token endpoint was hit exactly once (the failed proactive refresh).
+    assert_eq!(
+        token_stub.requests().len(),
+        1,
+        "the proactive refresh must have been attempted exactly once"
+    );
+
+    session_tx.send(SessionCommand::Shutdown).expect("shutdown");
+    drop(session_tx);
+    session_handle.join().expect("session thread panicked");
+    daemon_handle.join().expect("fake daemon thread");
+}
