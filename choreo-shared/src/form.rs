@@ -8,6 +8,20 @@
 //! the mirror the callback parsers use, so a value encoded by one path decodes
 //! identically on another.
 
+/// Percent-encode a single `application/x-www-form-urlencoded` value, the exact
+/// escaping [`form_encode`] applies to each side of a pair.
+///
+/// Used to build the RFC 6749 §2.3.1 HTTP Basic credential for a confidential
+/// client, whose id and secret must be url-encoded before base64 rather than
+/// concatenated raw (a secret containing `:` or a space would otherwise
+/// corrupt the credential).
+#[must_use]
+pub fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    encode_into(&mut out, value);
+    out
+}
+
 /// Percent-encode key/value pairs into `application/x-www-form-urlencoded`,
 /// leaving the RFC 3986 unreserved set untouched and encoding a space as `%20`.
 ///
@@ -139,6 +153,14 @@ mod tests {
     #[test]
     fn form_encoding_of_no_pairs_is_empty() {
         assert_eq!(form_encode(&[]), "");
+    }
+
+    #[test]
+    fn single_value_encoding_matches_a_pair_side() {
+        // The single-value encoder applies the same escaping form_encode does to
+        // each side of a pair.
+        assert_eq!(percent_encode("a b/c=d:e"), "a%20b%2Fc%3Dd%3Ae");
+        assert_eq!(percent_encode("plain-_.~"), "plain-_.~");
     }
 
     #[test]

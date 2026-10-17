@@ -158,12 +158,13 @@ fn untrusting_a_project_keeps_the_stored_credential_row() {
 
 // ── A mock authorization server ──────────────────────────────────────────
 
-/// One parsed HTTP/1.1 request (the body is captured so the token endpoint can
-/// inspect the form it carries).
+/// One parsed HTTP/1.1 request (the body and the `Authorization` header are
+/// captured so the token endpoint can inspect the client authentication).
 struct Request {
     method: String,
     path: String,
     body: String,
+    authorization: Option<String>,
 }
 
 /// Read one HTTP/1.1 request off `stream`.
@@ -175,6 +176,7 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
     let method = parts.next()?.to_string();
     let path = parts.next()?.to_string();
     let mut length = 0usize;
+    let mut authorization = None;
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header).ok()? == 0 {
@@ -184,10 +186,12 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
         if header.is_empty() {
             break;
         }
-        if let Some((name, value)) = header.split_once(':')
-            && name.trim().eq_ignore_ascii_case("content-length")
-        {
-            length = value.trim().parse().unwrap_or(0);
+        if let Some((name, value)) = header.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                length = value.trim().parse().unwrap_or(0);
+            } else if name.trim().eq_ignore_ascii_case("authorization") {
+                authorization = Some(value.trim().to_string());
+            }
         }
     }
     // Drain the body so the response is written against a clean stream.
@@ -199,6 +203,7 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
         method,
         path,
         body: String::from_utf8_lossy(&body).into_owned(),
+        authorization,
     })
 }
 
@@ -219,15 +224,26 @@ struct MockAuthorizationServer {
     _join: std::thread::JoinHandle<()>,
 }
 
+/// How the mock authorization server authenticates the client at the token
+/// endpoint, and what it advertises in `token_endpoint_auth_methods_supported`.
+#[derive(Clone, Copy)]
+enum ClientAuthMode {
+    /// A public client: no client credential, and no advertised method.
+    Public,
+    /// `client_secret_post` only.
+    Post,
+    /// `client_secret_basic` only.
+    Basic,
+}
+
 impl MockAuthorizationServer {
-    /// Start the mock. `require_client_secret` makes the token endpoint accept a
-    /// code exchange only when it carries `client_secret=right-secret`
-    /// (`client_secret_post`) — a confidential-client authorization server
-    /// (Shopify Customer Accounts, Entra, Keycloak). `advertise_challenge` makes
-    /// the `/mcp` endpoint answer an unauthenticated request with a `401` and a
-    /// `WWW-Authenticate: Bearer resource_metadata="…"` challenge, so the sign-in
-    /// must discover the authorization server from the challenge.
-    fn start(require_client_secret: bool, advertise_challenge: bool) -> Self {
+    /// Start the mock. `client_auth` selects the advertised token-endpoint
+    /// client-authentication method and the credential the token endpoint
+    /// requires. `advertise_challenge` makes the `/mcp` endpoint answer an
+    /// unauthenticated request with a `401` and a
+    /// `WWW-Authenticate: Bearer resource_metadata="…"` challenge, so the
+    /// sign-in must discover the authorization server from the challenge.
+    fn start(client_auth: ClientAuthMode, advertise_challenge: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock AS");
         let origin = format!("http://{}", listener.local_addr().expect("addr"));
         let state = origin.clone();
@@ -236,7 +252,7 @@ impl MockAuthorizationServer {
                 let Ok(stream) = stream else { continue };
                 let origin = state.clone();
                 std::thread::spawn(move || {
-                    handle(stream, &origin, require_client_secret, advertise_challenge);
+                    handle(stream, &origin, client_auth, advertise_challenge);
                 });
             }
         });
@@ -248,15 +264,30 @@ impl MockAuthorizationServer {
     }
 }
 
-/// Serve one mock-authorization-server request. When `require_client_secret` is
-/// set, a token exchange without the expected `client_secret` is rejected
-/// (`401 invalid_client`), so a client that cannot authenticate a confidential
-/// client fails loudly. When `advertise_challenge` is set, the MCP endpoint
+/// Whether the token request authenticated the client as the server demands.
+fn client_auth_ok(mode: ClientAuthMode, request: &Request) -> bool {
+    match mode {
+        ClientAuthMode::Public => true,
+        ClientAuthMode::Post => request.body.contains("client_secret=right-secret"),
+        ClientAuthMode::Basic => {
+            use base64::Engine as _;
+            let expected = format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode("app-1:right-secret")
+            );
+            request.authorization.as_deref() == Some(expected.as_str())
+        }
+    }
+}
+
+/// Serve one mock-authorization-server request. `client_auth` decides the
+/// advertised `token_endpoint_auth_methods_supported` and the credential the
+/// token endpoint accepts. When `advertise_challenge` is set, the MCP endpoint
 /// answers an unauthenticated request with an RFC 9728 §5.1 challenge.
 fn handle(
     mut stream: TcpStream,
     origin: &str,
-    require_client_secret: bool,
+    client_auth: ClientAuthMode,
     advertise_challenge: bool,
 ) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
@@ -282,14 +313,21 @@ fn handle(
             .to_string();
             write_json(&mut stream, "200 OK", &body);
         }
-        // RFC 8414 authorization-server metadata.
+        // RFC 8414 authorization-server metadata, advertising the client-auth
+        // method this run expects.
         ("GET", "/.well-known/oauth-authorization-server") => {
+            let methods: &[&str] = match client_auth {
+                ClientAuthMode::Public => &[],
+                ClientAuthMode::Post => &["client_secret_post"],
+                ClientAuthMode::Basic => &["client_secret_basic"],
+            };
             let body = serde_json::json!({
                 "issuer": origin,
                 "authorization_endpoint": format!("{origin}/authorize"),
                 "token_endpoint": format!("{origin}/token"),
                 "registration_endpoint": format!("{origin}/register"),
                 "scopes_supported": ["openid", "offline_access"],
+                "token_endpoint_auth_methods_supported": methods,
             })
             .to_string();
             write_json(&mut stream, "200 OK", &body);
@@ -303,9 +341,9 @@ fn handle(
             );
         }
         // The PKCE code exchange; returns the durable grant. A confidential
-        // mode rejects an exchange that omits the client secret.
+        // mode rejects an exchange that does not carry the expected credential.
         ("POST", "/token") => {
-            if require_client_secret && !request.body.contains("client_secret=right-secret") {
+            if !client_auth_ok(client_auth, &request) {
                 write_json(
                     &mut stream,
                     "401 Unauthorized",
@@ -410,7 +448,7 @@ fn drive_login(info: McpLoginInfo) -> (String, ServiceCredential) {
 #[test]
 #[ignore = "integration: binds a local mock authorization server"]
 fn mcp_login_discovers_registers_and_exchanges_pkce() {
-    let mock = MockAuthorizationServer::start(false, false);
+    let mock = MockAuthorizationServer::start(ClientAuthMode::Public, false);
     let credential_key = "mcp:docs|abc123".to_string();
     let info = McpLoginInfo {
         slug: "docs".to_string(),
@@ -459,13 +497,14 @@ fn mcp_login_discovers_registers_and_exchanges_pkce() {
 
 /// A confidential-client sign-in: the authorization server is named explicitly
 /// (no protected-resource probing), the client is pre-registered (no dynamic
-/// registration), and the token endpoint accepts the exchange only when it
-/// carries the secret from the configured environment variable — which is sent
-/// (`client_secret_post`) and stored in the durable grant.
+/// registration), and the server advertises `client_secret_post` only, so the
+/// token endpoint accepts the exchange only when the body carries the secret
+/// from the configured environment variable — which is sent and stored in the
+/// durable grant.
 #[test]
 #[ignore = "integration: binds a local mock authorization server"]
 fn mcp_login_confidential_client_sends_secret() {
-    let mock = MockAuthorizationServer::start(true, false);
+    let mock = MockAuthorizationServer::start(ClientAuthMode::Post, false);
     let credential_key = "mcp:shopify|abc123".to_string();
     // SAFETY: nextest runs each test in its own process, and this is the only
     // setter of this variable, so no other test observes the mutation.
@@ -507,6 +546,41 @@ fn mcp_login_confidential_client_sends_secret() {
     assert_eq!(view.refresh_token, Some("rt-mock"));
 }
 
+/// A confidential-client sign-in against a server that advertises
+/// `client_secret_basic` only: the secret rides the HTTP Basic `Authorization`
+/// header (the token endpoint rejects it otherwise), and is stored for refresh.
+#[test]
+#[ignore = "integration: binds a local mock authorization server"]
+fn mcp_login_confidential_client_uses_basic_when_advertised() {
+    let mock = MockAuthorizationServer::start(ClientAuthMode::Basic, false);
+    let credential_key = "mcp:entra|abc123".to_string();
+    // SAFETY: nextest runs each test in its own process, and this is the only
+    // setter of this variable, so no other test observes the mutation.
+    unsafe { std::env::set_var("CHOREO_MCP_TEST_CLIENT_SECRET", "right-secret") };
+    let info = McpLoginInfo {
+        slug: "entra".to_string(),
+        resource: mock.mcp_url.clone(),
+        credential_key: credential_key.clone(),
+        oauth: WireOAuthConfig {
+            client_id: Some("app-1".to_string()),
+            callback_port: Some(0),
+            scopes: vec!["openid".to_string()],
+            authorization_server: Some(mock.origin.clone()),
+            client_secret_env: Some("CHOREO_MCP_TEST_CLIENT_SECRET".to_string()),
+        },
+    };
+    let (service, credential) = drive_login(info);
+    assert_eq!(service, credential_key);
+    let view = credential.as_oauth().expect("an OAuth credential");
+    assert_eq!(view.kind, OAuthKind::Mcp);
+    assert_eq!(
+        view.client_secret,
+        Some("right-secret"),
+        "the secret sent via HTTP Basic is stored for refresh"
+    );
+    assert_eq!(view.refresh_token, Some("rt-mock"));
+}
+
 /// Discovery from the `WWW-Authenticate` challenge (RFC 9728 §5.1): the MCP
 /// endpoint answers the unauthenticated probe with a `401` naming the
 /// protected-resource metadata URL, and the flow completes with neither a
@@ -515,7 +589,7 @@ fn mcp_login_confidential_client_sends_secret() {
 #[test]
 #[ignore = "integration: binds a local mock authorization server"]
 fn mcp_login_discovers_via_www_authenticate_challenge() {
-    let mock = MockAuthorizationServer::start(false, true);
+    let mock = MockAuthorizationServer::start(ClientAuthMode::Public, true);
     let credential_key = "mcp:linear|abc123".to_string();
     let info = McpLoginInfo {
         slug: "linear".to_string(),

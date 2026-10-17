@@ -99,13 +99,40 @@ pub(super) fn authorize(
     let _ = tx.send(LoginEvent::Progress {
         message: "Authorization received; exchanging the code for tokens…".to_string(),
     });
-    exchange_code(
-        &agent,
-        &ctx.server.token_endpoint,
-        &request,
-        &callback.code,
-        &verifier,
-    )
+    exchange_code(&agent, ctx.server, &request, &callback.code, &verifier)
+}
+
+/// How the token endpoint authenticates the client (RFC 6749 §2.3.1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClientAuth {
+    /// No client credential: a public client sends its `client_id` in the body.
+    None,
+    /// `client_secret_post`: the id and secret ride the request body.
+    Post,
+    /// `client_secret_basic`: the id and secret ride an HTTP Basic header.
+    Basic,
+}
+
+/// Choose the token-endpoint client authentication from the methods the
+/// authorization server advertises.
+///
+/// The rule matches the RFC 6749 §2.3.1 default (and the runtime refresh path,
+/// `rmcp`): HTTP Basic unless the server advertises `client_secret_post` and
+/// **not** `client_secret_basic`. A server that advertises neither (or the
+/// field absent) gets Basic, the OAuth default; a public client — no secret —
+/// sends no client credential at all.
+fn client_auth_method(server: &AuthServer, has_secret: bool) -> ClientAuth {
+    if !has_secret {
+        return ClientAuth::None;
+    }
+    let methods = &server.token_endpoint_auth_methods_supported;
+    let has_post = methods.iter().any(|m| m == "client_secret_post");
+    let has_basic = methods.iter().any(|m| m == "client_secret_basic");
+    if has_post && !has_basic {
+        ClientAuth::Post
+    } else {
+        ClientAuth::Basic
+    }
 }
 
 /// Build the authorization URL with PKCE S256 and the resource indicator.
@@ -149,47 +176,73 @@ fn build_authorize_url(
 
 /// Exchange the authorization code at the token endpoint (form-encoded).
 ///
-/// Routed through the shared [`http::post`] so the request carries the same
-/// `Accept`, `Cache-Control: no-store`, and redirect policy as the provider
-/// flow.
+/// Routed through the shared [`http::post_with_basic_auth`] so the request
+/// carries the same `Accept`, `Cache-Control: no-store`, and redirect policy as
+/// the provider flow, and so a confidential client can authenticate with HTTP
+/// Basic when the server prefers it.
+///
+/// # Errors
+///
+/// Returns [`OAuthLoginError`] on an insecure endpoint, a network failure, a
+/// malformed body, or an OAuth error from the authorization server.
 fn exchange_code(
     agent: &ureq::Agent,
-    token_endpoint: &str,
+    server: &AuthServer,
     request: &CodeRequest<'_>,
     code: &str,
     verifier: &str,
 ) -> Result<http::TokenSet, OAuthLoginError> {
-    let params = code_exchange_pairs(request, code, verifier);
+    let auth = client_auth_method(server, request.client_secret.is_some());
+    let params = code_exchange_pairs(request, code, verifier, auth);
     let body = http::form_encode(&params);
-    let response = http::post(
+    // `client_secret_basic` puts the credential in the header; `client_secret_post`
+    // already carries it in `params`.
+    let basic = match auth {
+        ClientAuth::Basic => request
+            .client_secret
+            .map(|secret| (request.client_id, secret)),
+        ClientAuth::None | ClientAuth::Post => None,
+    };
+    let response = http::post_with_basic_auth(
         agent,
-        token_endpoint,
+        &server.token_endpoint,
         "application/x-www-form-urlencoded",
         &body,
         request.policy,
+        basic,
     )?;
     http::read_token_response(response)
 }
 
-/// The form pairs for the authorization-code exchange. A confidential client's
-/// secret is added as `client_secret` (`client_secret_post`) when one applies; a
-/// public client sends none. Extracted so the presence/absence of the secret is
-/// unit-testable without a network call.
+/// The form pairs for the authorization-code exchange.
+///
+/// A `client_secret_basic` request carries the client id in the `Authorization`
+/// header (RFC 6749 §2.3.1 forbids two client-auth methods in one request), so
+/// its body omits `client_id`; `client_secret_post` puts both id and secret in
+/// the body, and a public client sends the id alone. Extracted so the
+/// presence/absence of the secret is unit-testable without a network call.
 fn code_exchange_pairs<'a>(
     request: &CodeRequest<'a>,
     code: &'a str,
     verifier: &'a str,
+    auth: ClientAuth,
 ) -> Vec<(&'a str, &'a str)> {
     let mut params = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
         ("redirect_uri", request.redirect_uri),
-        ("client_id", request.client_id),
         ("code_verifier", verifier),
         ("resource", request.resource),
     ];
-    if let Some(secret) = request.client_secret {
-        params.push(("client_secret", secret));
+    match auth {
+        ClientAuth::Basic => {}
+        ClientAuth::Post => {
+            params.push(("client_id", request.client_id));
+            if let Some(secret) = request.client_secret {
+                params.push(("client_secret", secret));
+            }
+        }
+        ClientAuth::None => params.push(("client_id", request.client_id)),
     }
     params
 }
@@ -205,6 +258,7 @@ mod tests {
             token_endpoint: "https://as.example/token".to_string(),
             registration_endpoint: None,
             scopes_supported: vec!["openid".to_string()],
+            token_endpoint_auth_methods_supported: Vec::new(),
             challenge_scope: None,
             resource_scopes_supported: Vec::new(),
             authorization_response_iss_parameter_supported: false,
@@ -227,19 +281,52 @@ mod tests {
     }
 
     #[test]
-    fn code_exchange_pairs_include_client_secret_when_present() {
+    fn code_exchange_pairs_follow_the_client_auth_method() {
         let mut req = request("https://example.com/mcp", true);
         req.client_secret = Some("s3cret");
-        let pairs = code_exchange_pairs(&req, "the-code", "the-verifier");
-        assert!(pairs.contains(&("client_secret", "s3cret")));
-        // A public client (no secret) sends no client_secret pair.
+
+        // client_secret_post: id and secret ride the body.
+        let post = code_exchange_pairs(&req, "the-code", "the-verifier", ClientAuth::Post);
+        assert!(post.contains(&("client_id", "client-1")));
+        assert!(post.contains(&("client_secret", "s3cret")));
+
+        // client_secret_basic: neither id nor secret rides the body (they go in
+        // the Authorization header).
+        let basic = code_exchange_pairs(&req, "the-code", "the-verifier", ClientAuth::Basic);
+        assert!(!basic.iter().any(|(k, _)| *k == "client_id"));
+        assert!(!basic.iter().any(|(k, _)| *k == "client_secret"));
+
+        // A public client sends its id (no secret) in the body.
         req.client_secret = None;
-        let pairs = code_exchange_pairs(&req, "the-code", "the-verifier");
-        assert!(!pairs.iter().any(|(k, _)| *k == "client_secret"));
+        let public = code_exchange_pairs(&req, "the-code", "the-verifier", ClientAuth::None);
+        assert!(public.contains(&("client_id", "client-1")));
+        assert!(!public.iter().any(|(k, _)| *k == "client_secret"));
+
         // The mandatory pairs are always present.
-        assert!(pairs.contains(&("grant_type", "authorization_code")));
-        assert!(pairs.contains(&("code", "the-code")));
-        assert!(pairs.contains(&("code_verifier", "the-verifier")));
+        assert!(post.contains(&("grant_type", "authorization_code")));
+        assert!(post.contains(&("code", "the-code")));
+        assert!(post.contains(&("code_verifier", "the-verifier")));
+    }
+
+    #[test]
+    fn client_auth_method_follows_the_advertised_methods() {
+        let mut srv = server("https://as.example/authorize");
+        // Nothing advertised: HTTP Basic, the RFC 6749 §2.3.1 default.
+        assert_eq!(client_auth_method(&srv, true), ClientAuth::Basic);
+        // post-only → Post.
+        srv.token_endpoint_auth_methods_supported = vec!["client_secret_post".to_string()];
+        assert_eq!(client_auth_method(&srv, true), ClientAuth::Post);
+        // Both advertised → Basic (the OAuth default; matches the refresh path).
+        srv.token_endpoint_auth_methods_supported = vec![
+            "client_secret_post".to_string(),
+            "client_secret_basic".to_string(),
+        ];
+        assert_eq!(client_auth_method(&srv, true), ClientAuth::Basic);
+        // basic-only → Basic.
+        srv.token_endpoint_auth_methods_supported = vec!["client_secret_basic".to_string()];
+        assert_eq!(client_auth_method(&srv, true), ClientAuth::Basic);
+        // A public client (no secret) sends no client credential at all.
+        assert_eq!(client_auth_method(&srv, false), ClientAuth::None);
     }
 
     #[test]

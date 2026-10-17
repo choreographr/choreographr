@@ -233,7 +233,9 @@ pub(crate) fn agent() -> ureq::Agent {
 ///
 /// The shared POST for every credential-bearing call: it vets the endpoint,
 /// sends `Accept: application/json`, and sets `Cache-Control: no-store` so a
-/// proxy never caches a body carrying a code or token.
+/// proxy never caches a body carrying a code or token. The client is not
+/// authenticated; use [`post_with_basic_auth`] for a confidential client's
+/// token-endpoint exchange.
 pub(crate) fn post(
     agent: &ureq::Agent,
     url: &str,
@@ -241,16 +243,56 @@ pub(crate) fn post(
     body: &str,
     policy: HopPolicy,
 ) -> Result<ureq::http::Response<ureq::Body>, OAuthLoginError> {
+    post_with_basic_auth(agent, url, content_type, body, policy, None)
+}
+
+/// As [`post`], additionally authenticating the client with the RFC 6749 §2.3.1
+/// HTTP Basic credential (`client_secret_basic`) when `basic` is set.
+///
+/// The credential is built from the client id and secret — url-encoded
+/// separately, then `id:secret`, then base64 — and set as the `Authorization`
+/// header; the caller omits `client_id`/`client_secret` from `body` in that
+/// case (RFC 6749 forbids two client-auth methods in one request).
+pub(crate) fn post_with_basic_auth(
+    agent: &ureq::Agent,
+    url: &str,
+    content_type: &str,
+    body: &str,
+    policy: HopPolicy,
+    basic: Option<(&str, &str)>,
+) -> Result<ureq::http::Response<ureq::Body>, OAuthLoginError> {
     policy.check(url)?;
-    agent
+    let mut request = agent
         .post(url)
         .header("Content-Type", content_type)
         .header("Accept", "application/json")
         // These POSTs carry a code or device code; never let a redirect replay
         // them at another host.
-        .header("Cache-Control", "no-store")
+        .header("Cache-Control", "no-store");
+    if let Some((client_id, client_secret)) = basic {
+        let authorization = basic_authorization(client_id, client_secret);
+        request = request.header("Authorization", authorization.as_str());
+    }
+    request
         .send(body.as_bytes())
         .map_err(|e| OAuthLoginError::Network(e.to_string()))
+}
+
+/// The RFC 6749 §2.3.1 HTTP Basic credential for a confidential client: the
+/// client id and secret url-encoded separately, joined with `:`, and base64.
+///
+/// The intermediate `id:secret` buffer and the returned header value are
+/// wipe-on-drop ([`Zeroizing`]), so the client secret is not left in a plain
+/// `String` in freed memory.
+fn basic_authorization(client_id: &str, client_secret: &str) -> Zeroizing<String> {
+    use base64::Engine as _;
+    let credential = Zeroizing::new(format!(
+        "{}:{}",
+        choreo_shared::form::percent_encode(client_id),
+        choreo_shared::form::percent_encode(client_secret)
+    ));
+    let encoded = base64::engine::general_purpose::STANDARD.encode(credential.as_bytes());
+    Zeroizing::new(format!("Basic {encoded}"))
 }
 
 /// Interpret a token endpoint's response body, mapping an OAuth `error` to a
@@ -549,5 +591,24 @@ mod tests {
         assert!(ensure_secure("http://localhost:8080/token").is_ok());
         assert!(ensure_secure("http://[::1]:8080/token").is_ok());
         assert!(ensure_secure("http://evil.example/token").is_err());
+    }
+
+    #[test]
+    fn basic_authorization_encodes_the_rfc_6749_credential() {
+        use base64::Engine as _;
+        // RFC 6749 §2.3.1: the id and secret are url-encoded separately, joined
+        // with ':', then base64. `app-1:right-secret` carries no reserved bytes,
+        // so it is the raw concatenation.
+        assert_eq!(
+            basic_authorization("app-1", "right-secret").as_str(),
+            "Basic YXBwLTE6cmlnaHQtc2VjcmV0"
+        );
+        // A secret with reserved bytes is url-encoded first, so a ':' in it can
+        // never be read as the id/secret separator.
+        let expected = base64::engine::general_purpose::STANDARD.encode("id:a%3Ab%20c");
+        assert_eq!(
+            basic_authorization("id", "a:b c").as_str(),
+            format!("Basic {expected}")
+        );
     }
 }

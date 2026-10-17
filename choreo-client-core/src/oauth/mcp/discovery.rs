@@ -35,6 +35,12 @@ pub(super) struct AuthServer {
     pub(super) registration_endpoint: Option<String>,
     /// The scopes the server advertises support for.
     pub(super) scopes_supported: Vec<String>,
+    /// The token-endpoint client-authentication methods the server advertises
+    /// (`token_endpoint_auth_methods_supported`), used to choose how a
+    /// confidential client authenticates at the code exchange (RFC 6749
+    /// §2.3.1). Empty when the server advertises none, in which case HTTP Basic
+    /// is the RFC default.
+    pub(super) token_endpoint_auth_methods_supported: Vec<String>,
     /// The scopes named by the `WWW-Authenticate` challenge (`scope="…"`, RFC
     /// 6750 §3), when the server demanded them. Preferred over every other
     /// source in the scope-selection strategy.
@@ -262,9 +268,15 @@ pub(super) fn discover(
 
 /// The `scopes_supported` list of a metadata document, as strings.
 fn scopes_from(value: &Value) -> Vec<String> {
+    string_array(value, "scopes_supported")
+}
+
+/// The string entries of a metadata document's array field, dropping a missing
+/// field and any non-string entry.
+fn string_array(value: &Value, key: &str) -> Vec<String> {
     value
-        .get("scopes_supported")
-        .and_then(|v| v.as_array())
+        .get(key)
+        .and_then(Value::as_array)
         .map_or_else(Vec::new, |a| {
             a.iter()
                 .filter_map(|v| v.as_str().map(str::to_string))
@@ -342,6 +354,8 @@ pub(super) fn fetch_as_metadata(
     let issuer = string("issuer").unwrap_or_else(|| authorization_server.to_string());
     validate_issuer(&issuer, authorization_server)?;
     let scopes_supported = scopes_from(&metadata);
+    let token_endpoint_auth_methods_supported =
+        string_array(&metadata, "token_endpoint_auth_methods_supported");
     let authorization_response_iss_parameter_supported = metadata
         .get("authorization_response_iss_parameter_supported")
         .and_then(serde_json::Value::as_bool)
@@ -352,6 +366,7 @@ pub(super) fn fetch_as_metadata(
         token_endpoint,
         registration_endpoint: string("registration_endpoint"),
         scopes_supported,
+        token_endpoint_auth_methods_supported,
         // Filled by `discover` from the resource's metadata / the challenge.
         challenge_scope: None,
         resource_scopes_supported: Vec::new(),

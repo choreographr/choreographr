@@ -109,6 +109,7 @@ mod tests {
             token_endpoint: "https://as.example/token".to_string(),
             registration_endpoint: Some("https://as.example/register".to_string()),
             scopes_supported: advertised.iter().map(ToString::to_string).collect(),
+            token_endpoint_auth_methods_supported: Vec::new(),
             challenge_scope: challenge.map(|s| s.iter().map(ToString::to_string).collect()),
             resource_scopes_supported: resource.iter().map(ToString::to_string).collect(),
             authorization_response_iss_parameter_supported: false,
