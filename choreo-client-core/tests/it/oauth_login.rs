@@ -199,7 +199,6 @@ fn loopback_flow_exchanges_and_builds_a_provider_credential() {
         LoginOptions {
             account: "mock-account".into(),
             no_browser: true,
-            print_auth_url: false,
             callback_url: None,
             device: false,
         },
@@ -249,7 +248,6 @@ fn device_flow_polls_until_authorized() {
         LoginOptions {
             account: "mock-account".into(),
             no_browser: true,
-            print_auth_url: false,
             callback_url: None,
             device: true,
         },
@@ -290,7 +288,6 @@ fn cancelling_the_loopback_flow_stops_the_wait() {
         LoginOptions {
             account: "mock-account".into(),
             no_browser: true,
-            print_auth_url: false,
             callback_url: None,
             device: false,
         },

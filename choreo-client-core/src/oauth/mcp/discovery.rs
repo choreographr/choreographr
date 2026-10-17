@@ -36,18 +36,49 @@ pub(super) struct AuthServer {
     pub(super) scopes_supported: Vec<String>,
 }
 
-/// Fetch and parse an `https` (or loopback `http`) JSON document.
+/// The most redirects a discovery GET will follow. Each hop is re-vetted with
+/// the endpoint policy, so a redirect cannot steer the fetch onto a non-`https`
+/// remote host.
+const MAX_DISCOVERY_REDIRECTS: usize = 5;
+
+/// Fetch and parse an `https` (or loopback `http`) JSON document, following a
+/// small, bounded number of redirects — **re-vetting every hop** with
+/// [`http::ensure_secure`] before it is dialed, so a redirect cannot downgrade
+/// the fetch to cleartext. The caller's `discovery_agent` follows no redirects
+/// itself, which is what lets this loop police each target.
 fn get_json(agent: &ureq::Agent, url: &str) -> Result<Value, OAuthLoginError> {
-    http::ensure_secure(url)?;
-    let response = agent
-        .get(url)
-        .header("Accept", "application/json")
-        .call()
-        .map_err(|e| OAuthLoginError::Network(e.to_string()))?;
-    response
-        .into_body()
-        .read_json()
-        .map_err(|e| OAuthLoginError::Decode(format!("{url}: {e}")))
+    let mut current = parse_url(url, "discovery")?;
+    for _ in 0..=MAX_DISCOVERY_REDIRECTS {
+        http::ensure_secure(current.as_str())?;
+        let response = agent
+            .get(current.as_str())
+            .header("Accept", "application/json")
+            .call()
+            .map_err(|e| OAuthLoginError::Network(e.to_string()))?;
+        if response.status().is_redirection() {
+            // A credential-free metadata GET may redirect (e.g. to a tenant
+            // host); resolve the `Location` against the current URL and loop so
+            // the next hop is vetted before it is sent.
+            let target = response
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| {
+                    OAuthLoginError::Decode(format!("{current}: redirect with no Location header"))
+                })?;
+            current = current.join(target).map_err(|e| {
+                OAuthLoginError::Decode(format!("{current}: bad redirect target ({e})"))
+            })?;
+            continue;
+        }
+        return response
+            .into_body()
+            .read_json()
+            .map_err(|e| OAuthLoginError::Decode(format!("{current}: {e}")));
+    }
+    Err(OAuthLoginError::Decode(format!(
+        "{url}: too many redirects"
+    )))
 }
 
 /// Parse `raw` into a URL, naming `what` in the failure for a readable error.

@@ -8,8 +8,9 @@
 //! per-endpoint encoding — the code exchange and the refresh can differ (the
 //! `ChatGPT`/Codex backend accepts a form-encoded code exchange but a JSON
 //! refresh). No redirects are followed on these credential-bearing POSTs; the
-//! credential-free discovery GETs use a separate agent that follows a small,
-//! bounded number of redirects (see [`discovery_agent`]).
+//! credential-free discovery GETs use a separate agent that follows **no**
+//! redirects itself, and the discovery caller follows a bounded number of hops,
+//! re-vetting each with the endpoint policy (see [`discovery_agent`]).
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -19,24 +20,12 @@ use zeroize::Zeroizing;
 // here so `http::form_encode` stays the call site for both this module and the
 // MCP login submodules.
 pub(crate) use choreo_shared::form::form_encode;
+// The token-endpoint success/error body is the one shape `choreo-shared` parses,
+// so a token reply is read the same way by this login library and the runtime
+// refresh client (`choreo-ai-protocols`).
+use choreo_shared::oauth_token::{TokenResponse, parse};
 
 use super::OAuthLoginError;
-
-/// The token endpoint's success/error body.
-///
-/// A success and an OAuth error are the same JSON shape discriminated by which
-/// field is present, so one struct reads both: `access_token` on success, or
-/// `error`/`error_description` on failure.
-#[derive(Debug, Deserialize)]
-struct TokenResponse {
-    access_token: Option<String>,
-    refresh_token: Option<String>,
-    id_token: Option<String>,
-    token_type: Option<String>,
-    scope: Option<String>,
-    error: Option<String>,
-    error_description: Option<String>,
-}
 
 /// The tokens returned by an authorization-code or device-code exchange.
 ///
@@ -151,17 +140,17 @@ pub(crate) fn agent() -> ureq::Agent {
 }
 
 /// Build the agent for the credential-free **discovery** GETs (the RFC 9728 /
-/// 8414 well-known metadata fetches). Unlike [`agent`] it follows a small,
-/// bounded number of redirects, because an authorization server may redirect a
-/// well-known document (e.g. to a tenant host) and no secret rides a GET. Only
-/// the initial URL is vetted with the endpoint policy; redirect targets are
-/// bounded but not re-vetted, which is acceptable because a metadata document
-/// carries no credential.
+/// 8414 well-known metadata fetches). It follows **no** redirects itself; the
+/// discovery caller follows a small, bounded number of redirects, re-vetting
+/// each hop with the endpoint policy so a redirect cannot downgrade the fetch to
+/// cleartext (see `mcp::discovery::get_json`). A metadata document carries no
+/// credential, but the redirect target is still policed so discovery cannot be
+/// steered onto a non-`https` host.
 pub(crate) fn discovery_agent() -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(30)))
         .http_status_as_error(false)
-        .max_redirects(5)
+        .max_redirects(0)
         .build();
     ureq::Agent::new_with_config(config)
 }
@@ -195,10 +184,15 @@ pub(crate) fn read_token_response(
     response: ureq::http::Response<ureq::Body>,
 ) -> Result<TokenSet, OAuthLoginError> {
     let status = response.status();
-    let parsed: TokenResponse = response
-        .into_body()
-        .read_json()
-        .map_err(|e| OAuthLoginError::Decode(e.to_string()))?;
+    // The body carries the freshly minted access/refresh/id tokens, so it is
+    // wipe-on-drop rather than left in a plain `String` in freed memory.
+    let body = Zeroizing::new(
+        response
+            .into_body()
+            .read_to_string()
+            .map_err(|e| OAuthLoginError::Decode(e.to_string()))?,
+    );
+    let parsed: TokenResponse = parse(body.as_str());
     if let Some(error) = parsed.error {
         let description = parsed.error_description.unwrap_or_default();
         return Err(OAuthLoginError::TokenEndpoint { error, description });
@@ -256,17 +250,14 @@ pub(crate) fn exchange_code(
         ("code_verifier", code_verifier),
     ];
     let agent = agent();
-    let response = match encoding {
-        choreo_proto::OAuthGrantEncoding::Form => {
-            // The pairs are borrowed straight from the caller, so the `code` and
-            // `code_verifier` are never copied into a temporary owned string.
-            post(
-                &agent,
-                &url,
-                "application/x-www-form-urlencoded",
-                &form_encode(&params),
-            )?
-        }
+    // The body carries the authorization `code` and PKCE `code_verifier`, so
+    // both branches build it wipe-on-drop; the pairs are borrowed straight from
+    // the caller, so no non-zeroizing copy of a secret survives the request.
+    let (content_type, body) = match encoding {
+        choreo_proto::OAuthGrantEncoding::Form => (
+            "application/x-www-form-urlencoded",
+            Zeroizing::new(form_encode(&params)),
+        ),
         choreo_proto::OAuthGrantEncoding::Json => {
             let body = CodeExchangeBody {
                 grant_type: "authorization_code",
@@ -275,21 +266,31 @@ pub(crate) fn exchange_code(
                 client_id,
                 code_verifier,
             };
-            let body =
-                serde_json::to_string(&body).map_err(|e| OAuthLoginError::Decode(e.to_string()))?;
-            post(&agent, &url, "application/json", &body)?
+            (
+                "application/json",
+                Zeroizing::new(
+                    serde_json::to_string(&body)
+                        .map_err(|e| OAuthLoginError::Decode(e.to_string()))?,
+                ),
+            )
         }
     };
+    let response = post(&agent, &url, content_type, &body)?;
     read_token_response(response)
 }
 
 /// Request a device code (`usercode`) for the RFC 8628 headless flow.
+///
+/// Takes the already-built `agent` so the device-code wait reuses one
+/// connection pool across every poll instead of rebuilding an agent per
+/// iteration.
 ///
 /// # Errors
 ///
 /// Returns [`OAuthLoginError`] on an insecure endpoint, a network failure, a
 /// malformed body, or an OAuth error from the provider.
 pub(crate) fn device_authorize(
+    agent: &ureq::Agent,
     issuer: &str,
     device_authorization_path: &str,
     client_id: &str,
@@ -297,18 +298,19 @@ pub(crate) fn device_authorize(
 ) -> Result<DeviceCode, OAuthLoginError> {
     let url = choreo_shared::url::join_path(issuer, device_authorization_path);
     let pairs = [("client_id", client_id), ("scope", scope)];
-    let agent = agent();
-    let response = post(
-        &agent,
-        &url,
-        "application/x-www-form-urlencoded",
-        &form_encode(&pairs),
-    )?;
+    let body = Zeroizing::new(form_encode(&pairs));
+    let response = post(agent, &url, "application/x-www-form-urlencoded", &body)?;
     let status = response.status();
-    let parsed: DeviceCodeResponse = response
-        .into_body()
-        .read_json()
-        .map_err(|e| OAuthLoginError::Decode(e.to_string()))?;
+    // The response carries the opaque `device_code` (a short-lived secret), so
+    // its body is wipe-on-drop.
+    let body = Zeroizing::new(
+        response
+            .into_body()
+            .read_to_string()
+            .map_err(|e| OAuthLoginError::Decode(e.to_string()))?,
+    );
+    let parsed: DeviceCodeResponse =
+        serde_json::from_str(body.as_str()).map_err(|e| OAuthLoginError::Decode(e.to_string()))?;
     if let Some(error) = parsed.error {
         return Err(OAuthLoginError::TokenEndpoint {
             error,
@@ -350,12 +352,15 @@ struct DeviceCodeResponse {
 /// are returned as [`PollOutcome::Pending`] / [`PollOutcome::SlowDown`]; any
 /// other OAuth error is terminal.
 ///
+/// Takes the already-built `agent` so the poll loop reuses one connection pool.
+///
 /// # Errors
 ///
 /// Returns [`OAuthLoginError`] only on an insecure endpoint, a network failure,
 /// or a malformed body — the "still pending" case is a normal
 /// [`PollOutcome::Pending`], not an error.
 pub(crate) fn device_poll(
+    agent: &ureq::Agent,
     issuer: &str,
     device_token_path: &str,
     client_id: &str,
@@ -367,17 +372,17 @@ pub(crate) fn device_poll(
         ("device_code", device_code),
         ("client_id", client_id),
     ];
-    let agent = agent();
-    let response = post(
-        &agent,
-        &url,
-        "application/x-www-form-urlencoded",
-        &form_encode(&pairs),
-    )?;
-    let parsed: TokenResponse = response
-        .into_body()
-        .read_json()
-        .map_err(|e| OAuthLoginError::Decode(e.to_string()))?;
+    let body = Zeroizing::new(form_encode(&pairs));
+    let response = post(agent, &url, "application/x-www-form-urlencoded", &body)?;
+    // The response body carries the freshly minted tokens on the authorized
+    // poll, so it is wipe-on-drop.
+    let body = Zeroizing::new(
+        response
+            .into_body()
+            .read_to_string()
+            .map_err(|e| OAuthLoginError::Decode(e.to_string()))?,
+    );
+    let parsed: TokenResponse = parse(body.as_str());
     if let Some(access_token) = parsed.access_token {
         return Ok(PollOutcome::Tokens(TokenSet {
             access_token: Zeroizing::new(access_token),

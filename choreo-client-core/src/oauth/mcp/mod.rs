@@ -22,15 +22,15 @@
 //! client registration; the `authorize` submodule runs the PKCE callback flow
 //! and the code exchange.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use choreo_keystore::{OAuthKind, ServiceCredential};
 use choreo_proto::McpOAuthConfig;
 use crossbeam_channel::Sender;
-use tracing::warn;
 
-use super::{LoginEvent, LoginSession, OAuthLoginError, callback, credential, http};
+use super::{
+    LoginEvent, LoginSession, OAuthLoginError, callback, credential, http, spawn_login_worker,
+};
 use crate::credentials::build_add_credential_from_credential;
 
 mod authorize;
@@ -79,36 +79,11 @@ const CALLBACK_PORTS: [u16; 2] = [1455, 1457];
 /// `AddCredential` request carrying the credential under `info.credential_key`.
 #[must_use]
 pub fn start_mcp_login(info: McpLoginInfo, options: McpLoginOptions) -> LoginSession {
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let cancel = Arc::new(AtomicBool::new(false));
-    let cancel_worker = Arc::clone(&cancel);
-    let worker_tx = tx.clone();
-    let handle = std::thread::Builder::new()
-        .name("mcp-oauth-login".to_string())
-        .spawn(move || {
-            if let Err(error) = run(&info, &options, &worker_tx, &cancel_worker) {
-                let message = error.to_string();
-                warn!("mcp oauth login failed: {message}");
-                let _ = worker_tx.send(LoginEvent::Error { message });
-            }
-        });
-    let handle = match handle {
-        Ok(handle) => Some(handle),
-        Err(e) => {
-            let _ = tx.send(LoginEvent::Error {
-                message: format!("could not start the login worker: {e}"),
-            });
-            None
-        }
-    };
-    LoginSession {
-        events: rx,
-        cancel,
-        // MCP has no device-code interval wait; cancellation rides the flag the
-        // loopback accept loop polls.
-        stop: None,
-        handle,
-    }
+    // MCP has no device-code interval wait, so no stop channel is installed;
+    // cancellation rides the flag the loopback accept loop polls.
+    spawn_login_worker("mcp-oauth-login", false, move |tx, cancel, _stop| {
+        run(&info, &options, tx, cancel)
+    })
 }
 
 /// The worker entry point.

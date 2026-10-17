@@ -45,7 +45,6 @@ impl LoginModal {
             // Best-effort browser open: a headless host fails and falls back to
             // the URL shown in this modal.
             no_browser: false,
-            print_auth_url: false,
             callback_url: None,
             device,
         };

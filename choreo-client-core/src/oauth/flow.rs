@@ -44,7 +44,7 @@ pub(super) fn run_loopback(
     // captures the callback from the loopback server or a pasted URL.
     let callback = callback::capture_loopback_callback(
         &auth_url,
-        options.no_browser || options.print_auth_url,
+        options.no_browser,
         options.callback_url.as_deref(),
         &server,
         cancel,
@@ -99,8 +99,13 @@ pub(super) fn run_device(
         ));
     };
     let client_id = effective_client_id(descriptor)?;
+    // One agent for the whole flow: the device-authorization request and every
+    // poll in the (minutes-long) wait reuse the same connection pool instead of
+    // rebuilding an agent per iteration.
+    let agent = http::agent();
     let scope = descriptor.scopes.join(" ");
     let code = http::device_authorize(
+        &agent,
         &descriptor.issuer,
         device_authorization_path,
         &client_id,
@@ -134,6 +139,7 @@ pub(super) fn run_device(
         }
         wait_interval(stop, interval, cancel)?;
         match http::device_poll(
+            &agent,
             &descriptor.issuer,
             device_token_path,
             &client_id,

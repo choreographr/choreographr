@@ -278,10 +278,13 @@ fn handle_request(request: tiny_http::Request) -> Result<Option<Callback>, OAuth
         }
         (_, _, Some(error)) => {
             let _ = request.respond(response);
-            Err(OAuthLoginError::Callback(format!(
-                "provider returned error: {error} {}",
-                params.error_description.unwrap_or_default()
-            )))
+            // A provider denial is an OAuth `error`/`error_description` pair, not
+            // a loopback-server failure, so it is surfaced as the same
+            // provider-error class as a token-endpoint rejection.
+            Err(OAuthLoginError::TokenEndpoint {
+                error,
+                description: params.error_description.unwrap_or_default(),
+            })
         }
         _ => {
             // A callback path without a code or an error: keep waiting (some

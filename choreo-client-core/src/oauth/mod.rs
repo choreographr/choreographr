@@ -115,10 +115,6 @@ pub struct LoginOptions {
     pub account: String,
     /// Never open a browser; emit the authorize URL for the caller to surface.
     pub no_browser: bool,
-    /// Emit the authorize URL (in addition to any browser open) so a remote/SSH
-    /// user can open it elsewhere. The TUI always wants the URL, so this is a
-    /// hint for a CLI that would otherwise stay silent.
-    pub print_auth_url: bool,
     /// A full callback URL (or an authorize response URL) pasted by the user
     /// for the paste-URL path: when set, the flow parses the code/state from it
     /// instead of waiting on the loopback server.
@@ -213,6 +209,25 @@ impl LoginSession {
 /// over its normal request path on `LoginEvent::Done`.
 #[must_use]
 pub fn start_login(descriptor: OAuthProviderDescriptor, options: LoginOptions) -> LoginSession {
+    // The provider flow has a device-code interval wait, so it carries a stop
+    // channel for a prompt cancel; the loopback flow cancels on the flag alone.
+    spawn_login_worker("oauth-login", true, move |tx, cancel, stop| {
+        run(&descriptor, &options, tx, cancel, stop)
+    })
+}
+
+/// Spawn a login worker over a fresh event stream and cancel flag, returning the
+/// [`LoginSession`] handle. `with_stop` installs the device-code wait's stop
+/// channel (`true` for the provider flow, `false` for the MCP flow, which has no
+/// interval wait and cancels through the flag alone). Shared by [`start_login`]
+/// and the MCP `start_mcp_login` so the two cannot drift in how they wire the
+/// worker, the channels, or the thread-spawn-failure path.
+fn spawn_login_worker<F>(thread_name: &str, with_stop: bool, run: F) -> LoginSession
+where
+    F: FnOnce(&Sender<LoginEvent>, &AtomicBool, &Receiver<()>) -> Result<(), OAuthLoginError>
+        + Send
+        + 'static,
+{
     let (tx, rx) = crossbeam_channel::unbounded();
     let (stop, stop_rx) = crossbeam_channel::unbounded();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -220,22 +235,20 @@ pub fn start_login(descriptor: OAuthProviderDescriptor, options: LoginOptions) -
     // A clone goes to the worker so the original `tx` stays available for the
     // thread-spawn-failure path below; both drop when the login ends.
     let worker_tx = tx.clone();
-    // The descriptor and options are owned by the worker for its whole life;
-    // nothing is shared back except the event channel and the cancel flag.
+    // The descriptor and options (moved into the closure) are owned by the
+    // worker for its whole life; nothing is shared back except the event channel
+    // and the cancel flag.
     let handle = std::thread::Builder::new()
-        .name("oauth-login".to_string())
-        .spawn(move || {
-            let result = run(&descriptor, &options, &worker_tx, &cancel_worker, &stop_rx);
-            match result {
-                Ok(()) => {}
-                Err(error) => {
-                    let message = error.to_string();
-                    // Never log the raw error verbatim if it could carry a URL
-                    // with a code; the error strings here are already
-                    // code-free, but keep the log to a kind tag.
-                    warn!("oauth login failed: {message}");
-                    let _ = worker_tx.send(LoginEvent::Error { message });
-                }
+        .name(thread_name.to_string())
+        .spawn(move || match run(&worker_tx, &cancel_worker, &stop_rx) {
+            Ok(()) => {}
+            Err(error) => {
+                let message = error.to_string();
+                // Never log the raw error verbatim if it could carry a URL with
+                // a code; the error strings here are already code-free, but keep
+                // the log to a kind tag.
+                warn!("oauth login failed: {message}");
+                let _ = worker_tx.send(LoginEvent::Error { message });
             }
         });
     let handle = match handle {
@@ -252,7 +265,7 @@ pub fn start_login(descriptor: OAuthProviderDescriptor, options: LoginOptions) -
     LoginSession {
         events: rx,
         cancel,
-        stop: Some(stop),
+        stop: with_stop.then_some(stop),
         handle,
     }
 }
