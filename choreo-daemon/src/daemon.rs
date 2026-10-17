@@ -1661,13 +1661,10 @@ impl DaemonState {
         let refresh_token = oauth.refresh_token?;
         let profile = lookup_provider(&self.accounts.get(account)?.provider)?.oauth?;
         let issuer = oauth.issuer.unwrap_or(profile.issuer.as_str());
-        // Join the issuer and the token path tolerating either side's slash, so
-        // a profile path that omits the leading `/` still yields a valid URL.
-        let token_endpoint = if profile.token_path.starts_with('/') {
-            format!("{}{}", issuer.trim_end_matches('/'), profile.token_path)
-        } else {
-            format!("{}/{}", issuer.trim_end_matches('/'), profile.token_path)
-        };
+        // Join the issuer and the token path with the shared slash-tolerant
+        // helper, so a profile path that omits the leading `/` still yields a
+        // valid URL.
+        let token_endpoint = choreo_shared::url::join_path(issuer, &profile.token_path);
         Some(crate::oauth_refresh::RefreshMaterial {
             token_endpoint,
             encoding: profile.refresh_encoding,

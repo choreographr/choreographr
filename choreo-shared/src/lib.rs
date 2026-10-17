@@ -26,6 +26,9 @@
 //!   loopback `http` address) both the login library and the runtime refresh
 //!   client apply before sending a code or token, so the two cannot drift into
 //!   different rules for the same request shape.
+//! - [`url`] — the slash-tolerant base-plus-path join ([`url::join_path`]) the
+//!   login library, the MCP login, and the runtime refresh material share, so
+//!   the same issuer/path pair cannot join to different URLs in each path.
 //!
 //! It is deliberately a *leaf* (deps: `base64`, `clap`, `dirs`, `serde`,
 //! `serde_json`, `tracing`, `tracing-subscriber`, and `zeroize`) and holds no
@@ -46,6 +49,7 @@ pub mod oauth_claims;
 pub mod oauth_endpoint;
 pub mod paths;
 pub mod release_name;
+pub mod url;
 
 pub use clap_styles::clap_styles;
 pub use credential::{

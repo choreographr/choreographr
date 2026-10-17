@@ -207,7 +207,7 @@ fn build_authorize_url(
     code_challenge: &str,
     state: &str,
 ) -> Result<String, OAuthLoginError> {
-    let endpoint = http::join_url(&descriptor.issuer, &descriptor.authorize_path);
+    let endpoint = choreo_shared::url::join_path(&descriptor.issuer, &descriptor.authorize_path);
     http::ensure_secure(&endpoint)?;
     let mut params: Vec<(String, String)> = vec![
         ("response_type".to_string(), "code".to_string()),

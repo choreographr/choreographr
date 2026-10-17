@@ -100,18 +100,6 @@ pub(crate) enum PollOutcome {
     Expired(String),
 }
 
-/// Join an issuer base URL and a path into one URL, tolerating either a
-/// trailing slash on the issuer or a leading slash on the path.
-#[must_use]
-pub(crate) fn join_url(issuer: &str, path: &str) -> String {
-    let issuer = issuer.trim_end_matches('/');
-    if path.starts_with('/') {
-        format!("{issuer}{path}")
-    } else {
-        format!("{issuer}/{path}")
-    }
-}
-
 /// Append a form-encoded query to an authorization endpoint, choosing `&` when
 /// the endpoint already carries a query string. The one place the
 /// provider and MCP flows build an authorize URL, so the separator and encoding
@@ -269,7 +257,7 @@ pub(crate) fn exchange_code(
     redirect_uri: &str,
     code_verifier: &str,
 ) -> Result<TokenSet, OAuthLoginError> {
-    let url = join_url(issuer, token_path);
+    let url = choreo_shared::url::join_path(issuer, token_path);
     let params = [
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -319,7 +307,7 @@ pub(crate) fn device_authorize(
     client_id: &str,
     scope: &str,
 ) -> Result<DeviceCode, OAuthLoginError> {
-    let url = join_url(issuer, device_authorization_path);
+    let url = choreo_shared::url::join_path(issuer, device_authorization_path);
     let pairs = vec![
         ("client_id".to_string(), client_id.to_string()),
         ("scope".to_string(), scope.to_string()),
@@ -386,7 +374,7 @@ pub(crate) fn device_poll(
     client_id: &str,
     device_code: &str,
 ) -> Result<PollOutcome, OAuthLoginError> {
-    let url = join_url(issuer, device_token_path);
+    let url = choreo_shared::url::join_path(issuer, device_token_path);
     let pairs = vec![
         (
             "grant_type".to_string(),
@@ -442,22 +430,6 @@ mod tests {
         assert_eq!(
             authorize_url("https://as.example/authorize?keep=1", &params),
             "https://as.example/authorize?keep=1&state=s"
-        );
-    }
-
-    #[test]
-    fn join_url_handles_slashes() {
-        assert_eq!(
-            join_url("https://auth.openai.com", "/oauth/token"),
-            "https://auth.openai.com/oauth/token"
-        );
-        assert_eq!(
-            join_url("https://auth.openai.com/", "oauth/token"),
-            "https://auth.openai.com/oauth/token"
-        );
-        assert_eq!(
-            join_url("https://auth.openai.com/", "/oauth/token"),
-            "https://auth.openai.com/oauth/token"
         );
     }
 

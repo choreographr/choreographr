@@ -83,6 +83,9 @@ pub fn credential_matches_target(
 /// The hash is the repo's stable FNV-1a ([`short_hash`]) of the canonical
 /// identity joined to the slug with a `\0`, so two servers of one slug pointing
 /// at different endpoints key distinctly while the same endpoint keys the same.
+/// The hash is only an index: [`credential_matches_target`]'s canonical-resource
+/// re-validation on load is the authoritative guard against cross-target use, so
+/// a hash collision cannot hand one server another's token.
 #[must_use]
 pub fn credential_key(slug: &str, identity: &str) -> String {
     format!("mcp:{slug}|{}", short_hash(&format!("{identity}\0{slug}")))
