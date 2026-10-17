@@ -492,6 +492,39 @@ pub(crate) fn device_poll(
     }
 }
 
+/// Probe the MCP resource for a `WWW-Authenticate` challenge (RFC 9728 §5.1):
+/// send one unauthenticated `initialize` and return the challenge header value
+/// from a `401`. A missing endpoint, a non-`401` status, an insecure URL, or a
+/// network error yields `None`, so the caller falls back to well-known
+/// discovery.
+pub(crate) fn probe_www_authenticate(
+    agent: &ureq::Agent,
+    resource: &str,
+    policy: HopPolicy,
+) -> Option<String> {
+    if policy.check(resource).is_err() {
+        return None;
+    }
+    // A minimal, well-formed MCP `initialize`. An authorization-requiring server
+    // answers 401 before it inspects the body, so the contents do not matter
+    // beyond being valid JSON-RPC.
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"Choreographr","version":"0"}}}"#;
+    let response = agent
+        .post(resource)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .send(body.as_bytes())
+        .ok()?;
+    if response.status() != 401 {
+        return None;
+    }
+    response
+        .headers()
+        .get("www-authenticate")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

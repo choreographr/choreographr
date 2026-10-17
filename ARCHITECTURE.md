@@ -914,7 +914,11 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   variable holding a confidential client's secret) in `mcp.json`
   or a trusted project `.mcp.json`. Sign-in is a standard OAuth 2.1 PKCE flow
   owned by the frontend login library (`choreo-client-core`'s `oauth::mcp`,
-  split into `mcp::{mod,discovery,register,authorize}`): it discovers the
+  split into `mcp::{mod,discovery,register,authorize}`): an unauthenticated
+  `initialize` elicits the server's `WWW-Authenticate` challenge (RFC 9728
+  §5.1), whose `resource_metadata` URL is preferred as the
+  protected-resource metadata location; failing that it falls back to probing
+  the well-known path, discovering the
   authorization server (RFC 9728 protected-resource metadata → RFC 8414 or
   OpenID Connect Discovery), building each well-known URL with the segment
   inserted *before* a path-bearing issuer/resource and also appending it

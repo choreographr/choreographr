@@ -974,9 +974,11 @@ variable, so the secret itself never lands in the file:
 ```
 
 `mcp login <slug>` runs a PKCE sign-in: it discovers the authorization server
-(RFC 9728 protected-resource metadata → RFC 8414 or OpenID Connect Discovery,
-including the appended `{issuer}/.well-known/openid-configuration` form, or the
-explicit `authorizationServer` when set), registers a client
+(an unauthenticated request's `WWW-Authenticate` challenge names the
+protected-resource metadata URL; failing that, RFC 9728 protected-resource
+metadata → RFC 8414 or OpenID Connect Discovery, including the appended
+`{issuer}/.well-known/openid-configuration` form; or the explicit
+`authorizationServer` when set), registers a client
 dynamically when no `clientId` is configured, and drives a loopback callback
 (with a paste-URL fallback for a headless/remote host — there is no device-code
 flow here). A confidential client's secret is sent at the token endpoint

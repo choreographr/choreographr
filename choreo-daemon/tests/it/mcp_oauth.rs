@@ -12,10 +12,11 @@
 //! local sockets (the mock authorization server + the loopback callback), so
 //! they belong here and are marked `#[ignore = "integration"]` per AGENTS.md.
 
-// The mock-server and config helpers below use `expect`; clippy's
-// allow-*-in-tests config only covers `#[test]`-annotated functions, so a
-// file-level expectation is required for the helper fns.
+// The mock-server, login-driver, and config helpers below use `expect`/`panic!`;
+// clippy's allow-*-in-tests config only covers `#[test]`-annotated functions, so
+// a file-level expectation is required for the helper fns.
 #![expect(clippy::expect_used)]
+#![expect(clippy::panic)]
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -219,11 +220,14 @@ struct MockAuthorizationServer {
 }
 
 impl MockAuthorizationServer {
-    /// Start the mock; when `require_client_secret` is true the token endpoint
-    /// accepts a code exchange only when it carries `client_secret=right-secret`
-    /// (`client_secret_post`), modelling a confidential-client authorization
-    /// server (Shopify Customer Accounts, Entra, Keycloak).
-    fn start(require_client_secret: bool) -> Self {
+    /// Start the mock. `require_client_secret` makes the token endpoint accept a
+    /// code exchange only when it carries `client_secret=right-secret`
+    /// (`client_secret_post`) — a confidential-client authorization server
+    /// (Shopify Customer Accounts, Entra, Keycloak). `advertise_challenge` makes
+    /// the `/mcp` endpoint answer an unauthenticated request with a `401` and a
+    /// `WWW-Authenticate: Bearer resource_metadata="…"` challenge, so the sign-in
+    /// must discover the authorization server from the challenge.
+    fn start(require_client_secret: bool, advertise_challenge: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock AS");
         let origin = format!("http://{}", listener.local_addr().expect("addr"));
         let state = origin.clone();
@@ -231,7 +235,9 @@ impl MockAuthorizationServer {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
                 let origin = state.clone();
-                std::thread::spawn(move || handle(stream, &origin, require_client_secret));
+                std::thread::spawn(move || {
+                    handle(stream, &origin, require_client_secret, advertise_challenge);
+                });
             }
         });
         Self {
@@ -245,13 +251,28 @@ impl MockAuthorizationServer {
 /// Serve one mock-authorization-server request. When `require_client_secret` is
 /// set, a token exchange without the expected `client_secret` is rejected
 /// (`401 invalid_client`), so a client that cannot authenticate a confidential
-/// client fails loudly.
-fn handle(mut stream: TcpStream, origin: &str, require_client_secret: bool) {
+/// client fails loudly. When `advertise_challenge` is set, the MCP endpoint
+/// answers an unauthenticated request with an RFC 9728 §5.1 challenge.
+fn handle(
+    mut stream: TcpStream,
+    origin: &str,
+    require_client_secret: bool,
+    advertise_challenge: bool,
+) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
     let Some(request) = read_request(&stream) else {
         return;
     };
     match (request.method.as_str(), request.path.as_str()) {
+        // The MCP endpoint: an unauthenticated request is challenged with the
+        // protected-resource metadata URL it should use.
+        ("POST", "/mcp") if advertise_challenge => {
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer resource_metadata=\"{origin}/.well-known/oauth-protected-resource\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
         // RFC 9728 protected-resource metadata naming this origin as the AS.
         ("GET", "/.well-known/oauth-protected-resource") => {
             let body = serde_json::json!({
@@ -306,31 +327,12 @@ fn handle(mut stream: TcpStream, origin: &str, require_client_secret: bool) {
     }
 }
 
-/// The interactive MCP sign-in completes against the mock authorization
-/// server: it discovers the AS, dynamically registers a client, derives a PKCE
-/// S256 challenge, exchanges the code, and produces an `AddCredential` request
-/// carrying the durable MCP grant under the daemon-supplied credential key.
-#[test]
-#[ignore = "integration: binds a local mock authorization server"]
-fn mcp_login_discovers_registers_and_exchanges_pkce() {
-    let mock = MockAuthorizationServer::start(false);
-    let credential_key = "mcp:docs|abc123".to_string();
-
-    let info = McpLoginInfo {
-        slug: "docs".to_string(),
-        resource: mock.mcp_url.clone(),
-        credential_key: credential_key.clone(),
-        // No pre-registered id, so the flow must discover the registration
-        // endpoint and run dynamic client registration. Port 0 binds an
-        // ephemeral loopback port (the redirect_uri carries the real port).
-        oauth: WireOAuthConfig {
-            client_id: None,
-            callback_port: Some(0),
-            scopes: Vec::new(),
-            authorization_server: None,
-            client_secret_env: None,
-        },
-    };
+/// Drive one interactive MCP sign-in to completion against the mock: wait for
+/// the authorize URL (asserting it carries PKCE S256 and the RFC 8707 resource
+/// indicator), simulate the browser landing on the loopback callback with the
+/// code and matching state, and return the `AddCredential` service key and the
+/// credential it carries.
+fn drive_login(info: McpLoginInfo) -> (String, ServiceCredential) {
     let session = start_mcp_login(
         info,
         McpLoginOptions {
@@ -338,8 +340,6 @@ fn mcp_login_discovers_registers_and_exchanges_pkce() {
             callback_url: None,
         },
     );
-
-    // Wait for the authorize URL, capturing the state and redirect port.
     let (state, port) = loop {
         let event = session
             .events
@@ -374,9 +374,6 @@ fn mcp_login_discovers_registers_and_exchanges_pkce() {
             _ => {}
         }
     };
-
-    // Simulate the browser landing on the loopback callback with the code and
-    // the matching state.
     {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect callback");
         let request = format!(
@@ -388,8 +385,6 @@ fn mcp_login_discovers_registers_and_exchanges_pkce() {
         let mut response = String::new();
         let _ = stream.read_to_string(&mut response);
     }
-
-    // The flow finishes with the AddCredential request.
     let (service, message) = loop {
         let event = session
             .events
@@ -402,19 +397,41 @@ fn mcp_login_discovers_registers_and_exchanges_pkce() {
         }
     };
     session.join();
+    let choreo_proto::ClientMessageType::AddCredential { credential, .. } = *message else {
+        panic!("expected an AddCredential request");
+    };
+    (service, credential)
+}
+
+/// The interactive MCP sign-in completes against the mock authorization
+/// server: it discovers the AS, dynamically registers a client, derives a PKCE
+/// S256 challenge, exchanges the code, and produces an `AddCredential` request
+/// carrying the durable MCP grant under the daemon-supplied credential key.
+#[test]
+#[ignore = "integration: binds a local mock authorization server"]
+fn mcp_login_discovers_registers_and_exchanges_pkce() {
+    let mock = MockAuthorizationServer::start(false, false);
+    let credential_key = "mcp:docs|abc123".to_string();
+    let info = McpLoginInfo {
+        slug: "docs".to_string(),
+        resource: mock.mcp_url.clone(),
+        credential_key: credential_key.clone(),
+        // No pre-registered id, so the flow discovers the registration endpoint
+        // and runs dynamic client registration. Port 0 binds an ephemeral
+        // loopback port (the redirect_uri carries the real port).
+        oauth: WireOAuthConfig {
+            client_id: None,
+            callback_port: Some(0),
+            scopes: Vec::new(),
+            authorization_server: None,
+            client_secret_env: None,
+        },
+    };
+    let (service, credential) = drive_login(info);
     assert_eq!(
         service, credential_key,
         "the grant keys under the daemon key"
     );
-
-    let choreo_proto::ClientMessageType::AddCredential {
-        service: msg_service,
-        credential,
-    } = *message
-    else {
-        panic!("expected an AddCredential request");
-    };
-    assert_eq!(msg_service, credential_key);
     let view = credential.as_oauth().expect("an OAuth credential");
     assert_eq!(view.kind, OAuthKind::Mcp);
     assert_eq!(
@@ -428,6 +445,10 @@ fn mcp_login_discovers_registers_and_exchanges_pkce() {
         view.client_id,
         Some("dcr-client-1"),
         "the dynamically registered client id is recorded"
+    );
+    assert!(
+        view.client_secret.is_none(),
+        "a public client stores no secret"
     );
     // The access token is never part of the durable credential.
     assert!(
@@ -444,12 +465,11 @@ fn mcp_login_discovers_registers_and_exchanges_pkce() {
 #[test]
 #[ignore = "integration: binds a local mock authorization server"]
 fn mcp_login_confidential_client_sends_secret() {
-    let mock = MockAuthorizationServer::start(true);
+    let mock = MockAuthorizationServer::start(true, false);
     let credential_key = "mcp:shopify|abc123".to_string();
     // SAFETY: nextest runs each test in its own process, and this is the only
     // setter of this variable, so no other test observes the mutation.
     unsafe { std::env::set_var("CHOREO_MCP_TEST_CLIENT_SECRET", "right-secret") };
-
     let info = McpLoginInfo {
         slug: "shopify".to_string(),
         resource: mock.mcp_url.clone(),
@@ -465,77 +485,8 @@ fn mcp_login_confidential_client_sends_secret() {
             client_secret_env: Some("CHOREO_MCP_TEST_CLIENT_SECRET".to_string()),
         },
     };
-    let session = start_mcp_login(
-        info,
-        McpLoginOptions {
-            no_browser: true,
-            callback_url: None,
-        },
-    );
-
-    // Wait for the authorize URL, capturing the state and redirect port.
-    let (state, port) = loop {
-        let event = session
-            .events
-            .recv_timeout(std::time::Duration::from_secs(20))
-            .unwrap_or_else(|e| panic!("timed out waiting for the authorize URL: {e:?}"));
-        match event {
-            LoginEvent::AuthUrl { url } => {
-                assert!(
-                    url.contains("client_id=app-1"),
-                    "the pre-registered client id is sent: {url}"
-                );
-                let query = url.split_once('?').map_or("", |(_, q)| q);
-                let params: HashMap<&str, &str> = query
-                    .split('&')
-                    .filter_map(|pair| pair.split_once('='))
-                    .collect();
-                let state = params.get("state").expect("state param").to_string();
-                let redirect = params.get("redirect_uri").expect("redirect_uri param");
-                let redirect = redirect.replace("%3A", ":").replace("%2F", "/");
-                let port = redirect
-                    .rsplit_once(':')
-                    .and_then(|(_, tail)| tail.split('/').next())
-                    .and_then(|p| p.parse::<u16>().ok())
-                    .expect("redirect port");
-                break (state, port);
-            }
-            LoginEvent::Error { message } => panic!("login failed: {message}"),
-            _ => {}
-        }
-    };
-
-    // Simulate the browser landing on the loopback callback.
-    {
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect callback");
-        let request = format!(
-            "GET /auth/callback?code=test-code&state={state} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-        );
-        stream
-            .write_all(request.as_bytes())
-            .expect("write callback request");
-        let mut response = String::new();
-        let _ = stream.read_to_string(&mut response);
-    }
-
-    // The token endpoint requires the secret, so completion proves it was sent.
-    let (service, message) = loop {
-        let event = session
-            .events
-            .recv_timeout(std::time::Duration::from_secs(20))
-            .unwrap_or_else(|e| panic!("timed out waiting for login completion: {e:?}"));
-        match event {
-            LoginEvent::Done { service, message } => break (service, message),
-            LoginEvent::Error { message } => panic!("login failed: {message}"),
-            _ => {}
-        }
-    };
-    session.join();
+    let (service, credential) = drive_login(info);
     assert_eq!(service, credential_key);
-
-    let choreo_proto::ClientMessageType::AddCredential { credential, .. } = *message else {
-        panic!("expected an AddCredential request");
-    };
     let view = credential.as_oauth().expect("an OAuth credential");
     assert_eq!(view.kind, OAuthKind::Mcp);
     assert_eq!(
@@ -554,4 +505,38 @@ fn mcp_login_confidential_client_sends_secret() {
         "the confidential client's secret is sent and stored for refresh"
     );
     assert_eq!(view.refresh_token, Some("rt-mock"));
+}
+
+/// Discovery from the `WWW-Authenticate` challenge (RFC 9728 §5.1): the MCP
+/// endpoint answers the unauthenticated probe with a `401` naming the
+/// protected-resource metadata URL, and the flow completes with neither a
+/// configured `authorizationServer` nor a well-known-path guess for the
+/// resource.
+#[test]
+#[ignore = "integration: binds a local mock authorization server"]
+fn mcp_login_discovers_via_www_authenticate_challenge() {
+    let mock = MockAuthorizationServer::start(false, true);
+    let credential_key = "mcp:linear|abc123".to_string();
+    let info = McpLoginInfo {
+        slug: "linear".to_string(),
+        resource: mock.mcp_url.clone(),
+        credential_key: credential_key.clone(),
+        oauth: WireOAuthConfig {
+            client_id: None,
+            callback_port: Some(0),
+            scopes: Vec::new(),
+            authorization_server: None,
+            client_secret_env: None,
+        },
+    };
+    let (service, credential) = drive_login(info);
+    assert_eq!(service, credential_key);
+    let view = credential.as_oauth().expect("an OAuth credential");
+    assert_eq!(view.kind, OAuthKind::Mcp);
+    assert_eq!(
+        view.issuer,
+        Some(mock.origin.as_str()),
+        "the AS named by the challenge is discovered and recorded"
+    );
+    assert_eq!(view.client_id, Some("dcr-client-1"));
 }

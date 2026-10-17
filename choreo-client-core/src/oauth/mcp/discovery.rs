@@ -14,6 +14,7 @@ use url::Url;
 
 use super::super::OAuthLoginError;
 use super::super::http;
+use super::challenge;
 
 /// The RFC 9728 protected-resource metadata well-known segment.
 const PROTECTED_RESOURCE: &str = "/.well-known/oauth-protected-resource";
@@ -217,6 +218,18 @@ pub(super) fn discover(
         return fetch_as_metadata(agent, &as_url, policy);
     }
     let resource_url = parse_url(resource, "resource")?;
+    // RFC 9728 §5.1: an unauthenticated request's `WWW-Authenticate` challenge
+    // names the authoritative protected-resource metadata URL. Prefer it over
+    // guessing the well-known path, which is the fallback for a challenge that
+    // omits the parameter.
+    if let Some(header) = http::probe_www_authenticate(agent, resource, policy)
+        && let Some(metadata_url) = challenge::resource_metadata_url(&header)
+        && let Ok(metadata_url) = parse_url(&metadata_url, "resource metadata")
+        && let Ok(value) = get_json(agent, metadata_url.as_str(), policy)
+        && let Some(server) = first_authorization_server(&value)
+    {
+        return fetch_as_metadata(agent, &parse_url(&server, "authorization server")?, policy);
+    }
     // RFC 9728 protected-resource metadata: try the path-inserted document,
     // then the origin-rooted form.
     let mut resource_metadata = None;
@@ -228,17 +241,24 @@ pub(super) fn discover(
     }
     let authorization_server = resource_metadata
         .as_ref()
-        .and_then(|v| v.get("authorization_servers"))
-        .and_then(|v| v.as_array())
-        .and_then(|servers| servers.first())
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
+        .and_then(first_authorization_server);
     let authorization_server = match authorization_server {
         Some(server) => parse_url(&server, "authorization server")?,
         // No protected-resource metadata: assume the resource host is the AS.
         None => origin_url(&resource_url),
     };
     fetch_as_metadata(agent, &authorization_server, policy)
+}
+
+/// The first `authorization_servers` entry of a protected-resource metadata
+/// document, as a string.
+fn first_authorization_server(value: &Value) -> Option<String> {
+    value
+        .get("authorization_servers")
+        .and_then(|v| v.as_array())
+        .and_then(|servers| servers.first())
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 /// Whether an authorization-server metadata document carries the two endpoints

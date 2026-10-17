@@ -35,6 +35,7 @@ use super::{
 use crate::credentials::build_add_credential_from_credential;
 
 mod authorize;
+mod challenge;
 mod discovery;
 mod register;
 
