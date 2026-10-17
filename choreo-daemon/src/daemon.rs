@@ -70,6 +70,7 @@ mod image_provider;
 /// and the TOFU binding helpers — see `daemon/keystore.rs`.
 mod keystore;
 mod mcp_commands;
+mod oauth_store;
 mod open;
 mod session_image;
 mod subscriber_handlers;
@@ -257,7 +258,8 @@ pub struct DaemonState {
     /// quarantined so no further refresh is attempted (a hot-loop guard) and a
     /// re-login is required. Cleared when a fresh credential is stored for the
     /// account, and on unlock/lock (the whole credential map is re-read). Keyed
-    /// by account name; a member of the provider grant keyspace only.
+    /// by the credential key: a provider account name, or the target-scoped
+    /// `mcp:<slug>|<target-hash>` string for an MCP grant.
     pub dead_oauth: std::collections::HashSet<String>,
     /// The X/Twitter credential, mirrored out of `credentials` for the `x_*`
     /// tools' single `x_credentials` slot.
