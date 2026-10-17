@@ -82,7 +82,7 @@ pub(crate) fn retry_send(
     // (it stays `Fn`); each attempt shares the payload (`Arc<[u8]>`) and clones
     // the `Arc` upload hook. The Zeroizing wrapper ensures the temporary
     // `Bearer …` string is wiped when it goes out of scope.
-    retry::retry_loop_with_compression(
+    retry::retry_loop_with_provider_policies(
         &hooked,
         &config.provider_slug,
         || {

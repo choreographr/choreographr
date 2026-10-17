@@ -3,7 +3,13 @@
 //! Owns the retry/backoff loop ([`retry_loop`]), the `Retry-After` parsing and
 //! budget gate (`retry_decision`), cancellation-aware waits, and the
 //! normalized [`ProviderHttpError`] each adapter maps into its own error type.
-//! The retry decision is status + `Retry-After` only — never the response body.
+//! The core decision is status + `Retry-After` only — never the response body —
+//! so a 4xx is a deterministic rejection and is never retried. The one
+//! deliberate, tightly-scoped exception is `retry_loop_with_provider_policies`:
+//! the opencode.ai zen/go gateway enforces a message-*content* check on only some
+//! routes, so the identical request bytes flip 200/400/200 there; that wrapper
+//! resends the identical body a bounded number of times for the gateway's own
+//! known content-rejection signatures, and for nothing else.
 //!
 //! The module is split by concern: this file holds the retry/backoff policy and
 //! the retry loops, the serialized request body plus its upload-complete hook
@@ -24,6 +30,8 @@ mod send_body;
 
 use compression::note_request_compression_downgraded;
 use error::{extract_error_message, status_to_error};
+
+use crate::shared::is_opencode_gateway_slug;
 
 pub use compression::RequestCompression;
 pub(crate) use compression::effective_request_compression;
@@ -486,28 +494,37 @@ where
     retry_loop_impl(send_request, retry, ctx, Terminal::ConsumeIntoError)
 }
 
-/// Like [`retry_loop`], but tolerant of a provider that rejects a compressed
-/// request body with HTTP 415 `Unsupported Media Type`: on that status the body
-/// is downgraded to identity in place, the provider is remembered as
-/// identity-only for the process (see [`effective_request_compression`]), and
-/// the request is sent once more uncompressed.
+/// Like [`retry_loop`], but applies the provider-specific retry policies that a
+/// bare status decision cannot express. Two such policies exist, each gated
+/// tightly so no other provider or status is affected:
 ///
-/// The downgrade is handled here rather than in [`retry_loop`]'s decision logic
-/// because 415 is not a retryable status (resending the same compressed bytes
-/// would fail identically); only switching the body encoding can succeed.  A
-/// body already identity, or one that was already downgraded, falls straight
-/// through to [`retry_loop`] and a second 415 is terminal.  The uncompressed
-/// resend is a fresh [`retry_loop`] call, so it draws the full retry budget
-/// again rather than the remains of the first loop's: the two loops do not
-/// share one `max_attempts`, and a request whose earlier attempts burned budget
-/// on a retryable status before answering 415 still gets the whole budget for
-/// the uncompressed send (a first-attempt 415 spends a single send before the
-/// resend).
+/// 1. **HTTP 415 (compression).** A provider that rejects a compressed request
+///    body is remembered as identity-only for the process (see
+///    [`effective_request_compression`]) and the request is sent once more
+///    uncompressed. Handled here rather than in [`retry_loop`]'s decision logic
+///    because 415 is not a retryable status (resending the same compressed
+///    bytes would fail identically); only switching the body encoding can
+///    succeed. A body already identity, or already downgraded, falls straight
+///    through to [`retry_loop`] and a second 415 is terminal.
+///
+/// 2. **Transient gateway 400 (message content).** The opencode.ai zen/go
+///    gateway validates message content on only *some* routes, so the identical
+///    request bytes are rejected on one attempt and accepted on the next
+///    (measured upstream as a byte-faithful replay of 200/400/200). When `slug`
+///    is a gateway slug AND the terminal 400 matches one of the gateway's own
+///    content-rejection signatures (`is_transient_gateway_400`), the identical
+///    body is resent up to `GATEWAY_TRANSIENT_400_ATTEMPTS` times. Any other
+///    400 — this provider or any other — stays terminal.
+///
+/// Each resend is a fresh [`retry_loop`] call, so it draws the full retry budget
+/// again rather than the remains of the first loop's (a request whose earlier
+/// attempts burned budget on a retryable status before answering still gets a
+/// whole budget for the resend).
 ///
 /// # Errors
 ///
 /// Same as [`retry_loop`].
-pub(crate) fn retry_loop_with_compression<F>(
+pub(crate) fn retry_loop_with_provider_policies<F>(
     body: &HookedJsonBody,
     slug: &str,
     send_request: F,
@@ -517,7 +534,9 @@ pub(crate) fn retry_loop_with_compression<F>(
 where
     F: Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
 {
-    let result = retry_loop(&send_request, retry, ctx);
+    let mut result = retry_loop(&send_request, retry, ctx);
+
+    // Policy 1 — HTTP 415: downgrade the body to identity and resend.
     if let Err(ProviderHttpError::ClientError { status: 415, .. }) = &result
         && body.is_compressed()
     {
@@ -527,9 +546,115 @@ where
             provider = %slug,
             "retrying request with an uncompressed body after HTTP 415",
         );
-        return retry_loop(&send_request, retry, ctx);
+        result = retry_loop(&send_request, retry, ctx);
     }
+
+    // Policy 2 — transient gateway 400: resend the identical body a bounded
+    // number of times. `max_attempts == 1` (e.g. the cache-warming ping's
+    // `no_retry`) disables it. The extra attempts are counted separately from
+    // the per-send budget, so a genuinely deterministic rejection is only
+    // delayed by a few seconds before it surfaces; a request that is *not* a
+    // recognized gateway content rejection breaks out immediately.
+    if retry.max_attempts > 1 {
+        let extra = GATEWAY_TRANSIENT_400_ATTEMPTS.min(retry.max_attempts - 1);
+        for attempt in 1..=extra {
+            let Err(ProviderHttpError::ClientError {
+                status: 400,
+                detail,
+            }) = &result
+            else {
+                break;
+            };
+            if !is_transient_gateway_400(slug, detail) {
+                break;
+            }
+            let delay = backoff_duration(attempt, retry);
+            tracing::warn!(
+                provider = %slug,
+                code = gateway_error_code(detail).unwrap_or("none"),
+                attempt,
+                max_attempts = extra + 1,
+                delay_ms = delay.as_millis(),
+                "retrying transient gateway 400 (message-content rejection)",
+            );
+            wait_before_retry(attempt, extra + 1, delay, ctx.on_retry, ctx.cancel_rx)?;
+            result = retry_loop(&send_request, retry, ctx);
+        }
+    }
+
     result
+}
+
+/// Bounded number of extra resends for a transient opencode-gateway 400 (see
+/// [`retry_loop_with_provider_policies`]). Two resends cover the observed
+/// route-flap — the same order the community retry work-around uses — while a
+/// genuinely deterministic rejection is only delayed by a few seconds before it
+/// surfaces.
+const GATEWAY_TRANSIENT_400_ATTEMPTS: u32 = 2;
+
+/// Extract the provider/gateway error code that the opencode.ai zen/go gateway
+/// preserves as a `[code]` label at the start of a rewritten error message,
+/// e.g. `Upstream request failed: [unsupported_request] Message content must …`
+/// → `Some("unsupported_request")`. The gateway drops upstream codes outside
+/// its allow-list but keeps the original in this bracketed label; recovering it
+/// is what makes the failure classifiable — and the transient-400 gate possible
+/// — without trusting the human-readable prose.
+///
+/// Mirrors the gateway's own `<colon- and newline-free prefix>: [<code>]` shape:
+/// the prefix before the first colon must be non-empty and single-line, and the
+/// code must be `[A-Za-z0-9_.-]+`. Returns `None` when the message is not in
+/// that shape (a non-gateway error, or an opaque body with no label).
+#[must_use]
+pub(crate) fn gateway_error_code(message: &str) -> Option<&str> {
+    let colon = message.find(':')?;
+    let prefix = message.get(..colon)?;
+    if prefix.is_empty() || prefix.contains('\n') {
+        return None;
+    }
+    let rest = message.get(colon + 1..)?.strip_prefix(" [")?;
+    let code = rest.get(..rest.find(']')?)?;
+    (!code.is_empty()
+        && code
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')))
+    .then_some(code)
+}
+
+/// Whether a terminal `400` from `slug` is one of the opencode.ai zen/go
+/// gateway's *transient* message-content rejections — the ones it enforces on
+/// only some routes, so the identical request bytes often succeed on a resend.
+///
+/// Deliberately narrow, in three independent gates so nothing unrelated is ever
+/// retried: the slug must be a gateway slug (see [`is_opencode_gateway_slug`]),
+/// and the detail must either carry one of the gateway's exact content
+/// wordings or be the opaque model-only stub (`{"model":"…"}`, no
+/// `error`/`message` field) that upstream measured as route-flaky. Any other
+/// `400` — a genuine content/shape rejection, auth, quota, or a non-gateway
+/// provider's error — returns `false` and stays terminal.
+fn is_transient_gateway_400(slug: &str, detail: &str) -> bool {
+    // Both gateway content validators: text required, or text only (media not
+    // enabled). Matched as substrings so the surrounding prefix does not matter.
+    const MARKERS: &[&str] = &[
+        "Message content must contain text",
+        "Message content supports text content only",
+    ];
+    if !is_opencode_gateway_slug(slug) {
+        return false;
+    }
+    if MARKERS.iter().any(|marker| detail.contains(marker)) {
+        return true;
+    }
+    // Opaque model-only 400 stub: the body carried no reason at all, and
+    // upstream measured it as route-flaky (byte-identical 200/400/200).
+    detail
+        .strip_prefix("request failed with status 400:")
+        .map(str::trim)
+        .is_some_and(|body| {
+            body.starts_with('{')
+                && body.contains("\"model\"")
+                && !body.contains("\"error\"")
+                && !body.contains("\"message\"")
+        })
 }
 
 /// Like [`retry_loop`], but a terminal (non-2xx, non-retryable or

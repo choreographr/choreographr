@@ -765,7 +765,7 @@ broadly-supported one, via the same pure-Rust `flate2` backend ureq enables) and
 `structured-zstd` codec the DB uses). A provider that
 answers a compressed request with `415 Unsupported Media Type` is downgraded to
 identity in place and retried once uncompressed
-(`retry::retry_loop_with_compression`); the downgrade is then remembered per
+(`retry::retry_loop_with_provider_policies`); the downgrade is then remembered per
 provider for the process, so later requests skip compression entirely. The
 memory is the process-wide `retry::compression::COMPRESSION_DOWNGRADED` set —
 the **thirteenth** sanctioned shared-state exception (see AGENTS.md), read under
@@ -777,10 +777,34 @@ The downgrade triggers on `415` only, the spec-correct signal for an
 unsupported request coding: `400` is deliberately not treated as an encoding
 rejection, because it is also the status for a genuinely malformed request
 (bad JSON, unknown model, schema violation) that re-sending uncompressed cannot
-fix, and the retry layer never inspects the response body to disambiguate. A
+fix, and the retry layer never treats `400` as an encoding rejection (the one
+body-inspecting policy is the separate gateway-400 retry, below — it never
+applies to the compression decision). A
 provider — or a gateway in front of one — that answers `400` for an unsupported
 `Content-Encoding` therefore keeps failing until its `request_compression` is
 removed by hand.
+
+#### Transient gateway 400 (message content)
+
+The opencode.ai zen/go gateway validates message *content* on only some of its
+routes, so the same request bytes are rejected on one attempt and accepted on
+the next (upstream measured a byte-faithful replay of `200/400/200`). This is
+the one place the retry layer consults the response body, and it is fenced to
+exactly that case: `retry::retry_loop_with_provider_policies` resends the
+**identical** body up to two more times when, and only when, the provider slug
+is a known gateway slug (`shared::is_opencode_gateway_slug` — the same
+exact-match set that gates the gateway routing headers, so the two can never
+drift) **and** the terminal `400`'s detail matches one of the gateway's own
+content-rejection wordings — `Message content must contain text` or
+`Message content supports text content only` — or is the opaque model-only stub
+(`{"model":"…"}`, no `error`/`message` field). Every other `400` from every
+provider stays terminal, so the status-only "a 4xx is a deterministic rejection"
+contract holds everywhere else. The provider code the gateway preserves as a
+`[code]` label in its rewritten message (e.g. `[unsupported_request]`) is
+recovered by `retry::gateway_error_code` for the gate and the log line, so the
+failure class is diagnosable without trusting the prose. The extra attempts are
+counted separately from the per-send budget, and a `no_retry` request
+(`max_attempts == 1`, e.g. the cache-warming ping) skips the policy entirely.
 
 ### Runtime catalog refresh (S4)
 

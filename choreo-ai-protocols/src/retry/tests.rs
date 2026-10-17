@@ -565,3 +565,77 @@ fn attempt_deadline_arms_on_reset() {
         "reset must not move the deadline backwards"
     );
 }
+
+// ── gateway error-code recovery + transient-400 gate ───────────────────────
+
+#[test]
+fn gateway_error_code_recovers_the_bracketed_label() {
+    assert_eq!(
+        gateway_error_code(
+            "Upstream request failed: [unsupported_request] Message content must contain text."
+        ),
+        Some("unsupported_request")
+    );
+    // The label grammar mirrors the gateway's own `<prefix>: [<code>]` shape.
+    assert_eq!(gateway_error_code("[rate_limit] slow down"), None);
+    assert_eq!(
+        gateway_error_code("Upstream request failed: [] empty"),
+        None
+    );
+    assert_eq!(gateway_error_code("a: b: [code] tail"), None);
+    assert_eq!(gateway_error_code("prefix: [bad code] tail"), None);
+    // An opaque body carries no label.
+    assert_eq!(
+        gateway_error_code("request failed with status 400: {\"model\":\"x\"}"),
+        None
+    );
+}
+
+#[test]
+fn transient_gateway_400_matches_only_the_gateway_content_signatures() {
+    let text = "Upstream request failed: [unsupported_request] Message content must contain text.";
+    for slug in [
+        "opencode",
+        "opencode-go",
+        "opencode-go-anthropic-compatible",
+    ] {
+        assert!(is_transient_gateway_400(slug, text), "slug {slug}");
+    }
+    // The same wording is a deterministic rejection for any other provider.
+    assert!(!is_transient_gateway_400("openai", text));
+    assert!(!is_transient_gateway_400("deepseek", text));
+
+    // The sibling content validator (media not enabled) on the gateway.
+    assert!(is_transient_gateway_400(
+        "opencode-go",
+        "Upstream request failed: [unsupported_request] Message content supports text content only.",
+    ));
+
+    // A structured, deterministic gateway rejection is NOT retried.
+    assert!(!is_transient_gateway_400(
+        "opencode-go",
+        "Upstream request failed: [content_filter] The response was filtered",
+    ));
+    assert!(!is_transient_gateway_400(
+        "opencode-go",
+        "request failed with status 400: not the stub"
+    ));
+}
+
+#[test]
+fn transient_gateway_400_matches_the_opaque_model_stub() {
+    assert!(is_transient_gateway_400(
+        "opencode-go",
+        "request failed with status 400: {\"model\":\"deepseek-v4.1-flash\"}",
+    ));
+    // A body that carries a real reason is not the opaque stub.
+    assert!(!is_transient_gateway_400(
+        "opencode-go",
+        "request failed with status 400: {\"model\":\"x\",\"error\":{\"message\":\"bad\"}}",
+    ));
+    // Non-gateway providers never match, even the stub.
+    assert!(!is_transient_gateway_400(
+        "gemini",
+        "request failed with status 400: {\"model\":\"x\"}",
+    ));
+}

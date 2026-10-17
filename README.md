@@ -854,6 +854,14 @@ each requester's status reflects its own `--force` flag).
 | `context_window` | Default context window for all models (overrides catalog defaults) |
 | `model_context_windows` | Per-model context window overrides (e.g. `{"gpt-4.1-nano": 1048576}`) |
 
+> **Transient gateway 400s.** On the opencode.ai zen/go gateway, a `400` that
+> carries the gateway's own message-content rejection (`Message content must
+> contain text` / `… supports text content only`) or its opaque model-only stub
+> is resent up to two more times: the gateway enforces that content check on only
+> some routes, so the identical request bytes can be rejected once and accepted
+> on a retry. No other provider's `400` is retried, the extra attempts are
+> independent of the per-send budget, and `retry_max_attempts = 1` disables it.
+
 The Responses API is fully supported — including tool use, streaming, reasoning
 effort slugs (mapped to the `reasoning_effort` wire field), multi-turn chaining
 via `previous_response_id`, and **programmatic tool calling** (gpt-5.6+

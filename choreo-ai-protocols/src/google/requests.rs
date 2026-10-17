@@ -140,7 +140,7 @@ pub(super) fn generate_content_request(
     let compression =
         retry::effective_request_compression(&config.provider_slug, config.request_compression);
     let hooked = retry::HookedJsonBody::new(&body, on_uploaded, compression)?;
-    let response = retry::retry_loop_with_compression(
+    let response = retry::retry_loop_with_provider_policies(
         &hooked,
         &config.provider_slug,
         || {
@@ -234,7 +234,7 @@ where
     let compression =
         retry::effective_request_compression(&config.provider_slug, config.request_compression);
     let hooked = retry::HookedJsonBody::new(&body, on_uploaded, compression)?;
-    let response = retry::retry_loop_with_compression(
+    let response = retry::retry_loop_with_provider_policies(
         &hooked,
         &config.provider_slug,
         || {

@@ -403,19 +403,36 @@ pub(crate) const OPENCODE_CLIENT_ID: &str = "choreographr";
 /// for); every other slug gets an empty list. Used by both the `OpenAI` client
 /// path and the Anthropic Messages path — the gateway reads the header
 /// before protocol dispatch, so both wire formats route identically.
+///
+/// [`is_opencode_gateway_slug`] is the single source of truth for the slug set:
+/// this header gate and the gateway-specific retry policy (`crate::retry`) both
+/// consult it, so the two can never drift.
 pub(crate) fn opencode_gateway_headers(
     provider_slug: &str,
     session_id: &str,
     request_id: &str,
 ) -> Vec<(&'static str, String)> {
-    match provider_slug {
-        "opencode" | "opencode-go" | "opencode-go-anthropic-compatible" => vec![
-            ("x-opencode-session", session_id.to_string()),
-            ("x-opencode-request", request_id.to_string()),
-            ("x-opencode-client", OPENCODE_CLIENT_ID.to_string()),
-        ],
-        _ => Vec::new(),
+    if !is_opencode_gateway_slug(provider_slug) {
+        return Vec::new();
     }
+    vec![
+        ("x-opencode-session", session_id.to_string()),
+        ("x-opencode-request", request_id.to_string()),
+        ("x-opencode-client", OPENCODE_CLIENT_ID.to_string()),
+    ]
+}
+
+/// Whether `provider_slug` names the known opencode.ai zen/go gateway
+/// (exact match only — a merely `opencode-*`-prefixed slug is never treated as a
+/// gateway). The gateway is the one backend that validates message *content* on
+/// only some routes, so this predicate also gates the transient-400 retry in
+/// `crate::retry` (see `is_transient_gateway_400`): every other provider keeps
+/// the status-only "a 4xx is a deterministic rejection" policy.
+pub(crate) fn is_opencode_gateway_slug(provider_slug: &str) -> bool {
+    matches!(
+        provider_slug,
+        "opencode" | "opencode-go" | "opencode-go-anthropic-compatible"
+    )
 }
 
 /// Try to list models via the API; fall back to the static known list on any
