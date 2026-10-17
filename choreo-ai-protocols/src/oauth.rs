@@ -34,7 +34,7 @@ const TERMINAL_ERROR_CODES: &[&str] = &["invalid_grant", "invalid_token", "refre
 /// The `token_endpoint` is the absolute token URL (issuer + token path); the
 /// `encoding` is the profile's `refresh_encoding`. `client_secret` is present
 /// only for a confidential client.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OAuthRefreshRequest<'a> {
     /// The absolute token endpoint URL.
     pub token_endpoint: &'a str,
@@ -48,6 +48,22 @@ pub struct OAuthRefreshRequest<'a> {
     pub refresh_token: &'a str,
     /// The scopes to request; empty to omit the `scope` parameter.
     pub scopes: &'a [String],
+}
+
+/// Redacting `Debug`: the refresh token and any client secret are secret, so a
+/// logged request must not expose them. Only the non-secret routing fields and
+/// presence flags are printed.
+impl std::fmt::Debug for OAuthRefreshRequest<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthRefreshRequest")
+            .field("token_endpoint", &self.token_endpoint)
+            .field("encoding", &self.encoding)
+            .field("has_client_id", &self.client_id.is_some())
+            .field("has_client_secret", &self.client_secret.is_some())
+            .field("has_refresh_token", &(!self.refresh_token.is_empty()))
+            .field("scopes", &self.scopes.len())
+            .finish()
+    }
 }
 
 /// The token set a successful refresh returned.
@@ -130,6 +146,12 @@ pub fn refresh_oauth_token(
         .timeout_global(Some(std::time::Duration::from_secs(30)))
         .http_status_as_error(false)
         .user_agent(format!("choreographr/{}", env!("CARGO_PKG_VERSION")))
+        // A credential-bearing POST must never follow a redirect: the refresh
+        // token in the body would be replayed at a server the authorization
+        // server chose. ureq refuses to replay a POST body on a 307/308 and
+        // downgrades a 301/302/303 to a body-less GET, but this is spelled out
+        // explicitly so the guarantee does not rest on ureq's internals.
+        .max_redirects(0)
         .build()
         .into();
 
@@ -139,9 +161,6 @@ pub fn refresh_oauth_token(
         GrantEncoding::Form => call.header("Content-Type", "application/x-www-form-urlencoded"),
         GrantEncoding::Json => call.header("Content-Type", "application/json"),
     };
-    // A credential-bearing POST must never follow a redirect (the token would
-    // be re-sent to a server the authorization server chose); ureq does not
-    // follow redirects for POST by default, and the config keeps it that way.
     let response = call.send(body.as_slice()).map_err(|e| {
         // Transport errors (connect/read/timeout) are transient: retry.
         OAuthRefreshError::Transient {
