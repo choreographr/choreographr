@@ -28,6 +28,9 @@ pub(super) struct AuthorizeContext<'a> {
     pub(super) server: &'a AuthServer,
     /// The client id (pre-registered or dynamically registered).
     pub(super) client_id: &'a str,
+    /// The confidential client's secret, resolved from the configured
+    /// environment variable, when one applies.
+    pub(super) client_secret: Option<&'a str>,
     /// The bound loopback callback server and its `redirect_uri`.
     pub(super) bound: &'a BoundCallback,
     /// The flow's endpoint policy (discovered endpoints are vetted under it).
@@ -42,6 +45,7 @@ struct CodeRequest<'a> {
     client_id: &'a str,
     redirect_uri: &'a str,
     resource: &'a str,
+    client_secret: Option<&'a str>,
     policy: http::HopPolicy,
 }
 
@@ -61,6 +65,7 @@ pub(super) fn authorize(
         client_id: ctx.client_id,
         redirect_uri: &ctx.bound.redirect_uri,
         resource: &ctx.info.resource,
+        client_secret: ctx.client_secret,
         policy: ctx.policy,
     };
 
@@ -78,6 +83,18 @@ pub(super) fn authorize(
 
     if !pkce::state_matches(&state, &callback.state) {
         return Err(OAuthLoginError::StateMismatch);
+    }
+    // RFC 9207: validate the authorization-server issuer before the code reaches
+    // the token endpoint — a mix-up defence. Required when the server advertises
+    // `iss` support; a present `iss` is compared even when support is not
+    // advertised (the spec's local-policy provision).
+    match callback.iss.as_deref() {
+        Some(iss) if iss == ctx.server.issuer => {}
+        Some(_) => return Err(OAuthLoginError::IssuerMismatch),
+        None if ctx.server.authorization_response_iss_parameter_supported => {
+            return Err(OAuthLoginError::IssuerMismatch);
+        }
+        None => {}
     }
     let _ = tx.send(LoginEvent::Progress {
         message: "Authorization received; exchanging the code for tokens…".to_string(),
@@ -138,14 +155,7 @@ fn exchange_code(
     code: &str,
     verifier: &str,
 ) -> Result<http::TokenSet, OAuthLoginError> {
-    let params = [
-        ("grant_type", "authorization_code"),
-        ("code", code),
-        ("redirect_uri", request.redirect_uri),
-        ("client_id", request.client_id),
-        ("code_verifier", verifier),
-        ("resource", request.resource),
-    ];
+    let params = code_exchange_pairs(request, code, verifier);
     let body = http::form_encode(&params);
     let response = http::post(
         agent,
@@ -155,6 +165,29 @@ fn exchange_code(
         request.policy,
     )?;
     http::read_token_response(response)
+}
+
+/// The form pairs for the authorization-code exchange. A confidential client's
+/// secret is added as `client_secret` (`client_secret_post`) when one applies; a
+/// public client sends none. Extracted so the presence/absence of the secret is
+/// unit-testable without a network call.
+fn code_exchange_pairs<'a>(
+    request: &CodeRequest<'a>,
+    code: &'a str,
+    verifier: &'a str,
+) -> Vec<(&'a str, &'a str)> {
+    let mut params = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", request.redirect_uri),
+        ("client_id", request.client_id),
+        ("code_verifier", verifier),
+        ("resource", request.resource),
+    ];
+    if let Some(secret) = request.client_secret {
+        params.push(("client_secret", secret));
+    }
+    params
 }
 
 #[cfg(test)]
@@ -168,6 +201,7 @@ mod tests {
             token_endpoint: "https://as.example/token".to_string(),
             registration_endpoint: None,
             scopes_supported: vec!["openid".to_string()],
+            authorization_response_iss_parameter_supported: false,
         }
     }
 
@@ -176,6 +210,7 @@ mod tests {
             client_id: "client-1",
             redirect_uri: "http://127.0.0.1:1455/auth/callback",
             resource,
+            client_secret: None,
             // A loopback resource keeps both allowances; a remote one keeps
             // neither, which is what the strict-policy tests exercise.
             policy: http::HopPolicy {
@@ -183,6 +218,22 @@ mod tests {
                 allow_private_hosts: allow_loopback_http,
             },
         }
+    }
+
+    #[test]
+    fn code_exchange_pairs_include_client_secret_when_present() {
+        let mut req = request("https://example.com/mcp", true);
+        req.client_secret = Some("s3cret");
+        let pairs = code_exchange_pairs(&req, "the-code", "the-verifier");
+        assert!(pairs.contains(&("client_secret", "s3cret")));
+        // A public client (no secret) sends no client_secret pair.
+        req.client_secret = None;
+        let pairs = code_exchange_pairs(&req, "the-code", "the-verifier");
+        assert!(!pairs.iter().any(|(k, _)| *k == "client_secret"));
+        // The mandatory pairs are always present.
+        assert!(pairs.contains(&("grant_type", "authorization_code")));
+        assert!(pairs.contains(&("code", "the-code")));
+        assert!(pairs.contains(&("code_verifier", "the-verifier")));
     }
 
     #[test]

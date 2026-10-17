@@ -105,6 +105,15 @@ pub enum OAuthLoginError {
     /// The `--callback-url` value could not be parsed into a code/state.
     #[error("could not parse the callback URL: {0}")]
     CallbackUrl(String),
+    /// A configured `clientSecretEnv` named an environment variable that is
+    /// unset — a confidential-client server cannot be signed into without it.
+    #[error("the environment variable {0} named by clientSecretEnv is not set")]
+    ClientSecretEnvUnset(String),
+    /// The authorization response's `iss` was required but absent, or did not
+    /// match the discovered issuer (RFC 9207 authorization-server mix-up
+    /// defence).
+    #[error("OAuth issuer mismatch (possible mix-up); login aborted")]
+    IssuerMismatch,
 }
 
 /// Options controlling how the sign-in runs.

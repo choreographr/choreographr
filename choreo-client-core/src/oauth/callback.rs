@@ -38,7 +38,7 @@ const SUCCESS_PAGE: &str = "<!doctype html><html><head><meta charset=\"utf-8\">\
 <h1>Sign-in complete</h1><p>You can close this window and return to Choreographr.</p>\
 </body></html>";
 
-/// The `code` and `state` captured from the redirect.
+/// The `code`, `state`, and issuer captured from the redirect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Callback {
     /// The authorization code to exchange.
@@ -49,6 +49,10 @@ pub(crate) struct Callback {
     /// (the `OpenAI` dynamic-registration route). Preferred over the value sent
     /// when persisting the credential's client registration.
     pub(crate) client_id: Option<String>,
+    /// The authorization-server issuer (`iss`) the response carries, when the
+    /// server includes it (RFC 9207). Validated against the discovered issuer to
+    /// defeat an authorization-server mix-up.
+    pub(crate) iss: Option<String>,
 }
 
 /// Bind the callback server on the first free port from `ports`, on `host`.
@@ -140,6 +144,8 @@ pub(crate) struct CallbackParams {
     pub(crate) state: Option<String>,
     /// A client id the provider returned on the callback, when it issues one.
     pub(crate) client_id: Option<String>,
+    /// The authorization-server issuer (`iss`) the response carries (RFC 9207).
+    pub(crate) iss: Option<String>,
     /// The OAuth error code on a denied authorization.
     pub(crate) error: Option<String>,
     /// The human-readable error description, when supplied.
@@ -155,6 +161,7 @@ fn parse_callback_params(query: &str) -> CallbackParams {
             "code" => params.code = Some(value),
             "state" => params.state = Some(value),
             "client_id" => params.client_id = Some(value),
+            "iss" => params.iss = Some(value),
             "error" => params.error = Some(value),
             "error_description" => params.error_description = Some(value),
             _ => {}
@@ -181,6 +188,7 @@ pub(crate) fn parse_callback_url(url: &str) -> Result<Callback, OAuthLoginError>
             code,
             state,
             client_id: params.client_id,
+            iss: params.iss,
         }),
         _ => Err(OAuthLoginError::CallbackUrl(
             "the URL has no code/state parameters".to_string(),
@@ -274,6 +282,7 @@ fn handle_request(request: tiny_http::Request) -> Result<Option<Callback>, OAuth
                 code,
                 state,
                 client_id: params.client_id,
+                iss: params.iss,
             }))
         }
         (_, _, Some(error)) => {

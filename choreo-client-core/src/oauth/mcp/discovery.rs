@@ -34,6 +34,11 @@ pub(super) struct AuthServer {
     pub(super) registration_endpoint: Option<String>,
     /// The scopes the server advertises support for.
     pub(super) scopes_supported: Vec<String>,
+    /// Whether the server advertises RFC 9207 `iss` support
+    /// (`authorization_response_iss_parameter_supported`). When true the
+    /// authorization response's `iss` is required and validated; when false it
+    /// is validated only if present.
+    pub(super) authorization_response_iss_parameter_supported: bool,
 }
 
 /// The most redirects a discovery GET will follow. Each hop is re-vetted with
@@ -114,6 +119,20 @@ fn well_known_root(base: &Url, prefix: &str) -> Url {
     url
 }
 
+/// The `OpenID` Connect Discovery 1.0 appended form
+/// (`{issuer}/.well-known/openid-configuration`): the well-known segment goes
+/// AFTER the issuer's path, unlike the RFC 8414 path-inserted form
+/// ([`well_known`]). A path-issuer provider (Entra, Keycloak, Okta) serves its
+/// metadata only at this location.
+fn well_known_appended(base: &Url, suffix: &str) -> Url {
+    let mut url = base.clone();
+    let path = format!("{}{}", base.path().trim_end_matches('/'), suffix);
+    url.set_path(&path);
+    url.set_query(None);
+    url.set_fragment(None);
+    url
+}
+
 /// The origin of `url` (`scheme://host[:port]/`), the assumed authorization
 /// server when the resource advertises no protected-resource metadata.
 fn origin_url(url: &Url) -> Url {
@@ -146,11 +165,13 @@ fn protected_resource_candidates(resource: &Url) -> Vec<Url> {
 }
 
 /// The authorization-server metadata candidates for `issuer`, in order: the
-/// path-inserted RFC 8414 and OIDC forms, then their root fallbacks.
+/// path-inserted RFC 8414 and OIDC forms, the OIDC appended form, then their
+/// root fallbacks.
 fn authorization_server_candidates(issuer: &Url) -> Vec<Url> {
     dedup(vec![
         well_known(issuer, OAUTH_AUTHORIZATION_SERVER),
         well_known(issuer, OPENID_CONFIGURATION),
+        well_known_appended(issuer, OPENID_CONFIGURATION),
         well_known_root(issuer, OAUTH_AUTHORIZATION_SERVER),
         well_known_root(issuer, OPENID_CONFIGURATION),
     ])
@@ -178,14 +199,23 @@ fn validate_issuer(issuer: &str, authorization_server: &Url) -> Result<(), OAuth
 
 /// Discover the authorization server from the server URL (RFC 9728 → 8414).
 ///
-/// `policy` is the endpoint policy the whole flow runs under (see
+/// When `authorization_server` is `Some`, an explicit issuer is used directly
+/// (config `authorizationServer`), skipping protected-resource probing — the
+/// path for a server whose AS is not reachable via the resource's well-known
+/// paths. `policy` is the endpoint policy the whole flow runs under (see
 /// [`http::HopPolicy::for_resource`]), so a remote resource cannot steer
 /// discovery onto a loopback or private/link-local endpoint.
 pub(super) fn discover(
     agent: &ureq::Agent,
     resource: &str,
+    authorization_server: Option<&str>,
     policy: http::HopPolicy,
 ) -> Result<AuthServer, OAuthLoginError> {
+    // An explicit override names the AS directly: fetch its metadata at once.
+    if let Some(server) = authorization_server {
+        let as_url = parse_url(server, "authorization server")?;
+        return fetch_as_metadata(agent, &as_url, policy);
+    }
     let resource_url = parse_url(resource, "resource")?;
     // RFC 9728 protected-resource metadata: try the path-inserted document,
     // then the origin-rooted form.
@@ -277,12 +307,17 @@ pub(super) fn fetch_as_metadata(
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect()
         });
+    let authorization_response_iss_parameter_supported = metadata
+        .get("authorization_response_iss_parameter_supported")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     Ok(AuthServer {
         issuer,
         authorization_endpoint,
         token_endpoint,
         registration_endpoint: string("registration_endpoint"),
         scopes_supported,
+        authorization_response_iss_parameter_supported,
     })
 }
 
@@ -343,17 +378,41 @@ mod tests {
                 "https://example.com/.well-known/openid-configuration",
             ]
         );
-        // A path-bearing issuer: the path-inserted forms first, then the root
-        // fallbacks.
+        // A path-bearing issuer: the path-inserted forms first, then the OIDC
+        // appended form, then the root fallbacks.
         let path = authorization_server_candidates(&url("https://example.com/tenant"));
         assert_eq!(
             path.iter().map(Url::as_str).collect::<Vec<_>>(),
             vec![
                 "https://example.com/.well-known/oauth-authorization-server/tenant",
                 "https://example.com/.well-known/openid-configuration/tenant",
+                "https://example.com/tenant/.well-known/openid-configuration",
                 "https://example.com/.well-known/oauth-authorization-server",
                 "https://example.com/.well-known/openid-configuration",
             ]
+        );
+    }
+
+    #[test]
+    fn well_known_appended_puts_the_segment_after_the_path() {
+        // The `OpenID` Connect Discovery appended form: `{issuer}/.well-known/...`,
+        // the location a path-issuer provider (Entra, Keycloak) serves.
+        assert_eq!(
+            well_known_appended(
+                &url("https://login.microsoftonline.com/common/v2.0"),
+                OPENID_CONFIGURATION
+            )
+            .as_str(),
+            "https://login.microsoftonline.com/common/v2.0/.well-known/openid-configuration"
+        );
+        // A trailing slash on the base path is trimmed before appending.
+        assert_eq!(
+            well_known_appended(
+                &url("https://example.com/realms/main/"),
+                OPENID_CONFIGURATION
+            )
+            .as_str(),
+            "https://example.com/realms/main/.well-known/openid-configuration"
         );
     }
 

@@ -27,6 +27,7 @@ use std::sync::atomic::AtomicBool;
 use choreo_keystore::{OAuthKind, ServiceCredential};
 use choreo_proto::McpOAuthConfig;
 use crossbeam_channel::Sender;
+use zeroize::Zeroizing;
 
 use super::{
     LoginEvent, LoginSession, OAuthLoginError, callback, credential, http, spawn_login_worker,
@@ -103,7 +104,12 @@ fn run(
     let _ = tx.send(LoginEvent::Progress {
         message: "Discovering the authorization server…".to_string(),
     });
-    let server = discover(&http::agent(), &info.resource, policy)?;
+    let server = discover(
+        &http::agent(),
+        &info.resource,
+        info.oauth.authorization_server.as_deref(),
+        policy,
+    )?;
     // Bind the loopback callback FIRST so the redirect URI is known, then use
     // that exact URI for both dynamic registration and the authorize request.
     // A server that validates `redirect_uri` against the registered value must
@@ -126,16 +132,28 @@ fn run(
             tx,
         )?,
     };
+    // Resolve the confidential client's secret from the environment variable the
+    // config names, if any. An unset variable is a terminal error here rather
+    // than a later, less clear token-endpoint rejection.
+    let client_secret = resolve_client_secret(info.oauth.client_secret_env.as_deref())?;
     let ctx = AuthorizeContext {
         info,
         options,
         server: &server,
         client_id: &client_id,
+        client_secret: client_secret.as_ref().map(|s| s.as_str()),
         bound: &bound,
         policy,
     };
     let tokens = authorize(&ctx, tx, cancel)?;
-    finish(info, &server, &client_id, &tokens, tx)?;
+    finish(
+        info,
+        &server,
+        &client_id,
+        client_secret.as_ref().map(|s| s.as_str()),
+        &tokens,
+        tx,
+    )?;
     Ok(())
 }
 
@@ -146,11 +164,27 @@ struct BoundCallback {
     redirect_uri: String,
 }
 
+/// Resolve a confidential client's secret from the environment variable the
+/// config names, if any. Returning an error for an unset variable keeps the
+/// failure at the clear "set the variable" point rather than a later, opaque
+/// token-endpoint rejection.
+fn resolve_client_secret(
+    env_name: Option<&str>,
+) -> Result<Option<Zeroizing<String>>, OAuthLoginError> {
+    match env_name {
+        None => Ok(None),
+        Some(name) => std::env::var(name)
+            .map(|value| Some(Zeroizing::new(value)))
+            .map_err(|_| OAuthLoginError::ClientSecretEnvUnset(name.to_string())),
+    }
+}
+
 /// Build the credential from the exchanged tokens and emit `Done`.
 fn finish(
     info: &McpLoginInfo,
     server: &AuthServer,
     client_id: &str,
+    client_secret: Option<&str>,
     tokens: &http::TokenSet,
     tx: &Sender<LoginEvent>,
 ) -> Result<(), OAuthLoginError> {
@@ -167,7 +201,10 @@ fn finish(
         refresh_token: tokens.refresh_token.as_ref().map(|t| t.to_string()),
         account_id: None,
         client_id: Some(client_id.to_string()),
-        client_secret: None,
+        // Persisted only for a confidential client, so connect-time refresh can
+        // re-authenticate the token endpoint (rmcp applies it via
+        // `OAuthClientConfig::with_client_secret`).
+        client_secret: client_secret.map(str::to_string),
         granted_scopes,
         token_type: tokens.token_type.clone(),
     };
