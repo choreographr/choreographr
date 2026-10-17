@@ -24,7 +24,7 @@ use serde::Deserialize;
 /// token set) and an `error`/`error_description` reply: the caller keys its
 /// terminal-vs-transient decision on the HTTP status and only reads the fields
 /// the status makes meaningful.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 pub struct TokenResponse {
     /// The new bearer access token, present on a success reply.
     pub access_token: Option<String>,
@@ -45,6 +45,30 @@ pub struct TokenResponse {
     pub error: Option<String>,
     /// The human-readable failure description, when supplied.
     pub error_description: Option<String>,
+}
+
+/// Redacting `Debug`: the struct holds the freshly minted access/refresh/id
+/// tokens, so a logged response must not expose them. Hand-written (not derived)
+/// because this type sits on the shared login/refresh boundary — one stray
+/// `{:?}` would leak a live token — mirroring the redacting `Debug` on the
+/// sibling token types (`TokenSet`, `OAuthTokenResponse`). Only presence and the
+/// non-secret provider-error fields are printed.
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("refresh_token", &self.refresh_token.is_some())
+            .field("id_token", &self.id_token.is_some())
+            .field("token_type", &self.token_type)
+            .field("scope", &self.scope)
+            .field("expires_in", &self.expires_in)
+            .field("error", &self.error)
+            .field("error_description", &self.error_description)
+            .finish()
+    }
 }
 
 /// Parse a token-endpoint response body.
@@ -128,6 +152,25 @@ mod tests {
             Some("the grant is dead")
         );
         assert!(parsed.access_token.is_none());
+    }
+
+    #[test]
+    fn debug_never_prints_a_token_value() {
+        let body = r#"{
+            "access_token": "at-secret",
+            "refresh_token": "rt-secret",
+            "id_token": "idt-secret",
+            "token_type": "Bearer",
+            "error": "invalid_grant"
+        }"#;
+        let debug = format!("{:?}", parse(body));
+        for secret in ["at-secret", "rt-secret", "idt-secret"] {
+            assert!(!debug.contains(secret), "Debug leaked {secret}: {debug}");
+        }
+        // Presence flags and the non-secret fields still render.
+        assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(debug.contains("refresh_token: true"), "{debug}");
+        assert!(debug.contains("invalid_grant"), "{debug}");
     }
 
     #[test]
