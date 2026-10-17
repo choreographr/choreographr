@@ -82,6 +82,19 @@ choreo-client-core = { workspace = true, features = ["test-support"] }
 android-activity = { version = "0.6", features = ["native-activity"] }
 blitz-shell = "0.2"
 
+# Resolution hold, NOT a code dependency (nothing here references libc): an
+# exact `libc = "=0.2.189"` requirement that pins the shared workspace lock's
+# libc, which `cargo update` cannot lift. See the `libc` note in the workspace
+# manifest for the full why (nix 0.31.3 fails to compile for aarch64-apple-ios
+# against libc >= 0.2.190). It lives in this crate because choreo-gui's iOS
+# build — the embedded choreo-daemon pulling nix through choreo-sockreg/
+# choreo-transport — is exactly what the hold protects, and choreo-gui is the
+# ONE member with `publish = false`, so the exact pin never leaks into the
+# nineteen published manifests. cfg(unix) covers every target choreo-gui builds
+# for (Linux/macOS/Android/iOS are all unix).
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 # iOS-only: the embedded in-process daemon (choreo-daemon::embedded). Target-
 # gated so desktop and Android builds neither link nor compile-reach any of it
 # — a plain host build has no `choreo_daemon` symbols in this crate at all.
