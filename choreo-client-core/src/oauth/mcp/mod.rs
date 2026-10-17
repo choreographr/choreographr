@@ -37,7 +37,7 @@ mod authorize;
 mod discovery;
 mod register;
 
-use authorize::authorize;
+use authorize::{AuthorizeContext, authorize};
 use discovery::{AuthServer, discover};
 use register::register_client;
 
@@ -93,11 +93,16 @@ fn run(
     tx: &Sender<LoginEvent>,
     cancel: &AtomicBool,
 ) -> Result<(), OAuthLoginError> {
-    let discovery_agent = http::discovery_agent();
+    // The loopback `http` allowance is available only when the flow already
+    // began at a loopback resource (the in-repo mock server). A remote resource
+    // must not be able to steer any later hop — a metadata GET redirect, a
+    // discovered endpoint — onto `http://127.0.0.1`, so a hostile document
+    // cannot probe the host's local services.
+    let allow_loopback = choreo_shared::oauth_endpoint::is_loopback_endpoint(&info.resource);
     let _ = tx.send(LoginEvent::Progress {
         message: "Discovering the authorization server…".to_string(),
     });
-    let server = discover(&discovery_agent, &info.resource)?;
+    let server = discover(&http::agent(), &info.resource, allow_loopback)?;
     // Bind the loopback callback FIRST so the redirect URI is known, then use
     // that exact URI for both dynamic registration and the authorize request.
     // A server that validates `redirect_uri` against the registered value must
@@ -116,10 +121,19 @@ fn run(
             &server,
             &bound.redirect_uri,
             &info.oauth.scopes,
+            allow_loopback,
             tx,
         )?,
     };
-    let tokens = authorize(info, options, &server, &client_id, &bound, tx, cancel)?;
+    let ctx = AuthorizeContext {
+        info,
+        options,
+        server: &server,
+        client_id: &client_id,
+        bound: &bound,
+        allow_loopback_http: allow_loopback,
+    };
+    let tokens = authorize(&ctx, tx, cancel)?;
     finish(info, &server, &client_id, &tokens, tx)?;
     Ok(())
 }

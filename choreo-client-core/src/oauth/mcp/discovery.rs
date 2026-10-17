@@ -41,15 +41,21 @@ pub(super) struct AuthServer {
 /// remote host.
 const MAX_DISCOVERY_REDIRECTS: usize = 5;
 
-/// Fetch and parse an `https` (or loopback `http`) JSON document, following a
-/// small, bounded number of redirects — **re-vetting every hop** with
-/// [`http::ensure_secure`] before it is dialed, so a redirect cannot downgrade
-/// the fetch to cleartext. The caller's `discovery_agent` follows no redirects
-/// itself, which is what lets this loop police each target.
-fn get_json(agent: &ureq::Agent, url: &str) -> Result<Value, OAuthLoginError> {
+/// Fetch and parse an `https` (or, when `allow_loopback_http`, a loopback
+/// `http`) JSON document, following a small, bounded number of redirects —
+/// **re-vetting every hop** with [`http::ensure_secure_with`] before it is
+/// dialed, so a redirect can neither downgrade the fetch to cleartext nor (from
+/// a remote resource) steer it onto `http://127.0.0.1`. The caller's agent
+/// follows no redirects itself, which is what lets this loop police each
+/// target.
+fn get_json(
+    agent: &ureq::Agent,
+    url: &str,
+    allow_loopback_http: bool,
+) -> Result<Value, OAuthLoginError> {
     let mut current = parse_url(url, "discovery")?;
     for _ in 0..=MAX_DISCOVERY_REDIRECTS {
-        http::ensure_secure(current.as_str())?;
+        http::ensure_secure_with(current.as_str(), allow_loopback_http)?;
         let response = agent
             .get(current.as_str())
             .header("Accept", "application/json")
@@ -175,13 +181,21 @@ fn validate_issuer(issuer: &str, authorization_server: &Url) -> Result<(), OAuth
 }
 
 /// Discover the authorization server from the server URL (RFC 9728 → 8414).
-pub(super) fn discover(agent: &ureq::Agent, resource: &str) -> Result<AuthServer, OAuthLoginError> {
+///
+/// `allow_loopback_http` is the endpoint policy the whole flow runs under: it is
+/// set only when the starting resource is itself loopback, so a remote resource
+/// cannot steer discovery onto a local endpoint.
+pub(super) fn discover(
+    agent: &ureq::Agent,
+    resource: &str,
+    allow_loopback_http: bool,
+) -> Result<AuthServer, OAuthLoginError> {
     let resource_url = parse_url(resource, "resource")?;
     // RFC 9728 protected-resource metadata: try the path-inserted document,
     // then the origin-rooted form.
     let mut resource_metadata = None;
     for candidate in protected_resource_candidates(&resource_url) {
-        if let Ok(value) = get_json(agent, candidate.as_str()) {
+        if let Ok(value) = get_json(agent, candidate.as_str(), allow_loopback_http) {
             resource_metadata = Some(value);
             break;
         }
@@ -198,7 +212,7 @@ pub(super) fn discover(agent: &ureq::Agent, resource: &str) -> Result<AuthServer
         // No protected-resource metadata: assume the resource host is the AS.
         None => origin_url(&resource_url),
     };
-    fetch_as_metadata(agent, &authorization_server)
+    fetch_as_metadata(agent, &authorization_server, allow_loopback_http)
 }
 
 /// Whether an authorization-server metadata document carries the two endpoints
@@ -210,15 +224,17 @@ fn has_required_endpoints(metadata: &Value) -> bool {
         .all(|key| metadata.get(key).and_then(Value::as_str).is_some())
 }
 
-/// Fetch RFC 8414 / OIDC authorization-server metadata.
+/// Fetch RFC 8414 / OIDC authorization-server metadata under the flow's
+/// endpoint policy (`allow_loopback_http`).
 pub(super) fn fetch_as_metadata(
     agent: &ureq::Agent,
     authorization_server: &Url,
+    allow_loopback_http: bool,
 ) -> Result<AuthServer, OAuthLoginError> {
     let mut metadata = None;
     let mut last_error = OAuthLoginError::Decode("no metadata candidate".to_string());
     for candidate in authorization_server_candidates(authorization_server) {
-        match get_json(agent, candidate.as_str()) {
+        match get_json(agent, candidate.as_str(), allow_loopback_http) {
             Ok(value) => {
                 // A well-known document that exists but omits the required
                 // endpoints must not stop the search: some servers serve an

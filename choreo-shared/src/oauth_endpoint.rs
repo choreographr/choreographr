@@ -16,6 +16,14 @@
 /// Whether `url` is safe to send an OAuth code or token to: `https`, or a
 /// loopback `http` URL (`127.0.0.1`, `localhost`, or `[::1]`).
 ///
+/// This is the permissive default ([`is_secure_endpoint_with`] with the
+/// loopback allowance on), used by the provider login and the runtime refresh
+/// whose endpoints come from the trusted descriptor/credential. A caller whose
+/// URL was chosen by a *fetched* document (the MCP discovery flow) must use
+/// [`is_secure_endpoint_with`] with `allow_loopback_http = false` unless the
+/// flow already began at a loopback resource, so a remote document cannot steer
+/// a hop onto `http://127.0.0.1`.
+///
 /// The scheme and host are compared case-insensitively: a URL scheme is
 /// case-insensitive by RFC 3986, so `HTTPS://…` is accepted just like
 /// `https://…`. An unparseable prefix (any scheme other than http/https) is
@@ -23,6 +31,22 @@
 /// A URL whose authority carries userinfo (an `@`, as in `user:pass@host`) is
 /// refused outright: RFC 3986 places the host *after* the `@`, so the real host
 /// is remote even when the text before the `@` names a loopback host.
+#[must_use]
+pub fn is_secure_endpoint(url: &str) -> bool {
+    is_secure_endpoint_with(url, true)
+}
+
+/// Whether `url` is safe to send an OAuth code or token to under an explicit
+/// loopback policy: `https` is always safe, and a loopback `http` URL is safe
+/// only when `allow_loopback_http` is set.
+///
+/// The permissive case ([`is_secure_endpoint`]) exists for the in-repo mock
+/// server and a local test issuer. The strict case is what the MCP discovery
+/// flow uses when its resource was remote: the loopback allowance must not be
+/// reachable from a document a remote server chose, or a hostile
+/// protected-resource/authorization-server document could point a hop (a
+/// metadata fetch, the code exchange) at `http://127.0.0.1:<port>` and probe the
+/// host's local services.
 ///
 /// The parse is deliberately conservative — it over-refuses rather than
 /// under-refuses, because a false negative only blocks a legitimate endpoint
@@ -33,7 +57,7 @@
 /// whole authority-plus-query. Real token and device endpoints carry a path, so
 /// this only ever affects a hand-written test endpoint.
 #[must_use]
-pub fn is_secure_endpoint(url: &str) -> bool {
+pub fn is_secure_endpoint_with(url: &str, allow_loopback_http: bool) -> bool {
     // Lowercase only enough to normalize the scheme and host; the path's case is
     // irrelevant to this decision and copying the whole URL is cheap for the
     // handful of calls made per login/refresh.
@@ -41,28 +65,42 @@ pub fn is_secure_endpoint(url: &str) -> bool {
     if lower.starts_with("https://") {
         return true;
     }
-    let Some(rest) = lower.strip_prefix("http://") else {
-        return false;
-    };
-    // The authority is everything before the first `/`. Userinfo (`user:pass@host`)
-    // decodes to a remote host, so reading the host from before the `@` would
-    // select a loopback name for a URL that actually targets a remote host;
-    // refuse the whole URL rather than trying to parse past the userinfo.
+    allow_loopback_http && loopback_http_host(&lower).is_some()
+}
+
+/// Whether `url` is a loopback `http` URL (`127.0.0.1`, `localhost`, or `[::1]`)
+/// under the same conservative parse as [`is_secure_endpoint`]. The MCP
+/// discovery flow uses this on its starting resource to decide whether the
+/// loopback allowance is available for the rest of the flow.
+#[must_use]
+pub fn is_loopback_endpoint(url: &str) -> bool {
+    loopback_http_host(&url.to_ascii_lowercase()).is_some()
+}
+
+/// The loopback host of an `http://` URL (`127.0.0.1`, `localhost`, or `::1`),
+/// or `None` when the URL is not a loopback `http` URL.
+///
+/// `url_lower` must already be ASCII-lowercased. The authority is read
+/// conservatively: userinfo (`user:pass@host`) is refused outright, because
+/// RFC 3986 places the real host *after* the `@`, so reading the host before the
+/// `@` would select a loopback name for a URL that actually targets a remote
+/// host; a bracketed IPv6 host (`[::1]:port`) is unwrapped and a bracket with no
+/// closing `]` is refused rather than read as the host; and the host is read
+/// before the first `/`, so a path-less query (`http://localhost?x=1`) is
+/// refused rather than read as the host.
+fn loopback_http_host(url_lower: &str) -> Option<&str> {
+    let rest = url_lower.strip_prefix("http://")?;
     let authority = rest.split('/').next().unwrap_or_default();
     if authority.contains('@') {
-        return false;
+        return None;
     }
-    // A bracketed IPv6 host (`[::1]:port`) is unwrapped; a bracket with no
-    // closing `]` is malformed and refused rather than read as the host.
     let host = if let Some(after_bracket) = authority.strip_prefix('[') {
-        match after_bracket.split_once(']') {
-            Some((inner, _rest)) => inner,
-            None => return false,
-        }
+        let (inner, _rest) = after_bracket.split_once(']')?;
+        inner
     } else {
         authority.split(':').next().unwrap_or_default()
     };
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
+    matches!(host, "127.0.0.1" | "localhost" | "::1").then_some(host)
 }
 
 #[cfg(test)]
@@ -128,6 +166,35 @@ mod tests {
     fn loopback_with_a_port_is_still_secure() {
         assert!(is_secure_endpoint("http://localhost:8080/token"));
         assert!(is_secure_endpoint("http://[::1]:8080/token"));
+    }
+
+    #[test]
+    fn strict_policy_refuses_loopback_http_but_https_and_non_loopback() {
+        // With the loopback allowance off, only https is secure: a loopback
+        // `http` URL is refused so a remote document cannot steer a hop inward.
+        assert!(is_secure_endpoint_with("https://as.example/token", false));
+        assert!(!is_secure_endpoint_with("http://127.0.0.1/token", false));
+        assert!(!is_secure_endpoint_with(
+            "http://localhost:8080/token",
+            false
+        ));
+        assert!(!is_secure_endpoint_with("http://[::1]:8080/token", false));
+        assert!(!is_secure_endpoint_with("http://evil.example/token", false));
+        // The permissive default keeps accepting loopback http.
+        assert!(is_secure_endpoint_with("http://127.0.0.1/token", true));
+    }
+
+    #[test]
+    fn is_loopback_endpoint_matches_the_same_urls_as_the_permissive_rule() {
+        assert!(is_loopback_endpoint("http://127.0.0.1:8080/token"));
+        assert!(is_loopback_endpoint("http://localhost/token"));
+        assert!(is_loopback_endpoint("http://[::1]:8080/token"));
+        // https is never "loopback http" even for a loopback host, and a remote
+        // cleartext host is not loopback.
+        assert!(!is_loopback_endpoint("https://localhost/token"));
+        assert!(!is_loopback_endpoint("http://evil.example/token"));
+        assert!(!is_loopback_endpoint("http://localhost@evil.example/token"));
+        assert!(!is_loopback_endpoint("http://localhost?x=1"));
     }
 
     #[test]

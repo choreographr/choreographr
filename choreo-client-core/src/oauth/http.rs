@@ -8,9 +8,15 @@
 //! per-endpoint encoding — the code exchange and the refresh can differ (the
 //! `ChatGPT`/Codex backend accepts a form-encoded code exchange but a JSON
 //! refresh). No redirects are followed on these credential-bearing POSTs; the
-//! credential-free discovery GETs use a separate agent that follows **no**
-//! redirects itself, and the discovery caller follows a bounded number of hops,
-//! re-vetting each with the endpoint policy (see [`discovery_agent`]).
+//! credential-free discovery GETs use the same agent (which follows **no**
+//! redirects itself), and the discovery caller follows a bounded number of hops,
+//! re-vetting each with the endpoint policy (see `mcp::discovery::get_json`).
+//!
+//! Every credential-bearing endpoint is vetted with the shared `https`-or-
+//! loopback rule. The provider flow and the mock-server tests keep the loopback
+//! allowance; the MCP flow passes `allow_loopback_http = false` whenever its
+//! resource was remote, so a fetched document cannot steer a hop onto
+//! `http://127.0.0.1`.
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -120,7 +126,20 @@ pub(crate) fn authorize_url(endpoint: &str, params: &[(&str, &str)]) -> String {
 /// (`choreo_shared::oauth_endpoint`), the same rule the runtime refresh client
 /// applies, so login and refresh cannot drift.
 pub(crate) fn ensure_secure(url: &str) -> Result<(), OAuthLoginError> {
-    if choreo_shared::oauth_endpoint::is_secure_endpoint(url) {
+    ensure_secure_with(url, true)
+}
+
+/// As [`ensure_secure`], under an explicit loopback policy.
+///
+/// The MCP discovery flow passes `allow_loopback_http = false` when it did not
+/// begin at a loopback resource, so a fetched metadata document or a redirect
+/// cannot steer a hop onto `http://127.0.0.1` (an SSRF against the host's local
+/// services). The provider flow keeps the permissive default.
+pub(crate) fn ensure_secure_with(
+    url: &str,
+    allow_loopback_http: bool,
+) -> Result<(), OAuthLoginError> {
+    if choreo_shared::oauth_endpoint::is_secure_endpoint_with(url, allow_loopback_http) {
         Ok(())
     } else {
         Err(OAuthLoginError::InsecureEndpoint(url.to_string()))
@@ -129,24 +148,12 @@ pub(crate) fn ensure_secure(url: &str) -> Result<(), OAuthLoginError> {
 
 /// Build the shared agent: status responses are returned verbatim (a 400 token
 /// response is a normal, readable outcome), a global timeout bounds a hung
-/// provider, and redirects are never followed on these POSTs.
+/// provider, and redirects are never followed — on the credential-bearing POSTs
+/// (so a code or device code is never replayed at another host) or on the
+/// credential-free discovery GETs (whose caller follows a small, bounded number
+/// of hops itself, re-vetting each with the endpoint policy; see
+/// `mcp::discovery::get_json`).
 pub(crate) fn agent() -> ureq::Agent {
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(30)))
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .build();
-    ureq::Agent::new_with_config(config)
-}
-
-/// Build the agent for the credential-free **discovery** GETs (the RFC 9728 /
-/// 8414 well-known metadata fetches). It follows **no** redirects itself; the
-/// discovery caller follows a small, bounded number of redirects, re-vetting
-/// each hop with the endpoint policy so a redirect cannot downgrade the fetch to
-/// cleartext (see `mcp::discovery::get_json`). A metadata document carries no
-/// credential, but the redirect target is still policed so discovery cannot be
-/// steered onto a non-`https` host.
-pub(crate) fn discovery_agent() -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(30)))
         .http_status_as_error(false)
@@ -165,8 +172,9 @@ pub(crate) fn post(
     url: &str,
     content_type: &str,
     body: &str,
+    allow_loopback_http: bool,
 ) -> Result<ureq::http::Response<ureq::Body>, OAuthLoginError> {
-    ensure_secure(url)?;
+    ensure_secure_with(url, allow_loopback_http)?;
     agent
         .post(url)
         .header("Content-Type", content_type)
@@ -275,7 +283,7 @@ pub(crate) fn exchange_code(
             )
         }
     };
-    let response = post(&agent, &url, content_type, &body)?;
+    let response = post(&agent, &url, content_type, &body, true)?;
     read_token_response(response)
 }
 
@@ -299,7 +307,13 @@ pub(crate) fn device_authorize(
     let url = choreo_shared::url::join_path(issuer, device_authorization_path);
     let pairs = [("client_id", client_id), ("scope", scope)];
     let body = Zeroizing::new(form_encode(&pairs));
-    let response = post(agent, &url, "application/x-www-form-urlencoded", &body)?;
+    let response = post(
+        agent,
+        &url,
+        "application/x-www-form-urlencoded",
+        &body,
+        true,
+    )?;
     let status = response.status();
     // The response carries the opaque `device_code` (a short-lived secret), so
     // its body is wipe-on-drop.
@@ -373,7 +387,13 @@ pub(crate) fn device_poll(
         ("client_id", client_id),
     ];
     let body = Zeroizing::new(form_encode(&pairs));
-    let response = post(agent, &url, "application/x-www-form-urlencoded", &body)?;
+    let response = post(
+        agent,
+        &url,
+        "application/x-www-form-urlencoded",
+        &body,
+        true,
+    )?;
     // The response body carries the freshly minted tokens on the authorized
     // poll, so it is wipe-on-drop.
     let body = Zeroizing::new(

@@ -924,6 +924,17 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   the discovered metadata is vetted with the same `https`-or-loopback predicate
   before the browser is opened, so a server advertising a cleartext remote
   endpoint is refused.
+
+  The loopback side of that predicate is **earned by the resource**: the flow
+  computes the endpoint policy once from the resource URL (`is_loopback_endpoint`)
+  and permits a loopback `http` hop only when the resource itself is loopback
+  (the in-repo mock server). A remote resource's discovery GETs, redirects, and
+  discovered endpoints must all be `https`, so a hostile protected-resource or
+  authorization-server document cannot steer a hop — a metadata fetch or the
+  code exchange — onto `http://127.0.0.1:<port>` and probe the host's local
+  services. The provider login and the runtime refresh keep the permissive
+  default, since their endpoints come from the trusted descriptor/credential
+  rather than a fetched document.
   `mcp login <slug>` reads the server's resolved identity, `oauth` block, and
   credential key from the extended `McpStatus` and sends the grant over the
   existing `AddCredential`; `mcp logout <slug>` removes it via

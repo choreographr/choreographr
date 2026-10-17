@@ -19,11 +19,17 @@ use super::discovery::AuthServer;
 /// exactly. `scopes` is the same configured set the authorize request will ask
 /// for (falling back to the server's advertised scopes), so the registered
 /// client and the authorization request never disagree on scope.
+///
+/// `allow_loopback_http` is the flow's endpoint policy: the registration
+/// endpoint came from a fetched document, so it is vetted under the same rule as
+/// the rest of the flow (a remote resource cannot register against a local
+/// endpoint).
 pub(super) fn register_client(
     agent: &ureq::Agent,
     server: &AuthServer,
     redirect_uri: &str,
     scopes: &[String],
+    allow_loopback_http: bool,
     tx: &Sender<LoginEvent>,
 ) -> Result<String, OAuthLoginError> {
     let Some(endpoint) = server.registration_endpoint.as_deref() else {
@@ -35,7 +41,7 @@ pub(super) fn register_client(
     let _ = tx.send(LoginEvent::Progress {
         message: "Registering this client with the authorization server…".to_string(),
     });
-    http::ensure_secure(endpoint)?;
+    http::ensure_secure_with(endpoint, allow_loopback_http)?;
     let body = json!({
         "client_name": "Choreographr",
         "redirect_uris": [redirect_uri],
