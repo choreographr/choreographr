@@ -22,8 +22,6 @@
 //! the identity claim (`account_id`), replaced only when a new `id_token`
 //! carries it.
 
-use std::sync::PoisonError;
-
 use choreo_ai_protocols::catalog::GrantEncoding;
 use choreo_ai_protocols::oauth::{OAuthRefreshError, OAuthRefreshRequest, refresh_oauth_token};
 use tracing::warn;
@@ -274,7 +272,7 @@ pub fn refresh_single_flight(
     // winner's persisted token rather than spending a single-use one twice.
     let result = {
         let lock = oauth_refresh_locks::acquire(account);
-        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let _guard = lock.lock();
         refresh_under_lock(source, account, force, now)
     };
     oauth_refresh_locks::prune();
@@ -352,7 +350,7 @@ fn refresh_under_lock(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, PoisonError};
 
     fn cached(expires_at: Option<i64>, now: i64) -> CachedAccessToken {
         CachedAccessToken {

@@ -949,8 +949,9 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   fire-and-forget `DaemonCommand`s (`OAuthSave`/`OAuthClear`/`McpAuthRejected`)
   that persist to the binding public key when the loop is next free. The
   single-flight refresh guard reuses `OAuthRefreshLocks`, keyed by the MCP
-  credential key, through an owned `Send` guard (a one-token crossbeam
-  semaphore) the async adapter can hold across an `await`.
+  credential key: the registry's one semaphore-backed `OwnedRefreshLock` serves
+  both engines, and the async adapter takes its owned `Send` guard from a
+  `spawn_blocking` task so it can be held across the refresh `await`.
 
 ### Slug renames (one-time migration)
 

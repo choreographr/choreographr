@@ -220,7 +220,7 @@ impl CredentialBackend for McpOAuthBackend {
         // The adapter calls this from a `spawn_blocking` task (never an async
         // context), so the blocking acquisition is safe; the owned guard is
         // `Send + 'static` and can be held across the refresh `await`.
-        let lock = crate::oauth_refresh_locks::acquire_owned(&self.key);
+        let lock = crate::oauth_refresh_locks::acquire(&self.key);
         Ok(Some(RefreshGuard::new(lock.lock())))
     }
 
