@@ -15,15 +15,24 @@
 //! backend's `load` reads it directly. Writes (`save`, `clear`,
 //! `mark_reauthentication`) are **fire-and-forget** `DaemonCommand`s: an
 //! unbounded crossbeam send never blocks, so the connect-time refresh proceeds
-//! and the command loop persists the rotation when it is next free. A crash
-//! before that persist leaves a spent token → the next refresh is terminal →
-//! re-login, the correct safe failure.
+//! and the command loop persists the rotation when it is next free. Before
+//! enqueuing that durable command the backend also publishes the write into the
+//! snapshot synchronously ([`McpOAuthRuntime::publish_credential`] /
+//! `remove_credential`): a rotation (or a clear/rejection) lands in the read view
+//! before the per-credential single-flight guard is released, so a concurrent
+//! refresh of the same grant re-reads the rotated credential instead of spending
+//! an already-rotated single-use refresh token. A crash before the durable
+//! persist leaves a spent token → the next refresh is terminal → re-login, the
+//! correct safe failure.
 //!
 //! The snapshot is the same single-writer pattern as the tool registry: the
-//! command loop is its sole writer (it republishes after every credential
-//! mutation), and the connect-path backend reads it lock-protected. It carries
-//! only credential values the command loop already owns; it is not a second
-//! source of truth, just a read view that removes the deadlock.
+//! command loop is its durable single writer and whole-map republisher (it
+//! republishes after every credential mutation), while the connect-path backend
+//! also advances its own key's read-view entry synchronously (see
+//! [`McpOAuthRuntime::publish_credential`] / `remove_credential`), and the
+//! connect-path backend reads it lock-protected. It carries only credential
+//! values the command loop already owns; it is not a second source of truth,
+//! just a read view that removes the deadlock.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -42,8 +51,11 @@ use crate::daemon::DaemonCommand;
 /// The command-loop-published view of the daemon's MCP OAuth credentials, plus
 /// the command sender the backend uses for its non-blocking writes.
 pub struct McpOAuthRuntime {
-    /// The current MCP-keyed credentials, keyed `mcp:<slug>|<hash>`. Written
-    /// only by the command loop (via [`Self::publish`]); read by the backend.
+    /// The current MCP-keyed credentials, keyed `mcp:<slug>|<hash>`. The
+    /// command loop rewrites the whole map (via [`Self::publish`]); the
+    /// connect-path backend and the command loop both advance a single key's
+    /// entry (via [`Self::publish_credential`] / [`Self::remove_credential`]);
+    /// read by the backend.
     snapshot: Mutex<HashMap<String, ServiceCredential>>,
     /// The command-loop sender, used for fire-and-forget writes.
     tx: Sender<DaemonCommand>,
@@ -63,6 +75,36 @@ impl McpOAuthRuntime {
     /// Replace the whole MCP-keyed credential set (command-loop single writer).
     pub fn publish(&self, creds: HashMap<String, ServiceCredential>) {
         *self.snapshot.lock().unwrap_or_else(PoisonError::into_inner) = creds;
+    }
+
+    /// Publish one rotated (or freshly obtained) MCP credential into the
+    /// connect-path read view, synchronously.
+    ///
+    /// The connect-path backend calls this from inside a refresh while it holds
+    /// the per-credential single-flight guard, BEFORE enqueuing the durable
+    /// `OAuthSave`. That ordering is what closes the concurrent-refresh race: a
+    /// second connection that acquires the guard next re-reads this rotation from
+    /// the snapshot instead of the pre-rotation credential, so it never spends an
+    /// already-rotated single-use refresh token. The command loop remains the
+    /// durable single writer; this only advances the in-memory read view ahead of
+    /// the enqueued persist.
+    pub fn publish_credential(&self, key: &str, credential: ServiceCredential) {
+        self.snapshot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key.to_string(), credential);
+    }
+
+    /// Remove one MCP credential from the connect-path read view, synchronously
+    /// (the counterpart to [`Self::publish_credential`] for a logout/clear or a
+    /// terminally rejected grant), so a concurrent connect observes the removal
+    /// without waiting for the command loop. The durable removal is still the
+    /// command loop's.
+    pub fn remove_credential(&self, key: &str) {
+        self.snapshot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(key);
     }
 }
 
@@ -197,14 +239,27 @@ impl CredentialBackend for McpOAuthBackend {
         }
     }
 
+    /// Persist a rotated (or freshly obtained) credential.
+    ///
+    /// The durable write is fire-and-forget — an unbounded send never blocks, so
+    /// the connect-time refresh proceeds even while the command loop is busy;
+    /// the loop persists it when next free. But the connect-path read view is
+    /// advanced *synchronously first*: `rmcp` holds the per-credential
+    /// single-flight guard across `load → exchange → save`, and a second
+    /// connection can acquire that guard the moment this call returns. Publishing
+    /// the rotation before the enqueue (and therefore before the guard release)
+    /// means the loser re-reads the rotated credential rather than the
+    /// pre-rotation one, so it never spends an already-rotated single-use refresh
+    /// token. The command channel is FIFO, so the winner's publish happens-before
+    /// its guard release happens-before the loser's enqueue, and the durable
+    /// saves still apply in order.
     fn save(
         &self,
         credential: ServiceCredential,
         expected_refresh_token: Option<String>,
     ) -> Result<(), String> {
-        // Fire-and-forget: an unbounded send never blocks, so the connect-time
-        // refresh proceeds even while the command loop is busy. Persistence
-        // happens on the loop.
+        self.runtime
+            .publish_credential(&self.key, credential.clone());
         self.runtime
             .tx
             .send(DaemonCommand::OAuthSave {
@@ -217,6 +272,10 @@ impl CredentialBackend for McpOAuthBackend {
     }
 
     fn clear(&self) -> Result<(), String> {
+        // Advance the read view synchronously so a concurrent connect observes
+        // the removal without waiting for the command loop; the durable removal
+        // still travels as the fire-and-forget command below.
+        self.runtime.remove_credential(&self.key);
         self.runtime
             .tx
             .send(DaemonCommand::OAuthClear {
@@ -234,6 +293,10 @@ impl CredentialBackend for McpOAuthBackend {
     }
 
     fn mark_reauthentication(&self) -> Result<(), String> {
+        // A terminally rejected grant is withheld from the read view at once (the
+        // `dead_oauth` quarantine), so a concurrent connect never re-spends the
+        // spent token; the durable quarantine still travels as the command below.
+        self.runtime.remove_credential(&self.key);
         self.runtime
             .tx
             .send(DaemonCommand::McpAuthRejected {
@@ -248,6 +311,47 @@ mod tests {
     use super::*;
     use choreo_shared::OAuthKind;
 
+    const KEY: &str = "mcp:docs|x";
+
+    /// A minimal MCP OAuth credential whose refresh token is `refresh`, so a
+    /// rotated publish is distinguishable from the one it replaces.
+    fn sample_cred(refresh: &str) -> ServiceCredential {
+        ServiceCredential::OAuth {
+            kind: OAuthKind::Mcp,
+            issuer: None,
+            resource: None,
+            authorization_server: None,
+            token_endpoint: None,
+            refresh_encoding: None,
+            refresh_token: Some(refresh.into()),
+            account_id: None,
+            client_id: None,
+            client_secret: None,
+            granted_scopes: vec![],
+            token_type: None,
+        }
+    }
+
+    /// A runtime with an unbounded command channel, plus the backend that serves
+    /// `KEY` over it — the same shape the daemon builds for a remote server.
+    fn runtime_and_backend() -> (
+        Arc<McpOAuthRuntime>,
+        McpOAuthBackend,
+        crossbeam_channel::Receiver<DaemonCommand>,
+    ) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let rt = Arc::new(McpOAuthRuntime {
+            snapshot: Mutex::new(HashMap::new()),
+            tx,
+        });
+        let backend = McpOAuthBackend {
+            key: KEY.to_string(),
+            runtime: Arc::clone(&rt),
+            canonical_resource: "https://example.com/mcp".to_string(),
+        };
+        (rt, backend, rx)
+    }
+
     #[test]
     fn runtime_loads_and_publishes() {
         let (tx, _rx) = crossbeam_channel::unbounded();
@@ -255,23 +359,79 @@ mod tests {
             snapshot: Mutex::new(HashMap::new()),
             tx,
         });
-        assert!(rt.load("mcp:docs|x").is_none());
-        let cred = ServiceCredential::OAuth {
-            kind: OAuthKind::Mcp,
-            issuer: None,
-            resource: None,
-            authorization_server: None,
-            token_endpoint: None,
-            refresh_encoding: None,
-            refresh_token: Some("r".into()),
-            account_id: None,
-            client_id: None,
-            client_secret: None,
-            granted_scopes: vec![],
-            token_type: None,
+        assert!(rt.load(KEY).is_none());
+        let cred = sample_cred("r");
+        rt.publish(HashMap::from([(KEY.to_string(), cred.clone())]));
+        assert_eq!(rt.load(KEY), Some(cred));
+    }
+
+    #[test]
+    fn publish_and_remove_credential_advance_one_entry() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let rt = McpOAuthRuntime {
+            snapshot: Mutex::new(HashMap::new()),
+            tx,
         };
-        rt.publish(HashMap::from([("mcp:docs|x".to_string(), cred.clone())]));
-        assert_eq!(rt.load("mcp:docs|x"), Some(cred));
+        assert!(rt.load(KEY).is_none());
+
+        // A first publish lands the credential; a second for the same key
+        // replaces it in place (the rotation case).
+        rt.publish_credential(KEY, sample_cred("r1"));
+        assert_eq!(rt.load(KEY), Some(sample_cred("r1")));
+        rt.publish_credential(KEY, sample_cred("r2"));
+        assert_eq!(rt.load(KEY), Some(sample_cred("r2")));
+
+        // Removing one key leaves any other entry untouched.
+        rt.publish_credential("mcp:other|y", sample_cred("r3"));
+        rt.remove_credential(KEY);
+        assert!(rt.load(KEY).is_none());
+        assert_eq!(rt.load("mcp:other|y"), Some(sample_cred("r3")));
+    }
+
+    #[test]
+    fn save_publishes_the_rotation_then_enqueues_the_durable_write() {
+        let (rt, backend, rx) = runtime_and_backend();
+        let cred = sample_cred("rotated");
+        backend.save(cred.clone(), None).expect("save");
+
+        // The read view is advanced synchronously, so a concurrent refresh that
+        // acquires the guard next re-reads the rotation without a loop round-trip.
+        assert_eq!(rt.load(KEY), Some(cred.clone()));
+
+        // The durable write is still enqueued for the command loop.
+        let DaemonCommand::OAuthSave {
+            key,
+            credential,
+            expected_refresh_token,
+        } = rx.try_recv().expect("an enqueued OAuthSave")
+        else {
+            panic!("expected an OAuthSave command");
+        };
+        assert_eq!(key, KEY);
+        assert_eq!(credential, cred);
+        assert!(expected_refresh_token.is_none());
+    }
+
+    #[test]
+    fn clear_and_reauthentication_remove_the_read_view_then_enqueue() {
+        let (rt, backend, rx) = runtime_and_backend();
+
+        rt.publish_credential(KEY, sample_cred("r1"));
+        backend.clear().expect("clear");
+        assert!(rt.load(KEY).is_none());
+        assert!(matches!(
+            rx.try_recv().expect("an enqueued OAuthClear"),
+            DaemonCommand::OAuthClear { .. }
+        ));
+
+        // A terminally rejected grant is withheld from the read view at once.
+        rt.publish_credential(KEY, sample_cred("r2"));
+        backend.mark_reauthentication().expect("mark");
+        assert!(rt.load(KEY).is_none());
+        assert!(matches!(
+            rx.try_recv().expect("an enqueued McpAuthRejected"),
+            DaemonCommand::McpAuthRejected { .. }
+        ));
     }
 
     #[test]

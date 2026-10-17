@@ -1013,7 +1013,12 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   appends that state's label, so a server needing a re-login is visible to the
   operator. The backend's writes are
   fire-and-forget `DaemonCommand`s (`OAuthSave`/`OAuthClear`/`McpAuthRejected`)
-  that persist to the binding public key when the loop is next free. The
+  that persist to the binding public key when the loop is next free, but before
+  enqueuing each durable command the backend first advances the read-view
+  snapshot synchronously (publishing a rotation, or removing the entry on a
+  clear/rejection), so a concurrent refresh of the same grant re-reads the
+  rotated credential without a command-loop round-trip rather than spending an
+  already-rotated single-use refresh token. The
   single-flight refresh guard reuses `OAuthRefreshLocks`, keyed by the MCP
   credential key: the registry's one semaphore-backed `OwnedRefreshLock` serves
   both engines, and the async adapter takes its owned `Send` guard from a
