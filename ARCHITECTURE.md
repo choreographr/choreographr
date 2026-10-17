@@ -799,11 +799,14 @@ content-rejection wordings — `Message content must contain text` or
 `Message content supports text content only` — or is the opaque model-only stub
 (`{"model":"…"}`, no `error`/`message` field). Every other `400` from every
 provider stays terminal, so the status-only "a 4xx is a deterministic rejection"
-contract holds everywhere else. The provider code the gateway preserves as a
-`[code]` label in its rewritten message (e.g. `[unsupported_request]`) is
-recovered by `retry::gateway_error_code` for the gate and the log line, so the
-failure class is diagnosable without trusting the prose. The extra attempts are
-counted separately from the per-send budget, and a `no_retry` request
+contract holds everywhere else. The policy lives in `retry/gateway.rs`: its
+signature gate matches the gateway's human-readable content wordings (plus the
+opaque model-only stub), which is the more specific signal — the `[code]` label
+the gateway preserves in its rewritten message is generic (`unsupported_request`)
+and would also cover deterministic rejections. That recovered label is used
+only to label the retry's log line (`retry::gateway_error_code`), so the failure
+class is diagnosable without dumping the prose. The extra attempts are counted
+separately from the per-send budget, and a `no_retry` request
 (`max_attempts == 1`, e.g. the cache-warming ping) skips the policy entirely.
 
 ### Runtime catalog refresh (S4)

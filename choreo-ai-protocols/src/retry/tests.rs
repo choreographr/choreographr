@@ -639,3 +639,197 @@ fn transient_gateway_400_matches_the_opaque_model_stub() {
         "request failed with status 400: {\"model\":\"x\"}",
     ));
 }
+
+// ── retry_loop_with_provider_policies (the resend drivers) ─────────────────
+
+/// The signature the gateway returns for a transient message-content rejection.
+const GATEWAY_CONTENT_400: &str = r#"{"error":{"message":"Upstream request failed: [unsupported_request] Message content must contain text."}}"#;
+
+/// Build a synthetic HTTP response for driving the retry loop with no socket.
+fn synthetic_response(status: u16, body: &str) -> ureq::http::Response<ureq::Body> {
+    ureq::http::Response::builder()
+        .status(status)
+        .body(
+            ureq::Body::builder()
+                .mime_type("application/json")
+                .data(body),
+        )
+        .expect("build a synthetic response")
+}
+
+/// The outcome of driving `retry_loop_with_provider_policies` over a fixed
+/// sequence of replies.
+struct DrivenRetry {
+    /// How many times the send closure was called.
+    calls: usize,
+    /// Whether the request body was still compressed when the loop returned.
+    body_compressed: bool,
+    /// The final result.
+    result: Result<ureq::http::Response<ureq::Body>, ProviderHttpError>,
+}
+
+/// Drive `retry_loop_with_provider_policies` against a fixed sequence of
+/// `(status, body)` replies (the last reply repeating once the sequence is
+/// exhausted), with a zero backoff so the loop is fully deterministic and never
+/// sleeps — the resend budget, not real time, is what the tests observe.
+fn drive_gateway_retry(
+    slug: &str,
+    compression: RequestCompression,
+    replies: &[(u16, &str)],
+    max_attempts: u32,
+) -> DrivenRetry {
+    use std::cell::Cell;
+
+    let body = HookedJsonBody::new(&serde_json::json!({"messages": []}), None, compression)
+        .expect("serialize the request body");
+    let calls = Cell::new(0usize);
+    let send = || {
+        let n = calls.get();
+        calls.set(n + 1);
+        let (status, text) = replies
+            .get(n)
+            .copied()
+            .unwrap_or_else(|| *replies.last().expect("at least one reply"));
+        Ok(synthetic_response(status, text))
+    };
+    // `initial_backoff_ms = 0` makes `backoff_duration` return `Duration::ZERO`,
+    // so `wait_before_retry` resolves instantly (a zero-length sleep).
+    let retry = RetryConfig {
+        max_attempts,
+        initial_backoff_ms: 0,
+        max_backoff_ms: 0,
+    };
+    let mut on_retry = None;
+    let mut ctx = AttemptContext::new(&mut on_retry, None, None);
+    let result = retry_loop_with_provider_policies(&body, slug, send, &retry, &mut ctx);
+    DrivenRetry {
+        calls: calls.get(),
+        body_compressed: body.is_compressed(),
+        result,
+    }
+}
+
+#[test]
+fn gateway_400_is_resent_then_succeeds() {
+    let out = drive_gateway_retry(
+        "opencode-go",
+        RequestCompression::Identity,
+        &[(400, GATEWAY_CONTENT_400), (200, "{}")],
+        5,
+    );
+    assert_eq!(out.calls, 2, "a matching gateway 400 must be resent once");
+    assert!(
+        out.result.is_ok(),
+        "the resend must surface the eventual 200"
+    );
+}
+
+#[test]
+fn gateway_400_resends_are_bounded() {
+    // Every reply carries the transient signature; the loop must stop after the
+    // first attempt plus `GATEWAY_TRANSIENT_400_ATTEMPTS` resends, never loop.
+    let out = drive_gateway_retry(
+        "opencode-go",
+        RequestCompression::Identity,
+        &[(400, GATEWAY_CONTENT_400)],
+        5,
+    );
+    assert_eq!(
+        out.calls,
+        1 + GATEWAY_TRANSIENT_400_ATTEMPTS as usize,
+        "the resends must be capped at GATEWAY_TRANSIENT_400_ATTEMPTS"
+    );
+    assert!(matches!(
+        out.result,
+        Err(ProviderHttpError::ClientError { status: 400, .. })
+    ));
+}
+
+#[test]
+fn gateway_400_resend_count_is_clamped_by_the_attempt_budget() {
+    // With `max_attempts == 2` the policy may add only one resend (it never
+    // exceeds `max_attempts - 1`), so there are two sends in total.
+    let out = drive_gateway_retry(
+        "opencode-go",
+        RequestCompression::Identity,
+        &[(400, GATEWAY_CONTENT_400)],
+        2,
+    );
+    assert_eq!(out.calls, 2);
+}
+
+#[test]
+fn no_retry_skips_the_gateway_400_policy() {
+    // `max_attempts == 1` (the cache-warming ping's `no_retry`) disables the
+    // policy: the transient 400 is returned after a single send.
+    let out = drive_gateway_retry(
+        "opencode-go",
+        RequestCompression::Identity,
+        &[(400, GATEWAY_CONTENT_400), (200, "{}")],
+        1,
+    );
+    assert_eq!(out.calls, 1, "a no_retry request must not be resent");
+    assert!(matches!(
+        out.result,
+        Err(ProviderHttpError::ClientError { status: 400, .. })
+    ));
+}
+
+#[test]
+fn non_gateway_slug_400_is_never_resent() {
+    let out = drive_gateway_retry(
+        "openai",
+        RequestCompression::Identity,
+        &[(400, GATEWAY_CONTENT_400)],
+        5,
+    );
+    assert_eq!(out.calls, 1, "a non-gateway slug must never resend a 400");
+}
+
+#[test]
+fn unmatched_gateway_400_is_not_resent() {
+    // Gateway slug, but a deterministic rejection with a structured reason — not
+    // one of the transient content signatures — so it stays terminal.
+    let out = drive_gateway_retry(
+        "opencode-go",
+        RequestCompression::Identity,
+        &[(
+            400,
+            r#"{"error":{"message":"Upstream request failed: [content_filter] filtered"}}"#,
+        )],
+        5,
+    );
+    assert_eq!(out.calls, 1, "a non-signature 400 must stay terminal");
+}
+
+#[test]
+fn gateway_opaque_stub_400_is_resent() {
+    let out = drive_gateway_retry(
+        "opencode-go",
+        RequestCompression::Identity,
+        &[(400, r#"{"model":"deepseek-v4.1-flash"}"#), (200, "{}")],
+        5,
+    );
+    assert_eq!(out.calls, 2, "the opaque model-only stub must be resent");
+    assert!(out.result.is_ok());
+}
+
+#[test]
+fn http_415_downgrades_compression_and_resends_once() {
+    // Policy 1 still holds after the refactor: a gzip body answered 415 is
+    // downgraded in place and re-sent uncompressed. The slug is unique so the
+    // process-global downgrade registry (`COMPRESSION_DOWNGRADED`) picks up no
+    // other test's entry.
+    let out = drive_gateway_retry(
+        "test-provider-415",
+        RequestCompression::Gzip,
+        &[(415, "unsupported"), (200, "{}")],
+        5,
+    );
+    assert_eq!(out.calls, 2, "a 415 must trigger one uncompressed resend");
+    assert!(
+        !out.body_compressed,
+        "the body must be downgraded to identity"
+    );
+    assert!(out.result.is_ok());
+}
