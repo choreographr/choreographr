@@ -182,6 +182,10 @@ fn mcp_status_reply_serde_round_trip() {
                         client_id: Some("choreographr".to_string()),
                         callback_port: Some(8765),
                         scopes: vec!["openid".to_string()],
+                        authorization_server: Some(
+                            "https://shopify.com/authentication/1".to_string(),
+                        ),
+                        client_secret_env: Some("SHOPIFY_MCP_SECRET".to_string()),
                     }),
                 },
             ],

@@ -305,6 +305,8 @@ fn mcp_login_discovers_registers_and_exchanges_pkce() {
             client_id: None,
             callback_port: Some(0),
             scopes: Vec::new(),
+            authorization_server: None,
+            client_secret_env: None,
         },
     };
     let session = start_mcp_login(

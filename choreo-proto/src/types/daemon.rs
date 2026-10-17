@@ -146,9 +146,11 @@ impl McpAuthState {
 /// can run the interactive sign-in (discovery, dynamic client registration,
 /// PKCE) without a copy of the server's config.
 ///
-/// Deliberately carries **no** `client_secret`: a confidential client reads its
-/// secret from the environment, never a repo-controlled `.mcp.json`. A server
-/// with no `oauth` block has no [`McpServerStatus::oauth`] entry.
+/// Deliberately carries **no** literal `client_secret`: a confidential client
+/// reads its secret from the environment, never a repo-controlled `.mcp.json`.
+/// Instead [`Self::client_secret_env`] names the environment variable a
+/// frontend reads the secret from. A server with no `oauth` block has no
+/// [`McpServerStatus::oauth`] entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpOAuthConfig {
     /// A pre-registered client id, for an authorization server that supports
@@ -158,6 +160,18 @@ pub struct McpOAuthConfig {
     pub callback_port: Option<u16>,
     /// The scopes to request.
     pub scopes: Vec<String>,
+    /// An explicit authorization-server issuer URL. When set, discovery uses it
+    /// directly instead of probing the resource's well-known paths — the escape
+    /// hatch for an authorization server that is not reachable that way (a
+    /// path-issuer served only via the `OpenID` Connect appended form, or a server
+    /// that advertises its metadata only in a `WWW-Authenticate` header).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_server: Option<String>,
+    /// The **name** of an environment variable holding a confidential client's
+    /// secret; a frontend resolves the value from its own environment. Never a
+    /// literal secret on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret_env: Option<String>,
 }
 
 /// The state of one configured MCP server, as carried in

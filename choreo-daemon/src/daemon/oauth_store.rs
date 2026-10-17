@@ -632,6 +632,8 @@ mod tests {
                 client_id: None,
                 callback_port: None,
                 scopes: vec![],
+                authorization_server: None,
+                client_secret_env: None,
             }),
             auth: choreo_proto::McpAuthState::NotLoggedIn,
         };

@@ -106,8 +106,9 @@ impl McpTransportKind {
 /// A server's `oauth` block supplies only what the interactive sign-in cannot
 /// discover on its own; discovery (RFC 9728/8414), dynamic client registration
 /// (SEP-837), and client-metadata documents (SEP-991) are driven by the
-/// login flow. Deliberately **no** `client_secret`: a confidential client reads
-/// its secret from the environment, never a repo-controlled config file.
+/// login flow. Deliberately **no** literal `client_secret`: a confidential
+/// client reads its secret from the environment, never a repo-controlled config
+/// file — [`Self::client_secret_env`] names the variable to read instead.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct McpOAuthConfig {
     /// A pre-registered client id, for an authorization server that supports
@@ -117,6 +118,12 @@ pub struct McpOAuthConfig {
     pub callback_port: Option<u16>,
     /// The scopes to request at sign-in.
     pub scopes: Vec<String>,
+    /// An explicit authorization-server issuer URL. When set, discovery uses it
+    /// directly instead of probing the resource's well-known paths.
+    pub authorization_server: Option<String>,
+    /// The **name** of an environment variable holding a confidential client's
+    /// secret; the login flow resolves the value from the process environment.
+    pub client_secret_env: Option<String>,
 }
 
 /// A resolved transport for one MCP server.

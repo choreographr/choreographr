@@ -113,6 +113,8 @@ pub fn status_auth(
                 client_id: oauth.client_id.clone(),
                 callback_port: oauth.callback_port,
                 scopes: oauth.scopes.clone(),
+                authorization_server: oauth.authorization_server.clone(),
+                client_secret_env: oauth.client_secret_env.clone(),
             });
             let state = if oauth_config.is_some() {
                 choreo_proto::McpAuthState::NotLoggedIn

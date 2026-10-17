@@ -977,6 +977,8 @@ fn approx_wire_size_never_underestimates_encoded_payload() {
                             client_id: Some(format!("client-{i}")),
                             callback_port: Some(8765),
                             scopes: vec!["openid".into(), "offline_access".into()],
+                            authorization_server: None,
+                            client_secret_env: None,
                         }),
                     })
                     .collect(),
@@ -1031,6 +1033,8 @@ fn approx_wire_size_never_underestimates_encoded_payload() {
                             client_id: Some(format!("client-{i}")),
                             callback_port: Some(8765),
                             scopes: vec!["openid".into(), "offline_access".into()],
+                            authorization_server: None,
+                            client_secret_env: None,
                         }),
                     })
                     .collect(),

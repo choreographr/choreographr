@@ -97,7 +97,7 @@ fn default_true() -> bool {
 /// One server's `oauth` block. Every field is optional; a pre-registered client
 /// id is the only one the interactive sign-in cannot discover. Deliberately no
 /// `clientSecret`: a confidential client reads its secret from the environment,
-/// never a repo-controlled config file.
+/// never a repo-controlled config file — `clientSecretEnv` names the variable.
 #[derive(Deserialize, Debug, Clone)]
 struct OAuthEntry {
     /// A pre-registered client id (`clientId`).
@@ -109,6 +109,19 @@ struct OAuthEntry {
     /// The scopes to request at sign-in.
     #[serde(default)]
     scopes: Vec<String>,
+    /// An explicit authorization-server issuer URL (`authorizationServer`),
+    /// used directly instead of probing the resource's well-known paths.
+    #[serde(
+        default,
+        rename = "authorizationServer",
+        alias = "authorization_server"
+    )]
+    authorization_server: Option<String>,
+    /// The **name** of an environment variable holding a confidential client's
+    /// secret (`clientSecretEnv`); the value is read from the environment at
+    /// sign-in, never stored in this file.
+    #[serde(default, rename = "clientSecretEnv", alias = "client_secret_env")]
+    client_secret_env: Option<String>,
 }
 
 impl OAuthEntry {
@@ -118,6 +131,8 @@ impl OAuthEntry {
             client_id: self.client_id,
             callback_port: self.callback_port,
             scopes: self.scopes,
+            authorization_server: self.authorization_server,
+            client_secret_env: self.client_secret_env,
         }
     }
 }
@@ -983,5 +998,60 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("none.json");
         assert!(read_entries_into(&missing).unwrap().is_none());
+    }
+
+    #[test]
+    fn oauth_entry_parses_authorization_server_and_secret_env() {
+        // A confidential-client server: an explicit authorization-server issuer
+        // and an env-var name for the secret (never a literal secret in the
+        // file). Both spellings (camelCase and snake_case) resolve.
+        let entry = entry_from(serde_json::json!({
+            "url": "https://shopify.com/1/account/customer/api/mcp",
+            "oauth": {
+                "clientId": "app-1",
+                "authorizationServer": "https://shopify.com/authentication/1",
+                "clientSecretEnv": "SHOPIFY_MCP_SECRET",
+                "scopes": ["customer-account-mcp-api:full"]
+            }
+        }));
+        match resolve_transport("tier", "s", &entry, true).expect("resolved") {
+            McpTransport::Http { oauth, .. } => {
+                let oauth = oauth.expect("oauth block present");
+                assert_eq!(oauth.client_id.as_deref(), Some("app-1"));
+                assert_eq!(
+                    oauth.authorization_server.as_deref(),
+                    Some("https://shopify.com/authentication/1")
+                );
+                assert_eq!(
+                    oauth.client_secret_env.as_deref(),
+                    Some("SHOPIFY_MCP_SECRET")
+                );
+                assert_eq!(oauth.scopes, vec!["customer-account-mcp-api:full"]);
+            }
+            other @ McpTransport::Stdio { .. } => panic!("expected http, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oauth_entry_accepts_snake_case_aliases() {
+        let entry = entry_from(serde_json::json!({
+            "url": "https://example.com/mcp",
+            "oauth": {
+                "client_id": "c",
+                "authorization_server": "https://as.example",
+                "client_secret_env": "SECRET_VAR"
+            }
+        }));
+        match resolve_transport("tier", "s", &entry, true).expect("resolved") {
+            McpTransport::Http { oauth, .. } => {
+                let oauth = oauth.expect("oauth block present");
+                assert_eq!(
+                    oauth.authorization_server.as_deref(),
+                    Some("https://as.example")
+                );
+                assert_eq!(oauth.client_secret_env.as_deref(), Some("SECRET_VAR"));
+            }
+            other @ McpTransport::Stdio { .. } => panic!("expected http, got {other:?}"),
+        }
     }
 }
