@@ -92,6 +92,9 @@ pub fn refresh_oauth_token(
         })?;
 
     let status = response.status().as_u16();
-    let body_text = response.into_body().read_to_string().unwrap_or_default();
+    // The body carries the freshly minted access and refresh tokens, so it is
+    // wipe-on-drop rather than left in a plain `String` in freed memory.
+    let body_text =
+        zeroize::Zeroizing::new(response.into_body().read_to_string().unwrap_or_default());
     parse_token_response(status, body_text.as_str())
 }

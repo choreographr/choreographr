@@ -8,13 +8,16 @@
 //! [`Debug`](std::fmt::Debug) is provided. The parse is split from the transport
 //! so the classify contract is unit testable.
 
-use serde::Deserialize;
 use zeroize::Zeroizing;
 
 // The `ChatGPT` account-id decoder is shared with the login library, so a
 // rotated `id_token` is read through the same namespace decode; re-exported by
 // the parent module so callers keep using `choreo_ai_protocols::oauth::…`.
 use choreo_shared::oauth_claims::chatgpt_account_id_from_id_token;
+// The token-endpoint response shape is the one parse both the login library and
+// this refresh client read, so a token reply cannot drift in interpretation
+// between the two paths.
+use choreo_shared::oauth_token::{TokenResponse, parse};
 
 /// The terminal OAuth error codes the catalog documents as "the grant is dead":
 /// the refresh token was rejected, revoked, or already spent.
@@ -98,20 +101,6 @@ pub enum OAuthRefreshError {
     },
 }
 
-/// The token-endpoint success and error response shape. A single struct with
-/// every field optional so one deserialize covers both a token reply and an
-/// error reply.
-#[derive(Deserialize, Default)]
-struct RawTokenResponse {
-    access_token: Option<String>,
-    refresh_token: Option<String>,
-    id_token: Option<String>,
-    expires_in: Option<u64>,
-    token_type: Option<String>,
-    error: Option<String>,
-    error_description: Option<String>,
-}
-
 /// Parse the token endpoint's response: a 2xx body yields a token set, anything
 /// else a classified error. Split from the transport so the classify contract is
 /// unit testable. Visible to the parent module so `refresh_oauth_token` can hand
@@ -120,11 +109,11 @@ pub(super) fn parse_token_response(
     status: u16,
     body: &str,
 ) -> Result<OAuthTokenResponse, OAuthRefreshError> {
-    // A body that is not the expected JSON (an HTML error page, an empty body)
-    // degrades to all-`None` rather than failing the parse: the status still
-    // decides terminal-vs-transient, and a missing `access_token` on a 2xx is
-    // classified transient below.
-    let parsed: RawTokenResponse = serde_json::from_str(body).unwrap_or_default();
+    // The shared `choreo_shared::oauth_token` parse: every field is optional, a
+    // body that is not the expected JSON degrades to all-`None` (the status still
+    // decides terminal-vs-transient), and a `expires_in` emitted as a string is
+    // read leniently rather than dropping the freshly minted tokens.
+    let parsed: TokenResponse = parse(body);
 
     if (200..300).contains(&status) {
         // A success status with a token: the access token is the one required
@@ -208,6 +197,18 @@ mod tests {
         let body = r#"{"access_token": "at-1", "expires_in": 60}"#;
         let tokens = parse_token_response(200, body).expect("parses");
         assert!(tokens.refresh_token.is_none());
+    }
+
+    #[test]
+    fn success_response_with_a_string_expires_in_still_yields_tokens() {
+        // A provider that emits `expires_in` as a string must not drop the token
+        // set (a strict parse would discard the freshly minted tokens and force a
+        // re-refresh on every request). The shared lenient parse reads it as a
+        // number.
+        let body = r#"{"access_token":"at-1","expires_in":"3600"}"#;
+        let tokens = parse_token_response(200, body).expect("parses");
+        assert_eq!(tokens.access_token.as_str(), "at-1");
+        assert_eq!(tokens.expires_in, Some(3600));
     }
 
     #[test]
