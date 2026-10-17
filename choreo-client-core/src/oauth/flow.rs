@@ -10,7 +10,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use choreo_proto::OAuthProviderDescriptor;
-use crossbeam_channel::{Receiver, Sender, after, select};
+use crossbeam_channel::{Receiver, Sender, after, select_biased};
 
 use super::{LoginEvent, LoginOptions, OAuthLoginError, callback, http, pkce};
 
@@ -125,7 +125,9 @@ pub(super) fn run_device(
             &code.device_code,
         ) {
             Ok(http::PollOutcome::Tokens(tokens)) => return Ok((tokens, client_id)),
-            Ok(http::PollOutcome::Pending) => {}
+            // A pending poll is a successful round-trip, so it clears the
+            // transient-error run: only *consecutive* transport failures count.
+            Ok(http::PollOutcome::Pending) => transient_errors = 0,
             Ok(http::PollOutcome::SlowDown) => {
                 transient_errors = 0;
                 interval = interval.saturating_add(std::time::Duration::from_secs(5));
@@ -161,9 +163,9 @@ fn wait_interval(
         return Err(OAuthLoginError::Cancelled);
     }
     // The timer IS the event here, so `after` (a timer channel) is the wait;
-    // the stop channel wins the race so a cancel is observed instantly rather
-    // than after up to a full interval.
-    select! {
+    // the biased select makes the stop arm win when both are ready, so a cancel
+    // is observed instantly rather than after up to a full interval.
+    select_biased! {
         recv(stop) -> _ => Err(OAuthLoginError::Cancelled),
         recv(after(interval)) -> _ => {
             if cancel.load(Ordering::Relaxed) {
