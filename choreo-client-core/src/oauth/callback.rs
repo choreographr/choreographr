@@ -62,9 +62,10 @@ pub(crate) struct Callback {
 /// the address the browser will actually dial — a host whose `localhost`
 /// prefers `::1` cannot leave the server bound on `127.0.0.1` alone.
 ///
-/// Falls back to the next port when one is in use (`AddrInUse`) — the
-/// `:1455` then `:1457` sequence — and returns the port actually bound so the
-/// caller can build the `redirect_uri`.
+/// Tries each port in order, falling through to the next on any bind failure
+/// (the `:1455` then `:1457` sequence), and returns the port actually bound so
+/// the caller can build the `redirect_uri`; the last port's error is reported
+/// when none binds.
 ///
 /// # Errors
 ///

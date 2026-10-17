@@ -95,6 +95,8 @@ fn run(
     tx: &Sender<LoginEvent>,
     cancel: &AtomicBool,
 ) -> Result<(), OAuthLoginError> {
+    // Reject a nonsensical confidential-client config before any network work.
+    validate_oauth_config(&info.oauth)?;
     // The local allowances are available only when the flow already began at a
     // loopback (in-repo mock) or private IP-literal (LAN self-hosted) resource.
     // A resource reached by hostname is remote, so a document it served must
@@ -163,6 +165,18 @@ fn run(
 struct BoundCallback {
     server: tiny_http::Server,
     redirect_uri: String,
+}
+
+/// Reject an `oauth` block that cannot describe a usable client: a confidential
+/// client's secret (`clientSecretEnv`) is only meaningful with a pre-registered
+/// `clientId`. A client with no id is created by dynamic registration, which
+/// issues its own credentials, so supplying a secret for it could only ever
+/// authenticate as the wrong client.
+fn validate_oauth_config(oauth: &McpOAuthConfig) -> Result<(), OAuthLoginError> {
+    if oauth.client_secret_env.is_some() && oauth.client_id.is_none() {
+        return Err(OAuthLoginError::ClientSecretWithoutClientId);
+    }
+    Ok(())
 }
 
 /// Resolve a confidential client's secret from the environment variable the
@@ -241,5 +255,26 @@ mod tests {
         assert_eq!(preferred_ports(Some(9000)), vec![9000, 1455, 1457]);
         assert_eq!(preferred_ports(Some(1457)), vec![1457, 1455]);
         assert_eq!(preferred_ports(None), vec![1455, 1457]);
+    }
+
+    #[test]
+    fn client_secret_env_requires_a_client_id() {
+        let cfg = |client_id: Option<&str>, client_secret_env: Option<&str>| McpOAuthConfig {
+            client_id: client_id.map(str::to_string),
+            callback_port: None,
+            scopes: vec![],
+            authorization_server: None,
+            client_secret_env: client_secret_env.map(str::to_string),
+        };
+        // No secret, no id: fine (public, dynamically registered).
+        assert!(validate_oauth_config(&cfg(None, None)).is_ok());
+        // A secret with a pre-registered id: fine (confidential client).
+        assert!(validate_oauth_config(&cfg(Some("app-1"), Some("SHOPIFY_MCP_SECRET"))).is_ok());
+        // A secret WITHOUT an id is rejected: dynamic registration would mint a
+        // different client, so the configured secret can never match.
+        assert!(matches!(
+            validate_oauth_config(&cfg(None, Some("SHOPIFY_MCP_SECRET"))),
+            Err(OAuthLoginError::ClientSecretWithoutClientId)
+        ));
     }
 }

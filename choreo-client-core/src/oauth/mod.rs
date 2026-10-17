@@ -112,6 +112,14 @@ pub enum OAuthLoginError {
     /// unset — a confidential-client server cannot be signed into without it.
     #[error("the environment variable {0} named by clientSecretEnv is not set")]
     ClientSecretEnvUnset(String),
+    /// The `oauth` block set `clientSecretEnv` but no `clientId`: a confidential
+    /// client's secret only applies to a pre-registered client, and a client
+    /// with no id is created by dynamic registration, which issues its own
+    /// credentials.
+    #[error(
+        "the oauth block sets clientSecretEnv but no clientId; a confidential client needs a pre-registered client id"
+    )]
+    ClientSecretWithoutClientId,
     /// The authorization response's `iss` was required but absent, or did not
     /// match the discovered issuer (RFC 9207 authorization-server mix-up
     /// defence).

@@ -216,7 +216,10 @@ fn exchange_code(
 ) -> Result<http::TokenSet, OAuthLoginError> {
     let auth = client_auth_method(server, request.client_secret.is_some());
     let params = code_exchange_pairs(request, code, verifier, auth);
-    let body = http::form_encode(&params);
+    // The body carries the authorization `code` and, for `client_secret_post`,
+    // the client secret, so it is wipe-on-drop — the same rule the provider
+    // code-exchange body follows.
+    let body = zeroize::Zeroizing::new(http::form_encode(&params));
     // `client_secret_basic` puts the credential in the header; `client_secret_post`
     // already carries it in `params`.
     let basic = match auth {

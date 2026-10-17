@@ -215,17 +215,33 @@ fn resolve_transport(
                 tracing::warn!(server = %slug, "http MCP server has no `url`; skipping");
                 return None;
             };
+            // An untrusted project's `oauth` block is never honoured: it is
+            // repo-controlled input, so it is dropped rather than expanded,
+            // dialed, or offered as a login option.
+            let oauth = if expand_env {
+                entry.oauth.as_ref().map(|o| o.clone().into_config())
+            } else {
+                None
+            };
+            // A confidential client's secret only applies to a pre-registered
+            // client id; with none, dynamic registration would mint a different
+            // client, so the configured secret could never match. Warn early (the
+            // sign-in itself also rejects it) rather than silently confusing the
+            // flow.
+            if let Some(oauth) = &oauth
+                && oauth.client_secret_env.is_some()
+                && oauth.client_id.is_none()
+            {
+                tracing::warn!(
+                    server = %slug,
+                    "MCP oauth block sets clientSecretEnv without clientId; \
+                     a confidential client needs a pre-registered client id"
+                );
+            }
             Some(McpTransport::Http {
                 url,
                 headers: maybe_expand_env_map(&entry.headers, expand_env),
-                // An untrusted project's `oauth` block is never honoured: it is
-                // repo-controlled input, so it is dropped rather than expanded,
-                // dialed, or offered as a login option.
-                oauth: if expand_env {
-                    entry.oauth.as_ref().map(|o| o.clone().into_config())
-                } else {
-                    None
-                },
+                oauth,
             })
         }
         // `Auto` is resolved to a concrete kind above.

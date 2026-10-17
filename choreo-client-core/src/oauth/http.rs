@@ -560,9 +560,10 @@ pub(crate) fn device_poll(
 
 /// Probe the MCP resource for a `WWW-Authenticate` challenge (RFC 9728 §5.1):
 /// send one unauthenticated `initialize` and return the challenge header value
-/// from a `401`. A missing endpoint, a non-`401` status, an insecure URL, or a
-/// network error yields `None`, so the caller falls back to well-known
-/// discovery.
+/// from a `401` (authorization required) or a `403` (`insufficient_scope`, RFC
+/// 6750 §3.1 — the same challenge shape). A missing endpoint, any other status,
+/// an insecure URL, or a network error yields `None`, so the caller falls back
+/// to well-known discovery.
 pub(crate) fn probe_www_authenticate(
     agent: &ureq::Agent,
     resource: &str,
@@ -581,7 +582,7 @@ pub(crate) fn probe_www_authenticate(
         .header("Accept", "application/json, text/event-stream")
         .send(body.as_bytes())
         .ok()?;
-    if response.status() != 401 {
+    if response.status() != 401 && response.status() != 403 {
         return None;
     }
     response

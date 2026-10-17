@@ -235,19 +235,22 @@ impl CredentialStore for CredentialStoreAdapter {
         // the client registration and identity. A returned refresh token is
         // adopted; when the exchange omitted one, the seed's is kept rather than
         // dropping the durable grant root.
-        let seed_refresh = seed.refresh_token.as_ref().map(|t| t.as_str().to_string());
+        let seed_refresh = seed.refresh_token.clone();
         let (refresh_token, granted_scopes) = match &credentials.token_response {
             Some(response) => (
                 response
                     .refresh_token()
                     .map(|t| t.secret().clone())
-                    .or_else(|| seed_refresh.clone()),
+                    .or_else(|| seed_refresh.as_ref().map(|t| t.as_str().to_string())),
                 response.scopes().map_or_else(
                     || credentials.granted_scopes.clone(),
                     |scopes| scopes.iter().map(|s| s.as_ref().to_owned()).collect(),
                 ),
             ),
-            None => (seed_refresh.clone(), credentials.granted_scopes.clone()),
+            None => (
+                seed_refresh.as_ref().map(|t| t.as_str().to_string()),
+                credentials.granted_scopes.clone(),
+            ),
         };
         // The durable grant changes only when the exchange ROTATED the refresh
         // token. `rmcp` rewrites the previous refresh token back onto the
@@ -263,7 +266,7 @@ impl CredentialStore for CredentialStoreAdapter {
         // A plain `==` (not constant-time) is deliberate: both operands are
         // in-process secrets already resident in this task's memory, so there
         // is no timing oracle for an attacker who could not already read them.
-        if refresh_token.as_deref() == seed_refresh.as_deref() {
+        if refresh_token.as_deref() == seed_refresh.as_ref().map(|t| t.as_str()) {
             tracing::debug!(
                 key = %self.key,
                 "MCP token refresh carried no rotation; skipping the durable re-encrypt"
@@ -287,10 +290,15 @@ impl CredentialStore for CredentialStoreAdapter {
             token_type: seed.token_type,
         };
         let backend = self.backend.clone();
-        tokio::task::spawn_blocking(move || backend.save(durable, seed_refresh))
-            .await
-            .map_err(|e| AuthError::CredentialStoreError(format!("save task failed: {e}")))?
-            .map_err(AuthError::CredentialStoreError)
+        tokio::task::spawn_blocking(move || {
+            backend.save(
+                durable,
+                seed_refresh.as_ref().map(|t| t.as_str().to_string()),
+            )
+        })
+        .await
+        .map_err(|e| AuthError::CredentialStoreError(format!("save task failed: {e}")))?
+        .map_err(AuthError::CredentialStoreError)
     }
 
     async fn clear(&self) -> Result<(), AuthError> {

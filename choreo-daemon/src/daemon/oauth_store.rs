@@ -190,6 +190,12 @@ impl DaemonState {
         // credential the user just deleted. Drop it instead.
         if !self.credentials.contains_key(key) {
             warn!(%key, "OAuthSave dropped: credential already removed (logout/clear)");
+            // The connect path published this rotation into the read-view
+            // snapshot before enqueuing (that ordering is what lets a concurrent
+            // refresh re-read it). Restore the snapshot from the durable store —
+            // whose credential was just removed — so the read view does not keep
+            // serving a grant the user deleted.
+            self.publish_mcp_oauth_snapshot();
             return;
         }
         // Guard against a credential replaced under the refresh (a re-login
@@ -203,6 +209,10 @@ impl DaemonState {
         };
         if changed {
             warn!(%key, "OAuthSave dropped: credential changed under the refresh");
+            // As above: the connect path already advanced the read-view snapshot
+            // to this superseded rotation, so republish from the durable store to
+            // put the newer grant back.
+            self.publish_mcp_oauth_snapshot();
             return;
         }
         if let Err(e) = self.encrypt_and_persist_credential(key, &credential) {
@@ -655,6 +665,45 @@ mod tests {
         assert_eq!(
             state.mcp_auth_state(&status),
             choreo_proto::McpAuthState::Reauthentication
+        );
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn a_dropped_oauth_save_restores_the_read_view_snapshot() {
+        // Install the process-global runtime so `publish_mcp_oauth_snapshot` has
+        // a snapshot to write; the command sender is unused by these handlers.
+        // `install` is a `OnceLock`, and under nextest each test is its own
+        // process, so this test owns the runtime.
+        let (tx, _tx_rx) = crossbeam_channel::unbounded();
+        let runtime = crate::mcp::oauth::install(tx);
+
+        let (mut state, _rx) = make_daemon_state();
+        state.locked = false;
+        let key = "mcp:docs|drop";
+
+        // The connect path published a rotation into the read view, but the
+        // durable credential was already removed, so the save is dropped — the
+        // snapshot must be restored to the durable truth (key absent) rather
+        // than keep serving the rotation.
+        runtime.publish_credential(key, mcp_oauth_credential("rotated"));
+        state.handle_oauth_save(key, mcp_oauth_credential("rotated"), Some("rotated"));
+        assert!(
+            runtime.load(key).is_none(),
+            "a save dropped after removal must restore the read view"
+        );
+
+        // A save dropped because a re-login replaced the credential likewise
+        // republishes the newer stored grant, not the stale rotation.
+        state
+            .credentials
+            .insert(key.into(), mcp_oauth_credential("newer"));
+        runtime.publish_credential(key, mcp_oauth_credential("stale"));
+        state.handle_oauth_save(key, mcp_oauth_credential("stale"), Some("old"));
+        assert_eq!(
+            runtime.load(key),
+            Some(mcp_oauth_credential("newer")),
+            "the read view must show the newer stored grant, not the stale rotation"
         );
     }
 }

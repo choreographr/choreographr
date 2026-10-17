@@ -940,8 +940,12 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   (paste-URL fallback; no device code), and stores the durable grant as
   `ServiceCredential::OAuth { kind: Mcp }`. A confidential client's secret is
   read from the `clientSecretEnv` variable, sent at the token endpoint
-  (`client_secret_post`), and stored in the grant so connect-time refresh
-  re-authenticates the token endpoint; the authorization response's `iss` is
+  (`client_secret_basic` or `client_secret_post`, chosen from the server's
+  advertised methods), and stored in the grant so connect-time refresh
+  re-authenticates the token endpoint; a `clientSecretEnv` with no `clientId` is
+  rejected, because a client with no id is dynamically registered and would
+  receive its own credentials, so a configured secret could never match. The
+  authorization response's `iss` is
   validated against the discovered issuer when the server advertises RFC 9207
   support (or whenever the parameter is present), rejecting a mix-up before the
   code is exchanged. The check uses the same shared `issuers_match` as
@@ -1023,7 +1027,10 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   snapshot synchronously (publishing a rotation, or removing the entry on a
   clear/rejection), so a concurrent refresh of the same grant re-reads the
   rotated credential without a command-loop round-trip rather than spending an
-  already-rotated single-use refresh token. The
+  already-rotated single-use refresh token. A save the command loop drops — the
+  credential was removed (logout/clear), or a re-login replaced it mid-refresh —
+  republishes the snapshot from the durable store, so the synchronous publish
+  cannot leave the read view serving a grant the store rejected. The
   single-flight refresh guard reuses `OAuthRefreshLocks`, keyed by the MCP
   credential key: the registry's one semaphore-backed `OwnedRefreshLock` serves
   both engines, and the async adapter takes its owned `Send` guard from a
