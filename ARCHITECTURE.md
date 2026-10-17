@@ -714,10 +714,15 @@ Two rules make it correct under rotation. **Single-flight**: the whole
 `load → re-check → exchange → persist` runs under the account's lock in
 `OAuthRefreshLocks`, so the loser of a race re-reads the winner's persisted
 token (the load happens *under* the lock) and reuses it instead of spending a
-single-use refresh token twice. **Rotate-if-present**: the engine adopts a
-returned `refresh_token` when one is present and keeps the stored one when it is
-omitted — one code path for rotating and non-rotating providers — and replaces
-the `account_id` claim only when a new `id_token` carries it.
+single-use refresh token twice. The registry holds strong `Arc`s and is pruned
+opportunistically (`OAuthRefreshLocks::prune`) once a refresh releases its guard
+and no other thread holds the entry — the provider path prunes after
+`refresh_single_flight`, the MCP path after a credential save/clear — so it does
+not grow one lock per credential ever refreshed; a held guard pins its entry so
+a prune can never evict a lock that is in use. **Rotate-if-present**: the engine
+adopts a returned `refresh_token` when one is present and keeps the stored one
+when it is omitted — one code path for rotating and non-rotating providers — and
+replaces the `account_id` claim only when a new `id_token` carries it.
 
 A request refreshes proactively when the cached token is absent or within a
 hardcoded **60 s** buffer of expiry (`oauth_refresh::REFRESH_BUFFER_SECS`), and
@@ -890,8 +895,8 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   hash is the repo's stable FNV-1a over the canonicalized server URL joined to
   the slug. The daemon computes the key (one authority for provisioning and
   connect-time load) and exposes it, the resolved `oauth` block, and an auth
-  state (`NotApplicable`/`BearerToken`/`NotLoggedIn`/`OAuth`/`Reauthentication`/
-  `Unsupported`) per server in `McpServerStatus`. Load is **fail-closed**: a
+  state (`NotApplicable`/`BearerToken`/`NotLoggedIn`/`OAuth`/`Reauthentication`)
+  per server in `McpServerStatus`. Load is **fail-closed**: a
   stored credential whose `resource` no longer matches the configured URL is
   treated as absent, and — once the authorization server has been re-discovered
   at connect — so is one whose `issuer` differs from that server. A re-pointed
