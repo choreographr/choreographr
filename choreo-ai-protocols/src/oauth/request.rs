@@ -20,7 +20,6 @@ use crate::catalog::GrantEncoding;
 /// The `token_endpoint` is the absolute token URL recorded at login; the
 /// `encoding` is the credential's recorded `refresh_encoding`. `client_secret`
 /// is present only for a confidential client.
-#[derive(Clone)]
 pub struct OAuthRefreshRequest<'a> {
     /// The absolute token endpoint URL.
     pub token_endpoint: &'a str,

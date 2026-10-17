@@ -138,12 +138,13 @@ pub(super) fn parse_token_response(
         });
     }
 
-    // Non-2xx: 429 and 5xx are transient (back off and retry); any other 4xx is
+    // Non-2xx: a 3xx (the agent follows no redirects, so a redirect is returned
+    // here), 429, and 5xx are transient (back off and retry); any other 4xx is
     // terminal (retrying cannot clear it). The `error`/`error_description` pair
     // is the only part of the body retained — never a token or the full body.
     let detail =
         classify_error_detail(parsed.error.as_deref(), parsed.error_description.as_deref());
-    if status == 429 || (500..600).contains(&status) {
+    if (300..400).contains(&status) || status == 429 || (500..600).contains(&status) {
         Err(OAuthRefreshError::Transient {
             detail: format!("status {status}: {detail}"),
         })
@@ -219,6 +220,20 @@ mod tests {
             assert!(
                 matches!(err, OAuthRefreshError::Terminal { .. }),
                 "{code} must be terminal, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_redirect_is_transient_not_terminal() {
+        // The agent follows no redirects, so a 3xx reaches the classifier. It is
+        // transient — a misconfigured/re-pointed endpoint must not force the user
+        // through a needless re-login.
+        for status in [301, 302, 307, 308] {
+            let err = parse_token_response(status, "").expect_err("must fail");
+            assert!(
+                matches!(err, OAuthRefreshError::Transient { .. }),
+                "status {status} must be transient, got {err:?}"
             );
         }
     }

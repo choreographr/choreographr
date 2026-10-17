@@ -58,7 +58,7 @@ pub fn refresh_oauth_token(
     // bounded global timeout, and statuses are handled here (not by ureq) so a
     // 4xx body can be classified without an exception path. No socket registry:
     // this crate stays free of the daemon's cancellation plumbing.
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+    let config = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(30)))
         .http_status_as_error(false)
         .user_agent(format!("choreographr/{}", env!("CARGO_PKG_VERSION")))
@@ -68,8 +68,8 @@ pub fn refresh_oauth_token(
         // downgrades a 301/302/303 to a body-less GET, but this is spelled out
         // explicitly so the guarantee does not rest on ureq's internals.
         .max_redirects(0)
-        .build()
-        .into();
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
 
     let body = encode_refresh_body(request);
     // `Accept` mirrors the login path; `Cache-Control: no-store` keeps a proxy
@@ -93,8 +93,16 @@ pub fn refresh_oauth_token(
 
     let status = response.status().as_u16();
     // The body carries the freshly minted access and refresh tokens, so it is
-    // wipe-on-drop rather than left in a plain `String` in freed memory.
+    // wipe-on-drop rather than left in a plain `String` in freed memory. A read
+    // failure is transient: the request may succeed on a retry, and swallowing
+    // it would hide the fault behind an empty-body error.
     let body_text =
-        zeroize::Zeroizing::new(response.into_body().read_to_string().unwrap_or_default());
+        response
+            .into_body()
+            .read_to_string()
+            .map_err(|e| OAuthRefreshError::Transient {
+                detail: format!("failed to read the token response: {e}"),
+            })?;
+    let body_text = zeroize::Zeroizing::new(body_text);
     parse_token_response(status, body_text.as_str())
 }
