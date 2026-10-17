@@ -709,6 +709,31 @@ mod tests {
     }
 
     #[test]
+    fn opencode_gateway_base_urls_serve_the_model_list() {
+        // models.dev publishes the opencode gateways' OpenAI *chat* bases
+        // (…/inference/go/openai/v1 and …/inference/openai/v1), which have no
+        // /models endpoint, so the default `base_url + /models` model-list join
+        // 404s there. Both the model list and inference are served off the
+        // shorter base one segment up, which the bundled overlay pins; this
+        // guards it against a models.dev refresh silently reverting base_url to
+        // a list-less endpoint (the regression that broke model listing).
+        let catalog = loader::load_catalog();
+        for (slug, expected) in [
+            ("opencode-go", "https://opencode.ai/inference/go/v1"),
+            ("opencode", "https://opencode.ai/inference/v1"),
+        ] {
+            let entry = catalog
+                .iter()
+                .find(|e| e.slug == slug)
+                .unwrap_or_else(|| panic!("{slug} missing from the merged catalog"));
+            assert_eq!(
+                entry.base_url, expected,
+                "{slug} base_url must be the base that also serves /models",
+            );
+        }
+    }
+
+    #[test]
     fn overlay_only_providers_survive_the_merge() {
         // Providers models.dev does not cover are defined wholesale in the
         // bundled overlay; each keeps its slug and carries its policy.

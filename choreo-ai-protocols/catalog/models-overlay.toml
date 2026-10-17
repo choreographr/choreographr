@@ -227,6 +227,15 @@
 
 # opencode-go -> opencode-go (policy from the pre-models.dev TOML)
 [provider.opencode-go]
+  # models.dev now publishes the OpenAI chat base
+  # (https://opencode.ai/inference/go/openai/v1), but the gateway serves its
+  # model list one segment up, at https://opencode.ai/inference/go/v1/models —
+  # so base_url + the default `/models` model_list_path cannot reach it (the
+  # 404 that broke model listing). The gateway serves the model list, Chat
+  # Completions, and Responses off this shorter base (the successor of the old
+  # /zen/go/v1 base, which likewise carried both), so pin it here to keep model
+  # listing and inference on one endpoint.
+  base_url = "https://opencode.ai/inference/go/v1"
   max_tokens_field = "max_tokens"
   default_model = "kimi-k2.7-code"
 
@@ -265,6 +274,11 @@
 
 # opencode -> opencode (policy from the pre-models.dev TOML)
 [provider.opencode]
+  # Same as opencode-go: models.dev's OpenAI chat base
+  # (https://opencode.ai/inference/openai/v1) has no /models, while the
+  # Console model list and inference both live under
+  # https://opencode.ai/inference/v1.
+  base_url = "https://opencode.ai/inference/v1"
   max_tokens_field = "max_tokens"
   default_model = "kimi-k2.7-code"
 
