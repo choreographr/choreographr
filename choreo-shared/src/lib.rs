@@ -26,6 +26,10 @@
 //!   loopback `http` address) both the login library and the runtime refresh
 //!   client apply before sending a code or token, so the two cannot drift into
 //!   different rules for the same request shape.
+//! - [`oauth_token`] — the one read of an OAuth token-endpoint response body
+//!   ([`oauth_token::TokenResponse`] / [`oauth_token::parse`]), shared so the
+//!   login library and the runtime refresh client read the token reply — success
+//!   or error — the same way.
 //! - [`url`] — the slash-tolerant base-plus-path join ([`url::join_path`]) the
 //!   login library, the MCP login, and the runtime refresh material share, so
 //!   the same issuer/path pair cannot join to different URLs in each path.
@@ -52,6 +56,7 @@ pub mod form;
 pub mod logging;
 pub mod oauth_claims;
 pub mod oauth_endpoint;
+pub mod oauth_token;
 pub mod paths;
 pub mod release_name;
 pub mod url;
