@@ -55,7 +55,7 @@ impl McpServerStatus {
     /// A one-line human-readable summary of this server's state.
     #[must_use]
     pub fn summary(&self) -> String {
-        if self.connected {
+        let base = if self.connected {
             let name = self.server_name.as_deref().unwrap_or("unknown");
             let version = self.server_version.as_deref().unwrap_or("?");
             format!(
@@ -70,6 +70,14 @@ impl McpServerStatus {
                 self.target,
                 self.last_error.as_deref().unwrap_or("not connected")
             )
+        };
+        // Append the auth label only when the state is actionable, so a server
+        // needing a re-login is visible in `/mcp` without adding noise to the
+        // common authenticated / no-auth cases. The label comes from the wire
+        // type so the two summaries cannot drift.
+        match self.auth.label() {
+            "" => base,
+            label => format!("{base} [{label}]"),
         }
     }
 }
@@ -136,4 +144,44 @@ pub struct McpTrustOutcome {
     pub trusted: bool,
     /// A one-line human-readable summary of what happened.
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The daemon-side summary appends the same auth label as the wire type, so
+    /// a server needing a re-login is visible in `/mcp`. `choreo-proto`'s
+    /// `types/tests.rs` pins the wire rendering; this pins the daemon one so the
+    /// two cannot silently drift.
+    #[test]
+    fn summary_renders_the_auth_label() {
+        fn status(auth: McpAuthState) -> McpServerStatus {
+            McpServerStatus {
+                slug: "docs".into(),
+                tier: "daemon".into(),
+                transport: "http".into(),
+                target: "https://example.com/mcp".into(),
+                connected: true,
+                tool_count: 3,
+                server_name: Some("docs-server".into()),
+                server_version: Some("1.0.0".into()),
+                last_error: None,
+                credential_key: Some("mcp:docs|abc".into()),
+                auth,
+                oauth: None,
+            }
+        }
+
+        // A plain, unauthenticated server carries no trailing auth suffix.
+        assert_eq!(
+            status(McpAuthState::NotApplicable).summary(),
+            "docs [http → https://example.com/mcp] connected: docs-server 1.0.0, 3 tool(s)"
+        );
+        // A terminally rejected grant must read as a re-login prompt.
+        assert_eq!(
+            status(McpAuthState::Reauthentication).summary(),
+            "docs [http → https://example.com/mcp] connected: docs-server 1.0.0, 3 tool(s) [re-authentication required]"
+        );
+    }
 }

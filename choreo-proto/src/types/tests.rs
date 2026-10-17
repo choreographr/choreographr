@@ -1218,3 +1218,39 @@ fn oauth_providers_request_and_reply_round_trip() {
         "descriptor survives the frame round-trip"
     );
 }
+
+/// The `/mcp` summary renders the auth label so a server needing a re-login is
+/// visible in the status line. Both the wire type here and the daemon-side
+/// snapshot (`choreo-daemon`'s `mcp/status.rs`) append the same label; each has
+/// its own test so the two renderings cannot silently drift apart.
+#[test]
+fn mcp_summary_renders_the_auth_label() {
+    fn status(auth: McpAuthState) -> McpServerStatus {
+        McpServerStatus {
+            slug: "docs".into(),
+            tier: "daemon".into(),
+            transport: "http".into(),
+            target: "https://example.com/mcp".into(),
+            connected: true,
+            tool_count: 3,
+            server_name: None,
+            server_version: None,
+            last_error: None,
+            credential_key: Some("mcp:docs|abc".into()),
+            auth,
+            oauth: None,
+        }
+    }
+
+    // A plain, unauthenticated server carries no trailing auth suffix.
+    assert_eq!(
+        status(McpAuthState::NotApplicable).summary(),
+        "docs [http → https://example.com/mcp] connected: 3 tool(s)"
+    );
+    // A terminally rejected grant must read as a re-login prompt.
+    assert_eq!(
+        status(McpAuthState::Reauthentication).summary(),
+        "docs [http → https://example.com/mcp] connected: 3 tool(s) [re-authentication required]"
+    );
+    assert_eq!(McpAuthState::NotLoggedIn.label(), "not signed in");
+}

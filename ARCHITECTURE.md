@@ -949,8 +949,11 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   shared-state exception, see AGENTS.md). The snapshot **withholds a quarantined
   grant** (`dead_oauth`): a terminally rejected refresh token is not served
   again, so the connect proceeds unauthenticated and surfaces a re-login rather
-  than re-spending a spent token, while the `/mcp` status still reports the
-  quarantine. The backend's writes are
+  than re-spending a spent token. The `/mcp` status still reports the
+  quarantine: the daemon refines each server's `McpAuthState` from the store (a
+  quarantined key refines to `Reauthentication`) and the server summary line
+  appends that state's label, so a server needing a re-login is visible to the
+  operator. The backend's writes are
   fire-and-forget `DaemonCommand`s (`OAuthSave`/`OAuthClear`/`McpAuthRejected`)
   that persist to the binding public key when the loop is next free. The
   single-flight refresh guard reuses `OAuthRefreshLocks`, keyed by the MCP

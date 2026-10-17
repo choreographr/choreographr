@@ -121,6 +121,27 @@ pub enum McpAuthState {
     Reauthentication,
 }
 
+impl McpAuthState {
+    /// A short human-readable label for the state, appended to a server's
+    /// [`McpServerStatus::summary`] line so a user running `/mcp` can see at a
+    /// glance that a server needs a re-login.
+    ///
+    /// The two non-actionable states render an empty label: a server that needs
+    /// no authentication, or that authenticates with a static bearer header,
+    /// has no sign-in prompt to surface, so the summary stays clean for them.
+    /// Both [`McpServerStatus::summary`] implementations append this verbatim, so
+    /// the daemon-side and wire-side renderings cannot drift apart.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotApplicable | Self::BearerToken => "",
+            Self::NotLoggedIn => "not signed in",
+            Self::OAuth => "signed in",
+            Self::Reauthentication => "re-authentication required",
+        }
+    }
+}
+
 /// A remote MCP server's `oauth` configuration, supplied to a frontend so it
 /// can run the interactive sign-in (discovery, dynamic client registration,
 /// PKCE) without a copy of the server's config.
@@ -189,7 +210,7 @@ impl McpServerStatus {
     /// every front-end so the rendering cannot drift between them.
     #[must_use]
     pub fn summary(&self) -> String {
-        if self.connected {
+        let base = if self.connected {
             format!(
                 "{} [{} → {}] connected: {} tool(s)",
                 self.slug, self.transport, self.target, self.tool_count
@@ -202,6 +223,12 @@ impl McpServerStatus {
                 self.target,
                 self.last_error.as_deref().unwrap_or("not connected")
             )
+        };
+        // Append the auth label only when the state is actionable, so the common
+        // authenticated / no-auth cases carry no trailing noise.
+        match self.auth.label() {
+            "" => base,
+            label => format!("{base} [{label}]"),
         }
     }
 }
