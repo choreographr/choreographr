@@ -84,12 +84,19 @@ pub fn credential_matches_target(
     resource_matches && issuer_matches
 }
 
+/// The reserved service-key prefix for a target-scoped MCP OAuth credential
+/// (`mcp:<slug>|<hash>`). A provider account must never be named with it — a
+/// name in this form is read as an MCP credential key and could collide with a
+/// server's key (see [`credential_key`]).
+pub const MCP_CREDENTIAL_PREFIX: &str = "mcp:";
+
 /// Build the target-scoped credential key for a canonical target identity and
 /// slug: `mcp:<slug>|<short-hash>`.
 ///
-/// The `mcp:` prefix is **reserved** for these target-scoped MCP keys: a provider
-/// account must never be named `mcp:<slug>|…`, because a name in that form is
-/// read as an MCP credential key and could collide with a server's key.
+/// The [`MCP_CREDENTIAL_PREFIX`] is **reserved** for these target-scoped MCP
+/// keys: a provider account must never be named `mcp:<slug>|…`, because a name
+/// in that form is read as an MCP credential key and could collide with a
+/// server's key.
 ///
 /// The hash is the repo's stable FNV-1a ([`short_hash`]) of the canonical
 /// identity joined to the slug with a `\0`, so two servers of one slug pointing
@@ -99,7 +106,10 @@ pub fn credential_matches_target(
 /// a hash collision cannot hand one server another's token.
 #[must_use]
 pub fn credential_key(slug: &str, identity: &str) -> String {
-    format!("mcp:{slug}|{}", short_hash(&format!("{identity}\0{slug}")))
+    format!(
+        "{MCP_CREDENTIAL_PREFIX}{slug}|{}",
+        short_hash(&format!("{identity}\0{slug}"))
+    )
 }
 
 /// The target-scoped credential key for a resolved server config, or `None`
@@ -115,16 +125,27 @@ pub fn credential_key_for(config: &McpServerConfig) -> Option<String> {
     }
 }
 
+/// Whether `key` names an MCP OAuth credential (carries the reserved
+/// [`MCP_CREDENTIAL_PREFIX`]).
+///
+/// The single home for the prefix test, so the callers that key off it — the
+/// connect-path credential snapshot and the post-sign-in / post-unlock
+/// reconnect — cannot drift from [`credential_key`]'s encoding.
+#[must_use]
+pub fn is_mcp_credential_key(key: &str) -> bool {
+    key.starts_with(MCP_CREDENTIAL_PREFIX)
+}
+
 /// The server slug encoded in a target-scoped credential key
 /// (`mcp:<slug>|<target-hash>`), or `None` for any other service key.
 ///
 /// The inverse of [`credential_key`], kept beside it so the two cannot drift:
-/// it strips the reserved `mcp:` prefix and drops the target hash after the
-/// LAST `|`. The hash is [`short_hash`] hex and never contains a `|`, so a slug
-/// that itself contains one is recovered intact.
+/// it strips the reserved [`MCP_CREDENTIAL_PREFIX`] and drops the target hash
+/// after the LAST `|`. The hash is [`short_hash`] hex and never contains a `|`,
+/// so a slug that itself contains one is recovered intact.
 #[must_use]
 pub fn slug_from_credential_key(key: &str) -> Option<&str> {
-    key.strip_prefix("mcp:")?
+    key.strip_prefix(MCP_CREDENTIAL_PREFIX)?
         .rsplit_once('|')
         .map(|(slug, _hash)| slug)
 }

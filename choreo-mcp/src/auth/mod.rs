@@ -35,8 +35,8 @@ mod keying;
 pub use adapter::CredentialStoreAdapter;
 pub(crate) use connect::build_auth_client;
 pub use keying::{
-    canonical_target, credential_key, credential_key_for, credential_matches_target,
-    slug_from_credential_key,
+    MCP_CREDENTIAL_PREFIX, canonical_target, credential_key, credential_key_for,
+    credential_matches_target, is_mcp_credential_key, slug_from_credential_key,
 };
 
 use std::sync::Arc;

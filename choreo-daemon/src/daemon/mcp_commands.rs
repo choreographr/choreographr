@@ -192,7 +192,7 @@ impl DaemonState {
         let keys: Vec<String> = self
             .credentials
             .keys()
-            .filter(|key| key.starts_with("mcp:"))
+            .filter(|key| choreo_mcp::is_mcp_credential_key(key))
             .cloned()
             .collect();
         for key in keys {

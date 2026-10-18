@@ -266,7 +266,9 @@ impl DaemonState {
     fn mcp_oauth_snapshot(&self) -> std::collections::HashMap<String, ServiceCredential> {
         self.credentials
             .iter()
-            .filter(|(k, _)| k.starts_with("mcp:") && !self.dead_oauth.contains(k.as_str()))
+            .filter(|(k, _)| {
+                choreo_mcp::is_mcp_credential_key(k) && !self.dead_oauth.contains(k.as_str())
+            })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     }

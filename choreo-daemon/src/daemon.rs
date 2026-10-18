@@ -1227,7 +1227,7 @@ impl DaemonState {
                 // credential that was never stored.
                 let saved = self.handle_save_credential(&service, credential, reply, &ack);
                 #[cfg(feature = "mcp")]
-                if saved && service.starts_with("mcp:") {
+                if saved && choreo_mcp::is_mcp_credential_key(&service) {
                     self.reconnect_mcp_for_credential(&service);
                 }
                 // Without the `mcp` feature there is no server to bring up, so

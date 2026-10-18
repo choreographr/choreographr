@@ -47,8 +47,9 @@ pub mod session;
 mod stdio;
 
 pub use auth::{
-    CredentialBackend, CredentialStoreAdapter, McpAuthWiring, RefreshGuard, canonical_target,
-    credential_key, credential_key_for, credential_matches_target, slug_from_credential_key,
+    CredentialBackend, CredentialStoreAdapter, MCP_CREDENTIAL_PREFIX, McpAuthWiring, RefreshGuard,
+    canonical_target, credential_key, credential_key_for, credential_matches_target,
+    is_mcp_credential_key, slug_from_credential_key,
 };
 pub use config::{
     DEFAULT_MAX_CONCURRENT_CALLS, DEFAULT_MAX_RESTARTS, DEFAULT_TIMEOUT, McpOAuthConfig,
