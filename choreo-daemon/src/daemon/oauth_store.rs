@@ -205,6 +205,16 @@ impl DaemonState {
         // is newer, so persisting the rotated refresh token would clobber it.
         // Only apply the save when the stored refresh token is still the one the
         // refresh presented.
+        //
+        // This guard keys on the refresh token, so it does NOT cover an
+        // access-token-only grant (a server that issued no refresh token): with
+        // no refresh token to compare, `expected_refresh_token` is `None` and
+        // the guard passes unconditionally. That is acceptable because `rmcp`
+        // never reaches `save` for a grant with no refresh token — its refresh
+        // path returns `AuthorizationRequired` before calling `save` — so the
+        // access-token persistence here is defense-in-depth, not a live path.
+        // Should that ever change, fold the durable access token into the
+        // expectation this guard compares.
         let changed = match self.credentials.get(key) {
             Some(current) => !refresh_token_unchanged(current, expected_refresh_token),
             None => false,

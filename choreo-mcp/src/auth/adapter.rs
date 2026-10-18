@@ -110,38 +110,25 @@ impl CredentialStoreAdapter {
     }
 }
 
-/// A synthetic token response carrying only a refresh token and an empty
-/// access token.
+/// A synthetic token response a cold `load` builds from whatever the durable
+/// grant offers: a bearer token and/or a refresh token, never an `expires_in`.
 ///
-/// On a cold start the cache holds no access token, but the durable grant does
-/// carry a refresh token. Returning a response with an empty bearer (and no
-/// `expires_in`, so `rmcp` skips its expiry check) makes the first request go
-/// out unauthenticated, which 401s and drives `rmcp`'s one-shot refresh — so
-/// the durable refresh token is spent at connect time, not trusted as a
-/// persisted bearer.
-fn synthetic_refresh_only(refresh_token: &str) -> OAuthTokenResponse {
+/// Two shapes, both without `expires_in` so `rmcp` skips its expiry check. With
+/// a refresh token the bearer is left empty: the first request goes out
+/// unauthenticated, 401s, and drives `rmcp`'s one-shot refresh — so the durable
+/// refresh token is spent at connect time, not trusted as a persisted bearer.
+/// Without one, the durable access token is the only credential there is, so it
+/// is served directly as the bearer.
+fn synthetic_response(access_token: &str, refresh_token: Option<&str>) -> OAuthTokenResponse {
     let mut response: OAuthTokenResponse = StandardTokenResponse::new(
-        AccessToken::new(String::new()),
-        BasicTokenType::Bearer,
-        VendorExtraTokenFields::default(),
-    );
-    response.set_refresh_token(Some(RefreshToken::new(refresh_token.to_string())));
-    response
-}
-
-/// A synthetic token response carrying a durable access token and no refresh
-/// token.
-///
-/// Served on a cold start for a grant whose authorization server issued no
-/// refresh token: there is nothing to refresh, so the durable access token is
-/// the only credential. With no `expires_in`, `rmcp` skips its expiry check and
-/// sends the token as the bearer.
-fn synthetic_access_only(access_token: &str) -> OAuthTokenResponse {
-    StandardTokenResponse::new(
         AccessToken::new(access_token.to_string()),
         BasicTokenType::Bearer,
         VendorExtraTokenFields::default(),
-    )
+    );
+    if let Some(refresh_token) = refresh_token {
+        response.set_refresh_token(Some(RefreshToken::new(refresh_token.to_string())));
+    }
+    response
 }
 
 /// The current Unix time in seconds.
@@ -201,15 +188,16 @@ impl CredentialStore for CredentialStoreAdapter {
         let granted_scopes = view.granted_scopes.to_vec();
         // Remember the durable non-token fields so a later `save` can re-persist
         // them (the token response carries none of these). The refresh token,
-        // durable access token, and client secret are copied wipe-on-drop, so
-        // this second copy does not outlive the adapter's life in freed memory.
+        // durable access token, and client secret are wipe-on-drop; the two
+        // tokens reuse the handles cloned above, so this second copy does not
+        // outlive the adapter's life in freed memory.
         *self.seed.lock().await = Some(DurableSeed {
             issuer: issuer.clone(),
             resource: view.resource.map(str::to_string),
             authorization_server: view.authorization_server.map(str::to_string),
             account_id: view.account_id.map(str::to_string),
-            refresh_token: view.refresh_token.map(|t| Zeroizing::new(t.to_string())),
-            access_token: view.access_token.map(|t| Zeroizing::new(t.to_string())),
+            refresh_token: refresh_token.clone(),
+            access_token: access_token.clone(),
             client_secret: view.client_secret.map(|t| Zeroizing::new(t.to_string())),
             token_type: view.token_type.map(str::to_string),
         });
@@ -222,8 +210,11 @@ impl CredentialStore for CredentialStoreAdapter {
             // sends it as the bearer) — the server issued no refresh token, so
             // it is the only credential there is.
             None => match (refresh_token.as_deref(), access_token.as_deref()) {
-                (Some(rt), _) => (Some(synthetic_refresh_only(rt)), None),
-                (None, Some(at)) => (Some(synthetic_access_only(at)), None),
+                // A refresh token wins: serve it with an empty bearer so the
+                // connect-time refresh drives the exchange.
+                (Some(rt), _) => (Some(synthetic_response("", Some(rt))), None),
+                // No refresh token: the durable access token is the bearer.
+                (None, Some(at)) => (Some(synthetic_response(at, None)), None),
                 (None, None) => (None, None),
             },
         };
@@ -299,15 +290,24 @@ impl CredentialStore for CredentialStoreAdapter {
         let refresh_changed = refresh_token.as_deref() != seed_refresh.as_ref().map(|t| t.as_str());
         // The durable access token is persisted ONLY for a grant with no refresh
         // token (there is nothing to refresh, so it is the only credential). It
-        // is the freshly returned access token when the response carried one,
-        // else the seed's, so a save that omits the token does not drop it.
+        // is the freshly returned access token when the response carried a
+        // non-empty one, else the seed's, so a save that omits the token does
+        // not drop it. An empty token counts as absent: a blank bearer is never
+        // persisted or served, and only when neither source has a non-empty
+        // token does the field fail closed to `None`.
         let seed_access = seed.access_token.clone();
         let durable_access_token: Option<String> = if refresh_token.is_none() {
             credentials
                 .token_response
                 .as_ref()
                 .map(|r| r.access_token().secret().clone())
-                .or_else(|| seed_access.as_ref().map(|t| t.as_str().to_string()))
+                .filter(|token| !token.is_empty())
+                .or_else(|| {
+                    seed_access
+                        .as_ref()
+                        .map(|t| t.as_str().to_string())
+                        .filter(|token| !token.is_empty())
+                })
         } else {
             None
         };
@@ -618,6 +618,57 @@ mod tests {
         // The other durable fields survive the save.
         assert_eq!(view.client_secret, Some("client-secret"));
         assert_eq!(backend.saves.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn save_never_persists_an_empty_access_token() {
+        crate::runtime::init().expect("runtime init");
+        let mut cred = durable_oauth();
+        if let ServiceCredential::OAuth {
+            refresh_token,
+            access_token,
+            ..
+        } = &mut cred
+        {
+            *refresh_token = None;
+            *access_token = Some("first-access".into());
+        }
+        let backend = FakeBackend::new(Some(cred));
+        let adapter = CredentialStoreAdapter::new("mcp:docs|x".into(), backend.clone());
+        crate::runtime::block_on(async {
+            let _ = adapter.load().await.expect("load ok");
+            // A response carrying an EMPTY bearer (and no refresh token) must
+            // not blank the grant: an empty token counts as absent, so the
+            // seed's usable token is kept rather than persisted or served as an
+            // empty bearer.
+            let response: OAuthTokenResponse = StandardTokenResponse::new(
+                AccessToken::new(String::new()),
+                BasicTokenType::Bearer,
+                VendorExtraTokenFields::default(),
+            );
+            let stored = StoredCredentials::new(
+                "client-1".into(),
+                Some(response),
+                vec!["openid".into()],
+                Some(3_000),
+            )
+            .with_issuer(Some("https://as.example".into()));
+            adapter.save(stored).await.expect("save ok");
+        })
+        .expect("block_on");
+
+        let stored = backend
+            .stored
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a durable credential");
+        let view = stored.as_oauth().expect("oauth");
+        assert_eq!(view.access_token, Some("first-access"));
+        assert_ne!(view.access_token, Some(""));
+        // The empty bearer was the only candidate durable change and it is
+        // ignored, so the seed still governs and nothing is re-encrypted.
+        assert_eq!(backend.saves.load(Ordering::SeqCst), 0);
     }
 
     #[test]
