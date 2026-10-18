@@ -15,6 +15,8 @@ use choreo_mcp::{
     McpError, McpListKind, McpProtocolMode, McpServer, McpServerConfig, McpTransport,
 };
 use std::collections::HashMap;
+use std::io::Write;
+use std::process::Stdio;
 use std::time::Duration;
 
 /// Absolute path to the fixture server binary, provided by Cargo to
@@ -444,4 +446,44 @@ fn shutdown_is_bounded_with_a_stubborn_server() {
     // The abandoned caller observes the dispatcher going away rather than
     // blocking forever.
     let _ = call.join();
+}
+
+#[test]
+#[ignore = "integration: spawns the fixture subprocess per workspace test discipline"]
+fn slow_list_fixture_exits_on_stdin_eof() {
+    watchdog();
+    // The `slow-list` fixture handshakes then parks on `tools/list` without ever
+    // answering. It must not outlive the client: once a listing request has
+    // arrived and stdin is closed, the fixture drains the pipe to EOF and exits,
+    // so an abandoned wedged child is never orphaned.
+    let mut child = std::process::Command::new(FIXTURE_BIN)
+        .arg("slow-list")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the slow-list fixture");
+
+    {
+        let mut stdin = child.stdin.take().expect("child stdin is captured");
+        // Drive the fixture into its wedged branch: a `tools/list` request it
+        // never answers.
+        let request =
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}});
+        writeln!(stdin, "{request}").expect("write the tools/list request");
+        stdin.flush().expect("flush the request");
+        // Dropping the handle here sends EOF on the child's stdin.
+    }
+
+    // The fixture must exit once it observes EOF. Poll with a short bound rather
+    // than a fixed sleep; process spawn/IO is the boundary here.
+    let mut waited = 0;
+    while child.try_wait().expect("try_wait on the fixture").is_none() {
+        std::thread::sleep(Duration::from_millis(5));
+        waited += 1;
+        assert!(
+            waited < 2000,
+            "the slow-list fixture did not exit after its stdin was closed"
+        );
+    }
 }

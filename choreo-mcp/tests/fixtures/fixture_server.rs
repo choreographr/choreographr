@@ -28,11 +28,14 @@
 //   subscription and immediately emits a `notifications/tools/list_changed`
 //   (the subscription-to-daemon forwarding test).
 // - `slow-list` — handshakes promptly but never answers `tools/list` (it parks
-//   forever), so a caller's connect-and-discovery budget — not the per-server
-//   request timeout — is what bounds it.
+//   without responding), so a caller's connect-and-discovery budget — not the
+//   per-server request timeout — is what bounds it. It exits when the client
+//   closes its stdin; the client's process-group kill still ends it sooner on a
+//   timeout.
 // - `slow-list-after-first` — answers the FIRST `tools/list` promptly, then
-//   parks forever on every later one, so a catalogue refresh must bound its
-//   re-listing (and keep the server's previously-listed tools).
+//   parks without responding on every later one, so a catalogue refresh must
+//   bound its re-listing (and keep the server's previously-listed tools). Like
+//   `slow-list`, it exits when the client closes its stdin.
 //
 // Tools:
 // - `slow` answers from a background thread so the read loop can observe a
@@ -196,17 +199,27 @@ fn main() {
                 }
                 // A server that is alive but wedged on discovery: the handshake
                 // succeeded, yet the listing never arrives. Parking here (rather
-                // than responding) exercises the caller's budget; the client's
-                // process-group kill ends the child. The `*-after-first` variant
-                // answers the first listing so a later catalogue refresh is what
-                // gets bounded.
+                // than responding) exercises the caller's budget. The
+                // `*-after-first` variant answers the first listing so a later
+                // catalogue refresh is what gets bounded.
                 let after_first = scenario.contains("after-first");
                 let wedged =
                     scenario.contains("slow-list") && (!after_first || tools_list_count > 1);
                 if wedged {
+                    // Park without answering anything (the point of the
+                    // scenario), but do not outlive the client: drain stdin
+                    // until EOF, then exit. The client's process-group kill
+                    // still ends us sooner on a timeout; this is the clean path
+                    // when the pipe is simply closed.
+                    let mut sink = String::new();
                     loop {
-                        std::thread::sleep(std::time::Duration::from_secs(3600));
+                        sink.clear();
+                        match reader.read_line(&mut sink) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
                     }
+                    return;
                 }
                 respond_result(
                     &mut out,
