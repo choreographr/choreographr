@@ -168,7 +168,11 @@ pub enum ClientMessageType {
         service: String,
         /// The typed credential to store. It zeroizes on drop; the daemon
         /// encrypts it to the binding public key and never echoes it back.
-        credential: ServiceCredential,
+        ///
+        /// Boxed because the credential enum is large (the OAuth variant's many
+        /// optional string fields); `serde` encodes `Box<T>` exactly as `T`, so
+        /// the wire shape is unchanged.
+        credential: Box<ServiceCredential>,
     },
     /// Remove the stored credential for one service.
     RemoveCredential {

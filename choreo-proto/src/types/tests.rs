@@ -225,9 +225,9 @@ fn add_credential_round_trips_with_typed_credential() {
         7,
         ClientMessageType::AddCredential {
             service: "openai".to_string(),
-            credential: ServiceCredential::ApiKey {
+            credential: Box::new(ServiceCredential::ApiKey {
                 key: "sk-secret".to_string(),
-            },
+            }),
         },
     );
 

@@ -10,10 +10,13 @@
 //!
 //! Two invariants shape the adapter:
 //!
-//! - **The access token never reaches the keystore.** `save` strips it and
-//!   serves it from an in-process cache; `load` synthesises a token response
-//!   carrying the durable refresh token when the cache is cold, so `rmcp`
-//!   refreshes on connect rather than trusting a persisted bearer.
+//! - **The access token never reaches the keystore — normally.** `save` strips
+//!   it and serves it from an in-process cache; `load` synthesises a token
+//!   response carrying the durable refresh token when the cache is cold, so
+//!   `rmcp` refreshes on connect rather than trusting a persisted bearer. The
+//!   one deliberate exception: when the authorization server issued no refresh
+//!   token, the access token is the only usable credential, so it is persisted
+//!   in the durable grant and served directly on a cold `load`.
 //! - **No `rmcp` type crosses the crate boundary.** The [`CredentialBackend`]
 //!   trait is expressed entirely in this crate's own types plus the shared
 //!   [`ServiceCredential`]; the adapter (which does name `rmcp` types) lives in
@@ -76,7 +79,10 @@ pub trait CredentialBackend: Send + Sync + 'static {
     ///
     /// Returns a message when the backend cannot read its store.
     fn load(&self) -> Result<Option<ServiceCredential>, String>;
-    /// Persist the durable OAuth credential (the access token stripped).
+    /// Persist the durable OAuth credential.
+    ///
+    /// The access token is stripped by the adapter unless the server issued no
+    /// refresh token, where it is the durable grant's sole credential.
     ///
     /// `expected_refresh_token` is the refresh token the adapter loaded and
     /// presented for this refresh, so the backend can refuse to overwrite a

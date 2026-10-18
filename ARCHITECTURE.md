@@ -938,8 +938,14 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   dynamically registers a client
   (SEP-837) when no `clientId` is configured, runs PKCE over a loopback callback
   (paste-URL fallback; no device code), and stores the durable grant as
-  `ServiceCredential::OAuth { kind: Mcp }`. A confidential client's secret is
-  read from the `clientSecretEnv` variable, sent at the token endpoint
+  `ServiceCredential::OAuth { kind: Mcp }`. A server that issues no refresh
+  token — GitHub's remote MCP through an OAuth App is the motivating case, and
+  it does so even with `offline_access` requested — has no grant root to store,
+  so the long-lived access token it does return is persisted in the credential
+  as the deliberate exception to the usual "access token never persisted" rule:
+  with nothing to refresh, it is the only credential that can authenticate the
+  connect and the only thing that survives a restart. A confidential client's
+  secret is read from the `clientSecretEnv` variable, sent at the token endpoint
   (`client_secret_basic` or `client_secret_post`, chosen from the server's
   advertised methods), and stored in the grant so connect-time refresh
   re-authenticates the token endpoint; a `clientSecretEnv` with no `clientId` is
@@ -985,10 +991,15 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   re-unlock (the TUI auto-unlocks on every connect) leaves the live connections
   alone. Refresh at connect
   is owned by `rmcp`'s `AuthorizationManager`, driven through a
-  `CredentialStore` adapter in `choreo-mcp`'s `auth` module that strips the
-  access token on `save` (serving
+  `CredentialStore` adapter in `choreo-mcp`'s `auth` module that normally strips
+  the access token on `save` (serving
   it from an in-process cache; a cold start returns no usable token so `rmcp`
-  refreshes) and maps to and from `ServiceCredential::OAuth`. A configured
+  refreshes) and maps to and from `ServiceCredential::OAuth`. The exception is a
+  grant with no refresh token: there is nothing to refresh, so the adapter
+  persists the (possibly rotated) access token in the durable grant on `save`
+  and serves it directly as the bearer on a cold `load` (no `expires_in` and no
+  receipt time, so `rmcp` skips its expiry check), keeping a server that issues
+  only an access token usable across a restart. A configured
   `authorizationServer` overrides that connect-time discovery too, exactly as it
   does at sign-in: `rmcp` has no explicit-issuer setter, so the override URL's
   metadata is resolved by `rmcp`'s own discovery and seeded onto the manager
@@ -1285,11 +1296,15 @@ startup              connect→unbound?        /unlock [key]            AddCrede
 - The unlock key is sent over the channel (by `Unlock`/`BindKeystore`); zeroized after use
   by the daemon
 - A credential is one of `ApiKey`, `X`, `Substrate`, or `OAuth`. The `OAuth` variant
-  carries only the durable grant (the refresh token, the client registration, the
+  carries the durable grant (the refresh token, the client registration, the
   identity claim extracted from the id_token, and — for a provider grant — the
   token endpoint and refresh body encoding resolved at login, so a runtime refresh
-  does not depend on the catalog profile; never the raw JWT or the ephemeral
-  access token), discriminated by `OAuthKind` (`Provider` or `Mcp`); every variant
+  does not depend on the catalog profile; never the raw JWT), discriminated by
+  `OAuthKind` (`Provider` or `Mcp`). The ephemeral access token is not part of
+  that durable shape, with one deliberate exception: an MCP grant whose
+  authorization server issued **no refresh token** persists its long-lived access
+  token, because with nothing to refresh it is the only usable credential — absent
+  it the variant carries no access token. Every variant
   participates in `#[zeroize(drop)]` and redacts every secret field in both `Display`
   and `Debug`
 - `/lock` destroys all in-memory credentials, returning to locked state

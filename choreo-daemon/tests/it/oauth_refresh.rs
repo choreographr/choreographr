@@ -64,6 +64,7 @@ fn oauth_credential(account_id: Option<&str>, refresh_token: &str) -> ServiceCre
         token_endpoint: Some("http://127.0.0.1:1/token".into()),
         refresh_encoding: Some(OAuthGrantEncoding::Json),
         refresh_token: Some(refresh_token.into()),
+        access_token: None,
         account_id: account_id.map(str::to_string),
         client_id: Some("client-abc".into()),
         client_secret: None,

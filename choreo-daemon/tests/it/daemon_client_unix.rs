@@ -507,7 +507,7 @@ fn unix_unlock_on_unbound_keystore_is_refused_without_adopting() {
     // now requires an unlocked keystore.
     client.send(ClientMessageType::AddCredential {
         service: "svc".into(),
-        credential: choreo_keystore::ServiceCredential::ApiKey { key: "sk".into() },
+        credential: Box::new(choreo_keystore::ServiceCredential::ApiKey { key: "sk".into() }),
     });
     match client.recv() {
         DaemonMessageType::CredentialAddFailed { error, .. } => {

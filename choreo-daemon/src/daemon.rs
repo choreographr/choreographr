@@ -542,7 +542,9 @@ pub enum DaemonCommand {
     OAuthSave {
         /// The target-scoped credential key (`mcp:<slug>|<target-hash>`).
         key: String,
-        /// The durable credential to persist (access token already stripped).
+        /// The durable credential to persist. The access token is stripped by
+        /// the adapter unless the server issued no refresh token, in which case
+        /// it is the durable grant's sole credential.
         credential: ServiceCredential,
         /// The refresh token the adapter loaded and presented, so the loop can
         /// refuse to rotate onto a credential replaced (logout/re-login)

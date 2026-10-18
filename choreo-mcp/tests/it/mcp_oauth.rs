@@ -130,6 +130,7 @@ fn seed_mcp_grant(path: &std::path::Path, issuer: &str, resource: &str) {
         token_endpoint: None,
         refresh_encoding: None,
         refresh_token: Some("rt-initial".to_string()),
+        access_token: None,
         account_id: None,
         client_id: Some("client-1".to_string()),
         client_secret: None,

@@ -214,6 +214,15 @@ fn finish(
         token_endpoint: None,
         refresh_encoding: None,
         refresh_token: tokens.refresh_token.as_ref().map(|t| t.to_string()),
+        // Persist the access token ONLY when the server issued no refresh token:
+        // with nothing to refresh, it is the only credential that can
+        // authenticate the connect (and the only thing to survive a daemon
+        // restart). Whenever a refresh token exists, the access token is
+        // ephemeral and stays out of the durable grant.
+        access_token: tokens
+            .refresh_token
+            .is_none()
+            .then(|| tokens.access_token.to_string()),
         account_id: None,
         client_id: Some(client_id.to_string()),
         // Persisted only for a confidential client, so connect-time refresh can

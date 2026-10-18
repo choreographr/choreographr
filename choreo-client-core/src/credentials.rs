@@ -504,7 +504,7 @@ pub fn build_add_credential_from_credential(
     );
     Ok(ClientMessageType::AddCredential {
         service,
-        credential,
+        credential: Box::new(credential),
     })
 }
 
@@ -733,7 +733,7 @@ mod tests {
             } => {
                 assert_eq!(service, "svc");
                 assert!(
-                    matches!(credential, ServiceCredential::ApiKey { ref key } if key == "k"),
+                    matches!(*credential, ServiceCredential::ApiKey { ref key } if key == "k"),
                     "the credential must travel typed and unencrypted, got {credential:?}"
                 );
             }

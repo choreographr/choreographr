@@ -468,6 +468,7 @@ mod tests {
                 token_endpoint: None,
                 refresh_encoding: None,
                 refresh_token: None,
+                access_token: None,
                 account_id: None,
                 client_id: None,
                 client_secret: None,

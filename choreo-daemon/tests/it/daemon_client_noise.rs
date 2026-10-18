@@ -658,7 +658,7 @@ fn noise_large_message_through_daemon() {
     let big_key = "A".repeat(1024 * 1024);
     client.send(ClientMessageType::AddCredential {
         service: "big-blob".into(),
-        credential: choreo_keystore::ServiceCredential::ApiKey { key: big_key },
+        credential: Box::new(choreo_keystore::ServiceCredential::ApiKey { key: big_key }),
     });
     // A successful AddCredential yields exactly ONE targeted reply — the
     // `CredentialAdded`. The handler never changes lock state, so no lock-state

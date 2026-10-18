@@ -5,8 +5,10 @@
 //! `AuthClient` wiring) this is one of the two modules that name `rmcp`'s OAuth
 //! types; it maps the daemon's durable [`ServiceCredential`] to and from
 //! `rmcp`'s `StoredCredentials` and never leaks an `rmcp` type past its own
-//! boundary. The access token is served from an in-process cache and stripped
-//! on `save`, so it never reaches the keystore.
+//! boundary. The access token is served from an in-process cache and normally
+//! stripped on `save`, so it never reaches the keystore — except when the
+//! authorization server issued no refresh token, where the access token is the
+//! only usable credential and is persisted deliberately.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,10 +30,10 @@ use super::CredentialBackend;
 /// pair so a refresh can re-persist them (the token response `rmcp` hands back
 /// carries no client secret, issuer, or resource).
 ///
-/// The refresh token and client secret are wipe-on-drop (`Zeroizing`), matching
-/// the credential they are copied from: this seed is a second copy of those
-/// secrets that lives for the connection's lifetime, so it must not linger in
-/// freed memory when the adapter drops.
+/// The refresh token, the durable access token, and the client secret are
+/// wipe-on-drop (`Zeroizing`), matching the credential they are copied from:
+/// this seed is a second copy of those secrets that lives for the connection's
+/// lifetime, so it must not linger in freed memory when the adapter drops.
 #[derive(Clone)]
 struct DurableSeed {
     issuer: Option<String>,
@@ -39,6 +41,9 @@ struct DurableSeed {
     authorization_server: Option<String>,
     account_id: Option<String>,
     refresh_token: Option<Zeroizing<String>>,
+    /// The durable access token, present only for a grant whose server issued
+    /// no refresh token.
+    access_token: Option<Zeroizing<String>>,
     client_secret: Option<Zeroizing<String>>,
     token_type: Option<String>,
 }
@@ -124,6 +129,21 @@ fn synthetic_refresh_only(refresh_token: &str) -> OAuthTokenResponse {
     response
 }
 
+/// A synthetic token response carrying a durable access token and no refresh
+/// token.
+///
+/// Served on a cold start for a grant whose authorization server issued no
+/// refresh token: there is nothing to refresh, so the durable access token is
+/// the only credential. With no `expires_in`, `rmcp` skips its expiry check and
+/// sends the token as the bearer.
+fn synthetic_access_only(access_token: &str) -> OAuthTokenResponse {
+    StandardTokenResponse::new(
+        AccessToken::new(access_token.to_string()),
+        BasicTokenType::Bearer,
+        VendorExtraTokenFields::default(),
+    )
+}
+
 /// The current Unix time in seconds.
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -172,31 +192,39 @@ impl CredentialStore for CredentialStoreAdapter {
         }
         let issuer = view.issuer.map(str::to_string);
         let client_id = view.client_id.map(str::to_string);
-        // The refresh token is a secret handed to `rmcp` below; keep our own
-        // handle to it wipe-on-drop (rmcp's `oauth2` token type does not
-        // zeroize, so that copy is out of our hands).
+        // The refresh token and durable access token are secrets handed to
+        // `rmcp` below; keep our own handles to them wipe-on-drop (rmcp's
+        // `oauth2` token type does not zeroize, so that copy is out of our
+        // hands).
         let refresh_token = view.refresh_token.map(|t| Zeroizing::new(t.to_string()));
+        let access_token = view.access_token.map(|t| Zeroizing::new(t.to_string()));
         let granted_scopes = view.granted_scopes.to_vec();
         // Remember the durable non-token fields so a later `save` can re-persist
-        // them (the token response carries none of these). The refresh token and
-        // client secret are copied wipe-on-drop, so this second copy does not
-        // outlive the adapter's life in freed memory.
+        // them (the token response carries none of these). The refresh token,
+        // durable access token, and client secret are copied wipe-on-drop, so
+        // this second copy does not outlive the adapter's life in freed memory.
         *self.seed.lock().await = Some(DurableSeed {
             issuer: issuer.clone(),
             resource: view.resource.map(str::to_string),
             authorization_server: view.authorization_server.map(str::to_string),
             account_id: view.account_id.map(str::to_string),
             refresh_token: view.refresh_token.map(|t| Zeroizing::new(t.to_string())),
+            access_token: view.access_token.map(|t| Zeroizing::new(t.to_string())),
             client_secret: view.client_secret.map(|t| Zeroizing::new(t.to_string())),
             token_type: view.token_type.map(str::to_string),
         });
         let cached = self.cache.lock().await.clone();
         let (token_response, token_received_at) = match cached {
             Some(c) => (Some(c.response), Some(c.received_at)),
-            // Cold start: serve a refresh-only response so `rmcp` refreshes.
-            None => match refresh_token.as_deref() {
-                Some(rt) => (Some(synthetic_refresh_only(rt)), None),
-                None => (None, None),
+            // Cold start. With a refresh token, serve a refresh-only response so
+            // `rmcp` refreshes. Without one, serve the durable access token
+            // directly (no `received_at`, so `rmcp` skips the expiry check and
+            // sends it as the bearer) — the server issued no refresh token, so
+            // it is the only credential there is.
+            None => match (refresh_token.as_deref(), access_token.as_deref()) {
+                (Some(rt), _) => (Some(synthetic_refresh_only(rt)), None),
+                (None, Some(at)) => (Some(synthetic_access_only(at)), None),
+                (None, None) => (None, None),
             },
         };
         let Some(token_response) = token_response else {
@@ -217,9 +245,10 @@ impl CredentialStore for CredentialStoreAdapter {
 
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
         let received_at = credentials.token_received_at.unwrap_or_else(now_secs);
-        // The in-process cache update is unconditional: the access token is
-        // never part of the durable grant, so a plain expiry refresh updates it
-        // here and touches nothing on disk.
+        // The in-process cache update is unconditional: the cache is the
+        // working copy the adapter serves between refreshes, and the durable
+        // grant only mirrors the access token in the no-refresh-token case
+        // handled below.
         if let Some(response) = credentials.token_response.clone() {
             *self.cache.lock().await = Some(CachedToken {
                 response,
@@ -253,7 +282,8 @@ impl CredentialStore for CredentialStoreAdapter {
             ),
         };
         // The durable grant changes only when the exchange ROTATED the refresh
-        // token. `rmcp` rewrites the previous refresh token back onto the
+        // token (or, for a grant with no refresh token, when the access token
+        // changed). `rmcp` rewrites the previous refresh token back onto the
         // response on refresh, so "the response carries a refresh token" does
         // NOT imply rotation — compare the adopted value against the seed's, not
         // its presence. A non-rotating refresh (the access token lives only in
@@ -266,10 +296,27 @@ impl CredentialStore for CredentialStoreAdapter {
         // A plain `==` (not constant-time) is deliberate: both operands are
         // in-process secrets already resident in this task's memory, so there
         // is no timing oracle for an attacker who could not already read them.
-        if refresh_token.as_deref() == seed_refresh.as_ref().map(|t| t.as_str()) {
+        let refresh_changed = refresh_token.as_deref() != seed_refresh.as_ref().map(|t| t.as_str());
+        // The durable access token is persisted ONLY for a grant with no refresh
+        // token (there is nothing to refresh, so it is the only credential). It
+        // is the freshly returned access token when the response carried one,
+        // else the seed's, so a save that omits the token does not drop it.
+        let seed_access = seed.access_token.clone();
+        let durable_access_token: Option<String> = if refresh_token.is_none() {
+            credentials
+                .token_response
+                .as_ref()
+                .map(|r| r.access_token().secret().clone())
+                .or_else(|| seed_access.as_ref().map(|t| t.as_str().to_string()))
+        } else {
+            None
+        };
+        let access_changed =
+            durable_access_token.as_deref() != seed_access.as_ref().map(|t| t.as_str());
+        if !refresh_changed && !access_changed {
             tracing::debug!(
                 key = %self.key,
-                "MCP token refresh carried no rotation; skipping the durable re-encrypt"
+                "MCP token refresh carried no durable change; skipping the durable re-encrypt"
             );
             return Ok(());
         }
@@ -283,6 +330,7 @@ impl CredentialStore for CredentialStoreAdapter {
             token_endpoint: None,
             refresh_encoding: None,
             refresh_token,
+            access_token: durable_access_token,
             account_id: seed.account_id,
             client_id: Some(credentials.client_id.clone()),
             client_secret: seed.client_secret.as_ref().map(|s| s.as_str().to_string()),
@@ -394,6 +442,7 @@ mod tests {
             token_endpoint: None,
             refresh_encoding: None,
             refresh_token: Some("refresh-secret".into()),
+            access_token: None,
             account_id: None,
             client_id: Some("client-1".into()),
             client_secret: Some("client-secret".into()),
@@ -471,6 +520,107 @@ mod tests {
     }
 
     #[test]
+    fn cold_load_serves_the_durable_access_token_when_no_refresh_token() {
+        crate::runtime::init().expect("runtime init");
+        let mut cred = durable_oauth();
+        if let ServiceCredential::OAuth {
+            refresh_token,
+            access_token,
+            ..
+        } = &mut cred
+        {
+            *refresh_token = None;
+            *access_token = Some("durable-access".into());
+        }
+        let backend = FakeBackend::new(Some(cred));
+        let adapter = CredentialStoreAdapter::new("mcp:docs|x".into(), backend);
+        let stored = crate::runtime::block_on(adapter.load())
+            .expect("block_on")
+            .expect("load ok")
+            .expect("some credentials");
+        let response = stored.token_response.expect("a token response");
+        // The durable access token is served as the bearer, with no refresh
+        // token and no received_at (so `rmcp` skips the expiry check).
+        assert_eq!(response.access_token().secret(), "durable-access");
+        assert!(response.refresh_token().is_none());
+        assert_eq!(stored.token_received_at, None);
+        assert_eq!(stored.client_id, "client-1");
+    }
+
+    #[test]
+    fn cold_load_without_refresh_or_access_token_returns_none() {
+        crate::runtime::init().expect("runtime init");
+        let mut cred = durable_oauth();
+        if let ServiceCredential::OAuth {
+            refresh_token,
+            access_token,
+            ..
+        } = &mut cred
+        {
+            *refresh_token = None;
+            *access_token = None;
+        }
+        let backend = FakeBackend::new(Some(cred));
+        let adapter = CredentialStoreAdapter::new("mcp:docs|x".into(), backend);
+        let loaded = crate::runtime::block_on(adapter.load())
+            .expect("block_on")
+            .expect("load ok");
+        assert!(
+            loaded.is_none(),
+            "neither an access token nor a refresh token yields no credentials"
+        );
+    }
+
+    #[test]
+    fn save_persists_the_access_token_when_no_refresh_token() {
+        crate::runtime::init().expect("runtime init");
+        let mut cred = durable_oauth();
+        if let ServiceCredential::OAuth {
+            refresh_token,
+            access_token,
+            ..
+        } = &mut cred
+        {
+            *refresh_token = None;
+            *access_token = Some("first-access".into());
+        }
+        let backend = FakeBackend::new(Some(cred));
+        let adapter = CredentialStoreAdapter::new("mcp:docs|x".into(), backend.clone());
+        crate::runtime::block_on(async {
+            let _ = adapter.load().await.expect("load ok");
+            // A rotated access token with no refresh token must be persisted so
+            // it survives the process (there is nothing to refresh it with).
+            let response: OAuthTokenResponse = StandardTokenResponse::new(
+                AccessToken::new("rotated-access".into()),
+                BasicTokenType::Bearer,
+                VendorExtraTokenFields::default(),
+            );
+            let stored = StoredCredentials::new(
+                "client-1".into(),
+                Some(response),
+                vec!["openid".into()],
+                Some(3_000),
+            )
+            .with_issuer(Some("https://as.example".into()));
+            adapter.save(stored).await.expect("save ok");
+        })
+        .expect("block_on");
+
+        let stored = backend
+            .stored
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a durable credential");
+        let view = stored.as_oauth().expect("oauth");
+        assert_eq!(view.access_token, Some("rotated-access"));
+        assert_eq!(view.refresh_token, None);
+        // The other durable fields survive the save.
+        assert_eq!(view.client_secret, Some("client-secret"));
+        assert_eq!(backend.saves.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn save_strips_the_access_token() {
         crate::runtime::init().expect("runtime init");
         let backend = FakeBackend::new(Some(durable_oauth()));
@@ -504,7 +654,9 @@ mod tests {
             .expect("a durable credential");
         let view = stored.as_oauth().expect("oauth");
         assert_eq!(view.refresh_token, Some("rotated-refresh"));
-        // The access token is never in the durable credential's fields.
+        // The access token is never in the durable credential's fields when a
+        // refresh token exists.
+        assert_eq!(view.access_token, None);
         assert!(!format!("{stored:?}").contains("access-secret"));
         // The client secret survives the save (it is not in the token response).
         assert_eq!(view.client_secret, Some("client-secret"));

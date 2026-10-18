@@ -247,7 +247,7 @@ pub(super) fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -
                 "client {}: AddCredential service={}",
                 ctx.client_id, service
             );
-            handle_add_credential_sync(&mut *ctx, kind, &service, credential);
+            handle_add_credential_sync(&mut *ctx, kind, &service, *credential);
         }
         ClientMessageType::RemoveCredential { service } => {
             info!(

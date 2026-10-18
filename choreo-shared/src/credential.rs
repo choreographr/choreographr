@@ -98,10 +98,14 @@ pub enum ServiceCredential {
     /// authorization server issued at login, refreshed by the daemon when the
     /// access token expires or a request is rejected with 401.
     ///
-    /// It carries only the irreducible, durable subset — the refresh token,
-    /// the client registration, and the extracted identity claims. The access
-    /// token is derived, ephemeral, and lives in daemon memory only; the raw
-    /// `id_token` is never stored (only the claim extracted from it).
+    /// It carries the irreducible, durable subset — the refresh token, the
+    /// client registration, and the extracted identity claims — plus one
+    /// deliberate exception (`access_token`). The raw `id_token` is never
+    /// stored (only the claim extracted from it).
+    ///
+    /// The access token is normally derived, ephemeral, and held in daemon
+    /// memory only; it is persisted here solely when the authorization server
+    /// issued no refresh token, where it is the only usable credential.
     #[serde(rename = "oauth")]
     OAuth {
         /// Which OAuth profile this serves (provider versus MCP).
@@ -137,6 +141,28 @@ pub enum ServiceCredential {
         granted_scopes: Vec<String>,
         /// Bearer token type; almost always "Bearer".
         token_type: Option<String>,
+        /// A durable access token, populated ONLY when the authorization server
+        /// issued no refresh token at login. Some servers (e.g. GitHub's remote
+        /// MCP through an OAuth App) return a long-lived access token and no
+        /// refresh token even with `offline_access` requested; with no refresh
+        /// token, the access token is the only credential that can authenticate
+        /// the connect, so this is the deliberate exception to the usual
+        /// "access token never persisted" rule. Whenever a refresh token exists
+        /// this stays `None` and the access token lives only in daemon memory.
+        ///
+        /// The field is ALWAYS encoded — `#[serde(default)]` with no
+        /// `skip_serializing_if` — because the keystore blob is `postcard`,
+        /// which is positional and not self-describing: a skipped `None` would
+        /// omit the field from the encode and the same build could not decode
+        /// it (it would hit a truncated buffer). With the field always present,
+        /// the positional encode and decode agree and a `Some`/`None` pair
+        /// round-trips; `#[serde(default)]` still lets a self-describing blob
+        /// (the JSON wire, an older build's grant) that omits the key decode to
+        /// `None`. Declared last so it appends to the OAuth grant's shape; the
+        /// non-OAuth variants (`ApiKey`, `X`, `Substrate`) carry no access token
+        /// and their encodings are byte-unaffected.
+        #[serde(default)]
+        access_token: Option<String>,
     },
 }
 
@@ -179,16 +205,17 @@ fn fmt_redacted(credential: &ServiceCredential, f: &mut fmt::Formatter<'_>) -> f
             write!(f, "Substrate {{ name: ***, account_id: ***, seed: *** }}")
         }
         ServiceCredential::OAuth { kind, .. } => {
-            // Every OAuth field is redacted — the refresh token, the client
-            // secret, and the identity/issuer strings are all sensitive. Only
-            // the fieldless `kind` discriminator is printed plainly.
+            // Every OAuth field is redacted — the refresh token, the durable
+            // access token, the client secret, and the identity/issuer strings
+            // are all sensitive. Only the fieldless `kind` discriminator is
+            // printed plainly.
             write!(
                 f,
                 "OAuth {{ kind: {kind:?}, issuer: ***, resource: ***, \
                  authorization_server: ***, token_endpoint: ***, \
-                 refresh_encoding: ***, refresh_token: ***, account_id: ***, \
-                 client_id: ***, client_secret: ***, granted_scopes: ***, \
-                 token_type: *** }}"
+                 refresh_encoding: ***, refresh_token: ***, access_token: ***, \
+                 account_id: ***, client_id: ***, client_secret: ***, \
+                 granted_scopes: ***, token_type: *** }}"
             )
         }
     }
@@ -266,6 +293,8 @@ pub struct OAuthCredentialView<'a> {
     pub refresh_encoding: Option<OAuthGrantEncoding>,
     /// Long-lived refresh token (the durable grant root).
     pub refresh_token: Option<&'a str>,
+    /// A durable access token, present only for a grant with no refresh token.
+    pub access_token: Option<&'a str>,
     /// Identity claim extracted from the `id_token` at login.
     pub account_id: Option<&'a str>,
     /// The client id used at login.
@@ -286,9 +315,9 @@ impl fmt::Debug for OAuthCredentialView<'_> {
             f,
             "OAuthCredentialView {{ kind: {:?}, issuer: ***, resource: ***, \
              authorization_server: ***, token_endpoint: ***, \
-             refresh_encoding: ***, refresh_token: ***, account_id: ***, \
-             client_id: ***, client_secret: ***, granted_scopes: ***, \
-             token_type: *** }}",
+             refresh_encoding: ***, refresh_token: ***, access_token: ***, \
+             account_id: ***, client_id: ***, client_secret: ***, \
+             granted_scopes: ***, token_type: *** }}",
             self.kind
         )
     }
@@ -349,6 +378,7 @@ impl ServiceCredential {
                 token_endpoint,
                 refresh_encoding,
                 refresh_token,
+                access_token,
                 account_id,
                 client_id,
                 client_secret,
@@ -362,6 +392,7 @@ impl ServiceCredential {
                 token_endpoint: token_endpoint.as_deref(),
                 refresh_encoding: *refresh_encoding,
                 refresh_token: refresh_token.as_deref(),
+                access_token: access_token.as_deref(),
                 account_id: account_id.as_deref(),
                 client_id: client_id.as_deref(),
                 client_secret: client_secret.as_deref(),
@@ -630,6 +661,7 @@ mod tests {
             token_endpoint: Some("https://auth.openai.com/oauth/token".into()),
             refresh_encoding: Some(OAuthGrantEncoding::Json),
             refresh_token: Some("refresh-supersecret".into()),
+            access_token: Some("access-supersecret".into()),
             account_id: Some("acct-supersecret".into()),
             client_id: Some("client-supersecret".into()),
             client_secret: Some("clientsecret-supersecret".into()),
@@ -652,6 +684,7 @@ mod tests {
         );
         assert_eq!(view.refresh_encoding, Some(OAuthGrantEncoding::Json));
         assert_eq!(view.refresh_token, Some("refresh-supersecret"));
+        assert_eq!(view.access_token, Some("access-supersecret"));
         assert_eq!(view.account_id, Some("acct-supersecret"));
         assert_eq!(view.client_id, Some("client-supersecret"));
         assert_eq!(view.client_secret, Some("clientsecret-supersecret"));
@@ -685,6 +718,7 @@ mod tests {
             "api.example",
             "as.example",
             "refresh-supersecret",
+            "access-supersecret",
             "acct-supersecret",
             "client-supersecret",
             "clientsecret-supersecret",
@@ -694,8 +728,8 @@ mod tests {
         ] {
             assert!(!display.contains(secret), "Display leaked {secret}");
         }
-        // Eleven redacted fields; the fieldless `kind` is printed plainly.
-        assert_eq!(display.matches("***").count(), 11);
+        // Twelve redacted fields; the fieldless `kind` is printed plainly.
+        assert_eq!(display.matches("***").count(), 12);
         assert!(display.contains("kind: Provider"));
     }
 
@@ -705,12 +739,13 @@ mod tests {
         for secret in [
             "auth.openai.com",
             "refresh-supersecret",
+            "access-supersecret",
             "clientsecret-supersecret",
             "offline_access",
         ] {
             assert!(!debug.contains(secret), "Debug leaked {secret}");
         }
-        assert_eq!(debug.matches("***").count(), 11);
+        assert_eq!(debug.matches("***").count(), 12);
     }
 
     #[test]
@@ -721,12 +756,61 @@ mod tests {
         for secret in [
             "auth.openai.com",
             "refresh-supersecret",
+            "access-supersecret",
             "clientsecret-supersecret",
             "openid",
         ] {
             assert!(!debug.contains(secret), "view Debug leaked {secret}");
         }
-        assert_eq!(debug.matches("***").count(), 11);
+        assert_eq!(debug.matches("***").count(), 12);
+    }
+
+    #[test]
+    fn oauth_access_token_round_trips_and_defaults_to_none() {
+        // Present: the token survives a serialize/deserialize round trip.
+        let json = serde_json::to_string(&oauth_credential()).expect("serialize");
+        assert!(json.contains("access-supersecret"));
+        let restored: ServiceCredential = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            restored.as_oauth().expect("OAuth view").access_token,
+            Some("access-supersecret")
+        );
+
+        // Absent: a `None` field round-trips to `None`. The field is always
+        // encoded (never skipped), so the key is present and explicitly null;
+        // what matters is that the `None` survives the round trip.
+        let mut without = oauth_credential();
+        if let ServiceCredential::OAuth { access_token, .. } = &mut without {
+            *access_token = None;
+        }
+        let json = serde_json::to_string(&without).expect("serialize");
+        let restored: ServiceCredential = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.as_oauth().expect("OAuth view").access_token, None);
+
+        // A self-describing blob with no `access_token` key at all — the shape
+        // the JSON wire and an older build's grant produce — decodes to `None`
+        // through `#[serde(default)]`. (The `postcard` keystore blob is
+        // positional and always carries the field, so it is not exercised
+        // here.)
+        let legacy = serde_json::json!({
+            "oauth": {
+                "kind": "provider",
+                "issuer": "https://auth.openai.com",
+                "resource": null,
+                "authorization_server": null,
+                "token_endpoint": null,
+                "refresh_encoding": null,
+                "refresh_token": "refresh-supersecret",
+                "account_id": null,
+                "client_id": null,
+                "client_secret": null,
+                "granted_scopes": [],
+                "token_type": null,
+            }
+        });
+        let restored: ServiceCredential =
+            serde_json::from_value(legacy).expect("deserialize legacy blob");
+        assert_eq!(restored.as_oauth().expect("OAuth view").access_token, None);
     }
 
     #[test]
@@ -740,6 +824,7 @@ mod tests {
                 authorization_server,
                 token_endpoint,
                 refresh_token,
+                access_token,
                 account_id,
                 client_id,
                 client_secret,
@@ -759,6 +844,7 @@ mod tests {
                 assert!(cleared(authorization_server));
                 assert!(cleared(token_endpoint));
                 assert!(cleared(refresh_token));
+                assert!(cleared(access_token));
                 assert!(cleared(account_id));
                 assert!(cleared(client_id));
                 assert!(cleared(client_secret));

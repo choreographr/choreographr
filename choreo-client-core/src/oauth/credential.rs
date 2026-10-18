@@ -54,6 +54,8 @@ fn build_credential(
         )),
         refresh_encoding: Some(descriptor.refresh_encoding),
         refresh_token: tokens.refresh_token.as_ref().map(|t| t.to_string()),
+        // Providers refresh, so the access token is never persisted here.
+        access_token: None,
         account_id: extract_account_id(tokens),
         client_id: Some(client_id.to_string()),
         client_secret: None,

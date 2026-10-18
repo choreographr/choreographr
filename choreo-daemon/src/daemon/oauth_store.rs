@@ -169,9 +169,11 @@ impl DaemonState {
     /// [`DaemonCommand::OAuthSave`](crate::daemon::DaemonCommand::OAuthSave)).
     ///
     /// Re-encrypts the updated durable subset to the binding public key and
-    /// persists it (the daemon is the sole blob writer; the access token was
-    /// stripped by the adapter), then updates the in-memory map and the MCP
-    /// OAuth snapshot, dropping any cached token or quarantine for the key.
+    /// persists it (the daemon is the sole blob writer; the adapter keeps the
+    /// access token out of the durable grant unless the server issued no
+    /// refresh token, where it is the only credential), then updates the
+    /// in-memory map and the MCP OAuth snapshot, dropping any cached token or
+    /// quarantine for the key.
     pub(super) fn handle_oauth_save(
         &mut self,
         key: &str,
@@ -309,6 +311,7 @@ mod tests {
             token_endpoint: None,
             refresh_encoding: None,
             refresh_token: Some(refresh.to_string()),
+            access_token: None,
             account_id: None,
             client_id: Some("client-1".into()),
             client_secret: None,
@@ -326,6 +329,7 @@ mod tests {
             token_endpoint: Some("https://auth.example/token".into()),
             refresh_encoding: Some(choreo_keystore::OAuthGrantEncoding::Json),
             refresh_token: Some(refresh.to_string()),
+            access_token: None,
             account_id: None,
             client_id: None,
             client_secret: None,

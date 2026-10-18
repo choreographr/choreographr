@@ -117,6 +117,7 @@ fn untrusting_a_project_keeps_the_stored_credential_row() {
             token_endpoint: None,
             refresh_encoding: None,
             refresh_token: Some("rt".into()),
+            access_token: None,
             account_id: None,
             client_id: Some("client-1".into()),
             client_secret: None,
@@ -438,7 +439,7 @@ fn drive_login(info: McpLoginInfo) -> (String, ServiceCredential) {
     let choreo_proto::ClientMessageType::AddCredential { credential, .. } = *message else {
         panic!("expected an AddCredential request");
     };
-    (service, credential)
+    (service, *credential)
 }
 
 /// The interactive MCP sign-in completes against the mock authorization

@@ -164,6 +164,7 @@ mod tests {
             token_endpoint: None,
             refresh_encoding: None,
             refresh_token: Some("refresh-secret".into()),
+            access_token: None,
             account_id: None,
             client_id: Some("client-1".into()),
             client_secret: Some("client-secret".into()),

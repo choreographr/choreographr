@@ -123,9 +123,9 @@ fn mcp_login_done_reports_the_slug_and_skips_setup_follow() {
                 service: "mcp:docs|abc123".to_string(),
                 // The credential payload is opaque to this UI branch; the type
                 // does not affect it, only the `mcp:` service prefix does.
-                credential: ServiceCredential::ApiKey {
+                credential: Box::new(ServiceCredential::ApiKey {
                     key: "unused".to_string(),
-                },
+                }),
             }),
         },
         &tx,
@@ -165,9 +165,9 @@ fn provider_login_done_arms_setup_follow_and_reports_the_account() {
             service: "work".to_string(),
             message: Box::new(ClientMessageType::AddCredential {
                 service: "work".to_string(),
-                credential: ServiceCredential::ApiKey {
+                credential: Box::new(ServiceCredential::ApiKey {
                     key: "sk-secret".to_string(),
-                },
+                }),
             }),
         },
         &tx,
