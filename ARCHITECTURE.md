@@ -979,9 +979,11 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   and refresh the catalogue, so a sign-in is self-sufficient; `mcp logout
   <slug>` removes it via `RemoveCredential` and reconnects. The unlock tail
   (run by both `Unlock` and `BindKeystore`) likewise reconnects every
-  `mcp:`-keyed server: the daemon starts locked and connects its servers before
-  any grant is decryptable, so a restart brings signed-in servers up without a
-  manual reconnect. Refresh at connect
+  `mcp:`-keyed server on the locked→unlocked transition: the daemon starts
+  locked and connects its servers before any grant is decryptable, so a restart
+  brings signed-in servers up without a manual reconnect, while a redundant
+  re-unlock (the TUI auto-unlocks on every connect) leaves the live connections
+  alone. Refresh at connect
   is owned by `rmcp`'s `AuthorizationManager`, driven through a
   `CredentialStore` adapter in `choreo-mcp`'s `auth` module that strips the
   access token on `save` (serving

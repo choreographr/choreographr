@@ -573,6 +573,13 @@ fn finish_unlock(
     state: &mut DaemonState,
     credentials: HashMap<String, ServiceCredential>,
 ) -> io::Result<()> {
+    // Snapshot the pre-unlock lock state: the tail is shared by a REAL
+    // locked→unlocked transition (`Unlock`, or the TOFU `BindKeystore`) and a
+    // redundant re-unlock of an already-unlocked daemon — the TUI auto-unlocks
+    // on every connect, so a second client (or a reconnect) re-runs it. The MCP
+    // reconnect at the end must fire only on the transition: a redundant unlock
+    // would needlessly tear down every signed-in server's live connection.
+    let was_locked = state.locked;
     // Load accounts from the daemon's OWN accounts path — the same file
     // `state.accounts` was loaded from (`AccountManager::path`), NOT the
     // global config-dir assumption: an embedder that opened state with an
@@ -612,9 +619,13 @@ fn finish_unlock(
     // A daemon restart spawns the MCP servers while the keystore is still
     // LOCKED, so an OAuth server's first connect runs with no decryptable grant
     // and fails; nothing retries it when the keystore later unlocks. Now that
-    // the credentials are committed and published, bring those servers up. A
-    // no-op on a fresh bind, which has no stored credentials.
-    state.reconnect_mcp_servers_for_unlocked_credentials();
+    // the credentials are committed and published, bring those servers up — but
+    // only on a real locked→unlocked transition (`was_locked`), so a redundant
+    // re-unlock does not churn servers that are already connected. A no-op on a
+    // fresh bind, which has no stored credentials.
+    if was_locked {
+        state.reconnect_mcp_servers_for_unlocked_credentials();
+    }
 
     // Log the accounts summary AFTER the assignment (the credential decrypt
     // summary is logged by `decrypt_credential_blobs`, before publishing).

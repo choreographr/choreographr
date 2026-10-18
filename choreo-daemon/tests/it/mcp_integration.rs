@@ -1065,11 +1065,16 @@ fn unlock_reconnects_signed_in_mcp_servers() {
     state.handle_command(DaemonCommand::McpTierReload);
     assert_eq!(count_lines(&connect_log), 1, "docs connects on reload");
 
-    // Re-running the unlock tail against the stored grant must bring `docs`
-    // back up — a second connect — proving the unlock path reconnects it.
+    // Relock, then unlock: the reconnect is gated on a REAL locked→unlocked
+    // transition (a redundant re-unlock of an already-unlocked daemon must NOT
+    // churn live servers). A restart comes up locked, so this mirrors it.
+    let (lock_reply, _lock_rx) = std::sync::mpsc::channel();
+    state.handle_command(DaemonCommand::Lock { reply: lock_reply });
+    assert!(state.locked, "lock relatches the daemon");
+
     let (unlock_ack, _unlock_rx) = std::sync::mpsc::channel();
     state.handle_command(DaemonCommand::Unlock {
-        private_key: key,
+        private_key: key.clone(),
         reply: None,
         ack: unlock_ack,
     });
@@ -1078,6 +1083,21 @@ fn unlock_reconnects_signed_in_mcp_servers() {
         count_lines(&connect_log),
         2,
         "unlocking must reconnect the signed-in server (a second connect)"
+    );
+
+    // A redundant re-unlock of an already-unlocked daemon must NOT reconnect
+    // again: the reconnect is gated on the locked→unlocked transition, so a
+    // second client's auto-unlock does not churn the live connection.
+    let (redundant_ack, _redundant_rx) = std::sync::mpsc::channel();
+    state.handle_command(DaemonCommand::Unlock {
+        private_key: key,
+        reply: None,
+        ack: redundant_ack,
+    });
+    assert_eq!(
+        count_lines(&connect_log),
+        2,
+        "a redundant unlock must not reconnect (no third connect)"
     );
 
     choreo_daemon::mcp::config::set_test_config_root(None);
