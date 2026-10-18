@@ -1001,3 +1001,84 @@ fn storing_an_mcp_credential_reconnects_its_server() {
 
     choreo_daemon::mcp::config::set_test_config_root(None);
 }
+
+/// After the keystore unlocks, an already-signed-in MCP server is brought up
+/// automatically — the gap that leaves it dead after a daemon restart.
+///
+/// The daemon starts LOCKED and connects MCP servers before any grant is
+/// decryptable, so an OAuth server's first connect fails and nothing retries
+/// it. This proves the unlock tail reconnects `mcp:`-keyed servers: the fixture
+/// appends to `MCP_FIXTURE_CONNECT_LOG` on every startup, so the reconnect is a
+/// second connect.
+#[test]
+#[ignore = "integration"]
+fn unlock_reconnects_signed_in_mcp_servers() {
+    watchdog();
+
+    let log_dir = tempfile::tempdir().expect("log dir");
+    let connect_log = log_dir.path().join("connects.log");
+
+    // Start with NO config so the manager does not know `docs` yet: the
+    // credential is saved first, and the save-path reconnect (a no-op with no
+    // configured server) must not disturb the connect count below.
+    let empty = tempfile::tempdir().expect("empty config");
+    choreo_daemon::mcp::config::set_test_config_root(Some(empty.path().to_path_buf()));
+
+    let key = vec![7u8; 32];
+    let mut state = crate::common::test_daemon_state();
+    let (bind_ack, _bind_rx) = std::sync::mpsc::channel();
+    state.handle_command(DaemonCommand::BindKeystore {
+        key: key.clone(),
+        reply: None,
+        ack: bind_ack,
+    });
+    assert!(!state.locked, "bind leaves the keystore unlocked");
+
+    // Persist an `mcp:`-keyed grant (no server configured yet, so no connect).
+    let (save_ack, _save_rx) = std::sync::mpsc::channel();
+    state.handle_command(DaemonCommand::SaveCredential {
+        service: "mcp:docs|abc123".to_string(),
+        credential: ServiceCredential::OAuth {
+            kind: OAuthKind::Mcp,
+            issuer: Some("https://as.example".into()),
+            resource: Some("https://example.com/mcp".into()),
+            authorization_server: Some("https://as.example".into()),
+            token_endpoint: None,
+            refresh_encoding: None,
+            refresh_token: Some("rt".into()),
+            account_id: None,
+            client_id: Some("client-1".into()),
+            client_secret: None,
+            granted_scopes: vec!["openid".into()],
+            token_type: Some("Bearer".into()),
+        },
+        reply: None,
+        ack: save_ack,
+    });
+
+    // Now configure the fixture server and load it: `docs` connects once.
+    let mut server = fixture_entry("modern");
+    server["env"] = serde_json::json!({ "MCP_FIXTURE_CONNECT_LOG": connect_log });
+    let config_dir =
+        write_daemon_config(&serde_json::json!({ "docs": server })).expect("write config");
+    choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
+    state.handle_command(DaemonCommand::McpTierReload);
+    assert_eq!(count_lines(&connect_log), 1, "docs connects on reload");
+
+    // Re-running the unlock tail against the stored grant must bring `docs`
+    // back up — a second connect — proving the unlock path reconnects it.
+    let (unlock_ack, _unlock_rx) = std::sync::mpsc::channel();
+    state.handle_command(DaemonCommand::Unlock {
+        private_key: key,
+        reply: None,
+        ack: unlock_ack,
+    });
+    assert!(!state.locked, "unlock leaves the daemon unlocked");
+    assert_eq!(
+        count_lines(&connect_log),
+        2,
+        "unlocking must reconnect the signed-in server (a second connect)"
+    );
+
+    choreo_daemon::mcp::config::set_test_config_root(None);
+}

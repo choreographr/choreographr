@@ -609,6 +609,12 @@ fn finish_unlock(
     // Publish the freshly decrypted MCP OAuth credentials to the connect-path
     // snapshot so a server reconnecting against them finds them.
     state.publish_mcp_oauth_snapshot();
+    // A daemon restart spawns the MCP servers while the keystore is still
+    // LOCKED, so an OAuth server's first connect runs with no decryptable grant
+    // and fails; nothing retries it when the keystore later unlocks. Now that
+    // the credentials are committed and published, bring those servers up. A
+    // no-op on a fresh bind, which has no stored credentials.
+    state.reconnect_mcp_servers_for_unlocked_credentials();
 
     // Log the accounts summary AFTER the assignment (the credential decrypt
     // summary is logged by `decrypt_credential_blobs`, before publishing).

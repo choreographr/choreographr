@@ -176,6 +176,34 @@ impl DaemonState {
         }
     }
 
+    /// Bring up every MCP server whose OAuth grant just became available after
+    /// an unlock (or bind).
+    ///
+    /// The daemon starts LOCKED and spawns/connects MCP servers immediately, so
+    /// an OAuth server's first connect runs before its grant is decryptable and
+    /// 401s; nothing retries it when the keystore later unlocks. Reconnecting
+    /// the `mcp:`-keyed servers here means a restart brings signed-in servers up
+    /// without a manual `/mcp reconnect`. On a fresh bind there are no such
+    /// credentials, so this is a no-op.
+    #[cfg(feature = "mcp")]
+    pub(super) fn reconnect_mcp_servers_for_unlocked_credentials(&mut self) {
+        // Collect the keys first: `reconnect_mcp_for_credential` takes `&mut
+        // self`, so the `self.credentials` borrow cannot be held across the loop.
+        let keys: Vec<String> = self
+            .credentials
+            .keys()
+            .filter(|key| key.starts_with("mcp:"))
+            .cloned()
+            .collect();
+        for key in keys {
+            self.reconnect_mcp_for_credential(&key);
+        }
+    }
+
+    /// Without the `mcp` feature there are no MCP servers to bring up.
+    #[cfg(not(feature = "mcp"))]
+    pub(super) fn reconnect_mcp_servers_for_unlocked_credentials(&mut self) {}
+
     /// Reload the MCP configuration and refresh the catalogue.
     ///
     /// The manager re-reads the daemon-tier `mcp.json` and reconciles the
