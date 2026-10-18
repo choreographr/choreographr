@@ -14,7 +14,9 @@
 //! in crate-level `tests/` directories and must be ignored; `cargo test` runs
 //! only unit tests.
 
+use choreo_daemon::daemon::DaemonCommand;
 use choreo_daemon::tools::ToolOutputFormat;
+use choreo_keystore::{OAuthKind, ServiceCredential};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -929,5 +931,73 @@ fn failed_project_connect_does_not_shadow_daemon_group() {
     );
 
     drop(manager);
+    choreo_daemon::mcp::config::set_test_config_root(None);
+}
+
+/// A stored MCP OAuth grant brings its server up automatically.
+///
+/// A sign-in stores the grant, but the connection that failed with an
+/// auth-required error predates it, so without an automatic reconnect the user
+/// would have to run `/mcp reconnect <slug>` by hand. The fixture server
+/// appends a line to `MCP_FIXTURE_CONNECT_LOG` on every startup, so the
+/// reconnect is observable as a SECOND connect — no time-based wait. The
+/// credential key the daemon persists is transport-agnostic
+/// (`mcp:<slug>|<hash>`), so a stdio fixture exercises the key→slug→reconnect
+/// path the same way an HTTP OAuth server would.
+#[test]
+#[ignore = "integration"]
+fn storing_an_mcp_credential_reconnects_its_server() {
+    watchdog();
+
+    let log_dir = tempfile::tempdir().expect("log dir");
+    let connect_log = log_dir.path().join("connects.log");
+    let mut server = fixture_entry("modern");
+    server["env"] = serde_json::json!({ "MCP_FIXTURE_CONNECT_LOG": connect_log });
+    let config_dir =
+        write_daemon_config(&serde_json::json!({ "docs": server })).expect("write config");
+    choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
+
+    let mut state = crate::common::test_daemon_state();
+    // Load the daemon-tier config so `docs` is known and connected once.
+    state.handle_command(DaemonCommand::McpTierReload);
+    assert_eq!(count_lines(&connect_log), 1, "docs connects once on reload");
+
+    // Unlock so the credential save is accepted (a locked add is refused).
+    let (bind_ack, _bind_rx) = std::sync::mpsc::channel();
+    state.handle_command(DaemonCommand::BindKeystore {
+        key: vec![7u8; 32],
+        reply: None,
+        ack: bind_ack,
+    });
+    assert!(!state.locked, "bind leaves the keystore unlocked");
+
+    // Storing the grant for `docs` must reconnect it — a second connect.
+    let (save_ack, _save_rx) = std::sync::mpsc::channel();
+    state.handle_command(DaemonCommand::SaveCredential {
+        service: "mcp:docs|abc123".to_string(),
+        credential: ServiceCredential::OAuth {
+            kind: OAuthKind::Mcp,
+            issuer: Some("https://as.example".into()),
+            resource: Some("https://example.com/mcp".into()),
+            authorization_server: Some("https://as.example".into()),
+            token_endpoint: None,
+            refresh_encoding: None,
+            refresh_token: Some("rt".into()),
+            account_id: None,
+            client_id: Some("client-1".into()),
+            client_secret: None,
+            granted_scopes: vec!["openid".into()],
+            token_type: Some("Bearer".into()),
+        },
+        reply: None,
+        ack: save_ack,
+    });
+
+    assert_eq!(
+        count_lines(&connect_log),
+        2,
+        "storing the grant must reconnect the server (a second connect)"
+    );
+
     choreo_daemon::mcp::config::set_test_config_root(None);
 }

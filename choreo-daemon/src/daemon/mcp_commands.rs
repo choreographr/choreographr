@@ -109,28 +109,71 @@ impl DaemonState {
         self.tool_registry.store(registry);
     }
 
-    /// Reconnect one MCP server and refresh the catalogue.
+    /// Reconnect one MCP server and refresh the catalogue, reporting the
+    /// outcome to the requester.
     ///
-    /// On success the whole catalogue is rebuilt (so the reconnected server's
-    /// tools — whose sanitized names the manager may have disambiguated
-    /// differently from a prior connection — are registered fresh). The outcome
-    /// is reported back to the requester.
+    /// The reconnect itself lives in [`Self::reconnect_mcp_slug`] so the
+    /// `/mcp reconnect` command and the automatic post-sign-in reconnect share
+    /// one implementation and cannot drift.
     pub(super) fn handle_mcp_reconnect(
         &mut self,
         slug: &str,
         reply: &std::sync::mpsc::Sender<Result<(), String>>,
     ) {
-        let result = self.mcp_manager.reconnect(slug);
+        let result = self.reconnect_mcp_slug(slug);
         match &result {
-            Ok(()) => {
-                self.rebuild_tool_catalogue();
-                info!(server = %slug, "MCP server reconnected; tool catalogue refreshed");
-            }
-            Err(e) => {
-                warn!(server = %slug, error = %e, "MCP reconnect failed");
-            }
+            Ok(()) => info!(server = %slug, "MCP server reconnected; tool catalogue refreshed"),
+            Err(e) => warn!(server = %slug, error = %e, "MCP reconnect failed"),
         }
         let _ = reply.send(result);
+    }
+
+    /// Reconnect every connection with `slug` and refresh the catalogues it
+    /// feeds.
+    ///
+    /// On success the whole daemon catalogue is rebuilt (so the reconnected
+    /// server's tools — whose sanitized names the manager may have
+    /// disambiguated differently from a prior connection — are registered
+    /// fresh), and the sessions holding a PRIVATE (project or per-session)
+    /// server with this slug have their overlay re-resolved so the rebuilt
+    /// connection's tools reach them. A daemon shared server belongs to no
+    /// session overlay, so the overlay sweep is a no-op for it.
+    fn reconnect_mcp_slug(&mut self, slug: &str) -> Result<(), String> {
+        let result = self.mcp_manager.reconnect(slug);
+        if result.is_ok() {
+            self.rebuild_tool_catalogue();
+            let affected = self.mcp_manager.sessions_for_slug(slug);
+            self.refresh_session_overlays(affected);
+        }
+        result
+    }
+
+    /// Bring up the MCP server a just-stored OAuth grant belongs to.
+    ///
+    /// A completed sign-in stores the credential (see
+    /// `DaemonState::handle_save_credential`) but does NOT, on its own, rebuild
+    /// the connection that failed with an auth-required error before the grant
+    /// existed — so the server would stay offline until the user ran
+    /// `/mcp reconnect` or the next tool call triggered a lazy reconnect.
+    /// Reconnecting here makes a sign-in self-sufficient, and mirrors
+    /// `/mcp logout`, which already reconnects.
+    ///
+    /// `credential_key` is the daemon's target-scoped `mcp:<slug>|<hash>` key;
+    /// the slug it encodes is reconnected. A key that names no configured
+    /// server (a stale grant, or a project server on an untrusted root) simply
+    /// fails the reconnect, which is logged and otherwise harmless.
+    #[cfg(feature = "mcp")]
+    pub(super) fn reconnect_mcp_for_credential(&mut self, credential_key: &str) {
+        let Some(slug) = mcp_slug_from_credential_key(credential_key) else {
+            debug!(%credential_key, "stored credential is not an MCP key; nothing to reconnect");
+            return;
+        };
+        match self.reconnect_mcp_slug(slug) {
+            Ok(()) => {
+                info!(server = %slug, "MCP server brought up after sign-in; tool catalogue refreshed");
+            }
+            Err(e) => warn!(server = %slug, error = %e, "MCP reconnect after sign-in failed"),
+        }
     }
 
     /// Reload the MCP configuration and refresh the catalogue.
@@ -519,5 +562,44 @@ impl DaemonState {
             }
         }
         changed
+    }
+}
+
+/// The MCP server slug encoded in a target-scoped credential key
+/// (`mcp:<slug>|<target-hash>`), or `None` for any other service key.
+///
+/// The format is the daemon's own (`credential_key` in `choreo-mcp`): the
+/// `mcp:` prefix, the slug, a `|`, then a hex target hash that never contains a
+/// `|`. Splitting on the LAST `|` therefore recovers a slug that itself
+/// contains a `|` intact.
+#[cfg(feature = "mcp")]
+fn mcp_slug_from_credential_key(key: &str) -> Option<&str> {
+    key.strip_prefix("mcp:")?
+        .rsplit_once('|')
+        .map(|(slug, _hash)| slug)
+}
+
+#[cfg(all(test, feature = "mcp"))]
+mod tests {
+    use super::mcp_slug_from_credential_key;
+
+    #[test]
+    fn slug_is_recovered_from_an_mcp_credential_key() {
+        assert_eq!(
+            mcp_slug_from_credential_key("mcp:notion|deadbeef"),
+            Some("notion")
+        );
+        // A slug that itself contains the separator is recovered intact: only
+        // the hash after the LAST `|` is dropped.
+        assert_eq!(mcp_slug_from_credential_key("mcp:a|b|c0ffee"), Some("a|b"));
+    }
+
+    #[test]
+    fn a_non_mcp_service_key_has_no_slug() {
+        // A provider account name is never an MCP key.
+        assert_eq!(mcp_slug_from_credential_key("openai"), None);
+        // The prefix alone, or with no separator, is not a target-scoped key.
+        assert_eq!(mcp_slug_from_credential_key("mcp:"), None);
+        assert_eq!(mcp_slug_from_credential_key("mcp:notion"), None);
     }
 }

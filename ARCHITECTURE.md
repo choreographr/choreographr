@@ -974,8 +974,11 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   descriptor/credential rather than a fetched document.
   `mcp login <slug>` reads the server's resolved identity, `oauth` block, and
   credential key from the extended `McpStatus` and sends the grant over the
-  existing `AddCredential`; `mcp logout <slug>` removes it via
-  `RemoveCredential` and reconnects. Refresh at connect is owned by `rmcp`'s
+  existing `AddCredential`; storing an `mcp:`-keyed credential makes the
+  command loop reconnect the server the key names (the key encodes its slug)
+  and refresh the catalogue, so a sign-in is self-sufficient; `mcp logout
+  <slug>` removes it via `RemoveCredential` and reconnects. Refresh at connect
+  is owned by `rmcp`'s
   `AuthorizationManager`, driven through a `CredentialStore` adapter in
   `choreo-mcp`'s `auth` module that strips the access token on `save` (serving
   it from an in-process cache; a cold start returns no usable token so `rmcp`

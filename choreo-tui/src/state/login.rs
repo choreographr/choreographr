@@ -282,6 +282,10 @@ impl App {
             _ => (None, None, None),
         };
         self.update_login_fields(auth_url, device_code, status);
+        // The flow's target slug, captured before the modal is cleared on
+        // completion: an MCP sign-in's terminal `service` is a credential key
+        // (`mcp:<slug>|…`), so the human-facing server name comes from here.
+        let target = self.login.as_ref().map(|modal| modal.provider.clone());
         let terminal = if self.login.is_some() {
             classify_event(event)
         } else {
@@ -294,12 +298,19 @@ impl App {
                 // follows through to select this account, then open the model
                 // picker, once the daemon confirms `CredentialAdded` — which an
                 // OAuth `AddCredential` emits exactly like an API-key one. An
-                // MCP sign-in's service is a credential key, not an account, so
-                // it takes no follow-through.
-                if !service.starts_with("mcp:") {
+                // MCP sign-in's service is a credential key (`mcp:<slug>|…`),
+                // not an account, so it takes no follow-through: the daemon
+                // brings the server up itself once the grant is stored, and its
+                // tools land under the `mcp/<slug>` group.
+                if service.starts_with("mcp:") {
+                    let slug = target.unwrap_or(service);
+                    self.status = Some(format!(
+                        "signed in MCP server {slug}; connecting — its tools appear under the mcp/{slug} group"
+                    ));
+                } else {
                     self.arm_setup_follow(&service);
+                    self.status = Some(format!("signed in {service}; storing credential…"));
                 }
-                self.status = Some(format!("signed in {service}; storing credential…"));
                 self.login = None;
             }
             Some(LoginOutcome::Error(message)) => {
