@@ -1172,7 +1172,7 @@ mod unsent_draft_tests {
     }
 
     /// An MCP server status row carrying an `oauth` block and a credential
-    /// key, for the login/logout cache-freshness tests.
+    /// key, for the login/logout freshness tests.
     fn mcp_oauth_status_key(slug: &str, credential_key: &str) -> McpServerStatus {
         McpServerStatus {
             slug: slug.to_string(),
@@ -1212,12 +1212,12 @@ mod unsent_draft_tests {
     }
 
     #[test]
-    fn mcp_login_refetches_status_even_when_cached() {
-        // A `/mcp login` must resolve the server's oauth block FRESH: a cached
-        // status may predate a config edit (e.g. an added scope), and the login
-        // would then request the stale scopes. The flow waits for the reply.
+    fn mcp_login_requests_fresh_status_before_starting() {
+        // A `/mcp login` must resolve the server's oauth block from a FRESH
+        // status: the daemon owns it and it changes with the config (e.g. an
+        // added scope), so a cached copy would request the stale scopes. The
+        // flow waits for the reply rather than starting from any cache.
         let mut app = test_app();
-        app.mcp_servers = vec![mcp_oauth_status("docs")]; // a (possibly stale) cache
         let (tx, rx) = crossbeam_channel::unbounded();
 
         submit_mcp(&mut app, "/mcp login docs", &tx);
@@ -1229,7 +1229,25 @@ mod unsent_draft_tests {
         assert_eq!(app.pending_mcp_login.as_deref(), Some("docs"));
         assert!(
             app.login.is_none(),
-            "the flow must not start from the stale cache"
+            "the flow must not start before the fresh status arrives"
+        );
+    }
+
+    #[test]
+    fn mcp_login_supersedes_a_pending_logout() {
+        // The newest command wins: a login clears a logout still awaiting its
+        // status reply, so one reply cannot drive both flows.
+        let mut app = test_app();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+
+        submit_mcp(&mut app, "/mcp logout docs", &tx);
+        assert_eq!(app.pending_mcp_logout.as_deref(), Some("docs"));
+
+        submit_mcp(&mut app, "/mcp login docs", &tx);
+        assert_eq!(app.pending_mcp_login.as_deref(), Some("docs"));
+        assert!(
+            app.pending_mcp_logout.is_none(),
+            "login must clear the pending logout"
         );
     }
 
@@ -1259,11 +1277,10 @@ mod unsent_draft_tests {
     }
 
     #[test]
-    fn mcp_logout_removes_the_fresh_key_not_a_cached_one() {
-        // A `/mcp logout` must read the credential key FRESH, so a stale cache
-        // cannot remove the wrong credential.
+    fn mcp_logout_removes_the_status_reply_key() {
+        // A `/mcp logout` must read the credential key from the FRESH status,
+        // so a config change cannot make it remove the wrong credential.
         let mut app = test_app();
-        app.mcp_servers = vec![mcp_oauth_status_key("docs", "mcp:docs|STALE")];
         let (tx, rx) = crossbeam_channel::unbounded();
 
         submit_mcp(&mut app, "/mcp logout docs", &tx);
@@ -1273,7 +1290,7 @@ mod unsent_draft_tests {
         );
         assert_eq!(app.pending_mcp_logout.as_deref(), Some("docs"));
 
-        // The reply carries the CURRENT key; logout must use THAT, not the cache.
+        // The reply carries the CURRENT key; logout must use THAT.
         handle_daemon_message(
             DaemonMessage::broadcast(DaemonMessageType::McpStatus {
                 servers: vec![mcp_oauth_status_key("docs", "mcp:docs|FRESH")],

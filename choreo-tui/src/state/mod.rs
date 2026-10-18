@@ -341,9 +341,6 @@ pub(crate) struct App {
     /// The account is resolved to its provider when the command arrives, so the
     /// reply need only start the flow.
     pub(crate) pending_login: Option<(String, String, bool)>,
-    /// The most recent MCP server statuses from the daemon, kept so `mcp login`
-    /// can read a server's `oauth` block, resource URL, and credential key.
-    pub(crate) mcp_servers: Vec<choreo_proto::McpServerStatus>,
     /// A `/mcp login <slug>` awaiting the fresh status reply that carries the
     /// server's `oauth` block, resource URL, and credential key.
     pub(crate) pending_mcp_login: Option<String>,
@@ -435,7 +432,6 @@ impl App {
             oauth_providers: Vec::new(),
             oauth_providers_fetched: false,
             pending_login: None,
-            mcp_servers: Vec::new(),
             pending_mcp_login: None,
             pending_mcp_logout: None,
         }

@@ -678,13 +678,10 @@ pub(crate) fn handle_daemon_message(
                 ));
             }
             app.status = Some(lines.join("\n"));
-            // Cache the statuses so `mcp login`/`mcp logout` can read a
-            // server's oauth block, resource URL, and credential key.
-            app.mcp_servers.clone_from(servers);
-            // The cache is now current, so start any login/logout that was
-            // waiting on this reply (they read the daemon's LIVE oauth block
-            // and credential key, not a stale cache).
-            app.on_mcp_status(client_tx);
+            // Start any login/logout that was waiting on this reply: it reads
+            // the daemon's LIVE oauth block and credential key straight from
+            // THIS reply, so there is no cache to go stale.
+            app.on_mcp_status(servers, client_tx);
             return Ok(());
         }
         DaemonMessageType::McpTrustUpdated {

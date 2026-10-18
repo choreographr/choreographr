@@ -216,6 +216,8 @@ impl App {
         slug: String,
         client_tx: &crossbeam_channel::Sender<choreo_proto::ClientMessage>,
     ) {
+        // A newer command supersedes any flow still awaiting a status reply.
+        self.pending_mcp_logout = None;
         self.pending_mcp_login = Some(slug);
         self.pending
             .send(client_tx, ClientMessageType::McpStatusRequest);
@@ -232,6 +234,8 @@ impl App {
         slug: String,
         client_tx: &crossbeam_channel::Sender<choreo_proto::ClientMessage>,
     ) {
+        // A newer command supersedes any flow still awaiting a status reply.
+        self.pending_mcp_login = None;
         self.pending_mcp_logout = Some(slug);
         self.pending
             .send(client_tx, ClientMessageType::McpStatusRequest);
@@ -240,25 +244,26 @@ impl App {
 
     /// Start the login/logout a fresh `McpStatus` reply was awaited for.
     ///
-    /// Called from the `McpStatus` reply handler once `mcp_servers` has been
-    /// refreshed, so the flow resolves the daemon's LIVE oauth block and the
-    /// live credential key rather than a stale cache.
+    /// Called from the `McpStatus` reply handler with that reply's `servers`, so
+    /// the flow resolves the daemon's LIVE oauth block and credential key
+    /// straight from the reply — there is no cached status that could go stale.
     pub(crate) fn on_mcp_status(
         &mut self,
+        servers: &[choreo_proto::McpServerStatus],
         client_tx: &crossbeam_channel::Sender<choreo_proto::ClientMessage>,
     ) {
         if let Some(slug) = self.pending_mcp_login.take() {
-            self.start_mcp_login_for(&slug);
+            self.start_mcp_login_for(servers, &slug);
         }
         if let Some(slug) = self.pending_mcp_logout.take() {
-            self.logout_mcp(&slug, client_tx);
+            self.logout_mcp(servers, &slug, client_tx);
         }
     }
 
     /// Start the MCP sign-in worker for `slug`, or surface why it cannot be
     /// signed into (no `oauth` block, or not a remote server).
-    fn start_mcp_login_for(&mut self, slug: &str) {
-        let Some(server) = self.mcp_servers.iter().find(|s| s.slug == slug) else {
+    fn start_mcp_login_for(&mut self, servers: &[choreo_proto::McpServerStatus], slug: &str) {
+        let Some(server) = servers.iter().find(|s| s.slug == slug) else {
             self.status = Some(format!("no MCP server '{slug}'"));
             return;
         };
@@ -282,16 +287,18 @@ impl App {
         self.login = Some(LoginModal::start_mcp(info, McpLoginOptions::default()));
     }
 
+    // Private: the only caller is `on_mcp_status`, which reads the freshly
+    // received statuses rather than a cache.
     /// Sign out of an MCP server: remove its stored credential (keyed by the
     /// daemon-supplied credential key) and reconnect it so it drops the cached
     /// token.
-    pub(crate) fn logout_mcp(
+    fn logout_mcp(
         &mut self,
+        servers: &[choreo_proto::McpServerStatus],
         slug: &str,
         client_tx: &crossbeam_channel::Sender<choreo_proto::ClientMessage>,
     ) {
-        let key = self
-            .mcp_servers
+        let key = servers
             .iter()
             .find(|s| s.slug == slug)
             .and_then(|s| s.credential_key.clone());
