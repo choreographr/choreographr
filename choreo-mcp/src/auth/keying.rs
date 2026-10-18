@@ -115,6 +115,20 @@ pub fn credential_key_for(config: &McpServerConfig) -> Option<String> {
     }
 }
 
+/// The server slug encoded in a target-scoped credential key
+/// (`mcp:<slug>|<target-hash>`), or `None` for any other service key.
+///
+/// The inverse of [`credential_key`], kept beside it so the two cannot drift:
+/// it strips the reserved `mcp:` prefix and drops the target hash after the
+/// LAST `|`. The hash is [`short_hash`] hex and never contains a `|`, so a slug
+/// that itself contains one is recovered intact.
+#[must_use]
+pub fn slug_from_credential_key(key: &str) -> Option<&str> {
+    key.strip_prefix("mcp:")?
+        .rsplit_once('|')
+        .map(|(slug, _hash)| slug)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +240,26 @@ mod tests {
         let other = credential_key("docs", "http\0https://other.example/mcp");
         assert_ne!(a, other, "different targets key distinctly");
         assert!(a.starts_with("mcp:docs|"));
+    }
+
+    #[test]
+    fn slug_from_credential_key_inverts_credential_key() {
+        // The round trip: the slug that built the key is what the parser
+        // recovers, whatever the target.
+        let key = credential_key("docs", "http\0https://example.com/mcp");
+        assert_eq!(slug_from_credential_key(&key), Some("docs"));
+        // A slug that itself contains the separator is recovered intact: only
+        // the hash after the LAST `|` is dropped.
+        assert_eq!(slug_from_credential_key("mcp:a|b|c0ffee"), Some("a|b"));
+    }
+
+    #[test]
+    fn slug_from_credential_key_rejects_non_mcp_keys() {
+        // A provider account name is never an MCP key.
+        assert_eq!(slug_from_credential_key("openai"), None);
+        // The prefix alone, or with no separator, is not a target-scoped key.
+        assert_eq!(slug_from_credential_key("mcp:"), None);
+        assert_eq!(slug_from_credential_key("mcp:notion"), None);
     }
 
     #[test]

@@ -1219,22 +1219,21 @@ impl DaemonState {
                 // A stored MCP OAuth grant must bring its server up: the
                 // connection that failed with an auth-required error was built
                 // before the grant existed, so persisting the grant does not,
-                // by itself, reconnect it. Capture the key before `service` is
-                // consumed, save, then (only once the save actually took)
-                // reconnect the server the key names — the same rebuild
-                // `/mcp logout` performs, so a sign-in needs no manual
-                // `/mcp reconnect`.
+                // by itself, reconnect it. Save first, then — only when the save
+                // actually took — reconnect the server the key names, the same
+                // rebuild `/mcp logout` performs, so a sign-in needs no manual
+                // `/mcp reconnect`. A locked keystore rejects the add
+                // (`saved == false`), so no reconnect is attempted for a
+                // credential that was never stored.
+                let saved = self.handle_save_credential(&service, credential, reply, &ack);
                 #[cfg(feature = "mcp")]
-                let mcp_key = if service.starts_with("mcp:") {
-                    Some(service.clone())
-                } else {
-                    None
-                };
-                self.handle_save_credential(service, credential, reply, &ack);
-                #[cfg(feature = "mcp")]
-                if let Some(key) = mcp_key.filter(|k| self.credentials.contains_key(k)) {
-                    self.reconnect_mcp_for_credential(&key);
+                if saved && service.starts_with("mcp:") {
+                    self.reconnect_mcp_for_credential(&service);
                 }
+                // Without the `mcp` feature there is no server to bring up, so
+                // the save outcome is intentionally unused.
+                #[cfg(not(feature = "mcp"))]
+                let _ = saved;
             }
             DaemonCommand::RemoveCredentialCmd { service, reply } => {
                 self.handle_remove_credential(&service, &reply);

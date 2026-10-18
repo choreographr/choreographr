@@ -164,7 +164,7 @@ impl DaemonState {
     /// fails the reconnect, which is logged and otherwise harmless.
     #[cfg(feature = "mcp")]
     pub(super) fn reconnect_mcp_for_credential(&mut self, credential_key: &str) {
-        let Some(slug) = mcp_slug_from_credential_key(credential_key) else {
+        let Some(slug) = choreo_mcp::slug_from_credential_key(credential_key) else {
             debug!(%credential_key, "stored credential is not an MCP key; nothing to reconnect");
             return;
         };
@@ -562,44 +562,5 @@ impl DaemonState {
             }
         }
         changed
-    }
-}
-
-/// The MCP server slug encoded in a target-scoped credential key
-/// (`mcp:<slug>|<target-hash>`), or `None` for any other service key.
-///
-/// The format is the daemon's own (`credential_key` in `choreo-mcp`): the
-/// `mcp:` prefix, the slug, a `|`, then a hex target hash that never contains a
-/// `|`. Splitting on the LAST `|` therefore recovers a slug that itself
-/// contains a `|` intact.
-#[cfg(feature = "mcp")]
-fn mcp_slug_from_credential_key(key: &str) -> Option<&str> {
-    key.strip_prefix("mcp:")?
-        .rsplit_once('|')
-        .map(|(slug, _hash)| slug)
-}
-
-#[cfg(all(test, feature = "mcp"))]
-mod tests {
-    use super::mcp_slug_from_credential_key;
-
-    #[test]
-    fn slug_is_recovered_from_an_mcp_credential_key() {
-        assert_eq!(
-            mcp_slug_from_credential_key("mcp:notion|deadbeef"),
-            Some("notion")
-        );
-        // A slug that itself contains the separator is recovered intact: only
-        // the hash after the LAST `|` is dropped.
-        assert_eq!(mcp_slug_from_credential_key("mcp:a|b|c0ffee"), Some("a|b"));
-    }
-
-    #[test]
-    fn a_non_mcp_service_key_has_no_slug() {
-        // A provider account name is never an MCP key.
-        assert_eq!(mcp_slug_from_credential_key("openai"), None);
-        // The prefix alone, or with no separator, is not a target-scoped key.
-        assert_eq!(mcp_slug_from_credential_key("mcp:"), None);
-        assert_eq!(mcp_slug_from_credential_key("mcp:notion"), None);
     }
 }

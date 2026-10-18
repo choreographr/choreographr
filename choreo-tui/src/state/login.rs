@@ -88,6 +88,24 @@ impl LoginModal {
     }
 }
 
+#[cfg(test)]
+impl LoginModal {
+    /// A modal with no live worker, for unit tests of the terminal
+    /// `apply_login_event` transitions. No worker is started, so `events`
+    /// returns `None` and `cancel` is a no-op; only the terminal path under test
+    /// (which never touches the worker) is exercised.
+    pub(crate) fn test_modal(provider: &str, account: &str) -> Self {
+        Self {
+            provider: provider.to_string(),
+            account: account.to_string(),
+            status: String::new(),
+            auth_url: None,
+            device_code: None,
+            session: None,
+        }
+    }
+}
+
 /// Classify a login event: `None` for an in-progress event, or the terminal
 /// outcome once the flow finished or failed.
 fn classify_event(event: LoginEvent) -> Option<LoginOutcome> {

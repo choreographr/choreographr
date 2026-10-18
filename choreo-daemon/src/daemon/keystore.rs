@@ -231,32 +231,39 @@ impl DaemonState {
     /// its stored binding public key and encrypts the serialized credential to
     /// it before persisting, so the on-disk blob is readable only by an unlock
     /// that presents the binding's private key.
+    ///
+    /// Returns `true` when the credential was encrypted, persisted, and
+    /// registered, and `false` when the add was rejected (a locked keystore, or
+    /// a persist failure) — in which case the `CredentialAddFailed` reply has
+    /// already been enqueued. Callers use this to act only on a credential that
+    /// actually took (e.g. the MCP post-sign-in reconnect).
+    #[must_use]
     pub(super) fn handle_save_credential(
         &mut self,
-        service: String,
+        service: &str,
         credential: ServiceCredential,
         reply: Option<ReplyTarget>,
         ack: &mpsc::Sender<()>,
-    ) {
+    ) -> bool {
         // Require an unlocked keystore. Adding while locked is refused so the
         // handler never changes lock state and never publishes a decrypted
         // credential into a keystore the operator believes is locked.
         if self.locked {
             info!(service = %service, "AddCredential rejected: keystore is locked");
             Self::send_credential_add_failed(
-                &service,
+                service,
                 "unlock the keystore first".to_string(),
                 reply,
                 ack,
             );
-            return;
+            return false;
         }
 
         // Encrypt to the binding and persist — the one blob-write path the
         // daemon shares between provisioning and refresh rotation.
-        if let Err(e) = self.encrypt_and_persist_credential(&service, &credential) {
-            Self::send_credential_add_failed(&service, e, reply, ack);
-            return;
+        if let Err(e) = self.encrypt_and_persist_credential(service, &credential) {
+            Self::send_credential_add_failed(service, e, reply, ack);
+            return false;
         }
 
         // In-memory bookkeeping: mirror an X credential for the `twitter`
@@ -267,15 +274,15 @@ impl DaemonState {
             self.x_credentials = Some(credential.clone());
         }
         if matches!(&credential, ServiceCredential::ApiKey { .. }) {
-            self.drop_session_clients(Some(&service));
+            self.drop_session_clients(Some(service));
         }
         // A new credential replaces any previous one for this account, so any
         // cached access token derived from the old credential is stale and
         // must be dropped before the replacement is stored. A fresh credential
         // also clears any terminal quarantine: the grant is a new one.
-        self.access_tokens.remove(&service);
-        self.dead_oauth.remove(&service);
-        self.credentials.insert(service.clone(), credential);
+        self.access_tokens.remove(service);
+        self.dead_oauth.remove(service);
+        self.credentials.insert(service.to_string(), credential);
         self.publish_mcp_oauth_snapshot();
 
         info!(
@@ -288,11 +295,14 @@ impl DaemonState {
         // reply; there is no lock-state broadcast because the handler never
         // changes lock state.
         if let Some(target) = reply {
-            target.send(DaemonMessageType::CredentialAdded { service });
+            target.send(DaemonMessageType::CredentialAdded {
+                service: service.to_string(),
+            });
         } else {
             warn!("no reply target for the targeted AddCredential reply; dropping reply");
         }
         let _ = ack.send(());
+        true
     }
 
     /// Encrypt `credential` to the daemon's binding public key and persist the

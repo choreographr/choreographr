@@ -994,13 +994,13 @@ a same-slug server on a different endpoint keeps its own credential; `mcp logout
 the daemon brings it up once the grant is stored, the same rebuild `/mcp
 logout` performs — so no manual `/mcp reconnect` is needed; the server's tools
 then appear under its `mcp/<slug>` group. A project server's `oauth` block is
-repo-controlled, so
-sign-in for it refuses while the project root is untrusted, and a stored grant
-whose issuer or resource no longer matches the configured server is treated as
-absent (fail-closed) and surfaces a re-login. Token refresh at connect is owned
-by the `rmcp` client's authorization manager. A server that requires
-authorization and has neither a static token nor a completed sign-in fails with
-a clear, actionable error naming both paths rather than a raw status string.
+repo-controlled, so sign-in for it refuses while the project root is untrusted,
+and a stored grant whose issuer or resource no longer matches the configured
+server is treated as absent (fail-closed) and surfaces a re-login. Token refresh
+at connect is owned by the `rmcp` client's authorization manager. A server that
+requires authorization and has neither a static token nor a completed sign-in
+fails with a clear, actionable error naming both paths rather than a raw
+status string.
 
 Manage servers from the command line:
 

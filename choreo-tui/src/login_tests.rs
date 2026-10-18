@@ -2,8 +2,11 @@
 //! a live login worker (no network or thread): account resolution, the
 //! one-time descriptor fetch, and cancellation guards.
 
+use crate::state::LoginModal;
 use crate::test_util::test_app;
+use choreo_client_core::LoginEvent;
 use choreo_proto::{AccountInfo, ClientMessage, ClientMessageType, OAuthProviderDescriptor};
+use choreo_shared::ServiceCredential;
 
 fn account(name: &str, provider: &str) -> AccountInfo {
     AccountInfo {
@@ -99,4 +102,89 @@ fn handle_oauth_providers_reply_caches_without_pending() {
 fn cancel_login_when_none_is_open_is_a_noop() {
     let mut app = test_app();
     assert!(!app.cancel_login());
+}
+
+#[test]
+fn mcp_login_done_reports_the_slug_and_skips_setup_follow() {
+    let mut app = test_app();
+    // An attached session with no account: the PROVIDER branch would arm the
+    // first-run follow-through here, so its absence proves the MCP branch ran.
+    app.attached_session_id = Some(1);
+    app.attached_account_slug = None;
+    // The modal's `provider` is the human-facing slug; its `service` (the
+    // credential key) is the opaque `mcp:` form.
+    app.login = Some(LoginModal::test_modal("docs", "mcp:docs|abc123"));
+    let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
+
+    let changed = app.apply_login_event(
+        LoginEvent::Done {
+            service: "mcp:docs|abc123".to_string(),
+            message: Box::new(ClientMessageType::AddCredential {
+                service: "mcp:docs|abc123".to_string(),
+                // The credential payload is opaque to this UI branch; the type
+                // does not affect it, only the `mcp:` service prefix does.
+                credential: ServiceCredential::ApiKey {
+                    key: "unused".to_string(),
+                },
+            }),
+        },
+        &tx,
+    );
+
+    assert!(changed);
+    // The ready-to-send AddCredential request is forwarded verbatim.
+    let sent = rx.recv().expect("AddCredential");
+    assert!(matches!(
+        sent.inner,
+        ClientMessageType::AddCredential { .. }
+    ));
+    // The status names the slug and its tool group, never the raw credential key.
+    let status = app.status.as_deref().expect("status");
+    assert!(status.contains("docs"), "got: {status}");
+    assert!(status.contains("mcp/docs"), "got: {status}");
+    assert!(
+        !status.contains("abc123"),
+        "key leaked into status: {status}"
+    );
+    // The modal is closed and no first-run follow-through is armed (the daemon
+    // brings the server up itself once the grant is stored).
+    assert!(app.login.is_none());
+    assert!(app.setup_follow.is_none());
+}
+
+#[test]
+fn provider_login_done_arms_setup_follow_and_reports_the_account() {
+    let mut app = test_app();
+    app.attached_session_id = Some(1);
+    app.attached_account_slug = None;
+    app.login = Some(LoginModal::test_modal("openai", "work"));
+    let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
+
+    let changed = app.apply_login_event(
+        LoginEvent::Done {
+            service: "work".to_string(),
+            message: Box::new(ClientMessageType::AddCredential {
+                service: "work".to_string(),
+                credential: ServiceCredential::ApiKey {
+                    key: "sk-secret".to_string(),
+                },
+            }),
+        },
+        &tx,
+    );
+
+    assert!(changed);
+    let sent = rx.recv().expect("AddCredential");
+    assert!(matches!(
+        sent.inner,
+        ClientMessageType::AddCredential { .. }
+    ));
+    // The provider path arms the first-run follow-through and names the
+    // account (not a slug/tool group).
+    assert!(app.setup_follow.is_some());
+    assert_eq!(
+        app.status.as_deref(),
+        Some("signed in work; storing credential…")
+    );
+    assert!(app.login.is_none());
 }

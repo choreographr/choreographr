@@ -978,9 +978,9 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   command loop reconnect the server the key names (the key encodes its slug)
   and refresh the catalogue, so a sign-in is self-sufficient; `mcp logout
   <slug>` removes it via `RemoveCredential` and reconnects. Refresh at connect
-  is owned by `rmcp`'s
-  `AuthorizationManager`, driven through a `CredentialStore` adapter in
-  `choreo-mcp`'s `auth` module that strips the access token on `save` (serving
+  is owned by `rmcp`'s `AuthorizationManager`, driven through a
+  `CredentialStore` adapter in `choreo-mcp`'s `auth` module that strips the
+  access token on `save` (serving
   it from an in-process cache; a cold start returns no usable token so `rmcp`
   refreshes) and maps to and from `ServiceCredential::OAuth`. A configured
   `authorizationServer` overrides that connect-time discovery too, exactly as it
