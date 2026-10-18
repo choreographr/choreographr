@@ -179,9 +179,11 @@ pub fn sanitize_child_env(cmd: &mut std::process::Command) {
 
 /// A capped stdio transport plus the child process it owns.
 ///
-/// Owns the spawned child so it can be killed on `close` (and on `Drop`, so a
-/// transport dropped without a close — e.g. the service loop errored — does not
-/// leak the process tree).
+/// Owns the spawned child so it can be killed on `close` (an awaited
+/// `kill()`), and on `Drop` (a synchronous process-group kill), so a transport
+/// dropped without a close — e.g. the service loop errored, or a connect was
+/// abandoned — does not leak the process tree. The `Drop` kill needs no tokio
+/// runtime, unlike the awaited `close` path.
 pub(crate) struct StdioTransport {
     child: Option<Box<dyn ChildWrapper>>,
     inner: AsyncRwTransport<RoleClient, BoundedLineReader<ChildStdout>, ChildStdin>,
@@ -308,24 +310,17 @@ impl Transport<RoleClient> for StdioTransport {
 
 impl Drop for StdioTransport {
     fn drop(&mut self) {
-        // A transport dropped without a close still owns its child; kill the
-        // tree so it does not outlive the connection. The kill is async, so it
-        // runs on the sidecar runtime (or the current one if we are already on
-        // it).
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        let kill = async move {
-            let _ = Box::into_pin(child.kill()).await;
-        };
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(kill);
-        } else if let Some(rt) = crate::runtime::get() {
-            rt.spawn(kill);
+        if let Some(mut child) = self.child.take() {
+            // Synchronous group kill: `start_kill` signals the child's process
+            // group (the child is wrapped with `ProcessGroup::leader()` on
+            // unix) without awaiting and without needing a runtime. A transport
+            // dropped during teardown — or from a detached connect thread with
+            // no live runtime — must still reap its child, so this deliberately
+            // avoids the async `kill()` `close()` uses: an async kill scheduled
+            // here could be dropped un-polled when the process exits,
+            // orphaning the tree.
+            let _ = child.start_kill();
         }
-        // With no runtime available the kill is skipped: the process is left to
-        // the OS. This only happens during teardown, where the alternative
-        // (panicking in Drop) is strictly worse.
     }
 }
 
@@ -415,5 +410,90 @@ mod tests {
         })
         .expect_err("one byte over the limit breaches");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A stdio config whose child parks for the whole test, so only the
+    /// transport's kill path can end it.
+    #[cfg(unix)]
+    fn long_lived_child_config() -> McpServerConfig {
+        McpServerConfig {
+            slug: "sleepy".to_string(),
+            transport: McpTransport::Stdio {
+                command: "sleep".to_string(),
+                args: vec!["3600".to_string()],
+                env: std::collections::HashMap::new(),
+                cwd: None,
+                log_path: None,
+            },
+            enabled: true,
+            timeout: None,
+            protocol: crate::config::McpProtocolMode::Auto,
+            max_concurrent_calls: None,
+            max_restarts: None,
+            disabled_tools: Vec::new(),
+        }
+    }
+
+    /// A dropped transport must kill its child synchronously, even with no live
+    /// runtime — the teardown situation (a detached connect thread, or the
+    /// sidecar runtime already gone) where an async kill cannot be scheduled.
+    ///
+    /// The transport is spawned on a throwaway runtime (the subprocess
+    /// machinery needs *a* tokio context), which is then dropped before the
+    /// transport is, so the process-wide sidecar is never initialized and no
+    /// runtime handle is current at drop time.
+    #[cfg(unix)]
+    #[test]
+    fn drop_kills_the_child_without_a_live_runtime() {
+        use rustix::process::{Pid, WaitOptions};
+
+        // Ensure the child is killed even if an assertion panics before the
+        // transport's own drop — a leaked `sleep` would otherwise outlive the
+        // test.
+        struct KillOnDrop(Pid);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = rustix::process::kill_process(self.0, rustix::process::Signal::KILL);
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build the throwaway runtime");
+        let (transport, pid) = rt.block_on(async {
+            let transport = StdioTransport::spawn(&long_lived_child_config())
+                .expect("spawn the transport for a long-lived child");
+            let pid = transport
+                .child
+                .as_ref()
+                .and_then(|child| child.id())
+                .expect("a spawned child reports a pid");
+            (transport, pid)
+        });
+        // No runtime remains in scope once this returns.
+        drop(rt);
+
+        // u32→i32: pids live in the positive i32 range by kernel ABI.
+        #[expect(clippy::cast_possible_wrap)]
+        let child = Pid::from_raw(pid as i32).expect("a live child pid is nonzero");
+        let _reap = KillOnDrop(child);
+
+        // The drop must signal the child's process group right here, with no
+        // runtime to lean on.
+        drop(transport);
+
+        // Event-driven wait (no sleep-poll): the group kill makes the child
+        // exit, so `waitpid` reaps it; `ECHILD` means tokio's reaper already
+        // did — either way the child is gone.
+        match rustix::process::waitpid(Some(child), WaitOptions::empty()) {
+            Ok(_) | Err(rustix::io::Errno::CHILD) => {}
+            Err(e) => panic!("waitpid on the killed child failed: {e}"),
+        }
+        assert_eq!(
+            rustix::process::test_kill_process(child),
+            Err(rustix::io::Errno::SRCH),
+            "the child must be gone once the transport is dropped"
+        );
     }
 }
