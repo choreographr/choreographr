@@ -203,20 +203,55 @@ impl App {
         }
     }
 
-    /// Begin a `/mcp login <slug>` flow: use the cached server status if
-    /// present, else request the status list once and start when it arrives.
+    /// Begin a `/mcp login <slug>` flow.
+    ///
+    /// The server's resolved `oauth` block, resource URL, and credential key
+    /// are daemon-owned and change with the config (adding a scope or a client
+    /// id, say), so a FRESH status is always requested and the flow starts when
+    /// it arrives — a cached copy may predate a config edit (e.g. adding
+    /// `offline_access` to the scopes). The reply is handled by
+    /// [`Self::on_mcp_status`].
     pub(crate) fn begin_mcp_login(
         &mut self,
         slug: String,
         client_tx: &crossbeam_channel::Sender<choreo_proto::ClientMessage>,
     ) {
-        if self.mcp_servers.iter().any(|s| s.slug == slug) {
+        self.pending_mcp_login = Some(slug);
+        self.pending
+            .send(client_tx, ClientMessageType::McpStatusRequest);
+        self.status = Some("fetching MCP server status…".to_string());
+    }
+
+    /// Begin a `/mcp logout <slug>` flow.
+    ///
+    /// As with login, the credential key is read from a FRESH status: a stale
+    /// cached key could remove the wrong credential (or report a false "no
+    /// credential"). The reply is handled by [`Self::on_mcp_status`].
+    pub(crate) fn begin_mcp_logout(
+        &mut self,
+        slug: String,
+        client_tx: &crossbeam_channel::Sender<choreo_proto::ClientMessage>,
+    ) {
+        self.pending_mcp_logout = Some(slug);
+        self.pending
+            .send(client_tx, ClientMessageType::McpStatusRequest);
+        self.status = Some("fetching MCP server status…".to_string());
+    }
+
+    /// Start the login/logout a fresh `McpStatus` reply was awaited for.
+    ///
+    /// Called from the `McpStatus` reply handler once `mcp_servers` has been
+    /// refreshed, so the flow resolves the daemon's LIVE oauth block and the
+    /// live credential key rather than a stale cache.
+    pub(crate) fn on_mcp_status(
+        &mut self,
+        client_tx: &crossbeam_channel::Sender<choreo_proto::ClientMessage>,
+    ) {
+        if let Some(slug) = self.pending_mcp_login.take() {
             self.start_mcp_login_for(&slug);
-        } else {
-            self.pending_mcp_login = Some(slug);
-            self.pending
-                .send(client_tx, ClientMessageType::McpStatusRequest);
-            self.status = Some("fetching MCP server status…".to_string());
+        }
+        if let Some(slug) = self.pending_mcp_logout.take() {
+            self.logout_mcp(&slug, client_tx);
         }
     }
 

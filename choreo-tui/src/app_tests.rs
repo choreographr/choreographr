@@ -1171,6 +1171,135 @@ mod unsent_draft_tests {
         assert_eq!(app.status.as_deref(), Some("reconnecting MCP server docs…"));
     }
 
+    /// An MCP server status row carrying an `oauth` block and a credential
+    /// key, for the login/logout cache-freshness tests.
+    fn mcp_oauth_status_key(slug: &str, credential_key: &str) -> McpServerStatus {
+        McpServerStatus {
+            slug: slug.to_string(),
+            tier: "daemon".to_string(),
+            transport: "http".to_string(),
+            target: "https://example.com/mcp".to_string(),
+            connected: false,
+            tool_count: 0,
+            server_name: None,
+            server_version: None,
+            last_error: Some("authorization required".to_string()),
+            credential_key: Some(credential_key.to_string()),
+            auth: McpAuthState::NotLoggedIn,
+            oauth: Some(choreo_proto::McpOAuthConfig {
+                client_id: Some("client-1".to_string()),
+                callback_port: None,
+                scopes: vec!["read".to_string()],
+                authorization_server: None,
+                client_secret_env: None,
+            }),
+        }
+    }
+
+    fn mcp_oauth_status(slug: &str) -> McpServerStatus {
+        mcp_oauth_status_key(slug, &format!("mcp:{slug}|abc123"))
+    }
+
+    fn submit_mcp(app: &mut App, text: &str, tx: &crossbeam_channel::Sender<ClientMessage>) {
+        app.input.text = text.to_string();
+        app.input.cursor = app.input.text.len();
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            app,
+            tx,
+        )
+        .expect("submit MCP command");
+    }
+
+    #[test]
+    fn mcp_login_refetches_status_even_when_cached() {
+        // A `/mcp login` must resolve the server's oauth block FRESH: a cached
+        // status may predate a config edit (e.g. an added scope), and the login
+        // would then request the stale scopes. The flow waits for the reply.
+        let mut app = test_app();
+        app.mcp_servers = vec![mcp_oauth_status("docs")]; // a (possibly stale) cache
+        let (tx, rx) = crossbeam_channel::unbounded();
+
+        submit_mcp(&mut app, "/mcp login docs", &tx);
+
+        assert_eq!(
+            rx.recv().expect("McpStatusRequest sent").inner,
+            ClientMessageType::McpStatusRequest
+        );
+        assert_eq!(app.pending_mcp_login.as_deref(), Some("docs"));
+        assert!(
+            app.login.is_none(),
+            "the flow must not start from the stale cache"
+        );
+    }
+
+    #[test]
+    fn mcp_login_starts_from_the_fresh_status_reply() {
+        let mut app = test_app();
+        app.pending_mcp_login = Some("docs".to_string());
+        let (tx, _rx) = crossbeam_channel::unbounded();
+
+        handle_daemon_message(
+            DaemonMessage::broadcast(DaemonMessageType::McpStatus {
+                servers: vec![mcp_oauth_status("docs")],
+                project_root: None,
+                project_trusted: false,
+                ignored_project_servers: Vec::new(),
+            }),
+            &mut app,
+            &tx,
+        )
+        .expect("handle McpStatus");
+
+        assert!(
+            app.pending_mcp_login.is_none(),
+            "the pending login is taken"
+        );
+        assert!(app.login.is_some(), "the fresh status starts the sign-in");
+    }
+
+    #[test]
+    fn mcp_logout_removes_the_fresh_key_not_a_cached_one() {
+        // A `/mcp logout` must read the credential key FRESH, so a stale cache
+        // cannot remove the wrong credential.
+        let mut app = test_app();
+        app.mcp_servers = vec![mcp_oauth_status_key("docs", "mcp:docs|STALE")];
+        let (tx, rx) = crossbeam_channel::unbounded();
+
+        submit_mcp(&mut app, "/mcp logout docs", &tx);
+        assert_eq!(
+            rx.recv().expect("McpStatusRequest sent").inner,
+            ClientMessageType::McpStatusRequest
+        );
+        assert_eq!(app.pending_mcp_logout.as_deref(), Some("docs"));
+
+        // The reply carries the CURRENT key; logout must use THAT, not the cache.
+        handle_daemon_message(
+            DaemonMessage::broadcast(DaemonMessageType::McpStatus {
+                servers: vec![mcp_oauth_status_key("docs", "mcp:docs|FRESH")],
+                project_root: None,
+                project_trusted: false,
+                ignored_project_servers: Vec::new(),
+            }),
+            &mut app,
+            &tx,
+        )
+        .expect("handle McpStatus");
+
+        assert_eq!(
+            rx.recv().expect("RemoveCredential sent").inner,
+            ClientMessageType::RemoveCredential {
+                service: "mcp:docs|FRESH".to_string()
+            }
+        );
+        assert_eq!(
+            rx.recv().expect("McpReconnect sent").inner,
+            ClientMessageType::McpReconnect {
+                slug: "docs".to_string()
+            }
+        );
+    }
+
     #[test]
     fn mcp_status_reply_renders_one_server_per_line() {
         let mut app = test_app();

@@ -530,9 +530,10 @@ pub(super) fn run_command(
                     app.begin_mcp_login(slug, client_tx);
                 }
                 McpCommand::Logout { slug } => {
-                    // Remove the stored credential, then reconnect so the
-                    // connection drops its cached token.
-                    app.logout_mcp(&slug, client_tx);
+                    // Read a FRESH credential key (a cached one may predate a
+                    // config change), then remove the credential and reconnect
+                    // so the connection drops its cached token.
+                    app.begin_mcp_logout(slug, client_tx);
                 }
             }
         }

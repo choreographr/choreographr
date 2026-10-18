@@ -344,9 +344,12 @@ pub(crate) struct App {
     /// The most recent MCP server statuses from the daemon, kept so `mcp login`
     /// can read a server's `oauth` block, resource URL, and credential key.
     pub(crate) mcp_servers: Vec<choreo_proto::McpServerStatus>,
-    /// A `mcp login <slug>` awaiting the status reply that carries the server's
-    /// `oauth` block, when none was cached.
+    /// A `/mcp login <slug>` awaiting the fresh status reply that carries the
+    /// server's `oauth` block, resource URL, and credential key.
     pub(crate) pending_mcp_login: Option<String>,
+    /// A `/mcp logout <slug>` awaiting the fresh status reply that carries the
+    /// server's credential key, so the right credential is removed.
+    pub(crate) pending_mcp_logout: Option<String>,
 }
 
 pub(crate) enum UiEvent {
@@ -434,6 +437,7 @@ impl App {
             pending_login: None,
             mcp_servers: Vec::new(),
             pending_mcp_login: None,
+            pending_mcp_logout: None,
         }
     }
 
