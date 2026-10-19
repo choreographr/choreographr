@@ -48,6 +48,121 @@ struct DurableSeed {
     token_type: Option<String>,
 }
 
+/// The pure inputs to [`project_durable_grant`]: everything a `save` needs to
+/// decide the durable credential, lifted out of the `rmcp` [`StoredCredentials`]
+/// so the projection is unit-testable without a runtime or a backend.
+struct SaveInput {
+    /// The refresh token the token response carried, if any. `rmcp` rewrites the
+    /// previous token back onto the response, so a value here does NOT imply
+    /// rotation; it is compared against the seed's own token.
+    response_refresh_token: Option<String>,
+    /// The access token the token response carried, if any (an empty string
+    /// counts as absent).
+    response_access_token: Option<String>,
+    /// The scopes the token response reported, if any.
+    response_scopes: Option<Vec<String>>,
+    /// The scopes `rmcp`'s [`StoredCredentials`] carried (the fallback when the
+    /// response reports none).
+    stored_granted_scopes: Vec<String>,
+    /// The client id `rmcp`'s [`StoredCredentials`] carried.
+    stored_client_id: String,
+    /// The issuer `rmcp`'s [`StoredCredentials`] carried, if any.
+    stored_issuer: Option<String>,
+}
+
+impl SaveInput {
+    /// Project the `rmcp` [`StoredCredentials`] a `save` receives onto the pure
+    /// input struct, so the durable-grant decision is taken off `rmcp`'s types.
+    fn from_stored(credentials: &StoredCredentials) -> Self {
+        Self {
+            response_refresh_token: credentials
+                .token_response
+                .as_ref()
+                .and_then(|r| r.refresh_token().map(|t| t.secret().clone())),
+            response_access_token: credentials
+                .token_response
+                .as_ref()
+                .map(|r| r.access_token().secret().clone()),
+            response_scopes: credentials.token_response.as_ref().and_then(|r| {
+                r.scopes()
+                    .map(|scopes| scopes.iter().map(|s| s.as_ref().to_owned()).collect())
+            }),
+            stored_granted_scopes: credentials.granted_scopes.clone(),
+            stored_client_id: credentials.client_id.clone(),
+            stored_issuer: credentials.issuer.clone(),
+        }
+    }
+}
+
+/// Project a save onto the durable credential, or `None` when nothing durable
+/// changed (a non-rotating refresh lives only in the in-process cache and costs
+/// no re-encryption and no blob write, matching the provider path).
+///
+/// The durable grant changes only when the exchange ROTATED the refresh token
+/// (or, for a grant with no refresh token, when the access token changed).
+/// `rmcp` rewrites the previous refresh token back onto the response on refresh,
+/// so "the response carries a refresh token" does NOT imply rotation — the
+/// adopted value is compared against the seed's, not its presence.
+///
+/// The durable access token is persisted ONLY for a grant with no refresh token
+/// (there is nothing to refresh, so it is the only credential): the freshly
+/// returned token when the response carried a non-empty one, else the seed's, so
+/// a save that omits the token does not drop it. An empty token counts as
+/// absent — a blank bearer is never persisted or served, and only when neither
+/// source has a non-empty token does the field fail closed to `None`.
+fn project_durable_grant(seed: &DurableSeed, input: &SaveInput) -> Option<ServiceCredential> {
+    let seed_refresh = seed.refresh_token.as_ref().map(|t| t.as_str());
+    // Rotate-if-present: adopt the returned refresh token, else keep the seed's
+    // rather than dropping the durable grant root.
+    let refresh_token: Option<String> = input
+        .response_refresh_token
+        .clone()
+        .or_else(|| seed_refresh.map(str::to_string));
+    let granted_scopes = input
+        .response_scopes
+        .clone()
+        .unwrap_or_else(|| input.stored_granted_scopes.clone());
+    let seed_access = seed.access_token.as_ref().map(|t| t.as_str());
+    let durable_access_token: Option<String> = if refresh_token.is_none() {
+        input
+            .response_access_token
+            .clone()
+            .filter(|token| !token.is_empty())
+            .or_else(|| {
+                seed_access
+                    .map(str::to_string)
+                    .filter(|token| !token.is_empty())
+            })
+    } else {
+        None
+    };
+    // A plain `==`/`!=` (not constant-time) is deliberate: both operands are
+    // in-process secrets already resident in this task's memory, so there is no
+    // timing oracle for an attacker who could not already read them.
+    let refresh_changed = refresh_token.as_deref() != seed_refresh;
+    let access_changed = durable_access_token.as_deref() != seed_access;
+    if !refresh_changed && !access_changed {
+        return None;
+    }
+    Some(ServiceCredential::OAuth {
+        kind: OAuthKind::Mcp,
+        issuer: input.stored_issuer.clone().or_else(|| seed.issuer.clone()),
+        resource: seed.resource.clone(),
+        authorization_server: seed.authorization_server.clone(),
+        // MCP grants carry no provider token endpoint or refresh encoding; their
+        // refresh re-discovers through `rmcp`.
+        token_endpoint: None,
+        refresh_encoding: None,
+        refresh_token,
+        access_token: durable_access_token,
+        account_id: seed.account_id.clone(),
+        client_id: Some(input.stored_client_id.clone()),
+        client_secret: seed.client_secret.as_ref().map(|s| s.as_str().to_string()),
+        granted_scopes,
+        token_type: seed.token_type.clone(),
+    })
+}
+
 /// An access token served from memory between the keystore round-trips.
 #[derive(Clone)]
 struct CachedToken {
@@ -273,102 +388,28 @@ impl CredentialStore for CredentialStoreAdapter {
             // A save before any load: nothing durable to anchor it to.
             return Ok(());
         };
-        // Strip the access token: the durable grant is the refresh token plus
-        // the client registration and identity. A returned refresh token is
-        // adopted; when the exchange omitted one, the seed's is kept rather than
-        // dropping the durable grant root.
-        let seed_refresh = seed.refresh_token.clone();
-        let (refresh_token, granted_scopes) = match &credentials.token_response {
-            Some(response) => (
-                response
-                    .refresh_token()
-                    .map(|t| t.secret().clone())
-                    .or_else(|| seed_refresh.as_ref().map(|t| t.as_str().to_string())),
-                response.scopes().map_or_else(
-                    || credentials.granted_scopes.clone(),
-                    |scopes| scopes.iter().map(|s| s.as_ref().to_owned()).collect(),
-                ),
-            ),
-            None => (
-                seed_refresh.as_ref().map(|t| t.as_str().to_string()),
-                credentials.granted_scopes.clone(),
-            ),
-        };
-        // The durable grant changes only when the exchange ROTATED the refresh
-        // token (or, for a grant with no refresh token, when the access token
-        // changed). `rmcp` rewrites the previous refresh token back onto the
-        // response on refresh, so "the response carries a refresh token" does
-        // NOT imply rotation — compare the adopted value against the seed's, not
-        // its presence. A non-rotating refresh (the access token lives only in
-        // the in-process cache) is persisted nowhere, so it costs no
-        // re-encryption and no blob write, matching the provider path. One
-        // consequence: the daemon's `OAuthSave` handler also prunes the
-        // single-flight refresh-lock registry, so a skipped save leaves that
-        // key's entry lingering until the next save or clear — harmless, it is
-        // an idle lock the next refresh reuses.
-        // A plain `==` (not constant-time) is deliberate: both operands are
-        // in-process secrets already resident in this task's memory, so there
-        // is no timing oracle for an attacker who could not already read them.
-        let refresh_changed = refresh_token.as_deref() != seed_refresh.as_ref().map(|t| t.as_str());
-        // The durable access token is persisted ONLY for a grant with no refresh
-        // token (there is nothing to refresh, so it is the only credential). It
-        // is the freshly returned access token when the response carried a
-        // non-empty one, else the seed's, so a save that omits the token does
-        // not drop it. An empty token counts as absent: a blank bearer is never
-        // persisted or served, and only when neither source has a non-empty
-        // token does the field fail closed to `None`.
-        let seed_access = seed.access_token.clone();
-        let durable_access_token: Option<String> = if refresh_token.is_none() {
-            credentials
-                .token_response
-                .as_ref()
-                .map(|r| r.access_token().secret().clone())
-                .filter(|token| !token.is_empty())
-                .or_else(|| {
-                    seed_access
-                        .as_ref()
-                        .map(|t| t.as_str().to_string())
-                        .filter(|token| !token.is_empty())
-                })
-        } else {
-            None
-        };
-        let access_changed =
-            durable_access_token.as_deref() != seed_access.as_ref().map(|t| t.as_str());
-        if !refresh_changed && !access_changed {
+        // The pure projection decides whether anything durable changed. A
+        // non-rotating refresh (the access token lives only in the in-process
+        // cache) yields `None`, so it costs no re-encryption and no blob write,
+        // matching the provider path — and a skipped save leaves the daemon's
+        // `OAuthSave`-time refresh-lock prune unrun, which only leaves an idle
+        // lock the next refresh reuses.
+        let Some(durable) = project_durable_grant(&seed, &SaveInput::from_stored(&credentials))
+        else {
             tracing::debug!(
                 key = %self.key,
                 "MCP token refresh carried no durable change; skipping the durable re-encrypt"
             );
             return Ok(());
-        }
-        let durable = ServiceCredential::OAuth {
-            kind: OAuthKind::Mcp,
-            issuer: credentials.issuer.clone().or(seed.issuer),
-            resource: seed.resource,
-            authorization_server: seed.authorization_server,
-            // MCP grants carry no provider token endpoint or refresh encoding;
-            // their refresh re-discovers through `rmcp`.
-            token_endpoint: None,
-            refresh_encoding: None,
-            refresh_token,
-            access_token: durable_access_token,
-            account_id: seed.account_id,
-            client_id: Some(credentials.client_id.clone()),
-            client_secret: seed.client_secret.as_ref().map(|s| s.as_str().to_string()),
-            granted_scopes,
-            token_type: seed.token_type,
         };
+        // The refresh token the refresh actually loaded and presented, so the
+        // backend can refuse to overwrite a credential replaced mid-refresh.
+        let expected_refresh_token = seed.refresh_token.as_ref().map(|t| t.as_str().to_string());
         let backend = self.backend.clone();
-        tokio::task::spawn_blocking(move || {
-            backend.save(
-                durable,
-                seed_refresh.as_ref().map(|t| t.as_str().to_string()),
-            )
-        })
-        .await
-        .map_err(|e| AuthError::CredentialStoreError(format!("save task failed: {e}")))?
-        .map_err(AuthError::CredentialStoreError)
+        tokio::task::spawn_blocking(move || backend.save(durable, expected_refresh_token))
+            .await
+            .map_err(|e| AuthError::CredentialStoreError(format!("save task failed: {e}")))?
+            .map_err(AuthError::CredentialStoreError)
     }
 
     async fn clear(&self) -> Result<(), AuthError> {
@@ -816,5 +857,86 @@ mod tests {
             backend.rejected.load(Ordering::SeqCst),
             "a rejected refresh must be recorded"
         );
+    }
+
+    /// A seed carrying `refresh` (and, when set, `access`) and nothing else the
+    /// projection reads, for the pure projection tests below.
+    fn seed(refresh: Option<&str>, access: Option<&str>) -> DurableSeed {
+        DurableSeed {
+            issuer: Some("https://as.example".into()),
+            resource: Some("https://example.com/mcp".into()),
+            authorization_server: Some("https://as.example".into()),
+            account_id: None,
+            refresh_token: refresh.map(|r| Zeroizing::new(r.to_string())),
+            access_token: access.map(|a| Zeroizing::new(a.to_string())),
+            client_secret: None,
+            token_type: Some("Bearer".into()),
+        }
+    }
+
+    /// A `SaveInput` with every response field absent and the given stored
+    /// scopes/client id, so each test varies only the field it checks.
+    fn input() -> SaveInput {
+        SaveInput {
+            response_refresh_token: None,
+            response_access_token: None,
+            response_scopes: None,
+            stored_granted_scopes: vec!["openid".into()],
+            stored_client_id: "client-1".into(),
+            stored_issuer: Some("https://as.example".into()),
+        }
+    }
+
+    #[test]
+    fn projection_rotates_a_returned_refresh_token_and_strips_the_access_token() {
+        let mut inp = input();
+        inp.response_refresh_token = Some("new".into());
+        let durable = project_durable_grant(&seed(Some("old"), None), &inp)
+            .expect("a rotation is a durable change");
+        let view = durable.as_oauth().expect("oauth");
+        assert_eq!(view.refresh_token, Some("new"));
+        assert_eq!(
+            view.access_token, None,
+            "a grant with a refresh token never persists the access token"
+        );
+    }
+
+    #[test]
+    fn projection_skips_a_non_rotating_refresh() {
+        // `rmcp` rewrites the previous refresh token back onto the response, so
+        // an equal token is NOT a durable change.
+        let mut inp = input();
+        inp.response_refresh_token = Some("same".into());
+        inp.response_access_token = Some("fresh-access".into());
+        assert!(
+            project_durable_grant(&seed(Some("same"), None), &inp).is_none(),
+            "a non-rotating refresh must not re-encrypt"
+        );
+    }
+
+    #[test]
+    fn projection_persists_the_access_token_for_a_no_refresh_grant() {
+        let mut inp = input();
+        inp.response_access_token = Some("a2".into());
+        let durable = project_durable_grant(&seed(None, Some("a1")), &inp)
+            .expect("a changed access token is a durable change");
+        let view = durable.as_oauth().expect("oauth");
+        assert_eq!(view.refresh_token, None);
+        assert_eq!(view.access_token, Some("a2"));
+    }
+
+    #[test]
+    fn projection_never_persists_an_empty_access_token() {
+        // An empty bearer counts as absent: the seed's usable token governs, so
+        // there is no durable change and nothing is written.
+        let mut inp = input();
+        inp.response_access_token = Some(String::new());
+        assert!(project_durable_grant(&seed(None, Some("a1")), &inp).is_none());
+    }
+
+    #[test]
+    fn projection_is_a_noop_without_a_token_response() {
+        // No response fields at all, seed carries a refresh token: nothing changed.
+        assert!(project_durable_grant(&seed(Some("rt"), None), &input()).is_none());
     }
 }
