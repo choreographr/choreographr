@@ -127,6 +127,36 @@ pub enum OAuthLoginError {
     IssuerMismatch,
 }
 
+impl OAuthLoginError {
+    /// A stable, payload-free tag naming this failure's class.
+    ///
+    /// The rendered [`Display`](std::fmt::Display) message is for humans and may
+    /// embed provider-controlled text — an authorization server's
+    /// `error_description` in [`OAuthLoginError::TokenEndpoint`], a URL, an
+    /// account name — so it must never reach a log line. The failure log
+    /// therefore projects this tag instead. The `match` is exhaustive with no
+    /// `_` arm, so adding a variant is a compile error until it is given a tag.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::NoClientId(_) => "no_client_id",
+            Self::Unsupported(_) => "unsupported",
+            Self::CallbackBind(_) => "callback_bind",
+            Self::Callback(_) => "callback",
+            Self::StateMismatch => "state_mismatch",
+            Self::Cancelled => "cancelled",
+            Self::InsecureEndpoint(_) => "insecure_endpoint",
+            Self::Network(_) => "network",
+            Self::Decode(_) => "decode",
+            Self::TokenEndpoint { .. } => "token_endpoint",
+            Self::DeviceFlow(_) => "device_flow",
+            Self::CallbackUrl(_) => "callback_url",
+            Self::ClientSecretEnvUnset(_) => "client_secret_env_unset",
+            Self::ClientSecretWithoutClientId => "client_secret_without_client_id",
+            Self::IssuerMismatch => "issuer_mismatch",
+        }
+    }
+}
+
 /// Options controlling how the sign-in runs.
 #[derive(Debug, Clone)]
 pub struct LoginOptions {
@@ -301,10 +331,12 @@ where
             Ok(()) => {}
             Err(error) => {
                 let message = error.to_string();
-                // Never log the raw error verbatim if it could carry a URL with
-                // a code; the error strings here are already code-free, but keep
-                // the log to a kind tag.
-                warn!("oauth login failed: {message}");
+                // The full message goes to the UI (it explains the failure to the
+                // user); the log carries only a payload-free kind tag, because the
+                // rendered error embeds provider-controlled text (an authorization
+                // server's `error_description`, a URL). Never log the message, the
+                // account name, or the endpoint URL here.
+                warn!(kind = error.kind(), "oauth login failed");
                 let _ = worker_tx.send(LoginEvent::Error { message });
             }
         });
@@ -356,6 +388,24 @@ mod tests {
     /// on its own.
     fn idle_session(with_stop: bool) -> LoginSession {
         spawn_login_worker("test-oauth-login", with_stop, |_tx, _cancel, _stop| Ok(()))
+    }
+
+    #[test]
+    fn error_kinds_are_stable_payload_free_tags() {
+        // The log projects these tags, so the map from variant to tag is the
+        // contract that keeps provider-supplied text out of the failure line.
+        assert_eq!(OAuthLoginError::Cancelled.kind(), "cancelled");
+        assert_eq!(OAuthLoginError::StateMismatch.kind(), "state_mismatch");
+        assert_eq!(OAuthLoginError::IssuerMismatch.kind(), "issuer_mismatch");
+        assert_eq!(
+            OAuthLoginError::TokenEndpoint {
+                error: "invalid_grant".to_string(),
+                // The description is the provider's text; only the tag is logged.
+                description: "the refresh token was already used".to_string(),
+            }
+            .kind(),
+            "token_endpoint"
+        );
     }
 
     #[test]

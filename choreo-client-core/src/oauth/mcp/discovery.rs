@@ -97,6 +97,12 @@ fn get_json(
             })?;
             continue;
         }
+        // A non-2xx reply is not RFC 8414 metadata even when its body happens to
+        // carry `authorization_endpoint`/`token_endpoint` keys, so reject it
+        // before parsing. This also keeps `fetch_as_metadata`'s candidate loop
+        // correct: an `Err` means "try the next well-known candidate", so a 404
+        // falls through instead of being adopted as the document.
+        require_success(response.status().as_u16(), current.as_str())?;
         return response
             .into_body()
             .read_json()
@@ -105,6 +111,23 @@ fn get_json(
     Err(OAuthLoginError::Decode(format!(
         "{url}: too many redirects"
     )))
+}
+
+/// Require a discovery reply to be a 2xx success before its body is parsed.
+///
+/// Redirects are resolved by the caller before this check; every other
+/// non-success status (`404`, `403`, `500`) means the candidate carries no
+/// metadata, so it is rejected with a [`OAuthLoginError::Decode`] naming the
+/// status and `url`. Pure in `(status, url)` so the accept/reject decision is
+/// unit-testable without a socket.
+fn require_success(status: u16, url: &str) -> Result<(), OAuthLoginError> {
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(OAuthLoginError::Decode(format!(
+            "{url}: discovery returned HTTP status {status}"
+        )))
+    }
 }
 
 /// Parse `raw` into a URL, naming `what` in the failure for a readable error.
@@ -467,6 +490,21 @@ mod tests {
             .as_str(),
             "https://example.com/realms/main/.well-known/openid-configuration"
         );
+    }
+
+    #[test]
+    fn require_success_accepts_only_2xx() {
+        // A 2xx reply may be parsed as metadata.
+        assert!(require_success(200, "https://example.com/.well-known/x").is_ok());
+        assert!(require_success(204, "https://example.com/.well-known/x").is_ok());
+        // A redirect (handled by the caller) and every error status are rejected,
+        // so a 404 candidate falls through to the next rather than being parsed.
+        for status in [301, 404, 500] {
+            assert!(matches!(
+                require_success(status, "https://example.com/.well-known/x"),
+                Err(OAuthLoginError::Decode(_))
+            ));
+        }
     }
 
     #[test]
