@@ -538,6 +538,31 @@ mod tests {
 
     #[cfg(feature = "mcp")]
     #[test]
+    fn a_save_ignored_while_locked_withdraws_the_read_view() {
+        // Install the process-global runtime so the per-key publish has a read
+        // view to write (see the sibling snapshot tests).
+        let (tx, _tx_rx) = crossbeam_channel::unbounded();
+        let runtime = crate::mcp::oauth::install(tx);
+
+        // `make_daemon_state` starts locked, so this save is dropped below.
+        let (mut state, _rx) = make_daemon_state();
+        assert!(state.locked);
+        let key = "mcp:docs|locked";
+
+        // The connect path advanced this key's read view to the rotation before
+        // enqueuing the save. A locked keystore holds no cleartext, so the
+        // dropped save must withdraw that entry rather than leave a live token
+        // a later connect would be served.
+        runtime.publish_credential(key, mcp_oauth_credential("rotated"));
+        state.handle_oauth_save(key, mcp_oauth_credential("rotated"), Some("rotated"));
+        assert!(
+            runtime.load(key).is_none(),
+            "a save ignored while locked must withdraw the read view"
+        );
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
     fn an_applied_save_for_one_key_does_not_clobber_another_keys_pending_rotation() {
         // Install the process-global runtime so the per-key publishes have a
         // read view to write (see the sibling snapshot test).

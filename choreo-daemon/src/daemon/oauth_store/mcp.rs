@@ -34,6 +34,14 @@ impl DaemonState {
     ) {
         if self.locked {
             warn!(%key, "OAuthSave ignored: keystore is locked");
+            // The connect path published this rotation into the read-view
+            // snapshot before enqueuing (that ordering is what lets a concurrent
+            // refresh re-read it), so the read view is holding a live token even
+            // though the save is dropped. A locked daemon must not keep serving
+            // it: with `credentials` cleared by the lock, this resolves to a
+            // `remove_credential` for the key, withdrawing exactly what the
+            // connect path advanced.
+            self.publish_mcp_oauth_key(key);
             return;
         }
         // A save is always the terminal step of a refresh of a credential the
