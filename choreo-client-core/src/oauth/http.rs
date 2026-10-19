@@ -678,7 +678,7 @@ mod tests {
         );
         // A secret with reserved bytes is url-encoded first, so a ':' in it can
         // never be read as the id/secret separator.
-        let expected = base64::engine::general_purpose::STANDARD.encode("id:a%3Ab%20c");
+        let expected = base64::engine::general_purpose::STANDARD.encode("id:a%3Ab+c");
         assert_eq!(
             basic_authorization("id", "a:b c").as_str(),
             format!("Basic {expected}")

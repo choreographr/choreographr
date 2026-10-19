@@ -8,17 +8,19 @@
 //! the mirror the callback parsers use, so a value encoded by one path decodes
 //! identically on another.
 
-/// Percent-encode a single `application/x-www-form-urlencoded` value, the exact
-/// escaping [`form_encode`] applies to each side of a pair.
+/// Percent-encode a single `application/x-www-form-urlencoded` value per the
+/// RFC 6749 Appendix B component encoder, used to build the HTTP Basic
+/// credential.
 ///
 /// Used to build the RFC 6749 §2.3.1 HTTP Basic credential for a confidential
 /// client, whose id and secret must be url-encoded before base64 rather than
 /// concatenated raw (a secret containing `:` or a space would otherwise
-/// corrupt the credential).
+/// corrupt the credential). It differs from [`form_encode`] by encoding a space
+/// as `+` (as Appendix B specifies) rather than `%20`.
 #[must_use]
 pub fn percent_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
-    encode_into(&mut out, value);
+    encode_into(&mut out, value, true);
     out
 }
 
@@ -38,9 +40,9 @@ pub fn form_encode(params: &[(&str, &str)]) -> String {
         if i > 0 {
             out.push('&');
         }
-        encode_into(&mut out, key);
+        encode_into(&mut out, key, false);
         out.push('=');
-        encode_into(&mut out, value);
+        encode_into(&mut out, value, false);
     }
     out
 }
@@ -99,12 +101,17 @@ pub fn percent_decode(input: &str) -> String {
 }
 
 /// Append `value` percent-encoded per `application/x-www-form-urlencoded`.
-fn encode_into(out: &mut String, value: &str) {
+///
+/// `space_as_plus` selects how a space is encoded: `+` for the RFC 6749
+/// Appendix B component form used by the HTTP Basic credential, `%20` for a
+/// request body or query string (unambiguous in both).
+fn encode_into(out: &mut String, value: &str, space_as_plus: bool) {
     for byte in value.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(char::from(byte));
             }
+            b' ' if space_as_plus => out.push('+'),
             b' ' => out.push_str("%20"),
             _ => {
                 out.push('%');
@@ -156,10 +163,10 @@ mod tests {
     }
 
     #[test]
-    fn single_value_encoding_matches_a_pair_side() {
-        // The single-value encoder applies the same escaping form_encode does to
-        // each side of a pair.
-        assert_eq!(percent_encode("a b/c=d:e"), "a%20b%2Fc%3Dd%3Ae");
+    fn single_value_encoding_uses_plus_for_space() {
+        // The single-value encoder follows RFC 6749 Appendix B, which encodes a
+        // space as `+` (unlike form_encode, which keeps `%20` for bodies).
+        assert_eq!(percent_encode("a b/c=d:e"), "a+b%2Fc%3Dd%3Ae");
         assert_eq!(percent_encode("plain-_.~"), "plain-_.~");
     }
 
