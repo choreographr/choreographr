@@ -146,6 +146,38 @@ fn spawn_config_change_consumer(
     }
 }
 
+/// The ACL file's basename, for a config-watcher subscription. Falls back to
+/// the canonical `authorized_clients.toml` when the path has no final
+/// component.
+fn acl_basename(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || "authorized_clients.toml".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
+/// Watch an ACL file that lives OUTSIDE the shared config directory with its
+/// own `notify` transport (the shared watcher cannot see a foreign directory).
+/// A path with no parent disables ACL hot-reload with a warning; a directory
+/// that does not exist yet is created and armed, and a creation failure is
+/// retried by the transport's re-arm cadence.
+fn spawn_dedicated_acl_watcher(
+    daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
+    acl_path: &Path,
+) {
+    let Some(acl_dir) = acl_path.parent() else {
+        warn!(
+            path = %acl_path.display(),
+            "ACL path has no parent directory; ACL hot-reload disabled"
+        );
+        return;
+    };
+    let mut acl_watcher = crate::config_watch::ConfigWatcher::new(acl_dir.to_path_buf());
+    let acl_rx = acl_watcher.subscribe(&acl_basename(acl_path));
+    acl_watcher.spawn();
+    crate::server::acl::spawn_acl_watcher(daemon_tx, acl_rx);
+}
+
 /// Dedicated forwarder thread for MCP list-changed events: blocks on the
 /// servers' shared list-change receiver (a dedicated thread blocking in
 /// `recv()` is fine — the house rule only forbids blocking the command loop)
@@ -193,7 +225,7 @@ fn spawn_mcp_list_change_forwarder(
 // The assembly cannot fail: every fallible step degrades gracefully (no ACL
 // dir → no hot-reload, no config dir → never-delivering receivers), so the
 // function returns `DaemonCore` directly instead of a transparent Ok wrapper.
-pub(crate) fn start_daemon_core(state: DaemonState, opts: CoreOptions) -> DaemonCore {
+pub(crate) fn start_daemon_core(state: DaemonState, opts: &CoreOptions) -> DaemonCore {
     let mut state = state;
     let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
     state.daemon_tx = daemon_tx.clone();
@@ -221,70 +253,59 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: CoreOptions) -> Daemon
     // Skipped entirely when no ACL was provided (the embedded-daemon case:
     // it owns its ACL policy upstream, and a half-installed ACL — present in
     // state but unwatched — would silently diverge from the shipped
-    // binary's semantics).
-    if let Some(acl) = opts.acl {
-        let acl_path = acl.path().to_path_buf();
-        state.acl = Some(acl.clone());
-
-        // Dedicated config watcher for the ACL file. It watches the ACL's OWN
-        // parent directory, not the general config dir: in production they are
-        // the same directory, but tests (and any future --acl-path override)
-        // place the ACL elsewhere — and the watcher must follow the file the
-        // SharedAcl actually holds, not where the catalog overlay happens to
-        // live. The basename subscription keeps unrelated files in that dir
-        // from triggering reloads.
-        if let Some(acl_dir) = acl_path.parent() {
-            let mut acl_watcher = crate::config_watch::ConfigWatcher::new(acl_dir.to_path_buf());
-            let acl_rx = acl_watcher.subscribe(
-                acl_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .as_deref()
-                    .unwrap_or("authorized_clients.toml"),
-            );
-            acl_watcher.spawn();
-            crate::server::acl::spawn_acl_watcher(daemon_tx.clone(), acl_rx);
-        } else {
-            warn!(
-                path = %acl_path.display(),
-                "ACL path has no parent directory; ACL hot-reload disabled"
-            );
-        }
-    }
+    // binary's semantics). The file itself is watched below, folded into the
+    // shared config watcher when it lives in the config directory.
+    let acl_path = opts.acl.as_ref().map(|acl| {
+        let path = acl.path().to_path_buf();
+        state.acl = Some(Arc::clone(acl));
+        path
+    });
 
     // Shared config-file watching transport: ONE notify watcher on the config
     // directory, fanned out per-basename to consumers (the catalog overlay,
-    // accounts, and future files). Spawned before the consumers that react to
-    // its events. Degrades gracefully to no transport (and no auto-reload)
-    // when the config dir cannot be resolved, or when `config_watchers` is
-    // false (the embedded-daemon case: watchers are managed externally or not
-    // at all — the maintenance thread still runs, it just has no overlay
-    // events to react to).
-    let overlay_rx = match state.catalog_paths.overlay.parent().map(Path::to_path_buf) {
-        _ if !opts.config_watchers => {
+    // accounts, the MCP trust store, and — under the `mcp` feature — the
+    // daemon-tier config). Each consumer owns its reload policy; the transport
+    // only routes events. Degrades gracefully to a never-delivering receiver
+    // (and no auto-reload) when the config dir cannot be resolved or when
+    // `config_watchers` is false (the embedded-daemon case: watchers are
+    // managed externally or not at all — the maintenance thread still runs, it
+    // just has no overlay events to react to).
+    //
+    // The ACL file joins this transport when it lives in the config directory
+    // (the production layout), so the whole directory is watched by ONE
+    // `notify` instance rather than two; a dedicated watcher covers the case
+    // where the ACL is resolved elsewhere (see below).
+    let config_dir = state.catalog_paths.overlay.parent().map(Path::to_path_buf);
+    let mut config_watcher = match (config_dir.as_ref(), opts.config_watchers) {
+        (Some(dir), true) => Some(crate::config_watch::ConfigWatcher::new(dir.clone())),
+        (Some(_), false) => {
             warn!("config watchers disabled; config-file auto-reload disabled");
-            // A never-delivering receiver keeps the maintenance thread running
-            // (see the no-config-dir fallback for the same pattern).
-            crossbeam_channel::never()
+            None
         }
-        Some(config_dir) => {
-            let mut config_watcher = crate::config_watch::ConfigWatcher::new(config_dir.clone());
+        (None, _) => {
+            warn!("config directory not resolvable; config-file auto-reload disabled");
+            None
+        }
+    };
+
+    let overlay_rx = match (config_watcher.as_mut(), config_dir.as_ref()) {
+        (Some(watcher), Some(config_dir)) => {
             // The catalog maintenance thread reacts to overlay edits; the
             // accounts watcher reacts to accounts.toml edits. Each consumer
             // owns its reload policy (see `handle_accounts_reload` and the
             // maintenance loop's overlay arm).
-            let overlay_rx = config_watcher.subscribe(crate::catalog::USER_OVERLAY_NAME);
-            let accounts_rx = config_watcher.subscribe(crate::accounts::ACCOUNTS_TOML_NAME);
+            let overlay_rx = watcher.subscribe(crate::catalog::USER_OVERLAY_NAME);
+            let accounts_rx = watcher.subscribe(crate::accounts::ACCOUNTS_TOML_NAME);
             // The MCP trust store is always watched (it compiles without the
             // `mcp` feature): an edit re-resolves every session's overlay. The
             // daemon-tier `mcp.json` is watched only when the `mcp` feature is
             // built in (there is no manager without it). Per-session PROJECT
             // `.mcp.json` files are deliberately NOT watched — their roots are
             // unbounded, so they reload via `/mcp reload`.
-            let trust_rx = config_watcher.subscribe(crate::mcp::TRUST_FILE);
+            let trust_rx = watcher.subscribe(crate::mcp::TRUST_FILE);
             #[cfg(feature = "mcp")]
-            let mcp_rx = config_watcher.subscribe(crate::mcp::config::DAEMON_CONFIG_FILE);
-            config_watcher.spawn();
+            let mcp_rx = watcher.subscribe(crate::mcp::config::DAEMON_CONFIG_FILE);
+
             crate::accounts::spawn_accounts_watcher(daemon_tx.clone(), accounts_rx);
             spawn_config_change_consumer(
                 daemon_tx.clone(),
@@ -303,13 +324,38 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: CoreOptions) -> Daemon
             );
             overlay_rx
         }
-        None => {
-            warn!("config directory not resolvable; config-file auto-reload disabled");
-            // A never-delivering receiver so the maintenance thread still runs
-            // (it just has no overlay events to react to).
-            crossbeam_channel::never()
-        }
+        // A never-delivering receiver keeps the maintenance thread running (it
+        // just has no overlay events to react to).
+        _ => crossbeam_channel::never(),
     };
+
+    // ACL hot-reload. Reuse the shared config watcher when it watches the ACL's
+    // own directory (the production layout); otherwise — an ACL resolved
+    // outside the config dir (the `--base-dir` layout keeps it at the base
+    // root, not under `<base>/config/choreographr`), or config watching
+    // disabled/unresolved — fall back to a dedicated watcher so ACL hot-reload
+    // never depends on where the catalog overlay happens to live. The basename
+    // subscription keeps unrelated files in the directory from triggering
+    // reloads.
+    if let Some(acl_path) = acl_path.as_deref() {
+        let shared_acl_rx = match (config_watcher.as_mut(), config_dir.as_deref()) {
+            (Some(watcher), Some(config_dir)) if acl_path.parent() == Some(config_dir) => {
+                Some(watcher.subscribe(&acl_basename(acl_path)))
+            }
+            _ => None,
+        };
+        match shared_acl_rx {
+            Some(acl_rx) => crate::server::acl::spawn_acl_watcher(daemon_tx.clone(), acl_rx),
+            None => spawn_dedicated_acl_watcher(daemon_tx.clone(), acl_path),
+        }
+    }
+
+    // Arm the shared watcher only now that every subscription — the config
+    // basenames and any shared ACL basename — is registered, so no event can
+    // slip past an unregistered consumer.
+    if let Some(watcher) = config_watcher {
+        watcher.spawn();
+    }
 
     // Spawn the ONE background catalog-maintenance thread (S4) before the
     // command loop is moved into its own thread: it loads the cache, does the
@@ -473,5 +519,22 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: CoreOptions) -> Daemon
         db,
         writer_write_timeout,
         cmd_handle,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::acl_basename;
+    use std::path::Path;
+
+    #[test]
+    fn acl_basename_uses_the_final_component_or_a_fallback() {
+        assert_eq!(
+            acl_basename(Path::new("/etc/choreographr/authorized_clients.toml")),
+            "authorized_clients.toml"
+        );
+        // A path with no final component falls back to the canonical name.
+        assert_eq!(acl_basename(Path::new("/")), "authorized_clients.toml");
+        assert_eq!(acl_basename(Path::new("")), "authorized_clients.toml");
     }
 }

@@ -507,7 +507,12 @@ operator already trusts, or is confirmed by a human comparing fingerprints:
   `choreographr acl-add` CLI) — all converging on the same file and the same
   advisory-file-lock discipline, with the hot-reload chain making every path
   effective without a daemon restart. The ACL parse-compare reload policy
-  means a torn editor save never un-authorizes live clients.
+  means a torn editor save never un-authorizes live clients. When the ACL
+  lives in the config directory (the production layout) it is watched by the
+  same unified config transport as the overlay and accounts; an ACL resolved
+  elsewhere (the `--base-dir` layout keeps it at the base root) gets its own
+  watcher, so ACL hot-reload never depends on where the overlay happens to
+  live.
 - **Server key → client: learned in-band on FIRST contact only, confirmed by
   a human, then pinned.** With no pin for the address, the client runs the
   Noise XX handshake (`PREAMBLE_XX`), which reveals the server's static key;

@@ -821,7 +821,7 @@ entries (`[provider.<slug>.models."<model>"]` with `context_window`,
 `prompt_cache_short`, `prompt_cache_long`),
 plus wholesale provider definitions for anything models.dev doesn't list. The
 file is watched (via a shared config-file watcher, together with
-`accounts.toml`) and reloads automatically on change (deleting it falls back to
+`accounts.toml` and the ACL file) and reloads automatically on change (deleting it falls back to
 the bundled overlay; the config dir is created at startup so the watch installs
 even on a fresh system);
 `/refresh-models [--force]` re-fetches the upstream catalog on demand and also

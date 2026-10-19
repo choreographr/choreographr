@@ -125,7 +125,7 @@ pub fn spawn_embedded(state: DaemonState, _opts: EmbeddedOptions) -> io::Result<
     info!("spawning embedded daemon core");
     let core = start_daemon_core(
         state,
-        CoreOptions {
+        &CoreOptions {
             acl: None,
             config_watchers: true,
             // The embedded daemon has no Unix socket and no accept loop to

@@ -375,7 +375,7 @@ pub fn run_server(
     // to the pre-split inline assembly — the moved code is verbatim.
     let core = start_daemon_core(
         state,
-        CoreOptions {
+        &CoreOptions {
             acl: Some(Arc::clone(acl)),
             config_watchers: true,
             // Auto-exit only makes sense for a socket-listening daemon: the
