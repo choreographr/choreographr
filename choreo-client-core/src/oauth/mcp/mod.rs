@@ -41,7 +41,7 @@ mod register;
 
 use authorize::{AuthorizeContext, authorize};
 use discovery::{AuthServer, discover};
-use register::register_client;
+use register::{default_scopes, register_client};
 
 /// The server information a frontend derives from `McpStatus` to sign in.
 ///
@@ -203,7 +203,8 @@ fn finish(
     tokens: &http::TokenSet,
     tx: &Sender<LoginEvent>,
 ) -> Result<(), OAuthLoginError> {
-    let granted_scopes = credential::granted_scopes(tokens.scope.as_deref(), &info.oauth.scopes);
+    let granted_scopes =
+        resolved_granted_scopes(server, &info.oauth.scopes, tokens.scope.as_deref());
     let credential = ServiceCredential::OAuth {
         kind: OAuthKind::Mcp,
         issuer: Some(server.issuer.clone()),
@@ -241,6 +242,19 @@ fn finish(
     Ok(())
 }
 
+/// The scopes to record on the MCP credential: the token response's granted
+/// `scope` when present, else the same resolved set the authorize request and
+/// dynamic registration asked for (configured → challenge → resource → AS), so
+/// the stored grant never disagrees with what was requested.
+fn resolved_granted_scopes(
+    server: &AuthServer,
+    configured: &[String],
+    token_scope: Option<&str>,
+) -> Vec<String> {
+    let requested = default_scopes(server, configured);
+    credential::granted_scopes(token_scope, &requested)
+}
+
 /// The callback ports to try: the preferred one first, then the defaults.
 fn preferred_ports(preferred: Option<u16>) -> Vec<u16> {
     let mut ports = Vec::new();
@@ -264,6 +278,40 @@ mod tests {
         assert_eq!(preferred_ports(Some(9000)), vec![9000, 1455, 1457]);
         assert_eq!(preferred_ports(Some(1457)), vec![1457, 1455]);
         assert_eq!(preferred_ports(None), vec![1455, 1457]);
+    }
+
+    fn server(challenge: Option<&[&str]>) -> AuthServer {
+        AuthServer {
+            issuer: "https://as.example".to_string(),
+            authorization_endpoint: "https://as.example/authorize".to_string(),
+            token_endpoint: "https://as.example/token".to_string(),
+            registration_endpoint: Some("https://as.example/register".to_string()),
+            scopes_supported: Vec::new(),
+            token_endpoint_auth_methods_supported: Vec::new(),
+            challenge_scope: challenge.map(|s| s.iter().map(ToString::to_string).collect()),
+            resource_scopes_supported: Vec::new(),
+            authorization_response_iss_parameter_supported: false,
+        }
+    }
+
+    #[test]
+    fn resolved_granted_scopes_match_the_requested_set() {
+        // No token-response scope: fall back to the resolved set the authorize
+        // request and DCR asked for, so a challenge-scoped grant is recorded.
+        assert_eq!(
+            resolved_granted_scopes(&server(Some(&["c"])), &[], None),
+            ["c"]
+        );
+        // Configured scopes win in the resolution, so they are what is recorded.
+        assert_eq!(
+            resolved_granted_scopes(&server(Some(&["c"])), &["configured".to_string()], None),
+            ["configured"]
+        );
+        // A token-response scope is recorded verbatim, regardless of the request.
+        assert_eq!(
+            resolved_granted_scopes(&server(Some(&["c"])), &[], Some("x y")),
+            ["x", "y"]
+        );
     }
 
     #[test]
