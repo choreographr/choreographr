@@ -175,6 +175,14 @@ pub(super) fn run_device(
 }
 
 /// Wait one device-code poll interval, waking immediately on cancel.
+///
+/// A *disconnected* `stop` channel counts as cancellation, which is sound only
+/// because every caller of the device flow installs a stop channel: the provider
+/// flow passes `with_stop = true` to `spawn_login_worker`, and the MCP flow —
+/// which installs no stop channel — never runs a device flow. A flow that could
+/// run a device wait without a stop channel would be cancelled on its first
+/// interval; give such a flow a stop channel (and the `with_stop` wiring) rather
+/// than relying on the disconnect arm.
 fn wait_interval(
     stop: &Receiver<()>,
     interval: std::time::Duration,
@@ -185,7 +193,9 @@ fn wait_interval(
     }
     // The timer IS the event here, so `after` (a timer channel) is the wait;
     // the biased select makes the stop arm win when both are ready, so a cancel
-    // is observed instantly rather than after up to a full interval.
+    // is observed instantly rather than after up to a full interval. The stop arm
+    // also matches a *disconnected* channel, which is why that channel must always
+    // be installed (see the doc comment above).
     select_biased! {
         recv(stop) -> _ => Err(OAuthLoginError::Cancelled),
         recv(after(interval)) -> _ => {

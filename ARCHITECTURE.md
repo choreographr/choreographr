@@ -681,7 +681,11 @@ runs on a **worker thread** and streams progress (`AuthUrl`, `DeviceCode`,
 `Prompt`, `Progress`, `Done`, `Error`) over a crossbeam channel; a single-bit
 cancel flag (polled by the loopback accept loop via `tiny_http`'s
 `recv_timeout`, since a blocking accept cannot be interrupted by a channel
-message) and a stop channel end it. The `id_token`'s identity claim
+message) and a stop channel end it. The returned `LoginSession` handle owns the
+worker's lifetime: **dropping it requests cancellation** (setting the flag and
+sending on the stop channel, never joining), so a caller that discards a flow
+mid-sign-in never leaves the login thread — or its bound loopback callback
+server — running for the rest of the process. The `id_token`'s identity claim
 (`chatgpt_account_id`) is read **without signature verification** — the token
 arrived over TLS from the token endpoint — with the access token as a fallback;
 the access token is then dropped and only the refresh token, client

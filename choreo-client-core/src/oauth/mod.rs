@@ -187,6 +187,13 @@ pub enum LoginEvent {
 
 /// A running login flow: the event stream, a cancel handle, and the worker
 /// join handle.
+///
+/// The handle owns the worker's lifetime: **dropping it requests
+/// cancellation**, so a caller that simply discards the session (a closed
+/// modal, a replaced flow) never leaves the login thread — or, for the loopback
+/// flows, its bound callback server — running. Cancelling explicitly with
+/// [`LoginSession::cancel`] is therefore only needed to end the flow *before*
+/// dropping the handle.
 pub struct LoginSession {
     /// Events from the worker thread, oldest first. The stream ends when the
     /// worker finishes.
@@ -202,16 +209,11 @@ pub struct LoginSession {
 
 impl LoginSession {
     /// Request cancellation. Best-effort: the loopback accept loop observes it
-    /// within one poll interval, the device-code wait immediately.
+    /// within one poll interval, the device-code wait immediately. Dropping the
+    /// session requests the same cancellation, so this is only needed to stop a
+    /// flow early without dropping the handle.
     pub fn cancel(&self) {
-        self.cancel
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        // The device wait selects on this channel so a cancel is observed
-        // without waiting out the poll interval. A flow with no interval wait
-        // (MCP) carries no stop channel and cancels on the flag alone.
-        if let Some(stop) = &self.stop {
-            let _ = stop.send(());
-        }
+        self.request_cancel();
     }
 
     /// Block until the worker thread finishes.
@@ -219,6 +221,41 @@ impl LoginSession {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+
+    /// The one cancellation path shared by [`LoginSession::cancel`] and `Drop`,
+    /// so an explicit cancel and a drop can never drift apart. It only sets a
+    /// lock-free flag and performs a non-blocking send, so calling it from
+    /// `Drop` never blocks on the worker.
+    fn request_cancel(&self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // The device wait selects on this channel so a cancel is observed
+        // without waiting out the poll interval. A flow with no interval wait
+        // (MCP) carries no stop channel and cancels on the flag alone. A send
+        // whose receiver thread has already exited just fails, which is why a
+        // second cancel (after `join`) is harmless.
+        if let Some(stop) = &self.stop {
+            let _ = stop.send(());
+        }
+    }
+
+    /// Whether cancellation has been requested on this session. Test-only: the
+    /// cancel flag is the observable a caller cannot otherwise reach.
+    #[cfg(test)]
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Drop requests cancellation so a session discarded mid-flow never leaves the
+/// worker thread, its browser, or the loopback flow's callback server running
+/// for the rest of the process. `Drop` does not join: it sets an atomic flag and
+/// performs a non-blocking send, so it cannot block an exiting thread on a
+/// wedged worker.
+impl Drop for LoginSession {
+    fn drop(&mut self) {
+        self.request_cancel();
     }
 }
 
@@ -308,4 +345,56 @@ fn run(
         run_loopback(descriptor, options, tx, cancel)?
     };
     credential::finish(descriptor, options, tx, &tokens, &client_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A session whose worker does nothing (no network, no browser) and returns
+    /// at once, so the tests can exercise the handle's cancellation contract
+    /// on its own.
+    fn idle_session(with_stop: bool) -> LoginSession {
+        spawn_login_worker("test-oauth-login", with_stop, |_tx, _cancel, _stop| Ok(()))
+    }
+
+    #[test]
+    fn dropping_a_session_requests_cancellation() {
+        let session = idle_session(true);
+        // Read the flag through a clone: `self` is gone once the session drops.
+        let flag = Arc::clone(&session.cancel);
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+        drop(session);
+        // `Drop` requests cancellation regardless of whether the worker already
+        // finished — that is the guarantee a caller relies on.
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn explicit_cancel_sets_the_flag() {
+        let session = idle_session(true);
+        assert!(!session.is_cancelled());
+        session.cancel();
+        assert!(session.is_cancelled());
+    }
+
+    #[test]
+    fn joining_then_dropping_is_harmless() {
+        // The stop receiver is still alive when `cancel` sends, and gone by the
+        // time `Drop` re-cancels after `join`; both sends must simply succeed or
+        // fail without blocking or panicking.
+        let session = idle_session(true);
+        session.cancel();
+        session.join();
+    }
+
+    #[test]
+    fn dropping_a_stopless_session_requests_cancellation() {
+        // The MCP flow installs no stop channel; cancellation (including the
+        // drop-driven kind) must still reach the worker through the flag.
+        let session = idle_session(false);
+        let flag = Arc::clone(&session.cancel);
+        drop(session);
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
 }

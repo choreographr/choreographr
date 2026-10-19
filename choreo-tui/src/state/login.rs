@@ -29,6 +29,9 @@ pub(crate) struct LoginModal {
     /// A device code and its verification URI, once emitted.
     pub(crate) device_code: Option<(String, String)>,
     /// The worker session. `None` once the flow has ended (the modal closes).
+    /// Dropping the modal drops this session, which requests cancellation — so a
+    /// modal closed mid-flow (a quit, or a replaced modal) never leaves the login
+    /// thread, its browser, or its loopback server running.
     session: Option<LoginSession>,
 }
 
@@ -116,15 +119,6 @@ fn classify_event(event: LoginEvent) -> Option<LoginOutcome> {
         | LoginEvent::Progress { .. } => None,
         LoginEvent::Done { service, message } => Some(LoginOutcome::Done { service, message }),
         LoginEvent::Error { message } => Some(LoginOutcome::Error(message)),
-    }
-}
-
-/// Drop cancels the worker so a modal closed mid-flow (a quit, or a replaced
-/// modal) never leaves the login thread, its browser, or its loopback server
-/// running.
-impl Drop for LoginModal {
-    fn drop(&mut self) {
-        self.cancel();
     }
 }
 
