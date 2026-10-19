@@ -205,16 +205,24 @@ pub fn status_auth(
 /// authorization-required error the user resolves with `mcp login`).
 #[must_use]
 pub fn wiring_for(config: &McpServerConfig) -> Option<McpAuthWiring> {
-    match &config.transport {
-        McpTransport::Http { oauth: Some(_), .. } => {}
+    // One destructuring match resolves both facts the wiring needs in a single
+    // pass over the transport: the URL to canonicalise and whether the server
+    // configures an `oauth` block. A stdio transport, or an HTTP server with no
+    // `oauth` block, gets no wiring.
+    let url = match &config.transport {
+        McpTransport::Http {
+            url,
+            oauth: Some(_),
+            ..
+        } => url,
         McpTransport::Http { oauth: None, .. } | McpTransport::Stdio { .. } => return None,
-    }
-    let runtime = runtime()?;
-    let key = credential_key_for(config)?;
-    let canonical_resource = match &config.transport {
-        McpTransport::Http { url, .. } => choreo_mcp::canonical_target(url),
-        McpTransport::Stdio { .. } => return None,
     };
+    let runtime = runtime()?;
+    // `credential_key_for` returns `None` only for stdio, which the match above
+    // has already excluded, so the `?` never fires here; it keeps the key's
+    // `Option` contract intact rather than assuming the shape list.
+    let key = credential_key_for(config)?;
+    let canonical_resource = choreo_mcp::canonical_target(url);
     Some(McpAuthWiring {
         key: key.clone(),
         backend: Arc::new(McpOAuthBackend {

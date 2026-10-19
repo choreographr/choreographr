@@ -60,10 +60,7 @@ fn build_credential(
         client_id: Some(client_id.to_string()),
         client_secret: None,
         granted_scopes: granted_scopes(tokens.scope.as_deref(), &descriptor.scopes),
-        token_type: tokens
-            .token_type
-            .clone()
-            .or_else(|| Some("Bearer".to_string())),
+        token_type: resolve_token_type(tokens.token_type.clone()),
     }
 }
 
@@ -90,6 +87,17 @@ pub(super) fn granted_scopes(scope: Option<&str>, fallback: &[String]) -> Vec<St
         }
         _ => fallback.to_vec(),
     }
+}
+
+/// The token type to record on the credential: the token response's `token_type`
+/// when the server reports one, else `"Bearer"`. RFC 6749 §7.1 makes the field
+/// optional, and every server that issues a usable access token either names
+/// `Bearer` or its own scheme, so defaulting the absent case keeps the stored
+/// credential self-describing instead of leaving the scheme implicit. The one
+/// rule shared by the provider and MCP flows, so their credentials cannot
+/// disagree on the fallback.
+pub(super) fn resolve_token_type(token_type: Option<String>) -> Option<String> {
+    token_type.or_else(|| Some("Bearer".to_string()))
 }
 
 #[cfg(test)]
@@ -169,6 +177,28 @@ mod tests {
         assert_eq!(
             granted_scopes(Some("  "), &descriptor().scopes),
             ["openid", "offline_access"]
+        );
+    }
+
+    #[test]
+    fn build_credential_defaults_and_preserves_the_token_type() {
+        // A reply that omits `token_type` records `Bearer`, so the stored grant
+        // names its scheme rather than leaving it implicit.
+        let mut without_type = tokens(None, "opaque-access", Some("openid"));
+        without_type.token_type = None;
+        let cred = build_credential(&descriptor(), &without_type, "client-abc");
+        assert_eq!(
+            cred.as_oauth().expect("OAuth credential").token_type,
+            Some("Bearer")
+        );
+
+        // A reported non-Bearer type is preserved verbatim.
+        let mut non_bearer = tokens(None, "opaque-access", Some("openid"));
+        non_bearer.token_type = Some("mac".into());
+        let cred = build_credential(&descriptor(), &non_bearer, "client-abc");
+        assert_eq!(
+            cred.as_oauth().expect("OAuth credential").token_type,
+            Some("mac")
         );
     }
 

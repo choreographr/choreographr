@@ -21,6 +21,22 @@
 //! and RFC 8414 / OIDC metadata; the `register` submodule performs dynamic
 //! client registration; the `authorize` submodule runs the PKCE callback flow
 //! and the code exchange.
+//!
+//! The scopes recorded on the MCP credential are one composition of two rules,
+//! each owned by the module that applies it:
+//!
+//! - [`register::default_scopes`] resolves the **requested** set by precedence —
+//!   the configured `scopes`, else the `WWW-Authenticate` challenge's `scope`,
+//!   else the protected resource's `scopes_supported`, else the authorization
+//!   server's advertised `scopes_supported` (an empty result means "request
+//!   none", so the callers omit the `scope` parameter).
+//! - [`credential::granted_scopes`] then prefers the token response's own
+//!   `scope` when it is present and non-empty, falling back to that requested
+//!   set.
+//!
+//! [`resolved_granted_scopes`] is exactly that composition, so the scopes
+//! stored on the credential never disagree with what the authorize request and
+//! dynamic registration asked for.
 
 use std::sync::atomic::AtomicBool;
 
@@ -242,7 +258,7 @@ fn finish(
         // `OAuthClientConfig::with_client_secret`).
         client_secret: client_secret.map(str::to_string),
         granted_scopes,
-        token_type: tokens.token_type.clone(),
+        token_type: credential::resolve_token_type(tokens.token_type.clone()),
     };
     let message = build_add_credential_from_credential(info.credential_key.clone(), credential)
         .map_err(|e| OAuthLoginError::Decode(e.to_string()))?;
@@ -323,6 +339,50 @@ mod tests {
             resolved_granted_scopes(&server(Some(&["c"])), &[], Some("x y")),
             ["x", "y"]
         );
+    }
+
+    #[test]
+    fn finish_records_the_resolved_token_type() {
+        use choreo_proto::ClientMessageType;
+
+        // The MCP path shares the provider credential's token-type rule: a reply
+        // that omits `token_type` records `Bearer`, and a reported non-Bearer
+        // type (e.g. `mac`) is preserved.
+        for (reported, expected) in [(None, "Bearer"), (Some("mac"), "mac")] {
+            let info = McpLoginInfo {
+                slug: "docs".to_string(),
+                resource: "https://example.com/mcp".to_string(),
+                credential_key: "mcp:docs|x".to_string(),
+                oauth: McpOAuthConfig {
+                    client_id: Some("app-1".to_string()),
+                    callback_port: None,
+                    scopes: vec![],
+                    authorization_server: None,
+                    client_secret_env: None,
+                },
+            };
+            let tokens = http::TokenSet {
+                access_token: Zeroizing::new("access".to_string()),
+                refresh_token: Some(Zeroizing::new("refresh".to_string())),
+                id_token: None,
+                token_type: reported.map(str::to_string),
+                scope: None,
+                expires_in: None,
+            };
+            let (tx, rx) = crossbeam_channel::unbounded();
+            finish(&info, &server(None), "app-1", None, &tokens, &tx).expect("finish");
+
+            let LoginEvent::Done { message, .. } = rx.try_recv().expect("a Done event") else {
+                panic!("expected a Done event");
+            };
+            let ClientMessageType::AddCredential { credential, .. } = *message else {
+                panic!("expected an AddCredential message");
+            };
+            assert_eq!(
+                credential.as_oauth().expect("OAuth credential").token_type,
+                Some(expected)
+            );
+        }
     }
 
     #[test]
