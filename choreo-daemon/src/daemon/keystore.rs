@@ -283,7 +283,10 @@ impl DaemonState {
         self.access_tokens.remove(service);
         self.dead_oauth.remove(service);
         self.credentials.insert(service.to_string(), credential);
-        self.publish_mcp_oauth_snapshot();
+        // A keyed credential mutation refreshes only this key's read-view entry,
+        // so another key's rotation published ahead of its not-yet-durable
+        // `OAuthSave` is not reverted.
+        self.publish_mcp_oauth_key(service);
 
         info!(
             service = %service,

@@ -1054,8 +1054,15 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   rotated credential without a command-loop round-trip rather than spending an
   already-rotated single-use refresh token. A save the command loop drops — the
   credential was removed (logout/clear), or a re-login replaced it mid-refresh —
-  republishes the snapshot from the durable store, so the synchronous publish
-  cannot leave the read view serving a grant the store rejected. The
+  republishes that key's entry from the durable store, so the synchronous publish
+  cannot leave the read view serving a grant the store rejected. Every single-key
+  credential mutation publishes **only that key** (`publish_mcp_oauth_key`); the
+  whole-map `publish()` is reserved for the two places the entire credential set
+  changes wholesale (lock clears it, unlock decrypts it afresh). That per-key
+  granularity is what prevents another key's mutation from clobbering a rotation
+  that is published ahead of its not-yet-durable `OAuthSave` — a whole-map
+  republish built from the durable store would revert such a key to its
+  already-spent refresh token, and a concurrent refresh would then spend it. The
   single-flight refresh guard reuses `OAuthRefreshLocks`, keyed by the MCP
   credential key: the registry's one semaphore-backed `OwnedRefreshLock` serves
   both engines, and the async adapter takes its owned `Send` guard from a

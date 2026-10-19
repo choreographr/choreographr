@@ -2467,7 +2467,7 @@ impl DaemonState {
         if service == "twitter" {
             self.x_credentials = None;
         }
-        self.publish_mcp_oauth_snapshot();
+        self.publish_mcp_oauth_key(service);
         let _ = reply.send(Ok(()));
     }
 

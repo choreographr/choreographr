@@ -194,10 +194,11 @@ impl DaemonState {
             warn!(%key, "OAuthSave dropped: credential already removed (logout/clear)");
             // The connect path published this rotation into the read-view
             // snapshot before enqueuing (that ordering is what lets a concurrent
-            // refresh re-read it). Restore the snapshot from the durable store —
-            // whose credential was just removed — so the read view does not keep
-            // serving a grant the user deleted.
-            self.publish_mcp_oauth_snapshot();
+            // refresh re-read it). Restore THIS key's entry from the durable
+            // store — whose credential was just removed — so the read view does
+            // not keep serving a grant the user deleted, without disturbing any
+            // other key's pending rotation.
+            self.publish_mcp_oauth_key(key);
             return;
         }
         // Guard against a credential replaced under the refresh (a re-login
@@ -221,10 +222,10 @@ impl DaemonState {
         };
         if changed {
             warn!(%key, "OAuthSave dropped: credential changed under the refresh");
-            // As above: the connect path already advanced the read-view snapshot
-            // to this superseded rotation, so republish from the durable store to
-            // put the newer grant back.
-            self.publish_mcp_oauth_snapshot();
+            // As above: the connect path already advanced this key's read-view
+            // entry to the superseded rotation, so republish this key from the
+            // durable store to put the newer grant back.
+            self.publish_mcp_oauth_key(key);
             return;
         }
         if let Err(e) = self.encrypt_and_persist_credential(key, &credential) {
@@ -234,7 +235,10 @@ impl DaemonState {
         self.credentials.insert(key.to_string(), credential);
         self.access_tokens.remove(key);
         self.dead_oauth.remove(key);
-        self.publish_mcp_oauth_snapshot();
+        // Publish only this key: the rotation is now durable, so its entry is
+        // refreshed, while other keys' entries (including any rotation another
+        // key published ahead of its own save) are left untouched.
+        self.publish_mcp_oauth_key(key);
         // The MCP refresh completed (this save is its terminal step), so prune
         // any now-idle single-flight locks the refresh registry is holding for
         // this or another credential.
@@ -252,7 +256,7 @@ impl DaemonState {
         self.credentials.remove(key);
         self.access_tokens.remove(key);
         self.dead_oauth.remove(key);
-        self.publish_mcp_oauth_snapshot();
+        self.publish_mcp_oauth_key(key);
         crate::oauth_refresh_locks::prune();
         info!(%key, "cleared MCP OAuth credential");
     }
@@ -263,7 +267,9 @@ impl DaemonState {
     /// so the `/mcp` status shows a re-authentication request.
     pub(super) fn handle_mcp_auth_rejected(&mut self, key: &str) {
         if self.dead_oauth.insert(key.to_string()) {
-            self.publish_mcp_oauth_snapshot();
+            // Quarantining withdraws this key from the read view only; other
+            // keys' entries (and their pending rotations) stay intact.
+            self.publish_mcp_oauth_key(key);
             info!(%key, "MCP OAuth grant terminally rejected; re-authentication required");
         }
     }
@@ -285,10 +291,53 @@ impl DaemonState {
             .collect()
     }
 
-    /// Republish the MCP OAuth snapshot — the read view the connect path uses
-    /// so a credential load never round-trips the (possibly blocked) command
-    /// loop. The command loop is the snapshot's sole writer; it calls this
-    /// after every mutation of the MCP-keyed credentials.
+    /// Publish one key's current durable value into the MCP OAuth read view,
+    /// leaving every other key's entry untouched.
+    ///
+    /// A single-key mutation must NOT republish the whole map: the connect path
+    /// advances its own key's entry synchronously, ahead of the fire-and-forget
+    /// `OAuthSave` that makes it durable (`OAuthSave` is processed later by the
+    /// command loop). A whole-map republish built from `self.credentials` would
+    /// therefore revert another key whose rotation is visible but not yet
+    /// durable back to its pre-rotation (already-spent) refresh token. Updating
+    /// only this key keeps a rotation visible for its own key without
+    /// clobbering a pending rotation for any other.
+    ///
+    /// A non-MCP key, a quarantined key, or an absent credential removes the
+    /// entry — it must not be served (a non-MCP key never belongs in this
+    /// snapshot anyway, but gating on the key shape keeps the intent explicit).
+    pub(super) fn publish_mcp_oauth_key(&self, key: &str) {
+        #[cfg(feature = "mcp")]
+        {
+            // Only `mcp:`-keyed credentials belong in this read view; leave the
+            // snapshot untouched for any other key.
+            if !choreo_mcp::is_mcp_credential_key(key) {
+                return;
+            }
+            let Some(runtime) = crate::mcp::oauth::runtime() else {
+                return;
+            };
+            // A live durable grant is published; a quarantined or absent one is
+            // removed so a connect never re-sends a terminally rejected token
+            // (it surfaces a re-login instead).
+            match self.credentials.get(key) {
+                Some(credential) if !self.dead_oauth.contains(key) => {
+                    runtime.publish_credential(key, credential.clone());
+                }
+                _ => runtime.remove_credential(key),
+            }
+        }
+        // Without the `mcp` feature there is no connect path to feed.
+        #[cfg(not(feature = "mcp"))]
+        let _ = key;
+    }
+
+    /// Republish the whole MCP OAuth snapshot — the read view the connect path
+    /// uses so a credential load never round-trips the (possibly blocked)
+    /// command loop. Reserved for the two wholesale changes of the credential
+    /// set (lock clears it, unlock decrypts it afresh); every per-key mutation
+    /// uses [`Self::publish_mcp_oauth_key`] instead so it cannot clobber a
+    /// rotation another key published ahead of its not-yet-durable `OAuthSave`.
     ///
     /// A quarantined grant is withheld (see [`Self::mcp_oauth_snapshot`]): the
     /// connect then proceeds unauthenticated and surfaces a re-login. The `/mcp`
@@ -720,6 +769,52 @@ mod tests {
             runtime.load(key),
             Some(mcp_oauth_credential("newer")),
             "the read view must show the newer stored grant, not the stale rotation"
+        );
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn an_applied_save_for_one_key_does_not_clobber_another_keys_pending_rotation() {
+        // Install the process-global runtime so the per-key publishes have a
+        // read view to write (see the sibling snapshot test).
+        let (tx, _tx_rx) = crossbeam_channel::unbounded();
+        let runtime = crate::mcp::oauth::install(tx);
+
+        let (mut state, _rx) = make_daemon_state();
+        bind_for_test(&mut state);
+        state.locked = false;
+
+        let key_a = "mcp:docs|a";
+        let key_b = "mcp:docs|b";
+
+        // B's DURABLE grant still holds its old (already-spent) refresh token,
+        // while the connect path has published B's NEW rotation into the read
+        // view ahead of the OAuthSave that would make it durable.
+        state
+            .credentials
+            .insert(key_b.into(), mcp_oauth_credential("b-old"));
+        runtime.publish_credential(key_b, mcp_oauth_credential("b-new"));
+
+        // A normal applied save for an UNRELATED key A: its durable grant
+        // matches the presented expectation, so the rotation is persisted.
+        state
+            .credentials
+            .insert(key_a.into(), mcp_oauth_credential("a-old"));
+        state.handle_oauth_save(key_a, mcp_oauth_credential("a-new"), Some("a-old"));
+
+        // A's rotation took in the read view.
+        assert_eq!(
+            runtime.load(key_a),
+            Some(mcp_oauth_credential("a-new")),
+            "the applied save must publish its own key's rotation"
+        );
+        // B's pending rotation is untouched: an applied save for one key must
+        // not republish the whole map and revert another key's visible-but-not-yet-
+        // durable rotation to its spent token.
+        assert_eq!(
+            runtime.load(key_b),
+            Some(mcp_oauth_credential("b-new")),
+            "an applied save for one key must not clobber another key's pending rotation"
         );
     }
 }
