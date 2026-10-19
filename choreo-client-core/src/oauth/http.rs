@@ -312,12 +312,29 @@ fn basic_authorization(client_id: &str, client_secret: &str) -> Zeroizing<String
     Zeroizing::new(format!("Basic {encoded}"))
 }
 
+/// Whether a token-endpoint status is a TRANSIENT failure (a refused redirect
+/// the agent did not follow, `429`, or `5xx`) — the caller retries rather than
+/// treating it as a terminal protocol error. The one classifier shared by the
+/// device poll and the authorization-code exchange.
+fn is_transient_status(status: u16) -> bool {
+    (300..400).contains(&status) || status == 429 || (500..600).contains(&status)
+}
+
 /// Interpret a token endpoint's response body, mapping an OAuth `error` to a
 /// categorized failure and an absent `access_token` to a protocol error.
 pub(crate) fn read_token_response(
     response: ureq::http::Response<ureq::Body>,
 ) -> Result<TokenSet, OAuthLoginError> {
     let status = response.status();
+    // Classify the status before reading the body: a transient status (a refused
+    // redirect, 429, or 5xx) carries no meaningful token body, so it is a
+    // retryable network failure rather than a terminal decode error.
+    let code = status.as_u16();
+    if is_transient_status(code) {
+        return Err(OAuthLoginError::Network(format!(
+            "token endpoint returned transient status {code}"
+        )));
+    }
     // The body carries the freshly minted access/refresh/id tokens, so it is
     // wipe-on-drop rather than left in a plain `String` in freed memory.
     let body = Zeroizing::new(
@@ -524,7 +541,7 @@ pub(crate) fn device_poll(
     // caller tolerates a short run of transient failures before giving up, so a
     // one-off server error does not abort the (minutes-long) device flow. This
     // mirrors the runtime refresh classifier's terminal-vs-transient rule.
-    if (300..400).contains(&status) || status == 429 || (500..600).contains(&status) {
+    if is_transient_status(status) {
         return Err(OAuthLoginError::Network(format!(
             "device token endpoint returned transient status {status}"
         )));
@@ -666,5 +683,15 @@ mod tests {
             basic_authorization("id", "a:b c").as_str(),
             format!("Basic {expected}")
         );
+    }
+
+    #[test]
+    fn transient_status_classification_covers_3xx_429_and_5xx() {
+        for status in [301, 302, 307, 308, 429, 500, 503] {
+            assert!(is_transient_status(status), "{status} should be transient");
+        }
+        for status in [200, 204, 400, 401, 403, 404] {
+            assert!(!is_transient_status(status), "{status} should be terminal");
+        }
     }
 }
