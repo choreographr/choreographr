@@ -35,7 +35,7 @@
 //! just a read view that removes the deadlock.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use choreo_mcp::{
     CredentialBackend, McpAuthWiring, McpServerConfig, McpTransport, RefreshGuard,
@@ -43,7 +43,7 @@ use choreo_mcp::{
 };
 use choreo_shared::ServiceCredential;
 use crossbeam_channel::Sender;
-use tracing::warn;
+use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
 use crate::daemon::DaemonCommand;
@@ -108,27 +108,50 @@ impl McpOAuthRuntime {
     }
 }
 
-/// The process-global MCP OAuth runtime. Installed once by the daemon core
-/// (see [`install`]) so the connect path — which has no `DaemonState` — can
-/// reach it. Absent outside a running daemon (e.g. unit tests), in which case
-/// no OAuth wiring is produced and a remote server connects unauthenticated.
-static RUNTIME: OnceLock<Arc<McpOAuthRuntime>> = OnceLock::new();
+/// The process-global MCP OAuth runtime. Installed by the daemon core (see
+/// [`install`]) so the connect path — which has no `DaemonState` — can reach
+/// it. Absent outside a running daemon (e.g. unit tests), in which case no OAuth
+/// wiring is produced and a remote server connects unauthenticated.
+///
+/// The slot is re-installable: a process can start more than one daemon core
+/// (the embedded GUI shuts a stale daemon down and spawns a new one), and each
+/// restart must get a runtime bound to its **own** command sender and an empty
+/// snapshot — a fresh core must not keep a dead command sender (whose writes
+/// would fail, so rotations stop persisting) or the previous daemon's
+/// credentials. This is the same sanctioned read view as the fifteenth
+/// shared-state exception (see AGENTS.md), just swap-in-place rather than
+/// initialise-once; the lock is single-purpose, held only for the brief
+/// store/fetch, and carries no protocol data.
+static RUNTIME: LazyLock<Mutex<Option<Arc<McpOAuthRuntime>>>> = LazyLock::new(|| Mutex::new(None));
 
 /// Install the runtime with the command-loop sender, returning it. Called once
-/// the command loop's channel exists; a second call returns the existing one.
+/// the command loop's channel exists. A second call REPLACES the previous
+/// runtime with a fresh one (empty snapshot, the new sender) — a restarted
+/// embedded daemon must not keep the previous daemon's dead command sender or
+/// stale credentials — and returns the new one.
 pub fn install(tx: Sender<DaemonCommand>) -> Arc<McpOAuthRuntime> {
-    Arc::clone(RUNTIME.get_or_init(|| {
-        Arc::new(McpOAuthRuntime {
-            snapshot: Mutex::new(HashMap::new()),
-            tx,
-        })
-    }))
+    let fresh = Arc::new(McpOAuthRuntime {
+        snapshot: Mutex::new(HashMap::new()),
+        tx,
+    });
+    let mut slot = RUNTIME.lock().unwrap_or_else(PoisonError::into_inner);
+    // A populated slot means a previous daemon core already installed its
+    // runtime; replacing it is the daemon-restart signal. Never log the sender
+    // or any credential — only the fact of the replacement.
+    if slot.is_some() {
+        debug!("replacing the process-global MCP OAuth runtime (daemon restart)");
+    }
+    *slot = Some(Arc::clone(&fresh));
+    fresh
 }
 
 /// The installed runtime, if the daemon core has been assembled.
 #[must_use]
 pub fn runtime() -> Option<Arc<McpOAuthRuntime>> {
-    RUNTIME.get().cloned()
+    RUNTIME
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
 }
 
 /// The target-scoped credential key, the wire `oauth` block, and the baseline
@@ -351,6 +374,32 @@ mod tests {
             canonical_resource: "https://example.com/mcp".to_string(),
         };
         (rt, backend, rx)
+    }
+
+    #[test]
+    fn install_replaces_the_previous_runtime() {
+        // This test touches the process-global slot. Under nextest each test
+        // runs in its own process, so it owns the runtime; it still calls
+        // `install` itself to establish the state it asserts on rather than
+        // depending on execution order against any sibling test.
+        let (tx_a, _rx_a) = crossbeam_channel::unbounded();
+        let first = install(tx_a);
+        first.publish_credential(KEY, sample_cred("a"));
+
+        let (tx_b, _rx_b) = crossbeam_channel::unbounded();
+        let second = install(tx_b);
+
+        // The second install is a distinct runtime, and `runtime()` now returns
+        // it — not the first daemon's.
+        assert!(!Arc::ptr_eq(&first, &second));
+        let installed = runtime().expect("the second runtime is installed");
+        assert!(Arc::ptr_eq(&installed, &second));
+
+        // The replacement starts from an empty snapshot: the previous daemon's
+        // credential must not leak into the restarted daemon's read view.
+        assert!(second.load(KEY).is_none());
+        // The first runtime is left untouched for any handle still holding it.
+        assert_eq!(first.load(KEY), Some(sample_cred("a")));
     }
 
     #[test]

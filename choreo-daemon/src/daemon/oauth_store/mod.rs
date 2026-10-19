@@ -502,8 +502,8 @@ mod tests {
     fn a_dropped_oauth_save_restores_the_read_view_snapshot() {
         // Install the process-global runtime so `publish_mcp_oauth_snapshot` has
         // a snapshot to write; the command sender is unused by these handlers.
-        // `install` is a `OnceLock`, and under nextest each test is its own
-        // process, so this test owns the runtime.
+        // `install` owns the process-global slot, and under nextest each test is
+        // its own process, so this test owns the runtime.
         let (tx, _tx_rx) = crossbeam_channel::unbounded();
         let runtime = crate::mcp::oauth::install(tx);
 

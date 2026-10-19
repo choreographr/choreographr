@@ -1037,8 +1037,11 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   `mcp::oauth`): no `rmcp` type crosses the crate boundary. Because a server can
   connect while the command loop is blocked resolving a session overlay, the
   backend never round-trips the loop for a read — the command loop publishes a
-  credential snapshot the backend reads lock-free (the **fifteenth** sanctioned
-  shared-state exception, see AGENTS.md). The snapshot **withholds a quarantined
+  credential snapshot the backend reads under a short-lived lock (the
+  **fifteenth** sanctioned shared-state exception, see AGENTS.md). The slot is
+  re-installable: a restarted embedded daemon installs a fresh runtime (empty
+  snapshot, its own command sender) so it never keeps a dead command sender or
+  the previous daemon's credentials. The snapshot **withholds a quarantined
   grant** (`dead_oauth`): a terminally rejected refresh token is not served
   again, so the connect proceeds unauthenticated and surfaces a re-login rather
   than re-spending a spent token. The `/mcp` status still reports the
