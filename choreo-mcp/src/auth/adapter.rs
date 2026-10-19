@@ -11,7 +11,7 @@
 //! only usable credential and is persisted deliberately.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use choreo_shared::{OAuthKind, ServiceCredential};
@@ -110,25 +110,44 @@ impl CredentialStoreAdapter {
     }
 }
 
-/// A synthetic token response a cold `load` builds from whatever the durable
-/// grant offers: a bearer token and/or a refresh token, never an `expires_in`.
+/// A synthetic, **already-expired** refresh-only token response a cold `load`
+/// builds when the durable grant carries a refresh token.
 ///
-/// Two shapes, both without `expires_in` so `rmcp` skips its expiry check. With
-/// a refresh token the bearer is left empty: the first request goes out
-/// unauthenticated, 401s, and drives `rmcp`'s one-shot refresh — so the durable
-/// refresh token is spent at connect time, not trusted as a persisted bearer.
-/// Without one, the durable access token is the only credential there is, so it
-/// is served directly as the bearer.
-fn synthetic_response(access_token: &str, refresh_token: Option<&str>) -> OAuthTokenResponse {
+/// The bearer is left empty and the response is given a zero `expires_in`, so
+/// `rmcp`'s expiry check fires and it refreshes the access token *proactively*
+/// (via the durable refresh token) before the first request. Relying instead on
+/// the server answering the empty bearer with a `401` challenge to trigger the
+/// refresh is fragile: some authorization servers — GitHub's remote MCP
+/// endpoint among them — reject an empty `Authorization: Bearer` with `400`
+/// ("Authorization header is badly formatted") rather than `401`, and `rmcp`
+/// treats only `401` as an auth challenge, so the refresh would never run and
+/// the connect would fail. An immediate expiry makes the refresh independent of
+/// the server's challenge status, and the durable refresh token is still spent
+/// at connect time rather than trusted as a persisted bearer.
+fn synthetic_refresh_response(refresh_token: &str) -> OAuthTokenResponse {
     let mut response: OAuthTokenResponse = StandardTokenResponse::new(
-        AccessToken::new(access_token.to_string()),
+        AccessToken::new(String::new()),
         BasicTokenType::Bearer,
         VendorExtraTokenFields::default(),
     );
-    if let Some(refresh_token) = refresh_token {
-        response.set_refresh_token(Some(RefreshToken::new(refresh_token.to_string())));
-    }
+    response.set_refresh_token(Some(RefreshToken::new(refresh_token.to_string())));
+    // A zero lifetime marks the response expired, so `rmcp` refreshes at once
+    // (see above) instead of sending the empty bearer and awaiting a `401`.
+    response.set_expires_in(Some(&Duration::from_secs(0)));
     response
+}
+
+/// A synthetic token response a cold `load` builds when the durable grant
+/// carries **no** refresh token: the durable access token is the only credential
+/// there is, so it is served directly as the bearer, with no `expires_in` so
+/// `rmcp` skips its expiry check and sends it as-is (there is nothing to refresh
+/// it with).
+fn synthetic_access_response(access_token: &str) -> OAuthTokenResponse {
+    StandardTokenResponse::new(
+        AccessToken::new(access_token.to_string()),
+        BasicTokenType::Bearer,
+        VendorExtraTokenFields::default(),
+    )
 }
 
 /// The current Unix time in seconds.
@@ -204,17 +223,20 @@ impl CredentialStore for CredentialStoreAdapter {
         let cached = self.cache.lock().await.clone();
         let (token_response, token_received_at) = match cached {
             Some(c) => (Some(c.response), Some(c.received_at)),
-            // Cold start. With a refresh token, serve a refresh-only response so
-            // `rmcp` refreshes. Without one, serve the durable access token
-            // directly (no `received_at`, so `rmcp` skips the expiry check and
-            // sends it as the bearer) — the server issued no refresh token, so
+            // Cold start. With a refresh token, serve an already-expired
+            // refresh-only response so `rmcp` refreshes the access token at once
+            // (the durable refresh token is spent at connect time, never trusted
+            // as a persisted bearer). Without one, serve the durable access token
+            // directly with no `received_at`, so `rmcp` skips the expiry check
+            // and sends it as the bearer — the server issued no refresh token, so
             // it is the only credential there is.
             None => match (refresh_token.as_deref(), access_token.as_deref()) {
-                // A refresh token wins: serve it with an empty bearer so the
-                // connect-time refresh drives the exchange.
-                (Some(rt), _) => (Some(synthetic_response("", Some(rt))), None),
+                // A refresh token is served as an immediately-expired grant so
+                // `rmcp`'s proactive refresh runs before the first request; the
+                // `received_at` anchor is what lets its expiry check fire.
+                (Some(rt), _) => (Some(synthetic_refresh_response(rt)), Some(now_secs())),
                 // No refresh token: the durable access token is the bearer.
-                (None, Some(at)) => (Some(synthetic_response(at, None)), None),
+                (None, Some(at)) => (Some(synthetic_access_response(at)), None),
                 (None, None) => (None, None),
             },
         };
@@ -499,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn cold_load_serves_a_refresh_only_response() {
+    fn cold_load_serves_an_expired_refresh_only_response() {
         crate::runtime::init().expect("runtime init");
         let backend = FakeBackend::new(Some(durable_oauth()));
         let adapter = CredentialStoreAdapter::new("mcp:docs|x".into(), backend);
@@ -508,14 +530,24 @@ mod tests {
             .expect("load ok")
             .expect("some credentials");
         let response = stored.token_response.expect("a token response");
-        // No access token, but a refresh token is present, and no received_at
-        // so `rmcp` skips the expiry check and drives a connect-time refresh.
+        // No access token, the refresh token is present, and the response is
+        // marked expired (a zero `expires_in` plus a `received_at` anchor), so
+        // `rmcp`'s expiry check fires and it refreshes proactively before the
+        // first request — rather than sending an empty bearer and awaiting a
+        // `401` (which GitHub answers with `400`).
         assert_eq!(response.access_token().secret(), "");
         assert_eq!(
             response.refresh_token().map(|t| t.secret().as_str()),
             Some("refresh-secret")
         );
-        assert_eq!(stored.token_received_at, None);
+        assert_eq!(
+            response.expires_in(),
+            Some(std::time::Duration::from_secs(0))
+        );
+        assert!(
+            stored.token_received_at.is_some(),
+            "a `received_at` anchor is required for rmcp's expiry check to fire"
+        );
         assert_eq!(stored.client_id, "client-1");
     }
 

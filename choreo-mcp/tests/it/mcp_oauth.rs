@@ -617,8 +617,15 @@ fn insufficient_scope_surfaces_auth_required() {
         matches!(err, McpError::AuthRequired { .. }),
         "expected AuthRequired, got: {err:?}"
     );
-    // A 403 is not a refresh trigger, so the token endpoint is untouched.
-    assert_eq!(mock.token_hits(), 0, "a scope challenge does not refresh");
+    // The connect refreshes the access token up front (the cold load serves an
+    // already-expired refresh-only grant), so the token endpoint is hit once;
+    // the fresh bearer is then rejected with the scope challenge, which is what
+    // surfaces the authorization-required error.
+    assert_eq!(
+        mock.token_hits(),
+        1,
+        "the cold start refreshes once before the request"
+    );
 }
 
 /// A stored grant whose issuer no longer matches the authorization server

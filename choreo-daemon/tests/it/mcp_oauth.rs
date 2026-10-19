@@ -243,8 +243,21 @@ impl MockAuthorizationServer {
     /// requires. `advertise_challenge` makes the `/mcp` endpoint answer an
     /// unauthenticated request with a `401` and a
     /// `WWW-Authenticate: Bearer resource_metadata="…"` challenge, so the
-    /// sign-in must discover the authorization server from the challenge.
+    /// sign-in must discover the authorization server from the challenge. The
+    /// token endpoint issues a refresh token.
     fn start(client_auth: ClientAuthMode, advertise_challenge: bool) -> Self {
+        Self::start_with(client_auth, advertise_challenge, true)
+    }
+
+    /// As [`Self::start`], but `issue_refresh_token` selects whether the token
+    /// endpoint's reply carries a `refresh_token` at all. A false value models a
+    /// GitHub OAuth App (a long-lived access token and no refresh token), the
+    /// case where the durable grant must instead persist the access token.
+    fn start_with(
+        client_auth: ClientAuthMode,
+        advertise_challenge: bool,
+        issue_refresh_token: bool,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock AS");
         let origin = format!("http://{}", listener.local_addr().expect("addr"));
         let state = origin.clone();
@@ -253,7 +266,13 @@ impl MockAuthorizationServer {
                 let Ok(stream) = stream else { continue };
                 let origin = state.clone();
                 std::thread::spawn(move || {
-                    handle(stream, &origin, client_auth, advertise_challenge);
+                    handle(
+                        stream,
+                        &origin,
+                        client_auth,
+                        advertise_challenge,
+                        issue_refresh_token,
+                    );
                 });
             }
         });
@@ -290,6 +309,7 @@ fn handle(
     origin: &str,
     client_auth: ClientAuthMode,
     advertise_challenge: bool,
+    issue_refresh_token: bool,
 ) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
     let Some(request) = read_request(&stream) else {
@@ -352,15 +372,18 @@ fn handle(
                 );
                 return;
             }
-            let body = serde_json::json!({
+            let mut grant = serde_json::json!({
                 "access_token": "access-token-secret",
                 "token_type": "Bearer",
-                "refresh_token": "rt-mock",
                 "scope": "openid",
                 "expires_in": 3600,
-            })
-            .to_string();
-            write_json(&mut stream, "200 OK", &body);
+            });
+            // A server that issues no refresh token (a GitHub OAuth App) omits
+            // the field entirely rather than sending an empty one.
+            if issue_refresh_token && let Some(object) = grant.as_object_mut() {
+                object.insert("refresh_token".to_string(), serde_json::json!("rt-mock"));
+            }
+            write_json(&mut stream, "200 OK", &grant.to_string());
         }
         _ => write_json(&mut stream, "404 Not Found", "{}"),
     }
@@ -614,4 +637,41 @@ fn mcp_login_discovers_via_www_authenticate_challenge() {
         "the AS named by the challenge is discovered and recorded"
     );
     assert_eq!(view.client_id, Some("dcr-client-1"));
+}
+
+/// A server that issues NO refresh token (a GitHub OAuth App's shape): the
+/// sign-in must persist the long-lived access token in the durable grant — it
+/// is the only credential that can authenticate the connect — and leave the
+/// refresh token absent. This is the failing-first coverage for the case where
+/// an access-token-only grant was stored with the token dropped.
+#[test]
+#[ignore = "integration: binds a local mock authorization server"]
+fn mcp_login_stores_the_access_token_when_the_server_issues_no_refresh_token() {
+    let mock = MockAuthorizationServer::start_with(ClientAuthMode::Public, false, false);
+    let credential_key = "mcp:github|abc123".to_string();
+    let info = McpLoginInfo {
+        slug: "github".to_string(),
+        resource: mock.mcp_url.clone(),
+        credential_key: credential_key.clone(),
+        oauth: WireOAuthConfig {
+            client_id: None,
+            callback_port: Some(0),
+            scopes: Vec::new(),
+            authorization_server: None,
+            client_secret_env: None,
+        },
+    };
+    let (service, credential) = drive_login(info);
+    assert_eq!(service, credential_key);
+    let view = credential.as_oauth().expect("an OAuth credential");
+    assert_eq!(view.kind, OAuthKind::Mcp);
+    assert_eq!(
+        view.refresh_token, None,
+        "the mock issued no refresh token, so none must be stored"
+    );
+    assert_eq!(
+        view.access_token,
+        Some("access-token-secret"),
+        "with no refresh token, the access token is the only credential and must be persisted"
+    );
 }

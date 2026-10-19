@@ -1000,7 +1000,12 @@ manual `/mcp reconnect` either. A project server's `oauth` block is
 repo-controlled, so sign-in for it refuses while the project root is untrusted,
 and a stored grant whose issuer or resource no longer matches the configured
 server is treated as absent (fail-closed) and surfaces a re-login. Token refresh
-at connect is owned by the `rmcp` client's authorization manager. A server whose
+at connect is owned by the `rmcp` client's authorization manager: when the
+stored grant carries a refresh token, the connect refreshes the access token
+proactively (the adapter presents the durable refresh token as an
+already-expired grant, so the refresh happens up front rather than relying on the
+server challenging an empty bearer — GitHub answers that with a `400`, not the
+`401` a challenge-triggered refresh needs). A server whose
 authorization server issues **no refresh token** (e.g. GitHub's remote MCP via an
 OAuth App) is still usable: the long-lived access token it returns is stored in
 the grant — the one case the access token is persisted — so the server connects

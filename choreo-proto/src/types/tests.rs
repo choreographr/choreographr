@@ -244,6 +244,64 @@ fn add_credential_round_trips_with_typed_credential() {
 }
 
 #[test]
+fn add_credential_round_trips_an_oauth_access_token() {
+    // The durable MCP access token (present only for a grant whose server
+    // issued no refresh token) rides the same `AddCredential` frame. A grant
+    // whose `access_token` is `Some` must survive both wire formats with its
+    // value intact: a codec that dropped or nulled it would leave the server
+    // permanently unauthenticated even though the login stored it.
+    let credential = ServiceCredential::OAuth {
+        kind: choreo_shared::OAuthKind::Mcp,
+        issuer: Some("https://as.example".into()),
+        resource: Some("https://example.com/mcp".into()),
+        authorization_server: Some("https://as.example".into()),
+        token_endpoint: None,
+        refresh_encoding: None,
+        refresh_token: None,
+        access_token: Some("gho_durable_access".into()),
+        account_id: None,
+        client_id: Some("client-1".into()),
+        client_secret: None,
+        granted_scopes: vec!["repo".into()],
+        token_type: Some("Bearer".into()),
+    };
+    let msg = ClientMessage::request(
+        9,
+        ClientMessageType::AddCredential {
+            service: "mcp:github|abc".to_string(),
+            credential: Box::new(credential),
+        },
+    );
+
+    let bytes = rmp_serde::to_vec_named(&msg).expect("encode");
+    let decoded: ClientMessage = rmp_serde::from_slice(&bytes).expect("decode");
+    let ClientMessageType::AddCredential { credential, .. } = decoded.inner else {
+        panic!("expected AddCredential");
+    };
+    let view = credential.as_oauth().expect("an OAuth credential");
+    assert_eq!(
+        view.access_token,
+        Some("gho_durable_access"),
+        "MessagePack must preserve the durable access token"
+    );
+    assert!(view.refresh_token.is_none());
+
+    let json = serde_json::to_string(&msg).expect("serialize");
+    let decoded: ClientMessage = serde_json::from_str(&json).expect("deserialize");
+    let ClientMessageType::AddCredential { credential, .. } = decoded.inner else {
+        panic!("expected AddCredential");
+    };
+    assert_eq!(
+        credential
+            .as_oauth()
+            .expect("an OAuth credential")
+            .access_token,
+        Some("gho_durable_access"),
+        "JSON must preserve the durable access token"
+    );
+}
+
+#[test]
 fn add_credential_without_credential_fails_to_decode() {
     // The credential is a REQUIRED field; a payload carrying only the
     // service must REJECT rather than silently decoding with a missing

@@ -11,9 +11,11 @@
 //! Two invariants shape the adapter:
 //!
 //! - **The access token never reaches the keystore — normally.** `save` strips
-//!   it and serves it from an in-process cache; `load` synthesises a token
-//!   response carrying the durable refresh token when the cache is cold, so
-//!   `rmcp` refreshes on connect rather than trusting a persisted bearer. The
+//!   it and serves it from an in-process cache; `load` synthesises an
+//!   **already-expired** token response carrying the durable refresh token when
+//!   the cache is cold, so `rmcp` refreshes proactively on connect (its expiry
+//!   check fires) rather than trusting a persisted bearer or waiting for the
+//!   server to challenge an empty bearer. The
 //!   one deliberate exception: when the authorization server issued no refresh
 //!   token, the access token is the only usable credential, so it is persisted
 //!   in the durable grant and served directly on a cold `load`.
