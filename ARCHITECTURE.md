@@ -697,7 +697,10 @@ loopback `http` address) is likewise one shared predicate
 apply, so the two cannot drift; and the token-endpoint response body is parsed
 by one shared reader (`choreo-shared`'s `oauth_token`), so a token reply —
 success or error, and with a `expires_in` a lenient provider emits as a string —
-is interpreted identically by both paths. The login path applies the endpoint
+is interpreted identically by both paths, and the owned token set it projects to
+(`choreo_shared::oauth_token::TokenSet`) is that one shared type, so the
+wipe-on-drop of the access/refresh/id tokens and their redacting `Debug` are
+decided in one place rather than per path. The login path applies the endpoint
 rule to every endpoint it
 sends a credential to — the token and device calls, and the authorization
 endpoint before the URL is opened in the browser — refusing a URL whose
@@ -765,7 +768,11 @@ a prune can never evict a lock that is in use. `OAuthRefreshLocks` is the
 **Rotate-if-present**: the engine
 adopts a returned `refresh_token` when one is present and keeps the stored one
 when it is omitted — one code path for rotating and non-rotating providers — and
-replaces the `account_id` claim only when a new `id_token` carries it.
+replaces the `account_id` claim only when a new `id_token` carries it. That claim
+is derived at the one place that persists it (`refresh_under_lock`), from the
+returned `id_token` through the shared namespace decode, rather than carried on
+the token set: login and refresh read the claim the same way, and the refresh
+parse stays a pure status → token-set projection.
 
 A request refreshes proactively when the cached token is absent or within a
 hardcoded **60 s** buffer of expiry (`oauth_refresh::REFRESH_BUFFER_SECS`), and

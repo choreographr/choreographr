@@ -5,9 +5,11 @@
 //! and must read back the same reply — a token set on success, or an
 //! `error`/`error_description` pair on failure. This module is that read, so the
 //! two paths cannot drift into different interpretations of the same body. It
-//! sits beside [`oauth_claims`](crate::oauth_claims) (the `id_token` claim decode)
-//! and [`oauth_endpoint`](crate::oauth_endpoint) (the endpoint-security policy) as
-//! the third shared OAuth helper.
+//! also owns the owned projection of that read ([`TokenSet`]), so which fields
+//! are wipe-on-drop and which the redacting `Debug` withholds is decided here
+//! once, not per caller. It sits beside [`oauth_claims`](crate::oauth_claims) (the
+//! `id_token` claim decode) and [`oauth_endpoint`](crate::oauth_endpoint) (the
+//! endpoint-security policy) as the third shared OAuth helper.
 //!
 //! The shape is deliberately lenient: every field is optional and a body that is
 //! not the expected JSON degrades to all-`None` rather than failing the parse, so
@@ -17,6 +19,7 @@
 //! force a re-refresh on every request.
 
 use serde::Deserialize;
+use zeroize::Zeroizing;
 
 /// An OAuth token-endpoint response body.
 ///
@@ -50,9 +53,8 @@ pub struct TokenResponse {
 /// Redacting `Debug`: the struct holds the freshly minted access/refresh/id
 /// tokens, so a logged response must not expose them. Hand-written (not derived)
 /// because this type sits on the shared login/refresh boundary — one stray
-/// `{:?}` would leak a live token — mirroring the redacting `Debug` on the
-/// sibling token types (`TokenSet`, `OAuthTokenResponse`). Only presence and the
-/// non-secret provider-error fields are printed.
+/// `{:?}` would leak a live token — under the same rule [`TokenSet`] applies.
+/// Only presence and the non-secret provider-error fields are printed.
 impl std::fmt::Debug for TokenResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenResponse")
@@ -80,6 +82,68 @@ impl std::fmt::Debug for TokenResponse {
 #[must_use]
 pub fn parse(body: &str) -> TokenResponse {
     serde_json::from_str(body).unwrap_or_default()
+}
+
+/// The owned token set a successful token-endpoint reply projects to.
+///
+/// This is the one projection of a [`TokenResponse`] into the values a caller
+/// keeps: the login library and the runtime refresh client both build it via
+/// [`TokenSet::from_response`], so the two paths cannot disagree about which
+/// fields a reply yields. The access, refresh, and id tokens are wipe-on-drop
+/// ([`Zeroizing`]) and the hand-written `Debug` reports only their presence,
+/// never their value, so a token can never reach a log line by way of a `{:?}`.
+pub struct TokenSet {
+    /// The new bearer access token.
+    pub access_token: Zeroizing<String>,
+    /// A rotated refresh token, when the server issued one. Rotation is
+    /// rotate-if-present: an absent value means the caller keeps its stored one.
+    pub refresh_token: Option<Zeroizing<String>>,
+    /// The raw OIDC `id_token` (a JWT), when the server issued one. The identity
+    /// claim is decoded from it by whichever caller persists that claim.
+    pub id_token: Option<Zeroizing<String>>,
+    /// The bearer token type (almost always `Bearer`).
+    pub token_type: Option<String>,
+    /// The granted scopes, when the server echoed them.
+    pub scope: Option<String>,
+    /// The access token's lifetime in seconds, when the server reported one.
+    pub expires_in: Option<u64>,
+}
+
+/// Redacting `Debug`: the set holds the freshly minted access/refresh/id tokens,
+/// so a logged token set must not expose them. Hand-written (not derived) because
+/// one stray `{:?}` would leak a live token; only presence flags and the
+/// non-secret fields are printed.
+impl std::fmt::Debug for TokenSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenSet")
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &self.refresh_token.is_some())
+            .field("id_token", &self.id_token.is_some())
+            .field("token_type", &self.token_type)
+            .field("scope", &self.scope)
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
+
+impl TokenSet {
+    /// Project a parsed token reply into an owned token set, or `None` when the
+    /// reply carried no access token (an OAuth error body, or an empty one).
+    ///
+    /// The three token fields are wrapped in [`Zeroizing`] so they are wiped on
+    /// drop; the non-secret fields are carried verbatim.
+    #[must_use]
+    pub fn from_response(parsed: TokenResponse) -> Option<Self> {
+        let access_token = parsed.access_token?;
+        Some(Self {
+            access_token: Zeroizing::new(access_token),
+            refresh_token: parsed.refresh_token.map(Zeroizing::new),
+            id_token: parsed.id_token.map(Zeroizing::new),
+            token_type: parsed.token_type,
+            scope: parsed.scope,
+            expires_in: parsed.expires_in,
+        })
+    }
 }
 
 /// Deserialize `expires_in` from either a JSON number or a numeric string.
@@ -171,6 +235,57 @@ mod tests {
         assert!(debug.contains("<redacted>"), "{debug}");
         assert!(debug.contains("refresh_token: true"), "{debug}");
         assert!(debug.contains("invalid_grant"), "{debug}");
+    }
+
+    #[test]
+    fn token_set_projects_every_field_of_a_success_reply() {
+        let body = r#"{
+            "access_token": "at-1",
+            "refresh_token": "rt-2",
+            "id_token": "idt",
+            "token_type": "Bearer",
+            "scope": "openid profile",
+            "expires_in": 3600
+        }"#;
+        let tokens = TokenSet::from_response(parse(body)).expect("access token present");
+        assert_eq!(tokens.access_token.as_str(), "at-1");
+        assert_eq!(
+            tokens.refresh_token.as_deref().map(String::as_str),
+            Some("rt-2")
+        );
+        assert_eq!(tokens.id_token.as_deref().map(String::as_str), Some("idt"));
+        assert_eq!(tokens.token_type.as_deref(), Some("Bearer"));
+        assert_eq!(tokens.scope.as_deref(), Some("openid profile"));
+        assert_eq!(tokens.expires_in, Some(3600));
+    }
+
+    #[test]
+    fn token_set_is_none_without_an_access_token() {
+        // An OAuth error body carries no token set at all.
+        assert!(TokenSet::from_response(parse(r#"{"error":"invalid_grant"}"#)).is_none());
+        assert!(TokenSet::from_response(parse("")).is_none());
+    }
+
+    #[test]
+    fn token_set_debug_never_prints_a_token_value() {
+        let body = r#"{
+            "access_token": "at-secret",
+            "refresh_token": "rt-secret",
+            "id_token": "idt-secret",
+            "token_type": "Bearer",
+            "scope": "openid",
+            "expires_in": 60
+        }"#;
+        let tokens = TokenSet::from_response(parse(body)).expect("access token present");
+        let debug = format!("{tokens:?}");
+        for secret in ["at-secret", "rt-secret", "idt-secret"] {
+            assert!(!debug.contains(secret), "Debug leaked {secret}: {debug}");
+        }
+        // Presence flags and the non-secret fields still render.
+        assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(debug.contains("refresh_token: true"), "{debug}");
+        assert!(debug.contains("id_token: true"), "{debug}");
+        assert!(debug.contains("expires_in: Some(60)"), "{debug}");
     }
 
     #[test]

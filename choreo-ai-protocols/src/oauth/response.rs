@@ -2,21 +2,15 @@
 //! returns, the classified failure type, and the parse/classify contract.
 //!
 //! A 2xx body yields an [`OAuthTokenResponse`]; anything else yields an
-//! [`OAuthRefreshError`] classified terminal-vs-transient. The token fields are
-//! already wrapped in [`Zeroizing`] and the caller never logs them, so
-//! `Display`/`Debug` are not derived on the token response — only a redacting
-//! [`Debug`](std::fmt::Debug) is provided. The parse is split from the transport
-//! so the classify contract is unit testable.
+//! [`OAuthRefreshError`] classified terminal-vs-transient. The token set is the
+//! one shared projection (`choreo_shared::oauth_token::TokenSet`), so its
+//! wipe-on-drop token fields and its redacting `Debug` are defined in one place
+//! rather than here. The parse is split from the transport so the classify
+//! contract is unit testable.
 
-use zeroize::Zeroizing;
-
-// The `ChatGPT` account-id decoder is shared with the login library, so a
-// rotated `id_token` is read through the same namespace decode; re-exported by
-// the parent module so callers keep using `choreo_ai_protocols::oauth::…`.
-use choreo_shared::oauth_claims::chatgpt_account_id_from_id_token;
-// The token-endpoint response shape is the one parse both the login library and
-// this refresh client read, so a token reply cannot drift in interpretation
-// between the two paths.
+// The token-endpoint response shape and its owned projection are the one read
+// both the login library and this refresh client perform, so a token reply
+// cannot drift in interpretation between the two paths.
 use choreo_shared::oauth_token::{TokenResponse, parse};
 
 /// The terminal OAuth error codes the catalog documents as "the grant is dead":
@@ -31,45 +25,15 @@ const TERMINAL_ERROR_CODES: &[&str] = &["invalid_grant", "invalid_token", "refre
 
 /// The token set a successful refresh returned.
 ///
-/// Every secret field is wipe-on-drop. Only the access token is required by the
-/// spec; a rotating provider also returns a fresh `refresh_token`, and an OIDC
-/// provider may return a new `id_token` (from which the `ChatGPT` account claim
-/// is re-extracted). Rotation is **rotate-if-present**: the caller adopts
-/// `refresh_token` when `Some` and keeps the stored one when `None`.
-pub struct OAuthTokenResponse {
-    /// The new bearer access token.
-    pub access_token: Zeroizing<String>,
-    /// The rotated refresh token, when the server issued one.
-    pub refresh_token: Option<Zeroizing<String>>,
-    /// The raw OIDC `id_token`, when the server issued one. Not stored by the
-    /// caller — only the extracted claim is — and wipe-on-drop like the other
-    /// token fields.
-    pub id_token: Option<Zeroizing<String>>,
-    /// The access token's lifetime in seconds, when the server reported one.
-    pub expires_in: Option<u64>,
-    /// The bearer token type (almost always `Bearer`).
-    pub token_type: Option<String>,
-    /// The `ChatGPT` account id re-extracted from a new `id_token`, when one was
-    /// returned and carried the claim. `None` when no `id_token` was returned,
-    /// so the caller keeps the stored claim.
-    pub account_id: Option<String>,
-}
-
-/// Redacting `Debug`: the access/refresh tokens are secret and the account id
-/// is a sensitive claim, so a logged token response must not expose them; only
-/// presence flags are printed.
-impl std::fmt::Debug for OAuthTokenResponse {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OAuthTokenResponse")
-            .field("access_token", &"***")
-            .field("has_refresh_token", &self.refresh_token.is_some())
-            .field("has_id_token", &self.id_token.is_some())
-            .field("expires_in", &self.expires_in)
-            .field("token_type", &self.token_type)
-            .field("has_account_id", &self.account_id.is_some())
-            .finish()
-    }
-}
+/// This is the shared projection (`choreo_shared::oauth_token::TokenSet`) the
+/// login library also builds, so which fields a reply yields — and their
+/// wipe-on-drop and redacting-`Debug` rules — is defined in one place. Only the
+/// access token is required by the spec; a rotating provider also returns a fresh
+/// `refresh_token`, and an OIDC provider may return a new `id_token` (from which
+/// the identity claim is re-extracted by the caller that persists it). Rotation
+/// is **rotate-if-present**: the caller adopts `refresh_token` when `Some` and
+/// keeps the stored one when `None`.
+pub type OAuthTokenResponse = choreo_shared::oauth_token::TokenSet;
 
 /// A refresh failure, classified so the caller can act on it.
 #[derive(Debug, thiserror::Error)]
@@ -118,23 +82,14 @@ pub(super) fn parse_token_response(
     if (200..300).contains(&status) {
         // A success status with a token: the access token is the one required
         // field. A "success" without one is odd but transient — the caller
-        // retries rather than treating it as a dead grant.
-        let Some(access_token) = parsed.access_token else {
-            return Err(OAuthRefreshError::Transient {
+        // retries rather than treating it as a dead grant. The identity claim is
+        // deliberately not extracted here: whoever persists the claim derives it
+        // from the returned `id_token` through the shared decode, so this parse
+        // stays a pure status → token-set projection.
+        return OAuthTokenResponse::from_response(parsed).ok_or_else(|| {
+            OAuthRefreshError::Transient {
                 detail: format!("token endpoint returned {status} without an access_token"),
-            });
-        };
-        let account_id = parsed
-            .id_token
-            .as_deref()
-            .and_then(chatgpt_account_id_from_id_token);
-        return Ok(OAuthTokenResponse {
-            access_token: Zeroizing::new(access_token),
-            refresh_token: parsed.refresh_token.map(Zeroizing::new),
-            id_token: parsed.id_token.map(Zeroizing::new),
-            expires_in: parsed.expires_in,
-            token_type: parsed.token_type,
-            account_id,
+            }
         });
     }
 
@@ -174,6 +129,9 @@ fn classify_error_detail(error: Option<&str>, description: Option<&str>) -> Stri
 mod tests {
     use super::*;
     use base64::Engine as _;
+    // The identity-claim decoder the persisting caller uses; the tests exercise
+    // the same derivation from the returned token set.
+    use choreo_shared::oauth_claims::chatgpt_account_id_from_id_token;
 
     #[test]
     fn success_response_parses_and_rotates_if_present() {
@@ -271,13 +229,24 @@ mod tests {
         let body =
             format!(r#"{{"access_token":"at","refresh_token":"rt","id_token":"{id_token}"}}"#);
         let tokens = parse_token_response(200, &body).expect("parses");
-        assert_eq!(tokens.account_id.as_deref(), Some("acct_9"));
+        // The parse carries the raw `id_token`; the claim is derived from it by
+        // the caller that persists it, through the one shared decode.
+        let account_id = tokens
+            .id_token
+            .as_deref()
+            .and_then(|id_token| chatgpt_account_id_from_id_token(id_token.as_str()));
+        assert_eq!(account_id.as_deref(), Some("acct_9"));
     }
 
     #[test]
     fn account_id_is_none_without_an_id_token() {
         let tokens = parse_token_response(200, r#"{"access_token":"at"}"#).expect("parses");
-        assert!(tokens.account_id.is_none());
+        assert!(tokens.id_token.is_none());
+        let account_id = tokens
+            .id_token
+            .as_deref()
+            .and_then(|id_token| chatgpt_account_id_from_id_token(id_token.as_str()));
+        assert!(account_id.is_none());
     }
 
     #[test]

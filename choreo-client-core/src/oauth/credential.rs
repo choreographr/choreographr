@@ -122,6 +122,7 @@ mod tests {
             id_token: id_token.map(|t| zeroize::Zeroizing::new(t.to_string())),
             token_type: Some("Bearer".into()),
             scope: scope.map(str::to_string),
+            expires_in: None,
         }
     }
 

@@ -29,57 +29,13 @@ use zeroize::Zeroizing;
 pub(crate) use choreo_shared::form::form_encode;
 // The token-endpoint success/error body is the one shape `choreo-shared` parses,
 // so a token reply is read the same way by this login library and the runtime
-// refresh client (`choreo-ai-protocols`).
+// refresh client (`choreo-ai-protocols`); the owned token set it projects to is
+// re-exported from there too, so the wipe-on-drop and redaction rules on the
+// tokens live in one place.
+pub(crate) use choreo_shared::oauth_token::TokenSet;
 use choreo_shared::oauth_token::{TokenResponse, parse};
 
 use super::OAuthLoginError;
-
-/// The tokens returned by an authorization-code or device-code exchange.
-///
-/// The access, refresh, and id tokens are wipe-on-drop ([`Zeroizing`]); the
-/// `Debug` impl reports only their presence, never their value, so a token can
-/// never reach a log line by way of a `{:?}`.
-pub(crate) struct TokenSet {
-    /// The bearer access token.
-    pub(crate) access_token: Zeroizing<String>,
-    /// The refresh token, when the provider issued one.
-    pub(crate) refresh_token: Option<Zeroizing<String>>,
-    /// The OIDC `id_token` (JWT), when the provider issued one.
-    pub(crate) id_token: Option<Zeroizing<String>>,
-    /// The bearer token type (almost always `Bearer`).
-    pub(crate) token_type: Option<String>,
-    /// The scopes the provider granted.
-    pub(crate) scope: Option<String>,
-}
-
-impl std::fmt::Debug for TokenSet {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TokenSet")
-            .field("access_token", &"<redacted>")
-            .field("refresh_token", &self.refresh_token.is_some())
-            .field("id_token", &self.id_token.is_some())
-            .field("token_type", &self.token_type)
-            .field("scope", &self.scope)
-            .finish()
-    }
-}
-
-impl TokenSet {
-    /// Build a token set from the shared token-response parse, or `None` when
-    /// the reply carried no access token (an OAuth error body, or an empty
-    /// one). The one `TokenResponse`→`TokenSet` projection, so the code
-    /// exchange and the device poll read the shared parse identically.
-    fn from_response(parsed: TokenResponse) -> Option<Self> {
-        let access_token = parsed.access_token?;
-        Some(Self {
-            access_token: Zeroizing::new(access_token),
-            refresh_token: parsed.refresh_token.map(Zeroizing::new),
-            id_token: parsed.id_token.map(Zeroizing::new),
-            token_type: parsed.token_type,
-            scope: parsed.scope,
-        })
-    }
-}
 
 /// The device-authorization (`usercode`) response.
 ///
@@ -656,6 +612,7 @@ mod tests {
         assert_eq!(tokens.id_token.as_deref().map(String::as_str), Some("id"));
         assert_eq!(tokens.token_type.as_deref(), Some("Bearer"));
         assert_eq!(tokens.scope.as_deref(), Some("openid"));
+        assert_eq!(tokens.expires_in, None);
         // A reply with no access token (an OAuth error body, or an empty one)
         // yields no token set.
         let error_only = TokenResponse {

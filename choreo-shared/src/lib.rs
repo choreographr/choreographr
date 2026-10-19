@@ -27,9 +27,11 @@
 //!   client apply before sending a code or token, so the two cannot drift into
 //!   different rules for the same request shape.
 //! - [`oauth_token`] — the one read of an OAuth token-endpoint response body
-//!   ([`oauth_token::TokenResponse`] / [`oauth_token::parse`]), shared so the
-//!   login library and the runtime refresh client read the token reply — success
-//!   or error — the same way.
+//!   ([`oauth_token::TokenResponse`] / [`oauth_token::parse`]) and its owned
+//!   projection ([`oauth_token::TokenSet`]), shared so the login library and the
+//!   runtime refresh client read the token reply — success or error — the same
+//!   way, and agree on which token fields are wipe-on-drop and redacted in
+//!   `Debug`.
 //! - [`url`] — the slash-tolerant base-plus-path join ([`url::join_path`]) the
 //!   login library, the MCP login, and the runtime refresh material share, so
 //!   the same issuer/path pair cannot join to different URLs in each path.

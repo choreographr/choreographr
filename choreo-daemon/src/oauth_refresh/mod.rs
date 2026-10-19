@@ -27,7 +27,9 @@
 //! resolving it under `choreo_daemon::oauth_refresh::…`.
 
 use choreo_ai_protocols::catalog::GrantEncoding;
-use choreo_ai_protocols::oauth::{OAuthRefreshError, OAuthRefreshRequest, refresh_oauth_token};
+use choreo_ai_protocols::oauth::{
+    OAuthRefreshError, OAuthRefreshRequest, chatgpt_account_id_from_id_token, refresh_oauth_token,
+};
 use tracing::warn;
 use zeroize::Zeroizing;
 
@@ -267,7 +269,14 @@ fn refresh_under_lock(
                     .map(|secs| now.saturating_add(i64::try_from(secs).unwrap_or(i64::MAX))),
                 received_at: now,
                 refresh_token: tokens.refresh_token,
-                account_id: tokens.account_id,
+                // The identity claim is derived from the rotated `id_token` here,
+                // at the one place that persists it, rather than carried on the
+                // token set: the refresh parse stays claim-agnostic, and login
+                // and refresh read the same shared namespace decode.
+                account_id: tokens
+                    .id_token
+                    .as_deref()
+                    .and_then(|id_token| chatgpt_account_id_from_id_token(id_token.as_str())),
             };
             match source.save(account, Some(material.refresh_token.as_str()), &refreshed) {
                 Ok(()) => Ok(RefreshTokenOutcome::Refreshed),
