@@ -46,6 +46,13 @@ struct DurableSeed {
     access_token: Option<Zeroizing<String>>,
     client_secret: Option<Zeroizing<String>>,
     token_type: Option<String>,
+    /// The client id the durable grant was minted for. The token response never
+    /// carries it, so the warm-cache fast path (`load`'s cache-first branch)
+    /// needs this copy to build its `StoredCredentials` without a backend read.
+    client_id: String,
+    /// The scopes the durable grant was issued for, kept for the same reason as
+    /// the client id: `rmcp` replays them onto the refresh request.
+    granted_scopes: Vec<String>,
 }
 
 /// The pure inputs to [`project_durable_grant`]: everything a `save` needs to
@@ -223,6 +230,51 @@ impl CredentialStoreAdapter {
     pub fn key(&self) -> &str {
         &self.key
     }
+
+    /// Serve the warm in-process cache when `rmcp` would use the token as-is,
+    /// rather than paying a blocking backend read, the process-global snapshot
+    /// lock, and a whole-credential clone on every request.
+    ///
+    /// Returns `None` whenever the full load must run: no cached token, a token
+    /// inside [`CACHE_SERVE_MARGIN_SECS`], no established seed, or a seed that no
+    /// longer describes the cached grant.
+    ///
+    /// The seed check is what makes the shortcut safe for the save that follows a
+    /// refresh. A refresh rebuilds the seed from the durable store; serving from
+    /// cache skips that rebuild, so the seed must already match the cached token
+    /// (its refresh token is the one `rmcp` will present, and the one a later
+    /// `save` compares against and hands the backend as its
+    /// `expected_refresh_token`). The two agree exactly when the last full load
+    /// observed the grant the cache holds — a rotation this adapter then saved
+    /// leaves them apart until the next full load, which is what re-pins the
+    /// seed. Mismatched, the load falls through and re-reads the backend.
+    async fn load_from_cache(&self) -> Option<StoredCredentials> {
+        // The two mutexes are taken one at a time, in `save`'s order and never
+        // nested: only the value each guard covers is cloned out of it.
+        let cached = self.cache.lock().await.clone()?;
+        if !cache_is_usable(&cached.response, cached.received_at, now_secs()) {
+            return None;
+        }
+        let seed = self.seed.lock().await.clone()?;
+        // A plain `==` (not constant-time) is deliberate: both operands are
+        // in-process secrets already resident in this task's memory, so there is
+        // no timing oracle for an attacker who could not already read them.
+        let cached_refresh = cached.response.refresh_token().map(|t| t.secret().as_str());
+        let seed_refresh = seed.refresh_token.as_ref().map(|t| t.as_str());
+        if cached_refresh != seed_refresh {
+            return None;
+        }
+        tracing::trace!(key = %self.key, "served warm cached MCP token");
+        Some(
+            StoredCredentials::new(
+                seed.client_id.clone(),
+                Some(cached.response),
+                seed.granted_scopes.clone(),
+                Some(cached.received_at),
+            )
+            .with_issuer(seed.issuer.clone()),
+        )
+    }
 }
 
 /// A synthetic, **already-expired** refresh-only token response a cold `load`
@@ -265,6 +317,37 @@ fn synthetic_access_response(access_token: &str) -> OAuthTokenResponse {
     )
 }
 
+/// How much remaining lifetime a cached access token must keep for [`load`] to
+/// serve it without reading the backend.
+///
+/// The margin is deliberately larger than the 30-second buffer `rmcp` uses to
+/// refresh a token before it expires. That buffer is the only expiry check that
+/// starts a refresh from an otherwise-unexpired token, and every refresh re-reads
+/// the durable store under the per-credential single-flight guard (that re-read
+/// is what keeps a rotated single-use refresh token from being spent twice, see
+/// [`CredentialStore::load`]). Serving from cache only beyond a wider margin
+/// therefore keeps the shortcut to loads `rmcp` follows with a plain request, so
+/// no refresh — and no durable re-read — is ever skipped.
+///
+/// [`load`]: CredentialStore::load
+const CACHE_SERVE_MARGIN_SECS: u64 = 60;
+
+/// Whether a cached token response is fresh enough to serve without reading the
+/// backend (see [`CACHE_SERVE_MARGIN_SECS`]).
+///
+/// A response that reports no `expires_in` makes `rmcp` skip its expiry check and
+/// use the token as-is, so there is no refresh to short-circuit and it is always
+/// usable. Otherwise the remaining lifetime is `expires_in` minus the time since
+/// the token was received; the subtraction saturates so a clock step backwards
+/// can never extend a token's life.
+fn cache_is_usable(response: &OAuthTokenResponse, received_at: u64, now: u64) -> bool {
+    let Some(expires_in) = response.expires_in() else {
+        return true;
+    };
+    let elapsed = now.saturating_sub(received_at);
+    expires_in.as_secs().saturating_sub(elapsed) > CACHE_SERVE_MARGIN_SECS
+}
+
 /// The current Unix time in seconds.
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -274,7 +357,27 @@ fn now_secs() -> u64 {
 
 #[async_trait]
 impl CredentialStore for CredentialStoreAdapter {
+    /// Serve the credential, from the warm in-process cache when it can be.
+    ///
+    /// `rmcp` loads the credential on every request, so this is the hot path.
+    /// A cached token that `rmcp` would use as-is (see `cache_is_usable` and
+    /// `CACHE_SERVE_MARGIN_SECS`) is served directly from the cache and the
+    /// durable non-token fields remembered by the last load, with no backend
+    /// read.
+    ///
+    /// That shortcut cannot reopen the rotation race: it only applies to a load
+    /// `rmcp` follows with a plain request, never one it follows with a refresh.
+    /// A refresh always starts by re-reading the durable store under the
+    /// per-credential single-flight guard, so a second connection that acquires
+    /// the guard after a winner rotated re-reads the rotated credential instead of
+    /// spending an already-spent single-use refresh token. A token that is
+    /// expired, about to expire, or of unknown freshness falls through to the
+    /// full load below, which performs exactly that re-read; so does a cache whose
+    /// grant the seed no longer describes.
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
+        if let Some(stored) = self.load_from_cache().await {
+            return Ok(Some(stored));
+        }
         let backend = self.backend.clone();
         let loaded = tokio::task::spawn_blocking(move || backend.load())
             .await
@@ -334,6 +437,11 @@ impl CredentialStore for CredentialStoreAdapter {
             access_token: access_token.clone(),
             client_secret: view.client_secret.map(|t| Zeroizing::new(t.to_string())),
             token_type: view.token_type.map(str::to_string),
+            // The token response carries neither the client id nor the scopes, so
+            // the warm-cache fast path reads them from here rather than the
+            // backend.
+            client_id: client_id.clone().unwrap_or_default(),
+            granted_scopes: granted_scopes.clone(),
         });
         let cached = self.cache.lock().await.clone();
         let (token_response, token_received_at) = match cached {
@@ -452,11 +560,13 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// A scripted backend holding one durable credential in memory, counting
-    /// how many times `save` was called so a test can prove a non-rotating
-    /// refresh does not re-encrypt.
+    /// how many times `load` and `save` were called so a test can prove a
+    /// non-rotating refresh does not re-encrypt and a warm cache serves without a
+    /// backend read.
     struct FakeBackend {
         stored: StdMutex<Option<ServiceCredential>>,
         rejected: AtomicBool,
+        loads: AtomicUsize,
         saves: AtomicUsize,
     }
 
@@ -465,6 +575,7 @@ mod tests {
             Arc::new(Self {
                 stored: StdMutex::new(credential),
                 rejected: AtomicBool::new(false),
+                loads: AtomicUsize::new(0),
                 saves: AtomicUsize::new(0),
             })
         }
@@ -472,6 +583,7 @@ mod tests {
 
     impl CredentialBackend for FakeBackend {
         fn load(&self) -> Result<Option<ServiceCredential>, String> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
             Ok(self.stored.lock().unwrap().clone())
         }
         fn save(
@@ -871,7 +983,184 @@ mod tests {
             access_token: access.map(|a| Zeroizing::new(a.to_string())),
             client_secret: None,
             token_type: Some("Bearer".into()),
+            client_id: "client-1".into(),
+            granted_scopes: vec!["openid".into()],
         }
+    }
+
+    /// A token response with `lifetime` as its `expires_in` (`None` for a
+    /// response that reports no lifetime at all).
+    fn response_with_lifetime(lifetime: Option<u64>) -> OAuthTokenResponse {
+        let mut response: OAuthTokenResponse = StandardTokenResponse::new(
+            AccessToken::new("access-token".into()),
+            BasicTokenType::Bearer,
+            VendorExtraTokenFields::default(),
+        );
+        if let Some(secs) = lifetime {
+            response.set_expires_in(Some(&std::time::Duration::from_secs(secs)));
+        }
+        response
+    }
+
+    #[test]
+    fn cache_is_usable_only_beyond_the_serve_margin() {
+        let now = 10_000;
+        // No reported lifetime: `rmcp` skips its expiry check and uses the token
+        // as-is, so nothing could refresh and the cache is always servable.
+        assert!(cache_is_usable(&response_with_lifetime(None), now, now));
+        // A lifetime far beyond the margin is servable.
+        assert!(cache_is_usable(
+            &response_with_lifetime(Some(3_600)),
+            now,
+            now
+        ));
+        // A lifetime inside the margin is NOT: `rmcp` may refresh on the load
+        // that follows, and that refresh must re-read the durable store.
+        assert!(!cache_is_usable(
+            &response_with_lifetime(Some(90)),
+            now,
+            now + 45
+        ));
+        // An already-expired token is NOT servable.
+        assert!(!cache_is_usable(
+            &response_with_lifetime(Some(3_600)),
+            now,
+            now + 3_600
+        ));
+        // A clock step backwards cannot resurrect a token: `elapsed` saturates.
+        assert!(cache_is_usable(
+            &response_with_lifetime(Some(3_600)),
+            now,
+            now - 500
+        ));
+    }
+
+    #[test]
+    fn a_fresh_cache_serves_without_a_backend_read() {
+        crate::runtime::init().expect("runtime init");
+        let backend = FakeBackend::new(Some(durable_oauth()));
+        let adapter = CredentialStoreAdapter::new("mcp:docs|x".into(), backend.clone());
+        let now = now_secs();
+        crate::runtime::block_on(async {
+            // Cold: no cache yet, so the credential comes from the backend.
+            let _ = adapter.load().await.expect("load ok").expect("some");
+            assert_eq!(backend.loads.load(Ordering::SeqCst), 1);
+            // Warm the cache with a token that has an hour of life left and the
+            // same refresh token as the durable grant (a non-rotating refresh).
+            let mut response = response_with_lifetime(Some(3_600));
+            response.set_refresh_token(Some(RefreshToken::new("refresh-secret".into())));
+            adapter
+                .save(
+                    StoredCredentials::new(
+                        "client-1".into(),
+                        Some(response),
+                        vec!["openid".into()],
+                        Some(now),
+                    )
+                    .with_issuer(Some("https://as.example".into())),
+                )
+                .await
+                .expect("save ok");
+            // The steady-state load is served from the cache, unchanged, and the
+            // backend is not read again.
+            let stored = adapter.load().await.expect("load ok").expect("some");
+            assert_eq!(stored.client_id, "client-1");
+            assert_eq!(stored.granted_scopes, vec!["openid".to_string()]);
+            assert_eq!(stored.issuer.as_deref(), Some("https://as.example"));
+            assert_eq!(
+                stored
+                    .token_response
+                    .expect("a response")
+                    .access_token()
+                    .secret(),
+                "access-token"
+            );
+        })
+        .expect("block_on");
+        assert_eq!(
+            backend.loads.load(Ordering::SeqCst),
+            1,
+            "a warm, comfortably unexpired cache must not read the backend"
+        );
+    }
+
+    #[test]
+    fn a_cache_inside_the_margin_falls_through_to_the_backend() {
+        crate::runtime::init().expect("runtime init");
+        let backend = FakeBackend::new(Some(durable_oauth()));
+        let adapter = CredentialStoreAdapter::new("mcp:docs|x".into(), backend.clone());
+        crate::runtime::block_on(async {
+            let _ = adapter.load().await.expect("load ok").expect("some");
+            // A token received 45 seconds ago with a 90-second lifetime has 45
+            // seconds left — inside the 60-second serve margin, so `rmcp` could
+            // refresh after this load and the durable store MUST be re-read.
+            let mut response = response_with_lifetime(Some(90));
+            response.set_refresh_token(Some(RefreshToken::new("refresh-secret".into())));
+            adapter
+                .save(
+                    StoredCredentials::new(
+                        "client-1".into(),
+                        Some(response),
+                        vec!["openid".into()],
+                        Some(now_secs() - 45),
+                    )
+                    .with_issuer(Some("https://as.example".into())),
+                )
+                .await
+                .expect("save ok");
+            let stored = adapter.load().await.expect("load ok").expect("some");
+            assert_eq!(
+                stored
+                    .token_response
+                    .expect("a response")
+                    .access_token()
+                    .secret(),
+                "access-token"
+            );
+        })
+        .expect("block_on");
+        assert_eq!(
+            backend.loads.load(Ordering::SeqCst),
+            2,
+            "a token inside the margin must re-read the durable store, because a \
+             refresh (which does exactly that) may follow the load"
+        );
+    }
+
+    #[test]
+    fn a_seed_that_does_not_match_the_cache_falls_through_to_the_backend() {
+        crate::runtime::init().expect("runtime init");
+        let backend = FakeBackend::new(Some(durable_oauth()));
+        let adapter = CredentialStoreAdapter::new("mcp:docs|x".into(), backend.clone());
+        crate::runtime::block_on(async {
+            let _ = adapter.load().await.expect("load ok").expect("some");
+            // A ROTATING refresh: the cache now holds a refresh token the seed
+            // (built from the durable store at the previous load) does not know
+            // about, so the shortcut must decline and re-read the backend rather
+            // than let a later `save` compare against a stale seed.
+            let mut response = response_with_lifetime(Some(3_600));
+            response.set_refresh_token(Some(RefreshToken::new("rotated-refresh".into())));
+            adapter
+                .save(
+                    StoredCredentials::new(
+                        "client-1".into(),
+                        Some(response),
+                        vec!["openid".into()],
+                        Some(now_secs()),
+                    )
+                    .with_issuer(Some("https://as.example".into())),
+                )
+                .await
+                .expect("save ok");
+            let _ = adapter.load().await.expect("load ok").expect("some");
+        })
+        .expect("block_on");
+        assert_eq!(
+            backend.loads.load(Ordering::SeqCst),
+            2,
+            "a cache whose grant the seed does not describe must re-read the backend \
+             so the seed is re-pinned before any refresh"
+        );
     }
 
     /// A `SaveInput` with every response field absent and the given stored

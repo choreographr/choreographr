@@ -1006,7 +1006,14 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
   `CredentialStore` adapter in `choreo-mcp`'s `auth` module that normally strips
   the access token on `save` (serving
   it from an in-process cache; a cold start returns no usable token so `rmcp`
-  refreshes) and maps to and from `ServiceCredential::OAuth`. The exception is a
+  refreshes) and maps to and from `ServiceCredential::OAuth`. Because `rmcp`
+  loads the credential on every request, that cache is a fast path: a cached
+  token with more than a 60-second margin of life (deliberately above `rmcp`'s
+  own 30-second refresh buffer) is served with no backend read and no durable
+  credential clone, while anything nearer expiry — and any cache the remembered
+  durable fields no longer describe — falls through to the full load, which is
+  what re-reads a rotated single-use refresh token under the refresh guard. The
+  exception is a
   grant with no refresh token: there is nothing to refresh, so the adapter
   persists the (possibly rotated) access token in the durable grant on `save`
   and serves it directly as the bearer on a cold `load` (no `expires_in` and no
