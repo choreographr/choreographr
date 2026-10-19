@@ -6,19 +6,23 @@
 //! This is the OAuth-lifecycle sibling of `daemon/keystore.rs`, which owns the
 //! unlock/bind/lock lifecycle. Both run on the command loop and share the single
 //! blob-write path `encrypt_and_persist_credential` (defined in `keystore.rs`)
-//! and the daemon's `credentials` / `access_tokens` / `dead_oauth` state;
-//! splitting them keeps each module about one lifecycle.
+//! and the daemon's `credentials` / `access_tokens` / `dead_oauth` state.
 //!
-//! The daemon is the sole writer of every credential blob, so each handler here
-//! re-encrypts the updated durable credential to the binding public key before
-//! persisting it, and never needs the private key (the blob is a sealed box).
+//! The handlers are split by lifecycle: [`provider`] owns the provider refresh
+//! save and terminal quarantine, [`mcp`] owns the MCP credential save/clear and
+//! terminal rejection. This file keeps the shared stale-rotation guard
+//! ([`refresh_token_unchanged`]) and the MCP read-view publication
+//! ([`DaemonState::publish_mcp_oauth_key`] /
+//! [`DaemonState::publish_mcp_oauth_snapshot`]). The daemon is the sole writer of
+//! every credential blob, so each handler re-encrypts the updated durable
+//! credential to the binding public key before persisting it, and never needs
+//! the private key (the blob is a sealed box).
 
 use super::DaemonState;
-use crate::db;
-use crate::oauth_refresh::SaveToken;
-use choreo_keystore::{OAuthKind, ServiceCredential};
-use std::sync::mpsc;
-use tracing::{debug, info, warn};
+use choreo_keystore::ServiceCredential;
+
+mod mcp;
+mod provider;
 
 /// Whether the stored grant's refresh token still equals the one a refresh
 /// presented (or no expectation was recorded). Shared by the provider and MCP
@@ -30,250 +34,6 @@ fn refresh_token_unchanged(stored: &ServiceCredential, expected: Option<&str>) -
 }
 
 impl DaemonState {
-    /// Persist a refreshed OAuth token: update the in-memory access-token cache
-    /// and, when the exchange rotated the refresh token or refreshed the
-    /// identity claim, re-encrypt the updated durable credential to the binding
-    /// and persist it (rotate-if-present — the stored value is kept when the
-    /// exchange carried no new one).
-    pub(super) fn handle_save_oauth_token(
-        &mut self,
-        save: SaveToken<'_>,
-        reply: &mpsc::Sender<Result<(), String>>,
-    ) {
-        if self.locked {
-            let _ = reply.send(Err("unlock the keystore first".to_string()));
-            return;
-        }
-        // The account must hold an OAuth credential to rotate; an API key has
-        // no refresh token and is refused rather than silently mis-updated.
-        let Some(current) = self.credentials.get(save.account).cloned() else {
-            let _ = reply.send(Err(format!(
-                "no credential stored for account '{}'",
-                save.account
-            )));
-            return;
-        };
-        // The provider refresh path rotates ONLY a provider grant: an MCP grant
-        // stored under a same-named key refreshes through the MCP authorization
-        // manager, so its refresh token must never be rewritten here.
-        if !matches!(
-            current,
-            ServiceCredential::OAuth {
-                kind: OAuthKind::Provider,
-                ..
-            }
-        ) {
-            let _ = reply.send(Err(format!(
-                "account '{}' is not a provider OAuth credential",
-                save.account
-            )));
-            return;
-        }
-        // Guard against a credential replaced under us between the load and
-        // this save (a re-login or logout landing mid-exchange): the stored
-        // grant is a newer one, so the access token obtained here — minted from
-        // the superseded refresh token — must not overwrite the cache, and any
-        // rotation must not clobber the newer grant. The guard is unconditional
-        // (it must fire even for a non-rotating refresh), and
-        // `refresh_token_unchanged` is true when no expectation was recorded, so
-        // a save with no `expected_refresh_token` skips it.
-        if !refresh_token_unchanged(&current, save.expected_refresh_token) {
-            warn!(
-                account = %save.account,
-                "OAuth credential changed under the refresh; dropping the save"
-            );
-            // The newer grant owns the cache and the quarantine state: the
-            // access token obtained here was minted from the superseded refresh
-            // token, so do not overwrite the cache with it, and do not
-            // un-quarantine the account.
-            let _ = reply.send(Ok(()));
-            return;
-        }
-        // A refresh changes the durable blob only when it carries a refresh
-        // token or an identity claim that DIFFERS from the stored one — an OIDC
-        // provider that re-issues an identical `id_token`, or echoes the same
-        // refresh token, must not force a re-encrypt and disk write. Compare
-        // VALUES, not presence; a plain expiry refresh then updates the
-        // in-memory access-token cache alone.
-        let stored = current.as_oauth();
-        let durable_change = save
-            .rotated_refresh_token
-            .is_some_and(|rotated| stored.and_then(|v| v.refresh_token) != Some(rotated))
-            || save
-                .new_account_id
-                .is_some_and(|id| stored.and_then(|v| v.account_id) != Some(id));
-        if durable_change {
-            let mut updated = current;
-            if let ServiceCredential::OAuth {
-                refresh_token,
-                account_id,
-                ..
-            } = &mut updated
-            {
-                if let Some(rotated) = save.rotated_refresh_token {
-                    *refresh_token = Some(rotated.to_string());
-                }
-                if let Some(new_id) = save.new_account_id {
-                    *account_id = Some(new_id.to_string());
-                }
-            }
-            if let Err(e) = self.encrypt_and_persist_credential(save.account, &updated) {
-                let _ = reply.send(Err(e));
-                return;
-            }
-            self.credentials.insert(save.account.to_string(), updated);
-        }
-        self.access_tokens.insert(
-            save.account.to_string(),
-            super::AccessTokenCache {
-                access_token: save.access_token.clone(),
-                expires_at: save.expires_at,
-                received_at: save.received_at,
-            },
-        );
-        // A successful refresh means the grant is alive again.
-        self.dead_oauth.remove(save.account);
-        info!(
-            account = %save.account,
-            rotated = durable_change,
-            "OAuth token refreshed and persisted"
-        );
-        let _ = reply.send(Ok(()));
-    }
-
-    /// Quarantine an account after a terminal OAuth refresh failure and
-    /// broadcast a single re-login-required notice.
-    ///
-    /// Idempotent by design: the broadcast fires only on the FIRST transition
-    /// into the quarantined state, so concurrent sessions and retries cannot
-    /// produce a duplicate re-login notice. The dead grant's cached token is
-    /// dropped — it can only 401 again.
-    pub(super) fn handle_mark_oauth_dead(&mut self, account: &str) {
-        if !self.dead_oauth.insert(account.to_string()) {
-            debug!(
-                account,
-                "OAuth account already quarantined; suppressing duplicate re-login notice"
-            );
-            return;
-        }
-        self.access_tokens.remove(account);
-        info!(
-            account,
-            provider = %self.account_provider_slug(account).unwrap_or_default(),
-            "OAuth grant terminally rejected; re-login required"
-        );
-        self.broadcast_oauth_relogin_required(account);
-    }
-
-    /// Persist a rotated MCP OAuth credential (a fire-and-forget
-    /// [`DaemonCommand::OAuthSave`](crate::daemon::DaemonCommand::OAuthSave)).
-    ///
-    /// Re-encrypts the updated durable subset to the binding public key and
-    /// persists it (the daemon is the sole blob writer; the adapter keeps the
-    /// access token out of the durable grant unless the server issued no
-    /// refresh token, where it is the only credential), then updates the
-    /// in-memory map and the MCP OAuth snapshot, dropping any cached token or
-    /// quarantine for the key.
-    pub(super) fn handle_oauth_save(
-        &mut self,
-        key: &str,
-        credential: ServiceCredential,
-        expected_refresh_token: Option<&str>,
-    ) {
-        if self.locked {
-            warn!(%key, "OAuthSave ignored: keystore is locked");
-            return;
-        }
-        // A save is always the terminal step of a refresh of a credential the
-        // connect path just loaded, so the key must still be present. The save
-        // is fire-and-forget (an in-flight refresh cannot round-trip the command
-        // loop), so a save enqueued just before a logout/clear can be processed
-        // AFTER the credential was removed; persisting it then would resurrect a
-        // credential the user just deleted. Drop it instead.
-        if !self.credentials.contains_key(key) {
-            warn!(%key, "OAuthSave dropped: credential already removed (logout/clear)");
-            // The connect path published this rotation into the read-view
-            // snapshot before enqueuing (that ordering is what lets a concurrent
-            // refresh re-read it). Restore THIS key's entry from the durable
-            // store — whose credential was just removed — so the read view does
-            // not keep serving a grant the user deleted, without disturbing any
-            // other key's pending rotation.
-            self.publish_mcp_oauth_key(key);
-            return;
-        }
-        // Guard against a credential replaced under the refresh (a re-login
-        // landing between the connect-path load and this save): the stored grant
-        // is newer, so persisting the rotated refresh token would clobber it.
-        // Only apply the save when the stored refresh token is still the one the
-        // refresh presented.
-        //
-        // This guard keys on the refresh token, so it does NOT cover an
-        // access-token-only grant (a server that issued no refresh token): with
-        // no refresh token to compare, `expected_refresh_token` is `None` and
-        // the guard passes unconditionally. That is acceptable because `rmcp`
-        // never reaches `save` for a grant with no refresh token — its refresh
-        // path returns `AuthorizationRequired` before calling `save` — so the
-        // access-token persistence here is defense-in-depth, not a live path.
-        // Should that ever change, fold the durable access token into the
-        // expectation this guard compares.
-        let changed = match self.credentials.get(key) {
-            Some(current) => !refresh_token_unchanged(current, expected_refresh_token),
-            None => false,
-        };
-        if changed {
-            warn!(%key, "OAuthSave dropped: credential changed under the refresh");
-            // As above: the connect path already advanced this key's read-view
-            // entry to the superseded rotation, so republish this key from the
-            // durable store to put the newer grant back.
-            self.publish_mcp_oauth_key(key);
-            return;
-        }
-        if let Err(e) = self.encrypt_and_persist_credential(key, &credential) {
-            warn!(%key, error = %e, "failed to persist rotated MCP OAuth credential");
-            return;
-        }
-        self.credentials.insert(key.to_string(), credential);
-        self.access_tokens.remove(key);
-        self.dead_oauth.remove(key);
-        // Publish only this key: the rotation is now durable, so its entry is
-        // refreshed, while other keys' entries (including any rotation another
-        // key published ahead of its own save) are left untouched.
-        self.publish_mcp_oauth_key(key);
-        // The MCP refresh completed (this save is its terminal step), so prune
-        // any now-idle single-flight locks the refresh registry is holding for
-        // this or another credential.
-        crate::oauth_refresh_locks::prune();
-        info!(%key, "persisted rotated MCP OAuth credential");
-    }
-
-    /// Delete a stored MCP OAuth credential (a fire-and-forget
-    /// [`DaemonCommand::OAuthClear`](crate::daemon::DaemonCommand::OAuthClear)).
-    pub(super) fn handle_oauth_clear(&mut self, key: &str) {
-        if let Err(e) = db::remove_credential_blob(&self.db, key) {
-            warn!(%key, error = %e, "failed to remove MCP OAuth credential");
-            return;
-        }
-        self.credentials.remove(key);
-        self.access_tokens.remove(key);
-        self.dead_oauth.remove(key);
-        self.publish_mcp_oauth_key(key);
-        crate::oauth_refresh_locks::prune();
-        info!(%key, "cleared MCP OAuth credential");
-    }
-
-    /// Quarantine an MCP credential after a terminal refresh rejection (a
-    /// fire-and-forget
-    /// [`DaemonCommand::McpAuthRejected`](crate::daemon::DaemonCommand::McpAuthRejected)),
-    /// so the `/mcp` status shows a re-authentication request.
-    pub(super) fn handle_mcp_auth_rejected(&mut self, key: &str) {
-        if self.dead_oauth.insert(key.to_string()) {
-            // Quarantining withdraws this key from the read view only; other
-            // keys' entries (and their pending rotations) stay intact.
-            self.publish_mcp_oauth_key(key);
-            info!(%key, "MCP OAuth grant terminally rejected; re-authentication required");
-        }
-    }
-
     /// The MCP-keyed credentials the connect path may see: every `mcp:`-keyed
     /// credential that is not quarantined. A terminally rejected grant
     /// (`dead_oauth`) is withheld — the server already refused that refresh
@@ -359,6 +119,10 @@ mod tests {
     use super::super::tests::make_daemon_state;
     use super::*;
     use crate::daemon::DaemonCommand;
+    use crate::db;
+    use crate::oauth_refresh::SaveToken;
+    use choreo_keystore::OAuthKind;
+    use std::sync::mpsc;
     use zeroize::Zeroizing;
 
     fn mcp_oauth_credential(refresh: &str) -> ServiceCredential {
