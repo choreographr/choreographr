@@ -975,14 +975,17 @@ and `choreo-ai-protocols`'s `catalog::refresh`).
 
   The policy is **earned by the resource**: the flow computes a `HopPolicy` once
   from the resource URL and permits a loopback `http` hop only when the resource
-  itself is loopback (the in-repo mock server), and a private/link-local
-  IP-literal hop only when the resource is itself loopback or such an IP literal
+  itself is loopback (the in-repo mock server), and a non-public IP-literal hop
+  (private, link-local, or another internal-purpose range) only when the
+  resource is itself loopback or such an IP literal
   (a LAN self-hosted server). Every hop a fetched document chooses — a discovery
   GET or its redirect, the dynamic-registration endpoint, the discovered
   authorization and token endpoints — is vetted under that policy, so a hostile
   protected-resource or authorization-server document cannot steer a hop onto
-  `http://127.0.0.1:<port>` or an internal `10/8`/`192.168/16`/link-local
-  address and probe the host's own network. The IP-literal range check is the
+  `http://127.0.0.1:<port>` or an internal address — `10/8`/`192.168/16`, link-local,
+  the `100.64/10` shared (carrier-grade NAT) block, `198.18/15` benchmarking, the
+  unspecified address, or `0.0.0.0/8` — and probe the host's own network. The
+  IP-literal range check is the
   one shared classifier in `choreo-shared`'s `net` module (the same one the
   provider media download uses). The provider login and the runtime refresh keep
   the permissive default, since their endpoints come from the trusted

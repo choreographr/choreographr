@@ -12,8 +12,9 @@
 //! - **Scheme + SSRF guard** ([`is_downloadable_url`], [`is_http_url`],
 //!   [`choreo_shared::net::is_blocked_ip_literal`]) — the response's `url` field is
 //!   provider-controlled text, so it must never be dereferenced as
-//!   `file://`/etc., and an IP-literal host in a loopback/private/link-local
-//!   range is refused (the URL arrives over an authenticated provider TLS
+//!   `file://`/etc., and an IP-literal host in a loopback/private/link-local or
+//!   other internal-purpose (unspecified, shared/CGNAT, benchmarking) range is
+//!   refused (the URL arrives over an authenticated provider TLS
 //!   channel, not from user input, so the residual hostname risk is an
 //!   accepted decision — see [`is_downloadable_url`]). The guard only sees the
 //!   URL we hand it, so the download request disables redirect **following**
@@ -43,8 +44,10 @@ use crate::shared::ProviderError;
 /// Reject URLs whose host is an IP literal in a range that must never be
 /// dereferenced from provider-controlled response data (SSRF guard).
 ///
-/// Blocks loopback (127/8, `::1`), private (RFC 1918, RFC 4193 `fc00::/7`),
-/// and link-local (169.254/16, `fe80::/10`) addresses. Non-IP hostnames
+/// Blocks the unspecified address (`0.0.0.0`, `::`), `0.0.0.0/8`, loopback
+/// (127/8, `::1`), private (RFC 1918, RFC 4193 `fc00::/7`), shared/CGNAT
+/// (`100.64.0.0/10`), benchmarking (`198.18.0.0/15`), and link-local
+/// (169.254/16, `fe80::/10`) addresses. Non-IP hostnames
 /// (e.g. `mfile.z.ai`, `fal.media`) are ALLOWED — recorded security decision:
 /// the URL's hostname is provider-controlled, but DNS pinning for arbitrary
 /// provider hosts is out of scope here; the residual risk is accepted
@@ -66,7 +69,7 @@ pub(crate) fn is_downloadable_url(url: &str) -> Result<(), String> {
         .is_some_and(|host| choreo_shared::net::is_blocked_ip_literal(&host));
     if blocked {
         return Err(format!(
-            "media URL host is a private/loopback/link-local IP literal, refusing to fetch: {url}"
+            "media URL host is an internal/loopback/link-local/shared IP literal, refusing to fetch: {url}"
         ));
     }
     Ok(())
