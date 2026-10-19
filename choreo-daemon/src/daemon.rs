@@ -2559,6 +2559,17 @@ impl DaemonState {
         // Snapshot the catalog the live clients were built against, so the swap
         // below can invalidate the sessions whose provider's client-relevant
         // config actually changed (see `invalidate_changed_provider_clients`).
+        //
+        // On the first swap this is the first touch of the process-wide
+        // `PROVIDER_CATALOG`, so it seeds the `ArcSwap` from the embedded base +
+        // bundled overlay (`loader::load_catalog`) — a full merge that the swap
+        // below immediately supersedes. That one-time redundant merge is
+        // deliberate: the lazy default must already be a correct catalog
+        // (overlay included) for any reader that touches `PROVIDER_CATALOG`
+        // before the daemon's first swap, and every access — including
+        // `replace_catalog`'s `store` — forces that initializer. A second
+        // `overlay merge complete` line under the first `CatalogBaseChanged` is
+        // therefore expected, not a double-apply.
         let before = catalog_snapshot();
 
         // Single-writer point: the atomic swap. Readers are lock-free.
