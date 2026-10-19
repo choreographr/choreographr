@@ -9,11 +9,38 @@
 //! [`super::adapter`], so each module owns one concern.
 
 use choreo_shared::{OAuthKind, ServiceCredential};
-use rmcp::transport::auth::{AuthorizationManager, AuthorizationMetadata};
+use rmcp::transport::auth::{
+    AuthorizationManager, AuthorizationMetadata, OAuthHttpClient, default_oauth_http_client,
+};
+use std::sync::{Arc, OnceLock};
 
 use super::McpAuthWiring;
 use super::adapter::CredentialStoreAdapter;
 use crate::config::{McpServerConfig, McpTransport};
+
+/// The process-wide `rmcp` OAuth HTTP client, built once and shared across
+/// every OAuth connect.
+///
+/// `AuthorizationManager::new` builds a fresh default OAuth client on each call,
+/// and that client reads the entire platform trust store — so every OAuth
+/// connect (sign-in, token refresh, session reconnect) reloaded every system
+/// root certificate. Building the SDK's default once and handing it to
+/// `new_with_oauth_http_client` loads the roots a single time for the process;
+/// both constructors use the same stop-redirect refresh policy, so behavior is
+/// unchanged.
+static OAUTH_HTTP_CLIENT: OnceLock<Result<Arc<dyn OAuthHttpClient>, String>> = OnceLock::new();
+
+/// The shared `rmcp` OAuth HTTP client, or an error if it could not be built.
+fn shared_oauth_http_client() -> Result<Arc<dyn OAuthHttpClient>, crate::error::McpError> {
+    OAUTH_HTTP_CLIENT
+        .get_or_init(|| {
+            default_oauth_http_client()
+                .map(|client| Arc::new(client) as Arc<dyn OAuthHttpClient>)
+                .map_err(|e| e.to_string())
+        })
+        .clone()
+        .map_err(crate::error::McpError::InitializeFailed)
+}
 
 /// Build `rmcp`'s OAuth HTTP client for one remote server.
 ///
@@ -37,9 +64,14 @@ pub(crate) async fn build_auth_client(
 ) -> Result<rmcp::transport::auth::AuthClient<reqwest::Client>, crate::error::McpError> {
     use rmcp::transport::auth::{AuthClient, OAuthClientConfig};
 
-    let mut manager = AuthorizationManager::new(url).await.map_err(|e| {
-        crate::error::McpError::InitializeFailed(format!("OAuth discovery init failed: {e}"))
-    })?;
+    let mut manager =
+        AuthorizationManager::new_with_oauth_http_client(url, shared_oauth_http_client()?)
+            .await
+            .map_err(|e| {
+                crate::error::McpError::InitializeFailed(format!(
+                    "OAuth discovery init failed: {e}"
+                ))
+            })?;
 
     let backend = wiring.backend.clone();
     let loaded = tokio::task::spawn_blocking(move || backend.load())
@@ -125,7 +157,12 @@ async fn resolve_metadata(
 ) -> Result<AuthorizationMetadata, crate::error::McpError> {
     let resolution = match explicit_as {
         Some(as_url) => {
-            let resolver = AuthorizationManager::new(as_url).await.map_err(|e| {
+            let resolver = AuthorizationManager::new_with_oauth_http_client(
+                as_url,
+                shared_oauth_http_client()?,
+            )
+            .await
+            .map_err(|e| {
                 crate::error::McpError::InitializeFailed(format!(
                     "OAuth discovery init failed: {e}"
                 ))
