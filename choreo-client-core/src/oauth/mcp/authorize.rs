@@ -17,8 +17,8 @@ use super::{BoundCallback, McpLoginInfo, McpLoginOptions};
 
 /// The flow-wide inputs `authorize` runs against, grouped so the entry point
 /// takes one value rather than a long positional list: the login info, the
-/// options, the discovered server, the client id, the bound callback, and the
-/// flow's endpoint policy.
+/// options, the discovered server, the client id, the bound callback, the
+/// flow's endpoint policy, and the HTTP agent every request shares.
 pub(super) struct AuthorizeContext<'a> {
     /// The server's login info (its resource indicator and oauth block).
     pub(super) info: &'a McpLoginInfo,
@@ -35,6 +35,10 @@ pub(super) struct AuthorizeContext<'a> {
     pub(super) bound: &'a BoundCallback,
     /// The flow's endpoint policy (discovered endpoints are vetted under it).
     pub(super) policy: http::HopPolicy,
+    /// The one HTTP agent the whole sign-in shares, so the authorize flow and
+    /// its code exchange reuse the caller's TLS configuration and connection
+    /// pool instead of rebuilding an agent (and reloading the root store) here.
+    pub(super) agent: &'a ureq::Agent,
 }
 
 /// The per-request inputs both the authorize URL and the token exchange carry:
@@ -51,12 +55,15 @@ struct CodeRequest<'a> {
 
 /// Run the PKCE loopback (or paste-URL) authorization-code flow over the
 /// already-bound callback server and its `redirect_uri`.
+///
+/// Every request uses [`AuthorizeContext::agent`], the agent the caller built
+/// once for the whole sign-in, so the code exchange reuses the same
+/// TLS-configured connection pool rather than constructing a fresh agent.
 pub(super) fn authorize(
     ctx: &AuthorizeContext<'_>,
     tx: &Sender<LoginEvent>,
     cancel: &AtomicBool,
 ) -> Result<http::TokenSet, OAuthLoginError> {
-    let agent = http::agent();
     let verifier = pkce::generate_verifier();
     let challenge = pkce::challenge_s256(&verifier);
     let state = pkce::generate_state();
@@ -90,7 +97,7 @@ pub(super) fn authorize(
     let _ = tx.send(LoginEvent::Progress {
         message: "Authorization received; exchanging the code for tokens…".to_string(),
     });
-    exchange_code(&agent, ctx.server, &request, &callback.code, &verifier)
+    exchange_code(ctx.agent, ctx.server, &request, &callback.code, &verifier)
 }
 
 /// Validate the RFC 9207 authorization-response `iss` against the discovered

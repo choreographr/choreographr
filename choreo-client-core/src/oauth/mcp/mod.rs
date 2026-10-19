@@ -89,6 +89,11 @@ pub fn start_mcp_login(info: McpLoginInfo, options: McpLoginOptions) -> LoginSes
 }
 
 /// The worker entry point.
+///
+/// The flow reuses one HTTP agent built once here for every request it makes
+/// (discovery, registration, authorize, code exchange) instead of rebuilding
+/// one per request, because a new agent rebuilds the TLS configuration and
+/// reloads the root store.
 fn run(
     info: &McpLoginInfo,
     options: &McpLoginOptions,
@@ -104,11 +109,16 @@ fn run(
     // — onto `http://127.0.0.1` or an internal private/link-local address, which
     // would let a hostile document probe the host's local services.
     let policy = http::HopPolicy::for_resource(&info.resource);
+    // One agent for the whole sign-in: discovery, dynamic registration, the
+    // authorize request, and the code exchange all reuse the same
+    // TLS-configured connection pool. Building an agent per request would
+    // rebuild the TLS configuration and reload the root store each time.
+    let agent = http::agent();
     let _ = tx.send(LoginEvent::Progress {
         message: "Discovering the authorization server…".to_string(),
     });
     let server = discover(
-        &http::agent(),
+        &agent,
         &info.resource,
         info.oauth.authorization_server.as_deref(),
         policy,
@@ -127,7 +137,7 @@ fn run(
     let client_id = match info.oauth.client_id.clone() {
         Some(id) => id,
         None => register_client(
-            &http::agent(),
+            &agent,
             &server,
             &bound.redirect_uri,
             &info.oauth.scopes,
@@ -147,6 +157,7 @@ fn run(
         client_secret: client_secret.as_ref().map(|s| s.as_str()),
         bound: &bound,
         policy,
+        agent: &agent,
     };
     let tokens = authorize(&ctx, tx, cancel)?;
     finish(
