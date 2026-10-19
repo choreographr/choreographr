@@ -18,8 +18,7 @@ use super::McpAuthWiring;
 use super::adapter::CredentialStoreAdapter;
 use crate::config::{McpServerConfig, McpTransport};
 
-/// The process-wide `rmcp` OAuth HTTP client, built once and shared across
-/// every OAuth connect.
+/// The process-wide `rmcp` OAuth HTTP client, cached once it has been built.
 ///
 /// `AuthorizationManager::new` builds a fresh default OAuth client on each call,
 /// and that client reads the entire platform trust store — so every OAuth
@@ -28,18 +27,48 @@ use crate::config::{McpServerConfig, McpTransport};
 /// `new_with_oauth_http_client` loads the roots a single time for the process;
 /// both constructors use the same stop-redirect refresh policy, so behavior is
 /// unchanged.
-static OAUTH_HTTP_CLIENT: OnceLock<Result<Arc<dyn OAuthHttpClient>, String>> = OnceLock::new();
+///
+/// Only a **successful** build is stored. A built client is immutable and
+/// expensive, so caching it is pure gain; a build failure is neither, and the
+/// platform trust store it reads can be momentarily unreadable, so caching a
+/// failure would pin a transient error for the life of the process — every later
+/// connect would fail with it and nothing short of a restart could clear it. A
+/// failed build therefore stores nothing, and the next connect retries it.
+static OAUTH_HTTP_CLIENT: OnceLock<Arc<dyn OAuthHttpClient>> = OnceLock::new();
 
-/// The shared `rmcp` OAuth HTTP client, or an error if it could not be built.
+/// The shared `rmcp` OAuth HTTP client, building it on first use and after a
+/// failed build.
+///
+/// # Errors
+///
+/// Returns [`McpError::InitializeFailed`](crate::error::McpError::InitializeFailed)
+/// when the default client cannot be built (its platform trust store could not
+/// be read). The failure is deliberately not cached, so a later connect retries
+/// the build instead of inheriting a stale error.
 fn shared_oauth_http_client() -> Result<Arc<dyn OAuthHttpClient>, crate::error::McpError> {
-    OAUTH_HTTP_CLIENT
-        .get_or_init(|| {
-            default_oauth_http_client()
-                .map(|client| Arc::new(client) as Arc<dyn OAuthHttpClient>)
-                .map_err(|e| e.to_string())
-        })
-        .clone()
-        .map_err(crate::error::McpError::InitializeFailed)
+    // The fast path: a previous connect already stored a client.
+    if let Some(client) = OAUTH_HTTP_CLIENT.get() {
+        return Ok(Arc::clone(client));
+    }
+    let built: Arc<dyn OAuthHttpClient> = Arc::new(
+        default_oauth_http_client()
+            .map_err(|e| crate::error::McpError::InitializeFailed(e.to_string()))?,
+    );
+    // A concurrent connect may store its own client between the `get` above and
+    // this `set`. Only a successful build ever reaches the cache, so the racing
+    // build is equivalent and dropping it is harmless — but return whichever
+    // value actually landed so every connect shares one client.
+    let _ = OAUTH_HTTP_CLIENT.set(Arc::clone(&built));
+    Ok(prefer_cached(OAUTH_HTTP_CLIENT.get(), built))
+}
+
+/// Return the cached client when the cache already holds one, else `built`.
+///
+/// A pure helper so the race-resolution rule — the first successful build wins
+/// and a loser's equivalent client is dropped — stays testable without reading
+/// the platform trust store.
+fn prefer_cached<T: Clone>(cached: Option<&T>, built: T) -> T {
+    cached.cloned().unwrap_or(built)
 }
 
 /// Build `rmcp`'s OAuth HTTP client for one remote server.
@@ -175,4 +204,18 @@ async fn resolve_metadata(
         crate::error::McpError::InitializeFailed(format!("OAuth metadata discovery failed: {e}"))
     })?;
     Ok(resolution.metadata)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prefer_cached;
+
+    /// The stored client wins over a freshly built one, and a missing cache
+    /// entry takes the fresh build. Resolving the race this way is what keeps
+    /// every connect on a single shared client.
+    #[test]
+    fn prefer_cached_keeps_the_stored_value() {
+        assert_eq!(prefer_cached(Some(&1u8), 2), 1, "the stored value wins");
+        assert_eq!(prefer_cached(None, 2), 2, "nothing stored takes the build");
+    }
 }
