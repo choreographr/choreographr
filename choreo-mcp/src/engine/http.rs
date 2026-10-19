@@ -24,18 +24,24 @@ use std::time::Duration;
 /// connect has already failed, so it never adds latency to a healthy connect.
 const LEGACY_SSE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The shared `reqwest::Client` for the common (default-timeout) case.
+/// The shared `reqwest::Client` result for the common (default-timeout) case.
 ///
 /// A `reqwest::Client` owns its `rustls::ClientConfig`, and building one reads
 /// the platform trust store (every system root certificate) — so a fresh client
 /// per server connection reloads the same roots each time. Servers that leave
 /// `timeout` unset differ in no other client setting (redirect policy and idle
 /// pooling are fixed, and per-server headers ride the transport config), so
-/// they all share this ONE client and the roots load once per process. A server
-/// that sets a non-default `timeout` builds its own client instead, keeping its
-/// connect bound exact. `Client` is `Clone` (an `Arc` inside), so a clone per
-/// connection is free.
-static DEFAULT_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+/// they all share this ONE client and the roots load exactly once per process.
+/// A server that sets a non-default `timeout` builds its own client instead,
+/// keeping its connect bound exact. `Client` is `Clone` (an `Arc` inside), so a
+/// clone per connection is free.
+///
+/// The value is a `Result` so the build runs inside `get_or_init`, which fires
+/// at most once even when several servers connect concurrently — a bare
+/// `get`-then-`get_or_init` would let two racing connects each build (and each
+/// re-read the trust store) before either stored its client. A build failure is
+/// deterministic (the builder config is static), so memoizing it is harmless.
+static DEFAULT_HTTP_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
 
 /// Build (or reuse) the reqwest client used by the Streamable HTTP transport.
 ///
@@ -47,16 +53,13 @@ static DEFAULT_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 /// shared (see [`DEFAULT_HTTP_CLIENT`]); a non-default timeout gets its own.
 pub(super) fn http_client(config: &McpServerConfig) -> Result<reqwest::Client, McpError> {
     let timeout = config.request_timeout();
-    if timeout == DEFAULT_TIMEOUT {
-        if let Some(client) = DEFAULT_HTTP_CLIENT.get() {
-            return Ok(client.clone());
-        }
-        // Build at most once. A build failure is surfaced on every call rather
-        // than memoized, so a transient TLS-config problem can be retried.
-        let client = build_http_client(timeout)?;
-        return Ok(DEFAULT_HTTP_CLIENT.get_or_init(|| client).clone());
+    if timeout != DEFAULT_TIMEOUT {
+        return build_http_client(timeout);
     }
-    build_http_client(timeout)
+    DEFAULT_HTTP_CLIENT
+        .get_or_init(|| build_http_client(DEFAULT_TIMEOUT).map_err(|e| e.to_string()))
+        .clone()
+        .map_err(McpError::InitializeFailed)
 }
 
 /// Construct a client with the fixed transport settings and the given connect
