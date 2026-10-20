@@ -626,19 +626,27 @@ mod tests {
     #[test]
     fn basic_authorization_encodes_the_rfc_6749_credential() {
         use base64::Engine as _;
+        // The expected header is encoded at test time rather than spelled out as
+        // a base64 literal: a literal `Basic <base64>` string is indistinguishable
+        // from a leaked credential to secret scanners, even for a dummy value.
+        let basic = |raw: &str| {
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(raw)
+            )
+        };
         // RFC 6749 §2.3.1: the id and secret are url-encoded separately, joined
         // with ':', then base64. `app-1:right-secret` carries no reserved bytes,
         // so it is the raw concatenation.
         assert_eq!(
             basic_authorization("app-1", "right-secret").as_str(),
-            "Basic YXBwLTE6cmlnaHQtc2VjcmV0"
+            basic("app-1:right-secret")
         );
         // A secret with reserved bytes is url-encoded first, so a ':' in it can
         // never be read as the id/secret separator.
-        let expected = base64::engine::general_purpose::STANDARD.encode("id:a%3Ab+c");
         assert_eq!(
             basic_authorization("id", "a:b c").as_str(),
-            format!("Basic {expected}")
+            basic("id:a%3Ab+c")
         );
     }
 
