@@ -1,0 +1,103 @@
+name: Coverage
+
+# Measures line coverage of the full `test-all` suite (unit + integration, all
+# features, choreo-gui excluded — the same selection as the commit gate) with
+# cargo-llvm-cov, via `just coverage-lcov` (the single home of the invocation;
+# the selection flags live in the `coverage` alias in .cargo/config.toml).
+#
+# Outputs: a per-crate line-coverage table on the run's summary page
+# (scripts/coverage-summary.sh) and the raw `lcov.info` as an artifact, for
+# editor gutters or any external coverage service. The job reports; it does not
+# enforce a floor — a `--fail-under-lines N` can be added to the recipe once a
+# baseline has settled.
+#
+# Because the job runs the whole suite, it is also the CI signal that the tests
+# pass on a clean runner (the commit gate otherwise runs only locally). It is
+# scoped to the inputs that can change the result, so a docs-only change does
+# not pay for an instrumented build.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/config.toml'
+      - '.config/nextest.toml'
+      - 'rust-toolchain.toml'
+      - 'justfile'
+      - 'scripts/coverage-summary.sh'
+      - '.github/workflows/coverage.yml'
+  pull_request:
+    paths:
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/config.toml'
+      - '.config/nextest.toml'
+      - 'rust-toolchain.toml'
+      - 'justfile'
+      - 'scripts/coverage-summary.sh'
+      - '.github/workflows/coverage.yml'
+  workflow_dispatch:
+
+# A newer push to the same branch supersedes an in-flight measurement.
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: Line coverage (test-all)
+    # Pinned rather than ubuntu-latest: `--all-features` enables `avif`, which
+    # links the system libdav1d through pkg-config, and 24.04's libdav1d is the
+    # version the suite is known to build against.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: |
+          # The workspace pins nightly (rust-toolchain.toml) and the dev
+          # profile's -Z flags need it; llvm-tools provides the
+          # llvm-profdata/llvm-cov binaries that cargo-llvm-cov drives.
+          rustup toolchain install nightly --profile minimal \
+            --component llvm-tools-preview --no-self-update
+
+      - name: Install libdav1d
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libdav1d-dev pkg-config
+
+      # zlob's build.rs compiles its Zig source on every build; the version is
+      # pinned for the reason given in release.yml's header note.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # `just coverage-lcov` refuses a cargo-llvm-cov older than 0.9.1 (older
+      # releases miss the nextest binaries in the nightly build-dir layout).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-nextest,cargo-llvm-cov
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Measure coverage
+        run: just coverage-lcov target/coverage/lcov.info
+
+      - name: Write the job summary
+        run: |
+          {
+            echo '## Line coverage (`test-all` suite)'
+            echo
+            ./scripts/coverage-summary.sh target/coverage/lcov.info
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lcov
+          path: target/coverage/lcov.info
+          if-no-files-found: error

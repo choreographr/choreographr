@@ -1349,6 +1349,8 @@ just test-integration     # integration tests (the #[ignore] suite) via nextest
 just test-libtest         # unit tests via libtest (no nextest required)
 just test-crate choreo-proto   # a single crate via nextest
 just test-gui             # the GUI crate alone (excluded from `test-all`/`test-fast`)
+just coverage             # line coverage of the test-all suite (cargo-llvm-cov ≥ 0.9.1; extra args pass through, e.g. --html --open)
+just coverage-lcov        # the same as an lcov file + per-crate summary table (what the coverage CI job runs)
 
 just fmt                  # cargo fmt --all
 just clippy               # lint the workspace (all targets + features)
@@ -1369,7 +1371,10 @@ just tui / gui / im / acp # run the other clients (im takes e.g. `just im telegr
 `CARGO_FLAGS` (env) appends flags to every cargo invocation. The nextest-backed
 recipes (`test`, `test-fast`, `test-lean`, `test-integration`, `test-all`,
 `test-crate`, `shard`, `retry`) fail with an install hint until `cargo-nextest`
-is on `PATH`.
+is on `PATH`. The coverage recipes additionally need cargo-llvm-cov ≥ 0.9.1 and
+the `llvm-tools-preview` component (`just install-cargo-llvm-cov` installs
+both); the `coverage` CI workflow runs `just coverage-lcov` and posts the
+per-crate table on each run's summary page.
 
 ### Android (Termux) binaries
 

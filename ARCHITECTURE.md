@@ -2594,6 +2594,24 @@ just as two threads would, and `#[serial]` cannot serialize across processes —
 prefer ephemeral ports (`TcpListener::bind("127.0.0.1:0")`) so tests never
 contend for a fixed address.
 
+**Coverage:** the `coverage` cargo alias runs exactly the `test-all` selection
+under cargo-llvm-cov (`just coverage` for a per-file table, `just coverage-lcov`
+for an lcov file plus a per-crate summary from `scripts/coverage-summary.sh`).
+The `.github/workflows/coverage.yml` job runs `coverage-lcov` on every push and
+pull request that touches Rust sources, manifests, or the test configuration;
+it publishes the per-crate table on the run's summary page and the `lcov.info`
+artifact, and enforces no floor. Two tooling constraints shape it. First,
+cargo-llvm-cov must be ≥ 0.9.1: on the pinned nightly, test binaries land in
+the build-dir layout (`target/…/debug/build/<crate>/<hash>/out/`), which older
+releases do not scan — they report only the final binaries' share of the
+workspace (about a third) with no error, so `_require-llvm-cov` refuses them.
+Second, the report must come from the same invocation that ran the tests: a
+separate `cargo llvm-cov report` step has the same blind spot even on 0.9.1,
+which is why the per-crate summary is derived from the lcov file rather than
+from a second report pass. Coverage counts inline `#[cfg(test)]` modules
+inside source files (only crate-level `tests/` directories are excluded), so
+the figure slightly overstates production-code coverage.
+
 Run all tests:
 ```bash
 cargo test-all            # nextest: unit + integration, parallel

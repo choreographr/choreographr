@@ -90,6 +90,12 @@ install-git-cliff:
 install-cargo-zigbuild:
     cargo install cargo-zigbuild
 
+# taiki-e's prebuilt binaries are also fine: https://github.com/taiki-e/cargo-llvm-cov
+# Install cargo-llvm-cov (drives the coverage recipes) and the llvm-tools component
+install-cargo-llvm-cov:
+    rustup component add llvm-tools-preview
+    cargo install cargo-llvm-cov --locked
+
 # ── hidden prerequisites ──────────────────────────────────────────────────────
 
 # Fail fast with a hint when zig is missing. zig builds the zlob glob/walker
@@ -102,6 +108,20 @@ _require-zig:
 # command: test-fast".
 _require-nextest:
     @command -v cargo-nextest >/dev/null 2>&1 || { echo "error: cargo-nextest not found — run \`just install-nextest\`" >&2; exit 1; }
+
+# Fail fast with a hint when cargo-llvm-cov is missing or too old. Releases
+# before 0.9.1 do not find the nextest test binaries in the nightly build-dir
+# layout and report a fraction of the workspace without any error, so an old
+# version is refused rather than trusted.
+_require-llvm-cov:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v cargo-llvm-cov >/dev/null 2>&1 || { echo "error: cargo-llvm-cov not found — run \`just install-cargo-llvm-cov\`" >&2; exit 1; }
+    have=$(cargo llvm-cov --version | awk '{print $2}')
+    if [ "$(printf '%s\n%s\n' 0.9.1 "$have" | sort -V | head -n1)" != 0.9.1 ]; then
+        echo "error: cargo-llvm-cov $have is too old (need ≥ 0.9.1) — run \`just install-cargo-llvm-cov\`" >&2
+        exit 1
+    fi
 
 # Fail fast with a hint when git-cliff is missing (release-notes generation).
 _require-git-cliff:
@@ -324,6 +344,19 @@ test-integration: _require-nextest _require-zig
 # re-resolving against the live registry (see release.sh for the same control).
 test-all: _require-nextest _require-zig
     cargo test-all {{ CARGO_FLAGS }} --locked
+
+# Extra arguments go to cargo-llvm-cov (e.g. `just coverage --html --open`).
+# Line coverage of the `test-all` suite, printed as a per-file table
+coverage *args: _require-nextest _require-zig _require-llvm-cov
+    cargo coverage {{ CARGO_FLAGS }} --locked {{ args }}
+
+# One test run produces both outputs: the summary is derived from the lcov file
+# (see scripts/coverage-summary.sh). This is what the coverage CI workflow runs.
+# Coverage of the `test-all` suite as an lcov file plus a per-crate summary table
+coverage-lcov out="target/coverage/lcov.info": _require-nextest _require-zig _require-llvm-cov
+    mkdir -p "$(dirname '{{ out }}')"
+    cargo coverage {{ CARGO_FLAGS }} --locked --lcov --output-path '{{ out }}'
+    ./scripts/coverage-summary.sh '{{ out }}'
 
 # Unit tests via libtest (serialized across binaries; no nextest required)
 test-libtest: _require-zig
