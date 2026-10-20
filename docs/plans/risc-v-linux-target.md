@@ -1,10 +1,14 @@
 # Plan: RISC-V Linux release target
 
-**Status:** blocked — *waiting on upstream `zlob`*. The build is blocked by two
-bugs in the `zlob` crate (via `choreo-daemon`); both are fixed by
-[dmtrKovalenko/zlob#32](https://github.com/dmtrKovalenko/zlob/pull/32), which
-must merge **and** ship in a crates.io release before this work can start.
-**Date:** 2026-09-19
+**Status:** unblocked — *Phases 0 and 1 done; Phase 2 is next.*
+[dmtrKovalenko/zlob#32](https://github.com/dmtrKovalenko/zlob/pull/32) merged
+on 2026-10-16 and shipped in `zlob` 1.7.0; the workspace now requires
+`zlob` 1.7.1. Re-verified 2026-10-20 with no env workarounds:
+`cargo zigbuild --release --target riscv64gc-unknown-linux-musl` of
+`choreographr` + `choreo-tui` with the release feature set produces static-pie
+`UCB RISC-V` ELFs, and `scripts/daemon-smoke.sh` passes on a tarball of them
+under `qemu-riscv64-static` (binfmt).
+**Date:** 2026-09-19 (status updated 2026-10-20)
 **Target:** `riscv64gc-unknown-linux-musl` (fully static), shipped as a fourth
 release tarball alongside the current three.
 **Touches:** `scripts/release.sh`, `scripts/install.sh`, `Cargo.toml`
@@ -232,8 +236,10 @@ Each phase is one commit; overlapping-file phases run as **serial subsessions**
 (per `AGENTS.md`).
 
 - **Phase 0 — upstream (external).** Merge [zlob#32], cut a `zlob` release.
+  *Done — merged 2026-10-16, released in `zlob` 1.7.0.*
 - **Phase 1 — dependency bump.** Bump `zlob` in `Cargo.toml`/`Cargo.lock`; verify
-  local riscv musl build is green with **no** env workarounds.
+  local riscv musl build is green with **no** env workarounds. *Done —
+  `zlob = "1.7.1"`; build and QEMU daemon smoke green.*
 - **Phase 2 — build + installer.** `release.sh` target override + riscv branch;
   `install.sh` case; binstall override.
 - **Phase 3 — CI.** `linux-riscv64` job + QEMU smoke; wire into `release` `needs`.
