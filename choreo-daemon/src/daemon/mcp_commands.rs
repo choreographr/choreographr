@@ -1,33 +1,32 @@
-//! MCP command-loop handlers for [`DaemonState`] — the `/mcp` status, reconnect,
-//! reload, and trust operations, the per-session overlay resolution/reuse, and
-//! the tool-catalogue rebuild.
+//! MCP command-loop handlers for [`DaemonState`] — the `/mcp` status, reload,
+//! trust, and list-change operations plus the tool-catalogue rebuild.
 //!
 //! These methods run on the daemon command loop (dispatched from the
-//! `DaemonCommand` arms in `handle_command`) and are split out of `daemon.rs`
-//! so that file stays navigable as it grows. This is a child module of
+//! `DaemonCommand` arms in `handle_command`). This is a child module of
 //! `crate::daemon`, so the `impl DaemonState` block below reaches the state's
 //! private fields directly; the methods are `pub(super)` because the parent
-//! `handle_command` and `daemon/tests.rs` are their only callers.
+//! `daemon` module and its `daemon/tests.rs` are their only callers.
+//!
+//! The handlers are split by concern, each a child module that keeps the same
+//! private-field access:
+//!
+//! - `reconnect` — bringing one server up (background connect, its reply
+//!   parking, the post-unlock/post-sign-in resync, and the in-place rebuild of a
+//!   project/per-session server).
+//! - `overlay` — planning a session's overlay, spawning its connect worker, and
+//!   installing what lands.
+//!
+//! What stays here is the catalogue rebuild every MCP event funnels into, the
+//! config reloads, and the status/trust surface.
 
-use super::{DaemonState, SessionMcpProject};
+mod overlay;
+mod reconnect;
+
+use super::DaemonState;
 use crate::mcp::trust::McpTrustStore;
-use crate::mcp::{
-    McpReloadOutcome, McpServerStatus, McpStatusReport, McpTrustOutcome, SessionMcpOverlay,
-};
-use crate::sessions::SessionCommand;
+use crate::mcp::{McpReloadOutcome, McpServerStatus, McpStatusReport, McpTrustOutcome};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
-
-/// Aggregate budget for ONE overlay re-resolve sweep: the sessions re-resolved
-/// after a list change or a reload share one deadline, so re-resolving many
-/// sessions cannot stall the command loop for one connect budget per session.
-///
-/// A session reached after the deadline keeps its current overlay and is
-/// re-resolved on the next event. The connections already pooled for a session
-/// are reused, so the common case runs in microseconds and the deadline only
-/// bites when many sessions must each connect a fresh server.
-const OVERLAY_RERESOLVE_TOTAL_BUDGET: Duration = Duration::from_secs(10);
 
 impl DaemonState {
     /// Rebuild and swap the tool catalogue after an MCP server reported a
@@ -46,16 +45,13 @@ impl DaemonState {
     /// deadline, not the per-server request timeout); every other server's
     /// cached tool set is reused. The rebuilt catalogue is therefore identical
     /// to a full sweep, but the command loop pays one round-trip per event
-    /// instead of one per connected server. This runs on the command loop
-    /// because the catalogue has a single writer, and a slow server must not
-    /// freeze every session (a server that misses the deadline keeps its
-    /// previous registration).
+    /// instead of one per connected server.
     ///
     /// A server can also be a session's PRIVATE project/per-session server,
     /// whose tools live only in that session's overlay and are NOT touched by
     /// the daemon-tier rebuild. The sessions holding a private server with this
-    /// slug therefore have their overlay re-resolved too (re-ensured, not
-    /// released, so their connections are reused).
+    /// slug therefore have their overlay re-resolved too (planned against the
+    /// pool, so their connections are reused rather than rebuilt).
     pub(super) fn handle_mcp_list_changed(&mut self, slug: &str, tools_changed: bool) {
         // A resources-only change needs no action: the resource catalogue is
         // read live by the wrapper tools, so there is nothing cached to
@@ -72,34 +68,18 @@ impl DaemonState {
         info!(server = %slug, "MCP tool catalogue refreshed");
     }
 
-    /// Rebuild the whole tool catalogue from the current `McpManager` —
-    /// re-listing every connected server — and swap it into the shared
-    /// registry.
-    ///
-    /// The command loop is the single writer of `tool_registry` (the sanctioned
-    /// `ArcSwap` rule); this and [`DaemonState::rebuild_tool_catalogue_cached`]
-    /// are the two places the swap happens. This full sweep is the
-    /// reload/reconnect path, where the whole server set may have shifted (a
-    /// server added, removed, reconnected, or renamed) so every server must be
-    /// re-listed. A request already holding the previous registry keeps using
-    /// it safely; the swap is atomic and never tears a live load.
-    pub(super) fn rebuild_tool_catalogue(&mut self) {
-        let registry = super::open::build_tool_registry(
-            self.tool_policy,
-            self.platform_tool_bridge.as_ref(),
-            &mut self.mcp_manager,
-        );
-        self.tool_registry.store(registry);
-    }
-
     /// Rebuild the whole tool catalogue from the current `McpManager`, reusing
     /// every server's CACHED tool set, and swap it into the shared registry.
     ///
-    /// The list-change path's counterpart to
-    /// [`DaemonState::rebuild_tool_catalogue`]: the caller re-listed exactly the
-    /// one changed server first (`McpManager::refresh_server`), so this rebuild
-    /// produces the identical catalogue without re-listing the unchanged
-    /// servers. The swap is atomic and never tears a live load.
+    /// The command loop is the single writer of `tool_registry` (the sanctioned
+    /// `ArcSwap` rule); this is the one place the swap happens. Every MCP event —
+    /// a background connect landing, a list change (whose one changed server the
+    /// caller re-listed via `McpManager::refresh_server` first), a reload
+    /// dropping a server — leaves the manager's cached tool sets current, so the
+    /// rebuild produces the right catalogue without a single network round-trip
+    /// on the command loop. The swap is atomic and never tears a live load: a
+    /// request already holding the previous registry keeps using it safely while
+    /// the next turn sees the new one.
     pub(super) fn rebuild_tool_catalogue_cached(&mut self) {
         let registry = super::open::build_tool_registry_cached(
             self.tool_policy,
@@ -109,120 +89,31 @@ impl DaemonState {
         self.tool_registry.store(registry);
     }
 
-    /// Reconnect one MCP server and refresh the catalogue, reporting the
-    /// outcome to the requester.
-    ///
-    /// The reconnect itself lives in [`Self::reconnect_mcp_slug`] so the
-    /// `/mcp reconnect` command and the automatic post-sign-in reconnect share
-    /// one implementation and cannot drift.
-    pub(super) fn handle_mcp_reconnect(
-        &mut self,
-        slug: &str,
-        reply: &std::sync::mpsc::Sender<Result<(), String>>,
-    ) {
-        let result = self.reconnect_mcp_slug(slug);
-        match &result {
-            Ok(()) => info!(server = %slug, "MCP server reconnected; tool catalogue refreshed"),
-            Err(e) => warn!(server = %slug, error = %e, "MCP reconnect failed"),
-        }
-        let _ = reply.send(result);
-    }
-
-    /// Reconnect every connection with `slug` and refresh the catalogues it
-    /// feeds.
-    ///
-    /// On success the whole daemon catalogue is rebuilt (so the reconnected
-    /// server's tools — whose sanitized names the manager may have
-    /// disambiguated differently from a prior connection — are registered
-    /// fresh), and the sessions holding a PRIVATE (project or per-session)
-    /// server with this slug have their overlay re-resolved so the rebuilt
-    /// connection's tools reach them. A daemon shared server belongs to no
-    /// session overlay, so the overlay sweep is a no-op for it.
-    fn reconnect_mcp_slug(&mut self, slug: &str) -> Result<(), String> {
-        let result = self.mcp_manager.reconnect(slug);
-        if result.is_ok() {
-            self.rebuild_tool_catalogue();
-            let affected = self.mcp_manager.sessions_for_slug(slug);
-            self.refresh_session_overlays(affected);
-        }
-        result
-    }
-
-    /// Bring up the MCP server a just-stored OAuth grant belongs to.
-    ///
-    /// A completed sign-in stores the credential (see
-    /// `DaemonState::handle_save_credential`) but does NOT, on its own, rebuild
-    /// the connection that failed with an auth-required error before the grant
-    /// existed — so the server would stay offline until the user ran
-    /// `/mcp reconnect` or the next tool call triggered a lazy reconnect.
-    /// Reconnecting here makes a sign-in self-sufficient, and mirrors
-    /// `/mcp logout`, which already reconnects.
-    ///
-    /// `credential_key` is the daemon's target-scoped `mcp:<slug>|<hash>` key;
-    /// the slug it encodes is reconnected. A key that names no configured
-    /// server (a stale grant, or a project server on an untrusted root) simply
-    /// fails the reconnect, which is logged and otherwise harmless.
-    #[cfg(feature = "mcp")]
-    pub(super) fn reconnect_mcp_for_credential(&mut self, credential_key: &str) {
-        let Some(slug) = choreo_mcp::slug_from_credential_key(credential_key) else {
-            debug!(%credential_key, "stored credential is not an MCP key; nothing to reconnect");
-            return;
-        };
-        match self.reconnect_mcp_slug(slug) {
-            Ok(()) => {
-                info!(server = %slug, "MCP server brought up after sign-in; tool catalogue refreshed");
-            }
-            Err(e) => warn!(server = %slug, error = %e, "MCP reconnect after sign-in failed"),
-        }
-    }
-
-    /// Bring up every MCP server whose OAuth grant just became available after
-    /// an unlock (or bind).
-    ///
-    /// The daemon starts LOCKED and spawns/connects MCP servers immediately, so
-    /// an OAuth server's first connect runs before its grant is decryptable and
-    /// 401s; nothing retries it when the keystore later unlocks. Reconnecting
-    /// the `mcp:`-keyed servers here means a restart brings signed-in servers up
-    /// without a manual `/mcp reconnect`. On a fresh bind there are no such
-    /// credentials, so this is a no-op.
-    #[cfg(feature = "mcp")]
-    pub(super) fn reconnect_mcp_servers_for_unlocked_credentials(&mut self) {
-        // Collect the keys first: `reconnect_mcp_for_credential` takes `&mut
-        // self`, so the `self.credentials` borrow cannot be held across the loop.
-        let keys: Vec<String> = self
-            .credentials
-            .keys()
-            .filter(|key| choreo_mcp::is_mcp_credential_key(key))
-            .cloned()
-            .collect();
-        for key in keys {
-            self.reconnect_mcp_for_credential(&key);
-        }
-    }
-
-    /// Without the `mcp` feature there are no MCP servers to bring up.
-    #[cfg(not(feature = "mcp"))]
-    pub(super) fn reconnect_mcp_servers_for_unlocked_credentials(&mut self) {}
-
     /// Reload the MCP configuration and refresh the catalogue.
     ///
     /// The manager re-reads the daemon-tier `mcp.json` and reconciles the
-    /// running servers with it — connecting added servers, disconnecting removed
-    /// ones, and rebuilding changed ones — then reconciles the active session's
-    /// project `.mcp.json` (when one is attached). On success the
-    /// whole catalogue is rebuilt (a reload can add, remove, or rename
-    /// servers' tools), and the outcome is reported back to the requester. On
-    /// a config read/parse failure nothing is changed and the error is
-    /// reported.
+    /// running servers with it — dropping the slots of removed/changed servers
+    /// and reporting the shared ones whose connect the caller must spawn — then
+    /// reconciles the active session's project `.mcp.json` (when one is
+    /// attached). On success the catalogue is rebuilt from cache (a reload can
+    /// remove or rename servers' tools; the deferred connects register theirs as
+    /// they land), and the outcome is reported back to the requester. On a
+    /// config read/parse failure nothing is changed and the error is reported.
     pub(super) fn handle_mcp_reload(
         &mut self,
         session_id: Option<u64>,
         reply: &std::sync::mpsc::Sender<Result<McpReloadOutcome, String>>,
     ) {
-        let result = self.mcp_manager.reload();
-        match &result {
-            Ok(outcome) => {
-                self.rebuild_tool_catalogue();
+        match self.mcp_manager.reload() {
+            Ok((outcome, to_connect)) => {
+                // Rebuild from the CACHED tool sets (a dropped/changed server's
+                // tools vanish; unchanged servers keep theirs) — never re-list
+                // every server on the command loop. Each deferred connect
+                // registers its own tools when it lands (`handle_mcp_connected`).
+                self.rebuild_tool_catalogue_cached();
+                for slug in &to_connect {
+                    self.spawn_mcp_connect(slug);
+                }
                 // Reconcile the active session's project `.mcp.json` too (the
                 // daemon-tier `mcp.json` was just reloaded above; `trust.toml`
                 // is watcher-driven). Only the project file needs this explicit
@@ -235,13 +126,18 @@ impl DaemonState {
                 // this reload changed or removed, so they pick up the new
                 // config (the manager already dropped their stale slots).
                 self.refresh_session_overlays(outcome.affected_sessions.iter().copied());
-                info!(summary = %outcome.summary, "MCP config reloaded; tool catalogue refreshed");
+                info!(
+                    summary = %outcome.summary,
+                    connecting = to_connect.len(),
+                    "MCP config reloaded; reconnecting changed servers in background"
+                );
+                let _ = reply.send(Ok(outcome));
             }
             Err(e) => {
                 warn!(error = %e, "MCP config reload failed");
+                let _ = reply.send(Err(e));
             }
         }
-        let _ = reply.send(result);
     }
 
     /// Compute the project root + trust state for a session from its recorded
@@ -256,139 +152,6 @@ impl DaemonState {
             .as_deref()
             .is_some_and(|r| self.mcp_trust.is_trusted(r));
         (root, trusted)
-    }
-
-    /// Whether a session's overlay may REUSE its live connections: it must
-    /// still resolve to the same project root AND the same trust state it was
-    /// last resolved for.
-    ///
-    /// A resolved overlay's server set is determined by `(project_root,
-    /// trusted)`: a TRUSTED root contributes the project's servers plus the
-    /// daemon per-session servers, an UNTRUSTED (or absent) root contributes
-    /// only the daemon per-session servers — which do not depend on the root at
-    /// all. Reuse is therefore correct whenever neither the root nor the trust
-    /// state changed, INCLUDING the untrusted/absent case: reusing lets
-    /// `ensure_session` reuse the pooled daemon connections instead of dropping
-    /// and reconnecting them on every re-resolve.
-    ///
-    /// Leaving the root, or a trust flip in EITHER direction, must release
-    /// instead: a revocation that reused would leave the project's connections
-    /// live rather than releasing them.
-    pub(super) fn session_overlay_reuse(
-        previous: &SessionMcpProject,
-        root: Option<&Path>,
-        trusted: bool,
-    ) -> bool {
-        let leaving = previous.root.as_deref() != root;
-        let trust_flip = previous.trusted != trusted;
-        !leaving && !trust_flip
-    }
-
-    /// Resolve a session's MCP overlay and push it to the session thread (which
-    /// stores it for the request/execution path). Returns the overlay so a
-    /// caller that needs it (the ensure handler) can reply with it directly.
-    pub(super) fn resolve_and_push_session_overlay(
-        &mut self,
-        session_id: u64,
-        cancel_inflight: bool,
-    ) -> SessionMcpOverlay {
-        // The project this session's overlay was last resolved for, so a
-        // working-directory change (or a trust flip) that LEAVES that project
-        // can cancel exactly its servers' in-flight calls.
-        let previous = self
-            .session_mcp_projects
-            .get(&session_id)
-            .cloned()
-            .unwrap_or_default();
-        let (root, trusted) = self.session_project_root(session_id);
-        // The change LEFT the previous project when the resolved root differs
-        // (including entering or leaving the project tier entirely).
-        let leaving = previous.root != root;
-        if cancel_inflight || leaving {
-            // Stop the session's in-flight calls to the project it is leaving or
-            // revoking — and ONLY those. Its daemon-tier calls keep running: a
-            // working-directory change must not disturb an unrelated in-flight
-            // call.
-            if let Some(old_root) = previous.root.as_deref() {
-                self.mcp_manager
-                    .cancel_session_project(session_id, old_root);
-            }
-        }
-        // Reuse the live connections only when the session stays in the same
-        // TRUSTED project: `ensure_session` re-ensures, so pooled project-shared
-        // connections are reused rather than torn down and rebuilt. Every other
-        // case — leaving or entering a project, or a trust flip in EITHER
-        // direction — must release the session's current refs first, so those go
-        // through `reload_session` (release + ensure). A trust flip of the same
-        // root is exactly such a case: the previous resolve had connected the
-        // daemon-tier per-session servers under a key the new resolve no longer
-        // wants, so re-using would leave them live instead of releasing them.
-        let overlay = if Self::session_overlay_reuse(&previous, root.as_deref(), trusted) {
-            self.mcp_manager
-                .ensure_session(session_id, root.as_deref(), trusted)
-        } else {
-            self.mcp_manager
-                .reload_session(session_id, root.as_deref(), trusted)
-        };
-        // Record the freshly-resolved project + trust so the NEXT change knows
-        // what it left.
-        self.session_mcp_projects
-            .insert(session_id, SessionMcpProject { root, trusted });
-        self.push_overlay_to_session(session_id, &overlay);
-        overlay
-    }
-
-    /// Re-resolve ONE session's overlay WITHOUT releasing its existing
-    /// connections, and push it to the session thread.
-    ///
-    /// Used on an MCP list change (a project/per-session server that adds or
-    /// withdraws a tool changes the session's private overlay, so re-ensuring
-    /// rather than `reload_session`'s release-then-ensure reuses its live
-    /// connections while re-listing their tools) and after a daemon-tier
-    /// reload that changed or removed a per-session server (whose stale slots
-    /// the manager already dropped, so the re-ensure reconnects them with the
-    /// new config). The resolve is bounded by `deadline` (see
-    /// [`DaemonState::refresh_session_overlays`]).
-    pub(super) fn refresh_session_overlay(&mut self, session_id: u64, deadline: Instant) {
-        let (root, trusted) = self.session_project_root(session_id);
-        let overlay =
-            self.mcp_manager
-                .ensure_session_within(session_id, root.as_deref(), trusted, deadline);
-        self.session_mcp_projects
-            .insert(session_id, SessionMcpProject { root, trusted });
-        self.push_overlay_to_session(session_id, &overlay);
-    }
-
-    /// Re-resolve each of `sessions`' overlays under ONE shared deadline.
-    ///
-    /// Bounds the WHOLE sweep (not each session) so re-resolving many sessions
-    /// cannot stall the command loop for one connect budget per session; a
-    /// session reached after the deadline keeps its current overlay and is
-    /// re-resolved on the next event. Sessions holding only reused (pooled)
-    /// connections — the common case — are fast and always fit.
-    pub(super) fn refresh_session_overlays(&mut self, sessions: impl IntoIterator<Item = u64>) {
-        let deadline = Instant::now() + OVERLAY_RERESOLVE_TOTAL_BUDGET;
-        for session_id in sessions {
-            if Instant::now() >= deadline {
-                warn!("MCP overlay re-resolve budget exhausted; deferring remaining sessions");
-                break;
-            }
-            self.refresh_session_overlay(session_id, deadline);
-        }
-    }
-
-    /// Push a resolved overlay to the session thread (which stores it for the
-    /// request/execution path). Best-effort: a session with no live thread is
-    /// skipped with a warning.
-    pub(super) fn push_overlay_to_session(&self, session_id: u64, overlay: &SessionMcpOverlay) {
-        if let Some(entry) = self.active_sessions.get(&session_id)
-            && entry
-                .cmd_tx
-                .send(SessionCommand::SetMcpOverlay(Box::new(overlay.clone())))
-                .is_err()
-        {
-            warn!(session_id, "failed to push MCP overlay to session");
-        }
     }
 
     /// Build a full MCP status report for a session (or the daemon tier only
@@ -514,12 +277,21 @@ impl DaemonState {
     /// shared servers, then rebuild the catalogue.
     pub(super) fn handle_mcp_tier_reload(&mut self) {
         match self.mcp_manager.reload() {
-            Ok(outcome) => {
-                self.rebuild_tool_catalogue();
+            Ok((outcome, to_connect)) => {
+                // Cached rebuild only: deferred connects register their tools as
+                // they land, and an unchanged server keeps its cached tool set.
+                self.rebuild_tool_catalogue_cached();
+                for slug in &to_connect {
+                    self.spawn_mcp_connect(slug);
+                }
                 // Re-resolve the overlays that held a daemon per-session server
                 // this reload changed or removed.
                 self.refresh_session_overlays(outcome.affected_sessions.iter().copied());
-                info!(summary = %outcome.summary, "MCP daemon-tier config reloaded (watch)");
+                info!(
+                    summary = %outcome.summary,
+                    connecting = to_connect.len(),
+                    "MCP daemon-tier config reloaded (watch); reconnecting in background"
+                );
             }
             Err(e) => warn!(error = %e, "MCP daemon-tier config reload failed"),
         }

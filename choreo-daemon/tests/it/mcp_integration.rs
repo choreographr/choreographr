@@ -25,6 +25,11 @@ use std::time::Duration;
 /// package's integration tests.
 const FIXTURE_BIN: &str = env!("CARGO_BIN_EXE_mcp-daemon-fixture-server");
 
+/// Budget for one blocking overlay resolve (`ensure_session_blocking`). The
+/// daemon never blocks on an overlay, so this only bounds the test seam; it is
+/// generous because a real fixture server still has to start and handshake.
+const OVERLAY_BUDGET: Duration = Duration::from_secs(30);
+
 #[test]
 #[ignore = "integration"]
 fn mcp_fixture_tools_are_discovered_and_callable() {
@@ -59,7 +64,8 @@ fn mcp_fixture_tools_are_discovered_and_callable() {
 
     // ── 3. Build registry and spawn MCP servers via McpManager ──
     let mut registry = choreo_daemon::tools::ToolRegistry::new();
-    let mcp_manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
+    let mut mcp_manager = choreo_daemon::mcp::McpManager::new_from_config();
+    mcp_manager.connect_all_blocking(&mut registry, Duration::from_secs(30));
     let registry = Arc::new(registry);
 
     // ── 4. Verify the dynamic group was registered ──
@@ -182,7 +188,8 @@ fn mcp_resource_tools_are_registered_and_callable() {
     choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
 
     let mut registry = choreo_daemon::tools::ToolRegistry::new();
-    let manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
+    let mut manager = choreo_daemon::mcp::McpManager::new_from_config();
+    manager.connect_all_blocking(&mut registry, Duration::from_secs(30));
     let registry = Arc::new(registry);
 
     let mut active = HashSet::new();
@@ -245,7 +252,8 @@ fn mcp_list_change_is_forwarded_and_reregisters() {
     choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
 
     let mut registry = choreo_daemon::tools::ToolRegistry::new();
-    let mut manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
+    let mut manager = choreo_daemon::mcp::McpManager::new_from_config();
+    manager.connect_all_blocking(&mut registry, Duration::from_secs(30));
     let rx = manager
         .take_list_change_rx()
         .expect("a list-change channel is created for connected servers");
@@ -259,7 +267,8 @@ fn mcp_list_change_is_forwarded_and_reregisters() {
     // Rebuild into a fresh registry the way the daemon's list-change handler
     // does, and confirm the server's catalogue is re-registered.
     let mut rebuilt = choreo_daemon::tools::ToolRegistry::new();
-    manager.register_all(&mut rebuilt);
+    manager.refresh_server(&slug);
+    manager.register_cached(&mut rebuilt);
     assert!(
         rebuilt
             .group_names()
@@ -303,7 +312,8 @@ fn mcp_list_change_only_relists_the_changed_server() {
     choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
 
     let mut registry = choreo_daemon::tools::ToolRegistry::new();
-    let mut manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
+    let mut manager = choreo_daemon::mcp::McpManager::new_from_config();
+    manager.connect_all_blocking(&mut registry, Duration::from_secs(30));
     let rx = manager
         .take_list_change_rx()
         .expect("a list-change channel is created for connected servers");
@@ -313,7 +323,7 @@ fn mcp_list_change_only_relists_the_changed_server() {
         .expect("expected a forwarded list change");
     assert_eq!(change.slug, "lc");
 
-    // Both servers were listed exactly once by `from_config`'s connect sweep.
+    // Both servers were listed exactly once by the startup connect (`connect_all_blocking`).
     assert_eq!(
         count_lines(&lc_log),
         1,
@@ -392,14 +402,18 @@ fn mcp_startup_budget_bounds_slow_tool_listing() {
 
     let mut registry = choreo_daemon::tools::ToolRegistry::new();
     let start = std::time::Instant::now();
-    let manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
+    let mut manager = choreo_daemon::mcp::McpManager::new_from_config();
+    // A short budget: the server answers `initialize` but parks on
+    // `tools/list`, so discovery must be cut off by the connect budget rather
+    // than the server's 60 s request timeout.
+    manager.connect_all_blocking(&mut registry, Duration::from_secs(2));
     let elapsed = start.elapsed();
 
-    // The startup budget is 2 s; the request timeout is 60 s. Bound well below
-    // the latter so the assertion proves the budget did the work.
+    // Bound well below the 60 s request timeout so the assertion proves the
+    // connect budget (2 s) did the work, not the server's own timeout.
     assert!(
         elapsed < Duration::from_secs(6),
-        "from_config must bound slow discovery by the startup budget, took {elapsed:?}"
+        "a blocking connect must bound slow discovery by its budget, took {elapsed:?}"
     );
     assert_eq!(
         manager.server_count(),
@@ -425,7 +439,8 @@ fn mcp_catalogue_refresh_is_bounded_by_the_refresh_deadline() {
     choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
 
     let mut registry = choreo_daemon::tools::ToolRegistry::new();
-    let mut manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
+    let mut manager = choreo_daemon::mcp::McpManager::new_from_config();
+    manager.connect_all_blocking(&mut registry, Duration::from_secs(30));
     assert_eq!(
         manager.server_count(),
         1,
@@ -434,14 +449,15 @@ fn mcp_catalogue_refresh_is_bounded_by_the_refresh_deadline() {
 
     let mut rebuilt = choreo_daemon::tools::ToolRegistry::new();
     let start = std::time::Instant::now();
-    manager.register_all(&mut rebuilt);
+    manager.refresh_server(&slug);
+    manager.register_cached(&mut rebuilt);
     let elapsed = start.elapsed();
 
     // The refresh deadline is 3 s; the request timeout here is 10 s. Bound well
     // below the latter so the assertion proves the deadline did the work.
     assert!(
         elapsed < Duration::from_secs(6),
-        "register_all must bound a slow listing by the refresh deadline, took {elapsed:?}"
+        "the catalogue refresh must bound a slow listing by its deadline, took {elapsed:?}"
     );
     assert!(
         rebuilt
@@ -486,7 +502,7 @@ fn project_server_slug_maps_to_its_referencing_sessions() {
     );
 
     // A session that resolves its overlay references the project server.
-    let _overlay = manager.ensure_session(7, Some(root), true);
+    let _overlay = manager.ensure_session_blocking(7, Some(root), true, OVERLAY_BUDGET);
     assert!(
         manager.sessions_for_slug("proj").contains(&7),
         "a session holding the project server must be reported for its slug"
@@ -533,7 +549,8 @@ fn mcp_shutdown_all_is_bounded_with_a_stubborn_server() {
     choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
 
     let mut registry = choreo_daemon::tools::ToolRegistry::new();
-    let manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
+    let mut manager = choreo_daemon::mcp::McpManager::new_from_config();
+    manager.connect_all_blocking(&mut registry, Duration::from_secs(30));
     assert_eq!(
         manager.server_count(),
         1,
@@ -561,7 +578,8 @@ fn mcp_progress_streams_through_the_wrapper() {
     choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
 
     let mut registry = choreo_daemon::tools::ToolRegistry::new();
-    let manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
+    let mut manager = choreo_daemon::mcp::McpManager::new_from_config();
+    manager.connect_all_blocking(&mut registry, Duration::from_secs(30));
     let registry = Arc::new(registry);
 
     let call = choreo_ai_protocols::ChatToolCall {
@@ -671,14 +689,14 @@ fn same_root_re_resolve_reuses_connections() {
 
     let mut manager = choreo_daemon::mcp::McpManager::empty();
 
-    let first = manager.ensure_session(7, Some(root), true);
+    let first = manager.ensure_session_blocking(7, Some(root), true, OVERLAY_BUDGET);
     assert!(
         first.statuses.iter().any(|s| s.slug == "proj"),
         "the project server must connect on the first resolve: {:?}",
         first.statuses
     );
     // A second resolve for the SAME root re-ensures and reuses the connection.
-    let second = manager.ensure_session(7, Some(root), true);
+    let second = manager.ensure_session_blocking(7, Some(root), true, OVERLAY_BUDGET);
     assert!(
         second.statuses.iter().any(|s| s.slug == "proj"),
         "the reused server must still be present: {:?}",
@@ -722,8 +740,9 @@ fn untrusted_project_does_not_suppress_daemon_per_session_server() {
     .expect("write .mcp.json");
 
     let mut registry = choreo_daemon::tools::ToolRegistry::new();
-    let mut manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
-    let overlay = manager.ensure_session(7, Some(project.path()), false);
+    let mut manager = choreo_daemon::mcp::McpManager::new_from_config();
+    manager.connect_all_blocking(&mut registry, Duration::from_secs(30));
+    let overlay = manager.ensure_session_blocking(7, Some(project.path()), false, OVERLAY_BUDGET);
 
     assert!(
         overlay
@@ -759,8 +778,9 @@ fn reconnect_rebuilds_a_daemon_per_session_slot() {
     choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
 
     let mut registry = choreo_daemon::tools::ToolRegistry::new();
-    let mut manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
-    let overlay = manager.ensure_session(7, None, false);
+    let mut manager = choreo_daemon::mcp::McpManager::new_from_config();
+    manager.connect_all_blocking(&mut registry, Duration::from_secs(30));
+    let overlay = manager.ensure_session_blocking(7, None, false, OVERLAY_BUDGET);
     assert!(
         overlay.statuses.iter().any(|s| s.slug == "stateful"),
         "the per-session server must connect first: {:?}",
@@ -797,8 +817,9 @@ fn reload_drops_a_changed_daemon_per_session_slot() {
     choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
 
     let mut registry = choreo_daemon::tools::ToolRegistry::new();
-    let mut manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
-    let overlay = manager.ensure_session(7, None, false);
+    let mut manager = choreo_daemon::mcp::McpManager::new_from_config();
+    manager.connect_all_blocking(&mut registry, Duration::from_secs(30));
+    let overlay = manager.ensure_session_blocking(7, None, false, OVERLAY_BUDGET);
     assert!(
         overlay.statuses.iter().any(|s| s.slug == "stateful"),
         "the per-session server must connect first: {:?}",
@@ -816,7 +837,7 @@ fn reload_drops_a_changed_daemon_per_session_slot() {
     )
     .expect("rewrite mcp.json");
 
-    let outcome = manager.reload().expect("reload succeeds");
+    let outcome = manager.reload().expect("reload succeeds").0;
     assert!(
         outcome.summary.contains("1 restarted"),
         "a changed per-session server must count as restarted: {}",
@@ -852,7 +873,8 @@ fn reload_moves_a_shared_server_to_per_session() {
     choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
 
     let mut registry = choreo_daemon::tools::ToolRegistry::new();
-    let mut manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
+    let mut manager = choreo_daemon::mcp::McpManager::new_from_config();
+    manager.connect_all_blocking(&mut registry, Duration::from_secs(30));
     assert_eq!(
         manager.server_count(),
         1,
@@ -869,7 +891,7 @@ fn reload_moves_a_shared_server_to_per_session() {
     )
     .expect("rewrite mcp.json");
 
-    let outcome = manager.reload().expect("reload succeeds");
+    let outcome = manager.reload().expect("reload succeeds").0;
     assert!(
         outcome.summary.contains("1 restarted"),
         "the flip must count as restarted: {}",
@@ -882,7 +904,7 @@ fn reload_moves_a_shared_server_to_per_session() {
     );
 
     // The next resolve connects it as a per-session server instead.
-    let overlay = manager.ensure_session(7, None, false);
+    let overlay = manager.ensure_session_blocking(7, None, false, OVERLAY_BUDGET);
     assert!(
         overlay.statuses.iter().any(|s| s.slug == "flip"),
         "the server must reconnect per-session on the next resolve: {:?}",
@@ -921,8 +943,9 @@ fn failed_project_connect_does_not_shadow_daemon_group() {
     .expect("write .mcp.json");
 
     let mut registry = choreo_daemon::tools::ToolRegistry::new();
-    let mut manager = choreo_daemon::mcp::McpManager::from_config(&mut registry);
-    let overlay = manager.ensure_session(7, Some(project.path()), true);
+    let mut manager = choreo_daemon::mcp::McpManager::new_from_config();
+    manager.connect_all_blocking(&mut registry, Duration::from_secs(30));
+    let overlay = manager.ensure_session_blocking(7, Some(project.path()), true, OVERLAY_BUDGET);
 
     assert!(
         !overlay.shadowed_groups.contains("mcp/shared"),
@@ -957,9 +980,13 @@ fn storing_an_mcp_credential_reconnects_its_server() {
         write_daemon_config(&serde_json::json!({ "docs": server })).expect("write config");
     choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
 
-    let mut state = crate::common::test_daemon_state();
-    // Load the daemon-tier config so `docs` is known and connected once.
+    let (mut state, daemon_rx) = crate::common::test_daemon_state_pair();
+    // Load the daemon-tier config so `docs` is known and connected once. The
+    // connect is a background worker now, so pump its `McpConnected` through.
     state.handle_command(DaemonCommand::McpTierReload);
+    crate::common::pump_until(&mut state, &daemon_rx, Duration::from_secs(30), |s| {
+        s.mcp_connects_completed >= 1
+    });
     assert_eq!(count_lines(&connect_log), 1, "docs connects once on reload");
 
     // Unlock so the credential save is accepted (a locked add is refused).
@@ -992,6 +1019,11 @@ fn storing_an_mcp_credential_reconnects_its_server() {
         },
         reply: None,
         ack: save_ack,
+    });
+    // Storing the grant schedules a background reconnect for `docs`; pump it
+    // through the command loop before asserting (a second connect).
+    crate::common::pump_until(&mut state, &daemon_rx, Duration::from_secs(30), |s| {
+        s.mcp_connects_completed >= 2
     });
 
     assert_eq!(
@@ -1026,7 +1058,7 @@ fn unlock_reconnects_signed_in_mcp_servers() {
     choreo_daemon::mcp::config::set_test_config_root(Some(empty.path().to_path_buf()));
 
     let key = vec![7u8; 32];
-    let mut state = crate::common::test_daemon_state();
+    let (mut state, daemon_rx) = crate::common::test_daemon_state_pair();
     let (bind_ack, _bind_rx) = std::sync::mpsc::channel();
     state.handle_command(DaemonCommand::BindKeystore {
         key: key.clone(),
@@ -1065,6 +1097,9 @@ fn unlock_reconnects_signed_in_mcp_servers() {
         write_daemon_config(&serde_json::json!({ "docs": server })).expect("write config");
     choreo_daemon::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
     state.handle_command(DaemonCommand::McpTierReload);
+    crate::common::pump_until(&mut state, &daemon_rx, Duration::from_secs(30), |s| {
+        s.mcp_connects_completed >= 1
+    });
     assert_eq!(count_lines(&connect_log), 1, "docs connects on reload");
 
     // Relock, then unlock: the reconnect is gated on a REAL locked→unlocked
@@ -1081,6 +1116,10 @@ fn unlock_reconnects_signed_in_mcp_servers() {
         ack: unlock_ack,
     });
     assert!(!state.locked, "unlock leaves the daemon unlocked");
+    // The unlock schedules the resync on a background worker; pump it through.
+    crate::common::pump_until(&mut state, &daemon_rx, Duration::from_secs(30), |s| {
+        s.mcp_connects_completed >= 2
+    });
     assert_eq!(
         count_lines(&connect_log),
         2,

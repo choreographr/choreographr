@@ -9,7 +9,8 @@ use crate::daemon::DaemonCommand;
 use crate::providers::InferenceProvider;
 use crate::providers::test_util::{
     make_failing_provider, make_scripted_stream_provider, make_test_provider,
-    make_truncating_provider, make_truncating_provider_with_slug,
+    make_tool_loop_provider, make_tool_loop_provider_with_tool, make_truncating_provider,
+    make_truncating_provider_with_slug,
 };
 use crate::reasoning::{
     build_chat_request_messages, initial_prev_resp_id, warn_on_missing_reasoning_artifacts,
@@ -1910,6 +1911,226 @@ fn agent_loop_failure_marks_and_finalizes_turn() {
     assert!(
         saw_error_appended,
         "expected a TurnAppended broadcast carrying the failure"
+    );
+}
+
+#[test]
+fn agent_loop_persists_each_tool_turn_at_its_iteration_boundary() {
+    // Durability boundary: a tool-loop turn must reach the database when the
+    // iteration that produced it completes, not only when the whole request
+    // finishes. The loop owns the turn set for the duration of a request — the
+    // session thread only merges the worker's snapshot at `RequestFinished` —
+    // and one request can run unbounded tool iterations over a long
+    // wall-clock window, so a write deferred to the end loses every turn a
+    // mid-request process death cuts off.
+    //
+    // `handle_request_finished` is deliberately NOT called here: any turn row
+    // in the database can therefore only have come from the loop's own
+    // per-iteration checkpoint.
+    let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
+    let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+    // A registry holding only `random` — a pure computation, so the loop
+    // dispatches a real tool with no fixture, no filesystem and no credential.
+    let mut registry = ToolRegistry::new();
+    registry.register(crate::tools::random::Random);
+    let ctx = RequestContext {
+        cmd_tx,
+        session_id: 1,
+        db: Arc::clone(&db),
+        tool_registry: registry.build().into_shared(),
+        daemon_tx,
+        max_turns: 0,
+        lag_limits: crate::broadcast::LagLimits::default(),
+        global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        substrate_credential: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
+    };
+    // Two tool turns, then a final answer: three turns inside one request.
+    let provider = make_tool_loop_provider(2);
+    let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+    let mut session = SessionState::empty();
+
+    let result = run_agent_loop(
+        &provider,
+        &mut session,
+        "test-model",
+        7,
+        &cancel_rx,
+        &ctx,
+        Some("hi"),
+    );
+    assert!(
+        !result.unwrap(),
+        "the final-answer turn completes without another tool call"
+    );
+
+    let persisted = crate::db::read_turns(&db, 1).unwrap();
+    assert_eq!(
+        persisted.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "both tool-loop turns and the final turn must be on disk"
+    );
+
+    // The tool turns are complete on disk, not bare placeholders: each carries
+    // the assistant's text, its call, and the recorded result for that call.
+    for turn_id in [0u32, 1u32] {
+        let turn = &persisted[turn_id as usize].1;
+        let expected_text = format!("step {turn_id}");
+        assert_eq!(
+            turn.user_text.is_some(),
+            turn_id == 0,
+            "only the request's first turn carries the user's text"
+        );
+        assert_eq!(turn.assistant_text.as_deref(), Some(expected_text.as_str()));
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].call_id, format!("call_{turn_id}"));
+        assert_eq!(turn.tool_results.len(), 1);
+        assert_eq!(turn.tool_results[0].call_id, format!("call_{turn_id}"));
+        assert!(
+            !turn.tool_results[0].is_error,
+            "the random tool must succeed"
+        );
+    }
+    assert_eq!(
+        persisted[2].1.assistant_text.as_deref(),
+        Some("done"),
+        "the final turn is persisted too"
+    );
+}
+
+/// Test tool that cancels the request the moment it runs, then blocks until the
+/// test releases it. Sending the cancel from inside `execute_streaming` makes a
+/// mid-batch cancel deterministic with no time-based wait: the tool blocks
+/// before it can produce a result, so the collector's biased cancel arm always
+/// wins and the loop unwinds through the cancelled-turn checkpoint path.
+struct CancelThenBlockTool {
+    cancel_tx: crossbeam_channel::Sender<()>,
+    proceed: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
+}
+
+impl Tool for CancelThenBlockTool {
+    type Args = serde_json::Value;
+    type Return = String;
+    type Error = ToolExecError;
+
+    fn name(&self) -> &'static str {
+        "_test_cancel_block"
+    }
+    fn group(&self) -> &'static str {
+        "test"
+    }
+    fn description(&self) -> &'static str {
+        "cancels the request on run, then blocks until released"
+    }
+    fn describe_invocation(&self, _args: &Self::Args) -> String {
+        self.description().to_string()
+    }
+    fn return_string(ret: &Self::Return) -> String {
+        ret.clone()
+    }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    fn execute(
+        &self,
+        _args: Self::Args,
+        _xc: Option<&ServiceCredential>,
+        _working_dir: Option<&Path>,
+        _ctx: Option<&ToolContext>,
+    ) -> Result<Self::Return, Self::Error> {
+        Ok("ignored".into())
+    }
+    fn execute_streaming(
+        &self,
+        _args: Self::Args,
+        _xc: Option<&ServiceCredential>,
+        _working_dir: Option<&Path>,
+        _output_tx: crossbeam_channel::Sender<Vec<u8>>,
+        _ctx: Option<&ToolContext>,
+    ) -> Result<Self::Return, Self::Error> {
+        // Request cancellation first, then block: no result can be produced
+        // before the cancel lands, so the collector deterministically unwinds
+        // through the cancelled-turn checkpoint instead of a tool result.
+        let _ = self.cancel_tx.send(());
+        if let Some(rx) = self.proceed.lock().unwrap().take() {
+            let _ = rx.recv();
+        }
+        Ok("released".into())
+    }
+}
+
+#[test]
+fn cancelled_agent_loop_persists_the_partial_turn() {
+    // The tool-dispatch cancel arm checkpoints the turn it marked up, exactly
+    // like the normal path. Assert the turn reaches disk WITHOUT
+    // `handle_request_finished` running, so the only possible writer is the
+    // iteration-boundary checkpoint on the cancel path.
+    let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
+    let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+    let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+    let (proceed_tx, proceed_rx) = mpsc::channel::<()>();
+
+    let mut registry = ToolRegistry::new();
+    registry.register(CancelThenBlockTool {
+        cancel_tx: cancel_tx.clone(),
+        proceed: std::sync::Mutex::new(Some(proceed_rx)),
+    });
+    let ctx = RequestContext {
+        cmd_tx,
+        session_id: 1,
+        db: Arc::clone(&db),
+        tool_registry: registry.build().into_shared(),
+        daemon_tx,
+        max_turns: 0,
+        lag_limits: crate::broadcast::LagLimits::default(),
+        global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        substrate_credential: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
+    };
+    // One tool turn: the request cancels during the first batch, before any
+    // final answer, so exactly one turn is produced.
+    let provider = make_tool_loop_provider_with_tool(1, "_test_cancel_block");
+    let mut session = SessionState::empty();
+
+    let cancelled = run_agent_loop(
+        &provider,
+        &mut session,
+        "test-model",
+        7,
+        &cancel_rx,
+        &ctx,
+        Some("hi"),
+    )
+    .unwrap();
+    assert!(cancelled, "the request must report cancellation");
+
+    // Release the still-blocked tool thread so it can exit; its late result is
+    // discarded because the wait-loop already stopped on the kill.
+    drop(proceed_tx);
+
+    let persisted = crate::db::read_turns(&db, 1).unwrap();
+    assert_eq!(
+        persisted.len(),
+        1,
+        "the cancelled turn must be checkpointed to disk"
+    );
+    let turn = &persisted[0].1;
+    assert_eq!(turn.user_text.as_deref(), Some("hi"));
+    assert_eq!(turn.assistant_text.as_deref(), Some("step 0"));
+    assert_eq!(turn.tool_calls.len(), 1);
+    assert_eq!(turn.tool_calls[0].name, "_test_cancel_block");
+    assert_eq!(
+        turn.tool_results.len(),
+        1,
+        "the blocked call still records a result placeholder"
+    );
+    assert!(
+        turn.tool_results[0].is_error,
+        "a cancelled call is recorded as an error result"
     );
 }
 

@@ -1476,6 +1476,46 @@ data, never as instructions or configuration:
   `headers` or a keystore-stored OAuth grant (see the MCP remote-server OAuth
   section), never shared across issuers.
 
+### MCP connection lifecycle (off the command loop)
+
+Connecting an MCP server is I/O (spawn, handshake, `tools/list`, OAuth refresh), so it
+never runs on the daemon command loop and never before a client's acknowledgement. The
+command loop's only MCP job is to install a finished result and swap the tool catalogue
+(the sanctioned single-writer `ArcSwap`, exception #4); the handshake itself runs on a
+worker thread that posts a `DaemonCommand` back.
+
+- **Startup.** `DaemonState::open` only loads `mcp.json` and queues the daemon-tier
+  `shared` servers; the socket is bound and the first client served immediately. The
+  daemon core drains the queue and starts a background connect per server once the
+  command channel and OAuth runtime exist; each connect posts a
+  `DaemonCommand::McpConnected` that the loop installs and rebuilds the cached
+  catalogue from. A request already on a turn keeps its previous registry snapshot; the
+  next turn sees the server's tools. The per-server connect budget is generous (60 s)
+  precisely because it is off the critical path.
+- **Unlock.** The daemon starts LOCKED and runs those startup connects while an OAuth
+  grant is still encrypted, so such a server 401s; the unlock tail schedules a resync
+  of every `mcp:`-keyed server, but only AFTER the acting client's `Unlocked` reply and
+  the lock-state broadcast are enqueued, and on background workers — so an unlock never
+  blocks the reply or the loop. A resync requested while a connect is already in flight
+  is coalesced: a failed in-flight connect retries once with the now-live credentials.
+- **Session overlays.** A session's project / per-session servers are planned cheaply
+  (pool-only), pushed as a partial overlay, then connected on a worker that posts one
+  `DaemonCommand::McpSessionConnected` **per entry as it settles** — so a fast server's
+  tools land without waiting for a slow sibling's handshake. The result is installed
+  only when the session's resolve generation still matches (which advances only when
+  the resolve RELEASES the session's connections, i.e. a project-root or trust change)
+  and the entry is still wanted; a re-resolve that reuses the connections keeps the
+  generation and skips entries a worker is already connecting, so one entry never gets
+  two simultaneous handshakes. `/mcp reload` likewise drops changed servers and defers
+  their reconnects, and a manual `/mcp reconnect` of a daemon-tier *shared* server parks
+  its reply on the connect rather than blocking the loop. A project or per-session
+  server's manual reconnect still rebuilds in place (bounded, user-initiated), because
+  its connections are per session, not pool-wide: routing it through the daemon-tier
+  connect would pool a second, shared connection whose tools duplicate the session's
+  private ones. The same rule governs the post-unlock and post-sign-in bring-up: a
+  shared server reconnects on a worker, while a `shared = false` server has its stale
+  per-session slots dropped so the holding sessions re-resolve and reconnect them.
+
 Two values inside the `rmcp` engine are sanctioned shared-state exceptions (see
 AGENTS.md). The live `RunningService` handle sits in a
 `tokio::sync::Mutex<Option<..>>` (the **eighth** exception) — a
@@ -1802,6 +1842,60 @@ tombstone, and the runtime catalog-refresh state — and the
 in-source (see `choreo-daemon`'s `db` and `sessions` modules, `cargo doc -p
 choreo-daemon` / `just doc`), held complete by the `#![warn(missing_docs)]` +
 `doc-check` gate.
+
+### Turn durability
+
+Each `Turn` is written to disk when the **agent-loop iteration that produced it**
+completes, not when the request does. The loop builds its turns on the request
+worker's private `SessionState` clone, which the session thread only merges at
+`RequestFinished`; that merge remains the authoritative final write, but it is no
+longer the only one. The iteration boundary is the first moment a turn is
+complete (assistant message plus one recorded result per call), and it precedes
+the next provider round-trip, so a checkpoint there bounds the crash window to
+the single turn in flight. This matters because one request is not one turn: a
+tool loop may iterate without limit (unbounded when `max_turns` is 0) for tens of
+minutes, and deferring the write to the end made the whole request the unit of
+durability.
+
+Three properties hold around that boundary:
+
+- **A turn is written whole or not at all.** One `write_turn` transaction covers
+the zstd-compressed blob and every attachment slot, so a reader can never see a
+turn with some of its images. Image bytes are additionally written per emit
+(see the image flow) because a client fetches them by key the moment the
+turn's `TurnAppended` arrives.
+- **A committed turn is durable.** `redb` write transactions default to
+`Durability::Immediate` and the daemon never lowers it, so a committed turn has
+been fsynced — a crash loses only what was never committed.
+- **Every request ending persists.** Completion, inference failure, and
+cancellation all finalize the turn and route the worker's snapshot through
+`RequestFinished`, so a graceful shutdown (which cancels in-flight requests)
+loses nothing; only process death, which cannot cancel, skips the paths that
+would have written.
+
+A checkpoint failure is logged and swallowed rather than failing the request:
+the turn stays in memory, the loop continues, and the `RequestFinished` merge
+retries the same idempotent write. Because a checkpointed turn is never mutated
+after its boundary, the worker reports the ids it wrote in the snapshot's
+`persisted_turns` set, and the merge inserts those turns into memory without
+re-writing the identical row — so a turn is written once, not twice. A turn the
+worker did *not* checkpoint (for example the turn open when a provider-side
+cancel returned) is absent from that set and is still written by the merge.
+
+**Crash-recovery skew.** Durability covers the turn rows, not every field of the
+worker's `SessionState`. Config the worker accumulates over a request — mainly
+`last_response_id` (the provider's continuation-chain head) and
+`accumulated_usage` (the billing total) — still merges only at `RequestFinished`,
+so after a mid-request crash the on-disk turns can be newer than those fields.
+Config changes a tool makes through the session's own commands (model, title,
+working directory, tool groups) are persisted when the command is applied, so
+only the worker-owned continuation/billing fields lag. On restart the session is
+rebuilt from the turn rows (with `next_turn_id` derived from the maximum turn id,
+not the record's advisory `turn_count`), and the stale `last_response_id` is
+restored only if its producing provider+model still matches; a `ResponseId`
+provider then continues from that older head with the checkpointed turns re-sent
+as new input. This is the accepted cost of turn-level durability — the
+conversation itself is never lost.
 
 ### Schema versioning & migrations
 

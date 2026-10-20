@@ -52,6 +52,37 @@ pub struct McpServerStatus {
 }
 
 impl McpServerStatus {
+    /// The status row for one CONNECTED slot, in `tier`.
+    ///
+    /// Every connected row the manager produces — a daemon shared server, a
+    /// project-shared connection, a per-session connection, a cached overlay
+    /// rebuild — comes from here, so the credential key, transport label, and
+    /// self-reported name/version that `/mcp` renders cannot drift between the
+    /// status surfaces.
+    ///
+    /// `auth` and `oauth` are the configuration baseline from
+    /// `crate::mcp::oauth::status_auth`; the daemon refines `auth` against its
+    /// credential store afterwards.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub(super) fn for_slot(slug: &str, tier: &str, slot: &super::slot::ServerSlot) -> Self {
+        let (credential_key, oauth, auth) = crate::mcp::oauth::status_auth(&slot.config);
+        Self {
+            slug: slug.to_string(),
+            tier: tier.to_string(),
+            transport: slot.config.transport.label().to_string(),
+            target: slot.config.transport.target().to_string(),
+            connected: true,
+            tool_count: slot.tool_count,
+            server_name: Some(slot.handle.name().to_string()),
+            server_version: Some(slot.handle.version().to_string()),
+            last_error: None,
+            credential_key,
+            oauth,
+            auth,
+        }
+    }
+
     /// A one-line human-readable summary of this server's state.
     ///
     /// This renders the identical string to the wire type's summary in

@@ -111,6 +111,8 @@ pub(super) fn make_daemon_state() -> (DaemonState, crossbeam_channel::Receiver<D
         model_cache: HashMap::new(),
         model_prefetch_in_flight: HashSet::new(),
         mcp_manager: crate::mcp::McpManager::empty(),
+        pending_mcp_reconnects: std::collections::HashMap::new(),
+        mcp_connects_completed: 0,
         mcp_trust: crate::mcp::trust::McpTrustStore::load(config_dir.path().join("trust.toml")),
         maintenance_tx: None,
         acl: None,
@@ -2014,6 +2016,7 @@ fn trust_flip_on_the_same_root_forces_overlay_reload() {
     let revoked_previous = SessionMcpProject {
         root: untrusted.root.clone(),
         trusted: true,
+        ..SessionMcpProject::default()
     };
     assert!(!DaemonState::session_overlay_reuse(
         &revoked_previous,
@@ -2026,6 +2029,7 @@ fn trust_flip_on_the_same_root_forces_overlay_reload() {
     let trusted_previous = SessionMcpProject {
         root: untrusted.root.clone(),
         trusted: true,
+        ..SessionMcpProject::default()
     };
     assert!(
         DaemonState::session_overlay_reuse(&trusted_previous, Some(project.path()), true),
@@ -2051,6 +2055,113 @@ fn trust_flip_on_the_same_root_forces_overlay_reload() {
     let after = state.session_mcp_projects.get(&1).cloned().unwrap();
     assert_eq!(after.root.as_deref(), Some(project.path()));
     assert!(after.trusted, "the trust flip must be recorded");
+}
+
+#[cfg(feature = "mcp")]
+#[test]
+fn overlay_generation_advances_only_when_connections_are_released() {
+    // A background overlay connect carries the resolve generation it was planned
+    // under. A resolve that REUSES the session's connections (same root, same
+    // trust) keeps the generation, so a connect already in flight stays valid
+    // instead of being churned away by every re-resolve; a resolve that RELEASES
+    // them (a trust flip on the same root) advances it, so a superseded result is
+    // dropped rather than installed into the live pool.
+    let (mut state, _rx) = make_daemon_state();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project.path().join(".git")).unwrap();
+    std::fs::write(project.path().join(".mcp.json"), "{}").unwrap();
+    state.session_metadata.insert(
+        1,
+        SessionMetadata {
+            title: None,
+            selected_model: None,
+            reasoning_effort: None,
+            parent_session_id: None,
+            working_dir: Some(project.path().to_string_lossy().into_owned()),
+            created_at: 1000,
+            last_modified: 1000,
+            turn_count: 0,
+            status: SessionStatus::Inactive,
+            active_tool_groups: vec![],
+            account_name: None,
+            accumulated_usage: TokenUsage::default(),
+            context_window: None,
+            last_prompt_tokens: None,
+            pinned: false,
+            archived_at: None,
+        },
+    );
+
+    state.resolve_and_push_session_overlay(1, false);
+    let first = state.session_mcp_projects.get(&1).unwrap().generation;
+
+    // Same root, same trust → the connections are reused → the generation holds.
+    state.resolve_and_push_session_overlay(1, false);
+    assert_eq!(
+        state.session_mcp_projects.get(&1).unwrap().generation,
+        first,
+        "a re-resolve that reuses the connections must not churn the generation"
+    );
+
+    // A trust flip on the same root releases the stale connections, so the
+    // generation advances and anything planned before it is superseded.
+    state.mcp_trust.trust(project.path()).unwrap();
+    state.resolve_and_push_session_overlay(1, false);
+    assert!(
+        state.session_mcp_projects.get(&1).unwrap().generation > first,
+        "releasing the connections must advance the generation"
+    );
+    // A result from the superseded generation is discarded, leaving the current
+    // one untouched.
+    let current = state.session_mcp_projects.get(&1).unwrap().generation;
+    state.handle_mcp_session_connected(1, first, Vec::new(), Vec::new());
+    assert_eq!(
+        state.session_mcp_projects.get(&1).unwrap().generation,
+        current,
+        "a superseded result must not touch the session's current generation"
+    );
+}
+
+#[cfg(feature = "mcp")]
+#[test]
+fn reconnect_of_a_daemon_per_session_server_stays_per_session() {
+    // A daemon-tier `shared = false` server lives in each referencing session's
+    // overlay. A `/mcp reconnect` of it must go through the in-place rebuild of
+    // those per-session slots, never through the background daemon-tier connect:
+    // the latter would pool a second, SHARED connection (invisible in `/mcp`
+    // status, which reports only shared rows) whose tools duplicate the session's
+    // private ones.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("choreographr");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("mcp.json"),
+        r#"{"mcpServers":{"per":{"command":"true","shared":false},"shared":{"command":"true"}}}"#,
+    )
+    .unwrap();
+    crate::mcp::config::set_test_config_root(Some(dir.path().to_path_buf()));
+    let (mut state, _rx) = make_daemon_state();
+    state.mcp_manager = crate::mcp::McpManager::new_from_config();
+    crate::mcp::config::set_test_config_root(None);
+
+    let (reply, rx) = std::sync::mpsc::channel();
+    state.handle_mcp_reconnect("per", &reply);
+
+    // No per-session slot is live, so the in-place rebuild reports the slug as
+    // unknown — and crucially nothing is parked for a background connect.
+    assert!(
+        rx.recv().unwrap().is_err(),
+        "an unconnected per-session server cannot be rebuilt in place"
+    );
+    assert!(
+        state.pending_mcp_reconnects.is_empty(),
+        "a per-session server must never be parked for a daemon-tier connect"
+    );
+    assert_eq!(
+        state.mcp_manager.server_count(),
+        0,
+        "no daemon-tier shared connection may be created for it"
+    );
 }
 
 #[test]

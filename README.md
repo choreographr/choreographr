@@ -955,15 +955,25 @@ file:
 
 A confidential-client server (one whose authorization server requires client
 authentication, e.g. Shopify Customer Accounts) names its secret's environment
-variable, so the secret itself never lands in the file:
+variable, so the secret itself never lands in the file. Both the endpoint and
+the authorization server are per-tenant, so read them from the store's own
+discovery documents instead of guessing them:
+
+```terminal
+# The MCP endpoint (`mcp_api`) for this store:
+curl -s https://<store-domain>/.well-known/customer-account-api
+# The authorization-server issuer (`issuer`, https://shopify.com/authentication/<shop-id>)
+# and the endpoints it serves:
+curl -s https://<store-domain>/.well-known/openid-configuration
+```
 
 ```json
 {
   "mcpServers": {
     "shopify": {
-      "url": "https://shopify.com/<shop-id>/account/customer/api/mcp",
+      "url": "<mcp_api>",
       "oauth": {
-        "clientId": "<app-id>",
+        "clientId": "<app-client-id>",
         "authorizationServer": "https://shopify.com/authentication/<shop-id>",
         "clientSecretEnv": "SHOPIFY_MCP_SECRET",
         "scopes": ["customer-account-mcp-api:full"]
@@ -972,6 +982,19 @@ variable, so the secret itself never lands in the file:
   }
 }
 ```
+
+The client is a Shopify app with customer authentication enabled, a redirect URI
+of `http://127.0.0.1:1455/auth/callback`, the `customer-account-mcp-api:full`
+scope granted and the store's protected customer data access approved; its
+secret goes in the environment variable, never the file. `authorizationServer`
+names the issuer explicitly because `mcp_api` is not always served from it: a
+custom-domain store's `mcp_api` is on its `accounts.` host (whose RFC 9728
+metadata resolves the issuer on its own), while a `myshopify.com` store's is on
+`https://shopify.com/<shop-id>/…`, where the well-known paths carry no metadata
+and the override is what discovery follows. `scopes` is worth setting here for
+the other direction: with no configured scopes the request asks for every scope
+the authorization server advertises, which for Shopify includes `openid` and the
+UCP scopes alongside the MCP one.
 
 `mcp login <slug>` runs a PKCE sign-in: it discovers the authorization server
 (an unauthenticated request's `WWW-Authenticate` challenge names the

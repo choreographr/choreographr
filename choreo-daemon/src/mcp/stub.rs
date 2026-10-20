@@ -2,24 +2,21 @@
 //!
 //! Mirrors the metrics-module stub convention: without the `mcp` feature there
 //! is no `choreo-mcp` dependency, so the manager holds no servers. Construction,
-//! teardown, and `Drop` are all no-ops, and the API surface matches the real
-//! manager exactly (same method signatures) so call sites need no feature cfgs.
+//! teardown, and `Drop` are all no-ops, and the API surface a non-`mcp` call site
+//! reaches matches the real manager exactly (same method signatures) so those
+//! call sites need no feature cfgs.
 
+use super::{McpReloadOutcome, McpServerStatus};
 use crate::tools::ToolRegistry;
-
-use super::{McpReloadOutcome, McpServerStatus, SessionMcpOverlay};
 
 /// No-op stand-in for the real `McpManager` (see the module docs).
 pub struct McpManager;
 
 impl McpManager {
     /// Stub: no MCP config is loaded and no servers are spawned.
-    pub fn from_config(_registry: &mut ToolRegistry) -> Self {
+    pub fn new_from_config() -> Self {
         Self
     }
-
-    /// Stub: no server has any tools to (re-)register.
-    pub fn register_all(&mut self, _registry: &mut ToolRegistry) {}
 
     /// Stub: there are never any cached tools to register.
     pub fn register_cached(&self, _registry: &mut ToolRegistry) {}
@@ -42,45 +39,26 @@ impl McpManager {
         std::collections::HashSet::new()
     }
 
+    /// Stub: no config is ever loaded, so no slug is configured.
+    #[must_use]
+    pub fn is_configured(&self, _slug: &str) -> bool {
+        false
+    }
+
+    /// Stub: no config is ever loaded, so no slug is a shared server.
+    #[must_use]
+    pub fn is_shared_configured(&self, _slug: &str) -> bool {
+        false
+    }
+
     /// Stub: there are no servers to reconnect.
     pub fn reconnect(&mut self, slug: &str) -> Result<(), String> {
         Err(format!("unknown MCP server {slug:?} (MCP is not built in)"))
     }
 
     /// Stub: there is no config to reload.
-    pub fn reload(&mut self) -> Result<McpReloadOutcome, String> {
+    pub fn reload(&mut self) -> Result<(McpReloadOutcome, Vec<String>), String> {
         Err("MCP is not built in".to_string())
-    }
-
-    /// Stub: no servers are ever ensured.
-    pub fn ensure_session(
-        &mut self,
-        _session_id: u64,
-        _project_root: Option<&std::path::Path>,
-        _trusted: bool,
-    ) -> SessionMcpOverlay {
-        SessionMcpOverlay::empty()
-    }
-
-    /// Stub: no servers are ever ensured, so the deadline is irrelevant.
-    pub fn ensure_session_within(
-        &mut self,
-        _session_id: u64,
-        _project_root: Option<&std::path::Path>,
-        _trusted: bool,
-        _deadline: std::time::Instant,
-    ) -> SessionMcpOverlay {
-        SessionMcpOverlay::empty()
-    }
-
-    /// Stub: nothing to reload.
-    pub fn reload_session(
-        &mut self,
-        _session_id: u64,
-        _project_root: Option<&std::path::Path>,
-        _trusted: bool,
-    ) -> SessionMcpOverlay {
-        SessionMcpOverlay::empty()
     }
 
     /// Stub: nothing to release.

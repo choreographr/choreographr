@@ -12,8 +12,8 @@
 use super::config::{self, McpEntry};
 #[cfg(feature = "mcp")]
 use super::{
-    McpReloadOutcome, RECONNECT_BUDGET, RECONNECT_TOTAL_BUDGET, RELOAD_BUDGET, RELOAD_TOTAL_BUDGET,
-    ServerSlot, SharedSlot, connect_and_list, join_with_budget,
+    McpReloadOutcome, RECONNECT_BUDGET, RECONNECT_TOTAL_BUDGET, ServerSlot, SharedSlot,
+    connect_entry,
 };
 #[cfg(feature = "mcp")]
 use choreo_mcp::{McpListChange, McpServer, McpServerConfig, McpTool};
@@ -23,6 +23,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 #[cfg(feature = "mcp")]
 use std::time::{Duration, Instant};
+#[cfg(feature = "mcp")]
+use tracing::{info, warn};
 
 /// One live connection a reconnect can target, addressed by its pool key.
 ///
@@ -39,8 +41,6 @@ enum SlotKey {
     /// A per-session connection, keyed by `(session_id, root or None, slug)`.
     Session(u64, Option<PathBuf>, String),
 }
-#[cfg(feature = "mcp")]
-use tracing::{info, warn};
 
 /// The classification of one daemon-tier entry reconciled by a reload, tallied
 /// into `McpReloadOutcome::summary`, plus the sessions a change reached.
@@ -62,6 +62,10 @@ struct ReloadTally {
     /// The sessions whose overlay referenced a changed/removed daemon
     /// per-session server, to be re-resolved.
     affected: HashSet<u64>,
+    /// Daemon-tier SHARED servers dropped for a (re)connect. The caller connects
+    /// these on background workers (never on the command loop), so a reload
+    /// replies immediately and the servers come up asynchronously.
+    to_connect: Vec<String>,
 }
 
 #[cfg(feature = "mcp")]
@@ -201,22 +205,19 @@ impl super::McpManager {
     }
 
     /// Re-read the daemon-tier `mcp.json` and reconcile the daemon-tier shared
-    /// server set with it. Project-tier servers are reconciled per session
-    /// (see [`super::McpManager::reload_session`]).
+    /// server set with it. Project-tier servers are reconciled per session, by
+    /// the overlay resolution the command loop drives.
     ///
-    /// Daemon-tier `shared = false` servers are per-session, so their
-    /// reconciliation drops the stale per-session connections of a server
-    /// whose config changed or that was removed (a stale slot would otherwise
-    /// be returned by `ensure_session_slot` forever); the sessions that held
-    /// them are reported in the outcome so the daemon re-resolves their
-    /// overlays.
+    /// This never connects: an added/changed shared server is DROPPED from the
+    /// live pool and its slug returned in the second tuple element, for the
+    /// caller to connect on a background worker. That keeps a reload off the
+    /// command loop. Per-session (`shared = false`) entries are reconciled by
+    /// dropping their stale slots (their sessions are reported in the outcome).
     ///
     /// # Errors
     ///
-    /// Returns an error when the config cannot be read or parsed. A server
-    /// that fails to (re)connect is recorded in `failures` (and appears in the
-    /// outcome's status list), not as a hard error.
-    pub fn reload(&mut self) -> Result<McpReloadOutcome, String> {
+    /// Returns an error when the config cannot be read or parsed.
+    pub fn reload(&mut self) -> Result<(McpReloadOutcome, Vec<String>), String> {
         let mut entries: Vec<McpEntry> =
             config::load_daemon_config().map_err(|e| format!("failed to load MCP config: {e}"))?;
         entries.sort_by(|a, b| a.config.slug.cmp(&b.config.slug));
@@ -248,11 +249,6 @@ impl super::McpManager {
             info!(server = %slug, "MCP server removed by reload");
         }
 
-        // One deadline for the WHOLE reload: each (re)connect gets the smaller
-        // of its per-server budget and the remaining share, so a config with
-        // many slow servers cannot stall the command loop indefinitely.
-        let deadline = Instant::now() + RELOAD_TOTAL_BUDGET;
-
         for entry in &entries {
             let slug = entry.config.slug.clone();
             // `self.configs` still holds the PRE-reload set here, so it tells us
@@ -262,7 +258,7 @@ impl super::McpManager {
             // (which drops the old tier's connection).
             let was_configured = self.configs.contains_key(&slug);
             if entry.shared {
-                self.reconcile_shared_entry(&slug, entry, was_configured, deadline, &mut tally);
+                self.reconcile_shared_entry(&slug, entry, was_configured, &mut tally);
             } else {
                 self.reconcile_per_session_entry(&slug, entry, was_configured, &mut tally);
             }
@@ -280,14 +276,21 @@ impl super::McpManager {
             tally.failed.len()
         );
         info!(%summary, "reloaded MCP configuration");
-        // Deterministic order so the re-resolve sequence is reproducible.
+        // Deterministic order so the connect + re-resolve sequences are
+        // reproducible.
         let mut affected_sessions: Vec<u64> = tally.affected.into_iter().collect();
         affected_sessions.sort_unstable();
-        Ok(McpReloadOutcome {
-            summary,
-            servers: self.status(),
-            affected_sessions,
-        })
+        let mut to_connect = tally.to_connect;
+        to_connect.sort();
+        to_connect.dedup();
+        Ok((
+            McpReloadOutcome {
+                summary,
+                servers: self.status(),
+                affected_sessions,
+            },
+            to_connect,
+        ))
     }
 
     /// Reconcile one daemon-tier SHARED entry, reconnecting it when the live
@@ -306,7 +309,6 @@ impl super::McpManager {
         slug: &str,
         entry: &McpEntry,
         was_configured: bool,
-        deadline: Instant,
         tally: &mut ReloadTally,
     ) {
         // An unchanged resolved config keeps the live connection untouched.
@@ -326,27 +328,11 @@ impl super::McpManager {
         // A shared server being (re)connected leaves no per-session slots: drop
         // any (e.g. it was previously `shared = false`).
         tally.affected.extend(self.drop_daemon_session_slots(slug));
+        // Drop the stale slot and DEFER the connect: the caller spawns a
+        // background worker for this slug so the reload reply and the command
+        // loop are never blocked on a handshake.
         self.servers.remove(slug);
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let slot = if remaining.is_zero() {
-            warn!(server = %slug, "MCP reload budget exhausted; skipping connect");
-            None
-        } else {
-            Self::connect_slot(
-                &self.list_change_tx,
-                &entry.config,
-                remaining.min(RELOAD_BUDGET),
-            )
-        };
-        if let Some(slot) = slot {
-            self.failures.remove(slug);
-            self.servers.insert(slug.to_string(), slot);
-        } else {
-            let e = format!("connect to {slug:?} failed");
-            warn!(server = %slug, error = %e, "MCP server failed to connect during reload");
-            self.failures.insert(slug.to_string(), e);
-            tally.failed.push(slug.to_string());
-        }
+        tally.to_connect.push(slug.to_string());
     }
 
     /// Reconcile one daemon-tier PER-SESSION (`shared = false`) entry, dropping
@@ -409,25 +395,15 @@ impl super::McpManager {
         config: &McpServerConfig,
         timeout: Duration,
     ) -> Option<ServerSlot> {
-        let list_changes = Some(list_change_tx.clone());
-        let cfg = config.clone();
-        // Connect AND list inside the worker, so `timeout` bounds discovery as
-        // well as the handshake: a server that handshakes fast but never answers
-        // `tools/list` is dropped at the budget instead of stalling the (reload
-        // or command-loop) caller for the per-server request timeout.
-        let handle = std::thread::spawn(move || {
-            connect_and_list(&cfg, list_changes).map_err(anyhow::Error::from)
-        });
-        match join_with_budget(handle, timeout) {
-            Some(Ok((server, tools))) => {
-                Some(Self::slot_from_server(server, &tools, config.clone()))
-            }
-            Some(Err(e)) => {
+        // Connect AND list inside the bounded worker, so `timeout` bounds
+        // discovery as well as the handshake: a server that handshakes fast but
+        // never answers `tools/list` is dropped at the budget instead of
+        // stalling the (reload or command-loop) caller for the per-server request
+        // timeout.
+        match connect_entry(config, Some(list_change_tx.clone()), timeout) {
+            Ok((server, tools)) => Some(Self::slot_from_server(server, &tools, config.clone())),
+            Err(e) => {
                 warn!(server = %config.slug, error = %e, "MCP server failed to connect");
-                None
-            }
-            None => {
-                warn!(server = %config.slug, "MCP server connect/discovery timed out");
                 None
             }
         }
@@ -435,7 +411,7 @@ impl super::McpManager {
 
     /// Build a `ServerSlot` from a freshly connected `server` and its
     /// already-listed `tools` (the listing happened inside the connect budget).
-    fn slot_from_server(
+    pub(super) fn slot_from_server(
         server: McpServer,
         tools: &[McpTool],
         config: McpServerConfig,
@@ -514,11 +490,37 @@ mod tests {
     }
 
     #[test]
+    fn reload_defers_shared_connect_to_the_caller() {
+        // A shared server that was never connected is reconciled as "restarted"
+        // and its slug handed back for the caller to connect on a background
+        // worker: reload itself connects nothing, so it cannot stall the loop.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("choreographr");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("mcp.json"),
+            r#"{"mcpServers":{"docs":{"command":"true"}}}"#,
+        )
+        .unwrap();
+        config::set_test_config_root(Some(dir.path().to_path_buf()));
+        let mut manager = McpManager::new_from_config();
+        let (outcome, to_connect) = manager.reload().expect("reload ok");
+        config::set_test_config_root(None);
+        assert_eq!(to_connect, vec!["docs".to_string()]);
+        assert!(
+            outcome.summary.contains("1 restarted"),
+            "got: {}",
+            outcome.summary
+        );
+        assert!(manager.is_empty(), "reload connects nothing on the loop");
+    }
+
+    #[test]
     fn reload_with_no_config_reports_all_zero() {
         let dir = tempfile::tempdir().unwrap();
         config::set_test_config_root(Some(dir.path().to_path_buf()));
         let mut manager = McpManager::empty();
-        let outcome = manager.reload().expect("empty reload succeeds");
+        let outcome = manager.reload().expect("empty reload succeeds").0;
         config::set_test_config_root(None);
         assert_eq!(
             outcome.summary,

@@ -13,7 +13,7 @@
 //! same method signatures.
 
 #[cfg(feature = "mcp")]
-use super::{McpServerStatus, ServerSlot};
+use super::McpServerStatus;
 #[cfg(feature = "mcp")]
 use std::collections::HashSet;
 #[cfg(feature = "mcp")]
@@ -40,6 +40,12 @@ impl super::McpManager {
     }
 
     fn daemon_status(&self, slug: &str) -> McpServerStatus {
+        if let Some(slot) = self.servers.get(slug) {
+            return McpServerStatus::for_slot(slug, "daemon", slot);
+        }
+        // Not connected: report the CONFIG (so a never-connected server still
+        // shows the transport, target, and auth it would use) plus the last
+        // recorded failure.
         let config = self.configs.get(slug).map(|e| &e.config);
         let transport = config.map_or_else(String::new, |c| c.transport.label().to_string());
         let target = config.map_or_else(String::new, |c| c.transport.target().to_string());
@@ -47,35 +53,19 @@ impl super::McpManager {
             (None, None, choreo_proto::McpAuthState::NotApplicable),
             crate::mcp::oauth::status_auth,
         );
-        match self.servers.get(slug) {
-            Some(slot) => McpServerStatus {
-                slug: slug.to_string(),
-                tier: "daemon".to_string(),
-                transport,
-                target,
-                connected: true,
-                tool_count: slot.tool_count,
-                server_name: Some(slot.handle.name().to_string()),
-                server_version: Some(slot.handle.version().to_string()),
-                last_error: None,
-                credential_key,
-                oauth,
-                auth,
-            },
-            None => McpServerStatus {
-                slug: slug.to_string(),
-                tier: "daemon".to_string(),
-                transport,
-                target,
-                connected: false,
-                tool_count: 0,
-                server_name: None,
-                server_version: None,
-                last_error: self.failures.get(slug).cloned(),
-                credential_key,
-                oauth,
-                auth,
-            },
+        McpServerStatus {
+            slug: slug.to_string(),
+            tier: "daemon".to_string(),
+            transport,
+            target,
+            connected: false,
+            tool_count: 0,
+            server_name: None,
+            server_version: None,
+            last_error: self.failures.get(slug).cloned(),
+            credential_key,
+            oauth,
+            auth,
         }
     }
 
@@ -87,36 +77,18 @@ impl super::McpManager {
         // Project-shared connections this session references.
         for ((_, slug), shared) in &self.project_shared {
             if shared.sessions.contains(&session_id) {
-                out.push(Self::slot_status(slug, "project", &shared.slot));
+                out.push(McpServerStatus::for_slot(slug, "project", &shared.slot));
             }
         }
         // Per-session connections.
         for ((sid, root, slug), slot) in &self.session_slots {
             if *sid == session_id {
                 let tier = if root.is_some() { "project" } else { "daemon" };
-                out.push(Self::slot_status(slug, tier, slot));
+                out.push(McpServerStatus::for_slot(slug, tier, slot));
             }
         }
         out.sort_by(|a, b| a.tier.cmp(&b.tier).then_with(|| a.slug.cmp(&b.slug)));
         out
-    }
-
-    fn slot_status(slug: &str, tier: &str, slot: &ServerSlot) -> McpServerStatus {
-        let (credential_key, oauth, auth) = crate::mcp::oauth::status_auth(&slot.config);
-        McpServerStatus {
-            slug: slug.to_string(),
-            tier: tier.to_string(),
-            transport: slot.config.transport.label().to_string(),
-            target: slot.config.transport.target().to_string(),
-            connected: true,
-            tool_count: slot.tool_count,
-            server_name: Some(slot.handle.name().to_string()),
-            server_version: Some(slot.handle.version().to_string()),
-            last_error: None,
-            credential_key,
-            oauth,
-            auth,
-        }
     }
 
     /// Cancel every in-flight tool call started by `session_id`.
@@ -160,8 +132,8 @@ impl super::McpManager {
     ///
     /// A daemon-tier SHARED server with the same slug is NOT included: its tools
     /// live in the daemon-wide catalogue, which the command loop refreshes
-    /// separately (`register_all`). Used to route a list change into exactly the
-    /// sessions whose overlay a project server's change affects.
+    /// separately (`rebuild_tool_catalogue_cached`). Used to route a list change
+    /// into exactly the sessions whose overlay a project server's change affects.
     #[must_use]
     pub fn sessions_for_slug(&self, slug: &str) -> HashSet<u64> {
         let mut out = HashSet::new();

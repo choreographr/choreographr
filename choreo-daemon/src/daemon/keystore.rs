@@ -129,6 +129,11 @@ impl DaemonState {
         // A's status bar.
         if result.is_ok() && was_locked {
             self.broadcast_keystore_state();
+            // Retry the MCP servers whose first connect ran while the grant was
+            // still encrypted. This runs AFTER the targeted reply and the
+            // broadcast and spawns background workers, so the client's `Unlocked`
+            // is never delayed by a handshake.
+            self.schedule_mcp_resync_for_credentials();
         }
         info!("Unlock result: success={}", result.is_ok());
     }
@@ -164,6 +169,10 @@ impl DaemonState {
         Self::send_targeted_ack(reply, reply_msg, ack);
         if result.is_ok() && was_locked {
             self.broadcast_keystore_state();
+            // Same post-unlock retry as `handle_unlock`: a fresh bind runs the
+            // shared unlock tail, so any OAuth grant that existed already is now
+            // decryptable and its server should be brought up — off the loop.
+            self.schedule_mcp_resync_for_credentials();
         }
         info!("BindKeystore result: success={}", result.is_ok());
     }
@@ -576,13 +585,6 @@ fn finish_unlock(
     state: &mut DaemonState,
     credentials: HashMap<String, ServiceCredential>,
 ) -> io::Result<()> {
-    // Snapshot the pre-unlock lock state: the tail is shared by a REAL
-    // locked→unlocked transition (`Unlock`, or the TOFU `BindKeystore`) and a
-    // redundant re-unlock of an already-unlocked daemon — the TUI auto-unlocks
-    // on every connect, so a second client (or a reconnect) re-runs it. The MCP
-    // reconnect at the end must fire only on the transition: a redundant unlock
-    // would needlessly tear down every signed-in server's live connection.
-    let was_locked = state.locked;
     // Load accounts from the daemon's OWN accounts path — the same file
     // `state.accounts` was loaded from (`AccountManager::path`), NOT the
     // global config-dir assumption: an embedder that opened state with an
@@ -619,16 +621,12 @@ fn finish_unlock(
     // Publish the freshly decrypted MCP OAuth credentials to the connect-path
     // snapshot so a server reconnecting against them finds them.
     state.publish_mcp_oauth_snapshot();
-    // A daemon restart spawns the MCP servers while the keystore is still
+
+    // A daemon restart runs its MCP startup connects while the keystore is still
     // LOCKED, so an OAuth server's first connect runs with no decryptable grant
-    // and fails; nothing retries it when the keystore later unlocks. Now that
-    // the credentials are committed and published, bring those servers up — but
-    // only on a real locked→unlocked transition (`was_locked`), so a redundant
-    // re-unlock does not churn servers that are already connected. A no-op on a
-    // fresh bind, which has no stored credentials.
-    if was_locked {
-        state.reconnect_mcp_servers_for_unlocked_credentials();
-    }
+    // and fails. The retry is SCHEDULED by the caller (`handle_unlock` /
+    // `handle_bind_keystore`) after the client's `Unlocked` reply is enqueued —
+    // it must not block the reply here, and it must not run before it.
 
     // Log the accounts summary AFTER the assignment (the credential decrypt
     // summary is logged by `decrypt_credential_blobs`, before publishing).
@@ -652,6 +650,10 @@ fn finish_unlock(
     }
     info!("Unlock: keystore decrypted; sessions will rebuild providers lazily on next use");
 
+    // The lock-state transition is handled by the caller (`handle_unlock` /
+    // `handle_bind_keystore`), which snapshots `locked` before running the tail
+    // and schedules the post-unlock MCP resync after the client's `Unlocked`
+    // reply is enqueued.
     Ok(())
 }
 

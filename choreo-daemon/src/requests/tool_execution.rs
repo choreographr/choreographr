@@ -97,9 +97,10 @@ pub(crate) fn broadcast_turn_appended(
 /// whose image carries only metadata (see `turn_for_client`) and fetches the
 /// bytes on demand via `GetImage`, so the bytes MUST already be in
 /// `session_attachments` when that fetch arrives. Persisting here — rather
-/// than waiting for `RequestFinished`, which is the only other turn write —
-/// makes the DB the single source of truth for image bytes at every instant,
-/// including mid-request.
+/// than waiting for the turn's iteration-boundary checkpoint or the
+/// `RequestFinished` merge — makes the DB the single source of truth for image
+/// bytes at every instant, including mid-turn: the bytes must be readable
+/// before the turn they belong to has been written at all.
 ///
 /// The emit-time write is a single-slot insert
 /// ([`crate::db::write_attachment`] with an [`ImageKey::Displayed`]): just the
@@ -144,8 +145,8 @@ pub(crate) fn emit_image(
     // the image to the in-memory turn and BEFORE broadcasting — so an on-demand
     // `GetImage` that arrives with the broadcast already resolves. A failure is
     // logged and swallowed: the image still renders from the in-memory turn,
-    // and `finalize_turn` retries the full turn write (blob + all attachments)
-    // at turn completion.
+    // and both the iteration-boundary checkpoint and `finalize_and_broadcast_turn`
+    // rewrite the full turn (blob + all attachments) later.
     if let Err(e) = crate::db::write_attachment(
         db,
         session_id,
@@ -840,6 +841,10 @@ pub(crate) fn finalize_and_broadcast_turn(
     current_turn_id: u32,
 ) -> io::Result<()> {
     session.finalize_turn(&ctx.db, ctx.session_id, current_turn_id)?;
+    // Record the write so the `RequestFinished` merge skips re-persisting this
+    // turn: it is now on disk and the loop never mutates it again before the
+    // request ends (the terminal turn's arm returns right after this call).
+    session.persisted_turns.insert(current_turn_id);
     if let Some(turn) = session.turns.get(&current_turn_id) {
         let _ = ctx
             .cmd_tx
@@ -852,6 +857,51 @@ pub(crate) fn finalize_and_broadcast_turn(
             }));
     }
     Ok(())
+}
+
+/// Write a completed turn to the database at the agent loop's iteration
+/// boundary, without broadcasting it.
+///
+/// The agent loop owns the durable turn set for the duration of a request: it
+/// builds each turn on the worker's private `SessionState` clone, which the
+/// session thread only merges at `RequestFinished`. Waiting for that merge
+/// makes the whole request the unit of durability, and a request can run an
+/// unbounded number of tool-loop iterations over a long wall-clock window — so
+/// a process death mid-request loses every turn it produced. Checkpointing each
+/// iteration bounds that loss to the single turn in flight, which is the most a
+/// turn-at-a-time write can promise: the iteration boundary is the first point
+/// at which the turn is complete (assistant message and one recorded result per
+/// call), and it comes before the next provider round-trip.
+///
+/// No broadcast: the turn's final in-iteration state already reached clients
+/// through the per-tool-result `TurnAppended` deliveries, so a checkpoint is a
+/// storage concern only. A failed write is logged and swallowed rather than
+/// failing the request — the turn is still in memory, the loop can continue,
+/// and `RequestFinished`'s merge retries the write (it is an idempotent
+/// `write_turn` of the same blob plus attachments). On success the turn id is
+/// recorded in [`SessionState::persisted_turns`] so that merge can skip the
+/// redundant re-write for a turn that already matches disk.
+pub(crate) fn persist_turn_checkpoint(
+    session: &mut SessionState,
+    ctx: &RequestContext,
+    turn_id: u32,
+) {
+    match session.finalize_turn(&ctx.db, ctx.session_id, turn_id) {
+        Ok(()) => {
+            session.persisted_turns.insert(turn_id);
+            debug!(
+                session_id = ctx.session_id,
+                turn_id, "checkpointed the completed turn at its loop-iteration boundary",
+            );
+        }
+        Err(e) => warn!(
+            session_id = ctx.session_id,
+            turn_id,
+            error = %e,
+            "failed to persist the turn at its loop-iteration boundary; \
+             it stays in memory and RequestFinished retries the write",
+        ),
+    }
 }
 
 pub(crate) fn finish_tool_call(

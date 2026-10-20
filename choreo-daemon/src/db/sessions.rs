@@ -43,7 +43,15 @@ pub struct SessionRecord {
     /// The session's working directory; `None` to inherit the parent's, else the
     /// daemon's cwd.
     pub working_dir: Option<String>,
-    /// Number of turns persisted for this session (bounds the turns-table scan).
+    /// Number of turns in the session, taken from the in-memory turn map when
+    /// the record is written.
+    ///
+    /// Advisory, not a bound: `read_turns` finds a session's turns with a range
+    /// scan over the turns table, so this count never limits what is read. It
+    /// can therefore lag the turn rows — the turns are checkpointed per
+    /// agent-loop iteration, while this record is only rewritten when a request
+    /// finishes, so a crash mid-request leaves a stale (lower) count beside the
+    /// turn rows it did not account for. The next record write corrects it.
     pub turn_count: u32,
     /// Creation time, Unix-epoch-milliseconds.
     pub created_at: i64,

@@ -302,18 +302,31 @@ pub(in crate::sessions) fn handle_request_finished(
 
     // Merge turns from the worker snapshot into the main session state.
     for (&turn_id, turn) in &snapshot.turns {
-        let is_new = !state.turns.contains_key(&turn_id);
+        // Compare against the pre-merge copy BEFORE inserting, so a turn the
+        // worker changed since the previous merge is detected. (Comparing after
+        // the insert would compare the freshly inserted clone to itself and
+        // never fire.)
+        let already_present = state.turns.contains_key(&turn_id);
+        let changed = state.turns.get(&turn_id).is_some_and(|old| old != turn);
         state.turns.insert(turn_id, turn.clone());
-        if is_new {
-            // Persist the newly created turn. The turn was already broadcast
-            // during the agent loop, so no need to re-broadcast here.
-            if let Err(e) = write_turn_retry(&ctx.db, ctx.session_id, turn_id, turn) {
-                tracing::warn!(turn_id, error = %e, "failed to persist turn");
-            }
-        } else if state.turns.get(&turn_id).is_some_and(|t| t != turn) {
-            // Turn was updated — persist the latest state.
-            if let Err(e) = write_turn_retry(&ctx.db, ctx.session_id, turn_id, turn) {
+        // A new turn is written at least once even if unchanged; an existing one
+        // only when its content moved.
+        let needs_write = !already_present || changed;
+        // Skip a turn the worker already checkpointed to disk unchanged (see
+        // `persist_turn_checkpoint`): the row matches the snapshot, so rewriting
+        // it would only cost a redundant transaction + fsync. A turn the worker
+        // did NOT persist (e.g. the turn open when a provider-side cancel
+        // returned) is absent from `persisted_turns` and is still written here.
+        if !needs_write || snapshot.persisted_turns.contains(&turn_id) {
+            continue;
+        }
+        // The turn was already broadcast during the agent loop, so only the
+        // durable write remains.
+        if let Err(e) = write_turn_retry(&ctx.db, ctx.session_id, turn_id, turn) {
+            if already_present {
                 tracing::warn!(turn_id, error = %e, "failed to persist updated turn");
+            } else {
+                tracing::warn!(turn_id, error = %e, "failed to persist turn");
             }
         }
     }

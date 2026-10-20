@@ -320,4 +320,14 @@ pub struct SessionSnapshot {
     /// across the worker snapshot so the worker's agent loop reads the same
     /// policy the session resolved.
     pub warm_policy: WarmPolicy,
+    /// Turn ids the request worker has already written to the database at their
+    /// agent-loop iteration boundary (see `persist_turn_checkpoint`).
+    ///
+    /// Runtime-only, never persisted: it rides the `RequestFinished` snapshot so
+    /// the merge can insert these turns into the main state without re-writing a
+    /// row that already matches what checkpoints wrote to disk. Empty on a
+    /// snapshot taken before any checkpoint (including the panic-path
+    /// `initial_snapshot`), so a turn that never reached disk is still written
+    /// by the merge.
+    pub persisted_turns: HashSet<u32>,
 }

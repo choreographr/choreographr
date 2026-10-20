@@ -124,6 +124,17 @@ pub struct SessionState {
     /// (removed from the shared registry's contribution to this session's tool
     /// list — a project server replaces the daemon-tier one by group).
     pub project_shadowed_groups: HashSet<String>,
+    /// Turn ids this session has already written to the database in the current
+    /// request: the agent loop's per-iteration checkpoints plus the finalize of
+    /// the terminal turn (see `persist_turn_checkpoint` /
+    /// `finalize_and_broadcast_turn`).
+    ///
+    /// Runtime-only. A request worker populates it as it persists turns and
+    /// carries it back in the `RequestFinished` snapshot, so the merge can skip
+    /// re-writing a row that already matches disk. Empty until a checkpoint runs
+    /// (and always empty on the main session thread, which never checkpoints),
+    /// so a turn that never reached disk is still written by the merge.
+    pub persisted_turns: HashSet<u32>,
 }
 
 /// The assistant response recorded onto a turn by the agent loop: display
@@ -225,6 +236,7 @@ impl SessionState {
             project_shadowed_groups: self.project_shadowed_groups.clone(),
             provider_slug: self.provider_slug.clone(),
             warm_policy: self.warm_policy,
+            persisted_turns: self.persisted_turns.clone(),
         }
     }
 
@@ -258,6 +270,7 @@ impl SessionState {
             discovered_skills: snapshot.discovered_skills,
             project_tools: snapshot.project_tools,
             project_shadowed_groups: snapshot.project_shadowed_groups,
+            persisted_turns: snapshot.persisted_turns,
         }
     }
 
@@ -447,12 +460,27 @@ impl SessionState {
     /// Finalize a turn and persist it to the database.
     /// Returns an error if persistence fails after all retries.
     ///
+    /// This is the one write of a whole turn — its zstd-compressed blob plus
+    /// every attachment slot, in a single transaction — so the on-disk turn can
+    /// never be observed half-written. The agent loop calls it once per turn:
+    /// through `persist_turn_checkpoint` at its iteration boundary (a
+    /// crash-safety checkpoint) for a tool-use turn, or through
+    /// `finalize_and_broadcast_turn` for the terminal turn. A turn written this
+    /// way is then also re-written by the session thread's `RequestFinished`
+    /// merge (`write_turn_retry`); both writes are idempotent, so re-writing an
+    /// unchanged turn costs one transaction and changes nothing — the callers
+    /// record the id in [`SessionState::persisted_turns`] so the merge can skip
+    /// that redundant rewrite when the turn is unchanged.
+    ///
+    /// Takes `&self`: persisting reads the turn out of `turns`, it never
+    /// mutates the session (the callers record the persisted id).
+    ///
     /// # Errors
     ///
     /// Returns Err if the turn does not exist, the session write fails
     /// after retries, or encoding/persisting any displayed image fails.
     pub fn finalize_turn(
-        &mut self,
+        &self,
         db: &redb::Database,
         session_id: u64,
         turn_id: u32,
@@ -537,6 +565,7 @@ impl SessionState {
             discovered_skills: None,
             project_tools: Arc::new(ProjectToolSet::empty()),
             project_shadowed_groups: HashSet::new(),
+            persisted_turns: HashSet::new(),
         }
     }
 
