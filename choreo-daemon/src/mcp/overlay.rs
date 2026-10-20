@@ -428,7 +428,7 @@ impl super::McpManager {
                     self.install_session_connected(session_id, entry, server, &tools);
                 }
                 Err(e) => {
-                    warn!(server = %entry.slug, error = %e, "project MCP server failed to connect")
+                    warn!(server = %entry.slug, error = %e, "project MCP server failed to connect");
                 }
             }
         }
@@ -448,7 +448,7 @@ impl super::McpManager {
                     self.install_session_connected(session_id, entry, server, &tools);
                 }
                 Err(e) => {
-                    warn!(server = %entry.slug, error = %e, "per-session MCP server failed to connect")
+                    warn!(server = %entry.slug, error = %e, "per-session MCP server failed to connect");
                 }
             }
         }
