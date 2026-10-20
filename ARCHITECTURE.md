@@ -1875,7 +1875,27 @@ would have written.
 
 A checkpoint failure is logged and swallowed rather than failing the request:
 the turn stays in memory, the loop continues, and the `RequestFinished` merge
-retries the same idempotent write.
+retries the same idempotent write. Because a checkpointed turn is never mutated
+after its boundary, the worker reports the ids it wrote in the snapshot's
+`persisted_turns` set, and the merge inserts those turns into memory without
+re-writing the identical row — so a turn is written once, not twice. A turn the
+worker did *not* checkpoint (for example the turn open when a provider-side
+cancel returned) is absent from that set and is still written by the merge.
+
+**Crash-recovery skew.** Durability covers the turn rows, not every field of the
+worker's `SessionState`. Config the worker accumulates over a request — mainly
+`last_response_id` (the provider's continuation-chain head) and
+`accumulated_usage` (the billing total) — still merges only at `RequestFinished`,
+so after a mid-request crash the on-disk turns can be newer than those fields.
+Config changes a tool makes through the session's own commands (model, title,
+working directory, tool groups) are persisted when the command is applied, so
+only the worker-owned continuation/billing fields lag. On restart the session is
+rebuilt from the turn rows (with `next_turn_id` derived from the maximum turn id,
+not the record's advisory `turn_count`), and the stale `last_response_id` is
+restored only if its producing provider+model still matches; a `ResponseId`
+provider then continues from that older head with the checkpointed turns re-sent
+as new input. This is the accepted cost of turn-level durability — the
+conversation itself is never lost.
 
 ### Schema versioning & migrations
 

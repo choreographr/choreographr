@@ -836,11 +836,15 @@ pub(crate) fn spawn_single_tool(args: SpawnToolArgs) -> crossbeam_channel::Sende
 /// render the final/error turn from it. The DB write inside `finalize_turn`
 /// is required and unchanged.
 pub(crate) fn finalize_and_broadcast_turn(
-    session: &SessionState,
+    session: &mut SessionState,
     ctx: &RequestContext,
     current_turn_id: u32,
 ) -> io::Result<()> {
     session.finalize_turn(&ctx.db, ctx.session_id, current_turn_id)?;
+    // Record the write so the `RequestFinished` merge skips re-persisting this
+    // turn: it is now on disk and the loop never mutates it again before the
+    // request ends (the terminal turn's arm returns right after this call).
+    session.persisted_turns.insert(current_turn_id);
     if let Some(turn) = session.turns.get(&current_turn_id) {
         let _ = ctx
             .cmd_tx
@@ -874,16 +878,29 @@ pub(crate) fn finalize_and_broadcast_turn(
 /// storage concern only. A failed write is logged and swallowed rather than
 /// failing the request — the turn is still in memory, the loop can continue,
 /// and `RequestFinished`'s merge retries the write (it is an idempotent
-/// `write_turn` of the same blob plus attachments).
-pub(crate) fn persist_turn_checkpoint(session: &SessionState, ctx: &RequestContext, turn_id: u32) {
-    if let Err(e) = session.finalize_turn(&ctx.db, ctx.session_id, turn_id) {
-        warn!(
+/// `write_turn` of the same blob plus attachments). On success the turn id is
+/// recorded in [`SessionState::persisted_turns`] so that merge can skip the
+/// redundant re-write for a turn that already matches disk.
+pub(crate) fn persist_turn_checkpoint(
+    session: &mut SessionState,
+    ctx: &RequestContext,
+    turn_id: u32,
+) {
+    match session.finalize_turn(&ctx.db, ctx.session_id, turn_id) {
+        Ok(()) => {
+            session.persisted_turns.insert(turn_id);
+            debug!(
+                session_id = ctx.session_id,
+                turn_id, "checkpointed the completed turn at its loop-iteration boundary",
+            );
+        }
+        Err(e) => warn!(
             session_id = ctx.session_id,
             turn_id,
             error = %e,
             "failed to persist the turn at its loop-iteration boundary; \
              it stays in memory and RequestFinished retries the write",
-        );
+        ),
     }
 }
 

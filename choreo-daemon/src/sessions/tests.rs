@@ -106,6 +106,7 @@ fn test_state() -> SessionState {
         discovered_skills: None,
         project_tools: Arc::new(crate::mcp::ProjectToolSet::empty()),
         project_shadowed_groups: HashSet::new(),
+        persisted_turns: HashSet::new(),
         subscribers: HashMap::new(),
         active_requests: BTreeMap::new(),
         provider: None,
