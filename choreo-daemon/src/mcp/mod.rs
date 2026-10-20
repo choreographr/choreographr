@@ -49,20 +49,40 @@ mod stub;
 pub use paths::{PROJECT_CONFIG_FILE, TRUST_FILE, config_dir, set_test_config_root, trust_path};
 pub use project::{ProjectToolSet, SessionMcpOverlay, project_root_for};
 pub use status::{McpReloadOutcome, McpServerStatus, McpStatusReport, McpTrustOutcome};
+
+/// A background MCP connect's outcome: the connected server plus its listed
+/// tools, or the connect error message.
+///
+/// Carried across the command channel from a connect worker to the command
+/// loop, which owns the pool and is the sole writer of the tool catalogue (see
+/// `DaemonCommand::McpConnected`). `McpServer` is `Send` — it already lives in
+/// `DaemonState` — so the whole outcome rides the channel by value.
+#[cfg(feature = "mcp")]
+pub type McpConnectOutcome = Result<(McpServer, Vec<McpTool>), String>;
+
+// The connect plumbing is used by the daemon's background connect workers
+// (`daemon::mcp_commands`, `server::core`), so the slot module's private helpers
+// are re-exported here for those crate-level call sites.
+#[cfg(feature = "mcp")]
+pub(crate) use slot::{BACKGROUND_CONNECT_BUDGET, connect_and_list, join_with_budget};
+
+// The asynchronous overlay plan/install types cross the command channel, so the
+// daemon's off-loop connect handlers reach them through this re-export.
+#[cfg(feature = "mcp")]
+pub use overlay::PendingSessionConnect;
 #[cfg(not(feature = "mcp"))]
 pub use stub::McpManager;
 
 #[cfg(feature = "mcp")]
 use crate::tools::ToolRegistry;
 #[cfg(feature = "mcp")]
-use choreo_mcp::{McpListChange, McpServer, McpServerHandle, McpTool};
+use choreo_mcp::{McpListChange, McpServer, McpServerConfig, McpServerHandle, McpTool};
 #[cfg(feature = "mcp")]
 use config::McpEntry;
 #[cfg(feature = "mcp")]
 use slot::{
-    CATALOGUE_REFRESH_BUDGET, CATALOGUE_REFRESH_TOTAL_BUDGET, PendingConnect, RECONNECT_BUDGET,
-    RECONNECT_TOTAL_BUDGET, RELOAD_BUDGET, RELOAD_TOTAL_BUDGET, STARTUP_BUDGET, ServerSlot,
-    SharedSlot, connect_and_list, join_with_budget,
+    CATALOGUE_REFRESH_BUDGET, CATALOGUE_REFRESH_TOTAL_BUDGET, RECONNECT_BUDGET,
+    RECONNECT_TOTAL_BUDGET, RELOAD_BUDGET, ServerSlot, SharedSlot,
 };
 #[cfg(feature = "mcp")]
 use std::collections::HashMap;
@@ -75,7 +95,7 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "mcp")]
 use tool::build_server_wrappers;
 #[cfg(feature = "mcp")]
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Manages all MCP server connections and their registered tools.
 #[cfg(feature = "mcp")]
@@ -105,18 +125,41 @@ pub struct McpManager {
     /// [`McpManager::take_list_change_rx`]) and pumps it into the command loop;
     /// `None` once taken, or when no server could open a subscription.
     list_change_rx: Option<crossbeam_channel::Receiver<McpListChange>>,
+    /// Daemon-tier shared entries awaiting their FIRST connect, handed to the
+    /// daemon's background startup worker (via [`McpManager::take_startup_queue`]).
+    /// The queue is populated by [`McpManager::new_from_config`] but drained only
+    /// once the daemon core exists, because the connect workers need the
+    /// command channel and the OAuth runtime snapshot that are installed there.
+    startup_queue: Vec<McpEntry>,
+    /// Slugs with a background (re)connect in flight. A second request for the
+    /// same slug — a duplicate unlock, a sign-in racing the startup sweep — is
+    /// dropped rather than spawning a second worker, so at most one connect per
+    /// slug is ever outstanding.
+    in_flight: HashSet<String>,
+    /// Slugs an unlock asked to resync while a connect was ALREADY in flight.
+    ///
+    /// The TUI auto-unlocks immediately on connect, so the common case is an
+    /// unlock landing while the background startup connect (which ran with an
+    /// encrypted grant and will 401) is still handshaking. A failed in-flight
+    /// connect whose slug is recorded here is retried ONCE, now that the
+    /// credentials are live; success clears the entry so a healthy server is
+    /// never churned.
+    resync_requested: HashSet<String>,
 }
 
 #[cfg(feature = "mcp")]
 impl McpManager {
-    /// Connect every enabled daemon-tier SHARED server and register its tools
-    /// in the `ToolRegistry`.
+    /// Load the daemon-tier MCP configuration and prepare the shared server
+    /// queue, WITHOUT connecting anything.
     ///
     /// `shared = false` daemon-tier servers are NOT connected here: they are
     /// per-session, connected lazily when a session resolves its overlay (see
-    /// [`McpManager::ensure_session`]). Servers connect in parallel on
-    /// background threads; the whole batch is bounded by `STARTUP_BUDGET`.
-    pub fn from_config(registry: &mut ToolRegistry) -> Self {
+    /// [`McpManager::ensure_session`]). The `shared` entries are returned by
+    /// [`McpManager::take_startup_queue`] so the daemon core can connect them on
+    /// a background worker — this constructor returns immediately, so
+    /// `DaemonState::open` (and therefore the socket bind) never waits on an MCP
+    /// handshake.
+    pub fn new_from_config() -> Self {
         let mut configs: Vec<McpEntry> = match config::load_daemon_config() {
             Ok(configs) => configs,
             Err(e) => {
@@ -129,9 +172,20 @@ impl McpManager {
         // reconnect reproduces the same names.
         configs.sort_by(|a, b| a.config.slug.cmp(&b.config.slug));
 
+        // Which daemon-tier entries the background startup worker should
+        // connect: only the SHARED ones. A `shared = false` server is
+        // per-session, connected lazily when a session resolves its overlay.
+        let startup_queue: Vec<McpEntry> = configs.iter().filter(|c| c.shared).cloned().collect();
+        for deferred in configs.iter().filter(|c| !c.shared) {
+            debug!(
+                server = %deferred.config.slug,
+                "daemon-tier server is not shared; deferred to per-session connect"
+            );
+        }
+
         let (list_change_tx, list_change_rx) = crossbeam_channel::unbounded::<McpListChange>();
 
-        let mut manager = Self {
+        Self {
             servers: HashMap::new(),
             configs: configs
                 .iter()
@@ -141,73 +195,142 @@ impl McpManager {
             failures: HashMap::new(),
             project_shared: HashMap::new(),
             session_slots: HashMap::new(),
-            list_change_tx: list_change_tx.clone(),
+            list_change_tx,
             list_change_rx: Some(list_change_rx),
-        };
-
-        // Spawn only the shared servers up front so they handshake in parallel.
-        // Each worker connects AND performs the initial tool listing, so the
-        // startup budget below bounds discovery too, not just the handshake.
-        let mut pending: Vec<PendingConnect> = Vec::new();
-        for cfg in configs {
-            if !cfg.shared {
-                debug!(server = %cfg.config.slug, "daemon-tier server is not shared; deferred to per-session connect");
-                continue;
-            }
-            let slug = cfg.config.slug.clone();
-            info!(
-                server = %slug,
-                transport = cfg.config.transport.label(),
-                target = cfg.config.transport.target(),
-                "spawning MCP server"
-            );
-            let list_changes = Some(list_change_tx.clone());
-            let handle = std::thread::spawn(move || {
-                connect_and_list(&cfg.config, list_changes).map_err(anyhow::Error::from)
-            });
-            pending.push((slug, handle));
+            startup_queue,
+            in_flight: HashSet::new(),
+            resync_requested: HashSet::new(),
         }
+    }
 
-        let deadline = Instant::now() + STARTUP_BUDGET;
-        let mut used: HashSet<String> = HashSet::new();
-        for (slug, handle) in pending {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match join_with_budget(handle, remaining) {
-                Some(Ok((server, tools))) => {
-                    if let Err(e) = Self::register_server(
-                        &slug,
-                        server,
-                        tools,
-                        &mut used,
-                        registry,
-                        &mut manager,
-                    ) {
-                        error!(server = %slug, error = %e, "failed to register MCP server");
-                        manager.failures.insert(slug, e);
-                    }
-                }
-                Some(Err(e)) => {
-                    error!(server = %slug, error = %e, "failed to connect MCP server");
-                    manager.failures.insert(slug, e.to_string());
-                }
-                None => {
-                    warn!(
-                        server = %slug,
-                        budget_ms = STARTUP_BUDGET.as_millis(),
-                        "MCP server did not connect within the startup budget; skipping"
-                    );
-                    manager.failures.insert(
-                        slug,
-                        format!(
-                            "did not connect within the {}s startup budget",
-                            STARTUP_BUDGET.as_secs()
-                        ),
-                    );
-                }
+    /// Take the daemon-tier shared entries awaiting their first connect.
+    /// Called once by `start_daemon_core`, which spawns the background workers
+    /// once the command channel and OAuth runtime snapshot exist. Returning the
+    /// config (rather than spawning in `new_from_config`) keeps every MCP
+    /// connect off the `DaemonState::open` path, so the socket is bound and
+    /// clients are served before any handshake starts.
+    pub fn take_startup_queue(&mut self) -> Vec<McpEntry> {
+        std::mem::take(&mut self.startup_queue)
+    }
+
+    /// Blocking startup seam: connect every queued daemon-tier shared server
+    /// synchronously (each bounded by `budget`) and register their CACHED tools
+    /// into `registry`.
+    ///
+    /// The daemon never calls this — it connects on background workers so
+    /// startup is never blocked. This exists for an embedder or a test harness
+    /// that wants a fully populated catalogue before proceeding, and is the
+    /// direct executable counterpart of the work `new_from_config` queues.
+    pub fn connect_all_blocking(&mut self, registry: &mut ToolRegistry, budget: Duration) {
+        for entry in self.take_startup_queue() {
+            let slug = entry.config.slug.clone();
+            if let Some(slot) = Self::connect_slot(&self.list_change_tx, &entry.config, budget) {
+                self.failures.remove(&slug);
+                self.servers.insert(slug, slot);
+            } else {
+                warn!(server = %slug, "MCP server did not connect within the budget");
+                self.failures.insert(
+                    slug,
+                    format!("did not connect within {}s", budget.as_secs()),
+                );
             }
         }
+        self.register_cached(registry);
+    }
 
-        manager
+    /// Mark `slug` as having a background connect in flight, returning `false`
+    /// when one already is (the caller must then skip spawning a second).
+    pub fn mark_in_flight(&mut self, slug: &str) -> bool {
+        self.in_flight.insert(slug.to_string())
+    }
+
+    /// Record that `slug` should be retried if its in-flight connect fails (an
+    /// unlock asked to resync while the connect was running).
+    pub fn request_resync(&mut self, slug: &str) {
+        self.resync_requested.insert(slug.to_string());
+    }
+
+    /// Take (and clear) a pending resync request for `slug`. Returns `true` at
+    /// most once per request, so a failed connect triggers exactly one retry.
+    pub fn take_resync_request(&mut self, slug: &str) -> bool {
+        self.resync_requested.remove(slug)
+    }
+
+    /// Clear `slug`'s in-flight marker (a connect either landed or failed).
+    pub fn clear_in_flight(&mut self, slug: &str) {
+        self.in_flight.remove(slug);
+    }
+
+    /// Whether `slug` is a configured daemon-tier server (connected or not).
+    #[must_use]
+    pub fn is_configured(&self, slug: &str) -> bool {
+        self.configs.contains_key(slug)
+    }
+
+    /// The last recorded connect/refresh failure for `slug`, if any.
+    #[must_use]
+    pub fn failure(&self, slug: &str) -> Option<String> {
+        self.failures.get(slug).cloned()
+    }
+
+    /// Whether `slug` has a live daemon-tier shared connection.
+    #[must_use]
+    pub fn is_connected(&self, slug: &str) -> bool {
+        self.servers.contains_key(slug)
+    }
+
+    /// The connect inputs for a background (re)connect of `slug`: its resolved
+    /// config and a clone of the list-change sender (so the rebuilt transport
+    /// re-subscribes). `None` when no such daemon-tier entry is configured.
+    #[must_use]
+    pub fn connect_inputs(
+        &self,
+        slug: &str,
+    ) -> Option<(McpServerConfig, crossbeam_channel::Sender<McpListChange>)> {
+        let entry = self.configs.get(slug)?;
+        Some((entry.config.clone(), self.list_change_tx.clone()))
+    }
+
+    /// Install a server connected by a background worker, replacing any existing
+    /// daemon-tier connection for `slug`.
+    ///
+    /// The caller (the command loop) rebuilds the tool catalogue from the cached
+    /// tool sets afterwards, so registration order and tool naming are derived
+    /// from the manager's `order`, never from the order connects complete. A
+    /// slug that is no longer configured (removed by a reload while the connect
+    /// was in flight) is rejected: the freshly connected server is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns the slug's absence from the configured set as an error message.
+    pub fn install_connected(
+        &mut self,
+        slug: &str,
+        server: McpServer,
+        tools: &[McpTool],
+    ) -> Result<(), String> {
+        let config = self
+            .configs
+            .get(slug)
+            .map(|e| e.config.clone())
+            .ok_or_else(|| format!("server {slug:?} is no longer configured"))?;
+        // The slot derives its tool count from the tools + disabled filter, so
+        // the `/mcp` status surface reports the real count without a re-list.
+        let slot = Self::slot_from_server(server, tools, config);
+        let tool_count = slot.tool_count;
+        self.servers.insert(slug.to_string(), slot);
+        self.failures.remove(slug);
+        self.in_flight.remove(slug);
+        info!(server = %slug, tool_count, "connected MCP server (background)");
+        Ok(())
+    }
+
+    /// Record a background connect's failure for `slug`, clearing its in-flight
+    /// marker so a later attempt (a reload, a reconnect, an unlock) can retry.
+    pub fn note_connect_failure(&mut self, slug: &str, error: String) {
+        self.in_flight.remove(slug);
+        warn!(server = %slug, error = %error, "background MCP connect failed");
+        self.failures.insert(slug.to_string(), error);
     }
 
     /// Take the shared list-changed receiver, if a server could have opened a
@@ -346,42 +469,6 @@ impl McpManager {
         }
     }
 
-    fn register_server(
-        slug: &str,
-        server: McpServer,
-        tools: Vec<McpTool>,
-        used: &mut HashSet<String>,
-        registry: &mut ToolRegistry,
-        manager: &mut Self,
-    ) -> Result<(), String> {
-        let handle = server.handle();
-        let config = manager
-            .configs
-            .get(slug)
-            .map(|e| e.config.clone())
-            .ok_or_else(|| format!("no config for server {slug:?}"))?;
-        let tool_count = Self::register_server_tools(
-            slug,
-            &handle,
-            &tools,
-            &config.disabled_tools,
-            used,
-            registry,
-        );
-        manager.servers.insert(
-            slug.to_string(),
-            ServerSlot {
-                handle,
-                server,
-                config,
-                tool_count,
-                tools,
-            },
-        );
-        manager.failures.remove(slug);
-        Ok(())
-    }
-
     /// Register one server's advertised `tools` (and its catalogue group) into
     /// `registry`, returning the number of server tools registered (excluding
     /// the resource-catalogue wrappers).
@@ -475,6 +562,9 @@ impl McpManager {
             session_slots: HashMap::new(),
             list_change_tx,
             list_change_rx: Some(list_change_rx),
+            startup_queue: Vec::new(),
+            in_flight: HashSet::new(),
+            resync_requested: HashSet::new(),
         }
     }
 
@@ -563,14 +653,70 @@ mod tests {
     }
 
     #[test]
-    fn from_config_with_no_file_creates_empty() {
+    fn new_from_config_with_no_file_creates_empty() {
         let dir = tempfile::tempdir().unwrap();
         config::set_test_config_root(Some(dir.path().to_path_buf()));
-        let mut registry = crate::tools::ToolRegistry::new();
-        let manager = McpManager::from_config(&mut registry);
+        let mut manager = McpManager::new_from_config();
         config::set_test_config_root(None);
         assert!(manager.is_empty());
+        assert!(manager.take_startup_queue().is_empty());
         assert_eq!(manager.status().len(), 0);
+    }
+
+    #[test]
+    fn new_from_config_queues_only_shared_servers() {
+        // The startup queue must contain only the `shared` daemon-tier servers
+        // (they are connected on the background worker); a `shared = false`
+        // server is per-session and connected lazily, so it must NOT be queued.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("choreographr");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("mcp.json"),
+            r#"{"mcpServers":{"shared":{"command":"true"},"private":{"command":"true","shared":false}}}"#,
+        )
+        .unwrap();
+        config::set_test_config_root(Some(dir.path().to_path_buf()));
+        let mut manager = McpManager::new_from_config();
+        config::set_test_config_root(None);
+
+        assert!(manager.is_empty(), "construction connects nothing");
+        assert!(manager.is_configured("shared"));
+        assert!(manager.is_configured("private"));
+        let queue = manager.take_startup_queue();
+        let slugs: Vec<&str> = queue.iter().map(|e| e.config.slug.as_str()).collect();
+        assert_eq!(slugs, ["shared"], "only the shared entry is queued");
+        assert!(
+            manager.take_startup_queue().is_empty(),
+            "the queue drains once"
+        );
+    }
+
+    #[test]
+    fn in_flight_and_resync_are_one_shot() {
+        let mut manager = McpManager::empty();
+        assert!(manager.mark_in_flight("a"), "first mark takes");
+        assert!(!manager.mark_in_flight("a"), "a second mark is rejected");
+        // A resync request is consumed exactly once, so a failed connect retries
+        // at most once.
+        manager.request_resync("a");
+        assert!(manager.take_resync_request("a"));
+        assert!(!manager.take_resync_request("a"));
+        // Clearing the in-flight marker (a connect settled) re-arms it.
+        manager.clear_in_flight("a");
+        assert!(manager.mark_in_flight("a"));
+    }
+
+    #[test]
+    fn note_connect_failure_records_error_and_clears_in_flight() {
+        let mut manager = McpManager::empty();
+        manager.mark_in_flight("a");
+        manager.note_connect_failure("a", "boom".to_string());
+        assert_eq!(manager.failure("a").as_deref(), Some("boom"));
+        assert!(
+            manager.mark_in_flight("a"),
+            "a failure clears the in-flight marker so a retry can start"
+        );
     }
 
     /// A minimal daemon-tier entry with the given slug and pooling attribute.

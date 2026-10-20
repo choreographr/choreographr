@@ -144,6 +144,12 @@ pub struct SessionMcpProject {
     /// trust flip on the same root counts as a project CHANGE, not an
     /// unchanged project.
     pub trusted: bool,
+    /// The resolve generation, monotonically increasing per session. A
+    /// background overlay connect carries the generation it was planned under;
+    /// `handle_mcp_session_connected` drops a batch whose
+    /// generation no longer matches (the session was re-resolved or released in
+    /// the meantime), so a stale connect can never install into the live pool.
+    pub generation: u64,
 }
 
 /// Everything the daemon tracks about one connected client, keyed by its
@@ -247,8 +253,8 @@ pub struct DaemonState {
     /// that LEAVES a project can cancel that session's in-flight calls to
     /// exactly THAT project's servers, leaving its daemon-tier calls running,
     /// and so a trust change is never mistaken for an unchanged project.
-    /// Entries are set in `resolve_and_push_session_overlay` /
-    /// `refresh_session_overlay` and dropped in `handle_session_exited`.
+    /// Entries are set in `resolve_and_push_session_overlay` (which backs every
+    /// re-resolve sweep) and dropped in `handle_session_exited`.
     pub session_mcp_projects: HashMap<u64, SessionMcpProject>,
     /// Decrypted credentials held in memory while the keystore is unlocked,
     /// keyed by service name. Empty while locked; cleared by `/lock`.
@@ -349,6 +355,18 @@ pub struct DaemonState {
     /// session's project/per-session pools and the tool catalogue they feed.
     /// The command loop drives its reconciliation.
     pub mcp_manager: McpManager,
+    /// Background `/mcp reconnect` reply senders, keyed by slug, satisfied when
+    /// the connect lands (or fails) in `handle_mcp_connected`. Keeping
+    /// the reply HERE — instead of blocking the command loop on the connect —
+    /// preserves the request/reply contract for the connection thread that is
+    /// waiting, while the handshake itself runs on a worker thread. A slug
+    /// usually has at most one waiter; a repeated action coalesces under it.
+    pub pending_mcp_reconnects: HashMap<String, Vec<std::sync::mpsc::Sender<Result<(), String>>>>,
+    /// Monotonic count of daemon-tier MCP connects that SUCCEEDED and were
+    /// installed (incremented on the command loop in `handle_mcp_connected`). A
+    /// lightweight observability signal, and the deterministic "a background
+    /// connect landed" predicate a test harness pumps on.
+    pub mcp_connects_completed: u64,
     /// The MCP project-trust store (the set of project roots whose `.mcp.json`
     /// the daemon honours). Owned by the command loop (its single writer); the
     /// backing `trust.toml` is hot-reloaded via the config watcher.
@@ -1030,6 +1048,38 @@ pub enum DaemonCommand {
     /// active session's overlay (a trust flip changes which project servers are
     /// spawned). Fire-and-forget.
     McpTrustReload,
+    /// A background MCP connect (startup, unlock resync, sign-in, or a manual
+    /// reconnect) finished. The command loop is the sole writer of the tool
+    /// catalogue, so it installs the connected slot (or records the failure)
+    /// and swaps the rebuilt cached registry — never the connect worker. Off the
+    /// command loop precisely so a slow handshake cannot stall every session.
+    #[cfg(feature = "mcp")]
+    McpConnected {
+        /// The daemon-tier server slug whose connect finished.
+        slug: String,
+        /// The connected server plus its listed tools, or the connect error.
+        outcome: crate::mcp::McpConnectOutcome,
+    },
+    /// A background session overlay connect finished. The command loop installs
+    /// the results into the session's pool and rebuilds/pushes its overlay,
+    /// UNLESS the session was re-resolved since (the `generation` no longer
+    /// matches), in which case the batch is dropped. Off the command loop so a
+    /// project's slow servers never stall session create/attach.
+    #[cfg(feature = "mcp")]
+    McpSessionConnected {
+        /// The session whose overlay this batch belongs to.
+        session_id: u64,
+        /// The resolve generation the batch was planned under.
+        generation: u64,
+        /// The servers that connected, each with the entry it satisfies.
+        connected: Vec<(
+            crate::mcp::PendingSessionConnect,
+            choreo_mcp::McpServer,
+            Vec<choreo_mcp::McpTool>,
+        )>,
+        /// The entries that failed, each with its error.
+        failed: Vec<(crate::mcp::PendingSessionConnect, String)>,
+    },
     /// Set the display title for a session, forwarded to the session's
     /// main loop for in-memory update, broadcast, and persistence.
     SetSessionTitle {
@@ -1439,6 +1489,19 @@ impl DaemonState {
             }
             DaemonCommand::McpTierReload => self.handle_mcp_tier_reload(),
             DaemonCommand::McpTrustReload => self.handle_mcp_trust_reload(),
+            #[cfg(feature = "mcp")]
+            DaemonCommand::McpConnected { slug, outcome } => {
+                self.handle_mcp_connected(&slug, outcome);
+            }
+            #[cfg(feature = "mcp")]
+            DaemonCommand::McpSessionConnected {
+                session_id,
+                generation,
+                connected,
+                failed,
+            } => {
+                self.handle_mcp_session_connected(session_id, generation, connected, failed);
+            }
             DaemonCommand::SetSessionTitle { session_id, title } => {
                 self.handle_set_session_title(session_id, title);
             }

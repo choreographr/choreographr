@@ -1476,6 +1476,37 @@ data, never as instructions or configuration:
   `headers` or a keystore-stored OAuth grant (see the MCP remote-server OAuth
   section), never shared across issuers.
 
+### MCP connection lifecycle (off the command loop)
+
+Connecting an MCP server is I/O (spawn, handshake, `tools/list`, OAuth refresh), so it
+never runs on the daemon command loop and never before a client's acknowledgement. The
+command loop's only MCP job is to install a finished result and swap the tool catalogue
+(the sanctioned single-writer `ArcSwap`, exception #4); the handshake itself runs on a
+worker thread that posts a `DaemonCommand` back.
+
+- **Startup.** `DaemonState::open` only loads `mcp.json` and queues the daemon-tier
+  `shared` servers; the socket is bound and the first client served immediately. The
+  daemon core drains the queue and starts a background connect per server once the
+  command channel and OAuth runtime exist; each connect posts a
+  `DaemonCommand::McpConnected` that the loop installs and rebuilds the cached
+  catalogue from. A request already on a turn keeps its previous registry snapshot; the
+  next turn sees the server's tools. The per-server connect budget is generous (60 s)
+  precisely because it is off the critical path.
+- **Unlock.** The daemon starts LOCKED and runs those startup connects while an OAuth
+  grant is still encrypted, so such a server 401s; the unlock tail schedules a resync
+  of every `mcp:`-keyed server, but only AFTER the acting client's `Unlocked` reply and
+  the lock-state broadcast are enqueued, and on background workers — so an unlock never
+  blocks the reply or the loop. A resync requested while a connect is already in flight
+  is coalesced: a failed in-flight connect retries once with the now-live credentials.
+- **Session overlays.** A session's project / per-session servers are planned cheaply
+  (pool-only), pushed as a partial overlay, then connected on a worker whose
+  `DaemonCommand::McpSessionConnected` installs into the pool and pushes the rebuilt
+  overlay — guarded by a per-session generation so a batch planned before a re-resolve
+  is dropped rather than installed. `/mcp reload` likewise drops changed servers and
+  defers their reconnects, and a manual `/mcp reconnect` of a daemon-tier server parks
+  its reply on the connect rather than blocking the loop. Only a project/per-session
+  server's manual reconnect still rebuilds in place (bounded, user-initiated).
+
 Two values inside the `rmcp` engine are sanctioned shared-state exceptions (see
 AGENTS.md). The live `RunningService` handle sits in a
 `tokio::sync::Mutex<Option<..>>` (the **eighth** exception) — a

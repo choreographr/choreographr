@@ -20,46 +20,28 @@ use choreo_mcp::{McpListChange, McpServer, McpServerConfig, McpServerHandle, Mcp
 use std::collections::HashSet;
 use std::time::Duration;
 
-/// A background connect's join handle: the connected server plus its listed
-/// tools, or the connect/list error.
+/// Per-server budget for the daemon's BACKGROUND startup connect.
 ///
-/// The listing runs inside the same bounded worker as the connect (see
-/// [`connect_and_list`]), so the caller's budget covers connect AND discovery.
-pub(super) type PendingConnect = (
-    String,
-    std::thread::JoinHandle<anyhow::Result<(McpServer, Vec<McpTool>)>>,
-);
-
-/// Default budget for connecting all MCP servers during `from_config`.
-///
-/// A hung server must never stall daemon startup: the manager gives the whole
-/// batch this long to connect, then registers whatever is ready and leaves the
-/// rest (their threads detach and the server is dropped, so nothing leaks).
-pub(super) const STARTUP_BUDGET: Duration = Duration::from_secs(2);
+/// Startup connects run on a dedicated worker thread, never on the command
+/// loop, so the socket is bound and clients are served long before any server
+/// finishes handshaking. The budget therefore only bounds how long ONE server's
+/// connect may outlive its worker: a cold `npx` start is routinely multi-second,
+/// so this is deliberately generous (the old 2 s deadline was a startup-latency
+/// cap and dropped otherwise-healthy servers). A server that overruns it is
+/// recorded as failed and retried on the next `/mcp reload` or reconnect; its
+/// detached worker's server is dropped, so nothing leaks.
+pub(crate) const BACKGROUND_CONNECT_BUDGET: Duration = Duration::from_secs(60);
 
 /// Budget for a single manual reconnect attempt (the `/mcp` surface's
 /// reconnect action). Longer than the per-server startup share because it is
 /// user-initiated and can afford to wait for one server.
 pub(super) const RECONNECT_BUDGET: Duration = Duration::from_secs(10);
 
-/// Per-server budget for a config reload (the `/mcp reload` action). Reload
-/// reconciles every configured server, so a (re)connect attempt gets the same
-/// generous per-server share as a manual reconnect; servers are attempted one
-/// at a time.
+/// Per-server budget for ONE session-overlay connect attempt (the project and
+/// daemon per-session servers a resolve guarantees). The connect runs on a
+/// background worker, so this bounds a single entry rather than the loop; it
+/// matches the reconnect budget so a legitimately slow start still succeeds.
 pub(super) const RELOAD_BUDGET: Duration = Duration::from_secs(10);
-
-/// Aggregate budget for ONE reload sweep, capping the WHOLE reconcile rather
-/// than each server.
-///
-/// `reload` (re)connects every added or changed server serially on the
-/// command-loop thread, each bounded by [`RELOAD_BUDGET`]; without an aggregate
-/// cap a config with many slow servers would stall the command loop for up to
-/// one budget PER server. This deadline bounds the total (both the `/mcp`
-/// reload path and the `mcp.json` watcher path run it), so a large or
-/// partially-unreachable server set cannot compound into an unbounded stall; a
-/// server reached after the deadline is recorded as failed for this sweep and
-/// retried on the next reload.
-pub(super) const RELOAD_TOTAL_BUDGET: Duration = Duration::from_secs(15);
 
 /// Aggregate budget for ONE reconnect call, capping the WHOLE rebuild rather
 /// than each connection.
@@ -136,7 +118,7 @@ pub(super) struct SharedSlot {
 /// bound connect **and** discovery together: a server that handshakes quickly
 /// but never answers `tools/list` is dropped at the caller's budget rather than
 /// stalling it for the full per-server request timeout.
-pub(super) fn connect_and_list(
+pub(crate) fn connect_and_list(
     config: &McpServerConfig,
     list_changes: Option<crossbeam_channel::Sender<McpListChange>>,
 ) -> Result<(McpServer, Vec<McpTool>), choreo_mcp::McpError> {
@@ -151,7 +133,7 @@ pub(super) fn connect_and_list(
 
 /// Join a thread, giving up after `timeout` and returning `None` (leaving it
 /// detached) when it overruns.
-pub(super) fn join_with_budget<T: Send + 'static>(
+pub(crate) fn join_with_budget<T: Send + 'static>(
     handle: std::thread::JoinHandle<T>,
     timeout: Duration,
 ) -> Option<T> {

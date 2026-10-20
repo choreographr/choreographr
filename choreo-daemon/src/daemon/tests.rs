@@ -111,6 +111,8 @@ pub(super) fn make_daemon_state() -> (DaemonState, crossbeam_channel::Receiver<D
         model_cache: HashMap::new(),
         model_prefetch_in_flight: HashSet::new(),
         mcp_manager: crate::mcp::McpManager::empty(),
+        pending_mcp_reconnects: std::collections::HashMap::new(),
+        mcp_connects_completed: 0,
         mcp_trust: crate::mcp::trust::McpTrustStore::load(config_dir.path().join("trust.toml")),
         maintenance_tx: None,
         acl: None,
@@ -2014,6 +2016,7 @@ fn trust_flip_on_the_same_root_forces_overlay_reload() {
     let revoked_previous = SessionMcpProject {
         root: untrusted.root.clone(),
         trusted: true,
+        generation: 0,
     };
     assert!(!DaemonState::session_overlay_reuse(
         &revoked_previous,
@@ -2026,6 +2029,7 @@ fn trust_flip_on_the_same_root_forces_overlay_reload() {
     let trusted_previous = SessionMcpProject {
         root: untrusted.root.clone(),
         trusted: true,
+        generation: 0,
     };
     assert!(
         DaemonState::session_overlay_reuse(&trusted_previous, Some(project.path()), true),
@@ -2051,6 +2055,35 @@ fn trust_flip_on_the_same_root_forces_overlay_reload() {
     let after = state.session_mcp_projects.get(&1).cloned().unwrap();
     assert_eq!(after.root.as_deref(), Some(project.path()));
     assert!(after.trusted, "the trust flip must be recorded");
+}
+
+#[cfg(feature = "mcp")]
+#[test]
+fn stale_session_overlay_batch_is_dropped() {
+    // A background overlay connect carries the resolve generation it was
+    // planned under; a batch arriving under a generation the session has since
+    // moved past must be DROPPED (its servers discarded), never installed.
+    let (mut state, _rx) = make_daemon_state();
+    // A session with no metadata has no project and no per-session servers, so
+    // this resolve spawns no worker and records a fresh generation.
+    state.resolve_and_push_session_overlay(1, false);
+    let current = state.session_mcp_projects.get(&1).unwrap().generation;
+
+    // An old-generation batch is a no-op that leaves the recorded generation
+    // intact.
+    state.handle_mcp_session_connected(1, current.wrapping_sub(1), Vec::new(), Vec::new());
+    assert_eq!(
+        state.session_mcp_projects.get(&1).unwrap().generation,
+        current,
+        "a stale batch must not touch the session's current generation"
+    );
+
+    // A second resolve advances the generation, so the first batch is now stale.
+    state.resolve_and_push_session_overlay(1, false);
+    assert!(
+        state.session_mcp_projects.get(&1).unwrap().generation > current,
+        "each resolve bumps the generation"
+    );
 }
 
 #[test]

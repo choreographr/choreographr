@@ -47,6 +47,45 @@ pub fn test_daemon_state() -> DaemonState {
     test_daemon_state_with_limits(LagLimits::default())
 }
 
+/// Like [`test_daemon_state`], but returns the other end of the state's command
+/// channel so a test can PUMP the async background-connect results back through
+/// the command loop by hand: there is no real `run_server` loop in these tests,
+/// so a `DaemonCommand::McpConnected` posted by a connect worker only lands once
+/// the test dispatches it (see [`pump_until`]).
+pub fn test_daemon_state_pair() -> (
+    DaemonState,
+    crossbeam_channel::Receiver<choreo_daemon::daemon::DaemonCommand>,
+) {
+    let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
+    let mut state = test_daemon_state_with_limits(LagLimits::default());
+    // Replace the dummy command sender with a live one whose receiver we keep.
+    state.daemon_tx = daemon_tx;
+    (state, daemon_rx)
+}
+
+/// Dispatch commands a background worker posted onto `rx` through
+/// `state.handle_command` until `done(state)` holds or `timeout` elapses. This
+/// stands in for the real command loop, which these tests do not run: it is how
+/// an async connect's `DaemonCommand::McpConnected` reaches the state.
+pub fn pump_until(
+    state: &mut DaemonState,
+    rx: &crossbeam_channel::Receiver<choreo_daemon::daemon::DaemonCommand>,
+    timeout: Duration,
+    mut done: impl FnMut(&DaemonState) -> bool,
+) {
+    let deadline = Instant::now() + timeout;
+    while !done(state) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(cmd) => state.handle_command(cmd),
+            Err(_) => return,
+        }
+    }
+}
+
 /// Like [`test_daemon_state`] but with injectable lag thresholds. The
 /// default caps (64 MiB / 512 MiB) are far too large for a test to cross with
 /// a few KiB of streamed output, so the eviction integration test builds its
@@ -105,6 +144,8 @@ pub fn test_daemon_state_with_limits(limits: LagLimits) -> DaemonState {
         model_cache: HashMap::new(),
         model_prefetch_in_flight: HashSet::new(),
         mcp_manager: choreo_daemon::mcp::McpManager::empty(),
+        pending_mcp_reconnects: std::collections::HashMap::new(),
+        mcp_connects_completed: 0,
         mcp_trust: choreo_daemon::mcp::trust::McpTrustStore::load(
             accounts_path.with_file_name("trust.toml"),
         ),

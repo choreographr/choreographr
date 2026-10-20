@@ -215,6 +215,26 @@ fn spawn_mcp_list_change_forwarder(
     }
 }
 
+#[cfg(feature = "mcp")]
+fn spawn_mcp_startup_connects(state: &mut DaemonState) {
+    // Drain the daemon-tier shared entries gathered at construction and start a
+    // background connect for each. This is the whole of the daemon's MCP startup
+    // cost: the connects run on worker threads that hand their results back to
+    // the command loop as `DaemonCommand::McpConnected`, so the socket is bound
+    // and the first client is served long before any handshake completes.
+    let queue = state.mcp_manager.take_startup_queue();
+    for entry in queue {
+        let slug = entry.config.slug.clone();
+        info!(
+            server = %slug,
+            transport = entry.config.transport.label(),
+            target = entry.config.transport.target(),
+            "scheduling MCP server connect (background)"
+        );
+        state.spawn_mcp_connect(&slug);
+    }
+}
+
 /// Assemble the transport-independent daemon core: command channel, ACL
 /// install + watcher, config watchers, catalog-maintenance thread, shutdown
 /// flag, connection counter, and the command-loop thread.
@@ -245,6 +265,13 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: &CoreOptions) -> Daemo
     // without the `mcp` feature (no manager, no channel).
     #[cfg(feature = "mcp")]
     spawn_mcp_list_change_forwarder(&mut state, daemon_tx.clone());
+
+    // Kick off the daemon-tier shared-server connects on background workers,
+    // now that the OAuth runtime snapshot (installed above) and the command
+    // channel exist. This never blocks: every connect reports back through
+    // `DaemonCommand::McpConnected`, which the command loop installs.
+    #[cfg(feature = "mcp")]
+    spawn_mcp_startup_connects(&mut state);
 
     // Install the shared ACL into the state BEFORE the command loop takes
     // ownership: the command loop becomes its single WRITER (AclReload),

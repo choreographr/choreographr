@@ -52,45 +52,17 @@ pub struct OpenOptions {
     pub platform_tool_bridge: Option<Arc<dyn IosToolBridge>>,
 }
 
-/// Build the daemon's tool catalogue from its parts, re-listing every MCP
-/// server.
-///
-/// Used by the reload/reconnect rebuilds
-/// (`DaemonState::handle_mcp_reload`, `handle_mcp_reconnect`,
-/// `handle_mcp_tier_reload`), applying the core-tool registration, the
-/// platform-bridge extension, and the current MCP dynamic groups by one code
-/// path so a refresh cannot drift from startup. Returns the bare
-/// `Arc<ToolRegistry>`; the caller stores it into the daemon's shared
-/// `ArcSwap` (the command loop is its sole writer).
-pub(crate) fn build_tool_registry(
-    policy: ToolPolicy,
-    bridge: Option<&Arc<dyn IosToolBridge>>,
-    mcp: &mut McpManager,
-) -> Arc<ToolRegistry> {
-    let mut registry = base_registry(policy, bridge);
-    // MCP servers only exist under the Full policy (registration-time filter);
-    // re-listing and re-registering their dynamic groups keeps the
-    // `mcp/<slug>` catalogues current on a refresh. This sweep re-lists every
-    // connected server, so it is the reload/reconnect path (a change to one
-    // server's config or connection can shift the whole set); a single server's
-    // list change uses [`build_tool_registry_cached`] instead.
-    if policy == ToolPolicy::Full {
-        mcp.register_all(&mut registry);
-    }
-    registry.build_for_policy(policy)
-}
-
 /// Build the daemon's tool catalogue from its parts, registering each MCP
 /// server's CACHED tools without re-listing.
 ///
-/// The list-change counterpart of [`build_tool_registry`]: the caller has
-/// already re-listed the one server whose list changed (via
-/// [`McpManager::refresh_server`]), so every other server's tool set can be
-/// reused straight from its cache. The result is byte-for-byte the catalogue a
-/// full `build_tool_registry` would produce — the core tools, platform bridge,
-/// and MCP name resolution depend only on `self.order` and the tool lists, not
-/// on a live listing — but the command loop no longer pays a network round-trip
-/// per connected server on every event.
+/// The single catalogue-build path: every MCP install/removal (a background
+/// connect landing, a list change, a reload dropping a server) leaves the
+/// manager's cached tool sets current, and a subsequent rebuild folds the
+/// core-tool registration, the platform-bridge extension, and the MCP dynamic
+/// groups together. The result depends only on `self.order` and the tool lists,
+/// never on a live listing — so tool naming is deterministic regardless of the
+/// order connects complete — and the command loop never pays a network
+/// round-trip per connected server on a catalogue event.
 pub(crate) fn build_tool_registry_cached(
     policy: ToolPolicy,
     bridge: Option<&Arc<dyn IosToolBridge>>,
@@ -108,9 +80,8 @@ pub(crate) fn build_tool_registry_cached(
 ///
 /// The bridge's presence is the gate for the protected group (not a `cfg`), so
 /// an embedder that supplied one gets it on every rebuild too. The MCP dynamic
-/// groups are layered on by the callers (a live sweep in `build_tool_registry`,
-/// a cached one in `build_tool_registry_cached`), which keeps the shared
-/// core-plus-bridge setup in exactly one place.
+/// groups are layered on by the caller (`build_tool_registry_cached`), which
+/// keeps the shared core-plus-bridge setup in exactly one place.
 fn base_registry(policy: ToolPolicy, bridge: Option<&Arc<dyn IosToolBridge>>) -> ToolRegistry {
     let mut registry = ToolRegistry::new_for_policy(policy);
     if let Some(bridge) = bridge {
@@ -218,7 +189,7 @@ impl DaemonState {
             tool_registry.register_platform_tools(Arc::clone(bridge));
         }
         let mcp_manager = if opts.tool_policy == ToolPolicy::Full {
-            McpManager::from_config(&mut tool_registry)
+            McpManager::new_from_config()
         } else {
             info!("tool policy Mobile: MCP servers not spawned");
             McpManager::empty()
@@ -291,6 +262,8 @@ impl DaemonState {
             model_cache: HashMap::new(),
             model_prefetch_in_flight: HashSet::new(),
             mcp_manager,
+            pending_mcp_reconnects: HashMap::new(),
+            mcp_connects_completed: 0,
             // The trust store is loaded fail-closed: a missing or malformed
             // `trust.toml` yields an empty set. When no config dir is
             // resolvable the path is empty and every read/write degrades
