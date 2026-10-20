@@ -1843,6 +1843,40 @@ in-source (see `choreo-daemon`'s `db` and `sessions` modules, `cargo doc -p
 choreo-daemon` / `just doc`), held complete by the `#![warn(missing_docs)]` +
 `doc-check` gate.
 
+### Turn durability
+
+Each `Turn` is written to disk when the **agent-loop iteration that produced it**
+completes, not when the request does. The loop builds its turns on the request
+worker's private `SessionState` clone, which the session thread only merges at
+`RequestFinished`; that merge remains the authoritative final write, but it is no
+longer the only one. The iteration boundary is the first moment a turn is
+complete (assistant message plus one recorded result per call), and it precedes
+the next provider round-trip, so a checkpoint there bounds the crash window to
+the single turn in flight. This matters because one request is not one turn: a
+tool loop may iterate without limit (unbounded when `max_turns` is 0) for tens of
+minutes, and deferring the write to the end made the whole request the unit of
+durability.
+
+Three properties hold around that boundary:
+
+- **A turn is written whole or not at all.** One `write_turn` transaction covers
+the zstd-compressed blob and every attachment slot, so a reader can never see a
+turn with some of its images. Image bytes are additionally written per emit
+(see the image flow) because a client fetches them by key the moment the
+turn's `TurnAppended` arrives.
+- **A committed turn is durable.** `redb` write transactions default to
+`Durability::Immediate` and the daemon never lowers it, so a committed turn has
+been fsynced — a crash loses only what was never committed.
+- **Every request ending persists.** Completion, inference failure, and
+cancellation all finalize the turn and route the worker's snapshot through
+`RequestFinished`, so a graceful shutdown (which cancels in-flight requests)
+loses nothing; only process death, which cannot cancel, skips the paths that
+would have written.
+
+A checkpoint failure is logged and swallowed rather than failing the request:
+the turn stays in memory, the loop continues, and the `RequestFinished` merge
+retries the same idempotent write.
+
 ### Schema versioning & migrations
 
 The `meta` table holds the persisted schema version, and the daemon runs the

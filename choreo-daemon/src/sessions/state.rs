@@ -447,12 +447,24 @@ impl SessionState {
     /// Finalize a turn and persist it to the database.
     /// Returns an error if persistence fails after all retries.
     ///
+    /// This is the one write of a whole turn — its zstd-compressed blob plus
+    /// every attachment slot, in a single transaction — so the on-disk turn can
+    /// never be observed half-written. The agent loop calls it twice per turn:
+    /// once at its iteration boundary (a crash-safety checkpoint, through
+    /// `persist_turn_checkpoint` in the `requests` module) and once when the
+    /// turn is finalized for clients. Rewriting is
+    /// idempotent, so the second write of an unchanged turn costs one
+    /// transaction and changes nothing.
+    ///
+    /// Takes `&self`: persisting reads the turn out of `turns`, it never
+    /// mutates the session.
+    ///
     /// # Errors
     ///
     /// Returns Err if the turn does not exist, the session write fails
     /// after retries, or encoding/persisting any displayed image fails.
     pub fn finalize_turn(
-        &mut self,
+        &self,
         db: &redb::Database,
         session_id: u64,
         turn_id: u32,

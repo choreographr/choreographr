@@ -1036,6 +1036,101 @@ pub(crate) mod test_util {
         (provider, client)
     }
 
+    /// Provider client that answers the first `tool_turns` streaming calls with
+    /// a `ToolUse` requesting one `random` call, and every later call with a
+    /// final answer — the smallest shape that makes the agent loop iterate more
+    /// than once inside a single request.
+    ///
+    /// `random` is the tool of choice because it is a pure computation: it
+    /// reads no session state, touches no filesystem, and needs no credential,
+    /// so a test can drive real tool dispatch through the loop without a
+    /// fixture. The call counter is atomic (the trait hands the client to the
+    /// loop by shared reference), matching [`RecordingProviderClient`].
+    #[derive(Debug)]
+    pub(crate) struct ToolLoopProviderClient {
+        tool_turns: usize,
+        served: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ProviderClient for ToolLoopProviderClient {
+        // &'static str is the trait's required lifetime, not an over-bound literal.
+        #[expect(clippy::unnecessary_literal_bound)]
+        fn provider_slug(&self) -> &str {
+            "openai"
+        }
+
+        fn chat_completion_turn(
+            &self,
+            _params: ChatTurnRequest<'_>,
+        ) -> Result<ChatTurnResult, InferenceError> {
+            // The agent loop always drives the streaming path; a
+            // non-streaming call here is a bug.
+            Err(InferenceError::ClientError {
+                status: 500,
+                detail: "ToolLoopProviderClient is streaming-only".to_string(),
+            })
+        }
+
+        fn chat_completion_turn_streaming(
+            &self,
+            params: ChatTurnRequest<'_>,
+            _on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>,
+        ) -> Result<ChatTurnResult, InferenceError> {
+            // A real provider reports the upload boundary before any output.
+            if let Some(cb) = &params.on_uploaded {
+                cb();
+            }
+            let served = self
+                .served
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if served < self.tool_turns {
+                return Ok(ChatTurnResult::ToolUse(
+                    choreo_ai_protocols::ChatAssistantToolUse {
+                        content: Some(format!("step {served}")),
+                        tool_calls: vec![choreo_ai_protocols::ChatToolCall {
+                            id: format!("call_{served}"),
+                            name: "random".to_string(),
+                            arguments_json: "{}".to_string(),
+                            caller: None,
+                        }],
+                        reasoning: None,
+                        usage: None,
+                        response_id: None,
+                        reasoning_artifact: None,
+                    },
+                ));
+            }
+            Ok(ChatTurnResult::FinalText(
+                choreo_ai_protocols::FinalTextResult {
+                    content: "done".to_string(),
+                    truncated: false,
+                    reasoning: None,
+                    usage: None,
+                    response_id: None,
+                    reasoning_artifact: None,
+                },
+            ))
+        }
+
+        fn list_models(&self) -> Result<Vec<String>, InferenceError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Build a provider that requests one `random` tool call for its first
+    /// `tool_turns` streaming turns, then answers with a final text (see
+    /// [`ToolLoopProviderClient`]).
+    pub(crate) fn make_tool_loop_provider(tool_turns: usize) -> InferenceProvider {
+        InferenceProvider {
+            client: Arc::new(ToolLoopProviderClient {
+                tool_turns,
+                served: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            slug: "openai".to_string(),
+            image_client: None,
+        }
+    }
+
     /// Provider client that replays a scripted sequence of streaming `on_event`
     /// deltas and then returns a fixed final answer, so a test can pin exactly
     /// which `SessionStatus` phases the daemon broadcasts as the stream flows.

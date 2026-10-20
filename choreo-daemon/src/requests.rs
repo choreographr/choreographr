@@ -1577,8 +1577,22 @@ pub(crate) fn run_agent_loop(
                     // survives into the next request's history).
                     session.mark_unexecuted_tool_results(current_turn_id, &executed_tool_calls);
                     broadcast_turn_appended(&ctx.cmd_tx, session, ctx.session_id, current_turn_id);
+                    // The turn is complete as far as this request will take it,
+                    // so checkpoint it before unwinding — a cancel is a normal
+                    // outcome, and the work the tools already did must not be
+                    // lost if the process dies before `RequestFinished`.
+                    persist_turn_checkpoint(session, ctx, current_turn_id);
                     return Ok(true);
                 }
+
+                // The turn is complete: the assistant message is recorded, every
+                // call has a result (a real one, or the synthesized "panicked"
+                // / "cancelled" placeholder), and the config changes have been
+                // mirrored. Checkpoint it now — the loop may go on for many more
+                // iterations (unbounded when `max_turns` is 0), and everything
+                // below this point is a new provider round-trip whose failure
+                // would otherwise discard this turn too.
+                persist_turn_checkpoint(session, ctx, current_turn_id);
             }
             Ok(_) => {
                 // A new ChatTurnResult variant (this enum is #[non_exhaustive])

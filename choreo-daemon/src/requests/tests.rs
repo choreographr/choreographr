@@ -9,7 +9,7 @@ use crate::daemon::DaemonCommand;
 use crate::providers::InferenceProvider;
 use crate::providers::test_util::{
     make_failing_provider, make_scripted_stream_provider, make_test_provider,
-    make_truncating_provider, make_truncating_provider_with_slug,
+    make_tool_loop_provider, make_truncating_provider, make_truncating_provider_with_slug,
 };
 use crate::reasoning::{
     build_chat_request_messages, initial_prev_resp_id, warn_on_missing_reasoning_artifacts,
@@ -1814,7 +1814,7 @@ fn finalize_and_broadcast_turn_strips_reasoning_artifact() {
         },
     );
 
-    finalize_and_broadcast_turn(&mut session, &ctx, turn_id).unwrap();
+    finalize_and_broadcast_turn(&session, &ctx, turn_id).unwrap();
 
     match cmd_rx.try_recv() {
         Ok(SessionCommand::Broadcast(DaemonMessageType::Session {
@@ -1910,6 +1910,92 @@ fn agent_loop_failure_marks_and_finalizes_turn() {
     assert!(
         saw_error_appended,
         "expected a TurnAppended broadcast carrying the failure"
+    );
+}
+
+#[test]
+fn agent_loop_persists_each_tool_turn_at_its_iteration_boundary() {
+    // Durability boundary: a tool-loop turn must reach the database when the
+    // iteration that produced it completes, not only when the whole request
+    // finishes. The loop owns the turn set for the duration of a request — the
+    // session thread only merges the worker's snapshot at `RequestFinished` —
+    // and one request can run unbounded tool iterations over a long
+    // wall-clock window, so a write deferred to the end loses every turn a
+    // mid-request process death cuts off.
+    //
+    // `handle_request_finished` is deliberately NOT called here: any turn row
+    // in the database can therefore only have come from the loop's own
+    // per-iteration checkpoint.
+    let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
+    let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+    // A registry holding only `random` — a pure computation, so the loop
+    // dispatches a real tool with no fixture, no filesystem and no credential.
+    let mut registry = ToolRegistry::new();
+    registry.register(crate::tools::random::Random);
+    let ctx = RequestContext {
+        cmd_tx,
+        session_id: 1,
+        db: Arc::clone(&db),
+        tool_registry: registry.build().into_shared(),
+        daemon_tx,
+        max_turns: 0,
+        lag_limits: crate::broadcast::LagLimits::default(),
+        global_lag: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        substrate_credential: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
+    };
+    // Two tool turns, then a final answer: three turns inside one request.
+    let provider = make_tool_loop_provider(2);
+    let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+    let mut session = SessionState::empty();
+
+    let result = run_agent_loop(
+        &provider,
+        &mut session,
+        "test-model",
+        7,
+        &cancel_rx,
+        &ctx,
+        Some("hi"),
+    );
+    assert!(
+        !result.unwrap(),
+        "the final-answer turn completes without another tool call"
+    );
+
+    let persisted = crate::db::read_turns(&db, 1).unwrap();
+    assert_eq!(
+        persisted.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "both tool-loop turns and the final turn must be on disk"
+    );
+
+    // The tool turns are complete on disk, not bare placeholders: each carries
+    // the assistant's text, its call, and the recorded result for that call.
+    for turn_id in [0u32, 1u32] {
+        let turn = &persisted[turn_id as usize].1;
+        let expected_text = format!("step {turn_id}");
+        assert_eq!(
+            turn.user_text.is_some(),
+            turn_id == 0,
+            "only the request's first turn carries the user's text"
+        );
+        assert_eq!(turn.assistant_text.as_deref(), Some(expected_text.as_str()));
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].call_id, format!("call_{turn_id}"));
+        assert_eq!(turn.tool_results.len(), 1);
+        assert_eq!(turn.tool_results[0].call_id, format!("call_{turn_id}"));
+        assert!(
+            !turn.tool_results[0].is_error,
+            "the random tool must succeed"
+        );
+    }
+    assert_eq!(
+        persisted[2].1.assistant_text.as_deref(),
+        Some("done"),
+        "the final turn is persisted too"
     );
 }
 
