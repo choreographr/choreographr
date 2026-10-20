@@ -117,7 +117,14 @@ _require-llvm-cov:
     #!/usr/bin/env bash
     set -euo pipefail
     command -v cargo-llvm-cov >/dev/null 2>&1 || { echo "error: cargo-llvm-cov not found — run \`just install-cargo-llvm-cov\`" >&2; exit 1; }
-    have=$(cargo llvm-cov --version | awk '{print $2}')
+    # Pull the bare semver out of the version banner rather than assuming it is
+    # the second whitespace field: `|| true` keeps pipefail from aborting when
+    # grep finds no match, so the empty-version guard below produces the hint.
+    have=$(cargo llvm-cov --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
+    if [ -z "$have" ]; then
+        echo "error: could not determine cargo-llvm-cov version — run \`just install-cargo-llvm-cov\`" >&2
+        exit 1
+    fi
     if [ "$(printf '%s\n%s\n' 0.9.1 "$have" | sort -V | head -n1)" != 0.9.1 ]; then
         echo "error: cargo-llvm-cov $have is too old (need ≥ 0.9.1) — run \`just install-cargo-llvm-cov\`" >&2
         exit 1
