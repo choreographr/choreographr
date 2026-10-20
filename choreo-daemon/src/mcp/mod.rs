@@ -64,7 +64,7 @@ pub type McpConnectOutcome = Result<(McpServer, Vec<McpTool>), String>;
 // (`daemon::mcp_commands`, `server::core`), so the slot module's private helpers
 // are re-exported here for those crate-level call sites.
 #[cfg(feature = "mcp")]
-pub(crate) use slot::{BACKGROUND_CONNECT_BUDGET, connect_and_list, join_with_budget};
+pub(crate) use slot::{BACKGROUND_CONNECT_BUDGET, connect_entry};
 
 // The asynchronous overlay plan/install types cross the command channel, so the
 // daemon's off-loop connect handlers reach them through this re-export.
@@ -81,8 +81,7 @@ use choreo_mcp::{McpListChange, McpServer, McpServerConfig, McpServerHandle, Mcp
 use config::McpEntry;
 #[cfg(feature = "mcp")]
 use slot::{
-    CATALOGUE_REFRESH_BUDGET, CATALOGUE_REFRESH_TOTAL_BUDGET, RECONNECT_BUDGET,
-    RECONNECT_TOTAL_BUDGET, RELOAD_BUDGET, ServerSlot, SharedSlot,
+    CATALOGUE_REFRESH_BUDGET, RECONNECT_BUDGET, RECONNECT_TOTAL_BUDGET, ServerSlot, SharedSlot,
 };
 #[cfg(feature = "mcp")]
 use std::collections::HashMap;
@@ -91,7 +90,7 @@ use std::collections::HashSet;
 #[cfg(feature = "mcp")]
 use std::path::PathBuf;
 #[cfg(feature = "mcp")]
-use std::time::{Duration, Instant};
+use std::time::Duration;
 #[cfg(feature = "mcp")]
 use tool::build_server_wrappers;
 #[cfg(feature = "mcp")]
@@ -153,8 +152,9 @@ impl McpManager {
     /// queue, WITHOUT connecting anything.
     ///
     /// `shared = false` daemon-tier servers are NOT connected here: they are
-    /// per-session, connected lazily when a session resolves its overlay (see
-    /// [`McpManager::ensure_session`]). The `shared` entries are returned by
+    /// per-session, connected lazily when a session resolves its overlay (the
+    /// daemon plans it against the pool and connects what is missing off-loop).
+    /// The `shared` entries are returned by
     /// [`McpManager::take_startup_queue`] so the daemon core can connect them on
     /// a background worker — this constructor returns immediately, so
     /// `DaemonState::open` (and therefore the socket bind) never waits on an MCP
@@ -261,6 +261,18 @@ impl McpManager {
         self.in_flight.remove(slug);
     }
 
+    /// Whether `slug` is a configured daemon-tier SHARED server (connected or
+    /// not).
+    ///
+    /// Only a shared entry is connected at the daemon level: a `shared = false`
+    /// entry belongs to each referencing session's overlay, so its connection
+    /// lives in `session_slots` and is reconciled by the overlay resolution, not
+    /// by a daemon connect or by [`McpManager::install_connected`].
+    #[must_use]
+    pub fn is_shared_configured(&self, slug: &str) -> bool {
+        self.configs.get(slug).is_some_and(|e| e.shared)
+    }
+
     /// Whether `slug` is a configured daemon-tier server (connected or not).
     #[must_use]
     pub fn is_configured(&self, slug: &str) -> bool {
@@ -279,36 +291,48 @@ impl McpManager {
         self.servers.contains_key(slug)
     }
 
-    /// The connect inputs for a background (re)connect of `slug`: its resolved
-    /// config and a clone of the list-change sender (so the rebuilt transport
-    /// re-subscribes). `None` when no such daemon-tier entry is configured.
+    /// The connect inputs for a background (re)connect of the daemon-tier SHARED
+    /// server `slug`: its resolved config and a clone of the list-change sender
+    /// (so the rebuilt transport re-subscribes).
+    ///
+    /// `None` when no such daemon-tier entry is configured, or when the entry is
+    /// `shared = false`: a per-session entry is connected per session by the
+    /// overlay resolution, and a daemon-tier connect of it would register a
+    /// second connection whose tools duplicate the session's private ones.
     #[must_use]
     pub fn connect_inputs(
         &self,
         slug: &str,
     ) -> Option<(McpServerConfig, crossbeam_channel::Sender<McpListChange>)> {
-        let entry = self.configs.get(slug)?;
+        let entry = self.configs.get(slug).filter(|e| e.shared)?;
         Some((entry.config.clone(), self.list_change_tx.clone()))
     }
 
-    /// Install a server connected by a background worker, replacing any existing
-    /// daemon-tier connection for `slug`.
+    /// Install a daemon-tier SHARED server connected by a background worker,
+    /// replacing any existing connection for `slug`.
     ///
     /// The caller (the command loop) rebuilds the tool catalogue from the cached
     /// tool sets afterwards, so registration order and tool naming are derived
     /// from the manager's `order`, never from the order connects complete. A
-    /// slug that is no longer configured (removed by a reload while the connect
-    /// was in flight) is rejected: the freshly connected server is dropped.
+    /// slug that is no longer a configured SHARED server (removed or flipped to
+    /// `shared = false` by a reload while the connect was in flight) is
+    /// rejected: the freshly connected server is dropped.
     ///
     /// # Errors
     ///
-    /// Returns the slug's absence from the configured set as an error message.
+    /// Returns the slug's absence from the configured shared set as an error
+    /// message.
     pub fn install_connected(
         &mut self,
         slug: &str,
         server: McpServer,
         tools: &[McpTool],
     ) -> Result<(), String> {
+        if !self.is_shared_configured(slug) {
+            return Err(format!(
+                "server {slug:?} is no longer a configured daemon-tier shared server"
+            ));
+        }
         let config = self
             .configs
             .get(slug)
@@ -342,63 +366,17 @@ impl McpManager {
         self.list_change_rx.take()
     }
 
-    /// Re-register every daemon-tier shared server's tools into `registry`.
-    ///
-    /// Each server is listed with the short `CATALOGUE_REFRESH_BUDGET`
-    /// deadline, not the per-server request timeout: this sweep runs on the
-    /// command loop, and one slow server must not freeze every session. The
-    /// WHOLE sweep is additionally bounded by `CATALOGUE_REFRESH_TOTAL_BUDGET`,
-    /// so a reload/reconnect over many servers cannot compound into an unbounded
-    /// command-loop stall. A server that misses either deadline keeps its
-    /// previously-listed tool set (so its group does not blink out of the
-    /// catalogue) and is re-listed on the next refresh.
-    pub fn register_all(&mut self, registry: &mut ToolRegistry) {
-        let mut used: HashSet<String> = HashSet::new();
-        // One deadline for the WHOLE sweep: each server is re-listed under the
-        // smaller remaining share, so the total cannot exceed the aggregate
-        // budget no matter how many servers are connected.
-        let deadline = Instant::now() + CATALOGUE_REFRESH_TOTAL_BUDGET;
-        for slug in self.order.clone() {
-            let Some(slot) = self.servers.get_mut(&slug) else {
-                continue;
-            };
-            // Bound this server's re-list by the remaining share of the
-            // aggregate budget; once it is spent, skip the re-list and keep the
-            // server's CACHED tools so its group stays in the catalogue.
-            // Register straight from the cache (no clone).
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                warn!(
-                    server = %slug,
-                    "catalogue-refresh budget exhausted; keeping the cached tool set"
-                );
-            } else {
-                Self::relist_slot(slot, remaining.min(CATALOGUE_REFRESH_BUDGET));
-            }
-            Self::register_server_tools(
-                &slug,
-                &slot.handle,
-                &slot.tools,
-                &slot.config.disabled_tools,
-                &mut used,
-                registry,
-            );
-        }
-    }
-
     /// Re-list ONE daemon-tier shared server and update its cached tool set.
     ///
-    /// A list-changed event names exactly one server, so re-listing only that
-    /// server keeps the catalogue rebuild off every other server's request
-    /// path: a full [`McpManager::register_all`] sweep would re-list all N
-    /// connected servers (each bounded by `CATALOGUE_REFRESH_BUDGET`), so a
-    /// single event could stall the command loop for up to N × the budget.
+    /// A list-changed event names exactly one server, and the catalogue is
+    /// rebuilt from every other server's CACHE, so the command loop pays one
+    /// round-trip per event rather than one per connected server.
     ///
-    /// The re-listing is bounded by the same short catalogue-refresh deadline
-    /// as `register_all` (not the per-server request timeout), and a server
-    /// that misses it — or fails to list — keeps its previous tool set with a
-    /// warning, so its group never blinks out of the catalogue; it is re-listed
-    /// on the next event or a full `register_all`.
+    /// The re-listing is bounded by the short `CATALOGUE_REFRESH_BUDGET`
+    /// deadline (not the per-server request timeout), and a server that misses
+    /// it — or fails to list — keeps its previous tool set with a warning, so its
+    /// group never blinks out of the catalogue; it is re-listed on the next
+    /// event.
     ///
     /// A no-op when `slug` is not a connected daemon shared server: a
     /// per-session or project server's change is handled through its session
@@ -419,9 +397,7 @@ impl McpManager {
     ///
     /// A listing that fails or misses `deadline` keeps the slot's previous tool
     /// set with a warning, so the server's `mcp/<slug>` group never blinks out
-    /// of the catalogue; it is re-listed on the next refresh. Shared by the full
-    /// [`McpManager::register_all`] sweep and the single-server
-    /// [`McpManager::refresh_server`] path so the two cannot drift.
+    /// of the catalogue; it is re-listed on the next event.
     fn relist_slot(slot: &mut ServerSlot, deadline: Duration) {
         match slot.handle.list_tools_with_deadline(deadline) {
             Ok(tools) => {
@@ -444,14 +420,14 @@ impl McpManager {
     /// Re-register every daemon-tier shared server's CACHED tool set into
     /// `registry`, WITHOUT re-listing any of them.
     ///
-    /// The catalogued counterpart of the re-list in
+    /// The catalogue-build counterpart of the re-list in
     /// [`McpManager::refresh_server`]: after the one changed server has been
     /// re-listed, this rebuilds the daemon-wide catalogue from every server's
-    /// cached `tools`. It walks `self.order` with a fresh `used` set exactly
-    /// like [`McpManager::register_all`], so the registered tool names and
-    /// groups are identical to a full sweep — tool naming depends only on
-    /// `self.order` and the tool lists, never on a live listing — while the
-    /// network round-trips are skipped.
+    /// cached `tools`. It walks `self.order` with a fresh `used` set so the
+    /// registered tool names and groups are deterministic, while the network
+    /// round-trips are skipped. It is the single catalogue-build path: a
+    /// background connect landing, a list change, and a reload dropping a server
+    /// all end here.
     pub fn register_cached(&self, registry: &mut ToolRegistry) {
         let mut used: HashSet<String> = HashSet::new();
         for slug in &self.order {
@@ -705,6 +681,39 @@ mod tests {
         // Clearing the in-flight marker (a connect settled) re-arms it.
         manager.clear_in_flight("a");
         assert!(manager.mark_in_flight("a"));
+    }
+
+    #[test]
+    fn connect_inputs_are_shared_only() {
+        // Only a `shared = true` entry is connected at the daemon level. A daemon
+        // `shared = false` entry belongs to each referencing session's overlay, so
+        // a daemon-tier connect of it would pool a SECOND connection whose tools
+        // duplicate the session's private ones.
+        let mut manager = McpManager::empty();
+        manager
+            .configs
+            .insert("shared".to_string(), stdio_entry("shared", true));
+        manager
+            .configs
+            .insert("per".to_string(), stdio_entry("per", false));
+        manager.order = vec!["per".to_string(), "shared".to_string()];
+
+        assert!(
+            manager.connect_inputs("shared").is_some(),
+            "a shared entry is connectable in the background"
+        );
+        assert!(
+            manager.connect_inputs("per").is_none(),
+            "a per-session entry has no daemon-tier connect"
+        );
+
+        // Both are CONFIGURED (so status/reload see them); only one is shared.
+        assert!(manager.is_configured("per"));
+        assert!(manager.is_shared_configured("shared"));
+        assert!(
+            !manager.is_shared_configured("per"),
+            "a per-session entry is not a daemon-tier shared server"
+        );
     }
 
     #[test]

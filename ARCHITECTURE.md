@@ -1499,13 +1499,22 @@ worker thread that posts a `DaemonCommand` back.
   blocks the reply or the loop. A resync requested while a connect is already in flight
   is coalesced: a failed in-flight connect retries once with the now-live credentials.
 - **Session overlays.** A session's project / per-session servers are planned cheaply
-  (pool-only), pushed as a partial overlay, then connected on a worker whose
-  `DaemonCommand::McpSessionConnected` installs into the pool and pushes the rebuilt
-  overlay — guarded by a per-session generation so a batch planned before a re-resolve
-  is dropped rather than installed. `/mcp reload` likewise drops changed servers and
-  defers their reconnects, and a manual `/mcp reconnect` of a daemon-tier server parks
-  its reply on the connect rather than blocking the loop. Only a project/per-session
-  server's manual reconnect still rebuilds in place (bounded, user-initiated).
+  (pool-only), pushed as a partial overlay, then connected on a worker that posts one
+  `DaemonCommand::McpSessionConnected` **per entry as it settles** — so a fast server's
+  tools land without waiting for a slow sibling's handshake. The result is installed
+  only when the session's resolve generation still matches (which advances only when
+  the resolve RELEASES the session's connections, i.e. a project-root or trust change)
+  and the entry is still wanted; a re-resolve that reuses the connections keeps the
+  generation and skips entries a worker is already connecting, so one entry never gets
+  two simultaneous handshakes. `/mcp reload` likewise drops changed servers and defers
+  their reconnects, and a manual `/mcp reconnect` of a daemon-tier *shared* server parks
+  its reply on the connect rather than blocking the loop. A project or per-session
+  server's manual reconnect still rebuilds in place (bounded, user-initiated), because
+  its connections are per session, not pool-wide: routing it through the daemon-tier
+  connect would pool a second, shared connection whose tools duplicate the session's
+  private ones. The same rule governs the post-unlock and post-sign-in bring-up: a
+  shared server reconnects on a worker, while a `shared = false` server has its stale
+  per-session slots dropped so the holding sessions re-resolve and reconnect them.
 
 Two values inside the `rmcp` engine are sanctioned shared-state exceptions (see
 AGENTS.md). The live `RunningService` handle sits in a

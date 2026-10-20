@@ -13,7 +13,7 @@ use super::config::{self, McpEntry};
 #[cfg(feature = "mcp")]
 use super::{
     McpReloadOutcome, RECONNECT_BUDGET, RECONNECT_TOTAL_BUDGET, ServerSlot, SharedSlot,
-    connect_and_list, join_with_budget,
+    connect_entry,
 };
 #[cfg(feature = "mcp")]
 use choreo_mcp::{McpListChange, McpServer, McpServerConfig, McpTool};
@@ -23,6 +23,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 #[cfg(feature = "mcp")]
 use std::time::{Duration, Instant};
+#[cfg(feature = "mcp")]
+use tracing::{info, warn};
 
 /// One live connection a reconnect can target, addressed by its pool key.
 ///
@@ -39,8 +41,6 @@ enum SlotKey {
     /// A per-session connection, keyed by `(session_id, root or None, slug)`.
     Session(u64, Option<PathBuf>, String),
 }
-#[cfg(feature = "mcp")]
-use tracing::{info, warn};
 
 /// The classification of one daemon-tier entry reconciled by a reload, tallied
 /// into `McpReloadOutcome::summary`, plus the sessions a change reached.
@@ -205,8 +205,8 @@ impl super::McpManager {
     }
 
     /// Re-read the daemon-tier `mcp.json` and reconcile the daemon-tier shared
-    /// server set with it. Project-tier servers are reconciled per session
-    /// (see [`super::McpManager::reload_session`]).
+    /// server set with it. Project-tier servers are reconciled per session, by
+    /// the overlay resolution the command loop drives.
     ///
     /// This never connects: an added/changed shared server is DROPPED from the
     /// live pool and its slug returned in the second tuple element, for the
@@ -395,25 +395,15 @@ impl super::McpManager {
         config: &McpServerConfig,
         timeout: Duration,
     ) -> Option<ServerSlot> {
-        let list_changes = Some(list_change_tx.clone());
-        let cfg = config.clone();
-        // Connect AND list inside the worker, so `timeout` bounds discovery as
-        // well as the handshake: a server that handshakes fast but never answers
-        // `tools/list` is dropped at the budget instead of stalling the (reload
-        // or command-loop) caller for the per-server request timeout.
-        let handle = std::thread::spawn(move || {
-            connect_and_list(&cfg, list_changes).map_err(anyhow::Error::from)
-        });
-        match join_with_budget(handle, timeout) {
-            Some(Ok((server, tools))) => {
-                Some(Self::slot_from_server(server, &tools, config.clone()))
-            }
-            Some(Err(e)) => {
+        // Connect AND list inside the bounded worker, so `timeout` bounds
+        // discovery as well as the handshake: a server that handshakes fast but
+        // never answers `tools/list` is dropped at the budget instead of
+        // stalling the (reload or command-loop) caller for the per-server request
+        // timeout.
+        match connect_entry(config, Some(list_change_tx.clone()), timeout) {
+            Ok((server, tools)) => Some(Self::slot_from_server(server, &tools, config.clone())),
+            Err(e) => {
                 warn!(server = %config.slug, error = %e, "MCP server failed to connect");
-                None
-            }
-            None => {
-                warn!(server = %config.slug, "MCP server connect/discovery timed out");
                 None
             }
         }

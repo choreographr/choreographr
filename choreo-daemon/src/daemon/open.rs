@@ -263,6 +263,9 @@ impl DaemonState {
             model_prefetch_in_flight: HashSet::new(),
             mcp_manager,
             pending_mcp_reconnects: HashMap::new(),
+            // Test-only observability counter (see the field's docs): absent
+            // from a shipped build.
+            #[cfg(any(test, feature = "test-utils"))]
             mcp_connects_completed: 0,
             // The trust store is loaded fail-closed: a missing or malformed
             // `trust.toml` yields an empty set. When no config dir is

@@ -146,10 +146,25 @@ pub struct SessionMcpProject {
     pub trusted: bool,
     /// The resolve generation, monotonically increasing per session. A
     /// background overlay connect carries the generation it was planned under;
-    /// `handle_mcp_session_connected` drops a batch whose
-    /// generation no longer matches (the session was re-resolved or released in
-    /// the meantime), so a stale connect can never install into the live pool.
+    /// `handle_mcp_session_connected` drops a result whose generation no longer
+    /// matches (the session was re-resolved against a different root or trust
+    /// state, or released, in the meantime), so a superseded connect can never
+    /// install into the live pool.
+    ///
+    /// A resolve that REUSES the session's connections keeps the generation, so
+    /// a connect already in flight for it stays valid instead of being churned
+    /// away by every re-resolve.
     pub generation: u64,
+    /// Every overlay entry (`(root, slug)`) the most recent resolve wants —
+    /// pooled and pending alike. An arriving connect is installed only when its
+    /// entry is still in this set, so a connect that lands after the config
+    /// stopped declaring it is discarded instead of leaking a live connection
+    /// into the pool.
+    pub wanted: HashSet<(Option<PathBuf>, String)>,
+    /// The subset of `wanted` a background worker is currently connecting. A
+    /// re-resolve skips these — the in-flight connect installs them — so one
+    /// entry never gets two simultaneous handshakes.
+    pub pending: HashSet<(Option<PathBuf>, String)>,
 }
 
 /// Everything the daemon tracks about one connected client, keyed by its
@@ -363,9 +378,11 @@ pub struct DaemonState {
     /// usually has at most one waiter; a repeated action coalesces under it.
     pub pending_mcp_reconnects: HashMap<String, Vec<std::sync::mpsc::Sender<Result<(), String>>>>,
     /// Monotonic count of daemon-tier MCP connects that SUCCEEDED and were
-    /// installed (incremented on the command loop in `handle_mcp_connected`). A
-    /// lightweight observability signal, and the deterministic "a background
-    /// connect landed" predicate a test harness pumps on.
+    /// installed (incremented on the command loop in `handle_mcp_connected`).
+    /// The deterministic "a background connect landed" predicate a test harness
+    /// pumps on; compiled only for test builds so it never widens the shipped
+    /// API.
+    #[cfg(any(test, feature = "test-utils"))]
     pub mcp_connects_completed: u64,
     /// The MCP project-trust store (the set of project roots whose `.mcp.json`
     /// the daemon honours). Owned by the command loop (its single writer); the
@@ -1060,16 +1077,19 @@ pub enum DaemonCommand {
         /// The connected server plus its listed tools, or the connect error.
         outcome: crate::mcp::McpConnectOutcome,
     },
-    /// A background session overlay connect finished. The command loop installs
-    /// the results into the session's pool and rebuilds/pushes its overlay,
-    /// UNLESS the session was re-resolved since (the `generation` no longer
-    /// matches), in which case the batch is dropped. Off the command loop so a
-    /// project's slow servers never stall session create/attach.
+    /// A background session overlay connect finished (one command PER entry, as
+    /// each entry settles). The command loop installs the result into the
+    /// session's pool and rebuilds/pushes its overlay, UNLESS the session was
+    /// re-resolved against a different root or trust state since (the
+    /// `generation` no longer matches) or the entry is no longer wanted, in which
+    /// case the freshly connected server is dropped. Off the command loop so a
+    /// project's slow servers never stall session create/attach, and per entry so
+    /// a fast server's tools appear without waiting for a slow sibling.
     #[cfg(feature = "mcp")]
     McpSessionConnected {
-        /// The session whose overlay this batch belongs to.
+        /// The session whose overlay this result belongs to.
         session_id: u64,
-        /// The resolve generation the batch was planned under.
+        /// The resolve generation the entry was planned under.
         generation: u64,
         /// The servers that connected, each with the entry it satisfies.
         connected: Vec<(
