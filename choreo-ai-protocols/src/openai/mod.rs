@@ -10,6 +10,7 @@
 //! consumer keeps naming them as `openai::…`.
 
 mod chat_completions;
+mod chat_projection;
 mod config;
 mod message;
 mod reasoning_details;
@@ -19,7 +20,6 @@ mod retry;
 mod sse;
 #[cfg(test)]
 mod tests;
-mod wire;
 mod zhipu;
 pub use crate::shared::{MaxTokensField, RequestAuth};
 use crate::types::{ChatTurnResult, StreamEvent};
@@ -35,6 +35,10 @@ pub use message::{
 };
 pub(crate) use responses_input::messages_to_responses_input;
 
+pub use chat_projection::{
+    CHAT_REASONING_WIRE_KEYS, ChatWireMessage, ChatWireMessages, chat_assistant_payload_is_empty,
+    chat_wire_message, chat_wire_messages,
+};
 pub(crate) use config::endpoint_url;
 pub use config::{ServiceConfig, completion, validate_and_list_models};
 pub(crate) use sse::SseReader;
@@ -43,10 +47,6 @@ pub(crate) use sse::build_sse_event;
 #[cfg(test)]
 pub(crate) use sse::extract_responses_text_delta;
 pub(crate) use sse::{ResponsesStreamEvent, parse_responses_stream_event};
-pub use wire::{
-    CHAT_REASONING_WIRE_KEYS, ChatWireMessage, ChatWireMessages, chat_assistant_payload_is_empty,
-    chat_wire_message, chat_wire_messages,
-};
 
 // Re-export common retry types for use by sub-modules and tests.
 #[cfg(test)]

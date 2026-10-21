@@ -1,4 +1,5 @@
-//! The chat-completions wire projection of a canonical message slice.
+//! The chat-completions message projection: what one message looks like on the
+//! wire under a route's reasoning-echo policy.
 //!
 //! This module owns the one place where a [`ChatRequestMessage`] becomes an
 //! `OpenAI` Chat Completions payload: **which reasoning key** a message carries
@@ -14,28 +15,15 @@
 //! [`super::reasoning_details`]; this module only projects what was captured.
 
 use super::ChatRequestMessage;
-use super::reasoning_details::{details_companion, details_display_text, details_wire_value};
+use super::reasoning_details::{MAX_REASONING_BYTES, details_display_text, details_wire_value};
 use crate::catalog::ChatReasoningEcho;
 use choreo_proto::{ChatReasoningField, ReasoningArtifact};
 use serde::Serialize;
 use tracing::{debug, warn};
 
-/// Per-request cap on the total reasoning payload replayed across all assistant
-/// messages, in artifact bytes.
-///
-/// The per-turn capture cap bounds one turn's payload, but every earlier turn's
-/// artifact is replayed on every later request of the tool loop, so a long
-/// session's request grows to roughly `turns × per-turn cap`. This budget is
-/// small enough that such a loop cannot build a body the provider rejects:
-/// losing an old turn's reasoning echo degrades a route that requires it (the
-/// message still goes out, with the presence marker and no payload), while an
-/// oversized body would fail the whole turn. Scalar artifacts are not capped at
-/// capture at all — real thinking can exceed the per-turn cap and some routes
-/// demand it replayed — which is the other reason the total needs a bound here.
-///
-/// The **newest** artifact always replays, even when it alone exceeds the
-/// budget, so the immediately preceding turn's echo can never be starved.
-pub(crate) const MAX_REQUEST_REASONING_BYTES: usize = 256 * 1024;
+// The per-request replay budget is the crate's one reasoning byte budget: see
+// `reasoning_details::MAX_REASONING_BYTES` for why capture and replay share the
+// number, and `reasoning_replay_budget` below for how replay spends it.
 
 /// Every chat-completions reasoning wire key, in
 /// [`ChatReasoningField::ALL`] order — re-exported from [`choreo_proto`], where
@@ -59,9 +47,10 @@ pub use choreo_proto::CHAT_REASONING_WIRE_KEYS;
 ///   no assistant message on such a route can omit it.
 ///
 /// Exactly one wire shape is emitted per message — a scalar key or the
-/// structured `reasoning_details` array — and never on a non-assistant role. The
-/// only companion field is the bare-shape summary text (`reasoning_content`)
-/// emitted beside a bare-dialect details array.
+/// structured `reasoning_details` array — and never on a non-assistant role.
+/// Never two: sending a bare-dialect array *and* a scalar mirror beside it would
+/// be a shape no upstream documents, so the array is the only reasoning field a
+/// details route emits.
 pub struct ChatWireMessage<'a> {
     message: &'a ChatRequestMessage,
     /// The reasoning emission, decided once at lowering time and reused by both
@@ -101,7 +90,7 @@ pub struct ChatWireMessages<'a> {
 /// The reasoning artifacts are also budgeted here rather than per message: the
 /// total replayed across the request is what the provider sees, so a turn whose
 /// artifact the budget skips is lowered with no artifact at all (see
-/// `MAX_REQUEST_REASONING_BYTES`). Per-message projection
+/// `MAX_REASONING_BYTES`). Per-message projection
 /// ([`chat_wire_message`]) deliberately has no budget — it has no request to
 /// budget.
 #[must_use]
@@ -145,13 +134,13 @@ pub fn chat_wire_messages(
 }
 
 /// Decide, per message position, whether that message's reasoning artifact is
-/// replayed under `MAX_REQUEST_REASONING_BYTES`.
+/// replayed under `MAX_REASONING_BYTES`.
 ///
 /// The walk is newest-first because the recent echo is the one that matters: the
 /// most recent artifact-carrying assistant message always replays, and every
 /// older one replays only while the bytes already accepted stay at or below the
 /// budget. Because the check happens before an older artifact's bytes are
-/// added, the accepted total can reach `MAX_REQUEST_REASONING_BYTES` plus one
+/// added, the accepted total can reach `MAX_REASONING_BYTES` plus one
 /// artifact; that one-artifact overshoot is deliberate (it lets an older turn
 /// in while keeping the total bounded by the budget plus the newest turn).
 /// Non-assistant messages and messages with no artifact consume no budget, so
@@ -174,7 +163,7 @@ fn reasoning_replay_budget(messages: &[ChatRequestMessage]) -> Vec<bool> {
         if message.role != "assistant" {
             continue;
         }
-        if accepted && used > MAX_REQUEST_REASONING_BYTES {
+        if accepted && used > MAX_REASONING_BYTES {
             skipped += 1;
             continue;
         }
@@ -187,7 +176,7 @@ fn reasoning_replay_budget(messages: &[ChatRequestMessage]) -> Vec<bool> {
         // what a diagnostic needs, the reasoning itself is never logged.
         warn!(
             skipped,
-            budget = MAX_REQUEST_REASONING_BYTES,
+            budget = MAX_REASONING_BYTES,
             used,
             "replayed reasoning exceeds the per-request budget; dropping the oldest artifacts"
         );
@@ -449,34 +438,19 @@ impl ChatWireMessage<'_> {
 
 impl Serialize for ChatWireMessage<'_> {
     /// Manual impl: role, content, `tool_call_id`, `tool_calls`, and at most one
-    /// reasoning field (plus the bare-shape companion beside a details array),
-    /// with `None` fields omitted. An assistant message carrying a `ChatReasoning`
-    /// artifact re-emits it under the route's field (see [`ChatWireMessage`]);
-    /// the artifact itself never appears on the wire.
+    /// reasoning field, with `None` fields omitted. An assistant message carrying
+    /// a `ChatReasoning` artifact re-emits it under the route's field (see
+    /// [`ChatWireMessage`]); the artifact itself never appears on the wire.
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
 
-        // The bare-shape companion text, derived once and reused for the field
-        // count and the serialization (never derived twice on the per-message
-        // path).
-        let companion = match &self.reasoning {
-            Some(WireReasoning::Details(details)) => details_companion(details),
-            _ => None,
-        };
-
         // The count has to be exact — a `serde` struct serializer that is told
-        // the wrong length either truncates the output or panics — and it is not
-        // a constant: the details arm can write both `reasoning_content` (the
-        // Kimi companion) and `reasoning_details`.
+        // the wrong length either truncates the output or panics.
         let field_count = 1 // role
             + usize::from(!self.message.images.is_empty() || self.message.content.is_some())
             + usize::from(self.message.tool_call_id.is_some())
             + usize::from(self.message.tool_calls.is_some())
-            + match &self.reasoning {
-                None => 0,
-                Some(WireReasoning::Scalar { .. }) => 1,
-                Some(WireReasoning::Details(_)) => 1 + usize::from(companion.is_some()),
-            };
+            + usize::from(self.reasoning.is_some());
         let mut msg = serializer.serialize_struct("ChatWireMessage", field_count)?;
         msg.serialize_field("role", &self.message.role)?;
         // When the message carries images, `content` becomes an array of
@@ -499,12 +473,6 @@ impl Serialize for ChatWireMessage<'_> {
             match reasoning {
                 WireReasoning::Scalar { key, value } => msg.serialize_field(key, value)?,
                 WireReasoning::Details(details) => {
-                    // A bare-shape payload also carries the summary text as
-                    // `reasoning_content`; the one-channel rule holds only among
-                    // the scalar fields, so this companion is deliberate.
-                    if let Some(companion) = &companion {
-                        msg.serialize_field("reasoning_content", companion)?;
-                    }
                     msg.serialize_field("reasoning_details", details)?;
                 }
             }

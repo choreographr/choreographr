@@ -94,7 +94,7 @@ fn a_request_over_budget_replays_the_newest_artifacts() {
     // Four artifacts of just over a third of the budget each: the newest three
     // are accepted before the running total passes the budget, so the oldest
     // is the one that loses its payload.
-    let each = MAX_REQUEST_REASONING_BYTES / 3 + 1;
+    let each = MAX_REASONING_BYTES / 3 + 1;
     let messages = vec![
         assistant("oldest:", each),
         assistant("second:", each),
@@ -119,7 +119,7 @@ fn a_request_over_budget_replays_the_newest_artifacts() {
 fn the_newest_artifact_replays_even_when_it_alone_exceeds_the_budget() {
     let messages = vec![
         assistant("old:", 10),
-        assistant("huge:", MAX_REQUEST_REASONING_BYTES + 1),
+        assistant("huge:", MAX_REASONING_BYTES + 1),
     ];
     let payloads = replayed(&chat_wire_messages(&messages, plain_echo()));
     assert_eq!(
@@ -139,7 +139,7 @@ fn artifact_free_messages_consume_no_budget() {
     // The same four over-budget artifacts as above, but with artifact-free user
     // turns and one artifact-free assistant turn interleaved: neither consumes
     // budget, so exactly the same artifacts replay.
-    let each = MAX_REQUEST_REASONING_BYTES / 3 + 1;
+    let each = MAX_REASONING_BYTES / 3 + 1;
     let bare_assistant = ChatRequestMessage::simple("assistant", "no artifact".to_string());
     let messages = vec![
         user(),

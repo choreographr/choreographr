@@ -103,9 +103,13 @@ pub(crate) struct ReasoningStreamState {
     /// here rather than re-derived from the stored entries, so the replay cap
     /// can never blank the session's reasoning.
     details_text: String,
-    /// Whether the model produced any structured reasoning entry this turn,
-    /// including an encrypted-only one and one the replay cap refused.
-    saw_details_output: bool,
+    /// Whether the provider produced any reasoning output this turn, whether or
+    /// not it could be displayed or replayed (an encrypted-only entry, an entry
+    /// the replay cap refused, or a stray scalar delta). The one place the fact
+    /// is decided: [`apply`](Self::apply) sets it and [`finish`](Self::finish)
+    /// reports it, so a storage decision can never be mistaken for an empty
+    /// response.
+    produced: bool,
     /// Which channel owns the LIVE display this turn.
     display: DisplaySource,
     /// The scalar field the stream is using, locked in on the first non-empty
@@ -149,7 +153,7 @@ impl ReasoningStreamState {
                 details,
                 details_text,
                 display,
-                saw_details_output,
+                produced: turn_produced,
                 ..
             } = self;
             let saw_entry = details.push(raw, details_text, &mut |fragment| {
@@ -166,7 +170,7 @@ impl ReasoningStreamState {
             });
             // Both answers: the turn-wide fact, and this delta's contribution to
             // the caller's own "did anything happen" flag.
-            *saw_details_output |= saw_entry;
+            *turn_produced |= saw_entry;
             produced |= saw_entry;
             if let Some(error) = emit_error {
                 return Err(error);
@@ -185,6 +189,7 @@ impl ReasoningStreamState {
                 continue;
             };
             produced = true;
+            self.produced = true;
             let chosen = *self.scalar_field.get_or_insert(field);
             if chosen != field {
                 // Stray delta from a non-primary field — display and capture
@@ -216,7 +221,7 @@ impl ReasoningStreamState {
         let ReasoningStreamState {
             details,
             details_text,
-            saw_details_output,
+            produced,
             scalar_field,
             scalar_text,
             ..
@@ -233,7 +238,7 @@ impl ReasoningStreamState {
             scalar_text
         };
         TurnReasoning {
-            produced: saw_details_output || !display.is_empty(),
+            produced,
             display: (!display.is_empty()).then_some(display),
             artifact,
         }

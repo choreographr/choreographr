@@ -220,7 +220,7 @@ fn finish_keeps_the_display_of_an_overflowed_details_capture() {
     // The payload over the per-turn cap is dropped wholesale (no artifact, so
     // nothing to replay), but the turn keeps what the model said and still
     // counts as output — the cap governs replay, not the transcript or status.
-    let big = "x".repeat(super::super::super::reasoning_details::MAX_REASONING_DETAILS_BYTES + 1);
+    let big = "x".repeat(super::super::super::reasoning_details::MAX_REASONING_BYTES + 1);
     let mut state = ReasoningStreamState::default();
     let raw = format!(r#"{{"reasoning_details":[{{"type":"reasoning.text","text":"{big}"}}]}}"#);
     fold(&mut state, &delta(&raw));

@@ -609,11 +609,10 @@ fn openrouter_details_are_replayed_verbatim() {
 }
 
 /// A persisted Kimi-shaped payload keeps a stream `index`; replay rebuilds it
-/// minimally (index stripped) and mirrors the summary text as
-/// `reasoning_content`.
+/// minimally (index stripped) and emits no scalar mirror beside the array.
 #[ignore = "integration"]
 #[test]
-fn kimi_details_replay_strips_index_and_adds_companion() {
+fn kimi_details_replay_strips_the_stream_index() {
     let entries = serde_json::json!([
         {"type":"summary","summary":"step one ","index":0},
         {"type":"summary","summary":"and two","index":0}
@@ -642,8 +641,14 @@ fn kimi_details_replay_strips_index_and_adds_companion() {
         ]),
         "bare entries keep every field and lose only the stream index"
     );
-    // The merged summary text rides along as the scalar companion.
-    assert_eq!(assistant["reasoning_content"], "step one and two");
+    // The array is the ONLY reasoning field the message carries: a scalar
+    // mirror beside it is a shape no upstream documents.
+    for scalar in ["reasoning_content", "reasoning", "reasoning_text"] {
+        assert!(
+            assistant.get(scalar).is_none(),
+            "no scalar may be invented beside reasoning_details: {assistant}"
+        );
+    }
 }
 
 /// An entry whose `type` the catalog does not model is replayed verbatim: the

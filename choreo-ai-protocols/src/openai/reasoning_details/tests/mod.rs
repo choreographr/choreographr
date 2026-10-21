@@ -1,4 +1,5 @@
 use super::*;
+use choreo_proto::{ChatReasoningField, ReasoningArtifact};
 use serde_json::json;
 
 /// Fold one value into a fresh store, returning the store and the display text
@@ -218,15 +219,46 @@ fn typeless_entry_is_not_an_entry() {
 }
 
 #[test]
-fn entries_without_an_index_merge_as_one_block() {
-    // Neither entry names an index, so the provider does not distinguish
-    // stream slots: consecutive same-kind fragments are one logical block
-    // and merge, with the later fragment's metadata carried over.
+fn index_less_entries_in_one_delta_stay_discrete() {
+    // Two entries carried by ONE delta are two blocks by the array contract
+    // (`index` is documented as optional), so fusing them would rewrite the
+    // sequence the upstream requires to be replayed unmodified.
     let capture = capture(&json!([
         {"type":"reasoning.text","text":"first"},
         {"type":"reasoning.text","text":"second","signature":"sig"}
     ]));
     let artifact = capture.finish().expect("artifact");
+    let ReasoningArtifact::ChatReasoning { bytes, .. } = &artifact else {
+        panic!("expected ChatReasoning");
+    };
+    let entries: Value = serde_json::from_slice(bytes).expect("json");
+    assert_eq!(
+        entries,
+        json!([
+            {"type":"reasoning.text","text":"first"},
+            {"type":"reasoning.text","text":"second","signature":"sig"}
+        ])
+    );
+}
+
+#[test]
+fn index_less_entries_across_deltas_merge_as_one_block() {
+    // Neither entry names an index and they arrive in DIFFERENT deltas: the
+    // provider does not distinguish slots, so the later fragment continues the
+    // block being assembled — the stream rule the upstream states.
+    let mut store = DetailsStore::default();
+    let mut text = String::new();
+    store.push(
+        &json!([{"type":"reasoning.text","text":"first"}]),
+        &mut text,
+        &mut |_| {},
+    );
+    store.push(
+        &json!([{"type":"reasoning.text","text":"second","signature":"sig"}]),
+        &mut text,
+        &mut |_| {},
+    );
+    let artifact = store.finish().expect("artifact");
     let ReasoningArtifact::ChatReasoning { bytes, .. } = &artifact else {
         panic!("expected ChatReasoning");
     };
@@ -400,23 +432,31 @@ fn a_conflicting_identity_field_keeps_two_blocks_discrete() {
 }
 
 #[test]
-fn companion_mirrors_only_bare_summary_text() {
-    let bare = details_wire_value(br#"[{"type":"summary","summary":"a","index":0},{"type":"summary","summary":"b","index":0}]"#);
-    assert_eq!(details_companion(&bare).as_deref(), Some("ab"));
-    // OpenRouter dialect: the array is read alone.
-    let openrouter =
+fn the_array_is_the_only_reasoning_shape_a_details_route_emits() {
+    // A lowered array is replayed as itself in both dialects: no scalar mirror
+    // is invented beside it, because no upstream documents a message carrying
+    // both and a strict gateway may reject the pair.
+    let bare = details_wire_value(
+        br#"[{"type":"summary","summary":"a","index":0},{"type":"summary","summary":"b","index":0}]"#,
+    );
+    assert_eq!(
+        bare,
+        json!([
+            {"type":"summary","summary":"a"},
+            {"type":"summary","summary":"b"}
+        ])
+    );
+    let namespaced =
         details_wire_value(br#"[{"type":"reasoning.summary","summary":"a","index":0}]"#);
-    assert_eq!(details_companion(&openrouter), None);
-    // Encrypted-only: nothing textual to mirror.
-    let encrypted = details_wire_value(br#"[{"type":"encrypted","data":"x","index":0}]"#);
-    assert_eq!(details_companion(&encrypted), None);
-    // Empty array injects the key without a companion.
-    assert_eq!(details_companion(&json!([])), None);
+    assert_eq!(
+        namespaced,
+        json!([{"type":"reasoning.summary","summary":"a","index":0}])
+    );
 }
 
 #[test]
 fn oversized_payload_is_dropped_from_the_replay_payload() {
-    let big = "x".repeat(MAX_REASONING_DETAILS_BYTES + 1);
+    let big = "x".repeat(MAX_REASONING_BYTES + 1);
     let (store, text, produced) =
         capture_all(&json!([{"type":"reasoning.text","text":big,"index":0}]));
     // The replay payload goes (the whole array — a truncated sequence is not
@@ -424,7 +464,7 @@ fn oversized_payload_is_dropped_from_the_replay_payload() {
     // still keeps what the model said.
     assert!(store.finish().is_none());
     assert!(produced, "an over-cap entry is still model output");
-    assert_eq!(text.len(), MAX_REASONING_DETAILS_BYTES + 1);
+    assert_eq!(text.len(), MAX_REASONING_BYTES + 1);
 }
 
 #[test]
@@ -432,13 +472,13 @@ fn display_text_survives_the_replay_cap() {
     // The cap bounds what may be persisted and replayed, not what the session
     // shows: the display text keeps every fragment, including the ones the store
     // refused after the cap tripped.
-    let head = "y".repeat(MAX_REASONING_DETAILS_BYTES);
+    let head = "y".repeat(MAX_REASONING_BYTES);
     let (store, text, produced) = capture_all(&json!([
         {"type":"reasoning.text","text":head,"index":0},
         {"type":"reasoning.text","text":"tail","index":0}
     ]));
     assert!(store.finish().is_none(), "the payload is over the cap");
-    assert_eq!(text.len(), MAX_REASONING_DETAILS_BYTES + 4);
+    assert_eq!(text.len(), MAX_REASONING_BYTES + 4);
     assert!(
         text.ends_with("tail"),
         "the post-cap fragment still displays"
@@ -449,7 +489,7 @@ fn display_text_survives_the_replay_cap() {
 #[test]
 fn oversized_persisted_artifact_replays_empty() {
     let mut bytes = Vec::from(br#"[{"type":"reasoning.text","text":""#);
-    bytes.extend(std::iter::repeat_n(b'x', MAX_REASONING_DETAILS_BYTES));
+    bytes.extend(std::iter::repeat_n(b'x', MAX_REASONING_BYTES));
     bytes.extend_from_slice(br#""}]"#);
     assert_eq!(details_wire_value(&bytes), json!([]));
 }
