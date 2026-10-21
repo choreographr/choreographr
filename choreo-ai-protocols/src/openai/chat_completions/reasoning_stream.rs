@@ -35,7 +35,7 @@ use std::io;
 
 use choreo_proto::{ChatReasoningField, ReasoningArtifact};
 
-use super::super::reasoning_details::DetailsCapture;
+use super::super::reasoning_details::DetailsStore;
 use super::{StreamDelta, chat_reasoning_artifact};
 use crate::types::StreamEvent;
 
@@ -64,17 +64,48 @@ impl DisplaySource {
     }
 }
 
-/// One turn's streaming reasoning state: the live display owner plus both
-/// channels' captured payloads.
+/// What one turn's reasoning amounts to, after the whole turn is folded.
+///
+/// Three independent answers, which is the point: `produced` describes the
+/// provider's response, while `display` and `artifact` describe what this client
+/// chose to keep from it. A turn over the replay cap has `produced: true` with no
+/// artifact, and must not be mistaken for an empty response.
+#[derive(Debug, Default)]
+pub(crate) struct TurnReasoning {
+    /// Whether the provider produced any reasoning output this turn, whether or
+    /// not any of it could be displayed or replayed.
+    pub(crate) produced: bool,
+    /// The turn's display text, when it has any.
+    pub(crate) display: Option<String>,
+    /// The opaque round-trip payload, when one was captured and fits the caps.
+    pub(crate) artifact: Option<ReasoningArtifact>,
+}
+
+/// One turn's reasoning state: the live display owner, both channels' display
+/// text, the replay payload, and whether the model produced reasoning at all.
+///
+/// Those are four separate answers and stay separate here. The display text and
+/// the "produced output" fact are accumulated from the deltas as they arrive;
+/// only the replay payload
+/// ([`DetailsStore`]) is bounded by the per-turn cap. A payload the cap refuses
+/// therefore costs the turn its echo, never its transcript or its status.
 ///
 /// Both streaming request paths own one of these for the whole turn; the plain
 /// prompt path drops [`finish`](Self::finish) (it persists no artifact) while the
 /// tool path turns it into the round-trip artifact and the persisted display.
 #[derive(Debug, Default)]
 pub(crate) struct ReasoningStreamState {
-    /// The structured `reasoning_details` capture for this turn. Richest payload
-    /// the chat wire can replay; when it holds entries it becomes the artifact.
-    details: DetailsCapture,
+    /// The structured `reasoning_details` replay payload for this turn. Richest
+    /// payload the chat wire can replay; when it holds entries it becomes the
+    /// artifact.
+    details: DetailsStore,
+    /// Every displayable structured fragment, in arrival order — accumulated
+    /// here rather than re-derived from the stored entries, so the replay cap
+    /// can never blank the session's reasoning.
+    details_text: String,
+    /// Whether the model produced any structured reasoning entry this turn,
+    /// including an encrypted-only one and one the replay cap refused.
+    saw_details_output: bool,
     /// Which channel owns the LIVE display this turn.
     display: DisplaySource,
     /// The scalar field the stream is using, locked in on the first non-empty
@@ -101,21 +132,31 @@ impl ReasoningStreamState {
 
         // Structured entries fold first, so a delta carrying both channels lets
         // the structured entries claim the display before the scalar fields are
-        // considered. Any recognised entry (even an encrypted-only one) means the
-        // model produced output, so the turn is never reported as empty.
+        // considered. Any entry at all (even an encrypted-only one, or one the
+        // replay cap refuses) means the model produced output, so the turn is
+        // never reported as empty.
         if let Some(raw) = delta.reasoning_details.as_ref() {
-            // `DetailsCapture::push` reports fragments through an infallible
-            // callback because the capture has nothing to do with display, so an
+            // `DetailsStore::push` reports fragments through an infallible
+            // callback because the store has nothing to do with display, so an
             // `on_event` failure cannot propagate from inside it: the first error
             // is parked and re-raised below, after the delta is folded, so a
-            // failed emit never loses the capture.
+            // failed emit never loses what the turn accumulated.
             let mut emit_error: Option<io::Error> = None;
-            let display = &mut self.display;
-            self.details.push(raw, &mut |fragment| {
-                // A fragment reaches the display only while the details channel
-                // owns (or is first to claim) it; once the scalar field owns the
-                // display, the array carries the same text that is already on
-                // screen.
+            // Split the borrows: the store appends the turn's display text, the
+            // display-owner decides live emission, and neither needs the other
+            // field of `self`.
+            let ReasoningStreamState {
+                details,
+                details_text,
+                display,
+                saw_details_output,
+                ..
+            } = self;
+            let saw_entry = details.push(raw, details_text, &mut |fragment| {
+                // A fragment reaches the live display only while the details
+                // channel owns (or is first to claim) it; once the scalar field
+                // owns the display, the array carries the same text that is
+                // already on screen.
                 if !display.claim(DisplaySource::Details) || emit_error.is_some() {
                     return;
                 }
@@ -123,9 +164,10 @@ impl ReasoningStreamState {
                     emit_error = Some(error);
                 }
             });
-            if self.details.has_entries() {
-                produced = true;
-            }
+            // Both answers: the turn-wide fact, and this delta's contribution to
+            // the caller's own "did anything happen" flag.
+            *saw_details_output |= saw_entry;
+            produced |= saw_entry;
             if let Some(error) = emit_error {
                 return Err(error);
             }
@@ -162,29 +204,39 @@ impl ReasoningStreamState {
         Ok(produced)
     }
 
-    /// Finalize the turn into its display text and round-trip artifact.
+    /// Finalize the turn into its display text, round-trip artifact, and the
+    /// fact that it produced reasoning at all.
     ///
     /// The captured details outrank the scalar payload as the artifact (the array
     /// is the richer, replayable form) and the scalar text outranks the
-    /// details-derived display text; either may be absent.
-    pub(crate) fn finish(self) -> (Option<String>, Option<ReasoningArtifact>) {
-        // Split the state up front so the details capture can be borrowed for
-        // its display text and then consumed for the artifact.
+    /// details-derived display text; either may be absent. `produced` is
+    /// independent of both: it reports what the provider sent, so a turn whose
+    /// payload was over the replay cap still counts as output.
+    pub(crate) fn finish(self) -> TurnReasoning {
         let ReasoningStreamState {
             details,
+            details_text,
+            saw_details_output,
             scalar_field,
             scalar_text,
             ..
         } = self;
-        // The details-derived display is only worth building when the scalar
-        // channel has nothing to show: it concatenates every textual entry, and
-        // the scalar text wins whenever it exists.
-        let details_display = scalar_text.is_empty().then(|| details.display());
         let artifact = details.finish().or_else(|| {
             scalar_field.and_then(|field| chat_reasoning_artifact(field, &scalar_text))
         });
-        let display = details_display.unwrap_or(scalar_text);
-        ((!display.is_empty()).then_some(display), artifact)
+        // The scalar channel wins the display when it streamed anything (it is
+        // what the client already rendered live); otherwise the structured
+        // fragments stand in.
+        let display = if scalar_text.is_empty() {
+            details_text
+        } else {
+            scalar_text
+        };
+        TurnReasoning {
+            produced: saw_details_output || !display.is_empty(),
+            display: (!display.is_empty()).then_some(display),
+            artifact,
+        }
     }
 }
 

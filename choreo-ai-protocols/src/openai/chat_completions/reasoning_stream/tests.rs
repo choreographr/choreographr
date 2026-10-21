@@ -54,7 +54,9 @@ fn details_claim_the_display_then_scalar_fragments_stay_quiet() {
     let events = fold(&mut state, &delta(r#"{"reasoning":" again"}"#));
     assert_eq!(reasoning_events(&events), Vec::<&str>::new());
 
-    let (display, artifact) = state.finish();
+    let TurnReasoning {
+        display, artifact, ..
+    } = state.finish();
     // The scalar text is the persisted display text (it outranks the
     // details-derived text) and the details array is the artifact.
     assert_eq!(display.as_deref(), Some("think more again"));
@@ -88,7 +90,9 @@ fn scalar_claiming_early_suppresses_later_details_fragments() {
         "the scalar channel already owns the display"
     );
 
-    let (display, artifact) = state.finish();
+    let TurnReasoning {
+        display, artifact, ..
+    } = state.finish();
     assert_eq!(display.as_deref(), Some("early "));
     let Some(ReasoningArtifact::ChatReasoning { field, .. }) = artifact else {
         panic!("expected a chat reasoning artifact");
@@ -108,7 +112,9 @@ fn duplicate_scalar_fields_emit_once_from_the_first_field() {
     );
     assert_eq!(reasoning_events(&events), vec!["dup"]);
 
-    let (display, artifact) = state.finish();
+    let TurnReasoning {
+        display, artifact, ..
+    } = state.finish();
     assert_eq!(display.as_deref(), Some("dup"));
     assert_eq!(
         artifact,
@@ -126,7 +132,9 @@ fn a_stray_non_locked_scalar_field_is_neither_displayed_nor_captured() {
     let events = fold(&mut state, &delta(r#"{"reasoning_content":"stray"}"#));
     assert_eq!(reasoning_events(&events), Vec::<&str>::new());
 
-    let (display, artifact) = state.finish();
+    let TurnReasoning {
+        display, artifact, ..
+    } = state.finish();
     assert_eq!(display.as_deref(), Some("locked"));
     assert_eq!(
         artifact,
@@ -167,7 +175,9 @@ fn the_reported_output_flag_tracks_either_channel() {
 fn finish_reports_scalar_only() {
     let mut state = ReasoningStreamState::default();
     fold(&mut state, &delta(r#"{"reasoning":"only scalar"}"#));
-    let (display, artifact) = state.finish();
+    let TurnReasoning {
+        display, artifact, ..
+    } = state.finish();
     assert_eq!(display.as_deref(), Some("only scalar"));
     assert_eq!(
         artifact,
@@ -185,7 +195,9 @@ fn finish_reports_details_only() {
         &mut state,
         &delta(r#"{"reasoning_details":[{"type":"reasoning.text","text":"think","index":0}]}"#),
     );
-    let (display, artifact) = state.finish();
+    let TurnReasoning {
+        display, artifact, ..
+    } = state.finish();
     // No scalar field streamed, so the display is derived from the entries.
     assert_eq!(display.as_deref(), Some("think"));
     let Some(ReasoningArtifact::ChatReasoning { field, .. }) = artifact else {
@@ -198,16 +210,29 @@ fn finish_reports_details_only() {
 fn finish_with_nothing_captured_is_empty() {
     let mut state = ReasoningStreamState::default();
     fold(&mut state, &delta(r#"{"content":"answer"}"#));
-    assert_eq!(state.finish(), (None, None));
+    let finished = state.finish();
+    assert_eq!(finished.display, None);
+    assert_eq!(finished.artifact, None);
 }
 
 #[test]
-fn finish_drops_an_overflowed_details_capture() {
-    // The payload over the per-turn cap is dropped wholesale, so the turn has
-    // no display text and no artifact to replay.
+fn finish_keeps_the_display_of_an_overflowed_details_capture() {
+    // The payload over the per-turn cap is dropped wholesale (no artifact, so
+    // nothing to replay), but the turn keeps what the model said and still
+    // counts as output — the cap governs replay, not the transcript or status.
     let big = "x".repeat(super::super::super::reasoning_details::MAX_REASONING_DETAILS_BYTES + 1);
     let mut state = ReasoningStreamState::default();
     let raw = format!(r#"{{"reasoning_details":[{{"type":"reasoning.text","text":"{big}"}}]}}"#);
     fold(&mut state, &delta(&raw));
-    assert_eq!(state.finish(), (None, None));
+    let finished = state.finish();
+    assert_eq!(finished.artifact, None, "nothing to replay past the cap");
+    assert_eq!(
+        finished.display.as_deref().map(str::len),
+        Some(big.len()),
+        "the turn still displays the reasoning it received"
+    );
+    assert!(
+        finished.produced,
+        "an over-cap payload is still model output"
+    );
 }

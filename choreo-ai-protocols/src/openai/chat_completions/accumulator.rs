@@ -226,9 +226,11 @@ impl ChatCompletionsStreamAccumulator {
         // The state machine's finish applies the persisted precedence: a captured
         // structured details payload outranks the scalar text as the artifact (it
         // is the richer payload the route replays), and the scalar text supplies
-        // the display unless it is empty, in which case the details-derived text
-        // stands in.
-        let (display_reasoning, reasoning_artifact) = self.reasoning.finish();
+        // the display unless it is empty, in which case the accumulated structured
+        // text stands in. `produced` is the fold's own record of whether the
+        // provider sent reasoning at all, so a payload dropped by the replay cap
+        // still keeps the turn from reading as an empty response.
+        let reasoning = self.reasoning.finish();
 
         // The shared assembler owns the tool-call / truncation / empty-response
         // decision tree (identical to the non-streaming path); a tool-call
@@ -241,8 +243,9 @@ impl ChatCompletionsStreamAccumulator {
             final_text: self.full_content,
             content_is_empty,
             tool_calls,
-            reasoning: display_reasoning,
-            reasoning_artifact,
+            reasoning: reasoning.display,
+            reasoning_artifact: reasoning.artifact,
+            produced_reasoning: reasoning.produced,
             usage: self.last_usage,
             truncated,
         })

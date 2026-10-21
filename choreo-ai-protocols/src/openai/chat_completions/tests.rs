@@ -5,6 +5,7 @@ use super::super::{
 use super::*;
 // The types the request paths reach through their own imports; the suite names
 // them directly, so it imports them directly too.
+use crate::openai::reasoning_details::MAX_REASONING_DETAILS_BYTES;
 use crate::types::{ChatAssistantToolUse, ChatToolCall};
 use choreo_proto::{ChatReasoningField, ReasoningArtifact, TokenUsage};
 
@@ -770,6 +771,42 @@ fn response_to_turn_defaults_cached_tokens_to_zero_when_absent() {
             cache_write_tokens: 0,
         })
     );
+}
+
+#[test]
+fn an_over_cap_encrypted_only_response_is_output_not_an_empty_response() {
+    // A response whose only output was an encrypted reasoning block larger than
+    // the per-turn replay cap: the payload is dropped (nothing to replay), but
+    // the provider DID produce output, so this is a `FinalText` with no visible
+    // text — not the `EmptyResponse` error, which would fail the turn and be
+    // retried into the same result.
+    let big = "z".repeat(MAX_REASONING_DETAILS_BYTES + 1);
+    let json = format!(
+        r#"{{"choices":[{{"message":{{"content":"","reasoning_details":[{{"type":"reasoning.encrypted","data":"{big}","index":0}}]}}}}]}}"#
+    );
+    let payload: ChatCompletionsResponse = serde_json::from_str(&json).unwrap();
+    let turn = chat_completions_response_to_turn(payload).expect("turn is not empty");
+    let ChatTurnResult::FinalText(result) = turn else {
+        panic!("expected FinalText");
+    };
+    assert_eq!(result.content, "");
+    assert!(
+        result.reasoning_artifact.is_none(),
+        "the over-cap payload is not replayed"
+    );
+}
+
+#[test]
+fn an_encrypted_only_response_keeps_its_artifact_below_the_cap() {
+    // The same shape under the cap keeps its replay payload, so the turn is
+    // output for both reasons — a control for the test above.
+    let json = r#"{"choices":[{"message":{"content":"","reasoning_details":[{"type":"reasoning.encrypted","data":"opaque","index":0}]}}]}"#;
+    let payload: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+    let turn = chat_completions_response_to_turn(payload).expect("turn");
+    let ChatTurnResult::FinalText(result) = turn else {
+        panic!("expected FinalText");
+    };
+    assert!(result.reasoning_artifact.is_some());
 }
 
 // -- chat completions stream delta keeps reasoning separate -----------

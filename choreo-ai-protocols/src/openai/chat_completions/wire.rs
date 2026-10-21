@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use super::super::{AssistantToolCall, ChatToolDefinition, Usage};
-use super::reasoning_stream::ReasoningStreamState;
+use super::reasoning_stream::{ReasoningStreamState, TurnReasoning};
 use choreo_proto::{ChatReasoningField, ReasoningArtifact};
 
 // ── Chat Completions wire types ──────────────────────────────────────────
@@ -82,11 +82,13 @@ impl AssistantMessage {
     /// callback is a no-op: a non-streaming turn has no stream to render, so the
     /// derived text rides the turn result instead.
     ///
-    /// Returns the display text alongside an opaque [`ReasoningArtifact`], which
-    /// records WHICH field the payload was observed under so re-emission targets
-    /// the same wire field — a provider that sends `reasoning_text` must not have
-    /// its payload echoed back as `reasoning_content` on the next tool-loop turn.
-    pub(crate) fn take_reasoning(&mut self) -> (Option<String>, Option<ReasoningArtifact>) {
+    /// Returns the turn's [`TurnReasoning`]: its display text, its opaque
+    /// [`ReasoningArtifact`] (which records WHICH field the payload was observed
+    /// under, so re-emission targets the same wire field — a provider that sends
+    /// `reasoning_text` must not have its payload echoed back as
+    /// `reasoning_content` on the next tool-loop turn), and whether the response
+    /// carried reasoning at all.
+    pub(crate) fn take_reasoning(&mut self) -> TurnReasoning {
         let mut state = ReasoningStreamState::default();
         let delta = StreamDelta {
             content: None,
@@ -96,8 +98,9 @@ impl AssistantMessage {
             reasoning_text: self.reasoning_text.take(),
             reasoning_details: self.reasoning_details.take(),
         };
-        // The fold cannot fail with a no-op callback; its produced flag is the
-        // streaming caller's concern, not the non-streaming result's.
+        // The fold cannot fail with a no-op callback (there is no live stream to
+        // render); the fold's own output fact still rides on the result, so an
+        // encrypted-only or over-cap response is not read as empty.
         let _ = state.apply(&delta, &mut |_| Ok(()));
         state.finish()
     }

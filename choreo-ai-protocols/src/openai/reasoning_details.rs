@@ -44,6 +44,21 @@
 //!   entries. An encrypted-only (or unrecognised-only) turn still counts as
 //!   model output even though it yields no display text.
 //!
+//! Three answers, three owners — the separation this module exists to keep:
+//!
+//! - **What the model said** (display text) is a fold over the fragments, owned
+//!   by the turn's reasoning state, unbounded by anything here.
+//! - **What may be replayed** (the payload) is this module's [`DetailsStore`],
+//!   bounded by [`MAX_REASONING_DETAILS_BYTES`] per turn and by the request
+//!   budget across a request. Over the cap the whole array is dropped — a
+//!   partial sequence is not something the upstreams accept.
+//! - **Whether the model produced output at all** is a fact about the response,
+//!   reported by the fold, never inferred from whether a payload survived.
+//!
+//! Collapsing those three into one flag is what made an over-cap payload blank
+//! the transcript and read as an empty response; they stay separate so that a
+//! storage decision can only ever cost the echo.
+//!
 //! A **streamed block arrives as many deltas, each carrying the next fragment**
 //! of that block, so the block is the concatenation of its deltas in arrival
 //! order — the same rule the upstream states when it says the complete reasoning
@@ -70,16 +85,27 @@ use choreo_proto::{ChatReasoningField, ReasoningArtifact};
 use serde_json::{Map, Value};
 use tracing::{debug, warn};
 
-/// Per-turn cap on the serialized `reasoning_details` payload.
+/// Per-turn cap on the serialized `reasoning_details` payload this store keeps.
 ///
-/// The cap is deliberately small because the payload **compounds**: it is
-/// persisted per turn and replayed on every subsequent request of the tool loop,
-/// so a request body grows to roughly `turns × cap` and a session's accumulated
-/// history has no cumulative budget of its own. Beyond this limit the details are
-/// dropped (and logged) rather than failing the request: losing the reasoning
-/// echo degrades a route that requires it, but an oversized body would fail the
-/// whole turn.
-pub(crate) const MAX_REASONING_DETAILS_BYTES: usize = 64 * 1024;
+/// Two facts size it. Reasoning payloads **compound** — each turn's payload is
+/// persisted and replayed on every later request of the tool loop — so one turn
+/// must not be allowed to persist an unbounded blob; the aggregate is bounded
+/// separately, by the request budget
+/// ([`MAX_REQUEST_REASONING_BYTES`](super::wire::MAX_REQUEST_REASONING_BYTES),
+/// which drops the *oldest* artifacts and keeps the newest). And an encrypted
+/// block is produced alongside the reasoning tokens, so a model with a large
+/// output budget can legitimately exceed a small cap in one turn: a cap far
+/// below a max-length turn would fire on exactly the heavy-reasoning turns this
+/// payload exists for.
+///
+/// The two constants are therefore equal: an artifact larger than the request
+/// budget could only ever ride as that budget's "newest always replays"
+/// overshoot, so a larger per-turn cap would have no replay path. Beyond the cap
+/// the whole payload is dropped and logged — the whole array, because a partial
+/// sequence is not something the upstreams accept (the replayed blocks must match
+/// the original output) — while the turn keeps its display text and its "produced
+/// output" fact, which live outside this store.
+pub(crate) const MAX_REASONING_DETAILS_BYTES: usize = 256 * 1024;
 
 /// The kind of a captured reasoning-details entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,13 +243,18 @@ fn serialized_len(value: &Value) -> usize {
     }
 }
 
-/// A running capture of `reasoning_details` deltas.
+/// The turn's **replay payload**: the normalized `reasoning_details` entries the
+/// next request may send back.
 ///
-/// The streaming accumulator owns one for the whole turn; the non-streaming
-/// path folds its single response value through the same type, so both capture
-/// paths normalize identically.
+/// Owns one question only — what may be persisted and replayed — and answers it
+/// under this module's per-turn byte cap. It deliberately does *not* own the
+/// turn's display text or the fact that the model produced output: those are
+/// derived from the deltas as they arrive (see
+/// [`ReasoningStreamState`](super::chat_completions::reasoning_stream::ReasoningStreamState)),
+/// so a payload the cap refuses can never blank what the session shows or turn
+/// a real response into an empty one.
 #[derive(Debug, Default)]
-pub(crate) struct DetailsCapture {
+pub(crate) struct DetailsStore {
     entries: Vec<Value>,
     /// Running serialized byte total across the deltas folded in so far.
     ///
@@ -233,7 +264,8 @@ pub(crate) struct DetailsCapture {
     /// entry). The cap can therefore trip early, never late.
     bytes: usize,
     /// Set once the per-turn cap is exceeded; the whole payload is then dropped
-    /// at finish rather than failing the request.
+    /// at finish rather than failing the request. Only storage is affected —
+    /// the turn keeps its display text and its "produced output" fact.
     overflowed: bool,
 }
 
@@ -250,7 +282,7 @@ fn json_kind(value: &Value) -> &'static str {
     }
 }
 
-impl DetailsCapture {
+impl DetailsStore {
     /// Fold one streamed value (an array of entries, or a single entry object
     /// for tolerance) into the capture.
     ///
@@ -261,15 +293,25 @@ impl DetailsCapture {
     /// where cheap, the byte length), because a bare number or a string of
     /// garbage is not a reasoning payload and must not be invented into one.
     ///
-    /// Each newly recognised text/summary fragment is handed to `on_fragment` in
-    /// arrival order, so a streaming caller can forward it as a live display
-    /// event. Display rides a callback rather than a returned list because the
-    /// capture itself has nothing to do with display: a caller that wants none
-    /// (the non-streaming fold) passes a no-op and allocates nothing, instead of
-    /// receiving a fragment list it drops. An entry whose `type` is not modelled
-    /// is kept verbatim and yields no fragment; an entry with no `type` at all is
-    /// not an entry and is dropped.
-    pub(crate) fn push(&mut self, raw: &Value, on_fragment: &mut impl FnMut(&str)) {
+    /// Each newly recognised text/summary fragment is appended to `display_text`
+    /// and handed to `on_fragment` in arrival order, so the caller keeps the
+    /// turn's display text and can forward the fragment as a live display event.
+    /// The two are separate parameters on purpose: `display_text` is the turn's
+    /// own record (unbounded, and unaffected by this store's cap) while
+    /// `on_fragment` is only the live-render hook, which the non-streaming fold
+    /// passes as a no-op.
+    ///
+    /// Returns whether the model produced **any** structured reasoning entry,
+    /// which is a fact about the response, not about this store: an entry the cap
+    /// refused, and an encrypted entry with nothing displayable, still count. A
+    /// value that is not an entry at all (a bare number, a typeless object, a
+    /// string of garbage) does not.
+    pub(crate) fn push(
+        &mut self,
+        raw: &Value,
+        display_text: &mut String,
+        on_fragment: &mut impl FnMut(&str),
+    ) -> bool {
         // A double-encoded string is parsed once and then treated exactly like the
         // array/object it decodes to; `decoded` keeps the parsed value alive for
         // the shape dispatch below.
@@ -291,23 +333,30 @@ impl DetailsCapture {
                         payload_bytes = text.len(),
                         "ignoring a reasoning_details value that is not an array or object"
                     );
-                    return;
+                    return false;
                 }
             },
             other => other,
         };
         match raw {
             Value::Array(entries) => {
+                // Fold every entry: `any` would stop at the first one that
+                // reports output, dropping the rest of the array.
+                let mut saw_entry = false;
                 for entry in entries {
-                    self.push_entry(entry, on_fragment);
+                    saw_entry |= self.push_entry(entry, display_text, on_fragment);
                 }
+                saw_entry
             }
             // A single entry object is the same tolerance one level down.
-            Value::Object(_) => self.push_entry(raw, on_fragment),
-            other => warn!(
-                kind = json_kind(other),
-                "ignoring a reasoning_details value that is not an array or object"
-            ),
+            Value::Object(_) => self.push_entry(raw, display_text, on_fragment),
+            other => {
+                warn!(
+                    kind = json_kind(other),
+                    "ignoring a reasoning_details value that is not an array or object"
+                );
+                false
+            }
         }
     }
 
@@ -317,7 +366,12 @@ impl DetailsCapture {
     /// object — reach the same per-entry rules without first unifying them into a
     /// collection: a delta is on the hot path of every streamed chunk, so the
     /// shape dispatch allocates nothing.
-    fn push_entry(&mut self, entry: &Value, on_fragment: &mut impl FnMut(&str)) {
+    fn push_entry(
+        &mut self,
+        entry: &Value,
+        display_text: &mut String,
+        on_fragment: &mut impl FnMut(&str),
+    ) -> bool {
         // A typeless object is not a reasoning entry at all; keeping it would
         // replay a value the provider never described. Log the shape (never
         // the contents) so a malformed stream is still diagnosable.
@@ -326,20 +380,39 @@ impl DetailsCapture {
                 field_count = entry.as_object().map_or(0, Map::len),
                 "dropping a reasoning_details entry with no type tag"
             );
-            return;
+            return false;
         }
+        let kind = classify(entry);
+        // Display comes first and unconditionally: the fragment is part of what
+        // the model said, so the turn's text and the live render must not depend
+        // on whether this entry fits the replay cap below. A recognised kind with
+        // a non-empty textual payload is displayable; an encrypted or
+        // unrecognised entry has nothing to show and nothing to append.
+        if let Some(kind) = kind
+            && kind.is_textual()
+            && let Some(fragment) = entry
+                .get(kind.payload_key())
+                .and_then(Value::as_str)
+                .filter(|fragment| !fragment.is_empty())
+        {
+            display_text.push_str(fragment);
+            on_fragment(fragment);
+        }
+        // From here on the only question is storage: everything below may refuse
+        // the entry without affecting what the turn displays or the fact — which
+        // this return value reports — that the model produced output.
         self.bytes = self.bytes.saturating_add(serialized_len(entry));
         if self.bytes > MAX_REASONING_DETAILS_BYTES {
             if !self.overflowed {
                 warn!(
                     limit = MAX_REASONING_DETAILS_BYTES,
-                    "reasoning_details payload exceeds the per-turn cap; dropping it"
+                    "reasoning_details payload exceeds the per-turn cap; dropping the replay                      payload (the turn keeps its display text and still counts as output)"
                 );
             }
             self.overflowed = true;
-            return;
+            return true;
         }
-        let Some(kind) = classify(entry) else {
+        let Some(kind) = kind else {
             // The catalog does not model this `type`, but the upstream
             // requires the sequence it sent to come back unchanged — so it
             // is stored exactly as it arrived and only display ignores it.
@@ -348,16 +421,8 @@ impl DetailsCapture {
                 "keeping an unrecognised reasoning_details entry verbatim"
             );
             self.entries.push(entry.clone());
-            return;
+            return true;
         };
-        if kind.is_textual()
-            && let Some(fragment) = entry
-                .get(kind.payload_key())
-                .and_then(Value::as_str)
-                .filter(|fragment| !fragment.is_empty())
-        {
-            on_fragment(fragment);
-        }
         if kind.is_textual()
             && let Some(last) = self
                 .entries
@@ -365,35 +430,13 @@ impl DetailsCapture {
                 .filter(|last| classify(last) == Some(kind) && is_continuation(last, entry))
         {
             merge_textual(last, entry, kind.payload_key());
-            return;
+            return true;
         }
         self.entries.push(entry.clone());
+        true
     }
 
-    /// Whether the capture holds at least one entry.
-    ///
-    /// Any kept entry counts, including an entry whose `type` is not modelled and
-    /// an encrypted-only array: such a turn produced model output and must not be
-    /// reported as an `EmptyResponse`.
-    pub(crate) fn has_entries(&self) -> bool {
-        !self.entries.is_empty() && !self.overflowed
-    }
-
-    /// The display text derived from the captured text/summary entries.
-    ///
-    /// Empty when the capture overflowed its per-turn cap: the payload is dropped
-    /// wholesale, so the session must not display reasoning it can never replay.
-    /// This keeps [`display`](Self::display) in agreement with
-    /// [`has_entries`](Self::has_entries) and [`finish`](Self::finish), which both
-    /// report nothing for an overflowed turn.
-    pub(crate) fn display(&self) -> String {
-        if self.overflowed {
-            return String::new();
-        }
-        display_text(&self.entries)
-    }
-
-    /// Consume the capture into the opaque round-trip artifact. `None` when
+    /// Consume the store into the opaque round-trip artifact. `None` when
     /// nothing was recognised or the payload overflowed the per-turn cap.
     ///
     /// The serialized array is measured again even though [`push_entry`] already

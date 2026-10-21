@@ -1197,10 +1197,17 @@ them, which is what keeps the plain prompt path, the tool path, and the
 non-streaming turn result interpreting reasoning identically (including the
 first-non-empty scalar precedence that stops an empty field masking a populated
 one). Capture normalizes the array under a
-documented, deliberately small per-turn byte cap, beyond which the payload is
-dropped and logged rather than failing the request — and an overflowed capture
-then yields no display text either, so the session never shows reasoning it
-cannot replay. Two bounds work together, because the payload is persisted per
+documented per-turn byte cap, beyond which the *replay payload* is dropped and
+logged rather than failing the request. Three answers are kept apart here, which
+is what stops a storage bound from costing anything but the echo: the turn's
+display text is a fold over the fragments (unbounded, like the scalar channel), the
+payload is what the cap bounds, and "did the model produce output" is a fact
+reported by the fold — never inferred from whether a payload survived. An
+over-cap turn therefore still shows its reasoning, and an encrypted-only turn whose
+payload was over the cap is a `FinalText` with no visible text rather than an
+`EmptyResponse` error. The cap is sized to match the request budget below, since
+an artifact larger than that budget could only ever ride as its "newest always
+replays" overshoot. Two bounds work together, because the payload is persisted per
 turn and replayed on *every* later request of the tool loop: the per-turn cap
 limits what one turn may persist, and the request build that lowers the history
 applies a separate per-request budget to the total artifact bytes it replays

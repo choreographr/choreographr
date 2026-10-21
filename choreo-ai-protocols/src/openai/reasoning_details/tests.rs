@@ -1,10 +1,31 @@
 use super::*;
 use serde_json::json;
 
-fn capture(raw: &Value) -> DetailsCapture {
-    let mut capture = DetailsCapture::default();
-    capture.push(raw, &mut |_| {});
-    capture
+/// Fold one value into a fresh store, returning the store and the display text
+/// the fold accumulated (the two are separate answers now: the store owns the
+/// replay payload, the caller owns the text).
+fn capture(raw: &Value) -> DetailsStore {
+    let (store, _) = capture_with_text(raw);
+    store
+}
+
+/// Fold one value, keeping both answers plus the "produced output" fact.
+fn capture_with_text(raw: &Value) -> (DetailsStore, String) {
+    let (store, text, _produced) = capture_all(raw);
+    (store, text)
+}
+
+fn capture_all(raw: &Value) -> (DetailsStore, String, bool) {
+    let mut store = DetailsStore::default();
+    let mut text = String::new();
+    let produced = store.push(raw, &mut text, &mut |_| {});
+    (store, text, produced)
+}
+
+/// The display text a full turn would persist for one value.
+fn display_of(raw: &Value) -> String {
+    let (_, text, _) = capture_all(raw);
+    text
 }
 
 #[test]
@@ -17,11 +38,13 @@ fn a_double_encoded_array_string_folds_like_a_real_array() {
         {"type":"reasoning.text","text":"think","index":0}
     ]);
     let double_encoded = Value::String(entries.to_string());
-    let folded = capture(&double_encoded);
-    assert_eq!(folded.display(), "Let me think");
-    let plain = capture(&entries);
-    assert_eq!(folded.display(), plain.display());
-    let artifact = folded.finish().expect("artifact");
+    // Both spellings must fold to the same display text and the same payload.
+    assert_eq!(
+        display_of(&double_encoded),
+        display_of(&entries),
+        "the decoded value displays exactly like a real array"
+    );
+    let artifact = capture(&double_encoded).finish().expect("artifact");
     let ReasoningArtifact::ChatReasoning { bytes, .. } = &artifact else {
         panic!("expected ChatReasoning");
     };
@@ -32,10 +55,12 @@ fn a_double_encoded_array_string_folds_like_a_real_array() {
 
     // A double-encoded single entry object is the same tolerance one level
     // down: it folds as that one entry.
-    let single = capture(&Value::String(
-        json!({"type":"summary","summary":"only","index":0}).to_string(),
-    ));
-    assert_eq!(single.display(), "only");
+    let single = Value::String(json!({"type":"summary","summary":"only","index":0}).to_string());
+    assert_eq!(display_of(&single), "only");
+    assert_eq!(
+        display_of(&single),
+        display_of(&json!([{"type":"summary","summary":"only","index":0}]))
+    );
 }
 
 #[test]
@@ -43,7 +68,8 @@ fn non_structured_values_are_ignored_without_capture() {
     // A bare number and a string that is not JSON are neither entries nor
     // encoded payloads: they are ignored (logged by kind only) and the
     // capture stays empty rather than inventing an entry.
-    let mut capture = DetailsCapture::default();
+    let mut store = DetailsStore::default();
+    let mut text = String::new();
     let mut fragments = Vec::new();
     for raw in [
         json!(42),
@@ -51,11 +77,14 @@ fn non_structured_values_are_ignored_without_capture() {
         json!(null),
         json!(true),
     ] {
-        capture.push(&raw, &mut |fragment| fragments.push(fragment.to_string()));
+        let produced = store.push(&raw, &mut text, &mut |fragment: &str| {
+            fragments.push(fragment.to_string());
+        });
+        assert!(!produced, "a non-entry is not model output");
     }
     assert!(fragments.is_empty(), "no display fragment from a non-entry");
-    assert!(!capture.has_entries());
-    assert!(capture.finish().is_none());
+    assert!(text.is_empty(), "no display text from a non-entry");
+    assert!(store.finish().is_none());
 }
 
 #[test]
@@ -63,20 +92,22 @@ fn push_reports_fragments_through_the_callback() {
     // The callback is the display channel: it receives every recognised
     // textual fragment in arrival order and nothing else (the encrypted and
     // unrecognised entries yield no display text).
-    let mut capture = DetailsCapture::default();
+    let raw = json!([
+        {"type":"reasoning.text","text":"alpha","index":0},
+        {"type":"reasoning.encrypted","data":"opaque","index":1},
+        {"type":"notes","text":"ignored","index":0},
+        {"type":"reasoning.summary","summary":"beta","index":0}
+    ]);
+    let mut store = DetailsStore::default();
+    let mut text = String::new();
     let mut fragments = Vec::new();
-    capture.push(
-        &json!([
-            {"type":"reasoning.text","text":"alpha","index":0},
-            {"type":"reasoning.encrypted","data":"opaque","index":1},
-            {"type":"notes","text":"ignored","index":0},
-            {"type":"reasoning.summary","summary":"beta","index":0}
-        ]),
-        &mut |fragment| fragments.push(fragment.to_string()),
-    );
+    let produced = store.push(&raw, &mut text, &mut |fragment: &str| {
+        fragments.push(fragment.to_string());
+    });
+    assert!(produced);
     assert_eq!(fragments, vec!["alpha".to_string(), "beta".to_string()]);
-    // The same fragments are what the derived display text concatenates.
-    assert_eq!(capture.display(), "alphabeta");
+    // The turn's display text is exactly the fragments, concatenated in order.
+    assert_eq!(text, "alphabeta");
 }
 
 #[test]
@@ -164,11 +195,12 @@ fn bare_entries_merge_and_keep_unknown_types_verbatim() {
 #[test]
 fn unrecognised_only_round_trips_verbatim_without_display() {
     let raw = json!([{"type":"reasoning.image","data":"AA","index":0}]);
-    let capture = capture(&raw);
-    // An unrecognised-only turn is still model output, not an empty response.
-    assert!(capture.has_entries());
-    assert_eq!(capture.display(), "");
-    let artifact = capture.finish().expect("artifact");
+    let (store, text, produced) = capture_all(&raw);
+    // An unrecognised-only turn is still model output, not an empty response —
+    // even though it has nothing to display.
+    assert!(produced);
+    assert_eq!(text, "");
+    let artifact = store.finish().expect("artifact");
     let ReasoningArtifact::ChatReasoning { bytes, .. } = &artifact else {
         panic!("expected ChatReasoning");
     };
@@ -179,9 +211,10 @@ fn unrecognised_only_round_trips_verbatim_without_display() {
 
 #[test]
 fn typeless_entry_is_not_an_entry() {
-    let capture = capture(&json!([{"text":"no type tag"}, {"data":"x"}]));
-    assert!(!capture.has_entries());
-    assert!(capture.finish().is_none());
+    let (store, text, produced) = capture_all(&json!([{"text":"no type tag"}, {"data":"x"}]));
+    assert!(!produced, "a typeless object is not model output");
+    assert_eq!(text, "");
+    assert!(store.finish().is_none());
 }
 
 #[test]
@@ -251,12 +284,14 @@ fn entries_with_different_indices_are_not_merged() {
 
 #[test]
 fn display_derives_from_text_and_summary_entries() {
-    let capture = capture(&json!([
+    // The display text is the concatenation of the textual fragments in arrival
+    // order; the encrypted entry contributes nothing to it.
+    let raw = json!([
         {"type":"reasoning.text","text":"alpha","index":0},
         {"type":"reasoning.summary","summary":" beta","index":0},
         {"type":"reasoning.encrypted","data":"opaque","index":1}
-    ]));
-    assert_eq!(capture.display(), "alpha beta");
+    ]);
+    assert_eq!(display_of(&raw), "alpha beta");
 }
 
 #[test]
@@ -380,20 +415,35 @@ fn companion_mirrors_only_bare_summary_text() {
 }
 
 #[test]
-fn oversized_payload_is_dropped_at_capture() {
+fn oversized_payload_is_dropped_from_the_replay_payload() {
     let big = "x".repeat(MAX_REASONING_DETAILS_BYTES + 1);
-    let capture = capture(&json!([{"type":"reasoning.text","text":big,"index":0}]));
-    assert!(!capture.has_entries());
-    assert!(capture.finish().is_none());
+    let (store, text, produced) =
+        capture_all(&json!([{"type":"reasoning.text","text":big,"index":0}]));
+    // The replay payload goes (the whole array — a truncated sequence is not
+    // something the upstreams accept), but the turn still produced output and
+    // still keeps what the model said.
+    assert!(store.finish().is_none());
+    assert!(produced, "an over-cap entry is still model output");
+    assert_eq!(text.len(), MAX_REASONING_DETAILS_BYTES + 1);
 }
 
 #[test]
-fn overflowed_capture_reports_no_display_text() {
-    // The payload is dropped, so the session must not display reasoning it can
-    // never replay — display() agrees with has_entries()/finish().
-    let big = "y".repeat(MAX_REASONING_DETAILS_BYTES + 1);
-    let capture = capture(&json!([{"type":"reasoning.text","text":big,"index":0}]));
-    assert_eq!(capture.display(), "");
+fn display_text_survives_the_replay_cap() {
+    // The cap bounds what may be persisted and replayed, not what the session
+    // shows: the display text keeps every fragment, including the ones the store
+    // refused after the cap tripped.
+    let head = "y".repeat(MAX_REASONING_DETAILS_BYTES);
+    let (store, text, produced) = capture_all(&json!([
+        {"type":"reasoning.text","text":head,"index":0},
+        {"type":"reasoning.text","text":"tail","index":0}
+    ]));
+    assert!(store.finish().is_none(), "the payload is over the cap");
+    assert_eq!(text.len(), MAX_REASONING_DETAILS_BYTES + 4);
+    assert!(
+        text.ends_with("tail"),
+        "the post-cap fragment still displays"
+    );
+    assert!(produced);
 }
 
 #[test]

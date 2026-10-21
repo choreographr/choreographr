@@ -63,7 +63,7 @@ pub(crate) fn chat_completions_response_to_turn(
     let truncated = matches!(choice.finish_reason, Some(FinishReason::Length));
 
     // Extract reasoning early (before the partial moves into tool_calls / content)
-    let (reasoning, reasoning_artifact) = choice.message.take_reasoning();
+    let reasoning = choice.message.take_reasoning();
 
     // Extract token usage from the API response for cost tracking / display.
     // z.ai reports cached prompt tokens via `prompt_tokens_details`; providers
@@ -114,8 +114,9 @@ pub(crate) fn chat_completions_response_to_turn(
         final_text,
         content_is_empty,
         tool_calls,
-        reasoning,
-        reasoning_artifact,
+        reasoning: reasoning.display,
+        reasoning_artifact: reasoning.artifact,
+        produced_reasoning: reasoning.produced,
         usage: turn_usage,
         truncated,
     })
@@ -142,6 +143,10 @@ pub(super) struct ChatTurnParts {
     pub(super) reasoning: Option<String>,
     /// The opaque round-trip reasoning artifact.
     pub(super) reasoning_artifact: Option<ReasoningArtifact>,
+    /// Whether the provider produced reasoning output this turn — independent of
+    /// whether any of it could be displayed or replayed, so a turn whose payload
+    /// was over the replay cap is still model output.
+    pub(super) produced_reasoning: bool,
     /// Token usage reported for the turn, when the provider sent any.
     pub(super) usage: Option<TokenUsage>,
     /// Whether `finish_reason` was `length` on a final-text turn.
@@ -164,6 +169,7 @@ pub(super) fn assemble_turn(
         mut tool_calls,
         reasoning,
         reasoning_artifact,
+        produced_reasoning,
         usage,
         truncated,
     } = parts;
@@ -200,10 +206,11 @@ pub(super) fn assemble_turn(
             reasoning_artifact,
         }));
     }
-    // An encrypted-only (or unrecognised-only) reasoning turn has no visible
-    // text but IS model output; a missing artifact is what makes this a genuine
-    // empty response.
-    if content_is_empty && reasoning_artifact.is_none() {
+    // An encrypted-only, unrecognised-only, or over-the-replay-cap reasoning
+    // turn has no visible text but IS model output. The question here is what the
+    // provider produced, not what this client chose to keep, so it is answered by
+    // the fold's own output fact rather than by whether an artifact survived.
+    if content_is_empty && !produced_reasoning {
         return Err(super::super::OpenAiError::EmptyResponse);
     }
     Ok(ChatTurnResult::FinalText(FinalTextResult {
