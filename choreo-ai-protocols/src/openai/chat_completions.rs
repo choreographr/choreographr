@@ -267,6 +267,10 @@ where
     let sse =
         crate::stream::spawn_sse_reader(context, move || reader.next_event(), deadline.current());
     let mut has_any_output = false;
+    // The streamed finish reason, captured as it arrives (the last non-None wins)
+    // so a declared terminal reason is classified after the stream — the same
+    // helper the tool path and the non-streaming simple path use.
+    let mut finish_reason: Option<FinishReason> = None;
     // One shared state machine owns the turn's reasoning display (and, on the
     // tool path, its artifact); this path persists no artifact, so `finish` is
     // never called.
@@ -275,6 +279,12 @@ where
         let payload: ChatCompletionsStreamResponse =
             serde_json::from_str(&data).map_err(io::Error::other)?;
         for choice in payload.choices {
+            // Capture the finish reason before the `delta` field is moved out;
+            // it lands on the final chunk (often with `delta: null`), which the
+            // `let else` below would otherwise skip entirely.
+            if choice.finish_reason.is_some() {
+                finish_reason.clone_from(&choice.finish_reason);
+            }
             let Some(delta) = choice.delta else {
                 continue;
             };
@@ -289,6 +299,16 @@ where
             }
             has_any_output |= reasoning.apply(&delta, on_event)?;
         }
+    }
+
+    // A declared terminal finish reason is terminal on the streaming one-shot
+    // path too: z.ai's `sensitive` (and OpenAI's `content_filter`) streams no
+    // content, which would otherwise be reported as an (apparently retryable)
+    // empty completion rather than the policy refusal it is. The tool path and
+    // the non-streaming simple path classify the same reasons through this same
+    // helper, so the two simple paths cannot drift apart.
+    if let Some(err) = finish_reason_terminal_error(finish_reason.as_ref()) {
+        return Err(err);
     }
 
     if !has_any_output {
