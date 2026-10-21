@@ -466,11 +466,12 @@ pub(crate) fn warn_on_uncaptured_reasoning(
 /// Estimate the input tokens contributed by a reasoning artifact's payload.
 ///
 /// The artifact is opaque bytes owned by the producing adapter; the daemon
-/// never interprets it. Most current payloads (chat `reasoning_content`
-/// strings, Anthropic thinking-block JSON, Gemini signatures) are UTF-8 text,
-/// so count them with the encoding when decodable; otherwise fall back to a
-/// bytes/4 heuristic. Replayed reasoning is billed as input on keep-all
-/// models, so under-counting here would mislead the context-window display.
+/// never interprets it. Most payloads (chat `reasoning_content` strings,
+/// Anthropic thinking-block JSON, Gemini signatures, and the structured
+/// `reasoning_details` JSON array) are UTF-8 text, so count them with the
+/// encoding when decodable; otherwise fall back to a bytes/4 heuristic.
+/// Replayed reasoning is billed as input on keep-all models, so under-counting
+/// here would mislead the context-window display.
 pub(crate) fn reasoning_artifact_tokens(
     enc: &tiktoken::CoreBpe,
     artifact: &ReasoningArtifact,

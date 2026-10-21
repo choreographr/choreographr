@@ -1148,14 +1148,34 @@ outranks the field a payload was *observed* under: `ReasoningArtifact::
 ChatReasoning` records the observation (a hint, used only when the route declares
 nothing) while `ModelEntry::reasoning_echo` states the requirement. On a route
 that declares one, the lowering writes that field on every assistant message —
-the artifact's text when there is something to replay, an empty string when
-there is not — so presence and destination are one decision in one place. This
-is why a gateway that streams DeepSeek thinking under `reasoning` while
+the artifact's text when there is something to replay, an empty string (or, for
+the structured field, an empty array) when there is not — so presence and
+destination are one decision in one place. This is why a gateway that streams
+DeepSeek thinking under `reasoning` while
 rejecting any history without `reasoning_content` cannot starve the required
 field. The artifact never leaves the daemon process — client-bound
 `SessionEvent`s carry it as `None`. The variant semantics and the resolver
 contracts are documented on `ReasoningPassback`, `ChatReasoningEcho`, and the
 resolver functions.
+
+**Structured details.** Some chat routes carry reasoning as a structured
+`reasoning_details` array instead of a scalar string (models.dev's `interleaved`
+names it for the OpenRouter resellers and a few gateways). The artifact then
+stores the array as JSON under `ChatReasoningField::ReasoningDetails` rather than
+text: display text is derived from its text/summary entries when no scalar field
+streamed, and an encrypted-only array still counts as model output (never an
+empty response). Capture normalizes the array — consecutive same-kind text and
+summary entries merge, encrypted entries stay discrete (they are individually
+opaque), and unrecognised `type`s are dropped — under a documented per-turn byte
+cap, beyond which the payload is dropped and logged rather than failing the
+request. The lowering replays OpenRouter's namespace-prefixed `reasoning.*`
+entries verbatim (index, format, and signature intact) and rebuilds bare
+Kimi-shaped entries minimally, stripping the stream-only `index` and mirroring
+the summary text as a companion `reasoning_content`. That companion is the one
+deliberate scalar beside the array — the one-channel rule constrains the scalar
+fields, and Kimi-shaped routes expect both. A declaring route with nothing to
+echo emits `reasoning_details: []`; an empty array is a presence marker, not a
+payload, so it never keeps an otherwise-empty assistant message alive.
 
 **Empty turns never reach the wire.** An assistant turn that produced no visible
 content (blank text counts as none), no tool calls, and no reasoning payload is
@@ -2486,6 +2506,10 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
     declared echo field (`ModelEntry::reasoning_echo`, ingested from the snapshot's
     `interleaved`): a declared field outranks the field the payload was observed under, and an
     assistant message with nothing to echo still carries it (empty) rather than omitting it.
+    The field may be the structured `reasoning_details` array: its artifact payload is JSON
+    (normalized at capture under a per-turn cap), replayed verbatim for OpenRouter's `reasoning.*`
+    entries and rebuilt minimally for bare Kimi-shaped ones, with the Kimi summary text mirrored
+    in `reasoning_content`.
 
 
 

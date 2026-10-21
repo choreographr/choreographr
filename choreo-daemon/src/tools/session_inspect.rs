@@ -225,7 +225,12 @@ fn build_report(
         assistant_count += 1;
         let value = serde_json::to_value(w)
             .map_err(|e| ToolExecError(format!("serialize request message: {e}")))?;
-        let keys = ["reasoning_content", "reasoning", "reasoning_text"];
+        let keys = [
+            "reasoning_content",
+            "reasoning",
+            "reasoning_text",
+            "reasoning_details",
+        ];
         let present: Vec<&str> = keys
             .iter()
             .copied()
@@ -249,7 +254,8 @@ fn build_report(
             .is_some_and(|arr| !arr.is_empty());
         // Empty-message alarm: the lowering drops these, so a survivor with no
         // content, no tool calls, and no non-empty reasoning echo means the drop
-        // predicate and the serialization have drifted apart.
+        // predicate and the serialization have drifted apart. A non-empty
+        // `reasoning_details` array is a payload; the injected `[]` is not.
         let content_empty = value
             .get("content")
             .and_then(|c| c.as_str())
@@ -257,7 +263,11 @@ fn build_report(
         let reasoning_non_empty = keys
             .iter()
             .filter_map(|k| value.get(*k).and_then(|v| v.as_str()))
-            .any(|s| !s.trim().is_empty());
+            .any(|s| !s.trim().is_empty())
+            || value
+                .get("reasoning_details")
+                .and_then(|details| details.as_array())
+                .is_some_and(|entries| !entries.is_empty());
         if content_empty && !has_tools && !reasoning_non_empty {
             wire_empty.push(format!(
                 "  position {msg_index}: empty assistant message survived the projection"
@@ -318,16 +328,22 @@ fn build_report(
             "n/a".to_string()
         } else if echo_has_artifact {
             match echo.field {
+                // The structured array is its own destination; name the shape
+                // rather than a scalar wire key.
+                Some(ChatReasoningField::ReasoningDetails) => "yes(details)".to_string(),
                 // The declared field wins over the observation, so say which
                 // one the wire will actually carry.
                 Some(field) => format!("yes(declared:{})", fmt_field(field)),
                 None => "yes(observed)".to_string(),
             }
         } else if wire_present {
-            format!(
-                "yes(empty:{})",
-                fmt_field(echo.field.unwrap_or(ChatReasoningField::ReasoningContent))
-            )
+            match echo.field {
+                Some(ChatReasoningField::ReasoningDetails) => "yes(details:empty)".to_string(),
+                field => format!(
+                    "yes(empty:{})",
+                    fmt_field(field.unwrap_or(ChatReasoningField::ReasoningContent))
+                ),
+            }
         } else if !same_model {
             "no:producer-mismatch".to_string()
         } else if turn.reasoning_artifact.is_none() {
@@ -605,9 +621,21 @@ fn dominant_producer(turns: &BTreeMap<u32, Turn>) -> Option<ReasoningProducer> {
 }
 
 /// Compact artifact descriptor for the ledger: variant tag + wire field (for
-/// chat) + byte size. Never includes the payload bytes themselves.
+/// chat) + byte size. Never includes the payload bytes themselves. A structured
+/// `reasoning_details` payload also reports its entry count, since the bytes are
+/// a JSON array rather than display text.
 fn fmt_artifact(artifact: &ReasoningArtifact) -> String {
     match artifact {
+        ReasoningArtifact::ChatReasoning {
+            field: ChatReasoningField::ReasoningDetails,
+            bytes,
+        } => {
+            let entries = serde_json::from_slice::<serde_json::Value>(bytes)
+                .ok()
+                .and_then(|value| value.as_array().map(Vec::len))
+                .unwrap_or(0);
+            format!("chat[reasoning_details;{entries} entries;{}B]", bytes.len())
+        }
         ReasoningArtifact::ChatReasoning { field, bytes } => {
             format!("chat[{};{}B]", fmt_field(*field), bytes.len())
         }
@@ -622,6 +650,7 @@ fn fmt_field(field: ChatReasoningField) -> &'static str {
         ChatReasoningField::ReasoningContent => "reasoning_content",
         ChatReasoningField::Reasoning => "reasoning",
         ChatReasoningField::ReasoningText => "reasoning_text",
+        ChatReasoningField::ReasoningDetails => "reasoning_details",
     }
 }
 
@@ -700,6 +729,20 @@ mod tests {
         ReasoningArtifact::ChatReasoning {
             field: ChatReasoningField::ReasoningContent,
             bytes: text.as_bytes().to_vec(),
+        }
+    }
+
+    fn details_artifact(entries: &serde_json::Value) -> ReasoningArtifact {
+        ReasoningArtifact::ChatReasoning {
+            field: ChatReasoningField::ReasoningDetails,
+            bytes: serde_json::to_vec(entries).unwrap(),
+        }
+    }
+
+    fn openrouter_producer(model: &str) -> ReasoningProducer {
+        ReasoningProducer {
+            provider_slug: "openrouter".into(),
+            model: model.into(),
         }
     }
 
@@ -782,6 +825,65 @@ mod tests {
 
     fn run(ctx: &ToolContext, args: SessionInspectArgs) -> String {
         SessionInspect.execute(args, None, None, Some(ctx)).unwrap()
+    }
+
+    #[test]
+    fn details_artifact_renders_shape_and_details_echo() {
+        // An OpenRouter route declares `reasoning_details`; the ledger must
+        // report the structured artifact shape and the details echo, with no
+        // declared-field violation and ledger/wire parity.
+        let model = "minimax/minimax-m2";
+        let (_dir, ctx) = seed(
+            42,
+            42,
+            model,
+            vec![(
+                0,
+                tool_turn(
+                    "c1",
+                    "exec",
+                    Some(details_artifact(&serde_json::json!([
+                        {"type":"reasoning.text","text":"think","index":0}
+                    ]))),
+                    Some(openrouter_producer(model)),
+                    Some("think"),
+                ),
+            )],
+        );
+        let out = run(&ctx, inspect_args(None));
+        assert!(out.contains("echo=yes(details)"), "{out}");
+        assert!(
+            out.contains("art=chat[reasoning_details;1 entries;"),
+            "the structured shape (entry count + bytes) is rendered: {out}"
+        );
+        assert!(
+            out.contains("declared-field violations: 0 assistant message(s) omit"),
+            "{out}"
+        );
+        assert!(out.contains("ledger vs wire: OK"), "{out}");
+    }
+
+    #[test]
+    fn details_route_without_artifact_reports_empty_details() {
+        // A tool turn with nothing to echo on a details-declaring route: the
+        // injected `reasoning_details: []` is reported as `yes(details:empty)`.
+        let model = "minimax/minimax-m2";
+        let (_dir, ctx) = seed(
+            42,
+            42,
+            model,
+            vec![(
+                0,
+                tool_turn("c1", "exec", None, Some(openrouter_producer(model)), None),
+            )],
+        );
+        let out = run(&ctx, inspect_args(None));
+        assert!(out.contains("echo=yes(details:empty)"), "{out}");
+        assert!(
+            out.contains("declared-field violations: 0 assistant message(s) omit"),
+            "{out}"
+        );
+        assert!(out.contains("ledger vs wire: OK"), "{out}");
     }
 
     #[test]

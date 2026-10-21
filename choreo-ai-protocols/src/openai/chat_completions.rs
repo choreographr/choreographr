@@ -13,6 +13,8 @@ use choreo_proto::{ChatReasoningField, ReasoningArtifact, TokenUsage};
 use std::collections::HashMap;
 use std::io;
 
+use super::reasoning_details::DetailsCapture;
+
 // ── Chat Completions wire types ──────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -64,37 +66,69 @@ pub(crate) struct AssistantMessage {
     pub(crate) reasoning_content: Option<String>,
     pub(crate) reasoning: Option<String>,
     pub(crate) reasoning_text: Option<String>,
+    /// The structured `reasoning_details` array (`OpenRouter` / Kimi-shaped
+    /// routes), kept as raw JSON so an unrecognised entry shape cannot fail the
+    /// whole response parse.
+    #[serde(default)]
+    pub(crate) reasoning_details: Option<serde_json::Value>,
 }
 
 impl AssistantMessage {
-    /// Extract reasoning content from whichever field the model populated
-    /// (`reasoning_content`, reasoning, or `reasoning_text`), consuming the field
-    /// with the non-streaming precedence `reasoning_content` > reasoning >
-    /// `reasoning_text`.
+    /// Extract the reasoning payload from whichever field the model populated.
     ///
-    /// Returns the display text alongside an opaque [`ReasoningArtifact`]
-    /// capturing the same raw value as UTF-8 bytes. The artifact records
-    /// WHICH field was consumed, so re-emission targets the same wire field
-    /// the provider used — a provider that sends `reasoning_text` must not
-    /// have its payload echoed back as `reasoning_content` on the next
-    /// tool-loop turn.
+    /// The scalar fields are consumed with the non-streaming precedence
+    /// `reasoning_content` > `reasoning` > `reasoning_text`. When the route
+    /// streamed a structured `reasoning_details` array, it becomes the captured
+    /// artifact (the richer, replayable payload) regardless of which scalar
+    /// field also carried display text.
+    ///
+    /// Returns the display text alongside an opaque [`ReasoningArtifact`].
+    /// The artifact records WHICH field was consumed, so re-emission targets the
+    /// same wire field the provider used — a provider that sends
+    /// `reasoning_text` must not have its payload echoed back as
+    /// `reasoning_content` on the next tool-loop turn. When no scalar reasoning
+    /// streamed, the display text is derived from the details array's
+    /// text/summary entries.
     pub(crate) fn take_reasoning(&mut self) -> (Option<String>, Option<ReasoningArtifact>) {
-        // Consume the fields in precedence order and record the winner; the
-        // artifact is built from the value BEFORE it leaves `self`, so the
-        // round-trip payload survives the parse boundary untouched.
-        if let Some(text) = self.reasoning_content.take() {
-            let artifact = chat_reasoning_artifact(ChatReasoningField::ReasoningContent, &text);
-            return (Some(text), artifact);
+        // Structured details are normalized first so both the artifact and the
+        // display fallback are ready before the scalar precedence is applied.
+        let mut details = DetailsCapture::default();
+        if let Some(raw) = self.reasoning_details.take() {
+            details.push(&raw);
         }
-        if let Some(text) = self.reasoning.take() {
-            let artifact = chat_reasoning_artifact(ChatReasoningField::Reasoning, &text);
-            return (Some(text), artifact);
+        let details_display = details.display();
+        let details_artifact = details.finish();
+
+        let scalar = self
+            .reasoning_content
+            .take()
+            .map(|text| (ChatReasoningField::ReasoningContent, text))
+            .or_else(|| {
+                self.reasoning
+                    .take()
+                    .map(|text| (ChatReasoningField::Reasoning, text))
+            })
+            .or_else(|| {
+                self.reasoning_text
+                    .take()
+                    .map(|text| (ChatReasoningField::ReasoningText, text))
+            });
+        if let Some((field, text)) = scalar {
+            // Prefer the structured artifact: it is the payload the route can
+            // replay. Fall back to the scalar text when no details streamed.
+            let artifact = details_artifact.or_else(|| chat_reasoning_artifact(field, &text));
+            let display = if text.is_empty() {
+                details_display
+            } else {
+                text
+            };
+            return ((!display.is_empty()).then_some(display), artifact);
         }
-        if let Some(text) = self.reasoning_text.take() {
-            let artifact = chat_reasoning_artifact(ChatReasoningField::ReasoningText, &text);
-            return (Some(text), artifact);
-        }
-        (None, None)
+        // No scalar field: any display text comes from the details entries.
+        (
+            (!details_display.is_empty()).then_some(details_display),
+            details_artifact,
+        )
     }
 }
 
@@ -143,6 +177,9 @@ pub(crate) struct StreamDelta {
     pub(crate) reasoning_content: Option<String>,
     pub(crate) reasoning: Option<String>,
     pub(crate) reasoning_text: Option<String>,
+    /// A structured `reasoning_details` delta (an array of entries, or a single
+    /// entry object for tolerance).
+    pub(crate) reasoning_details: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -510,7 +547,9 @@ fn chat_completions_response_to_turn(
         .unwrap_or_default()
         .trim()
         .to_string();
-    if content.is_empty() {
+    // An encrypted-only reasoning_details turn has no visible text but IS model
+    // output; a missing artifact is what makes this a genuine empty response.
+    if content.is_empty() && reasoning_artifact.is_none() {
         return Err(super::OpenAiError::EmptyResponse);
     }
 
@@ -598,6 +637,9 @@ where
     let sse =
         crate::stream::spawn_sse_reader(context, move || reader.next_event(), deadline.current());
     let mut has_any_output = false;
+    // Structured details ride the same display channel; the capture only needs
+    // the derived fragments here (this path persists no artifact).
+    let mut details = DetailsCapture::default();
     while let Some(data) = crate::stream::recv_sse_event(&sse, cancel_rx)? {
         let payload: ChatCompletionsStreamResponse =
             serde_json::from_str(&data).map_err(io::Error::other)?;
@@ -606,6 +648,15 @@ where
                 continue;
             };
 
+            if let Some(raw) = delta.reasoning_details.as_ref() {
+                let fragments = details.push(raw);
+                if details.has_entries() {
+                    has_any_output = true;
+                }
+                for fragment in fragments {
+                    on_event(StreamEvent::Reasoning(fragment))?;
+                }
+            }
             if let Some(content) = delta.content.filter(|c| !c.is_empty()) {
                 has_any_output = true;
                 on_event(StreamEvent::Answer(content))?;
@@ -697,6 +748,9 @@ struct ChatCompletionsStreamAccumulator {
     /// that sends `reasoning_text` must not have it replayed as
     /// `reasoning_content` on the next tool-loop turn.
     reasoning_field: Option<ChatReasoningField>,
+    /// The structured `reasoning_details` capture for this turn. Richest payload
+    /// the chat wire can replay; when it holds entries it becomes the artifact.
+    reasoning_details: DetailsCapture,
     /// Raw tool call deltas across all chunks, merged by index by
     /// `accumulate_tool_calls_from_deltas` once the stream is fully consumed.
     raw_tool_call_deltas: Vec<StreamToolCallDelta>,
@@ -720,6 +774,7 @@ impl Default for ChatCompletionsStreamAccumulator {
             full_content: String::new(),
             full_reasoning: String::new(),
             reasoning_field: None,
+            reasoning_details: DetailsCapture::default(),
             raw_tool_call_deltas: Vec::new(),
             seen_tool_call_indices: [false; MAX_TOOL_CALLS],
             distinct_tool_call_count: 0,
@@ -808,6 +863,20 @@ impl ChatCompletionsStreamAccumulator {
                 on_event(StreamEvent::Reasoning(text.to_string()))?;
             }
 
+            // Structured reasoning_details deltas: normalize into the capture
+            // and forward each new text/summary fragment as a display event.
+            // Any recognised entry (even an encrypted-only one) means the model
+            // produced output, so the turn is never reported as empty.
+            if let Some(raw) = delta.reasoning_details.as_ref() {
+                let fragments = self.reasoning_details.push(raw);
+                if self.reasoning_details.has_entries() {
+                    self.has_any_output = true;
+                }
+                for fragment in fragments {
+                    on_event(StreamEvent::Reasoning(fragment))?;
+                }
+            }
+
             // Collect raw tool call deltas — the shared accumulator
             // (accumulate_tool_calls_from_deltas) will merge them by index
             // and produce sorted ChatToolCall output after the stream ends.
@@ -862,10 +931,21 @@ impl ChatCompletionsStreamAccumulator {
         let truncated = matches!(self.finish_reason, Some(FinishReason::Length));
 
         // The field was locked in on the first non-empty delta; the artifact
-        // carries that field so re-emission targets the same wire field.
-        let reasoning_artifact = self
-            .reasoning_field
-            .and_then(|field| chat_reasoning_artifact(field, &self.full_reasoning));
+        // carries that field so re-emission targets the same wire field. A
+        // captured structured details payload outranks the scalar text (it is
+        // the richer payload the route replays), and its text/summary entries
+        // supply the display fallback when no scalar reasoning streamed.
+        let details_display = self.reasoning_details.display();
+        let reasoning_artifact = self.reasoning_details.finish().or_else(|| {
+            self.reasoning_field
+                .and_then(|field| chat_reasoning_artifact(field, &self.full_reasoning))
+        });
+        let display_reasoning = if self.full_reasoning.is_empty() {
+            details_display
+        } else {
+            self.full_reasoning.clone()
+        };
+        let display_reasoning = (!display_reasoning.is_empty()).then_some(display_reasoning);
 
         if !self.raw_tool_call_deltas.is_empty() {
             let mut tool_calls = accumulate_tool_calls_from_deltas(self.raw_tool_call_deltas);
@@ -878,11 +958,7 @@ impl ChatCompletionsStreamAccumulator {
                         Some(self.full_content)
                     },
                     tool_calls,
-                    reasoning: if self.full_reasoning.is_empty() {
-                        None
-                    } else {
-                        Some(self.full_reasoning)
-                    },
+                    reasoning: display_reasoning.clone(),
                     usage: self.last_usage,
                     response_id: None,
                     reasoning_artifact,
@@ -901,11 +977,7 @@ impl ChatCompletionsStreamAccumulator {
                 return Ok(ChatTurnResult::FinalText(FinalTextResult {
                     content: self.full_content,
                     truncated,
-                    reasoning: if self.full_reasoning.is_empty() {
-                        None
-                    } else {
-                        Some(self.full_reasoning)
-                    },
+                    reasoning: display_reasoning.clone(),
                     usage: self.last_usage,
                     response_id: None,
                     reasoning_artifact,
@@ -916,11 +988,7 @@ impl ChatCompletionsStreamAccumulator {
         Ok(ChatTurnResult::FinalText(FinalTextResult {
             content: self.full_content,
             truncated,
-            reasoning: if self.full_reasoning.is_empty() {
-                None
-            } else {
-                Some(self.full_reasoning)
-            },
+            reasoning: display_reasoning,
             usage: self.last_usage,
             response_id: None,
             reasoning_artifact,
@@ -1881,6 +1949,120 @@ mod tests {
     }
 
     #[test]
+    fn non_streaming_captures_details_artifact_and_derives_display() {
+        // A route that streams only `reasoning_details` (no scalar field): the
+        // array is captured as the artifact and its text entry supplies display.
+        let json = r#"{"choices":[{"message":{
+            "content":"answer",
+            "reasoning_details":[{"type":"reasoning.text","text":"think step","index":0}]
+        }}],"usage":null}"#;
+        let payload: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+        let result = chat_completions_response_to_turn(payload).unwrap();
+        match result {
+            ChatTurnResult::FinalText(f) => {
+                assert_eq!(f.content, "answer");
+                assert_eq!(f.reasoning.as_deref(), Some("think step"));
+                let Some(ReasoningArtifact::ChatReasoning { field, bytes }) = f.reasoning_artifact
+                else {
+                    panic!("expected a chat reasoning artifact");
+                };
+                assert_eq!(field, ChatReasoningField::ReasoningDetails);
+                let entries: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    entries,
+                    serde_json::json!([{"type":"reasoning.text","text":"think step","index":0}])
+                );
+            }
+            other => panic!("expected FinalText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_streaming_encrypted_only_details_counts_as_output() {
+        // Encrypted-only reasoning_details with no visible text is still model
+        // output — never an EmptyResponse.
+        let json = r#"{"choices":[{"message":{
+            "content":null,
+            "reasoning_details":[{"type":"reasoning.encrypted","data":"opaque","index":0}]
+        },"finish_reason":"stop"}],"usage":null}"#;
+        let payload: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+        let result = chat_completions_response_to_turn(payload).unwrap();
+        match result {
+            ChatTurnResult::FinalText(f) => {
+                assert_eq!(f.content, "");
+                assert!(f.reasoning.is_none());
+                assert!(f.reasoning_artifact.is_some());
+            }
+            other => panic!("expected FinalText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streaming_accumulates_details_artifact() {
+        let mut acc = ChatCompletionsStreamAccumulator::default();
+        let chunk1: ChatCompletionsStreamResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"think ","index":0}]}}]}"#,
+        )
+        .unwrap();
+        let chunk2: ChatCompletionsStreamResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"more","index":0}],"content":"answer"}}]}"#,
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        acc.apply(&chunk1, &mut |e| {
+            events.push(e);
+            Ok(())
+        })
+        .unwrap();
+        acc.apply(&chunk2, &mut |e| {
+            events.push(e);
+            Ok(())
+        })
+        .unwrap();
+        let result = acc.into_turn_result().unwrap();
+        match result {
+            ChatTurnResult::FinalText(f) => {
+                assert_eq!(f.content, "answer");
+                assert_eq!(f.reasoning.as_deref(), Some("think more"));
+                let Some(ReasoningArtifact::ChatReasoning { field, .. }) = f.reasoning_artifact
+                else {
+                    panic!("expected a chat reasoning artifact");
+                };
+                assert_eq!(field, ChatReasoningField::ReasoningDetails);
+            }
+            other => panic!("expected FinalText, got {other:?}"),
+        }
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::Reasoning("think ".into()),
+                // Within one chunk content is emitted before reasoning (the
+                // established order); the second details fragment follows.
+                StreamEvent::Answer("answer".into()),
+                StreamEvent::Reasoning("more".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn streaming_encrypted_only_details_is_not_an_empty_response() {
+        let mut acc = ChatCompletionsStreamAccumulator::default();
+        let chunk: ChatCompletionsStreamResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","data":"opaque","index":0}]},"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        acc.apply(&chunk, &mut |_| Ok(())).unwrap();
+        let result = acc.into_turn_result().unwrap();
+        match result {
+            ChatTurnResult::FinalText(f) => {
+                assert!(f.reasoning.is_none());
+                assert!(f.reasoning_artifact.is_some());
+            }
+            other => panic!("expected FinalText, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn non_streaming_captures_artifact_on_tool_use() {
         // The artifact must ride along on ChatAssistantToolUse too — that's
         // the DeepSeek tool-loop case where `reasoning_content` has to be
@@ -2300,6 +2482,102 @@ mod tests {
         serde_json::to_value(chat_wire_message(msg, echo)).unwrap()
     }
 
+    /// A structured details artifact from a JSON entry array.
+    fn details_artifact(entries: &serde_json::Value) -> ReasoningArtifact {
+        ReasoningArtifact::ChatReasoning {
+            field: ChatReasoningField::ReasoningDetails,
+            bytes: serde_json::to_vec(entries).unwrap(),
+        }
+    }
+
+    #[test]
+    fn declared_details_replays_openrouter_entries_verbatim() {
+        // Verbatim replay: index, format and signature stay intact, and no
+        // scalar field is invented beside the array.
+        let entries = serde_json::json!([{
+            "type":"reasoning.text","text":"think","signature":"sig","format":"f","index":0
+        }]);
+        let msg = assistant_with(details_artifact(&entries));
+        let body = wire(&msg, declared(ChatReasoningField::ReasoningDetails));
+        assert_eq!(body["reasoning_details"], entries);
+        for scalar in ["reasoning_content", "reasoning", "reasoning_text"] {
+            assert!(body.get(scalar).is_none(), "{scalar} must stay absent");
+        }
+    }
+
+    #[test]
+    fn declared_details_rebuilds_kimi_entries_with_companion() {
+        // A persisted Kimi payload keeps a stream `index`; replay strips it and
+        // mirrors the summary text as `reasoning_content`.
+        let msg = assistant_with(details_artifact(&serde_json::json!([
+            {"type":"summary","summary":"step one","index":0}
+        ])));
+        let body = wire(&msg, declared(ChatReasoningField::ReasoningDetails));
+        assert_eq!(
+            body["reasoning_details"],
+            serde_json::json!([{"type":"summary","summary":"step one"}])
+        );
+        assert_eq!(body["reasoning_content"], "step one");
+    }
+
+    #[test]
+    fn declaring_details_route_emits_an_empty_array_when_nothing_to_echo() {
+        let msg = ChatRequestMessage::simple("assistant", "plain".into());
+        let body = wire(&msg, declared(ChatReasoningField::ReasoningDetails));
+        assert_eq!(body["reasoning_details"], serde_json::json!([]));
+        assert!(body.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn injected_empty_details_does_not_keep_an_empty_message_alive() {
+        // `reasoning_details: []` is a presence marker, not a payload.
+        let messages = vec![
+            ChatRequestMessage::simple("user", "q".into()),
+            ChatRequestMessage::simple("assistant", String::new()),
+        ];
+        assert_eq!(
+            project(&messages, declared(ChatReasoningField::ReasoningDetails)),
+            (vec!["user".to_string()], 1)
+        );
+    }
+
+    #[test]
+    fn non_empty_details_keeps_an_empty_assistant_message_alive() {
+        // The array IS the payload: dropping the message would starve the echo.
+        let mut msg = assistant_with(details_artifact(&serde_json::json!([
+            {"type":"reasoning.encrypted","data":"opaque","index":0}
+        ])));
+        msg.content = Some(String::new());
+        let messages = vec![ChatRequestMessage::simple("user", "q".into()), msg];
+        let (roles, dropped) = project(&messages, declared(ChatReasoningField::ReasoningDetails));
+        assert_eq!(roles, vec!["user".to_string(), "assistant".to_string()]);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn observed_details_replays_details_without_a_declaration() {
+        // With no declared field the observation routes the payload: a details
+        // artifact goes back as `reasoning_details`.
+        let msg = assistant_with(details_artifact(&serde_json::json!([
+            {"type":"reasoning.text","text":"t","index":0}
+        ])));
+        let body = wire(&msg, ChatReasoningEcho::default());
+        assert!(body.get("reasoning_details").is_some());
+        assert!(body.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn declared_scalar_route_uses_details_display_text() {
+        // Cross-route mismatch: a structured artifact on a route that declares a
+        // scalar field replays its derived text, never raw JSON.
+        let msg = assistant_with(details_artifact(&serde_json::json!([
+            {"type":"reasoning.text","text":"think","index":0},
+            {"type":"reasoning.summary","summary":" more","index":0}
+        ])));
+        let body = wire(&msg, declared(ChatReasoningField::ReasoningContent));
+        assert_eq!(body["reasoning_content"], "think more");
+    }
+
     #[test]
     fn declared_field_overrides_the_observed_field() {
         // The live-failure shape: the gateway streamed the reasoning under
@@ -2344,6 +2622,7 @@ mod tests {
                 ChatReasoningField::ReasoningContent => "reasoning_content",
                 ChatReasoningField::Reasoning => "reasoning",
                 ChatReasoningField::ReasoningText => "reasoning_text",
+                ChatReasoningField::ReasoningDetails => "reasoning_details",
             };
             assert_eq!(body[key], "payload", "{key}");
             for other in ["reasoning_content", "reasoning", "reasoning_text"] {

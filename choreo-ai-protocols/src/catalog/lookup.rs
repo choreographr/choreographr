@@ -794,6 +794,27 @@ mod tests {
     }
 
     #[test]
+    fn chat_reasoning_echo_resolves_structured_details_fact() {
+        // The snapshot's OpenRouter/Kimi routes declare `reasoning_details` in
+        // their `interleaved`; the resolver surfaces the structured field so the
+        // adapter replays the array instead of guessing a scalar key.
+        for (provider, model) in [
+            ("openrouter", "moonshotai/kimi-k2.5"),
+            ("openrouter", "minimax/minimax-m2"),
+            ("ollama-cloud", "qwen3.5:397b"),
+        ] {
+            assert_eq!(
+                chat_reasoning_echo(provider, model),
+                ChatReasoningEcho {
+                    field: Some(ChatReasoningField::ReasoningDetails),
+                    require_present: true,
+                },
+                "{provider}/{model}"
+            );
+        }
+    }
+
+    #[test]
     fn chat_reasoning_echo_overlay_field_wins() {
         // glm-5.3-flash is not in the snapshot (upstream exposes it under
         // internal names); the bundled overlay defines it wholesale with an

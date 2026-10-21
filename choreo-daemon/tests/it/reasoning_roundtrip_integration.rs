@@ -12,7 +12,12 @@
 //! AGENTS.md they live in `tests/` and are marked `#[ignore = "integration"]` (run via
 //! `cargo test-integration`).
 
+// clippy's allow-*-in-tests only recognizes #[test] functions; the
+// helpers in this file need this file-level allowance.
+#![expect(clippy::expect_used)]
+
 use choreo_ai_protocols::ChatTurnRequest;
+use choreo_ai_protocols::ChatTurnResult;
 use choreo_ai_protocols::openai::{
     ChatRequestMessage, MaxTokensField, OpenAiClient, RequestAuth, ServiceConfig,
 };
@@ -468,4 +473,381 @@ fn empty_assistant_turn_is_dropped_from_the_request() {
             );
         }
     }
+}
+
+// ── Structured reasoning_details (OpenRouter / Kimi) ────────────────────
+
+/// An `OpenRouter` route that declares `reasoning_details` (the `OpenRouter`
+/// namespace dialect).
+const OPENROUTER_MODEL: &str = "minimax/minimax-m2";
+/// An `OpenRouter`-hosted Kimi route (bare-dialect entries + `reasoning_content`).
+const KIMI_DETAILS_MODEL: &str = "moonshotai/kimi-k2.5";
+
+fn details_artifact(entries: &serde_json::Value) -> ReasoningArtifact {
+    ReasoningArtifact::ChatReasoning {
+        field: ChatReasoningField::ReasoningDetails,
+        bytes: serde_json::to_vec(entries).expect("serialize details"),
+    }
+}
+
+/// Append a tool-call turn carrying an arbitrary reasoning artifact, produced by
+/// the given provider+model (so the provenance gate accepts it).
+fn add_artifact_tool_turn(
+    session: &mut SessionState,
+    user_text: &str,
+    artifact: ReasoningArtifact,
+    provider_slug: &str,
+    model: &str,
+) {
+    let (tid, _) = session.start_turn(Some(user_text.to_string()));
+    session.set_assistant_response(
+        tid,
+        AssistantResponse {
+            tool_calls: vec![AssistantToolCallRecord {
+                call_id: "call_1".into(),
+                name: "get_weather".into(),
+                arguments_json: r#"{"city":"London"}"#.into(),
+            }],
+            reasoning_artifact: Some(artifact),
+            reasoning_producer: Some(ReasoningProducer {
+                provider_slug: provider_slug.to_string(),
+                model: model.to_string(),
+            }),
+            ..Default::default()
+        },
+    );
+}
+
+fn openrouter_client(mock: &MockProvider) -> OpenAiClient {
+    OpenAiClient::new(
+        ServiceConfig {
+            base_url: mock.base_url("v1"),
+            provider_slug: "openrouter".to_string(),
+            streaming: false,
+            retry_max_attempts: 1,
+            connect_timeout_secs: 5,
+            request_timeout_secs: 30,
+            total_timeout_secs: 60,
+            chat_completions_max_tokens_field: MaxTokensField::MaxCompletionTokens,
+            ..Default::default()
+        },
+        RequestAuth::api_key("test-key"),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .expect("openai client")
+}
+
+fn send(client: &OpenAiClient, model: &str, messages: &[ChatRequestMessage]) -> ChatTurnResult {
+    client
+        .chat_completion_turn(ChatTurnRequest {
+            model,
+            messages,
+            tools: &[],
+            thinking_effort: "high".to_string(),
+            on_retry: &mut None,
+            on_uploaded: None,
+            cancel_rx: None,
+            previous_response_id: None,
+            tool_results: &[],
+            programmatic_tool_calling: false,
+            session_id: "42".to_string(),
+            request_id: "7".to_string(),
+            max_output_tokens_override: None,
+            no_retry: false,
+        })
+        .expect("turn succeeds")
+}
+
+/// The single assistant message on a captured chat request body.
+fn captured_assistant(body: &serde_json::Value) -> serde_json::Value {
+    body["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .cloned()
+        .expect("an assistant message")
+}
+
+/// The `OpenRouter` dialect is replayed verbatim — index, format and signature
+/// intact — and no scalar reasoning field is invented beside the array.
+#[ignore = "integration"]
+#[test]
+fn openrouter_details_are_replayed_verbatim() {
+    let entries = serde_json::json!([{
+        "type":"reasoning.text",
+        "text":"think it through",
+        "signature":"sig_abc",
+        "format":"openai-responses-v1",
+        "index":0
+    }]);
+    let mut session = SessionState::empty();
+    add_artifact_tool_turn(
+        &mut session,
+        "go",
+        details_artifact(&entries),
+        "openrouter",
+        OPENROUTER_MODEL,
+    );
+
+    let mock = MockProvider::start(vec![(200, "application/json", final_text_response())]);
+    let client = openrouter_client(&mock);
+    let messages =
+        build_chat_request_messages(&session, None, "openrouter", OPENROUTER_MODEL, None);
+    send(&client, OPENROUTER_MODEL, &messages);
+
+    let assistant = captured_assistant(&mock.requests()[0].body_json());
+    assert_eq!(assistant["reasoning_details"], entries);
+    for scalar in ["reasoning_content", "reasoning", "reasoning_text"] {
+        assert!(
+            assistant.get(scalar).is_none(),
+            "no scalar may be invented beside reasoning_details: {assistant}"
+        );
+    }
+}
+
+/// A persisted Kimi-shaped payload keeps a stream `index`; replay rebuilds it
+/// minimally (index stripped) and mirrors the summary text as
+/// `reasoning_content`.
+#[ignore = "integration"]
+#[test]
+fn kimi_details_replay_strips_index_and_adds_companion() {
+    let entries = serde_json::json!([
+        {"type":"summary","summary":"step one ","index":0},
+        {"type":"summary","summary":"and two","index":0}
+    ]);
+    let mut session = SessionState::empty();
+    add_artifact_tool_turn(
+        &mut session,
+        "go",
+        details_artifact(&entries),
+        "openrouter",
+        KIMI_DETAILS_MODEL,
+    );
+
+    let mock = MockProvider::start(vec![(200, "application/json", final_text_response())]);
+    let client = openrouter_client(&mock);
+    let messages =
+        build_chat_request_messages(&session, None, "openrouter", KIMI_DETAILS_MODEL, None);
+    send(&client, KIMI_DETAILS_MODEL, &messages);
+
+    let assistant = captured_assistant(&mock.requests()[0].body_json());
+    assert_eq!(
+        assistant["reasoning_details"],
+        serde_json::json!([
+            {"type":"summary","summary":"step one "},
+            {"type":"summary","summary":"and two"}
+        ]),
+        "bare Kimi entries are rebuilt minimally without the stream index"
+    );
+    // The merged summary text rides along as the scalar companion.
+    assert_eq!(assistant["reasoning_content"], "step one and two");
+}
+
+/// An unrecognised detail `type` is dropped at replay rather than forwarded.
+#[ignore = "integration"]
+#[test]
+fn unknown_details_type_is_dropped_on_replay() {
+    let entries = serde_json::json!([
+        {"type":"reasoning.text","text":"keep","index":0},
+        {"type":"vendor.mystery","payload":"drop me"}
+    ]);
+    let mut session = SessionState::empty();
+    add_artifact_tool_turn(
+        &mut session,
+        "go",
+        details_artifact(&entries),
+        "openrouter",
+        OPENROUTER_MODEL,
+    );
+
+    let mock = MockProvider::start(vec![(200, "application/json", final_text_response())]);
+    let client = openrouter_client(&mock);
+    let messages =
+        build_chat_request_messages(&session, None, "openrouter", OPENROUTER_MODEL, None);
+    send(&client, OPENROUTER_MODEL, &messages);
+
+    let assistant = captured_assistant(&mock.requests()[0].body_json());
+    assert_eq!(
+        assistant["reasoning_details"],
+        serde_json::json!([{"type":"reasoning.text","text":"keep","index":0}])
+    );
+}
+
+/// A details-declaring route injects `reasoning_details: []` on an assistant
+/// message with nothing to echo, and an empty assistant message is still dropped
+/// (`[]` is a presence marker, not a payload).
+#[ignore = "integration"]
+#[test]
+fn empty_details_is_present_but_does_not_keep_an_empty_message_alive() {
+    let mut session = SessionState::empty();
+    // Turn 1: a tool turn with no reasoning at all — must carry `[]`.
+    let (tid, _) = session.start_turn(Some("first".to_string()));
+    session.set_assistant_response(
+        tid,
+        AssistantResponse {
+            tool_calls: vec![AssistantToolCallRecord {
+                call_id: "call_1".into(),
+                name: "get_weather".into(),
+                arguments_json: r#"{"city":"London"}"#.into(),
+            }],
+            reasoning_producer: Some(ReasoningProducer {
+                provider_slug: "openrouter".into(),
+                model: OPENROUTER_MODEL.into(),
+            }),
+            ..Default::default()
+        },
+    );
+    // Turn 2: a wholly empty assistant turn — dropped from the projection.
+    let (empty_tid, _) = session.start_turn(Some("second".to_string()));
+    session.set_assistant_response(
+        empty_tid,
+        AssistantResponse {
+            text: Some(String::new()),
+            ..Default::default()
+        },
+    );
+
+    let mock = MockProvider::start(vec![(200, "application/json", final_text_response())]);
+    let client = openrouter_client(&mock);
+    let messages =
+        build_chat_request_messages(&session, None, "openrouter", OPENROUTER_MODEL, None);
+    send(&client, OPENROUTER_MODEL, &messages);
+
+    let body = mock.requests()[0].body_json();
+    let assistants: Vec<&serde_json::Value> = body["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .collect();
+    assert_eq!(
+        assistants.len(),
+        1,
+        "the empty assistant turn must be dropped: {body}"
+    );
+    assert_eq!(assistants[0]["reasoning_details"], serde_json::json!([]));
+    assert!(assistants[0].get("reasoning_content").is_none());
+}
+
+/// A details artifact produced by a different model is dropped by the
+/// provenance gate — but the turn itself survives (its content/tool calls are
+/// intact), carrying the injected empty array.
+#[ignore = "integration"]
+#[test]
+fn provenance_mismatch_drops_details_but_keeps_the_turn() {
+    let entries = serde_json::json!([{"type":"reasoning.text","text":"stale","index":0}]);
+    let mut session = SessionState::empty();
+    add_artifact_tool_turn(
+        &mut session,
+        "go",
+        details_artifact(&entries),
+        "openai",
+        "gpt-4",
+    );
+
+    let mock = MockProvider::start(vec![(200, "application/json", final_text_response())]);
+    let client = openrouter_client(&mock);
+    let messages =
+        build_chat_request_messages(&session, None, "openrouter", OPENROUTER_MODEL, None);
+    send(&client, OPENROUTER_MODEL, &messages);
+
+    let assistant = captured_assistant(&mock.requests()[0].body_json());
+    assert_eq!(
+        assistant["reasoning_details"],
+        serde_json::json!([]),
+        "a foreign artifact must not be replayed"
+    );
+    assert!(
+        assistant["tool_calls"]
+            .as_array()
+            .is_some_and(|arr| !arr.is_empty()),
+        "the turn itself must survive: {assistant}"
+    );
+}
+
+/// A persisted details artifact larger than the per-turn cap is dropped at
+/// replay (an empty array) instead of failing the request.
+#[ignore = "integration"]
+#[test]
+fn oversized_details_are_dropped_on_replay() {
+    let big = "x".repeat(1024 * 1024 + 16);
+    let artifact = ReasoningArtifact::ChatReasoning {
+        field: ChatReasoningField::ReasoningDetails,
+        bytes: format!(r#"[{{"type":"reasoning.text","text":"{big}","index":0}}]"#).into_bytes(),
+    };
+    let mut session = SessionState::empty();
+    add_artifact_tool_turn(&mut session, "go", artifact, "openrouter", OPENROUTER_MODEL);
+
+    let mock = MockProvider::start(vec![(200, "application/json", final_text_response())]);
+    let client = openrouter_client(&mock);
+    let messages =
+        build_chat_request_messages(&session, None, "openrouter", OPENROUTER_MODEL, None);
+    send(&client, OPENROUTER_MODEL, &messages);
+
+    let assistant = captured_assistant(&mock.requests()[0].body_json());
+    assert_eq!(
+        assistant["reasoning_details"],
+        serde_json::json!([]),
+        "an oversized payload is dropped rather than sent"
+    );
+}
+
+/// Capture-side display: text/summary entries supply the display text when no
+/// scalar field streamed, and an encrypted-only turn still counts as output
+/// (never an `EmptyResponse`).
+#[ignore = "integration"]
+#[test]
+fn details_capture_drives_display_and_encrypted_only_is_output() {
+    let text_response = r#"{
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "reasoning_details": [
+                    {"type":"reasoning.text","text":"deep think","index":0}
+                ]
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    }"#
+    .to_string();
+    let encrypted_response = r#"{
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "reasoning_details": [
+                    {"type":"reasoning.encrypted","data":"opaque","index":0}
+                ]
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    }"#
+    .to_string();
+
+    let mock = MockProvider::start(vec![
+        (200, "application/json", text_response),
+        (200, "application/json", encrypted_response),
+    ]);
+    let client = openrouter_client(&mock);
+    let messages = vec![ChatRequestMessage::simple("user", "hi".to_string())];
+
+    let first = send(&client, OPENROUTER_MODEL, &messages);
+    let ChatTurnResult::FinalText(first) = first else {
+        panic!("expected FinalText");
+    };
+    assert_eq!(first.reasoning.as_deref(), Some("deep think"));
+    assert!(first.reasoning_artifact.is_some());
+
+    // Encrypted-only: no display text, but the turn is model output, so no
+    // EmptyResponse and the replayable artifact is captured.
+    let second = send(&client, OPENROUTER_MODEL, &messages);
+    let ChatTurnResult::FinalText(second) = second else {
+        panic!("expected FinalText");
+    };
+    assert!(second.reasoning.is_none());
+    assert!(second.reasoning_artifact.is_some());
 }

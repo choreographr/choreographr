@@ -188,24 +188,22 @@ impl RawInterleaved {
 
 /// Map a models.dev `interleaved` field name onto the catalog's echo field.
 ///
-/// Only the three *scalar* chat fields this catalog can echo text into are
-/// facts. Two encodings are deliberately "no fact" rather than a guess:
-///
-/// - `"reasoning_details"` — a structured array (OpenRouter/Kimi summaries +
-///   signatures) that a scalar field cannot carry; replaying it as text would
-///   corrupt it. Structured replay is a separate, unbuilt feature.
-/// - any unknown name — a snapshot vocabulary this catalog does not model.
-///
-/// Guessing here would be unauditable: the requirement decides which wire key
-/// every assistant message carries, so an unrecognised name must degrade to "no
-/// declared field" (and an upstream 400) rather than to a silent wrong key.
+/// Four chat fields this catalog can replay are facts: the three scalar fields
+/// (`reasoning_content`, `reasoning`, `reasoning_text`) and the structured
+/// `reasoning_details` array. Any unknown name is deliberately "no fact" rather
+/// than a guess: an unrecognised name is a snapshot vocabulary this catalog
+/// does not model, and guessing would be unauditable — the requirement decides
+/// which wire key every assistant message carries, so an unknown name must
+/// degrade to "no declared field" (and an upstream 400) rather than to a silent
+/// wrong key.
 fn echo_field(name: &str) -> Option<ChatReasoningField> {
     match name {
         "reasoning_content" => Some(ChatReasoningField::ReasoningContent),
         "reasoning" => Some(ChatReasoningField::Reasoning),
         "reasoning_text" => Some(ChatReasoningField::ReasoningText),
+        "reasoning_details" => Some(ChatReasoningField::ReasoningDetails),
         other => {
-            debug!(interleaved_field = %other, "models.dev interleaved field is not a scalar echo fact; ignoring");
+            debug!(interleaved_field = %other, "models.dev interleaved field is not a chat echo fact; ignoring");
             None
         }
     }
@@ -257,11 +255,12 @@ fn normalize_provider(slug: String, raw: RawProvider) -> ProviderEntry {
             reasoning_passback: None,
             // Reasoning echo field: a FACT from the snapshot — the model
             // demands this specific field on every assistant message exactly
-            // when its `interleaved` names one of the scalar chat fields
-            // (DeepSeek/GLM 5.x on their own endpoints). The field NAME is
-            // preserved (not collapsed to a boolean): the adapter needs it to
-            // pick the wire key. Any other encoding (bare `true`, absent, a
-            // structured or unknown field) is "no declared field" → `None`;
+            // when its `interleaved` names one of the replayable chat fields
+            // (DeepSeek/GLM 5.x `reasoning_content`, OpenRouter/Kimi
+            // `reasoning_details`). The field NAME is preserved (not collapsed
+            // to a boolean): the adapter needs it to pick the wire key. Any
+            // other encoding (bare `true`, absent, an unknown field) is "no
+            // declared field" → `None`;
             // the overlay overrides, and `None` means no echo requirement (no
             // name-based guessing).
             reasoning_echo: m
@@ -621,13 +620,16 @@ mod tests {
     }
 
     #[test]
-    fn interleaved_without_a_scalar_echo_field_is_no_fact() {
+    fn interleaved_reasoning_details_is_a_structured_echo_fact() {
         let catalog = normalize_modelsdev(SNAPSHOT);
         let features = &catalog[5];
-        // `reasoning_details` is a structured array a scalar field cannot
-        // carry; replaying it as text would corrupt it, so it is NOT mapped
-        // onto `reasoning_content`.
-        assert_eq!(features.models[2].reasoning_echo, None);
+        // `reasoning_details` is a structured array, but the catalog records it
+        // as the declared echo field so the adapter can replay it structurally
+        // (the bytes are a JSON array, not text).
+        assert_eq!(
+            features.models[2].reasoning_echo,
+            Some(ChatReasoningField::ReasoningDetails)
+        );
         // An unknown field name stays unknown (no guessing).
         assert_eq!(features.models[3].reasoning_echo, None);
         // Bare `true` is a capability flag, not a field fact.

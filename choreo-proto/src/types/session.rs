@@ -120,6 +120,18 @@ pub enum ChatReasoningField {
     Reasoning,
     /// The `reasoning_text` field.
     ReasoningText,
+    /// The structured `reasoning_details` field (`OpenRouter` and Kimi-shaped
+    /// routes).
+    ///
+    /// Unlike the scalar variants, its [`ReasoningArtifact::ChatReasoning`]
+    /// `bytes` are a **JSON array** of reasoning-detail entries, not UTF-8
+    /// display text. Each entry keeps the provider's own shape verbatim (e.g.
+    /// `OpenRouter`'s `{"type":"reasoning.text","text":…,"signature":…,"index":0}`
+    /// or Kimi's bare `{"type":"summary","summary":…,"index":0}`); the
+    /// adapter lowering re-emits `reasoning.*` entries verbatim and rebuilds
+    /// bare entries minimally. Display text is derived from the text/summary
+    /// entries when no scalar reasoning field streamed.
+    ReasoningDetails,
 }
 
 /// Opaque reasoning round-trip payload, captured verbatim by a provider
@@ -145,17 +157,23 @@ pub enum ChatReasoningField {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningArtifact {
-    /// OpenAI-compatible chat: the reasoning text (verbatim) plus the field it
-    /// was *observed* under (see [`ChatReasoningField`]). Re-emission targets
+    /// OpenAI-compatible chat: the reasoning payload (verbatim) plus the field
+    /// it was *observed* under (see [`ChatReasoningField`]). Re-emission targets
     /// the route's declared echo field when the catalog names one, and falls
     /// back to this observation when it does not — the observation is a hint,
     /// never an instruction.
+    ///
+    /// `bytes` is UTF-8 display text for every scalar field, and a **JSON
+    /// array** when `field` is [`ChatReasoningField::ReasoningDetails`].
     ChatReasoning {
-        /// Which chat field the reasoning text arrived under — the *observed*
-        /// field. Only the fallback destination: the catalog's declared echo
-        /// field wins whenever the route names one.
+        /// Which chat field the reasoning payload arrived under — the
+        /// *observed* field. Only the fallback destination: the catalog's
+        /// declared echo field wins whenever the route names one.
         field: ChatReasoningField,
-        /// The reasoning text bytes, exactly as the provider sent them.
+        /// The reasoning payload bytes, exactly as the provider sent them.
+        /// UTF-8 text for the scalar fields; a serialized JSON array of
+        /// reasoning-detail entries for
+        /// [`ChatReasoningField::ReasoningDetails`].
         bytes: Vec<u8>,
     },
     /// Anthropic: ordered thinking / `redacted_thinking` blocks, JSON as

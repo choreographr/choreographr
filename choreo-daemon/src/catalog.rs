@@ -74,7 +74,7 @@ const CATALOG_BIN_NAME: &str = "catalog.bin";
 /// version makes a stale cache unambiguous and forces the embedded fallback.
 /// Bump on every shape change of [`choreo_ai_protocols::ModelEntry`] or
 /// `ProviderEntry`.
-const CATALOG_CACHE_SCHEMA: u16 = 2;
+const CATALOG_CACHE_SCHEMA: u16 = 3;
 /// User overlay filename under the config dir. `pub` so the shared config
 /// transport's subscription (in `run_server`) registers the same basename.
 pub const USER_OVERLAY_NAME: &str = "models-overlay.toml";

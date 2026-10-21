@@ -621,6 +621,17 @@ and re-emits it per provider rules on the next request:
   no reasoning to replay — is dropped from the request instead of being sent
   empty; it stays in the transcript, but the model no longer receives a message
   every provider rejects.
+- **OpenRouter / Kimi (structured `reasoning_details`)** — routes that declare
+  the structured array (OpenRouter's resellers, Ollama Cloud, a few gateways)
+  round-trip it as JSON rather than text. Consecutive text/summary entries are
+  merged at capture, encrypted entries stay discrete, and unrecognised types are
+  dropped; the display text is derived from the text/summary entries when no
+  scalar field streamed, and an encrypted-only turn still counts as output. On
+  replay the OpenRouter `reasoning.*` entries are sent back verbatim (index,
+  format, signature intact) while bare Kimi-shaped entries are rebuilt without
+  the stream-only `index` and mirrored as a `reasoning_content` companion. A
+  declaring route with nothing to echo sends an empty array, and the payload is
+  capped per turn (dropped and logged rather than failing the request).
 - **Gemini** — the encrypted thought-step `thoughtSignature` values are sent
   back (the summary text stays display-only).
 - **OpenAI / xAI Responses** — reasoning continuity is chained across user

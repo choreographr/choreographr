@@ -523,16 +523,16 @@ fn parse_passback(value: &str) -> Option<ReasoningPassback> {
     }
 }
 
-/// Convert an overlay `reasoning_echo_field` value into the scalar chat field
-/// the route must carry. Only the three fields the chat adapter can echo text
-/// into are accepted; anything else (including `reasoning_details`, which is a
-/// structured array) is rejected so a typo cannot silently select a wrong
-/// wire key.
+/// Convert an overlay `reasoning_echo_field` value into the chat field the
+/// route must carry. The three scalar fields plus the structured
+/// `reasoning_details` array are accepted; anything else is rejected so a typo
+/// cannot silently select a wrong wire key.
 fn parse_echo_field(value: &str) -> Option<ChatReasoningField> {
     match value {
         "reasoning_content" => Some(ChatReasoningField::ReasoningContent),
         "reasoning" => Some(ChatReasoningField::Reasoning),
         "reasoning_text" => Some(ChatReasoningField::ReasoningText),
+        "reasoning_details" => Some(ChatReasoningField::ReasoningDetails),
         _ => None,
     }
 }
@@ -821,14 +821,37 @@ reasoning_content_required = false
     }
 
     #[test]
-    fn overlay_rejects_an_unknown_reasoning_echo_field() {
-        // A typo (or `reasoning_details`, which is structured) must not select
-        // an arbitrary wire key: it is warned and skipped, leaving no fact.
+    fn overlay_accepts_a_structured_reasoning_echo_field() {
+        // `reasoning_details` is structured, but it is a field the adapter can
+        // replay; the overlay can name it (e.g. for a gateway model the
+        // snapshot omits).
         let merged = merge_overlay(
             &base(),
             r#"
 [provider.acme.models."acme-base"]
 reasoning_echo_field = "reasoning_details"
+"#,
+        );
+        let acme = merged.iter().find(|e| e.slug == "acme").expect("acme");
+        assert_eq!(
+            acme.models
+                .iter()
+                .find(|m| m.model == "acme-base")
+                .expect("acme-base")
+                .reasoning_echo,
+            Some(ChatReasoningField::ReasoningDetails)
+        );
+    }
+
+    #[test]
+    fn overlay_rejects_an_unknown_reasoning_echo_field() {
+        // A typo must not select an arbitrary wire key: it is warned and
+        // skipped, leaving no fact.
+        let merged = merge_overlay(
+            &base(),
+            r#"
+[provider.acme.models."acme-base"]
+reasoning_echo_field = "vendor_reasoning"
 "#,
         );
         let acme = merged.iter().find(|e| e.slug == "acme").expect("acme");

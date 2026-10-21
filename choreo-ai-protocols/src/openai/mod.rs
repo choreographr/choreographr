@@ -7,6 +7,7 @@
 
 mod chat_completions;
 mod config;
+mod reasoning_details;
 mod responses;
 mod retry;
 mod sse;
@@ -20,6 +21,7 @@ use tracing::{debug, info, warn};
 use crate::SocketRegistry;
 use crate::ToolResultItem;
 use choreo_proto::{ChatReasoningField, ReasoningArtifact};
+use reasoning_details::{details_companion, details_display_text, details_wire_value};
 
 pub(crate) use config::endpoint_url;
 pub use config::{ServiceConfig, completion, validate_and_list_models};
@@ -262,11 +264,14 @@ pub struct ChatRequestMessage {
 ///   streams `reasoning` while rejecting a history without `reasoning_content`
 ///   is real, so the observation is only a fallback hint.
 /// - **whether the key must exist** — under a route that requires the field, an
-///   assistant message with nothing to echo carries it as an empty string, so
+///   assistant message with nothing to echo carries it as an empty string, or as
+///   an empty `reasoning_details` array when the declared field is structured, so
 ///   no assistant message on such a route can omit it.
 ///
-/// At most one reasoning key is emitted per message, and never on a
-/// non-assistant role.
+/// Exactly one wire shape is emitted per message — a scalar key or the
+/// structured `reasoning_details` array — and never on a non-assistant role. The
+/// only companion field is the Kimi-shaped summary text (`reasoning_content`)
+/// emitted beside a bare-dialect details array.
 pub struct ChatWireMessage<'a> {
     message: &'a ChatRequestMessage,
     echo: ChatReasoningEcho,
@@ -343,12 +348,51 @@ pub fn chat_wire_message(
 }
 
 /// The wire key for one chat reasoning field.
+///
+/// [`ChatReasoningField::ReasoningDetails`] maps to the structured
+/// `reasoning_details` array; it is never used as a scalar key (see
+/// [`WireReasoning`]).
 #[must_use]
 fn reasoning_wire_key(field: ChatReasoningField) -> &'static str {
     match field {
         ChatReasoningField::ReasoningContent => "reasoning_content",
         ChatReasoningField::Reasoning => "reasoning",
         ChatReasoningField::ReasoningText => "reasoning_text",
+        ChatReasoningField::ReasoningDetails => "reasoning_details",
+    }
+}
+
+/// How one assistant message re-emits its reasoning on the chat wire.
+///
+/// Two shapes, never mixed: a scalar field (`reasoning_content`, `reasoning`,
+/// or `reasoning_text`) or the structured `reasoning_details` array. Both are
+/// decided in exactly one place ([`ChatWireMessage::reasoning_field`]), so
+/// presence and destination cannot drift apart.
+#[derive(Debug, Clone)]
+enum WireReasoning {
+    /// A scalar chat field carrying the artifact's text (or an empty string as
+    /// a presence marker on a declaring route).
+    Scalar {
+        /// The wire key (`reasoning_content` and friends).
+        key: &'static str,
+        /// The value to write under that key.
+        value: String,
+    },
+    /// The structured `reasoning_details` array, replayed verbatim for the
+    /// `OpenRouter` dialect and rebuilt minimally for Kimi-shaped entries.
+    Details(serde_json::Value),
+}
+
+impl WireReasoning {
+    /// Whether this emission carries a real payload (as opposed to a presence
+    /// marker: an empty scalar string or an empty details array).
+    fn has_payload(&self) -> bool {
+        match self {
+            WireReasoning::Scalar { value, .. } => !value.trim().is_empty(),
+            WireReasoning::Details(details) => details
+                .as_array()
+                .is_some_and(|entries| !entries.is_empty()),
+        }
     }
 }
 
@@ -387,61 +431,93 @@ impl ChatWireMessage<'_> {
         let has_images = !self.message.images.is_empty();
         let has_reasoning = self
             .reasoning_field()
-            .is_some_and(|(_, text)| !text.trim().is_empty());
+            .is_some_and(|reasoning| reasoning.has_payload());
         !has_content && !has_tool_calls && !has_images && !has_reasoning
     }
 
-    /// The reasoning (key, value) this message carries, if any — the single
-    /// decision point for reasoning re-emission: exactly one key or none.
-    fn reasoning_field(&self) -> Option<(&'static str, String)> {
+    /// The reasoning emission this message carries, if any — the single
+    /// decision point for reasoning re-emission: exactly one wire shape.
+    fn reasoning_field(&self) -> Option<WireReasoning> {
         // Only assistant messages may carry provider reasoning. An artifact on
         // any other role is a builder bug, so it is dropped rather than
         // re-emitted.
         if self.message.role != "assistant" {
             return None;
         }
+        // The destination: the route's declared field outranks the field the
+        // payload was observed under (the observation is only a fallback hint).
+        let observed = match &self.message.reasoning_artifact {
+            Some(ReasoningArtifact::ChatReasoning { field, .. }) => Some(*field),
+            _ => None,
+        };
+        let destination = self.echo.field.or(observed);
+
+        // Structured `reasoning_details` destination.
+        if destination == Some(ChatReasoningField::ReasoningDetails) {
+            let details = match &self.message.reasoning_artifact {
+                Some(ReasoningArtifact::ChatReasoning {
+                    field: ChatReasoningField::ReasoningDetails,
+                    bytes,
+                }) => details_wire_value(bytes),
+                // Nothing structured to echo (no artifact, a foreign variant, or
+                // a scalar artifact on a details route): emit the declared key
+                // empty so the route never sees an assistant message without it.
+                _ => serde_json::Value::Array(Vec::new()),
+            };
+            debug!(
+                entries = details.as_array().map_or(0, Vec::len),
+                declared = self.echo.field.is_some(),
+                "re-emitting structured reasoning_details"
+            );
+            return Some(WireReasoning::Details(details));
+        }
+
+        // Scalar destination: the artifact's text, if it has any.
+        let mut scalar_text: Option<String> = None;
         if let Some(ReasoningArtifact::ChatReasoning { field, bytes }) =
             &self.message.reasoning_artifact
         {
-            // The declared field outranks the observation; the observation is
-            // what makes a provider that streams `reasoning_text` get
-            // `reasoning_text` back on routes that declare nothing.
-            let field = self.echo.field.unwrap_or(*field);
             match std::str::from_utf8(bytes) {
-                Ok(text) => {
-                    debug!(
-                        field = ?field,
-                        declared = self.echo.field.is_some(),
-                        payload_bytes = bytes.len(),
-                        "re-emitting chat reasoning artifact"
-                    );
-                    return Some((reasoning_wire_key(field), text.to_string()));
+                Ok(_) if *field == ChatReasoningField::ReasoningDetails => {
+                    // A structured payload on a scalar route: use its derived
+                    // display text rather than replaying raw JSON as a string.
+                    scalar_text = details_display_text(bytes);
                 }
+                Ok(text) => scalar_text = Some(text.to_string()),
                 Err(_) => {
                     // A corrupted persisted blob must not fail the whole
                     // request: drop the payload so the required-field arm below
                     // still keeps the message valid, and log the loss.
                     warn!(
-                        field = ?field,
+                        field = ?destination,
                         payload_bytes = bytes.len(),
                         "dropping corrupt chat reasoning artifact (not valid UTF-8)",
                     );
                 }
             }
         }
+        if let Some(value) = scalar_text {
+            let key =
+                reasoning_wire_key(destination.unwrap_or(ChatReasoningField::ReasoningContent));
+            debug!(
+                field = ?destination,
+                declared = self.echo.field.is_some(),
+                payload_bytes = value.len(),
+                "re-emitting chat reasoning artifact"
+            );
+            return Some(WireReasoning::Scalar { key, value });
+        }
         // Nothing to echo. On a route that requires the field, emit it empty so
         // the assistant message never omits it (the DeepSeek/GLM 5.x rule);
         // `reasoning_content` is the chat-completions default when the policy
         // names no field of its own.
-        self.echo.require_present.then(|| {
-            (
-                reasoning_wire_key(
-                    self.echo
-                        .field
-                        .unwrap_or(ChatReasoningField::ReasoningContent),
-                ),
-                String::new(),
-            )
+        self.echo.require_present.then(|| WireReasoning::Scalar {
+            key: reasoning_wire_key(
+                self.echo
+                    .field
+                    .unwrap_or(ChatReasoningField::ReasoningContent),
+            ),
+            value: String::new(),
         })
     }
 }
@@ -473,8 +549,19 @@ impl Serialize for ChatWireMessage<'_> {
         if let Some(tool_calls) = &self.message.tool_calls {
             msg.serialize_field("tool_calls", tool_calls)?;
         }
-        if let Some((key, value)) = &reasoning {
-            msg.serialize_field(key, value)?;
+        if let Some(reasoning) = &reasoning {
+            match reasoning {
+                WireReasoning::Scalar { key, value } => msg.serialize_field(key, value)?,
+                WireReasoning::Details(details) => {
+                    // Kimi-shaped payloads also carry the summary text as
+                    // `reasoning_content`; the one-channel rule holds only among
+                    // the scalar fields, so this companion is deliberate.
+                    if let Some(companion) = details_companion(details) {
+                        msg.serialize_field("reasoning_content", &companion)?;
+                    }
+                    msg.serialize_field("reasoning_details", details)?;
+                }
+            }
         }
         msg.end()
     }
