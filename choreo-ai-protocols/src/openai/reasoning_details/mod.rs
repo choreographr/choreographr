@@ -33,14 +33,16 @@
 //! ## Contracts this module holds
 //!
 //! - **Capture normalizes, replay preserves.** A streamed block arrives as many
-//!   deltas, so consecutive same-kind text/summary entries of one stream slot are
-//!   merged into one block (equal `index`, or no `index` on both entries of
-//!   *different* deltas); entries carried by one delta are distinct blocks, a
-//!   mixed index presence is ambiguous stays unmerged, and encrypted entries
-//!   never merge — they are opaque and individually signed. A merge is refused
-//!   when the two entries state conflicting identity (a different `id`,
-//!   `format`, or `signature`): that is two blocks whose deltas merely share a
-//!   slot number.
+//!   deltas, so the fragments of one stream slot are merged into one block. A
+//!   slot is the entry's `index` (equal `index` on both entries) or, for a
+//!   provider that names none, "the newest index-less entry of this kind" — and
+//!   each slot remembers its own accumulating entry, so a route that interleaves
+//!   two slots in one delta still merges both. Entries carried by one delta are
+//!   distinct blocks unless they share an `index`; a mixed index presence is
+//!   ambiguous and stays unmerged; and encrypted entries never merge — they are
+//!   opaque and individually signed. A merge is refused when the two entries
+//!   state conflicting identity (a different `id`, `format`, or `signature`):
+//!   that is two blocks whose deltas merely share a slot number.
 //! - **Nothing is dropped or rewritten on the way back out.** The upstreams
 //!   require the replayed sequence to match what the model produced (see
 //!   [preserving
@@ -100,7 +102,7 @@ use serde_json::Value;
 pub(crate) const MAX_REASONING_BYTES: usize = 256 * 1024;
 
 /// The kind of a captured reasoning-details entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum DetailKind {
     /// A plain thinking-text block (`reasoning.text` / bare `text`).
     Text,

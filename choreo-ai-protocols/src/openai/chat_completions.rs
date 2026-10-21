@@ -93,11 +93,21 @@ pub(crate) fn chat_completions_request(
         .read_json()
         .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
 
-    let content = payload
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|choice| choice.message.content)
+    // A one-shot prompt has no turn result to carry a truncation flag, but a
+    // declared terminal finish reason is still terminal: z.ai's `sensitive`
+    // streams no content at all, which would otherwise be reported as an
+    // (apparently retryable) empty completion rather than the policy refusal it
+    // is. The turn paths classify the same reasons through this same helper.
+    let Some(choice) = payload.choices.into_iter().next() else {
+        return Err(super::OpenAiError::EmptyResponse);
+    };
+    if let Some(err) = finish_reason_terminal_error(choice.finish_reason.as_ref()) {
+        return Err(err);
+    }
+
+    let content = choice
+        .message
+        .content
         .unwrap_or_default()
         .trim()
         .to_string();

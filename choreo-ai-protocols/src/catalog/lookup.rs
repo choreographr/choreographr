@@ -276,7 +276,8 @@ pub struct ChatReasoningEcho {
 /// the `OpenAI` **Responses** API resolves to the default — `reasoning_content`
 /// and friends are chat-completions wire concepts, and continuity there flows
 /// through `previous_response_id`/input items, so a mis-ingested entry cannot
-/// leak a chat field into a Responses request.
+/// leak a chat field into a Responses request. The guard lives inside the one
+/// catalog walk, so the whole policy costs a single lock-free read.
 ///
 /// Fixes for a catalog gap: add the model to the snapshot, or to the overlay
 /// with `reasoning_echo_field = "…"` (and `reasoning_echo_required = true` when
@@ -284,21 +285,19 @@ pub struct ChatReasoningEcho {
 #[must_use]
 pub fn chat_reasoning_echo(provider_slug: &str, model: &str) -> ChatReasoningEcho {
     let echo = with_model_fact(provider_slug, model, |m| {
+        if m.openai_responses {
+            return ChatReasoningEcho::default();
+        }
         // The destination and the presence requirement are separate catalog
         // facts, so both are projected here and neither is inferred from the
         // other: a presence-only pin (no declared destination) is a legitimate
         // catalog entry and must survive to the caller.
-        (m.reasoning_echo, m.reasoning_echo_required.unwrap_or(false))
-    })
-    // The Responses guard flattens the pair to the whole default together, so a
-    // guarded route never resolves to a half-answer.
-    .filter(|_| model_request_format(provider_slug, model) != Some(RequestFormat::Responses))
-    .map_or_else(ChatReasoningEcho::default, |(field, require_present)| {
         ChatReasoningEcho {
-            field,
-            require_present,
+            field: m.reasoning_echo,
+            require_present: m.reasoning_echo_required.unwrap_or(false),
         }
-    });
+    })
+    .unwrap_or_default();
     trace!(
         provider = %provider_slug,
         model = %model,

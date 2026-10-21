@@ -9,13 +9,14 @@
 //! so a payload the cap refuses can never blank what the session shows or turn a
 //! real response into an empty one.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 
 use choreo_proto::{ChatReasoningField, ReasoningArtifact};
 use serde_json::{Map, Value};
 use tracing::{debug, warn};
 
-use super::{MAX_REASONING_BYTES, classify, is_continuation};
+use super::{DetailKind, MAX_REASONING_BYTES, classify, entry_index, is_continuation};
 
 #[derive(Debug, Default)]
 struct ByteCounter(usize);
@@ -61,6 +62,16 @@ pub(crate) struct DetailsStore {
     /// a generation number rather than a flag so the rule needs no bookkeeping
     /// at the end of a delta.
     entry_delta: Vec<u64>,
+    /// Where the fragments of an indexed block resume: the position of the
+    /// accumulating entry for each (`kind`, `index`) stream slot.
+    ///
+    /// Per-slot rather than "the newest entry" so a route that interleaves two
+    /// slots across deltas still merges both, instead of starting a fresh entry
+    /// for each fragment the moment the other slot intervenes.
+    indexed: HashMap<(DetailKind, u64), usize>,
+    /// The same for a provider that names no slot: the newest index-less entry
+    /// of each textual kind is the block being assembled.
+    unindexed: HashMap<DetailKind, usize>,
     /// The current delta generation, bumped by every [`push`](Self::push).
     delta: u64,
     /// Running serialized byte total across the deltas folded in so far.
@@ -235,31 +246,59 @@ impl DetailsStore {
                 field_count = entry.as_object().map_or(0, Map::len),
                 "keeping an unrecognised reasoning_details entry verbatim"
             );
-            self.store(entry.clone());
+            self.store(entry.clone(), None);
             return true;
         };
-        let same_delta = self.last_entry_is_from_this_delta();
         if kind.is_textual()
-            && let Some(last) = self.entries.last_mut().filter(|last| {
-                classify(last) == Some(kind) && is_continuation(last, entry, same_delta)
-            })
+            && let Some(position) = self.continuation(kind, entry)
+            && let Some(existing) = self.entries.get_mut(position)
         {
-            merge_textual(last, entry, kind.payload_key());
+            merge_textual(existing, entry, kind.payload_key());
             return true;
         }
-        self.store(entry.clone());
+        self.store(entry.clone(), Some(kind));
         true
     }
 
-    /// Store one entry, recording the delta generation it arrived in.
-    fn store(&mut self, entry: Value) {
+    /// Store one entry, recording the delta generation it arrived in and, for a
+    /// textual kind, the stream slot later fragments of the same block resolve
+    /// to.
+    fn store(&mut self, entry: Value, kind: Option<DetailKind>) {
+        let position = self.entries.len();
+        let index = entry_index(&entry);
         self.entries.push(entry);
         self.entry_delta.push(self.delta);
+        let Some(kind) = kind.filter(|kind| kind.is_textual()) else {
+            return;
+        };
+        match index {
+            Some(index) => {
+                self.indexed.insert((kind, index), position);
+            }
+            None => {
+                self.unindexed.insert(kind, position);
+            }
+        }
     }
 
-    /// Whether the last stored entry was folded in the current delta.
-    fn last_entry_is_from_this_delta(&self) -> bool {
-        self.entry_delta.last() == Some(&self.delta)
+    /// The position of the stored entry `entry` continues, if any.
+    ///
+    /// An indexed entry continues the newest stored entry of its kind at the
+    /// same stream slot; an index-less entry continues the newest index-less
+    /// entry of its kind, because a provider that names no slot has one block
+    /// being assembled. Meeting the slot is necessary but not sufficient:
+    /// [`is_continuation`] still refuses a merge when the two entries disagree
+    /// about their identity or when both arrived in one delta, so two distinct
+    /// blocks that merely share a slot number stay distinct.
+    fn continuation(&self, kind: DetailKind, entry: &Value) -> Option<usize> {
+        let position = match entry_index(entry) {
+            Some(index) => *self.indexed.get(&(kind, index))?,
+            None => *self.unindexed.get(&kind)?,
+        };
+        let existing = self.entries.get(position)?;
+        let same_delta = self.entry_delta.get(position) == Some(&self.delta);
+        (is_continuation(existing, entry, same_delta) && classify(existing) == Some(kind))
+            .then_some(position)
     }
 
     /// Consume the store into the opaque round-trip artifact. `None` when

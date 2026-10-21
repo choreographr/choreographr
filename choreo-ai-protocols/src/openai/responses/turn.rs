@@ -42,7 +42,9 @@ pub(super) fn responses_usage_to_token_usage(usage: &super::super::Usage) -> Tok
 /// answer reported as truncated — the same reading chat gives
 /// `finish_reason: length`. An unknown reason is logged so it stays
 /// diagnosable without failing a turn the provider charged for.
-fn incomplete_stop(payload: &ResponsesResponse) -> Result<bool, super::super::OpenAiError> {
+pub(super) fn incomplete_stop(
+    payload: &ResponsesResponse,
+) -> Result<bool, super::super::OpenAiError> {
     let reason = payload
         .incomplete_details
         .as_ref()

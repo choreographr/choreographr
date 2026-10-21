@@ -363,6 +363,38 @@ fn replay_preserves_bare_entries_and_strips_only_the_index() {
 }
 
 #[test]
+fn interleaved_slots_merge_into_their_own_blocks() {
+    // Two stream slots whose fragments alternate across deltas: each index keeps
+    // its own accumulating block, so the array ends up with one entry per slot
+    // rather than a fragment entry per delta.
+    let mut store = DetailsStore::default();
+    let mut text = String::new();
+    for delta in [
+        json!([
+            {"type":"reasoning.text","text":"a1 ","index":0},
+            {"type":"reasoning.text","text":"b1 ","index":1}
+        ]),
+        json!([
+            {"type":"reasoning.text","text":"a2","index":0},
+            {"type":"reasoning.text","text":"b2","index":1}
+        ]),
+    ] {
+        store.push(&delta, &mut text, &mut |_| {});
+    }
+    let artifact = store.finish().expect("artifact");
+    let ReasoningArtifact::ChatReasoning { bytes, .. } = &artifact else {
+        panic!("expected ChatReasoning");
+    };
+    assert_eq!(
+        serde_json::from_slice::<Value>(bytes).expect("json"),
+        json!([
+            {"type":"reasoning.text","text":"a1 a2","index":0},
+            {"type":"reasoning.text","text":"b1 b2","index":1}
+        ])
+    );
+}
+
+#[test]
 fn a_conflicting_signature_keeps_two_blocks_discrete() {
     // Same slot, different signature: two distinct blocks whose deltas merely
     // share an index. Merging would edit a sequence the upstream requires to be
