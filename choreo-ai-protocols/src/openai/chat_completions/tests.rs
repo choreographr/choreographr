@@ -3,6 +3,10 @@ use super::super::{
     chat_wire_messages,
 };
 use super::*;
+// The types the request paths reach through their own imports; the suite names
+// them directly, so it imports them directly too.
+use crate::types::{ChatAssistantToolUse, ChatToolCall};
+use choreo_proto::{ChatReasoningField, ReasoningArtifact, TokenUsage};
 
 // -- finish_reason lenient deserialization -----------------------------
 
