@@ -10,7 +10,9 @@
 use choreo_ai_protocols::openai::{
     AssistantToolCall, AssistantToolFunction, ChatImagePart, ChatRequestMessage,
 };
-use choreo_ai_protocols::{ReasoningPassback, model_reasoning_passback, model_supports_vision};
+use choreo_ai_protocols::{
+    ReasoningPassback, chat_reasoning_echo, model_reasoning_passback, model_supports_vision,
+};
 use choreo_proto::{ReasoningArtifact, Turn};
 use tracing::{debug, warn};
 
@@ -52,9 +54,13 @@ pub fn build_chat_request_messages(
         messages.push(ChatRequestMessage::simple("system", prompt.to_string()));
     }
 
-    // The passback policy decides *whether* the artifact is replayed; it is
-    // constant for the whole request (the model does not change mid-loop).
+    // The passback policy decides *whether* the artifact is replayed. Both
+    // halves are constant for the whole request (the model does not change
+    // mid-loop): the passback format, and whether the route demands the echoed
+    // field on every assistant message — which is what decides whether a
+    // non-tool turn's payload rides too (see `include_reasoning_artifact`).
     let passback = model_reasoning_passback(provider_slug, model);
+    let echo = chat_reasoning_echo(provider_slug, model);
     // Whether the active model accepts image input. Tool-result images are
     // attached natively only when it does; otherwise they are replaced with a
     // text placeholder (the vision gate). Constant per request.
@@ -78,9 +84,13 @@ pub fn build_chat_request_messages(
         // passback policy for this request — OR the empty-message fallback
         // applies (see the reasoning_content comment below: a content-less,
         // tool-less turn must never ship bare under an echo-capable policy):
-        //   ToolLoop  → only tool-involving turns (assistant tool_calls or
-        //               tool results attached) — DeepSeek/Kimi reject a tool
-        //               loop whose assistant message drops reasoning_content
+        //   ToolLoop  → tool-involving turns (assistant tool_calls or tool
+        //               results attached), plus every turn on a route whose
+        //               catalog entry requires the echoed field: DeepSeek asks
+        //               for `reasoning_content` back on ALL earlier turns of a
+        //               request that carries tools, "even for turns where the
+        //               model did not perform a tool call"
+        //               (https://api-docs.deepseek.com/guides/thinking_mode)
         //   AllTurns  → every turn (Anthropic keep-all)
         //   Signature → every turn (Gemini encrypted thought signatures)
         //   ResponseId→ never via the message; continuity flows through
@@ -93,7 +103,8 @@ pub fn build_chat_request_messages(
         // `ChatWireMessage`. *Whether* the artifact rides is the only decision
         // this builder makes; *where* it lands, and whether the field must be
         // present even when there is nothing to echo, belongs to the adapter.
-        let include_artifact = include_reasoning_artifact(turn, provider_slug, model, passback);
+        let include_artifact =
+            include_reasoning_artifact(turn, provider_slug, model, passback, echo.require_present);
         let has_tool_calls = !turn.tool_calls.is_empty();
         if turn.assistant_text.is_some() || has_tool_calls {
             let tool_calls = if has_tool_calls {
@@ -255,10 +266,12 @@ fn tool_result_image_messages(
 }
 
 /// Whether a turn participates in the tool loop (its assistant message
-/// carries tool calls, or tool results are attached to it). DeepSeek/Kimi
-/// reject a tool loop whose assistant message drops `reasoning_content`, so
-/// `ToolLoop`-policy providers need the artifact echoed exactly on these
-/// turns.
+/// carries tool calls, or tool results are attached to it).
+///
+/// This is the *minimum* a `ToolLoop`-policy provider needs its reasoning
+/// echoed on; a route whose catalog entry additionally requires the echoed
+/// field on every assistant message replays it on all of them (see
+/// [`include_reasoning_artifact`]).
 fn turn_has_tool_involvement(turn: &Turn) -> bool {
     !turn.tool_calls.is_empty() || !turn.tool_results.is_empty()
 }
@@ -274,14 +287,17 @@ fn turn_has_tool_involvement(turn: &Turn) -> bool {
 ///    by a different model (or with an unrecorded producer) must not have
 ///    its payload replayed, matching Anthropic's strip-on-model-change rule.
 /// 2. **The passback policy** for the request:
-///    `ToolLoop`  → tool-involving turns only
+///    `ToolLoop`  → tool-involving turns, and every turn when
+///    `route_requires_field` says the route demands the echoed field on each
+///    assistant message
 ///    `AllTurns` / Signature → every turn
 ///    None / `ResponseId` → never via the message
 ///
 /// `passback` must be the resolved policy for `(provider_slug, model)`
-/// ([`model_reasoning_passback`]); callers that also need the value for
-/// their own logic resolve it once per request and pass it in, so the helper
-/// never re-scans the catalog per turn.
+/// ([`model_reasoning_passback`]), and `route_requires_field` its companion
+/// chat fact ([`chat_reasoning_echo`]'s `require_present`); callers resolve
+/// both once per request and pass them in, so the helper never re-scans the
+/// catalog per turn.
 ///
 /// PLUS the **empty-message fallback**: the builder must never ship a
 /// provably-invalid assistant message — a turn recorded with empty content
@@ -305,6 +321,7 @@ pub(crate) fn include_reasoning_artifact(
     provider_slug: &str,
     model: &str,
     passback: ReasoningPassback,
+    route_requires_field: bool,
 ) -> bool {
     // Same-model provenance: compare `(slug, model)` string pairs directly
     // instead of constructing a temporary `ReasoningProducer` (which would
@@ -320,7 +337,17 @@ pub(crate) fn include_reasoning_artifact(
     }
     let policy_echo = match passback {
         ReasoningPassback::None | ReasoningPassback::ResponseId => false,
-        ReasoningPassback::ToolLoop => turn_has_tool_involvement(turn),
+        // A route that demands the echoed field on every assistant message
+        // wants the *payload* there too, not just the key: DeepSeek asks for
+        // every earlier turn's `reasoning_content` back once the request
+        // carries `tools`, including turns that made no tool call
+        // (https://api-docs.deepseek.com/guides/thinking_mode), and GLM warns
+        // that a missing block degrades its preserved thinking
+        // (https://docs.z.ai/guides/capabilities/thinking-mode). Replaying
+        // only tool-involving turns would satisfy the field's presence (the
+        // lowering emits the empty marker) while silently dropping the
+        // continuity those routes are built on.
+        ReasoningPassback::ToolLoop => turn_has_tool_involvement(turn) || route_requires_field,
         ReasoningPassback::AllTurns | ReasoningPassback::Signature => true,
     };
     // Empty-message fallback: a content-less, tool-less turn would otherwise
@@ -426,9 +453,12 @@ pub(crate) fn warn_on_uncaptured_reasoning(
     provider_slug: &str,
     model: &str,
 ) -> usize {
-    // Only the passback policy is needed, to know whether the builder's
-    // empty-message fallback will replay a same-model artifact.
+    // Both policy halves are needed to know whether the builder will replay a
+    // same-model artifact: the passback format, and whether the route demands
+    // the echoed field on every assistant message (see
+    // `include_reasoning_artifact`).
     let passback = model_reasoning_passback(provider_slug, model);
+    let echo = chat_reasoning_echo(provider_slug, model);
     let mut problems = 0;
     for (turn_id, turn) in &session.turns {
         if turn.undone {
@@ -438,7 +468,8 @@ pub(crate) fn warn_on_uncaptured_reasoning(
         if turn.assistant_text.is_none() && turn.tool_calls.is_empty() {
             continue;
         }
-        let artifact_fills = include_reasoning_artifact(turn, provider_slug, model, passback);
+        let artifact_fills =
+            include_reasoning_artifact(turn, provider_slug, model, passback, echo.require_present);
         if !artifact_fills && turn_is_wire_empty(turn) {
             problems += 1;
             warn!(

@@ -2589,7 +2589,13 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
     its own wire format. *Whether* to send is derived, never configured: same-model provenance
     (`Turn.reasoning_producer` vs current provider+model, so a mid-session model switch drops every
     old artifact) plus the catalog's `reasoning_passback` policy (`None` / `ToolLoop` / `AllTurns` /
-    `Signature` / `ResponseId`, per-model override else protocol default). Display text stays in
+    `Signature` / `ResponseId`, per-model override else protocol default). `ToolLoop` echoes the
+    tool-involving turns, and on a route whose catalog entry requires the echoed field it echoes
+    every turn instead: DeepSeek asks for all earlier turns' `reasoning_content` once the request
+    carries `tools`, tool-less turns included
+    ([docs](https://api-docs.deepseek.com/guides/thinking_mode)), and GLM treats a missing block as
+    degraded preserved thinking ([docs](https://docs.z.ai/guides/capabilities/thinking-mode)).
+    Display text stays in
     `Turn.assistant_reasoning`; the artifact bytes are never interpreted by the daemon.
     *Where* the payload lands on the chat wire is the adapter's decision, from two independent
     catalog facts — the desired field (`ModelEntry::reasoning_echo`, ingested from the snapshot's

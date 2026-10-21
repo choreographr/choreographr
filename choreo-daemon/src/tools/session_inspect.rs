@@ -311,7 +311,8 @@ fn build_report(
         // its same-model artifact so the wire message is never empty) is
         // applied here automatically, keeping the ledger and the wire in
         // lockstep.
-        let include_artifact = include_reasoning_artifact(turn, &provider, &model, passback);
+        let include_artifact =
+            include_reasoning_artifact(turn, &provider, &model, passback, echo.require_present);
         let echo_has_artifact = include_artifact && turn.reasoning_artifact.is_some();
         // Whether the turn's assistant message survives the lowering at all —
         // decided by the very predicate the projection uses (`ChatWireMessage`'s
@@ -431,8 +432,10 @@ fn build_report(
             ));
         }
         // Under ToolLoop, a plain-text assistant turn that produced reasoning
-        // is deliberately sent bare — informational, matches the policy (and
-        // suppressed on models that declare a required field).
+        // is sent bare *unless* the route demands the echoed field on every
+        // assistant message — such a route replays the payload on all its
+        // turns, because its upstream asks for the continuity, not just the
+        // key. Informational: the bare form matches the policy.
         if has_assistant_msg
             && turn.tool_calls.is_empty()
             && !wire_present
@@ -441,9 +444,9 @@ fn build_report(
             && matches!(passback, ReasoningPassback::ToolLoop)
         {
             infos.push(format!(
-                "  t{turn_id}: short answer with reasoning artifact — ToolLoop echoes only \
-                 tool turns, so this turn is sent bare (harmless unless the provider \
-                 requires an all-turns echo)"
+                "  t{turn_id}: short answer with reasoning artifact — ToolLoop echoes tool \
+                 turns only and this route declares no required echo field, so this turn \
+                 is sent bare"
             ));
         }
 

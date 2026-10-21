@@ -68,8 +68,15 @@ pub use refresh::{RefreshError, RefreshOutcome, fetch_modelsdev};
 pub enum ReasoningPassback {
     /// Never send reasoning back (display-only providers / fields).
     None,
-    /// Echo reasoning on assistant messages that had tool calls
-    /// (DeepSeek/Kimi chat, and the minimum for Anthropic tool loops).
+    /// Echo reasoning on assistant messages that had tool calls — the
+    /// minimum for a chat tool loop. A route whose separate chat fact demands
+    /// the echoed field on every assistant message echoes it on all of them
+    /// instead, because those upstreams ask for the continuity itself:
+    /// `DeepSeek` wants every earlier turn's `reasoning_content` back once the
+    /// request carries `tools`
+    /// ([docs](https://api-docs.deepseek.com/guides/thinking_mode)) and `GLM`
+    /// treats a missing block as a degraded preserved-thinking context
+    /// ([docs](https://docs.z.ai/guides/capabilities/thinking-mode)).
     ToolLoop,
     /// Echo reasoning across all turns of the session (Anthropic keep-all,
     /// GPT-5.6 `all_turns`).

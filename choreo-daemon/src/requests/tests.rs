@@ -699,11 +699,13 @@ fn wire_json(
 }
 
 #[test]
-fn builder_tool_loop_attaches_artifact_only_for_tool_involving_turns() {
+fn builder_tool_loop_replays_every_turn_on_a_requires_field_route() {
     let mut session = SessionState::empty();
-    // Plain text turn (no tool involvement) with an artifact: must NOT be
-    // replayed under ToolLoop (DeepSeek/Kimi only require it on tool-loop
-    // messages).
+    // Plain text turn (no tool involvement) with an artifact. deepseek-v4-pro
+    // declares `reasoning_content` as a required echo field, and DeepSeek asks
+    // for every earlier turn's reasoning back once the request carries
+    // `tools` — including turns that made no tool call — so this turn replays
+    // its payload rather than an empty marker.
     add_turn(
         &mut session,
         "hello",
@@ -727,8 +729,9 @@ fn builder_tool_loop_attaches_artifact_only_for_tool_involving_turns() {
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 2);
     assert_eq!(
-        assistants[0].reasoning_artifact, None,
-        "plain text turn must not replay reasoning under ToolLoop",
+        assistants[0].reasoning_artifact,
+        Some(artifact(b"plain")),
+        "a route requiring the echo field replays every turn's payload",
     );
     assert_eq!(
         assistants[1].reasoning_artifact,
@@ -889,10 +892,12 @@ fn builder_requires_rc_empty_content_turn_echoes_artifact() {
 }
 
 #[test]
-fn builder_requires_rc_empty_content_turn_keeps_content_turn_bare() {
-    // The fallback must NOT change plain-text turns: a non-empty assistant
-    // message with a same-model artifact but no tool involvement is still
-    // sent bare under ToolLoop (no echo needed — the message is valid).
+fn builder_requires_field_route_echoes_a_plain_turns_payload() {
+    // A plain-text assistant turn with a same-model artifact on a route that
+    // declares `reasoning_content` required: the payload rides, because the
+    // upstream asks for the reasoning itself back, not just the key. (The
+    // empty-message fallback is not what keeps this turn alive — its content
+    // is non-empty; the required-field fact is what selects the echo.)
     let mut session = SessionState::empty();
     add_turn(
         &mut session,
@@ -906,11 +911,9 @@ fn builder_requires_rc_empty_content_turn_keeps_content_turn_bare() {
     let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro", None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
-    assert_eq!(assistants[0].reasoning_artifact, None);
-    // The route declares `reasoning_content`, so the wire carries it empty even
-    // though this turn has a (deliberately un-echoed) artifact.
+    assert_eq!(assistants[0].reasoning_artifact, Some(artifact(b"plain")));
     let wire = wire_json(&result, "deepseek", "deepseek-v4-pro");
-    assert_eq!(wire[1]["reasoning_content"], "");
+    assert_eq!(wire[1]["reasoning_content"], "plain");
 }
 
 #[test]
@@ -988,6 +991,31 @@ fn guard_requires_rc_empty_content_turn_missing_artifact_is_flagged() {
         warn_on_uncaptured_reasoning(&session, 7, "deepseek", "deepseek-v4-pro"),
         1,
         "wire-empty turn with no artifact to fill it is flagged",
+    );
+}
+
+#[test]
+fn builder_tool_loop_still_gates_per_turn_without_a_required_field() {
+    // The mirror of `builder_tool_loop_replays_every_turn_on_a_requires_field_route`:
+    // on a ToolLoop route that demands no echoed field (groq here), a plain-text
+    // turn's payload still stays home — the upstream asks for nothing, so
+    // replaying it would only spend context.
+    let mut session = SessionState::empty();
+    add_turn(
+        &mut session,
+        "hello",
+        "hi",
+        Some(artifact(b"plain")),
+        Some(groq_producer()),
+        vec![],
+    );
+
+    let result = build_chat_request_messages(&session, None, "groq", GROQ_MODEL, None);
+    let assistants = assistant_messages(&result);
+    assert_eq!(assistants.len(), 1);
+    assert_eq!(
+        assistants[0].reasoning_artifact, None,
+        "a route with no required echo field keeps the per-turn ToolLoop gate",
     );
 }
 
