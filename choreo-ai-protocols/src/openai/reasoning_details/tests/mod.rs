@@ -140,6 +140,37 @@ fn openrouter_text_entries_are_kept_verbatim_and_merged() {
 }
 
 #[test]
+fn a_null_metadata_field_is_replaced_by_a_later_real_value() {
+    // `OpenRouter`'s documented stream opens a block with `"signature": null`
+    // and `"format": null` and delivers the real values on a later fragment of
+    // the same slot. An explicit `null` is "not stated yet" (the same reading
+    // `is_continuation` uses for an identity conflict), so the later value must
+    // be grafted onto the one block rather than shadowed by the earlier null —
+    // otherwise the replayed block would arrive unsigned.
+    let mut store = DetailsStore::default();
+    let mut text = String::new();
+    store.push(
+        &json!([{"type":"reasoning.text","text":"a","index":0,"signature":null,"format":null}]),
+        &mut text,
+        &mut |_| {},
+    );
+    store.push(
+        &json!([{"type":"reasoning.text","text":"b","index":0,"signature":"sig","format":"f"}]),
+        &mut text,
+        &mut |_| {},
+    );
+    let artifact = store.finish().expect("artifact");
+    let ReasoningArtifact::ChatReasoning { bytes, .. } = &artifact else {
+        panic!("expected ChatReasoning");
+    };
+    assert_eq!(
+        serde_json::from_slice::<Value>(bytes).expect("json"),
+        json!([{"type":"reasoning.text","text":"ab","index":0,"signature":"sig","format":"f"}])
+    );
+    assert_eq!(capture_display(&artifact), "ab");
+}
+
+#[test]
 fn encrypted_entries_stay_discrete() {
     let capture = capture(&json!([
         {"type":"reasoning.encrypted","data":"AAA","index":0},

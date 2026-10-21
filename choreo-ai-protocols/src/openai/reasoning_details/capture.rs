@@ -343,12 +343,20 @@ impl DetailsStore {
 }
 
 /// Merge `incoming`'s textual payload onto `existing`, carrying over any
-/// metadata field the accumulated entry does not yet have.
+/// metadata field the accumulated entry does not yet state.
 ///
 /// The metadata carry-over is what makes this safe to restrict to same-index
 /// continuations: a `signature` (or `format`/`id`) legitimately arrives in a
 /// later delta of the *same* stream slot, and only then does grafting it onto the
 /// accumulated entry describe one block rather than fuse two.
+///
+/// "Does not yet state" uses the same reading [`is_continuation`] does for an
+/// identity conflict: an absent key, an explicit `null`, and an empty string all
+/// mean the provider has not given the field a value yet. This matters because
+/// `OpenRouter`'s documented stream opens a block with `"signature": null` and
+/// delivers the real signature on a later fragment of the same slot; treating
+/// that `null` as an established value would shadow the signature and replay an
+/// unsigned block.
 fn merge_textual(existing: &mut Value, incoming: &Value, key: &str) {
     let Some(existing_obj) = existing.as_object_mut() else {
         return;
@@ -379,12 +387,20 @@ fn merge_textual(existing: &mut Value, incoming: &Value, key: &str) {
     };
     // `incoming` is a separate value from `existing`, so the incoming pairs can be
     // walked while grafting into the existing map — no intermediate collection is
-    // needed on the per-delta path. Only fields the accumulated entry does not
-    // already have are grafted (a later delta's metadata must not overwrite what
-    // an earlier one established), and the payload key is skipped: its text was
-    // just merged above.
+    // needed on the per-delta path. A field is grafted only when the accumulated
+    // entry does not yet STATE it (absent, `null`, or empty — the same rule
+    // `is_continuation` uses to decide an identity conflict), so a later delta's
+    // real `signature`/`id`/`format` lands on the block instead of being shadowed
+    // by an earlier `null`; a value already stated is never overwritten. The
+    // payload key is skipped: its text was just merged above.
     for (name, value) in incoming_obj {
-        if name != key && !existing_obj.contains_key(name) {
+        if name == key {
+            continue;
+        }
+        let unstated = existing_obj
+            .get(name)
+            .is_none_or(|prior| prior.is_null() || prior.as_str().is_some_and(str::is_empty));
+        if unstated {
             existing_obj.insert(name.clone(), value.clone());
         }
     }
