@@ -1146,11 +1146,14 @@ chain.
 **Which key wins.** The catalog's declared echo field is authoritative and
 outranks the field a payload was *observed* under: `ReasoningArtifact::
 ChatReasoning` records the observation (a hint, used only when the route declares
-nothing) while `ModelEntry::reasoning_echo` states the requirement. On a route
-that declares one, the lowering writes that field on every assistant message —
-the artifact's text when there is something to replay, an empty string (or, for
-the structured field, an empty array) when there is not — so presence and
-destination are one decision in one place. This is why a gateway that streams
+nothing) while `ModelEntry::reasoning_echo` states the requirement. There are
+**two destinations**: a declared scalar field (`reasoning_content`, `reasoning`,
+or `reasoning_text`), written on every assistant message of such a route — the
+artifact's text when there is something to replay, an empty string when there is
+not — or the declared structured `reasoning_details` array. Presence and
+destination are one decision in one place (`choreo-ai-protocols`'
+`openai::wire`, which owns the projection), so they cannot drift apart. This is
+why a gateway that streams
 DeepSeek thinking under `reasoning` while
 rejecting any history without `reasoning_content` cannot starve the required
 field. The artifact never leaves the daemon process — client-bound
@@ -1173,9 +1176,17 @@ entries verbatim (index, format, and signature intact) and rebuilds bare
 Kimi-shaped entries minimally, stripping the stream-only `index` and mirroring
 the summary text as a companion `reasoning_content`. That companion is the one
 deliberate scalar beside the array — the one-channel rule constrains the scalar
-fields, and Kimi-shaped routes expect both. A declaring route with nothing to
-echo emits `reasoning_details: []`; an empty array is a presence marker, not a
-payload, so it never keeps an otherwise-empty assistant message alive.
+fields, and Kimi-shaped routes expect both. A *declared* structured route with
+nothing to echo emits `reasoning_details: []`; an empty array is a presence
+marker, not a payload, so it never keeps an otherwise-empty assistant message
+alive. An **undeclared** route is the mirror image: it only reaches the array
+through the observation, so when the artifact lowers to nothing (corrupt, over
+the cap, or every entry unrecognised) no key is emitted at all — a route never
+gets an injected `reasoning_details: []` it did not ask for. A scalar payload
+reaching a structured route (a catalog or overlay flip changes a model's
+declared field) is replayed as one `reasoning.text` entry rather than discarded,
+the counterpart of deriving display text from a structured payload on a scalar
+route.
 
 **Empty turns never reach the wire.** An assistant turn that produced no visible
 content (blank text counts as none), no tool calls, and no reasoning payload is

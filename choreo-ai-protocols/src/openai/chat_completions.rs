@@ -2579,6 +2579,60 @@ mod tests {
     }
 
     #[test]
+    fn scalar_artifact_on_a_details_route_round_trips_as_a_text_entry() {
+        // The mirror image of `declared_scalar_route_uses_details_display_text`:
+        // a scalar payload observed under `reasoning_content` reaching a route
+        // that declares the structured array is replayed as one
+        // `reasoning.text` entry rather than discarded (a catalog/overlay flip
+        // can put a scalar artifact on a details route).
+        let msg = assistant_with(chat_artifact(
+            ChatReasoningField::ReasoningContent,
+            b"recoverable thought",
+        ));
+        let body = wire(&msg, declared(ChatReasoningField::ReasoningDetails));
+        assert_eq!(
+            body["reasoning_details"],
+            serde_json::json!([{"type":"reasoning.text","text":"recoverable thought"}])
+        );
+        // Exactly one destination: no scalar reasoning key beside the array.
+        for scalar in ["reasoning_content", "reasoning", "reasoning_text"] {
+            assert!(body.get(scalar).is_none(), "{scalar} must stay absent");
+        }
+    }
+
+    #[test]
+    fn undeclared_route_injects_no_empty_details_array_for_an_unreplayable_artifact() {
+        // Nothing is declared, so the destination came only from the
+        // observation: an artifact that lowers to nothing must not materialize a
+        // brand-new `reasoning_details: []` key the route never asked for.
+        let msg = assistant_with(ReasoningArtifact::ChatReasoning {
+            field: ChatReasoningField::ReasoningDetails,
+            bytes: b"not json".to_vec(),
+        });
+        let body = wire(&msg, ChatReasoningEcho::default());
+        assert!(
+            body.get("reasoning_details").is_none(),
+            "an undeclared route must not receive an injected empty array: {body}"
+        );
+        for scalar in ["reasoning_content", "reasoning", "reasoning_text"] {
+            assert!(body.get(scalar).is_none(), "{scalar} must stay absent");
+        }
+    }
+
+    #[test]
+    fn declaring_details_route_still_emits_an_empty_array_for_a_corrupt_artifact() {
+        // A declared structured route keeps its presence marker even when the
+        // persisted payload is unreplayable: the array is `[]`, never absent.
+        let msg = assistant_with(ReasoningArtifact::ChatReasoning {
+            field: ChatReasoningField::ReasoningDetails,
+            bytes: b"not json".to_vec(),
+        });
+        let body = wire(&msg, declared(ChatReasoningField::ReasoningDetails));
+        assert_eq!(body["reasoning_details"], serde_json::json!([]));
+        assert!(body.get("reasoning_content").is_none());
+    }
+
+    #[test]
     fn declared_field_overrides_the_observed_field() {
         // The live-failure shape: the gateway streamed the reasoning under
         // `reasoning` yet rejects any history without `reasoning_content`.

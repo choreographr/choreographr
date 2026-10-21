@@ -630,8 +630,11 @@ and re-emits it per provider rules on the next request:
   replay the OpenRouter `reasoning.*` entries are sent back verbatim (index,
   format, signature intact) while bare Kimi-shaped entries are rebuilt without
   the stream-only `index` and mirrored as a `reasoning_content` companion. A
-  declaring route with nothing to echo sends an empty array, and the payload is
-  capped per turn (dropped and logged rather than failing the request).
+  declared route with nothing to echo sends an empty array, an undeclared route
+  sends no array at all, and a scalar payload that was observed on a structured
+  route is replayed as one `reasoning.text` entry instead of being discarded.
+  The payload is capped per turn (dropped and logged rather than failing the
+  request).
 - **Gemini** — the encrypted thought-step `thoughtSignature` values are sent
   back (the summary text stays display-only).
 - **OpenAI / xAI Responses** — reasoning continuity is chained across user
