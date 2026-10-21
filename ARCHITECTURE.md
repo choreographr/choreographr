@@ -1194,12 +1194,26 @@ delegate those rules to one shared state machine
 (`openai/chat_completions/reasoning_stream.rs`) rather than each reimplementing
 them, which is what keeps the plain prompt path and the tool path displaying
 identically. Capture normalizes the array under a
-documented, deliberately small per-turn byte cap (small because the payload is
-persisted per turn and replayed on every later request of the tool loop, so
-request size grows to
-roughly `turns × cap`), beyond which the payload is dropped and logged rather
-than failing the request — and an overflowed capture then yields no display text
-either, so the session never shows reasoning it cannot replay. Consecutive
+documented, deliberately small per-turn byte cap, beyond which the payload is
+dropped and logged rather than failing the request — and an overflowed capture
+then yields no display text either, so the session never shows reasoning it
+cannot replay. Two bounds work together, because the payload is persisted per
+turn and replayed on *every* later request of the tool loop: the per-turn cap
+limits what one turn may persist, and the request build that lowers the history
+applies a separate per-request budget to the total artifact bytes it replays
+across all assistant messages. The request walks the history **newest-first**:
+the most recent artifact-carrying assistant turn always replays, even when that
+single artifact alone exceeds the budget, and each older turn replays only while
+the bytes already accepted stay within the budget. A turn the budget skips is
+lowered with no artifact but under the same echo policy, so a route that
+requires the key still emits its presence marker (an empty string, or the empty
+details array) and only the payload is lost. Without that second bound a long
+tool loop would build a request body that grows roughly with `turns × cap` until
+the provider rejects it outright: losing an old turn's echo degrades a route
+that requires it, while an oversized body fails the whole turn. The scalar
+artifacts are not capped at capture at all — real thinking can exceed the
+per-turn cap and the DeepSeek/GLM echo requirement needs it replayed — so they
+are bounded by that same request budget rather than by capture. Consecutive
 same-kind text and summary entries merge only when the provider marks them as the
 same stream slot (equal `index`); a missing index is never treated as
 compatible, because merging on absent evidence would fuse two distinct blocks
@@ -2568,7 +2582,9 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
     The field may be the structured `reasoning_details` array: its artifact payload is JSON
     (normalized at capture under a per-turn cap), replayed verbatim for OpenRouter's `reasoning.*`
     entries and rebuilt minimally for bare Kimi-shaped ones, with the Kimi summary text mirrored
-    in `reasoning_content`.
+    in `reasoning_content`. Replay itself is bounded separately, per request, over the artifacts of
+    the whole history (newest always kept, older ones while the total stays within the budget), so
+    the per-turn cap cannot compound into an oversized body.
 
 
 

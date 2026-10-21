@@ -20,6 +20,23 @@ use choreo_proto::{ChatReasoningField, ReasoningArtifact};
 use serde::Serialize;
 use tracing::{debug, warn};
 
+/// Per-request cap on the total reasoning payload replayed across all assistant
+/// messages, in artifact bytes.
+///
+/// The per-turn capture cap bounds one turn's payload, but every earlier turn's
+/// artifact is replayed on every later request of the tool loop, so a long
+/// session's request grows to roughly `turns × per-turn cap`. This budget is
+/// small enough that such a loop cannot build a body the provider rejects:
+/// losing an old turn's reasoning echo degrades a route that requires it (the
+/// message still goes out, with the presence marker and no payload), while an
+/// oversized body would fail the whole turn. Scalar artifacts are not capped at
+/// capture at all — real thinking can exceed the per-turn cap and some routes
+/// demand it replayed — which is the other reason the total needs a bound here.
+///
+/// The **newest** artifact always replays, even when it alone exceeds the
+/// budget, so the immediately preceding turn's echo can never be starved.
+pub const MAX_REQUEST_REASONING_BYTES: usize = 256 * 1024;
+
 /// Every chat-completions reasoning wire key, in the order diagnostics report
 /// them. Shared so a diagnostic cannot drift from the lowering.
 pub const CHAT_REASONING_WIRE_KEYS: [&str; 4] = [
@@ -83,17 +100,33 @@ pub struct ChatWireMessages<'a> {
 /// Only the assistant role is dropped: the history always keeps at least the
 /// user/system turns it was built from, so a request can never end up with an
 /// empty `messages` array.
+///
+/// The reasoning artifacts are also budgeted here rather than per message: the
+/// total replayed across the request is what the provider sees, so a turn whose
+/// artifact the budget skips is lowered with no artifact at all (see
+/// `MAX_REQUEST_REASONING_BYTES`). Per-message projection
+/// ([`chat_wire_message`]) deliberately has no budget — it has no request to
+/// budget.
 #[must_use]
 pub fn chat_wire_messages(
     messages: &[ChatRequestMessage],
     echo: ChatReasoningEcho,
 ) -> ChatWireMessages<'_> {
+    let replays = reasoning_replay_budget(messages);
     let mut kept = Vec::with_capacity(messages.len());
     let mut dropped = 0usize;
-    for message in messages {
+    for (index, message) in messages.iter().enumerate() {
+        // A skipped turn keeps its place in the request and its echo policy; only
+        // the payload is withheld, so a route that requires the key still emits
+        // its presence marker (an empty string, or the empty details array) and
+        // the wire shape stays valid.
+        let artifact = message
+            .reasoning_artifact
+            .as_ref()
+            .filter(|_| replays.get(index).copied().unwrap_or(false));
         let wire = ChatWireMessage {
             message,
-            reasoning: lower_reasoning(message.role, message.reasoning_artifact.as_ref(), echo),
+            reasoning: lower_reasoning(message.role, artifact, echo),
         };
         if wire.is_empty() {
             dropped += 1;
@@ -112,6 +145,53 @@ pub fn chat_wire_messages(
         messages: kept,
         dropped,
     }
+}
+
+/// Decide, per message position, whether that message's reasoning artifact is
+/// replayed under `MAX_REQUEST_REASONING_BYTES`.
+///
+/// The walk is newest-first because the recent echo is the one that matters: the
+/// most recent artifact-carrying assistant message always replays, and every
+/// older one replays only while the bytes already accepted stay at or below the
+/// budget. Non-assistant messages and messages with no artifact consume no
+/// budget, so the decision depends only on the artifacts themselves.
+fn reasoning_replay_budget(messages: &[ChatRequestMessage]) -> Vec<bool> {
+    let mut replays = vec![false; messages.len()];
+    let mut used = 0usize;
+    let mut accepted = false;
+    let mut skipped = 0usize;
+    // The reverse walk pairs each decision slot with its message, so the newest
+    // artifact is considered first and no position has to be indexed.
+    for (replay, message) in replays.iter_mut().zip(messages).rev() {
+        // Only an assistant message carrying a chat artifact replays at all (the
+        // lowering drops reasoning on every other role and on every other
+        // artifact variant), so only those are charged against the budget.
+        let Some(ReasoningArtifact::ChatReasoning { bytes, .. }) = &message.reasoning_artifact
+        else {
+            continue;
+        };
+        if message.role != "assistant" {
+            continue;
+        }
+        if accepted && used > MAX_REQUEST_REASONING_BYTES {
+            skipped += 1;
+            continue;
+        }
+        *replay = true;
+        accepted = true;
+        used = used.saturating_add(bytes.len());
+    }
+    if skipped > 0 {
+        // One line per request, never per turn, and payload-free: the counts are
+        // what a diagnostic needs, the reasoning itself is never logged.
+        warn!(
+            skipped,
+            budget = MAX_REQUEST_REASONING_BYTES,
+            used,
+            "replayed reasoning exceeds the per-request budget; dropping the oldest artifacts"
+        );
+    }
+    replays
 }
 
 /// Lower one message for the chat-completions wire under one route policy.
@@ -440,6 +520,192 @@ impl Serialize for ChatWireMessage<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An artifact whose serialized text starts with `label` and is exactly
+    /// `payload_len` bytes long (the label pads with `x`), so a test can both
+    /// identify an artifact on the wire and size it against the budget.
+    fn artifact(label: &str, payload_len: usize) -> ReasoningArtifact {
+        let mut bytes = label.as_bytes().to_vec();
+        bytes.resize(payload_len.max(label.len()), b'x');
+        ReasoningArtifact::ChatReasoning {
+            field: ChatReasoningField::ReasoningContent,
+            bytes,
+        }
+    }
+
+    /// An assistant message carrying one artifact, with content so the projection
+    /// never drops it (a dropped message would shift the positions under test).
+    fn assistant(label: &str, payload_len: usize) -> ChatRequestMessage {
+        ChatRequestMessage {
+            reasoning_artifact: Some(artifact(label, payload_len)),
+            ..ChatRequestMessage::simple("assistant", "answer".to_string())
+        }
+    }
+
+    fn user() -> ChatRequestMessage {
+        ChatRequestMessage::simple("user", "prompt".to_string())
+    }
+
+    /// A route that names no field and requires none: a skipped artifact leaves
+    /// the message with no reasoning key at all.
+    fn plain_echo() -> ChatReasoningEcho {
+        ChatReasoningEcho {
+            field: None,
+            require_present: false,
+        }
+    }
+
+    /// A route that requires the reasoning key's presence: a skipped artifact
+    /// must still emit the empty presence marker.
+    fn pinned_echo() -> ChatReasoningEcho {
+        ChatReasoningEcho {
+            field: None,
+            require_present: true,
+        }
+    }
+
+    /// The `reasoning_content` payload each kept message carries, in order.
+    fn replayed(wire: &ChatWireMessages<'_>) -> Vec<Option<String>> {
+        wire.messages
+            .iter()
+            .map(|message| {
+                let json = serde_json::to_value(message).expect("serialize");
+                json.get("reasoning_content")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_request_within_budget_replays_every_artifact() {
+        let messages = vec![
+            user(),
+            assistant("alpha:", 1_000),
+            user(),
+            assistant("beta:", 2_000),
+        ];
+        let payloads = replayed(&chat_wire_messages(&messages, plain_echo()));
+        assert_eq!(payloads.len(), 4);
+        assert!(
+            payloads[1]
+                .as_deref()
+                .is_some_and(|text| text.starts_with("alpha:")),
+            "every artifact under the budget replays"
+        );
+        assert!(
+            payloads[3]
+                .as_deref()
+                .is_some_and(|text| text.starts_with("beta:")),
+            "every artifact under the budget replays"
+        );
+        assert!(
+            payloads[1]
+                .as_deref()
+                .is_some_and(|text| text.len() == 1_000)
+                && payloads[3]
+                    .as_deref()
+                    .is_some_and(|text| text.len() == 2_000),
+            "the replayed payload is the artifact itself"
+        );
+    }
+
+    #[test]
+    fn a_request_over_budget_replays_the_newest_artifacts() {
+        // Four artifacts of just over a third of the budget each: the newest three
+        // are accepted before the running total passes the budget, so the oldest
+        // is the one that loses its payload.
+        let each = MAX_REQUEST_REASONING_BYTES / 3 + 1;
+        let messages = vec![
+            assistant("oldest:", each),
+            assistant("second:", each),
+            assistant("third:", each),
+            assistant("newest:", each),
+        ];
+        let payloads = replayed(&chat_wire_messages(&messages, pinned_echo()));
+        // The dropped turn keeps its place on a require-present route, carrying the
+        // empty presence marker rather than omitting the key.
+        assert_eq!(payloads[0], Some(String::new()));
+        for (index, label) in [(1, "second:"), (2, "third:"), (3, "newest:")] {
+            assert!(
+                payloads[index]
+                    .as_deref()
+                    .is_some_and(|text| text.starts_with(label)),
+                "message {index} should still replay its artifact"
+            );
+        }
+    }
+
+    #[test]
+    fn the_newest_artifact_replays_even_when_it_alone_exceeds_the_budget() {
+        let messages = vec![
+            assistant("old:", 10),
+            assistant("huge:", MAX_REQUEST_REASONING_BYTES + 1),
+        ];
+        let payloads = replayed(&chat_wire_messages(&messages, plain_echo()));
+        assert_eq!(
+            payloads[0], None,
+            "the older artifact is dropped once the newest has spent the budget"
+        );
+        assert!(
+            payloads[1]
+                .as_deref()
+                .is_some_and(|text| text.starts_with("huge:")),
+            "the newest artifact replays even alone over budget"
+        );
+    }
+
+    #[test]
+    fn artifact_free_messages_consume_no_budget() {
+        // The same four over-budget artifacts as above, but with artifact-free user
+        // turns and one artifact-free assistant turn interleaved: neither consumes
+        // budget, so exactly the same artifacts replay.
+        let each = MAX_REQUEST_REASONING_BYTES / 3 + 1;
+        let bare_assistant = ChatRequestMessage::simple("assistant", "no artifact".to_string());
+        let messages = vec![
+            user(),
+            user(),
+            assistant("oldest:", each),
+            user(),
+            bare_assistant,
+            assistant("second:", each),
+            user(),
+            assistant("third:", each),
+            user(),
+            user(),
+            assistant("newest:", each),
+            user(),
+        ];
+        let carrying: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.reasoning_artifact.is_some())
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(carrying.len(), 4, "four turns carry an artifact");
+        let payloads = replayed(&chat_wire_messages(&messages, plain_echo()));
+        // Nothing is dropped (every message has content), so positions line up.
+        assert_eq!(payloads.len(), messages.len());
+        assert_eq!(
+            payloads[carrying[0]], None,
+            "the oldest artifact is still the one dropped"
+        );
+        for (label, index) in ["second:", "third:", "newest:"]
+            .into_iter()
+            .zip(&carrying[1..])
+        {
+            assert!(
+                payloads[*index]
+                    .as_deref()
+                    .is_some_and(|text| text.starts_with(label)),
+                "message {index} should still replay its artifact"
+            );
+        }
+        assert_eq!(
+            payloads[4], None,
+            "an artifact-free assistant turn carries no reasoning key"
+        );
+    }
 
     #[test]
     fn presence_pin_without_a_destination_emits_an_empty_key() {

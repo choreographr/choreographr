@@ -204,12 +204,11 @@ impl DetailsCapture {
     /// is kept verbatim and yields no fragment; an entry with no `type` at all is
     /// not an entry and is dropped.
     pub(crate) fn push(&mut self, raw: &Value, on_fragment: &mut impl FnMut(&str)) {
-        // `decoded` holds the value when a double-encoded string had to be
-        // parsed, so its borrow outlives the entry slice below.
+        // A double-encoded string is parsed once and then treated exactly like the
+        // array/object it decodes to; `decoded` keeps the parsed value alive for
+        // the shape dispatch below.
         let decoded;
-        let entries: &[Value] = match raw {
-            Value::Array(entries) => entries,
-            Value::Object(_) => std::slice::from_ref(raw),
+        let raw = match raw {
             Value::String(text) => match serde_json::from_str::<Value>(text) {
                 Ok(value) if value.is_array() || value.is_object() => {
                     debug!(
@@ -218,11 +217,7 @@ impl DetailsCapture {
                          folding the decoded value"
                     );
                     decoded = value;
-                    if let Value::Array(entries) = &decoded {
-                        entries
-                    } else {
-                        std::slice::from_ref(&decoded)
-                    }
+                    &decoded
                 }
                 _ => {
                     warn!(
@@ -233,66 +228,80 @@ impl DetailsCapture {
                     return;
                 }
             },
-            other => {
-                warn!(
-                    kind = json_kind(other),
-                    "ignoring a reasoning_details value that is not an array or object"
-                );
-                return;
-            }
+            other => other,
         };
-        for entry in entries {
-            // A typeless object is not a reasoning entry at all; keeping it would
-            // replay a value the provider never described. Log the shape (never
-            // the contents) so a malformed stream is still diagnosable.
-            if entry.get("type").and_then(Value::as_str).is_none() {
-                warn!(
-                    field_count = entry.as_object().map_or(0, Map::len),
-                    "dropping a reasoning_details entry with no type tag"
-                );
-                continue;
-            }
-            self.bytes = self.bytes.saturating_add(serialized_len(entry));
-            if self.bytes > MAX_REASONING_DETAILS_BYTES {
-                if !self.overflowed {
-                    warn!(
-                        limit = MAX_REASONING_DETAILS_BYTES,
-                        "reasoning_details payload exceeds the per-turn cap; dropping it"
-                    );
+        match raw {
+            Value::Array(entries) => {
+                for entry in entries {
+                    self.push_entry(entry, on_fragment);
                 }
-                self.overflowed = true;
-                continue;
             }
-            let Some(kind) = classify(entry) else {
-                // The catalog does not model this `type`, but the upstream
-                // requires the sequence it sent to come back unchanged — so it
-                // is stored exactly as it arrived and only display ignores it.
-                debug!(
-                    field_count = entry.as_object().map_or(0, Map::len),
-                    "keeping an unrecognised reasoning_details entry verbatim"
-                );
-                self.entries.push(entry.clone());
-                continue;
-            };
-            if kind.is_textual()
-                && let Some(fragment) = entry
-                    .get(kind.payload_key())
-                    .and_then(Value::as_str)
-                    .filter(|fragment| !fragment.is_empty())
-            {
-                on_fragment(fragment);
-            }
-            if kind.is_textual()
-                && let Some(last) = self
-                    .entries
-                    .last_mut()
-                    .filter(|last| classify(last) == Some(kind) && is_continuation(last, entry))
-            {
-                merge_textual(last, entry, kind.payload_key());
-                continue;
-            }
-            self.entries.push(entry.clone());
+            // A single entry object is the same tolerance one level down.
+            Value::Object(_) => self.push_entry(raw, on_fragment),
+            other => warn!(
+                kind = json_kind(other),
+                "ignoring a reasoning_details value that is not an array or object"
+            ),
         }
+    }
+
+    /// Fold one entry into the capture (see [`push`](Self::push)).
+    ///
+    /// Split out so both incoming shapes — a streamed array and a lone entry
+    /// object — reach the same per-entry rules without first unifying them into a
+    /// collection: a delta is on the hot path of every streamed chunk, so the
+    /// shape dispatch allocates nothing.
+    fn push_entry(&mut self, entry: &Value, on_fragment: &mut impl FnMut(&str)) {
+        // A typeless object is not a reasoning entry at all; keeping it would
+        // replay a value the provider never described. Log the shape (never
+        // the contents) so a malformed stream is still diagnosable.
+        if entry.get("type").and_then(Value::as_str).is_none() {
+            warn!(
+                field_count = entry.as_object().map_or(0, Map::len),
+                "dropping a reasoning_details entry with no type tag"
+            );
+            return;
+        }
+        self.bytes = self.bytes.saturating_add(serialized_len(entry));
+        if self.bytes > MAX_REASONING_DETAILS_BYTES {
+            if !self.overflowed {
+                warn!(
+                    limit = MAX_REASONING_DETAILS_BYTES,
+                    "reasoning_details payload exceeds the per-turn cap; dropping it"
+                );
+            }
+            self.overflowed = true;
+            return;
+        }
+        let Some(kind) = classify(entry) else {
+            // The catalog does not model this `type`, but the upstream
+            // requires the sequence it sent to come back unchanged — so it
+            // is stored exactly as it arrived and only display ignores it.
+            debug!(
+                field_count = entry.as_object().map_or(0, Map::len),
+                "keeping an unrecognised reasoning_details entry verbatim"
+            );
+            self.entries.push(entry.clone());
+            return;
+        };
+        if kind.is_textual()
+            && let Some(fragment) = entry
+                .get(kind.payload_key())
+                .and_then(Value::as_str)
+                .filter(|fragment| !fragment.is_empty())
+        {
+            on_fragment(fragment);
+        }
+        if kind.is_textual()
+            && let Some(last) = self
+                .entries
+                .last_mut()
+                .filter(|last| classify(last) == Some(kind) && is_continuation(last, entry))
+        {
+            merge_textual(last, entry, kind.payload_key());
+            return;
+        }
+        self.entries.push(entry.clone());
     }
 
     /// Whether the capture holds at least one entry.
@@ -367,21 +376,36 @@ fn merge_textual(existing: &mut Value, incoming: &Value, key: &str) {
         .get(key)
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let merged = existing_obj.get(key).and_then(Value::as_str).map_or_else(
-        || fragment.to_string(),
-        |prior| format!("{prior}{fragment}"),
-    );
-    existing_obj.insert(key.to_string(), Value::String(merged));
+    // Append in place: a block arrives as many deltas, so rebuilding
+    // `format!("{prior}{fragment}")` would copy the whole accumulated block once
+    // per fragment (a 30 KiB block in ~500 deltas copies megabytes). `get_mut`'s
+    // else arm cannot touch the same map — the borrow the match holds is still
+    // live there — so the non-string shapes only record that they need the
+    // replace/insert afterwards: an existing non-string payload is replaced by
+    // the fragment, and a missing payload is inserted as the fragment.
+    let appended = match existing_obj.get_mut(key) {
+        Some(Value::String(prior)) => {
+            prior.push_str(fragment);
+            true
+        }
+        _ => false,
+    };
+    if !appended {
+        existing_obj.insert(key.to_string(), Value::String(fragment.to_string()));
+    }
     let Some(incoming_obj) = incoming.as_object() else {
         return;
     };
-    let missing: Vec<(String, Value)> = incoming_obj
-        .iter()
-        .filter(|(name, _)| name.as_str() != key && !existing_obj.contains_key(name.as_str()))
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect();
-    for (name, value) in missing {
-        existing_obj.insert(name, value);
+    // `incoming` is a separate value from `existing`, so the incoming pairs can be
+    // walked while grafting into the existing map — no intermediate collection is
+    // needed on the per-delta path. Only fields the accumulated entry does not
+    // already have are grafted (a later delta's metadata must not overwrite what
+    // an earlier one established), and the payload key is skipped: its text was
+    // just merged above.
+    for (name, value) in incoming_obj {
+        if name != key && !existing_obj.contains_key(name) {
+            existing_obj.insert(name.clone(), value.clone());
+        }
     }
 }
 

@@ -652,9 +652,13 @@ and re-emits it per provider rules on the next request:
   invented; the array is a destination, not a presence requirement), while a
   scalar payload that was observed on a structured route is replayed as one
   `reasoning.text` entry instead of being discarded. The payload is capped per
-  turn, small because it is replayed
-  on every later request of the tool loop (dropped and logged rather than failing
-  the request).
+  turn, small because it is replayed on every later request of the tool loop
+  (dropped and logged rather than failing the request), and the total replayed
+  across a request is bounded separately: the history is walked newest-first, the
+  most recent turn's artifact always replays, and each older one replays only
+  while the accepted bytes stay within the request budget. A turn over budget
+  still goes out under the route's echo rules with the key present and its
+  payload dropped, so a long tool loop never builds a body the provider rejects.
 - **Gemini** — the encrypted thought-step `thoughtSignature` values are sent
   back (the summary text stays display-only).
 - **OpenAI / xAI Responses** — reasoning continuity is chained across user
