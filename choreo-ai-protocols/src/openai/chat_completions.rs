@@ -5,18 +5,23 @@ use super::retry;
 use super::{
     ChatRequestMessage, ChatToolDefinition, SseReader, endpoint_url, validate_tool_call_arguments,
 };
-use crate::shared::{MAX_TOOL_CALLS, RequestAuth};
+use crate::shared::RequestAuth;
 use crate::types::{
     ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
 };
 use choreo_proto::{ChatReasoningField, ReasoningArtifact, TokenUsage};
-use std::collections::HashMap;
 use std::io;
 
 use super::reasoning_details::DetailsCapture;
 
+mod accumulator;
 mod reasoning_stream;
 
+use accumulator::ChatCompletionsStreamAccumulator;
+#[cfg(test)]
+// The sibling test suite exercises the delta merger on its own, so it is in
+// scope here (the request path only reaches it through the accumulator).
+use accumulator::accumulate_tool_calls_from_deltas;
 use reasoning_stream::ReasoningStreamState;
 
 // ── Chat Completions wire types ──────────────────────────────────────────
@@ -667,260 +672,6 @@ where
     }
 
     Ok(())
-}
-
-// ── Chat Completions tool call accumulation ─────────────────────────────
-
-/// Accumulates tool call fields across streaming SSE chunks keyed by the
-/// tool call index assigned by the API.
-#[derive(Debug, Default)]
-struct AccumulatingToolCall {
-    id: Option<String>,
-    name: Option<String>,
-    arguments: String,
-}
-
-/// Accumulate tool call deltas from streaming SSE chunks into ordered tool
-/// calls.  Deltas with the same index are combined — `id` and `name` are taken
-/// from the last chunk that carries them, and `arguments` is concatenated.
-pub(crate) fn accumulate_tool_calls_from_deltas(
-    deltas: impl IntoIterator<Item = StreamToolCallDelta>,
-) -> Vec<ChatToolCall> {
-    let mut map: HashMap<u32, AccumulatingToolCall> = HashMap::new();
-    for tc_delta in deltas {
-        let entry = map.entry(tc_delta.index).or_default();
-        if let Some(id) = tc_delta.id {
-            entry.id = Some(id);
-        }
-        if let Some(func) = tc_delta.function {
-            if let Some(name) = func.name {
-                entry.name = Some(name);
-            }
-            if let Some(args) = func.arguments {
-                entry.arguments.push_str(&args);
-            }
-        }
-    }
-    let mut calls: Vec<_> = map.into_iter().collect();
-    calls.sort_by_key(|(idx, _)| *idx);
-    calls
-        .into_iter()
-        .map(|(_, tc)| ChatToolCall {
-            id: tc.id.unwrap_or_default(),
-            name: tc.name.unwrap_or_default(),
-            arguments_json: tc.arguments,
-            caller: None,
-        })
-        .collect()
-}
-
-// ── Streaming chat completions with tools ───────────────────────────────
-
-/// Mutable state accumulated across streamed chat-completions chunks.
-///
-/// Extracted from the streaming request loop so the parse→accumulate→turn
-/// pipeline is unit-testable without an HTTP connection (mirrors the
-/// `accumulate_tool_calls_from_deltas` helper above).
-#[derive(Debug)]
-struct ChatCompletionsStreamAccumulator {
-    has_any_output: bool,
-    full_content: String,
-    /// The turn's streaming reasoning: both capture channels, the locked scalar
-    /// field, and the channel that owns the live display (see
-    /// [`ReasoningStreamState`]).
-    reasoning: ReasoningStreamState,
-    /// Raw tool call deltas across all chunks, merged by index by
-    /// `accumulate_tool_calls_from_deltas` once the stream is fully consumed.
-    raw_tool_call_deltas: Vec<StreamToolCallDelta>,
-    seen_tool_call_indices: [bool; MAX_TOOL_CALLS],
-    distinct_tool_call_count: usize,
-    /// Usage from the final SSE chunk (`OpenAI` sends a usage chunk with
-    /// choices: [] when `stream_options.include_usage` is true).
-    last_usage: Option<TokenUsage>,
-    /// Finish reason from the final SSE chunk (last non-None wins — the
-    /// provider sends it exactly once, but tolerate repeats defensively).
-    finish_reason: Option<FinishReason>,
-}
-
-impl Default for ChatCompletionsStreamAccumulator {
-    fn default() -> Self {
-        // Manual impl: std implements `Default` only for arrays up to `[T; 32]`
-        // (const-generic array Default was never stabilized), so `[bool;
-        // MAX_TOOL_CALLS]` (128) cannot be derived.
-        Self {
-            has_any_output: false,
-            full_content: String::new(),
-            reasoning: ReasoningStreamState::default(),
-            raw_tool_call_deltas: Vec::new(),
-            seen_tool_call_indices: [false; MAX_TOOL_CALLS],
-            distinct_tool_call_count: 0,
-            last_usage: None,
-            finish_reason: None,
-        }
-    }
-}
-
-impl ChatCompletionsStreamAccumulator {
-    /// Fold one streamed chunk into the accumulated state, forwarding
-    /// content/reasoning deltas to `on_event` immediately so subscribers
-    /// see them in real time.
-    fn apply(
-        &mut self,
-        payload: &ChatCompletionsStreamResponse,
-        on_event: &mut impl FnMut(StreamEvent) -> io::Result<()>,
-    ) -> Result<(), super::OpenAiError> {
-        // Capture usage from the final chunk (choices: []).
-        if let Some(ref u) = payload.usage {
-            let cached_tokens = u
-                .prompt_tokens_details
-                .as_ref()
-                .map_or(0, |d| d.cached_tokens);
-            debug!(
-                prompt_tokens = u.prompt_tokens,
-                completion_tokens = u.completion_tokens,
-                total_tokens = u.total_tokens,
-                cached_tokens,
-                "OpenAI streaming turn usage"
-            );
-            let usage = TokenUsage {
-                input_tokens: u.prompt_tokens,
-                output_tokens: u.completion_tokens,
-                total_tokens: u.total_tokens,
-                cached_tokens,
-                cache_write_tokens: 0,
-            };
-            self.last_usage = Some(usage);
-        }
-
-        for choice in &payload.choices {
-            // Capture the finish reason (arrives on the final chunk).
-            if choice.finish_reason.is_some() {
-                self.finish_reason.clone_from(&choice.finish_reason);
-            }
-            let Some(delta) = &choice.delta else {
-                continue;
-            };
-
-            // Content chunks: answer text
-            if let Some(content) = delta.content.as_ref().filter(|c| !c.is_empty()) {
-                self.has_any_output = true;
-                self.full_content.push_str(content);
-                on_event(StreamEvent::Answer(content.clone()))?;
-            }
-
-            // Both reasoning channels fold through one shared state machine,
-            // which owns the display-claim rule and the capture of the other
-            // channel. It reports whether the delta carried reasoning output at
-            // all, including an encrypted-only details entry (which is model
-            // output even though it never displays).
-            self.has_any_output |= self.reasoning.apply(delta, on_event)?;
-            // Collect raw tool call deltas — the shared accumulator
-            // (accumulate_tool_calls_from_deltas) will merge them by index
-            // and produce sorted ChatToolCall output after the stream ends.
-            if let Some(ref tcs) = delta.tool_calls {
-                self.has_any_output = true;
-                for tc in tcs {
-                    if self.distinct_tool_call_count >= MAX_TOOL_CALLS {
-                        return Err(super::OpenAiError::Io(io::Error::other(format!(
-                            "too many tool calls (max {MAX_TOOL_CALLS})"
-                        ))));
-                    }
-                    if (tc.index as usize) >= MAX_TOOL_CALLS {
-                        return Err(super::OpenAiError::Io(io::Error::other(format!(
-                            "tool call index {} out of bounds (max {})",
-                            tc.index,
-                            MAX_TOOL_CALLS - 1,
-                        ))));
-                    }
-                    // The bounds check above guarantees `tc.index` is within
-                    // the fixed-size array, so this lookup always succeeds;
-                    // the None arm is unreachable.
-                    if let Some(seen) = self.seen_tool_call_indices.get_mut(tc.index as usize)
-                        && !*seen
-                    {
-                        *seen = true;
-                        self.distinct_tool_call_count += 1;
-                    }
-                    self.raw_tool_call_deltas.push(tc.clone());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Finalize the accumulated stream into a turn result, attaching the
-    /// `ChatReasoning` artifact captured from the accumulated reasoning
-    /// deltas (the concatenated deltas of the locked-in field are the
-    /// provider's raw reasoning value, echoed verbatim — to the same field —
-    /// on tool-loop turns).
-    fn into_turn_result(self) -> Result<ChatTurnResult, super::OpenAiError> {
-        // A declared terminal finish reason wins over the accumulated body:
-        // z.ai's `sensitive` streams no content, which would otherwise fall
-        // through to the (retryable-looking) EmptyResponse error.
-        if let Some(err) = finish_reason_terminal_error(self.finish_reason.as_ref()) {
-            return Err(err);
-        }
-        if !self.has_any_output {
-            return Err(super::OpenAiError::EmptyResponse);
-        }
-        // `length` on a FINAL-TEXT turn is a truncation notice, not an error;
-        // only the FinalText paths below carry the flag.
-        let truncated = matches!(self.finish_reason, Some(FinishReason::Length));
-
-        // The state machine's finish applies the persisted precedence: a captured
-        // structured details payload outranks the scalar text as the artifact (it
-        // is the richer payload the route replays), and the scalar text supplies
-        // the display unless it is empty, in which case the details-derived text
-        // stands in.
-        let (display_reasoning, reasoning_artifact) = self.reasoning.finish();
-
-        if !self.raw_tool_call_deltas.is_empty() {
-            let mut tool_calls = accumulate_tool_calls_from_deltas(self.raw_tool_call_deltas);
-            let discarded = validate_tool_call_arguments(&mut tool_calls);
-            if !tool_calls.is_empty() {
-                return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
-                    content: if self.full_content.is_empty() {
-                        None
-                    } else {
-                        Some(self.full_content)
-                    },
-                    tool_calls,
-                    reasoning: display_reasoning.clone(),
-                    usage: self.last_usage,
-                    response_id: None,
-                    reasoning_artifact,
-                }));
-            }
-            if !discarded.is_empty() {
-                // Every accumulated tool call had invalid (truncated)
-                // arguments. If the model also streamed visible text, return it
-                // (the tool call is the casualty, not the answer); otherwise
-                // surface `TruncatedToolCall` so the daemon can recover instead
-                // of rendering an empty, truncated-looking final answer. Same
-                // invariant and shape as the non-streaming path above.
-                if self.full_content.is_empty() {
-                    return Err(super::OpenAiError::TruncatedToolCall { discarded });
-                }
-                return Ok(ChatTurnResult::FinalText(FinalTextResult {
-                    content: self.full_content,
-                    truncated,
-                    reasoning: display_reasoning.clone(),
-                    usage: self.last_usage,
-                    response_id: None,
-                    reasoning_artifact,
-                }));
-            }
-        }
-
-        Ok(ChatTurnResult::FinalText(FinalTextResult {
-            content: self.full_content,
-            truncated,
-            reasoning: display_reasoning,
-            usage: self.last_usage,
-            response_id: None,
-            reasoning_artifact,
-        }))
-    }
 }
 
 /// Streaming variant of `chat_completions_request_with_tools`.
