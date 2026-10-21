@@ -37,14 +37,11 @@ use tracing::{debug, warn};
 /// budget, so the immediately preceding turn's echo can never be starved.
 pub(crate) const MAX_REQUEST_REASONING_BYTES: usize = 256 * 1024;
 
-/// Every chat-completions reasoning wire key, in the order diagnostics report
-/// them. Shared so a diagnostic cannot drift from the lowering.
-pub const CHAT_REASONING_WIRE_KEYS: [&str; 4] = [
-    "reasoning_content",
-    "reasoning",
-    "reasoning_text",
-    "reasoning_details",
-];
+/// Every chat-completions reasoning wire key, in
+/// [`ChatReasoningField::ALL`] order — re-exported from [`choreo_proto`], where
+/// it sits beside the field-to-key mapping so a diagnostic, the lowering, and
+/// the catalog parser cannot spell one key two ways.
+pub use choreo_proto::CHAT_REASONING_WIRE_KEYS;
 
 /// One `OpenAI` Chat Completions wire message: a [`ChatRequestMessage`] lowered
 /// under one route's [`ChatReasoningEcho`] policy.
@@ -251,24 +248,6 @@ fn payload_is_empty(
     !has_content && !has_tool_calls && !has_images && !has_reasoning
 }
 
-/// The wire key for one chat reasoning field.
-///
-/// [`ChatReasoningField::ReasoningDetails`] maps to the structured
-/// `reasoning_details` array; it is never used as a scalar key (see
-/// [`WireReasoning`]). This is the lowering's own mapping — a new
-/// `ChatReasoningField` variant is deliberately a two-place edit, because
-/// [`CHAT_REASONING_WIRE_KEYS`] (what diagnostics scan for) must list the same
-/// keys.
-#[must_use]
-fn reasoning_wire_key(field: ChatReasoningField) -> &'static str {
-    match field {
-        ChatReasoningField::ReasoningContent => "reasoning_content",
-        ChatReasoningField::Reasoning => "reasoning",
-        ChatReasoningField::ReasoningText => "reasoning_text",
-        ChatReasoningField::ReasoningDetails => "reasoning_details",
-    }
-}
-
 /// How one assistant message re-emits its reasoning on the chat wire.
 ///
 /// Two shapes, never mixed: a scalar field (`reasoning_content`, `reasoning`,
@@ -387,7 +366,10 @@ fn lower_reasoning(
         }
     }
     if let Some(value) = scalar_text {
-        let key = reasoning_wire_key(destination.unwrap_or(ChatReasoningField::ReasoningContent));
+        // The mapping lives on the field, so every layer spells a key the same way.
+        let key = destination
+            .unwrap_or(ChatReasoningField::ReasoningContent)
+            .wire_name();
         debug!(
             field = ?destination,
             declared = echo.field.is_some(),
@@ -401,7 +383,10 @@ fn lower_reasoning(
     // `reasoning_content` is the chat-completions default when the policy
     // names no field of its own.
     echo.require_present.then(|| WireReasoning::Scalar {
-        key: reasoning_wire_key(echo.field.unwrap_or(ChatReasoningField::ReasoningContent)),
+        key: echo
+            .field
+            .unwrap_or(ChatReasoningField::ReasoningContent)
+            .wire_name(),
         value: String::new(),
     })
 }

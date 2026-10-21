@@ -1327,3 +1327,24 @@ fn mcp_summary_renders_the_auth_label() {
     );
     assert_eq!(McpAuthState::NotLoggedIn.label(), "not signed in");
 }
+
+#[test]
+fn every_chat_reasoning_field_has_one_wire_name_in_the_shared_list() {
+    // The wire name is the single mapping the catalog parser, the chat
+    // lowering, and diagnostics all read, so the list a diagnostic scans and
+    // the variants that exist must agree exactly — a new variant that forgets
+    // the list (or a renamed key) fails here rather than at a provider.
+    assert_eq!(
+        ChatReasoningField::ALL.map(ChatReasoningField::wire_name),
+        CHAT_REASONING_WIRE_KEYS,
+        "CHAT_REASONING_WIRE_KEYS must mirror ChatReasoningField::ALL"
+    );
+    for field in ChatReasoningField::ALL {
+        assert_eq!(
+            ChatReasoningField::from_wire_name(field.wire_name()),
+            Some(field),
+            "a wire name must round-trip back to its field"
+        );
+    }
+    assert_eq!(ChatReasoningField::from_wire_name("vendor_reasoning"), None);
+}

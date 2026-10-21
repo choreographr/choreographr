@@ -249,15 +249,11 @@ fn blank_scalar_text_is_not_a_details_entry() {
 
 #[test]
 fn wire_keys_cover_every_field_variant() {
-    for field in [
-        ChatReasoningField::ReasoningContent,
-        ChatReasoningField::Reasoning,
-        ChatReasoningField::ReasoningText,
-        ChatReasoningField::ReasoningDetails,
-    ] {
-        assert!(
-            CHAT_REASONING_WIRE_KEYS.contains(&reasoning_wire_key(field)),
-            "every field variant's key must be listed"
-        );
-    }
+    // The shared list is what diagnostics scan for, so it must cover every
+    // variant's own wire name (the mapping itself lives on the field).
+    assert_eq!(
+        ChatReasoningField::ALL.map(ChatReasoningField::wire_name),
+        CHAT_REASONING_WIRE_KEYS,
+        "every field variant's key must be listed, in ALL order"
+    );
 }

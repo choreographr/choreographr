@@ -194,29 +194,26 @@ impl RawInterleaved {
 
 /// Map a models.dev `interleaved` field name onto the catalog's echo field.
 ///
-/// The four chat fields this catalog can replay are facts: the three scalar
-/// fields (`reasoning_content`, `reasoning`, `reasoning_text`) and the structured
-/// `reasoning_details` array. The snapshot schema itself only permits
-/// `reasoning_content` and `reasoning_details`
-/// ([schema](https://github.com/anomalyco/models.dev/blob/dev/packages/core/src/schema.ts));
-/// the two scalar aliases are accepted alongside them because an overlay can
-/// pin either. Any unknown name is deliberately "no fact" rather
-/// than a guess: an unrecognised name is a snapshot vocabulary this catalog
-/// does not model, and guessing would be unauditable — the requirement decides
-/// which wire key every assistant message carries, so an unknown name must
-/// degrade to "no declared field" (and an upstream 400) rather than to a silent
-/// wrong key.
+/// The chat fields this catalog can replay are facts, and the mapping lives on
+/// [`ChatReasoningField::from_wire_name`] so the snapshot parser, the overlay,
+/// the chat lowering and diagnostics all spell a key the same way. The snapshot
+/// schema itself only permits `reasoning_content` and `reasoning_details`
+/// ([schema](https://github.com/anomalyco/models.dev/blob/dev/packages/core/src/schema.ts)).
+///
+/// An unknown name is deliberately "no fact" rather than a guess: it is a
+/// snapshot vocabulary this catalog does not model, and guessing would be
+/// unauditable — the requirement decides which wire key every assistant message
+/// carries, so an unknown name must degrade to "no declared field" (and an
+/// upstream 400) rather than to a silent wrong key.
 fn echo_field(name: &str) -> Option<ChatReasoningField> {
-    match name {
-        "reasoning_content" => Some(ChatReasoningField::ReasoningContent),
-        "reasoning" => Some(ChatReasoningField::Reasoning),
-        "reasoning_text" => Some(ChatReasoningField::ReasoningText),
-        "reasoning_details" => Some(ChatReasoningField::ReasoningDetails),
-        other => {
-            debug!(interleaved_field = %other, "models.dev interleaved field is not a chat echo fact; ignoring");
-            None
-        }
+    let field = ChatReasoningField::from_wire_name(name);
+    if field.is_none() {
+        debug!(
+            interleaved_field = %name,
+            "models.dev interleaved field is not a chat echo fact; ignoring"
+        );
     }
+    field
 }
 
 /// Normalize a models.dev snapshot document into the base provider catalog.

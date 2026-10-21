@@ -136,6 +136,56 @@ pub enum ChatReasoningField {
     ReasoningDetails,
 }
 
+/// Every chat-completions reasoning wire key, in [`ChatReasoningField::ALL`]
+/// order.
+///
+/// The canonical list a diagnostic scans for when it checks which reasoning
+/// keys an assistant message carries; [`ChatReasoningField::wire_name`] is the
+/// mapping it mirrors (a test holds the two together, so a new variant cannot
+/// leave the list stale).
+pub const CHAT_REASONING_WIRE_KEYS: [&str; 4] = [
+    "reasoning_content",
+    "reasoning",
+    "reasoning_text",
+    "reasoning_details",
+];
+
+impl ChatReasoningField {
+    /// Every variant, in [`CHAT_REASONING_WIRE_KEYS`] order.
+    pub const ALL: [Self; 4] = [
+        Self::ReasoningContent,
+        Self::Reasoning,
+        Self::ReasoningText,
+        Self::ReasoningDetails,
+    ];
+
+    /// The wire key this field names.
+    ///
+    /// The one mapping every layer reads: the catalog parses a snapshot's field
+    /// name with [`from_wire_name`](Self::from_wire_name), the chat lowering
+    /// writes [`wire_name`](Self::wire_name) to the request, and diagnostics
+    /// name the key the same way. Keeping the pair here is what stops a new
+    /// variant from being spelled differently in two places.
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::ReasoningContent => "reasoning_content",
+            Self::Reasoning => "reasoning",
+            Self::ReasoningText => "reasoning_text",
+            Self::ReasoningDetails => "reasoning_details",
+        }
+    }
+
+    /// The field a wire key names, or `None` for a key this catalog does not
+    /// model.
+    #[must_use]
+    pub fn from_wire_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|field| field.wire_name() == name)
+    }
+}
+
 /// Opaque reasoning round-trip payload, captured verbatim by a provider
 /// adapter and re-emitted verbatim on the next request. Only the producing
 /// adapter may interpret the payload. Display text lives separately in

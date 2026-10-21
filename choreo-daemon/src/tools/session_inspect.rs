@@ -658,12 +658,9 @@ fn fmt_artifact(artifact: &ReasoningArtifact) -> String {
 }
 
 fn fmt_field(field: ChatReasoningField) -> &'static str {
-    match field {
-        ChatReasoningField::ReasoningContent => "reasoning_content",
-        ChatReasoningField::Reasoning => "reasoning",
-        ChatReasoningField::ReasoningText => "reasoning_text",
-        ChatReasoningField::ReasoningDetails => "reasoning_details",
-    }
+    // The wire key comes from the field itself, so the ledger names exactly the
+    // key the lowering writes (and the keys `CHAT_REASONING_WIRE_KEYS` scans).
+    field.wire_name()
 }
 
 /// Message-text previews are scope-gated: empty unless the report is for the

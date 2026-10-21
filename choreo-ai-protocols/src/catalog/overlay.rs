@@ -550,17 +550,14 @@ fn parse_passback(value: &str) -> Option<ReasoningPassback> {
 }
 
 /// Convert an overlay `reasoning_echo_field` value into the chat field the
-/// route must carry. The three scalar fields plus the structured
-/// `reasoning_details` array are accepted; anything else is rejected so a typo
-/// cannot silently select a wrong wire key.
+/// route must carry.
+///
+/// The mapping is [`ChatReasoningField::from_wire_name`] — the same one the
+/// snapshot parser and the chat lowering use — so an overlay cannot select a
+/// key the adapter would spell differently. Anything it does not model is
+/// rejected, so a typo cannot silently select a wrong wire key.
 fn parse_echo_field(value: &str) -> Option<ChatReasoningField> {
-    match value {
-        "reasoning_content" => Some(ChatReasoningField::ReasoningContent),
-        "reasoning" => Some(ChatReasoningField::Reasoning),
-        "reasoning_text" => Some(ChatReasoningField::ReasoningText),
-        "reasoning_details" => Some(ChatReasoningField::ReasoningDetails),
-        _ => None,
-    }
+    ChatReasoningField::from_wire_name(value)
 }
 
 /// Convert a TOML array of strings into a `Vec<String>` (silently dropping
