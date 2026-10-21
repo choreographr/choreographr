@@ -673,14 +673,16 @@ fn unknown_details_type_is_replayed_verbatim() {
     assert_eq!(assistant["reasoning_details"], entries);
 }
 
-/// A details-declaring route injects `reasoning_details: []` on an assistant
-/// message with nothing to echo, and an empty assistant message is still dropped
-/// (`[]` is a presence marker, not a payload).
+/// A details-declaring route is a DESTINATION fact, not a presence
+/// requirement: an assistant message with nothing to echo carries no reasoning
+/// key at all, and a wholly empty assistant message is still dropped from the
+/// projection.
 #[ignore = "integration"]
 #[test]
-fn empty_details_is_present_but_does_not_keep_an_empty_message_alive() {
+fn empty_details_route_invents_no_reasoning_key_and_drops_the_empty_message() {
     let mut session = SessionState::empty();
-    // Turn 1: a tool turn with no reasoning at all — must carry `[]`.
+    // Turn 1: a tool turn with no reasoning at all — surviving on its own
+    // content, so it must carry no invented reasoning key.
     let (tid, _) = session.start_turn(Some("first".to_string()));
     session.set_assistant_response(
         tid,
@@ -725,13 +727,25 @@ fn empty_details_is_present_but_does_not_keep_an_empty_message_alive() {
         1,
         "the empty assistant turn must be dropped: {body}"
     );
-    assert_eq!(assistants[0]["reasoning_details"], serde_json::json!([]));
-    assert!(assistants[0].get("reasoning_content").is_none());
+    // The surviving tool turn carries no reasoning key: the route declares the
+    // array as a destination only, so nothing is invented for it.
+    for key in [
+        "reasoning_details",
+        "reasoning_content",
+        "reasoning",
+        "reasoning_text",
+    ] {
+        assert!(
+            assistants[0].get(key).is_none(),
+            "{key} must stay absent on a destination-only route: {body}"
+        );
+    }
 }
 
 /// A details artifact produced by a different model is dropped by the
 /// provenance gate — but the turn itself survives (its content/tool calls are
-/// intact), carrying the injected empty array.
+/// intact), carrying no reasoning key since the route imposes no presence
+/// requirement.
 #[ignore = "integration"]
 #[test]
 fn provenance_mismatch_drops_details_but_keeps_the_turn() {
@@ -752,10 +766,9 @@ fn provenance_mismatch_drops_details_but_keeps_the_turn() {
     send(&client, OPENROUTER_MODEL, &messages);
 
     let assistant = captured_assistant(&mock.requests()[0].body_json());
-    assert_eq!(
-        assistant["reasoning_details"],
-        serde_json::json!([]),
-        "a foreign artifact must not be replayed"
+    assert!(
+        assistant.get("reasoning_details").is_none(),
+        "a foreign artifact must not be replayed: {assistant}"
     );
     assert!(
         assistant["tool_calls"]
@@ -766,7 +779,7 @@ fn provenance_mismatch_drops_details_but_keeps_the_turn() {
 }
 
 /// A persisted details artifact larger than the per-turn cap is dropped at
-/// replay (an empty array) instead of failing the request.
+/// replay (no reasoning key) instead of failing the request.
 #[ignore = "integration"]
 #[test]
 fn oversized_details_are_dropped_on_replay() {
@@ -785,10 +798,9 @@ fn oversized_details_are_dropped_on_replay() {
     send(&client, OPENROUTER_MODEL, &messages);
 
     let assistant = captured_assistant(&mock.requests()[0].body_json());
-    assert_eq!(
-        assistant["reasoning_details"],
-        serde_json::json!([]),
-        "an oversized payload is dropped rather than sent"
+    assert!(
+        assistant.get("reasoning_details").is_none(),
+        "an oversized payload is dropped rather than sent: {assistant}"
     );
 }
 

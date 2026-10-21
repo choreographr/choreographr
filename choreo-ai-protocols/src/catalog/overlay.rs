@@ -17,9 +17,15 @@
 //! [provider.opencode.models."gpt-5.4"]
 //! responses = true
 //! reasoning_passback = "response_id"
-//! reasoning_echo_field = "reasoning_content"   # the wire key every assistant
-//!                                              # message must carry (alias:
-//!                                              # reasoning_content_required)
+//! reasoning_echo_field = "reasoning_content"   # the wire key replayed reasoning is
+//!                                             # shaped as (alias:
+//!                                             # reasoning_content_required)
+//! reasoning_echo_required = true      # …and that key must be PRESENT on every
+//!                                     # assistant message, empty when there is
+//!                                     # nothing to echo. Independent of
+//!                                     # `reasoning_echo_field`; the legacy
+//!                                     # `reasoning_content_required` alias sets
+//!                                     # both halves.
 //! prompt_cache_short = 300             # per-model TTL override
 //! prompt_cache_long = 3600
 //!
@@ -338,6 +344,10 @@ fn apply_model_overlay(model: &mut ModelEntry, table: &toml::Table) {
                     );
                 }
             }
+            // The DESTINATION half of the echo policy: which wire key replayed
+            // reasoning is shaped as. It never implies a presence requirement —
+            // a route can want a specific destination without demanding its
+            // presence; that is the separate `reasoning_echo_required` key.
             "reasoning_echo_field" => {
                 if let Some(field) = value.as_str().and_then(parse_echo_field) {
                     model.reasoning_echo = Some(field);
@@ -348,15 +358,31 @@ fn apply_model_overlay(model: &mut ModelEntry, table: &toml::Table) {
                     );
                 }
             }
-            // Older spelling of the same policy: "require `reasoning_content`
-            // on every assistant message". Kept as an alias so existing
-            // overlay files keep working; `reasoning_echo_field` is the
-            // expressive form (it can name any scalar field). Both assign the
-            // same field, so the key that appears LATER in the file wins —
-            // set only one per model.
+            // The PRESENCE half: whether every assistant message must carry the
+            // declared echo field (empty when there is nothing to echo).
+            // Settable on its own where the snapshot already declares the
+            // destination, or alongside `reasoning_echo_field` to pin a
+            // DeepSeek/GLM-style upstream rule wholesale.
+            "reasoning_echo_required" => {
+                if let Some(required) = value.as_bool() {
+                    model.reasoning_echo_required = Some(required);
+                } else {
+                    warn!(
+                        model = %model.model,
+                        "overlay: reasoning_echo_required is not a bool; skipping",
+                    );
+                }
+            }
+            // Older spelling of the whole policy: "require `reasoning_content`
+            // on every assistant message". Kept as an alias so existing overlay
+            // files keep working; it sets BOTH halves (the destination field and
+            // its presence requirement), whereas `reasoning_echo_field` /
+            // `reasoning_echo_required` set them independently. The key that
+            // appears LATER in the file wins, so set only one spelling per model.
             "reasoning_content_required" => {
                 if let Some(required) = value.as_bool() {
                     model.reasoning_echo = required.then_some(ChatReasoningField::ReasoningContent);
+                    model.reasoning_echo_required = required.then_some(true);
                 } else {
                     warn!(
                         model = %model.model,
@@ -760,9 +786,10 @@ max_tokens_field = "max_tokens"
 
     #[test]
     fn overlay_reasoning_echo_field_declares_the_wire_key() {
-        // The expressive form: the overlay names the exact field the route
-        // must carry, and it lands on the model entry as a field NAME (not a
-        // boolean), so the adapter can pick the right wire key.
+        // The expressive form: the overlay names the exact field replayed
+        // reasoning is shaped as, and it lands on the model entry as a field
+        // NAME (not a boolean), so the adapter can pick the right wire key. It
+        // never implies presence — that is a separately settable fact.
         let merged = merge_overlay(
             &base(),
             r#"
@@ -777,12 +804,60 @@ reasoning_echo_field = "reasoning"
             .find(|m| m.model == "acme-base")
             .expect("acme-base");
         assert_eq!(model.reasoning_echo, Some(ChatReasoningField::Reasoning));
+        assert_eq!(model.reasoning_echo_required, None);
     }
 
     #[test]
-    fn overlay_reasoning_content_required_alias_sets_the_same_field() {
-        // The pre-existing spelling keeps working and means exactly the same
-        // thing (`reasoning_content`, present on every assistant message).
+    fn overlay_reasoning_echo_required_sets_the_presence_fact() {
+        // The presence half is its own key, so a route can demand the key on
+        // every assistant message alongside a declared destination…
+        let merged = merge_overlay(
+            &base(),
+            r#"
+[provider.acme.models."acme-base"]
+reasoning_echo_field = "reasoning_content"
+reasoning_echo_required = true
+"#,
+        );
+        let acme = merged.iter().find(|e| e.slug == "acme").expect("acme");
+        let model = acme
+            .models
+            .iter()
+            .find(|m| m.model == "acme-base")
+            .expect("acme-base");
+        assert_eq!(
+            model.reasoning_echo,
+            Some(ChatReasoningField::ReasoningContent)
+        );
+        assert_eq!(model.reasoning_echo_required, Some(true));
+
+        // …and a later layer can drop the requirement while keeping the
+        // destination, which is exactly the "declare but do not force" shape.
+        let relaxed = merge_overlay(
+            &merged,
+            r#"
+[provider.acme.models."acme-base"]
+reasoning_echo_required = false
+"#,
+        );
+        let acme = relaxed.iter().find(|e| e.slug == "acme").expect("acme");
+        let model = acme
+            .models
+            .iter()
+            .find(|m| m.model == "acme-base")
+            .expect("acme-base");
+        assert_eq!(
+            model.reasoning_echo,
+            Some(ChatReasoningField::ReasoningContent)
+        );
+        assert_eq!(model.reasoning_echo_required, Some(false));
+    }
+
+    #[test]
+    fn overlay_reasoning_content_required_alias_sets_both_echo_facts() {
+        // The pre-existing spelling keeps working and means the whole policy
+        // (`reasoning_content`, present on every assistant message), so it
+        // assigns BOTH the destination and the presence requirement.
         let merged = merge_overlay(
             &base(),
             r#"
@@ -800,8 +875,9 @@ reasoning_content_required = true
             model.reasoning_echo,
             Some(ChatReasoningField::ReasoningContent)
         );
+        assert_eq!(model.reasoning_echo_required, Some(true));
 
-        // `false` clears a fact the base (or an earlier layer) declared.
+        // `false` clears both facts a base (or an earlier layer) declared.
         let cleared = merge_overlay(
             &merged,
             r#"
@@ -810,14 +886,13 @@ reasoning_content_required = false
 "#,
         );
         let acme = cleared.iter().find(|e| e.slug == "acme").expect("acme");
-        assert_eq!(
-            acme.models
-                .iter()
-                .find(|m| m.model == "acme-base")
-                .expect("acme-base")
-                .reasoning_echo,
-            None
-        );
+        let model = acme
+            .models
+            .iter()
+            .find(|m| m.model == "acme-base")
+            .expect("acme-base");
+        assert_eq!(model.reasoning_echo, None);
+        assert_eq!(model.reasoning_echo_required, None);
     }
 
     #[test]

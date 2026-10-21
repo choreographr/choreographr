@@ -1138,21 +1138,29 @@ interprets the bytes; and the chat adapter's lowering (`ChatWireMessage`) decide
 provenance (`Turn.reasoning_producer` versus the current provider + model, so a
 mid-session model switch drops every old artifact) plus the passback policy —
 with the empty-message fallback (a reasoning-only turn is never shipped as a
-wholly empty assistant message), the data-driven `reasoning_echo` fact (ingested
-from the snapshot's `interleaved` field name, with no name-based heuristic, and
-overridable per model by the overlay), and the `previous_response_id` continuity
+wholly empty assistant message), the data-driven `reasoning_echo` /
+`reasoning_echo_required` facts (ingested from the snapshot's `interleaved` field
+name, with no name-based heuristic, and overridable per model by the overlay),
+and the `previous_response_id` continuity
 chain.
 
 **Which key wins.** The catalog's declared echo field is authoritative and
 outranks the field a payload was *observed* under: `ReasoningArtifact::
 ChatReasoning` records the observation (a hint, used only when the route declares
-nothing) while `ModelEntry::reasoning_echo` states the requirement. There are
-**two destinations**: a declared scalar field (`reasoning_content`, `reasoning`,
-or `reasoning_text`), written on every assistant message of such a route — the
-artifact's text when there is something to replay, an empty string when there is
-not — or the declared structured `reasoning_details` array. Presence and
-destination are one decision in one place (`choreo-ai-protocols`'
-`openai::wire`, which owns the projection), so they cannot drift apart. This is
+nothing) while `ModelEntry::reasoning_echo` states the destination — and, when
+the separate `ModelEntry::reasoning_echo_required` fact says so, that the field
+must be present. There are **two destinations**: a declared scalar field
+(`reasoning_content`, `reasoning`, or `reasoning_text`) or the declared
+structured `reasoning_details` array. Destination and presence are **two
+independent catalog facts**, and the lowering (`choreo-ai-protocols`'
+`openai::wire`, which owns the projection) applies both in one place so they
+cannot drift apart. Writing a scalar destination on *every* assistant message —
+the artifact's text when there is something to replay, an empty string when
+there is not — is exactly the presence case (`require_present`), not a
+consequence of declaring a field. Ingestion keeps the two aligned with what the
+upstream actually enforces: `interleaved` naming a scalar field sets BOTH facts
+(a scalar name has always meant the upstream demands the key echoed), while
+`interleaved` naming the structured array sets only the destination. This is
 why a gateway that streams
 DeepSeek thinking under `reasoning` while
 rejecting any history without `reasoning_content` cannot starve the required
@@ -1185,13 +1193,17 @@ and signature intact) and rebuilds bare Kimi-shaped entries minimally, stripping
 the stream-only `index` and mirroring the summary text as a companion
 `reasoning_content`. That companion is the one
 deliberate scalar beside the array — the one-channel rule constrains the scalar
-fields, and Kimi-shaped routes expect both. A *declared* structured route with
-nothing to echo emits `reasoning_details: []`; an empty array is a presence
-marker, not a payload, so it never keeps an otherwise-empty assistant message
-alive. An **undeclared** route is the mirror image: it only reaches the array
-through the observation, so when the artifact lowers to nothing (corrupt or over
-the cap) no key is emitted at all — a route never
-gets an injected `reasoning_details: []` it did not ask for. A scalar payload
+fields, and Kimi-shaped routes expect both. The array is a **destination fact
+only**: a declared details route with nothing to echo emits *no* reasoning key,
+because no upstream is known to reject a history that omits the array and an
+invented `reasoning_details: []` would send an unverified array to a gateway
+that is strict about its contents. An **undeclared** route is the same shape for
+a different reason: it only reaches the array through the observation, so when
+the artifact lowers to nothing (corrupt or over the cap) no key is emitted at
+all. A route whose separate presence fact (`reasoning_echo_required`) demands
+the array still carries it empty on every assistant message — an empty array is
+a presence marker, not a payload, so it never keeps an otherwise-empty assistant
+message alive. A scalar payload
 reaching a structured route (a catalog or overlay flip changes a model's
 declared field) is replayed as one `reasoning.text` entry rather than discarded,
 the counterpart of deriving display text from a structured payload on a scalar
@@ -2522,10 +2534,14 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
     old artifact) plus the catalog's `reasoning_passback` policy (`None` / `ToolLoop` / `AllTurns` /
     `Signature` / `ResponseId`, per-model override else protocol default). Display text stays in
     `Turn.assistant_reasoning`; the artifact bytes are never interpreted by the daemon.
-    *Where* the payload lands on the chat wire is the adapter's decision, from the catalog's
-    declared echo field (`ModelEntry::reasoning_echo`, ingested from the snapshot's
-    `interleaved`): a declared field outranks the field the payload was observed under, and an
-    assistant message with nothing to echo still carries it (empty) rather than omitting it.
+    *Where* the payload lands on the chat wire is the adapter's decision, from two independent
+    catalog facts — the desired field (`ModelEntry::reasoning_echo`, ingested from the snapshot's
+    `interleaved`) and whether that field must be PRESENT on every assistant message even when
+    empty (`ModelEntry::reasoning_echo_required`). A declared field outranks the field the payload
+    was observed under; a scalar
+    `interleaved` name sets both facts, while the structured `reasoning_details` array is a
+    destination only — a details route with nothing to echo omits the key instead of carrying an
+    unverified empty array.
     The field may be the structured `reasoning_details` array: its artifact payload is JSON
     (normalized at capture under a per-turn cap), replayed verbatim for OpenRouter's `reasoning.*`
     entries and rebuilt minimally for bare Kimi-shaped ones, with the Kimi summary text mirrored

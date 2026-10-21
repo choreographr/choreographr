@@ -606,9 +606,12 @@ and re-emits it per provider rules on the next request:
   `redacted_thinking` blocks are echoed back, complete and unmodified,
   alongside `tool_use` blocks (a missing or altered block is a 400).
 - **DeepSeek / Kimi (OpenAI-compatible chat)** — `reasoning_content` is passed
-  back on every assistant message when the model's route declares it, which some
-  gateways require even for a call that produced no reasoning (the field then
-  goes out empty). The declared field always wins over the field a response
+  back on every assistant message when the model's catalog fact says the route
+  *requires its presence*, which some gateways demand even for a call that
+  produced no reasoning (the field then goes out empty). Presence is its own
+  catalog fact, separate from which field a route wants: a route can declare a
+  destination field without forcing it to appear on a message that has nothing
+  to echo. The declared field always wins over the field a response
   happened to stream the text in, because gateways exist that answer under
   `reasoning` while rejecting any history without `reasoning_content`. On any
   echo-capable chat provider, a turn recorded as reasoning-only (empty content,
@@ -633,10 +636,12 @@ and re-emits it per provider rules on the next request:
   output. On replay the OpenRouter `reasoning.*` entries are sent back verbatim
   (index, format, signature intact) while bare Kimi-shaped entries are rebuilt
   without the stream-only `index` and mirrored as a `reasoning_content`
-  companion. A declared route with nothing to echo sends an empty array, an
-  undeclared route sends no array at all, and a scalar payload that was observed
-  on a structured route is replayed as one `reasoning.text` entry instead of
-  being discarded. The payload is capped per turn, small because it is replayed
+  companion. A details route replays the array whenever there is one to replay
+  and omits the key entirely when there is not (no unverified empty array is
+  invented; the array is a destination, not a presence requirement), while a
+  scalar payload that was observed on a structured route is replayed as one
+  `reasoning.text` entry instead of being discarded. The payload is capped per
+  turn, small because it is replayed
   on every later request of the tool loop (dropped and logged rather than failing
   the request).
 - **Gemini** — the encrypted thought-step `thoughtSignature` values are sent

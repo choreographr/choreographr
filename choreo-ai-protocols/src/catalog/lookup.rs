@@ -220,39 +220,44 @@ pub fn image_edit_models_for_provider(provider_slug: &str) -> Vec<String> {
 
 /// How a route wants replayed reasoning shaped on the chat-completions wire.
 ///
-/// Two independent facts, because a provider can want a specific destination
-/// field without demanding its presence (and vice versa):
+/// Two genuinely independent facts, both read from the per-model catalog entry:
 ///
-/// - [`field`](Self::field) — the wire key the route requires. When set it
-///   ALWAYS wins over the field a response was observed to stream under: a
-///   gateway that answers under `reasoning` while rejecting any history
-///   without `reasoning_content` exists in the wild, so the observation cannot
-///   be trusted as the destination.
+/// - [`field`](Self::field) — the wire key the route wants (the *destination*).
+///   When set it ALWAYS wins over the field a response was observed to stream
+///   under: a gateway that answers under `reasoning` while rejecting any
+///   history without `reasoning_content` exists in the wild, so the observation
+///   cannot be trusted as the destination.
 /// - [`require_present`](Self::require_present) — whether every assistant
 ///   message must carry the field, empty when there is nothing to echo. This is
 ///   the DeepSeek/GLM 5.x rule: an upstream 400s a tool-loop history whose
 ///   assistant message omits the field, even for a call that produced no
 ///   reasoning.
 ///
+/// A route can declare a destination without demanding its presence (the
+/// OpenRouter/Ollama `reasoning_details` resellers), so presence is an explicit
+/// opt-in catalog fact — never inferred from a declared field.
+///
 /// The default (`field: None, require_present: false`) means "no declared
 /// shape": the adapter then echoes whatever field the payload was observed
 /// under, and omits the key entirely when there is nothing to echo.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChatReasoningEcho {
-    /// The wire field the route requires, when the catalog declares one.
+    /// The wire field the route wants, when the catalog declares one.
     pub field: Option<ChatReasoningField>,
-    /// Whether every assistant message must carry the field (empty when
-    /// there is nothing to echo). True exactly when `field` is declared.
+    /// Whether every assistant message must carry the field (empty when there
+    /// is nothing to echo), resolved from the catalog's explicit
+    /// `reasoning_echo_required` fact.
     pub require_present: bool,
 }
 
 /// Resolve the chat-completions reasoning-echo policy for one route.
 ///
 /// Purely data-driven: the ingested models.dev fact (`interleaved` naming a
-/// scalar chat field) and the per-model overlay override are the only sources,
-/// with NO name-based fallback. An uncataloged model resolves to the default,
-/// so a catalog gap surfaces as the upstream provider's own error instead of a
-/// silent heuristic guess that could never be audited or overridden.
+/// replayable chat field), the per-model overlay override, and the separate
+/// presence requirement are the only sources, with NO name-based fallback. An
+/// uncataloged model resolves to the default, so a catalog gap surfaces as the
+/// upstream provider's own error instead of a silent heuristic guess that could
+/// never be audited or overridden.
 ///
 /// Guards, applied independently of the fact:
 ///
@@ -263,16 +268,27 @@ pub struct ChatReasoningEcho {
 /// - a non-chat request format resolves to the default for the same reason.
 ///
 /// Fixes for a catalog gap: add the model to the snapshot, or to the overlay
-/// with `reasoning_echo_field = "…"`.
+/// with `reasoning_echo_field = "…"` (and `reasoning_echo_required = true` when
+/// the upstream also demands the key's presence).
 #[must_use]
 pub fn chat_reasoning_echo(provider_slug: &str, model: &str) -> ChatReasoningEcho {
-    let echo = with_model_fact(provider_slug, model, |m| m.reasoning_echo)
-        .flatten()
-        .filter(|_| model_request_format(provider_slug, model) != Some(RequestFormat::Responses))
-        .map_or_else(ChatReasoningEcho::default, |field| ChatReasoningEcho {
-            field: Some(field),
-            require_present: true,
-        });
+    let echo = with_model_fact(provider_slug, model, |m| {
+        // The destination and the presence requirement are separate catalog
+        // facts, so project both here and let the guard below flatten the pair
+        // to the default together — a guarded route must resolve to the whole
+        // default, never to a half-answer carrying a field with no presence.
+        (m.reasoning_echo, m.reasoning_echo_required.unwrap_or(false))
+    })
+    .filter(|(field, _)| {
+        field.is_some()
+            && model_request_format(provider_slug, model) != Some(RequestFormat::Responses)
+    })
+    .map_or_else(ChatReasoningEcho::default, |(field, require_present)| {
+        ChatReasoningEcho {
+            field,
+            require_present,
+        }
+    });
     trace!(
         provider = %provider_slug,
         model = %model,
@@ -795,9 +811,11 @@ mod tests {
 
     #[test]
     fn chat_reasoning_echo_resolves_structured_details_fact() {
-        // The snapshot's OpenRouter/Kimi routes declare `reasoning_details` in
+        // The snapshot's OpenRouter/Ollama routes declare `reasoning_details` in
         // their `interleaved`; the resolver surfaces the structured field so the
-        // adapter replays the array instead of guessing a scalar key.
+        // adapter replays the array instead of guessing a scalar key. The array
+        // is a DESTINATION only: no presence requirement is derived for it, so
+        // an assistant message with nothing to replay simply omits the key.
         for (provider, model) in [
             ("openrouter", "moonshotai/kimi-k2.5"),
             ("openrouter", "minimax/minimax-m2"),
@@ -807,11 +825,49 @@ mod tests {
                 chat_reasoning_echo(provider, model),
                 ChatReasoningEcho {
                     field: Some(ChatReasoningField::ReasoningDetails),
-                    require_present: true,
+                    require_present: false,
                 },
                 "{provider}/{model}"
             );
         }
+    }
+
+    #[test]
+    fn chat_reasoning_echo_presence_is_its_own_catalog_fact() {
+        // A structured destination CAN be paired with a presence requirement —
+        // the two facts are independent, so a catalog entry (or overlay) that
+        // sets both resolves both. This pins that the resolver reads the
+        // requirement from the catalog rather than inferring it from the field.
+        let _restore = RestoreBundledOnDrop;
+        let bundled = catalog_snapshot();
+        crate::catalog::replace_catalog({
+            let mut c = tiny_catalog();
+            c[0].models[0].reasoning_echo = Some(ChatReasoningField::ReasoningDetails);
+            c[0].models[0].reasoning_echo_required = Some(true);
+            c
+        });
+        assert_eq!(
+            chat_reasoning_echo("tiny-test", "tiny-model"),
+            ChatReasoningEcho {
+                field: Some(ChatReasoningField::ReasoningDetails),
+                require_present: true,
+            }
+        );
+        // And the reverse independence: the same destination with the
+        // requirement unset resolves no presence.
+        crate::catalog::replace_catalog({
+            let mut c = tiny_catalog();
+            c[0].models[0].reasoning_echo = Some(ChatReasoningField::ReasoningDetails);
+            c
+        });
+        assert_eq!(
+            chat_reasoning_echo("tiny-test", "tiny-model"),
+            ChatReasoningEcho {
+                field: Some(ChatReasoningField::ReasoningDetails),
+                require_present: false,
+            }
+        );
+        crate::catalog::replace_catalog(bundled.to_vec());
     }
 
     #[test]
@@ -902,6 +958,7 @@ mod tests {
             let mut c = tiny_catalog();
             c[0].models[0].openai_responses = false;
             c[0].models[0].reasoning_echo = Some(ChatReasoningField::ReasoningContent);
+            c[0].models[0].reasoning_echo_required = Some(true);
             c
         });
         assert_eq!(

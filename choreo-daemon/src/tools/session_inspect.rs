@@ -189,8 +189,9 @@ fn build_report(
 
     let passback = model_reasoning_passback(&provider, &model);
     // The route's chat reasoning-echo policy: the declared field outranks the
-    // field a payload was observed under, and a declared field must be present
-    // on every assistant message (empty when there is nothing to echo).
+    // field a payload was observed under, and a route whose catalog fact
+    // requires presence carries it on every assistant message (empty when there
+    // is nothing to echo).
     let echo = chat_reasoning_echo(&provider, &model);
 
     // Reconstruct the state the builder reads. `build_chat_request_messages`
@@ -856,17 +857,22 @@ mod tests {
             out.contains("art=chat[reasoning_details;1 entries;"),
             "the structured shape (entry count + bytes) is rendered: {out}"
         );
+        // The array is a destination, not a presence requirement, so the
+        // violation line (which only exists for a requiring route) is absent.
         assert!(
-            out.contains("declared-field violations: 0 assistant message(s) omit"),
+            out.contains("route echo policy: field=reasoning_details require_present=false"),
             "{out}"
         );
+        assert!(!out.contains("declared-field violations"), "{out}");
         assert!(out.contains("ledger vs wire: OK"), "{out}");
     }
 
     #[test]
-    fn details_route_without_artifact_reports_empty_details() {
+    fn details_route_without_artifact_echoes_nothing() {
         // A tool turn with nothing to echo on a details-declaring route: the
-        // injected `reasoning_details: []` is reported as `yes(details:empty)`.
+        // route declares the array as a DESTINATION only, with no presence
+        // requirement, so no `reasoning_details` key is invented and the ledger
+        // reports the documented no-artifact label.
         let model = "minimax/minimax-m2";
         let (_dir, ctx) = seed(
             42,
@@ -878,9 +884,14 @@ mod tests {
             )],
         );
         let out = run(&ctx, inspect_args(None));
-        assert!(out.contains("echo=yes(details:empty)"), "{out}");
+        assert!(out.contains("echo=no:no-artifact"), "{out}");
+        assert!(!out.contains("echo=yes(details"), "{out}");
+        // No presence requirement on a details route, so the violation line
+        // (printed only for a requiring route) is absent and the risk line
+        // stays clean.
+        assert!(!out.contains("declared-field violations"), "{out}");
         assert!(
-            out.contains("declared-field violations: 0 assistant message(s) omit"),
+            out.contains("RISK (assistant messages missing the route's declared field): none"),
             "{out}"
         );
         assert!(out.contains("ledger vs wire: OK"), "{out}");

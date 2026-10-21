@@ -159,24 +159,34 @@ pub struct ModelEntry {
     /// including `Some(ReasoningPassback::None)` for "never replay this
     /// model's reasoning".
     pub reasoning_passback: Option<ReasoningPassback>,
-    /// The wire field every assistant message on this route must carry, when
-    /// the provider declares one (e.g. DeepSeek/GLM 5.x chat: the upstream
-    /// rejects a history whose assistant tool-call message omits
-    /// `reasoning_content`, even when the model produced no reasoning on that
-    /// call).
+    /// The wire field a route wants replayed reasoning shaped as, when the
+    /// provider declares one (e.g. DeepSeek/GLM 5.x chat and the
+    /// OpenRouter/Ollama `reasoning_details` resellers).
     ///
     /// Ingested from the models.dev snapshot as a FACT — the model's
-    /// `interleaved` value names the echo field — and overridable per-model by
-    /// the overlay (`reasoning_echo_field = "…"`, or the older
+    /// `interleaved` value names the field — and overridable per-model by the
+    /// overlay (`reasoning_echo_field = "…"`, or the older
     /// `reasoning_content_required = true|false` alias). `None` means "no
-    /// declared field": there is NO name-based fallback, so a model not
+    /// declared destination": there is NO name-based fallback, so a model not
     /// covered by the snapshot needs an explicit overlay entry.
     ///
-    /// This is a *route requirement*, and it outranks whatever field a
-    /// response happened to stream the reasoning under (the artifact's
-    /// observation) — see [`chat_reasoning_echo`].
+    /// This is the *destination*, and it outranks whatever field a response
+    /// happened to stream the reasoning under (the artifact's observation) —
+    /// see [`chat_reasoning_echo`]. Whether the field must also be PRESENT on
+    /// every assistant message is the separate
+    /// [`reasoning_echo_required`](Self::reasoning_echo_required) fact; a
+    /// declared field alone never demands presence.
     #[serde(default)]
     pub reasoning_echo: Option<ChatReasoningField>,
+    /// Whether [`reasoning_echo`](Self::reasoning_echo)'s field must be PRESENT on
+    /// every assistant message (empty when there is nothing to echo), not merely
+    /// be the preferred destination.
+    ///
+    /// A separate fact from the field name, because a route can want a specific
+    /// destination without demanding its presence. `None` means "no requirement"
+    /// — presence is opt-in, never inferred from the field.
+    #[serde(default)]
+    pub reasoning_echo_required: Option<bool>,
     /// Maximum output tokens the model can produce (`0` = unknown), ingested
     /// from the snapshot's `limit.output` and resolvable via
     /// [`lookup_max_output_tokens`] (which maps 0 back to `None`).
@@ -247,6 +257,7 @@ impl Default for ModelEntry {
             openai_responses: false,
             reasoning_passback: None,
             reasoning_echo: None,
+            reasoning_echo_required: None,
             max_output_tokens: 0,
             supports_temperature: true,
             deprecated: false,

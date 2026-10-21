@@ -243,70 +243,88 @@ fn normalize_provider(slug: String, raw: RawProvider) -> ProviderEntry {
     let models = raw
         .models
         .into_iter()
-        .map(|(model, m)| ModelEntry {
-            model,
-            context_window: m.limit.as_ref().map_or(0, |l| l.context),
-            reasoning_supported: m.reasoning,
-            openai_reasoning_levels: effort_levels(&m.reasoning_options),
-            openai_responses,
-            // Derived at lookup time (`model_reasoning_passback`): the base
-            // carries no passback policy; per-model exceptions come from the
-            // overlay.
-            reasoning_passback: None,
-            // Reasoning echo field: a FACT from the snapshot — the model
-            // demands this specific field on every assistant message exactly
-            // when its `interleaved` names one of the replayable chat fields
-            // (DeepSeek/GLM 5.x `reasoning_content`, OpenRouter/Kimi
-            // `reasoning_details`). The field NAME is preserved (not collapsed
-            // to a boolean): the adapter needs it to pick the wire key. Any
-            // other encoding (bare `true`, absent, an unknown field) is "no
-            // declared field" → `None`;
-            // the overlay overrides, and `None` means no echo requirement (no
-            // name-based guessing).
-            reasoning_echo: m
+        .map(|(model, m)| {
+            // Reasoning echo: TWO facts from the same snapshot signal, and the
+            // asymmetry between them is deliberate. The model's `interleaved`
+            // value names a replayable chat field (`reasoning_echo`), and the
+            // field NAME is preserved (never collapsed to a boolean) because
+            // the adapter needs it to pick the wire key. Any other encoding
+            // (bare `true`, absent, an unknown field) is "no declared field"
+            // → `None`.
+            let echo_field = m
                 .interleaved
                 .as_ref()
                 .and_then(RawInterleaved::field)
-                .and_then(echo_field),
-            // Output-token ceiling (`0` = unknown, mirroring context_window).
-            max_output_tokens: m.limit.as_ref().map_or(0, |l| l.output),
-            // Temperature acceptance: absent means models.dev records no
-            // constraint, so the permissive wire default stands.
-            supports_temperature: m.temperature.unwrap_or(true),
-            // Lifecycle status: only "deprecated" is lifted into the base.
-            deprecated: m.status.as_deref() == Some("deprecated"),
-            // Vision: `"image"` in `modalities.input`. Absent modalities
-            // (older snapshot entries) default to text-only.
-            supports_vision: m
-                .modalities
-                .as_ref()
-                .is_some_and(|mods| mods.input.iter().any(|m| m == "image")),
-            // Image OUTPUT: same safe-default pattern, on the `output` side
-            // of the modalities pair. `"image"` there means the model can
-            // *produce* images (gpt-image-1, Gemini image models, …);
-            // absent modalities → false (text-generation only).
-            supports_image_output: m
-                .modalities
-                .as_ref()
-                .is_some_and(|mods| mods.output.iter().any(|m| m == "image")),
-            // Image EDIT: overlay-only policy. models.dev records no "edit"
-            // modality, so the base never sets this — the overlay pins it for
-            // the models whose provider exposes an edit endpoint. Kept
-            // explicit (not `..Default`) so a future fact can be added here
-            // deliberately rather than silently inheriting false.
-            supports_image_edit: false,
-            // Token prices (USD per million tokens): a fact from the snapshot's
-            // `cost` object when present; `None` when the model records no cost.
-            // Only the four flat prices are modelled — the aux/nested cost keys
-            // are out of scope (see RawCost).
-            cost: m.cost.map(|c| ModelCost {
-                input: c.input,
-                output: c.output,
-                cache_read: c.cache_read,
-                cache_write: c.cache_write,
-            }),
-            // Prompt-cache TTL is overlay policy, never a models.dev fact.
-            prompt_cache: None,
+                .and_then(echo_field);
+            // Whether the field must also be PRESENT on every assistant
+            // message (`reasoning_echo_required`) depends on WHICH field it is:
+            // a scalar name (`reasoning_content`, `reasoning`, `reasoning_text`)
+            // has always meant "the upstream demands this key echoed" — the
+            // DeepSeek/GLM 5.x rule, where a tool-loop history omitting it 400s
+            // — so a scalar sets `Some(true)`. The structured
+            // `reasoning_details` array is a DESTINATION fact only: no upstream
+            // is known to reject a history that omits it, and inventing an
+            // empty `reasoning_details: []` on every assistant message sends an
+            // unverified array to gateways that are strict about its contents,
+            // so that case leaves the requirement unset. Presence stays
+            // opt-in, and the overlay can pin either half independently.
+            let echo_required = match echo_field {
+                Some(ChatReasoningField::ReasoningDetails) => None,
+                Some(_) => Some(true),
+                None => None,
+            };
+            ModelEntry {
+                model,
+                context_window: m.limit.as_ref().map_or(0, |l| l.context),
+                reasoning_supported: m.reasoning,
+                openai_reasoning_levels: effort_levels(&m.reasoning_options),
+                openai_responses,
+                // Derived at lookup time (`model_reasoning_passback`): the base
+                // carries no passback policy; per-model exceptions come from the
+                // overlay.
+                reasoning_passback: None,
+                reasoning_echo: echo_field,
+                reasoning_echo_required: echo_required,
+                // Output-token ceiling (`0` = unknown, mirroring context_window).
+                max_output_tokens: m.limit.as_ref().map_or(0, |l| l.output),
+                // Temperature acceptance: absent means models.dev records no
+                // constraint, so the permissive wire default stands.
+                supports_temperature: m.temperature.unwrap_or(true),
+                // Lifecycle status: only "deprecated" is lifted into the base.
+                deprecated: m.status.as_deref() == Some("deprecated"),
+                // Vision: `"image"` in `modalities.input`. Absent modalities
+                // (older snapshot entries) default to text-only.
+                supports_vision: m
+                    .modalities
+                    .as_ref()
+                    .is_some_and(|mods| mods.input.iter().any(|m| m == "image")),
+                // Image OUTPUT: same safe-default pattern, on the `output` side
+                // of the modalities pair. `"image"` there means the model can
+                // *produce* images (gpt-image-1, Gemini image models, …);
+                // absent modalities → false (text-generation only).
+                supports_image_output: m
+                    .modalities
+                    .as_ref()
+                    .is_some_and(|mods| mods.output.iter().any(|m| m == "image")),
+                // Image EDIT: overlay-only policy. models.dev records no "edit"
+                // modality, so the base never sets this — the overlay pins it for
+                // the models whose provider exposes an edit endpoint. Kept
+                // explicit (not `..Default`) so a future fact can be added here
+                // deliberately rather than silently inheriting false.
+                supports_image_edit: false,
+                // Token prices (USD per million tokens): a fact from the snapshot's
+                // `cost` object when present; `None` when the model records no cost.
+                // Only the four flat prices are modelled — the aux/nested cost keys
+                // are out of scope (see RawCost).
+                cost: m.cost.map(|c| ModelCost {
+                    input: c.input,
+                    output: c.output,
+                    cache_read: c.cache_read,
+                    cache_write: c.cache_write,
+                }),
+                // Prompt-cache TTL is overlay policy, never a models.dev fact.
+                prompt_cache: None,
+            }
         })
         .collect();
 
@@ -602,8 +620,10 @@ mod tests {
         let m = &features.models[0];
         assert_eq!(m.model, "echo-field");
         // The field NAME survives ingestion: the adapter needs it to pick the
-        // wire key, so it is not collapsed to a boolean.
+        // wire key, so it is not collapsed to a boolean. A scalar name also
+        // means the upstream demands the key echoed.
         assert_eq!(m.reasoning_echo, Some(ChatReasoningField::ReasoningContent));
+        assert_eq!(m.reasoning_echo_required, Some(true));
         // limit.output is lifted into max_output_tokens.
         assert_eq!(m.max_output_tokens, 32_000);
     }
@@ -612,11 +632,13 @@ mod tests {
     fn interleaved_string_shorthand_is_a_field_fact() {
         let catalog = normalize_modelsdev(SNAPSHOT);
         // A plain string IS the field name, for any of the three scalar fields
-        // — not only `reasoning_content`.
+        // — not only `reasoning_content`. A scalar always carries the presence
+        // requirement with it.
         assert_eq!(
             catalog[5].models[1].reasoning_echo,
             Some(ChatReasoningField::Reasoning)
         );
+        assert_eq!(catalog[5].models[1].reasoning_echo_required, Some(true));
     }
 
     #[test]
@@ -625,17 +647,24 @@ mod tests {
         let features = &catalog[5];
         // `reasoning_details` is a structured array, but the catalog records it
         // as the declared echo field so the adapter can replay it structurally
-        // (the bytes are a JSON array, not text).
+        // (the bytes are a JSON array, not text). It is a DESTINATION only: no
+        // presence requirement is derived for the structured array, because
+        // injecting an unverified empty array into every assistant message is
+        // worse than omitting the key.
         assert_eq!(
             features.models[2].reasoning_echo,
             Some(ChatReasoningField::ReasoningDetails)
         );
+        assert_eq!(features.models[2].reasoning_echo_required, None);
         // An unknown field name stays unknown (no guessing).
         assert_eq!(features.models[3].reasoning_echo, None);
+        assert_eq!(features.models[3].reasoning_echo_required, None);
         // Bare `true` is a capability flag, not a field fact.
         assert_eq!(features.models[4].reasoning_echo, None);
+        assert_eq!(features.models[4].reasoning_echo_required, None);
         // Absent interleaved → None (never Some(false); None means unknown).
         assert_eq!(features.models[5].reasoning_echo, None);
+        assert_eq!(features.models[5].reasoning_echo_required, None);
     }
 
     #[test]

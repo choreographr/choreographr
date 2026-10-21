@@ -103,12 +103,14 @@ pub struct ImageReference {
 ///   [`ReasoningArtifact::ChatReasoning`]'s `field`). A provider that streams
 ///   `reasoning_text` should get `reasoning_text` back when nothing says
 ///   otherwise, so this is worth recording.
-/// - **Route requirement** — which field the model's *route* demands on every
-///   assistant message. The catalog records this
-///   (`ModelEntry::reasoning_echo`) and it always wins: e.g. the DeepSeek/GLM
-///   chat gateways reject a history whose assistant messages lack
-///   `reasoning_content` even when the stream delivered the text under
-///   `reasoning`.
+/// - **Route requirement** — which field the model's *route* wants replayed
+///   reasoning shaped as, and whether that field must be present on every
+///   assistant message. The catalog records the destination
+///   (`ModelEntry::reasoning_echo`) and the separate presence fact
+///   (`ModelEntry::reasoning_echo_required`), and the destination always wins:
+///   e.g. the DeepSeek/GLM chat gateways reject a history whose assistant
+///   messages lack `reasoning_content` even when the stream delivered the text
+///   under `reasoning`.
 ///
 /// The observation is therefore a hint, never an instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

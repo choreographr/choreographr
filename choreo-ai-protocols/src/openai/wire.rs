@@ -189,8 +189,9 @@ fn reasoning_wire_key(field: ChatReasoningField) -> &'static str {
 ///
 /// Two shapes, never mixed: a scalar field (`reasoning_content`, `reasoning`,
 /// or `reasoning_text`) or the structured `reasoning_details` array. Both are
-/// decided in exactly one place ([`lower_reasoning`]), so presence and
-/// destination cannot drift apart.
+/// decided in exactly one place ([`lower_reasoning`]), so a message never
+/// carries two reasoning keys and the two catalog facts (destination, presence)
+/// are applied consistently.
 #[derive(Debug, Clone)]
 enum WireReasoning {
     /// A scalar chat field carrying the artifact's text (or an empty string as
@@ -255,21 +256,24 @@ fn lower_reasoning(
                 lower_scalar_text_as_details(bytes)
             }
             // Nothing structured to echo (no artifact, or a foreign variant):
-            // the declared key goes out empty so the route never sees an
-            // assistant message without it.
+            // whether the key goes out empty is the presence decision below.
             _ => serde_json::Value::Array(Vec::new()),
         };
-        // An undeclared route reached this arm only through the observation, so
-        // an empty array is not a presence marker there — it would be a brand-new
-        // `reasoning_details: []` key the route never asked for (a corrupt or
-        // over-cap artifact, or one whose entries all lowered away). A declaring
-        // route keeps the empty array; that is the documented presence marker.
-        if echo.field.is_none() && details.as_array().is_some_and(Vec::is_empty) {
+        // An empty array is a presence marker, not a payload, so it goes out
+        // only on a route whose catalog fact REQUIRES the field. Everywhere
+        // else — an undeclared route that reached this arm only through the
+        // observation, or a details route with no presence requirement whose
+        // artifact lowered away (corrupt, over cap, or blank text) — the key is
+        // omitted rather than inventing a `reasoning_details: []` the route
+        // never asked for: an unverified array sent to a gateway that is strict
+        // about its contents is worse than omitting it.
+        if !echo.require_present && details.as_array().is_some_and(Vec::is_empty) {
             return None;
         }
         debug!(
             entries = details.as_array().map_or(0, Vec::len),
             declared = echo.field.is_some(),
+            required = echo.require_present,
             "re-emitting structured reasoning_details"
         );
         return Some(WireReasoning::Details(details));
