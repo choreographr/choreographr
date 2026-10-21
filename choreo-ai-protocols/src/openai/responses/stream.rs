@@ -19,8 +19,8 @@ use super::super::retry;
 use super::super::{
     ResponsesStreamEvent, SseReader, parse_responses_stream_event, validate_tool_call_arguments,
 };
-use super::body::{build_responses_request_body, extract_reasoning_text};
-use super::turn::{merge_reasoning_item, responses_items_artifact};
+use super::body::build_responses_request_body;
+use super::turn::{merge_reasoning_item, responses_items_artifact, responses_usage_to_token_usage};
 
 /// Accumulator for Responses API tool call arguments keyed by `call_id`.
 /// Used in `responses_request_streaming_with_tools` to merge delta chunks.
@@ -120,6 +120,11 @@ where
     let mut full_reasoning = String::new();
     let mut last_usage: Option<TokenUsage> = None;
     let mut response_id: Option<String> = None;
+    // The response stopped early with output it did keep (`max_output_tokens`
+    // and any reason this client does not classify): the partial answer rides
+    // a `FinalText` with this flag rather than failing the turn, exactly as
+    // chat maps `finish_reason: length`.
+    let mut truncated = false;
     // Opaque reasoning items collected across the stream (deduped by id in
     // `merge_reasoning_item`) — serialized into the round-trip artifact at
     // the end.
@@ -150,18 +155,23 @@ where
                 // Text output is complete — continue listening for the
                 // completion / failure events and any remaining tool calls.
             }
-            Some(ResponsesStreamEvent::ReasoningSummary(summary)) => {
-                if let Some(text) = extract_reasoning_text(&summary) {
-                    has_any_output = true;
-                    full_reasoning.push_str(&text);
-                    on_event(StreamEvent::Reasoning(text))?;
-                }
+            Some(ResponsesStreamEvent::ReasoningSummaryText(text)) => {
+                has_any_output = true;
+                full_reasoning.push_str(&text);
+                on_event(StreamEvent::Reasoning(text))?;
             }
             Some(ResponsesStreamEvent::ReasoningItem(item)) => {
                 // Capture the opaque reasoning item verbatim (id, summary,
                 // and encrypted_content in stateless mode) for the
                 // round-trip artifact. `output_item.added` and `.done` both
                 // map here — merge_reasoning_item dedupes by id.
+                //
+                // The item also makes this a produced response even when it
+                // carries nothing displayable (an encrypted-only item): the
+                // provider generated and billed it, so the turn must never be
+                // reported as an empty response. That fact is read from
+                // `reasoning_items` at the end, so it survives an item the
+                // dedupe replaced.
                 merge_reasoning_item(&mut reasoning_items, item);
             }
             Some(ResponsesStreamEvent::FunctionCallArgumentsDelta { call_id, delta }) => {
@@ -212,26 +222,41 @@ where
                         total_tokens = u.total_tokens,
                         "responses streaming turn usage",
                     );
-                    let usage = TokenUsage {
-                        input_tokens: u.prompt_tokens,
-                        output_tokens: u.completion_tokens,
-                        total_tokens: u.total_tokens,
-                        // See responses_response_to_turn: Responses API
-                        // cached-token plumbing is a possible follow-up.
-                        cached_tokens: 0,
-                        cache_write_tokens: 0,
-                    };
-                    last_usage = Some(usage);
+                    last_usage = Some(responses_usage_to_token_usage(&u));
                 }
                 break;
             }
             Some(ResponsesStreamEvent::ResponseFailed(error)) => {
                 return Err(super::super::OpenAiError::Io(io::Error::other(error)));
             }
-            Some(ResponsesStreamEvent::ResponseIncomplete) => {
-                return Err(super::super::OpenAiError::Io(io::Error::other(
-                    "response incomplete",
-                )));
+            Some(ResponsesStreamEvent::ResponseIncomplete { id, usage, reason }) => {
+                // A terminal SUCCESS with possibly-partial output. The provider
+                // names why it stopped under `incomplete_details.reason`;
+                // `max_output_tokens` (and any reason this client does not
+                // classify) leaves a partial answer we surface as a truncation,
+                // while a policy block is terminal and never retryable.
+                response_id = id;
+                if let Some(u) = usage {
+                    last_usage = Some(responses_usage_to_token_usage(&u));
+                }
+                match reason.as_deref() {
+                    Some("content_filter") => {
+                        return Err(super::super::OpenAiError::ContentFiltered {
+                            detail: "provider content filter stopped the response \
+                                     (response.incomplete: content_filter)"
+                                .into(),
+                        });
+                    }
+                    other => {
+                        if let Some(reason) = other
+                            && reason != "max_output_tokens"
+                        {
+                            warn!(reason, "responses stream ended incomplete");
+                        }
+                        truncated = true;
+                        break;
+                    }
+                }
             }
             Some(ResponsesStreamEvent::ProgramCodeDelta(delta)) => {
                 // Streaming JS code from the model-generated program that runs
@@ -274,7 +299,12 @@ where
 
     let reasoning_artifact = responses_items_artifact(&reasoning_items)?;
 
-    if !has_any_output {
+    // "The model produced output" is a fact about the response, not about what
+    // survived into a display string: an encrypted-only reasoning item (or one
+    // whose summary this client could not read) is output the provider billed
+    // for, so it must never surface as an empty response. The chat adapter's
+    // reasoning fold reports the same fact the same way.
+    if !has_any_output && reasoning_items.is_empty() {
         return Err(super::super::OpenAiError::EmptyResponse);
     }
 
@@ -343,15 +373,17 @@ where
         warn!("discarded {total_calls} incomplete tool call(s) from provider (no name set)",);
     }
 
-    // If only reasoning events arrived without any answer text, treat it as
-    // empty — matching the non-streaming variant's behaviour.
-    if full_content.is_empty() {
+    // If only reasoning arrived and no answer text, the turn is still model
+    // output — it becomes a `FinalText` with empty content that carries the
+    // reasoning and its round-trip artifact. Only a turn that produced neither
+    // content nor reasoning is empty.
+    if full_content.is_empty() && reasoning_artifact.is_none() {
         return Err(super::super::OpenAiError::EmptyResponse);
     }
 
     Ok(ChatTurnResult::FinalText(FinalTextResult {
         content: full_content,
-        truncated: false,
+        truncated,
         reasoning: if full_reasoning.is_empty() {
             None
         } else {

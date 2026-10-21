@@ -228,6 +228,105 @@ fn parse_responses_stream_event_unknown_type_returns_none() {
 }
 
 #[test]
+fn parse_responses_stream_event_completed_reads_the_wrapped_response_object() {
+    // The documented terminal event wraps the whole `Response` object under
+    // `response` — id and usage live there, not on the event root.
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.completed","sequence_number":42,"response":{"id":"resp_9","status":"completed","usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::ResponseCompleted { id, usage } => {
+            assert_eq!(id.as_deref(), Some("resp_9"));
+            let usage = usage.expect("usage");
+            assert_eq!(usage.total_tokens, 7);
+        }
+        other => panic!("expected ResponseCompleted, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_incomplete_carries_the_provider_reason() {
+    // `incomplete` is a terminal success whose output may be partial; the
+    // provider states why under `incomplete_details.reason`.
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.incomplete","response":{"id":"resp_5","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::ResponseIncomplete { id, usage, reason } => {
+            assert_eq!(id.as_deref(), Some("resp_5"));
+            assert_eq!(reason.as_deref(), Some("max_output_tokens"));
+            assert_eq!(usage.expect("usage").total_tokens, 11);
+        }
+        other => panic!("expected ResponseIncomplete, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_incomplete_without_a_reason() {
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.incomplete","response":{"id":"resp_6","status":"incomplete"}}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::ResponseIncomplete { reason, .. } => assert!(reason.is_none()),
+        other => panic!("expected ResponseIncomplete, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_failed_reads_the_wrapped_error() {
+    // `response.failed` carries the same wrapping: the error object sits on
+    // `response.error`, not on the event root.
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.failed","response":{"id":"resp_7","status":"failed","error":{"code":"server_error","message":"upstream exploded"}}}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::ResponseFailed(error) => assert_eq!(error, "upstream exploded"),
+        other => panic!("expected ResponseFailed, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_reasoning_summary_text_delta() {
+    // The summary is the only reasoning text a Responses model streams; the
+    // event carries one text fragment per chunk.
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","delta":"step one"}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::ReasoningSummaryText(text) => assert_eq!(text, "step one"),
+        other => panic!("expected ReasoningSummaryText, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_reasoning_summary_part_boundaries_are_ignored() {
+    // Part boundaries carry no text of their own (the parts concatenate in
+    // arrival order), so they are not modelled as events.
+    for event_type in [
+        "response.reasoning_summary_part.added",
+        "response.reasoning_summary_part.done",
+    ] {
+        let data = format!(r#"{{"type":"{event_type}","item_id":"rs_1"}}"#);
+        assert!(
+            parse_responses_stream_event(&data)
+                .expect("parse")
+                .is_none(),
+            "{event_type} must not produce an event",
+        );
+    }
+}
+
+#[test]
 fn parse_responses_stream_event_response_failed_decodes_error_object() {
     // `response.failed.error` is the OpenAI error object `{code, message,
     // param, type}`; the surfaced text must be `message`, not a blank string

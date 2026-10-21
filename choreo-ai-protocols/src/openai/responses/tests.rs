@@ -4,7 +4,10 @@ use serde_json::json;
 // The types and helpers the request paths reach through their own imports; the
 // suite names them directly, so it imports them directly too.
 use crate::ToolResultItem;
-use crate::openai::{ChatRequestMessage, ChatToolDefinition, messages_to_responses_input};
+use crate::openai::{
+    AssistantToolCall, AssistantToolFunction, ChatRequestMessage, ChatToolDefinition,
+    messages_to_responses_input,
+};
 use choreo_proto::ReasoningArtifact;
 
 // ── Serialisation tests ───────────────────────────────────────────
@@ -320,6 +323,123 @@ fn response_output_item_deserializes_reasoning() {
 }
 
 // ── Reasoning artifact capture (phase 2c) ───────────────────────────
+
+#[test]
+fn a_reasoning_only_response_is_output_not_an_empty_response() {
+    // The provider produced (and billed) a reasoning item and no visible
+    // answer text. That is model output, so the turn is a `FinalText` with
+    // empty content that still carries the round-trip artifact — never an
+    // `EmptyResponse` error, which would discard the payload and report the
+    // paid turn as a failure.
+    let json_str = r#"{
+            "id": "resp_only",
+            "status": "completed",
+            "output": [
+                {"type": "reasoning", "id": "re_1", "summary": [], "encrypted_content": "eJxT_opaque"}
+            ]
+        }"#;
+    let payload: ResponsesResponse = serde_json::from_str(json_str).unwrap();
+    let result = responses_response_to_turn(payload).expect("reasoning-only turn is not empty");
+    match result {
+        ChatTurnResult::FinalText(f) => {
+            assert_eq!(f.content, "");
+            assert!(f.reasoning.is_none(), "an encrypted item has no text");
+            assert!(
+                matches!(
+                    f.reasoning_artifact,
+                    Some(ReasoningArtifact::ResponsesItems(_))
+                ),
+                "the captured item rides the artifact",
+            );
+        }
+        other => panic!("expected FinalText, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_response_without_content_or_reasoning_is_still_an_empty_response() {
+    let payload: ResponsesResponse = serde_json::from_str(r#"{"id":"r","output":[]}"#).unwrap();
+    assert!(matches!(
+        responses_response_to_turn(payload),
+        Err(super::super::OpenAiError::EmptyResponse)
+    ));
+}
+
+#[test]
+fn an_incomplete_response_reports_truncation_not_an_error() {
+    // `status: incomplete` with `max_output_tokens` is precisely a
+    // length-capped answer: the partial text rides a truncated `FinalText`,
+    // the same reading chat gives `finish_reason: length`.
+    let json_str = r#"{
+            "id": "resp_cut",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "The answer is"}]}
+            ]
+        }"#;
+    let payload: ResponsesResponse = serde_json::from_str(json_str).unwrap();
+    let result = responses_response_to_turn(payload).expect("partial output is a turn");
+    match result {
+        ChatTurnResult::FinalText(f) => {
+            assert_eq!(f.content, "The answer is");
+            assert!(f.truncated, "a length-capped answer is truncated");
+        }
+        other => panic!("expected FinalText, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_incomplete_response_with_an_unclassified_reason_is_a_truncation() {
+    // A reason this client does not model must not throw away output the
+    // provider charged for; it is logged and the turn keeps its text.
+    let json_str = r#"{
+            "status": "incomplete",
+            "incomplete_details": {"reason": "some_new_reason"},
+            "output": [
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "partial"}]}
+            ]
+        }"#;
+    let payload: ResponsesResponse = serde_json::from_str(json_str).unwrap();
+    match responses_response_to_turn(payload).expect("turn") {
+        ChatTurnResult::FinalText(f) => {
+            assert_eq!(f.content, "partial");
+            assert!(f.truncated);
+        }
+        other => panic!("expected FinalText, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_incomplete_response_stopped_by_the_content_filter_is_terminal() {
+    // A policy block is the one incomplete reason that is an error: retrying
+    // the same request can never clear it.
+    let json_str = r#"{
+            "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"},
+            "output": []
+        }"#;
+    let payload: ResponsesResponse = serde_json::from_str(json_str).unwrap();
+    assert!(matches!(
+        responses_response_to_turn(payload),
+        Err(super::super::OpenAiError::ContentFiltered { .. })
+    ));
+}
+
+#[test]
+fn a_completed_response_is_not_truncated() {
+    let json_str = r#"{
+            "status": "completed",
+            "output": [
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}
+            ]
+        }"#;
+    let payload: ResponsesResponse = serde_json::from_str(json_str).unwrap();
+    match responses_response_to_turn(payload).expect("turn") {
+        ChatTurnResult::FinalText(f) => assert!(!f.truncated),
+        other => panic!("expected FinalText, got {other:?}"),
+    }
+}
 
 #[test]
 fn non_streaming_captures_reasoning_items_artifact() {
@@ -990,6 +1110,72 @@ fn messages_to_responses_input_keeps_reasoning_items_for_an_empty_turn() {
     let items = messages_to_responses_input(&[msg]).unwrap();
     assert_eq!(items.len(), 1, "{items:?}");
     assert_eq!(items[0]["type"], "reasoning");
+}
+
+#[test]
+fn messages_to_responses_input_replays_the_function_calls_its_outputs_answer() {
+    // A rebuilt (un-chained) history must introduce every tool call before the
+    // `function_call_output` that answers it by `call_id`; the API rejects an
+    // output whose call never appeared in `input`.
+    let assistant = ChatRequestMessage {
+        role: "assistant",
+        content: None,
+        images: Vec::new(),
+        tool_call_id: None,
+        tool_calls: Some(vec![AssistantToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: AssistantToolFunction {
+                name: "get_weather".to_string(),
+                arguments: r#"{"city":"London"}"#.to_string(),
+            },
+        }]),
+        reasoning_artifact: None,
+    };
+    let tool_result = ChatRequestMessage {
+        role: "tool",
+        content: Some("72F".to_string()),
+        images: Vec::new(),
+        tool_call_id: Some("call_1".to_string()),
+        tool_calls: None,
+        reasoning_artifact: None,
+    };
+    let items = messages_to_responses_input(&[assistant, tool_result]).unwrap();
+    assert_eq!(items.len(), 2, "{items:?}");
+    assert_eq!(items[0]["type"], "function_call");
+    assert_eq!(items[0]["call_id"], "call_1");
+    assert_eq!(items[0]["name"], "get_weather");
+    assert_eq!(items[0]["arguments"], r#"{"city":"London"}"#);
+    assert_eq!(items[1]["type"], "function_call_output");
+    assert_eq!(items[1]["call_id"], "call_1");
+}
+
+#[test]
+fn messages_to_responses_input_places_reasoning_before_the_call_it_explains() {
+    // Provider output ordering: reasoning item, then message, then the calls.
+    let msg = ChatRequestMessage {
+        role: "assistant",
+        content: Some("checking".to_string()),
+        images: Vec::new(),
+        tool_call_id: None,
+        tool_calls: Some(vec![AssistantToolCall {
+            id: "call_9".to_string(),
+            kind: "function".to_string(),
+            function: AssistantToolFunction {
+                name: "lookup".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]),
+        reasoning_artifact: Some(ReasoningArtifact::ResponsesItems(
+            br#"[{"type":"reasoning","id":"rs_1"}]"#.to_vec(),
+        )),
+    };
+    let items = messages_to_responses_input(&[msg]).unwrap();
+    let kinds: Vec<&str> = items
+        .iter()
+        .map(|item| item["type"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(kinds, vec!["reasoning", "message", "function_call"]);
 }
 
 #[test]

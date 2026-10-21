@@ -116,8 +116,6 @@ pub(crate) enum ResponsesStreamEvent {
     TextDelta(String),
     /// Text output is complete
     TextDone,
-    /// Reasoning summary
-    ReasoningSummary(Vec<serde_json::Value>),
     /// A complete opaque reasoning output item (`response.output_item.added`
     /// / `.done` with `type: "reasoning"`), exactly as received. Carries
     /// the item id, summary array and — in stateless mode —
@@ -132,6 +130,14 @@ pub(crate) enum ResponsesStreamEvent {
         name: String,
         arguments: String,
     },
+    /// Reasoning-summary text delta (`response.reasoning_summary_text.delta`).
+    ///
+    /// The summary is the only reasoning text a Responses model exposes, so
+    /// this is what the session displays live. Part boundaries
+    /// (`response.reasoning_summary_part.done`) carry no text of their own and
+    /// are not modelled: parts concatenate in arrival order, which is the
+    /// complete summary the API defines.
+    ReasoningSummaryText(String),
     /// Response is complete with optional id and usage
     ResponseCompleted {
         id: Option<String>,
@@ -139,8 +145,19 @@ pub(crate) enum ResponsesStreamEvent {
     },
     /// Response failed with an error message
     ResponseFailed(String),
-    /// Response incomplete
-    ResponseIncomplete,
+    /// The response stopped early, carrying the provider's reason when it sent
+    /// one (`max_output_tokens`, `content_filter`, …).
+    ///
+    /// `incomplete` is a terminal SUCCESS whose output may be partial, not a
+    /// transport failure: the id and usage are the same ones `completed`
+    /// carries, and the reason decides whether the turn is a truncation (a
+    /// length-capped answer, exactly like chat's `finish_reason: length`) or a
+    /// terminal error.
+    ResponseIncomplete {
+        id: Option<String>,
+        usage: Option<super::Usage>,
+        reason: Option<String>,
+    },
     /// Program code delta (streaming generated JavaScript)
     ProgramCodeDelta(String),
     /// Program code is complete
@@ -154,6 +171,35 @@ pub(crate) enum ResponsesStreamEvent {
         result: String,
         status: String,
     },
+}
+
+/// The `response` object a terminal event wraps.
+///
+/// `response.completed` / `.incomplete` / `.failed` carry the whole `Response`
+/// object under a `response` key (see the streaming-events reference); a
+/// handful of gateways flatten those fields onto the event root instead, so
+/// every reader of the object goes through here and sees the other case for
+/// free.
+fn response_object(payload: &serde_json::Value) -> &serde_json::Value {
+    payload.get("response").unwrap_or(payload)
+}
+
+/// The response id a terminal event reports, when it reports one.
+fn response_id(response: &serde_json::Value) -> Option<String> {
+    response
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
+/// The response usage a terminal event reports.
+///
+/// If usage is present but unparseable, `None` rather than zeroed — the caller
+/// can then distinguish "no usage data" from invalid data.
+fn response_usage(response: &serde_json::Value) -> Option<super::Usage> {
+    response
+        .get("usage")
+        .and_then(|u| serde_json::from_value::<super::Usage>(u.clone()).ok())
 }
 
 /// Parse a single Responses API SSE event data string into a typed event.
@@ -178,13 +224,19 @@ pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<Resp
             Ok(delta)
         }
         "response.output_text.done" => Ok(Some(ResponsesStreamEvent::TextDone)),
-        "response.reasoning.summary" => {
-            let summary = payload
-                .get("summary")
-                .and_then(|value| value.as_array())
-                .cloned()
-                .unwrap_or_default();
-            Ok(Some(ResponsesStreamEvent::ReasoningSummary(summary)))
+        "response.reasoning_summary_text.delta" => {
+            let delta = payload
+                .get("delta")
+                .and_then(|value| value.as_str())
+                .map(|s| ResponsesStreamEvent::ReasoningSummaryText(s.to_string()));
+            Ok(delta)
+        }
+        // `response.reasoning_summary_part.added` / `.done` carry no text (the
+        // parts concatenate in arrival order), so they fall through to the
+        // unknown-event arm rather than inventing a separator the provider
+        // never sent.
+        "response.reasoning_summary_part.added" | "response.reasoning_summary_part.done" => {
+            Ok(None)
         }
         "response.output_item.added" | "response.output_item.done" => {
             // Reasoning items arrive as opaque output items. Capture the raw
@@ -237,14 +289,26 @@ pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<Resp
             }))
         }
         "response.completed" => {
-            let id = payload.get("id").and_then(|v| v.as_str()).map(String::from);
-            // If usage is present but unparseable, return None rather than
-            // silently zeroing it — the caller can distinguish "no usage data"
-            // from invalid data.
-            let usage = payload
-                .get("usage")
-                .and_then(|u| serde_json::from_value::<super::Usage>(u.clone()).ok());
-            Ok(Some(ResponsesStreamEvent::ResponseCompleted { id, usage }))
+            let response = response_object(&payload);
+            Ok(Some(ResponsesStreamEvent::ResponseCompleted {
+                id: response_id(response),
+                usage: response_usage(response),
+            }))
+        }
+        "response.incomplete" => {
+            let response = response_object(&payload);
+            Ok(Some(ResponsesStreamEvent::ResponseIncomplete {
+                id: response_id(response),
+                usage: response_usage(response),
+                // `incomplete_details.reason` is the only place the provider
+                // says WHY it stopped; absent, the caller treats the partial
+                // output as a truncation it cannot classify further.
+                reason: response
+                    .get("incomplete_details")
+                    .and_then(|details| details.get("reason"))
+                    .and_then(|value| value.as_str())
+                    .map(String::from),
+            }))
         }
         "response.failed" => {
             // `response.failed.error` is the OpenAI error object
@@ -253,16 +317,21 @@ pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<Resp
             // emulators emit a plain string instead, so accept both; last
             // resort is the serialized error object so a mid-stream failure
             // is never silently blank.
-            let error = payload.get("error").map_or_default(|value| match value {
-                serde_json::Value::String(s) => s.clone(),
-                other => other
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .map_or_else(|| other.to_string(), String::from),
-            });
+            // The error object lives on the wrapped `response`; a flattened
+            // event keeps it on the root, so both are read.
+            let root = response_object(&payload);
+            let error = root
+                .get("error")
+                .or_else(|| payload.get("error"))
+                .map_or_default(|value| match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .map_or_else(|| other.to_string(), String::from),
+                });
             Ok(Some(ResponsesStreamEvent::ResponseFailed(error)))
         }
-        "response.incomplete" => Ok(Some(ResponsesStreamEvent::ResponseIncomplete)),
         "response.program.code.delta" => {
             let delta = payload
                 .get("delta")

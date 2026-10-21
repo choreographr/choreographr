@@ -28,6 +28,21 @@ pub(crate) enum ResponsesInputItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         caller: Option<CallerInfo>,
     },
+    /// An assistant turn's tool request, replayed when the history is rebuilt
+    /// from messages rather than chained through `previous_response_id`.
+    ///
+    /// Every `function_call_output` names its originating call by `call_id`, so
+    /// the call itself has to appear earlier in `input`; the API rejects an
+    /// output whose call was never introduced. `arguments` is the raw JSON
+    /// string exactly as the model emitted it (never re-serialized).
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caller: Option<CallerInfo>,
+    },
 }
 
 /// Nested `reasoning` object for Responses requests.
@@ -94,6 +109,20 @@ pub(crate) struct ResponsesResponse {
     pub(crate) output: Vec<serde_json::Value>,
     #[serde(default)]
     pub(crate) usage: Option<Usage>,
+    /// `incomplete_details: { reason }` on a response that stopped early
+    /// (`status: "incomplete"`): `max_output_tokens`, `content_filter`, …
+    /// Parsed so the stop keeps its provider-stated cause instead of being
+    /// flattened into one error.
+    #[serde(default)]
+    pub(crate) incomplete_details: Option<ResponsesIncompleteDetails>,
+}
+
+/// Why a Responses API response stopped early.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ResponsesIncompleteDetails {
+    /// The provider's stop reason (`max_output_tokens`, `content_filter`, …).
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
 }
 
 /// Items in a Responses API response output array.

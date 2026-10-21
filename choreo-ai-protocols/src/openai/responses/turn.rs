@@ -8,13 +8,60 @@
 
 use std::io;
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::super::validate_tool_call_arguments;
 use super::body::extract_reasoning_text;
 use super::wire::{ResponseOutputItem, ResponsesResponse};
 use crate::types::{ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult};
 use choreo_proto::{ReasoningArtifact, TokenUsage};
+
+/// Project the Responses API usage onto the shared token counter.
+///
+/// The Responses API's cached-token analogue
+/// (`input_tokens_details.cached_tokens`) is not modelled yet, so the cache
+/// fields stay zero; every caller shares this one projection so the streaming
+/// and non-streaming paths cannot disagree about it.
+pub(super) fn responses_usage_to_token_usage(usage: &super::super::Usage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: usage.prompt_tokens,
+        output_tokens: usage.completion_tokens,
+        total_tokens: usage.total_tokens,
+        cached_tokens: 0,
+        cache_write_tokens: 0,
+    }
+}
+
+/// Classify a response that stopped early (`status: "incomplete"`).
+///
+/// `incomplete` is a terminal SUCCESS with possibly-partial output, so its
+/// reason decides what the caller does: a policy block is a terminal error
+/// that retrying can never clear, and every other reason
+/// (`max_output_tokens` included, and the absent-reason case) yields a partial
+/// answer reported as truncated — the same reading chat gives
+/// `finish_reason: length`. An unknown reason is logged so it stays
+/// diagnosable without failing a turn the provider charged for.
+fn incomplete_stop(payload: &ResponsesResponse) -> Result<bool, super::super::OpenAiError> {
+    let reason = payload
+        .incomplete_details
+        .as_ref()
+        .and_then(|details| details.reason.as_deref());
+    if payload.status.as_deref() != Some("incomplete") && reason.is_none() {
+        return Ok(false);
+    }
+    match reason {
+        Some("content_filter") => Err(super::super::OpenAiError::ContentFiltered {
+            detail: "provider content filter stopped the response \
+                     (incomplete: content_filter)"
+                .into(),
+        }),
+        Some("max_output_tokens") | None => Ok(true),
+        Some(other) => {
+            warn!(reason = other, "responses turn stopped incomplete");
+            Ok(true)
+        }
+    }
+}
 
 /// Build the opaque `ResponsesItems` artifact from the collected reasoning
 /// output items, or `None` when nothing was captured. The payload is the
@@ -75,16 +122,12 @@ pub(crate) fn responses_response_to_turn(
     payload: ResponsesResponse,
 ) -> Result<ChatTurnResult, super::super::OpenAiError> {
     let response_id = payload.id.clone();
-    let turn_usage = payload.usage.map(|u| TokenUsage {
-        input_tokens: u.prompt_tokens,
-        output_tokens: u.completion_tokens,
-        total_tokens: u.total_tokens,
-        // The Responses API has no `prompt_tokens_details` object; its
-        // cached-token analogue (`input_tokens_details.cached_tokens`) is a
-        // possible follow-up, so chat-completions z.ai parsing only for now.
-        cached_tokens: 0,
-        cache_write_tokens: 0,
-    });
+    // A declared stop wins over whatever (possibly empty) body arrived: a
+    // length-capped answer keeps its partial text as `truncated`, while a
+    // content-filter refusal is a distinct terminal error. Classified before
+    // the usage field is moved out below.
+    let truncated = incomplete_stop(&payload)?;
+    let turn_usage = payload.usage.as_ref().map(responses_usage_to_token_usage);
 
     // Parse output items: extract text, reasoning, tool calls, and the
     // opaque reasoning items for the round-trip artifact.
@@ -196,9 +239,7 @@ pub(crate) fn responses_response_to_turn(
         if !full_text.is_empty() {
             return Ok(ChatTurnResult::FinalText(FinalTextResult {
                 content: full_text,
-                // Responses API has no finish_reason-equivalent length flag
-                // parsed today; only the chat-completions adapter sets it.
-                truncated: false,
+                truncated,
                 reasoning: if full_reasoning.is_empty() {
                     None
                 } else {
@@ -212,13 +253,17 @@ pub(crate) fn responses_response_to_turn(
         return Err(super::super::OpenAiError::TruncatedToolCall { discarded });
     }
 
-    if full_text.is_empty() {
+    // No answer text, but a reasoning item was captured: the provider produced
+    // (and billed) output this turn, so it is a `FinalText` with empty content
+    // that carries the reasoning and its round-trip artifact — never an empty
+    // response. The same rule the chat adapter's reasoning fold applies.
+    if full_text.is_empty() && reasoning_artifact.is_none() {
         return Err(super::super::OpenAiError::EmptyResponse);
     }
 
     Ok(ChatTurnResult::FinalText(FinalTextResult {
         content: full_text,
-        truncated: false,
+        truncated,
         reasoning: if full_reasoning.is_empty() {
             None
         } else {

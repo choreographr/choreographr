@@ -1,8 +1,9 @@
 //! Lowering of the canonical message list into the Responses API `input` array.
 //!
 //! The Responses wire format does not take a `messages` list: it takes a flat
-//! `input` array of typed items (`message`, `function_call_output`, and the
-//! provider's own replayed `reasoning` items), so the canonical
+//! `input` array of typed items (`message`, `function_call`,
+//! `function_call_output`, and the provider's own replayed `reasoning` items),
+//! so the canonical
 //! [`ChatRequestMessage`] slice has to be lowered item by item. The item types
 //! themselves belong to the Responses adapter (see [`super::responses`]); this
 //! module is only the shared messages→input builder both Responses request
@@ -87,6 +88,23 @@ pub(crate) fn messages_to_responses_input(
                             content: msg.responses_content_value(),
                         },
                     )?);
+                }
+                // An assistant turn's tool requests are their own input items,
+                // placed after its message exactly as the provider emitted
+                // them. They are what every later `function_call_output` calls
+                // back to by `call_id`: a rebuilt history that omitted them
+                // would send an output for a call the API never saw introduced.
+                if msg.role == "assistant" {
+                    for call in msg.tool_calls.iter().flatten() {
+                        items.push(responses_input_item_value(
+                            &responses::ResponsesInputItem::FunctionCall {
+                                call_id: call.id.clone(),
+                                name: call.function.name.clone(),
+                                arguments: call.function.arguments.clone(),
+                                caller: None,
+                            },
+                        )?);
+                    }
                 }
             }
             "tool" => {

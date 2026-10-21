@@ -159,10 +159,19 @@ where
             Some(ResponsesStreamEvent::ResponseFailed(error)) => {
                 return Err(super::OpenAiError::Io(io::Error::other(error)));
             }
-            Some(ResponsesStreamEvent::ResponseIncomplete) => {
-                return Err(super::OpenAiError::Io(io::Error::other(
-                    "response incomplete",
-                )));
+            Some(ResponsesStreamEvent::ResponseIncomplete { reason, .. }) => {
+                // A one-shot prompt has no artifact to carry and no turn result
+                // to flag, so a policy block is the only outcome it can report:
+                // `has_any_output` below decides whether the partial text is a
+                // usable answer.
+                if reason.as_deref() == Some("content_filter") {
+                    return Err(super::OpenAiError::ContentFiltered {
+                        detail: "provider content filter stopped the response \
+                                 (response.incomplete: content_filter)"
+                            .into(),
+                    });
+                }
+                break;
             }
             _ => {}
         }
