@@ -20,13 +20,12 @@ use tracing::debug;
 
 use super::reasoning_stream::ReasoningStreamState;
 use super::{
-    ChatCompletionsStreamResponse, FinishReason, StreamToolCallDelta, finish_reason_terminal_error,
+    ChatCompletionsStreamResponse, ChatTurnParts, FinishReason, StreamToolCallDelta, assemble_turn,
+    finish_reason_terminal_error,
 };
-use crate::openai::{OpenAiError, validate_tool_call_arguments};
+use crate::openai::OpenAiError;
 use crate::shared::MAX_TOOL_CALLS;
-use crate::types::{
-    ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
-};
+use crate::types::{ChatToolCall, ChatTurnResult, StreamEvent};
 
 // ── Chat Completions tool call accumulation ─────────────────────────────
 
@@ -82,7 +81,6 @@ pub(crate) fn accumulate_tool_calls_from_deltas(
 /// `accumulate_tool_calls_from_deltas` helper above).
 #[derive(Debug)]
 pub(super) struct ChatCompletionsStreamAccumulator {
-    has_any_output: bool,
     full_content: String,
     /// The turn's streaming reasoning: both capture channels, the locked scalar
     /// field, and the channel that owns the live display (see
@@ -107,7 +105,6 @@ impl Default for ChatCompletionsStreamAccumulator {
         // (const-generic array Default was never stabilized), so `[bool;
         // MAX_TOOL_CALLS]` (128) cannot be derived.
         Self {
-            has_any_output: false,
             full_content: String::new(),
             reasoning: ReasoningStreamState::default(),
             raw_tool_call_deltas: Vec::new(),
@@ -160,24 +157,28 @@ impl ChatCompletionsStreamAccumulator {
                 continue;
             };
 
-            // Content chunks: answer text
+            // Content chunks: answer text. Emitted before the reasoning
+            // channels so a delta carrying both keeps the reply ahead of the
+            // thinking — the same order the simple streaming path and the
+            // non-streaming bridge use; the client stores the two in separate
+            // turn fields and renders the answer above a collapsible reasoning
+            // section.
             if let Some(content) = delta.content.as_ref().filter(|c| !c.is_empty()) {
-                self.has_any_output = true;
                 self.full_content.push_str(content);
                 on_event(StreamEvent::Answer(content.clone()))?;
             }
 
             // Both reasoning channels fold through one shared state machine,
             // which owns the display-claim rule and the capture of the other
-            // channel. It reports whether the delta carried reasoning output at
-            // all, including an encrypted-only details entry (which is model
-            // output even though it never displays).
-            self.has_any_output |= self.reasoning.apply(delta, on_event)?;
+            // channel. Whether the turn produced any output is derived from the
+            // accumulated content, tool calls, and captured artifact when the
+            // result is assembled, so the fold's produced flag is not tracked
+            // here.
+            self.reasoning.apply(delta, on_event)?;
             // Collect raw tool call deltas — the shared accumulator
             // (accumulate_tool_calls_from_deltas) will merge them by index
             // and produce sorted ChatToolCall output after the stream ends.
             if let Some(ref tcs) = delta.tool_calls {
-                self.has_any_output = true;
                 for tc in tcs {
                     if self.distinct_tool_call_count >= MAX_TOOL_CALLS {
                         return Err(OpenAiError::Io(io::Error::other(format!(
@@ -219,11 +220,7 @@ impl ChatCompletionsStreamAccumulator {
         if let Some(err) = finish_reason_terminal_error(self.finish_reason.as_ref()) {
             return Err(err);
         }
-        if !self.has_any_output {
-            return Err(OpenAiError::EmptyResponse);
-        }
-        // `length` on a FINAL-TEXT turn is a truncation notice, not an error;
-        // only the FinalText paths below carry the flag.
+        // `length` on a FINAL-TEXT turn is a truncation notice, not an error.
         let truncated = matches!(self.finish_reason, Some(FinishReason::Length));
 
         // The state machine's finish applies the persisted precedence: a captured
@@ -233,51 +230,21 @@ impl ChatCompletionsStreamAccumulator {
         // stands in.
         let (display_reasoning, reasoning_artifact) = self.reasoning.finish();
 
-        if !self.raw_tool_call_deltas.is_empty() {
-            let mut tool_calls = accumulate_tool_calls_from_deltas(self.raw_tool_call_deltas);
-            let discarded = validate_tool_call_arguments(&mut tool_calls);
-            if !tool_calls.is_empty() {
-                return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
-                    content: if self.full_content.is_empty() {
-                        None
-                    } else {
-                        Some(self.full_content)
-                    },
-                    tool_calls,
-                    reasoning: display_reasoning.clone(),
-                    usage: self.last_usage,
-                    response_id: None,
-                    reasoning_artifact,
-                }));
-            }
-            if !discarded.is_empty() {
-                // Every accumulated tool call had invalid (truncated)
-                // arguments. If the model also streamed visible text, return it
-                // (the tool call is the casualty, not the answer); otherwise
-                // surface `TruncatedToolCall` so the daemon can recover instead
-                // of rendering an empty, truncated-looking final answer. Same
-                // invariant and shape as the non-streaming path above.
-                if self.full_content.is_empty() {
-                    return Err(OpenAiError::TruncatedToolCall { discarded });
-                }
-                return Ok(ChatTurnResult::FinalText(FinalTextResult {
-                    content: self.full_content,
-                    truncated,
-                    reasoning: display_reasoning.clone(),
-                    usage: self.last_usage,
-                    response_id: None,
-                    reasoning_artifact,
-                }));
-            }
-        }
-
-        Ok(ChatTurnResult::FinalText(FinalTextResult {
-            content: self.full_content,
-            truncated,
+        // The shared assembler owns the tool-call / truncation / empty-response
+        // decision tree (identical to the non-streaming path); a tool-call
+        // message forwards only non-empty content.
+        let tool_use_content = (!self.full_content.is_empty()).then(|| self.full_content.clone());
+        let content_is_empty = self.full_content.is_empty();
+        let tool_calls = accumulate_tool_calls_from_deltas(self.raw_tool_call_deltas);
+        assemble_turn(ChatTurnParts {
+            tool_use_content,
+            final_text: self.full_content,
+            content_is_empty,
+            tool_calls,
             reasoning: display_reasoning,
-            usage: self.last_usage,
-            response_id: None,
             reasoning_artifact,
-        }))
+            usage: self.last_usage,
+            truncated,
+        })
     }
 }

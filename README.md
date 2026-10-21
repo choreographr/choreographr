@@ -629,7 +629,8 @@ and re-emits it per provider rules on the next request:
 - **OpenRouter / Kimi (structured `reasoning_details`)** — routes that declare
   the structured array (OpenRouter's resellers, Ollama Cloud, a few gateways)
   round-trip it as JSON rather than text. Consecutive text/summary entries of one
-  stream slot (equal `index`) are merged at capture and encrypted entries stay
+  stream slot (equal `index`, or an `index` absent on both) are merged at capture
+  and encrypted entries stay
   discrete, while an unrecognised entry type is preserved verbatim and replayed
   unchanged — the upstream requires the returned sequence to match what the model
   produced, so nothing may be dropped; unrecognised entries contribute nothing to

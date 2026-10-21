@@ -1155,6 +1155,32 @@ fn non_streaming_empty_reasoning_yields_none_artifact() {
 }
 
 #[test]
+fn non_streaming_empty_scalar_does_not_mask_a_populated_field() {
+    // A provider that always emits `reasoning_content: ""` beside a real
+    // `reasoning` payload must not have the populated field discarded: the
+    // first NON-empty field wins (here `reasoning`), becoming both the display
+    // text and the artifact, tagged with the field it arrived under. The
+    // non-streaming fold shares the streaming state machine, so this matches
+    // the streaming first-non-empty rule.
+    let json = r#"{"choices":[{"message":{"content":"answer","tool_calls":[],"reasoning_content":"","reasoning":"real thought","reasoning_text":null}}],"usage":null}"#;
+    let payload: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+    let result = chat_completions_response_to_turn(payload).unwrap();
+    match result {
+        ChatTurnResult::FinalText(f) => {
+            assert_eq!(f.reasoning.as_deref(), Some("real thought"));
+            assert_eq!(
+                f.reasoning_artifact,
+                Some(ReasoningArtifact::ChatReasoning {
+                    field: ChatReasoningField::Reasoning,
+                    bytes: b"real thought".to_vec(),
+                })
+            );
+        }
+        other => panic!("expected FinalText, got {other:?}"),
+    }
+}
+
+#[test]
 fn streaming_accumulates_reasoning_artifact() {
     // Two chunks carrying reasoning deltas plus an answer chunk, then
     // finalize — the concatenated deltas become the artifact bytes.

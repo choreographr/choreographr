@@ -257,6 +257,12 @@ fn build_report(
         // content, no tool calls, and no non-empty reasoning echo means the drop
         // predicate and the serialization have drifted apart. A non-empty
         // `reasoning_details` array is a payload; the injected `[]` is not.
+        //
+        // This deliberately re-derives "non-empty reasoning" from the SERIALIZED
+        // value rather than calling `chat_assistant_payload_is_empty` (which
+        // `survives` already used above): the point is to check the emit path's
+        // own output against the drop decision, so a drift between the two shows
+        // up as an alarm instead of being masked by reusing one predicate.
         let content_empty = value
             .get("content")
             .and_then(|c| c.as_str())

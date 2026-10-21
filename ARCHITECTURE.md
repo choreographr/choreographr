@@ -1189,11 +1189,14 @@ scalar fields, so a chunk carrying both lets the structured entries claim first.
 Both channels are still captured regardless of who owns the display — the scalar
 text is accumulated all the same, since it stays the display and artifact
 fallback for a route that streams only the scalar field, and the array is
-captured even while the scalar field is on screen. Both streaming request paths
+captured even while the scalar field is on screen. All three capture paths —
+both streaming request paths and the non-streaming response conversion —
 delegate those rules to one shared state machine
 (`openai/chat_completions/reasoning_stream.rs`) rather than each reimplementing
-them, which is what keeps the plain prompt path and the tool path displaying
-identically. Capture normalizes the array under a
+them, which is what keeps the plain prompt path, the tool path, and the
+non-streaming turn result interpreting reasoning identically (including the
+first-non-empty scalar precedence that stops an empty field masking a populated
+one). Capture normalizes the array under a
 documented, deliberately small per-turn byte cap, beyond which the payload is
 dropped and logged rather than failing the request — and an overflowed capture
 then yields no display text either, so the session never shows reasoning it
@@ -1214,10 +1217,12 @@ that requires it, while an oversized body fails the whole turn. The scalar
 artifacts are not capped at capture at all — real thinking can exceed the
 per-turn cap and the DeepSeek/GLM echo requirement needs it replayed — so they
 are bounded by that same request budget rather than by capture. Consecutive
-same-kind text and summary entries merge only when the provider marks them as the
-same stream slot (equal `index`); a missing index is never treated as
-compatible, because merging on absent evidence would fuse two distinct blocks
-into a sequence the upstream requires to match. Encrypted entries stay discrete
+same-kind text and summary entries merge when the provider marks them as the
+same stream slot (equal `index`) or leaves the `index` off on both (it does not
+distinguish slots, so adjacency plus kind is the only signal — the shape the
+reference implementations merge on); a mixed presence is ambiguous and stays
+unmerged, because fusing on absent evidence could rewrite a sequence the
+upstream requires to match. Encrypted entries stay discrete
 (they are individually opaque), and an entry whose `type` is not modelled is kept
 and replayed **verbatim** — it contributes nothing to display text, but dropping
 it would again alter the sequence the model produced. The lowering replays

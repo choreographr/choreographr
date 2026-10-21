@@ -34,7 +34,7 @@ fn chat_message_with_images_serializes_content_as_parts_array() {
 
 #[test]
 fn chat_message_without_images_serializes_content_as_plain_string() {
-    // Regression: a text-only message keeps the exact legacy wire shape
+    // A text-only message serializes to the plain role/content shape
     // (content is a plain string; no images field).
     let msg = ChatRequestMessage::simple("user", "hi".to_string());
     let value =

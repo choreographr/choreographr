@@ -12,8 +12,6 @@ use crate::types::{
 use choreo_proto::{ChatReasoningField, ReasoningArtifact, TokenUsage};
 use std::io;
 
-use super::reasoning_details::DetailsCapture;
-
 mod accumulator;
 mod reasoning_stream;
 
@@ -82,63 +80,34 @@ pub(crate) struct AssistantMessage {
 }
 
 impl AssistantMessage {
-    /// Extract the reasoning payload from whichever field the model populated.
+    /// Extract the reasoning payload and display text for the turn.
     ///
-    /// The scalar fields are consumed with the non-streaming precedence
-    /// `reasoning_content` > `reasoning` > `reasoning_text`. When the route
-    /// streamed a structured `reasoning_details` array, it becomes the captured
-    /// artifact (the richer, replayable payload) regardless of which scalar
-    /// field also carried display text.
+    /// The response's reasoning fields are folded through the same
+    /// [`ReasoningStreamState`] the streaming paths use, so field precedence
+    /// (`reasoning_content` > `reasoning` > `reasoning_text`, first NON-empty
+    /// wins), empty-skipping, the structured-artifact-over-scalar choice, and
+    /// the display fallback are decided in exactly one place. The live-display
+    /// callback is a no-op: a non-streaming turn has no stream to render, so the
+    /// derived text rides the turn result instead.
     ///
-    /// Returns the display text alongside an opaque [`ReasoningArtifact`].
-    /// The artifact records WHICH field was consumed, so re-emission targets the
-    /// same wire field the provider used — a provider that sends
-    /// `reasoning_text` must not have its payload echoed back as
-    /// `reasoning_content` on the next tool-loop turn. When no scalar reasoning
-    /// streamed, the display text is derived from the details array's
-    /// text/summary entries.
+    /// Returns the display text alongside an opaque [`ReasoningArtifact`], which
+    /// records WHICH field the payload was observed under so re-emission targets
+    /// the same wire field — a provider that sends `reasoning_text` must not have
+    /// its payload echoed back as `reasoning_content` on the next tool-loop turn.
     pub(crate) fn take_reasoning(&mut self) -> (Option<String>, Option<ReasoningArtifact>) {
-        // Structured details are normalized first so both the artifact and the
-        // display fallback are ready before the scalar precedence is applied.
-        let mut details = DetailsCapture::default();
-        if let Some(raw) = self.reasoning_details.take() {
-            // Nothing on this path displays the fragments live: the turn result
-            // carries the derived text, so the callback is a no-op.
-            details.push(&raw, &mut |_| {});
-        }
-        let details_display = details.display();
-        let details_artifact = details.finish();
-
-        let scalar = self
-            .reasoning_content
-            .take()
-            .map(|text| (ChatReasoningField::ReasoningContent, text))
-            .or_else(|| {
-                self.reasoning
-                    .take()
-                    .map(|text| (ChatReasoningField::Reasoning, text))
-            })
-            .or_else(|| {
-                self.reasoning_text
-                    .take()
-                    .map(|text| (ChatReasoningField::ReasoningText, text))
-            });
-        if let Some((field, text)) = scalar {
-            // Prefer the structured artifact: it is the payload the route can
-            // replay. Fall back to the scalar text when no details streamed.
-            let artifact = details_artifact.or_else(|| chat_reasoning_artifact(field, &text));
-            let display = if text.is_empty() {
-                details_display
-            } else {
-                text
-            };
-            return ((!display.is_empty()).then_some(display), artifact);
-        }
-        // No scalar field: any display text comes from the details entries.
-        (
-            (!details_display.is_empty()).then_some(details_display),
-            details_artifact,
-        )
+        let mut state = ReasoningStreamState::default();
+        let delta = StreamDelta {
+            content: None,
+            tool_calls: None,
+            reasoning_content: self.reasoning_content.take(),
+            reasoning: self.reasoning.take(),
+            reasoning_text: self.reasoning_text.take(),
+            reasoning_details: self.reasoning_details.take(),
+        };
+        // The fold cannot fail with a no-op callback; its produced flag is the
+        // streaming caller's concern, not the non-streaming result's.
+        let _ = state.apply(&delta, &mut |_| Ok(()));
+        state.finish()
     }
 }
 
@@ -470,11 +439,11 @@ fn chat_completions_response_to_turn(
     if let Some(err) = finish_reason_terminal_error(choice.finish_reason.as_ref()) {
         return Err(err);
     }
-    // `length` on a FINAL-TEXT turn means the answer was cut off; only the
-    // FinalText paths below set the flag (ToolUse is normal tool-loop flow).
+    // `length` on a FINAL-TEXT turn means the answer was cut off; the tool-call
+    // arm ignores it (a length-truncated tool call is normal tool-loop flow).
     let truncated = matches!(choice.finish_reason, Some(FinishReason::Length));
 
-    // Extract reasoning early (before partial moves into tool_calls / content)
+    // Extract reasoning early (before the partial moves into tool_calls / content)
     let (reasoning, reasoning_artifact) = choice.message.take_reasoning();
 
     // Extract token usage from the API response for cost tracking / display.
@@ -498,7 +467,7 @@ fn chat_completions_response_to_turn(
         }
     });
 
-    let mut tool_calls: Vec<ChatToolCall> = choice
+    let tool_calls: Vec<ChatToolCall> = choice
         .message
         .tool_calls
         .into_iter()
@@ -509,65 +478,118 @@ fn chat_completions_response_to_turn(
             caller: None,
         })
         .collect();
+
+    // A tool-call message keeps the provider's raw `content` Option; the
+    // final-text content is trimmed (a blank answer reads as none), and the
+    // empty-response guard keys on that trimmed text.
+    let tool_use_content = choice.message.content;
+    let final_text = tool_use_content
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let content_is_empty = final_text.is_empty();
+
+    assemble_turn(ChatTurnParts {
+        tool_use_content,
+        final_text,
+        content_is_empty,
+        tool_calls,
+        reasoning,
+        reasoning_artifact,
+        usage: turn_usage,
+        truncated,
+    })
+}
+
+/// The finalized parts of one chat turn, handed to [`assemble_turn`].
+///
+/// Bundled so the assembler takes one value instead of a long positional list
+/// (no `too_many_arguments` suppression) and each caller names every part
+/// explicitly.
+struct ChatTurnParts {
+    /// Content to attach to a `ToolUse` result (the provider's raw option for
+    /// the non-streaming path, `None`-when-empty for the streaming path).
+    tool_use_content: Option<String>,
+    /// Content to attach to a `FinalText` result (already normalized by the
+    /// caller: trimmed for non-streaming, the accumulated text for streaming).
+    final_text: String,
+    /// Whether the turn's visible content is empty (drives the empty-response
+    /// and truncated-tool-call guards).
+    content_is_empty: bool,
+    /// The turn's tool calls, collected but not yet validated.
+    tool_calls: Vec<ChatToolCall>,
+    /// The turn's display reasoning text.
+    reasoning: Option<String>,
+    /// The opaque round-trip reasoning artifact.
+    reasoning_artifact: Option<ReasoningArtifact>,
+    /// Token usage reported for the turn, when the provider sent any.
+    usage: Option<TokenUsage>,
+    /// Whether `finish_reason` was `length` on a final-text turn.
+    truncated: bool,
+}
+
+/// Assemble a chat turn result from its finalized parts.
+///
+/// Shared by the non-streaming response conversion and the streaming
+/// accumulator so the `ToolUse` / truncated-tool-call / final-text decision tree
+/// exists exactly once. A message with empty content, no tool calls, and no
+/// reasoning artifact is a genuine empty response.
+fn assemble_turn(parts: ChatTurnParts) -> Result<ChatTurnResult, super::OpenAiError> {
+    let ChatTurnParts {
+        tool_use_content,
+        final_text,
+        content_is_empty,
+        mut tool_calls,
+        reasoning,
+        reasoning_artifact,
+        usage,
+        truncated,
+    } = parts;
+    // Truncated / malformed tool calls are dropped here, once, for both paths.
     let discarded = validate_tool_call_arguments(&mut tool_calls);
     if !tool_calls.is_empty() {
         return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
-            content: choice.message.content,
+            content: tool_use_content,
             tool_calls,
             reasoning,
-            usage: turn_usage,
+            usage,
             response_id: None,
             reasoning_artifact,
         }));
     }
-
     if !discarded.is_empty() {
         // Every tool call had invalid (truncated) arguments: the provider cut
         // the response off mid-call, so the call is unsafe to execute. If the
         // model also produced visible text, surface it — the casualty is the
         // tool call, not the answer. Otherwise there is nothing usable to
         // return, so signal a dedicated `TruncatedToolCall` instead of
-        // fabricating an empty "final answer" that looks complete. This mirrors
-        // the Responses adapter and the shared invariant that a length-
-        // truncated tool call must never be laundered into a final turn — the
-        // daemon special-cases `TruncatedToolCall` to tell the model what
-        // happened and let it retry in smaller steps.
-        let content = choice
-            .message
-            .content
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if content.is_empty() {
+        // fabricating an empty "final answer" that looks complete — the daemon
+        // special-cases it to tell the model what happened and let it retry in
+        // smaller steps.
+        if content_is_empty {
             return Err(super::OpenAiError::TruncatedToolCall { discarded });
         }
         return Ok(ChatTurnResult::FinalText(FinalTextResult {
-            content,
+            content: final_text,
             truncated,
             reasoning,
-            usage: turn_usage,
+            usage,
             response_id: None,
             reasoning_artifact,
         }));
     }
-
-    let content = choice
-        .message
-        .content
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    // An encrypted-only reasoning_details turn has no visible text but IS model
-    // output; a missing artifact is what makes this a genuine empty response.
-    if content.is_empty() && reasoning_artifact.is_none() {
+    // An encrypted-only (or unrecognised-only) reasoning turn has no visible
+    // text but IS model output; a missing artifact is what makes this a genuine
+    // empty response.
+    if content_is_empty && reasoning_artifact.is_none() {
         return Err(super::OpenAiError::EmptyResponse);
     }
-
     Ok(ChatTurnResult::FinalText(FinalTextResult {
-        content,
+        content: final_text,
         truncated,
         reasoning,
-        usage: turn_usage,
+        usage,
         response_id: None,
         reasoning_artifact,
     }))
@@ -659,11 +681,15 @@ where
                 continue;
             };
 
-            has_any_output |= reasoning.apply(&delta, on_event)?;
-            if let Some(content) = delta.content.filter(|c| !c.is_empty()) {
+            // Answer before reasoning, matching the tool accumulator and the
+            // non-streaming bridge (`emit_non_streaming_events`): the reply is
+            // the primary content, and the client renders it above a
+            // collapsible reasoning section regardless of arrival order.
+            if let Some(content) = delta.content.as_ref().filter(|c| !c.is_empty()) {
                 has_any_output = true;
-                on_event(StreamEvent::Answer(content))?;
+                on_event(StreamEvent::Answer(content.clone()))?;
             }
+            has_any_output |= reasoning.apply(&delta, on_event)?;
         }
     }
 
