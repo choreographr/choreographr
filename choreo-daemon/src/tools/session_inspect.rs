@@ -12,7 +12,9 @@
 //! `chat_reasoning_echo`, `warn_on_uncaptured_reasoning`,
 //! `model_reasoning_passback`), so the report is a faithful dry-run rather than
 //! a reimplementation that can drift. The messages are lowered by the chat
-//! adapter's own `chat_wire_messages`, so the per-message keys in this report
+//! adapter's own `chat_wire_messages`, and its reasoning-key scan and
+//! empty-message drop rule come from the adapter's `CHAT_REASONING_WIRE_KEYS`
+//! and `chat_assistant_payload_is_empty`, so the per-message keys and the ledger
 //! are exactly what the upstream would see. Read-only: only redb read
 //! transactions are opened; session state is never mutated.
 //!
@@ -32,7 +34,9 @@ use crate::reasoning::{
 use crate::sessions::SessionState;
 use crate::tools::Tool;
 use crate::tools::context::ToolContext;
-use choreo_ai_protocols::openai::chat_wire_messages;
+use choreo_ai_protocols::openai::{
+    CHAT_REASONING_WIRE_KEYS, chat_assistant_payload_is_empty, chat_wire_messages,
+};
 use choreo_ai_protocols::{
     ReasoningPassback, chat_reasoning_echo, model_reasoning_passback, provider_slug_for_model,
 };
@@ -226,13 +230,9 @@ fn build_report(
         assistant_count += 1;
         let value = serde_json::to_value(w)
             .map_err(|e| ToolExecError(format!("serialize request message: {e}")))?;
-        let keys = [
-            "reasoning_content",
-            "reasoning",
-            "reasoning_text",
-            "reasoning_details",
-        ];
-        let present: Vec<&str> = keys
+        // Scanned with the chat adapter's own key list, so this dry-run cannot
+        // report a key the projection never emits (nor miss one it does).
+        let present: Vec<&str> = CHAT_REASONING_WIRE_KEYS
             .iter()
             .copied()
             .filter(|k| value.get(*k).is_some())
@@ -261,7 +261,7 @@ fn build_report(
             .get("content")
             .and_then(|c| c.as_str())
             .is_none_or(|text| text.trim().is_empty());
-        let reasoning_non_empty = keys
+        let reasoning_non_empty = CHAT_REASONING_WIRE_KEYS
             .iter()
             .filter_map(|k| value.get(*k).and_then(|v| v.as_str()))
             .any(|s| !s.trim().is_empty())
@@ -307,15 +307,20 @@ fn build_report(
         // lockstep.
         let include_artifact = include_reasoning_artifact(turn, &provider, &model, passback);
         let echo_has_artifact = include_artifact && turn.reasoning_artifact.is_some();
-        // Whether the turn's assistant message survives the lowering at all: the
-        // projection drops an assistant message with no non-blank content and no
-        // tool calls (whitespace-only counts as empty). Mirrors
-        // `ChatWireMessage::is_empty`, so the ledger and the wire agree.
-        let survives = turn
-            .assistant_text
-            .as_deref()
-            .is_some_and(|text| !text.trim().is_empty())
-            || !turn.tool_calls.is_empty();
+        // Whether the turn's assistant message survives the lowering at all —
+        // decided by the very predicate the projection uses (`ChatWireMessage`'s
+        // drop rule), so the ledger cannot drift from the wire. A replayed
+        // artifact is passed only when this turn actually echoes one, matching
+        // what the projection is told; an assistant turn never carries images.
+        let survives = !chat_assistant_payload_is_empty(
+            turn.assistant_text.as_deref(),
+            !turn.tool_calls.is_empty(),
+            false,
+            include_artifact
+                .then_some(turn.reasoning_artifact.as_ref())
+                .flatten(),
+            echo,
+        );
         // Whether this turn's assistant message carries A reasoning key on the
         // wire: the artifact (under the declared field, else the observed one),
         // or the required field as an empty string when there is nothing to

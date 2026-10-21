@@ -412,7 +412,10 @@ pub(crate) fn initial_prev_resp_id(
 /// hazard on its own. The previous policy-shaped version gated on the
 /// `DeepSeek`/Kimi `reasoning_content` flag and flagged every tool turn the model
 /// happened to answer without thinking (five spurious warnings on one request)
-/// while missing the real failure mode entirely.
+/// while missing the real failure mode entirely. The capture-loss branch consults
+/// no `ReasoningPassback` fact on purpose: a turn whose displayed reasoning can no
+/// longer be replayed is worth surfacing on any route, because the loss lives in
+/// the session's record rather than in the request being built.
 ///
 /// Returns the number of turns flagged, so tests can exercise the path
 /// deterministically; turn-level diagnosis of a whole request belongs to the
