@@ -1,6 +1,12 @@
 use super::*;
 use serde_json::json;
 
+// The types and helpers the request paths reach through their own imports; the
+// suite names them directly, so it imports them directly too.
+use crate::ToolResultItem;
+use crate::openai::{ChatRequestMessage, ChatToolDefinition, messages_to_responses_input};
+use choreo_proto::ReasoningArtifact;
+
 // ── Serialisation tests ───────────────────────────────────────────
 
 #[test]
