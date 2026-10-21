@@ -551,13 +551,14 @@ fn lower_entry(entry: &Value) -> Option<Value> {
     Some(lowered)
 }
 
-/// The Kimi-style scalar companion for a lowered details array: its
-/// concatenated summary text, emitted as `reasoning_content`.
+/// The scalar companion for a lowered details array: its concatenated summary
+/// text, emitted as `reasoning_content`.
 ///
 /// `None` for the `OpenRouter` dialect (whose routes read the array alone), for
 /// an empty array, and for an encrypted-only array (nothing displayable to
 /// mirror). The one-channel rule holds among the scalar fields; this companion
-/// is the deliberate exception Kimi-shaped routes require.
+/// is the deliberate exception the bare shape requires, since a route that
+/// streams it expects the summary beside the array.
 pub(crate) fn details_companion(details: &Value) -> Option<String> {
     let entries = details.as_array()?;
     if entries.is_empty() || entries.iter().any(is_namespaced) {

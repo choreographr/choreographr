@@ -1558,8 +1558,8 @@ fn declared_details_replays_openrouter_entries_verbatim() {
 }
 
 #[test]
-fn declared_details_rebuilds_kimi_entries_with_companion() {
-    // A persisted Kimi payload keeps a stream `index`; replay strips it and
+fn declared_details_strips_the_index_and_adds_companion() {
+    // A persisted bare payload keeps a stream `index`; replay strips it and
     // mirrors the summary text as `reasoning_content`.
     let msg = assistant_with(details_artifact(&serde_json::json!([
         {"type":"summary","summary":"step one","index":0}

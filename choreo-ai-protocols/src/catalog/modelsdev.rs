@@ -155,19 +155,25 @@ struct ModelLimit {
     output: u32,
 }
 
-/// The snapshot's `interleaved` value in any of its encodings. Serde tries
-/// each untagged variant in order; `true` matches only the bool variant, so
-/// a bare `true` can never be mistaken for a field name. The bool form
-/// ("supports interleaved thinking") carries no field name and is the
-/// models.dev schema's documented shape (`true | { field: ... }`); the plain
-/// string shorthand is accepted for forward compatibility (a string IS the
-/// field name).
+/// The snapshot's `interleaved` value in any of its encodings.
+///
+/// The schema spells it `true | { field: "reasoning_content" | "reasoning_details" }`
+/// ([schema](https://github.com/anomalyco/models.dev/blob/dev/packages/core/src/schema.ts)),
+/// so serde tries each untagged variant in order: an object carries the field
+/// name, and `true` — "supports interleaved thinking", the only other legal
+/// form — matches only the bool variant, so it can never be mistaken for a
+/// field name.
+///
+/// The plain-string variant is a **tolerance**, not a documented shape: a
+/// string is read as the field name so a hand-written or newer snapshot cannot
+/// fail the whole parse, which would otherwise cost the entire embedded catalog
+/// over one forgotten wrapper object. It records the same fact an object does.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum RawInterleaved {
     /// `{ "field": "reasoning_content" }` — the echo field the model demands.
     Field { field: String },
-    /// A plain string IS the field name (shorthand).
+    /// A plain string read as the field name (tolerance beyond the schema).
     Shorthand(String),
     /// `true` — interleaved thinking supported, but no echo-field fact. The
     /// payload is intentionally ignored (a capability flag, not a fact).
@@ -188,9 +194,13 @@ impl RawInterleaved {
 
 /// Map a models.dev `interleaved` field name onto the catalog's echo field.
 ///
-/// Four chat fields this catalog can replay are facts: the three scalar fields
-/// (`reasoning_content`, `reasoning`, `reasoning_text`) and the structured
-/// `reasoning_details` array. Any unknown name is deliberately "no fact" rather
+/// The four chat fields this catalog can replay are facts: the three scalar
+/// fields (`reasoning_content`, `reasoning`, `reasoning_text`) and the structured
+/// `reasoning_details` array. The snapshot schema itself only permits
+/// `reasoning_content` and `reasoning_details`
+/// ([schema](https://github.com/anomalyco/models.dev/blob/dev/packages/core/src/schema.ts));
+/// the two scalar aliases are accepted alongside them because an overlay can
+/// pin either. Any unknown name is deliberately "no fact" rather
 /// than a guess: an unrecognised name is a snapshot vocabulary this catalog
 /// does not model, and guessing would be unauditable — the requirement decides
 /// which wire key every assistant message carries, so an unknown name must
@@ -259,15 +269,21 @@ fn normalize_provider(slug: String, raw: RawProvider) -> ProviderEntry {
             // Whether the field must also be PRESENT on every assistant
             // message (`reasoning_echo_required`) depends on WHICH field it is:
             // a scalar name (`reasoning_content`, `reasoning`, `reasoning_text`)
-            // has always meant "the upstream demands this key echoed" — the
-            // DeepSeek/GLM 5.x rule, where a tool-loop history omitting it 400s
-            // — so a scalar sets `Some(true)`. The structured
-            // `reasoning_details` array is a DESTINATION fact only: no upstream
-            // is known to reject a history that omits it, and inventing an
-            // empty `reasoning_details: []` on every assistant message sends an
-            // unverified array to gateways that are strict about its contents,
-            // so that case leaves the requirement unset. Presence stays
-            // opt-in, and the overlay can pin either half independently.
+            // means "the upstream demands this key echoed" — DeepSeek returns a
+            // 400 for a request carrying `tools` whose earlier turns omit it
+            // (https://api-docs.deepseek.com/guides/thinking_mode), and GLM asks
+            // for the blocks back unmodified
+            // (https://docs.z.ai/guides/capabilities/thinking-mode) — so a
+            // scalar sets `Some(true)`. The structured `reasoning_details` array
+            // is a DESTINATION fact only: no upstream is known to reject a
+            // history that omits it (OpenRouter only asks that a replayed
+            // sequence be preserved, not that one be present —
+            // https://openrouter.ai/docs/guides/best-practices/reasoning-tokens#preserving-reasoning),
+            // and inventing an empty `reasoning_details: []` on every assistant
+            // message sends an unverified array to gateways that are strict
+            // about its contents, so that case leaves the requirement unset.
+            // Presence stays opt-in per route, and the overlay can pin either
+            // half independently.
             let echo_required = match echo_field {
                 Some(ChatReasoningField::ReasoningDetails) => None,
                 Some(_) => Some(true),

@@ -640,7 +640,7 @@ fn kimi_details_replay_strips_index_and_adds_companion() {
             {"type":"summary","summary":"step one "},
             {"type":"summary","summary":"and two"}
         ]),
-        "bare Kimi entries are rebuilt minimally without the stream index"
+        "bare entries keep every field and lose only the stream index"
     );
     // The merged summary text rides along as the scalar companion.
     assert_eq!(assistant["reasoning_content"], "step one and two");

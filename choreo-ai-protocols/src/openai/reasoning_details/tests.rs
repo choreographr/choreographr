@@ -123,7 +123,7 @@ fn encrypted_entries_stay_discrete() {
 }
 
 #[test]
-fn kimi_bare_entries_merge_and_keep_unknown_types_verbatim() {
+fn bare_entries_merge_and_keep_unknown_types_verbatim() {
     let raw = json!([
         {"type":"summary","summary":"step ","index":0},
         {"type":"summary","summary":"one","index":0},
@@ -365,9 +365,9 @@ fn a_conflicting_identity_field_keeps_two_blocks_discrete() {
 }
 
 #[test]
-fn companion_mirrors_only_kimi_summary_text() {
-    let kimi = details_wire_value(br#"[{"type":"summary","summary":"a","index":0},{"type":"summary","summary":"b","index":0}]"#);
-    assert_eq!(details_companion(&kimi).as_deref(), Some("ab"));
+fn companion_mirrors_only_bare_summary_text() {
+    let bare = details_wire_value(br#"[{"type":"summary","summary":"a","index":0},{"type":"summary","summary":"b","index":0}]"#);
+    assert_eq!(details_companion(&bare).as_deref(), Some("ab"));
     // OpenRouter dialect: the array is read alone.
     let openrouter =
         details_wire_value(br#"[{"type":"reasoning.summary","summary":"a","index":0}]"#);

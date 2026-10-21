@@ -73,9 +73,9 @@ pub(crate) struct AssistantMessage {
     pub(crate) reasoning_content: Option<String>,
     pub(crate) reasoning: Option<String>,
     pub(crate) reasoning_text: Option<String>,
-    /// The structured `reasoning_details` array (`OpenRouter` / Kimi-shaped
-    /// routes), kept as raw JSON so an unrecognised entry shape cannot fail the
-    /// whole response parse.
+    /// The structured `reasoning_details` array (`OpenRouter` and the bare
+    /// shape some routes stream), kept as raw JSON so an unrecognised entry
+    /// shape cannot fail the whole response parse.
     pub(crate) reasoning_details: Option<serde_json::Value>,
 }
 

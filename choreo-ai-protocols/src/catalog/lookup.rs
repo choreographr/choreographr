@@ -228,13 +228,21 @@ pub fn image_edit_models_for_provider(provider_slug: &str) -> Vec<String> {
 ///   cannot be trusted as the destination.
 /// - [`require_present`](Self::require_present) — whether every assistant
 ///   message must carry the field, empty when there is nothing to echo. This is
-///   the DeepSeek/GLM 5.x rule: an upstream 400s a tool-loop history whose
-///   assistant message omits the field, even for a call that produced no
-///   reasoning.
+///   the `DeepSeek`/`GLM` rule: `DeepSeek` returns a 400 for a request carrying
+///   `tools` whose earlier turns do not pass `reasoning_content` back
+///   ([docs](https://api-docs.deepseek.com/guides/thinking_mode)), and GLM asks
+///   for the same blocks to be returned unmodified
+///   ([docs](https://docs.z.ai/guides/capabilities/thinking-mode)).
 ///
 /// A route can declare a destination without demanding its presence (the
-/// OpenRouter/Ollama `reasoning_details` resellers), so presence is an explicit
-/// opt-in catalog fact — never inferred from a declared field.
+/// OpenRouter/Ollama `reasoning_details` resellers, whose documentation only
+/// asks for the blocks to be preserved when replaying them —
+/// [docs](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens#preserving-reasoning)),
+/// so the two are stored separately and either can be pinned on its own. The
+/// base ingestion derives presence only for a **scalar** destination, because a
+/// scalar field name is the snapshot's way of recording the upstream's replayed
+/// side channel; the structured array is destination-only there. Presence is a
+/// per-route fact, never invented at lowering time.
 ///
 /// The default (`field: None, require_present: false`) means "no declared
 /// shape": the adapter then echoes whatever field the payload was observed
@@ -244,8 +252,9 @@ pub struct ChatReasoningEcho {
     /// The wire field the route wants, when the catalog declares one.
     pub field: Option<ChatReasoningField>,
     /// Whether every assistant message must carry the field (empty when there
-    /// is nothing to echo), resolved from the catalog's explicit
-    /// `reasoning_echo_required` fact.
+    /// is nothing to echo), resolved from the catalog's
+    /// `reasoning_echo_required` fact — pinned by the overlay, or derived by
+    /// ingestion for a scalar destination (see the type docs).
     pub require_present: bool,
 }
 

@@ -63,7 +63,7 @@ pub const CHAT_REASONING_WIRE_KEYS: [&str; 4] = [
 ///
 /// Exactly one wire shape is emitted per message — a scalar key or the
 /// structured `reasoning_details` array — and never on a non-assistant role. The
-/// only companion field is the Kimi-shaped summary text (`reasoning_content`)
+/// only companion field is the bare-shape summary text (`reasoning_content`)
 /// emitted beside a bare-dialect details array.
 pub struct ChatWireMessage<'a> {
     message: &'a ChatRequestMessage,
@@ -287,7 +287,8 @@ enum WireReasoning {
         value: String,
     },
     /// The structured `reasoning_details` array, replayed verbatim for the
-    /// `OpenRouter` dialect and rebuilt minimally for Kimi-shaped entries.
+    /// `OpenRouter` dialect and stripped of only the stream `index` for a bare
+    /// (undocumented) entry.
     Details(serde_json::Value),
 }
 
@@ -463,15 +464,16 @@ impl ChatWireMessage<'_> {
 
 impl Serialize for ChatWireMessage<'_> {
     /// Manual impl: role, content, `tool_call_id`, `tool_calls`, and at most one
-    /// reasoning field (plus the Kimi companion beside a details array), with
-    /// `None` fields omitted. An assistant message carrying a `ChatReasoning`
+    /// reasoning field (plus the bare-shape companion beside a details array),
+    /// with `None` fields omitted. An assistant message carrying a `ChatReasoning`
     /// artifact re-emits it under the route's field (see [`ChatWireMessage`]);
     /// the artifact itself never appears on the wire.
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
 
-        // The Kimi companion text, derived once and reused for the field count
-        // and the serialization (never derived twice on the per-message path).
+        // The bare-shape companion text, derived once and reused for the field
+        // count and the serialization (never derived twice on the per-message
+        // path).
         let companion = match &self.reasoning {
             Some(WireReasoning::Details(details)) => details_companion(details),
             _ => None,
@@ -512,7 +514,7 @@ impl Serialize for ChatWireMessage<'_> {
             match reasoning {
                 WireReasoning::Scalar { key, value } => msg.serialize_field(key, value)?,
                 WireReasoning::Details(details) => {
-                    // Kimi-shaped payloads also carry the summary text as
+                    // A bare-shape payload also carries the summary text as
                     // `reasoning_content`; the one-channel rule holds only among
                     // the scalar fields, so this companion is deliberate.
                     if let Some(companion) = &companion {
