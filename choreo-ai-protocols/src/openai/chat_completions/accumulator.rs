@@ -20,10 +20,10 @@ use tracing::debug;
 
 use super::reasoning_stream::ReasoningStreamState;
 use super::{
-    ChatCompletionsStreamResponse, ChatTurnParts, FinishReason, StreamToolCallDelta, assemble_turn,
-    finish_reason_terminal_error,
+    ChatCompletionsStreamResponse, FinishReason, StreamToolCallDelta, finish_reason_terminal_error,
 };
 use crate::openai::OpenAiError;
+use crate::openai::turn::{TurnParts, assemble_turn};
 use crate::shared::MAX_TOOL_CALLS;
 use crate::types::{ChatToolCall, ChatTurnResult, StreamEvent};
 
@@ -79,7 +79,7 @@ pub(crate) fn accumulate_tool_calls_from_deltas(
 /// Extracted from the streaming request loop so the parse→accumulate→turn
 /// pipeline is unit-testable without an HTTP connection (mirrors the
 /// `accumulate_tool_calls_from_deltas` helper above).
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(super) struct ChatCompletionsStreamAccumulator {
     full_content: String,
     /// The turn's streaming reasoning: both capture channels, the locked scalar
@@ -89,31 +89,12 @@ pub(super) struct ChatCompletionsStreamAccumulator {
     /// Raw tool call deltas across all chunks, merged by index by
     /// `accumulate_tool_calls_from_deltas` once the stream is fully consumed.
     raw_tool_call_deltas: Vec<StreamToolCallDelta>,
-    seen_tool_call_indices: [bool; MAX_TOOL_CALLS],
-    distinct_tool_call_count: usize,
     /// Usage from the final SSE chunk (`OpenAI` sends a usage chunk with
     /// choices: [] when `stream_options.include_usage` is true).
     last_usage: Option<TokenUsage>,
     /// Finish reason from the final SSE chunk (last non-None wins — the
     /// provider sends it exactly once, but tolerate repeats defensively).
     finish_reason: Option<FinishReason>,
-}
-
-impl Default for ChatCompletionsStreamAccumulator {
-    fn default() -> Self {
-        // Manual impl: std implements `Default` only for arrays up to `[T; 32]`
-        // (const-generic array Default was never stabilized), so `[bool;
-        // MAX_TOOL_CALLS]` (128) cannot be derived.
-        Self {
-            full_content: String::new(),
-            reasoning: ReasoningStreamState::default(),
-            raw_tool_call_deltas: Vec::new(),
-            seen_tool_call_indices: [false; MAX_TOOL_CALLS],
-            distinct_tool_call_count: 0,
-            last_usage: None,
-            finish_reason: None,
-        }
-    }
 }
 
 impl ChatCompletionsStreamAccumulator {
@@ -180,26 +161,16 @@ impl ChatCompletionsStreamAccumulator {
             // and produce sorted ChatToolCall output after the stream ends.
             if let Some(ref tcs) = delta.tool_calls {
                 for tc in tcs {
-                    if self.distinct_tool_call_count >= MAX_TOOL_CALLS {
-                        return Err(OpenAiError::Io(io::Error::other(format!(
-                            "too many tool calls (max {MAX_TOOL_CALLS})"
-                        ))));
-                    }
+                    // One call per index, so bounding the index bounds the call
+                    // count: an out-of-range index is the only way a route can
+                    // exceed `MAX_TOOL_CALLS`, and it is rejected here rather
+                    // than silently truncated into a colliding slot.
                     if (tc.index as usize) >= MAX_TOOL_CALLS {
                         return Err(OpenAiError::Io(io::Error::other(format!(
                             "tool call index {} out of bounds (max {})",
                             tc.index,
                             MAX_TOOL_CALLS - 1,
                         ))));
-                    }
-                    // The bounds check above guarantees `tc.index` is within
-                    // the fixed-size array, so this lookup always succeeds;
-                    // the None arm is unreachable.
-                    if let Some(seen) = self.seen_tool_call_indices.get_mut(tc.index as usize)
-                        && !*seen
-                    {
-                        *seen = true;
-                        self.distinct_tool_call_count += 1;
                     }
                     self.raw_tool_call_deltas.push(tc.clone());
                 }
@@ -238,7 +209,7 @@ impl ChatCompletionsStreamAccumulator {
         let tool_use_content = (!self.full_content.is_empty()).then(|| self.full_content.clone());
         let content_is_empty = self.full_content.is_empty();
         let tool_calls = accumulate_tool_calls_from_deltas(self.raw_tool_call_deltas);
-        assemble_turn(ChatTurnParts {
+        assemble_turn(TurnParts {
             tool_use_content,
             final_text: self.full_content,
             content_is_empty,
@@ -248,6 +219,7 @@ impl ChatCompletionsStreamAccumulator {
             produced_reasoning: reasoning.produced,
             usage: self.last_usage,
             truncated,
+            response_id: None,
         })
     }
 }

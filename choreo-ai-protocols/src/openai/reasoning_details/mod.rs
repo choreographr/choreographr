@@ -1,5 +1,6 @@
 //! Structured `reasoning_details` capture and lowering for the chat-completions
-//! adapter.
+//! adapter, plus the crate's one reasoning byte budget (which the Responses
+//! adapter shares — see [`MAX_REASONING_BYTES`]).
 //!
 //! Several OpenAI-compatible routes (`OpenRouter` and its resellers, a few
 //! gateway brands) carry reasoning as a **structured array** rather than a
@@ -68,7 +69,8 @@ pub(crate) use lower::{details_display_text, details_wire_value};
 use serde_json::Value;
 
 /// The reasoning byte budget, in artifact bytes — **one** number for both the
-/// per-turn capture cap and the per-request replay budget.
+/// per-turn capture cap and the per-request replay budget, shared by every
+/// adapter that round-trips reasoning payloads.
 ///
 /// Two facts size it. Reasoning payloads **compound** — each turn's payload is
 /// persisted and replayed on every later request of the tool loop — so one turn
@@ -77,6 +79,11 @@ use serde_json::Value;
 /// budget can legitimately exceed a small cap in one turn: a cap far below a
 /// max-length turn would fire on exactly the heavy-reasoning turns this payload
 /// exists for.
+///
+/// It is the chat adapter's details array and the Responses adapter's reasoning
+/// items alike: both are opaque provider payloads that ride the same persisted
+/// `ReasoningArtifact` and are replayed on every later request, so one number
+/// bounds both rather than each adapter inventing its own.
 ///
 /// The two bounds are deliberately the same number. A per-turn cap larger than
 /// the request budget would have no replay path — such an artifact could only

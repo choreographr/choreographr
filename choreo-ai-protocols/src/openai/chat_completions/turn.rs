@@ -1,16 +1,17 @@
-//! Assembling a chat-completions reply into a turn result.
+//! Turning a chat-completions reply into a turn result.
 //!
 //! Both the non-streaming response conversion and the streaming accumulator
-//! funnel into [`assemble_turn`], so the `ToolUse` / truncated-tool-call /
-//! final-text decision tree — and the terminal finish-reason errors that must
-//! surface before it — exist exactly once for both paths.
+//! funnel into the crate's shared [`assemble_turn`], so the `ToolUse` /
+//! truncated-tool-call / final-text decision tree — and the terminal
+//! finish-reason errors that must surface before it — exist exactly once for
+//! every `OpenAI` path.
 
 use tracing::debug;
 
-use super::super::validate_tool_call_arguments;
+use super::super::turn::{TurnParts, assemble_turn};
 use super::wire::{ChatCompletionsResponse, FinishReason};
-use crate::types::{ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult};
-use choreo_proto::{ReasoningArtifact, TokenUsage};
+use crate::types::{ChatToolCall, ChatTurnResult};
+use choreo_proto::TokenUsage;
 
 /// Convert a parsed non-streaming chat completions response into a turn
 /// result. The raw reasoning value is captured into the round-trip artifact
@@ -109,7 +110,7 @@ pub(crate) fn chat_completions_response_to_turn(
         .to_string();
     let content_is_empty = final_text.is_empty();
 
-    assemble_turn(ChatTurnParts {
+    assemble_turn(TurnParts {
         tool_use_content,
         final_text,
         content_is_empty,
@@ -119,106 +120,6 @@ pub(crate) fn chat_completions_response_to_turn(
         produced_reasoning: reasoning.produced,
         usage: turn_usage,
         truncated,
-    })
-}
-
-/// The finalized parts of one chat turn, handed to [`assemble_turn`].
-///
-/// Bundled so the assembler takes one value instead of a long positional list
-/// (no `too_many_arguments` suppression) and each caller names every part
-/// explicitly.
-pub(super) struct ChatTurnParts {
-    /// Content to attach to a `ToolUse` result (the provider's raw option for
-    /// the non-streaming path, `None`-when-empty for the streaming path).
-    pub(super) tool_use_content: Option<String>,
-    /// Content to attach to a `FinalText` result (already normalized by the
-    /// caller: trimmed for non-streaming, the accumulated text for streaming).
-    pub(super) final_text: String,
-    /// Whether the turn's visible content is empty (drives the empty-response
-    /// and truncated-tool-call guards).
-    pub(super) content_is_empty: bool,
-    /// The turn's tool calls, collected but not yet validated.
-    pub(super) tool_calls: Vec<ChatToolCall>,
-    /// The turn's display reasoning text.
-    pub(super) reasoning: Option<String>,
-    /// The opaque round-trip reasoning artifact.
-    pub(super) reasoning_artifact: Option<ReasoningArtifact>,
-    /// Whether the provider produced reasoning output this turn — independent of
-    /// whether any of it could be displayed or replayed, so a turn whose payload
-    /// was over the replay cap is still model output.
-    pub(super) produced_reasoning: bool,
-    /// Token usage reported for the turn, when the provider sent any.
-    pub(super) usage: Option<TokenUsage>,
-    /// Whether `finish_reason` was `length` on a final-text turn.
-    pub(super) truncated: bool,
-}
-
-/// Assemble a chat turn result from its finalized parts.
-///
-/// Shared by the non-streaming response conversion and the streaming
-/// accumulator so the `ToolUse` / truncated-tool-call / final-text decision tree
-/// exists exactly once. A message with empty content, no tool calls, and no
-/// reasoning artifact is a genuine empty response.
-pub(super) fn assemble_turn(
-    parts: ChatTurnParts,
-) -> Result<ChatTurnResult, super::super::OpenAiError> {
-    let ChatTurnParts {
-        tool_use_content,
-        final_text,
-        content_is_empty,
-        mut tool_calls,
-        reasoning,
-        reasoning_artifact,
-        produced_reasoning,
-        usage,
-        truncated,
-    } = parts;
-    // Truncated / malformed tool calls are dropped here, once, for both paths.
-    let discarded = validate_tool_call_arguments(&mut tool_calls);
-    if !tool_calls.is_empty() {
-        return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
-            content: tool_use_content,
-            tool_calls,
-            reasoning,
-            usage,
-            response_id: None,
-            reasoning_artifact,
-        }));
-    }
-    if !discarded.is_empty() {
-        // Every tool call had invalid (truncated) arguments: the provider cut
-        // the response off mid-call, so the call is unsafe to execute. If the
-        // model also produced visible text, surface it — the casualty is the
-        // tool call, not the answer. Otherwise there is nothing usable to
-        // return, so signal a dedicated `TruncatedToolCall` instead of
-        // fabricating an empty "final answer" that looks complete — the daemon
-        // special-cases it to tell the model what happened and let it retry in
-        // smaller steps.
-        if content_is_empty {
-            return Err(super::super::OpenAiError::TruncatedToolCall { discarded });
-        }
-        return Ok(ChatTurnResult::FinalText(FinalTextResult {
-            content: final_text,
-            truncated,
-            reasoning,
-            usage,
-            response_id: None,
-            reasoning_artifact,
-        }));
-    }
-    // An encrypted-only, unrecognised-only, or over-the-replay-cap reasoning
-    // turn has no visible text but IS model output. The question here is what the
-    // provider produced, not what this client chose to keep, so it is answered by
-    // the fold's own output fact rather than by whether an artifact survived.
-    if content_is_empty && !produced_reasoning {
-        return Err(super::super::OpenAiError::EmptyResponse);
-    }
-    Ok(ChatTurnResult::FinalText(FinalTextResult {
-        content: final_text,
-        truncated,
-        reasoning,
-        usage,
         response_id: None,
-        reasoning_artifact,
-    }))
+    })
 }

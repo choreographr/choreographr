@@ -3,17 +3,18 @@
 //! Owns the round-trip artifact for this adapter — the provider's `reasoning`
 //! output items (with `encrypted_content` where present), serialized exactly as
 //! received so they can be replayed into `input` — and the response →
-//! [`ChatTurnResult`] conversion that applies the tool-call and empty-response
-//! guards.
+//! [`ChatTurnResult`] conversion that hands its parts to the crate's shared
+//! [`assemble_turn`].
 
 use std::io;
 
 use tracing::{debug, warn};
 
-use super::super::validate_tool_call_arguments;
+use super::super::reasoning_details::MAX_REASONING_BYTES;
 use super::body::extract_reasoning_text;
 use super::wire::{ResponseOutputItem, ResponsesResponse};
-use crate::types::{ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult};
+use crate::openai::turn::{TurnParts, assemble_turn};
+use crate::types::{ChatToolCall, ChatTurnResult};
 use choreo_proto::{ReasoningArtifact, TokenUsage};
 
 /// Project the Responses API usage onto the shared token counter.
@@ -67,6 +68,12 @@ fn incomplete_stop(payload: &ResponsesResponse) -> Result<bool, super::super::Op
 /// output items, or `None` when nothing was captured. The payload is the
 /// JSON serialization of the items exactly as received (type tag, id,
 /// summary and — in stateless mode — `encrypted_content`).
+///
+/// Bounded by the crate's one reasoning byte budget, for the same reason the
+/// chat adapter's capture is: a reasoning item is persisted with the turn and
+/// replayed on every later request, so one heavy turn must not be able to
+/// store an unbounded blob. An over-cap payload is dropped (the turn keeps its
+/// display text and still counts as output) rather than failing the request.
 pub(super) fn responses_items_artifact(
     items: &[serde_json::Value],
 ) -> Result<Option<ReasoningArtifact>, super::super::OpenAiError> {
@@ -75,6 +82,15 @@ pub(super) fn responses_items_artifact(
     }
     let bytes = serde_json::to_vec(items)
         .map_err(|e| super::super::OpenAiError::Io(io::Error::other(e)))?;
+    if bytes.len() > MAX_REASONING_BYTES {
+        warn!(
+            payload_bytes = bytes.len(),
+            limit = MAX_REASONING_BYTES,
+            "reasoning items exceed the per-turn cap; dropping the replay payload \
+             (the turn keeps its display text and still counts as output)"
+        );
+        return Ok(None);
+    }
     debug!(
         item_count = items.len(),
         payload_bytes = bytes.len(),
@@ -213,64 +229,24 @@ pub(crate) fn responses_response_to_turn(
 
     let reasoning_artifact = responses_items_artifact(&reasoning_items)?;
 
-    let discarded = validate_tool_call_arguments(&mut tool_calls);
-    if !tool_calls.is_empty() {
-        return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
-            content: if full_text.is_empty() {
-                None
-            } else {
-                Some(full_text)
-            },
-            tool_calls,
-            reasoning: if full_reasoning.is_empty() {
-                None
-            } else {
-                Some(full_reasoning)
-            },
-            usage: turn_usage,
-            response_id,
-            reasoning_artifact,
-        }));
-    }
-
-    // All calls had invalid arguments — surface the error unless the
-    // model also produced text, in which case return the text.
-    if !discarded.is_empty() {
-        if !full_text.is_empty() {
-            return Ok(ChatTurnResult::FinalText(FinalTextResult {
-                content: full_text,
-                truncated,
-                reasoning: if full_reasoning.is_empty() {
-                    None
-                } else {
-                    Some(full_reasoning)
-                },
-                usage: turn_usage,
-                response_id,
-                reasoning_artifact,
-            }));
-        }
-        return Err(super::super::OpenAiError::TruncatedToolCall { discarded });
-    }
-
     // No answer text, but a reasoning item was captured: the provider produced
-    // (and billed) output this turn, so it is a `FinalText` with empty content
-    // that carries the reasoning and its round-trip artifact — never an empty
-    // response. The same rule the chat adapter's reasoning fold applies.
-    if full_text.is_empty() && reasoning_artifact.is_none() {
-        return Err(super::super::OpenAiError::EmptyResponse);
-    }
-
-    Ok(ChatTurnResult::FinalText(FinalTextResult {
-        content: full_text,
-        truncated,
-        reasoning: if full_reasoning.is_empty() {
-            None
-        } else {
-            Some(full_reasoning)
-        },
-        usage: turn_usage,
-        response_id,
+    // (and billed) output this turn, so the shared assembler turns it into a
+    // `FinalText` with empty content that carries the reasoning and its
+    // round-trip artifact — never an empty response. That is what
+    // `produced_reasoning` reports; an item the byte cap refused still counts,
+    // so it is read from the collected items, not from the surviving artifact.
+    let produced_reasoning = !reasoning_items.is_empty() || !full_reasoning.is_empty();
+    let content_is_empty = full_text.is_empty();
+    assemble_turn(TurnParts {
+        tool_use_content: (!full_text.is_empty()).then(|| full_text.clone()),
+        final_text: full_text,
+        content_is_empty,
+        tool_calls,
+        reasoning: (!full_reasoning.is_empty()).then_some(full_reasoning),
         reasoning_artifact,
-    }))
+        produced_reasoning,
+        usage: turn_usage,
+        truncated,
+        response_id,
+    })
 }

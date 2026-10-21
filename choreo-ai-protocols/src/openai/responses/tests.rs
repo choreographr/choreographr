@@ -4,10 +4,12 @@ use serde_json::json;
 // The types and helpers the request paths reach through their own imports; the
 // suite names them directly, so it imports them directly too.
 use crate::ToolResultItem;
+use crate::openai::reasoning_details::MAX_REASONING_BYTES;
 use crate::openai::{
     AssistantToolCall, AssistantToolFunction, ChatRequestMessage, ChatToolDefinition,
     messages_to_responses_input,
 };
+use crate::shared::MAX_TOOL_CALLS;
 use choreo_proto::ReasoningArtifact;
 
 // ── Serialisation tests ───────────────────────────────────────────
@@ -1071,6 +1073,72 @@ fn messages_to_responses_input_reasoning_items_preserve_order() {
     assert_eq!(items[1]["id"], "re_2");
     assert_eq!(items[1]["encrypted_content"], "eJxT_opaque");
     assert_eq!(items[2]["type"], "message");
+}
+
+#[test]
+fn a_corrupt_reasoning_artifact_is_dropped_not_fatal() {
+    // The artifact is this client's own cache of the provider's output, so a
+    // payload that will not decode costs reasoning continuity for that turn —
+    // never the whole request, which would make every later turn of the session
+    // unsendable. The rest of the history still goes out.
+    let msg = ChatRequestMessage {
+        role: "assistant",
+        content: Some("the answer".to_string()),
+        images: Vec::new(),
+        tool_call_id: None,
+        tool_calls: None,
+        reasoning_artifact: Some(ReasoningArtifact::ResponsesItems(b"{not json".to_vec())),
+    };
+    let items = messages_to_responses_input(&[msg]).expect("a corrupt artifact is not fatal");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["type"], "message");
+}
+
+#[test]
+fn an_over_budget_reasoning_artifact_is_not_replayed() {
+    // Replay enforces the same reasoning byte budget the capture does, so an
+    // artifact that somehow exceeds it cannot ride every later request of the
+    // tool loop.
+    let oversized = format!(
+        r#"[{{"type":"reasoning","id":"re_1","encrypted_content":"{}"}}]"#,
+        "z".repeat(MAX_REASONING_BYTES + 1)
+    );
+    let msg = ChatRequestMessage {
+        role: "assistant",
+        content: Some("the answer".to_string()),
+        images: Vec::new(),
+        tool_call_id: None,
+        tool_calls: None,
+        reasoning_artifact: Some(ReasoningArtifact::ResponsesItems(oversized.into_bytes())),
+    };
+    let items = messages_to_responses_input(&[msg]).expect("an oversized artifact is not fatal");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["type"], "message");
+}
+
+#[test]
+fn a_full_tool_call_map_still_accepts_a_known_call_id() {
+    // The cap bounds the NUMBER of distinct calls; a later delta for a call the
+    // stream already named is a legal continuation and must never be turned
+    // into an error just because the map happens to be full.
+    let mut calls = AccCalls::default();
+    for i in 0..MAX_TOOL_CALLS {
+        calls
+            .entry(format!("call_{i}"))
+            .expect("the first MAX_TOOL_CALLS ids fit");
+    }
+    calls
+        .entry("call_0".to_string())
+        .expect("a known id keeps accumulating")
+        .arguments
+        .push('{');
+    assert!(
+        calls.entry("call_one_too_many".to_string()).is_err(),
+        "a new id past the cap is rejected"
+    );
+    let ordered = calls.into_ordered();
+    assert_eq!(ordered.len(), MAX_TOOL_CALLS);
+    assert_eq!(ordered[0].1.arguments, "{");
 }
 
 #[test]

@@ -91,7 +91,20 @@ fn lower_entry(entry: &Value) -> Option<Value> {
 /// The display text of a persisted details payload, for replay onto a scalar
 /// route (a catalog/observation mismatch: the route declares a scalar field but
 /// the artifact is structured). `None` when nothing textual was captured.
+///
+/// The same byte budget the replay path enforces applies here: an over-budget
+/// payload is not parsed at all, so a corrupt or hostile persisted blob cannot
+/// cost a large allocation on every request of the loop.
 pub(crate) fn details_display_text(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > MAX_REASONING_BYTES {
+        warn!(
+            payload_bytes = bytes.len(),
+            limit = MAX_REASONING_BYTES,
+            "persisted reasoning_details artifact exceeds the per-turn cap; \
+             deriving no display text"
+        );
+        return None;
+    }
     let value = serde_json::from_slice::<Value>(bytes).ok()?;
     let entries = value.as_array()?;
     let text = display_text(entries);

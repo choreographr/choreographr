@@ -14,6 +14,7 @@ use std::io;
 use choreo_proto::ReasoningArtifact;
 use tracing::{debug, warn};
 
+use super::reasoning_details::MAX_REASONING_BYTES;
 use super::responses;
 use super::{ChatRequestMessage, OpenAiError};
 
@@ -24,6 +25,39 @@ fn responses_input_item_value(
     item: &responses::ResponsesInputItem,
 ) -> Result<serde_json::Value, OpenAiError> {
     serde_json::to_value(item).map_err(|e| OpenAiError::Io(io::Error::other(e)))
+}
+
+/// Decode one persisted `ResponsesItems` artifact for replay, or `None` when it
+/// cannot be replayed.
+///
+/// Two refusals, both payload-free and both non-fatal (see the caller): the
+/// payload is over the crate's reasoning byte budget — the same number the chat
+/// adapter enforces, so a heavy turn cannot ride every later request — or it is
+/// not the JSON array the capture wrote.
+fn decode_reasoning_items(bytes: &[u8]) -> Option<Vec<serde_json::Value>> {
+    if bytes.len() > MAX_REASONING_BYTES {
+        warn!(
+            payload_bytes = bytes.len(),
+            limit = MAX_REASONING_BYTES,
+            "persisted responses reasoning artifact exceeds the reasoning byte budget; \
+             not replaying it"
+        );
+        return None;
+    }
+    if let Ok(items) = serde_json::from_slice::<Vec<serde_json::Value>>(bytes) {
+        debug!(
+            item_count = items.len(),
+            "re-emitting responses reasoning items from artifact"
+        );
+        Some(items)
+    } else {
+        warn!(
+            payload_bytes = bytes.len(),
+            "persisted responses reasoning artifact is not a JSON item array; \
+             not replaying it"
+        );
+        None
+    }
 }
 
 /// Convert `ChatRequestMessage` slice to Responses API input format.
@@ -58,15 +92,17 @@ pub(crate) fn messages_to_responses_input(
                 // tag, id, summary, encrypted_content) verbatim, placed ahead
                 // of the message content exactly as the provider emitted them
                 // in the original output array.
+                //
+                // A corrupted or over-budget persisted payload is dropped with a
+                // warning rather than failing the request: the artifact is this
+                // client's own cache of the provider's output, so losing it costs
+                // reasoning continuity for that turn, while a hard error would
+                // make every later turn of the session unsendable. The chat
+                // adapter lowers a bad payload the same way.
                 if msg.role == "assistant"
                     && let Some(ReasoningArtifact::ResponsesItems(bytes)) = &msg.reasoning_artifact
+                    && let Some(reasoning_items) = decode_reasoning_items(bytes)
                 {
-                    let reasoning_items: Vec<serde_json::Value> = serde_json::from_slice(bytes)
-                        .map_err(|e| OpenAiError::Io(io::Error::other(e)))?;
-                    debug!(
-                        item_count = reasoning_items.len(),
-                        "re-emitting responses reasoning items from artifact"
-                    );
                     items.extend(reasoning_items);
                 }
                 // Content is a plain string, or an array of input_text/

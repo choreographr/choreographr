@@ -20,6 +20,8 @@ mod retry;
 mod sse;
 #[cfg(test)]
 mod tests;
+// Turn-result assembly shared by both wire formats (see the module docs).
+mod turn;
 mod zhipu;
 pub use crate::shared::{MaxTokensField, RequestAuth};
 use crate::types::{ChatTurnResult, StreamEvent};

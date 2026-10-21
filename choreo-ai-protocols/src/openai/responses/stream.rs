@@ -10,17 +10,14 @@ use std::io;
 use tracing::{debug, info, trace, warn};
 
 use crate::shared::{MAX_TOOL_CALLS, RequestAuth};
-use crate::types::{
-    ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
-};
+use crate::types::{ChatToolCall, ChatTurnResult, StreamEvent};
 use choreo_proto::TokenUsage;
 
 use super::super::retry;
-use super::super::{
-    ResponsesStreamEvent, SseReader, parse_responses_stream_event, validate_tool_call_arguments,
-};
+use super::super::{ResponsesStreamEvent, SseReader, parse_responses_stream_event};
 use super::body::build_responses_request_body;
 use super::turn::{merge_reasoning_item, responses_items_artifact, responses_usage_to_token_usage};
+use crate::openai::turn::{TurnParts, assemble_turn};
 
 /// Accumulator for Responses API tool call arguments keyed by `call_id`.
 /// Used in `responses_request_streaming_with_tools` to merge delta chunks.
@@ -53,6 +50,47 @@ impl AccCall {
             arguments: String::new(),
             index,
         }
+    }
+}
+
+/// The streamed tool calls of one turn, keyed by `call_id`.
+///
+/// The Responses API assigns no server-side index, so the accumulator mints one
+/// per first-seen `call_id` to keep the model's call order. The map is the
+/// call-count bound: a *new* id past [`MAX_TOOL_CALLS`] is rejected, while a
+/// later delta for an already-known id is always accepted — a full map must not
+/// turn a legal continuation into an error.
+#[derive(Default)]
+pub(super) struct AccCalls {
+    by_id: HashMap<String, AccCall>,
+    next_index: u32,
+}
+
+impl AccCalls {
+    /// The accumulator slot for `call_id`, minting one when this is the first
+    /// time the stream names it.
+    pub(super) fn entry(
+        &mut self,
+        call_id: String,
+    ) -> Result<&mut AccCall, super::super::OpenAiError> {
+        if !self.by_id.contains_key(&call_id) && self.by_id.len() >= MAX_TOOL_CALLS {
+            return Err(super::super::OpenAiError::Io(io::Error::other(format!(
+                "too many tool calls (max {MAX_TOOL_CALLS})"
+            ))));
+        }
+        let next_index = &mut self.next_index;
+        Ok(self.by_id.entry(call_id).or_insert_with(|| {
+            let index = *next_index;
+            *next_index = next_index.saturating_add(1);
+            AccCall::new(index)
+        }))
+    }
+
+    /// The accumulated calls in the model's own order.
+    pub(super) fn into_ordered(self) -> Vec<(String, AccCall)> {
+        let mut sorted: Vec<(String, AccCall)> = self.by_id.into_iter().collect();
+        sorted.sort_by_key(|(_, acc)| acc.index);
+        sorted
     }
 }
 
@@ -115,7 +153,6 @@ where
         &mut ctx,
     )?;
 
-    let mut has_any_output = false;
     let mut full_content = String::new();
     let mut full_reasoning = String::new();
     let mut last_usage: Option<TokenUsage> = None;
@@ -130,8 +167,7 @@ where
     // the end.
     let mut reasoning_items: Vec<serde_json::Value> = Vec::new();
 
-    let mut acc_calls: HashMap<String, AccCall> = HashMap::new();
-    let mut next_tool_index: u32 = 0;
+    let mut acc_calls = AccCalls::default();
 
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
     // Reader thread decouples the blocking socket read from cancellation
@@ -147,7 +183,6 @@ where
         let event = parse_responses_stream_event(&data)?;
         match event {
             Some(ResponsesStreamEvent::TextDelta(text)) => {
-                has_any_output = true;
                 full_content.push_str(&text);
                 on_event(StreamEvent::Answer(text))?;
             }
@@ -156,7 +191,6 @@ where
                 // completion / failure events and any remaining tool calls.
             }
             Some(ResponsesStreamEvent::ReasoningSummaryText(text)) => {
-                has_any_output = true;
                 full_reasoning.push_str(&text);
                 on_event(StreamEvent::Reasoning(text))?;
             }
@@ -176,20 +210,9 @@ where
             }
             Some(ResponsesStreamEvent::FunctionCallArgumentsDelta { call_id, delta }) => {
                 // `call_id` is provided by the trusted API server — no validation
-                // needed; it's used directly as a HashMap key to accumulate deltas
+                // needed; it is used directly as a HashMap key to accumulate deltas
                 // for this specific tool call.
-                has_any_output = true;
-                if acc_calls.len() >= MAX_TOOL_CALLS {
-                    return Err(super::super::OpenAiError::Io(io::Error::other(format!(
-                        "too many tool calls (max {MAX_TOOL_CALLS})"
-                    ))));
-                }
-                let entry = acc_calls.entry(call_id).or_insert_with(|| {
-                    let i = next_tool_index;
-                    next_tool_index += 1;
-                    AccCall::new(i)
-                });
-                entry.arguments.push_str(&delta);
+                acc_calls.entry(call_id)?.arguments.push_str(&delta);
             }
             Some(ResponsesStreamEvent::FunctionCallArgumentsDone {
                 call_id,
@@ -199,12 +222,7 @@ where
                 // `call_id` comes from the trusted API server — safe to use as a
                 // HashMap key.  `arguments` is the complete final JSON string
                 // (not a delta), so it replaces any accumulated partial value.
-                has_any_output = true;
-                let entry = acc_calls.entry(call_id).or_insert_with(|| {
-                    let i = next_tool_index;
-                    next_tool_index += 1;
-                    AccCall::new(i)
-                });
+                let entry = acc_calls.entry(call_id)?;
                 entry.name = Some(name);
                 entry.arguments = arguments;
                 trace!(
@@ -301,96 +319,48 @@ where
 
     // "The model produced output" is a fact about the response, not about what
     // survived into a display string: an encrypted-only reasoning item (or one
-    // whose summary this client could not read) is output the provider billed
-    // for, so it must never surface as an empty response. The chat adapter's
-    // reasoning fold reports the same fact the same way.
-    if !has_any_output && reasoning_items.is_empty() {
-        return Err(super::super::OpenAiError::EmptyResponse);
-    }
+    // whose summary this client could not read, or one the byte cap refused) is
+    // output the provider billed for, so it must never surface as an empty
+    // response. The chat adapter's reasoning fold reports the same fact the same
+    // way.
+    let produced_reasoning = !reasoning_items.is_empty() || !full_reasoning.is_empty();
 
-    if !acc_calls.is_empty() {
-        let mut sorted: Vec<(String, AccCall)> = acc_calls.into_iter().collect();
-        sorted.sort_by_key(|(_, acc)| acc.index);
-        let total_calls = sorted.len();
-
-        // First pass: filter out calls without a name (the provider sent
-        // incomplete function call events, e.g. arguments delta without a
-        // done event).
-        let mut tool_calls: Vec<ChatToolCall> = sorted
-            .into_iter()
-            .filter_map(|(call_id, acc)| {
-                let name = acc.name.as_deref().filter(|n| !n.is_empty())?;
-                Some(ChatToolCall {
-                    id: call_id,
-                    name: name.to_string(),
-                    arguments_json: acc.arguments,
-                    caller: None,
-                })
+    // The shared assembler owns the tool-call / truncation / empty-response
+    // decision tree, so this path and the non-streaming one cannot disagree.
+    // A call whose `arguments.done` never arrived has no name and is filtered
+    // out here, with the count logged so an aborted call stays diagnosable.
+    let ordered = acc_calls.into_ordered();
+    let named = ordered.len();
+    let tool_calls: Vec<ChatToolCall> = ordered
+        .into_iter()
+        .filter_map(|(call_id, acc)| {
+            let name = acc.name.as_deref().filter(|n| !n.is_empty())?;
+            Some(ChatToolCall {
+                id: call_id,
+                name: name.to_string(),
+                arguments_json: acc.arguments,
+                caller: None,
             })
-            .collect();
-
-        // Second pass: discard calls with truncated arguments JSON.
-        let discarded = validate_tool_call_arguments(&mut tool_calls);
-
-        if !tool_calls.is_empty() {
-            return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
-                content: if full_content.is_empty() {
-                    None
-                } else {
-                    Some(full_content)
-                },
-                tool_calls,
-                reasoning: if full_reasoning.is_empty() {
-                    None
-                } else {
-                    Some(full_reasoning)
-                },
-                usage: last_usage,
-                response_id,
-                reasoning_artifact,
-            }));
-        }
-
-        // All calls were discarded — show a user-visible error in the TUI,
-        // not just a log line, unless the model also produced text.
-        if !discarded.is_empty() && !full_content.is_empty() {
-            return Ok(ChatTurnResult::FinalText(FinalTextResult {
-                content: full_content,
-                truncated: false,
-                reasoning: if full_reasoning.is_empty() {
-                    None
-                } else {
-                    Some(full_reasoning)
-                },
-                usage: last_usage,
-                response_id,
-                reasoning_artifact,
-            }));
-        }
-        if !discarded.is_empty() {
-            return Err(super::super::OpenAiError::TruncatedToolCall { discarded });
-        }
-        warn!("discarded {total_calls} incomplete tool call(s) from provider (no name set)",);
+        })
+        .collect();
+    if tool_calls.len() < named {
+        warn!(
+            dropped = named - tool_calls.len(),
+            "discarded incomplete tool call(s) from provider (no name set)"
+        );
     }
 
-    // If only reasoning arrived and no answer text, the turn is still model
-    // output — it becomes a `FinalText` with empty content that carries the
-    // reasoning and its round-trip artifact. Only a turn that produced neither
-    // content nor reasoning is empty.
-    if full_content.is_empty() && reasoning_artifact.is_none() {
-        return Err(super::super::OpenAiError::EmptyResponse);
-    }
-
-    Ok(ChatTurnResult::FinalText(FinalTextResult {
-        content: full_content,
-        truncated,
-        reasoning: if full_reasoning.is_empty() {
-            None
-        } else {
-            Some(full_reasoning)
-        },
-        usage: last_usage,
-        response_id,
+    let content_is_empty = full_content.is_empty();
+    assemble_turn(TurnParts {
+        tool_use_content: (!full_content.is_empty()).then(|| full_content.clone()),
+        final_text: full_content,
+        content_is_empty,
+        tool_calls,
+        reasoning: (!full_reasoning.is_empty()).then_some(full_reasoning),
         reasoning_artifact,
-    }))
+        produced_reasoning,
+        usage: last_usage,
+        truncated,
+        response_id,
+    })
 }

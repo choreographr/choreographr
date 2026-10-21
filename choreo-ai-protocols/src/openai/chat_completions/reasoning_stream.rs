@@ -229,9 +229,13 @@ impl ReasoningStreamState {
         let artifact = details.finish().or_else(|| {
             scalar_field.and_then(|field| chat_reasoning_artifact(field, &scalar_text))
         });
-        // The scalar channel wins the display when it streamed anything (it is
-        // what the client already rendered live); otherwise the structured
-        // fragments stand in.
+        // The scalar text is the preferred display whenever it streamed
+        // anything: it is the provider's verbatim reasoning string, whereas
+        // `details_text` is a concatenation of the array's summary/text entries.
+        // This decides what the transcript keeps, not which channel the client
+        // rendered live — that one was settled by `DisplaySource` as the deltas
+        // arrived — so a details-first turn still persists the richer scalar
+        // text. The structured fragments stand in only for a details-only turn.
         let display = if scalar_text.is_empty() {
             details_text
         } else {

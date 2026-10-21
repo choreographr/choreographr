@@ -64,6 +64,48 @@ fn build_sse_event_returns_done_marker() {
 }
 
 #[test]
+fn sse_reader_yields_successive_events() {
+    // The per-event byte budget is reset between events, so a long stream of
+    // ordinary events is unaffected by it.
+    let mut reader =
+        SseReader::from_reader(std::io::Cursor::new(b"data: one\n\ndata: two\n\n".to_vec()));
+    assert_eq!(reader.next_event().unwrap().as_deref(), Some("one"));
+    assert_eq!(reader.next_event().unwrap().as_deref(), Some("two"));
+    assert_eq!(reader.next_event().unwrap(), None);
+}
+
+#[test]
+fn sse_reader_rejects_an_unterminated_line_past_the_ceiling() {
+    // A peer that never emits a newline must not be able to grow the pending
+    // buffer without bound: the read fails once the ceiling is crossed.
+    struct EndlessLine;
+    impl std::io::Read for EndlessLine {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            buf.fill(b'x');
+            Ok(buf.len())
+        }
+    }
+    let mut reader = SseReader::from_reader(EndlessLine);
+    let err = reader
+        .next_event()
+        .expect_err("an endless line must fail the read");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn sse_reader_rejects_a_single_line_past_the_ceiling() {
+    // Same ceiling one level up: a line that is itself too long to be a real
+    // provider event.
+    let mut payload = vec![b'd'; 9 * 1024 * 1024];
+    payload.push(b'\n');
+    let mut reader = SseReader::from_reader(std::io::Cursor::new(payload));
+    let err = reader
+        .next_event()
+        .expect_err("an oversized line must fail the read");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
 fn extracts_responses_text_delta() {
     let delta =
         extract_responses_text_delta(r#"{"type":"response.output_text.delta","delta":"hello"}"#)

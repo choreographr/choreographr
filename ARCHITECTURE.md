@@ -2504,6 +2504,11 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
    for OpenAI SSE, giving full control over parsing and buffering behavior. The Anthropic
    module has its own `AnthropicSseReader` that handles both `event:` and `data:` lines
    (required by the Anthropic Messages streaming format) and yields `(event_type, data)` pairs.
+   Because the peer is a provider, a gateway, or a proxy, an event is only delimited by a blank
+   line — so the reader caps one event's accumulated bytes (`MAX_SSE_EVENT_BYTES`) rather than
+   letting a peer that never terminates an event grow the buffers without bound, and it resumes
+   its newline scan from the last unscanned offset instead of rescanning the whole buffer on
+   every read (which would make one large event quadratic in its length).
    The blocking socket read is decoupled onto a dedicated reader thread (`stream.rs`) that
    forwards parsed events through a bounded crossbeam channel, so the caller can `select!`
    on the event channel, the cancellation channel, and the deadline timer simultaneously —
@@ -2640,13 +2645,21 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
     within the budget), and that budget is the *same number* as the per-turn cap: a larger
     per-turn cap would have no replay path, so the two differ in behaviour (capture drops the one
     turn's array, replay drops the oldest) rather than in size — which is why they are one
-    constant, `reasoning_details::MAX_REASONING_BYTES`.
+    constant, `reasoning_details::MAX_REASONING_BYTES`. The Responses adapter's opaque reasoning
+    items ride the same persisted `ReasoningArtifact` and the same compounding replay path, so
+    they are bounded by that one constant too: capture drops an over-budget item array, and a
+    replay skips an artifact that somehow exceeds it. A corrupt persisted payload is likewise a
+    dropped artifact on both adapters, never a failed request — a hard error there would make
+    every later turn of the session unsendable.
 
-    **A reasoning-only turn is output.** On both adapters the turn result carries the fact that
-    the provider produced reasoning, independent of whether any of it could be displayed or
-    replayed: a response whose only output is a reasoning item (or an entry over the replay cap)
-    becomes a `FinalText` with empty content that still carries the round-trip artifact, never an
-    `EmptyResponse` error that discards a payload the provider billed for.
+    **A reasoning-only turn is output.** The turn result carries the fact that the provider
+    produced reasoning, independent of whether any of it could be displayed or replayed: a
+    response whose only output is a reasoning item (or an entry over the replay cap) becomes a
+    `FinalText` with empty content that still carries the round-trip artifact, never an
+    `EmptyResponse` error that discards a payload the provider billed for. Both wire formats
+    reach that verdict through one shared assembler (`openai::turn::assemble_turn`), fed by
+    adapter-specific parts, so the tool-call / truncated-call / empty-response decision tree
+    exists once rather than once per path.
 
 
 

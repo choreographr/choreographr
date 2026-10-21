@@ -23,7 +23,6 @@ use accumulator::ChatCompletionsStreamAccumulator;
 // scope here (the request path only reaches it through the accumulator).
 use accumulator::accumulate_tool_calls_from_deltas;
 use reasoning_stream::ReasoningStreamState;
-use turn::{ChatTurnParts, assemble_turn};
 pub(crate) use turn::{chat_completions_response_to_turn, finish_reason_terminal_error};
 pub(crate) use wire::{
     ChatCompletionsRequest, ChatCompletionsResponse, ChatCompletionsStreamOptions,
