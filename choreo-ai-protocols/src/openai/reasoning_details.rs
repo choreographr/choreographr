@@ -175,17 +175,20 @@ impl DetailsCapture {
     /// Fold one streamed value (an array of entries, or a single entry object
     /// for tolerance) into the capture.
     ///
-    /// Returns the newly recognised text/summary fragments in order, so the
-    /// caller can forward them as live display events. An entry whose `type` is
-    /// not modelled is kept verbatim and yields no fragment; an entry with no
-    /// `type` at all is not an entry and is dropped.
-    pub(crate) fn push(&mut self, raw: &Value) -> Vec<String> {
+    /// Each newly recognised text/summary fragment is handed to `on_fragment` in
+    /// arrival order, so a streaming caller can forward it as a live display
+    /// event. Display rides a callback rather than a returned list because the
+    /// capture itself has nothing to do with display: a caller that wants none
+    /// (the non-streaming fold) passes a no-op and allocates nothing, instead of
+    /// receiving a fragment list it drops. An entry whose `type` is not modelled
+    /// is kept verbatim and yields no fragment; an entry with no `type` at all is
+    /// not an entry and is dropped.
+    pub(crate) fn push(&mut self, raw: &Value, on_fragment: &mut impl FnMut(&str)) {
         let items: Vec<&Value> = match raw {
             Value::Array(entries) => entries.iter().collect(),
             Value::Object(_) => vec![raw],
-            _ => return Vec::new(),
+            _ => return,
         };
-        let mut fragments = Vec::new();
         for entry in items {
             // A typeless object is not a reasoning entry at all; keeping it would
             // replay a value the provider never described. Log the shape (never
@@ -225,7 +228,7 @@ impl DetailsCapture {
                     .and_then(Value::as_str)
                     .filter(|fragment| !fragment.is_empty())
             {
-                fragments.push(fragment.to_string());
+                on_fragment(fragment);
             }
             if kind.is_textual()
                 && let Some(last) = self
@@ -238,7 +241,6 @@ impl DetailsCapture {
             }
             self.entries.push(entry.clone());
         }
-        fragments
     }
 
     /// Whether the capture holds at least one entry.
@@ -446,8 +448,29 @@ mod tests {
 
     fn capture(raw: &Value) -> DetailsCapture {
         let mut capture = DetailsCapture::default();
-        capture.push(raw);
+        capture.push(raw, &mut |_| {});
         capture
+    }
+
+    #[test]
+    fn push_reports_fragments_through_the_callback() {
+        // The callback is the display channel: it receives every recognised
+        // textual fragment in arrival order and nothing else (the encrypted and
+        // unrecognised entries yield no display text).
+        let mut capture = DetailsCapture::default();
+        let mut fragments = Vec::new();
+        capture.push(
+            &json!([
+                {"type":"reasoning.text","text":"alpha","index":0},
+                {"type":"reasoning.encrypted","data":"opaque","index":1},
+                {"type":"notes","text":"ignored","index":0},
+                {"type":"reasoning.summary","summary":"beta","index":0}
+            ]),
+            &mut |fragment| fragments.push(fragment.to_string()),
+        );
+        assert_eq!(fragments, vec!["alpha".to_string(), "beta".to_string()]);
+        // The same fragments are what the derived display text concatenates.
+        assert_eq!(capture.display(), "alphabeta");
     }
 
     #[test]

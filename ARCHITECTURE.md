@@ -1175,9 +1175,15 @@ names it for the OpenRouter resellers and a few gateways). The artifact then
 stores the array as JSON under `ChatReasoningField::ReasoningDetails` rather than
 text: display text is derived from its text/summary entries when no scalar field
 streamed, and an encrypted-only array still counts as model output (never an
-empty response). Capture normalizes the array under a documented, deliberately
-small per-turn byte cap (small because the payload is persisted per turn and
-replayed on every later request of the tool loop, so request size grows to
+empty response). The live display comes from exactly one channel — the
+structured entries once a delta has left one behind, otherwise the scalar field
+— because a route that populates both sends the same reasoning twice and
+emitting both renders it twice in the client; the scalar text is still
+accumulated all the same, since it stays the display and artifact fallback for a
+route that streams only the scalar field. Capture normalizes the array under a
+documented, deliberately small per-turn byte cap (small because the payload is
+persisted per turn and replayed on every later request of the tool loop, so
+request size grows to
 roughly `turns × cap`), beyond which the payload is dropped and logged rather
 than failing the request — and an overflowed capture then yields no display text
 either, so the session never shows reasoning it cannot replay. Consecutive

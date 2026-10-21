@@ -633,7 +633,10 @@ and re-emits it per provider rules on the next request:
   produced, so nothing may be dropped; unrecognised entries contribute nothing to
   the display text. The display text is derived from the text/summary entries
   when no scalar field streamed, and an encrypted-only turn still counts as
-  output. On replay the OpenRouter `reasoning.*` entries are sent back verbatim
+  output. The live display comes from one channel only — the structured entries
+  when the turn has any, otherwise the scalar field — so a route that populates
+  both does not show the same reasoning twice. On replay the OpenRouter
+  `reasoning.*` entries are sent back verbatim
   (index, format, signature intact) while bare Kimi-shaped entries are rebuilt
   without the stream-only `index` and mirrored as a `reasoning_content`
   companion. A details route replays the array whenever there is one to replay

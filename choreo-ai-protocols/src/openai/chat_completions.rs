@@ -94,7 +94,9 @@ impl AssistantMessage {
         // display fallback are ready before the scalar precedence is applied.
         let mut details = DetailsCapture::default();
         if let Some(raw) = self.reasoning_details.take() {
-            details.push(&raw);
+            // Nothing on this path displays the fragments live: the turn result
+            // carries the derived text, so the callback is a no-op.
+            details.push(&raw, &mut |_| {});
         }
         let details_display = details.display();
         let details_artifact = details.finish();
@@ -153,6 +155,38 @@ fn chat_reasoning_artifact(
         field,
         bytes: reasoning.as_bytes().to_vec(),
     })
+}
+
+/// Fold one `reasoning_details` delta into `capture`, forwarding each newly
+/// recognised fragment to `on_event` as a live reasoning display event.
+///
+/// The capture reports fragments through an infallible callback because it has
+/// nothing to do with display, so an `on_event` failure cannot be propagated
+/// from inside it: the first error is parked and re-raised here after the delta
+/// is folded. Deferring the error rather than collecting the fragments into a
+/// list keeps a delta with nothing displayable allocation-free.
+fn push_details_fragments<F>(
+    capture: &mut DetailsCapture,
+    raw: &serde_json::Value,
+    on_event: &mut F,
+) -> io::Result<()>
+where
+    F: FnMut(StreamEvent) -> io::Result<()>,
+{
+    let mut emit_error: Option<io::Error> = None;
+    capture.push(raw, &mut |fragment| {
+        // After a failure the events are dropped, but the delta is still folded
+        // so the capture describes the stream that was actually received.
+        if emit_error.is_none()
+            && let Err(error) = on_event(StreamEvent::Reasoning(fragment.to_string()))
+        {
+            emit_error = Some(error);
+        }
+    });
+    match emit_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -637,9 +671,11 @@ where
     let sse =
         crate::stream::spawn_sse_reader(context, move || reader.next_event(), deadline.current());
     let mut has_any_output = false;
-    // Structured details ride the same display channel; the capture only needs
-    // the derived fragments here (this path persists no artifact).
+    // The capture only needs the derived fragments here (this path persists no
+    // artifact); `details_streaming` latches on the first delta that leaves an
+    // entry behind, and from then on the structured channel owns the live display.
     let mut details = DetailsCapture::default();
+    let mut details_streaming = false;
     while let Some(data) = crate::stream::recv_sse_event(&sse, cancel_rx)? {
         let payload: ChatCompletionsStreamResponse =
             serde_json::from_str(&data).map_err(io::Error::other)?;
@@ -649,12 +685,10 @@ where
             };
 
             if let Some(raw) = delta.reasoning_details.as_ref() {
-                let fragments = details.push(raw);
+                push_details_fragments(&mut details, raw, on_event)?;
                 if details.has_entries() {
+                    details_streaming = true;
                     has_any_output = true;
-                }
-                for fragment in fragments {
-                    on_event(StreamEvent::Reasoning(fragment))?;
                 }
             }
             if let Some(content) = delta.content.filter(|c| !c.is_empty()) {
@@ -671,7 +705,13 @@ where
             .filter(|content| !content.is_empty())
             {
                 has_any_output = true;
-                on_event(StreamEvent::Reasoning(reasoning))?;
+                // The scalar field and the structured array carry the same
+                // content when a route populates both, so only one channel may
+                // feed the live display: the structured entries, when the turn
+                // has any, and the scalar field otherwise.
+                if !details_streaming {
+                    on_event(StreamEvent::Reasoning(reasoning))?;
+                }
             }
         }
     }
@@ -751,6 +791,12 @@ struct ChatCompletionsStreamAccumulator {
     /// The structured `reasoning_details` capture for this turn. Richest payload
     /// the chat wire can replay; when it holds entries it becomes the artifact.
     reasoning_details: DetailsCapture,
+    /// Whether the structured `reasoning_details` channel has produced an entry
+    /// this turn. Latched on the first delta that leaves one behind, and from
+    /// then on it owns the live display: the scalar fields and the array carry
+    /// the same content on a route that populates both, so emitting both would
+    /// render the reasoning twice.
+    details_streaming: bool,
     /// Raw tool call deltas across all chunks, merged by index by
     /// `accumulate_tool_calls_from_deltas` once the stream is fully consumed.
     raw_tool_call_deltas: Vec<StreamToolCallDelta>,
@@ -775,6 +821,7 @@ impl Default for ChatCompletionsStreamAccumulator {
             full_reasoning: String::new(),
             reasoning_field: None,
             reasoning_details: DetailsCapture::default(),
+            details_streaming: false,
             raw_tool_call_deltas: Vec::new(),
             seen_tool_call_indices: [false; MAX_TOOL_CALLS],
             distinct_tool_call_count: 0,
@@ -832,8 +879,22 @@ impl ChatCompletionsStreamAccumulator {
                 on_event(StreamEvent::Answer(content.clone()))?;
             }
 
-            // Reasoning chunks — accumulate into `full_reasoning` (used for
-            // both display and the round-trip artifact) and forward each
+            // Structured reasoning_details deltas come first so the structured
+            // channel claims the turn's display before any scalar field is
+            // considered: normalize the delta into the capture and forward each
+            // new text/summary fragment as a display event. Any recognised entry
+            // (even an encrypted-only one) means the model produced output, so
+            // the turn is never reported as empty.
+            if let Some(raw) = delta.reasoning_details.as_ref() {
+                push_details_fragments(&mut self.reasoning_details, raw, on_event)?;
+                if self.reasoning_details.has_entries() {
+                    self.details_streaming = true;
+                    self.has_any_output = true;
+                }
+            }
+
+            // Scalar reasoning chunks — accumulate into `full_reasoning` (used
+            // for both display and the round-trip artifact) and forward each
             // delta as a display event. The field is locked in on the first
             // non-empty delta (precedence reasoning_content > reasoning >
             // reasoning_text, matching the non-streaming `take_reasoning`
@@ -859,21 +920,16 @@ impl ChatCompletionsStreamAccumulator {
                     // replays to the correct wire field).
                     continue;
                 }
+                // The scalar text is always accumulated: it is the display
+                // fallback for a turn whose details yield none and the artifact
+                // fallback when no details were captured, and a route that
+                // streams only the scalar field is the other, still-supported
+                // shape. Only the live event is withheld while the structured
+                // channel is active, because the two carry the same content and
+                // emitting both renders the reasoning twice.
                 self.full_reasoning.push_str(text);
-                on_event(StreamEvent::Reasoning(text.to_string()))?;
-            }
-
-            // Structured reasoning_details deltas: normalize into the capture
-            // and forward each new text/summary fragment as a display event.
-            // Any recognised entry (even an encrypted-only one) means the model
-            // produced output, so the turn is never reported as empty.
-            if let Some(raw) = delta.reasoning_details.as_ref() {
-                let fragments = self.reasoning_details.push(raw);
-                if self.reasoning_details.has_entries() {
-                    self.has_any_output = true;
-                }
-                for fragment in fragments {
-                    on_event(StreamEvent::Reasoning(fragment))?;
+                if !self.details_streaming {
+                    on_event(StreamEvent::Reasoning(text.to_string()))?;
                 }
             }
 
@@ -2040,6 +2096,86 @@ mod tests {
                 // established order); the second details fragment follows.
                 StreamEvent::Answer("answer".into()),
                 StreamEvent::Reasoning("more".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn streaming_emits_reasoning_once_when_scalar_and_details_carry_it() {
+        // A route that populates both the scalar field and the structured array
+        // sends the same reasoning twice; the live display must come from one
+        // channel only (the structured entries), so each fragment is emitted
+        // exactly once.
+        let mut acc = ChatCompletionsStreamAccumulator::default();
+        let chunk1: ChatCompletionsStreamResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{"reasoning":"think ","reasoning_details":[{"type":"reasoning.text","text":"think ","index":0}]}}]}"#,
+        )
+        .unwrap();
+        let chunk2: ChatCompletionsStreamResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{"reasoning":"more","reasoning_details":[{"type":"reasoning.text","text":"more","index":0}]}}]}"#,
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        acc.apply(&chunk1, &mut |e| {
+            events.push(e);
+            Ok(())
+        })
+        .unwrap();
+        acc.apply(&chunk2, &mut |e| {
+            events.push(e);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::Reasoning("think ".into()),
+                StreamEvent::Reasoning("more".into()),
+            ]
+        );
+        // The artifact and the persisted display text are unaffected by the
+        // deduplication: the details capture still wins the artifact, and the
+        // accumulated scalar text is still the display value.
+        let result = acc.into_turn_result().unwrap();
+        match result {
+            ChatTurnResult::FinalText(f) => {
+                assert_eq!(f.reasoning.as_deref(), Some("think more"));
+                let Some(ReasoningArtifact::ChatReasoning { field, bytes }) = f.reasoning_artifact
+                else {
+                    panic!("expected a chat reasoning artifact");
+                };
+                assert_eq!(field, ChatReasoningField::ReasoningDetails);
+                let entries: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    entries,
+                    serde_json::json!([{"type":"reasoning.text","text":"think more","index":0}])
+                );
+            }
+            other => panic!("expected FinalText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streaming_scalar_only_reasoning_is_still_displayed() {
+        // Negative control for the one-channel rule: with no structured details
+        // in the turn the scalar field is the display channel, so every delta is
+        // forwarded.
+        let mut acc = ChatCompletionsStreamAccumulator::default();
+        let chunk: ChatCompletionsStreamResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{"reasoning_content":"step ","content":"answer"}}]}"#,
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        acc.apply(&chunk, &mut |e| {
+            events.push(e);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::Answer("answer".into()),
+                StreamEvent::Reasoning("step ".into()),
             ]
         );
     }
