@@ -1106,7 +1106,7 @@ runtime alias resolution**. The metrics `endpoint` label changes with the slug
 
 The merged catalog is parsed lazily into `PROVIDER_CATALOG`, a process-global
 `LazyLock<ArcSwap<Vec<ProviderEntry>>>` (`catalog/mod.rs` +
-`catalog/loader.rs`): the first access deserializes the embedded base and
+`catalog/loader.rs`, with the entry types themselves in `catalog/entry.rs`): the first access deserializes the embedded base and
 merges the bundled overlay once; every later access goes straight to the
 `ArcSwap` (an atomic load, then lock-free reads / atomic `store` on swap). The
 `ArcSwap` makes the catalog runtime-swappable: readers are lock-free and
@@ -1156,7 +1156,7 @@ independent catalog facts**, each pinnable on its own — a presence requirement
 with no declared destination resolves to the chat default key
 (`field: None, require_present: true`), which the lowering emits empty — and the
 lowering (`choreo-ai-protocols`'
-`openai::wire`, which owns the projection) applies both in one place so they
+`openai::chat_projection`, which owns the projection) applies both in one place so they
 cannot drift apart. Writing a scalar destination on *every* assistant message —
 the artifact's text when there is something to replay, an empty string when
 there is not — is exactly the presence case (`require_present`), not a
@@ -1205,9 +1205,11 @@ payload is what the cap bounds, and "did the model produce output" is a fact
 reported by the fold — never inferred from whether a payload survived. An
 over-cap turn therefore still shows its reasoning, and an encrypted-only turn whose
 payload was over the cap is a `FinalText` with no visible text rather than an
-`EmptyResponse` error. The cap is sized to match the request budget below, since
-an artifact larger than that budget could only ever ride as its "newest always
-replays" overshoot. Two bounds work together, because the payload is persisted per
+`EmptyResponse` error. That bound and the per-request replay budget below are
+**one number** (`reasoning_details::MAX_REASONING_BYTES`): an artifact larger
+than the request budget could only ever ride as its "newest always
+replays" overshoot, so a larger per-turn cap would have no replay path. Two
+bounds still work together, because the payload is persisted per
 turn and replayed on *every* later request of the tool loop: the per-turn cap
 limits what one turn may persist, and the request build that lowers the history
 applies a separate per-request budget to the total artifact bytes it replays
@@ -1225,8 +1227,10 @@ artifacts are not capped at capture at all — real thinking can exceed the
 per-turn cap and the DeepSeek/GLM echo requirement needs it replayed — so they
 are bounded by that same request budget rather than by capture. Consecutive
 same-kind text and summary entries merge when the provider marks them as the
-same stream slot (equal `index`) or leaves the `index` off on both (it does not
-distinguish slots, so adjacency plus kind is the only signal); a mixed presence
+same stream slot (equal `index`) or leaves the `index` off on both entries of
+*different* deltas (it does not distinguish slots, so a later delta's fragment
+is the block being assembled); entries carried by one delta are distinct blocks
+and never merge on absent-index evidence, and a mixed presence
 is ambiguous and stays unmerged, because fusing on absent evidence could rewrite
 a sequence the upstream requires to match. A merge is also refused when the two
 entries state a conflicting identity — a different `id`, `format`, or
@@ -1241,8 +1245,7 @@ modelled is kept and replayed **verbatim** — it contributes nothing to display
 text, but dropping it would again alter the sequence the model produced. The
 lowering replays OpenRouter's namespace-prefixed `reasoning.*` entries verbatim
 (index, format, and signature intact, as its documented array shape specifies —
-[spec](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens#reasoning_details-array-structure))
-and mirrors a bare entry's summary text as a companion `reasoning_content`.
+[spec](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens#reasoning_details-array-structure)).
 A **bare** entry (an undocumented single-word `type`) is the one exception to
 verbatim replay: it loses only the stream-only `index` and keeps everything else,
 the payload key included, because no upstream documents that shape — Kimi's own
@@ -1250,11 +1253,12 @@ documentation uses solely `reasoning_content`
 ([docs](https://platform.kimi.ai/docs/guide/use-thinking-models)) and models.dev's
 snapshot vocabulary is `reasoning_content` or `reasoning_details`
 ([schema](https://github.com/anomalyco/models.dev/blob/dev/packages/core/src/schema.ts)) —
-so a rebuilt entry could drop an opaque block under a guessed key. That companion
-is the one
-deliberate scalar beside the array — the one-channel rule constrains the scalar
-fields, and Kimi-shaped routes expect both. The array is a **destination fact
-only**: a declared details route with nothing to echo emits *no* reasoning key,
+so a rebuilt entry could drop an opaque block under a guessed key. The array is
+the **only** reasoning field such a message carries — a scalar mirror beside it
+would be a shape no upstream documents, and OpenRouter's guidance is one form
+*or* the other, so the companion is not emitted. The array is a **destination
+fact only**: a declared details route with nothing to echo emits *no* reasoning
+key,
 because no upstream is known to reject a history that omits the array and an
 invented `reasoning_details: []` would send an unverified array to a gateway
 that is strict about its contents. An **undeclared** route is the same shape for
@@ -2537,10 +2541,25 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
     Every entry point (`completion`, `completion_stream`, `chat_completion_turn`,
     `chat_completion_turn_streaming`) matches on the resolved format and calls the appropriate
     request builder. Input/output mapping differs between the two: system messages go into the
-    `input` array as `{role: "system"}` items (rather than the `instructions` field), tool results
-    become `function_call_output` items, and the `input` is an array of typed items rather than a
+    `input` array as `{role: "system"}` items (rather than the `instructions` field), an
+    assistant turn's tool requests become `function_call` items and their answers
+    `function_call_output` items (the answer names its call by `call_id`, so a history
+    rebuilt from messages — no chained `previous_response_id`, e.g. after a model switch
+    or a restored session — has to replay the calls themselves, not only the outputs),
+    and the `input` is an array of typed items rather than a
     flat messages list. Multi-turn chaining uses `previous_response_id` to link turns together,
     while Chat Completions relies on the full message history.
+
+    The streaming terminal events wrap the whole `Response` object under `response`:
+    `response.completed` and `response.incomplete` carry the id/usage there (`sse::response_object`
+    also reads a flattened shape, which some gateways emit), and `response.failed` carries the
+    error object on `response.error`. `incomplete` is a terminal **success**, not a transport
+    failure: `incomplete_details.reason` decides — `content_filter` is the terminal
+    `ContentFiltered` error, while `max_output_tokens` (and any reason this client does not
+    classify) leaves a partial answer reported as a truncated `FinalText`, the same reading chat
+    gives `finish_reason: length`. Reasoning text is streamed as
+    `response.reasoning_summary_text.delta` fragments (the summary is the only reasoning text a
+    Responses model exposes); part boundaries carry no text and are not modelled.
 
     **Programmatic tool calling (Responses API, gpt-5.6+):** When enabled, the Responses
     request body includes a `programmatic_tool_calling` tool with `type: "programmatic_tool_calling"`.
@@ -2613,11 +2632,21 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
     destination only — a details route with nothing to echo omits the key instead of carrying an
     unverified empty array.
     The field may be the structured `reasoning_details` array: its artifact payload is JSON
-    (normalized at capture under a per-turn cap), replayed verbatim for OpenRouter's `reasoning.*`
-    entries and rebuilt minimally for bare Kimi-shaped ones, with the Kimi summary text mirrored
-    in `reasoning_content`. Replay itself is bounded separately, per request, over the artifacts of
-    the whole history (newest always kept, older ones while the total stays within the budget), so
-    the per-turn cap cannot compound into an oversized body.
+    (normalized at capture under the reasoning byte budget), replayed verbatim for OpenRouter's
+    `reasoning.*` entries and rebuilt minimally for bare Kimi-shaped ones. The array is the
+    **only** reasoning field such a message carries — no scalar mirror is invented beside it,
+    because no upstream documents a message carrying both. Replay itself is bounded, per request,
+    over the artifacts of the whole history (newest always kept, older ones while the total stays
+    within the budget), and that budget is the *same number* as the per-turn cap: a larger
+    per-turn cap would have no replay path, so the two differ in behaviour (capture drops the one
+    turn's array, replay drops the oldest) rather than in size — which is why they are one
+    constant, `reasoning_details::MAX_REASONING_BYTES`.
+
+    **A reasoning-only turn is output.** On both adapters the turn result carries the fact that
+    the provider produced reasoning, independent of whether any of it could be displayed or
+    replayed: a response whose only output is a reasoning item (or an entry over the replay cap)
+    becomes a `FinalText` with empty content that still carries the round-trip artifact, never an
+    `EmptyResponse` error that discards a payload the provider billed for.
 
 
 

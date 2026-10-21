@@ -647,15 +647,16 @@ and re-emits it per provider rules on the next request:
   is still captured for the artifact and as the display fallback. On replay the OpenRouter
   `reasoning.*` entries are sent back verbatim
   (index, format, signature intact) while bare Kimi-shaped entries are rebuilt
-  without the stream-only `index` and mirrored as a `reasoning_content`
-  companion. A details route replays the array whenever there is one to replay
+  without the stream-only `index`, and the array is the only reasoning field
+  that message carries (no scalar mirror is invented beside it).
+  A details route replays the array whenever there is one to replay
   and omits the key entirely when there is not (no unverified empty array is
   invented; the array is a destination, not a presence requirement), while a
   scalar payload that was observed on a structured route is replayed as one
   `reasoning.text` entry instead of being discarded. The payload is capped per
   turn, small because it is replayed on every later request of the tool loop
   (dropped and logged rather than failing the request), and the total replayed
-  across a request is bounded separately: the history is walked newest-first, the
+  across a request is bounded separately in behaviour by that same number: the history is walked newest-first, the
   most recent turn's artifact always replays, and each older one replays only
   while the accepted bytes stay within the request budget. A turn over budget
   still goes out under the route's echo rules with the key present and its
