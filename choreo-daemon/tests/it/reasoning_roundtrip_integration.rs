@@ -644,13 +644,15 @@ fn kimi_details_replay_strips_index_and_adds_companion() {
     assert_eq!(assistant["reasoning_content"], "step one and two");
 }
 
-/// An unrecognised detail `type` is dropped at replay rather than forwarded.
+/// An entry whose `type` the catalog does not model is replayed verbatim: the
+/// route requires the returned sequence to match what the model produced, so an
+/// unknown block must survive the round-trip rather than being dropped.
 #[ignore = "integration"]
 #[test]
-fn unknown_details_type_is_dropped_on_replay() {
+fn unknown_details_type_is_replayed_verbatim() {
     let entries = serde_json::json!([
         {"type":"reasoning.text","text":"keep","index":0},
-        {"type":"vendor.mystery","payload":"drop me"}
+        {"type":"vendor.mystery","payload":"keep me"}
     ]);
     let mut session = SessionState::empty();
     add_artifact_tool_turn(
@@ -668,10 +670,7 @@ fn unknown_details_type_is_dropped_on_replay() {
     send(&client, OPENROUTER_MODEL, &messages);
 
     let assistant = captured_assistant(&mock.requests()[0].body_json());
-    assert_eq!(
-        assistant["reasoning_details"],
-        serde_json::json!([{"type":"reasoning.text","text":"keep","index":0}])
-    );
+    assert_eq!(assistant["reasoning_details"], entries);
 }
 
 /// A details-declaring route injects `reasoning_details: []` on an assistant

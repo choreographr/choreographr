@@ -1167,21 +1167,30 @@ names it for the OpenRouter resellers and a few gateways). The artifact then
 stores the array as JSON under `ChatReasoningField::ReasoningDetails` rather than
 text: display text is derived from its text/summary entries when no scalar field
 streamed, and an encrypted-only array still counts as model output (never an
-empty response). Capture normalizes the array — consecutive same-kind text and
-summary entries merge, encrypted entries stay discrete (they are individually
-opaque), and unrecognised `type`s are dropped — under a documented per-turn byte
-cap, beyond which the payload is dropped and logged rather than failing the
-request. The lowering replays OpenRouter's namespace-prefixed `reasoning.*`
-entries verbatim (index, format, and signature intact) and rebuilds bare
-Kimi-shaped entries minimally, stripping the stream-only `index` and mirroring
-the summary text as a companion `reasoning_content`. That companion is the one
+empty response). Capture normalizes the array under a documented, deliberately
+small per-turn byte cap (small because the payload is persisted per turn and
+replayed on every later request of the tool loop, so request size grows to
+roughly `turns × cap`), beyond which the payload is dropped and logged rather
+than failing the request — and an overflowed capture then yields no display text
+either, so the session never shows reasoning it cannot replay. Consecutive
+same-kind text and summary entries merge only when the provider marks them as the
+same stream slot (equal `index`); a missing index is never treated as
+compatible, because merging on absent evidence would fuse two distinct blocks
+into a sequence the upstream requires to match. Encrypted entries stay discrete
+(they are individually opaque), and an entry whose `type` is not modelled is kept
+and replayed **verbatim** — it contributes nothing to display text, but dropping
+it would again alter the sequence the model produced. The lowering replays
+OpenRouter's namespace-prefixed `reasoning.*` entries verbatim (index, format,
+and signature intact) and rebuilds bare Kimi-shaped entries minimally, stripping
+the stream-only `index` and mirroring the summary text as a companion
+`reasoning_content`. That companion is the one
 deliberate scalar beside the array — the one-channel rule constrains the scalar
 fields, and Kimi-shaped routes expect both. A *declared* structured route with
 nothing to echo emits `reasoning_details: []`; an empty array is a presence
 marker, not a payload, so it never keeps an otherwise-empty assistant message
 alive. An **undeclared** route is the mirror image: it only reaches the array
-through the observation, so when the artifact lowers to nothing (corrupt, over
-the cap, or every entry unrecognised) no key is emitted at all — a route never
+through the observation, so when the artifact lowers to nothing (corrupt or over
+the cap) no key is emitted at all — a route never
 gets an injected `reasoning_details: []` it did not ask for. A scalar payload
 reaching a structured route (a catalog or overlay flip changes a model's
 declared field) is replayed as one `reasoning.text` entry rather than discarded,

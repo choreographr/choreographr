@@ -623,18 +623,22 @@ and re-emits it per provider rules on the next request:
   every provider rejects.
 - **OpenRouter / Kimi (structured `reasoning_details`)** — routes that declare
   the structured array (OpenRouter's resellers, Ollama Cloud, a few gateways)
-  round-trip it as JSON rather than text. Consecutive text/summary entries are
-  merged at capture, encrypted entries stay discrete, and unrecognised types are
-  dropped; the display text is derived from the text/summary entries when no
-  scalar field streamed, and an encrypted-only turn still counts as output. On
-  replay the OpenRouter `reasoning.*` entries are sent back verbatim (index,
-  format, signature intact) while bare Kimi-shaped entries are rebuilt without
-  the stream-only `index` and mirrored as a `reasoning_content` companion. A
-  declared route with nothing to echo sends an empty array, an undeclared route
-  sends no array at all, and a scalar payload that was observed on a structured
-  route is replayed as one `reasoning.text` entry instead of being discarded.
-  The payload is capped per turn (dropped and logged rather than failing the
-  request).
+  round-trip it as JSON rather than text. Consecutive text/summary entries of one
+  stream slot (equal `index`) are merged at capture and encrypted entries stay
+  discrete, while an unrecognised entry type is preserved verbatim and replayed
+  unchanged — the upstream requires the returned sequence to match what the model
+  produced, so nothing may be dropped; unrecognised entries contribute nothing to
+  the display text. The display text is derived from the text/summary entries
+  when no scalar field streamed, and an encrypted-only turn still counts as
+  output. On replay the OpenRouter `reasoning.*` entries are sent back verbatim
+  (index, format, signature intact) while bare Kimi-shaped entries are rebuilt
+  without the stream-only `index` and mirrored as a `reasoning_content`
+  companion. A declared route with nothing to echo sends an empty array, an
+  undeclared route sends no array at all, and a scalar payload that was observed
+  on a structured route is replayed as one `reasoning.text` entry instead of
+  being discarded. The payload is capped per turn, small because it is replayed
+  on every later request of the tool loop (dropped and logged rather than failing
+  the request).
 - **Gemini** — the encrypted thought-step `thoughtSignature` values are sent
   back (the summary text stays display-only).
 - **OpenAI / xAI Responses** — reasoning continuity is chained across user
