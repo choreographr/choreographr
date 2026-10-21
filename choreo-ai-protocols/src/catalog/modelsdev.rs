@@ -232,8 +232,8 @@ pub fn normalize_modelsdev(src: &str) -> Vec<ProviderEntry> {
 fn normalize_provider(slug: String, raw: RawProvider) -> ProviderEntry {
     let protocol = derive_protocol(&raw.npm);
     // Derived default: the FIRST model in the snapshot's JSON order. The
-    // bundled overlay may override this per provider where the old TOML
-    // picked a different default.
+    // bundled overlay overrides this per provider where a different default is
+    // wanted.
     let default_model = raw.models.keys().next().cloned().unwrap_or_default();
     // Responses-API default: only OpenAI's own SDK defaults to the Responses
     // endpoint; everything else is Chat Completions unless a per-model

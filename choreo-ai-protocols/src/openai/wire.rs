@@ -442,6 +442,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn presence_pin_without_a_destination_emits_an_empty_key() {
+        // A route whose catalog fact demands the field without naming one: the
+        // lowering falls back to the chat default `reasoning_content` and writes
+        // it EMPTY as a presence marker, so the message never omits the key.
+        let messages = vec![ChatRequestMessage::simple("assistant", String::new())];
+        let echo = ChatReasoningEcho {
+            field: None,
+            require_present: true,
+        };
+        let wire = chat_wire_message(&messages[0], echo);
+        let json = serde_json::to_value(&wire).expect("serialize");
+        assert_eq!(
+            json.get("reasoning_content"),
+            Some(&serde_json::Value::String(String::new())),
+            "the presence pin must put the key on the wire, empty"
+        );
+        // The empty scalar is a presence marker, not a payload, so it does not
+        // keep an otherwise-empty turn alive: the request projection still drops
+        // it. The pin only matters on a message that survives for another reason.
+        assert!(wire.is_empty());
+        assert_eq!(chat_wire_messages(&messages, echo).dropped, 1);
+    }
+
+    #[test]
     fn scalar_text_on_a_details_route_becomes_one_text_entry() {
         let artifact = ReasoningArtifact::ChatReasoning {
             field: ChatReasoningField::ReasoningContent,

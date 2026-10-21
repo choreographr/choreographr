@@ -83,15 +83,14 @@ pub enum RefreshError {
 /// * `force` — send `Cache-Control: no-cache` and bypass the etag so the
 ///   server returns a fresh 200 even if nothing changed.
 ///
-/// Returns [`RefreshOutcome::NotModified`] on 304, [`RefreshOutcome::Fetched`]
-/// on 200, and a structured [`RefreshError`] on transport/status/body
-/// problems. Never panics.
-/// Fetch the models.dev catalog, honoring conditional GET (etag) semantics.
-///
 /// # Errors
 ///
 /// Returns [`RefreshError`] on network failure, non-200/304 status, or body
-/// parsing failures.
+/// parsing failures, and [`RefreshError::InvalidUtf8`] /
+/// [`RefreshError::BodyTooLarge`] when the body is not usable. A 304 is a
+/// normal outcome, not an error: it resolves to
+/// [`RefreshOutcome::NotModified`], while a 200 resolves to
+/// [`RefreshOutcome::Fetched`].
 pub fn fetch_modelsdev(
     current_etag: Option<&str>,
     force: bool,

@@ -27,11 +27,10 @@ use super::{
 /// the live catalog, holding the `ArcSwap` guard only for the duration of the
 /// call, and map it through `f`.
 ///
-/// This collapses the repeated find-provider/find-model walk that used to be
-/// duplicated across the per-fact resolvers: the guard is acquired once here
-/// (readers are lock-free, but a shared walk means the traversal logic can
-/// never drift between resolvers), and each resolver supplies only its own
-/// field projection and default mapping via `f`.
+/// Every per-fact resolver walks the catalog through this one function: the
+/// guard is acquired once here (readers are lock-free, but a shared walk means
+/// the traversal logic can never drift between resolvers), and each resolver
+/// supplies only its own field projection and default mapping via `f`.
 ///
 /// Returns `None` when the provider slug or the model slug does not match any
 /// catalog entry — each resolver decides what that means for its own fact.
@@ -259,13 +258,16 @@ pub struct ChatReasoningEcho {
 /// upstream provider's own error instead of a silent heuristic guess that could
 /// never be audited or overridden.
 ///
-/// Guards, applied independently of the fact:
+/// The two facts are independent, so each half can be pinned on its own: a
+/// destination with no presence requirement, a presence requirement with no
+/// destination (resolving to `field: None, require_present: true`, which the
+/// adapter emits as an empty default `reasoning_content`), or both.
 ///
-/// - a model on the `OpenAI` **Responses** API resolves to the default —
-///   `reasoning_content` and friends are chat-completions wire concepts, and
-///   continuity there flows through `previous_response_id`/input items, so a
-///   mis-ingested entry cannot leak a chat field into a Responses request;
-/// - a non-chat request format resolves to the default for the same reason.
+/// One guard applies to the whole policy, independently of the facts: a model on
+/// the `OpenAI` **Responses** API resolves to the default — `reasoning_content`
+/// and friends are chat-completions wire concepts, and continuity there flows
+/// through `previous_response_id`/input items, so a mis-ingested entry cannot
+/// leak a chat field into a Responses request.
 ///
 /// Fixes for a catalog gap: add the model to the snapshot, or to the overlay
 /// with `reasoning_echo_field = "…"` (and `reasoning_echo_required = true` when
@@ -274,15 +276,14 @@ pub struct ChatReasoningEcho {
 pub fn chat_reasoning_echo(provider_slug: &str, model: &str) -> ChatReasoningEcho {
     let echo = with_model_fact(provider_slug, model, |m| {
         // The destination and the presence requirement are separate catalog
-        // facts, so project both here and let the guard below flatten the pair
-        // to the default together — a guarded route must resolve to the whole
-        // default, never to a half-answer carrying a field with no presence.
+        // facts, so both are projected here and neither is inferred from the
+        // other: a presence-only pin (no declared destination) is a legitimate
+        // catalog entry and must survive to the caller.
         (m.reasoning_echo, m.reasoning_echo_required.unwrap_or(false))
     })
-    .filter(|(field, _)| {
-        field.is_some()
-            && model_request_format(provider_slug, model) != Some(RequestFormat::Responses)
-    })
+    // The Responses guard flattens the pair to the whole default together, so a
+    // guarded route never resolves to a half-answer.
+    .filter(|_| model_request_format(provider_slug, model) != Some(RequestFormat::Responses))
     .map_or_else(ChatReasoningEcho::default, |(field, require_present)| {
         ChatReasoningEcho {
             field,
@@ -454,7 +455,7 @@ mod tests {
         );
         assert_eq!(lookup_context_window("openai", "gpt-5"), Some(400_000));
         // models.dev is authoritative for context windows: gpt-5.4 is a
-        // 1.05M-token model there (the old TOML's 272k was stale).
+        // 1.05M-token model there.
         assert_eq!(lookup_context_window("openai", "gpt-5.4"), Some(1_050_000));
         assert_eq!(
             lookup_context_window("openai", "gpt-5.5-pro"),
@@ -621,8 +622,7 @@ mod tests {
     fn model_reasoning_passback_deepseek_derives_tool_loop() {
         // DeepSeek is a chat-completions OpenAI-protocol provider, so both
         // models derive the ToolLoop default (echo reasoning on tool-call
-        // turns) — the old TOML's explicit tool_loop override was redundant
-        // with the derived default and is not carried into the overlay.
+        // turns) without needing a per-model override.
         assert_eq!(
             model_reasoning_passback("deepseek", "deepseek-v4-flash"),
             ReasoningPassback::ToolLoop
@@ -871,6 +871,52 @@ mod tests {
     }
 
     #[test]
+    fn chat_reasoning_echo_presence_pin_without_a_destination_resolves() {
+        // The presence requirement stands on its own: an overlay can pin
+        // `reasoning_echo_required = true` for a route whose destination the
+        // snapshot never named (or named elsewhere), and the resolver must
+        // surface it rather than discarding the pin for lack of a field. The
+        // adapter then emits the chat default key empty.
+        let _restore = RestoreBundledOnDrop;
+        let bundled = catalog_snapshot();
+        crate::catalog::replace_catalog({
+            let mut c = tiny_catalog();
+            c[0].models[0].reasoning_echo = None;
+            c[0].models[0].reasoning_echo_required = Some(true);
+            c
+        });
+        assert_eq!(
+            chat_reasoning_echo("tiny-test", "tiny-model"),
+            ChatReasoningEcho {
+                field: None,
+                require_present: true,
+            }
+        );
+        crate::catalog::replace_catalog(bundled.to_vec());
+    }
+
+    #[test]
+    fn chat_reasoning_echo_responses_guard_covers_a_presence_only_pin() {
+        // The Responses guard applies to the whole policy, not just to a declared
+        // destination: a presence-only pin on a Responses model resolves to the
+        // default too, because presence is a chat-completions wire concern.
+        let _restore = RestoreBundledOnDrop;
+        let bundled = catalog_snapshot();
+        crate::catalog::replace_catalog({
+            let mut c = tiny_catalog();
+            c[0].models[0].openai_responses = true;
+            c[0].models[0].reasoning_echo = None;
+            c[0].models[0].reasoning_echo_required = Some(true);
+            c
+        });
+        assert_eq!(
+            chat_reasoning_echo("tiny-test", "tiny-model"),
+            ChatReasoningEcho::default()
+        );
+        crate::catalog::replace_catalog(bundled.to_vec());
+    }
+
+    #[test]
     fn chat_reasoning_echo_overlay_field_wins() {
         // glm-5.3-flash is not in the snapshot (upstream exposes it under
         // internal names); the bundled overlay defines it wholesale with an
@@ -894,10 +940,10 @@ mod tests {
 
     #[test]
     fn chat_reasoning_echo_unknown_model_is_default() {
-        // The old deepseek/kimi NAME heuristic is gone: a plainly-named but
-        // uncataloged model resolves to the default — no declared field, no
-        // presence requirement. Catalog gaps surface as upstream errors (the
-        // provider's own 400) instead of a silent unauditable guess.
+        // No name heuristic applies: a plainly-named but uncataloged model
+        // resolves to the default — no declared field, no presence requirement.
+        // Catalog gaps surface as upstream errors (the provider's own 400)
+        // instead of a silent unauditable guess.
         for (provider, model) in [
             ("deepseek", "deepseek-v99-unknown"),
             ("futurmix", "deepseek-chat-unknown"),

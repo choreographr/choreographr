@@ -611,7 +611,9 @@ and re-emits it per provider rules on the next request:
   produced no reasoning (the field then goes out empty). Presence is its own
   catalog fact, separate from which field a route wants: a route can declare a
   destination field without forcing it to appear on a message that has nothing
-  to echo. The declared field always wins over the field a response
+  to echo, and can require the key's presence without naming a destination (the
+  chat default `reasoning_content` then goes out, empty). The declared field
+  always wins over the field a response
   happened to stream the text in, because gateways exist that answer under
   `reasoning` while rejecting any history without `reasoning_content`. On any
   echo-capable chat provider, a turn recorded as reasoning-only (empty content,
@@ -631,7 +633,10 @@ and re-emits it per provider rules on the next request:
   discrete, while an unrecognised entry type is preserved verbatim and replayed
   unchanged — the upstream requires the returned sequence to match what the model
   produced, so nothing may be dropped; unrecognised entries contribute nothing to
-  the display text. The display text is derived from the text/summary entries
+  the display text. A delta that arrives double-encoded as a JSON string (some
+  proxies do this) is decoded once and folds exactly like a real array; a value
+  that is still not an array or object is ignored and logged by kind alone. The
+  display text is derived from the text/summary entries
   when no scalar field streamed, and an encrypted-only turn still counts as
   output. The live display comes from one channel only — the structured entries
   when the turn has any, otherwise the scalar field — so a route that populates

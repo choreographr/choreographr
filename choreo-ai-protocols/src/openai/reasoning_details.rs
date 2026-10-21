@@ -171,9 +171,29 @@ pub(crate) struct DetailsCapture {
     overflowed: bool,
 }
 
+/// A payload-free kind tag for a JSON value, so a rejected shape is diagnosable
+/// without ever logging its contents.
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 impl DetailsCapture {
     /// Fold one streamed value (an array of entries, or a single entry object
     /// for tolerance) into the capture.
+    ///
+    /// A JSON **string** value is parsed once and folded when it decodes to an
+    /// array or object: some proxies double-encode the array as a JSON string,
+    /// and the payload is otherwise lost outright. Anything that is still not an
+    /// array or object is ignored with a payload-free log line (a kind tag and,
+    /// where cheap, the byte length), because a bare number or a string of
+    /// garbage is not a reasoning payload and must not be invented into one.
     ///
     /// Each newly recognised text/summary fragment is handed to `on_fragment` in
     /// arrival order, so a streaming caller can forward it as a live display
@@ -184,12 +204,44 @@ impl DetailsCapture {
     /// is kept verbatim and yields no fragment; an entry with no `type` at all is
     /// not an entry and is dropped.
     pub(crate) fn push(&mut self, raw: &Value, on_fragment: &mut impl FnMut(&str)) {
-        let items: Vec<&Value> = match raw {
-            Value::Array(entries) => entries.iter().collect(),
-            Value::Object(_) => vec![raw],
-            _ => return,
+        // `decoded` holds the value when a double-encoded string had to be
+        // parsed, so its borrow outlives the entry slice below.
+        let decoded;
+        let entries: &[Value] = match raw {
+            Value::Array(entries) => entries,
+            Value::Object(_) => std::slice::from_ref(raw),
+            Value::String(text) => match serde_json::from_str::<Value>(text) {
+                Ok(value) if value.is_array() || value.is_object() => {
+                    debug!(
+                        payload_bytes = text.len(),
+                        "reasoning_details arrived as a double-encoded JSON string; \
+                         folding the decoded value"
+                    );
+                    decoded = value;
+                    if let Value::Array(entries) = &decoded {
+                        entries
+                    } else {
+                        std::slice::from_ref(&decoded)
+                    }
+                }
+                _ => {
+                    warn!(
+                        kind = json_kind(raw),
+                        payload_bytes = text.len(),
+                        "ignoring a reasoning_details value that is not an array or object"
+                    );
+                    return;
+                }
+            },
+            other => {
+                warn!(
+                    kind = json_kind(other),
+                    "ignoring a reasoning_details value that is not an array or object"
+                );
+                return;
+            }
         };
-        for entry in items {
+        for entry in entries {
             // A typeless object is not a reasoning entry at all; keeping it would
             // replay a value the provider never described. Log the shape (never
             // the contents) so a malformed stream is still diagnosable.
@@ -450,6 +502,57 @@ mod tests {
         let mut capture = DetailsCapture::default();
         capture.push(raw, &mut |_| {});
         capture
+    }
+
+    #[test]
+    fn a_double_encoded_array_string_folds_like_a_real_array() {
+        // Some proxies serialize the array a second time, so the delta arrives as
+        // a JSON STRING. Decoding it once must yield exactly the capture a real
+        // array produces — same entries, same display, same replay.
+        let entries = json!([
+            {"type":"reasoning.text","text":"Let me ","index":0},
+            {"type":"reasoning.text","text":"think","index":0}
+        ]);
+        let double_encoded = Value::String(entries.to_string());
+        let folded = capture(&double_encoded);
+        assert_eq!(folded.display(), "Let me think");
+        let plain = capture(&entries);
+        assert_eq!(folded.display(), plain.display());
+        let artifact = folded.finish().expect("artifact");
+        let ReasoningArtifact::ChatReasoning { bytes, .. } = &artifact else {
+            panic!("expected ChatReasoning");
+        };
+        assert_eq!(
+            serde_json::from_slice::<Value>(bytes).expect("json"),
+            json!([{"type":"reasoning.text","text":"Let me think","index":0}])
+        );
+
+        // A double-encoded single entry object is the same tolerance one level
+        // down: it folds as that one entry.
+        let single = capture(&Value::String(
+            json!({"type":"summary","summary":"only","index":0}).to_string(),
+        ));
+        assert_eq!(single.display(), "only");
+    }
+
+    #[test]
+    fn non_structured_values_are_ignored_without_capture() {
+        // A bare number and a string that is not JSON are neither entries nor
+        // encoded payloads: they are ignored (logged by kind only) and the
+        // capture stays empty rather than inventing an entry.
+        let mut capture = DetailsCapture::default();
+        let mut fragments = Vec::new();
+        for raw in [
+            json!(42),
+            json!("not json at all"),
+            json!(null),
+            json!(true),
+        ] {
+            capture.push(&raw, &mut |fragment| fragments.push(fragment.to_string()));
+        }
+        assert!(fragments.is_empty(), "no display fragment from a non-entry");
+        assert!(!capture.has_entries());
+        assert!(capture.finish().is_none());
     }
 
     #[test]

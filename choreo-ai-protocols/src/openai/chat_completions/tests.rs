@@ -1,4 +1,3 @@
-
 use super::super::{
     AssistantToolCall, AssistantToolFunction, ChatReasoningEcho, chat_wire_message,
     chat_wire_messages,

@@ -139,9 +139,10 @@ fn builder_model_switch_drops_old_turn_artifacts() {
 /// The model-switch behavior verified on the wire: build the messages with a
 /// real `SessionState`, send them to a mock provider, and assert the mock
 /// sees the old `reasoning_content` echoed on the same-model request but NO
-/// old reasoning on the request sent after the switch (`deepseek-chat` is a
-/// `requires_reasoning_content` provider, so the field is still carried — as
-/// an empty string placeholder — but never the previous model's payload).
+/// old reasoning on the request sent after the switch (`deepseek-chat`'s
+/// catalog entry requires the `reasoning_content` field's presence, so the
+/// field is still carried — as an empty string placeholder — but never the
+/// previous model's payload).
 #[ignore = "integration"]
 #[test]
 fn model_switch_sends_no_reasoning_on_the_wire() {
@@ -246,12 +247,13 @@ fn model_switch_sends_no_reasoning_on_the_wire() {
     assert_eq!(assistants.len(), 2);
     for assistant in assistants {
         // After a model switch the OLD reasoning payload must never be
-        // replayed. `deepseek-chat` is a `requires_reasoning_content`
-        // provider, so the builder still carries `reasoning_content` — as an
-        // EMPTY string, because DeepSeek 400s a tool-loop turn that omits the
-        // field — but never the previous model's text. Treating "absent or
-        // empty" as "no old reasoning" also stays correct if a future catalog
-        // change drops the field requirement for this model.
+        // replayed. `deepseek-chat`'s catalog entry requires the
+        // `reasoning_content` field's presence, so the builder still carries
+        // `reasoning_content` — as an EMPTY string, because DeepSeek 400s a
+        // tool-loop turn that omits the field — but never the previous model's
+        // text. Treating "absent or empty" as "no old reasoning" also stays
+        // correct if a future catalog change drops the field requirement for
+        // this model.
         let rc = assistant
             .get("reasoning_content")
             .and_then(|v| v.as_str())

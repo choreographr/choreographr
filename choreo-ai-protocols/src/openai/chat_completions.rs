@@ -69,7 +69,6 @@ pub(crate) struct AssistantMessage {
     /// The structured `reasoning_details` array (`OpenRouter` / Kimi-shaped
     /// routes), kept as raw JSON so an unrecognised entry shape cannot fail the
     /// whole response parse.
-    #[serde(default)]
     pub(crate) reasoning_details: Option<serde_json::Value>,
 }
 
@@ -192,7 +191,7 @@ where
 #[derive(Debug, Deserialize)]
 pub(crate) struct ChatCompletionsStreamResponse {
     pub(crate) choices: Vec<StreamChoice>,
-    #[serde(default)]
+    /// Token usage, present only on the final chunk of a stream that reports it.
     pub(crate) usage: Option<super::Usage>,
 }
 

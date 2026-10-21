@@ -4,7 +4,7 @@
 //! identical request bytes flip 200/400/200 there.  This submodule owns the
 //! three pieces that make a bounded resend of that flake safe: the resend count
 //! ([`GATEWAY_TRANSIENT_400_ATTEMPTS`]), the signature gate
-//! ([`is_transient_gateway_400`]), and the error-code recovery used to label a
+//! ([`is_transient_gateway_400`]), and the error-code recovery that labels a
 //! retry in the log ([`gateway_error_code`]).
 //!
 //! The driver that consumes them lives in `retry_loop_with_provider_policies`

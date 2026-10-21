@@ -405,8 +405,8 @@ pub fn sleep_or_cancel(
     if let Some(rx) = cancel_rx {
         // Wait on the cancel channel and a delay timer simultaneously, so a
         // cancellation wakes this thread the instant it is sent instead of at
-        // the next poll tick.  `select_biased!` (cancel arm first) is the
-        // event-driven replacement for the old `recv_timeout(delay)` loop:
+        // the next poll tick.  `select_biased!` (cancel arm first) is
+        // event-driven, never a `recv_timeout(delay)` poll loop:
         // an already-queued cancel is selected deterministically (the biased
         // fast path scans arms in order), and a cancel that arrives just
         // before the backoff timer expires is *more likely* to win the race

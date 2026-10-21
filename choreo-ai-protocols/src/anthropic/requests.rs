@@ -941,9 +941,9 @@ mod tests {
         );
     }
 
-    /// The SSE handler previously *errored* on `signature_delta` events: the
-    /// variant was missing, so deserialization failed and killed the whole
-    /// stream. Pin that it now parses and carries the signature.
+    /// A `signature_delta` event carries the signature of the thinking block the
+    /// stream is accumulating, so it must deserialize and reach the handler with
+    /// its signature intact.
     #[test]
     fn signature_delta_deserializes() {
         let delta: ContentBlockDelta = serde_json::from_value(json!({

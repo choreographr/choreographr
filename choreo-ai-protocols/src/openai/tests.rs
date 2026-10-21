@@ -231,7 +231,7 @@ fn parse_responses_stream_event_unknown_type_returns_none() {
 fn parse_responses_stream_event_response_failed_decodes_error_object() {
     // `response.failed.error` is the OpenAI error object `{code, message,
     // param, type}`; the surfaced text must be `message`, not a blank string
-    // (the old `as_str()` on the object yielded nothing).
+    // (`as_str()` on the object yields nothing).
     let event = parse_responses_stream_event(
         r#"{"type":"response.failed","error":{"code":"server_error","message":"Request failed due to internal server error.","param":null,"type":"server_error"}}"#,
     )

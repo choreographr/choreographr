@@ -1152,7 +1152,10 @@ the separate `ModelEntry::reasoning_echo_required` fact says so, that the field
 must be present. There are **two destinations**: a declared scalar field
 (`reasoning_content`, `reasoning`, or `reasoning_text`) or the declared
 structured `reasoning_details` array. Destination and presence are **two
-independent catalog facts**, and the lowering (`choreo-ai-protocols`'
+independent catalog facts**, each pinnable on its own — a presence requirement
+with no declared destination resolves to the chat default key
+(`field: None, require_present: true`), which the lowering emits empty — and the
+lowering (`choreo-ai-protocols`'
 `openai::wire`, which owns the projection) applies both in one place so they
 cannot drift apart. Writing a scalar destination on *every* assistant message —
 the artifact's text when there is something to replay, an empty string when
@@ -1209,7 +1212,11 @@ the artifact lowers to nothing (corrupt or over the cap) no key is emitted at
 all. A route whose separate presence fact (`reasoning_echo_required`) demands
 the array still carries it empty on every assistant message — an empty array is
 a presence marker, not a payload, so it never keeps an otherwise-empty assistant
-message alive. A scalar payload
+message alive. Capture tolerates a value that is not an array or object only as
+far as one JSON decode: a proxy that double-encodes the array as a JSON string is
+decoded once and folded like a real array, and anything still not an array or
+object (a bare number, a string of non-JSON) is ignored and logged by kind alone
+— never logged by content, never invented into an entry. A scalar payload
 reaching a structured route (a catalog or overlay flip changes a model's
 declared field) is replayed as one `reasoning.text` entry rather than discarded,
 the counterpart of deriving display text from a structured payload on a scalar

@@ -1,4 +1,3 @@
-
 use super::*;
 use serde_json::json;
 
@@ -74,9 +73,9 @@ fn responses_body_nests_reasoning_and_omits_it_for_non_reasoning() {
 
     // Collect the serialized body's keys as a sorted `Vec<String>` so we
     // can assert the EXACT key set — more precise than poking at
-    // individual fields (which is tautological now that the old
-    // top-level `reasoning_effort` / `include` fields no longer exist on
-    // `ResponsesRequest`).
+    // individual fields, which would be tautological here because
+    // `ResponsesRequest` carries no top-level `reasoning_effort` / `include`
+    // field of its own.
     let body_keys = |body: &serde_json::Value| -> Vec<String> {
         let mut keys: Vec<String> = body.as_object().unwrap().keys().cloned().collect();
         keys.sort();

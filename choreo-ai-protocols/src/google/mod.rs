@@ -692,9 +692,8 @@ fn build_message_payloads<'a>(
     messages: &'a [ChatRequestMessage],
 ) -> Result<(Vec<ContentPayload<'a>>, Option<String>), GoogleError> {
     // System texts borrowed verbatim and joined once at the end — `.format`
-    // places the newline separators, so the old clone-into-Vec + `join` no
-    // longer needs owned strings (and multiple system segments can never
-    // drift apart).
+    // places the newline separators, so nothing needs cloning into an owned
+    // string (and multiple system segments can never drift apart).
     let mut system_texts: Vec<&str> = Vec::new();
     let mut payloads: Vec<ContentPayload<'a>> = Vec::new();
 

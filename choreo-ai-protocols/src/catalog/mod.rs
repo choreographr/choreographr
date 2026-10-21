@@ -411,8 +411,8 @@ impl ProviderEntry {
 /// parse, so the `ArcSwap` itself is lazily initialized behind a [`LazyLock`]:
 /// the first access parses the bundled data once, and every later access goes
 /// straight to the `ArcSwap` (an atomic load, then lock-free reads / atomic
-/// `store` on swap). This preserves the old lazy-init behavior exactly while
-/// making the catalog runtime-swappable.
+/// `store` on swap). The lazy init keeps the first-access parse out of static
+/// initialization while making the catalog runtime-swappable.
 pub static PROVIDER_CATALOG: LazyLock<ArcSwap<Vec<ProviderEntry>>> =
     LazyLock::new(|| ArcSwap::from_pointee(loader::load_catalog()));
 
@@ -497,7 +497,7 @@ pub fn all_display_names() -> Vec<String> {
 ///
 /// Returns `None` when the model id is not known to any provider; the caller
 /// should treat that as "provider unresolvable" rather than guessing a slug
-/// that would feed a wrong `model_reasoning_passback` / `requires_reasoning_content`.
+/// that would feed a wrong `model_reasoning_passback` / `chat_reasoning_echo`.
 pub fn provider_slug_for_model(model: &str) -> Option<String> {
     let catalog = PROVIDER_CATALOG.load();
     catalog

@@ -396,7 +396,7 @@ pub(crate) const OPENCODE_CLIENT_ID: &str = "choreographr";
 /// REAL per-session id spreads sessions
 /// across buckets and lets the gateway's own health machinery route around
 /// broken upstreams; a fixed constant would pin every choreographr session
-/// to one bucket forever, which is why the old hardcoded value was removed.
+/// to one bucket forever.
 ///
 /// Only the known gateway slugs get headers (exact match, so an unrelated
 /// `opencode-*` slug is never given routing behavior it wasn't configured

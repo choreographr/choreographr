@@ -943,9 +943,10 @@ fn build_tool_payloads(tools: &[ChatToolDefinition]) -> Vec<ToolPayload<'_>> {
 /// Others → enabled thinking with `budget_tokens`.
 ///
 /// The catalog advertises the Anthropic effort set as `off` / `minimal` /
-/// `low` / `medium` / `high` / `xhigh`; every slug except `off` must map to a
-/// real thinking budget — an unmapped slug used to silently disable thinking
-/// (only a warn), which made the advertised `minimal`/`xhigh` levels no-ops.
+/// `low` / `medium` / `high` / `xhigh`; every slug except `off` maps to a real
+/// thinking budget, so an advertised level is never a silent no-op. A slug no
+/// catalog entry declares still disables thinking, with a warn, because there is
+/// no budget to infer for it.
 pub(super) fn thinking_payload(slug: &str, max_tokens: u32) -> Option<ThinkingPayload> {
     match slug {
         "off" => None,
