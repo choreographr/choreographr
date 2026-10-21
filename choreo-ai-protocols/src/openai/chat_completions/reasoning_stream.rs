@@ -168,16 +168,22 @@ impl ReasoningStreamState {
     /// is the richer, replayable form) and the scalar text outranks the
     /// details-derived display text; either may be absent.
     pub(crate) fn finish(self) -> (Option<String>, Option<ReasoningArtifact>) {
-        let details_display = self.details.display();
-        let artifact = self.details.finish().or_else(|| {
-            self.scalar_field
-                .and_then(|field| chat_reasoning_artifact(field, &self.scalar_text))
+        // Split the state up front so the details capture can be borrowed for
+        // its display text and then consumed for the artifact.
+        let ReasoningStreamState {
+            details,
+            scalar_field,
+            scalar_text,
+            ..
+        } = self;
+        // The details-derived display is only worth building when the scalar
+        // channel has nothing to show: it concatenates every textual entry, and
+        // the scalar text wins whenever it exists.
+        let details_display = scalar_text.is_empty().then(|| details.display());
+        let artifact = details.finish().or_else(|| {
+            scalar_field.and_then(|field| chat_reasoning_artifact(field, &scalar_text))
         });
-        let display = if self.scalar_text.is_empty() {
-            details_display
-        } else {
-            self.scalar_text
-        };
+        let display = details_display.unwrap_or(scalar_text);
         ((!display.is_empty()).then_some(display), artifact)
     }
 }

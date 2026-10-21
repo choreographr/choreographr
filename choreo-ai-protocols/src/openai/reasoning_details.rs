@@ -395,6 +395,13 @@ impl DetailsCapture {
 
     /// Consume the capture into the opaque round-trip artifact. `None` when
     /// nothing was recognised or the payload overflowed the per-turn cap.
+    ///
+    /// The serialized array is measured again even though [`push_entry`] already
+    /// tracked a running total: that total sums each entry's own length, while
+    /// the array it becomes adds the brackets and one comma per separator, so a
+    /// capture sitting just under the cap can serialize just over it. The
+    /// re-check is what makes the persisted artifact fit the same limit a reader
+    /// enforces (`details_wire_value`), not a redundant second look.
     pub(crate) fn finish(self) -> Option<ReasoningArtifact> {
         if self.overflowed || self.entries.is_empty() {
             return None;
