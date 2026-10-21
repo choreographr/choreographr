@@ -2,16 +2,20 @@
 //!
 //! Owns the client itself — construction, model listing, and dispatching each
 //! turn to the Chat Completions or Responses wire format from the model's
-//! catalog-recorded [`RequestFormat`] — plus the `Usage` / `TurnParams` shapes
-//! its request builders share. The canonical [`ChatRequestMessage`] /
-//! [`ChatToolDefinition`] types that the Anthropic and Google clients translate
-//! into their own wire formats live in `message`, and the Responses `input`
-//! lowering lives in `responses_input`; both are re-exported here so every
-//! consumer keeps naming them as `openai::…`.
+//! catalog-recorded [`RequestFormat`] — plus the `TurnParams` shape its request
+//! builders share and the one private resolver that fills it in.
+//! The canonical [`ChatRequestMessage`] / [`ChatToolDefinition`] types that the
+//! Anthropic and Google clients translate into their own wire formats live in
+//! `message`, the Responses `input` lowering lives in `responses_input`, the
+//! usage / `/models` envelopes in `wire`, and the model-usage error annotation
+//! in `error`; each is re-exported here so every consumer keeps naming them as
+//! `openai::…`.
 
 mod chat_completions;
 mod chat_projection;
 mod config;
+// The model-usage error annotation (provider verdict → one user-facing line).
+mod error;
 mod message;
 mod reasoning_details;
 mod responses;
@@ -22,10 +26,11 @@ mod sse;
 mod tests;
 // Turn-result assembly shared by both wire formats (see the module docs).
 mod turn;
+// The small envelopes the client parses itself (usage counters, `/models`).
+mod wire;
 mod zhipu;
 pub use crate::shared::{MaxTokensField, RequestAuth};
 use crate::types::{ChatTurnResult, StreamEvent};
-use tracing::info;
 
 use crate::SocketRegistry;
 use crate::ToolResultItem;
@@ -41,14 +46,21 @@ pub use chat_projection::{
     CHAT_REASONING_WIRE_KEYS, ChatWireMessage, ChatWireMessages, chat_assistant_payload_is_empty,
     chat_wire_message, chat_wire_messages,
 };
+pub(crate) use error::annotate_model_usage_error;
+// The classifier itself is only named by the tests, which pin the body prose it
+// matches; production only ever reaches it through the annotation above.
 pub(crate) use config::endpoint_url;
 pub use config::{ServiceConfig, completion, validate_and_list_models};
+#[cfg(test)]
+pub(crate) use error::model_usage_rejection_reason;
 pub(crate) use sse::SseReader;
 #[cfg(test)]
 pub(crate) use sse::build_sse_event;
 #[cfg(test)]
 pub(crate) use sse::extract_responses_text_delta;
 pub(crate) use sse::{ResponsesStreamEvent, parse_responses_stream_event};
+use wire::ModelListResponse;
+pub(crate) use wire::Usage;
 
 // Re-export common retry types for use by sub-modules and tests.
 #[cfg(test)]
@@ -130,36 +142,6 @@ pub enum AllowedCaller {
     Direct,
     /// A caller that is itself a model call — programmatic tool calling.
     Programmatic,
-}
-
-#[derive(Debug, Deserialize)]
-struct ModelListResponse {
-    data: Vec<ModelInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ModelInfo {
-    id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct Usage {
-    prompt_tokens: u32,
-    completion_tokens: u32,
-    total_tokens: u32,
-    /// OpenAI-style per-prompt breakdown. z.ai (and `OpenAI` itself) report
-    /// `prompt_tokens_details.cached_tokens` here; providers that omit the
-    /// object entirely (e.g. plain `DeepSeek`) still parse via `#[serde(default)]`.
-    /// NOTE: `DeepSeek` also exposes a differently-shaped flat
-    /// `prompt_cache_hit_tokens` field — parsing that is a possible follow-up.
-    #[serde(default)]
-    prompt_tokens_details: Option<PromptTokensDetails>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct PromptTokensDetails {
-    #[serde(default)]
-    cached_tokens: u32,
 }
 
 /// The OpenAI-compatible client: an `OpenAI`, OpenAI-protocol gateway, or any
@@ -349,40 +331,13 @@ impl OpenAiClient {
     // caller across the daemon and tests.
     pub fn chat_completion_turn(
         &self,
-        params: crate::ChatTurnRequest<'_>,
+        mut params: crate::ChatTurnRequest<'_>,
     ) -> Result<ChatTurnResult, OpenAiError> {
         // `params.model` is a `Copy` `&str`; capture it before `params` is
-        // moved into the request builders below so the error annotation can
-        // still name the model.
+        // borrowed for the request builders so the error annotation can still
+        // name the model.
         let model = params.model;
-        // z.ai models only accept a subset of the OpenAI effort slugs, and
-        // the accepted set differs by GLM generation — dispatch to the
-        // Zhipu-specific mapper for those providers, plain pass-through for
-        // everything else.
-        let reasoning_effort = if is_zhipu_provider_slug(&self.config.provider_slug) {
-            zhipu_reasoning_effort_api_value(&params.thinking_effort, params.model)
-        } else {
-            reasoning_effort_api_value(&params.thinking_effort)
-        };
-        tracing::debug!(effort = %params.thinking_effort, ?reasoning_effort, "chat_completion_turn");
-        // The turn's real session/request ids drive the opencode gateway's
-        // per-session sticky routing (see `shared::opencode_gateway_headers`).
-        let route = Some((params.session_id.as_str(), params.request_id.as_str()));
-        let turn = TurnParams {
-            model,
-            messages: params.messages,
-            tools: params.tools,
-            reasoning_effort,
-            on_retry: params.on_retry,
-            on_uploaded: params.on_uploaded,
-            cancel_rx: params.cancel_rx,
-            route,
-            previous_response_id: params.previous_response_id,
-            tool_results: params.tool_results,
-            programmatic_tool_calling: params.programmatic_tool_calling,
-            max_output_tokens_override: params.max_output_tokens_override,
-            no_retry: params.no_retry,
-        };
+        let turn = self.turn_params(&mut params);
         let result = match self.config.request_format_for_model(model) {
             RequestFormat::Responses => {
                 responses::responses_request_with_tools(&self.http, &self.config, &self.auth, turn)
@@ -407,7 +362,7 @@ impl OpenAiClient {
     /// event-callback failures.
     pub fn chat_completion_turn_streaming<F>(
         &self,
-        params: crate::ChatTurnRequest<'_>,
+        mut params: crate::ChatTurnRequest<'_>,
         mut on_event: F,
     ) -> Result<ChatTurnResult, OpenAiError>
     where
@@ -416,43 +371,16 @@ impl OpenAiClient {
         // Same `Copy` capture as `chat_completion_turn`, for the model-named
         // error annotation on the streaming dispatch below.
         let model = params.model;
-        // Same Zhipu dispatch as `chat_completion_turn` — both turn paths
-        // must apply the identical mapping so streaming and non-streaming
-        // requests carry the same wire value.
-        let reasoning_effort = if is_zhipu_provider_slug(&self.config.provider_slug) {
-            zhipu_reasoning_effort_api_value(&params.thinking_effort, params.model)
-        } else {
-            reasoning_effort_api_value(&params.thinking_effort)
-        };
-        tracing::debug!(
-            effort = %params.thinking_effort,
-            ?reasoning_effort,
-            "chat_completion_turn_streaming"
-        );
         if !self.config.streaming {
             let result = self.chat_completion_turn(params)?;
             let result = crate::shared::emit_non_streaming_events(result, &mut on_event)?;
             return Ok(result);
         }
 
-        // The turn's real session/request ids drive the opencode gateway's
-        // per-session sticky routing (see `shared::opencode_gateway_headers`).
-        let route = Some((params.session_id.as_str(), params.request_id.as_str()));
-        let turn = TurnParams {
-            model,
-            messages: params.messages,
-            tools: params.tools,
-            reasoning_effort,
-            on_retry: params.on_retry,
-            on_uploaded: params.on_uploaded,
-            cancel_rx: params.cancel_rx,
-            route,
-            previous_response_id: params.previous_response_id,
-            tool_results: params.tool_results,
-            programmatic_tool_calling: params.programmatic_tool_calling,
-            max_output_tokens_override: params.max_output_tokens_override,
-            no_retry: params.no_retry,
-        };
+        // The non-streaming fallback above goes through
+        // `chat_completion_turn`, which resolves the same params, so the
+        // mapping is still applied exactly once per request.
+        let turn = self.turn_params(&mut params);
         let result = match self.config.request_format_for_model(model) {
             RequestFormat::Responses => responses::responses_request_streaming_with_tools(
                 &self.http,
@@ -473,78 +401,57 @@ impl OpenAiClient {
         };
         result.map_err(|e| annotate_model_usage_error(model, e))
     }
+
+    /// Resolve one turn's request inputs, identically for the streaming and
+    /// non-streaming tool paths.
+    ///
+    /// One place decides the wire `reasoning_effort` — z.ai's GLM models accept
+    /// only a subset of the `OpenAI` effort slugs and the accepted set differs
+    /// by generation, so those providers route through the Zhipu mapper while
+    /// everything else passes the slug through — and one place names the
+    /// gateway route. Both dispatch methods call it, so a provider-specific
+    /// mapping can never be applied to one wire format and forgotten on the
+    /// other.
+    fn turn_params<'p, 'a: 'p>(
+        &self,
+        params: &'p mut crate::ChatTurnRequest<'a>,
+    ) -> TurnParams<'p> {
+        let reasoning_effort = if is_zhipu_provider_slug(&self.config.provider_slug) {
+            zhipu_reasoning_effort_api_value(&params.thinking_effort, params.model)
+        } else {
+            reasoning_effort_api_value(&params.thinking_effort)
+        };
+        tracing::debug!(
+            effort = %params.thinking_effort,
+            ?reasoning_effort,
+            "chat turn reasoning effort"
+        );
+        TurnParams {
+            model: params.model,
+            messages: params.messages,
+            tools: params.tools,
+            reasoning_effort,
+            // Reborrowed rather than moved: the caller keeps ownership of the
+            // callback slot for as long as it needs it.
+            on_retry: &mut *params.on_retry,
+            on_uploaded: params.on_uploaded.clone(),
+            cancel_rx: params.cancel_rx,
+            // The turn's real session/request ids drive the opencode gateway's
+            // per-session sticky routing (see `shared::opencode_gateway_headers`).
+            route: Some((params.session_id.as_str(), params.request_id.as_str())),
+            previous_response_id: params.previous_response_id,
+            tool_results: params.tool_results,
+            programmatic_tool_calling: params.programmatic_tool_calling,
+            max_output_tokens_override: params.max_output_tokens_override,
+            no_retry: params.no_retry,
+        }
+    }
 }
 
 /// Map reasoning slug string to `OpenAI`'s `reasoning_effort` API value.
 /// "off" → None (omit the field). Others → Some(slug).
 pub(crate) fn reasoning_effort_api_value(slug: &str) -> Option<&str> {
     if slug == "off" { None } else { Some(slug) }
-}
-
-/// Rewrite a provider rejection that means "this model can't be used here"
-/// into a short, plain message, e.g. `'gpt-4o' is not a chat model — please
-/// try a different one.`
-///
-/// The live model picker deliberately lists the provider's *full* catalogue —
-/// including models choreographr cannot drive (legacy completions models,
-/// embeddings, audio, image, moderation). A just-released or custom model must
-/// stay selectable too, so the list is never filtered; instead, when a turn is
-/// sent with an unusable model, the provider's verdict (e.g. the `OpenAI`
-/// `404 This is not a chat model …`) becomes a short user-facing line. The
-/// provider is the only reliable authority on usability (the `/v1/models`
-/// payload carries no modality), so this reacts to its verdict rather than
-/// guessing locally. The provider's raw wording is jargon to a user, so it is
-/// dropped from the message and kept in the log instead.
-fn annotate_model_usage_error(model: &str, err: OpenAiError) -> OpenAiError {
-    let OpenAiError::ClientError { status, detail } = &err else {
-        return err;
-    };
-    // The helper lowercases once and decides both *whether* this is a
-    // model-usability rejection and *how* to phrase it; a `None` here means
-    // the body is unrelated and must pass through verbatim.
-    let Some(reason) = model_usage_rejection_reason(detail) else {
-        return err;
-    };
-    // Keep the provider's technical wording for operators — the user only sees
-    // the plain line below.
-    info!(model = %model, provider_detail = %detail, "provider rejected the model as unusable");
-    OpenAiError::ClientError {
-        status: *status,
-        detail: format!("'{model}' {reason} — please try a different one."),
-    }
-}
-
-/// Classify a provider error body: `Some(reason)` when it means the selected
-/// model cannot be used on the endpoint, with the short phrase to name the
-/// cause; `None` when it is unrelated (and must pass through verbatim). The
-/// body is free-form prose, so this is a deliberately narrow substring match
-/// over the known OpenAI-family rejections.
-///
-/// `crate::retry::extract_error_message` (in `retry.rs`) unwraps the standard
-/// JSON error envelope and returns only `error.message`, DROPPING the `code`
-/// field. On that parsed-envelope path the human-readable
-/// `"does not exist or you do not have access"` prose is therefore the primary
-/// model-not-found signal — the literal `"model_not_found"` code never
-/// survives extraction. That literal only reaches here when the body was NOT a
-/// parseable envelope, in which case the verbatim body is kept.
-///
-/// Note: `"not supported in the v1/chat/completions"` / `"not supported in the
-/// v1/responses"` are deliberately NOT matched — `OpenAI` uses the same wording
-/// for genuine "Unsupported parameter" errors, so matching them would mask real
-/// parameter bugs behind the generic line. The intended legacy-completions case
-/// is already covered by `"not a chat model"`.
-fn model_usage_rejection_reason(detail: &str) -> Option<&'static str> {
-    // One lowercase pass for both the classification and the phrasing.
-    let d = detail.to_ascii_lowercase();
-    if d.contains("not a chat model") {
-        Some("is not a chat model")
-    } else if d.contains("model_not_found")
-        || d.contains("does not exist or you do not have access")
-    {
-        Some("can't be used here")
-    } else {
-        None
-    }
 }
 
 // Zhipu (z.ai / bigmodel.cn) provider-specific request shaping lives in the
