@@ -1178,12 +1178,22 @@ names it for the OpenRouter resellers and a few gateways). The artifact then
 stores the array as JSON under `ChatReasoningField::ReasoningDetails` rather than
 text: display text is derived from its text/summary entries when no scalar field
 streamed, and an encrypted-only array still counts as model output (never an
-empty response). The live display comes from exactly one channel — the
-structured entries once a delta has left one behind, otherwise the scalar field
-— because a route that populates both sends the same reasoning twice and
-emitting both renders it twice in the client; the scalar text is still
-accumulated all the same, since it stays the display and artifact fallback for a
-route that streams only the scalar field. Capture normalizes the array under a
+empty response). The live display comes from exactly one channel — whichever
+channel produced a fragment first claims it for the rest of the turn, and the
+other channel then contributes nothing to the display — because a route that
+populates both sends the same reasoning twice and emitting both renders it twice
+in the client. The rule is symmetric: a route may stream the scalar field first
+and the structured array later just as easily as the reverse, so neither channel
+is privileged. Processing order inside a delta stays details-first, then the
+scalar fields, so a chunk carrying both lets the structured entries claim first.
+Both channels are still captured regardless of who owns the display — the scalar
+text is accumulated all the same, since it stays the display and artifact
+fallback for a route that streams only the scalar field, and the array is
+captured even while the scalar field is on screen. Both streaming request paths
+delegate those rules to one shared state machine
+(`openai/chat_completions/reasoning_stream.rs`) rather than each reimplementing
+them, which is what keeps the plain prompt path and the tool path displaying
+identically. Capture normalizes the array under a
 documented, deliberately small per-turn byte cap (small because the payload is
 persisted per turn and replayed on every later request of the tool loop, so
 request size grows to

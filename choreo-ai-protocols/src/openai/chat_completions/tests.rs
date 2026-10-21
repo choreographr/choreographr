@@ -1006,6 +1006,52 @@ fn streaming_emits_reasoning_once_when_scalar_and_details_carry_it() {
 }
 
 #[test]
+fn streaming_scalar_first_keeps_the_details_out_of_the_display() {
+    // A route that streams the scalar field in an early chunk and the structured
+    // array later sends the same reasoning twice; the scalar channel claimed the
+    // display first, so the later details fragments must not be rendered a second
+    // time — while the details payload still wins the artifact.
+    let mut acc = ChatCompletionsStreamAccumulator::default();
+    let chunk1: ChatCompletionsStreamResponse =
+        serde_json::from_str(r#"{"choices":[{"delta":{"reasoning_content":"step one "}}]}"#)
+            .unwrap();
+    let chunk2: ChatCompletionsStreamResponse = serde_json::from_str(
+        r#"{"choices":[{"delta":{"reasoning_content":"step two","reasoning_details":[{"type":"reasoning.text","text":"step one step two","index":0}]}}]}"#,
+    )
+    .unwrap();
+    let mut events = Vec::new();
+    acc.apply(&chunk1, &mut |e| {
+        events.push(e);
+        Ok(())
+    })
+    .unwrap();
+    acc.apply(&chunk2, &mut |e| {
+        events.push(e);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        events,
+        vec![
+            StreamEvent::Reasoning("step one ".into()),
+            StreamEvent::Reasoning("step two".into()),
+        ],
+        "the scalar channel owns the display for the whole turn"
+    );
+    let result = acc.into_turn_result().unwrap();
+    match result {
+        ChatTurnResult::FinalText(f) => {
+            assert_eq!(f.reasoning.as_deref(), Some("step one step two"));
+            let Some(ReasoningArtifact::ChatReasoning { field, .. }) = f.reasoning_artifact else {
+                panic!("expected a chat reasoning artifact");
+            };
+            assert_eq!(field, ChatReasoningField::ReasoningDetails);
+        }
+        other => panic!("expected FinalText, got {other:?}"),
+    }
+}
+
+#[test]
 fn streaming_scalar_only_reasoning_is_still_displayed() {
     // Negative control for the one-channel rule: with no structured details
     // in the turn the scalar field is the display channel, so every delta is

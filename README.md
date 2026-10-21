@@ -638,9 +638,12 @@ and re-emits it per provider rules on the next request:
   that is still not an array or object is ignored and logged by kind alone. The
   display text is derived from the text/summary entries
   when no scalar field streamed, and an encrypted-only turn still counts as
-  output. The live display comes from one channel only — the structured entries
-  when the turn has any, otherwise the scalar field — so a route that populates
-  both does not show the same reasoning twice. On replay the OpenRouter
+  output. The live display comes from one channel only — whichever channel
+  produced a fragment first owns it for the rest of the turn, so a route that
+  populates both does not show the same reasoning twice. The rule is symmetric
+  (scalar-then-structured is as legal as structured-then-scalar), a chunk
+  carrying both lets the structured entries claim first, and the losing channel
+  is still captured for the artifact and as the display fallback. On replay the OpenRouter
   `reasoning.*` entries are sent back verbatim
   (index, format, signature intact) while bare Kimi-shaped entries are rebuilt
   without the stream-only `index` and mirrored as a `reasoning_content`
