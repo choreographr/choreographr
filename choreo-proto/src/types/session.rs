@@ -129,10 +129,10 @@ pub enum ChatReasoningField {
     /// `bytes` are a **JSON array** of reasoning-detail entries, not UTF-8
     /// display text. Each entry keeps the provider's own shape verbatim (e.g.
     /// `OpenRouter`'s `{"type":"reasoning.text","text":…,"signature":…,"index":0}`
-    /// or Kimi's bare `{"type":"summary","summary":…,"index":0}`); the
-    /// adapter lowering re-emits `reasoning.*` entries verbatim and rebuilds
-    /// bare entries minimally. Display text is derived from the text/summary
-    /// entries when no scalar reasoning field streamed.
+    /// or a bare `{"type":"summary","summary":…,"index":0}`); the adapter
+    /// lowering re-emits `reasoning.*` entries verbatim and strips only the
+    /// stream-only `index` from a bare entry. Display text is derived from the
+    /// text/summary entries when no scalar reasoning field streamed.
     ReasoningDetails,
 }
 

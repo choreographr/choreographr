@@ -1219,17 +1219,32 @@ per-turn cap and the DeepSeek/GLM echo requirement needs it replayed — so they
 are bounded by that same request budget rather than by capture. Consecutive
 same-kind text and summary entries merge when the provider marks them as the
 same stream slot (equal `index`) or leaves the `index` off on both (it does not
-distinguish slots, so adjacency plus kind is the only signal — the shape the
-reference implementations merge on); a mixed presence is ambiguous and stays
-unmerged, because fusing on absent evidence could rewrite a sequence the
-upstream requires to match. Encrypted entries stay discrete
-(they are individually opaque), and an entry whose `type` is not modelled is kept
-and replayed **verbatim** — it contributes nothing to display text, but dropping
-it would again alter the sequence the model produced. The lowering replays
-OpenRouter's namespace-prefixed `reasoning.*` entries verbatim (index, format,
-and signature intact) and rebuilds bare Kimi-shaped entries minimally, stripping
-the stream-only `index` and mirroring the summary text as a companion
-`reasoning_content`. That companion is the one
+distinguish slots, so adjacency plus kind is the only signal); a mixed presence
+is ambiguous and stays unmerged, because fusing on absent evidence could rewrite
+a sequence the upstream requires to match. A merge is also refused when the two
+entries state a conflicting identity — a different `id`, `format`, or
+`signature` — since that is two distinct blocks sharing a slot number. OpenRouter
+states the rule this protects: the entire sequence of reasoning blocks must match
+the output of the original request and may not be rearranged or modified
+([docs](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens#preserving-reasoning)),
+and GLM says the same of its preserved-thinking blocks
+([docs](https://docs.z.ai/guides/capabilities/thinking-mode)). Encrypted entries
+stay discrete (they are individually opaque), and an entry whose `type` is not
+modelled is kept and replayed **verbatim** — it contributes nothing to display
+text, but dropping it would again alter the sequence the model produced. The
+lowering replays OpenRouter's namespace-prefixed `reasoning.*` entries verbatim
+(index, format, and signature intact, as its documented array shape specifies —
+[spec](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens#reasoning_details-array-structure))
+and mirrors a bare entry's summary text as a companion `reasoning_content`.
+A **bare** entry (an undocumented single-word `type`) is the one exception to
+verbatim replay: it loses only the stream-only `index` and keeps everything else,
+the payload key included, because no upstream documents that shape — Kimi's own
+documentation uses solely `reasoning_content`
+([docs](https://platform.kimi.ai/docs/guide/use-thinking-models)) and models.dev's
+snapshot vocabulary is `reasoning_content` or `reasoning_details`
+([schema](https://github.com/anomalyco/models.dev/blob/dev/packages/core/src/schema.ts)) —
+so a rebuilt entry could drop an opaque block under a guessed key. That companion
+is the one
 deliberate scalar beside the array — the one-channel rule constrains the scalar
 fields, and Kimi-shaped routes expect both. The array is a **destination fact
 only**: a declared details route with nothing to echo emits *no* reasoning key,

@@ -3,16 +3,31 @@
 //!
 //! Several OpenAI-compatible routes (`OpenRouter` and its resellers, a few
 //! gateway brands) carry reasoning as a **structured array** rather than a
-//! scalar string. The array shape differs by dialect:
+//! scalar string. The documented shape is `OpenRouter`'s — three namespaced
+//! entry types, each with provider-opaque metadata that must survive the
+//! round-trip verbatim
+//! ([docs](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens#reasoning_details-array-structure)):
 //!
-//! - **`OpenRouter`** — namespaced entries whose `type` starts with
-//!   `reasoning.`: `reasoning.text` (a `text` field), `reasoning.summary` (a
-//!   `summary` field), and `reasoning.encrypted` (a `data` field). An entry
-//!   also carries provider-opaque metadata (`index`, `format`, `id`,
-//!   `signature`) that must survive the round-trip verbatim.
-//! - **Kimi-shaped** — bare entries: `{"type":"summary","summary":…,"index":0}`
-//!   and `{"type":"encrypted","data":…,"index":0}`. `index` is a stream
-//!   bookkeeping field, not part of the replay payload.
+//! - `reasoning.text` (a `text` field, optional `signature`)
+//! - `reasoning.summary` (a `summary` field)
+//! - `reasoning.encrypted` (a `data` field)
+//!
+//! plus the common fields `id` (string or null), `format` (an enumerated
+//! provider-format tag) and `index` (the sequential index of the entry).
+//!
+//! A second, **undocumented** shape also arrives in practice: bare entries whose
+//! `type` is a single word (`summary`, `encrypted`, and occasionally `text`)
+//! with the payload under the same-named field and a stream-only `index`. No
+//! upstream documents it — Kimi's own API documentation uses only
+//! `reasoning_content`
+//! ([docs](https://platform.kimi.ai/docs/guide/use-thinking-models)) and
+//! models.dev's snapshot vocabulary is `reasoning_content` or
+//! `reasoning_details`, never a bare entry type
+//! ([schema](https://github.com/anomalyco/models.dev/blob/dev/packages/core/src/schema.ts)) —
+//! so this module treats it as a tolerance case rather than a dialect it claims
+//! to know: a bare entry is replayed with only its stream-only `index` removed
+//! and every other field preserved exactly as received, including the payload
+//! key it arrived under.
 //!
 //! Two rules shape this module:
 //!
@@ -38,6 +53,16 @@
 //! `index` off entirely (it does not distinguish slots, so adjacency plus kind is
 //! the only signal); a mixed presence is ambiguous and stays unmerged. Encrypted
 //! entries never merge — they are individually opaque and signed.
+//!
+//! A merge is further refused when two entries state **conflicting identity** —
+//! a different `id`, `format`, or `signature` — because that identifies two
+//! different blocks whose deltas merely share a slot number, and the upstream
+//! requires the replayed sequence to be exactly the sequence the model produced
+//! ([`OpenRouter`](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens#preserving-reasoning)
+//! forbids reordering or modifying it; GLM states the same rule for its
+//! preserved-thinking blocks,
+//! [docs](https://docs.z.ai/guides/capabilities/thinking-mode)). Fusing such a
+//! pair would edit the sequence; keeping them discrete preserves it.
 
 use std::io::{self, Write};
 
@@ -68,7 +93,13 @@ enum DetailKind {
 }
 
 impl DetailKind {
-    /// The entry field carrying this kind's payload.
+    /// The entry field carrying this kind's payload, for display derivation.
+    ///
+    /// Only the textual kinds are ever read through this: the encrypted kind
+    /// contributes nothing to display, and its payload key is dialect-specific
+    /// (`data` for `OpenRouter`'s `reasoning.encrypted`, the same-named field
+    /// for an undocumented bare entry), so the lowering never consults it —
+    /// replay copies the entry's own fields instead (see [`lower_entry`]).
     fn payload_key(self) -> &'static str {
         match self {
             DetailKind::Text => "text",
@@ -108,18 +139,47 @@ fn entry_index(entry: &Value) -> Option<u64> {
     entry.get("index").and_then(Value::as_u64)
 }
 
+/// Whether two entries state *different* values for one metadata field.
+///
+/// Only two *stated* values can disagree: an absent key and an explicit `null`
+/// both mean the provider said nothing, so neither conflicts with a stated
+/// value.
+fn stated_values_differ(existing: &Value, incoming: &Value, key: &str) -> bool {
+    fn stated<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+    }
+    match (stated(existing, key), stated(incoming, key)) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    }
+}
+
 /// Whether `incoming` continues the stream slot of `existing`, i.e. whether the
 /// two entries may be merged.
 ///
 /// Two cases qualify: both entries name the same `index` (the provider told us
 /// they are one stream slot), or neither entry carries an `index` at all (the
 /// provider does not distinguish slots, so consecutive same-kind fragments are
-/// the single block being assembled — the shape every reference implementation
-/// merges on, and leaving them unmerged would produce a word-per-entry sequence
-/// some upstreams reject and that can overflow the per-turn cap). A mixed
-/// presence is ambiguous and stays unmerged, because fusing on absent evidence
-/// could rewrite a sequence the upstream requires to match the original output.
+/// the single block being assembled — leaving them unmerged would produce a
+/// word-per-entry sequence some upstreams reject and that can overflow the
+/// per-turn cap). A mixed presence is ambiguous and stays unmerged, because
+/// fusing on absent evidence could rewrite a sequence the upstream requires to
+/// match the original output.
+///
+/// Neither case qualifies when the two entries disagree about their identity —
+/// a different `id`, `format`, or `signature` — since that is two distinct
+/// blocks sharing a slot number, and merging them would edit a sequence the
+/// upstream requires to be replayed unmodified (see the module docs).
 fn is_continuation(existing: &Value, incoming: &Value) -> bool {
+    let identity_conflict = ["id", "format", "signature"]
+        .iter()
+        .any(|key| stated_values_differ(existing, incoming, key));
+    if identity_conflict {
+        return false;
+    }
     match (entry_index(existing), entry_index(incoming)) {
         (Some(a), Some(b)) => a == b,
         (None, None) => true,
@@ -433,9 +493,12 @@ fn display_text(entries: &[Value]) -> String {
 /// Lower a persisted details artifact into the `reasoning_details` wire array.
 ///
 /// - Namespaced (`reasoning.*`) entries are replayed **verbatim** — index,
-///   format, and signature intact.
-/// - Bare Kimi-shaped entries are rebuilt minimally: `type` plus the payload
-///   field, with the stream-only `index` stripped.
+///   format, and signature intact, exactly as the upstream documents the array
+///   ([`OpenRouter`](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens#reasoning_details-array-structure)).
+/// - A bare (undocumented) entry keeps every field it arrived with and loses
+///   only the stream-only `index`; nothing is rebuilt from a guessed payload
+///   key, because no upstream documents the shape and a wrong guess would drop
+///   an opaque block outright.
 /// - Any other entry (an unrecognised `type`, namespaced or bare) is replayed
 ///   **verbatim**: the upstream requires the sequence to match the original
 ///   output, so a lowerer may not rewrite or drop a block it does not model.
@@ -474,18 +537,18 @@ fn lower_entry(entry: &Value) -> Option<Value> {
     let ty = entry.get("type").and_then(Value::as_str)?;
     // Namespaced entries and anything this module does not model both replay
     // verbatim — dropping an unknown block would again modify the sequence.
-    let Some(kind) = classify(entry) else {
-        return Some(entry.clone());
-    };
-    if ty.starts_with("reasoning.") {
+    if ty.starts_with("reasoning.") || classify(entry).is_none() {
         return Some(entry.clone());
     }
-    let mut object = Map::new();
-    object.insert("type".to_string(), Value::String(ty.to_string()));
-    if let Some(payload) = entry.get(kind.payload_key()) {
-        object.insert(kind.payload_key().to_string(), payload.clone());
+    // A bare entry replays as itself minus the stream-only `index` (the one
+    // transformation the shape is documented to need), so the payload survives
+    // under whichever key the provider used rather than a key this module
+    // guessed.
+    let mut lowered = entry.clone();
+    if let Some(object) = lowered.as_object_mut() {
+        object.remove("index");
     }
-    Some(Value::Object(object))
+    Some(lowered)
 }
 
 /// The Kimi-style scalar companion for a lowered details array: its

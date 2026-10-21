@@ -271,14 +271,96 @@ fn replay_keeps_namespaced_entries_verbatim() {
 }
 
 #[test]
-fn replay_rebuilds_bare_entries_without_index() {
-    // A persisted Kimi payload carries the stream `index`; replay must
-    // rebuild it minimally, stripping the index.
+fn replay_preserves_bare_entries_and_strips_only_the_index() {
+    // A persisted bare payload carries the stream `index`; replay removes that
+    // one field and keeps everything else — including the payload under
+    // whichever key the provider used, so a dialect this module does not model
+    // cannot lose its block.
     let persisted = br#"[{"type":"summary","summary":"sum","index":0},{"type":"encrypted","data":"enc","index":1}]"#;
     let wire = details_wire_value(persisted);
     assert_eq!(
         wire,
         json!([{"type":"summary","summary":"sum"},{"type":"encrypted","data":"enc"}])
+    );
+
+    // The payload key is whatever arrived: an `encrypted` field survives too.
+    let alternate = details_wire_value(br#"[{"type":"encrypted","encrypted":"opaque","index":1}]"#);
+    assert_eq!(
+        alternate,
+        json!([{"type":"encrypted","encrypted":"opaque"}])
+    );
+
+    // Any other field an entry carried rides along untouched.
+    let extra = details_wire_value(br#"[{"type":"summary","summary":"s","index":0,"id":"x"}]"#);
+    assert_eq!(extra, json!([{"type":"summary","summary":"s","id":"x"}]));
+}
+
+#[test]
+fn a_conflicting_signature_keeps_two_blocks_discrete() {
+    // Same slot, different signature: two distinct blocks whose deltas merely
+    // share an index. Merging would edit a sequence the upstream requires to be
+    // replayed unmodified, so both survive with their own signature.
+    let capture = capture(&json!([
+        {"type":"reasoning.text","text":"one","index":0,"signature":"sig_a"},
+        {"type":"reasoning.text","text":"two","index":0,"signature":"sig_b"}
+    ]));
+    let artifact = capture.finish().expect("artifact");
+    let ReasoningArtifact::ChatReasoning { bytes, .. } = &artifact else {
+        panic!("expected ChatReasoning");
+    };
+    let entries: Value = serde_json::from_slice(bytes).expect("json");
+    assert_eq!(
+        entries,
+        json!([
+            {"type":"reasoning.text","text":"one","index":0,"signature":"sig_a"},
+            {"type":"reasoning.text","text":"two","index":0,"signature":"sig_b"}
+        ])
+    );
+    // Display still concatenates the textual payloads in order.
+    assert_eq!(capture_display(&artifact), "onetwo");
+}
+
+#[test]
+fn a_conflicting_identity_field_keeps_two_blocks_discrete() {
+    // `id` and `format` identify a block just as `signature` does, so a stated
+    // difference in either refuses the merge.
+    for conflicting in [
+        json!({"id":"reasoning-1"}),
+        json!({"format":"google-gemini-v1"}),
+    ] {
+        let mut second = json!({"type":"reasoning.summary","summary":"two","index":0});
+        let mut first = json!({"type":"reasoning.summary","summary":"one","index":0});
+        for (name, value) in conflicting.as_object().expect("object") {
+            first[name] = value.clone();
+            second[name] = Value::String("something-else".to_string());
+        }
+        let capture = capture(&json!([first, second]));
+        let artifact = capture.finish().expect("artifact");
+        let ReasoningArtifact::ChatReasoning { bytes, .. } = &artifact else {
+            panic!("expected ChatReasoning");
+        };
+        let entries: Value = serde_json::from_slice(bytes).expect("json");
+        assert_eq!(
+            entries.as_array().map(Vec::len),
+            Some(2),
+            "a differing {conflicting} must keep both blocks: {entries}"
+        );
+    }
+
+    // A value only ONE entry states is not a conflict: it merges and the
+    // accumulated block keeps it (the later delta did not contradict anything).
+    let capture = capture(&json!([
+        {"type":"reasoning.summary","summary":"one","index":0},
+        {"type":"reasoning.summary","summary":"two","index":0,"format":"anthropic-claude-v1"}
+    ]));
+    let artifact = capture.finish().expect("artifact");
+    let ReasoningArtifact::ChatReasoning { bytes, .. } = &artifact else {
+        panic!("expected ChatReasoning");
+    };
+    let entries: Value = serde_json::from_slice(bytes).expect("json");
+    assert_eq!(
+        entries,
+        json!([{"type":"reasoning.summary","summary":"onetwo","index":0,"format":"anthropic-claude-v1"}])
     );
 }
 
