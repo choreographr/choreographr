@@ -5,7 +5,7 @@ use crate::context::{self, SkillMeta};
 use crate::providers::InferenceProvider;
 use crate::reasoning::{
     build_chat_request_messages, initial_prev_resp_id, reasoning_artifact_tokens,
-    warn_on_missing_reasoning_artifacts,
+    warn_on_uncaptured_reasoning,
 };
 use crate::sessions::{AssistantResponse, RequestContext, SessionCommand, SessionState};
 use crate::tools::ToolOutput;
@@ -542,17 +542,11 @@ pub(crate) fn run_agent_loop(
     let mut pending_user_text: Option<String> = None;
     let mut truncation_recoveries: u32 = 0;
 
-    // Precondition guard (phase 4c): before sending a request whose passback
-    // policy requires echoing reasoning, verify every turn that will carry an
-    // assistant message has its artifact — and that the artifact's producer
-    // matches the current model (a mid-session model switch omits the echo on
-    // the wire there too, exactly like a missing artifact). `ToolLoop` checks
-    // only tool-involving turns (where the provider demands the echo);
-    // `AllTurns`/`Signature` echo on every assistant message. A turn recorded
-    // before the artifact was captured (e.g. a pre-migration session) would
-    // otherwise produce a mysterious 400 from the provider; surface it as a
-    // diagnosable warning.
-    warn_on_missing_reasoning_artifacts(session, ctx.session_id, &provider_slug, model);
+    // Capture-fidelity guard: reasoning the session displays but never
+    // captured for the round-trip is lost payload (the wire echo degrades to an
+    // empty field). Wire *validity* is the adapter's job and is not checked
+    // here; `session_inspect` diagnoses a whole request.
+    warn_on_uncaptured_reasoning(session, ctx.session_id, &provider_slug, model);
 
     // Lazily cache discovered skills — they don't change during a session.
     // Global skills are always discoverable; discovery handles the optional
@@ -1742,7 +1736,7 @@ pub const IMAGE_TOKEN_ESTIMATE: u32 = 1000;
 #[cfg(test)]
 // Every test in this module reads the process-wide `PROVIDER_CATALOG`
 // ArcSwap (via `build_chat_request_messages`/`initial_prev_resp_id`/
-// `warn_on_missing_reasoning_artifacts` → `model_reasoning_passback`, and
+// `warn_on_uncaptured_reasoning`/`chat_reasoning_echo` → `model_reasoning_passback`, and
 // `resolve_reasoning_effort` → `model_reasoning_capability`), and the daemon
 // catalog-swap tests (`daemon.rs`, `#[serial(catalog)]`) mutate that global
 // concurrently. Under libtest's in-process parallel execution a swap can land

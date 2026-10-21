@@ -94,11 +94,23 @@ pub struct ImageReference {
     pub data: Vec<u8>,
 }
 
-/// Which OpenAI-compatible chat field carried the reasoning text, locked in
-/// when the adapter captured the payload. The artifact must be re-emitted to
-/// the SAME field the provider used — a provider that streams `reasoning_text`
-/// must not have its payload echoed back as `reasoning_content` on the next
-/// tool-loop turn (the mis-routing this tag prevents).
+/// An OpenAI-compatible chat field that can carry reasoning text.
+///
+/// The name is used for two different jobs, and only the second is
+/// authoritative:
+///
+/// - **Observation** — which field a captured payload arrived under (see
+///   [`ReasoningArtifact::ChatReasoning`]'s `field`). A provider that streams
+///   `reasoning_text` should get `reasoning_text` back when nothing says
+///   otherwise, so this is worth recording.
+/// - **Route requirement** — which field the model's *route* demands on every
+///   assistant message. The catalog records this
+///   (`ModelEntry::reasoning_echo`) and it always wins: e.g. the DeepSeek/GLM
+///   chat gateways reject a history whose assistant messages lack
+///   `reasoning_content` even when the stream delivered the text under
+///   `reasoning`.
+///
+/// The observation is therefore a hint, never an instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatReasoningField {
@@ -133,12 +145,15 @@ pub enum ChatReasoningField {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningArtifact {
-    /// OpenAI-compatible chat: the reasoning text (verbatim) plus the wire
-    /// field it was captured from (see [`ChatReasoningField`]), so re-emission
-    /// targets the same field the provider used.
+    /// OpenAI-compatible chat: the reasoning text (verbatim) plus the field it
+    /// was *observed* under (see [`ChatReasoningField`]). Re-emission targets
+    /// the route's declared echo field when the catalog names one, and falls
+    /// back to this observation when it does not — the observation is a hint,
+    /// never an instruction.
     ChatReasoning {
-        /// Which chat field the reasoning text was captured from, so it is
-        /// re-emitted to the same field.
+        /// Which chat field the reasoning text arrived under — the *observed*
+        /// field. Only the fallback destination: the catalog's declared echo
+        /// field wins whenever the route names one.
         field: ChatReasoningField,
         /// The reasoning text bytes, exactly as the provider sent them.
         bytes: Vec<u8>,

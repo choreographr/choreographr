@@ -248,9 +248,16 @@ pub(crate) fn chat_completions_request(
     let (max_tokens_field, max_completion_tokens_field) = config.max_tokens_field_pair(model);
     let retry = retry::retry_config_from_config(config);
     let messages = [ChatRequestMessage::simple("user", prompt.to_string())];
+    // The route's reasoning-echo policy shapes every message on the wire; a
+    // prompt-only request carries no assistant message, so it is a no-op here,
+    // but it must still go through the same lowering as every other body.
+    let wire = super::chat_wire_messages(
+        &messages,
+        crate::catalog::chat_reasoning_echo(&config.provider_slug, model),
+    );
     let body = serde_json::to_value(&ChatCompletionsRequest {
         model,
-        messages: &messages,
+        messages: &wire,
         tools: None,
         stream: false,
         stream_options: None,
@@ -324,9 +331,13 @@ pub(crate) fn chat_completions_request_with_tools(
     let (max_tokens_field, max_completion_tokens_field) =
         config.max_tokens_field_pair_with_override(model, max_output_tokens_override);
     let retry = retry::retry_config_from_config(config).with_no_retry(no_retry);
+    let wire = super::chat_wire_messages(
+        messages,
+        crate::catalog::chat_reasoning_echo(&config.provider_slug, model),
+    );
     let body = serde_json::to_value(&ChatCompletionsRequest {
         model,
-        messages,
+        messages: &wire,
         tools: Some(tools),
         stream: false,
         stream_options: None,
@@ -535,9 +546,13 @@ where
     let (max_tokens_field, max_completion_tokens_field) = config.max_tokens_field_pair(model);
     let retry = retry::retry_config_from_config(config);
     let messages = [ChatRequestMessage::simple("user", prompt.to_string())];
+    let wire = super::chat_wire_messages(
+        &messages,
+        crate::catalog::chat_reasoning_echo(&config.provider_slug, model),
+    );
     let body = serde_json::to_value(&ChatCompletionsRequest {
         model,
-        messages: &messages,
+        messages: &wire,
         tools: None,
         stream: true,
         stream_options: Some(ChatCompletionsStreamOptions {
@@ -946,9 +961,13 @@ where
     let (max_tokens_field, max_completion_tokens_field) =
         config.max_tokens_field_pair_with_override(model, max_output_tokens_override);
     let retry = retry::retry_config_from_config(config).with_no_retry(no_retry);
+    let wire = super::chat_wire_messages(
+        messages,
+        crate::catalog::chat_reasoning_echo(&config.provider_slug, model),
+    );
     let body = serde_json::to_value(&ChatCompletionsRequest {
         model,
-        messages,
+        messages: &wire,
         tools: Some(tools),
         stream: true,
         // Configurable stream_options — some OpenAI-compatible providers
@@ -1004,6 +1023,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::super::{ChatReasoningEcho, chat_wire_message, chat_wire_messages};
     use super::*;
 
     // -- finish_reason lenient deserialization -----------------------------
@@ -1654,7 +1674,10 @@ mod tests {
     fn chat_completions_request_omits_reasoning_effort_when_none() {
         let body = serde_json::to_value(&ChatCompletionsRequest {
             model: "gpt-4.1",
-            messages: &[ChatRequestMessage::simple("user", "hello".into())],
+            messages: &chat_wire_messages(
+                &[ChatRequestMessage::simple("user", "hello".into())],
+                ChatReasoningEcho::default(),
+            ),
             tools: None,
             stream: false,
             stream_options: None,
@@ -2116,15 +2139,13 @@ mod tests {
             images: Vec::new(),
             tool_call_id: None,
             tool_calls: None,
-            reasoning_content: None,
-            reasoning: None,
-            reasoning_text: None,
             reasoning_artifact: Some(ReasoningArtifact::ChatReasoning {
                 field: ChatReasoningField::ReasoningContent,
                 bytes: b"Let me think step-by-step".to_vec(),
             }),
         };
-        let body = serde_json::to_value(&msg).unwrap();
+        let body =
+            serde_json::to_value(chat_wire_message(&msg, ChatReasoningEcho::default())).unwrap();
         assert_eq!(body["reasoning_content"], "Let me think step-by-step");
         // The artifact field itself never appears on the wire.
         assert!(body.get("reasoning_artifact").is_none());
@@ -2146,15 +2167,13 @@ mod tests {
                 images: Vec::new(),
                 tool_call_id: None,
                 tool_calls: None,
-                reasoning_content: None,
-                reasoning: None,
-                reasoning_text: None,
                 reasoning_artifact: Some(ReasoningArtifact::ChatReasoning {
                     field,
                     bytes: b"provider reasoning".to_vec(),
                 }),
             };
-            let body = serde_json::to_value(&msg).unwrap();
+            let body = serde_json::to_value(chat_wire_message(&msg, ChatReasoningEcho::default()))
+                .unwrap();
             assert_eq!(body[wire_key], "provider reasoning");
             for other in ["reasoning_content", "reasoning", "reasoning_text"] {
                 if other != wire_key {
@@ -2172,7 +2191,8 @@ mod tests {
     fn chat_request_message_without_artifact_omits_reasoning_content() {
         // Control: no artifact → no `reasoning_content` on the wire.
         let msg = ChatRequestMessage::simple("assistant", "plain".into());
-        let body = serde_json::to_value(&msg).unwrap();
+        let body =
+            serde_json::to_value(chat_wire_message(&msg, ChatReasoningEcho::default())).unwrap();
         assert!(body.get("reasoning_content").is_none());
     }
 
@@ -2189,16 +2209,14 @@ mod tests {
             images: Vec::new(),
             tool_call_id: None,
             tool_calls: None,
-            reasoning_content: None,
-            reasoning: None,
-            reasoning_text: None,
             reasoning_artifact: Some(ReasoningArtifact::ChatReasoning {
                 field: ChatReasoningField::ReasoningContent,
                 // 0xFF is never valid UTF-8.
                 bytes: vec![0xFF, 0xFE, 0x00, 0x41],
             }),
         };
-        let body = serde_json::to_value(&msg).unwrap();
+        let body =
+            serde_json::to_value(chat_wire_message(&msg, ChatReasoningEcho::default())).unwrap();
         assert_eq!(body["content"], "answer");
         assert!(body.get("reasoning_content").is_none());
         assert!(body.get("reasoning_artifact").is_none());
@@ -2214,15 +2232,13 @@ mod tests {
             images: Vec::new(),
             tool_call_id: None,
             tool_calls: None,
-            reasoning_content: None,
-            reasoning: None,
-            reasoning_text: None,
             reasoning_artifact: Some(ReasoningArtifact::ChatReasoning {
                 field: ChatReasoningField::ReasoningContent,
                 bytes: b"should not leak".to_vec(),
             }),
         };
-        let body = serde_json::to_value(&msg).unwrap();
+        let body =
+            serde_json::to_value(chat_wire_message(&msg, ChatReasoningEcho::default())).unwrap();
         assert!(body.get("reasoning_content").is_none());
         assert!(body.get("reasoning_artifact").is_none());
     }
@@ -2237,16 +2253,146 @@ mod tests {
             images: Vec::new(),
             tool_call_id: None,
             tool_calls: None,
-            reasoning_content: None,
-            reasoning: None,
-            reasoning_text: None,
             reasoning_artifact: Some(ReasoningArtifact::GoogleSignatures(
                 b"encrypted-sig".to_vec(),
             )),
         };
-        let body = serde_json::to_value(&msg).unwrap();
+        let body =
+            serde_json::to_value(chat_wire_message(&msg, ChatReasoningEcho::default())).unwrap();
         assert!(body.get("reasoning_content").is_none());
         assert!(body.get("reasoning_artifact").is_none());
+    }
+
+    // -- route-declared reasoning echo policy ----------------------------
+
+    /// A chat artifact whose payload was observed under `observed`.
+    fn chat_artifact(observed: ChatReasoningField, text: &[u8]) -> ReasoningArtifact {
+        ReasoningArtifact::ChatReasoning {
+            field: observed,
+            bytes: text.to_vec(),
+        }
+    }
+
+    fn assistant_with(artifact: ReasoningArtifact) -> ChatRequestMessage {
+        ChatRequestMessage {
+            role: "assistant",
+            content: Some("answer".into()),
+            images: Vec::new(),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_artifact: Some(artifact),
+        }
+    }
+
+    /// The echo policy a route that declares `field` resolves to.
+    fn declared(field: ChatReasoningField) -> ChatReasoningEcho {
+        ChatReasoningEcho {
+            field: Some(field),
+            require_present: true,
+        }
+    }
+
+    fn wire(msg: &ChatRequestMessage, echo: ChatReasoningEcho) -> serde_json::Value {
+        serde_json::to_value(chat_wire_message(msg, echo)).unwrap()
+    }
+
+    #[test]
+    fn declared_field_overrides_the_observed_field() {
+        // The live-failure shape: the gateway streamed the reasoning under
+        // `reasoning` yet rejects any history without `reasoning_content`.
+        // The catalog's declared field wins over the observation, and exactly
+        // one reasoning key reaches the wire.
+        let msg = assistant_with(chat_artifact(ChatReasoningField::Reasoning, b"thought"));
+        let body = wire(&msg, declared(ChatReasoningField::ReasoningContent));
+        assert_eq!(body["reasoning_content"], "thought");
+        assert!(
+            body.get("reasoning").is_none(),
+            "the observed field must not survive beside the declared one"
+        );
+    }
+
+    #[test]
+    fn declared_non_content_field_also_wins() {
+        // The policy is not hard-wired to `reasoning_content`: any declared
+        // field wins over the observation.
+        let msg = assistant_with(chat_artifact(
+            ChatReasoningField::ReasoningContent,
+            b"thought",
+        ));
+        let body = wire(&msg, declared(ChatReasoningField::ReasoningText));
+        assert_eq!(body["reasoning_text"], "thought");
+        assert!(body.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn observed_field_is_used_when_the_route_declares_none() {
+        // With no declared field the observation is the destination — a
+        // provider that answers under `reasoning_text` gets `reasoning_text`
+        // back rather than a key it never used.
+        for observed in [
+            ChatReasoningField::ReasoningContent,
+            ChatReasoningField::Reasoning,
+            ChatReasoningField::ReasoningText,
+        ] {
+            let msg = assistant_with(chat_artifact(observed, b"payload"));
+            let body = wire(&msg, ChatReasoningEcho::default());
+            let key = match observed {
+                ChatReasoningField::ReasoningContent => "reasoning_content",
+                ChatReasoningField::Reasoning => "reasoning",
+                ChatReasoningField::ReasoningText => "reasoning_text",
+            };
+            assert_eq!(body[key], "payload", "{key}");
+            for other in ["reasoning_content", "reasoning", "reasoning_text"] {
+                if other != key {
+                    assert!(body.get(other).is_none(), "{other} must stay absent");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn required_field_is_present_but_empty_when_there_is_nothing_to_echo() {
+        // An assistant message with no artifact on a route that requires the
+        // field: the key exists, empty. This is what keeps a DeepSeek/GLM
+        // history valid on a turn that produced no reasoning at all.
+        let msg = ChatRequestMessage::simple("assistant", "plain".into());
+        let body = wire(&msg, declared(ChatReasoningField::ReasoningContent));
+        assert_eq!(body["reasoning_content"], "");
+    }
+
+    #[test]
+    fn no_key_when_the_route_declares_nothing_and_there_is_nothing_to_echo() {
+        // Without a declared field and without an artifact, no reasoning key is
+        // invented — the message is serialized exactly as recorded.
+        let msg = ChatRequestMessage::simple("assistant", "plain".into());
+        let body = wire(&msg, ChatReasoningEcho::default());
+        for key in ["reasoning_content", "reasoning", "reasoning_text"] {
+            assert!(body.get(key).is_none(), "{key} must not be invented");
+        }
+    }
+
+    #[test]
+    fn required_field_is_present_for_a_foreign_artifact_variant() {
+        // An artifact this adapter cannot interpret must never satisfy the
+        // required field with garbage — but the field itself still has to be
+        // there, so it goes out empty.
+        let msg = assistant_with(ReasoningArtifact::GoogleSignatures(b"sig".to_vec()));
+        let body = wire(&msg, declared(ChatReasoningField::ReasoningContent));
+        assert_eq!(body["reasoning_content"], "");
+        assert!(body.get("reasoning_artifact").is_none());
+    }
+
+    #[test]
+    fn corrupt_artifact_still_satisfies_a_required_field() {
+        // A corrupted persisted blob drops the payload but must not remove the
+        // required key: the message stays valid instead of 400-ing forever.
+        let msg = assistant_with(chat_artifact(
+            ChatReasoningField::ReasoningContent,
+            &[0xFF, 0xFE],
+        ));
+        let body = wire(&msg, declared(ChatReasoningField::ReasoningContent));
+        assert_eq!(body["reasoning_content"], "");
+        assert_eq!(body["content"], "answer");
     }
 
     // -- per-call output cap (cache-warming ping) --------------------------
@@ -2262,7 +2408,7 @@ mod tests {
                     config.max_tokens_field_pair_with_override(model, override_);
                 serde_json::to_value(&ChatCompletionsRequest {
                     model,
-                    messages: &[] as &[super::super::ChatRequestMessage],
+                    messages: &[] as &[String],
                     tools: None,
                     stream: false,
                     stream_options: None,

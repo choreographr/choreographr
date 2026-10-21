@@ -65,9 +65,6 @@ fn build_message_payloads_tool_result() {
         images: Vec::new(),
         tool_call_id: Some("call_abc".to_string()),
         tool_calls: None,
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: None,
     }];
     let (payloads, system) = build_message_payloads(&msgs).unwrap();
@@ -96,9 +93,6 @@ fn build_message_payloads_tool_call() {
                 arguments: r#"{"location":"NYC"}"#.to_string(),
             },
         }]),
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: None,
     }];
     let (payloads, system) = build_message_payloads(&msgs).unwrap();
@@ -877,9 +871,6 @@ fn build_message_payloads_attaches_thought_signature_to_last_part() {
                 arguments: r#"{"location":"NYC"}"#.to_string(),
             },
         }]),
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: Some(ReasoningArtifact::GoogleSignatures(
             br#"["encrypted-sig-1","encrypted-sig-2"]"#.to_vec(),
         )),
@@ -909,9 +900,6 @@ fn build_message_payloads_thought_signature_on_single_text_part() {
         images: Vec::new(),
         tool_call_id: None,
         tool_calls: None,
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: Some(ReasoningArtifact::GoogleSignatures(
             br#"["encrypted-sig-1"]"#.to_vec(),
         )),
@@ -945,9 +933,6 @@ fn build_message_payloads_foreign_artifact_variant_is_dropped() {
         images: Vec::new(),
         tool_call_id: None,
         tool_calls: None,
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: Some(ReasoningArtifact::ChatReasoning {
             field: choreo_proto::ChatReasoningField::ReasoningContent,
             bytes: b"not a signature".to_vec(),
@@ -974,9 +959,6 @@ fn build_message_payloads_user_image_renders_inline_data() {
         }],
         tool_call_id: None,
         tool_calls: None,
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: None,
     }];
     let (payloads, _) = build_message_payloads(&msgs).unwrap();

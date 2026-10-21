@@ -65,6 +65,16 @@ const REFRESH_ATTEMPT_INTERVAL: Duration = Duration::from_hours(25);
 
 /// Postcard cache filename under the data dir.
 const CATALOG_BIN_NAME: &str = "catalog.bin";
+/// Schema version prefixed to the postcard cache blob.
+///
+/// Postcard is positional and non-self-describing, so a `ModelEntry` change
+/// against a stale cache either fails (missing fields) or — worse — decodes
+/// into a *wrong* catalog. Reasoning-echo requirements are wire validity now, so
+/// a silently wrong catalog would 400 every request of an affected route: the
+/// version makes a stale cache unambiguous and forces the embedded fallback.
+/// Bump on every shape change of [`choreo_ai_protocols::ModelEntry`] or
+/// `ProviderEntry`.
+const CATALOG_CACHE_SCHEMA: u16 = 2;
 /// User overlay filename under the config dir. `pub` so the shared config
 /// transport's subscription (in `run_server`) registers the same basename.
 pub const USER_OVERLAY_NAME: &str = "models-overlay.toml";
@@ -155,9 +165,9 @@ impl CatalogPaths {
 }
 
 /// Load the cached normalized base from `path` (postcard). Logs a warning and
-/// returns `None` when the file is missing or fails to deserialize — the
-/// caller then falls back to the embedded `catalog.bin` (load order: valid
-/// cache file → embedded).
+/// returns `None` when the file is missing, carries a different schema version,
+/// or fails to deserialize — the caller then falls back to the embedded
+/// `catalog.bin` (load order: valid cache file → embedded).
 pub(crate) fn load_cached_base(path: &Path) -> Option<Vec<ProviderEntry>> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -167,7 +177,29 @@ pub(crate) fn load_cached_base(path: &Path) -> Option<Vec<ProviderEntry>> {
             return None;
         }
     };
-    match postcard::from_bytes(&bytes) {
+    // The version is a separate leading field, so a stale blob is rejected
+    // before any provider entry is decoded out of the wrong byte offsets.
+    let (version, rest) = match postcard::take_from_bytes::<u16>(&bytes) {
+        Ok(parts) => parts,
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "catalog cache has no schema version; falling back to the embedded catalog",
+            );
+            return None;
+        }
+    };
+    if version != CATALOG_CACHE_SCHEMA {
+        warn!(
+            path = %path.display(),
+            cached = version,
+            expected = CATALOG_CACHE_SCHEMA,
+            "catalog cache schema changed; falling back to the embedded catalog",
+        );
+        return None;
+    }
+    match postcard::from_bytes(rest) {
         Ok(base) => Some(base),
         Err(e) => {
             warn!(
@@ -209,7 +241,10 @@ pub(crate) fn overlay_fingerprint_changed(last_applied: Option<&str>, fresh: Opt
 /// etag paired with the OLD bin, which self-heals via a 200 on the next fetch
 /// (a new etag over old content would 304 forever instead).
 pub(crate) fn write_catalog_cache(base: &[ProviderEntry], bin_path: &Path) -> io::Result<()> {
-    let bytes = postcard::to_allocvec(base).map_err(io::Error::other)?;
+    // Version first, then the entries: keeps a stale blob from being decoded at
+    // the wrong offsets (see `CATALOG_CACHE_SCHEMA`).
+    let mut bytes = postcard::to_allocvec(&CATALOG_CACHE_SCHEMA).map_err(io::Error::other)?;
+    bytes.extend_from_slice(&postcard::to_allocvec(base).map_err(io::Error::other)?);
     write_file_atomic(bin_path, &bytes)
 }
 
@@ -789,6 +824,20 @@ mod tests {
         std::fs::write(&bin, b"not postcard data").unwrap();
         // A corrupt cache must not brick the daemon: it logs a warning and
         // returns None so the embedded catalog.bin is used instead.
+        assert!(load_cached_base(&bin).is_none());
+    }
+
+    #[test]
+    fn stale_cache_schema_falls_back_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("catalog.bin");
+        // A blob written by an older schema: valid postcard, wrong version. It
+        // must be rejected rather than decoded against the current field layout
+        // (reasoning-echo requirements are wire validity, so a wrong catalog
+        // would 400 every request of an affected route).
+        let mut bytes = postcard::to_allocvec(&(CATALOG_CACHE_SCHEMA - 1)).unwrap();
+        bytes.extend_from_slice(&postcard::to_allocvec(&tiny_base()).unwrap());
+        std::fs::write(&bin, bytes).unwrap();
         assert!(load_cached_base(&bin).is_none());
     }
 

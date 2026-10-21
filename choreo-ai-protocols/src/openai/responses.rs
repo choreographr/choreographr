@@ -1241,9 +1241,6 @@ mod tests {
                 }],
                 tool_call_id: None,
                 tool_calls: None,
-                reasoning_content: None,
-                reasoning: None,
-                reasoning_text: None,
                 reasoning_artifact: None,
             }
             .responses_content_value(),
@@ -2119,9 +2116,6 @@ mod tests {
             images: Vec::new(),
             tool_call_id: None,
             tool_calls: None,
-            reasoning_content: None,
-            reasoning: None,
-            reasoning_text: None,
             reasoning_artifact: Some(ReasoningArtifact::ResponsesItems(
                 br#"[{"type":"reasoning","id":"re_1","summary":[{"text":"think carefully"}]}]"#
                     .to_vec(),
@@ -2149,9 +2143,6 @@ mod tests {
             images: Vec::new(),
             tool_call_id: None,
             tool_calls: None,
-            reasoning_content: None,
-            reasoning: None,
-            reasoning_text: None,
             reasoning_artifact: Some(ReasoningArtifact::ResponsesItems(
                 br#"[{"type":"reasoning","id":"re_1"},{"type":"reasoning","id":"re_2","encrypted_content":"eJxT_opaque"}]"#
                     .to_vec(),

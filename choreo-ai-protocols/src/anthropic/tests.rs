@@ -583,9 +583,6 @@ fn build_message_payloads_reemits_thinking_blocks_verbatim() {
                 arguments: r#"{"city":"London"}"#.to_string(),
             },
         }]),
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: Some(ReasoningArtifact::AnthropicThinking(
             br#"[{"type":"thinking","thinking":"Let me analyze.","signature":"sig_abc"},{"type":"redacted_thinking","data":"eJxT_opaque"}]"#
                 .to_vec(),
@@ -634,9 +631,6 @@ fn build_message_payloads_drops_thinking_blocks_when_thinking_disabled() {
         images: Vec::new(),
         tool_call_id: None,
         tool_calls: None,
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: Some(ReasoningArtifact::AnthropicThinking(
             br#"[{"type":"thinking","thinking":"secret","signature":"sig_1"}]"#.to_vec(),
         )),
@@ -672,9 +666,6 @@ fn build_message_payloads_foreign_artifact_variant_is_dropped() {
         images: Vec::new(),
         tool_call_id: None,
         tool_calls: None,
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: Some(ReasoningArtifact::ChatReasoning {
             field: choreo_proto::ChatReasoningField::ReasoningContent,
             bytes: b"not anthropic".to_vec(),
@@ -701,9 +692,6 @@ fn build_message_payloads_user_image_renders_image_block() {
         }],
         tool_call_id: None,
         tool_calls: None,
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: None,
     }];
     let (payloads, _) = build_message_payloads(&msgs, &[], false).unwrap();
@@ -739,9 +727,6 @@ fn build_message_payloads_unsupported_image_mime_degrades_to_text_only() {
         }],
         tool_call_id: None,
         tool_calls: None,
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: None,
     }];
     let (payloads, _) = build_message_payloads(&msgs, &[], false).unwrap();

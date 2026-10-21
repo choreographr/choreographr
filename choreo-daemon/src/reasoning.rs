@@ -10,9 +10,7 @@
 use choreo_ai_protocols::openai::{
     AssistantToolCall, AssistantToolFunction, ChatImagePart, ChatRequestMessage,
 };
-use choreo_ai_protocols::{
-    ReasoningPassback, model_reasoning_passback, model_supports_vision, requires_reasoning_content,
-};
+use choreo_ai_protocols::{ReasoningPassback, model_reasoning_passback, model_supports_vision};
 use choreo_proto::{ReasoningArtifact, Turn};
 use tracing::{debug, warn};
 
@@ -57,11 +55,6 @@ pub fn build_chat_request_messages(
     // The passback policy decides *whether* the artifact is replayed; it is
     // constant for the whole request (the model does not change mid-loop).
     let passback = model_reasoning_passback(provider_slug, model);
-    // DeepSeek/Kimi chat requires `reasoning_content` to be PRESENT on every
-    // assistant message, even (indeed especially) when the model produced no
-    // reasoning on a given call — the upstream 400s a tool-loop turn that
-    // omits it. Constant per request (model-bound), so resolve once.
-    let requires_rc = requires_reasoning_content(provider_slug, model);
     // Whether the active model accepts image input. Tool-result images are
     // attached natively only when it does; otherwise they are replaced with a
     // text placeholder (the vision gate). Constant per request.
@@ -93,12 +86,13 @@ pub fn build_chat_request_messages(
         //   ResponseId→ never via the message; continuity flows through
         //               previous_response_id (handled in the agent loop)
         //   None      → display-only providers, never replay
-        // The three legacy string fields (reasoning_content/reasoning/
-        // reasoning_text) stay None: the adapter re-emits the artifact in its
-        // own wire format (phase 4a), so the daemon never interprets it. The
-        // whole decision (policy + provenance + empty-fill) lives in
-        // `include_reasoning_artifact`, shared with the precondition guard
-        // and `session_inspect` so the three can never drift.
+        // The three legacy wire-shaped reasoning fields are gone: an artifact is
+        // the only reasoning payload a message may carry, and the adapter picks
+        // the wire key from the catalog's declared echo field (falling back to
+        // the field the payload was observed under) — see
+        // `ChatWireMessage`. *Whether* the artifact rides is the only decision
+        // this builder makes; *where* it lands, and whether the field must be
+        // present even when there is nothing to echo, belongs to the adapter.
         let include_artifact = include_reasoning_artifact(turn, provider_slug, model, passback);
         let has_tool_calls = !turn.tool_calls.is_empty();
         if turn.assistant_text.is_some() || has_tool_calls {
@@ -125,22 +119,6 @@ pub fn build_chat_request_messages(
                 images: Vec::new(),
                 tool_call_id: None,
                 tool_calls,
-                // reasoning_content handling for the echo policy: a real
-                // artifact re-emits its text (leave the explicit field None);
-                // on a DeepSeek/Kimi model that requires the field present
-                // and where nothing will be echoed, inject an EMPTY string so
-                // the wire always carries the field.
-                // `include_reasoning_artifact` already forces the artifact
-                // in for a content-less, tool-less turn under an echo-capable
-                // policy (the "empty assistant message" 400), so the injected
-                // empty string only appears when nothing real can be echoed.
-                reasoning_content: if requires_rc && !include_artifact {
-                    Some(String::new())
-                } else {
-                    None
-                },
-                reasoning: None,
-                reasoning_text: None,
                 reasoning_artifact: if include_artifact {
                     turn.reasoning_artifact.clone()
                 } else {
@@ -156,9 +134,6 @@ pub fn build_chat_request_messages(
                 images: Vec::new(),
                 tool_call_id: Some(tr.call_id.clone()),
                 tool_calls: None,
-                reasoning_content: None,
-                reasoning: None,
-                reasoning_text: None,
                 reasoning_artifact: None,
             });
         }
@@ -406,151 +381,72 @@ pub(crate) fn initial_prev_resp_id(
     }
 }
 
-/// Precondition guard for reasoning-echo policies (phase 4c).
+/// Precondition guard: report turns whose assistant message will be *degraded*
+/// on the wire.
 ///
-/// Before sending a request whose passback policy requires echoing reasoning
-/// (ToolLoop/AllTurns/Signature), check that every turn that will carry an
-/// assistant message has its artifact. A turn recorded before the artifact
-/// was captured (e.g. a pre-migration session state) would otherwise be sent
-/// without the reasoning payload the provider demands on tool-loop turns,
-/// surfacing as a mysterious 400 — this turns that into a diagnosable log
-/// line. Returns the number of turns that will omit a required reasoning
-/// echo (missing artifact, or an artifact produced by a different model), 0
-/// when clean, so tests can exercise the path deterministically.
+/// Two independent degradations, neither of which the adapter can repair:
 ///
-/// The guard deliberately does NOT disable thinking for the request: for
-/// `ToolLoop` providers (DeepSeek/Kimi) the 400 comes from *history*, not the
-/// current request's thinking setting, so flipping the effort to "off" would
-/// not fix the failure and would silently change model behavior — the warn is
-/// the honest signal. ResponseId/None policies skip the check entirely (no
-/// artifact is expected on the wire).
+/// 1. **Wire-empty assistant message** — the turn recorded no content and no
+///    tool calls, and no same-model artifact will fill it. OpenAI-compatible
+///    chat providers reject such a message outright ("the message ... with
+///    role 'assistant' must not be empty"), and the required-field empty
+///    string is no substitute for a real payload.
+/// 2. **Capture loss** — the turn's reasoning was displayed in the session but
+///    never captured as an artifact, so the echo degrades to an empty field
+///    (or disappears entirely on a route that declares none).
 ///
-/// Scope: `ToolLoop` cares only about tool-involving turns (that is where the
-/// provider demands the echo); `AllTurns`/`Signature` echo on every assistant
-/// message, so any assistant turn missing its artifact is a violation there.
-/// Additionally, an assistant message that would be **empty on the wire** (no
-/// content, no tool calls — e.g. a reasoning-only response) is flagged when
-/// the builder has no replayable same-model artifact to fill it: the
-/// provider's "message ... must not be empty" 400 is then the certain outcome
-/// on ANY OpenAI-compatible chat provider, not just the DeepSeek/Kimi
-/// (`requires_rc`) ones — the empty `reasoning_content` injection those
-/// models get is no substitute for a real payload. Whether the turn is on a
-/// `requires_rc` model is logged alongside so the two hazards stay
-/// distinguishable.
+/// Deliberately NOT a policy test: which field carries the echo, and whether it
+/// must be present, is the adapter's decision from the catalog fact, so a turn
+/// without an artifact is not itself a hazard — only the two shapes above are.
+/// The previous policy-shaped version gated on the DeepSeek/Kimi
+/// `reasoning_content` flag and flagged every tool turn the model happened to
+/// answer without thinking (five spurious warnings on one request) while
+/// missing the real failure mode entirely.
 ///
-/// Provenance is checked exactly like the builder: an artifact is only
-/// replayed when its producer matches the current (`provider_slug`, model), so
-/// after a deliberate mid-session model switch every pre-switch turn is
-/// flagged on each request. That is the intended diagnostic signal — the
-/// built request genuinely omits those echoes; if the provider accepts the
-/// switch, the warnings are informational rather than a blocker. The replay
-/// decision (including the empty-message fallback) comes from
-/// [`include_reasoning_artifact`], the same helper the builder uses, so the
-/// guard can never disagree with the request that is actually sent.
-pub(crate) fn warn_on_missing_reasoning_artifacts(
+/// Returns the number of turns flagged, so tests can exercise the path
+/// deterministically; turn-level diagnosis of a whole request belongs to the
+/// `session_inspect` tool, which dry-runs the real lowering.
+pub(crate) fn warn_on_uncaptured_reasoning(
     session: &SessionState,
     session_id: u64,
     provider_slug: &str,
     model: &str,
 ) -> usize {
+    // Only the passback policy is needed, to know whether the builder's
+    // empty-message fallback will replay a same-model artifact.
     let passback = model_reasoning_passback(provider_slug, model);
-    if matches!(
-        passback,
-        ReasoningPassback::None | ReasoningPassback::ResponseId
-    ) {
-        return 0;
-    }
-    // Mirror the builder's `requires_reasoning_content` resolution so the
-    // wire-empty hazard is logged with the same injection the builder will
-    // apply (a requires_rc turn that is unfixable still ships the empty
-    // string, distinguishable from a plain empty message).
-    let requires_rc = requires_reasoning_content(provider_slug, model);
-    // AllTurns/Signature echo on every assistant message; ToolLoop only on
-    // tool-involving turns.
-    let check_all_turns = matches!(
-        passback,
-        ReasoningPassback::AllTurns | ReasoningPassback::Signature
-    );
     let mut problems = 0;
     for (turn_id, turn) in &session.turns {
         if turn.undone {
             continue;
         }
-        // Only turns that emit an assistant message in the builder need an
-        // artifact; a user-only turn (in-progress or failed) has none.
-        let has_assistant_message = turn.assistant_text.is_some() || !turn.tool_calls.is_empty();
-        if !has_assistant_message {
+        // Only a turn that emits an assistant message can be degraded.
+        if turn.assistant_text.is_none() && turn.tool_calls.is_empty() {
             continue;
         }
-        // The artifact is on the wire exactly when the builder (and the
-        // `session_inspect` dry-run) replay it — one helper, no drift. When
-        // it is echoed the message is non-empty (artifacts always carry
-        // non-empty bytes) and the required echo is present: clean.
-        if include_reasoning_artifact(turn, provider_slug, model, passback) {
+        let artifact_fills = include_reasoning_artifact(turn, provider_slug, model, passback);
+        if !artifact_fills && turn_is_wire_empty(turn) {
+            problems += 1;
+            warn!(
+                session_id,
+                turn_id,
+                provider_slug,
+                model,
+                "assistant turn is empty on the wire and no artifact can fill it; \
+                 providers reject an empty assistant message",
+            );
             continue;
         }
-        // Nothing was echoed. That is a problem when the passback policy
-        // demands the echo on this turn (AllTurns/Signature everywhere,
-        // ToolLoop on tool-involving turns), OR when omitting it leaves a
-        // wire-EMPTY assistant message — the "must not be empty" 400 is then
-        // certain on ANY OpenAI-compatible chat provider (the `requires_rc`
-        // empty-string injection is no substitute for a real payload), so
-        // the unfixable turns are flagged wherever the guard has
-        // jurisdiction.
-        let wire_empty = turn_is_wire_empty(turn);
-        let policy_demands_echo = check_all_turns || turn_has_tool_involvement(turn);
-        if !policy_demands_echo && !wire_empty {
-            continue;
-        }
-        // Mirror the builder's provenance gate exactly: an artifact is
-        // replayed only when its producer matches the current (provider_slug,
-        // model), so every turn that reaches the classification below has a
-        // producer mismatch (or none) — the `include_reasoning_artifact`
-        // early-return above already skipped every replayable same-model
-        // turn. Flagging it like a missing artifact keeps the provider 400
-        // after a model switch diagnosable.
-        problems += 1;
-        match (&turn.reasoning_artifact, turn.reasoning_producer.as_ref()) {
-            (None, _) => {
-                warn!(
-                    session_id,
-                    turn_id,
-                    provider_slug,
-                    model,
-                    passback = ?passback,
-                    requires_rc,
-                    wire_empty,
-                    "reasoning artifact missing for turn; provider may reject this request",
-                );
-            }
-            // Artifact bytes exist but their provenance was never recorded (a
-            // pre-migration state or a capture bug): the builder cannot prove
-            // same-model provenance, so the payload is dropped — flag it like
-            // a missing artifact rather than claiming a model mismatch.
-            (Some(_), None) => {
-                warn!(
-                    session_id,
-                    turn_id,
-                    provider_slug,
-                    model,
-                    passback = ?passback,
-                    requires_rc,
-                    wire_empty,
-                    "reasoning artifact present but its producer is unrecorded; it will not be replayed and the provider may reject this request",
-                );
-            }
-            (Some(_), Some(_)) => {
-                warn!(
-                    session_id,
-                    turn_id,
-                    provider_slug,
-                    model,
-                    passback = ?passback,
-                    requires_rc,
-                    wire_empty,
-                    "reasoning artifact produced by a different model; it will not be replayed and the provider may reject this request",
-                );
-            }
+        if turn.reasoning_artifact.is_none() && turn.assistant_reasoning.is_some() {
+            problems += 1;
+            warn!(
+                session_id,
+                turn_id,
+                provider_slug,
+                model,
+                "reasoning was displayed but not captured for the round-trip; \
+                 the echo degrades to an empty field",
+            );
         }
     }
     problems

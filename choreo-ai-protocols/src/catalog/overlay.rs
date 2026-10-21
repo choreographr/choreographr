@@ -17,6 +17,9 @@
 //! [provider.opencode.models."gpt-5.4"]
 //! responses = true
 //! reasoning_passback = "response_id"
+//! reasoning_echo_field = "reasoning_content"   # the wire key every assistant
+//!                                              # message must carry (alias:
+//!                                              # reasoning_content_required)
 //! prompt_cache_short = 300             # per-model TTL override
 //! prompt_cache_long = 3600
 //!
@@ -67,6 +70,7 @@ use super::{
 };
 use crate::retry::RequestCompression;
 use crate::shared::MaxTokensField;
+use choreo_proto::ChatReasoningField;
 
 /// Merge an overlay TOML document over a base catalog, returning a new
 /// catalog. The base is never mutated (S4 builds a fresh merged `Vec` per
@@ -334,9 +338,25 @@ fn apply_model_overlay(model: &mut ModelEntry, table: &toml::Table) {
                     );
                 }
             }
+            "reasoning_echo_field" => {
+                if let Some(field) = value.as_str().and_then(parse_echo_field) {
+                    model.reasoning_echo = Some(field);
+                } else {
+                    warn!(
+                        model = %model.model,
+                        "overlay: unknown reasoning_echo_field; skipping",
+                    );
+                }
+            }
+            // Older spelling of the same policy: "require `reasoning_content`
+            // on every assistant message". Kept as an alias so existing
+            // overlay files keep working; `reasoning_echo_field` is the
+            // expressive form (it can name any scalar field). Both assign the
+            // same field, so the key that appears LATER in the file wins —
+            // set only one per model.
             "reasoning_content_required" => {
                 if let Some(required) = value.as_bool() {
-                    model.reasoning_content_required = Some(required);
+                    model.reasoning_echo = required.then_some(ChatReasoningField::ReasoningContent);
                 } else {
                     warn!(
                         model = %model.model,
@@ -499,6 +519,20 @@ fn parse_passback(value: &str) -> Option<ReasoningPassback> {
         "all_turns" => Some(ReasoningPassback::AllTurns),
         "signature" => Some(ReasoningPassback::Signature),
         "response_id" => Some(ReasoningPassback::ResponseId),
+        _ => None,
+    }
+}
+
+/// Convert an overlay `reasoning_echo_field` value into the scalar chat field
+/// the route must carry. Only the three fields the chat adapter can echo text
+/// into are accepted; anything else (including `reasoning_details`, which is a
+/// structured array) is rejected so a typo cannot silently select a wrong
+/// wire key.
+fn parse_echo_field(value: &str) -> Option<ChatReasoningField> {
+    match value {
+        "reasoning_content" => Some(ChatReasoningField::ReasoningContent),
+        "reasoning" => Some(ChatReasoningField::Reasoning),
+        "reasoning_text" => Some(ChatReasoningField::ReasoningText),
         _ => None,
     }
 }
@@ -722,6 +756,90 @@ max_tokens_field = "max_tokens"
             .find(|e| e.slug == "zoocorp")
             .expect("zoocorp");
         assert_eq!(zoo.base_url, "https://api.zoocorp.dev");
+    }
+
+    #[test]
+    fn overlay_reasoning_echo_field_declares_the_wire_key() {
+        // The expressive form: the overlay names the exact field the route
+        // must carry, and it lands on the model entry as a field NAME (not a
+        // boolean), so the adapter can pick the right wire key.
+        let merged = merge_overlay(
+            &base(),
+            r#"
+[provider.acme.models."acme-base"]
+reasoning_echo_field = "reasoning"
+"#,
+        );
+        let acme = merged.iter().find(|e| e.slug == "acme").expect("acme");
+        let model = acme
+            .models
+            .iter()
+            .find(|m| m.model == "acme-base")
+            .expect("acme-base");
+        assert_eq!(model.reasoning_echo, Some(ChatReasoningField::Reasoning));
+    }
+
+    #[test]
+    fn overlay_reasoning_content_required_alias_sets_the_same_field() {
+        // The pre-existing spelling keeps working and means exactly the same
+        // thing (`reasoning_content`, present on every assistant message).
+        let merged = merge_overlay(
+            &base(),
+            r#"
+[provider.acme.models."acme-base"]
+reasoning_content_required = true
+"#,
+        );
+        let acme = merged.iter().find(|e| e.slug == "acme").expect("acme");
+        let model = acme
+            .models
+            .iter()
+            .find(|m| m.model == "acme-base")
+            .expect("acme-base");
+        assert_eq!(
+            model.reasoning_echo,
+            Some(ChatReasoningField::ReasoningContent)
+        );
+
+        // `false` clears a fact the base (or an earlier layer) declared.
+        let cleared = merge_overlay(
+            &merged,
+            r#"
+[provider.acme.models."acme-base"]
+reasoning_content_required = false
+"#,
+        );
+        let acme = cleared.iter().find(|e| e.slug == "acme").expect("acme");
+        assert_eq!(
+            acme.models
+                .iter()
+                .find(|m| m.model == "acme-base")
+                .expect("acme-base")
+                .reasoning_echo,
+            None
+        );
+    }
+
+    #[test]
+    fn overlay_rejects_an_unknown_reasoning_echo_field() {
+        // A typo (or `reasoning_details`, which is structured) must not select
+        // an arbitrary wire key: it is warned and skipped, leaving no fact.
+        let merged = merge_overlay(
+            &base(),
+            r#"
+[provider.acme.models."acme-base"]
+reasoning_echo_field = "reasoning_details"
+"#,
+        );
+        let acme = merged.iter().find(|e| e.slug == "acme").expect("acme");
+        assert_eq!(
+            acme.models
+                .iter()
+                .find(|m| m.model == "acme-base")
+                .expect("acme-base")
+                .reasoning_echo,
+            None
+        );
     }
 
     #[test]

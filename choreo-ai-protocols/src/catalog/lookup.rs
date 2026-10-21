@@ -14,7 +14,7 @@
 
 use tracing::trace;
 
-use choreo_proto::ReasoningCapability;
+use choreo_proto::{ChatReasoningField, ReasoningCapability};
 
 use crate::openai::RequestFormat;
 
@@ -218,36 +218,69 @@ pub fn image_edit_models_for_provider(provider_slug: &str) -> Vec<String> {
         })
 }
 
-/// Whether the model requires `reasoning_content` to be present on every
-/// assistant message (e.g. DeepSeek/GLM 5.x chat completions). Purely
-/// data-driven now: the ingested models.dev fact (`interleaved.field ==
-/// "reasoning_content"`) and the per-model overlay override are the only
-/// sources — an explicit `Some(bool)` on the model entry wins, and `None`
-/// (no fact) or an unknown provider/model resolve to `false`. There is NO
-/// name-based fallback: an uncataloged model gets no injection, so a catalog
-/// gap surfaces as the upstream provider's error (a 400 about the missing
-/// field) instead of a silent heuristic guess that can never be audited.
+/// How a route wants replayed reasoning shaped on the chat-completions wire.
 ///
-/// Independently of the fact, the resolver returns `false` for any model
-/// whose `openai_responses` is `true`: `reasoning_content` is a
-/// chat-completions wire concept, and the Responses path must never receive
-/// the injection — even if a (mis-ingested) entry carries
-/// `reasoning_content_required = Some(true)`, the two facts cannot both be
-/// authoritative, and the wire format wins.
-/// Fixes: add the model to the snapshot/overlay with an explicit
-/// `reasoning_content_required` flag (chat-completions models only).
-pub fn requires_reasoning_content(provider_slug: &str, model: &str) -> bool {
-    let required = with_model_fact(provider_slug, model, |m| {
-        m.reasoning_content_required.unwrap_or(false) && !m.openai_responses
-    })
-    .unwrap_or(false);
+/// Two independent facts, because a provider can want a specific destination
+/// field without demanding its presence (and vice versa):
+///
+/// - [`field`](Self::field) — the wire key the route requires. When set it
+///   ALWAYS wins over the field a response was observed to stream under: a
+///   gateway that answers under `reasoning` while rejecting any history
+///   without `reasoning_content` exists in the wild, so the observation cannot
+///   be trusted as the destination.
+/// - [`require_present`](Self::require_present) — whether every assistant
+///   message must carry the field, empty when there is nothing to echo. This is
+///   the DeepSeek/GLM 5.x rule: an upstream 400s a tool-loop history whose
+///   assistant message omits the field, even for a call that produced no
+///   reasoning.
+///
+/// The default (`field: None, require_present: false`) means "no declared
+/// shape": the adapter then echoes whatever field the payload was observed
+/// under, and omits the key entirely when there is nothing to echo.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChatReasoningEcho {
+    /// The wire field the route requires, when the catalog declares one.
+    pub field: Option<ChatReasoningField>,
+    /// Whether every assistant message must carry the field (empty when
+    /// there is nothing to echo). True exactly when `field` is declared.
+    pub require_present: bool,
+}
+
+/// Resolve the chat-completions reasoning-echo policy for one route.
+///
+/// Purely data-driven: the ingested models.dev fact (`interleaved` naming a
+/// scalar chat field) and the per-model overlay override are the only sources,
+/// with NO name-based fallback. An uncataloged model resolves to the default,
+/// so a catalog gap surfaces as the upstream provider's own error instead of a
+/// silent heuristic guess that could never be audited or overridden.
+///
+/// Guards, applied independently of the fact:
+///
+/// - a model on the `OpenAI` **Responses** API resolves to the default —
+///   `reasoning_content` and friends are chat-completions wire concepts, and
+///   continuity there flows through `previous_response_id`/input items, so a
+///   mis-ingested entry cannot leak a chat field into a Responses request;
+/// - a non-chat request format resolves to the default for the same reason.
+///
+/// Fixes for a catalog gap: add the model to the snapshot, or to the overlay
+/// with `reasoning_echo_field = "…"`.
+#[must_use]
+pub fn chat_reasoning_echo(provider_slug: &str, model: &str) -> ChatReasoningEcho {
+    let echo = with_model_fact(provider_slug, model, |m| m.reasoning_echo)
+        .flatten()
+        .filter(|_| model_request_format(provider_slug, model) != Some(RequestFormat::Responses))
+        .map_or_else(ChatReasoningEcho::default, |field| ChatReasoningEcho {
+            field: Some(field),
+            require_present: true,
+        });
     trace!(
         provider = %provider_slug,
         model = %model,
-        required,
-        "requires_reasoning_content"
+        field = ?echo.field,
+        require_present = echo.require_present,
+        "chat_reasoning_echo"
     );
-    required
+    echo
 }
 
 /// Look up whether a model should use `OpenAI`'s Responses API.
@@ -739,84 +772,124 @@ mod tests {
     }
 
     #[test]
-    fn requires_reasoning_content_resolves_ingested_snapshot_fact() {
+    fn chat_reasoning_echo_resolves_ingested_snapshot_field() {
         // The snapshot's deepseek models carry `interleaved: {field:
-        // "reasoning_content"}` — the echo requirement is a FACT now, no
-        // name heuristic involved.
-        assert!(requires_reasoning_content("deepseek", "deepseek-v4-flash"));
-        assert!(requires_reasoning_content("deepseek", "deepseek-v4-pro"));
-        // GLM 5.x on zhipuai likewise carries the interleaved field.
-        assert!(requires_reasoning_content("zhipuai", "glm-5"));
+        // "reasoning_content"}` — the echo field is a FACT, no name heuristic
+        // involved, and the field NAME survives ingestion (not just "required:
+        // yes").
+        for (provider, model) in [
+            ("deepseek", "deepseek-v4-flash"),
+            ("deepseek", "deepseek-v4-pro"),
+            ("zhipuai", "glm-5"),
+        ] {
+            assert_eq!(
+                chat_reasoning_echo(provider, model),
+                ChatReasoningEcho {
+                    field: Some(ChatReasoningField::ReasoningContent),
+                    require_present: true,
+                },
+                "{provider}/{model}"
+            );
+        }
     }
 
     #[test]
-    fn requires_reasoning_content_overlay_override_wins() {
+    fn chat_reasoning_echo_overlay_field_wins() {
         // glm-5.3-flash is not in the snapshot (upstream exposes it under
         // internal names); the bundled overlay defines it wholesale with an
-        // explicit `reasoning_content_required = true` — the explicit flag
-        // is the only path for models the snapshot does not cover.
-        assert!(requires_reasoning_content("opencode-go", "glm-5.3-flash"));
+        // explicit echo field — the only path for models the snapshot does not
+        // cover.
+        assert_eq!(
+            chat_reasoning_echo("opencode-go", "glm-5.3-flash").field,
+            Some(ChatReasoningField::ReasoningContent)
+        );
     }
 
     #[test]
-    fn requires_reasoning_content_false_without_the_fact() {
-        // glm-4.5 is cataloged but carries no interleaved reasoning_content
-        // fact in the snapshot → no echo requirement.
-        assert!(!requires_reasoning_content("zhipuai", "glm-4.5"));
+    fn chat_reasoning_echo_default_without_the_fact() {
+        // glm-4.5 is cataloged but carries no interleaved echo fact in the
+        // snapshot → no declared shape: the adapter echoes the observed field.
+        assert_eq!(
+            chat_reasoning_echo("zhipuai", "glm-4.5"),
+            ChatReasoningEcho::default()
+        );
     }
 
     #[test]
-    fn requires_reasoning_content_unknown_model_is_false() {
-        // Behavior change (pinned): the old deepseek/kimi NAME heuristic is
-        // gone. A plainly-named but uncataloged model resolves FALSE — no
-        // injection. Catalog gaps now surface as upstream errors (the
-        // provider's own 400 about the missing field) instead of a silent
-        // heuristic guess that could never be audited or overridden.
-        assert!(!requires_reasoning_content(
-            "deepseek",
-            "deepseek-v99-unknown"
-        ));
-        assert!(!requires_reasoning_content(
-            "futurmix",
-            "deepseek-chat-unknown"
-        ));
-        assert!(!requires_reasoning_content(
-            "no-such-provider",
-            "deepseek-chat"
-        ));
+    fn chat_reasoning_echo_unknown_model_is_default() {
+        // The old deepseek/kimi NAME heuristic is gone: a plainly-named but
+        // uncataloged model resolves to the default — no declared field, no
+        // presence requirement. Catalog gaps surface as upstream errors (the
+        // provider's own 400) instead of a silent unauditable guess.
+        for (provider, model) in [
+            ("deepseek", "deepseek-v99-unknown"),
+            ("futurmix", "deepseek-chat-unknown"),
+            ("no-such-provider", "deepseek-chat"),
+        ] {
+            assert_eq!(
+                chat_reasoning_echo(provider, model),
+                ChatReasoningEcho::default(),
+                "{provider}/{model}"
+            );
+        }
     }
 
     #[test]
-    fn requires_reasoning_content_never_applies_to_responses_models() {
+    fn chat_reasoning_echo_declares_a_non_content_field() {
+        // The policy is not hard-wired to `reasoning_content`: a route that
+        // wants a different scalar field declares it and gets it.
+        let _restore = RestoreBundledOnDrop;
+        let bundled = catalog_snapshot();
+        crate::catalog::replace_catalog({
+            let mut c = tiny_catalog();
+            c[0].models[0].reasoning_echo = Some(ChatReasoningField::ReasoningText);
+            c
+        });
+        assert_eq!(
+            chat_reasoning_echo("tiny-test", "tiny-model").field,
+            Some(ChatReasoningField::ReasoningText)
+        );
+        crate::catalog::replace_catalog(bundled.to_vec());
+    }
+
+    #[test]
+    fn chat_reasoning_echo_never_applies_to_responses_models() {
         // `reasoning_content` is a chat-completions wire concept: even if a
-        // model entry carries the fact `Some(true)` (e.g. a mis-merge between
-        // a chat-completions model and its Responses twin), the Responses
-        // guard must suppress the injection — the wire format wins over the
-        // fact. Pin the guard with a synthetic catalog entry carrying BOTH
-        // `openai_responses: true` and `reasoning_content_required: Some(true)`.
+        // model entry carries the fact (e.g. a mis-merge between a
+        // chat-completions model and its Responses twin), the Responses guard
+        // must suppress it — the wire format wins over the fact. Pin the guard
+        // with a synthetic catalog entry carrying BOTH `openai_responses: true`
+        // and a declared echo field.
         let _restore = RestoreBundledOnDrop;
         let bundled = catalog_snapshot();
         crate::catalog::replace_catalog({
             let mut c = tiny_catalog();
             c[0].models[0].openai_responses = true;
-            c[0].models[0].reasoning_content_required = Some(true);
+            c[0].models[0].reasoning_echo = Some(ChatReasoningField::ReasoningContent);
             c
         });
-        assert!(
-            !requires_reasoning_content("tiny-test", "tiny-model"),
-            "Responses models must never receive the reasoning_content injection"
+        assert_eq!(
+            chat_reasoning_echo("tiny-test", "tiny-model"),
+            ChatReasoningEcho::default(),
+            "Responses models must never receive a chat reasoning field"
         );
 
         // The negative control: the identical fact on a chat-completions twin
-        // (openai_responses = false) DOES resolve true, so the guard — not a
-        // missing fact — is what produced the `false` above.
+        // (openai_responses = false) DOES resolve, so the guard — not a
+        // missing fact — is what produced the default above.
         crate::catalog::replace_catalog({
             let mut c = tiny_catalog();
             c[0].models[0].openai_responses = false;
-            c[0].models[0].reasoning_content_required = Some(true);
+            c[0].models[0].reasoning_echo = Some(ChatReasoningField::ReasoningContent);
             c
         });
-        assert!(requires_reasoning_content("tiny-test", "tiny-model"));
+        assert_eq!(
+            chat_reasoning_echo("tiny-test", "tiny-model"),
+            ChatReasoningEcho {
+                field: Some(ChatReasoningField::ReasoningContent),
+                require_present: true,
+            }
+        );
 
         // Explicit restore (the guard also restores on panic) so the test is
         // self-documenting about returning the global to its initial state.

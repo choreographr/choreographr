@@ -1127,21 +1127,35 @@ For Anthropic (thinking blocks + signatures), DeepSeek/Kimi
 (`reasoning_content`), Gemini (thought signatures), and OpenAI/xAI Responses
 (opaque reasoning items + `previous_response_id`), reasoning must be sent back
 on the next request or the tool-call loop fails with a 400. The round-trip
-payload is an **opaque, provider-owned artifact** handled in three layers: the
+payload is an **opaque, provider-owned artifact** handled in four layers: the
 catalog decides *how* to send (`ReasoningPassback`, per-model override else
-protocol default via `model_reasoning_passback`); each adapter captures the
-artifact verbatim at its parse boundary and re-emits it verbatim in its own wire
-format; the daemon's request builder (`choreo-daemon/src/reasoning.rs`) decides
-*whether* to send and never interprets the bytes. *Whether* is derived, never
-configured: same-model provenance (`Turn.reasoning_producer` versus the current
-provider + model, so a mid-session model switch drops every old artifact) plus
-the passback policy — with the empty-message fallback (a reasoning-only turn is
-never shipped as a wholly empty assistant message), the data-driven
-`requires_reasoning_content` fact (ingested from the snapshot, with no
-name-based heuristic), and the `previous_response_id` continuity chain. The
-artifact never leaves the daemon process — client-bound `SessionEvent`s carry it
-as `None`. The variant semantics and the resolver contracts are documented on
-`ReasoningPassback` and the resolver functions.
+protocol default via `model_reasoning_passback`, plus the chat echo policy in
+`chat_reasoning_echo`); each adapter captures the artifact verbatim at its parse
+boundary and re-emits it verbatim in its own wire format; the daemon's request
+builder (`choreo-daemon/src/reasoning.rs`) decides *whether* to send and never
+interprets the bytes; and the chat adapter's lowering (`ChatWireMessage`) decides
+*which wire key* carries it. *Whether* is derived, never configured: same-model
+provenance (`Turn.reasoning_producer` versus the current provider + model, so a
+mid-session model switch drops every old artifact) plus the passback policy —
+with the empty-message fallback (a reasoning-only turn is never shipped as a
+wholly empty assistant message), the data-driven `reasoning_echo` fact (ingested
+from the snapshot's `interleaved` field name, with no name-based heuristic, and
+overridable per model by the overlay), and the `previous_response_id` continuity
+chain.
+
+**Which key wins.** The catalog's declared echo field is authoritative and
+outranks the field a payload was *observed* under: `ReasoningArtifact::
+ChatReasoning` records the observation (a hint, used only when the route declares
+nothing) while `ModelEntry::reasoning_echo` states the requirement. On a route
+that declares one, the lowering writes that field on every assistant message —
+the artifact's text when there is something to replay, an empty string when
+there is not — so presence and destination are one decision in one place. This
+is why a gateway that streams DeepSeek thinking under `reasoning` while
+rejecting any history without `reasoning_content` cannot starve the required
+field. The artifact never leaves the daemon process — client-bound
+`SessionEvent`s carry it as `None`. The variant semantics and the resolver
+contracts are documented on `ReasoningPassback`, `ChatReasoningEcho`, and the
+resolver functions.
 
 ### Supported providers
 
@@ -2456,6 +2470,10 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
     old artifact) plus the catalog's `reasoning_passback` policy (`None` / `ToolLoop` / `AllTurns` /
     `Signature` / `ResponseId`, per-model override else protocol default). Display text stays in
     `Turn.assistant_reasoning`; the artifact bytes are never interpreted by the daemon.
+    *Where* the payload lands on the chat wire is the adapter's decision, from the catalog's
+    declared echo field (`ModelEntry::reasoning_echo`, ingested from the snapshot's
+    `interleaved`): a declared field outranks the field the payload was observed under, and an
+    assistant message with nothing to echo still carries it (empty) rather than omitting it.
 
 
 

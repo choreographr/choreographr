@@ -15,12 +15,10 @@ fn chat_message_with_images_serializes_content_as_parts_array() {
         }],
         tool_call_id: None,
         tool_calls: None,
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: None,
     };
-    let value = serde_json::to_value(&msg).unwrap();
+    let value =
+        serde_json::to_value(chat_wire_message(&msg, ChatReasoningEcho::default())).unwrap();
     let content = value["content"].as_array().expect("content array");
     assert_eq!(content[0]["type"], "text");
     assert_eq!(content[0]["text"], "what is this?");
@@ -39,7 +37,8 @@ fn chat_message_without_images_serializes_content_as_plain_string() {
     // Regression: a text-only message keeps the exact legacy wire shape
     // (content is a plain string; no images field).
     let msg = ChatRequestMessage::simple("user", "hi".to_string());
-    let value = serde_json::to_value(&msg).unwrap();
+    let value =
+        serde_json::to_value(chat_wire_message(&msg, ChatReasoningEcho::default())).unwrap();
     assert_eq!(value["content"], "hi");
     assert!(value.get("images").is_none());
 }

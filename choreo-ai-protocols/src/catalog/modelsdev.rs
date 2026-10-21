@@ -23,10 +23,12 @@
 
 use indexmap::IndexMap;
 use serde::Deserialize;
+use tracing::debug;
 
 use super::{ModelCost, ModelEntry, ProviderEntry, ProviderProtocol};
 use crate::retry::RequestCompression;
 use crate::shared::MaxTokensField;
+use choreo_proto::ChatReasoningField;
 
 /// One provider as recorded by the models.dev snapshot.
 #[derive(Debug, Deserialize)]
@@ -184,6 +186,31 @@ impl RawInterleaved {
     }
 }
 
+/// Map a models.dev `interleaved` field name onto the catalog's echo field.
+///
+/// Only the three *scalar* chat fields this catalog can echo text into are
+/// facts. Two encodings are deliberately "no fact" rather than a guess:
+///
+/// - `"reasoning_details"` — a structured array (OpenRouter/Kimi summaries +
+///   signatures) that a scalar field cannot carry; replaying it as text would
+///   corrupt it. Structured replay is a separate, unbuilt feature.
+/// - any unknown name — a snapshot vocabulary this catalog does not model.
+///
+/// Guessing here would be unauditable: the requirement decides which wire key
+/// every assistant message carries, so an unrecognised name must degrade to "no
+/// declared field" (and an upstream 400) rather than to a silent wrong key.
+fn echo_field(name: &str) -> Option<ChatReasoningField> {
+    match name {
+        "reasoning_content" => Some(ChatReasoningField::ReasoningContent),
+        "reasoning" => Some(ChatReasoningField::Reasoning),
+        "reasoning_text" => Some(ChatReasoningField::ReasoningText),
+        other => {
+            debug!(interleaved_field = %other, "models.dev interleaved field is not a scalar echo fact; ignoring");
+            None
+        }
+    }
+}
+
 /// Normalize a models.dev snapshot document into the base provider catalog.
 ///
 /// On a parse failure the snapshot is logged as an error and an empty catalog
@@ -228,20 +255,20 @@ fn normalize_provider(slug: String, raw: RawProvider) -> ProviderEntry {
             // carries no passback policy; per-model exceptions come from the
             // overlay.
             reasoning_passback: None,
-            // Reasoning_content echo: a FACT from the snapshot now — the model
-            // demands `reasoning_content` on every assistant message exactly
-            // when its `interleaved` names that field (DeepSeek/GLM 5.x on
-            // their own endpoints). Any other encoding (string shorthand for
-            // another field, bare `true`, absent) is "no explicit fact" →
-            // `None`; the overlay overrides, and `None` resolves to false at
-            // lookup time (no name-based guessing anymore).
-            reasoning_content_required: if m.interleaved.as_ref().and_then(RawInterleaved::field)
-                == Some("reasoning_content")
-            {
-                Some(true)
-            } else {
-                None
-            },
+            // Reasoning echo field: a FACT from the snapshot — the model
+            // demands this specific field on every assistant message exactly
+            // when its `interleaved` names one of the scalar chat fields
+            // (DeepSeek/GLM 5.x on their own endpoints). The field NAME is
+            // preserved (not collapsed to a boolean): the adapter needs it to
+            // pick the wire key. Any other encoding (bare `true`, absent, a
+            // structured or unknown field) is "no declared field" → `None`;
+            // the overlay overrides, and `None` means no echo requirement (no
+            // name-based guessing).
+            reasoning_echo: m
+                .interleaved
+                .as_ref()
+                .and_then(RawInterleaved::field)
+                .and_then(echo_field),
             // Output-token ceiling (`0` = unknown, mirroring context_window).
             max_output_tokens: m.limit.as_ref().map_or(0, |l| l.output),
             // Temperature acceptance: absent means models.dev records no
@@ -434,6 +461,14 @@ mod tests {
                     "reasoning": true,
                     "interleaved": "reasoning"
                 },
+                "structured-details-field": {
+                    "reasoning": true,
+                    "interleaved": {"field": "reasoning_details"}
+                },
+                "unknown-field": {
+                    "reasoning": true,
+                    "interleaved": {"field": "vendor_reasoning"}
+                },
                 "bare-true": {
                     "reasoning": true,
                     "interleaved": true
@@ -562,27 +597,43 @@ mod tests {
     }
 
     #[test]
-    fn interleaved_field_reasoning_content_is_a_required_echo_fact() {
+    fn interleaved_names_the_echo_field() {
         let catalog = normalize_modelsdev(SNAPSHOT);
         let features = &catalog[5];
         let m = &features.models[0];
         assert_eq!(m.model, "echo-field");
-        assert_eq!(m.reasoning_content_required, Some(true));
+        // The field NAME survives ingestion: the adapter needs it to pick the
+        // wire key, so it is not collapsed to a boolean.
+        assert_eq!(m.reasoning_echo, Some(ChatReasoningField::ReasoningContent));
         // limit.output is lifted into max_output_tokens.
         assert_eq!(m.max_output_tokens, 32_000);
     }
 
     #[test]
-    fn interleaved_without_the_reasoning_content_field_is_no_fact() {
+    fn interleaved_string_shorthand_is_a_field_fact() {
+        let catalog = normalize_modelsdev(SNAPSHOT);
+        // A plain string IS the field name, for any of the three scalar fields
+        // — not only `reasoning_content`.
+        assert_eq!(
+            catalog[5].models[1].reasoning_echo,
+            Some(ChatReasoningField::Reasoning)
+        );
+    }
+
+    #[test]
+    fn interleaved_without_a_scalar_echo_field_is_no_fact() {
         let catalog = normalize_modelsdev(SNAPSHOT);
         let features = &catalog[5];
-        // A plain string shorthand names a field — but only "reasoning_content"
-        // is a fact this catalog acts on; anything else (and a bare `true`,
-        // which carries no field at all) stays "no explicit fact" → None.
-        assert_eq!(features.models[1].reasoning_content_required, None);
-        assert_eq!(features.models[2].reasoning_content_required, None);
+        // `reasoning_details` is a structured array a scalar field cannot
+        // carry; replaying it as text would corrupt it, so it is NOT mapped
+        // onto `reasoning_content`.
+        assert_eq!(features.models[2].reasoning_echo, None);
+        // An unknown field name stays unknown (no guessing).
+        assert_eq!(features.models[3].reasoning_echo, None);
+        // Bare `true` is a capability flag, not a field fact.
+        assert_eq!(features.models[4].reasoning_echo, None);
         // Absent interleaved → None (never Some(false); None means unknown).
-        assert_eq!(features.models[3].reasoning_content_required, None);
+        assert_eq!(features.models[5].reasoning_echo, None);
     }
 
     #[test]
@@ -591,7 +642,7 @@ mod tests {
         let features = &catalog[5];
         // temperature:false → supports_temperature false; status
         // "deprecated" → deprecated true.
-        let frozen = &features.models[4];
+        let frozen = &features.models[6];
         assert!(!frozen.supports_temperature);
         assert!(frozen.deprecated);
         // Absent temperature → permissive true; absent status → not deprecated.

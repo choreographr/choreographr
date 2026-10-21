@@ -117,7 +117,7 @@ pub(crate) fn zhipu_reasoning_effort_api_value<'a>(slug: &'a str, model: &str) -
 mod tests {
     use super::super::chat_completions::ChatCompletionsRequest;
     use super::*;
-    use crate::openai::ChatRequestMessage;
+    use crate::openai::{ChatReasoningEcho, ChatRequestMessage, chat_wire_messages};
 
     #[test]
     fn zhipu_reasoning_effort_mapper_table() {
@@ -204,7 +204,10 @@ mod tests {
         let effort = zhipu_reasoning_effort_api_value("medium", "glm-5.3");
         let body = serde_json::to_value(&ChatCompletionsRequest {
             model: "glm-5.3",
-            messages: &[ChatRequestMessage::simple("user", "hello".into())],
+            messages: &chat_wire_messages(
+                &[ChatRequestMessage::simple("user", "hello".into())],
+                ChatReasoningEcho::default(),
+            ),
             tools: None,
             stream: false,
             stream_options: None,

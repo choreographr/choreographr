@@ -606,13 +606,17 @@ and re-emits it per provider rules on the next request:
   `redacted_thinking` blocks are echoed back, complete and unmodified,
   alongside `tool_use` blocks (a missing or altered block is a 400).
 - **DeepSeek / Kimi (OpenAI-compatible chat)** — `reasoning_content` is passed
-  back on every assistant tool-call message when the request carries `tools`.
-  On any echo-capable chat provider, a turn recorded as reasoning-only (empty
-  content, no tool calls) still echoes its same-model reasoning text so the
-  history never ships a wholly empty assistant message (the "must not be
-  empty" 400 that previously broke a mid-session model switch, e.g. deepseek
-  → kimi); models pinned to "never replay" (e.g. Cerebras gpt-oss) and the
-  Responses API are left to the flag-only diagnostic instead.
+  back on every assistant message when the model's route declares it, which some
+  gateways require even for a call that produced no reasoning (the field then
+  goes out empty). The declared field always wins over the field a response
+  happened to stream the text in, because gateways exist that answer under
+  `reasoning` while rejecting any history without `reasoning_content`. On any
+  echo-capable chat provider, a turn recorded as reasoning-only (empty content,
+  no tool calls) still echoes its same-model reasoning text so the history never
+  ships a wholly empty assistant message (the "must not be empty" 400 that
+  previously broke a mid-session model switch, e.g. deepseek → kimi); models
+  pinned to "never replay" (e.g. Cerebras gpt-oss) and the Responses API are
+  left to the flag-only diagnostic instead.
 - **Gemini** — the encrypted thought-step `thoughtSignature` values are sent
   back (the summary text stays display-only).
 - **OpenAI / xAI Responses** — reasoning continuity is chained across user

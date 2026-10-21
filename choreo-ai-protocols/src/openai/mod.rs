@@ -38,6 +38,8 @@ pub(crate) use crate::retry::{
 pub use retry::{RequestUploadedCallback, RetryCallback};
 
 use serde::{Deserialize, Serialize};
+
+use crate::catalog::ChatReasoningEcho;
 use std::io;
 
 /// Re-export the shared provider error type so all `OpenAI` code continues to
@@ -221,6 +223,11 @@ impl ChatImagePart {
 
 /// One message in a chat conversation, in the canonical `OpenAI` shape the
 /// other adapters translate from.
+///
+/// Deliberately **not** `Serialize`: the chat-completions wire shape is
+/// [`ChatWireMessage`], because the reasoning field a route demands belongs to
+/// the *route*, not to the message. A message therefore cannot reach the wire
+/// without an echo policy — the mistake this split exists to prevent.
 #[derive(Debug, Clone)]
 pub struct ChatRequestMessage {
     /// Message role (`"system"`, `"user"`, `"assistant"`, or `"tool"`).
@@ -235,111 +242,152 @@ pub struct ChatRequestMessage {
     pub tool_call_id: Option<String>,
     /// For an `"assistant"` message, the tool calls it requested.
     pub tool_calls: Option<Vec<AssistantToolCall>>,
-    /// Provider reasoning under the `reasoning_content` wire field.
-    pub reasoning_content: Option<String>,
-    /// Provider reasoning under the `reasoning` wire field.
-    pub reasoning: Option<String>,
-    /// Provider reasoning under the `reasoning_text` wire field.
-    pub reasoning_text: Option<String>,
     /// Opaque reasoning round-trip artifact captured by the producing adapter
-    /// at parse time (see `ReasoningArtifact`). Never serialized as a field of
-    /// its own — each adapter re-emits it in ITS OWN wire format: `OpenAI` chat
-    /// writes it back as the field recorded in the artifact
-    /// (`reasoning_content` / `reasoning` / `reasoning_text`) on assistant
-    /// messages (see the manual `Serialize` impl below), Responses pushes the
-    /// items into `input`, and the Anthropic/Google builders interpret their
-    /// own variants.
+    /// at parse time (see [`ReasoningArtifact`]). Never serialized as a field
+    /// of its own — each adapter re-emits it in ITS OWN wire format: chat
+    /// writes it under the route's declared reasoning field (see
+    /// [`ChatWireMessage`]), Responses pushes the items into `input`, and the
+    /// Anthropic/Google builders interpret their own variants.
     pub reasoning_artifact: Option<ReasoningArtifact>,
 }
 
-impl Serialize for ChatRequestMessage {
-    /// Manual impl: the wire shape is byte-identical to the derived one
-    /// (role, content, `tool_call_id`, `tool_calls`, `reasoning_content`,
-    /// reasoning, `reasoning_text` — `None` fields omitted) EXCEPT that an
-    /// assistant message carrying a `ChatReasoning` artifact re-emits it as
-    /// the wire field recorded at capture time (`reasoning_content` /
-    /// `reasoning` / `reasoning_text`), decoded from the captured bytes — a
-    /// provider that streamed `reasoning_text` must get `reasoning_text`
-    /// back, not `reasoning_content` (the mis-routing this field tag
-    /// prevents). The artifact field itself never appears on the wire.
-    /// DeepSeek/Kimi reject a tool-loop turn whose assistant message drops
-    /// `reasoning_content`, so the round-trip payload must survive to the
-    /// next request.
+/// One `OpenAI` Chat Completions wire message: a [`ChatRequestMessage`] lowered
+/// under one route's [`ChatReasoningEcho`] policy.
+///
+/// Serialization lives here rather than on the message because reasoning
+/// re-emission has two halves that must not be decided in different places:
+///
+/// - **which key** — the route's declared field, else the field the payload was
+///   observed under, else nothing. A declared field always wins: a gateway that
+///   streams `reasoning` while rejecting a history without `reasoning_content`
+///   is real, so the observation is only a fallback hint.
+/// - **whether the key must exist** — under a route that requires the field, an
+///   assistant message with nothing to echo carries it as an empty string, so
+///   no assistant message on such a route can omit it.
+///
+/// At most one reasoning key is emitted per message, and never on a
+/// non-assistant role.
+pub struct ChatWireMessage<'a> {
+    message: &'a ChatRequestMessage,
+    echo: ChatReasoningEcho,
+}
+
+/// Lower a message slice for the chat-completions wire under one route policy.
+#[must_use]
+pub fn chat_wire_messages(
+    messages: &[ChatRequestMessage],
+    echo: ChatReasoningEcho,
+) -> Vec<ChatWireMessage<'_>> {
+    messages
+        .iter()
+        .map(|message| ChatWireMessage { message, echo })
+        .collect()
+}
+
+/// Lower one message for the chat-completions wire under one route policy.
+#[must_use]
+pub fn chat_wire_message(
+    message: &ChatRequestMessage,
+    echo: ChatReasoningEcho,
+) -> ChatWireMessage<'_> {
+    ChatWireMessage { message, echo }
+}
+
+/// The wire key for one chat reasoning field.
+#[must_use]
+fn reasoning_wire_key(field: ChatReasoningField) -> &'static str {
+    match field {
+        ChatReasoningField::ReasoningContent => "reasoning_content",
+        ChatReasoningField::Reasoning => "reasoning",
+        ChatReasoningField::ReasoningText => "reasoning_text",
+    }
+}
+
+impl ChatWireMessage<'_> {
+    /// The reasoning (key, value) this message carries, if any — the single
+    /// decision point for reasoning re-emission: exactly one key or none.
+    fn reasoning_field(&self) -> Option<(&'static str, String)> {
+        // Only assistant messages may carry provider reasoning. An artifact on
+        // any other role is a builder bug, so it is dropped rather than
+        // re-emitted.
+        if self.message.role != "assistant" {
+            return None;
+        }
+        if let Some(ReasoningArtifact::ChatReasoning { field, bytes }) =
+            &self.message.reasoning_artifact
+        {
+            // The declared field outranks the observation; the observation is
+            // what makes a provider that streams `reasoning_text` get
+            // `reasoning_text` back on routes that declare nothing.
+            let field = self.echo.field.unwrap_or(*field);
+            match std::str::from_utf8(bytes) {
+                Ok(text) => {
+                    debug!(
+                        field = ?field,
+                        declared = self.echo.field.is_some(),
+                        payload_bytes = bytes.len(),
+                        "re-emitting chat reasoning artifact"
+                    );
+                    return Some((reasoning_wire_key(field), text.to_string()));
+                }
+                Err(_) => {
+                    // A corrupted persisted blob must not fail the whole
+                    // request: drop the payload so the required-field arm below
+                    // still keeps the message valid, and log the loss.
+                    warn!(
+                        field = ?field,
+                        payload_bytes = bytes.len(),
+                        "dropping corrupt chat reasoning artifact (not valid UTF-8)",
+                    );
+                }
+            }
+        }
+        // Nothing to echo. On a route that requires the field, emit it empty so
+        // the assistant message never omits it (the DeepSeek/GLM 5.x rule);
+        // `reasoning_content` is the chat-completions default when the policy
+        // names no field of its own.
+        self.echo.require_present.then(|| {
+            (
+                reasoning_wire_key(
+                    self.echo
+                        .field
+                        .unwrap_or(ChatReasoningField::ReasoningContent),
+                ),
+                String::new(),
+            )
+        })
+    }
+}
+
+impl Serialize for ChatWireMessage<'_> {
+    /// Manual impl: role, content, `tool_call_id`, `tool_calls`, and at most one
+    /// reasoning field, with `None` fields omitted. An assistant message
+    /// carrying a `ChatReasoning` artifact re-emits it under the route's field
+    /// (see [`ChatWireMessage`]); the artifact itself never appears on the wire.
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
 
-        // Explicit reasoning fields win when the daemon populated them
-        // directly; the artifact is the fallback so a message built with only
-        // the opaque payload still round-trips. Only assistant-role messages
-        // may carry provider reasoning — user/tool/system messages never had
-        // any, so the artifact is dropped for them.
-        let mut reasoning_content = self.reasoning_content.clone();
-        let mut reasoning = self.reasoning.clone();
-        let mut reasoning_text = self.reasoning_text.clone();
-        if self.role == "assistant"
-            && let Some(ReasoningArtifact::ChatReasoning { field, bytes }) =
-                &self.reasoning_artifact
-        {
-            // The artifact is opaque bytes; only the producing adapter may
-            // interpret it. Chat artifacts are always captured from a Rust
-            // String (so valid UTF-8), but a corrupted persisted blob must
-            // not fail the whole request — log and drop the payload so the
-            // request proceeds without the reasoning echo (the provider may
-            // reject it, but that is a diagnosable 400 rather than a
-            // serialization crash on every subsequent turn).
-            if let Ok(text) = std::str::from_utf8(bytes) {
-                debug!(
-                    ?field,
-                    payload_bytes = bytes.len(),
-                    "re-emitting chat reasoning artifact"
-                );
-                // Write the decoded text to the field named by the artifact's
-                // tag (only when that field is currently None — explicit
-                // values still win), so re-emission targets the same wire
-                // field the provider used at capture.
-                let target = match field {
-                    ChatReasoningField::ReasoningContent => &mut reasoning_content,
-                    ChatReasoningField::Reasoning => &mut reasoning,
-                    ChatReasoningField::ReasoningText => &mut reasoning_text,
-                };
-                if target.is_none() {
-                    *target = Some(text.to_string());
-                }
-            } else {
-                warn!(
-                    ?field,
-                    payload_bytes = bytes.len(),
-                    "dropping corrupt chat reasoning artifact (not valid UTF-8)",
-                );
-            }
-        }
-
-        let mut msg = serializer.serialize_struct("ChatRequestMessage", 7)?;
-        msg.serialize_field("role", &self.role)?;
+        let reasoning = self.reasoning_field();
+        let mut msg = serializer.serialize_struct("ChatWireMessage", 6)?;
+        msg.serialize_field("role", &self.message.role)?;
         // When the message carries images, `content` becomes an array of
         // `{type:"text"/"image_url"}` parts (the OpenAI chat vision shape);
         // otherwise it stays a plain string. Only user messages carry images
         // (the daemon guarantees this), but the branch is unconditional so a
         // misconstructed message still serializes rather than 400-ing later.
-        if !self.images.is_empty() {
-            msg.serialize_field("content", &self.openai_chat_content_value())?;
-        } else if let Some(content) = &self.content {
+        if !self.message.images.is_empty() {
+            msg.serialize_field("content", &self.message.openai_chat_content_value())?;
+        } else if let Some(content) = &self.message.content {
             msg.serialize_field("content", content)?;
         }
-        if let Some(tool_call_id) = &self.tool_call_id {
+        if let Some(tool_call_id) = &self.message.tool_call_id {
             msg.serialize_field("tool_call_id", tool_call_id)?;
         }
-        if let Some(tool_calls) = &self.tool_calls {
+        if let Some(tool_calls) = &self.message.tool_calls {
             msg.serialize_field("tool_calls", tool_calls)?;
         }
-        if let Some(rc) = &reasoning_content {
-            msg.serialize_field("reasoning_content", rc)?;
-        }
-        if let Some(reasoning) = &reasoning {
-            msg.serialize_field("reasoning", reasoning)?;
-        }
-        if let Some(reasoning_text) = &reasoning_text {
-            msg.serialize_field("reasoning_text", reasoning_text)?;
+        if let Some((key, value)) = &reasoning {
+            msg.serialize_field(key, value)?;
         }
         msg.end()
     }
@@ -365,9 +413,6 @@ impl ChatRequestMessage {
             images,
             tool_call_id: None,
             tool_calls: None,
-            reasoning_content: None,
-            reasoning: None,
-            reasoning_text: None,
             reasoning_artifact: None,
         }
     }

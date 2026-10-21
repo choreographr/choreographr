@@ -257,3 +257,128 @@ fn model_switch_sends_no_reasoning_on_the_wire() {
         );
     }
 }
+
+/// Append a tool-call turn whose reasoning payload was *observed* under an
+/// arbitrary chat field — the shape a gateway produces when it streams
+/// `DeepSeek` thinking under `reasoning` instead of `reasoning_content`.
+fn add_tool_turn_observed(
+    session: &mut SessionState,
+    user_text: &str,
+    reasoning: &str,
+    observed: ChatReasoningField,
+    provider_slug: &str,
+    model: &str,
+) {
+    let (tid, _) = session.start_turn(Some(user_text.to_string()));
+    session.set_assistant_response(
+        tid,
+        AssistantResponse {
+            reasoning: Some(reasoning.to_string()),
+            tool_calls: vec![AssistantToolCallRecord {
+                call_id: "call_1".into(),
+                name: "get_weather".into(),
+                arguments_json: r#"{"city":"London"}"#.into(),
+            }],
+            reasoning_artifact: Some(ReasoningArtifact::ChatReasoning {
+                field: observed,
+                bytes: reasoning.as_bytes().to_vec(),
+            }),
+            reasoning_producer: Some(ReasoningProducer {
+                provider_slug: provider_slug.to_string(),
+                model: model.to_string(),
+            }),
+            ..Default::default()
+        },
+    );
+}
+
+/// The live-failure shape: a route that *declares* `reasoning_content` while
+/// the provider streamed the payload under the bare `reasoning` field. The
+/// observation must not decide the destination — the declared field wins, and
+/// the wire carries it on every assistant message. This is the session that
+/// failed with "The `reasoning_content` in the thinking mode must be passed
+/// back to the API".
+#[ignore = "integration"]
+#[test]
+fn observed_other_field_never_starves_a_declared_echo_field() {
+    const REASONING: &str = "reasoning that arrived under `reasoning`";
+
+    let mut session = SessionState::empty();
+    // Two turns exactly as the live gateway produced them: captured under
+    // `reasoning`, produced by the model the request is for.
+    add_tool_turn_observed(
+        &mut session,
+        "What's the weather?",
+        REASONING,
+        ChatReasoningField::Reasoning,
+        "deepseek",
+        "deepseek-v4-pro",
+    );
+    add_tool_turn_observed(
+        &mut session,
+        "And tomorrow?",
+        REASONING,
+        ChatReasoningField::Reasoning,
+        "deepseek",
+        "deepseek-v4-pro",
+    );
+
+    let mock = MockProvider::start(vec![(200, "application/json", final_text_response())]);
+    let client = OpenAiClient::new(
+        ServiceConfig {
+            base_url: mock.base_url("v1"),
+            provider_slug: "deepseek".to_string(),
+            streaming: false,
+            retry_max_attempts: 1,
+            connect_timeout_secs: 5,
+            request_timeout_secs: 30,
+            total_timeout_secs: 60,
+            chat_completions_max_tokens_field: MaxTokensField::MaxCompletionTokens,
+            ..Default::default()
+        },
+        RequestAuth::api_key("test-key"),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .expect("openai client");
+
+    let messages = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro", None);
+    client
+        .chat_completion_turn(ChatTurnRequest {
+            model: "deepseek-v4-pro",
+            messages: &messages,
+            tools: &[],
+            thinking_effort: "high".to_string(),
+            on_retry: &mut None,
+            on_uploaded: None,
+            cancel_rx: None,
+            previous_response_id: None,
+            tool_results: &[],
+            programmatic_tool_calling: false,
+            session_id: "42".to_string(),
+            request_id: "7".to_string(),
+            max_output_tokens_override: None,
+            no_retry: false,
+        })
+        .expect("turn succeeds");
+
+    let requests = mock.requests();
+    let body = requests[0].body_json();
+    let assistants: Vec<&serde_json::Value> = body["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .collect();
+    assert_eq!(assistants.len(), 2);
+    for assistant in assistants {
+        assert_eq!(
+            assistant["reasoning_content"].as_str(),
+            Some(REASONING),
+            "the declared field must carry the reasoning, whatever field it arrived in: {assistant}",
+        );
+        assert!(
+            assistant.get("reasoning").is_none(),
+            "the observed field must not be echoed beside the declared one: {assistant}",
+        );
+    }
+}

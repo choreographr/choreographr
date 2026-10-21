@@ -9,12 +9,11 @@
 //!
 //! Everything is computed from the persisted session record + turns using the
 //! SAME code paths the agent loop uses (`build_chat_request_messages`,
-//! `warn_on_missing_reasoning_artifacts`, `model_reasoning_passback`), so the
-//! report is a faithful dry-run rather than a reimplementation that can drift.
-//! The request messages themselves are serialized the way the provider
-//! adapter would emit them (the manual `Serialize` impl re-emits artifacts
-//! into the wire field), so the "would carry `reasoning_content` on the wire"
-//! count is exactly what the upstream would see. Read-only: only redb read
+//! `chat_reasoning_echo`, `warn_on_uncaptured_reasoning`,
+//! `model_reasoning_passback`), so the report is a faithful dry-run rather than
+//! a reimplementation that can drift. The messages are lowered by the chat
+//! adapter's own `chat_wire_messages`, so the per-message keys in this report
+//! are exactly what the upstream would see. Read-only: only redb read
 //! transactions are opened; session state is never mutated.
 //!
 //! Privacy mirrors the codebase's thinking-content invariant: artifact
@@ -28,14 +27,14 @@ use super::ToolExecError;
 use crate::daemon::DaemonCommand;
 use crate::db::{read_session, read_turns};
 use crate::reasoning::{
-    build_chat_request_messages, include_reasoning_artifact, warn_on_missing_reasoning_artifacts,
+    build_chat_request_messages, include_reasoning_artifact, warn_on_uncaptured_reasoning,
 };
 use crate::sessions::SessionState;
 use crate::tools::Tool;
 use crate::tools::context::ToolContext;
+use choreo_ai_protocols::openai::chat_wire_messages;
 use choreo_ai_protocols::{
-    ReasoningPassback, model_reasoning_passback, provider_slug_for_model,
-    requires_reasoning_content,
+    ReasoningPassback, chat_reasoning_echo, model_reasoning_passback, provider_slug_for_model,
 };
 use choreo_proto::{ChatReasoningField, ReasoningArtifact, ReasoningProducer, Turn};
 use schemars::JsonSchema;
@@ -189,11 +188,10 @@ fn build_report(
     }
 
     let passback = model_reasoning_passback(&provider, &model);
-    // DeepSeek/Kimi chat: the builder injects an empty `reasoning_content` on
-    // assistant messages with nothing to echo, so those turns carry the field
-    // on the wire (not bare). Mirror it here or the ledger-vs-wire parity
-    // check would disagree with the dry-run.
-    let requires_rc = requires_reasoning_content(&provider, &model);
+    // The route's chat reasoning-echo policy: the declared field outranks the
+    // field a payload was observed under, and a declared field must be present
+    // on every assistant message (empty when there is nothing to echo).
+    let echo = chat_reasoning_echo(&provider, &model);
 
     // Reconstruct the state the builder reads. `build_chat_request_messages`
     // only consults `turns` (and the optional system prompt, which we pass as
@@ -203,48 +201,58 @@ fn build_report(
     state.turns = turns;
     state.config.selected_model = Some(model.clone());
 
-    let guard_problems = warn_on_missing_reasoning_artifacts(&state, session_id, &provider, &model);
+    let guard_problems = warn_on_uncaptured_reasoning(&state, session_id, &provider, &model);
     // The dry-run has no request in flight, so the builder's image-decay
     // marker is `None`: every historical tool-result image renders as a text
     // placeholder here, exactly as it would on the request a freshly-loaded
     // session would build (only a live agent loop's own turns carry pixels).
     let messages = build_chat_request_messages(&state, None, &provider, &model, None);
 
-    // Wire accounting: serialize each built message exactly as the adapter
-    // would (the manual `Serialize` impl re-emits the artifact into the wire
-    // field), then count what the upstream would actually see.
+    // Wire accounting: lower the messages with the chat adapter's own policy
+    // application, so this dry-run cannot invent a different key than the real
+    // request. The counts are what the upstream would actually see.
+    let wire = chat_wire_messages(&messages, echo);
     let mut assistant_count = 0usize;
-    let mut wire_rc_count = 0usize;
-    let mut wire_tool_no_rc = 0usize;
+    let mut wire_reasoning_count = 0usize;
+    let mut wire_required_missing = 0usize;
     let mut wire_empty: Vec<String> = Vec::new();
-    for (msg_index, m) in messages.iter().enumerate() {
+    for (msg_index, (m, w)) in messages.iter().zip(&wire).enumerate() {
         if m.role != "assistant" {
             continue;
         }
         assistant_count += 1;
-        let value = serde_json::to_value(m)
+        let value = serde_json::to_value(w)
             .map_err(|e| ToolExecError(format!("serialize request message: {e}")))?;
-        let has_rc = value.get("reasoning_content").is_some();
+        let keys = ["reasoning_content", "reasoning", "reasoning_text"];
+        let present: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|k| value.get(*k).is_some())
+            .collect();
+        if !present.is_empty() {
+            wire_reasoning_count += 1;
+        }
+        // The declared field must be on EVERY assistant message of a route that
+        // declares one — its absence is the 400 shape this tool exists to catch.
+        let declared_present = echo
+            .field
+            .map(fmt_field)
+            .is_some_and(|k| present.contains(&k));
+        if echo.require_present && !declared_present {
+            wire_required_missing += 1;
+        }
         let has_tools = value
             .get("tool_calls")
             .and_then(|tc| tc.as_array())
             .is_some_and(|arr| !arr.is_empty());
-        if has_rc {
-            wire_rc_count += 1;
-        }
-        if has_tools && !has_rc {
-            wire_tool_no_rc += 1;
-        }
         // "must not be empty" hazard: an assistant message with no content,
         // no tool calls, and no non-empty reasoning echo is exactly what
-        // OpenAI-compatible providers reject with a 400. Any turn reaching
-        // this state on the wire is a hard failure candidate regardless of
-        // the passback accounting.
+        // OpenAI-compatible providers reject with a 400.
         let content_empty = value
             .get("content")
             .and_then(|c| c.as_str())
             .is_none_or(str::is_empty);
-        let reasoning_non_empty = ["reasoning_content", "reasoning", "reasoning_text"]
+        let reasoning_non_empty = keys
             .iter()
             .filter_map(|k| value.get(*k).and_then(|v| v.as_str()))
             .any(|s| !s.is_empty());
@@ -258,14 +266,12 @@ fn build_report(
     // Per-turn ledger, computed with the same gates as the builder so the
     // report can attribute a reason to each turn. The wire cross-check below
     // validates that the two views agree — a MISMATCH means the ledger logic
-    // and the real builder have drifted, which is itself a diagnostic signal.
+    // and the real lowering have drifted, which is itself a diagnostic signal.
     let mut ledger = Vec::new();
-    let mut risks: Vec<String> = Vec::new();
-    let mut notes: Vec<String> = Vec::new();
+    let mut capture_losses: Vec<String> = Vec::new();
     let mut infos: Vec<String> = Vec::new();
     let mut raw_lines: Vec<String> = Vec::new();
-    let mut ledger_echo_count = 0usize;
-    let mut ledger_tool_no_echo = 0usize;
+    let mut ledger_key_count = 0usize;
     let own_session = session_id == ctx.session_id;
     let cap = args.max_turns.unwrap_or(DEFAULT_MAX_TURNS);
 
@@ -288,20 +294,27 @@ fn build_report(
         // lockstep.
         let include_artifact = include_reasoning_artifact(turn, &provider, &model, passback);
         let echo_has_artifact = include_artifact && turn.reasoning_artifact.is_some();
-        // Whether this turn's assistant message carries SOME
-        // `reasoning_content` on the wire: the real artifact text, or (on
-        // models that require the field, e.g. DeepSeek/Kimi) an injected
-        // empty string. The builder injects it only for non-undone turns that
-        // emit a message and have nothing to echo — mirror that exactly.
-        let wire_rc_present =
-            !turn.undone && has_assistant_msg && (echo_has_artifact || requires_rc);
+        // Whether this turn's assistant message carries A reasoning key on the
+        // wire: the artifact (under the declared field, else the observed one),
+        // or the required field as an empty string when there is nothing to
+        // echo. Mirrors `ChatWireMessage::reasoning_field` exactly.
+        let wire_present =
+            !turn.undone && has_assistant_msg && (echo_has_artifact || echo.require_present);
 
-        let echo = if !has_assistant_msg {
+        let echo_label = if !has_assistant_msg {
             "n/a".to_string()
         } else if echo_has_artifact {
-            "yes".to_string()
-        } else if wire_rc_present {
-            "yes(empty)".to_string()
+            match echo.field {
+                // The declared field wins over the observation, so say which
+                // one the wire will actually carry.
+                Some(field) => format!("yes(declared:{})", fmt_field(field)),
+                None => "yes(observed)".to_string(),
+            }
+        } else if wire_present {
+            format!(
+                "yes(empty:{})",
+                fmt_field(echo.field.unwrap_or(ChatReasoningField::ReasoningContent))
+            )
         } else if !same_model {
             "no:producer-mismatch".to_string()
         } else if turn.reasoning_artifact.is_none() {
@@ -325,6 +338,16 @@ fn build_report(
             .reasoning_artifact
             .as_ref()
             .map_or_else(|| "-".into(), fmt_artifact);
+        // The field the payload was observed under, shown beside the artifact so
+        // a provider that streams one field while declaring another is visible
+        // at a glance.
+        let observed = turn.reasoning_artifact.as_ref().map_or_else(
+            || "-".to_string(),
+            |artifact| match artifact {
+                ReasoningArtifact::ChatReasoning { field, .. } => fmt_field(*field).to_string(),
+                _ => "-".to_string(),
+            },
+        );
         let prod = producer.map_or_else(
             || "-".into(),
             |p| format!("{}/{}", p.provider_slug, p.model),
@@ -340,50 +363,38 @@ fn build_report(
 
         if idx < cap {
             ledger.push(format!(
-                "  t{turn_id:>5} [{flags}] u={user_len} a={asst_len} tc={} r={} art={art} prod={prod} same={same} echo={echo}",
+                "  t{turn_id:>5} [{flags}] u={user_len} a={asst_len} tc={} r={} art={art} obs={observed} prod={prod} same={same} echo={echo_label}",
                 turn.tool_calls.len(),
                 turn.tool_results.len(),
             ));
         }
 
-        // Wire-parity counters (vs. the serialized-message dry-run below):
-        // the builder skips `undone` turns entirely, so only non-undone turns
-        // produce a message on the wire and count toward the parity check —
-        // otherwise any undone turn with an artifact/tool call would make the
-        // ledger and the wire tallies disagree on sessions containing undos.
-        if !turn.undone && has_assistant_msg {
-            if wire_rc_present {
-                ledger_echo_count += 1;
-            } else if !turn.tool_calls.is_empty() {
-                ledger_tool_no_echo += 1;
-            }
+        // Wire-parity counter (vs. the lowered-message dry-run above): the
+        // builder skips `undone` turns entirely, so only non-undone turns
+        // produce a message on the wire and count toward the parity check.
+        if wire_present {
+            ledger_key_count += 1;
         }
 
-        // Risk classification: "risk" means there is evidence the model
-        // reasoned here (artifact bytes or displayed reasoning text) yet the
-        // wire will omit ALL reasoning_content on a tool-call turn — exactly
-        // the shape DeepSeek/Kimi reject with a `reasoning_content` 400.
-        if has_assistant_msg && !turn.tool_calls.is_empty() && !wire_rc_present {
-            if turn.reasoning_artifact.is_some() || turn.assistant_reasoning.is_some() {
-                risks.push(format!(
-                    "  t{turn_id}: {echo} (user: {})",
-                    own_preview(turn.user_text.as_deref(), own_session),
-                ));
-            } else if !turn.undone {
-                // Tool call with no reasoning evidence at all: cannot
-                // distinguish "model produced no reasoning" from "capture
-                // lost it" — surfaced as a note, not a hard risk.
-                notes.push(format!(
-                    "  t{turn_id}: tool call with no artifact and no displayed reasoning",
-                ));
-            }
+        // Capture loss: the model reasoned, the session displays it, but no
+        // artifact exists to replay — the echo degrades to an empty field. Not
+        // a request hazard (the declared field is still present), so it is a
+        // note rather than a risk.
+        if has_assistant_msg
+            && turn.reasoning_artifact.is_none()
+            && turn.assistant_reasoning.is_some()
+        {
+            capture_losses.push(format!(
+                "  t{turn_id}: reasoning displayed but not captured (echo degrades to an empty field) user: {}",
+                own_preview(turn.user_text.as_deref(), own_session),
+            ));
         }
         // Under ToolLoop, a plain-text assistant turn that produced reasoning
         // is deliberately sent bare — informational, matches the policy (and
-        // suppressed on models that now inject an empty reasoning_content).
+        // suppressed on models that declare a required field).
         if has_assistant_msg
             && turn.tool_calls.is_empty()
-            && !wire_rc_present
+            && !wire_present
             && turn.reasoning_artifact.is_some()
             && same_model
             && matches!(passback, ReasoningPassback::ToolLoop)
@@ -411,7 +422,7 @@ fn build_report(
         }
     }
 
-    let mismatch = if ledger_echo_count == wire_rc_count && ledger_tool_no_echo == wire_tool_no_rc {
+    let mismatch = if ledger_key_count == wire_reasoning_count {
         "OK"
     } else {
         "MISMATCH"
@@ -443,16 +454,26 @@ fn build_report(
     out.push('\n');
     let _ = writeln!(
         out,
-        "  daemon guard warn_on_missing_reasoning_artifacts: {guard_problems} problem(s)"
+        "  daemon guard warn_on_uncaptured_reasoning: {guard_problems} problem(s)"
     );
     let _ = writeln!(
         out,
-        "  wire dry-run: {wire_rc_count}/{assistant_count} assistant messages carry reasoning_content;"
+        "  route echo policy: field={} require_present={}",
+        echo.field
+            .map_or("none".to_string(), |f| fmt_field(f).to_string()),
+        echo.require_present
     );
     let _ = writeln!(
         out,
-        "  {wire_tool_no_rc} assistant tool-call message(s) carry NONE (provider-reject risk); ledger vs wire: {mismatch}"
+        "  wire dry-run: {wire_reasoning_count}/{assistant_count} assistant messages carry a reasoning field; ledger vs wire: {mismatch}"
     );
+    if echo.require_present {
+        let _ = writeln!(
+            out,
+            "  declared-field violations: {wire_required_missing} assistant message(s) omit {} (must be 0)",
+            fmt_field(echo.field.unwrap_or(ChatReasoningField::ReasoningContent))
+        );
+    }
     if wire_empty.is_empty() {
         out.push_str("  empty assistant message(s) on the wire: none\n");
     } else {
@@ -464,20 +485,22 @@ fn build_report(
     }
     out.push('\n');
 
-    if risks.is_empty() {
-        out.push_str("RISK (tool-call turns with reasoning evidence but no wire echo): none\n");
+    // The invariant this tool exists to verify is now structural (the lowering
+    // enforces it), so a violation is a regression alarm rather than a
+    // classification to interpret.
+    if wire_required_missing == 0 {
+        out.push_str("RISK (assistant messages missing the route's declared field): none\n");
     } else {
-        let _ = write!(
+        let _ = writeln!(
             out,
-            "RISK (tool-call turns with reasoning evidence but no wire echo — DeepSeek-style 400 candidates):\n{}\n",
-            risks.join("\n")
+            "RISK (assistant messages missing the route's declared field — a lowering regression, expect a provider 400): {wire_required_missing}"
         );
     }
-    if !notes.is_empty() {
+    if !capture_losses.is_empty() {
         let _ = write!(
             out,
-            "NOTE (tool calls with no reasoning evidence at all — unverifiable):\n{}\n",
-            notes.join("\n")
+            "NOTE (reasoning displayed but not captured — the echo degrades to an empty field):\n{}\n",
+            capture_losses.join("\n")
         );
     }
     if !infos.is_empty() {
@@ -776,12 +799,24 @@ mod tests {
         );
         let out = run(&ctx, inspect_args(None));
         assert!(out.contains("t    0"), "t0 must appear in ledger: {out}");
-        assert!(out.contains("echo=yes"), "t0 must echo: {out}");
+        assert!(
+            out.contains("echo=yes(observed)"),
+            "t0 echoes under the observed field (groq declares none): {out}"
+        );
         assert!(out.contains("t    1"), "t1 must appear: {out}");
         assert!(out.contains("no:reasoning-without-artifact"), "{out}");
-        assert!(out.contains("RISK (tool-call turns"), "{out}");
+        assert!(
+            out.contains("NOTE (reasoning displayed but not captured"),
+            "{out}"
+        );
+        // groq declares no reasoning field, so no assistant message can omit
+        // one: the request-validity alarm stays quiet.
+        assert!(
+            out.contains("RISK (assistant messages missing the route's declared field): none"),
+            "{out}"
+        );
         assert!(out.contains("ledger vs wire: OK"), "{out}");
-        // The daemon's own guard must flag the one bare tool turn too.
+        // The daemon's own guard flags the capture loss.
         assert!(out.contains("1 problem(s)"), "{out}");
     }
 
@@ -799,18 +834,21 @@ mod tests {
             vec![(0, tool_turn("c1", "exec", None, Some(ds_producer()), None))],
         );
         let out = run(&ctx, inspect_args(None));
-        assert!(out.contains("echo=yes(empty)"), "{out}");
+        assert!(out.contains("echo=yes(empty:reasoning_content)"), "{out}");
         assert!(
-            out.contains("RISK (tool-call turns with reasoning evidence but no wire echo): none"),
+            out.contains("RISK (assistant messages missing the route's declared field): none"),
             "{out}"
         );
         assert!(
-            !out.contains("NOTE (tool calls with no reasoning evidence"),
+            !out.contains("NOTE (reasoning displayed but not captured"),
             "{out}"
         );
-        assert!(out.contains("carry NONE (provider-reject risk); "), "{out}");
         assert!(
-            out.contains("0 assistant tool-call message(s) carry NONE"),
+            out.contains("declared-field violations: 0 assistant message(s) omit"),
+            "{out}"
+        );
+        assert!(
+            out.contains("1/1 assistant messages carry a reasoning field"),
             "{out}"
         );
         assert!(out.contains("ledger vs wire: OK"), "{out}");
@@ -833,12 +871,14 @@ mod tests {
         );
         let out = run(&ctx, inspect_args(None));
         assert!(out.contains("echo=no:no-artifact"), "{out}");
+        // No displayed reasoning, so nothing was lost — just a bare tool turn
+        // under a route that declares no field.
         assert!(
-            out.contains("NOTE (tool calls with no reasoning evidence"),
+            !out.contains("NOTE (reasoning displayed but not captured"),
             "{out}"
         );
-        // Both the ledger and the wire must count this one bare tool message
-        // (and the echoed-message total must agree too) → parity OK.
+        // Both the ledger and the wire must agree that no reasoning key is
+        // present → parity OK.
         assert!(out.contains("ledger vs wire: OK"), "{out}");
     }
 
@@ -867,7 +907,13 @@ mod tests {
         );
         let out = run(&ctx, inspect_args(None));
         assert!(out.contains("no:producer-mismatch"), "{out}");
-        assert!(out.contains("RISK (tool-call turns"), "{out}");
+        // A model-bound artifact dropped by the provenance gate is not a
+        // request hazard: the turn still has content and tool calls, and groq
+        // declares no field to omit.
+        assert!(
+            out.contains("RISK (assistant messages missing the route's declared field): none"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -894,7 +940,7 @@ mod tests {
         assert!(!out.contains("no:producer-mismatch"), "{out}");
         // The RISK section must be the "none" variant, not a list.
         assert!(
-            out.contains("RISK (tool-call turns with reasoning evidence but no wire echo): none"),
+            out.contains("RISK (assistant messages missing the route's declared field): none"),
             "{out}"
         );
     }
@@ -924,13 +970,16 @@ mod tests {
             )],
         );
         let out = run(&ctx, inspect_args(None));
-        assert!(out.contains("echo=yes"), "artifact echoed: {out}");
+        assert!(
+            out.contains("echo=yes(declared:reasoning_content)"),
+            "artifact echoed under the declared field: {out}"
+        );
         assert!(
             out.contains("empty assistant message(s) on the wire: none"),
             "no empty assistant message on the wire: {out}"
         );
         assert!(
-            out.contains("daemon guard warn_on_missing_reasoning_artifacts: 0 problem(s)"),
+            out.contains("daemon guard warn_on_uncaptured_reasoning: 0 problem(s)"),
             "guard clean: {out}"
         );
         assert!(out.contains("ledger vs wire: OK"), "{out}");
@@ -956,7 +1005,7 @@ mod tests {
             "wire-empty candidate surfaced: {out}"
         );
         assert!(
-            out.contains("daemon guard warn_on_missing_reasoning_artifacts: 1 problem(s)"),
+            out.contains("daemon guard warn_on_uncaptured_reasoning: 1 problem(s)"),
             "guard flags the unfixable turn: {out}"
         );
         assert!(out.contains("ledger vs wire: OK"), "{out}");
@@ -982,13 +1031,13 @@ mod tests {
             )],
         );
         let out = run(&ctx, inspect_args(None));
-        assert!(out.contains("echo=yes"), "artifact echoed: {out}");
+        assert!(out.contains("echo=yes(observed)"), "artifact echoed: {out}");
         assert!(
             out.contains("empty assistant message(s) on the wire: none"),
             "no empty assistant message on the wire: {out}"
         );
         assert!(
-            out.contains("daemon guard warn_on_missing_reasoning_artifacts: 0 problem(s)"),
+            out.contains("daemon guard warn_on_uncaptured_reasoning: 0 problem(s)"),
             "guard clean: {out}"
         );
         assert!(out.contains("ledger vs wire: OK"), "{out}");
@@ -1014,7 +1063,7 @@ mod tests {
             "wire-empty candidate surfaced: {out}"
         );
         assert!(
-            out.contains("daemon guard warn_on_missing_reasoning_artifacts: 1 problem(s)"),
+            out.contains("daemon guard warn_on_uncaptured_reasoning: 1 problem(s)"),
             "guard flags the unfixable turn: {out}"
         );
         assert!(out.contains("ledger vs wire: OK"), "{out}");

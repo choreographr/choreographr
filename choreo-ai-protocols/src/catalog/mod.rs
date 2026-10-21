@@ -32,6 +32,7 @@ use std::sync::{Arc, LazyLock};
 use tracing::debug;
 
 use arc_swap::ArcSwap;
+use choreo_proto::ChatReasoningField;
 use serde::{Deserialize, Serialize};
 
 use crate::retry::RequestCompression;
@@ -46,10 +47,11 @@ pub mod refresh;
 
 pub use loader::{bundled_overlay_src, load_bundled_base};
 pub use lookup::{
-    image_edit_models_for_provider, image_models_for_provider, lookup_context_window,
-    lookup_max_output_tokens, model_cost, model_reasoning_capability, model_reasoning_passback,
-    model_request_format, model_supports_image_output, model_supports_temperature,
-    model_supports_vision, prompt_cache_ttl, requires_reasoning_content,
+    ChatReasoningEcho, chat_reasoning_echo, image_edit_models_for_provider,
+    image_models_for_provider, lookup_context_window, lookup_max_output_tokens, model_cost,
+    model_reasoning_capability, model_reasoning_passback, model_request_format,
+    model_supports_image_output, model_supports_temperature, model_supports_vision,
+    prompt_cache_ttl,
 };
 pub use modelsdev::normalize_modelsdev;
 pub use overlay::merge_overlay;
@@ -157,19 +159,24 @@ pub struct ModelEntry {
     /// including `Some(ReasoningPassback::None)` for "never replay this
     /// model's reasoning".
     pub reasoning_passback: Option<ReasoningPassback>,
-    /// Whether this model requires `reasoning_content` to be *present* on
-    /// every assistant message sent back (e.g. DeepSeek/GLM 5.x chat: the
-    /// upstream rejects a history whose assistant tool-call message omits
-    /// `reasoning_content`, even when the model produced no reasoning on
-    /// that call). Ingested from the models.dev snapshot as a FACT — the
-    /// model's `interleaved` value names `"reasoning_content"` as the echo
-    /// field — and overridable per-model by the overlay
-    /// (`reasoning_content_required = true|false`). `None` means "no explicit
-    /// fact" and resolves to `false` in [`requires_reasoning_content`] —
-    /// there is NO name-based fallback anymore; a model not covered by the
-    /// snapshot needs an explicit overlay flag.
+    /// The wire field every assistant message on this route must carry, when
+    /// the provider declares one (e.g. DeepSeek/GLM 5.x chat: the upstream
+    /// rejects a history whose assistant tool-call message omits
+    /// `reasoning_content`, even when the model produced no reasoning on that
+    /// call).
+    ///
+    /// Ingested from the models.dev snapshot as a FACT — the model's
+    /// `interleaved` value names the echo field — and overridable per-model by
+    /// the overlay (`reasoning_echo_field = "…"`, or the older
+    /// `reasoning_content_required = true|false` alias). `None` means "no
+    /// declared field": there is NO name-based fallback, so a model not
+    /// covered by the snapshot needs an explicit overlay entry.
+    ///
+    /// This is a *route requirement*, and it outranks whatever field a
+    /// response happened to stream the reasoning under (the artifact's
+    /// observation) — see [`chat_reasoning_echo`].
     #[serde(default)]
-    pub reasoning_content_required: Option<bool>,
+    pub reasoning_echo: Option<ChatReasoningField>,
     /// Maximum output tokens the model can produce (`0` = unknown), ingested
     /// from the snapshot's `limit.output` and resolvable via
     /// [`lookup_max_output_tokens`] (which maps 0 back to `None`).
@@ -239,7 +246,7 @@ impl Default for ModelEntry {
             openai_reasoning_levels: Vec::new(),
             openai_responses: false,
             reasoning_passback: None,
-            reasoning_content_required: None,
+            reasoning_echo: None,
             max_output_tokens: 0,
             supports_temperature: true,
             deprecated: false,
