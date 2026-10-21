@@ -2168,6 +2168,34 @@ mod tests {
     }
 
     #[test]
+    fn messages_to_responses_input_skips_empty_assistant_content() {
+        // A blank assistant turn produces no message item: an empty text item is
+        // meaningless and rejects on strict endpoints.
+        let msg = ChatRequestMessage::simple("assistant", "  \n ".into());
+        let items = messages_to_responses_input(&[msg]).unwrap();
+        assert!(items.is_empty(), "{items:?}");
+    }
+
+    #[test]
+    fn messages_to_responses_input_keeps_reasoning_items_for_an_empty_turn() {
+        // The message item is skipped, but the replayed reasoning items still
+        // ride — continuity is the payload, not the empty content.
+        let msg = ChatRequestMessage {
+            role: "assistant",
+            content: Some(String::new()),
+            images: Vec::new(),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_artifact: Some(ReasoningArtifact::ResponsesItems(
+                br#"[{"type":"reasoning","id":"rs_1","encrypted_content":"eJxT"}]"#.to_vec(),
+            )),
+        };
+        let items = messages_to_responses_input(&[msg]).unwrap();
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0]["type"], "reasoning");
+    }
+
+    #[test]
     #[serial_test::serial(catalog)]
     fn responses_max_output_tokens_prefers_the_override() {
         // A per-call cap (the cache-warming ping's 1-token cap) must win over

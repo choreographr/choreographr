@@ -1157,6 +1157,18 @@ field. The artifact never leaves the daemon process — client-bound
 contracts are documented on `ReasoningPassback`, `ChatReasoningEcho`, and the
 resolver functions.
 
+**Empty turns never reach the wire.** An assistant turn that produced no visible
+content (blank text counts as none), no tool calls, and no reasoning payload is
+dropped from the provider-facing projection by every adapter — a message with
+neither content nor tool calls is rejected outright by chat servers, and an
+empty `content`/`parts` array is rejected by Anthropic and Gemini. The turn stays
+in the session (the transcript, diagnostics, and `session_inspect` still see it);
+only the request projection omits it. A turn whose *only* payload is a replayed
+reasoning artifact is not empty and always survives — dropping it would starve
+the very echo this section is about — while a required-field empty string is a
+presence marker, not a payload, so it never keeps an otherwise-empty message
+alive.
+
 ### Supported providers
 
 Currently supports 209 providers (184 from the models.dev base + 25 overlay-only). Adding or refreshing a provider is a data change in `catalog/`: update the snapshot (or add an overlay entry) and re-run `cargo run --bin catalog-gen` — zero client code.

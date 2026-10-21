@@ -692,6 +692,7 @@ fn wire_json(
     model: &str,
 ) -> Vec<serde_json::Value> {
     chat_wire_messages(messages, chat_reasoning_echo(provider, model))
+        .messages
         .iter()
         .map(|m| serde_json::to_value(m).expect("serialize wire message"))
         .collect()
@@ -933,15 +934,14 @@ fn builder_requires_rc_empty_content_turn_foreign_artifact_not_replayed() {
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
     assert_eq!(assistants[0].reasoning_artifact, None);
-    // The wire still carries the REQUIRED field (the route declares it), but
-    // empty: the foreign payload is never replayed, and presence is what the
-    // provider demands.
+    // Nothing is on the wire for this turn: the foreign payload is never
+    // replayed, and a required-field empty string is not a payload, so the
+    // projection drops the empty message rather than sending it.
     let wire = wire_json(&result, "deepseek", "deepseek-v4-pro");
-    assert_eq!(wire[1]["reasoning_content"], "");
+    assert_eq!(wire.len(), 1, "only the user message survives: {wire:?}");
+    assert_eq!(wire[0]["role"], "user");
 
-    // The guard reports the wire-empty message: the required field keeps the
-    // echo present, but an assistant message with neither content nor tool
-    // calls is rejected regardless, and nothing here can fill it.
+    // The guard reports the turn, because it has left the model's view.
     assert_eq!(
         warn_on_uncaptured_reasoning(&session, 7, "deepseek", "deepseek-v4-pro"),
         1,
@@ -1048,11 +1048,12 @@ fn guard_wire_empty_turn_without_artifact_flagged_on_non_requires_rc() {
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
     assert_eq!(assistants[0].reasoning_artifact, None);
-    // groq declares no echo field, so nothing is invented on the wire: the
-    // message stays exactly as empty as the turn is (the hazard the guard just
-    // reported).
+    // groq declares no echo field and nothing was captured, so the empty
+    // assistant message is dropped from the projection (the hazard the guard
+    // just reported never reaches the wire).
     let wire = wire_json(&result, "groq", GROQ_MODEL);
-    assert!(wire[1].get("reasoning_content").is_none());
+    assert_eq!(wire.len(), 1, "only the user message survives: {wire:?}");
+    assert_eq!(wire[0]["role"], "user");
 }
 
 #[test]
@@ -1077,11 +1078,11 @@ fn builder_wire_empty_turn_never_echoes_under_none_passback() {
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
     assert_eq!(assistants[0].reasoning_artifact, None);
-    let wire = wire_json(&result, "cerebras", "gpt-oss-120b");
-    assert!(wire[1].get("reasoning_content").is_none());
     // The never-replay pin means the wire-empty message cannot be filled at
-    // all, so the guard reports it as the hazard it is — the empty-string
-    // injection an echo-capable route would add is not available here.
+    // all, so the projection drops it instead of sending an empty assistant
+    // message (which the gateway would reject just as hard).
+    let wire = wire_json(&result, "cerebras", "gpt-oss-120b");
+    assert_eq!(wire.len(), 1, "only the user message survives: {wire:?}");
     assert_eq!(
         warn_on_uncaptured_reasoning(&session, 7, "cerebras", "gpt-oss-120b"),
         1,
@@ -1416,6 +1417,25 @@ fn guard_flags_wire_empty_turn_without_artifact_on_any_policy() {
             "{provider}/{model}: a wire-empty assistant message is always a hazard",
         );
     }
+}
+
+#[test]
+fn guard_flags_a_whitespace_only_assistant_turn() {
+    // A blank answer is not a payload: the projection trims before deciding, so a
+    // whitespace-only turn is dropped and the guard must report it.
+    let mut session = SessionState::empty();
+    add_turn(
+        &mut session,
+        "continue",
+        "  \n\t ",
+        None,
+        Some(deepseek_producer()),
+        vec![],
+    );
+    assert_eq!(
+        warn_on_uncaptured_reasoning(&session, 7, "deepseek", "deepseek-v4-pro"),
+        1,
+    );
 }
 
 #[test]

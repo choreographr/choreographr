@@ -617,6 +617,10 @@ and re-emits it per provider rules on the next request:
   previously broke a mid-session model switch, e.g. deepseek → kimi); models
   pinned to "never replay" (e.g. Cerebras gpt-oss) and the Responses API are
   left to the flag-only diagnostic instead.
+  A turn that produced no visible output at all — blank text, no tool calls, and
+  no reasoning to replay — is dropped from the request instead of being sent
+  empty; it stays in the transcript, but the model no longer receives a message
+  every provider rejects.
 - **Gemini** — the encrypted thought-step `thoughtSignature` values are sent
   back (the summary text stays display-only).
 - **OpenAI / xAI Responses** — reasoning continuity is chained across user

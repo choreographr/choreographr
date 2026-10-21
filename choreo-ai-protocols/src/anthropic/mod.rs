@@ -864,6 +864,15 @@ fn build_message_payloads<'a>(
                         });
                     }
                 }
+                // A message with no blocks at all (no text, no tool calls, no
+                // replayed thinking) carries nothing: providers reject an empty
+                // content array, and an assistant turn that produced no visible
+                // output gives the model nothing to read. Skipping keeps the
+                // history valid without fabricating output.
+                if blocks.is_empty() {
+                    debug!("skipping an assistant message with no content blocks");
+                    continue;
+                }
                 payloads.push(MessagePayload {
                     role: "assistant",
                     content: blocks,

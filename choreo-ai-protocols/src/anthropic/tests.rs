@@ -880,3 +880,42 @@ fn request_body_carries_configured_max_tokens_without_override() {
     let body = serialize_messages_request_with_max_tokens(effective_max_tokens(None, 4096));
     assert_eq!(body["max_tokens"], 4096);
 }
+
+#[test]
+fn build_message_payloads_skips_an_assistant_message_with_no_blocks() {
+    // An assistant turn that produced no visible output carries nothing, and
+    // Anthropic rejects an empty `content` array — so the payload is skipped,
+    // not sent empty (and not replaced with a fabricated utterance).
+    let msgs = vec![
+        ChatRequestMessage::simple("user", "q".to_string()),
+        ChatRequestMessage::simple("assistant", String::new()),
+    ];
+    let (payloads, _) = build_message_payloads(&msgs, &[], true).unwrap();
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads[0].role, "user");
+}
+
+#[test]
+fn build_message_payloads_keeps_an_assistant_message_carrying_only_thinking() {
+    // A reasoning-only turn whose artifact replays as thinking blocks is NOT
+    // empty: the blocks are the payload, so the payload survives.
+    use choreo_proto::ReasoningArtifact;
+
+    let msgs = vec![
+        ChatRequestMessage::simple("user", "q".to_string()),
+        ChatRequestMessage {
+            role: "assistant",
+            content: Some(String::new()),
+            images: Vec::new(),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_artifact: Some(ReasoningArtifact::AnthropicThinking(
+                br#"[{"type":"thinking","thinking":"hmm","signature":"sig_1"}]"#.to_vec(),
+            )),
+        },
+    ];
+    let (payloads, _) = build_message_payloads(&msgs, &[], true).unwrap();
+    assert_eq!(payloads.len(), 2);
+    assert_eq!(payloads[1].role, "assistant");
+    assert_eq!(payloads[1].content.len(), 1);
+}

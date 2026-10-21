@@ -207,7 +207,8 @@ mod tests {
             messages: &chat_wire_messages(
                 &[ChatRequestMessage::simple("user", "hello".into())],
                 ChatReasoningEcho::default(),
-            ),
+            )
+            .messages,
             tools: None,
             stream: false,
             stream_options: None,

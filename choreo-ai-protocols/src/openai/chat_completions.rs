@@ -257,7 +257,7 @@ pub(crate) fn chat_completions_request(
     );
     let body = serde_json::to_value(&ChatCompletionsRequest {
         model,
-        messages: &wire,
+        messages: &wire.messages,
         tools: None,
         stream: false,
         stream_options: None,
@@ -337,7 +337,7 @@ pub(crate) fn chat_completions_request_with_tools(
     );
     let body = serde_json::to_value(&ChatCompletionsRequest {
         model,
-        messages: &wire,
+        messages: &wire.messages,
         tools: Some(tools),
         stream: false,
         stream_options: None,
@@ -552,7 +552,7 @@ where
     );
     let body = serde_json::to_value(&ChatCompletionsRequest {
         model,
-        messages: &wire,
+        messages: &wire.messages,
         tools: None,
         stream: true,
         stream_options: Some(ChatCompletionsStreamOptions {
@@ -967,7 +967,7 @@ where
     );
     let body = serde_json::to_value(&ChatCompletionsRequest {
         model,
-        messages: &wire,
+        messages: &wire.messages,
         tools: Some(tools),
         stream: true,
         // Configurable stream_options — some OpenAI-compatible providers
@@ -1023,7 +1023,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::super::{ChatReasoningEcho, chat_wire_message, chat_wire_messages};
+    use super::super::{
+        AssistantToolCall, AssistantToolFunction, ChatReasoningEcho, chat_wire_message,
+        chat_wire_messages,
+    };
     use super::*;
 
     // -- finish_reason lenient deserialization -----------------------------
@@ -1677,7 +1680,8 @@ mod tests {
             messages: &chat_wire_messages(
                 &[ChatRequestMessage::simple("user", "hello".into())],
                 ChatReasoningEcho::default(),
-            ),
+            )
+            .messages,
             tools: None,
             stream: false,
             stream_options: None,
@@ -2393,6 +2397,108 @@ mod tests {
         let body = wire(&msg, declared(ChatReasoningField::ReasoningContent));
         assert_eq!(body["reasoning_content"], "");
         assert_eq!(body["content"], "answer");
+    }
+
+    // -- empty-message projection ----------------------------------------
+
+    /// Lower a slice, returning the wire roles and how many were dropped.
+    fn project(messages: &[ChatRequestMessage], echo: ChatReasoningEcho) -> (Vec<String>, usize) {
+        let lowered = chat_wire_messages(messages, echo);
+        (
+            lowered
+                .messages
+                .iter()
+                .map(|m| m.role().to_string())
+                .collect(),
+            lowered.dropped,
+        )
+    }
+
+    #[test]
+    fn empty_assistant_message_is_dropped() {
+        // An assistant turn that produced no visible content and carries no
+        // reasoning payload is dropped from the request rather than sent empty
+        // (a message with neither content nor tool calls is rejected outright).
+        let messages = vec![
+            ChatRequestMessage::simple("user", "q".into()),
+            ChatRequestMessage::simple("assistant", String::new()),
+        ];
+        assert_eq!(
+            project(&messages, ChatReasoningEcho::default()),
+            (vec!["user".to_string()], 1)
+        );
+    }
+
+    #[test]
+    fn whitespace_only_assistant_message_is_dropped() {
+        // A blank "answer" is not a payload: strict servers treat it as an empty
+        // message, so the projection trims before deciding.
+        let messages = vec![
+            ChatRequestMessage::simple("user", "q".into()),
+            ChatRequestMessage::simple("assistant", " \n\t ".into()),
+        ];
+        assert_eq!(
+            project(&messages, ChatReasoningEcho::default()),
+            (vec!["user".to_string()], 1)
+        );
+    }
+
+    #[test]
+    fn empty_assistant_message_with_a_reasoning_artifact_survives() {
+        // The echo IS the payload: dropping this message would starve the
+        // reasoning round-trip the route requires.
+        let mut msg = assistant_with(chat_artifact(ChatReasoningField::Reasoning, b"thinking"));
+        msg.content = Some(String::new());
+        let messages = vec![ChatRequestMessage::simple("user", "q".into()), msg];
+        let (roles, dropped) = project(&messages, declared(ChatReasoningField::ReasoningContent));
+        assert_eq!(roles, vec!["user".to_string(), "assistant".to_string()]);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn empty_assistant_message_with_tool_calls_survives() {
+        let mut msg = ChatRequestMessage::simple("assistant", String::new());
+        msg.tool_calls = Some(vec![AssistantToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: AssistantToolFunction {
+                name: "sh".into(),
+                arguments: "{}".into(),
+            },
+        }]);
+        let messages = vec![ChatRequestMessage::simple("user", "q".into()), msg];
+        let (roles, dropped) = project(&messages, ChatReasoningEcho::default());
+        assert_eq!(roles, vec!["user".to_string(), "assistant".to_string()]);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn required_empty_field_does_not_keep_an_empty_message_alive() {
+        // The required-field empty string is a presence marker, not a payload: a
+        // still-empty assistant message is dropped even on a route that declares
+        // the field.
+        let messages = vec![
+            ChatRequestMessage::simple("user", "q".into()),
+            ChatRequestMessage::simple("assistant", String::new()),
+        ];
+        assert_eq!(
+            project(&messages, declared(ChatReasoningField::ReasoningContent)),
+            (vec!["user".to_string()], 1)
+        );
+    }
+
+    #[test]
+    fn non_assistant_messages_are_never_dropped() {
+        // The projection only removes assistant messages: every other role is
+        // part of the history the request was built from, so a request can never
+        // end up with an empty messages array.
+        let messages = vec![
+            ChatRequestMessage::simple("system", String::new()),
+            ChatRequestMessage::simple("user", String::new()),
+        ];
+        let (roles, dropped) = project(&messages, ChatReasoningEcho::default());
+        assert_eq!(roles, vec!["system".to_string(), "user".to_string()]);
+        assert_eq!(dropped, 0);
     }
 
     // -- per-call output cap (cache-warming ping) --------------------------

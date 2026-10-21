@@ -210,14 +210,16 @@ fn build_report(
 
     // Wire accounting: lower the messages with the chat adapter's own policy
     // application, so this dry-run cannot invent a different key than the real
-    // request. The counts are what the upstream would actually see.
+    // request — and cannot count a message the lowering drops. The counts are
+    // what the upstream would actually see.
     let wire = chat_wire_messages(&messages, echo);
+    let dropped = wire.dropped;
     let mut assistant_count = 0usize;
     let mut wire_reasoning_count = 0usize;
     let mut wire_required_missing = 0usize;
     let mut wire_empty: Vec<String> = Vec::new();
-    for (msg_index, (m, w)) in messages.iter().zip(&wire).enumerate() {
-        if m.role != "assistant" {
+    for (msg_index, w) in wire.messages.iter().enumerate() {
+        if w.role() != "assistant" {
             continue;
         }
         assistant_count += 1;
@@ -245,20 +247,20 @@ fn build_report(
             .get("tool_calls")
             .and_then(|tc| tc.as_array())
             .is_some_and(|arr| !arr.is_empty());
-        // "must not be empty" hazard: an assistant message with no content,
-        // no tool calls, and no non-empty reasoning echo is exactly what
-        // OpenAI-compatible providers reject with a 400.
+        // Empty-message alarm: the lowering drops these, so a survivor with no
+        // content, no tool calls, and no non-empty reasoning echo means the drop
+        // predicate and the serialization have drifted apart.
         let content_empty = value
             .get("content")
             .and_then(|c| c.as_str())
-            .is_none_or(str::is_empty);
+            .is_none_or(|text| text.trim().is_empty());
         let reasoning_non_empty = keys
             .iter()
             .filter_map(|k| value.get(*k).and_then(|v| v.as_str()))
-            .any(|s| !s.is_empty());
+            .any(|s| !s.trim().is_empty());
         if content_empty && !has_tools && !reasoning_non_empty {
             wire_empty.push(format!(
-                "  position {msg_index}: \"must not be empty\" 400 candidate"
+                "  position {msg_index}: empty assistant message survived the projection"
             ));
         }
     }
@@ -294,12 +296,23 @@ fn build_report(
         // lockstep.
         let include_artifact = include_reasoning_artifact(turn, &provider, &model, passback);
         let echo_has_artifact = include_artifact && turn.reasoning_artifact.is_some();
+        // Whether the turn's assistant message survives the lowering at all: the
+        // projection drops an assistant message with no non-blank content and no
+        // tool calls (whitespace-only counts as empty). Mirrors
+        // `ChatWireMessage::is_empty`, so the ledger and the wire agree.
+        let survives = turn
+            .assistant_text
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
+            || !turn.tool_calls.is_empty();
         // Whether this turn's assistant message carries A reasoning key on the
         // wire: the artifact (under the declared field, else the observed one),
         // or the required field as an empty string when there is nothing to
-        // echo. Mirrors `ChatWireMessage::reasoning_field` exactly.
-        let wire_present =
-            !turn.undone && has_assistant_msg && (echo_has_artifact || echo.require_present);
+        // echo. A required-but-empty field is not a payload, so it cannot keep a
+        // message the projection drops. Mirrors `ChatWireMessage` exactly.
+        let wire_present = !turn.undone
+            && has_assistant_msg
+            && (echo_has_artifact || (echo.require_present && survives));
 
         let echo_label = if !has_assistant_msg {
             "n/a".to_string()
@@ -445,10 +458,11 @@ fn build_report(
     );
     let _ = writeln!(
         out,
-        "  turns={} assistant_messages={} messages_on_wire={}",
+        "  turns={} assistant_messages_on_wire={} dropped={} messages_on_wire={}",
         state.turns.len(),
         assistant_count,
-        messages.len()
+        dropped,
+        wire.messages.len()
     );
     out.push_str(&mcp_section(ctx));
     out.push('\n');
@@ -474,12 +488,18 @@ fn build_report(
             fmt_field(echo.field.unwrap_or(ChatReasoningField::ReasoningContent))
         );
     }
+    if dropped > 0 {
+        let _ = writeln!(
+            out,
+            "  projection dropped {dropped} assistant message(s) that would have carried nothing (the model does not see them)"
+        );
+    }
     if wire_empty.is_empty() {
         out.push_str("  empty assistant message(s) on the wire: none\n");
     } else {
         let _ = write!(
             out,
-            "  empty assistant message(s) on the wire (\"must not be empty\" 400 candidates):\n{}\n",
+            "  empty assistant message(s) on the wire (the drop predicate and the serializer have drifted):\n{}\n",
             wire_empty.join("\n")
         );
     }
@@ -986,11 +1006,11 @@ mod tests {
     }
 
     #[test]
-    fn requires_rc_empty_content_turn_without_artifact_is_reported() {
-        // Same reasoning-only shape but NO artifact available to fill the
-        // message: the builder cannot self-heal, so the report must surface
-        // the wire-empty candidate (the provider's "must not be empty" 400)
-        // and the daemon guard must count it as a problem.
+    fn wire_empty_turn_without_artifact_is_dropped_from_the_projection() {
+        // Same reasoning-only shape but NO artifact to fill the message: the
+        // projection drops the empty assistant message, so it never reaches the
+        // wire at all — and the guard still reports the turn, because it left the
+        // model's view of the conversation.
         let (_dir, ctx) = seed(
             42,
             42,
@@ -999,14 +1019,16 @@ mod tests {
         );
         let out = run(&ctx, inspect_args(None));
         assert!(
-            out.contains(
-                "empty assistant message(s) on the wire (\"must not be empty\" 400 candidates)"
-            ),
-            "wire-empty candidate surfaced: {out}"
+            out.contains("projection dropped 1 assistant message(s)"),
+            "the drop is reported: {out}"
+        );
+        assert!(
+            out.contains("empty assistant message(s) on the wire: none"),
+            "nothing empty survives to the wire: {out}"
         );
         assert!(
             out.contains("daemon guard warn_on_uncaptured_reasoning: 1 problem(s)"),
-            "guard flags the unfixable turn: {out}"
+            "guard flags the turn the model will not see: {out}"
         );
         assert!(out.contains("ledger vs wire: OK"), "{out}");
     }
@@ -1044,11 +1066,10 @@ mod tests {
     }
 
     #[test]
-    fn wire_empty_turn_without_artifact_reported_on_non_requires_rc_provider() {
-        // Same reasoning-only shape on groq but NO artifact: the builder
-        // cannot self-heal and the guard must flag it — the generalization of
-        // the DeepSeek-only wire-empty flag to every echo-capable chat
-        // provider.
+    fn wire_empty_turn_without_artifact_dropped_on_non_requires_rc_provider() {
+        // Same reasoning-only shape on groq but NO artifact: the projection drops
+        // the empty assistant message on any chat route, and the guard flags the
+        // turn — the DeepSeek-only behaviour generalized to every chat provider.
         let (_dir, ctx) = seed(
             42,
             42,
@@ -1057,14 +1078,16 @@ mod tests {
         );
         let out = run(&ctx, inspect_args(None));
         assert!(
-            out.contains(
-                "empty assistant message(s) on the wire (\"must not be empty\" 400 candidates)"
-            ),
-            "wire-empty candidate surfaced: {out}"
+            out.contains("projection dropped 1 assistant message(s)"),
+            "the drop is reported: {out}"
+        );
+        assert!(
+            out.contains("empty assistant message(s) on the wire: none"),
+            "nothing empty survives to the wire: {out}"
         );
         assert!(
             out.contains("daemon guard warn_on_uncaptured_reasoning: 1 problem(s)"),
-            "guard flags the unfixable turn: {out}"
+            "guard flags the turn the model will not see: {out}"
         );
         assert!(out.contains("ledger vs wire: OK"), "{out}");
     }

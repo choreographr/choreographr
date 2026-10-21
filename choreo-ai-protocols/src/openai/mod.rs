@@ -272,19 +272,68 @@ pub struct ChatWireMessage<'a> {
     echo: ChatReasoningEcho,
 }
 
+/// The chat-completions wire view of a message slice under one route policy.
+pub struct ChatWireMessages<'a> {
+    /// The messages that will actually be sent, in order.
+    pub messages: Vec<ChatWireMessage<'a>>,
+    /// How many messages were dropped because they would have carried nothing.
+    pub dropped: usize,
+}
+
 /// Lower a message slice for the chat-completions wire under one route policy.
+///
+/// Assistant messages that would carry nothing at all — no non-empty content,
+/// no tool calls, no images, and no non-empty reasoning payload — are dropped
+/// rather than sent empty. Every reference implementation of this history
+/// projection does the same, because a message with neither content nor tool
+/// calls is rejected outright by OpenAI-compatible servers and by chat
+/// providers generally, and an assistant turn that produced no visible output
+/// carries no information the model can use.
+///
+/// Two things are deliberately preserved:
+///
+/// - a message whose only payload is a replayed **reasoning artifact** is not
+///   empty and always survives (dropping it would starve the echo the route
+///   requires — the failure this projection must not reintroduce);
+/// - a required-field *empty* string is not a payload, so it does not keep an
+///   otherwise-empty message alive.
+///
+/// Only the assistant role is dropped: the history always keeps at least the
+/// user/system turns it was built from, so a request can never end up with an
+/// empty `messages` array.
 #[must_use]
 pub fn chat_wire_messages(
     messages: &[ChatRequestMessage],
     echo: ChatReasoningEcho,
-) -> Vec<ChatWireMessage<'_>> {
-    messages
-        .iter()
-        .map(|message| ChatWireMessage { message, echo })
-        .collect()
+) -> ChatWireMessages<'_> {
+    let mut kept = Vec::with_capacity(messages.len());
+    let mut dropped = 0usize;
+    for message in messages {
+        let wire = ChatWireMessage { message, echo };
+        if wire.is_empty() {
+            dropped += 1;
+            continue;
+        }
+        kept.push(wire);
+    }
+    if dropped > 0 {
+        debug!(
+            dropped,
+            sent = kept.len(),
+            "dropped empty chat messages from the request"
+        );
+    }
+    ChatWireMessages {
+        messages: kept,
+        dropped,
+    }
 }
 
 /// Lower one message for the chat-completions wire under one route policy.
+///
+/// Prefer [`chat_wire_messages`] for a request build: it also drops the
+/// assistant messages that would carry nothing. This projection keeps the
+/// message as given, for diagnostics that must see every turn.
 #[must_use]
 pub fn chat_wire_message(
     message: &ChatRequestMessage,
@@ -304,6 +353,44 @@ fn reasoning_wire_key(field: ChatReasoningField) -> &'static str {
 }
 
 impl ChatWireMessage<'_> {
+    /// The message role (`"system"`, `"user"`, `"assistant"`, or `"tool"`).
+    #[must_use]
+    pub fn role(&self) -> &'static str {
+        self.message.role
+    }
+
+    /// Whether this message would carry nothing at all on the wire.
+    ///
+    /// "Nothing" means: no non-empty content (whitespace-only counts as empty —
+    /// strict servers treat it as an empty message), no tool calls, no images,
+    /// and no non-empty reasoning payload. A required-field *empty* string is
+    /// not a payload, so an assistant message that only carries that is empty
+    /// too.
+    ///
+    /// Only assistant messages can be emptied by the projection: every other
+    /// role is part of the history the request was built from.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        if self.message.role != "assistant" {
+            return false;
+        }
+        let has_content = self
+            .message
+            .content
+            .as_deref()
+            .is_some_and(|content| !content.trim().is_empty());
+        let has_tool_calls = self
+            .message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty());
+        let has_images = !self.message.images.is_empty();
+        let has_reasoning = self
+            .reasoning_field()
+            .is_some_and(|(_, text)| !text.trim().is_empty());
+        !has_content && !has_tool_calls && !has_images && !has_reasoning
+    }
+
     /// The reasoning (key, value) this message carries, if any — the single
     /// decision point for reasoning re-emission: exactly one key or none.
     fn reasoning_field(&self) -> Option<(&'static str, String)> {
@@ -955,9 +1042,17 @@ pub(crate) fn messages_to_responses_input(
                 }
                 // Content is a plain string, or an array of input_text/
                 // input_image parts when the message carries images. A message
-                // with neither text nor images is skipped (as before — an
-                // empty input item would be meaningless).
-                if msg.content.is_some() || !msg.images.is_empty() {
+                // with neither text nor images is skipped (an empty input item
+                // would be meaningless) — and for an assistant turn the
+                // replayed reasoning items above still ride, so a
+                // reasoning-only turn keeps its continuity payload without an
+                // empty message beside it.
+                if msg
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| !content.trim().is_empty())
+                    || !msg.images.is_empty()
+                {
                     items.push(responses_input_item_value(
                         &responses::ResponsesInputItem::Message {
                             role: msg.role.to_string(),

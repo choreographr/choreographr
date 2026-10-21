@@ -382,3 +382,90 @@ fn observed_other_field_never_starves_a_declared_echo_field() {
         );
     }
 }
+
+/// A reasoning-only turn whose artifact never made it into the session is
+/// dropped from the request rather than sent as an empty assistant message
+/// (which every provider rejects: chat servers with "must not be empty",
+/// Anthropic and Gemini with an empty content/parts array). The turn stays in
+/// the session, so the transcript still shows what happened.
+#[ignore = "integration"]
+#[test]
+fn empty_assistant_turn_is_dropped_from_the_request() {
+    let mut session = SessionState::empty();
+    // Turn 1: a real answer, so the session has shape around the empty turn.
+    add_tool_turn_observed(
+        &mut session,
+        "What's the weather?",
+        "thinking",
+        ChatReasoningField::ReasoningContent,
+        "deepseek",
+        "deepseek-v4-pro",
+    );
+    // Turn 2: reasoning-only, content empty, no tool calls, no artifact.
+    let (tid, _) = session.start_turn(Some("continue".to_string()));
+    session.set_assistant_response(
+        tid,
+        AssistantResponse {
+            text: Some(String::new()),
+            reasoning: Some("displayed but never captured".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let mock = MockProvider::start(vec![(200, "application/json", final_text_response())]);
+    let client = OpenAiClient::new(
+        ServiceConfig {
+            base_url: mock.base_url("v1"),
+            provider_slug: "deepseek".to_string(),
+            streaming: false,
+            retry_max_attempts: 1,
+            connect_timeout_secs: 5,
+            request_timeout_secs: 30,
+            total_timeout_secs: 60,
+            chat_completions_max_tokens_field: MaxTokensField::MaxCompletionTokens,
+            ..Default::default()
+        },
+        RequestAuth::api_key("test-key"),
+        &choreo_ai_protocols::SocketRegistry::new(),
+    )
+    .expect("openai client");
+
+    let messages = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro", None);
+    client
+        .chat_completion_turn(ChatTurnRequest {
+            model: "deepseek-v4-pro",
+            messages: &messages,
+            tools: &[],
+            thinking_effort: "high".to_string(),
+            on_retry: &mut None,
+            on_uploaded: None,
+            cancel_rx: None,
+            previous_response_id: None,
+            tool_results: &[],
+            programmatic_tool_calling: false,
+            session_id: "42".to_string(),
+            request_id: "7".to_string(),
+            max_output_tokens_override: None,
+            no_retry: false,
+        })
+        .expect("turn succeeds");
+
+    let requests = mock.requests();
+    let body = requests[0].body_json();
+    for message in body["messages"].as_array().expect("messages array") {
+        // The invariant the projection enforces: an assistant message always
+        // carries something — non-blank content or tool calls, never neither.
+        if message["role"] == "assistant" {
+            let has_content = message["content"]
+                .as_str()
+                .is_some_and(|content| !content.trim().is_empty());
+            let has_tool_calls = message["tool_calls"]
+                .as_array()
+                .is_some_and(|calls| !calls.is_empty());
+            assert!(
+                has_content || has_tool_calls,
+                "no empty assistant message may reach the wire: {message}",
+            );
+        }
+    }
+}

@@ -335,15 +335,24 @@ pub(crate) fn include_reasoning_artifact(
 }
 
 /// Whether the turn's assistant message would be EMPTY on the wire (no
-/// content and no tool calls) — the shape OpenAI-compatible chat providers
-/// reject with "the message ... with role 'assistant' must not be empty".
-/// Tool-call turns always serialize a non-empty `tool_calls` array, and text
-/// with only whitespace still serializes a non-empty string, so the only way
-/// to reach this state is a recorded `assistant_text` of `""` (or `None`,
-/// which emits no assistant message at all — callers guard with
-/// `has_assistant_message` first).
+/// non-blank content and no tool calls).
+///
+/// This is the shape every provider rejects — chat servers with "the message
+/// ... with role 'assistant' must not be empty", Anthropic and Gemini with an
+/// empty content/parts array — and the shape the protocol lowerings drop from
+/// the projection rather than send. Whitespace-only text counts as empty: a
+/// blank message reads as nothing to a model and is rejected by strict
+/// servers, so a leading/trailing-whitespace "answer" is not a payload.
+///
+/// Tool-call turns always serialize a non-empty `tool_calls` array, and a turn
+/// that never produced an assistant message is the caller's concern
+/// (`has_assistant_message`), so neither can reach here.
 fn turn_is_wire_empty(turn: &Turn) -> bool {
-    turn.tool_calls.is_empty() && turn.assistant_text.as_deref().is_none_or(str::is_empty)
+    turn.tool_calls.is_empty()
+        && turn
+            .assistant_text
+            .as_deref()
+            .is_none_or(|text| text.trim().is_empty())
 }
 
 /// Resolve the starting `previous_response_id` for a new agent-loop
@@ -386,22 +395,24 @@ pub(crate) fn initial_prev_resp_id(
 ///
 /// Two independent degradations, neither of which the adapter can repair:
 ///
-/// 1. **Wire-empty assistant message** — the turn recorded no content and no
-///    tool calls, and no same-model artifact will fill it. OpenAI-compatible
-///    chat providers reject such a message outright ("the message ... with
-///    role 'assistant' must not be empty"), and the required-field empty
-///    string is no substitute for a real payload.
+/// 1. **Wire-empty assistant turn** — the turn recorded no non-blank content and
+///    no tool calls, and no same-model artifact will fill it. Every protocol
+///    lowering drops such a message rather than send it (an empty assistant
+///    message is rejected by chat servers, Anthropic, and Gemini alike), so the
+///    turn silently leaves the model's view of the conversation.
 /// 2. **Capture loss** — the turn's reasoning was displayed in the session but
 ///    never captured as an artifact, so the echo degrades to an empty field
 ///    (or disappears entirely on a route that declares none).
 ///
-/// Deliberately NOT a policy test: which field carries the echo, and whether it
-/// must be present, is the adapter's decision from the catalog fact, so a turn
-/// without an artifact is not itself a hazard — only the two shapes above are.
-/// The previous policy-shaped version gated on the DeepSeek/Kimi
-/// `reasoning_content` flag and flagged every tool turn the model happened to
-/// answer without thinking (five spurious warnings on one request) while
-/// missing the real failure mode entirely.
+/// Both are reported as warnings about *information*, not request validity: the
+/// request is already safe, because a dropped message cannot be invalid. That is
+/// also why this guard no longer looks at the echo policy — which field carries
+/// the echo, and whether its presence is mandatory, is the adapter's decision
+/// from the catalog fact, and an assistant turn without an artifact is not a
+/// hazard on its own. The previous policy-shaped version gated on the
+/// `DeepSeek`/Kimi `reasoning_content` flag and flagged every tool turn the model
+/// happened to answer without thinking (five spurious warnings on one request)
+/// while missing the real failure mode entirely.
 ///
 /// Returns the number of turns flagged, so tests can exercise the path
 /// deterministically; turn-level diagnosis of a whole request belongs to the
@@ -432,8 +443,8 @@ pub(crate) fn warn_on_uncaptured_reasoning(
                 turn_id,
                 provider_slug,
                 model,
-                "assistant turn is empty on the wire and no artifact can fill it; \
-                 providers reject an empty assistant message",
+                "assistant turn has no visible content and no artifact to replay; \
+                 it is dropped from the request and the model will not see it",
             );
             continue;
         }
