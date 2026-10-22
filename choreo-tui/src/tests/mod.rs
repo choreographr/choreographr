@@ -8,7 +8,9 @@
 //!
 //! To add a test module, create `tests/<subject>.rs` and add one `mod
 //! <subject>;` line here — do not declare test modules from `lib.rs`, which
-//! keeps that file's module list free of test-only entries.
+//! keeps that file's module list free of test-only entries. A subject too large
+//! for one file becomes a directory module (`tests/<subject>/mod.rs` declaring
+//! one child per subject); the parent's own `mod` list is unchanged either way.
 
 pub(crate) mod support;
 
