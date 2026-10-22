@@ -1,16 +1,21 @@
 //! The terminal-safety filter: one fused pass that makes untrusted text safe to
 //! measure and draw in a terminal cell grid.
 //!
-//! Two sinks share it, and they differ only in how a complete SGR colour
-//! sequence is treated. [`normalize_ansi_text`] is the *ANSI* sink: it keeps
-//! `ESC [ params m` verbatim, because the caller hands the text to an ANSI
-//! parser that turns it into styling. [`normalize_display_text`] is the plain
-//! sink: nothing downstream parses escape sequences, so it escapes them like
-//! any other control character.
+//! Three sinks share it. Two of them *escape*, and they differ only in how a
+//! complete SGR colour sequence is treated. [`normalize_ansi_text`] is the
+//! *ANSI* sink: it keeps `ESC [ params m` verbatim, because the caller hands the
+//! text to an ANSI parser that turns it into styling.
+//! [`normalize_display_text`] is the plain sink: nothing downstream parses
+//! escape sequences, so it escapes them like any other control character. The
+//! third, [`sanitize_pasted_text`], is the *editing* ingest rule: text bound for
+//! the input buffer is **rewritten** instead — control characters dropped, tabs
+//! expanded, a CR folded to `\n` — with nothing escaped, so the bytes stored are
+//! the bytes drawn (see below).
 //!
-//! Both escape every other control character — including a lone CR, which would
-//! let hostile content overwrite its own rendered line (a CRLF pair is folded to
-//! a single `\n` first) — the line/paragraph separators U+2028/U+2029, and every
+//! Both escape-normalizers escape every other control character — including a
+//! lone CR, which would let hostile content overwrite its own rendered line (a
+//! CRLF pair is folded to a single `\n` first) — the line/paragraph separators
+//! U+2028/U+2029, and every
 //! Unicode *format* character except the joiners U+200C/U+200D. That last set is
 //! the shared [`is_unsafe_unicode`] policy owned by `choreo-sanitize`, so this
 //! sink classifies exactly the characters the daemon's sanitizers and the OSC
@@ -29,6 +34,18 @@
 //! Escaping happens *before* the ANSI sink's `contains("\x1b[")` gate, so only
 //! genuine (complete) SGR sequences ever reach the parser.
 //!
+//! **Why the editing rule drops instead of escaping.** The two display sinks own
+//! only the drawing, so they may rewrite text on its way to a cell grid. The
+//! input buffer is the opposite case: its bytes are exactly what the daemon
+//! receives, and the cursor is a byte offset into them, so the stored text has
+//! to *be* the drawn text — an injected `\u{1b}` would be characters the user
+//! never typed, and a cursor could not be trusted to land correctly among them.
+//! Dropping what the terminal cannot draw and expanding tabs gives that identity
+//! for free. This closes the last surface outside the measure==draw invariant:
+//! once a paste is sanitized, the editable buffer can contain no character whose
+//! measured and drawn widths disagree, so the editing exemption costs no
+//! measurement honesty.
+//!
 //! Column rule, in full (the wrapping/height math depends on it):
 //!
 //! * a `\n` resets the column to 0, so each logical line counts from its own
@@ -39,6 +56,12 @@
 //!   produced (`\u{1b}` is six columns of literal text), because that text is
 //!   what is drawn;
 //! * every other kept char advances it by its own display width.
+//!
+//! One bounded divergence is accepted as the cost of a char-wise pass: the column
+//! is counted with `UnicodeWidthChar::width`, while ratatui and the wrapping math
+//! use `UnicodeWidthStr::width`, and the two disagree for an emoji-presentation
+//! sequence (`❤️` = U+2764 U+FE0F measures 1 char-wise but 2 as a string), so a
+//! tab following one can pad a single column short.
 
 use std::borrow::Cow;
 
@@ -212,6 +235,79 @@ fn normalize_impl(text: &str, sgr_policy: SgrPolicy) -> String {
     out
 }
 
+/// The *editing* ingest rule: rewrite pasted text so it can live in an input
+/// buffer, which stores the bytes the daemon will receive and addresses the
+/// cursor by byte offset.
+///
+/// Rewrites rather than escapes, which is what distinguishes it from the two
+/// display sinks: an escaped control character would be text the user never
+/// typed, and it would sit between the cursor and the glyph it points at. So:
+///
+/// * a CRLF pair folds to a single `\n`, and a lone `\r` becomes `\n` — a
+///   carriage return cannot be stored in the buffer at all;
+/// * each tab expands to spaces up to the next [`TAB_STOP`] column of the current
+///   logical line, counted exactly as [`normalize_impl`] counts it (a `\n`
+///   resets the column, every kept char advances it by its own display width);
+/// * every character [`terminal_keeps`] rejects is dropped — all C0/C1 controls
+///   and DEL, the line/paragraph separators, and the non-joiner Unicode format
+///   class (bidi overrides, ZWSP, BOM, …). The joiners U+200C/U+200D survive, as
+///   they do everywhere else;
+/// * everything else is kept verbatim. Nothing is escaped: a `\u{1b}` the user
+///   actually typed stays the characters it is.
+///
+/// With control characters gone and tabs expanded, the buffer holds no character
+/// whose measured and drawn widths can disagree — so the prompt's wrapping,
+/// which measures with `UnicodeWidthStr::width`, measures exactly what ratatui
+/// draws, and the cursor's byte offset stays honest.
+///
+/// Clean text borrows: the common case costs one scan and no allocation.
+pub(crate) fn sanitize_pasted_text(text: &str) -> Cow<'_, str> {
+    // A tab or a CR always needs rewriting; anything else only if the per-char
+    // predicate rejects it. `terminal_keeps` reports tabs as kept (the display
+    // sinks expand them in the same pass), so this checks them separately.
+    if !text.contains(['\t', '\r']) && text.chars().all(terminal_keeps) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    // Print column within the current logical line — the same state, and the
+    // same rule, as `normalize_impl`, so a tab lands on the same stop here as it
+    // would in a displayed result.
+    let mut col = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        // A CR can never be stored: CRLF is a normal line ending and folds to a
+        // single `\n`, and a lone CR becomes a newline too rather than reaching
+        // the daemon as a byte that would overwrite the drawn line.
+        if c == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next(); // consume the '\n' of the pair
+            }
+            out.push('\n');
+            col = 0;
+            continue;
+        }
+        match c {
+            '\t' => {
+                let pad = TAB_STOP - (col % TAB_STOP);
+                out.extend(std::iter::repeat_n(' ', pad));
+                col += pad;
+            }
+            '\n' => {
+                out.push('\n');
+                col = 0;
+            }
+            _ if terminal_keeps(c) => {
+                out.push(c);
+                col += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            }
+            // Every control and spoofing char is dropped, not escaped — the
+            // editing rule cannot expand what it stores (see the doc above).
+            _ => {}
+        }
+    }
+    Cow::Owned(out)
+}
+
 /// Standard terminal tab-stop interval.  No width library agrees with what
 /// ratatui draws for a tab: `unicode-width` counts `\t` as **one** column
 /// inside a string, while ratatui filters control characters out of the
@@ -223,19 +319,22 @@ fn normalize_impl(text: &str, sgr_policy: SgrPolicy) -> String {
 /// `Line::width`, height `div_ceil`, fill padding, code-box padding) measure
 /// exactly what ratatui draws, and keeps tab-aligned columns aligned — matching
 /// what the raw bytes would have shown on a terminal with 4-wide tab stops.
-pub(crate) const TAB_STOP: usize = 4;
+const TAB_STOP: usize = 4;
 
 /// Whether a single char passes through the terminal filter unchanged: tabs,
 /// newlines, printable ASCII, and safe non-ASCII. Everything else — every
-/// C0/C1 control (including lone CR; a CRLF pair is folded to `\n` by
-/// [`normalize_impl`] before this predicate runs), the line/paragraph
-/// separators, and the non-joiner format-char spoofing class via the shared
-/// [`is_unsafe_unicode`] predicate (owned by `choreo-sanitize`, the same
-/// policy the daemon's sanitizers use) — is escaped. SGR sequences are
-/// handled separately by the filter (kept whole), so the per-char predicate
-/// needs no ESC case.  Tabs are reported as kept because they survive the
-/// escaping step; [`normalize_impl`] expands them to spaces in the same pass.
-pub(crate) fn terminal_keeps(c: char) -> bool {
+/// C0/C1 control (the `Cc` category, exactly the predicate
+/// [`crate::terminal::is_control_char`] applies to OSC payloads; a lone CR is
+/// folded to `\n` by [`normalize_impl`] and [`sanitize_pasted_text`] before
+/// this predicate runs), the line/paragraph separators, and the non-joiner
+/// format-char spoofing class via the shared [`is_unsafe_unicode`] predicate
+/// (owned by `choreo-sanitize`, the same policy the daemon's sanitizers use) —
+/// is escaped by the display sinks and dropped by [`sanitize_pasted_text`]. SGR
+/// sequences are handled separately by the display sinks (kept whole), so the
+/// per-char predicate needs no ESC case.  Tabs are reported as kept because they
+/// survive the classification step; both callers expand them to spaces in the
+/// same pass.
+fn terminal_keeps(c: char) -> bool {
     c == '\t'
         || c == '\n'
         || (c.is_ascii() && (' '..='~').contains(&c))
@@ -700,5 +799,91 @@ mod tests {
                 );
             }
         });
+    }
+
+    // ── sanitize_pasted_text (the editing ingest rule) ────────────────
+
+    #[test]
+    fn sanitize_pasted_text_borrows_clean_text_unchanged() {
+        // The overwhelmingly common paste — clean text — costs one scan and no
+        // allocation, and comes back byte-identical.
+        let clean = "plain 日本語 text\nwith lines";
+        assert_eq!(sanitize_pasted_text(clean).as_ref(), clean);
+        assert!(matches!(sanitize_pasted_text(clean), Cow::Borrowed(_)));
+        assert!(matches!(sanitize_pasted_text(""), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn sanitize_pasted_text_drops_escapes_instead_of_escaping_them() {
+        // The editing rule stores text the user will submit, so a control
+        // character is *dropped* — never expanded into the `\u{1b}` escape text
+        // the display sinks produce (that would be characters nobody typed).
+        assert_eq!(sanitize_pasted_text("\x1b[31mred").as_ref(), "[31mred");
+        assert_eq!(sanitize_pasted_text("a\x1bb").as_ref(), "ab");
+        assert_eq!(sanitize_pasted_text("\x1b").as_ref(), "");
+        assert_ne!(
+            sanitize_pasted_text("\x1b[31m").as_ref(),
+            "\\u{1b}[31m",
+            "a pasted ESC must be dropped, not escaped"
+        );
+        // A literal `\u{1b}` the user actually typed is printable text and
+        // passes through verbatim — nothing is re-escaped.
+        assert_eq!(sanitize_pasted_text("\\u{1b}").as_ref(), "\\u{1b}");
+    }
+
+    #[test]
+    fn sanitize_pasted_text_expands_tabs_to_the_next_stop() {
+        // Tab stops follow the same 4-column rule the display sinks use.
+        assert_eq!(sanitize_pasted_text("\tfoo").as_ref(), "    foo");
+        // "abc" sits at column 3, so the next stop is 4 (one space).
+        assert_eq!(sanitize_pasted_text("abc\tdef").as_ref(), "abc def");
+        // "1234567" fills column 7; a tab there advances one column to 8.
+        assert_eq!(sanitize_pasted_text("1234567\tx").as_ref(), "1234567 x");
+        // Column tracking restarts after every newline.
+        assert_eq!(sanitize_pasted_text("a\tb\n\tc").as_ref(), "a   b\n    c");
+    }
+
+    #[test]
+    fn sanitize_pasted_text_expands_tab_after_wide_char() {
+        // "日" occupies two columns, so a tab at column 2 pads two spaces to
+        // reach the stop at 4.
+        assert_eq!(sanitize_pasted_text("日\tx").as_ref(), "日  x");
+    }
+
+    #[test]
+    fn sanitize_pasted_text_folds_carriage_returns() {
+        // A CR cannot be stored: CRLF folds to one newline, and a lone CR
+        // becomes a newline rather than overwriting the drawn line.
+        assert_eq!(sanitize_pasted_text("one\r\ntwo").as_ref(), "one\ntwo");
+        assert_eq!(sanitize_pasted_text("a\rb").as_ref(), "a\nb");
+        assert_eq!(sanitize_pasted_text("a\r").as_ref(), "a\n");
+        assert!(!sanitize_pasted_text("a\r\nb\rc").contains('\r'));
+    }
+
+    #[test]
+    fn sanitize_pasted_text_drops_controls_and_separators() {
+        // DEL, backspace and BEL leave no trace in the stored buffer.
+        assert_eq!(sanitize_pasted_text("a\x7f\x08\x07b").as_ref(), "ab");
+        // A bidi override, a zero-width space and a line separator are dropped
+        // too, so a paste cannot smuggle an invisible reordering character into
+        // the prompt.
+        assert_eq!(sanitize_pasted_text("a\u{202e}b").as_ref(), "ab");
+        assert_eq!(sanitize_pasted_text("a\u{2028}b").as_ref(), "ab");
+        assert_eq!(sanitize_pasted_text("a\u{200b}b").as_ref(), "ab");
+    }
+
+    #[test]
+    fn sanitize_pasted_text_keeps_the_joiners() {
+        // U+200C/U+200D survive, exactly as they do at the display sinks.
+        assert_eq!(sanitize_pasted_text("a\u{200c}b").as_ref(), "a\u{200c}b");
+        assert_eq!(sanitize_pasted_text("a\u{200d}b").as_ref(), "a\u{200d}b");
+    }
+
+    #[test]
+    fn sanitize_pasted_text_of_only_controls_is_empty() {
+        // A paste of nothing but control characters sanitizes away entirely —
+        // the caller then edits nothing at all.
+        assert_eq!(sanitize_pasted_text("\x1b\x07\x7f\u{202e}").as_ref(), "");
+        assert!(sanitize_pasted_text("\x00\x01\x02").is_empty());
     }
 }

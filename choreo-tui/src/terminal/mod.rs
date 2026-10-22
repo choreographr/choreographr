@@ -64,13 +64,14 @@ pub(crate) fn write(seq: &str) {
 /// report) and the bytes a raw `ESC`/`ST` in a title could use to inject or
 /// terminate a sequence, so every OSC family strips them before framing.
 ///
-/// This stays a hand-written byte-class test (rather than delegating to the
-/// shared Unicode policy) because the shared crate does not provide one: the
-/// control classes are a fixed C0/DEL/C1 range check that both needs to be
-/// exact — a C1 byte is enough to break a report — and needs no data table.
-/// The rest of the strip set comes from [`is_unsafe_display_char`].
+/// The name states the protocol rule this serves, but the classification is
+/// std's `char::is_control` — the Unicode `Cc` general category, which is exactly
+/// the C0/DEL/C1 set above. So it is by construction the same predicate the grid
+/// filter applies (`text_filter::terminal_keeps`), rather than a second range
+/// list that could drift from it. The rest of the strip set comes from
+/// [`is_unsafe_display_char`].
 pub(crate) fn is_control_char(c: char) -> bool {
-    matches!(u32::from(c), 0x00..=0x1F | 0x7F | 0x80..=0x9F)
+    c.is_control()
 }
 
 /// Whether `c` must be stripped from free text shown outside the terminal grid

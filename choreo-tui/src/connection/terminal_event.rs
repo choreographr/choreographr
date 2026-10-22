@@ -233,7 +233,23 @@ pub(crate) fn handle_terminal_event(
 /// selector's filter, when it is open) receives the paste; on the AI
 /// Providers page the credential modal's key input, or the wizard's
 /// provider filter / slug field, receives it.
+///
+/// Every paste target sits behind this one function, so it is the single choke
+/// point where untrusted clipboard bytes meet an editing buffer: the text is
+/// sanitized once, here, before any branch sees it.
 fn handle_paste_event(data: &str, app: &mut App) {
+    // The buffer's bytes are what the daemon receives and the cursor is a byte
+    // offset into them, so the paste is rewritten on the way in (control
+    // characters dropped, tabs expanded, CR folded) rather than escaped at draw
+    // time — see `text_filter::sanitize_pasted_text`.  A paste that sanitizes to
+    // nothing edits nothing, so it must return before any branch runs: the Chat
+    // branch, for one, detaches a recalled history entry on a real edit.
+    let sanitized = crate::text_filter::sanitize_pasted_text(data);
+    let data = sanitized.as_ref();
+    if data.is_empty() {
+        tracing::debug!("[choreo-tui] paste sanitized to nothing; ignoring");
+        return;
+    }
     match app.page {
         Page::Chat => {
             // While the model selector is open, pasted text goes into its
@@ -244,13 +260,11 @@ fn handle_paste_event(data: &str, app: &mut App) {
                 return;
             }
             tracing::debug!("[choreo-tui] pasting into chat input buffer");
-            // A non-empty paste mutates the buffer, so a recalled history entry
-            // detaches into the draft eagerly; an empty paste edits nothing and
-            // must leave browsing (and the recalled entry) intact.
-            if !data.is_empty() {
-                app.detach_history_on_edit();
-                app.input.insert_str_at_cursor(data);
-            }
+            // A recalled history entry detaches into the draft eagerly: the
+            // paste is known non-empty here (an empty or fully sanitized-away
+            // paste returned above), so this is always a real edit.
+            app.detach_history_on_edit();
+            app.input.insert_str_at_cursor(data);
             app.ensure_input_cursor_visible();
         }
         Page::AIProviders => {

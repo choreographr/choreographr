@@ -79,6 +79,13 @@ use ratatui::{
 /// rewriting the text on the way to the screen would both desync the cursor
 /// from the row it draws on and change what the user ends up submitting.
 ///
+/// That exemption costs no measurement honesty, because the buffer is sanitized
+/// where it is filled: every paste passes the terminal-event choke point's
+/// [`sanitize_pasted_text`](crate::text_filter::sanitize_pasted_text), which
+/// drops control characters, expands tabs and folds CR before the bytes enter
+/// any input buffer.  The raw bytes the widgets draw are therefore already
+/// measured-exactly-drawn text.
+///
 /// The one implementation is the terminal-safety filter's
 /// [`normalize_display_text`](crate::text_filter::normalize_display_text);
 /// this is the entry point for the plain widgets that share the same sink rule.

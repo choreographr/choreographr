@@ -1,7 +1,7 @@
 use crate::connection::handle_terminal_event;
 use crate::state::*;
-use crate::tests::support::test_app;
-use crossterm::event::Event;
+use crate::tests::support::{add_user_text, test_app};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 // ── Cursor & editing tests ────────────────────────────────────
 
@@ -140,6 +140,68 @@ fn paste_event_noop_on_unhandled_page() {
         .expect("handle paste on session manager page");
     assert_eq!(app.input.text, "unchanged");
     assert_eq!(app.input.cursor, 9);
+}
+
+#[test]
+fn paste_event_sanitizes_controls_and_expands_tabs() {
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+
+    // A hostile paste: an SGR-looking ESC, then text with a tab, then a CSI.
+    // The ESC bytes are dropped rather than escaped into visible `\u{1b}` text
+    // (the buffer stores what the daemon receives), and the tab expands to the
+    // next 4-column stop — column 6, so two spaces.
+    handle_terminal_event(
+        Event::Paste("\x1b[31mab\tcd\x1b[2J".to_string()),
+        &mut app,
+        &tx,
+    )
+    .expect("handle hostile paste");
+
+    assert_eq!(app.input.text, "[31mab  cd[2J");
+    assert_eq!(
+        app.input.cursor,
+        app.input.text.len(),
+        "cursor after the paste"
+    );
+    assert!(
+        !app.input.text.chars().any(char::is_control),
+        "no control character may land in the buffer: {:?}",
+        app.input.text
+    );
+    assert!(
+        !app.input.text.contains('\t'),
+        "a pasted tab must be expanded, not stored"
+    );
+}
+
+#[test]
+fn paste_event_of_only_control_characters_edits_nothing() {
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    add_user_text(&mut app, "recent prompt");
+
+    // Recall the entry so there is a browsing state a stray edit could detach.
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle up");
+    assert!(app.history_index.is_some());
+    assert_eq!(app.input.text, "recent prompt");
+
+    // A paste whose every byte is a control character sanitizes to nothing, so
+    // it must edit nothing at all — not the buffer, and not the browsing state.
+    handle_terminal_event(Event::Paste("\x1b\x07\x7f".to_string()), &mut app, &tx)
+        .expect("handle control-only paste");
+
+    assert!(
+        app.history_index.is_some(),
+        "a paste that sanitizes to nothing must not detach a recalled entry"
+    );
+    assert_eq!(app.input.text, "recent prompt");
+    assert_eq!(app.input.cursor, "recent prompt".len());
 }
 
 #[test]

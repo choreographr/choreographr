@@ -1789,7 +1789,10 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
   spaces, so the text measured is the text drawn. This is what makes the raw
   shell/VM streams safe to draw; it defends against terminal-escape injection (OSC-52
   clipboard writes, clear-screen, title changes, …) for every tool at once, including
-  the tools that never sanitize at the source.
+  the tools that never sanitize at the source. The module's third entry point,
+  `sanitize_pasted_text`, is the *editing* rule described under the two-tier policy
+  below: it rewrites rather than escapes, because its output is stored and submitted
+  rather than drawn.
 - **Model output is filtered at the same sink.** The markdown renderer (the
   response, the reasoning body, user text, and tool descriptions) runs
   `normalize_display_text` over its source before parsing it: the same fused pass with
@@ -1859,9 +1862,16 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
   selector, provider wizard) draw their raw bytes deliberately: those bytes are
   exactly what reaches the daemon, and the buffer's cursor is a byte offset into
   them, so normalizing on the way to the screen would desync the cursor from the
-  row it is drawn on and alter the text that gets submitted.  Everything the
-  user merely reads — including their own submitted turn text, once it is out of
-  the buffer — is normalized like any other displayed content.
+  row it is drawn on and alter the text that gets submitted.  That exemption
+  costs no measurement honesty, because a paste is sanitized at the paste choke
+  point before it reaches any of those buffers: `sanitize_pasted_text` drops
+  every character the terminal filter rejects (C0/C1 controls and DEL, the
+  line/paragraph separators, the non-joiner format class), expands tabs to
+  4-column stops, and folds CR to `\n` — rewriting rather than escaping, since an
+  injected `\u{1b}` would be text nobody typed. The buffer's bytes therefore stay
+  exactly what the daemon receives *and* measure exactly what draws.  Everything
+  the user merely reads — including their own submitted turn text, once it is out
+  of the buffer — is normalized like any other displayed content.
 
 **Streaming is byte-bounded end to end.** The bounded streaming channel only bounds
 *in-flight* chunks (backpressure); the *total* is capped too, so the live view can never
