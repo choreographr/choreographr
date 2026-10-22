@@ -2315,8 +2315,13 @@ fn scroll_mouse_outside_history_box_does_not_update_accumulator() {
     let mut app = test_app();
     app.history_viewport.height = 1;
 
-    let (_, height) = crossterm::terminal::size().expect("terminal size");
-    let row = height.saturating_sub(1); // input area, outside history box
+    // Pin a fixed terminal instead of querying the real one: the test runner
+    // may have no TTY at all, and the mouse arm only compares the row against
+    // `history_viewport`, so the bottom row of any terminal taller than the
+    // one-row history box is a position outside it.
+    let height = 24;
+    app.last_terminal_size = Some((80, height));
+    let row = height - 1; // input area, outside history box
 
     handle_terminal_event(
         Event::Mouse(MouseEvent {

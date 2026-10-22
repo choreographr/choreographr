@@ -141,7 +141,7 @@ jobs:
           tool: cargo-zigbuild
       - uses: mlugg/setup-zig@v2
         with:
-          # Pin the last Zig release zlob 1.6.5 accepts: Zig 0.17.0 rejects the
+          # Pin the last Zig release zlob 1.7.1 accepts: Zig 0.17.0 rejects the
           # `--global-cache-dir` flag its build.rs passes (see the header note).
           version: 0.16.0
 
@@ -233,7 +233,7 @@ jobs:
           tool: cargo-zigbuild
       - uses: mlugg/setup-zig@v2
         with:
-          # Pin the last Zig release zlob 1.6.5 accepts: Zig 0.17.0 rejects the
+          # Pin the last Zig release zlob 1.7.1 accepts: Zig 0.17.0 rejects the
           # `--global-cache-dir` flag its build.rs passes (see the header note).
           version: 0.16.0
 
@@ -298,7 +298,7 @@ jobs:
       # zlob's direct zig dependency.
       - uses: mlugg/setup-zig@v2
         with:
-          # Pin the last Zig release zlob 1.6.5 accepts: Zig 0.17.0 rejects the
+          # Pin the last Zig release zlob 1.7.1 accepts: Zig 0.17.0 rejects the
           # `--global-cache-dir` flag its build.rs passes (see the header note).
           version: 0.16.0
 
@@ -396,7 +396,7 @@ jobs:
       # see the macos job comment) — the Windows zip build is no exception.
       - uses: mlugg/setup-zig@v2
         with:
-          # Pin the last Zig release zlob 1.6.5 accepts: Zig 0.17.0 rejects the
+          # Pin the last Zig release zlob 1.7.1 accepts: Zig 0.17.0 rejects the
           # `--global-cache-dir` flag its build.rs passes (see the header note).
           version: 0.16.0
 
@@ -503,7 +503,7 @@ jobs:
       # satisfy it.
       - uses: mlugg/setup-zig@v2
         with:
-          # Pin the last Zig release zlob 1.6.5 accepts: Zig 0.17.0 rejects the
+          # Pin the last Zig release zlob 1.7.1 accepts: Zig 0.17.0 rejects the
           # `--global-cache-dir` flag its build.rs passes (see the header note).
           version: 0.16.0
 
@@ -687,7 +687,7 @@ jobs:
 
       - uses: mlugg/setup-zig@v2
         with:
-          # Pin the last Zig release zlob 1.6.5 accepts: Zig 0.17.0 rejects the
+          # Pin the last Zig release zlob 1.7.1 accepts: Zig 0.17.0 rejects the
           # `--global-cache-dir` flag its build.rs passes (see the header note).
           version: 0.16.0
         # The macOS aarch64 job above documents the same need: zlob (via

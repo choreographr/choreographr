@@ -40,6 +40,13 @@ test-integration = "nextest run --workspace --all-features --run-ignored only"
 # same "too heavy for casual builds" rationale that keeps it out of
 # `default-members` applies to the gate too.  Run its tests with `just test-gui`.
 test-all = "nextest run --workspace --all-targets --all-features --run-ignored all --exclude choreo-gui"
+# line/region coverage of exactly the `test-all` suite (same selection flags),
+# via cargo-llvm-cov ≥ 0.9.1 — older releases do not find the nextest test
+# binaries in the nightly build-dir layout and silently report a fraction of
+# the workspace. Append an output flag (`--lcov --output-path …`, `--html`,
+# `--summary-only`). Emit the report from this one invocation: a separate
+# `cargo llvm-cov report` step has the same blind spot and reports ~nothing.
+coverage = "llvm-cov nextest --workspace --all-targets --all-features --run-ignored all --exclude choreo-gui"
 
 # Clippy / fmt gate aliases — the single home of the AGENTS.md commit-gate flags
 # (see AGENTS.md → Commit Workflow), so the `justfile` recipes stay flag-free. The
