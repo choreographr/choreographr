@@ -1,5 +1,7 @@
 use super::super::*;
 
+use super::draw_rows;
+
 // ── markdown_lines ───────────────────────────────────────────────────
 
 #[test]
@@ -333,36 +335,6 @@ fn code_block_indented_wrapping() {
 }
 
 // ── Code box: tab-indented code ─────────────────────────────────────
-
-/// Draw `lines` into a `TestBackend` through the same non-wrapping
-/// `Paragraph` the chat history uses, returning one `String` per rendered row.
-///
-/// Drawing is what the box's alignment actually depends on: the rows' own
-/// [`Line::width`] values agree even when the *drawn* cells do not (a control
-/// character measures as one column and draws as none), so a width-only
-/// assertion cannot catch a desync between measurement and the screen.  The
-/// samples here are ASCII, so a char index in the returned string is also its
-/// display column.
-fn draw_rows(lines: &[Line<'static>], width: u16) -> Vec<String> {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-    use ratatui::widgets::Paragraph;
-
-    let height = u16::try_from(lines.len()).expect("row count fits a viewport");
-    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
-    let lines = lines.to_vec();
-    terminal
-        .draw(|frame| frame.render_widget(Paragraph::new(lines), frame.area()))
-        .expect("draw the paragraph");
-    let buffer = terminal.backend().buffer();
-    (0..height)
-        .map(|y| {
-            (0..width)
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>()
-        })
-        .collect()
-}
 
 #[test]
 fn code_box_tab_indented_rows_keep_the_frame_aligned() {

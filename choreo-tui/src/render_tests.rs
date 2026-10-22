@@ -2,6 +2,32 @@ use super::render::*;
 use choreo_proto::{SessionStatus, SessionSummary, TokenUsage};
 use ratatui::buffer::Cell;
 
+/// Draw one whole frame through `render` into a `TestBackend` and return the
+/// drawn cells as a flat string.
+///
+/// A test reads back the cells the backend actually holds, so the assertion is
+/// on what reaches the screen rather than on what a widget was asked to draw.
+/// The returned string preserves the buffer's row-major order, so `contains`
+/// and `find` splice it exactly as a reader sees the frame; a test that needs
+/// cell *styling* rather than symbols (a background-colour span) reads the
+/// buffer directly instead.
+fn drawn_cells(app: &mut crate::state::App, w: u16, h: u16) -> String {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    terminal
+        .draw(|frame| render(frame, app))
+        .expect("render a frame");
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(Cell::symbol)
+        .collect()
+}
+
 // ── format_status tests ──
 
 #[test]
@@ -123,8 +149,6 @@ fn session_detail_tokens_line_small_counts_pass_through() {
 #[test]
 fn render_model_selector_shows_title_filter_and_models() {
     use crate::test_util::test_app;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
 
     let mut app = test_app();
     app.model_selector.open();
@@ -138,19 +162,7 @@ fn render_model_selector_shows_title_filter_and_models() {
         false,
     );
 
-    let backend = TestBackend::new(80, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render with model selector open");
-
-    let content: String = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(Cell::symbol)
-        .collect();
+    let content = drawn_cells(&mut app, 80, 24);
     assert!(content.contains("Select Model"), "popup title is drawn");
     assert!(content.contains("gpt-4o"), "all models are listed");
     assert!(content.contains("gpt-4o-mini"));
@@ -161,42 +173,18 @@ fn render_model_selector_shows_title_filter_and_models() {
 #[test]
 fn render_model_selector_loading_and_error_states() {
     use crate::test_util::test_app;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
 
     // Loading state (selector just opened, reply not yet arrived).
     let mut app = test_app();
     app.model_selector.open();
-    let backend = TestBackend::new(80, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render loading state");
-    let content: String = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(Cell::symbol)
-        .collect();
+    let content = drawn_cells(&mut app, 80, 24);
     assert!(content.contains("Loading models"), "loading row is drawn");
 
     // Error state (the daemon rejected the model list request).
     let mut app = test_app();
     app.model_selector.open();
     app.model_selector.apply_error("no credential".to_string());
-    let backend = TestBackend::new(80, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render error state");
-    let content: String = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(Cell::symbol)
-        .collect();
+    let content = drawn_cells(&mut app, 80, 24);
     assert!(content.contains("no credential"), "error row is drawn");
 }
 
@@ -205,26 +193,12 @@ fn render_model_selector_loading_and_error_states() {
 #[test]
 fn render_wizard_provider_shows_filter_and_providers() {
     use crate::test_util::test_app;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
 
     let mut app = test_app();
     app.page = crate::state::Page::AIProviders;
     app.ai_providers.wizard.open();
 
-    let backend = TestBackend::new(80, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render wizard provider picker");
-
-    let content: String = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(Cell::symbol)
-        .collect();
+    let content = drawn_cells(&mut app, 80, 24);
     assert!(content.contains("Select Provider"), "popup title is drawn");
     // The picker is alphabetical by display name, so the first provider is
     // shown.  The canonical slug must NOT appear (it is easily confused with
@@ -247,16 +221,7 @@ fn render_wizard_provider_shows_filter_and_providers() {
 
     // A filter with no matches renders the empty state (not a panic).
     app.ai_providers.wizard.filter.text = "zzzz-no-such-provider".to_string();
-    terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render empty filter state");
-    let content: String = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(Cell::symbol)
-        .collect();
+    let content = drawn_cells(&mut app, 80, 24);
     assert!(
         content.contains("No providers match the filter."),
         "empty filter message is drawn"
@@ -267,8 +232,6 @@ fn render_wizard_provider_shows_filter_and_providers() {
 fn render_wizard_slug_shows_picked_provider_and_slug_prompt() {
     use crate::state::AccountWizardStep;
     use crate::test_util::test_app;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
 
     let mut app = test_app();
     app.page = crate::state::Page::AIProviders;
@@ -278,19 +241,7 @@ fn render_wizard_slug_shows_picked_provider_and_slug_prompt() {
     app.ai_providers.wizard.picked_name = Some("OpenAI".to_string());
     app.ai_providers.wizard.step = AccountWizardStep::Slug;
 
-    let backend = TestBackend::new(80, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render wizard slug modal");
-
-    let content: String = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(Cell::symbol)
-        .collect();
+    let content = drawn_cells(&mut app, 80, 24);
     assert!(content.contains("Add Account"), "popup title is drawn");
     assert!(
         content.contains("OpenAI"),
@@ -306,8 +257,6 @@ fn render_wizard_slug_shows_picked_provider_and_slug_prompt() {
 #[test]
 fn render_credential_modal_shows_title_and_masked_key() {
     use crate::test_util::test_app;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
 
     let mut app = test_app();
     app.page = crate::state::Page::AIProviders;
@@ -315,19 +264,7 @@ fn render_credential_modal_shows_title_and_masked_key() {
     app.ai_providers.credential.input.text = "sk-abcdefghijklmnop".to_string();
     app.ai_providers.credential.input.cursor = app.ai_providers.credential.input.text.len();
 
-    let backend = TestBackend::new(80, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render credential modal");
-
-    let content: String = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(Cell::symbol)
-        .collect();
+    let content = drawn_cells(&mut app, 80, 24);
     assert!(
         content.contains("API Key for \"my-account\""),
         "popup title names the account"
@@ -348,8 +285,6 @@ fn render_credential_modal_shows_title_and_masked_key() {
 #[test]
 fn render_credential_modal_short_key_mid_cursor_does_not_panic() {
     use crate::test_util::test_app;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
 
     let mut app = test_app();
     app.page = crate::state::Page::AIProviders;
@@ -362,19 +297,7 @@ fn render_credential_modal_short_key_mid_cursor_does_not_panic() {
     app.ai_providers.credential.input.text = "abcde".to_string();
     app.ai_providers.credential.input.cursor = 2;
 
-    let backend = TestBackend::new(80, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render credential modal with mid-cursor short key");
-
-    let content: String = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(Cell::symbol)
-        .collect();
+    let content = drawn_cells(&mut app, 80, 24);
     assert!(
         content.contains("API Key for \"my-account\""),
         "popup title names the account"
@@ -393,8 +316,6 @@ fn render_credential_modal_short_key_mid_cursor_does_not_panic() {
 fn render_session_list_shows_ids_parents_and_titles() {
     use crate::test_util::test_app;
     use choreo_proto::SessionStatus;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
 
     let mut app = test_app();
     app.page = crate::state::Page::SessionManager;
@@ -442,18 +363,7 @@ fn render_session_list_shows_ids_parents_and_titles() {
     // 100 columns (not the usual 80) so every fixed column plus the 4-wide
     // marker column leaves room for the full "Title" header — the pushpin
     // pin marker costs one column over the old single-char "P".
-    let backend = TestBackend::new(100, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render session list");
-    let content: String = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(Cell::symbol)
-        .collect();
+    let content = drawn_cells(&mut app, 100, 24);
 
     // Table headers are drawn, including the new id columns.
     assert!(content.contains("Session"), "session header drawn");
@@ -587,8 +497,6 @@ fn session_list_selected_row_highlight_is_solid_across_width() {
 #[test]
 fn session_list_scrolls_to_keep_selection_visible() {
     use crate::test_util::test_app;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
 
     // 30 sessions on a 100x24 terminal: the bordered list block leaves
     // 21 content rows, one of which is the table header, so 20 session
@@ -623,18 +531,7 @@ fn session_list_scrolls_to_keep_selection_visible() {
     app.session_mgr.set_sessions(sessions);
     app.session_mgr.selection = Some(25);
 
-    let backend = TestBackend::new(100, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render scrolled list");
-    let content: String = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(Cell::symbol)
-        .collect();
+    let content = drawn_cells(&mut app, 100, 24);
 
     // First visible row is index 6 ("session 7"); the selected row 25
     // ("session 26") must be on screen.  A trailing space disambiguates
@@ -660,8 +557,6 @@ fn session_list_scrolls_down_then_up_directionally() {
     use crate::connection::handle_terminal_event;
     use crate::test_util::test_app;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
 
     let mut app = test_app();
     app.page = crate::state::Page::SessionManager;
@@ -695,23 +590,13 @@ fn session_list_scrolls_down_then_up_directionally() {
     app.session_mgr.viewport_height = 20;
 
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
     let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
 
     // Scroll to the bottom: 29 × j.  Window rows 10..29 (sessions 11..30).
     for _ in 0..29 {
         handle_terminal_event(key(KeyCode::Char('j')), &mut app, &tx).expect("j");
     }
-    terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render");
-    let content: String = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(Cell::symbol)
-        .collect();
+    let content = drawn_cells(&mut app, 100, 24);
     assert!(content.contains("session 11 "), "scrolled past the fold");
     assert!(content.contains("session 30 "), "last session visible");
     assert!(!content.contains("session 1 "), "top row scrolled off");
@@ -722,16 +607,7 @@ fn session_list_scrolls_down_then_up_directionally() {
     for _ in 0..19 {
         handle_terminal_event(key(KeyCode::Char('k')), &mut app, &tx).expect("k");
     }
-    terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render");
-    let content: String = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(Cell::symbol)
-        .collect();
+    let content = drawn_cells(&mut app, 100, 24);
     assert!(
         content.contains("session 11 "),
         "window start unchanged while selection climbs"
@@ -745,16 +621,7 @@ fn session_list_scrolls_down_then_up_directionally() {
     // One more up: the selection (now 9) leaves the top edge, so the
     // window finally scrolls up one row (sessions 10..29).
     handle_terminal_event(key(KeyCode::Char('k')), &mut app, &tx).expect("k");
-    terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render");
-    let content: String = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(Cell::symbol)
-        .collect();
+    let content = drawn_cells(&mut app, 100, 24);
     assert!(
         content.contains("session 10 "),
         "window scrolled up one row"
@@ -770,8 +637,6 @@ fn session_list_scrolls_down_then_up_directionally() {
 #[test]
 fn session_list_archived_view_renders_only_archived() {
     use crate::test_util::{make_session, test_app};
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
 
     let mut app = test_app();
     app.page = crate::state::Page::SessionManager;
@@ -782,17 +647,7 @@ fn session_list_archived_view_renders_only_archived() {
     // Tab into the archived view.
     app.session_mgr.toggle_view();
 
-    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
-    terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render archived view");
-    let content: String = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(Cell::symbol)
-        .collect();
+    let content = drawn_cells(&mut app, 120, 24);
 
     assert!(content.contains("Archived"), "archived block title drawn");
     assert!(
@@ -808,8 +663,6 @@ fn session_list_archived_view_renders_only_archived() {
 #[test]
 fn session_list_archived_view_empty_state_message() {
     use crate::test_util::{make_session, test_app};
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
 
     let mut app = test_app();
     app.page = crate::state::Page::SessionManager;
@@ -817,25 +670,13 @@ fn session_list_archived_view_empty_state_message() {
         .set_sessions(vec![make_session(1, "live", "gpt-4", 1)]);
     app.session_mgr.toggle_view();
 
-    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-    terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render empty archived view");
-    let content: String = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(Cell::symbol)
-        .collect();
+    let content = drawn_cells(&mut app, 80, 24);
     assert!(content.contains("No archived sessions."));
 }
 
 #[test]
 fn session_list_shows_pin_marker() {
     use crate::test_util::{make_session, test_app};
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
 
     let mut app = test_app();
     app.page = crate::state::Page::SessionManager;
@@ -848,17 +689,7 @@ fn session_list_shows_pin_marker() {
     app.session_mgr.selection = Some(0);
     app.attached_session_id = Some(1);
 
-    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-    terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render pinned list");
-    let content: String = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(Cell::symbol)
-        .collect();
+    let content = drawn_cells(&mut app, 80, 24);
     assert!(
         content.contains(">*📌"),
         "the pinned, selected, attached row draws the pushpin pin marker"
@@ -928,25 +759,6 @@ fn format_timestamp_older_year_shows_full_date() {
 
 // ── Inline command palette rendering ───────────────────────────────────
 
-/// Render the Chat page and return the flat buffer content as a string.
-fn render_chat_content(app: &mut crate::state::App, w: u16, h: u16) -> String {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
-    let backend = TestBackend::new(w, h);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| render(frame, app))
-        .expect("render chat page");
-    terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(Cell::symbol)
-        .collect()
-}
-
 #[test]
 fn command_palette_lists_commands_for_a_command_line() {
     use crate::test_util::test_app;
@@ -958,7 +770,7 @@ fn command_palette_lists_commands_for_a_command_line() {
         "a `/`-leading line shows the palette"
     );
 
-    let content = render_chat_content(&mut app, 80, 24);
+    let content = drawn_cells(&mut app, 80, 24);
     // The palette lists the catalog alphabetically and windows to the first
     // rows on an empty line, so the leading commands are drawn (the tail is
     // summarized with a `+N more` row).
@@ -978,7 +790,7 @@ fn command_palette_narrows_to_model_for_prefix_query() {
     let mut app = test_app();
     app.input.text = "/mo".to_string();
 
-    let content = render_chat_content(&mut app, 80, 24);
+    let content = drawn_cells(&mut app, 80, 24);
     assert!(content.contains("/model"), "the matched command is drawn");
     assert!(
         !content.contains("/session"),
@@ -994,7 +806,7 @@ fn command_palette_draws_nothing_for_a_plain_prompt() {
     app.input.text = "hi".to_string();
     assert!(!app.command_palette_active(), "plain text opens nothing");
 
-    let content = render_chat_content(&mut app, 80, 24);
+    let content = drawn_cells(&mut app, 80, 24);
     assert!(!content.contains("/model"), "no palette row is drawn");
     assert!(!content.contains("/session"), "no palette row is drawn");
 }
@@ -1010,7 +822,7 @@ fn status_bar_renders_daemon_errors_inert() {
 
     let mut app = test_app();
     app.set_error("bad request\u{7}\tbody\x1b[31m".to_string());
-    let content = render_chat_content(&mut app, 80, 24);
+    let content = drawn_cells(&mut app, 80, 24);
     assert!(
         !content.chars().any(char::is_control),
         "no control char may reach a cell: {content:?}"
@@ -1070,7 +882,7 @@ fn session_manager_cells_render_untrusted_titles_inert() {
         archived_at: None,
     }]);
 
-    let content = render_chat_content(&mut app, 100, 24);
+    let content = drawn_cells(&mut app, 100, 24);
     assert!(
         !content.chars().any(|c| c.is_control() || c == '\u{202e}'),
         "no live control or bidi char may reach a cell: {content:?}"
@@ -1138,7 +950,7 @@ fn login_modal_renders_untrusted_fields_inert() {
     assert_eq!(modal.provider, "openai\u{7}");
     assert_eq!(modal.account, "work\tacct");
 
-    let content = render_chat_content(&mut app, 100, 30);
+    let content = drawn_cells(&mut app, 100, 30);
     assert!(
         !content.chars().any(|c| c.is_control() || c == '\u{202e}'),
         "no live control or bidi char may reach a cell: {content:?}"
@@ -1179,7 +991,7 @@ fn status_bar_identity_fields_render_inert() {
     display.selected_model = Some("gpt\u{202e}4o".to_string());
     display.reasoning_effort = Some("hi\tgh".to_string());
 
-    let content = render_chat_content(&mut app, 200, 24);
+    let content = drawn_cells(&mut app, 200, 24);
     assert!(
         !content.chars().any(|c| c.is_control() || c == '\u{202e}'),
         "no live control or bidi char may reach a cell: {content:?}"
@@ -1229,7 +1041,7 @@ fn session_manager_detail_renders_tool_groups_inert() {
         archived_at: None,
     });
 
-    let content = render_chat_content(&mut app, 100, 24);
+    let content = drawn_cells(&mut app, 100, 24);
     assert!(
         !content.chars().any(|c| c.is_control() || c == '\u{202e}'),
         "no live control or bidi char may reach a cell: {content:?}"
