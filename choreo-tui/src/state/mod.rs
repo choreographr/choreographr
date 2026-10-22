@@ -521,13 +521,19 @@ impl App {
         } else {
             return 0;
         };
+        // Measure the *normalized* text — the same bytes the renderer draws
+        // (see `normalize_display_text`).  A tab or control character in a
+        // daemon error or a model-chosen session title measures wider than it
+        // draws, so measuring the raw message would reserve a height the drawn
+        // wrapping never fills (or, in the other direction, clip the tail).
+        let text = crate::markdown_render::normalize_display_text(text);
         // The status/error Paragraph is drawn inset by one column on each side
         // (render.rs `notify_area`), so it wraps at `width - 2` columns.
         // Measure at that same inner width, or a long message's reserved
         // height can fall short of the rows ratatui actually draws and the
         // tail gets clipped by the layout.
         let inner = width.saturating_sub(2);
-        let lines = plain_text_lines(text, inner);
+        let lines = plain_text_lines(&text, inner);
         lines_height(&lines, inner).max(1) as u16
     }
 

@@ -5,6 +5,8 @@
 // provider picker and the connection-layer mouse handlers.
 use crate::markdown_render::display_width;
 use crate::state::{App, PopupSize, centered_popup, selector_list_layout};
+
+use super::display_text;
 use ratatui::{
     Frame,
     style::{Color, Modifier, Style},
@@ -71,7 +73,7 @@ pub(super) fn render_model_selector(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(ref err) = app.model_selector.error {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!(" Error: {err}"),
+                format!(" Error: {}", display_text(err)),
                 Style::default().fg(Color::Red),
             ))),
             body,

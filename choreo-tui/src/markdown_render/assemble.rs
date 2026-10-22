@@ -8,8 +8,8 @@
 
 use super::{
     IncrementalMarkdown, LineChrome, LineJoin, RenderedTurnLines, RowContent, ansi_lines_joined,
-    classify_row_content, expand_tabs, markdown_lines_joined, plain_text_lines_joined,
-    sanitize_for_terminal,
+    classify_row_content, expand_tabs, markdown_lines_joined, normalize_display_text,
+    plain_text_lines_joined, sanitize_for_terminal,
 };
 use crate::render::{BG_SHADE, format_timestamp};
 use choreo_proto::Turn;
@@ -324,11 +324,13 @@ fn render_turn_lines_impl(
     // the same plain-text wrapper the tool output uses (preserving every
     // character verbatim); `lines_height`'s div_ceil math then sizes the
     // block correctly.  The body is provider-controlled bytes, so it goes
-    // through the same terminal-safety gate as tool output (escape
-    // OSC/CSI/control chars, expand tabs) before reaching the screen.
+    // through the terminal-safety gate before reaching the screen (escape
+    // OSC/CSI/control chars, expand tabs) — the *inert* variant, because the
+    // plain-text wrapper below parses no escape sequences: a kept SGR would
+    // draw as literal `[31m` while still measuring as four columns.
     if let Some(ref err) = turn.error {
         let header = format!("Error: {err}");
-        let header = expand_tabs(&sanitize_for_terminal(&header));
+        let header = normalize_display_text(&header);
         let (lines, joins) = plain_text_lines_joined(&header, content_width);
         let lines: Vec<Line<'static>> = lines
             .into_iter()

@@ -8,6 +8,8 @@
 //! [`LoginEvent`](choreo_client_core::LoginEvent).
 
 use crate::state::{App, PopupSize, centered_popup};
+
+use super::display_text;
 use ratatui::{
     Frame,
     style::{Color, Style},
@@ -24,20 +26,29 @@ pub(crate) fn render_login_modal(frame: &mut Frame<'_>, app: &App) {
     // Clear first so the modal reads as opaque over the page beneath.
     frame.render_widget(Clear, area);
 
+    // Everything in this modal arrives from outside the TUI: the provider and
+    // account names from the credential, the status line and device code from
+    // the authorization server, and the authorize URL.  Normalize each so the
+    // popup's lines occupy exactly the columns they draw and no live escape
+    // sequence rides along (see `display_text`).
     let mut lines = vec![
-        Line::from(format!("Provider: {}", modal.provider)),
-        Line::from(format!("Account:  {}", modal.account)),
+        Line::from(format!("Provider: {}", display_text(&modal.provider))),
+        Line::from(format!("Account:  {}", display_text(&modal.account))),
         Line::from(""),
-        Line::from(modal.status.clone()),
+        Line::from(display_text(&modal.status).into_owned()),
     ];
     if let Some(url) = &modal.auth_url {
         lines.push(Line::from(""));
         lines.push(Line::from("Open this URL in a browser to sign in:"));
-        lines.push(Line::from(url.clone()));
+        lines.push(Line::from(display_text(url).into_owned()));
     }
     if let Some((code, uri)) = &modal.device_code {
         lines.push(Line::from(""));
-        lines.push(Line::from(format!("Enter the code {code} at {uri}")));
+        lines.push(Line::from(format!(
+            "Enter the code {} at {}",
+            display_text(code),
+            display_text(uri)
+        )));
     }
     lines.push(Line::from(""));
     lines.push(dim_line("Esc: cancel"));

@@ -998,3 +998,113 @@ fn command_palette_draws_nothing_for_a_plain_prompt() {
     assert!(!content.contains("/model"), "no palette row is drawn");
     assert!(!content.contains("/session"), "no palette row is drawn");
 }
+
+// ── Untrusted text is normalized at every widget sink ──────────────────
+
+#[test]
+fn status_bar_renders_daemon_errors_inert() {
+    // `app.error` carries daemon-authored text (a provider's rejected request
+    // body, say).  A control character must not reach a cell, and an escape
+    // sequence must not ride along; the tab expands to spaces.
+    use crate::test_util::test_app;
+
+    let mut app = test_app();
+    app.error = Some("bad request\u{7}\tbody\x1b[31m".to_string());
+    let content = render_chat_content(&mut app, 80, 24);
+    assert!(
+        !content.chars().any(char::is_control),
+        "no control char may reach a cell: {content:?}"
+    );
+    assert!(content.contains("bad request"), "the message is shown");
+    assert!(
+        content.contains("\\u{7}") && content.contains("\\u{1b}[31m"),
+        "hostile bytes render as inert text: {content:?}"
+    );
+}
+
+#[test]
+fn status_error_height_measures_the_normalized_text() {
+    // The reserved height must match the rows the normalized text wraps to, or
+    // the tail of a long message is clipped by the layout.
+    use crate::test_util::test_app;
+
+    let mut app = test_app();
+    app.error = Some("aaaaaaaaaa\tbbbbbbbbbb\tcccc".to_string());
+    let width = 24u16;
+    let height = app.status_error_height(width);
+    // Drawing the same message must actually occupy exactly that many rows.
+    let text =
+        crate::markdown_render::normalize_display_text(app.error.as_deref().unwrap_or_default());
+    let drawn_rows = crate::markdown_render::plain_text_lines(&text, width - 2).len();
+    assert_eq!(
+        usize::from(height),
+        drawn_rows,
+        "height must match the drawn rows for {text:?}"
+    );
+}
+
+#[test]
+fn session_manager_cells_render_untrusted_titles_inert() {
+    // Session titles are model-chosen and model ids come from the catalog;
+    // neither may carry a control character into a fixed-width column.
+    use crate::test_util::test_app;
+
+    let mut app = test_app();
+    app.page = crate::state::Page::SessionManager;
+    app.session_mgr.set_sessions(vec![SessionSummary {
+        session_id: 1,
+        title: Some("evil\u{202e}title\tx".to_string()),
+        selected_model: Some("model\u{7}".to_string()),
+        reasoning_effort: None,
+        parent_session_id: None,
+        working_dir: None,
+        created_at: 1_705_314_000_000,
+        last_modified: 1_705_314_000_000,
+        turn_count: 0,
+        status: SessionStatus::Inactive,
+        active_tool_groups: vec![],
+        account_name: None,
+        token_usage: None,
+        context_window: None,
+        last_prompt_tokens: None,
+        pinned: false,
+        archived_at: None,
+    }]);
+
+    let content = render_chat_content(&mut app, 100, 24);
+    assert!(
+        !content.chars().any(|c| c.is_control() || c == '\u{202e}'),
+        "no live control or bidi char may reach a cell: {content:?}"
+    );
+    assert!(
+        content.contains("\\u{202e}") && content.contains("model\\u{7}"),
+        "untrusted cell text renders inert: {content:?}"
+    );
+}
+
+#[test]
+fn login_modal_renders_untrusted_fields_inert() {
+    // The authorization server supplies the status line, the authorize URL, and
+    // the device code; the credential supplies the account name.
+    use crate::state::LoginModal;
+    use crate::test_util::test_app;
+
+    let mut app = test_app();
+    let mut modal = LoginModal::test_modal("openai\u{7}", "work\tacct");
+    modal.status = "waiting\x1b[2J".to_string();
+    modal.auth_url = Some("https://x/\u{202e}evil".to_string());
+    modal.device_code = Some(("AB\u{7}CD".to_string(), "https://x/dc".to_string()));
+    app.login = Some(modal);
+
+    let content = render_chat_content(&mut app, 100, 30);
+    assert!(
+        !content.chars().any(|c| c.is_control() || c == '\u{202e}'),
+        "no live control or bidi char may reach a cell: {content:?}"
+    );
+    for inert in ["openai\\u{7}", "waiting\\u{1b}[2J", "AB\\u{7}CD"] {
+        assert!(
+            content.contains(inert),
+            "{inert:?} should render inert: {content:?}"
+        );
+    }
+}

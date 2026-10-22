@@ -3,6 +3,7 @@
 // Shared helpers (cursor positioning, the scrollbar widget) live in the
 // parent render/mod.rs; popup sizing/centering and the LIST-popup 3-band
 // layout live in `state/layout.rs` (`centered_popup`, `selector_list_layout`).
+use super::display_text;
 use crate::markdown_render::display_width;
 use crate::scrollbar::SmoothScrollbarState;
 use crate::state::{
@@ -269,7 +270,7 @@ fn render_credential_modal(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(ref err) = app.ai_providers.credential.error {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!("  Error: {err}"),
+                format!("  Error: {}", display_text(err)),
                 Style::default().fg(Color::Red),
             ))),
             error_row,
@@ -445,7 +446,10 @@ fn render_wizard_slug(frame: &mut Frame<'_>, app: &mut App) {
         .as_deref()
         .unwrap_or("(none)");
     let lines: Vec<Line> = vec![
-        Line::from(Span::styled(format!("  Provider: {provider_name}"), accent)),
+        Line::from(Span::styled(
+            format!("  Provider: {}", display_text(provider_name)),
+            accent,
+        )),
         Line::from(Span::styled(
             "  Name this account — keep the suggestion or type your own.",
             dim,
@@ -461,7 +465,7 @@ fn render_wizard_slug(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(ref err) = app.ai_providers.wizard.error {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!("  Error: {err}"),
+                format!("  Error: {}", display_text(err)),
                 Style::default().fg(Color::Red),
             ))),
             error_row,
@@ -554,7 +558,7 @@ fn render_polkadot_import(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(ref err) = app.ai_providers.polkadot_import.error {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!("  Error: {err}"),
+                format!("  Error: {}", display_text(err)),
                 Style::default().fg(Color::Red),
             ))),
             error_row,

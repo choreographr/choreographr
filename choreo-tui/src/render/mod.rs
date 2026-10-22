@@ -18,6 +18,25 @@ use ratatui_image::StatefulImage;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+/// Normalize one piece of UI text before a widget draws it.
+///
+/// The TUI authors some of what it shows and merely *displays* the rest — a
+/// daemon error string that embeds a provider's response body, a model-chosen
+/// session title, an id or display name from the model catalog, an account name
+/// from the keystore, OAuth status text and device codes.  Everything it only
+/// displays goes through here on its way to a widget, so a control character
+/// cannot occupy a measured column that never draws (which ragged a code box's
+/// frame, and would misalign a table row or mis-size a wrapped block) and a live
+/// escape sequence cannot ride along.  Clean text borrows, so the cost is one
+/// scan and no allocation.
+///
+/// The one implementation is the markdown renderer's
+/// [`normalize_display_text`](crate::markdown_render::normalize_display_text);
+/// this is the entry point for the plain widgets that share the same sink rule.
+pub(crate) fn display_text(text: &str) -> std::borrow::Cow<'_, str> {
+    crate::markdown_render::normalize_display_text(text)
+}
+
 // The former monolithic render.rs was split into a render/ module.  This file
 // keeps the chat/fullscreen/history drawing plus the helpers shared by several
 // pages (cursor positioning, status/timestamp formatting, the scrollbar
@@ -310,12 +329,15 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
         ..status_error_area
     };
     if let Some(ref err) = app.error {
-        let err_para = Paragraph::new(Text::from(err.clone()))
+        // `app.error` carries strings the TUI did not author (a daemon error that
+        // embeds a provider body, say), so it is normalized like any other
+        // displayed text: measured and drawn identically, no live escapes.
+        let err_para = Paragraph::new(Text::from(display_text(err).into_owned()))
             .style(Style::default().fg(Color::Red))
             .wrap(Wrap { trim: false });
         frame.render_widget(err_para, notify_area);
     } else if let Some(ref status) = app.status {
-        let status_para = Paragraph::new(Text::from(status.clone()))
+        let status_para = Paragraph::new(Text::from(display_text(status).into_owned()))
             .style(Style::default().fg(Color::Green))
             .wrap(Wrap { trim: false });
         frame.render_widget(status_para, notify_area);
@@ -489,12 +511,24 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
         // disappear; tools in the middle; runtime metrics (tokens, context
         // window fill, active status) on the right.
         // ── Session identity (always present, default to "-") ──
+        // A working directory, account name, and model id are filesystem-,
+        // keystore-, and catalog-controlled respectively: normalize each so it
+        // occupies exactly the columns it draws in this single clipped line.
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(wd, Style::default().fg(Color::White)));
+        spans.push(Span::styled(
+            display_text(wd).into_owned(),
+            Style::default().fg(Color::White),
+        ));
         spans.push(Span::raw(" | "));
-        spans.push(Span::styled(account, Style::default().fg(Color::White)));
+        spans.push(Span::styled(
+            display_text(account).into_owned(),
+            Style::default().fg(Color::White),
+        ));
         spans.push(Span::raw(" | "));
-        spans.push(Span::styled(model, Style::default().fg(Color::White)));
+        spans.push(Span::styled(
+            display_text(model).into_owned(),
+            Style::default().fg(Color::White),
+        ));
         spans.push(Span::raw(" | "));
         spans.push(Span::styled(reasoning, Style::default().fg(Color::White)));
 

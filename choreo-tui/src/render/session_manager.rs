@@ -13,7 +13,8 @@ use ratatui::{
 };
 
 use super::{
-    format_status, format_timestamp, session_detail_tokens_line, status_display, vertical_scrollbar,
+    display_text, format_status, format_timestamp, session_detail_tokens_line, status_display,
+    vertical_scrollbar,
 };
 
 // ── Session Manager ──────────────────────────────────────────
@@ -79,7 +80,8 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
 
     if let Some(ref err) = app.session_mgr.error {
         let err_style = Style::default().fg(Color::Red);
-        let err_text = format!("Error: {err}");
+        // Daemon-authored: normalize before it draws (see `display_text`).
+        let err_text = format!("Error: {}", display_text(err));
         let err_para = Paragraph::new(Line::from(Span::styled(err_text, err_style)));
         let err_area = Rect {
             x: list_inner.x + 1,
@@ -160,15 +162,22 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
                 .parent_session_id
                 .map_or_else(|| "-".to_string(), |id| id.to_string());
             let (status_text, status_color) = status_display(&session.status);
-            let model = session.selected_model.as_deref().unwrap_or("-");
-            let model_display =
-                if let Some(effort) = session.reasoning_effort.as_deref().filter(|e| *e != "off") {
-                    format!("{model} ({effort})")
-                } else {
-                    model.to_string()
-                };
+            // Model ids, reasoning-effort tags, and titles come from the catalog
+            // and from the model itself: normalize each cell's text so a control
+            // character cannot shift the fixed column widths (see `display_text`).
+            let model = display_text(session.selected_model.as_deref().unwrap_or("-"));
+            let model_display = if let Some(effort) = session
+                .reasoning_effort
+                .as_deref()
+                .filter(|e| *e != "off")
+                .map(display_text)
+            {
+                format!("{model} ({effort})")
+            } else {
+                model.to_string()
+            };
             let modified = format_timestamp(session.last_modified);
-            let title = session.title.as_deref().unwrap_or("untitled");
+            let title = display_text(session.title.as_deref().unwrap_or("untitled"));
 
             // Apply the selection style to the whole Row (not to each cell's
             // span) so the highlight background is solid across the entire
@@ -195,7 +204,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
                         width = turns_w as usize
                     )),
                     Cell::from(truncate_str(&modified, modified_w as usize)),
-                    Cell::from(truncate_str(title, title_w)),
+                    Cell::from(truncate_str(&title, title_w)),
                 ])
                 .style(row_style),
             );
