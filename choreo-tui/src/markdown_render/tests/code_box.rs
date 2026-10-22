@@ -448,7 +448,77 @@ fn incremental_render_matches_whole_render_for_tab_indented_code() {
     );
 }
 
-// ── Code box: copy classification edge cases ─────────────────────────
+#[test]
+fn code_box_control_char_rows_keep_the_frame_aligned() {
+    // Every char class whose measured width disagrees with what ratatui draws
+    // has to be gone before the box is built: a control char (BEL, backspace) or
+    // a live escape sequence inside a fence would otherwise occupy a measured
+    // column while drawing nothing, and the frame's right `│` would jog left.
+    for code in ["if (x)\u{7}\n\treturn y;", "a\u{8}b\nc", "\u{1b}[2Jc\nd"] {
+        let md = format!("```c\n{code}\n```");
+        let (lines, _joins, _chrome) = markdown_lines_joined(&md, 80);
+        let box_width = lines[0].width();
+        let drawn = draw_rows(&lines, 80);
+        for (i, row) in drawn.iter().enumerate() {
+            assert_eq!(
+                row.trim_end().chars().count(),
+                box_width,
+                "row {i} does not draw the box width ({box_width}) for {code:?}: {row:?}"
+            );
+        }
+        // The escaped form is what reaches the screen — inert text, not a live
+        // control character and no invisible column.
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.to_string().chars().any(char::is_control)),
+            "no control char may survive into a box row: {lines:#?}"
+        );
+    }
+}
+
+#[test]
+fn markdown_prose_escapes_hostile_format_chars() {
+    // Model output is untrusted: a bidi override must not be able to reorder the
+    // rendered text, and it must not occupy an invisible measured column either.
+    // (Prose reflows, so the expanded tab's run of spaces collapses to one — the
+    // point here is that the override is inert on screen, not how it is spaced.)
+    let (lines, _joins, _chrome) = markdown_lines_joined("a\u{202e}b\tc", 40);
+    let text = lines
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(text, "a\\u{202e}b c", "rows: {lines:#?}");
+    assert!(
+        !text.chars().any(|c| c.is_control() || c == '\u{202e}'),
+        "no live control or bidi char may reach a row: {text:?}"
+    );
+}
+
+#[test]
+fn incremental_render_matches_whole_render_for_control_chars() {
+    // The streaming path must normalize exactly like the whole-document render,
+    // including a control char that only becomes a complete escape sequence
+    // later in the response (an unterminated ESC is escaped; the completed SGR is
+    // escaped too, so the two frames agree).
+    let src = "```c\nif (x)\u{7}\n\treturn \u{1b}[31mred\u{1b}[0m;\n```";
+    let (whole, _, _) = markdown_lines_joined(src, 60);
+    let mut cache = IncrementalMarkdown::new();
+    let mut rendered = Vec::new();
+    for (end, _) in src.char_indices().chain(std::iter::once((src.len(), ' '))) {
+        rendered = cache.render(src.get(..end).unwrap_or_default(), 60).0;
+    }
+    let as_text =
+        |lines: &[Line<'static>]| lines.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(
+        as_text(&rendered),
+        as_text(&whole),
+        "incremental render must match the whole-document render"
+    );
+}
+
+// ── Code box: copy classification edge cases ──────────────────────────────────
 
 #[test]
 fn code_box_interior_blank_line_is_blank_content() {

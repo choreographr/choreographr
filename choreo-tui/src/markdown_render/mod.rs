@@ -336,16 +336,15 @@ pub(crate) fn markdown_lines_joined(
     markdown: &str,
     width: u16,
 ) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
-    // Expand tabs before the document is parsed, so every width this renderer
-    // computes matches what ratatui draws (see [`expand_tabs`]).  It has to
-    // happen here, ahead of the block renderers, because the highlighter can
-    // hand a lone `\t` to a row as a span of its own: ratatui measures a
-    // single-byte control character as one column (`CellWidth`) but filters it
-    // out when drawing, so such a row would render one column narrower than it
-    // was measured and the code box's right `│` would jog left on exactly the
-    // tab-indented lines.  Expanding first also keeps the indentation visible
-    // instead of silently dropping it.
-    let markdown = expand_tabs(markdown);
+    // Normalize the source before the document is parsed, so every block
+    // renderer measures exactly what ratatui draws (see
+    // [`normalize_display_text`]): tabs are expanded instead of silently
+    // dropped — the highlighter can hand a lone `\t` to a row as its own span,
+    // and ratatui measures a control character as one column while filtering it
+    // out when drawing, so the code box's right `│` used to jog left on exactly
+    // the tab-indented lines — and hostile control characters render inert
+    // rather than as invisible width.
+    let markdown = normalize_display_text(markdown);
     let document = MarkdownDocument::parse(&markdown);
     // Normalize heading levels so the document's first heading always renders
     // as level 1.  LLM output sometimes starts a document at `##` (or deeper)

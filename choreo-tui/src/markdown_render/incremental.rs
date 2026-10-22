@@ -38,8 +38,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use super::{
-    BlockKind, LineChrome, LineJoin, expand_tabs, first_block_kind, last_block_kind, line_is_blank,
-    render_blocks_untrimmed, render_document_lines,
+    BlockKind, LineChrome, LineJoin, first_block_kind, last_block_kind, line_is_blank,
+    normalize_display_text, render_blocks_untrimmed, render_document_lines,
 };
 use crate::MarkdownDocument;
 
@@ -158,15 +158,17 @@ impl IncrementalMarkdown {
         src: &str,
         width: u16,
     ) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
-        // Expand tabs before any prefix bookkeeping, for the reasons
-        // [`expand_tabs`] documents and so the committed byte offsets stay
-        // offsets into the text the parser sees.  Expansion is computed per
-        // line from the line's own column, and every commit boundary is a line
-        // start, so expanding each piece as it arrives yields exactly the prefix
-        // of expanding the whole source — the cache's byte-identical guarantee
-        // holds.
-        let src = expand_tabs(src);
-        let src = src.as_str();
+        // Normalize the source before any prefix bookkeeping, for the reasons
+        // [`normalize_display_text`] documents and so the committed byte offsets
+        // stay offsets into the text the parser sees.  Tab expansion is computed
+        // per line from that line's own column and every commit boundary is a
+        // line start, so a piece normalizes to exactly the prefix of normalizing
+        // the whole source — the cache's byte-identical guarantee holds.  A
+        // control character straddling the still-growing tail can only make the
+        // committed prefix stop matching (the `starts_with` check below), which
+        // resets the cache and re-renders; it can never splice stale rows.
+        let src = normalize_display_text(src);
+        let src = src.as_ref();
         // A different width invalidates the wrapped lines; a source that is not
         // an extension of the committed prefix (a replaced/edited response)
         // invalidates the committed blocks too.  Either way, start over.

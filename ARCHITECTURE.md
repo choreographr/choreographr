@@ -1786,6 +1786,19 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
   shell/VM streams safe to draw; it defends against terminal-escape injection (OSC-52
   clipboard writes, clear-screen, title changes, …) for every tool at once, including
   the tools that never sanitize at the source.
+- **Model output is filtered at the same sink.** The markdown renderer (the
+  response, the reasoning body, user text, and tool descriptions) runs
+  `normalize_display_text` over its source before parsing it: the same filter with
+  SGR passthrough **off** (`sanitize_without_ansi` — nothing there parses escape
+  sequences, so a kept one would only draw as literal `[31m`), followed by tab
+  expansion. Besides making hostile model output inert, this closes a
+  measurement/drawing desync: `unicode-width` counts a control character as one
+  column while ratatui filters it out of the drawn grapheme stream, so a row
+  carrying one measured wider than it rendered — which is what ragged a code box's
+  right border on tab-indented lines. The rule the renderer holds to is that
+  **every row measures exactly what ratatui draws**; any producer that hands the
+  block renderers text must normalize it first (clean text borrows, so the common
+  case costs one scan).
 
 **Streaming is byte-bounded end to end.** The bounded streaming channel only bounds
 *in-flight* chunks (backpressure); the *total* is capped too, so the live view can never

@@ -2,6 +2,7 @@
 //! sanitization, ANSI handling, tab expansion, and width/height measurement.
 
 use super::{Arc, Line, LineJoin, Span, Style, is_unsafe_unicode, warn};
+use std::borrow::Cow;
 pub(crate) fn plain_text_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     plain_text_lines_joined(text, width).0
 }
@@ -160,6 +161,18 @@ pub(crate) fn grapheme_chunks(run: &str, width: usize, floor: usize) -> Vec<Stri
     chunks
 }
 
+/// How [`sanitize_impl`] treats a complete SGR colour sequence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SgrPolicy {
+    /// Keep `ESC [ params m` verbatim, because the caller will hand the text to
+    /// an ANSI parser that turns it into styling.
+    Keep,
+    /// Escape it like any other control character, because nothing downstream
+    /// parses escape sequences — the ESC byte would render as literal text
+    /// anyway, and its column would be measured but never drawn.
+    Escape,
+}
+
 /// Terminal-safe filter for tool-result content: keeps complete SGR color
 /// sequences (`ESC [ params m`) so ANSI coloring still works, plus tabs,
 /// newlines, printable ASCII, the joiners, and safe non-ASCII; escapes
@@ -184,6 +197,25 @@ pub(crate) fn grapheme_chunks(run: &str, width: usize, floor: usize) -> Vec<Stri
 /// allocation plus one reused ESC-sequence buffer — it is called inside
 /// `render_turn_lines` for the in-flight turn on every streamed chunk.
 pub(crate) fn sanitize_for_terminal(text: &str) -> String {
+    sanitize_impl(text, SgrPolicy::Keep)
+}
+
+/// [`sanitize_for_terminal`] for content that no ANSI parser will ever see:
+/// escape sequences are escaped like any other control character instead of
+/// being kept.
+///
+/// Markdown source is exactly such content — the block renderer turns it into
+/// styled [`Line`]s itself, so a surviving `ESC [ 3 1 m` would draw as the
+/// literal text `[31m` while still measuring as four columns, desyncing the row
+/// it sits in from everything measured around it.  Escaping it renders the
+/// sequence inert (`\u{1b}[31m`) *and* keeps measurement honest.
+pub(crate) fn sanitize_without_ansi(text: &str) -> String {
+    sanitize_impl(text, SgrPolicy::Escape)
+}
+
+/// The body shared by [`sanitize_for_terminal`] and [`sanitize_without_ansi`];
+/// see their docs for the policy and the char classes involved.
+fn sanitize_impl(text: &str, sgr_policy: SgrPolicy) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     // Reused ESC-sequence assembly buffer: one heap allocation for all the
@@ -207,7 +239,7 @@ pub(crate) fn sanitize_for_terminal(text: &str) -> String {
         // CSI (`\x1b[2J`) or OSC (`\x1b]…`) therefore renders as the inert
         // `\u{1b}` followed by literal text instead of reaching the
         // terminal as a live control sequence.
-        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+        if c == '\u{1b}' && sgr_policy == SgrPolicy::Keep && chars.peek() == Some(&'[') {
             chars.next(); // consume '['
             seq.clear();
             seq.push('\u{1b}');
@@ -345,6 +377,29 @@ pub(crate) fn terminal_keeps(c: char) -> bool {
         || c == '\n'
         || (c.is_ascii() && (' '..='~').contains(&c))
         || (!c.is_ascii() && !c.is_control() && !is_unsafe_unicode(c))
+}
+
+/// Normalize untrusted display text for the markdown renderer: make it inert
+/// ([`sanitize_without_ansi`]) and expand its tabs ([`expand_tabs`]).
+///
+/// Both steps exist for one reason — the text this renderer *measures* has to be
+/// exactly the text ratatui *draws*.  A control character breaks that: ratatui
+/// filters it out of the drawn grapheme stream while `unicode-width` still
+/// counts it (one column for `\t` and for any other C0 char inside a string), so
+/// a row carrying one measured wider than it rendered — a code box's right `│`
+/// then jogged left on every tab-indented line, and its indentation vanished.
+/// Escaping the control characters and expanding the tabs leaves no character
+/// whose measured and drawn widths disagree.
+///
+/// Runs *before* the markdown is parsed, so every block renderer (paragraphs,
+/// code boxes, tables, diff fences) sees the same normalized source.  Content
+/// that is already clean borrows: the common case costs one scan and no
+/// allocation.
+pub(crate) fn normalize_display_text(text: &str) -> Cow<'_, str> {
+    if !text.contains('\t') && text.chars().all(terminal_keeps) {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(expand_tabs(&sanitize_without_ansi(text)))
 }
 
 /// Render ANSI-escape-coded text as styled ratatui lines, wrapping at `width`.

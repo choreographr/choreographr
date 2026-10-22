@@ -114,6 +114,36 @@ fn expand_tabs_sgr_and_newline_interaction() {
 }
 
 #[test]
+fn sanitize_without_ansi_escapes_sgr_sequences() {
+    // Content no ANSI parser will see (markdown source, which this renderer
+    // styles itself) must come out with no control character at all: a kept SGR
+    // sequence would draw as the literal text `[31m` while still measuring four
+    // columns, desyncing the row from everything around it.
+    assert_eq!(
+        sanitize_without_ansi("\x1b[31mred\x1b[0m"),
+        "\\u{1b}[31mred\\u{1b}[0m"
+    );
+    // Everything that is not ESC behaves exactly like the SGR-preserving filter.
+    assert_eq!(sanitize_without_ansi("a\u{202e}b"), "a\\u{202e}b");
+    assert_eq!(sanitize_without_ansi("a\tb\nc\r\n日"), "a\tb\nc\n日");
+}
+
+#[test]
+fn normalize_display_text_borrows_clean_text_and_escapes_tabs() {
+    // A response that is already clean — the overwhelmingly common case — costs
+    // one scan and no allocation.
+    assert!(matches!(
+        normalize_display_text("plain 日本語 text\nwith lines"),
+        std::borrow::Cow::Borrowed(_)
+    ));
+    // A tab expands at the 4-column stop *and* the control characters around it
+    // are escaped, so nothing measured is invisible on screen.
+    assert_eq!(normalize_display_text("\tif (x)"), "    if (x)");
+    assert_eq!(normalize_display_text("a\x07b"), "a\\u{7}b");
+    assert_eq!(normalize_display_text("\x1b[2J"), "\\u{1b}[2J");
+}
+
+#[test]
 fn sanitize_for_terminal_keeps_sgr_sequences() {
     // Genuine SGR color sequences survive the filter verbatim so the
     // ANSI renderer below can still colorize shell/VM output.
