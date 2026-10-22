@@ -376,7 +376,7 @@ fn ai_providers_new_account_starts_at_provider_step() {
     assert_eq!(app.ai_providers.wizard.focused, 0);
     assert!(app.ai_providers.wizard.filter.text.is_empty());
     assert!(!app.ai_providers.wizard.slug.is_focused());
-    assert!(app.ai_providers.wizard.error.is_none());
+    assert!(app.ai_providers.wizard.error.get().is_none());
 }
 
 #[test]
@@ -394,7 +394,7 @@ fn ai_providers_new_account_enter_advances_to_slug() {
 
     assert_eq!(app.ai_providers.wizard.step, AccountWizardStep::Slug);
     assert!(app.ai_providers.wizard.slug.is_focused());
-    assert!(app.ai_providers.wizard.error.is_none());
+    assert!(app.ai_providers.wizard.error.get().is_none());
     assert_eq!(
         app.ai_providers.wizard.picked_name.as_deref(),
         Some(app.providers[0].display_name.as_str()),
@@ -706,7 +706,7 @@ fn ai_providers_new_account_slug_validation_empty() {
         "should stay on slug field when slug is empty"
     );
     assert_eq!(
-        app.ai_providers.wizard.error.as_deref(),
+        app.ai_providers.wizard.error.get(),
         Some("Account name is required"),
     );
 }
@@ -737,7 +737,7 @@ fn ai_providers_new_account_slug_validation_invalid() {
         "should stay on slug field when slug is invalid"
     );
     assert_eq!(
-        app.ai_providers.wizard.error.as_deref(),
+        app.ai_providers.wizard.error.get(),
         Some("account name must be lowercase letters, digits, hyphens, or underscores"),
     );
 }

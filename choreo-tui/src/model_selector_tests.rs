@@ -116,7 +116,7 @@ fn model_selector_populates_from_models_reply() {
         vec!["claude-3", "gpt-4o", "gpt-4o-mini"]
     );
     // The reply must not leak into the chat status line.
-    assert!(app.status.is_none());
+    assert!(app.status().is_none());
 }
 
 #[test]
@@ -153,7 +153,10 @@ fn models_updated_broadcast_refreshes_the_open_picker_for_the_attached_account()
         !app.model_selector.provisional,
         "a live list clears the provisional marker"
     );
-    assert!(app.status.is_none(), "the broadcast must not print to chat");
+    assert!(
+        app.status().is_none(),
+        "the broadcast must not print to chat"
+    );
 }
 
 #[test]
@@ -340,9 +343,7 @@ fn model_selector_models_reply_falls_through_when_closed() {
     .expect("handle Models");
 
     assert!(
-        app.status
-            .as_deref()
-            .is_some_and(|s| s.contains("supported models")),
+        app.status().is_some_and(|s| s.contains("supported models")),
         "closed selector keeps the chat-history behavior"
     );
 }
@@ -369,8 +370,8 @@ fn model_selector_failed_reply_shows_error_when_open() {
     .expect("handle ModelsFailed");
 
     assert!(!app.model_selector.loading);
-    assert_eq!(app.model_selector.error.as_deref(), Some("no credential"));
-    assert!(app.status.is_none(), "error stays scoped to the popup");
+    assert_eq!(app.model_selector.error.get(), Some("no credential"));
+    assert!(app.status().is_none(), "error stays scoped to the popup");
 }
 
 #[test]

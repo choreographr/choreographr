@@ -131,7 +131,7 @@ fn handle_failed_for_request_failure_does_not_write_global_error() {
     let mut app = test_app();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
-    assert!(app.error.is_none());
+    assert!(app.error().is_none());
 
     app.handle_failed(
         Some(42),
@@ -140,7 +140,8 @@ fn handle_failed_for_request_failure_does_not_write_global_error() {
     );
 
     assert_eq!(
-        app.error, None,
+        app.error(),
+        None,
         "a request failure's transcript block must not be duplicated on the status bar"
     );
     assert_eq!(
@@ -158,11 +159,11 @@ fn handle_failed_connection_level_writes_global_error_for_attached_session() {
     let mut app = App::new();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
-    assert!(app.error.is_none());
+    assert!(app.error().is_none());
 
     app.handle_failed(None, 7, "no session attached".into());
 
-    assert_eq!(app.error.as_deref(), Some("no session attached"));
+    assert_eq!(app.error(), Some("no session attached"));
     assert_eq!(
         app.display_for(42).error.as_deref(),
         Some("no session attached")
@@ -180,11 +181,11 @@ fn handle_failed_connection_level_without_attached_session_still_writes_global_e
     // status line — there is no transcript block for it.
     let mut app = test_app();
     app.attached_session_id = None;
-    assert!(app.error.is_none());
+    assert!(app.error().is_none());
 
     app.handle_failed(None, 9, "no session attached".into());
 
-    assert_eq!(app.error.as_deref(), Some("no session attached"));
+    assert_eq!(app.error(), Some("no session attached"));
 }
 
 #[test]
@@ -197,12 +198,13 @@ fn handle_failed_for_background_session_does_not_write_global_error() {
     let mut app = test_app();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
-    assert!(app.error.is_none());
+    assert!(app.error().is_none());
 
     app.handle_failed(Some(99), 3, "background failure".into());
 
     assert_eq!(
-        app.error, None,
+        app.error(),
+        None,
         "background failure must not write the global error bar"
     );
     assert_eq!(

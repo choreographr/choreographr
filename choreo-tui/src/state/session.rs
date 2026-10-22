@@ -352,7 +352,7 @@ impl App {
 
     pub(crate) fn handle_session_title_set(&mut self, session_id: u64, title: &str) {
         if self.attached_session_id == Some(session_id) {
-            self.status = Some(format!("Session title changed to '{title}'"));
+            self.set_status(format!("Session title changed to '{title}'"));
             if let Some(s) = self.attached_session_mut() {
                 s.title = Some(title.to_owned());
             }
@@ -555,7 +555,7 @@ impl App {
 
         self.attach_to_session(parent_id, client_tx)?;
 
-        self.status = Some(format!(
+        self.set_status(format!(
             "Subsession \"{subsession_title}\" finished. Switched back to parent \"{parent_title}\"."
         ));
         Ok(())
@@ -582,9 +582,9 @@ impl App {
             .retain(|id, _| sessions.iter().any(|s| s.session_id == *id));
         if self.page == Page::Chat {
             if sessions.is_empty() {
-                self.status = Some("[daemon] no sessions".to_string());
+                self.set_status("[daemon] no sessions".to_string());
             } else {
-                self.status = Some(format!("[daemon] sessions ({})", sessions.len()));
+                self.set_status(format!("[daemon] sessions ({})", sessions.len()));
                 for session in sessions {
                     let prefix = if Some(session.session_id) == self.attached_session_id {
                         "*"
@@ -593,7 +593,7 @@ impl App {
                     };
                     let title = session.title.as_deref().unwrap_or("untitled");
                     let model = session.selected_model.as_deref().unwrap_or("-");
-                    self.status = Some(format!(
+                    self.set_status(format!(
                         "{} {}: \"{title}\" ({model}) — {} turns",
                         prefix, session.session_id, session.turn_count,
                     ));
@@ -721,7 +721,7 @@ impl App {
     }
 
     pub(crate) fn handle_session_delete_failed(&mut self, session_id: u64, error: &str) {
-        self.status = Some(format!("failed to delete session {session_id}: {error}"));
+        self.set_status(format!("failed to delete session {session_id}: {error}"));
     }
 
     /// A per-session `pinned`/`archived_at` flag change was broadcast by the

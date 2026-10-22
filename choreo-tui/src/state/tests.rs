@@ -12,6 +12,7 @@ use crate::state::{App, SessionStatus};
 use choreo_proto::{SessionSummary, Turn};
 
 mod content_version;
+mod display_line;
 mod find_turn;
 mod height;
 mod images;

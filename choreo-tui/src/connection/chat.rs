@@ -24,8 +24,8 @@ pub(super) fn handle_chat_event(
                 return Ok(());
             }
             // Any keypress clears transient status/error messages.
-            app.status = None;
-            app.error = None;
+            app.clear_status();
+            app.clear_error();
             // Don't clear help on the help-toggle chord itself — let the
             // toggle arm below handle it.
             let help_toggle = key.modifiers.contains(KeyModifiers::ALT)
@@ -134,7 +134,7 @@ pub(super) fn handle_chat_event(
                             .send(client_tx, ClientMessageType::Cancel { stream_id: 0 });
                     } else {
                         tracing::debug!("Esc ignored — no session attached");
-                        app.status = Some("no session attached".to_string());
+                        app.set_status("no session attached".to_string());
                     }
                 }
                 KeyCode::Up => history_or_line_up(app),
@@ -171,8 +171,8 @@ pub(super) fn handle_chat_event(
                         && let Some(reason) = app.new_turn_rejection()
                     {
                         tracing::debug!(reason, "[choreo-tui] prompt rejected client-side");
-                        app.status = Some(reason.to_string());
-                        app.error = None;
+                        app.set_status(reason.to_string());
+                        app.clear_error();
                         return Ok(());
                     }
                     app.input.clear();
@@ -226,7 +226,7 @@ pub(super) fn handle_chat_event(
                         bytes = text.len(),
                         "[choreo-tui] copied selection to clipboard via OSC 52"
                     );
-                    app.status = Some("Selection copied to clipboard.".to_string());
+                    app.set_status("Selection copied to clipboard.".to_string());
                 } else {
                     // Over the OSC 52 size cap: say so instead of
                     // pretending the copy succeeded (see clipboard.rs).
@@ -234,7 +234,7 @@ pub(super) fn handle_chat_event(
                         bytes = text.len(),
                         "[choreo-tui] selection exceeds the OSC 52 size cap; not copied"
                     );
-                    app.status = Some("Selection too large to copy to clipboard.".to_string());
+                    app.set_status("Selection too large to copy to clipboard.".to_string());
                 }
             }
         }

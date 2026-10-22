@@ -1797,8 +1797,7 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
   column while ratatui filters it out of the drawn grapheme stream, so a row
   carrying one measures wider than it renders — which rags a code box's right
   border on tab-indented lines. The same normalizer is applied by every
-  plain widget that *displays* rather than authors its text — the status/error
-  line (and the height math that reserves rows for it), the status bar's session
+  plain widget that *displays* rather than authors its text — the status bar's session
   identity fields (working directory, account, model, reasoning effort, tool
   groups), the session-status label (whose tool name is MCP-supplied), tool-result
   labels, the session table and detail pane (title, model, working dir, account,
@@ -1809,6 +1808,36 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
   The rule the renderer holds to is that **every row measures exactly what
   ratatui draws**; any producer that hands a widget text it did not author must
   normalize it first (clean text borrows, so the common case costs one scan).
+
+  The policy is tiered, and which tier a value belongs to is decided by whether
+  anything other than a widget reads it:
+
+  1. **Ingest** — daemon-authored text that is *only* displayed is normalized
+     once, where it is stored: the chat status/error line
+     (`App::set_status`/`App::set_error` writing a private `DisplayLine` field,
+     so no call site can store raw bytes and the height math measures exactly
+     the drawn text without re-scanning), the AI-providers sub-modal error
+     lines, the session-manager and model-selector error rows, and the login
+     modal's status text, authorize URL and device code (both halves). Because
+     the stored value is already inert, it stays inert at every place it is
+     later read — including a non-ratatui consumer with no widget sink of its
+     own to route through (a `println!` output path, a log line, a clipboard
+     copy).
+  2. **Sink** — identity-bearing or keyed values stay byte-exact in state and
+     are normalized at the draw sink instead: a model id, a reasoning effort,
+     an account slug, a session title (which also feeds the OSC 2 window title
+     under that path's own strip policy), a tool name compared against
+     `MARKDOWN_TOOLS`, a tool-call id — and, in the login modal, `provider` and
+     `account`, because the account name is the credential key the modal hands
+     back and the provider selects the auth descriptor. Escaping those in place
+     would change what is sent back to the daemon, what is compared, or what
+     key it is looked up by, so the rewriting happens at the last moment.
+
+  The two tiers compose safely: the normalizer is idempotent and borrows text
+  that is already normalized, so a sink pass over an ingest-normalized string
+  costs one scan and allocates nothing. The sink therefore stays as
+  belt-and-braces for whatever a future widget forgets to place on the ingest
+  tier.
 
   The rule covers text the TUI only *displays*, not text the user is *editing*.
   The prompt buffer and the picker filter fields (command palette, model

@@ -78,7 +78,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
     let list_rows = max_rows.saturating_sub(1);
     let (scroll, _count) = app.session_mgr.window(list_rows);
 
-    if let Some(ref err) = app.session_mgr.error {
+    if let Some(err) = app.session_mgr.error.get() {
         let err_style = Style::default().fg(Color::Red);
         // Daemon-authored: normalize before it draws (see `display_text`).
         let err_text = format!("Error: {}", display_text(err));

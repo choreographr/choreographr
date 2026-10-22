@@ -70,7 +70,7 @@ pub(super) fn render_model_selector(frame: &mut Frame<'_>, app: &mut App) {
 
     // ── Body: error / loading / empty / list ───────────────────
     let body = layout.body;
-    if let Some(ref err) = app.model_selector.error {
+    if let Some(err) = app.model_selector.error.get() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!(" Error: {}", display_text(err)),

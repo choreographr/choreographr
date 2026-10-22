@@ -18,9 +18,10 @@ use choreo_proto::{ReasoningCapability, SessionStatus, TokenUsage, socket_path};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use std::collections::{HashMap, HashSet};
 
-use crate::markdown_render::{lines_height, plain_text_lines};
+use crate::markdown_render::{lines_height, normalize_display_text, plain_text_lines};
 
 mod command_palette;
+mod display_line;
 mod draft;
 mod history;
 mod images;
@@ -43,6 +44,7 @@ mod turn;
 // re-exported here so `crate::state::X` references (in this crate and in
 // `app_tests.rs`/`render_tests.rs`) keep resolving exactly as before.
 pub(crate) use command_palette::*;
+pub(crate) use display_line::DisplayLine;
 pub(crate) use history::*;
 pub(crate) use images::{
     ImageJobRequest, ImageSlot, slot_source, turn_image_count, turn_image_slots,
@@ -73,6 +75,31 @@ pub(crate) const PAGE_SCROLL_LINES: usize = 3;
 /// [`input_inner_width`] so they all agree on where word-wrap happens;
 /// otherwise a wrapped line can be computed in one path but not another.
 pub(crate) const INPUT_PAD: u16 = 2;
+
+/// Store a display-only string, normalizing it exactly once as it enters the
+/// state.
+///
+/// This is the ingest half of the display policy (see
+/// [`crate::render::display_text`] for the sink half): text the daemon authors
+/// that is only ever *displayed* is made inert here, in the one place it is
+/// stored, rather than re-scanned at every widget that draws it.  The normalizer
+/// strips control characters, escape sequences and bidi overrides and expands
+/// tabs, so a stored value can never occupy a measured column that does not
+/// draw, and can never carry a live escape to any later reader — including a
+/// non-ratatui consumer that has no sink to route through.
+///
+/// The normalizer borrows already-normalized text, so the common case (clean
+/// text, or text already normalized by an earlier pass) costs one scan and —
+/// because the caller hands over an owned `String` anyway — no second
+/// allocation.
+pub(crate) fn normalized_display_text(text: impl Into<String>) -> String {
+    let text = text.into();
+    match normalize_display_text(&text) {
+        // Already normalized: keep the caller's allocation instead of copying.
+        std::borrow::Cow::Borrowed(_) => text,
+        std::borrow::Cow::Owned(normalized) => normalized,
+    }
+}
 
 /// Inner content width (columns) of the command input box for a given terminal
 /// width: terminal width minus the horizontal padding on both sides.
@@ -306,7 +333,12 @@ pub(crate) struct App {
     /// session switch.
     pub(crate) history_index: Option<usize>,
     pub(crate) fullscreen_image_target: Option<(u64, u32, ImageSlot)>,
-    pub(crate) status: Option<String>,
+    /// The transient status line drawn above the command box (green).
+    ///
+    /// Private so every writer goes through [`App::set_status`], which
+    /// normalizes the text for display at ingest; see
+    /// [`normalized_display_text`] for why that is the choke point.
+    status: DisplayLine,
     /// Whether the current `status` came from a connection-task
     /// [`UiEvent::Status`] (a transient progress message like
     /// "daemon started") rather than from daemon traffic. A transient
@@ -315,7 +347,12 @@ pub(crate) struct App {
     /// the first turn happens to be quiet. Daemon-derived statuses never set
     /// this flag, so they are never cleared by the arrive-of-traffic rule.
     pub(crate) status_is_transient: bool,
-    pub(crate) error: Option<String>,
+    /// The error line drawn above the command box (red), and the only surface
+    /// for connection-level failures that have no turn to render into.
+    ///
+    /// Private so every writer goes through [`App::set_error`], which
+    /// normalizes the text for display at ingest; see [`normalized_display_text`].
+    error: DisplayLine,
     pub(crate) session_displays: HashMap<u64, SessionDisplayState>,
     pub(crate) active_session_id: Option<u64>,
     /// The address string this session talks to (dial addr for TCP, unix
@@ -422,9 +459,9 @@ impl App {
             text_selection: None,
             history_index: None,
             fullscreen_image_target: None,
-            status: None,
+            status: DisplayLine::none(),
             status_is_transient: false,
-            error: None,
+            error: DisplayLine::none(),
             last_terminal_size: None,
             terminal_resized: false,
             session_displays: HashMap::new(),
@@ -438,6 +475,45 @@ impl App {
             pending_mcp_login: None,
             pending_mcp_logout: None,
         }
+    }
+
+    /// Replace the status line, normalizing the text for display as it is
+    /// stored.
+    ///
+    /// Ingest is the choke point: the field is private, so every daemon-authored
+    /// message (a progress line, a list dump, a `[error] …` note) reaches the
+    /// state through here and is made inert exactly once.  Every later reader —
+    /// the status/error bar, the height measurement, a futures consumer with no
+    /// ratatui sink — then sees display-safe bytes, and the widget sink's own
+    /// pass over them borrows instead of rewriting.
+    pub(crate) fn set_status(&mut self, text: impl Into<String>) {
+        self.status.set(text);
+    }
+
+    /// Clear the status line (see [`Self::set_status`] for the ingest rule).
+    pub(crate) fn clear_status(&mut self) {
+        self.status.clear();
+    }
+
+    /// The status line to draw, already normalized (see [`Self::set_status`]).
+    pub(crate) fn status(&self) -> Option<&str> {
+        self.status.get()
+    }
+
+    /// Replace the error line, normalizing the text for display as it is stored
+    /// (see [`Self::set_status`]: the same ingest rule and the same reasoning).
+    pub(crate) fn set_error(&mut self, text: impl Into<String>) {
+        self.error.set(text);
+    }
+
+    /// Clear the error line, restoring the status line (if any) as what draws.
+    pub(crate) fn clear_error(&mut self) {
+        self.error.clear();
+    }
+
+    /// The error line to draw, already normalized (see [`Self::set_status`]).
+    pub(crate) fn error(&self) -> Option<&str> {
+        self.error.get()
     }
 
     /// The key that opens the model selector — `Alt+M` on every terminal now
@@ -514,26 +590,27 @@ impl App {
     // cast cannot truncate in practice.
     #[expect(clippy::cast_possible_truncation)]
     pub(crate) fn status_error_height(&self, width: u16) -> u16 {
-        let text = if let Some(ref err) = self.error {
-            err.as_str()
-        } else if let Some(ref status) = self.status {
-            status.as_str()
+        // Read through the accessors, which return the stored (already
+        // normalized) text.  Because normalization happens at ingest
+        // (`App::set_error`/`App::set_status`), these are exactly the bytes the
+        // renderer draws, so measuring them directly cannot reserve a height the
+        // drawn wrapping never fills (or clip the tail) — a tab or control
+        // character in a daemon-supplied message measured wider than it drew
+        // when the raw text was measured here.
+        let text = if let Some(err) = self.error() {
+            err
+        } else if let Some(status) = self.status() {
+            status
         } else {
             return 0;
         };
-        // Measure the *normalized* text — the same bytes the renderer draws
-        // (see `normalize_display_text`).  A tab or control character in a
-        // daemon-supplied error or status message measures wider than it draws,
-        // so measuring the raw message would reserve a height the drawn
-        // wrapping never fills (or, in the other direction, clip the tail).
-        let text = crate::markdown_render::normalize_display_text(text);
         // The status/error Paragraph is drawn inset by one column on each side
         // (render.rs `notify_area`), so it wraps at `width - 2` columns.
         // Measure at that same inner width, or a long message's reserved
         // height can fall short of the rows ratatui actually draws and the
         // tail gets clipped by the layout.
         let inner = width.saturating_sub(2);
-        let lines = plain_text_lines(&text, inner);
+        let lines = plain_text_lines(text, inner);
         lines_height(&lines, inner).max(1) as u16
     }
 

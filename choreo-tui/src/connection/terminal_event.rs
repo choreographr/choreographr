@@ -355,7 +355,7 @@ pub(super) fn handle_ui_event(
             // lingers on the status line until the first daemon handler
             // happens to write one.
             if app.status_is_transient {
-                app.status = None;
+                app.clear_status();
                 app.status_is_transient = false;
             }
             handle_daemon_message(*message, app, client_tx)?;
@@ -376,7 +376,7 @@ pub(super) fn handle_ui_event(
             // daemon message this never scrolls or mutates a view — it just
             // sets the status line, flagged transient so the first real
             // daemon message clears it (see the `Daemon` arm above).
-            app.status = Some(message);
+            app.set_status(message);
             app.status_is_transient = true;
             Ok(true)
         }

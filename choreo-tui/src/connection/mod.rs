@@ -725,7 +725,7 @@ mod tests {
             app.text_selection.is_none(),
             "selection cleared after release"
         );
-        let status = app.status.as_deref().expect("copy sets a status message");
+        let status = app.status().expect("copy sets a status message");
         assert_eq!(status, "Selection copied to clipboard.");
     }
 
@@ -755,7 +755,7 @@ mod tests {
             "a plain click must not leave a selection armed"
         );
         assert!(
-            app.status.is_none(),
+            app.status().is_none(),
             "a plain click must not trigger a copy status"
         );
     }
@@ -950,7 +950,7 @@ mod tests {
 
         assert!(dirty, "a status change must trigger a repaint");
         assert_eq!(
-            app.status.as_deref(),
+            app.status(),
             Some("no daemon running — starting choreographr…")
         );
         assert!(
@@ -973,7 +973,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         handle_ui_event(UiEvent::Status("daemon started".to_string()), &mut app, &tx)
             .expect("handle Status");
-        assert_eq!(app.status.as_deref(), Some("daemon started"));
+        assert_eq!(app.status(), Some("daemon started"));
 
         handle_ui_event(
             UiEvent::Daemon(Box::new(DaemonMessage::broadcast(
@@ -986,11 +986,11 @@ mod tests {
         )
         .expect("handle Daemon");
         assert!(
-            app.status.is_none(),
+            app.status().is_none(),
             "the transient status must be cleared by the first daemon message"
         );
         assert!(!app.status_is_transient);
-        assert!(app.error.is_some(), "the daemon's error still lands");
+        assert!(app.error().is_some(), "the daemon's error still lands");
     }
 
     #[test]
@@ -999,7 +999,7 @@ mod tests {
         // traffic — only the transient connection-task flag is cleared.
         let mut app = test_app();
         let (tx, _rx) = crossbeam_channel::unbounded();
-        app.status = Some("a daemon-set status".to_string());
+        app.set_status("a daemon-set status".to_string());
         app.status_is_transient = false;
 
         handle_ui_event(
@@ -1012,7 +1012,7 @@ mod tests {
             &tx,
         )
         .expect("handle Daemon");
-        assert_eq!(app.status.as_deref(), Some("a daemon-set status"));
+        assert_eq!(app.status(), Some("a daemon-set status"));
     }
 
     #[test]

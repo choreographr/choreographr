@@ -464,7 +464,7 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         // so nothing here may suggest something is wrong. A daemon already
         // bound to ANOTHER client's key reports `Locked`, and that handler
         // explains how to supply the key.
-        app.status = Some("connecting to the daemon…".to_string());
+        app.set_status("connecting to the daemon…".to_string());
     }
 
     app.pending
@@ -719,7 +719,7 @@ fn run_ui_loop(
                 elapsed_secs = timeout.elapsed.as_secs_f64(),
                 "request timed out without a daemon reply"
             );
-            app.status = Some(format!(
+            app.set_status(format!(
                 "[daemon] {:?} timed out after {:.0}s",
                 timeout.kind,
                 timeout.elapsed.as_secs_f64()

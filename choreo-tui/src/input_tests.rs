@@ -2521,7 +2521,7 @@ fn input_box_rect_unaffected_by_status_and_help_rows() {
     app.last_terminal_size = Some((80, 30));
     app.input.text = "hello".to_string();
     app.input.generation += 1;
-    app.status = Some("some transient status".to_string());
+    app.set_status("some transient status".to_string());
 
     let r = app.input_box_rect(80, 30);
     assert_eq!(r.height, 3);

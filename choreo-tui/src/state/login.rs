@@ -15,18 +15,28 @@ use choreo_client_core::{
 use choreo_proto::{ClientMessageType, OAuthProviderDescriptor};
 
 use super::App;
+use super::normalized_display_text;
 
 /// The live state of an in-progress OAuth login.
 pub(crate) struct LoginModal {
-    /// The provider slug the flow targets (for the title).
+    /// The provider slug the flow targets (for the title).  Deliberately kept
+    /// raw: it selects the auth descriptor the flow was started from, so it is
+    /// an identity, not display text, and normalizing it would change what is
+    /// requested.
     pub(crate) provider: String,
-    /// The account being signed in (the `AddCredential` service).
+    /// The account being signed in (the `AddCredential` service).  Deliberately
+    /// kept raw: this string is the credential key handed back to the daemon
+    /// when the flow completes, so normalizing it would store the credential
+    /// under a different name than the one the user asked for.
     pub(crate) account: String,
-    /// The latest human-readable status line.
+    /// The latest human-readable status line, normalized for display when it is
+    /// stored (see `App::update_login_fields`).
     pub(crate) status: String,
-    /// The authorize URL to display, once emitted.
+    /// The authorize URL to display, once emitted; normalized for display when
+    /// it is stored.
     pub(crate) auth_url: Option<String>,
-    /// A device code and its verification URI, once emitted.
+    /// A device code and its verification URI, once emitted; both halves are
+    /// normalized for display when they are stored.
     pub(crate) device_code: Option<(String, String)>,
     /// The worker session. `None` once the flow has ended (the modal closes).
     /// Dropping the modal drops this session, which requests cancellation — so a
@@ -151,7 +161,7 @@ impl App {
             .iter()
             .find(|a| a.name == account)
         else {
-            self.status = Some(format!(
+            self.set_status(format!(
                 "no account '{account}'; create it first with /add-account"
             ));
             return;
@@ -163,7 +173,7 @@ impl App {
             self.oauth_providers_fetched = true;
             self.pending
                 .send(client_tx, ClientMessageType::ListOAuthProviders);
-            self.status = Some("fetching OAuth sign-in options…".to_string());
+            self.set_status("fetching OAuth sign-in options…".to_string());
             return;
         }
         self.start_login_flow(&provider, account, device);
@@ -178,12 +188,12 @@ impl App {
             .find(|d| d.provider == provider)
             .cloned()
         else {
-            self.status = Some(format!(
+            self.set_status(format!(
                 "provider '{provider}' does not support OAuth sign-in; use /add-key or a supported provider"
             ));
             return;
         };
-        self.status = Some(format!("signing in {account} ({provider})…"));
+        self.set_status(format!("signing in {account} ({provider})…"));
         self.login = Some(LoginModal::start(descriptor, account, device));
     }
 
@@ -215,7 +225,7 @@ impl App {
         self.pending_mcp_login = Some(slug);
         self.pending
             .send(client_tx, ClientMessageType::McpStatusRequest);
-        self.status = Some("fetching MCP server status…".to_string());
+        self.set_status("fetching MCP server status…".to_string());
     }
 
     /// Begin a `/mcp logout <slug>` flow.
@@ -233,7 +243,7 @@ impl App {
         self.pending_mcp_logout = Some(slug);
         self.pending
             .send(client_tx, ClientMessageType::McpStatusRequest);
-        self.status = Some("fetching MCP server status…".to_string());
+        self.set_status("fetching MCP server status…".to_string());
     }
 
     /// Start the login/logout a fresh `McpStatus` reply was awaited for.
@@ -258,17 +268,17 @@ impl App {
     /// signed into (no `oauth` block, or not a remote server).
     fn start_mcp_login_for(&mut self, servers: &[choreo_proto::McpServerStatus], slug: &str) {
         let Some(server) = servers.iter().find(|s| s.slug == slug) else {
-            self.status = Some(format!("no MCP server '{slug}'"));
+            self.set_status(format!("no MCP server '{slug}'"));
             return;
         };
         let Some(oauth) = server.oauth.clone() else {
-            self.status = Some(format!(
+            self.set_status(format!(
                 "MCP server '{slug}' has no oauth block; it cannot be signed in"
             ));
             return;
         };
         let Some(credential_key) = server.credential_key.clone() else {
-            self.status = Some(format!("MCP server '{slug}' is not a remote server"));
+            self.set_status(format!("MCP server '{slug}' is not a remote server"));
             return;
         };
         let info = McpLoginInfo {
@@ -277,7 +287,7 @@ impl App {
             credential_key,
             oauth,
         };
-        self.status = Some(format!("signing in MCP server {slug}…"));
+        self.set_status(format!("signing in MCP server {slug}…"));
         self.login = Some(LoginModal::start_mcp(info, McpLoginOptions::default()));
     }
 
@@ -297,7 +307,7 @@ impl App {
             .find(|s| s.slug == slug)
             .and_then(|s| s.credential_key.clone());
         let Some(key) = key else {
-            self.status = Some(format!("no MCP credential for server '{slug}'"));
+            self.set_status(format!("no MCP credential for server '{slug}'"));
             return;
         };
         self.pending.send(
@@ -310,7 +320,7 @@ impl App {
                 slug: slug.to_string(),
             },
         );
-        self.status = Some(format!("signing out MCP server {slug}…"));
+        self.set_status(format!("signing out MCP server {slug}…"));
     }
 
     /// Apply one streamed login event. Returns whether the UI changed. On
@@ -358,17 +368,17 @@ impl App {
                 // tools land under the `mcp/<slug>` group.
                 if service.starts_with("mcp:") {
                     let slug = target.unwrap_or(service);
-                    self.status = Some(format!(
+                    self.set_status(format!(
                         "signed in MCP server {slug}; connecting — its tools appear under the mcp/{slug} group"
                     ));
                 } else {
                     self.arm_setup_follow(&service);
-                    self.status = Some(format!("signed in {service}; storing credential…"));
+                    self.set_status(format!("signed in {service}; storing credential…"));
                 }
                 self.login = None;
             }
             Some(LoginOutcome::Error(message)) => {
-                self.status = Some(format!("[error] {message}"));
+                self.set_status(format!("[error] {message}"));
                 self.login = None;
             }
             None => {}
@@ -377,6 +387,17 @@ impl App {
     }
 
     /// Update the modal's displayed fields without re-creating it.
+    ///
+    /// These three fields are display-only — nothing reads them back out of the
+    /// modal — so they are normalized for display here, at the single point they
+    /// are taken from a [`LoginEvent`], rather than at each widget that draws
+    /// them.  Every later reader, including a consumer with no ratatui sink,
+    /// then sees inert bytes.
+    ///
+    /// `provider` and `account` are deliberately NOT normalized, and must not be
+    /// "finished" later: the account name is the credential key the modal hands
+    /// back when the flow completes, and the provider selects the auth
+    /// descriptor, so rewriting either would change what is stored or requested.
     fn update_login_fields(
         &mut self,
         auth_url: Option<String>,
@@ -385,13 +406,14 @@ impl App {
     ) {
         if let Some(modal) = self.login.as_mut() {
             if let Some(url) = auth_url {
-                modal.auth_url = Some(url);
+                modal.auth_url = Some(normalized_display_text(url));
             }
-            if let Some(device) = device_code {
-                modal.device_code = Some(device);
+            if let Some((code, uri)) = device_code {
+                modal.device_code =
+                    Some((normalized_display_text(code), normalized_display_text(uri)));
             }
             if let Some(status) = status {
-                modal.status = status;
+                modal.status = normalized_display_text(status);
             }
         }
     }
@@ -400,7 +422,7 @@ impl App {
     pub(crate) fn cancel_login(&mut self) -> bool {
         if let Some(modal) = self.login.take() {
             modal.cancel();
-            self.status = Some("sign-in cancelled".to_string());
+            self.set_status("sign-in cancelled".to_string());
             true
         } else {
             false

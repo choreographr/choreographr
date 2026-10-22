@@ -5,7 +5,7 @@
 //! `state/model_selector.rs`, the session-manager list/detail state in
 //! `state/session_manager.rs`; the history marker (`Marker`) lives here.
 
-use super::{InputBuffer, ProviderInfo};
+use super::{DisplayLine, InputBuffer, ProviderInfo};
 use choreo_proto::AccountInfo;
 use crossterm::event::KeyEvent;
 use tui_prompts::{State, TextState};
@@ -295,8 +295,10 @@ pub(crate) struct AccountWizardState {
     pub(crate) picked_name: Option<String>,
     /// Slug (account name) entry field (step 2).
     pub(crate) slug: TextState<'static>,
-    /// Wizard-scoped error text (e.g. slug validation failures).
-    pub(crate) error: Option<String>,
+    /// Wizard-scoped error text (e.g. slug validation failures).  A
+    /// [`DisplayLine`] stores it normalized for display, so every reader sees
+    /// inert bytes without re-scanning.
+    pub(crate) error: DisplayLine,
 }
 
 impl AccountWizardState {
@@ -311,7 +313,7 @@ impl AccountWizardState {
             picked_slug: None,
             picked_name: None,
             slug: TextState::default(),
-            error: None,
+            error: DisplayLine::none(),
         }
     }
 
@@ -343,7 +345,7 @@ impl AccountWizardState {
         self.picked_slug = None;
         self.picked_name = None;
         self.slug = TextState::default();
-        self.error = None;
+        self.error.clear();
     }
 
     /// Providers matching the current filter (case-insensitive substring over
@@ -478,7 +480,7 @@ impl AccountWizardState {
         self.picked_name = Some(picked.display_name.clone());
         self.step = AccountWizardStep::Slug;
         self.slug = TextState::default();
-        self.error = None;
+        self.error.clear();
         self.slug.focus();
     }
 
@@ -496,7 +498,7 @@ impl AccountWizardState {
     pub(crate) fn back_to_provider(&mut self, providers: &[ProviderInfo]) {
         self.step = AccountWizardStep::Provider;
         self.slug = TextState::default();
-        self.error = None;
+        self.error.clear();
         self.clamp_focus(providers);
     }
 }
@@ -510,7 +512,9 @@ pub(crate) struct CredentialModalState {
     /// The account the key is for; `Some` means the modal is open.
     pub(crate) target: Option<String>,
     pub(crate) input: InputBuffer,
-    pub(crate) error: Option<String>,
+    /// Modal-scoped error text, stored normalized for display (see
+    /// [`DisplayLine`]); it is only ever drawn.
+    pub(crate) error: DisplayLine,
 }
 
 impl CredentialModalState {
@@ -518,7 +522,7 @@ impl CredentialModalState {
         Self {
             target: None,
             input: InputBuffer::new(),
-            error: None,
+            error: DisplayLine::none(),
         }
     }
 
@@ -529,13 +533,13 @@ impl CredentialModalState {
     pub(crate) fn open(&mut self, account_name: String) {
         self.target = Some(account_name);
         self.wipe_input();
-        self.error = None;
+        self.error.clear();
     }
 
     pub(crate) fn close(&mut self) {
         self.target = None;
         self.wipe_input();
-        self.error = None;
+        self.error.clear();
     }
 
     /// Discard the typed key and wipe its bytes from the input buffer's heap
@@ -592,8 +596,10 @@ pub(crate) struct PolkadotImportState {
     pub(crate) path: TextState<'static>,
     /// Account password (step 3).  Wiped on close.
     pub(crate) password: TextState<'static>,
-    /// Modal-scoped error text (validation, file-read, decryption failures).
-    pub(crate) error: Option<String>,
+    /// Modal-scoped error text (validation, file-read, decryption failures),
+    /// stored normalized for display (see [`DisplayLine`]); it is only ever
+    /// drawn.
+    pub(crate) error: DisplayLine,
 }
 
 impl PolkadotImportState {
@@ -604,7 +610,7 @@ impl PolkadotImportState {
             name: TextState::default(),
             path: TextState::default(),
             password: TextState::default(),
-            error: None,
+            error: DisplayLine::none(),
         }
     }
 
@@ -633,7 +639,7 @@ impl PolkadotImportState {
         self.name = TextState::default();
         self.path = TextState::default();
         self.wipe_password();
-        self.error = None;
+        self.error.clear();
     }
 
     /// Discard the typed password and wipe its bytes from the heap before the
@@ -654,7 +660,7 @@ impl PolkadotImportState {
     /// Advance to the next step, focusing its input field.  Called by the
     /// Enter handler after a step validates.
     pub(crate) fn advance(&mut self) {
-        self.error = None;
+        self.error.clear();
         self.step = match self.step {
             PolkadotImportStep::Name => PolkadotImportStep::Path,
             PolkadotImportStep::Path => PolkadotImportStep::Password,
@@ -668,7 +674,7 @@ impl PolkadotImportState {
     /// Back out one step (Esc on the path/password steps), keeping each
     /// previously-entered field so the user can correct it.
     pub(crate) fn back(&mut self) {
-        self.error = None;
+        self.error.clear();
         self.step = match self.step {
             PolkadotImportStep::Name => PolkadotImportStep::Name,
             PolkadotImportStep::Path => PolkadotImportStep::Name,

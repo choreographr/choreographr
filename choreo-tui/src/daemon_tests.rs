@@ -595,7 +595,7 @@ fn enter_continue_when_attached_sends_continue_generation() {
     )
     .expect("handle enter");
 
-    assert_eq!(app.status.as_deref(), Some("> continue"));
+    assert_eq!(app.status(), Some("> continue"));
     let msg = rx.recv().expect("should send ContinueGeneration");
     // The daemon assigns the stream id (reported on `Started`); the client
     // sends the bare request.
@@ -616,7 +616,7 @@ fn enter_continue_when_not_attached_shows_error() {
     )
     .expect("handle enter");
 
-    assert_eq!(app.status.as_deref(), Some("no session attached"));
+    assert_eq!(app.status(), Some("no session attached"));
 }
 
 #[test]
@@ -662,7 +662,7 @@ fn enter_stop_when_attached_sends_cancel_all() {
     )
     .expect("handle enter");
 
-    assert_eq!(app.status.as_deref(), Some("> stop"));
+    assert_eq!(app.status(), Some("> stop"));
     let msg = rx.recv().expect("should send Cancel");
     assert_eq!(msg.inner, ClientMessageType::Cancel { stream_id: 0 });
 }
@@ -681,7 +681,7 @@ fn enter_stop_when_not_attached_shows_error() {
     )
     .expect("handle enter");
 
-    assert_eq!(app.status.as_deref(), Some("no session attached"));
+    assert_eq!(app.status(), Some("no session attached"));
 }
 
 #[test]
@@ -697,7 +697,7 @@ fn enter_undo_sends_undo() {
     )
     .expect("handle enter");
 
-    assert_eq!(app.status.as_deref(), Some("> undo"));
+    assert_eq!(app.status(), Some("> undo"));
     let msg = rx.recv().expect("should send Undo");
     assert_eq!(msg.inner, ClientMessageType::Undo);
 }
@@ -715,7 +715,7 @@ fn enter_redo_sends_redo() {
     )
     .expect("handle enter");
 
-    assert_eq!(app.status.as_deref(), Some("> redo"));
+    assert_eq!(app.status(), Some("> redo"));
     let msg = rx.recv().expect("should send Redo");
     assert_eq!(msg.inner, ClientMessageType::Redo);
 }
@@ -738,7 +738,7 @@ fn enter_undo_while_busy_is_rejected_client_side() {
     .expect("handle enter");
 
     assert_eq!(
-        app.status.as_deref(),
+        app.status(),
         Some("Session is not idle, please wait before undoing or redoing.")
     );
     assert!(
@@ -762,7 +762,7 @@ fn enter_redo_while_busy_is_rejected_client_side() {
     .expect("handle enter");
 
     assert_eq!(
-        app.status.as_deref(),
+        app.status(),
         Some("Session is not idle, please wait before undoing or redoing.")
     );
     assert!(
@@ -787,7 +787,7 @@ fn alt_up_undo_while_busy_is_rejected_client_side() {
     .expect("handle alt+up");
 
     assert_eq!(
-        app.status.as_deref(),
+        app.status(),
         Some("Session is not idle, please wait before undoing or redoing.")
     );
     assert!(
@@ -853,7 +853,7 @@ fn ctrl_r_no_session_shows_message() {
     .expect("handle alt+r");
 
     assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("low"));
-    assert_eq!(app.status.as_deref(), Some("reasoning: low"));
+    assert_eq!(app.status(), Some("reasoning: low"));
 }
 
 #[test]
@@ -874,7 +874,7 @@ fn ctrl_r_no_active_display_shows_message() {
     )
     .expect("handle alt+r");
 
-    assert_eq!(app.status.as_deref(), Some("no session attached"));
+    assert_eq!(app.status(), Some("no session attached"));
     assert!(rx.try_iter().next().is_none(), "no client message expected");
 }
 
@@ -900,7 +900,7 @@ fn ctrl_r_cycles_through_valid_slugs() {
     )
     .expect("handle alt+r 1");
     assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("low"));
-    assert_eq!(app.status.as_deref(), Some("reasoning: low"));
+    assert_eq!(app.status(), Some("reasoning: low"));
     let msg = rx.recv().expect("SetReasoningEffort 1");
     assert_eq!(
         msg.inner,
@@ -980,7 +980,7 @@ fn ctrl_r_no_model_selected_shows_message() {
     .expect("handle alt+r");
 
     assert_eq!(
-        app.status.as_deref(),
+        app.status(),
         Some("no model selected — pick one with Alt+M")
     );
     // Effort should remain unchanged (still None) and nothing is sent to
@@ -1006,10 +1006,7 @@ fn ctrl_r_model_selected_capability_pending_shows_message() {
     )
     .expect("handle alt+r");
 
-    assert_eq!(
-        app.status.as_deref(),
-        Some("reasoning capability not yet available")
-    );
+    assert_eq!(app.status(), Some("reasoning capability not yet available"));
     // Effort should remain unchanged (still None) and nothing is sent to
     // the daemon (no cycling, so no SetReasoningEffort).
     assert!(app.display_for(0).reasoning_effort.is_none());
@@ -1324,10 +1321,7 @@ fn ctrl_r_with_empty_capability_shows_message() {
     )
     .expect("handle alt+r");
 
-    assert_eq!(
-        app.status.as_deref(),
-        Some("model does not support reasoning")
-    );
+    assert_eq!(app.status(), Some("model does not support reasoning"));
 }
 
 // ── per-session pin/archive flags (SessionFlagsChanged) ──
@@ -1399,7 +1393,7 @@ fn session_failed_for_pin_and_archive_sets_page_error() {
     let mut app = test_app();
     app.page = Page::SessionManager;
     let (tx, _rx) = crossbeam_channel::unbounded();
-    assert!(app.session_mgr.error.is_none());
+    assert!(app.session_mgr.error.get().is_none());
 
     handle_daemon_message(
         DaemonMessage::broadcast(DaemonMessageType::Session {
@@ -1413,12 +1407,12 @@ fn session_failed_for_pin_and_archive_sets_page_error() {
         &tx,
     )
     .expect("handle SessionFailed");
-    assert_eq!(app.session_mgr.error.as_deref(), Some("boom"));
+    assert_eq!(app.session_mgr.error.get(), Some("boom"));
     // The generic dispatch overwrites `app.error` with the raw daemon error
     // text after this arm; the page-local error is the useful signal here.
-    assert_eq!(app.error.as_deref(), Some("boom"));
+    assert_eq!(app.error(), Some("boom"));
 
-    app.session_mgr.error = None;
+    app.session_mgr.error.clear();
     handle_daemon_message(
         DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(1),
@@ -1431,7 +1425,7 @@ fn session_failed_for_pin_and_archive_sets_page_error() {
         &tx,
     )
     .expect("handle SessionFailed");
-    assert_eq!(app.session_mgr.error.as_deref(), Some("nope"));
+    assert_eq!(app.session_mgr.error.get(), Some("nope"));
 }
 
 // ── First-run follow-through (key saved → account selected → model picker) ──
@@ -1611,7 +1605,7 @@ fn model_picker_without_an_account_explains_what_is_missing() {
     .expect("handle Alt+M");
 
     assert!(!app.model_selector.is_open());
-    assert!(app.error.as_deref().is_some_and(|e| e.contains("alt+a")));
+    assert!(app.error().is_some_and(|e| e.contains("alt+a")));
     assert!(
         !sent(&rx)
             .iter()
@@ -1644,7 +1638,7 @@ fn warming_model_list_schedules_a_retry_instead_of_an_error() {
         app.model_selector.loading,
         "the popup keeps showing loading"
     );
-    assert_eq!(app.model_selector.error, None);
+    assert_eq!(app.model_selector.error.get(), None);
     assert!(app.model_selector.retry_timer.is_some());
 }
 
@@ -1668,7 +1662,7 @@ fn a_real_model_list_failure_is_shown_without_retrying() {
     .expect("handle ModelsFailed");
 
     assert_eq!(
-        app.model_selector.error.as_deref(),
+        app.model_selector.error.get(),
         Some("no accounts configured")
     );
     assert!(app.model_selector.retry_timer.is_none());

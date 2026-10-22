@@ -39,11 +39,7 @@ fn begin_login_unknown_account_reports_and_sends_nothing() {
     let mut app = test_app();
     let (tx, rx) = crossbeam_channel::unbounded::<ClientMessage>();
     app.begin_login("nope".to_string(), false, &tx);
-    assert!(
-        app.status
-            .as_deref()
-            .is_some_and(|s| s.contains("no account"))
-    );
+    assert!(app.status().is_some_and(|s| s.contains("no account")));
     assert!(app.login.is_none());
     assert!(
         rx.try_recv().is_err(),
@@ -79,11 +75,10 @@ fn begin_login_reports_a_provider_without_oauth_support() {
     let (tx, _rx) = crossbeam_channel::unbounded::<ClientMessage>();
     app.begin_login("work".to_string(), false, &tx);
     assert!(
-        app.status
-            .as_deref()
+        app.status()
             .is_some_and(|s| s.contains("does not support OAuth")),
         "got: {:?}",
-        app.status
+        app.status()
     );
     assert!(app.login.is_none());
 }
@@ -139,7 +134,7 @@ fn mcp_login_done_reports_the_slug_and_skips_setup_follow() {
         ClientMessageType::AddCredential { .. }
     ));
     // The status names the slug and its tool group, never the raw credential key.
-    let status = app.status.as_deref().expect("status");
+    let status = app.status().expect("status");
     assert!(status.contains("docs"), "got: {status}");
     assert!(status.contains("mcp/docs"), "got: {status}");
     assert!(
@@ -182,9 +177,6 @@ fn provider_login_done_arms_setup_follow_and_reports_the_account() {
     // The provider path arms the first-run follow-through and names the
     // account (not a slug/tool group).
     assert!(app.setup_follow.is_some());
-    assert_eq!(
-        app.status.as_deref(),
-        Some("signed in work; storing credential…")
-    );
+    assert_eq!(app.status(), Some("signed in work; storing credential…"));
     assert!(app.login.is_none());
 }

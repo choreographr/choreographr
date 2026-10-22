@@ -1009,7 +1009,7 @@ fn status_bar_renders_daemon_errors_inert() {
     use crate::test_util::test_app;
 
     let mut app = test_app();
-    app.error = Some("bad request\u{7}\tbody\x1b[31m".to_string());
+    app.set_error("bad request\u{7}\tbody\x1b[31m".to_string());
     let content = render_chat_content(&mut app, 80, 24);
     assert!(
         !content.chars().any(char::is_control),
@@ -1023,19 +1023,18 @@ fn status_bar_renders_daemon_errors_inert() {
 }
 
 #[test]
-fn status_error_height_measures_the_normalized_text() {
-    // The reserved height must match the rows the normalized text wraps to, or
-    // the tail of a long message is clipped by the layout.
+fn status_error_height_measures_the_stored_text_as_drawn() {
+    // The reserved height is measured from the STORED text, which ingest already
+    // normalized — the same bytes the renderer draws — so the two cannot
+    // disagree about how many rows a taboo-laden message occupies.
     use crate::test_util::test_app;
 
     let mut app = test_app();
-    app.error = Some("aaaaaaaaaa\tbbbbbbbbbb\tcccc".to_string());
+    app.set_error("aaaaaaaaaa\tbbbbbbbbbb\tcccc".to_string());
     let width = 24u16;
     let height = app.status_error_height(width);
-    // Drawing the same message must actually occupy exactly that many rows.
-    let text =
-        crate::markdown_render::normalize_display_text(app.error.as_deref().unwrap_or_default());
-    let drawn_rows = crate::markdown_render::plain_text_lines(&text, width - 2).len();
+    let text = app.error().expect("error stored");
+    let drawn_rows = crate::markdown_render::plain_text_lines(text, width - 2).len();
     assert_eq!(
         usize::from(height),
         drawn_rows,
@@ -1084,17 +1083,60 @@ fn session_manager_cells_render_untrusted_titles_inert() {
 
 #[test]
 fn login_modal_renders_untrusted_fields_inert() {
-    // The authorization server supplies the status line, the authorize URL, and
-    // the device code; the credential supplies the account name.
+    // The authorization server supplies the status line, the authorize URL and
+    // the device code, and the credential supplies the account name.  The three
+    // display-only fields are normalized at INGEST (where `apply_login_event`
+    // takes them from the event) while `provider`/`account` stay raw, so this
+    // asserts both halves: the modal holds inert text, the drawn content is
+    // inert end to end, and the identity fields still carry their exact bytes.
     use crate::state::LoginModal;
     use crate::test_util::test_app;
+    use choreo_client_core::LoginEvent;
 
     let mut app = test_app();
-    let mut modal = LoginModal::test_modal("openai\u{7}", "work\tacct");
-    modal.status = "waiting\x1b[2J".to_string();
-    modal.auth_url = Some("https://x/\u{202e}evil".to_string());
-    modal.device_code = Some(("AB\u{7}CD".to_string(), "https://x/dc".to_string()));
-    app.login = Some(modal);
+    app.login = Some(LoginModal::test_modal("openai\u{7}", "work\tacct"));
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    app.apply_login_event(
+        LoginEvent::AuthUrl {
+            url: "https://x/\u{202e}evil".to_string(),
+        },
+        &tx,
+    );
+    app.apply_login_event(
+        LoginEvent::DeviceCode {
+            code: "AB\u{7}CD".to_string(),
+            uri: "https://x/dc\tx".to_string(),
+        },
+        &tx,
+    );
+    app.apply_login_event(
+        LoginEvent::Prompt {
+            message: "waiting\x1b[2J".to_string(),
+        },
+        &tx,
+    );
+
+    let modal = app.login.as_ref().expect("the flow is still running");
+    let mut display_only = vec![
+        modal.status.as_str(),
+        modal.auth_url.as_deref().unwrap_or(""),
+    ];
+    if let Some((code, uri)) = modal.device_code.as_ref() {
+        display_only.push(code.as_str());
+        display_only.push(uri.as_str());
+    }
+    for text in display_only {
+        assert!(
+            !text.chars().any(char::is_control)
+                && !text.contains('\u{202e}')
+                && !text.contains('\t'),
+            "display-only login fields are stored inert: {text:?}"
+        );
+    }
+    // Deliberately NOT normalized: the account is the credential key the modal
+    // hands back, and the provider selects the auth descriptor.
+    assert_eq!(modal.provider, "openai\u{7}");
+    assert_eq!(modal.account, "work\tacct");
 
     let content = render_chat_content(&mut app, 100, 30);
     assert!(

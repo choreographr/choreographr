@@ -157,7 +157,7 @@ fn failed_and_cancelled_records() {
         "a user cancel must not record an error"
     );
     assert!(
-        app.error.is_none(),
+        app.error().is_none(),
         "a user cancel must not write the global error bar"
     );
 

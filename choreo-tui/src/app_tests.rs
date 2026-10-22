@@ -147,7 +147,7 @@ fn submitting_prompt_while_locked_is_rejected_with_feedback() {
     )
     .expect("handle enter");
 
-    let status = app.status.as_deref().expect("lock feedback status");
+    let status = app.status().expect("lock feedback status");
     assert!(
         status.contains("locked"),
         "must tell the user the daemon is locked, got: {status}"
@@ -191,7 +191,7 @@ fn submitting_prompt_while_busy_is_rejected_and_preserves_input() {
     press_enter(&mut app, &tx);
 
     assert_eq!(
-        app.status.as_deref(),
+        app.status(),
         Some("Session is not idle, please wait before prompting.")
     );
     assert!(
@@ -217,7 +217,7 @@ fn submitting_prompt_while_sleeping_is_rejected() {
     press_enter(&mut app, &tx);
 
     assert_eq!(
-        app.status.as_deref(),
+        app.status(),
         Some("Session is not idle, please wait before prompting.")
     );
     assert!(rx.try_recv().is_err());
@@ -294,7 +294,7 @@ fn empty_submission_while_busy_is_a_noop() {
 
     press_enter(&mut app, &tx);
 
-    assert_eq!(app.status, None);
+    assert_eq!(app.status(), None);
     assert!(rx.try_recv().is_err());
 }
 
@@ -322,7 +322,7 @@ fn alt_enter_while_busy_is_rejected_by_the_same_guard() {
     press_alt_enter(&mut app, &tx);
 
     assert_eq!(
-        app.status.as_deref(),
+        app.status(),
         Some("Session is not idle, please wait before prompting.")
     );
     assert!(
@@ -343,7 +343,7 @@ fn alt_enter_while_locked_is_rejected_by_the_same_guard() {
 
     press_alt_enter(&mut app, &tx);
 
-    let status = app.status.as_deref().expect("lock feedback status");
+    let status = app.status().expect("lock feedback status");
     assert!(status.contains("locked"), "got: {status}");
     assert!(rx.try_recv().is_err());
 }
@@ -361,7 +361,7 @@ fn alt_enter_while_idle_is_sent() {
         rx.recv().expect("sent message").inner,
         ClientMessageType::ContinueGeneration
     ));
-    assert!(app.status.is_none(), "no status message on success");
+    assert!(app.status().is_none(), "no status message on success");
 }
 
 #[test]
@@ -377,7 +377,7 @@ fn continue_command_while_busy_is_rejected_by_the_same_guard() {
     press_enter(&mut app, &tx);
 
     assert_eq!(
-        app.status.as_deref(),
+        app.status(),
         Some("Session is not idle, please wait before prompting.")
     );
     assert!(
@@ -397,7 +397,7 @@ fn continue_command_while_locked_is_rejected_by_the_same_guard() {
 
     press_enter(&mut app, &tx);
 
-    let status = app.status.as_deref().expect("lock feedback status");
+    let status = app.status().expect("lock feedback status");
     assert!(status.contains("locked"), "got: {status}");
     assert!(rx.try_recv().is_err());
 }
@@ -630,7 +630,7 @@ fn chat_esc_stops_active_session() {
 
     let msg = rx.recv().expect("sent message");
     assert_eq!(msg.inner, ClientMessageType::Cancel { stream_id: 0 });
-    assert!(app.status.is_none(), "no status message on success");
+    assert!(app.status().is_none(), "no status message on success");
 }
 
 #[test]
@@ -646,7 +646,7 @@ fn chat_esc_no_session_shows_status() {
     )
     .expect("handle esc");
 
-    assert_eq!(app.status.as_deref(), Some("no session attached"));
+    assert_eq!(app.status(), Some("no session attached"));
 }
 
 #[test]
@@ -666,7 +666,7 @@ fn chat_alt_enter_continues_generation() {
     // sends only the request (its reply id is allocated by `pending`).
     let msg = rx.recv().expect("sent message");
     assert_eq!(msg.inner, ClientMessageType::ContinueGeneration);
-    assert!(app.status.is_none(), "no status message on success");
+    assert!(app.status().is_none(), "no status message on success");
 }
 
 #[test]
@@ -682,7 +682,7 @@ fn chat_alt_enter_no_session_shows_status() {
     )
     .expect("handle alt+enter");
 
-    assert_eq!(app.status.as_deref(), Some("no session attached"));
+    assert_eq!(app.status(), Some("no session attached"));
 }
 
 // ── Unsent prompt drafts are stored per session ──
@@ -1051,7 +1051,7 @@ mod unsent_draft_tests {
         let msg = rx.recv().expect("RefreshModels sent");
         assert_eq!(msg.inner, ClientMessageType::RefreshModels { force: true });
         assert_eq!(
-            app.status.as_deref(),
+            app.status(),
             Some("refreshing models… (forced)"),
             "status set before the reply arrives"
         );
@@ -1073,7 +1073,7 @@ mod unsent_draft_tests {
         )
         .expect("handle ModelsRefreshed");
         assert_eq!(
-            app.status.as_deref(),
+            app.status(),
             Some("models updated (208 providers, 1234 models)")
         );
 
@@ -1088,7 +1088,7 @@ mod unsent_draft_tests {
         )
         .expect("handle ModelsRefreshed 304");
         assert_eq!(
-            app.status.as_deref(),
+            app.status(),
             Some("models up to date (208 providers, 1234 models)")
         );
 
@@ -1102,7 +1102,7 @@ mod unsent_draft_tests {
             &tx,
         )
         .expect("handle ModelsRefreshed forced");
-        assert!(app.status.as_deref().unwrap().contains("forced"));
+        assert!(app.status().unwrap().contains("forced"));
     }
 
     #[test]
@@ -1119,7 +1119,7 @@ mod unsent_draft_tests {
         )
         .expect("handle ModelsRefreshFailed");
         assert_eq!(
-            app.error.as_deref(),
+            app.error(),
             Some("[daemon] refresh-models failed: network error")
         );
     }
@@ -1144,7 +1144,7 @@ mod unsent_draft_tests {
 
         let msg = rx.recv().expect("McpStatusRequest sent");
         assert_eq!(msg.inner, ClientMessageType::McpStatusRequest);
-        assert_eq!(app.status.as_deref(), Some("> /mcp"));
+        assert_eq!(app.status(), Some("> /mcp"));
     }
 
     #[test]
@@ -1168,7 +1168,7 @@ mod unsent_draft_tests {
                 slug: "docs".to_string(),
             }
         );
-        assert_eq!(app.status.as_deref(), Some("reconnecting MCP server docs…"));
+        assert_eq!(app.status(), Some("reconnecting MCP server docs…"));
     }
 
     /// An MCP server status row carrying an `oauth` block and a credential
@@ -1363,7 +1363,7 @@ mod unsent_draft_tests {
         )
         .expect("handle McpStatus");
 
-        let status = app.status.expect("status set from McpStatus");
+        let status = app.status().expect("status set from McpStatus");
         let lines: Vec<&str> = status.lines().collect();
         assert_eq!(lines[0], "MCP servers (2)");
         assert!(lines[1].contains("docs") && lines[1].contains("4 tool(s)"));
@@ -1386,7 +1386,7 @@ mod unsent_draft_tests {
             &tx,
         )
         .expect("handle empty McpStatus");
-        assert_eq!(app.status.as_deref(), Some("no MCP servers configured"));
+        assert_eq!(app.status(), Some("no MCP servers configured"));
     }
 
     #[test]
@@ -1404,7 +1404,7 @@ mod unsent_draft_tests {
         )
         .expect("handle McpReconnectFailed");
         assert_eq!(
-            app.error.as_deref(),
+            app.error(),
             Some("[daemon] mcp reconnect docs failed: connection refused")
         );
     }
@@ -1425,7 +1425,7 @@ mod unsent_draft_tests {
 
         let msg = rx.recv().expect("McpReload sent");
         assert_eq!(msg.inner, ClientMessageType::McpReload);
-        assert_eq!(app.status.as_deref(), Some("reloading MCP configuration…"));
+        assert_eq!(app.status(), Some("reloading MCP configuration…"));
     }
 
     #[test]
@@ -1457,7 +1457,7 @@ mod unsent_draft_tests {
         )
         .expect("handle McpReloaded");
 
-        let status = app.status.expect("status set from McpReloaded");
+        let status = app.status().expect("status set from McpReloaded");
         let lines: Vec<&str> = status.lines().collect();
         assert_eq!(
             lines[0],
@@ -1480,7 +1480,7 @@ mod unsent_draft_tests {
         )
         .expect("handle McpReloadFailed");
         assert_eq!(
-            app.error.as_deref(),
+            app.error(),
             Some("[daemon] mcp reload failed: failed to parse mcp.json")
         );
     }
@@ -1523,7 +1523,7 @@ mod unsent_draft_tests {
         assert_eq!(app.providers[1].slug, "openai");
         // Highlight was beyond the new list's end → clamped to the last row.
         assert_eq!(app.ai_providers.wizard.focused, 1);
-        assert_eq!(app.status.as_deref(), Some("catalog updated (2 providers)"));
+        assert_eq!(app.status(), Some("catalog updated (2 providers)"));
     }
 
     #[test]
@@ -1532,7 +1532,7 @@ mod unsent_draft_tests {
         // identical payload must not overwrite an unrelated status message.
         let mut app = test_app();
         let (tx, _rx) = crossbeam_channel::unbounded();
-        app.status = Some("busy".to_string());
+        app.set_status("busy".to_string());
 
         let providers = app
             .providers
@@ -1549,7 +1549,7 @@ mod unsent_draft_tests {
         )
         .expect("handle CatalogUpdated");
 
-        assert_eq!(app.status.as_deref(), Some("busy"), "status preserved");
+        assert_eq!(app.status(), Some("busy"), "status preserved");
         assert_eq!(app.providers.len(), 209);
     }
 
@@ -1718,7 +1718,7 @@ mod unsent_draft_tests {
         .expect("enter empty key");
         assert!(app.ai_providers.credential.is_open());
         assert_eq!(
-            app.ai_providers.credential.error.as_deref(),
+            app.ai_providers.credential.error.get(),
             Some("API key cannot be empty")
         );
     }
@@ -1745,7 +1745,7 @@ mod unsent_draft_tests {
         // is on the global error line.
         assert!(!app.ai_providers.credential.is_open());
         assert_eq!(
-            app.error.as_deref(),
+            app.error(),
             Some("[daemon] failed to add account my-account: duplicate slug")
         );
     }
@@ -1786,7 +1786,7 @@ mod unsent_draft_tests {
         assert_eq!(app.ai_providers.credential.input.cursor, 4);
         // The failure is still surfaced on the global error line.
         assert_eq!(
-            app.error.as_deref(),
+            app.error(),
             Some("[daemon] failed to add account my-account: duplicate slug")
         );
     }
@@ -2115,11 +2115,10 @@ fn palette_enter_runs_an_unknown_command() {
     );
     assert!(app.input.is_empty());
     assert!(
-        app.status
-            .as_deref()
+        app.status()
             .is_some_and(|s| s.starts_with("unknown command")),
         "got: {:?}",
-        app.status
+        app.status()
     );
 }
 
@@ -2199,7 +2198,7 @@ fn a_double_slash_is_run_verbatim_never_silently_prepended() {
     assert!(rx.try_recv().is_err(), "an unknown command sends nothing");
     assert!(app.input.is_empty());
     assert_eq!(
-        app.status.as_deref(),
+        app.status(),
         Some("unknown command: //acl"),
         "the run reflects exactly what the user saw"
     );
@@ -2266,7 +2265,7 @@ fn alt_r_cycles_reasoning_effort() {
     .expect("alt+r");
 
     assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("low"));
-    assert_eq!(app.status.as_deref(), Some("reasoning: low"));
+    assert_eq!(app.status(), Some("reasoning: low"));
     assert_eq!(
         rx.recv().expect("sent message").inner,
         ClientMessageType::SetReasoningEffort {
@@ -2297,7 +2296,7 @@ fn alt_s_opens_session_manager() {
         ClientMessageType::SubscribeSessionsSummary
     );
     // A bare keypress must not echo a `> /session` status.
-    assert!(app.status.is_none());
+    assert!(app.status().is_none());
 }
 
 #[test]
@@ -2317,7 +2316,7 @@ fn alt_m_opens_selector_and_requests_models() {
         rx.recv().expect("ListModels").inner,
         ClientMessageType::ListModels
     );
-    assert!(app.status.is_none(), "a bare keypress must not echo");
+    assert!(app.status().is_none(), "a bare keypress must not echo");
 }
 
 #[test]

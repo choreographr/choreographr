@@ -27,7 +27,7 @@ fn model_selector_open_resets_state_and_marks_loading() {
     sel.filter.cursor = 5;
     sel.focused = 3;
     sel.scroll = 2;
-    sel.error = Some("old error".into());
+    sel.error.set("old error");
 
     sel.open();
 
@@ -36,7 +36,7 @@ fn model_selector_open_resets_state_and_marks_loading() {
     assert!(sel.filter.text.is_empty());
     assert_eq!(sel.focused, 0);
     assert_eq!(sel.scroll, 0);
-    assert!(sel.error.is_none());
+    assert!(sel.error.get().is_none());
 }
 
 #[test]
@@ -313,7 +313,7 @@ fn model_selector_apply_error_records_and_clears_loading() {
     sel.open();
     sel.apply_error("no credential".to_string());
     assert!(!sel.loading);
-    assert_eq!(sel.error.as_deref(), Some("no credential"));
+    assert_eq!(sel.error.get(), Some("no credential"));
 }
 
 #[test]
@@ -326,7 +326,7 @@ fn warming_retries_stop_at_the_budget() {
     }
     // Budget spent: the daemon's message is shown and nothing is re-armed.
     assert!(!selector.schedule_warming_retry("warming"));
-    assert_eq!(selector.error.as_deref(), Some("warming"));
+    assert_eq!(selector.error.get(), Some("warming"));
     assert!(selector.retry_timer.is_none());
 }
 
@@ -360,7 +360,7 @@ fn a_terminal_error_disarms_an_armed_warming_retry() {
 
     // A real failure replaces the warming state, so the retry must stop.
     selector.apply_error("no credential");
-    assert_eq!(selector.error.as_deref(), Some("no credential"));
+    assert_eq!(selector.error.get(), Some("no credential"));
     assert!(selector.retry_timer.is_none());
     assert!(!selector.take_retry());
 }

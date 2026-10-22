@@ -208,12 +208,15 @@ pub(super) fn handle_credential_modal_event(
 
             if api_key.is_empty() {
                 tracing::debug!(account_name, "credential save rejected: empty key");
-                app.ai_providers.credential.error = Some("API key cannot be empty".to_string());
+                app.ai_providers
+                    .credential
+                    .error
+                    .set("API key cannot be empty".to_string());
                 app.ai_providers.credential.target = Some(account_name);
                 return;
             }
 
-            app.ai_providers.credential.error = None;
+            app.ai_providers.credential.error.clear();
 
             // Build and send the credential as a TYPED plaintext value: no key
             // rides the request, the daemon encrypts it to its own binding key.
@@ -232,13 +235,13 @@ pub(super) fn handle_credential_modal_event(
                     // confirms the key (see `SetupFollow`).
                     app.arm_setup_follow(&account_name);
                     app.pending.send(client_tx, msg);
-                    app.status = Some(format!(
+                    app.set_status(format!(
                         "[daemon] credential stored for account: {account_name}"
                     ));
                 }
                 Err(e) => {
                     tracing::warn!(account_name, %e, "failed to build API-key credential message");
-                    app.status = Some(format!(
+                    app.set_status(format!(
                         "[warning] failed to build credential for {account_name}: {e}"
                     ));
                 }
@@ -286,12 +289,14 @@ pub(super) fn handle_polkadot_import_event(
                     .trim()
                     .to_string();
                 if name.is_empty() {
-                    app.ai_providers.polkadot_import.error =
-                        Some("Account name is required".to_string());
+                    app.ai_providers
+                        .polkadot_import
+                        .error
+                        .set("Account name is required".to_string());
                     return;
                 }
                 if !is_valid_account_name(&name) {
-                    app.ai_providers.polkadot_import.error = Some(
+                    app.ai_providers.polkadot_import.error.set(
                         "name must be lowercase alphanumeric, hyphens, or underscores".to_string(),
                     );
                     return;
@@ -307,8 +312,10 @@ pub(super) fn handle_polkadot_import_event(
                     .trim()
                     .to_string();
                 if path.is_empty() {
-                    app.ai_providers.polkadot_import.error =
-                        Some("Keystore path is required".to_string());
+                    app.ai_providers
+                        .polkadot_import
+                        .error
+                        .set("Keystore path is required".to_string());
                     return;
                 }
                 app.ai_providers.polkadot_import.advance();
@@ -394,12 +401,12 @@ fn submit_polkadot_import(app: &mut App, client_tx: &crossbeam_channel::Sender<C
 
     match result {
         Ok(status) => {
-            app.status = Some(status);
+            app.set_status(status);
             app.ai_providers.polkadot_import.close();
         }
         Err(e) => {
             tracing::warn!(%e, "polkadot account import failed");
-            app.ai_providers.polkadot_import.error = Some(e);
+            app.ai_providers.polkadot_import.error.set(e);
         }
     }
 }
@@ -470,19 +477,21 @@ pub(super) fn handle_account_wizard_event(
                         let slug = app.ai_providers.wizard.slug.value().trim().to_string();
                         if slug.is_empty() {
                             tracing::debug!("slug rejected: empty");
-                            app.ai_providers.wizard.error =
-                                Some("Account name is required".to_string());
+                            app.ai_providers
+                                .wizard
+                                .error
+                                .set("Account name is required".to_string());
                             return Ok(());
                         }
                         if !is_valid_account_name(&slug) {
                             tracing::debug!(%slug, "slug rejected: invalid characters");
-                            app.ai_providers.wizard.error = Some(
+                            app.ai_providers.wizard.error.set(
                                 "account name must be lowercase letters, digits, hyphens, or underscores"
                                     .to_string(),
                             );
                             return Ok(());
                         }
-                        app.ai_providers.wizard.error = None;
+                        app.ai_providers.wizard.error.clear();
                         submit_new_account(app, client_tx)?;
                     } else {
                         // All other keys go to the slug input buffer.
@@ -570,7 +579,7 @@ fn submit_new_account(
         .or_else(|| app.providers.first().map(|p| p.slug.clone()))
         .unwrap_or_default();
 
-    app.ai_providers.wizard.error = None;
+    app.ai_providers.wizard.error.clear();
 
     tracing::info!(%slug, %provider_str, "sending AddAccount");
 

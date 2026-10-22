@@ -1202,7 +1202,7 @@ fn model_selected_for_background_session_does_not_write_global_status() {
     // The user is viewing session 42.
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
-    assert!(app.status.is_none() && app.error.is_none());
+    assert!(app.status().is_none() && app.error().is_none());
 
     // A background session (99) changes its model.  Its per-session display
     // is updated, but the global status/error line must stay untouched.
@@ -1220,11 +1220,13 @@ fn model_selected_for_background_session_does_not_write_global_status() {
     .expect("handle ModelSelected");
 
     assert_eq!(
-        app.status, None,
+        app.status(),
+        None,
         "a background session's model change must not write the global status line"
     );
     assert_eq!(
-        app.error, None,
+        app.error(),
+        None,
         "a background session's model change must not write the global error line"
     );
     assert_eq!(
@@ -1257,7 +1259,7 @@ fn model_selected_for_attached_session_writes_status_feedback() {
     .expect("handle ModelSelected");
 
     assert_eq!(
-        app.status.as_deref(),
+        app.status(),
         Some("[daemon] selected model: gpt-new"),
         "attached-session /model feedback must be preserved"
     );
@@ -1273,7 +1275,7 @@ fn reasoning_effort_set_for_background_session_does_not_write_global_status() {
     let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
-    assert!(app.status.is_none() && app.error.is_none());
+    assert!(app.status().is_none() && app.error().is_none());
 
     handle_daemon_message(
         DaemonMessage::broadcast(DaemonMessageType::Session {
@@ -1287,8 +1289,8 @@ fn reasoning_effort_set_for_background_session_does_not_write_global_status() {
     )
     .expect("handle ReasoningEffortSet");
 
-    assert_eq!(app.status, None);
-    assert_eq!(app.error, None);
+    assert_eq!(app.status(), None);
+    assert_eq!(app.error(), None);
     assert_eq!(
         app.display_for(99).reasoning_effort.as_deref(),
         Some("high")
@@ -1315,7 +1317,7 @@ fn reasoning_effort_set_for_attached_session_writes_status_feedback() {
     .expect("handle ReasoningEffortSet");
 
     assert_eq!(
-        app.status.as_deref(),
+        app.status(),
         Some("[daemon] reasoning effort: high"),
         "attached-session /reasoning feedback must be preserved"
     );
@@ -1331,7 +1333,7 @@ fn session_account_set_for_background_session_does_not_write_global_status() {
     let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
-    assert!(app.status.is_none() && app.error.is_none());
+    assert!(app.status().is_none() && app.error().is_none());
 
     handle_daemon_message(
         DaemonMessage::broadcast(DaemonMessageType::Session {
@@ -1345,8 +1347,8 @@ fn session_account_set_for_background_session_does_not_write_global_status() {
     )
     .expect("handle SessionAccountSet");
 
-    assert_eq!(app.status, None);
-    assert_eq!(app.error, None);
+    assert_eq!(app.status(), None);
+    assert_eq!(app.error(), None);
     assert_eq!(
         app.display_for(99).account_name.as_deref(),
         Some("bg-account")
@@ -1373,7 +1375,7 @@ fn session_account_set_for_attached_session_writes_status_feedback() {
     .expect("handle SessionAccountSet");
 
     assert_eq!(
-        app.status.as_deref(),
+        app.status(),
         Some("[daemon] session account set: main"),
         "attached-session /account feedback must be preserved"
     );
@@ -1386,7 +1388,7 @@ fn reasoning_effort_set_failed_for_background_session_does_not_write_global_stat
     let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
-    assert!(app.status.is_none() && app.error.is_none());
+    assert!(app.status().is_none() && app.error().is_none());
 
     // A background session's rejection previously leaked through BOTH the
     // explicit `app.status` write and the generic dispatch's `app.error`.
@@ -1404,11 +1406,13 @@ fn reasoning_effort_set_failed_for_background_session_does_not_write_global_stat
     .expect("handle ReasoningEffortSetFailed");
 
     assert_eq!(
-        app.status, None,
+        app.status(),
+        None,
         "a background session's rejection must not write the global status line"
     );
     assert_eq!(
-        app.error, None,
+        app.error(),
+        None,
         "a background session's rejection must not write the global error line"
     );
     assert_eq!(app.display_for(99).reasoning_effort.as_deref(), Some("off"));
@@ -1437,11 +1441,11 @@ fn reasoning_effort_set_failed_for_attached_session_writes_status_and_error() {
     .expect("handle ReasoningEffortSetFailed");
 
     assert_eq!(
-        app.status.as_deref(),
+        app.status(),
         Some("reasoning effort rejected: model does not support reasoning")
     );
     assert_eq!(
-        app.error.as_deref(),
+        app.error(),
         Some("[daemon] failed to set reasoning effort high: model does not support reasoning")
     );
     assert_eq!(app.display_for(42).reasoning_effort.as_deref(), Some("off"));
@@ -1480,7 +1484,7 @@ fn reasoning_effort_set_connection_level_writes_status_feedback_for_attached_ses
     .expect("handle ReasoningEffortSet");
 
     assert_eq!(
-        app.status.as_deref(),
+        app.status(),
         Some("[daemon] reasoning effort: high"),
         "bare /reasoning feedback must be preserved for a connection-level reply"
     );
@@ -1494,7 +1498,7 @@ fn reasoning_effort_set_connection_level_writes_status_feedback_for_attached_ses
         None,
         "a connection-level reply must not write a phantom session-0 display"
     );
-    assert_eq!(app.error, None);
+    assert_eq!(app.error(), None);
 }
 
 #[test]
@@ -1521,11 +1525,11 @@ fn reasoning_effort_set_failed_connection_level_writes_status_and_error() {
     .expect("handle ReasoningEffortSetFailed");
 
     assert_eq!(
-        app.status.as_deref(),
+        app.status(),
         Some("reasoning effort rejected: no session attached")
     );
     assert_eq!(
-        app.error.as_deref(),
+        app.error(),
         Some("[daemon] failed to set reasoning effort high: no session attached")
     );
     assert_eq!(
@@ -1541,7 +1545,7 @@ fn model_selection_failed_for_background_session_does_not_write_global_error() {
     let (tx, _rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
-    assert!(app.status.is_none() && app.error.is_none());
+    assert!(app.status().is_none() && app.error().is_none());
 
     handle_daemon_message(
         DaemonMessage::broadcast(DaemonMessageType::Session {
@@ -1557,10 +1561,11 @@ fn model_selection_failed_for_background_session_does_not_write_global_error() {
     .expect("handle ModelSelectionFailed");
 
     assert_eq!(
-        app.error, None,
+        app.error(),
+        None,
         "a background session's model rejection must not write the global error line"
     );
-    assert_eq!(app.status, None);
+    assert_eq!(app.status(), None);
 }
 
 #[test]
@@ -1586,7 +1591,7 @@ fn model_selection_failed_for_attached_session_writes_global_error() {
     .expect("handle ModelSelectionFailed");
 
     assert_eq!(
-        app.error.as_deref(),
+        app.error(),
         Some("[daemon] failed to select model gpt-x: model not found"),
         "attached-session /model rejection feedback must be preserved"
     );
@@ -1615,7 +1620,7 @@ fn model_selection_failed_connection_level_writes_global_error() {
     .expect("handle ModelSelectionFailed");
 
     assert_eq!(
-        app.error.as_deref(),
+        app.error(),
         Some("[daemon] failed to select model gpt-x: no session attached")
     );
 }
@@ -2049,7 +2054,7 @@ fn subsession_finish_switches_back_to_parent_with_notification() {
     );
     // The notification names both sessions.
     assert_eq!(
-        app.status.as_deref(),
+        app.status(),
         Some("Subsession \"child task\" finished. Switched back to parent \"parent session\".")
     );
     // The status bar immediately reflects the parent's (idle) summary status
@@ -2087,7 +2092,7 @@ fn subsession_finish_does_not_fire_on_duplicate_idle_broadcast() {
     .expect("handle SessionStatusChanged");
 
     assert_eq!(app.attached_session_id, Some(99));
-    assert_eq!(app.status, None);
+    assert_eq!(app.status(), None);
     assert!(
         rx.try_iter().next().is_none(),
         "no attach may be sent for an idle → idle broadcast"
@@ -2119,7 +2124,7 @@ fn top_level_session_finish_does_not_switch() {
     // A top-level session finishing is normal lifecycle — no switch, no
     // notification, no messages.
     assert_eq!(app.attached_session_id, Some(42));
-    assert_eq!(app.status, None);
+    assert_eq!(app.status(), None);
     assert!(rx.try_iter().next().is_none());
 }
 
@@ -2151,7 +2156,7 @@ fn subsession_finish_with_missing_parent_does_not_switch() {
     // The view stays on the finished child; no attach is attempted.
     assert_eq!(app.attached_session_id, Some(99));
     assert_eq!(app.active_session_id, Some(99));
-    assert_eq!(app.status, None);
+    assert_eq!(app.status(), None);
     assert!(
         rx.try_iter().next().is_none(),
         "no attach may be sent when the parent is missing from the summary"

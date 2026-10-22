@@ -319,7 +319,7 @@ impl TurnEventHandler for App {
             // "no session attached") is exactly what the user needs to see
             // on the status line.
             if is_connection_level {
-                self.error = Some(error);
+                self.set_error(error);
             }
             return;
         };
@@ -341,7 +341,7 @@ impl TurnEventHandler for App {
         // the per-session display.  (Written before the mutable display
         // borrow below so `self.error` is still reachable.)
         if is_connection_level {
-            self.error = Some(error.clone());
+            self.set_error(error.clone());
         }
         // The per-session display records the failure for whichever session it
         // belongs to (rendered once the user views that session).
@@ -581,11 +581,11 @@ impl TurnEventHandler for App {
     }
 
     fn handle_status_text(&mut self, text: String) {
-        self.status = Some(text);
+        self.set_status(text);
     }
 
     fn handle_error(&mut self, error: String) {
-        self.error = Some(error);
+        self.set_error(error);
     }
 
     fn handle_oauth_providers(&mut self, providers: Vec<choreo_proto::OAuthProviderDescriptor>) {
@@ -598,7 +598,7 @@ impl TurnEventHandler for App {
     fn handle_oauth_relogin_required(&mut self, account: String) {
         // The daemon emits this exactly once per terminal refresh failure, so
         // no local dedup is needed — surface the actionable re-login prompt.
-        self.status = Some(format!(
+        self.set_status(format!(
             "OAuth sign-in expired for account '{account}' — run /login to sign in again"
         ));
     }

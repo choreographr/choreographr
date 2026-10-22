@@ -10,6 +10,7 @@
 //! (`pub(crate) use session_manager::*;`), so `crate::state::*` paths are
 //! unchanged.
 
+use super::DisplayLine;
 use super::PAGE_SCROLL_LINES;
 use choreo_proto::{SessionStatus, SessionSummary, TokenUsage};
 
@@ -78,7 +79,10 @@ pub(crate) struct SessionManagerState {
     pub(crate) viewport_height: usize,
     pub(crate) detail_data: Option<SessionDetailData>,
     pub(crate) confirm_delete: Option<(u64, String)>,
-    pub(crate) error: Option<String>,
+    /// Page-scoped error text (e.g. a failed list or delete).  A
+    /// [`DisplayLine`] stores it normalized for display, so the row that draws
+    /// it never has to re-scan and can never pick up a live escape.
+    pub(crate) error: DisplayLine,
 }
 
 impl SessionManagerState {
@@ -93,12 +97,12 @@ impl SessionManagerState {
             viewport_height: 0,
             detail_data: None,
             confirm_delete: None,
-            error: None,
+            error: DisplayLine::none(),
         }
     }
 
     pub(crate) fn set_sessions(&mut self, sessions: Vec<SessionSummary>) {
-        self.error = None;
+        self.error.clear();
         // `select_session`'s one-shot preference takes priority over whatever
         // the user had highlighted, so the fresh list lands on the session
         // they were just viewing.  `rebuild_view` below preserves the current
@@ -445,6 +449,6 @@ impl SessionManagerState {
     }
 
     pub(crate) fn set_error(&mut self, msg: impl Into<String>) {
-        self.error = Some(msg.into());
+        self.error.set(msg);
     }
 }

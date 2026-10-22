@@ -272,7 +272,7 @@ fn render_credential_modal(frame: &mut Frame<'_>, app: &mut App) {
     };
     set_input_cursor(frame, input_row, 0, 2, &masked_before);
 
-    if let Some(ref err) = app.ai_providers.credential.error {
+    if let Some(err) = app.ai_providers.credential.error.get() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!("  Error: {}", display_text(err)),
@@ -467,7 +467,7 @@ fn render_wizard_slug(frame: &mut Frame<'_>, app: &mut App) {
         .with_block(Block::bordered().border_style(border_style));
     (&slug_prompt).draw(frame, slug_row, &mut app.ai_providers.wizard.slug);
 
-    if let Some(ref err) = app.ai_providers.wizard.error {
+    if let Some(err) = app.ai_providers.wizard.error.get() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!("  Error: {}", display_text(err)),
@@ -560,7 +560,7 @@ fn render_polkadot_import(frame: &mut Frame<'_>, app: &mut App) {
     // leaves the TUI and is zeroized on close (see `PolkadotImportState`).
     (&prompt).draw(frame, input_row, app.ai_providers.polkadot_import.field());
 
-    if let Some(ref err) = app.ai_providers.polkadot_import.error {
+    if let Some(err) = app.ai_providers.polkadot_import.error.get() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!("  Error: {}", display_text(err)),

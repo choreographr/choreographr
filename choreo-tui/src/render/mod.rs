@@ -20,15 +20,35 @@ use std::sync::Arc;
 
 /// Normalize one piece of UI text before a widget draws it.
 ///
-/// The TUI authors some of what it shows and merely *displays* the rest — a
-/// daemon error string that embeds a provider's response body, a model-chosen
-/// session title, an id or display name from the model catalog, an account name
-/// from the keystore, OAuth status text and device codes.  Everything it only
-/// displays goes through here on its way to a widget, so a control character
-/// cannot occupy a measured column that never draws (which misaligns a code
-/// box's frame, and would misalign a table row or mis-size a wrapped block) and
-/// a live escape sequence cannot ride along.  Clean text borrows, so the cost is
-/// one scan and no allocation.
+/// Display text reaches the screen through one of two tiers, and this function
+/// is the second:
+///
+/// 1. **Ingest** — text the daemon authors that is *only* displayed is
+///    normalized once where it is stored: the status/error line
+///    ([`App::set_status`] / [`App::set_error`], via
+///    [`crate::state::normalized_display_text`]), the AI-providers sub-modal
+///    error lines, and the login modal's status text, authorize URL and device
+///    code.  Because the stored value is already inert, it stays inert at every
+///    place it is later read — including a non-ratatui consumer (the plain
+///    `println!` output path, a log line, a clipboard copy) that has no widget
+///    sink to route through.
+/// 2. **Sink** — identity-bearing or keyed values stay raw in state and are
+///    normalized here as they are drawn: a model id, a reasoning effort, an
+///    account slug, a session title (which also feeds the OSC 2 window title
+///    under its own strip policy), a tool name compared against
+///    `MARKDOWN_TOOLS`, a tool-call id.  Escaping those in place would change
+///    what is sent back to the daemon, what is compared, or what key it is
+///    looked up by, so the rewriting happens at the last possible moment.
+///
+/// Both tiers are safe to combine: the normalizer is idempotent and borrows text
+/// that is already normalized, so the sink pass over an ingest-normalized
+/// string costs one scan and allocates nothing.  The sink therefore stays as
+/// belt-and-braces for whatever a future widget forgets to place on the ingest
+/// tier.
+///
+/// What it stops: a control character that would occupy a measured column but
+/// draw nothing (misaligning a code box's frame, a table row, or a wrapped
+/// block's height) and a live escape sequence riding along into the terminal.
 ///
 /// What the user is *editing* is deliberately excluded: the prompt buffer and
 /// every filter field (the command palette's, the model selector's, the
@@ -347,16 +367,18 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
         width: status_error_area.width.saturating_sub(2),
         ..status_error_area
     };
-    if let Some(ref err) = app.error {
-        // `app.error` carries strings the TUI did not author (a daemon error that
-        // embeds a provider body, say), so it is normalized like any other
-        // displayed text: measured and drawn identically, no live escapes.
-        let err_para = Paragraph::new(Text::from(display_text_owned(err)))
+    if let Some(err) = app.error() {
+        // No sink normalization here: `App::set_error` already normalized the
+        // text at ingest, so these bytes are inert and width-honest as stored
+        // and the span can borrow them directly.  (Text that is not normalized
+        // at ingest still goes through `display_text` at its widget.)
+        let err_para = Paragraph::new(Text::from(err))
             .style(Style::default().fg(Color::Red))
             .wrap(Wrap { trim: false });
         frame.render_widget(err_para, notify_area);
-    } else if let Some(ref status) = app.status {
-        let status_para = Paragraph::new(Text::from(display_text_owned(status)))
+    } else if let Some(status) = app.status() {
+        // Same ingest guarantee as the error line above.
+        let status_para = Paragraph::new(Text::from(status))
             .style(Style::default().fg(Color::Green))
             .wrap(Wrap { trim: false });
         frame.render_widget(status_para, notify_area);

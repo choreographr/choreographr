@@ -143,7 +143,7 @@ pub(crate) fn handle_daemon_message(
             },
             ..
         } => {
-            app.error = Some(format!("[daemon] {operation} failed: {error}"));
+            app.set_error(format!("[daemon] {operation} failed: {error}"));
             // A rejected account selection ends the first-run follow-through:
             // the model picker will never open, and leaving the chain armed
             // would only mis-fire on a later, unrelated `SessionAccountSet`.
@@ -172,11 +172,11 @@ pub(crate) fn handle_daemon_message(
             // user sees the response to their `/account` command.
         }
         DaemonMessageType::AccountListFailed { error } => {
-            app.error = Some(format!("[daemon] failed to list accounts: {error}"));
+            app.set_error(format!("[daemon] failed to list accounts: {error}"));
             return Ok(());
         }
         DaemonMessageType::AccountAdded { name } => {
-            app.status = Some(format!("[daemon] account added: {name}"));
+            app.set_status(format!("[daemon] account added: {name}"));
             app.pending.send(client_tx, ClientMessageType::ListAccounts);
         }
         DaemonMessageType::AccountAddFailed { name, error } => {
@@ -190,22 +190,22 @@ pub(crate) fn handle_daemon_message(
             if app.ai_providers.credential.target.as_deref() == Some(name.as_str()) {
                 app.ai_providers.credential.close();
             }
-            app.error = Some(format!("[daemon] failed to add account {name}: {error}"));
+            app.set_error(format!("[daemon] failed to add account {name}: {error}"));
         }
         DaemonMessageType::AccountRemoved { name } => {
-            app.status = Some(format!("[daemon] account removed: {name}"));
+            app.set_status(format!("[daemon] account removed: {name}"));
             app.ai_providers.remove_account(name);
             app.pending.send(client_tx, ClientMessageType::ListAccounts);
         }
         DaemonMessageType::AccountRemoveFailed { name, error } => {
-            app.error = Some(format!("[daemon] failed to remove account {name}: {error}"));
+            app.set_error(format!("[daemon] failed to remove account {name}: {error}"));
         }
         // A credential mutation does not carry the updated account list, so
         // re-request it: the accounts page renders `has_credential` per
         // account, and without a refresh it would keep showing the stale
         // pre-credential state until the user leaves and re-enters the page.
         DaemonMessageType::CredentialAdded { service } => {
-            app.status = Some(format!("[daemon] credential added: {service}"));
+            app.set_status(format!("[daemon] credential added: {service}"));
             // The add carries no unlock key, so there is nothing to record
             // per-daemon here; refresh the account list so the page reflects
             // the new credential's `has_credential` state.
@@ -227,7 +227,7 @@ pub(crate) fn handle_daemon_message(
             }
         }
         DaemonMessageType::CredentialRemoved { service } => {
-            app.status = Some(format!("[daemon] credential removed: {service}"));
+            app.set_status(format!("[daemon] credential removed: {service}"));
             app.pending.send(client_tx, ClientMessageType::ListAccounts);
         }
         // ACL enrollment feedback: the direct reply says whether THIS add
@@ -235,13 +235,13 @@ pub(crate) fn handle_daemon_message(
         // (this client included, so one status line suffices per event).
         DaemonMessageType::AclAddResult { ok, message } => {
             if *ok {
-                app.status = Some(format!("[daemon] {message}"));
+                app.set_status(format!("[daemon] {message}"));
             } else {
-                app.status = Some(format!("[daemon] acl add failed: {message}"));
+                app.set_status(format!("[daemon] acl add failed: {message}"));
             }
         }
         DaemonMessageType::AclUpdated { clients } => {
-            app.status = Some(format!(
+            app.set_status(format!(
                 "[daemon] ACL updated — {clients} authorized client(s)"
             ));
         }
@@ -478,7 +478,7 @@ pub(crate) fn handle_daemon_message(
             // rejection notice and fall through so the generic dispatch
             // records the error as well.
             tracing::warn!(%effort, error_len = error.len(), "reasoning effort rejected by daemon");
-            app.status = Some(format!("reasoning effort rejected: {error}"));
+            app.set_status(format!("reasoning effort rejected: {error}"));
         }
         DaemonMessageType::Session {
             session_id,
@@ -637,12 +637,12 @@ pub(crate) fn handle_daemon_message(
                 }
             };
             tracing::info!(%message, "refresh-models reply");
-            app.status = Some(message);
+            app.set_status(message);
             return Ok(());
         }
         DaemonMessageType::ModelsRefreshFailed { error } => {
             tracing::warn!(error_len = error.len(), "refresh-models failed");
-            app.error = Some(format!("[daemon] refresh-models failed: {error}"));
+            app.set_error(format!("[daemon] refresh-models failed: {error}"));
             return Ok(());
         }
         // ── S5: /mcp replies ────────────────────────────────────────────
@@ -680,7 +680,7 @@ pub(crate) fn handle_daemon_message(
                     ignored_project_servers.join(", ")
                 ));
             }
-            app.status = Some(lines.join("\n"));
+            app.set_status(lines.join("\n"));
             // Start any login/logout that was waiting on this reply: it reads
             // the daemon's LIVE oauth block and credential key straight from
             // THIS reply, so there is no cache to go stale.
@@ -693,24 +693,24 @@ pub(crate) fn handle_daemon_message(
             message,
         } => {
             let _ = trusted;
-            app.status = Some(message.clone());
+            app.set_status(message.clone());
             return Ok(());
         }
         DaemonMessageType::McpTrustList { roots } => {
             if roots.is_empty() {
-                app.status = Some("no trusted project MCP roots".to_string());
+                app.set_status("no trusted project MCP roots".to_string());
             } else {
                 let mut lines = vec![format!("trusted project MCP roots ({})", roots.len())];
                 for root in roots {
                     lines.push(root.clone());
                 }
-                app.status = Some(lines.join("\n"));
+                app.set_status(lines.join("\n"));
             }
             return Ok(());
         }
         DaemonMessageType::McpReconnectFailed { slug, error } => {
             tracing::warn!(%slug, error_len = error.len(), "mcp reconnect failed");
-            app.error = Some(format!("[daemon] mcp reconnect {slug} failed: {error}"));
+            app.set_error(format!("[daemon] mcp reconnect {slug} failed: {error}"));
             return Ok(());
         }
         // A successful `/mcp reload` arrives as McpReloaded: the summary line
@@ -721,12 +721,12 @@ pub(crate) fn handle_daemon_message(
             for server in servers {
                 lines.push(server.summary());
             }
-            app.status = Some(lines.join("\n"));
+            app.set_status(lines.join("\n"));
             return Ok(());
         }
         DaemonMessageType::McpReloadFailed { error } => {
             tracing::warn!(error_len = error.len(), "mcp reload failed");
-            app.error = Some(format!("[daemon] mcp reload failed: {error}"));
+            app.set_error(format!("[daemon] mcp reload failed: {error}"));
             return Ok(());
         }
         DaemonMessageType::CatalogUpdated { providers } => {
@@ -743,7 +743,7 @@ pub(crate) fn handle_daemon_message(
                 })
                 .collect();
             if app.set_providers(mapped) {
-                app.status = Some(format!(
+                app.set_status(format!(
                     "catalog updated ({} providers)",
                     app.providers.len()
                 ));
@@ -847,14 +847,14 @@ pub(crate) fn handle_daemon_message(
             discard_rejected_unlock_key(app, &mut resolved);
             // Distinct guidance: this is not "wrong key" but "never bound" —
             // the fix is automatic, not something the user must do.
-            app.status = Some(
+            app.set_status(
                 "keystore not initialized — a binding will be created automatically".to_string(),
             );
             // Bind-loop guard: a second `KeystoreUnbound` after our bind was
             // sent means the confirmation was lost or the daemon re-keyed —
             // surface an error, leave the connection as-is.
             if !trigger_keystore_auto_bind(app, client_tx) {
-                app.error = Some(
+                app.set_error(
                     "[daemon] keystore still unbound after bind attempt — reconnect to retry"
                         .to_string(),
                 );
@@ -875,7 +875,7 @@ pub(crate) fn handle_daemon_message(
                 // "still unbound" error and drop the minted pending key.
                 if !app.keystore_auto_bind.attempted() {
                     discard_rejected_unlock_key(app, &mut resolved);
-                    app.status = Some(
+                    app.set_status(
                         "keystore not initialized — a binding will be created automatically"
                             .to_string(),
                     );
@@ -890,7 +890,7 @@ pub(crate) fn handle_daemon_message(
                 // error because the generic dispatch below overwrites the
                 // status line with the plain "keystore locked" text.
                 if choreo_client_core::try_auto_unlock_key(&app.connection_addr).is_none() {
-                    app.error = Some(
+                    app.set_error(
                         "this daemon's keystore was set up by another client — run \
                          /unlock <base64 unlock-key> with that client's unlock key"
                             .to_string(),
@@ -993,7 +993,7 @@ fn trigger_keystore_auto_bind(
         // Persist failure (refused pre-send) or store errors: the daemon
         // stays unbound and locked; the user can reconnect to retry.
         AutoBindAttempt::Failed { error } => {
-            app.error = Some(format!("[error] auto-bind failed: {error}"));
+            app.set_error(format!("[error] auto-bind failed: {error}"));
             true
         }
     }
@@ -1022,7 +1022,7 @@ fn record_confirmed_unlock_key(app: &mut App, resolved: Option<&Pending>) {
             );
         }
         Err(e) => {
-            app.error = Some(format!("[error] failed to record unlock key: {e}"));
+            app.set_error(format!("[error] failed to record unlock key: {e}"));
         }
     }
 }
@@ -1092,11 +1092,9 @@ mod tests {
             &mut app,
         );
         assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|e| e.contains("nothing to undo")),
+            app.error().is_some_and(|e| e.contains("nothing to undo")),
             "a Failed reply must set the error line, got {:?}",
-            app.error
+            app.error()
         );
     }
 
@@ -1114,7 +1112,7 @@ mod tests {
             ),
             &mut app,
         );
-        assert!(app.error.is_none(), "Accepted must not surface an error");
+        assert!(app.error().is_none(), "Accepted must not surface an error");
     }
 
     #[test]
@@ -1300,7 +1298,7 @@ mod tests {
 
         // A SECOND KeystoreUnbound on the same connection must NOT re-bind:
         // surface an error instead (bind-loop guard).
-        app.error = None;
+        app.clear_error();
         handle_daemon_message(
             DaemonMessage::broadcast(DaemonMessageType::KeystoreUnbound {
                 error: "still unbound".into(),
@@ -1311,7 +1309,7 @@ mod tests {
         .unwrap();
         assert!(rx.try_recv().is_err(), "no second bind attempt");
         assert!(
-            app.error.is_some(),
+            app.error().is_some(),
             "the repeat unbound report is surfaced as an error"
         );
     }
@@ -1394,7 +1392,7 @@ mod tests {
 
         // A SECOND unbound push on the same connection is inert: no re-bind
         // and no spurious "still unbound" error.
-        app.error = None;
+        app.clear_error();
         handle_daemon_message(
             DaemonMessage::broadcast(DaemonMessageType::Keystore {
                 state: KeystoreState::Unbound,
@@ -1404,7 +1402,7 @@ mod tests {
         )
         .unwrap();
         assert!(rx.try_recv().is_err(), "no second bind attempt");
-        assert!(app.error.is_none(), "duplicate unbound push is silent");
+        assert!(app.error().is_none(), "duplicate unbound push is silent");
     }
 
     #[test]

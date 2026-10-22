@@ -97,7 +97,7 @@ pub(super) fn handle_model_selector_event(
                         // failed refresh (the error text replaces it), so a row
                         // click must not select a stale model from an earlier
                         // load — the clicked row was never drawn.
-                        if app.model_selector.loading || app.model_selector.error.is_some() {
+                        if app.model_selector.loading || app.model_selector.error.get().is_some() {
                             return Ok(());
                         }
                         // Click in the list body: move the highlight to

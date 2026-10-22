@@ -16,6 +16,7 @@
 //! event, never polling).
 
 use super::InputBuffer;
+use super::display_line::DisplayLine;
 use super::pages::{PROVIDER_PAGE_LINES, filter_matches, picker_window, step_focus};
 use crossterm::event::KeyEvent;
 use std::time::{Duration, Instant};
@@ -54,8 +55,9 @@ pub(crate) struct ModelSelectorState {
     /// falls back to focus-only moves with a render-time clamp (mirrors
     /// `SessionManagerState::viewport_height`).
     pub(crate) viewport_height: usize,
-    /// Popup-scoped error text (e.g. the daemon failed to list models).
-    pub(crate) error: Option<String>,
+    /// Popup-scoped error text (e.g. the daemon failed to list models), stored
+    /// normalized for display by [`DisplayLine`] — the row is only ever drawn.
+    pub(crate) error: DisplayLine,
     /// True while the painted list is a stand-in the daemon could not verify
     /// for this account: a stale cache entry or the local catalog's curated set
     /// for the provider, with the live fetch still running (or failed). The
@@ -93,7 +95,7 @@ impl ModelSelectorState {
             focused: 0,
             scroll: 0,
             viewport_height: 0,
-            error: None,
+            error: DisplayLine::none(),
             provisional: false,
             retry_timer: None,
             retries: 0,
@@ -115,7 +117,7 @@ impl ModelSelectorState {
         }
         self.retries += 1;
         self.loading = true;
-        self.error = None;
+        self.error.clear();
         self.retry_timer = Some(crossbeam_channel::after(MODEL_LIST_RETRY_DELAY));
         true
     }
@@ -134,7 +136,7 @@ impl ModelSelectorState {
     pub(crate) fn open(&mut self) {
         self.open = true;
         self.loading = true;
-        self.error = None;
+        self.error.clear();
         self.retry_timer = None;
         self.retries = 0;
         self.filter.clear();
@@ -147,7 +149,7 @@ impl ModelSelectorState {
     pub(crate) fn close(&mut self) {
         self.open = false;
         self.loading = false;
-        self.error = None;
+        self.error.clear();
         self.retry_timer = None;
     }
 
@@ -205,7 +207,7 @@ impl ModelSelectorState {
         self.all_models = models;
         self.provisional = provisional;
         self.loading = false;
-        self.error = None;
+        self.error.clear();
         // The list landed, so any armed warming retry is moot: disarming it
         // here stops the UI loop from firing one more `ListModels` after a
         // success that raced the timer.
@@ -215,7 +217,7 @@ impl ModelSelectorState {
     /// Record a `ModelsFailed` reply so the popup can show the error inline.
     pub(crate) fn apply_error(&mut self, error: impl Into<String>) {
         self.loading = false;
-        self.error = Some(error.into());
+        self.error.set(error);
         // A terminal error ends the warming retry: an armed timer here would
         // re-request a list the daemon has already refused.
         self.retry_timer = None;

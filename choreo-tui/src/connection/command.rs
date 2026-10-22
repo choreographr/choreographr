@@ -43,7 +43,7 @@ fn send_continue_generation(
 ) -> Result<(), ClientError> {
     if app.attached_session_id.is_none() {
         tracing::debug!("continue ignored — no session attached");
-        app.status = Some("no session attached".to_string());
+        app.set_status("no session attached".to_string());
         return Ok(());
     }
     // Shared guard with the plain-prompt path: a `ContinueGeneration` becomes a
@@ -51,12 +51,12 @@ fn send_continue_generation(
     // keystore is locked.  See `App::new_turn_rejection`.
     if let Some(reason) = app.new_turn_rejection() {
         tracing::debug!(reason, "[choreo-tui] continue rejected client-side");
-        app.status = Some(reason.to_string());
-        app.error = None;
+        app.set_status(reason.to_string());
+        app.clear_error();
         return Ok(());
     }
     if echo && let Some(text) = command_echo(&Command::Continue) {
-        app.status = Some(text);
+        app.set_status(text);
     }
     app.pending
         .send(client_tx, ClientMessageType::ContinueGeneration);
@@ -81,7 +81,7 @@ pub(super) fn open_model_selector(
     // account. Say what is actually missing and how to fix it instead.
     if app.attached_session_id.is_some() && app.attached_account_slug.is_none() {
         tracing::debug!("[choreo-tui] model selector needs an account first");
-        app.error = Some(
+        app.set_error(
             "choose an account first — press alt+a to add one or pick one with Enter".to_string(),
         );
         return Ok(());
@@ -143,7 +143,7 @@ fn cycle_reasoning(
         // No session attached — there is no display whose capability could be
         // consulted.  Mirror the wording the other session-bound shortcuts use
         // (Alt+Enter, Esc, /stop).
-        app.status = Some("no session attached".to_string());
+        app.set_status("no session attached".to_string());
         tracing::warn!(
             session_id = ?app.attached_session_id,
             "reasoning cycle ignored — no active display (no session attached)",
@@ -160,7 +160,7 @@ fn cycle_reasoning(
         // not supported" signal.  This must stay distinct from `None`, which
         // only means "capability not yet known".
         Some(c) if c.available_effort_levels.is_empty() => {
-            app.status = Some("model does not support reasoning".to_string());
+            app.set_status("model does not support reasoning".to_string());
         }
         Some(c) => {
             let current = current_effort.unwrap_or_else(|| "off".to_string());
@@ -168,7 +168,7 @@ fn cycle_reasoning(
                 if let Some(d) = app.active_display() {
                     d.reasoning_effort = Some(next.clone());
                 }
-                app.status = Some(format!("reasoning: {next}"));
+                app.set_status(format!("reasoning: {next}"));
                 tracing::info!(
                     session_id = ?app.attached_session_id,
                     current = %current,
@@ -183,14 +183,14 @@ fn cycle_reasoning(
                 // `cycle_from` only returns None for an empty level set, which
                 // the guard above already handled — this is a defensive
                 // fallback.
-                app.status = Some("model does not support reasoning".to_string());
+                app.set_status("model does not support reasoning".to_string());
             }
         }
         // A model is selected but the daemon has not reported its effort
         // levels yet.  `None` here must NOT be conflated with "reasoning
         // unsupported".
         None if selected_model.is_some() => {
-            app.status = Some("reasoning capability not yet available".to_string());
+            app.set_status("reasoning capability not yet available".to_string());
             tracing::info!(
                 session_id = ?app.attached_session_id,
                 model = ?selected_model,
@@ -198,7 +198,7 @@ fn cycle_reasoning(
             );
         }
         None => {
-            app.status = Some(format!(
+            app.set_status(format!(
                 "no model selected — pick one with {}",
                 App::model_selector_label()
             ));
@@ -225,23 +225,23 @@ fn reasoning_list(app: &mut App) {
             session_id = ?app.attached_session_id,
             "reasoning list ignored — no active display (no session attached)",
         );
-        app.status = Some("no session attached".to_string());
+        app.set_status("no session attached".to_string());
         return;
     };
     match capability.as_ref() {
         Some(c) if c.available_effort_levels.is_empty() => {
-            app.status = Some("model does not support reasoning".to_string());
+            app.set_status("model does not support reasoning".to_string());
         }
         Some(c) => {
             let levels = c.available_effort_levels.join(", ");
             tracing::debug!(levels = %levels, "listing reasoning effort levels");
-            app.status = Some(format!("reasoning levels: {levels}"));
+            app.set_status(format!("reasoning levels: {levels}"));
         }
         None if selected_model.is_some() => {
-            app.status = Some("reasoning capability not yet available".to_string());
+            app.set_status("reasoning capability not yet available".to_string());
         }
         None => {
-            app.status = Some(format!(
+            app.set_status(format!(
                 "no model selected — pick one with {}",
                 App::model_selector_label()
             ));
@@ -266,9 +266,9 @@ pub(super) fn run_command(
     match command {
         Command::Empty => {}
         Command::InvalidCancel(value) => {
-            app.status = Some(format!("invalid request id: {value}"));
+            app.set_status(format!("invalid request id: {value}"));
         }
-        Command::UnknownCommand(error) => app.status = Some(error),
+        Command::UnknownCommand(error) => app.set_status(error),
         Command::Send(message) => {
             // Client-side validation: reject reasoning slugs that the attached
             // model's capability set does not include.  This provides faster
@@ -287,7 +287,7 @@ pub(super) fn run_command(
                         %effort,
                         "TUI rejected reasoning slug not in capability set",
                     );
-                    app.status = Some(format!("model does not support reasoning '{effort}'"));
+                    app.set_status(format!("model does not support reasoning '{effort}'"));
                     return Ok(());
                 }
             }
@@ -324,10 +324,10 @@ pub(super) fn run_command(
                 other => other,
             };
             if echo && let Some(text) = command_echo(&Command::Send(message.clone())) {
-                app.status = Some(text);
+                app.set_status(text);
             }
             if let ClientMessageType::RunInput { .. } = &message {
-                app.error = None;
+                app.clear_error();
                 // The run's `stream_id` is daemon-assigned: the daemon reports it
                 // in the `Started` reply/broadcast, and `handle_started` records
                 // the in-flight stream on the active display then. Nothing to
@@ -360,8 +360,8 @@ pub(super) fn run_command(
                     // base64 key from /unlock <key>) in the status bar — a
                     // warn-only log would look like the command silently did
                     // nothing.
-                    app.status = Some(format!("[error] {e}"));
-                    app.error = None;
+                    app.set_status(format!("[error] {e}"));
+                    app.clear_error();
                 }
             }
         }
@@ -397,7 +397,7 @@ pub(super) fn run_command(
                     device,
                 })
             {
-                app.status = Some(text);
+                app.set_status(text);
             }
             // The login library builds the credential; on completion the UI
             // loop sends the `AddCredential` it produced.
@@ -409,7 +409,7 @@ pub(super) fn run_command(
                     pubkey: pubkey.clone(),
                 })
             {
-                app.status = Some(text);
+                app.set_status(text);
             }
             app.pending.send(
                 client_tx,
@@ -424,7 +424,7 @@ pub(super) fn run_command(
                     service: service.clone(),
                 })
             {
-                app.status = Some(text);
+                app.set_status(text);
             }
             app.pending.send(
                 client_tx,
@@ -439,11 +439,11 @@ pub(super) fn run_command(
             // authority, this just skips the doomed round-trip.
             if let Some(reason) = app.idle_rejection() {
                 tracing::debug!(reason, "[choreo-tui] undo rejected client-side");
-                app.status = Some(reason.to_string());
-                app.error = None;
+                app.set_status(reason.to_string());
+                app.clear_error();
             } else {
                 if echo && let Some(text) = command_echo(&Command::Undo) {
-                    app.status = Some(text);
+                    app.set_status(text);
                 }
                 app.pending.send(client_tx, ClientMessageType::Undo);
             }
@@ -451,11 +451,11 @@ pub(super) fn run_command(
         Command::Redo => {
             if let Some(reason) = app.idle_rejection() {
                 tracing::debug!(reason, "[choreo-tui] redo rejected client-side");
-                app.status = Some(reason.to_string());
-                app.error = None;
+                app.set_status(reason.to_string());
+                app.clear_error();
             } else {
                 if echo && let Some(text) = command_echo(&Command::Redo) {
-                    app.status = Some(text);
+                    app.set_status(text);
                 }
                 app.pending.send(client_tx, ClientMessageType::Redo);
             }
@@ -468,7 +468,7 @@ pub(super) fn run_command(
         }
         Command::Stop => {
             if echo && let Some(text) = command_echo(&Command::Stop) {
-                app.status = Some(text);
+                app.set_status(text);
             }
             // Send Cancel with stream_id 0 (the CANCEL_ALL sentinel) to stop
             // whatever request is currently active on the attached session and
@@ -477,20 +477,20 @@ pub(super) fn run_command(
                 app.pending
                     .send(client_tx, ClientMessageType::Cancel { stream_id: 0 });
             } else {
-                app.status = Some("no session attached".to_string());
+                app.set_status("no session attached".to_string());
             }
         }
         Command::RefreshModels { force } => {
             // Show immediate feedback; the daemon replies asynchronously via
             // ModelsRefreshed / ModelsRefreshFailed.
             let suffix = if force { " (forced)" } else { "" };
-            app.status = Some(format!("refreshing models…{suffix}"));
+            app.set_status(format!("refreshing models…{suffix}"));
             app.pending
                 .send(client_tx, ClientMessageType::RefreshModels { force });
         }
         Command::Mcp(mcp) => {
             if echo && let Some(text) = command_echo(&Command::Mcp(mcp.clone())) {
-                app.status = Some(text);
+                app.set_status(text);
             }
             match mcp {
                 McpCommand::Status => {
@@ -502,22 +502,22 @@ pub(super) fn run_command(
                 McpCommand::Reconnect { slug } => {
                     // Immediate feedback; the reply is a refreshed McpStatus
                     // (success) or McpReconnectFailed.
-                    app.status = Some(format!("reconnecting MCP server {slug}…"));
+                    app.set_status(format!("reconnecting MCP server {slug}…"));
                     app.pending
                         .send(client_tx, ClientMessageType::McpReconnect { slug });
                 }
                 McpCommand::Reload => {
                     // Immediate feedback; the reply is McpReloaded (success) or
                     // McpReloadFailed.
-                    app.status = Some("reloading MCP configuration…".to_string());
+                    app.set_status("reloading MCP configuration…".to_string());
                     app.pending.send(client_tx, ClientMessageType::McpReload);
                 }
                 McpCommand::Trust => {
-                    app.status = Some("trusting project MCP root…".to_string());
+                    app.set_status("trusting project MCP root…".to_string());
                     app.pending.send(client_tx, ClientMessageType::McpTrust);
                 }
                 McpCommand::Untrust => {
-                    app.status = Some("revoking project MCP trust…".to_string());
+                    app.set_status("revoking project MCP trust…".to_string());
                     app.pending.send(client_tx, ClientMessageType::McpUntrust);
                 }
                 McpCommand::TrustList => {
