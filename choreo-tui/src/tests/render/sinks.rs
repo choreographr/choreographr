@@ -1,5 +1,6 @@
 use super::drawn_cells;
 use crate::render::*;
+use crate::tests::support::test_app;
 use choreo_proto::{SessionStatus, SessionSummary};
 
 // ── Untrusted text is normalized at every widget sink ──────────────────
@@ -9,8 +10,6 @@ fn status_bar_renders_daemon_errors_inert() {
     // `app.error` carries daemon-authored text (a provider's rejected request
     // body, say).  A control character must not reach a cell, and an escape
     // sequence must not ride along; the tab expands to spaces.
-    use crate::tests::support::test_app;
-
     let mut app = test_app();
     app.set_error("bad request\u{7}\tbody\x1b[31m".to_string());
     let content = drawn_cells(&mut app, 80, 24);
@@ -30,8 +29,6 @@ fn status_error_height_measures_the_stored_text_as_drawn() {
     // The reserved height is measured from the STORED text, which ingest already
     // normalized — the same bytes the renderer draws — so the two cannot
     // disagree about how many rows a taboo-laden message occupies.
-    use crate::tests::support::test_app;
-
     let mut app = test_app();
     app.set_error("aaaaaaaaaa\tbbbbbbbbbb\tcccc".to_string());
     let width = 24u16;
@@ -49,8 +46,6 @@ fn status_error_height_measures_the_stored_text_as_drawn() {
 fn session_manager_cells_render_untrusted_titles_inert() {
     // Session titles are model-chosen and model ids come from the catalog;
     // neither may carry a control character into a fixed-width column.
-    use crate::tests::support::test_app;
-
     let mut app = test_app();
     app.page = crate::state::Page::SessionManager;
     app.session_mgr.set_sessions(vec![SessionSummary {
@@ -93,7 +88,6 @@ fn login_modal_renders_untrusted_fields_inert() {
     // asserts both halves: the modal holds inert text, the drawn content is
     // inert end to end, and the identity fields still carry their exact bytes.
     use crate::state::LoginModal;
-    use crate::tests::support::test_app;
     use choreo_client_core::LoginEvent;
 
     let mut app = test_app();
@@ -170,8 +164,6 @@ fn status_bar_identity_fields_render_inert() {
     // keystore, the model id from the catalog, the reasoning effort and tool
     // groups echoed back by the daemon.  None may carry a live control or bidi
     // character into the single clipped line.
-    use crate::tests::support::test_app;
-
     let mut app = test_app();
     // The identity block draws only for an attached session.
     app.attached_session_id = Some(0);
@@ -207,7 +199,6 @@ fn session_manager_detail_renders_tool_groups_inert() {
     // The detail pane prints the session's active tool groups, which the daemon
     // echoes back from the turn — arbitrary text like every other line there.
     use crate::state::{Page, SessionDetailData, SessionManagerView};
-    use crate::tests::support::test_app;
 
     let mut app = test_app();
     app.page = Page::SessionManager;
