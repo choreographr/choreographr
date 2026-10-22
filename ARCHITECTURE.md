@@ -1817,12 +1817,13 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
      (`App::set_status`/`App::set_error` writing a private `DisplayLine` field,
      so no call site can store raw bytes and the height math measures exactly
      the drawn text without re-scanning), the AI-providers sub-modal error
-     lines, the session-manager and model-selector error rows, and the login
-     modal's status text, authorize URL and device code (both halves). Because
-     the stored value is already inert, it stays inert at every place it is
-     later read — including a non-ratatui consumer with no widget sink of its
-     own to route through (a `println!` output path, a log line, a clipboard
-     copy).
+     lines, the session-manager and model-selector error rows, the login
+     modal's status text, authorize URL and device code (both halves), and the
+     quit message `run_app` prints with `println!` once the alternate screen is
+     gone. Because the stored value is already inert, it stays inert at every
+     place it is later read — including a non-ratatui consumer with no widget
+     sink of its own to route through (a `println!` output path, a log line, a
+     clipboard copy).
   2. **Sink** — identity-bearing or keyed values stay byte-exact in state and
      are normalized at the draw sink instead: a model id, a reasoning effort,
      an account slug, a session title (which also feeds the OSC 2 window title

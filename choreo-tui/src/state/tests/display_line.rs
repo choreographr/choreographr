@@ -91,3 +91,61 @@ fn empty_text_is_a_present_blank_line() {
     assert_eq!(app.status(), None);
     assert_eq!(app.error(), None);
 }
+
+/// A hostile quit message: the constructs that do real damage on a terminal
+/// that is back in its normal screen once the TUI has exited — a BEL, a
+/// screen-clear CSI (`ESC[2J`), an OSC-52 clipboard write, a right-to-left
+/// override, and a tab.
+const HOSTILE_QUIT: &str = "bye\u{7}\u{1b}[2J\u{1b}]52;c;cGF3bmVk\u{7}\u{202e}dekooc\tmsg";
+
+#[test]
+fn quit_message_is_stored_inert() {
+    // The quit message is the only text the TUI prints outside ratatui's frame
+    // buffer (`run_app` writes it with `println!` on the restored terminal), so
+    // ingest is the sole guard between a stored byte and a live terminal
+    // sequence.  Asserting on the stored string — not on captured stdout — keeps
+    // the test on the invariant itself: whatever the print site does, it cannot
+    // emit an escape that was already neutralized here.
+    let mut app = test_app();
+    app.quit_message.set(HOSTILE_QUIT);
+
+    let stored = app.quit_message.get().expect("quit message stored");
+    assert_inert(stored);
+    assert!(
+        !stored.contains('\u{1b}'),
+        "no live escape may reach the print site: {stored:?}"
+    );
+    // The hostile bytes are escaped in place rather than dropped, so the reason
+    // stays legible instead of silently losing its tail.
+    assert!(
+        stored.contains("\\u{1b}[2J") && stored.contains("\\u{1b}]52;c;cGF3bmVk"),
+        "CSI and OSC are escaped in place: {stored:?}"
+    );
+    assert!(
+        stored.starts_with("bye") && stored.ends_with("msg"),
+        "the readable text survives: {stored:?}"
+    );
+}
+
+#[test]
+fn quit_message_is_absent_on_a_normal_quit() {
+    // Nothing set means nothing printed: the exit path only writes when a
+    // reason was stored.
+    assert!(test_app().quit_message.get().is_none());
+}
+
+#[test]
+fn quit_message_set_if_absent_keeps_the_specific_reason() {
+    // A reason already stored is strictly more specific than the generic
+    // fallback a later layer would install, so the first writer wins — and the
+    // fallback is normalized on the path that does store it.
+    let mut app = test_app();
+    app.quit_message.set("the server is shutting down");
+    app.quit_message.set_if_absent(HOSTILE_QUIT);
+    assert_eq!(app.quit_message.get(), Some("the server is shutting down"));
+
+    let mut app = test_app();
+    app.quit_message.set_if_absent(HOSTILE_QUIT);
+    let stored = app.quit_message.get().expect("fallback stored");
+    assert_inert(stored);
+}

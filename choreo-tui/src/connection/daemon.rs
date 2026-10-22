@@ -760,15 +760,14 @@ pub(crate) fn handle_daemon_message(
         DaemonMessageType::ShuttingDown => {
             tracing::info!("daemon announced shutdown; quitting");
             app.should_quit = true;
-            app.quit_message = Some("the server is shutting down".to_string());
+            app.quit_message.set("the server is shutting down");
             return Ok(());
         }
         DaemonMessageType::Evicted => {
             tracing::warn!("evicted by the daemon for lag; quitting");
             app.should_quit = true;
-            app.quit_message = Some(
-                "disconnected by the daemon: evicted for falling behind the streaming lag limit"
-                    .to_string(),
+            app.quit_message.set(
+                "disconnected by the daemon: evicted for falling behind the streaming lag limit",
             );
             return Ok(());
         }

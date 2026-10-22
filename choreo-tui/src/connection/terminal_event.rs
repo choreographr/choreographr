@@ -367,7 +367,7 @@ pub(super) fn handle_ui_event(
             // keep that message; a bare EOF means the daemon went away
             // without an advisory (crash, restart, or the socket closed).
             app.quit_message
-                .get_or_insert_with(|| "the connection to the daemon was closed".to_string());
+                .set_if_absent("the connection to the daemon was closed");
             Ok(false)
         }
         UiEvent::Status(message) => {

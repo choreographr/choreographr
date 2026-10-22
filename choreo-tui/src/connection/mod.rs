@@ -902,6 +902,33 @@ mod tests {
     }
 
     #[test]
+    fn version_mismatch_wording_survives_the_quit_message_ingest() {
+        // The quit message is normalized as it is stored (it is printed outside
+        // ratatui, see `run_app`), so the actionable wording must be clean
+        // enough to pass through that ingest byte-for-byte — otherwise the one
+        // message that tells the user to restart the daemon would reach the
+        // terminal mangled by escaping.
+        let error =
+            ClientError::Proto(choreo_proto::ProtoError::UnsupportedVersion { version: 99 });
+        let wording = crate::connection_quit_message(&error);
+
+        let mut app = test_app();
+        app.quit_message.set(wording.clone());
+
+        assert_eq!(
+            app.quit_message.get(),
+            Some(wording.as_str()),
+            "the actionable wording must survive ingest unchanged"
+        );
+        assert!(
+            app.quit_message
+                .get()
+                .is_some_and(|m| m.contains("restart the daemon")),
+            "the restart hint must stay readable"
+        );
+    }
+
+    #[test]
     fn ordinary_connection_errors_keep_the_generic_wording() {
         // Only the version-mismatch case is remapped; everything else keeps
         // the historical "connection to the daemon failed: {error}" shape.
@@ -926,7 +953,7 @@ mod tests {
         );
         assert!(app.should_quit);
         assert_eq!(
-            app.quit_message.as_deref(),
+            app.quit_message.get(),
             Some("the connection to the daemon was closed"),
             "a bare EOF must report the dropped connection"
         );
@@ -958,7 +985,7 @@ mod tests {
             "a connection-task status must be flagged transient"
         );
         assert!(!app.should_quit, "a status event must never quit");
-        assert!(app.quit_message.is_none());
+        assert!(app.quit_message.get().is_none());
     }
 
     #[test]
@@ -1033,7 +1060,7 @@ mod tests {
         handle_ui_event(UiEvent::ReaderClosed, &mut app, &tx).expect("handle ReaderClosed");
 
         assert_eq!(
-            app.quit_message.as_deref(),
+            app.quit_message.get(),
             Some("the server is shutting down"),
             "the specific reason must survive the trailing EOF"
         );

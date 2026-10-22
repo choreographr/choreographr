@@ -258,8 +258,18 @@ pub(crate) struct App {
     /// Why the TUI is exiting, when it is NOT a user-initiated quit (Alt+Q).
     /// Set when the daemon evicts this client, announces shutdown, or the
     /// connection drops; printed to the restored terminal after teardown so
-    /// the user sees why the TUI left. `None` on a normal user quit.
-    pub(crate) quit_message: Option<String>,
+    /// the user sees why the TUI left.  No message is set on a normal user
+    /// quit, so nothing prints.
+    ///
+    /// Held in [`DisplayLine`] rather than an `Option<String>` because this is
+    /// the one message the TUI prints *outside* ratatui: `run_app` writes it
+    /// with `println!` after the alternate screen is gone, so there is no cell
+    /// buffer and no widget sink between the stored bytes and the terminal.  A
+    /// [`DisplayLine`] makes the text inert where it is stored — the same
+    /// ingest rule as `status`/`error` — so the print site needs no second
+    /// normalizing pass and a future daemon-supplied reason cannot reach a
+    /// normal-screen terminal as a live escape or OSC sequence.
+    pub(crate) quit_message: DisplayLine,
     pub(crate) image_job_tx: Option<crossbeam_channel::Sender<ImageJob>>,
     pub(crate) attached_session_id: Option<u64>,
     /// Account slug shown in the status bar — the attached session's account
@@ -412,7 +422,7 @@ impl App {
             pending_image_fetch: Vec::new(),
             history_viewport: HistoryViewport::new(),
             should_quit: false,
-            quit_message: None,
+            quit_message: DisplayLine::none(),
             image_job_tx: None,
             pending_job_idx: HashMap::new(),
             attached_session_id: None,
