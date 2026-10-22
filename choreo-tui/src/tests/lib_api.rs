@@ -1,4 +1,4 @@
-use super::*;
+use crate::*;
 
 #[test]
 fn build_picker_returns_halfblocks_on_fallback() {

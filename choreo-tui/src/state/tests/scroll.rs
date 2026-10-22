@@ -1,7 +1,7 @@
 //! Scrollbar notch math, scrollbar up/down steps, track-row mapping, and
 //! `scroll_to_content_line`.
 
-use crate::test_util::test_app;
+use crate::tests::support::test_app;
 use choreo_proto::Turn;
 
 // ── scroll_to_content_line ──

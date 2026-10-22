@@ -1,7 +1,7 @@
 //! Turn content-version bookkeeping: the cache key's content fingerprint, its
 //! pruning on undo, and the stale-line regressions it guards.
 
-use crate::test_util::test_app;
+use crate::tests::support::test_app;
 use choreo_client_core::TurnEventHandler;
 use choreo_proto::{ToolResultRecord, Turn};
 

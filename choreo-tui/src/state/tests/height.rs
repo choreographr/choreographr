@@ -2,7 +2,7 @@
 //! content growth and removal.
 
 use super::insert_turn;
-use crate::test_util::test_app;
+use crate::tests::support::test_app;
 
 // ── compute_total_height_and_markers scroll preservation ──
 

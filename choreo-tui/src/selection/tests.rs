@@ -1,7 +1,7 @@
 use super::*;
 use crate::markdown_render::LineChrome;
 use crate::state::{App, find_turn_at_row};
-use crate::test_util::test_app;
+use crate::tests::support::test_app;
 use choreo_proto::{ToolResultRecord, Turn};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;

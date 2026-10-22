@@ -1,7 +1,7 @@
 //! `handle_turns_undone` pruning of the per-turn override and content-version
 //! maps so they stay bounded by the live (non-undone) turn set.
 
-use crate::test_util::test_app;
+use crate::tests::support::test_app;
 use choreo_client_core::TurnEventHandler;
 use choreo_proto::{ToolResultRecord, Turn};
 

@@ -1,6 +1,6 @@
 use crate::connection::{handle_daemon_message, handle_terminal_event};
 use crate::state::*;
-use crate::test_util::test_app;
+use crate::tests::support::test_app;
 use choreo_proto::{
     AccountInfo, ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType,
 };

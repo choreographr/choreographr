@@ -7,7 +7,7 @@
 use super::insert_turn;
 use crate::markdown_render::render_turn_lines;
 use crate::state::App;
-use crate::test_util::test_app;
+use crate::tests::support::test_app;
 use choreo_client_core::TurnEventHandler;
 use choreo_proto::{OutputStream, ToolResultRecord, Turn};
 use std::borrow::Cow;

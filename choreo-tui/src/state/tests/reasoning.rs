@@ -4,7 +4,7 @@
 
 use crate::markdown_render::{LineChrome, LineJoin};
 use crate::state::{RenderCacheKey, RenderedCache, RenderedTurn};
-use crate::test_util::test_app;
+use crate::tests::support::test_app;
 use choreo_client_core::TurnEventHandler;
 use choreo_proto::{OutputStream, Turn};
 use ratatui::text::Line;

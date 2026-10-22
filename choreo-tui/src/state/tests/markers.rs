@@ -1,7 +1,7 @@
 //! User-text turn marker computation (content line and virtual slot).
 
 use super::insert_turn;
-use crate::test_util::test_app;
+use crate::tests::support::test_app;
 use choreo_proto::Turn;
 
 // ── marker computation ──

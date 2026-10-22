@@ -143,7 +143,7 @@ pub(super) fn handle_full_page_list_mouse(
 mod tests {
     use super::*;
     use crate::state::{Marker, UiEvent};
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
     use choreo_proto::Turn;
     // The crossterm types the page handlers used to pull in through
     // `super::*` are no longer imported by this module, so the tests name the

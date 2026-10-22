@@ -2,7 +2,7 @@
 //! short-history case.
 
 use crate::state::{App, find_turn_at_row};
-use crate::test_util::test_app;
+use crate::tests::support::test_app;
 use choreo_proto::Turn;
 
 // ── find_turn_at_row ──

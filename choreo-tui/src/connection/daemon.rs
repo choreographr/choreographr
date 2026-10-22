@@ -1057,7 +1057,7 @@ fn discard_rejected_unlock_key(app: &mut App, resolved: &mut Option<Pending>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
 
     /// Drive one daemon message through `handle_daemon_message`. The generic
     /// dispatch's status/error handling needs a sender, but none of the

@@ -2,7 +2,7 @@
 //! resizes.
 
 use crate::state::Page;
-use crate::test_util::test_app;
+use crate::tests::support::test_app;
 
 // ── text selection lifecycle ──
 

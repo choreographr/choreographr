@@ -4,7 +4,7 @@
 
 use super::make_session;
 use crate::state::{SessionDetailData, SessionManagerState, SessionManagerView};
-use crate::test_util::test_app;
+use crate::tests::support::test_app;
 use choreo_proto::SessionStatus;
 
 fn make_detail_data(session_id: u64) -> SessionDetailData {

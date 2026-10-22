@@ -3,7 +3,7 @@
 //! one-time descriptor fetch, and cancellation guards.
 
 use crate::state::LoginModal;
-use crate::test_util::test_app;
+use crate::tests::support::test_app;
 use choreo_client_core::LoginEvent;
 use choreo_proto::{AccountInfo, ClientMessage, ClientMessageType, OAuthProviderDescriptor};
 use choreo_shared::ServiceCredential;

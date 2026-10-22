@@ -3,7 +3,7 @@
 
 use super::insert_turn;
 use crate::state::App;
-use crate::test_util::test_app;
+use crate::tests::support::test_app;
 use choreo_client_core::TurnEventHandler;
 
 #[test]

@@ -1,4 +1,4 @@
-use super::render::*;
+use crate::render::*;
 use choreo_proto::{SessionStatus, SessionSummary, TokenUsage};
 use ratatui::buffer::Cell;
 
@@ -148,7 +148,7 @@ fn session_detail_tokens_line_small_counts_pass_through() {
 
 #[test]
 fn render_model_selector_shows_title_filter_and_models() {
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
 
     let mut app = test_app();
     app.model_selector.open();
@@ -172,7 +172,7 @@ fn render_model_selector_shows_title_filter_and_models() {
 
 #[test]
 fn render_model_selector_loading_and_error_states() {
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
 
     // Loading state (selector just opened, reply not yet arrived).
     let mut app = test_app();
@@ -192,7 +192,7 @@ fn render_model_selector_loading_and_error_states() {
 
 #[test]
 fn render_wizard_provider_shows_filter_and_providers() {
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
 
     let mut app = test_app();
     app.page = crate::state::Page::AIProviders;
@@ -231,7 +231,7 @@ fn render_wizard_provider_shows_filter_and_providers() {
 #[test]
 fn render_wizard_slug_shows_picked_provider_and_slug_prompt() {
     use crate::state::AccountWizardStep;
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
 
     let mut app = test_app();
     app.page = crate::state::Page::AIProviders;
@@ -256,7 +256,7 @@ fn render_wizard_slug_shows_picked_provider_and_slug_prompt() {
 
 #[test]
 fn render_credential_modal_shows_title_and_masked_key() {
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
 
     let mut app = test_app();
     app.page = crate::state::Page::AIProviders;
@@ -284,7 +284,7 @@ fn render_credential_modal_shows_title_and_masked_key() {
 
 #[test]
 fn render_credential_modal_short_key_mid_cursor_does_not_panic() {
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
 
     let mut app = test_app();
     app.page = crate::state::Page::AIProviders;
@@ -314,7 +314,7 @@ fn render_credential_modal_short_key_mid_cursor_does_not_panic() {
 
 #[test]
 fn render_session_list_shows_ids_parents_and_titles() {
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
     use choreo_proto::SessionStatus;
 
     let mut app = test_app();
@@ -402,7 +402,7 @@ fn render_session_list_shows_ids_parents_and_titles() {
 #[expect(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
 #[test]
 fn session_list_selected_row_highlight_is_solid_across_width() {
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
@@ -496,7 +496,7 @@ fn session_list_selected_row_highlight_is_solid_across_width() {
 #[expect(clippy::cast_possible_truncation)]
 #[test]
 fn session_list_scrolls_to_keep_selection_visible() {
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
 
     // 30 sessions on a 100x24 terminal: the bordered list block leaves
     // 21 content rows, one of which is the table header, so 20 session
@@ -555,7 +555,7 @@ fn session_list_scrolls_to_keep_selection_visible() {
 #[test]
 fn session_list_scrolls_down_then_up_directionally() {
     use crate::connection::handle_terminal_event;
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
     let mut app = test_app();
@@ -636,7 +636,7 @@ fn session_list_scrolls_down_then_up_directionally() {
 
 #[test]
 fn session_list_archived_view_renders_only_archived() {
-    use crate::test_util::{make_session, test_app};
+    use crate::tests::support::{make_session, test_app};
 
     let mut app = test_app();
     app.page = crate::state::Page::SessionManager;
@@ -662,7 +662,7 @@ fn session_list_archived_view_renders_only_archived() {
 
 #[test]
 fn session_list_archived_view_empty_state_message() {
-    use crate::test_util::{make_session, test_app};
+    use crate::tests::support::{make_session, test_app};
 
     let mut app = test_app();
     app.page = crate::state::Page::SessionManager;
@@ -676,7 +676,7 @@ fn session_list_archived_view_empty_state_message() {
 
 #[test]
 fn session_list_shows_pin_marker() {
-    use crate::test_util::{make_session, test_app};
+    use crate::tests::support::{make_session, test_app};
 
     let mut app = test_app();
     app.page = crate::state::Page::SessionManager;
@@ -761,7 +761,7 @@ fn format_timestamp_older_year_shows_full_date() {
 
 #[test]
 fn command_palette_lists_commands_for_a_command_line() {
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
 
     let mut app = test_app();
     app.input.text = "/".to_string();
@@ -785,7 +785,7 @@ fn command_palette_lists_commands_for_a_command_line() {
 
 #[test]
 fn command_palette_narrows_to_model_for_prefix_query() {
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
 
     let mut app = test_app();
     app.input.text = "/mo".to_string();
@@ -800,7 +800,7 @@ fn command_palette_narrows_to_model_for_prefix_query() {
 
 #[test]
 fn command_palette_draws_nothing_for_a_plain_prompt() {
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
 
     let mut app = test_app();
     app.input.text = "hi".to_string();
@@ -818,7 +818,7 @@ fn status_bar_renders_daemon_errors_inert() {
     // `app.error` carries daemon-authored text (a provider's rejected request
     // body, say).  A control character must not reach a cell, and an escape
     // sequence must not ride along; the tab expands to spaces.
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
 
     let mut app = test_app();
     app.set_error("bad request\u{7}\tbody\x1b[31m".to_string());
@@ -839,7 +839,7 @@ fn status_error_height_measures_the_stored_text_as_drawn() {
     // The reserved height is measured from the STORED text, which ingest already
     // normalized — the same bytes the renderer draws — so the two cannot
     // disagree about how many rows a taboo-laden message occupies.
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
 
     let mut app = test_app();
     app.set_error("aaaaaaaaaa\tbbbbbbbbbb\tcccc".to_string());
@@ -858,7 +858,7 @@ fn status_error_height_measures_the_stored_text_as_drawn() {
 fn session_manager_cells_render_untrusted_titles_inert() {
     // Session titles are model-chosen and model ids come from the catalog;
     // neither may carry a control character into a fixed-width column.
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
 
     let mut app = test_app();
     app.page = crate::state::Page::SessionManager;
@@ -902,7 +902,7 @@ fn login_modal_renders_untrusted_fields_inert() {
     // asserts both halves: the modal holds inert text, the drawn content is
     // inert end to end, and the identity fields still carry their exact bytes.
     use crate::state::LoginModal;
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
     use choreo_client_core::LoginEvent;
 
     let mut app = test_app();
@@ -979,7 +979,7 @@ fn status_bar_identity_fields_render_inert() {
     // keystore, the model id from the catalog, the reasoning effort and tool
     // groups echoed back by the daemon.  None may carry a live control or bidi
     // character into the single clipped line.
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
 
     let mut app = test_app();
     // The identity block draws only for an attached session.
@@ -1016,7 +1016,7 @@ fn session_manager_detail_renders_tool_groups_inert() {
     // The detail pane prints the session's active tool groups, which the daemon
     // echoes back from the turn — arbitrary text like every other line there.
     use crate::state::{Page, SessionDetailData, SessionManagerView};
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
 
     let mut app = test_app();
     app.page = Page::SessionManager;

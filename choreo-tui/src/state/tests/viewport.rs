@@ -4,7 +4,7 @@
 use crate::state::{
     RenderCacheKey, RenderedCache, RenderedTurn, ViewportChange, classify_viewport_change,
 };
-use crate::test_util::test_app;
+use crate::tests::support::test_app;
 use ratatui::text::Line;
 use std::sync::Arc;
 

@@ -7,7 +7,7 @@
 
 use super::insert_turn;
 use crate::state::{App, ResponsePin};
-use crate::test_util::test_app;
+use crate::tests::support::test_app;
 use choreo_client_core::TurnEventHandler;
 use choreo_client_core::dispatch::ToolCallEvent;
 use choreo_proto::{OutputStream, ToolResultRecord, Turn};

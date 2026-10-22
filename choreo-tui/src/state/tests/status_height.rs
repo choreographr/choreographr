@@ -1,6 +1,6 @@
 //! `status_error_height` wrapping and precedence.
 
-use crate::test_util::test_app;
+use crate::tests::support::test_app;
 
 // ── status_error_height ──
 

@@ -1,6 +1,6 @@
 use crate::connection::handle_terminal_event;
 use crate::state::*;
-use crate::test_util::{add_user_text, test_app};
+use crate::tests::support::{add_user_text, test_app};
 use choreo_proto::{ClientMessage, ClientMessageType, Turn};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,

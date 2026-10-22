@@ -3,7 +3,7 @@
 
 use crate::markdown_render::{LineChrome, LineJoin};
 use crate::state::{RenderCacheKey, RenderedCache, RenderedTurn};
-use crate::test_util::test_app;
+use crate::tests::support::test_app;
 use choreo_proto::{ToolResultRecord, Turn};
 use ratatui::text::Line;
 use std::sync::Arc;

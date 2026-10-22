@@ -1,7 +1,7 @@
 use crate::connection::{handle_daemon_message, handle_terminal_event};
 use crate::markdown_render::*;
 use crate::state::*;
-use crate::test_util::{make_session, test_app};
+use crate::tests::support::{make_session, test_app};
 use choreo_proto::{
     AccountInfo, CatalogProvider, ClientMessage, ClientMessageType, DaemonMessage,
     DaemonMessageType, McpAuthState, McpServerStatus, ReasoningCapability, RefreshStatus,

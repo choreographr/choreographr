@@ -421,7 +421,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
 
     #[test]
     fn request_image_fetch_queues_only_stripped_nonempty_images() {

@@ -6,7 +6,7 @@
 //! `App::set_status`) rather than the private fields, because the setters *are*
 //! the choke point under test.
 
-use crate::test_util::test_app;
+use crate::tests::support::test_app;
 
 /// One hostile fixture carrying every construct the normalizer has to
 /// neutralize: a BEL, a tab, a right-to-left override, and a CSI sequence.

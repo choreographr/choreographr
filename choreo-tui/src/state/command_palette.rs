@@ -230,7 +230,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::test_app;
+    use crate::tests::support::test_app;
 
     /// Set the composer to a command line (leading slash included) the way
     /// typing it would — the buffer holds the `/`, so a command line is just a

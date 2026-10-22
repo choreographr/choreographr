@@ -3,7 +3,7 @@
 
 use crate::markdown_render::{lines_height, render_turn_lines};
 use crate::state::ImageSlot;
-use crate::test_util::test_app;
+use crate::tests::support::test_app;
 use choreo_proto::Turn;
 use ratatui::layout::Size;
 

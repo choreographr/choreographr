@@ -1,6 +1,6 @@
 use crate::connection::handle_daemon_message;
 use crate::state::*;
-use crate::test_util::{make_session, test_app};
+use crate::tests::support::{make_session, test_app};
 use choreo_client_core::TurnEventHandler;
 use choreo_proto::{
     ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, DisplayedImageRecord,

@@ -1,6 +1,6 @@
 use crate::connection::{handle_daemon_message, handle_terminal_event};
 use crate::state::{App, PROVIDER_PAGE_LINES, selector_list_layout};
-use crate::test_util::test_app;
+use crate::tests::support::test_app;
 use choreo_proto::{ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
