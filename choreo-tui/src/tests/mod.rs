@@ -3,7 +3,9 @@
 //! Every child is compiled only under `cfg(test)` because this parent is
 //! declared `#[cfg(test)] mod tests;` in `lib.rs`, so no child needs its own
 //! gate. `support` is the shared harness (`test_app`, `add_user_text`,
-//! `make_session`) that the children reach as `crate::tests::support`.
+//! `make_session`, `make_session_full`, `insert_turn`) that the children reach
+//! as `crate::tests::support` — one definition site and one import path for the
+//! whole suite, so a fixture never depends on which module a test lives in.
 //!
 //! What belongs here: a test that reaches the code under test through
 //! `crate::…` paths — so the item is public or `pub(crate)` and the crate
@@ -12,8 +14,8 @@
 //! test modules from `lib.rs`, which keeps that file's module list free of
 //! test-only entries. A subject too large for one file becomes a directory
 //! module (`tests/<subject>/mod.rs` declaring one child per subject, as
-//! `tests/state/` does), and the parent then also holds the fixtures those
-//! children share.
+//! `tests/state/` does); fixtures shared across children live in `support`,
+//! never in a subject's parent module.
 //!
 //! What does not: a test that needs a module's *private* items. That is a
 //! white-box test and cannot live here — a private item is not reachable from
@@ -21,11 +23,12 @@
 //! tests` (`render/tests.rs`, `selection/tests.rs`, `markdown_render/tests/`,
 //! and the inline blocks throughout `src/`).
 //!
-//! The split itself is deliberate: a monolithic suite file per area
-//! (`app_tests.rs`, `session_tests.rs`, …) is one extra relink and one extra
-//! clippy re-check, and a file name says nothing about which subject a test
-//! covers. One module per subject keeps both costs proportionate to the
-//! subject and makes a test's home obvious from its subject.
+//! The split itself is deliberate, and it is the standing reason for one
+//! module per subject: each top-level test file is an extra relink and an
+//! extra clippy re-check on every library change, and a file name says nothing
+//! about which subject a test covers. One module per subject keeps both costs
+//! proportionate to the subject and makes a test's home obvious from its
+//! subject.
 
 pub(crate) mod support;
 

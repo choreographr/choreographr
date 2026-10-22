@@ -328,14 +328,16 @@ fn session_list_scrolls_down_then_up_directionally() {
 
 #[test]
 fn session_list_archived_view_renders_only_archived() {
-    use crate::tests::support::{make_session, test_app};
+    use crate::tests::support::{make_session_full, test_app};
 
     let mut app = test_app();
     app.page = crate::state::Page::SessionManager;
-    let mut archived = make_session(2, "old-session", "gpt-4", 1);
+    let mut archived = make_session_full(2, "old-session", "gpt-4", 1);
     archived.archived_at = Some(1_705_314_000_500);
-    app.session_mgr
-        .set_sessions(vec![make_session(1, "live-session", "gpt-4", 1), archived]);
+    app.session_mgr.set_sessions(vec![
+        make_session_full(1, "live-session", "gpt-4", 1),
+        archived,
+    ]);
     // Tab into the archived view.
     app.session_mgr.toggle_view();
 
@@ -354,12 +356,12 @@ fn session_list_archived_view_renders_only_archived() {
 
 #[test]
 fn session_list_archived_view_empty_state_message() {
-    use crate::tests::support::{make_session, test_app};
+    use crate::tests::support::{make_session_full, test_app};
 
     let mut app = test_app();
     app.page = crate::state::Page::SessionManager;
     app.session_mgr
-        .set_sessions(vec![make_session(1, "live", "gpt-4", 1)]);
+        .set_sessions(vec![make_session_full(1, "live", "gpt-4", 1)]);
     app.session_mgr.toggle_view();
 
     let content = drawn_cells(&mut app, 80, 24);
@@ -368,14 +370,14 @@ fn session_list_archived_view_empty_state_message() {
 
 #[test]
 fn session_list_shows_pin_marker() {
-    use crate::tests::support::{make_session, test_app};
+    use crate::tests::support::{make_session_full, test_app};
 
     let mut app = test_app();
     app.page = crate::state::Page::SessionManager;
-    let mut pinned = make_session(1, "pinned-session", "gpt-4", 1);
+    let mut pinned = make_session_full(1, "pinned-session", "gpt-4", 1);
     pinned.pinned = true;
     app.session_mgr
-        .set_sessions(vec![pinned, make_session(2, "plain", "gpt-4", 1)]);
+        .set_sessions(vec![pinned, make_session_full(2, "plain", "gpt-4", 1)]);
     // Make the pinned top row both selected and attached so its marker column
     // renders the unique "sel + attached + pin" glyph sequence.
     app.session_mgr.selection = Some(0);

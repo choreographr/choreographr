@@ -2,9 +2,8 @@
 //! pinned/archived partitions, flag application, status-change reordering, and
 //! `remove_session` cleanup.
 
-use super::make_session;
 use crate::state::{SessionDetailData, SessionManagerState, SessionManagerView};
-use crate::tests::support::test_app;
+use crate::tests::support::{make_session, test_app};
 use choreo_proto::SessionStatus;
 
 fn make_detail_data(session_id: u64) -> SessionDetailData {

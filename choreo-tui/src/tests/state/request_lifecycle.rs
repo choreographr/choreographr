@@ -1,9 +1,8 @@
 //! Request lifecycle handlers: `handle_started`, `handle_done`, and the
 //! `handle_failed` error-routing matrix.
 
-use super::insert_turn;
 use crate::state::App;
-use crate::tests::support::test_app;
+use crate::tests::support::{insert_turn, test_app};
 use choreo_client_core::TurnEventHandler;
 
 #[test]

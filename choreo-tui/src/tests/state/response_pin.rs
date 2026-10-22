@@ -5,9 +5,8 @@
 //! the UI loop uses (`handle_request_stream` + `compute_total_height_and_markers`),
 //! so the pin is checked where it is actually decided.
 
-use super::insert_turn;
 use crate::state::{App, ResponsePin};
-use crate::tests::support::test_app;
+use crate::tests::support::{insert_turn, test_app};
 use choreo_client_core::TurnEventHandler;
 use choreo_client_core::dispatch::ToolCallEvent;
 use choreo_proto::{OutputStream, ToolResultRecord, Turn};

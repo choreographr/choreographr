@@ -28,10 +28,11 @@ mod ui_loop;
 pub(crate) use ui_loop::run_app;
 
 // `handle_daemon_message` and `handle_terminal_event` are referenced from
-// outside the module only by the crate's `#[cfg(test)]` test modules
-// (app_tests.rs, input_tests.rs, …), so the re-exports are gated to the test
-// build — the lib build reaches these through the sibling modules directly,
-// and an ungated re-export would be flagged unused there.
+// outside the module only by the crate suite (`crate::tests` — its `app`,
+// `daemon`, `session`, `input`, `render`, `ai_providers` and
+// `model_selector` subjects), so the re-exports are gated to the test build —
+// the lib build reaches these through the sibling modules directly, and an
+// ungated re-export would be flagged unused there.
 #[cfg(test)]
 pub(crate) use daemon::handle_daemon_message;
 #[cfg(test)]

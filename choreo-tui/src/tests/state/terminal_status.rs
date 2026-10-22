@@ -1,7 +1,6 @@
 //! Unit tests for `state::terminal_status` (OSC 7501 records + OSC 2 title).
 
-use super::make_session;
-use crate::tests::support::test_app;
+use crate::tests::support::{make_session, test_app};
 use choreo_client_core::TurnEventHandler;
 use choreo_proto::SessionStatus;
 

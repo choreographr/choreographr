@@ -1,6 +1,6 @@
 use crate::connection::handle_daemon_message;
 use crate::state::*;
-use crate::tests::support::{make_session, test_app};
+use crate::tests::support::{make_session_full, test_app};
 use choreo_proto::{DaemonMessage, DaemonMessageType, SessionEvent};
 
 // ── per-session pin/archive flags (SessionFlagsChanged) ──
@@ -10,8 +10,8 @@ fn session_flags_changed_updates_list_and_archived_split() {
     let mut app = test_app();
     let (tx, _rx) = crossbeam_channel::unbounded();
     app.session_mgr.set_sessions(vec![
-        make_session(1, "a", "m", 0),
-        make_session(2, "b", "m", 0),
+        make_session_full(1, "a", "m", 0),
+        make_session_full(2, "b", "m", 0),
     ]);
     // The live view holds both sessions.
     assert_eq!(app.session_mgr.sessions.len(), 2);

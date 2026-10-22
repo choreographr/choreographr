@@ -42,8 +42,8 @@ mod terminal_status;
 mod turn;
 
 // Compatibility layer: every item moved into the sibling modules is
-// re-exported here so `crate::state::X` references (in this crate and in
-// `app_tests.rs`/`render_tests.rs`) keep resolving exactly as before.
+// re-exported here so `crate::state::X` references (in this crate and in the
+// crate's `crate::tests` suite) keep resolving exactly as before.
 pub(crate) use command_palette::*;
 pub(crate) use display_line::DisplayLine;
 pub(crate) use history::*;

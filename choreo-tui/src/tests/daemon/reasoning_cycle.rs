@@ -1,5 +1,5 @@
 use crate::connection::{handle_daemon_message, handle_terminal_event};
-use crate::tests::support::{make_session, test_app};
+use crate::tests::support::{make_session_full, test_app};
 use choreo_proto::{
     ClientMessageType, DaemonMessage, DaemonMessageType, ReasoningCapability, SessionEvent,
 };
@@ -354,7 +354,7 @@ fn model_selected_for_attached_session_updates_display_and_summary() {
     app.display_for(42).selected_model = Some("gpt-old".to_string());
     // The summary the status bar's session-identity fields read from.
     app.session_mgr
-        .set_sessions(vec![make_session(42, "a", "gpt-old", 0)]);
+        .set_sessions(vec![make_session_full(42, "a", "gpt-old", 0)]);
 
     handle_daemon_message(
         DaemonMessage::broadcast(DaemonMessageType::Session {
@@ -392,7 +392,7 @@ fn reasoning_effort_set_for_attached_session_updates_display_and_summary() {
     app.active_session_id = Some(42);
     app.display_for(42).reasoning_effort = Some("off".to_string());
     app.session_mgr
-        .set_sessions(vec![make_session(42, "a", "m", 0)]);
+        .set_sessions(vec![make_session_full(42, "a", "m", 0)]);
 
     handle_daemon_message(
         DaemonMessage::broadcast(DaemonMessageType::Session {

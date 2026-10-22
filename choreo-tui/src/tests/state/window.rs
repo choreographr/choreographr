@@ -1,7 +1,7 @@
 //! Selection-driven window scrolling and page-jump paging.
 
-use super::make_session;
 use crate::state::{PAGE_SCROLL_LINES, SessionManagerState};
+use crate::tests::support::make_session;
 
 // ── window (selection-driven scroll) ──
 

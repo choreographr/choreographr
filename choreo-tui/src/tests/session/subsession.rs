@@ -1,6 +1,6 @@
 use crate::connection::handle_daemon_message;
 use crate::state::*;
-use crate::tests::support::{make_session, test_app};
+use crate::tests::support::{make_session_full, test_app};
 use choreo_proto::{
     ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent, SessionStatus, TokenUsage,
 };
@@ -8,9 +8,9 @@ use choreo_proto::{
 // ── Sub-session finish auto-switches back to the parent ─────────────
 
 /// Build a session summary for a running sub-session: same fields as
-/// `make_session`, plus a parent id and an active (streaming) status.
+/// `make_session_full`, plus a parent id and an active (streaming) status.
 fn make_subsession(id: u64, title: &str, parent_id: u64) -> choreo_proto::SessionSummary {
-    let mut s = make_session(id, title, "m1", 0);
+    let mut s = make_session_full(id, title, "m1", 0);
     s.parent_session_id = Some(parent_id);
     s.status = choreo_proto::SessionStatus::Responding;
     s
@@ -22,7 +22,7 @@ fn attached_subsession_finished_detects_active_to_idle_only() {
     app.attached_session_id = Some(99);
     app.active_session_id = Some(99);
     app.session_mgr.set_sessions(vec![
-        make_session(42, "parent session", "m1", 3),
+        make_session_full(42, "parent session", "m1", 3),
         make_subsession(99, "child task", 42),
     ]);
 
@@ -95,7 +95,7 @@ fn subsession_finish_switches_back_to_parent_with_notification() {
     app.attached_session_id = Some(99);
     app.active_session_id = Some(99);
     app.session_mgr.set_sessions(vec![
-        make_session(42, "parent session", "m1", 3),
+        make_session_full(42, "parent session", "m1", 3),
         make_subsession(99, "child task", 42),
     ]);
 
@@ -151,7 +151,7 @@ fn subsession_finish_does_not_fire_on_duplicate_idle_broadcast() {
     app.attached_session_id = Some(99);
     app.active_session_id = Some(99);
     app.session_mgr.set_sessions(vec![
-        make_session(42, "parent session", "m1", 3),
+        make_session_full(42, "parent session", "m1", 3),
         make_subsession(99, "child task", 42),
     ]);
     app.handle_session_status_changed(99, &SessionStatus::Inactive, 1_705_315_000_000);
@@ -184,7 +184,7 @@ fn top_level_session_finish_does_not_switch() {
     app.attached_session_id = Some(42);
     app.active_session_id = Some(42);
     app.session_mgr
-        .set_sessions(vec![make_session(42, "my session", "m1", 3)]);
+        .set_sessions(vec![make_session_full(42, "my session", "m1", 3)]);
 
     handle_daemon_message(
         DaemonMessage::broadcast(DaemonMessageType::Session {
@@ -264,7 +264,7 @@ fn session_attached_does_not_regress_accumulated_live_state() {
     // The session summary (refreshed on ListSessions, potentially stale) has
     // older values for the same fields.
     app.session_mgr
-        .set_sessions(vec![make_session(42, "a", "gpt-stale", 0)]);
+        .set_sessions(vec![make_session_full(42, "a", "gpt-stale", 0)]);
     {
         let s = app.session_mgr.all.first_mut().unwrap();
         s.token_usage = Some(TokenUsage {
@@ -319,12 +319,12 @@ fn handle_sessions_auto_attach_prefers_top_level_session() {
     // recently modified (its requests completed while the parent's agent
     // worked, each bumping last_modified).
     // Session 3 is the most recently modified top-level session.
-    let mut child = make_session(7, "sub", "m", 0);
+    let mut child = make_session_full(7, "sub", "m", 0);
     child.parent_session_id = Some(3);
     child.last_modified = 3000;
-    let mut top = make_session(3, "main", "m", 0);
+    let mut top = make_session_full(3, "main", "m", 0);
     top.last_modified = 2000;
-    let mut older = make_session(1, "old", "m", 0);
+    let mut older = make_session_full(1, "old", "m", 0);
     older.last_modified = 1000;
 
     app.handle_sessions(&[child.clone(), top.clone(), older.clone()], &tx)
@@ -357,7 +357,7 @@ fn handle_sessions_auto_attach_falls_back_to_child_when_no_top_level() {
     app.image_job_tx = None;
     let (tx, rx) = crossbeam_channel::unbounded();
 
-    let mut child = make_session(7, "sub", "m", 0);
+    let mut child = make_session_full(7, "sub", "m", 0);
     child.parent_session_id = Some(3);
     app.handle_sessions(&[child], &tx)
         .expect("handle_sessions should succeed");
@@ -408,11 +408,11 @@ fn handle_sessions_auto_attach_skips_archived_sessions() {
     app.image_job_tx = None;
     let (tx, rx) = crossbeam_channel::unbounded();
 
-    let mut archived = make_session(5, "archived", "m", 0);
+    let mut archived = make_session_full(5, "archived", "m", 0);
     archived.archived_at = Some(1_705_314_000_500);
     archived.pinned = true;
     archived.last_modified = 2_000_000_000_000; // newest → sorts first
-    let live = make_session(3, "live", "m", 0);
+    let live = make_session_full(3, "live", "m", 0);
 
     app.handle_sessions(&[archived, live], &tx)
         .expect("handle_sessions should succeed");
@@ -434,7 +434,7 @@ fn handle_sessions_only_archived_creates_default_instead_of_attaching() {
     app.image_job_tx = None;
     let (tx, rx) = crossbeam_channel::unbounded();
 
-    let mut archived = make_session(5, "archived", "m", 0);
+    let mut archived = make_session_full(5, "archived", "m", 0);
     archived.archived_at = Some(1_705_314_000_500);
 
     app.handle_sessions(&[archived], &tx)

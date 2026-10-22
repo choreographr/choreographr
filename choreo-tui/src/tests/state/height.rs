@@ -1,8 +1,7 @@
 //! `compute_total_height_and_markers` scroll and anchor preservation across
 //! content growth and removal.
 
-use super::insert_turn;
-use crate::tests::support::test_app;
+use crate::tests::support::{insert_turn, test_app};
 
 // ── compute_total_height_and_markers scroll preservation ──
 

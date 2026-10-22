@@ -131,8 +131,8 @@ use self::image::render_fullscreen_only;
 use self::status::KEYS_LOCKED_MARKER;
 
 // Re-exported so every `crate::render::<name>` path outside this file keeps
-// resolving after the split: the markdown renderer and its tests import
-// `format_timestamp`, and `render_tests` glob-imports the rest.
+// resolving after the split: the markdown renderer imports `format_timestamp`,
+// and the crate suite's `tests/render/` glob-imports the rest.
 pub(crate) use self::format::{format_timestamp, session_detail_tokens_line, status_token_readout};
 pub(crate) use self::status::{format_status, status_display};
 // `slot_label` is drawn only from within `image` itself; its sole outside

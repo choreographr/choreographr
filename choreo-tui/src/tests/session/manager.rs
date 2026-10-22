@@ -1,5 +1,5 @@
 use crate::state::*;
-use crate::tests::support::{make_session, test_app};
+use crate::tests::support::{make_session_full, test_app};
 use choreo_proto::{ClientMessage, ClientMessageType};
 use crossterm::event::Event;
 
@@ -44,8 +44,8 @@ fn session_manager_set_sessions_empty() {
 fn session_manager_set_sessions_selects_first() {
     let mut state = SessionManagerState::new();
     state.set_sessions(vec![
-        make_session(1, "a", "m1", 5),
-        make_session(2, "b", "m2", 3),
+        make_session_full(1, "a", "m1", 5),
+        make_session_full(2, "b", "m2", 3),
     ]);
     assert_eq!(state.sessions.len(), 2);
     assert_eq!(state.selection, Some(0));
@@ -55,9 +55,9 @@ fn session_manager_set_sessions_selects_first() {
 fn session_manager_select_up_down() {
     let mut state = SessionManagerState::new();
     state.set_sessions(vec![
-        make_session(1, "a", "m1", 5),
-        make_session(2, "b", "m2", 3),
-        make_session(3, "c", "m3", 7),
+        make_session_full(1, "a", "m1", 5),
+        make_session_full(2, "b", "m2", 3),
+        make_session_full(3, "c", "m3", 7),
     ]);
 
     assert_eq!(state.selection, Some(0));
@@ -85,8 +85,8 @@ fn session_manager_select_up_down() {
 fn session_manager_enter_detail_uses_selected_session() {
     let mut state = SessionManagerState::new();
     state.set_sessions(vec![
-        make_session(10, "test-session", "gpt-4", 5),
-        make_session(20, "other", "claude", 3),
+        make_session_full(10, "test-session", "gpt-4", 5),
+        make_session_full(20, "other", "claude", 3),
     ]);
 
     state.enter_detail();
@@ -109,7 +109,7 @@ fn session_manager_enter_detail_fails_when_no_selection() {
 #[test]
 fn session_manager_leave_detail_returns_to_list() {
     let mut state = SessionManagerState::new();
-    state.set_sessions(vec![make_session(1, "a", "m1", 0)]);
+    state.set_sessions(vec![make_session_full(1, "a", "m1", 0)]);
     state.enter_detail();
     assert_eq!(state.view, SessionManagerView::Detail);
 
@@ -122,9 +122,9 @@ fn session_manager_leave_detail_returns_to_list() {
 fn session_manager_set_sessions_preserves_selection_by_id() {
     let mut state = SessionManagerState::new();
     state.set_sessions(vec![
-        make_session(1, "a", "m1", 0),
-        make_session(2, "b", "m2", 0),
-        make_session(3, "c", "m3", 0),
+        make_session_full(1, "a", "m1", 0),
+        make_session_full(2, "b", "m2", 0),
+        make_session_full(3, "c", "m3", 0),
     ]);
     state.select_down();
     state.select_down();
@@ -132,9 +132,9 @@ fn session_manager_set_sessions_preserves_selection_by_id() {
 
     // Refresh sessions — should preserve selection on session 3
     state.set_sessions(vec![
-        make_session(1, "a", "m1", 0),
-        make_session(3, "c", "m3", 5),
-        make_session(4, "d", "m4", 0),
+        make_session_full(1, "a", "m1", 0),
+        make_session_full(3, "c", "m3", 5),
+        make_session_full(4, "d", "m4", 0),
     ]);
     assert_eq!(state.selection, Some(1)); // session 3 is now at index 1
 }
@@ -146,8 +146,8 @@ fn make_sm_app() -> App {
     let mut app = test_app();
     app.page = Page::SessionManager;
     app.session_mgr.set_sessions(vec![
-        make_session(1, "first", "gpt-4", 3),
-        make_session(2, "second", "claude", 5),
+        make_session_full(1, "first", "gpt-4", 3),
+        make_session_full(2, "second", "claude", 5),
     ]);
     app
 }
@@ -245,7 +245,7 @@ fn session_manager_ctrl_a_does_not_archive() {
     let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = make_sm_app();
     app.session_mgr
-        .set_sessions(vec![make_session(7, "s", "m", 1)]);
+        .set_sessions(vec![make_session_full(7, "s", "m", 1)]);
     app.session_mgr.selection = Some(0);
 
     handle_terminal_event(
@@ -290,9 +290,9 @@ fn chat_alt_s_highlights_previously_viewed_session() {
     // The list is already loaded from an earlier visit, and the
     // previously highlighted row is a *different* session (index 2).
     app.session_mgr.set_sessions(vec![
-        make_session(7, "old", "m1", 1),
-        make_session(42, "viewed", "m2", 5),
-        make_session(3, "other", "m3", 2),
+        make_session_full(7, "old", "m1", 1),
+        make_session_full(42, "viewed", "m2", 5),
+        make_session_full(3, "other", "m3", 2),
     ]);
     app.session_mgr.selection = Some(2);
 
@@ -333,9 +333,9 @@ fn chat_alt_s_remembers_viewed_session_before_list_arrives() {
     // The daemon's Sessions reply populates the list; the pending
     // highlight is applied (and consumed).
     app.session_mgr.set_sessions(vec![
-        make_session(7, "old", "m1", 1),
-        make_session(42, "viewed", "m2", 5),
-        make_session(3, "other", "m3", 2),
+        make_session_full(7, "old", "m1", 1),
+        make_session_full(42, "viewed", "m2", 5),
+        make_session_full(3, "other", "m3", 2),
     ]);
     let sel = app
         .session_mgr

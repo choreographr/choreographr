@@ -1,6 +1,6 @@
 use crate::connection::{handle_daemon_message, handle_terminal_event};
 use crate::state::*;
-use crate::tests::support::{make_session, test_app};
+use crate::tests::support::{make_session_full, test_app};
 use choreo_proto::{
     AccountInfo, CatalogProvider, ClientMessage, ClientMessageType, DaemonMessage,
     DaemonMessageType, McpAuthState, McpServerStatus, RefreshStatus, SessionStatus, Turn,
@@ -151,8 +151,8 @@ fn session_manager_switch_preserves_unsent_prompt_per_session() {
     let mut app = test_app();
     app.page = Page::SessionManager;
     app.session_mgr.set_sessions(vec![
-        make_session(1, "first", "gpt-4", 3),
-        make_session(2, "second", "claude", 5),
+        make_session_full(1, "first", "gpt-4", 3),
+        make_session_full(2, "second", "claude", 5),
     ]);
     // The user was viewing session 1 with an unsent prompt.
     app.attached_session_id = Some(1);
