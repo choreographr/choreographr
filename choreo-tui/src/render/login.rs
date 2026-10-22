@@ -9,7 +9,7 @@
 
 use crate::state::{App, PopupSize, centered_popup};
 
-use super::display_text;
+use super::{display_text, display_text_owned};
 use ratatui::{
     Frame,
     style::{Color, Style},
@@ -35,12 +35,12 @@ pub(crate) fn render_login_modal(frame: &mut Frame<'_>, app: &App) {
         Line::from(format!("Provider: {}", display_text(&modal.provider))),
         Line::from(format!("Account:  {}", display_text(&modal.account))),
         Line::from(""),
-        Line::from(display_text(&modal.status).into_owned()),
+        Line::from(display_text_owned(&modal.status)),
     ];
     if let Some(url) = &modal.auth_url {
         lines.push(Line::from(""));
         lines.push(Line::from("Open this URL in a browser to sign in:"));
-        lines.push(Line::from(display_text(url).into_owned()));
+        lines.push(Line::from(display_text_owned(url)));
     }
     if let Some((code, uri)) = &modal.device_code {
         lines.push(Line::from(""));

@@ -370,9 +370,9 @@ fn streaming_answer_reuses_the_incremental_response_cache() {
         .expect("streaming fast path must populate the response cache");
     assert_eq!(cache.turn_id, 1, "cache is keyed to the streaming turn");
     assert!(
-        cache.markdown.parsed_bytes * 2 < naive_bytes,
+        cache.markdown.parsed_bytes() * 2 < naive_bytes,
         "incremental parsed {} bytes vs {naive_bytes} naive — prefix not reused",
-        cache.markdown.parsed_bytes
+        cache.markdown.parsed_bytes()
     );
 
     // The rendered cache entry must match a whole-response render exactly.

@@ -1776,22 +1776,23 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
   This closes the remaining
   LLM-spoofing gap for the streaming tools whose raw output is deliberately not
   source-escaped.
-- **Sink.** `choreo-tui`'s `sanitize_for_terminal` filter runs over every tool-result
+- **Sink.** `choreo-tui`'s `normalize_ansi_text` filter runs over every tool-result
   body before rendering: it keeps complete SGR color sequences (`ESC [ … m`, so ANSI
   coloring still works) and escapes everything else — OSC/CSI/DCS sequences, C0/C1
   controls (including lone CR: a carriage return not followed by a line feed
   would let hostile content overwrite its own rendered line; a CRLF pair is folded to
   a single `\n`, matching the daemon's line sanitizers), U+2028/U+2029, and the Cf spoofing class (via the same shared
-  `choreo_sanitize::is_unsafe_unicode`). This is what makes the raw
+  `choreo_sanitize::is_unsafe_unicode`). The same pass expands tabs to 4-column
+  spaces, so the text measured is the text drawn. This is what makes the raw
   shell/VM streams safe to draw; it defends against terminal-escape injection (OSC-52
   clipboard writes, clear-screen, title changes, …) for every tool at once, including
   the tools that never sanitize at the source.
 - **Model output is filtered at the same sink.** The markdown renderer (the
   response, the reasoning body, user text, and tool descriptions) runs
-  `normalize_display_text` over its source before parsing it: the same filter with
-  SGR passthrough **off** (`sanitize_without_ansi` — nothing there parses escape
-  sequences, so a kept one would only draw as literal `[31m`), followed by tab
-  expansion. Besides making hostile model output inert, this closes a
+  `normalize_display_text` over its source before parsing it: the same fused pass with
+  SGR passthrough **off** (nothing there parses escape
+  sequences, so a kept one would only draw as literal `[31m`), tabs expanded in the
+  same scan. Besides making hostile model output inert, this closes a
   measurement/drawing desync: `unicode-width` counts a control character as one
   column while ratatui filters it out of the drawn grapheme stream, so a row
   carrying one measures wider than it renders — which rags a code box's right

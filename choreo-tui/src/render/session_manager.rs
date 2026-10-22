@@ -13,8 +13,8 @@ use ratatui::{
 };
 
 use super::{
-    display_text, format_status, format_timestamp, session_detail_tokens_line, status_display,
-    vertical_scrollbar,
+    display_text, display_text_owned, format_status, format_timestamp, session_detail_tokens_line,
+    status_display, vertical_scrollbar,
 };
 
 // ── Session Manager ──────────────────────────────────────────
@@ -295,7 +295,7 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
                     .reasoning_effort
                     .as_deref()
                     .filter(|e| *e != "off")
-                    .map_or_else(|| "off".to_string(), |e| display_text(e).into_owned())
+                    .map_or_else(|| "off".to_string(), display_text_owned)
             )),
             Line::from(format!(
                 "Parent:        {}",

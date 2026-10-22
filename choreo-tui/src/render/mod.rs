@@ -44,6 +44,18 @@ pub(crate) fn display_text(text: &str) -> std::borrow::Cow<'_, str> {
     crate::markdown_render::normalize_display_text(text)
 }
 
+/// [`display_text`] for a sink that stores the text — a [`String`] field, a
+/// tuple element, a `Paragraph`'s content — rather than borrowing it for the
+/// duration of a draw.
+///
+/// The borrow fast path only helps a caller that can keep the borrow alive; at
+/// an owned-string sink the text has to be copied either way, so this says so
+/// at the call site instead of spelling the same thing as `.into_owned()` on
+/// every line.
+pub(crate) fn display_text_owned(text: &str) -> String {
+    display_text(text).into_owned()
+}
+
 // The former monolithic render.rs was split into a render/ module.  This file
 // keeps the chat/fullscreen/history drawing plus the helpers shared by several
 // pages (cursor positioning, status/timestamp formatting, the scrollbar
@@ -339,12 +351,12 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
         // `app.error` carries strings the TUI did not author (a daemon error that
         // embeds a provider body, say), so it is normalized like any other
         // displayed text: measured and drawn identically, no live escapes.
-        let err_para = Paragraph::new(Text::from(display_text(err).into_owned()))
+        let err_para = Paragraph::new(Text::from(display_text_owned(err)))
             .style(Style::default().fg(Color::Red))
             .wrap(Wrap { trim: false });
         frame.render_widget(err_para, notify_area);
     } else if let Some(ref status) = app.status {
-        let status_para = Paragraph::new(Text::from(display_text(status).into_owned()))
+        let status_para = Paragraph::new(Text::from(display_text_owned(status)))
             .style(Style::default().fg(Color::Green))
             .wrap(Wrap { trim: false });
         frame.render_widget(status_para, notify_area);
@@ -525,22 +537,22 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
         // draws in this single clipped line.
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
-            display_text(wd).into_owned(),
+            display_text_owned(wd),
             Style::default().fg(Color::White),
         ));
         spans.push(Span::raw(" | "));
         spans.push(Span::styled(
-            display_text(account).into_owned(),
+            display_text_owned(account),
             Style::default().fg(Color::White),
         ));
         spans.push(Span::raw(" | "));
         spans.push(Span::styled(
-            display_text(model).into_owned(),
+            display_text_owned(model),
             Style::default().fg(Color::White),
         ));
         spans.push(Span::raw(" | "));
         spans.push(Span::styled(
-            display_text(reasoning).into_owned(),
+            display_text_owned(reasoning),
             Style::default().fg(Color::White),
         ));
 
@@ -548,7 +560,7 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
         if !tool_groups.is_empty() {
             spans.push(Span::raw(" | "));
             spans.push(Span::styled(
-                display_text(&tool_groups).into_owned(),
+                display_text_owned(&tool_groups),
                 Style::default().fg(Color::DarkGray),
             ));
         }

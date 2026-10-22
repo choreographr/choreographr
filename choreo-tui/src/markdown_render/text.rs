@@ -161,7 +161,7 @@ pub(crate) fn grapheme_chunks(run: &str, width: usize, floor: usize) -> Vec<Stri
     chunks
 }
 
-/// How [`sanitize_impl`] treats a complete SGR colour sequence.
+/// How [`normalize_impl`] treats a complete SGR colour sequence.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SgrPolicy {
     /// Keep `ESC [ params m` verbatim, because the caller will hand the text to
@@ -173,50 +173,82 @@ enum SgrPolicy {
     Escape,
 }
 
-/// Terminal-safe filter for tool-result content: keeps complete SGR color
-/// sequences (`ESC [ params m`) so ANSI coloring still works, plus tabs,
-/// newlines, printable ASCII, the joiners, and safe non-ASCII; escapes
-/// everything else — C0/C1 controls (including lone CR: a carriage return not
-/// followed by a line feed would let hostile content overwrite its own
-/// rendered line; a CRLF pair is folded to a single line feed), non-SGR ESC
-/// sequences (OSC/DCS/CSI — the terminal-injection vector), the
-/// line/paragraph separators U+2028/U+2029, and Unicode format chars (bidi,
-/// ZWSP, …) except the joiners — via `char::escape_default` (e.g. `\u{1b}`,
-/// `\u{202e}`), so hostile content renders as inert text.
+/// Normalize ANSI-escape-coded tool-result content: escape every control
+/// character, keep complete SGR colour sequences (`ESC [ params m`) verbatim so
+/// ANSI coloring still works, and expand tabs — all in one scan with one output
+/// allocation.
 ///
 /// This is the *sink* defense: it protects the terminal from every tool at
 /// once, including the streaming shell/VM tools whose raw output the daemon
 /// deliberately does not escape (colors are a feature). The daemon separately
 /// escapes the same char classes at the source for the line-oriented tools
-/// and for the LLM transcript; the render filter is what makes raw content
-/// safe to draw. Escaping happens *before* the `contains("\x1b[")` gate so
+/// and for the LLM transcript; this filter is what makes raw content safe to
+/// draw. Escaping happens *before* the caller's `contains("\x1b[")` gate so
 /// that only genuine SGR sequences ever reach the ANSI parser.
-///
-/// Iterates the input with a `Peekable<Chars>` (no intermediate `Vec<char>`),
-/// so the per-chunk cost during streaming stays O(chunk) with one output
-/// allocation plus one reused ESC-sequence buffer — it is called inside
-/// `render_turn_lines` for the in-flight turn on every streamed chunk.
-pub(crate) fn sanitize_for_terminal(text: &str) -> String {
-    sanitize_impl(text, SgrPolicy::Keep)
+pub(crate) fn normalize_ansi_text(text: &str) -> String {
+    normalize_impl(text, SgrPolicy::Keep)
 }
 
-/// [`sanitize_for_terminal`] for content that no ANSI parser will ever see:
-/// escape sequences are escaped like any other control character instead of
-/// being kept.
+/// Normalize untrusted display text for the markdown renderer — the same fused
+/// pass as [`normalize_ansi_text`], but with escape sequences escaped instead of
+/// kept, because no ANSI parser will ever see this content.
 ///
 /// Markdown source is exactly such content — the block renderer turns it into
 /// styled [`Line`]s itself, so a surviving `ESC [ 3 1 m` would draw as the
 /// literal text `[31m` while still measuring as four columns, desyncing the row
 /// it sits in from everything measured around it.  Escaping it renders the
 /// sequence inert (`\u{1b}[31m`) *and* keeps measurement honest.
-pub(crate) fn sanitize_without_ansi(text: &str) -> String {
-    sanitize_impl(text, SgrPolicy::Escape)
+///
+/// Both halves of the pass exist for one reason — the text this renderer
+/// *measures* has to be exactly the text ratatui *draws*.  A control character
+/// breaks that: ratatui filters it out of the drawn grapheme stream while
+/// `unicode-width` still counts it (one column for `\t` and for any other C0
+/// char inside a string), so a row carrying one measures wider than it renders —
+/// a code box's right `│` then jogs left on every tab-indented line, and its
+/// indentation vanishes.  Escaping the control characters and expanding the tabs
+/// leaves no character whose measured and drawn widths disagree.
+///
+/// Runs *before* the markdown is parsed, so every block renderer (paragraphs,
+/// code boxes, tables, diff fences) sees the same normalized source.  Content
+/// that is already clean borrows: the common case costs one scan and no
+/// allocation.
+pub(crate) fn normalize_display_text(text: &str) -> Cow<'_, str> {
+    if !text.contains('\t') && text.chars().all(terminal_keeps) {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(normalize_impl(text, SgrPolicy::Escape))
 }
 
-/// The body shared by [`sanitize_for_terminal`] and [`sanitize_without_ansi`];
-/// see their docs for the policy and the char classes involved.
-fn sanitize_impl(text: &str, sgr_policy: SgrPolicy) -> String {
+/// The body shared by [`normalize_ansi_text`] and [`normalize_display_text`]:
+/// one scan that escapes what [`terminal_keeps`] rejects *and* expands tabs, so
+/// the slow path allocates once instead of twice.
+///
+/// Fusing the two steps is safe precisely because tab expansion's only carried
+/// state is the print column of the current logical line: the escaping decision
+/// for a char is local (plus the CSI lookahead), so a column can be advanced in
+/// the same step that emits the char's final on-screen text.
+///
+/// Iterates the input with a `Peekable<Chars>` (no intermediate `Vec<char>`),
+/// so the per-chunk cost during streaming stays O(chunk) with one output
+/// allocation plus one reused ESC-sequence buffer — it is called inside
+/// `render_turn_lines` for the in-flight turn on every streamed chunk.
+///
+/// Column rule, in full (the renderer's width invariant depends on it):
+///
+/// * a `\n` resets the column to 0, so each logical line counts from its own
+///   start (the tab stops a terminal would use);
+/// * a kept SGR sequence advances it by 0, because the sequence draws no cell;
+///   counting its bytes would under-pad a tab that follows a colour code;
+/// * an escaped char advances it by the display width of the *escape text* it
+///   produced (`\u{1b}` is six columns of literal text), because that text is
+///   what is drawn;
+/// * every other kept char advances it by its own display width.
+fn normalize_impl(text: &str, sgr_policy: SgrPolicy) -> String {
     let mut out = String::with_capacity(text.len());
+    // Print column within the current logical line — the only state the pass
+    // carries, which is why a normalizer resumed at a line start is complete
+    // (the incremental streaming cache relies on exactly that).
+    let mut col = 0usize;
     let mut chars = text.chars().peekable();
     // Reused ESC-sequence assembly buffer: one heap allocation for all the
     // color sequences in a chunk, not one per sequence (ANSI-heavy shell
@@ -232,6 +264,7 @@ fn sanitize_impl(text: &str, sgr_policy: SgrPolicy) -> String {
         if c == '\r' && chars.peek() == Some(&'\n') {
             out.push('\n');
             chars.next(); // consume the '\n'
+            col = 0;
             continue;
         }
         // Keep a complete SGR sequence (ESC [ params m) verbatim so ANSI
@@ -264,23 +297,47 @@ fn sanitize_impl(text: &str, sgr_policy: SgrPolicy) -> String {
                 }
             }
             if sgr {
-                // Valid SGR — keep the whole sequence verbatim.
+                // Valid SGR — keep the whole sequence verbatim.  It draws no
+                // cell, so the column stays where it was.
                 out.push_str(&seq);
             } else {
                 // Non-SGR ESC use: render the ESC inert and the consumed
                 // `[` + intermediate bytes as plain text (`seq` is
                 // ESC + '[' + … , so everything after the leading ESC byte
                 // is kept; `.get(1..)` is total because `seq` always starts
-                // with the one-byte ESC).
+                // with the one-byte ESC).  All of it is drawn, so all of it
+                // advances the column: the six chars of `\u{1b}` plus the
+                // tail.
                 out.push_str("\\u{1b}");
-                out.push_str(seq.get(1..).unwrap_or(""));
+                let tail = seq.get(1..).unwrap_or("");
+                out.push_str(tail);
+                col += 6 + tail.len();
             }
             continue;
         }
-        if terminal_keeps(c) {
-            out.push(c);
-        } else {
-            out.extend(c.escape_default());
+        match c {
+            // Expand to the next tab stop of the current line before emitting,
+            // so the spaces count as the columns they occupy.
+            '\t' => {
+                let pad = TAB_STOP - (col % TAB_STOP);
+                out.extend(std::iter::repeat_n(' ', pad));
+                col += pad;
+            }
+            '\n' => {
+                out.push('\n');
+                col = 0;
+            }
+            _ if terminal_keeps(c) => {
+                out.push(c);
+                col += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            }
+            _ => {
+                // `escape_default` emits ASCII only, so the byte count it adds
+                // is exactly the number of columns it draws.
+                let before = out.len();
+                out.extend(c.escape_default());
+                col += out.len() - before;
+            }
         }
     }
     out
@@ -299,107 +356,21 @@ fn sanitize_impl(text: &str, sgr_policy: SgrPolicy) -> String {
 /// what the raw bytes would have shown on a terminal with 4-wide tab stops.
 pub(crate) const TAB_STOP: usize = 4;
 
-/// Replace each `\t` with the spaces needed to reach the next `TAB_STOP`
-/// column, tracking the column per logical line (`\n` resets it).  Every
-/// control char other than `\t` and `\n` is copied through untouched — the
-/// caller decides whether the input has been through
-/// [`sanitize_for_terminal`] first.  Of the input that can carry a tab, only
-/// sanitized tool output can hold a complete SGR color sequence (`ESC [`
-/// params `m`) besides; those bytes are invisible on screen, so they are
-/// copied through *without* advancing the column (counting them would shrink
-/// the tab padding after a color code).  Every other char advances the column
-/// by its display width.  O(1) for content without tabs (the common case),
-/// O(n) with one output allocation otherwise.
-pub(crate) fn expand_tabs(text: &str) -> String {
-    if !text.contains('\t') {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut col = 0usize;
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\t' => {
-                // Advance to the next multiple of TAB_STOP from the line
-                // start (the same rule a terminal's default tab stops use).
-                let pad = TAB_STOP - (col % TAB_STOP);
-                out.extend(std::iter::repeat_n(' ', pad));
-                col += pad;
-            }
-            '\n' => {
-                out.push('\n');
-                col = 0;
-            }
-            // A complete SGR sequence (the only ESC use the terminal filter
-            // keeps, per [`sanitize_for_terminal`]) is invisible — copy it
-            // verbatim and leave the column where it was.  Counting the
-            // escape bytes as visible columns would under-expand a tab that
-            // follows a color code (e.g. `\x1b[32mred\t` would pad to column
-            // 8 of the *raw* text instead of the visible column 3).
-            '\u{1b}' => {
-                out.push('\u{1b}');
-                if chars.peek() == Some(&'[') {
-                    out.push('[');
-                    chars.next();
-                    // Params are 0x30-0x3F, then the final byte 0x40-0x7E
-                    // ('m' for SGR).  sanitize_for_terminal only keeps
-                    // complete sequences, so the loop always terminates on
-                    // the final byte.
-                    while let Some(&n) = chars.peek() {
-                        out.push(n);
-                        chars.next();
-                        if ('\u{40}'..='\u{7e}').contains(&n) {
-                            break;
-                        }
-                    }
-                }
-            }
-            _ => {
-                out.push(c);
-                col += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-            }
-        }
-    }
-    out
-}
-
 /// Whether a single char passes through the terminal filter unchanged: tabs,
 /// newlines, printable ASCII, and safe non-ASCII. Everything else — every
 /// C0/C1 control (including lone CR; a CRLF pair is folded to `\n` by
-/// [`sanitize_for_terminal`] before this predicate runs), the line/paragraph
+/// [`normalize_impl`] before this predicate runs), the line/paragraph
 /// separators, and the non-joiner format-char spoofing class via the shared
 /// [`is_unsafe_unicode`] predicate (owned by `choreo-sanitize`, the same
 /// policy the daemon's sanitizers use) — is escaped. SGR sequences are
 /// handled separately by the filter (kept whole), so the per-char predicate
-/// needs no ESC case.
+/// needs no ESC case.  Tabs are reported as kept because they survive the
+/// escaping step; [`normalize_impl`] expands them to spaces in the same pass.
 pub(crate) fn terminal_keeps(c: char) -> bool {
     c == '\t'
         || c == '\n'
         || (c.is_ascii() && (' '..='~').contains(&c))
         || (!c.is_ascii() && !c.is_control() && !is_unsafe_unicode(c))
-}
-
-/// Normalize untrusted display text for the markdown renderer: make it inert
-/// ([`sanitize_without_ansi`]) and expand its tabs ([`expand_tabs`]).
-///
-/// Both steps exist for one reason — the text this renderer *measures* has to be
-/// exactly the text ratatui *draws*.  A control character breaks that: ratatui
-/// filters it out of the drawn grapheme stream while `unicode-width` still
-/// counts it (one column for `\t` and for any other C0 char inside a string), so
-/// a row carrying one measures wider than it renders — a code box's right `│`
-/// then jogs left on every tab-indented line, and its indentation vanishes.
-/// Escaping the control characters and expanding the tabs leaves no character
-/// whose measured and drawn widths disagree.
-///
-/// Runs *before* the markdown is parsed, so every block renderer (paragraphs,
-/// code boxes, tables, diff fences) sees the same normalized source.  Content
-/// that is already clean borrows: the common case costs one scan and no
-/// allocation.
-pub(crate) fn normalize_display_text(text: &str) -> Cow<'_, str> {
-    if !text.contains('\t') && text.chars().all(terminal_keeps) {
-        return Cow::Borrowed(text);
-    }
-    Cow::Owned(expand_tabs(&sanitize_without_ansi(text)))
 }
 
 /// Render ANSI-escape-coded text as styled ratatui lines, wrapping at `width`.

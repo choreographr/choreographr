@@ -33,6 +33,13 @@
 //!   missed boundary only costs a whole-tail re-render, never a divergent
 //!   result — so this stays conservative rather than trying to prove the blank
 //!   interior.
+//!
+//! The source is also normalized incrementally ([`NormalizedSource`]): the
+//! same reasoning applies to [`normalize_display_text`](super::normalize_display_text),
+//! whose tab expansion makes it stateful along a line.  A line start is the only
+//! position at which that state is empty again, so each frame re-normalizes only
+//! from the last line start onward, and the cached text stays byte-identical to
+//! normalizing the whole source.
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -46,6 +53,42 @@ use crate::MarkdownDocument;
 /// A committed render of a source prefix plus the incremental state needed to
 /// extend it.  See the module docs.
 pub(crate) struct IncrementalMarkdown {
+    /// Incremental normalization cache for the source text.
+    source: NormalizedSource,
+    /// The committed render and its bookkeeping.
+    committed: Committed,
+}
+
+/// Incremental normalization cache for a streaming source.
+///
+/// Holds the raw bytes seen so far and their normalized form, and on each frame
+/// re-normalizes only the text from the last line start onward.  A line start is
+/// the only raw position at which normalization is independent of what precedes
+/// it:
+///
+/// * tab-stop columns reset at `\n`, and the print column is the whole of the
+///   normalizer's run state;
+/// * a `\r` whose `\n` has not arrived yet always sits *after* the last line
+///   start, so the CRLF-fold decision is re-made from scratch rather than
+///   inherited;
+/// * an ESC sequence cannot contain `\n`, so no sequence straddles the boundary.
+///
+/// Invariant: `normalized == normalize_display_text(&raw)` after every update.
+/// That is the cache's contract — the streaming render and the whole-document
+/// render normalize to the same bytes for the same source, so they splice the
+/// same rows.
+#[derive(Default)]
+struct NormalizedSource {
+    /// Every raw byte of the source seen so far.
+    raw: String,
+    /// The normalized form of [`raw`](Self::raw).
+    normalized: String,
+}
+
+/// The committed prefix render and the state needed to extend it.  See the
+/// module docs.
+#[derive(Default)]
+struct Committed {
     /// Wrap width of the committed lines; a change resets the cache.
     width: u16,
     /// Stable source prefix the committed lines were rendered from.  It ends
@@ -59,10 +102,10 @@ pub(crate) struct IncrementalMarkdown {
     heading_shift: Option<usize>,
     /// Bytes handed to the parser, for the reuse test.
     #[cfg(test)]
-    pub(crate) parsed_bytes: usize,
+    parsed_bytes: usize,
     /// Whole-source renders (the fallback path), for the reuse test.
     #[cfg(test)]
-    pub(crate) full_parses: usize,
+    full_parses: usize,
 }
 
 /// One rendered source piece plus the metadata the caller needs to place it.
@@ -88,21 +131,104 @@ impl Default for IncrementalMarkdown {
 impl IncrementalMarkdown {
     pub(crate) fn new() -> Self {
         Self {
-            width: 0,
-            committed_src: String::new(),
-            committed: Vec::new(),
-            committed_joins: Vec::new(),
-            committed_chrome: Vec::new(),
-            heading_shift: None,
-            #[cfg(test)]
-            parsed_bytes: 0,
-            #[cfg(test)]
-            full_parses: 0,
+            source: NormalizedSource::default(),
+            committed: Committed::default(),
         }
     }
 
-    /// Drop all committed state so the next [`render`](Self::render) starts from
-    /// scratch.  Used when the wrap width or the source identity changes.
+    /// Render the source, reusing the committed prefix when possible.
+    ///
+    /// `src` must be the *whole* response text for this frame (the caller trims
+    /// it, matching [`markdown_lines_joined`](super::markdown_lines_joined)).
+    /// Byte-identical to `markdown_lines_joined(src, width)` at every prefix.
+    pub(crate) fn render(
+        &mut self,
+        src: &str,
+        width: u16,
+    ) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
+        // Normalize first, and incrementally: tab stops are per line and every
+        // commit boundary is a line start, so a piece normalizes to exactly the
+        // prefix of normalizing the whole source (see [`NormalizedSource`]).
+        self.source.update(src);
+        // Split the borrow by field: the normalized text lives in `source` and
+        // the commit bookkeeping in `committed`, so the render can read the one
+        // while mutating the other.
+        let Self { source, committed } = self;
+        committed.render(source.text(), width)
+    }
+}
+
+#[cfg(test)]
+impl IncrementalMarkdown {
+    /// Bytes handed to the parser across all frames, for the reuse test.
+    pub(crate) fn parsed_bytes(&self) -> usize {
+        self.committed.parsed_bytes
+    }
+
+    /// Whole-source renders (the fallback path), for the reuse test.
+    pub(crate) fn full_parses(&self) -> usize {
+        self.committed.full_parses
+    }
+
+    /// The cached normalized source, so a test can pin the cache's contract:
+    /// it always equals normalizing the whole raw source.
+    pub(crate) fn normalized_source(&self) -> &str {
+        self.source.text()
+    }
+}
+
+impl NormalizedSource {
+    /// The normalized text of every raw byte seen so far.
+    fn text(&self) -> &str {
+        &self.normalized
+    }
+
+    /// Bring the cached text up to date with `src`, which is this frame's whole
+    /// source.
+    ///
+    /// Cost is the appended bytes plus one re-normalization of the *last line*
+    /// — not of the whole source — because everything before the last line start
+    /// is already correct in both strings.
+    fn update(&mut self, src: &str) {
+        // A source that does not extend the bytes already seen (a replaced or
+        // edited response) has no reusable prefix at all: rebuild from scratch.
+        if !src.starts_with(self.raw.as_str()) {
+            self.raw.clear();
+            self.raw.push_str(src);
+            self.normalized.clear();
+            self.normalized.push_str(&normalize_display_text(src));
+            return;
+        }
+        let appended = src.get(self.raw.len()..).unwrap_or("");
+        if appended.is_empty() {
+            return;
+        }
+        // Resume at the last line start of each string.  The two locate the same
+        // boundary: every input `\n` normalizes to exactly one output `\n` and
+        // nothing else in the output is one, so `rfind` finds it in both.
+        // Scanning back to it touches only the last line — the same region that
+        // has to be normalized again anyway.
+        let raw_line_start = line_start(&self.raw);
+        let out_line_start = line_start(&self.normalized);
+        let tail = src.get(raw_line_start..).unwrap_or("");
+        let tail_normalized = normalize_display_text(tail);
+        // Truncating to the last line start's image drops nothing that is still
+        // valid; the re-normalized tail then restores the invariant.
+        self.normalized.truncate(out_line_start);
+        self.normalized.push_str(&tail_normalized);
+        self.raw.push_str(appended);
+    }
+}
+
+/// Byte offset just past the last line start in `text`: 0 when it carries no
+/// newline, because then its only line start is its beginning.
+fn line_start(text: &str) -> usize {
+    text.rfind('\n').map_or(0, |i| i + 1)
+}
+
+impl Committed {
+    /// Drop all committed state so the next render starts from scratch.  Used
+    /// when the wrap width or the source identity changes.
     fn reset(&mut self) {
         self.committed_src.clear();
         self.committed.clear();
@@ -148,27 +274,18 @@ impl IncrementalMarkdown {
         }
     }
 
-    /// Render the source, reusing the committed prefix when possible.
+    /// Render the normalized source, reusing the committed prefix when
+    /// possible.
     ///
-    /// `src` must be the *whole* response text for this frame (the caller trims
-    /// it, matching [`markdown_lines_joined`](super::markdown_lines_joined)).
-    /// Byte-identical to `markdown_lines_joined(src, width)` at every prefix.
-    pub(crate) fn render(
+    /// `src` is this frame's whole source *after* [`NormalizedSource`]
+    /// normalization, so the committed byte offsets are offsets into the text
+    /// the parser sees.  Byte-identical to `markdown_lines_joined(src, width)` at
+    /// every prefix.
+    fn render(
         &mut self,
         src: &str,
         width: u16,
     ) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
-        // Normalize the source before any prefix bookkeeping, for the reasons
-        // [`normalize_display_text`] documents and so the committed byte offsets
-        // stay offsets into the text the parser sees.  Tab expansion is computed
-        // per line from that line's own column and every commit boundary is a
-        // line start, so a piece normalizes to exactly the prefix of normalizing
-        // the whole source — the cache's byte-identical guarantee holds.  A
-        // control character straddling the still-growing tail can only make the
-        // committed prefix stop matching (the `starts_with` check below), which
-        // resets the cache and re-renders; it can never splice stale rows.
-        let src = normalize_display_text(src);
-        let src = src.as_ref();
         // A different width invalidates the wrapped lines; a source that is not
         // an extension of the committed prefix (a replaced/edited response)
         // invalidates the committed blocks too.  Either way, start over.

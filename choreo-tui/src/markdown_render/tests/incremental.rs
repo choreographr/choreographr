@@ -55,6 +55,14 @@ const CORPUS: &[(&str, &str)] = &[
         "mixed everything",
         "Intro.\n\n## Section\n\nProse paragraph.\n\n- item one\n- item two\n\n> a quote\n\n```\ncode\n\nmore code\n```\n\n| x | y |\n| - | - |\n| 1 | 2 |\n\nDone.\n",
     ),
+    (
+        "tab-indented code",
+        "Lead.\n\n```rust\n\tfn a() {\n\t\tinner();\n\t}\n```\n\n```\n\t\tdeep\t\tcode\n```\n\nTrailing.\n",
+    ),
+    (
+        "crlf line endings",
+        "First line\r\n\r\nSecond\tparagraph\r\n\r\n- item\r\n- other\r\n\r\nEnd.\r\n",
+    ),
 ];
 
 /// Render every prefix of `doc` (at char boundaries) through a fresh
@@ -170,16 +178,16 @@ fn incremental_reuses_the_committed_prefix() {
     // renderer must be far below that (it parses each byte only while it is in
     // the still-growing tail).
     assert!(
-        incremental.parsed_bytes * 3 < full_bytes,
+        incremental.parsed_bytes() * 3 < full_bytes,
         "incremental parsed {} bytes vs {} for full renders — prefix was not reused",
-        incremental.parsed_bytes,
+        incremental.parsed_bytes(),
         full_bytes
     );
     // And it must not have re-rendered the whole source on every frame.
     assert!(
-        incremental.full_parses < 20,
+        incremental.full_parses() < 20,
         "expected few whole-source fallbacks, got {}",
-        incremental.full_parses
+        incremental.full_parses()
     );
 }
 
@@ -242,4 +250,99 @@ fn streaming_turn_render_matches_full_for_every_prefix() {
             "tool header indexes differ at prefix {end}"
         );
     }
+}
+
+/// Sources whose normalization state genuinely spans bytes: tab stops counted
+/// from a line's own start (after wide chars, after an escape, at consecutive
+/// stops), CRLF pairs that arrive split across frames, and control characters
+/// that must be escaped.  A resume point that is not a line boundary shows up
+/// immediately on these.
+const NORMALIZE_STREAM_CORPUS: &[(&str, &str)] = &[
+    (
+        "tab-indented code",
+        "Intro.\n\n```rust\n\tfn a() {\n\t\tinner();\n\t}\n```\n\n\t\ttail\tline\n",
+    ),
+    (
+        "crlf straddling chunk boundaries",
+        "First\r\nSecond\tvalue\r\n\r\nThird\t\tpair\r\n",
+    ),
+    (
+        "wide chars before tabs",
+        "日本語\tcolumns\nok\r\n漢字\there\t\tand\tmore\n",
+    ),
+    (
+        "control chars and tabs",
+        "a\x07b\tc\u{202e}d\te\r\n\0f\tg\n\t\x1b[31mred\t\x1b[0m\n",
+    ),
+];
+
+/// Let the source cache see `doc` in every prefix, asserting after each frame
+/// that its normalized text is byte-identical to a fresh full normalization —
+/// the cache's contract, and what keeps the streaming render identical to the
+/// whole-document one.
+fn assert_normalized_at_every_prefix(name: &str, doc: &str) {
+    let mut cache = IncrementalMarkdown::new();
+    for end in prefix_ends(doc) {
+        let prefix = doc.get(..end).expect("prefix end is a char boundary");
+        let _ = cache.render(prefix, 40);
+        assert_eq!(
+            cache.normalized_source(),
+            normalize_display_text(prefix).as_ref(),
+            "[{name}] cached normalization drifted at prefix {end:?} of {doc:?}"
+        );
+    }
+}
+
+#[test]
+fn incremental_normalization_matches_a_fresh_normalization_at_every_prefix() {
+    for (name, doc) in NORMALIZE_STREAM_CORPUS {
+        assert_normalized_at_every_prefix(name, doc);
+    }
+}
+
+#[test]
+fn incremental_normalization_rebuilds_after_a_non_extension() {
+    // A replaced source (an edit, an undo, a new turn reusing the cache) shares
+    // no prefix with what was cached, so the cache must rebuild rather than
+    // splice — and be exactly a full normalization of the new source.
+    let mut cache = IncrementalMarkdown::new();
+    let _ = cache.render("first\tline\r\nsecond\t\tline", 40);
+    let replaced = "# Replacement\n\n\ttabbed\tbody\r\n\r\nplain\n";
+    let (lines, _, _) = cache.render(replaced, 40);
+    assert_eq!(
+        cache.normalized_source(),
+        normalize_display_text(replaced).as_ref(),
+        "replaced source must normalize exactly as a fresh pass would"
+    );
+    assert_eq!(
+        lines,
+        markdown_lines_joined(replaced, 40).0,
+        "replaced source must render exactly as a whole render would"
+    );
+}
+
+#[test]
+fn incremental_normalization_survives_a_width_change() {
+    // Normalization does not depend on the wrap width, so a width change resets
+    // only the committed blocks; the cached text still has to match a fresh
+    // normalization of the same source afterwards.
+    let doc = "Lead\tword\n\n```\n\tcode\tline\n```\n\n\nTrailing\ttext\n";
+    let mut cache = IncrementalMarkdown::new();
+    let halfway = doc
+        .char_indices()
+        .map(|(i, _)| i)
+        .nth(doc.chars().count() / 2)
+        .unwrap_or(doc.len());
+    let _ = cache.render(doc.get(..halfway).expect("char boundary"), 80);
+    let (lines, _, _) = cache.render(doc, 20);
+    assert_eq!(
+        cache.normalized_source(),
+        normalize_display_text(doc).as_ref(),
+        "cached normalization must survive a width change"
+    );
+    assert_eq!(
+        lines,
+        markdown_lines_joined(doc, 20).0,
+        "a width change must render exactly as a whole render would"
+    );
 }

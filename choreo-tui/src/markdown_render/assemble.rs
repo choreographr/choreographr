@@ -8,8 +8,8 @@
 
 use super::{
     IncrementalMarkdown, LineChrome, LineJoin, RenderedTurnLines, RowContent, ansi_lines_joined,
-    classify_row_content, expand_tabs, markdown_lines_joined, normalize_display_text,
-    plain_text_lines_joined, sanitize_for_terminal,
+    classify_row_content, markdown_lines_joined, normalize_ansi_text, normalize_display_text,
+    plain_text_lines_joined,
 };
 use crate::render::{BG_SHADE, format_timestamp};
 use choreo_proto::Turn;
@@ -590,16 +590,14 @@ fn render_turn_lines_impl(
                 // sequences so hostile file/URL/shell bytes (OSC clipboard
                 // writes, CSI clears, bidi overrides, …) render as inert text
                 // regardless of which tool produced them. SGR survives, so
-                // ANSI coloring still works below.
-                let content = sanitize_for_terminal(&tr.content);
-                // Expand tabs to 4-column spaces (see [`expand_tabs`]):
-                // unicode-width measures `\t` as one column and ratatui draws
-                // it as none (control chars are filtered from the drawn
-                // grapheme stream), so a literal tab would vanish *and* leave
-                // every width computation (wrap, height, fill padding)
-                // mis-measured.  After expansion all four branches below
+                // ANSI coloring still works below.  The same pass expands tabs
+                // to 4-column spaces: unicode-width measures `\t` as one column
+                // and ratatui draws it as none (control chars are filtered from
+                // the drawn grapheme stream), so a literal tab would vanish *and*
+                // leave every width computation (wrap, height, fill padding)
+                // mis-measured.  After this single pass all four branches below
                 // (ansi/diff/markdown/plain) see exact widths.
-                let content = expand_tabs(&content);
+                let content = normalize_ansi_text(&tr.content);
                 // Content with ANSI escape codes gets colored rendering.
                 if content.contains("\x1b[") {
                     let (lines, joins) = ansi_lines_joined(&content, tool_content_width);
