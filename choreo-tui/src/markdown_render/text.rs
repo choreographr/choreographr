@@ -386,8 +386,8 @@ pub(crate) fn terminal_keeps(c: char) -> bool {
 /// exactly the text ratatui *draws*.  A control character breaks that: ratatui
 /// filters it out of the drawn grapheme stream while `unicode-width` still
 /// counts it (one column for `\t` and for any other C0 char inside a string), so
-/// a row carrying one measured wider than it rendered — a code box's right `│`
-/// then jogged left on every tab-indented line, and its indentation vanished.
+/// a row carrying one measures wider than it renders — a code box's right `│`
+/// then jogs left on every tab-indented line, and its indentation vanishes.
 /// Escaping the control characters and expanding the tabs leaves no character
 /// whose measured and drawn widths disagree.
 ///

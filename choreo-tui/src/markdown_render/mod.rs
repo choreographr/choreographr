@@ -341,9 +341,9 @@ pub(crate) fn markdown_lines_joined(
     // [`normalize_display_text`]): tabs are expanded instead of silently
     // dropped — the highlighter can hand a lone `\t` to a row as its own span,
     // and ratatui measures a control character as one column while filtering it
-    // out when drawing, so the code box's right `│` used to jog left on exactly
-    // the tab-indented lines — and hostile control characters render inert
-    // rather than as invisible width.
+    // out when drawing, so a code box's right `│` jogs left on exactly the
+    // tab-indented lines — and hostile control characters render inert rather
+    // than as invisible width.
     let markdown = normalize_display_text(markdown);
     let document = MarkdownDocument::parse(&markdown);
     // Normalize heading levels so the document's first heading always renders

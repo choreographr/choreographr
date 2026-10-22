@@ -25,10 +25,17 @@ use std::sync::Arc;
 /// session title, an id or display name from the model catalog, an account name
 /// from the keystore, OAuth status text and device codes.  Everything it only
 /// displays goes through here on its way to a widget, so a control character
-/// cannot occupy a measured column that never draws (which ragged a code box's
-/// frame, and would misalign a table row or mis-size a wrapped block) and a live
-/// escape sequence cannot ride along.  Clean text borrows, so the cost is one
-/// scan and no allocation.
+/// cannot occupy a measured column that never draws (which misaligns a code
+/// box's frame, and would misalign a table row or mis-size a wrapped block) and
+/// a live escape sequence cannot ride along.  Clean text borrows, so the cost is
+/// one scan and no allocation.
+///
+/// What the user is *editing* is deliberately excluded: the prompt buffer and
+/// every filter field (the command palette's, the model selector's, the
+/// provider wizard's) draw their raw bytes.  Those bytes are the ones the
+/// daemon receives, and the buffer's cursor is a byte offset into them, so
+/// rewriting the text on the way to the screen would both desync the cursor
+/// from the row it draws on and change what the user ends up submitting.
 ///
 /// The one implementation is the markdown renderer's
 /// [`normalize_display_text`](crate::markdown_render::normalize_display_text);
@@ -511,9 +518,11 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
         // disappear; tools in the middle; runtime metrics (tokens, context
         // window fill, active status) on the right.
         // ── Session identity (always present, default to "-") ──
-        // A working directory, account name, and model id are filesystem-,
-        // keystore-, and catalog-controlled respectively: normalize each so it
-        // occupies exactly the columns it draws in this single clipped line.
+        // Every value this block pushes — working directory, account name, model
+        // id, reasoning effort, and the tool-group list — comes from the
+        // filesystem, the keystore, the model catalog, or the daemon rather than
+        // from the TUI: normalize each so it occupies exactly the columns it
+        // draws in this single clipped line.
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             display_text(wd).into_owned(),
@@ -530,13 +539,16 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
             Style::default().fg(Color::White),
         ));
         spans.push(Span::raw(" | "));
-        spans.push(Span::styled(reasoning, Style::default().fg(Color::White)));
+        spans.push(Span::styled(
+            display_text(reasoning).into_owned(),
+            Style::default().fg(Color::White),
+        ));
 
         // ── Tool groups (conditionally present) ──
         if !tool_groups.is_empty() {
             spans.push(Span::raw(" | "));
             spans.push(Span::styled(
-                tool_groups,
+                display_text(&tool_groups).into_owned(),
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -837,10 +849,18 @@ fn render_text_block(
 /// A short human label for an image slot, used in placeholder titles so the
 /// reader can tell a displayed image from a tool-result vision image (and which
 /// tool call it belongs to).
-fn slot_label(slot: &ImageSlot) -> String {
+///
+/// The `ToolResult` arm embeds a model-chosen `call_id`, so the label is
+/// normalized here rather than at each call site: every title built from a
+/// slot label is inert and measures exactly what it draws, and a future caller
+/// inherits that without repeating the rule.
+///
+/// `pub(crate)` so the sink test can pin the label without drawing a full image
+/// block.
+pub(crate) fn slot_label(slot: &ImageSlot) -> String {
     match slot {
         ImageSlot::Displayed(index) => format!("[{index}]"),
-        ImageSlot::ToolResult(call_id) => format!("[{call_id}]"),
+        ImageSlot::ToolResult(call_id) => format!("[{}]", display_text(call_id)),
     }
 }
 

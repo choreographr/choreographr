@@ -1117,3 +1117,102 @@ fn status_display_renders_a_hostile_tool_name_inert() {
     assert_eq!(label, "tool call: evil\\u{7}tool");
     assert!(!label.chars().any(char::is_control), "{label:?}");
 }
+
+#[test]
+fn status_bar_identity_fields_render_inert() {
+    // Every value in the status bar's identity block is externally supplied —
+    // the working directory from the filesystem, the account slug from the
+    // keystore, the model id from the catalog, the reasoning effort and tool
+    // groups echoed back by the daemon.  None may carry a live control or bidi
+    // character into the single clipped line.
+    use crate::test_util::test_app;
+
+    let mut app = test_app();
+    // The identity block draws only for an attached session.
+    app.attached_session_id = Some(0);
+    app.attached_account_slug = Some("acct\u{7}".to_string());
+    app.attached_tool_groups = vec!["core\u{202e}".to_string(), "browser".to_string()];
+    let display = app.display_for(0);
+    display.working_dir = Some("/tmp/\u{7}evil".to_string());
+    display.selected_model = Some("gpt\u{202e}4o".to_string());
+    display.reasoning_effort = Some("hi\tgh".to_string());
+
+    let content = render_chat_content(&mut app, 200, 24);
+    assert!(
+        !content.chars().any(|c| c.is_control() || c == '\u{202e}'),
+        "no live control or bidi char may reach a cell: {content:?}"
+    );
+    for inert in [
+        "/tmp/\\u{7}evil",
+        "acct\\u{7}",
+        "gpt\\u{202e}4o",
+        // The reasoning tab expands at the 4-column stop instead of dropping.
+        "hi  gh",
+        "core\\u{202e}, browser",
+    ] {
+        assert!(
+            content.contains(inert),
+            "{inert:?} should render inert: {content:?}"
+        );
+    }
+}
+
+#[test]
+fn session_manager_detail_renders_tool_groups_inert() {
+    // The detail pane prints the session's active tool groups, which the daemon
+    // echoes back from the turn — arbitrary text like every other line there.
+    use crate::state::{Page, SessionDetailData, SessionManagerView};
+    use crate::test_util::test_app;
+
+    let mut app = test_app();
+    app.page = Page::SessionManager;
+    app.session_mgr.view = SessionManagerView::Detail;
+    app.session_mgr.detail_data = Some(SessionDetailData {
+        session_id: 1,
+        title: "t".to_string(),
+        selected_model: "m".to_string(),
+        reasoning_effort: None,
+        parent_session_id: None,
+        working_dir: "/tmp".to_string(),
+        created_at: 1_705_314_000_000,
+        last_modified: 1_705_314_000_000,
+        turn_count: 0,
+        status: SessionStatus::Inactive,
+        active_tool_groups: vec!["core\u{7}".to_string(), "browser\u{202e}".to_string()],
+        account_name: None,
+        accumulated_usage: None,
+        context_window: None,
+        last_prompt_tokens: None,
+        pinned: false,
+        archived_at: None,
+    });
+
+    let content = render_chat_content(&mut app, 100, 24);
+    assert!(
+        !content.chars().any(|c| c.is_control() || c == '\u{202e}'),
+        "no live control or bidi char may reach a cell: {content:?}"
+    );
+    assert!(
+        content.contains("Tool Groups:") && content.contains("core\\u{7}"),
+        "the group list renders inert: {content:?}"
+    );
+    assert!(
+        content.contains("browser\\u{202e}"),
+        "every group in the list renders inert: {content:?}"
+    );
+}
+
+#[test]
+fn image_placeholder_label_renders_a_hostile_call_id_inert() {
+    // A tool-result vision image's placeholder title embeds the model-chosen
+    // tool-call id, so the label itself must be inert — asserting on the label
+    // builder rather than drawing a whole image block keeps the test off the
+    // image-protocol machinery.
+    use crate::state::ImageSlot;
+
+    let label = slot_label(&ImageSlot::ToolResult("call\u{7}\u{202e}".to_string()));
+    assert_eq!(label, "[call\\u{7}\\u{202e}]");
+    assert!(!label.chars().any(char::is_control), "{label:?}");
+    // A positional slot carries no untrusted component.
+    assert_eq!(slot_label(&ImageSlot::Displayed(2)), "[2]");
+}

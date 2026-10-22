@@ -144,6 +144,28 @@ fn normalize_display_text_borrows_clean_text_and_escapes_tabs() {
 }
 
 #[test]
+fn normalize_display_text_is_idempotent() {
+    // Normalized output is itself clean — no tab, no character outside
+    // `terminal_keeps` — so re-normalizing it must return the same bytes and
+    // take the borrowed fast path.  Widgets that normalize at more than one
+    // layer (a body normalized before the markdown parse, then again by the
+    // plain-text sink drawing a label built from it) rely on this: the second
+    // pass is free and cannot double-escape.
+    let once = normalize_display_text("a\u{7}\tb\u{202e}c\x1b[31m");
+    let twice = normalize_display_text(&once);
+    assert_eq!(twice, once, "re-normalizing clean text changes nothing");
+    assert!(
+        matches!(twice, std::borrow::Cow::Borrowed(_)),
+        "clean text takes the borrowed fast path: {twice:?}"
+    );
+    // The empty string and text that was clean to begin with both round-trip.
+    assert!(matches!(
+        normalize_display_text(&normalize_display_text("plain text")),
+        std::borrow::Cow::Borrowed(_)
+    ));
+}
+
+#[test]
 fn sanitize_for_terminal_keeps_sgr_sequences() {
     // Genuine SGR color sequences survive the filter verbatim so the
     // ANSI renderer below can still colorize shell/VM output.

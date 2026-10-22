@@ -357,7 +357,9 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
             Line::from(format!("Status:        {}", format_status(&detail.status))),
             Line::from(format!(
                 "Tool Groups:   {}",
-                humfmt::list(&detail.active_tool_groups)
+                // The group names are daemon-supplied, so the joined line is
+                // normalized like every other value in this pane.
+                display_text(&humfmt::list(&detail.active_tool_groups).to_string())
             )),
         ];
         let paragraph = Paragraph::new(lines);

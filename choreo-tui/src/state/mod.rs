@@ -523,8 +523,8 @@ impl App {
         };
         // Measure the *normalized* text — the same bytes the renderer draws
         // (see `normalize_display_text`).  A tab or control character in a
-        // daemon error or a model-chosen session title measures wider than it
-        // draws, so measuring the raw message would reserve a height the drawn
+        // daemon-supplied error or status message measures wider than it draws,
+        // so measuring the raw message would reserve a height the drawn
         // wrapping never fills (or, in the other direction, clip the tail).
         let text = crate::markdown_render::normalize_display_text(text);
         // The status/error Paragraph is drawn inset by one column on each side
