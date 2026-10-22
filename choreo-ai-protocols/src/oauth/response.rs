@@ -17,10 +17,11 @@ use choreo_shared::oauth_token::{TokenResponse, parse};
 /// the refresh token was rejected, revoked, or already spent.
 ///
 /// This constant does NOT decide the terminal-vs-transient classification — the
-/// caller's decision keys on the HTTP status (any 4xx other than `429`, and any
-/// `5xx`, is treated as transient). It is used only by [`classify_error_detail`]
-/// to pick the `terminal` vs `rejected` tag in the log-only detail string, so a
-/// documented terminal code reads distinctly from an arbitrary rejection.
+/// caller's decision keys on the HTTP status (a `3xx`, `429`, or `5xx` is
+/// transient, and any other `4xx` is terminal). It is used only by
+/// [`classify_error_detail`] to pick the `terminal` vs `rejected` tag in the
+/// log-only detail string, so a documented terminal code reads distinctly from
+/// an arbitrary rejection.
 const TERMINAL_ERROR_CODES: &[&str] = &["invalid_grant", "invalid_token", "refresh_token_reused"];
 
 /// The token set a successful refresh returned.

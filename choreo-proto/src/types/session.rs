@@ -94,11 +94,25 @@ pub struct ImageReference {
     pub data: Vec<u8>,
 }
 
-/// Which OpenAI-compatible chat field carried the reasoning text, locked in
-/// when the adapter captured the payload. The artifact must be re-emitted to
-/// the SAME field the provider used — a provider that streams `reasoning_text`
-/// must not have its payload echoed back as `reasoning_content` on the next
-/// tool-loop turn (the mis-routing this tag prevents).
+/// An OpenAI-compatible chat field that can carry reasoning text.
+///
+/// The name is used for two different jobs, and only the second is
+/// authoritative:
+///
+/// - **Observation** — which field a captured payload arrived under (see
+///   [`ReasoningArtifact::ChatReasoning`]'s `field`). A provider that streams
+///   `reasoning_text` should get `reasoning_text` back when nothing says
+///   otherwise, so this is worth recording.
+/// - **Route requirement** — which field the model's *route* wants replayed
+///   reasoning shaped as, and whether that field must be present on every
+///   assistant message. The catalog records the destination
+///   (`ModelEntry::reasoning_echo`) and the separate presence fact
+///   (`ModelEntry::reasoning_echo_required`), and the destination always wins:
+///   e.g. the DeepSeek/GLM chat gateways reject a history whose assistant
+///   messages lack `reasoning_content` even when the stream delivered the text
+///   under `reasoning`.
+///
+/// The observation is therefore a hint, never an instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatReasoningField {
@@ -108,6 +122,68 @@ pub enum ChatReasoningField {
     Reasoning,
     /// The `reasoning_text` field.
     ReasoningText,
+    /// The structured `reasoning_details` field (`OpenRouter` and Kimi-shaped
+    /// routes).
+    ///
+    /// Unlike the scalar variants, its [`ReasoningArtifact::ChatReasoning`]
+    /// `bytes` are a **JSON array** of reasoning-detail entries, not UTF-8
+    /// display text. Each entry keeps the provider's own shape verbatim (e.g.
+    /// `OpenRouter`'s `{"type":"reasoning.text","text":…,"signature":…,"index":0}`
+    /// or a bare `{"type":"summary","summary":…,"index":0}`); the adapter
+    /// lowering re-emits `reasoning.*` entries verbatim and strips only the
+    /// stream-only `index` from a bare entry. Display text is derived from the
+    /// text/summary entries when no scalar reasoning field streamed.
+    ReasoningDetails,
+}
+
+/// Every chat-completions reasoning wire key, in [`ChatReasoningField::ALL`]
+/// order.
+///
+/// The canonical list a diagnostic scans for when it checks which reasoning
+/// keys an assistant message carries; [`ChatReasoningField::wire_name`] is the
+/// mapping it mirrors (a test holds the two together, so a new variant cannot
+/// leave the list stale).
+pub const CHAT_REASONING_WIRE_KEYS: [&str; 4] = [
+    "reasoning_content",
+    "reasoning",
+    "reasoning_text",
+    "reasoning_details",
+];
+
+impl ChatReasoningField {
+    /// Every variant, in [`CHAT_REASONING_WIRE_KEYS`] order.
+    pub const ALL: [Self; 4] = [
+        Self::ReasoningContent,
+        Self::Reasoning,
+        Self::ReasoningText,
+        Self::ReasoningDetails,
+    ];
+
+    /// The wire key this field names.
+    ///
+    /// The one mapping every layer reads: the catalog parses a snapshot's field
+    /// name with [`from_wire_name`](Self::from_wire_name), the chat lowering
+    /// writes [`wire_name`](Self::wire_name) to the request, and diagnostics
+    /// name the key the same way. Keeping the pair here is what stops a new
+    /// variant from being spelled differently in two places.
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::ReasoningContent => "reasoning_content",
+            Self::Reasoning => "reasoning",
+            Self::ReasoningText => "reasoning_text",
+            Self::ReasoningDetails => "reasoning_details",
+        }
+    }
+
+    /// The field a wire key names, or `None` for a key this catalog does not
+    /// model.
+    #[must_use]
+    pub fn from_wire_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|field| field.wire_name() == name)
+    }
 }
 
 /// Opaque reasoning round-trip payload, captured verbatim by a provider
@@ -133,14 +209,23 @@ pub enum ChatReasoningField {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningArtifact {
-    /// OpenAI-compatible chat: the reasoning text (verbatim) plus the wire
-    /// field it was captured from (see [`ChatReasoningField`]), so re-emission
-    /// targets the same field the provider used.
+    /// OpenAI-compatible chat: the reasoning payload (verbatim) plus the field
+    /// it was *observed* under (see [`ChatReasoningField`]). Re-emission targets
+    /// the route's declared echo field when the catalog names one, and falls
+    /// back to this observation when it does not — the observation is a hint,
+    /// never an instruction.
+    ///
+    /// `bytes` is UTF-8 display text for every scalar field, and a **JSON
+    /// array** when `field` is [`ChatReasoningField::ReasoningDetails`].
     ChatReasoning {
-        /// Which chat field the reasoning text was captured from, so it is
-        /// re-emitted to the same field.
+        /// Which chat field the reasoning payload arrived under — the
+        /// *observed* field. Only the fallback destination: the catalog's
+        /// declared echo field wins whenever the route names one.
         field: ChatReasoningField,
-        /// The reasoning text bytes, exactly as the provider sent them.
+        /// The reasoning payload bytes, exactly as the provider sent them.
+        /// UTF-8 text for the scalar fields; a serialized JSON array of
+        /// reasoning-detail entries for
+        /// [`ChatReasoningField::ReasoningDetails`].
         bytes: Vec<u8>,
     },
     /// Anthropic: ordered thinking / `redacted_thinking` blocks, JSON as

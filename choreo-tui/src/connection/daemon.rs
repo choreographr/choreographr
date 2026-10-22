@@ -566,6 +566,7 @@ pub(crate) fn handle_daemon_message(
         DaemonMessageType::Models {
             models,
             selected_model,
+            provisional,
         } => {
             // A `Models` reply that resolved a pending `ListModels` slot is the
             // answer to OUR model-list request, so it populates the selector
@@ -583,9 +584,11 @@ pub(crate) fn handle_daemon_message(
                 tracing::debug!(
                     count = models.len(),
                     ?selected,
+                    provisional,
                     "model selector: received model list"
                 );
-                app.model_selector.apply_models(models.clone(), selected);
+                app.model_selector
+                    .apply_models(models.clone(), selected, *provisional);
                 return Ok(());
             }
             // Not our reply (no pending ListModels slot): fall through to
@@ -926,6 +929,28 @@ pub(crate) fn handle_daemon_message(
             }
             // Must NOT fall through to the generic dispatch, which has nothing
             // to render for this event.
+            return Ok(());
+        }
+        DaemonMessageType::ModelsUpdated { account, models } => {
+            // A background model-list fetch finished. If the picker is open
+            // for the attached session's account, swap its list in place:
+            // this replaces the instant catalog seed (or a stale "warming"
+            // state) with the live list, so newly-available models appear
+            // without the user reopening the picker. Ignore other accounts —
+            // the picker is scoped to the attached session only.
+            let attached = app.attached_account_slug.as_deref();
+            if app.model_selector.is_open() && attached == Some(account.as_str()) {
+                tracing::debug!(
+                    count = models.len(),
+                    "model selector: list refreshed by background fetch"
+                );
+                // `refresh_models`, NOT `apply_models`: this replaces a list the
+                // user may already be navigating, so it keeps the highlighted
+                // row's model (and the scroll window) instead of re-deriving the
+                // cursor from the active model.
+                app.model_selector.refresh_models(models.clone());
+            }
+            // Never falls through to the generic dispatch (nothing to render).
             return Ok(());
         }
         _ => {}

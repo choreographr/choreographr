@@ -271,6 +271,7 @@ fn dispatch_flat_message(msg: DaemonMessageType, handler: &mut impl TurnEventHan
         DaemonMessageType::Models {
             models,
             selected_model,
+            provisional,
         } => {
             if models.is_empty() {
                 handler.handle_status_text("[daemon] no models available".to_string());
@@ -283,6 +284,14 @@ fn dispatch_flat_message(msg: DaemonMessageType, handler: &mut impl TurnEventHan
                         "-"
                     };
                     lines.push(format!("{prefix} {model}"));
+                }
+                // A provisional list stands in for a fetch that has not landed
+                // (a stale cache entry or the catalog's curated set), so say so
+                // rather than presenting it as the account's verified list.
+                if provisional {
+                    lines.push(
+                        "(provisional: the live model list has not been fetched yet)".to_string(),
+                    );
                 }
                 handler.handle_status_text(lines.join("\n"));
             }
@@ -487,9 +496,9 @@ fn dispatch_flat_message(msg: DaemonMessageType, handler: &mut impl TurnEventHan
         }
         // Explicit no-ops, enumerated so a new flat variant still forces this
         // match to grow:
-        // - ModelsRefreshed/ModelsRefreshFailed/CatalogUpdated: catalog-level
-        //   replies surfaced by the connection layer, not by the generic text
-        //   dispatch.
+        // - ModelsRefreshed/ModelsRefreshFailed/ModelsUpdated/CatalogUpdated:
+        //   catalog-level replies/broadcasts surfaced by the connection layer,
+        //   not by the generic text dispatch.
         // - Evicted: the best-effort advisory travels ahead of the
         //   disconnect and the connection layer shows it.
         // The `@` binding keeps the whole value available so the debug line can
@@ -497,6 +506,7 @@ fn dispatch_flat_message(msg: DaemonMessageType, handler: &mut impl TurnEventHan
         // carries the provider catalog; the failure variants carry error text).
         msg @ (DaemonMessageType::ModelsRefreshed { .. }
         | DaemonMessageType::ModelsRefreshFailed { .. }
+        | DaemonMessageType::ModelsUpdated { .. }
         | DaemonMessageType::CatalogUpdated { .. }
         | DaemonMessageType::Evicted) => {
             debug!(

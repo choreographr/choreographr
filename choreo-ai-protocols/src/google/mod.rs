@@ -692,9 +692,8 @@ fn build_message_payloads<'a>(
     messages: &'a [ChatRequestMessage],
 ) -> Result<(Vec<ContentPayload<'a>>, Option<String>), GoogleError> {
     // System texts borrowed verbatim and joined once at the end — `.format`
-    // places the newline separators, so the old clone-into-Vec + `join` no
-    // longer needs owned strings (and multiple system segments can never
-    // drift apart).
+    // places the newline separators, so nothing needs cloning into an owned
+    // string (and multiple system segments can never drift apart).
     let mut system_texts: Vec<&str> = Vec::new();
     let mut payloads: Vec<ContentPayload<'a>> = Vec::new();
 
@@ -744,6 +743,14 @@ fn build_message_payloads<'a>(
                 // continuity across turns). See `attach_thought_signatures`
                 // for the attachment policy.
                 attach_thought_signatures(&mut parts, msg.reasoning_artifact.as_ref())?;
+                // A message with no parts at all (no text, no tool calls, no
+                // replayed signatures) carries nothing: providers reject an
+                // empty parts array, and an assistant turn that produced no
+                // visible output gives the model nothing to read.
+                if parts.is_empty() {
+                    debug!("skipping an assistant message with no content parts");
+                    continue;
+                }
                 payloads.push(ContentPayload {
                     role: "model",
                     parts,

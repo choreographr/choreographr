@@ -19,14 +19,14 @@ pub use io::{
     read_message, read_payload, socket_listening, socket_path, write_message,
 };
 pub use types::{
-    AccountInfo, AssistantToolCallRecord, CatalogProvider, ChatReasoningField, ClientMessage,
-    ClientMessageType, ContextConfig, DaemonMessage, DaemonMessageType, DiscardedToolCall,
-    DisplayedImageRecord, ImageKey, ImageMetadata, ImageReference, InferenceError, KeystoreState,
-    McpAuthState, McpOAuthConfig, McpServerStatus, MessageKind, OAuthClientIdentity,
-    OAuthGrantEncoding, OAuthProviderDescriptor, OutputStream, ReasoningArtifact,
-    ReasoningCapability, ReasoningProducer, RefreshStatus, SessionEvent, SessionStatus,
-    SessionSummary, TimestampMs, TokenUsage, ToolResultRecord, Turn, is_models_warming_error,
-    models_warming_error,
+    AccountInfo, AssistantToolCallRecord, CHAT_REASONING_WIRE_KEYS, CatalogProvider,
+    ChatReasoningField, ClientMessage, ClientMessageType, ContextConfig, DaemonMessage,
+    DaemonMessageType, DiscardedToolCall, DisplayedImageRecord, ImageKey, ImageMetadata,
+    ImageReference, InferenceError, KeystoreState, McpAuthState, McpOAuthConfig, McpServerStatus,
+    MessageKind, OAuthClientIdentity, OAuthGrantEncoding, OAuthProviderDescriptor, OutputStream,
+    ReasoningArtifact, ReasoningCapability, ReasoningProducer, RefreshStatus, SessionEvent,
+    SessionStatus, SessionSummary, TimestampMs, TokenUsage, ToolResultRecord, Turn,
+    is_models_warming_error, models_warming_error,
 };
 
 #[cfg(test)]

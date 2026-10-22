@@ -1,34 +1,66 @@
 //! OpenAI-compatible client (Chat Completions + Responses API).
 //!
-//! Owns the canonical [`ChatRequestMessage`] / [`ChatToolDefinition`] types
-//! that the Anthropic and Google clients translate into their own wire formats,
-//! and dispatches each turn to the Chat Completions or Responses wire format
-//! from the model's catalog-recorded [`RequestFormat`].
+//! Owns the client itself — construction, model listing, and dispatching each
+//! turn to the Chat Completions or Responses wire format from the model's
+//! catalog-recorded [`RequestFormat`] — plus the `TurnParams` shape its request
+//! builders share and the one private resolver that fills it in.
+//! The canonical [`ChatRequestMessage`] / [`ChatToolDefinition`] types that the
+//! Anthropic and Google clients translate into their own wire formats live in
+//! `message`, the Responses `input` lowering lives in `responses_input`, the
+//! usage / `/models` envelopes in `wire`, and the model-usage error annotation
+//! in `error`; each is re-exported here so every consumer keeps naming them as
+//! `openai::…`.
 
 mod chat_completions;
+mod chat_projection;
 mod config;
+// The model-usage error annotation (provider verdict → one user-facing line).
+mod error;
+mod message;
+mod reasoning_details;
 mod responses;
+mod responses_input;
 mod retry;
 mod sse;
 #[cfg(test)]
 mod tests;
+// Turn-result assembly shared by both wire formats (see the module docs).
+mod turn;
+// The small envelopes the client parses itself (usage counters, `/models`).
+mod wire;
 mod zhipu;
 pub use crate::shared::{MaxTokensField, RequestAuth};
 use crate::types::{ChatTurnResult, StreamEvent};
-use tracing::{debug, info, warn};
 
 use crate::SocketRegistry;
 use crate::ToolResultItem;
-use choreo_proto::{ChatReasoningField, ReasoningArtifact};
 
+pub(crate) use message::validate_tool_call_arguments;
+pub use message::{
+    AssistantToolCall, AssistantToolFunction, ChatImagePart, ChatRequestMessage,
+    ChatToolDefinition, ChatToolFunction,
+};
+pub(crate) use responses_input::messages_to_responses_input;
+
+pub use chat_projection::{
+    CHAT_REASONING_WIRE_KEYS, ChatWireMessage, ChatWireMessages, chat_assistant_payload_is_empty,
+    chat_wire_message, chat_wire_messages,
+};
+pub(crate) use error::annotate_model_usage_error;
+// The classifier itself is only named by the tests, which pin the body prose it
+// matches; production only ever reaches it through the annotation above.
 pub(crate) use config::endpoint_url;
 pub use config::{ServiceConfig, completion, validate_and_list_models};
+#[cfg(test)]
+pub(crate) use error::model_usage_rejection_reason;
 pub(crate) use sse::SseReader;
 #[cfg(test)]
 pub(crate) use sse::build_sse_event;
 #[cfg(test)]
 pub(crate) use sse::extract_responses_text_delta;
 pub(crate) use sse::{ResponsesStreamEvent, parse_responses_stream_event};
+use wire::ModelListResponse;
+pub(crate) use wire::Usage;
 
 // Re-export common retry types for use by sub-modules and tests.
 #[cfg(test)]
@@ -38,6 +70,11 @@ pub(crate) use crate::retry::{
 pub use retry::{RequestUploadedCallback, RetryCallback};
 
 use serde::{Deserialize, Serialize};
+
+// Re-exported so every chat-wire call site (`super::ChatReasoningEcho` from the
+// submodules, the daemon from `choreo_ai_protocols::openai`) names the route
+// policy through the module that applies it.
+pub use crate::catalog::ChatReasoningEcho;
 use std::io;
 
 /// Re-export the shared provider error type so all `OpenAI` code continues to
@@ -105,365 +142,6 @@ pub enum AllowedCaller {
     Direct,
     /// A caller that is itself a model call — programmatic tool calling.
     Programmatic,
-}
-
-#[derive(Debug, Deserialize)]
-struct ModelListResponse {
-    data: Vec<ModelInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ModelInfo {
-    id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct Usage {
-    prompt_tokens: u32,
-    completion_tokens: u32,
-    total_tokens: u32,
-    /// OpenAI-style per-prompt breakdown. z.ai (and `OpenAI` itself) report
-    /// `prompt_tokens_details.cached_tokens` here; providers that omit the
-    /// object entirely (e.g. plain `DeepSeek`) still parse via `#[serde(default)]`.
-    /// NOTE: `DeepSeek` also exposes a differently-shaped flat
-    /// `prompt_cache_hit_tokens` field — parsing that is a possible follow-up.
-    #[serde(default)]
-    prompt_tokens_details: Option<PromptTokensDetails>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct PromptTokensDetails {
-    #[serde(default)]
-    cached_tokens: u32,
-}
-
-/// A tool definition advertised to an OpenAI-compatible provider.
-#[derive(Debug, Clone, Serialize)]
-pub struct ChatToolDefinition {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    /// The single `function` entry the definition wraps.
-    pub function: ChatToolFunction,
-}
-
-/// The function a [`ChatToolDefinition`] wraps: its name, description, and
-/// JSON-Schema parameters, plus optional programmatic-calling metadata.
-#[derive(Debug, Clone, Serialize)]
-pub struct ChatToolFunction {
-    /// Function name the model must call.
-    pub name: String,
-    /// Human-readable description guiding the model's use of the tool.
-    pub description: String,
-    /// JSON Schema for the function's arguments.
-    pub parameters: serde_json::Value,
-    /// Optional JSON Schema for the tool's output (programmatic tool calling).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_schema: Option<serde_json::Value>,
-    /// Optional allowlist of callers permitted to invoke the tool.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub allowed_callers: Option<Vec<AllowedCaller>>,
-}
-
-/// A tool call echoed back to the provider on an assistant message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AssistantToolCall {
-    /// Provider-assigned id of the call.
-    pub id: String,
-    /// The call type tag (always `"function"`).
-    #[serde(rename = "type")]
-    pub kind: String,
-    /// The function the model called.
-    pub function: AssistantToolFunction,
-}
-
-/// The function half of an [`AssistantToolCall`]: name plus the raw argument
-/// string as the provider emitted it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AssistantToolFunction {
-    /// Function name.
-    pub name: String,
-    /// The arguments as a raw JSON string (kept verbatim, never re-encoded).
-    pub arguments: String,
-}
-
-/// One image carried by a user chat message, sent to the provider as a
-/// vision content part. The daemon attaches these (attached images, or a
-/// `read_image` tool result re-read at request time); each provider adapter
-/// renders them in its own wire format:
-///
-/// - `OpenAI` Chat Completions → `{"type":"image_url","image_url":{"url":"data:…;base64,…","detail":"auto"}}`
-/// - `OpenAI` Responses API → `{"type":"input_image","image_url":"data:…;base64,…"}` (flat string)
-/// - Anthropic Messages → `{"type":"image","source":{"type":"base64","media_type":…,"data":…}}`
-/// - Google Gemini → `{"inline_data":{"mime_type":…,"data":…}}`
-///
-/// Bytes are the raw encoded image (PNG/JPEG/WebP/GIF), not base64; the
-/// serializers encode them. Only `user`-role messages carry images (per
-/// provider restrictions), which the daemon guarantees by deferring tool
-/// images to a synthetic user message.
-#[derive(Debug, Clone)]
-pub struct ChatImagePart {
-    /// Raw encoded image bytes.
-    pub data: Vec<u8>,
-    /// Image MIME type (e.g. `image/png`).
-    pub mime_type: String,
-}
-
-impl ChatImagePart {
-    /// `data:<mime>;base64,<bytes>` URL — the wire value for `OpenAI`
-    /// `image_url.url` (chat and Responses).
-    #[must_use]
-    pub fn data_url(&self) -> String {
-        use base64::Engine as _;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&self.data);
-        format!("data:{};base64,{}", self.mime_type, b64)
-    }
-}
-
-/// One message in a chat conversation, in the canonical `OpenAI` shape the
-/// other adapters translate from.
-#[derive(Debug, Clone)]
-pub struct ChatRequestMessage {
-    /// Message role (`"system"`, `"user"`, `"assistant"`, or `"tool"`).
-    pub role: &'static str,
-    /// Text content of the message, when it has any.
-    pub content: Option<String>,
-    /// Images attached to this message (user role). Empty for text-only
-    /// messages. Rendered per-provider by the serializers; see
-    /// [`ChatImagePart`].
-    pub images: Vec<ChatImagePart>,
-    /// For a `"tool"` message, the id of the call it answers.
-    pub tool_call_id: Option<String>,
-    /// For an `"assistant"` message, the tool calls it requested.
-    pub tool_calls: Option<Vec<AssistantToolCall>>,
-    /// Provider reasoning under the `reasoning_content` wire field.
-    pub reasoning_content: Option<String>,
-    /// Provider reasoning under the `reasoning` wire field.
-    pub reasoning: Option<String>,
-    /// Provider reasoning under the `reasoning_text` wire field.
-    pub reasoning_text: Option<String>,
-    /// Opaque reasoning round-trip artifact captured by the producing adapter
-    /// at parse time (see `ReasoningArtifact`). Never serialized as a field of
-    /// its own — each adapter re-emits it in ITS OWN wire format: `OpenAI` chat
-    /// writes it back as the field recorded in the artifact
-    /// (`reasoning_content` / `reasoning` / `reasoning_text`) on assistant
-    /// messages (see the manual `Serialize` impl below), Responses pushes the
-    /// items into `input`, and the Anthropic/Google builders interpret their
-    /// own variants.
-    pub reasoning_artifact: Option<ReasoningArtifact>,
-}
-
-impl Serialize for ChatRequestMessage {
-    /// Manual impl: the wire shape is byte-identical to the derived one
-    /// (role, content, `tool_call_id`, `tool_calls`, `reasoning_content`,
-    /// reasoning, `reasoning_text` — `None` fields omitted) EXCEPT that an
-    /// assistant message carrying a `ChatReasoning` artifact re-emits it as
-    /// the wire field recorded at capture time (`reasoning_content` /
-    /// `reasoning` / `reasoning_text`), decoded from the captured bytes — a
-    /// provider that streamed `reasoning_text` must get `reasoning_text`
-    /// back, not `reasoning_content` (the mis-routing this field tag
-    /// prevents). The artifact field itself never appears on the wire.
-    /// DeepSeek/Kimi reject a tool-loop turn whose assistant message drops
-    /// `reasoning_content`, so the round-trip payload must survive to the
-    /// next request.
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-
-        // Explicit reasoning fields win when the daemon populated them
-        // directly; the artifact is the fallback so a message built with only
-        // the opaque payload still round-trips. Only assistant-role messages
-        // may carry provider reasoning — user/tool/system messages never had
-        // any, so the artifact is dropped for them.
-        let mut reasoning_content = self.reasoning_content.clone();
-        let mut reasoning = self.reasoning.clone();
-        let mut reasoning_text = self.reasoning_text.clone();
-        if self.role == "assistant"
-            && let Some(ReasoningArtifact::ChatReasoning { field, bytes }) =
-                &self.reasoning_artifact
-        {
-            // The artifact is opaque bytes; only the producing adapter may
-            // interpret it. Chat artifacts are always captured from a Rust
-            // String (so valid UTF-8), but a corrupted persisted blob must
-            // not fail the whole request — log and drop the payload so the
-            // request proceeds without the reasoning echo (the provider may
-            // reject it, but that is a diagnosable 400 rather than a
-            // serialization crash on every subsequent turn).
-            if let Ok(text) = std::str::from_utf8(bytes) {
-                debug!(
-                    ?field,
-                    payload_bytes = bytes.len(),
-                    "re-emitting chat reasoning artifact"
-                );
-                // Write the decoded text to the field named by the artifact's
-                // tag (only when that field is currently None — explicit
-                // values still win), so re-emission targets the same wire
-                // field the provider used at capture.
-                let target = match field {
-                    ChatReasoningField::ReasoningContent => &mut reasoning_content,
-                    ChatReasoningField::Reasoning => &mut reasoning,
-                    ChatReasoningField::ReasoningText => &mut reasoning_text,
-                };
-                if target.is_none() {
-                    *target = Some(text.to_string());
-                }
-            } else {
-                warn!(
-                    ?field,
-                    payload_bytes = bytes.len(),
-                    "dropping corrupt chat reasoning artifact (not valid UTF-8)",
-                );
-            }
-        }
-
-        let mut msg = serializer.serialize_struct("ChatRequestMessage", 7)?;
-        msg.serialize_field("role", &self.role)?;
-        // When the message carries images, `content` becomes an array of
-        // `{type:"text"/"image_url"}` parts (the OpenAI chat vision shape);
-        // otherwise it stays a plain string. Only user messages carry images
-        // (the daemon guarantees this), but the branch is unconditional so a
-        // misconstructed message still serializes rather than 400-ing later.
-        if !self.images.is_empty() {
-            msg.serialize_field("content", &self.openai_chat_content_value())?;
-        } else if let Some(content) = &self.content {
-            msg.serialize_field("content", content)?;
-        }
-        if let Some(tool_call_id) = &self.tool_call_id {
-            msg.serialize_field("tool_call_id", tool_call_id)?;
-        }
-        if let Some(tool_calls) = &self.tool_calls {
-            msg.serialize_field("tool_calls", tool_calls)?;
-        }
-        if let Some(rc) = &reasoning_content {
-            msg.serialize_field("reasoning_content", rc)?;
-        }
-        if let Some(reasoning) = &reasoning {
-            msg.serialize_field("reasoning", reasoning)?;
-        }
-        if let Some(reasoning_text) = &reasoning_text {
-            msg.serialize_field("reasoning_text", reasoning_text)?;
-        }
-        msg.end()
-    }
-}
-
-impl ChatRequestMessage {
-    /// Build a text-only message of the given role.
-    #[must_use]
-    pub fn simple(role: &'static str, content: String) -> Self {
-        ChatRequestMessage::with_images(role, content, Vec::new())
-    }
-
-    /// Build a text + image user message (vision input). `content` is the
-    /// lead-in text rendered ahead of the images; each provider adapter emits
-    /// the images in its own wire format. Only `user`-role messages carry
-    /// images (the daemon guarantees this by deferring tool images to
-    /// synthetic user messages).
-    #[must_use]
-    pub fn with_images(role: &'static str, content: String, images: Vec<ChatImagePart>) -> Self {
-        ChatRequestMessage {
-            role,
-            content: Some(content),
-            images,
-            tool_call_id: None,
-            tool_calls: None,
-            reasoning_content: None,
-            reasoning: None,
-            reasoning_text: None,
-            reasoning_artifact: None,
-        }
-    }
-
-    /// The `OpenAI` chat-completions `content` value for this message: a plain
-    /// string when it carries no images, or an array of `{type:"text"}` and
-    /// `{type:"image_url"}` parts when it does. `detail` is fixed to `"auto"`
-    /// (the provider decides; see the vision plan).
-    #[must_use]
-    pub fn openai_chat_content_value(&self) -> serde_json::Value {
-        if self.images.is_empty() {
-            serde_json::Value::String(self.content.clone().unwrap_or_default())
-        } else {
-            let mut parts: Vec<serde_json::Value> = Vec::new();
-            if let Some(text) = self.content.as_deref().filter(|t| !t.is_empty()) {
-                parts.push(serde_json::json!({ "type": "text", "text": text }));
-            }
-            for image in &self.images {
-                parts.push(serde_json::json!({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": image.data_url(),
-                        "detail": "auto",
-                    }
-                }));
-            }
-            serde_json::Value::Array(parts)
-        }
-    }
-
-    /// The Responses API `input` content value for a user/assistant message:
-    /// a plain string when image-free, or an array of `input_text` and
-    /// `input_image` parts when it carries images. `input_image.image_url` is a
-    /// **flat string** (the Responses gotcha — it is not the nested object the
-    /// chat-completions `image_url` uses). `detail` fixed to `"auto"`.
-    #[must_use]
-    pub fn responses_content_value(&self) -> serde_json::Value {
-        if self.images.is_empty() {
-            serde_json::Value::String(self.content.clone().unwrap_or_default())
-        } else {
-            let mut parts: Vec<serde_json::Value> = Vec::new();
-            if let Some(text) = self.content.as_deref().filter(|t| !t.is_empty()) {
-                parts.push(serde_json::json!({ "type": "input_text", "text": text }));
-            }
-            for image in &self.images {
-                parts.push(serde_json::json!({
-                    "type": "input_image",
-                    "image_url": image.data_url(),
-                    "detail": "auto",
-                }));
-            }
-            serde_json::Value::Array(parts)
-        }
-    }
-}
-
-impl ChatToolDefinition {
-    /// Build a plain function tool definition (no output schema, no caller
-    /// allowlist).
-    #[must_use]
-    pub fn function(
-        name: impl Into<String>,
-        description: impl Into<String>,
-        parameters: serde_json::Value,
-    ) -> Self {
-        Self {
-            kind: "function",
-            function: ChatToolFunction {
-                name: name.into(),
-                description: description.into(),
-                parameters,
-                output_schema: None,
-                allowed_callers: None,
-            },
-        }
-    }
-
-    /// Create a tool definition with `output_schema` and `allowed_callers`.
-    pub fn function_with_options(
-        name: impl Into<String>,
-        description: impl Into<String>,
-        parameters: serde_json::Value,
-        output_schema: Option<serde_json::Value>,
-        allowed_callers: Option<Vec<AllowedCaller>>,
-    ) -> Self {
-        Self {
-            kind: "function",
-            function: ChatToolFunction {
-                name: name.into(),
-                description: description.into(),
-                parameters,
-                output_schema,
-                allowed_callers,
-            },
-        }
-    }
 }
 
 /// The OpenAI-compatible client: an `OpenAI`, OpenAI-protocol gateway, or any
@@ -653,40 +331,13 @@ impl OpenAiClient {
     // caller across the daemon and tests.
     pub fn chat_completion_turn(
         &self,
-        params: crate::ChatTurnRequest<'_>,
+        mut params: crate::ChatTurnRequest<'_>,
     ) -> Result<ChatTurnResult, OpenAiError> {
         // `params.model` is a `Copy` `&str`; capture it before `params` is
-        // moved into the request builders below so the error annotation can
-        // still name the model.
+        // borrowed for the request builders so the error annotation can still
+        // name the model.
         let model = params.model;
-        // z.ai models only accept a subset of the OpenAI effort slugs, and
-        // the accepted set differs by GLM generation — dispatch to the
-        // Zhipu-specific mapper for those providers, plain pass-through for
-        // everything else.
-        let reasoning_effort = if is_zhipu_provider_slug(&self.config.provider_slug) {
-            zhipu_reasoning_effort_api_value(&params.thinking_effort, params.model)
-        } else {
-            reasoning_effort_api_value(&params.thinking_effort)
-        };
-        tracing::debug!(effort = %params.thinking_effort, ?reasoning_effort, "chat_completion_turn");
-        // The turn's real session/request ids drive the opencode gateway's
-        // per-session sticky routing (see `shared::opencode_gateway_headers`).
-        let route = Some((params.session_id.as_str(), params.request_id.as_str()));
-        let turn = TurnParams {
-            model,
-            messages: params.messages,
-            tools: params.tools,
-            reasoning_effort,
-            on_retry: params.on_retry,
-            on_uploaded: params.on_uploaded,
-            cancel_rx: params.cancel_rx,
-            route,
-            previous_response_id: params.previous_response_id,
-            tool_results: params.tool_results,
-            programmatic_tool_calling: params.programmatic_tool_calling,
-            max_output_tokens_override: params.max_output_tokens_override,
-            no_retry: params.no_retry,
-        };
+        let turn = self.turn_params(&mut params);
         let result = match self.config.request_format_for_model(model) {
             RequestFormat::Responses => {
                 responses::responses_request_with_tools(&self.http, &self.config, &self.auth, turn)
@@ -711,7 +362,7 @@ impl OpenAiClient {
     /// event-callback failures.
     pub fn chat_completion_turn_streaming<F>(
         &self,
-        params: crate::ChatTurnRequest<'_>,
+        mut params: crate::ChatTurnRequest<'_>,
         mut on_event: F,
     ) -> Result<ChatTurnResult, OpenAiError>
     where
@@ -720,43 +371,16 @@ impl OpenAiClient {
         // Same `Copy` capture as `chat_completion_turn`, for the model-named
         // error annotation on the streaming dispatch below.
         let model = params.model;
-        // Same Zhipu dispatch as `chat_completion_turn` — both turn paths
-        // must apply the identical mapping so streaming and non-streaming
-        // requests carry the same wire value.
-        let reasoning_effort = if is_zhipu_provider_slug(&self.config.provider_slug) {
-            zhipu_reasoning_effort_api_value(&params.thinking_effort, params.model)
-        } else {
-            reasoning_effort_api_value(&params.thinking_effort)
-        };
-        tracing::debug!(
-            effort = %params.thinking_effort,
-            ?reasoning_effort,
-            "chat_completion_turn_streaming"
-        );
         if !self.config.streaming {
             let result = self.chat_completion_turn(params)?;
             let result = crate::shared::emit_non_streaming_events(result, &mut on_event)?;
             return Ok(result);
         }
 
-        // The turn's real session/request ids drive the opencode gateway's
-        // per-session sticky routing (see `shared::opencode_gateway_headers`).
-        let route = Some((params.session_id.as_str(), params.request_id.as_str()));
-        let turn = TurnParams {
-            model,
-            messages: params.messages,
-            tools: params.tools,
-            reasoning_effort,
-            on_retry: params.on_retry,
-            on_uploaded: params.on_uploaded,
-            cancel_rx: params.cancel_rx,
-            route,
-            previous_response_id: params.previous_response_id,
-            tool_results: params.tool_results,
-            programmatic_tool_calling: params.programmatic_tool_calling,
-            max_output_tokens_override: params.max_output_tokens_override,
-            no_retry: params.no_retry,
-        };
+        // The non-streaming fallback above goes through
+        // `chat_completion_turn`, which resolves the same params, so the
+        // mapping is still applied exactly once per request.
+        let turn = self.turn_params(&mut params);
         let result = match self.config.request_format_for_model(model) {
             RequestFormat::Responses => responses::responses_request_streaming_with_tools(
                 &self.http,
@@ -777,6 +401,51 @@ impl OpenAiClient {
         };
         result.map_err(|e| annotate_model_usage_error(model, e))
     }
+
+    /// Resolve one turn's request inputs, identically for the streaming and
+    /// non-streaming tool paths.
+    ///
+    /// One place decides the wire `reasoning_effort` — z.ai's GLM models accept
+    /// only a subset of the `OpenAI` effort slugs and the accepted set differs
+    /// by generation, so those providers route through the Zhipu mapper while
+    /// everything else passes the slug through — and one place names the
+    /// gateway route. Both dispatch methods call it, so a provider-specific
+    /// mapping can never be applied to one wire format and forgotten on the
+    /// other.
+    fn turn_params<'p, 'a: 'p>(
+        &self,
+        params: &'p mut crate::ChatTurnRequest<'a>,
+    ) -> TurnParams<'p> {
+        let reasoning_effort = if is_zhipu_provider_slug(&self.config.provider_slug) {
+            zhipu_reasoning_effort_api_value(&params.thinking_effort, params.model)
+        } else {
+            reasoning_effort_api_value(&params.thinking_effort)
+        };
+        tracing::debug!(
+            effort = %params.thinking_effort,
+            ?reasoning_effort,
+            "chat turn reasoning effort"
+        );
+        TurnParams {
+            model: params.model,
+            messages: params.messages,
+            tools: params.tools,
+            reasoning_effort,
+            // Reborrowed rather than moved: the caller keeps ownership of the
+            // callback slot for as long as it needs it.
+            on_retry: &mut *params.on_retry,
+            on_uploaded: params.on_uploaded.clone(),
+            cancel_rx: params.cancel_rx,
+            // The turn's real session/request ids drive the opencode gateway's
+            // per-session sticky routing (see `shared::opencode_gateway_headers`).
+            route: Some((params.session_id.as_str(), params.request_id.as_str())),
+            previous_response_id: params.previous_response_id,
+            tool_results: params.tool_results,
+            programmatic_tool_calling: params.programmatic_tool_calling,
+            max_output_tokens_override: params.max_output_tokens_override,
+            no_retry: params.no_retry,
+        }
+    }
 }
 
 /// Map reasoning slug string to `OpenAI`'s `reasoning_effort` API value.
@@ -785,200 +454,10 @@ pub(crate) fn reasoning_effort_api_value(slug: &str) -> Option<&str> {
     if slug == "off" { None } else { Some(slug) }
 }
 
-/// Rewrite a provider rejection that means "this model can't be used here"
-/// into a short, plain message, e.g. `'gpt-4o' is not a chat model — please
-/// try a different one.`
-///
-/// The live model picker deliberately lists the provider's *full* catalogue —
-/// including models choreographr cannot drive (legacy completions models,
-/// embeddings, audio, image, moderation). A just-released or custom model must
-/// stay selectable too, so the list is never filtered; instead, when a turn is
-/// sent with an unusable model, the provider's verdict (e.g. the `OpenAI`
-/// `404 This is not a chat model …`) becomes a short user-facing line. The
-/// provider is the only reliable authority on usability (the `/v1/models`
-/// payload carries no modality), so this reacts to its verdict rather than
-/// guessing locally. The provider's raw wording is jargon to a user, so it is
-/// dropped from the message and kept in the log instead.
-fn annotate_model_usage_error(model: &str, err: OpenAiError) -> OpenAiError {
-    let OpenAiError::ClientError { status, detail } = &err else {
-        return err;
-    };
-    // The helper lowercases once and decides both *whether* this is a
-    // model-usability rejection and *how* to phrase it; a `None` here means
-    // the body is unrelated and must pass through verbatim.
-    let Some(reason) = model_usage_rejection_reason(detail) else {
-        return err;
-    };
-    // Keep the provider's technical wording for operators — the user only sees
-    // the plain line below.
-    info!(model = %model, provider_detail = %detail, "provider rejected the model as unusable");
-    OpenAiError::ClientError {
-        status: *status,
-        detail: format!("'{model}' {reason} — please try a different one."),
-    }
-}
-
-/// Classify a provider error body: `Some(reason)` when it means the selected
-/// model cannot be used on the endpoint, with the short phrase to name the
-/// cause; `None` when it is unrelated (and must pass through verbatim). The
-/// body is free-form prose, so this is a deliberately narrow substring match
-/// over the known OpenAI-family rejections.
-///
-/// `crate::retry::extract_error_message` (in `retry.rs`) unwraps the standard
-/// JSON error envelope and returns only `error.message`, DROPPING the `code`
-/// field. On that parsed-envelope path the human-readable
-/// `"does not exist or you do not have access"` prose is therefore the primary
-/// model-not-found signal — the literal `"model_not_found"` code never
-/// survives extraction. That literal only reaches here when the body was NOT a
-/// parseable envelope, in which case the verbatim body is kept.
-///
-/// Note: `"not supported in the v1/chat/completions"` / `"not supported in the
-/// v1/responses"` are deliberately NOT matched — `OpenAI` uses the same wording
-/// for genuine "Unsupported parameter" errors, so matching them would mask real
-/// parameter bugs behind the generic line. The intended legacy-completions case
-/// is already covered by `"not a chat model"`.
-fn model_usage_rejection_reason(detail: &str) -> Option<&'static str> {
-    // One lowercase pass for both the classification and the phrasing.
-    let d = detail.to_ascii_lowercase();
-    if d.contains("not a chat model") {
-        Some("is not a chat model")
-    } else if d.contains("model_not_found")
-        || d.contains("does not exist or you do not have access")
-    {
-        Some("can't be used here")
-    } else {
-        None
-    }
-}
-
 // Zhipu (z.ai / bigmodel.cn) provider-specific request shaping lives in the
 // `zhipu` submodule; these re-exports keep the existing call sites (the two
 // turn paths above) and tests importing through `super::` working unchanged.
 pub(crate) use zhipu::{is_zhipu_provider_slug, zhipu_reasoning_effort_api_value};
-
-/// Serialize a Responses input item to its wire JSON value. Kept as a tiny
-/// helper because the Responses adapter owns the item type but the conversion
-/// happens here, in the shared messages→input builder.
-fn responses_input_item_value(
-    item: &responses::ResponsesInputItem,
-) -> Result<serde_json::Value, OpenAiError> {
-    serde_json::to_value(item).map_err(|e| OpenAiError::Io(io::Error::other(e)))
-}
-
-/// Convert `ChatRequestMessage` slice to Responses API input format.
-/// System messages go into `input` as `{role: "system"}` items (not the
-/// `instructions` field); the `instructions` field is a separate top-level
-/// parameter set via explicit provider configuration.
-///
-/// Assistant messages additionally re-emit the opaque reasoning items from
-/// the round-trip artifact (if any) directly into `input`, BEFORE the message
-/// content item — mirroring the provider's output ordering where a reasoning
-/// item precedes its message. `reasoning_content` is never emitted here:
-/// that field is chat-completions-only and invalid on Responses messages.
-pub(crate) fn messages_to_responses_input(
-    messages: &[ChatRequestMessage],
-) -> Result<Vec<serde_json::Value>, OpenAiError> {
-    let mut items: Vec<serde_json::Value> = Vec::new();
-
-    for msg in messages {
-        match msg.role {
-            "system" => {
-                if let Some(ref content) = msg.content {
-                    items.push(responses_input_item_value(
-                        &responses::ResponsesInputItem::Message {
-                            role: "system".to_string(),
-                            content: serde_json::Value::String(content.clone()),
-                        },
-                    )?);
-                }
-            }
-            "user" | "assistant" => {
-                // Assistant turns replay their opaque reasoning items (type
-                // tag, id, summary, encrypted_content) verbatim, placed ahead
-                // of the message content exactly as the provider emitted them
-                // in the original output array.
-                if msg.role == "assistant"
-                    && let Some(ReasoningArtifact::ResponsesItems(bytes)) = &msg.reasoning_artifact
-                {
-                    let reasoning_items: Vec<serde_json::Value> = serde_json::from_slice(bytes)
-                        .map_err(|e| OpenAiError::Io(io::Error::other(e)))?;
-                    debug!(
-                        item_count = reasoning_items.len(),
-                        "re-emitting responses reasoning items from artifact"
-                    );
-                    items.extend(reasoning_items);
-                }
-                // Content is a plain string, or an array of input_text/
-                // input_image parts when the message carries images. A message
-                // with neither text nor images is skipped (as before — an
-                // empty input item would be meaningless).
-                if msg.content.is_some() || !msg.images.is_empty() {
-                    items.push(responses_input_item_value(
-                        &responses::ResponsesInputItem::Message {
-                            role: msg.role.to_string(),
-                            content: msg.responses_content_value(),
-                        },
-                    )?);
-                }
-            }
-            "tool" => {
-                // Tool results become function_call_output items
-                if let Some(ref call_id) = msg.tool_call_id
-                    && let Some(ref content) = msg.content
-                {
-                    items.push(responses_input_item_value(
-                        &responses::ResponsesInputItem::FunctionCallOutput {
-                            call_id: call_id.clone(),
-                            output: content.clone(),
-                            caller: None,
-                        },
-                    )?);
-                }
-            }
-            _ => {
-                warn!(
-                    "unexpected message role in messages_to_responses_input: {}",
-                    msg.role
-                );
-            }
-        }
-    }
-
-    debug!("messages_to_responses_input: {} items", items.len());
-
-    Ok(items)
-}
-
-/// Filter tool calls whose `arguments_json` is not valid JSON (e.g. truncated
-/// mid-stream by the provider).  Returns the discarded calls so the caller can
-/// surface the cropped JSON in error messages.
-/// Providers (especially cheaper models via OpenAI-compatible APIs) sometimes
-/// return incomplete `function.arguments` strings, which would cause tool
-/// execution to fail with a JSON parse error and trigger an error-recovery
-/// loop that inflates the context and eventually hits the provider's 400/500.
-pub(crate) fn validate_tool_call_arguments(
-    tool_calls: &mut Vec<crate::types::ChatToolCall>,
-) -> Vec<choreo_proto::DiscardedToolCall> {
-    let all = std::mem::take(tool_calls);
-    let (valid, discarded): (Vec<_>, Vec<_>) = all
-        .into_iter()
-        .partition(|tc| serde_json::from_str::<serde_json::Value>(&tc.arguments_json).is_ok());
-    for tc in &discarded {
-        warn!(
-            name = %tc.name,
-            args_len = tc.arguments_json.len(),
-            "discarding tool call with invalid (truncated) arguments JSON",
-        );
-    }
-    *tool_calls = valid;
-    discarded
-        .into_iter()
-        .map(|tc| choreo_proto::DiscardedToolCall {
-            name: tc.name,
-            arguments_json: tc.arguments_json,
-        })
-        .collect()
-}
 
 // ── ProviderClient trait impl ───────────────────────────────────────────
 

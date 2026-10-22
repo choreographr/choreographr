@@ -711,9 +711,10 @@ pub(super) fn handle_list_models_sync(
         reply,
     });
     match result {
-        Ok(Ok((models, selected_model))) => handle.send(DaemonMessageType::Models {
-            models,
-            selected_model,
+        Ok(Ok(list)) => handle.send(DaemonMessageType::Models {
+            models: list.models,
+            selected_model: list.selected_model,
+            provisional: list.provisional,
         }),
         Ok(Err(e)) => handle.send(DaemonMessageType::ModelsFailed { error: e }),
         Err(_) => handle.abandon(),

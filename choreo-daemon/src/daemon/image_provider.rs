@@ -102,7 +102,8 @@ impl DaemonState {
     /// split out so the error precedence (lock → no match → no backend) is
     /// unit-testable without threading a channel through the test.
     ///
-    /// Resolution order mirrors `handle_list_models_inner`: an explicit
+    /// Resolution order mirrors `handle_list_models` (see
+    /// `daemon/models.rs`): an explicit
     /// account name wins; `None` falls through to the only/default account —
     /// there is no persistent "default account" concept in `DaemonState`, so
     /// the deterministic pick is the FIRST image-capable credentialed account

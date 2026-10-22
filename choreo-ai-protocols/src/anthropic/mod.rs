@@ -864,6 +864,15 @@ fn build_message_payloads<'a>(
                         });
                     }
                 }
+                // A message with no blocks at all (no text, no tool calls, no
+                // replayed thinking) carries nothing: providers reject an empty
+                // content array, and an assistant turn that produced no visible
+                // output gives the model nothing to read. Skipping keeps the
+                // history valid without fabricating output.
+                if blocks.is_empty() {
+                    debug!("skipping an assistant message with no content blocks");
+                    continue;
+                }
                 payloads.push(MessagePayload {
                     role: "assistant",
                     content: blocks,
@@ -934,9 +943,10 @@ fn build_tool_payloads(tools: &[ChatToolDefinition]) -> Vec<ToolPayload<'_>> {
 /// Others → enabled thinking with `budget_tokens`.
 ///
 /// The catalog advertises the Anthropic effort set as `off` / `minimal` /
-/// `low` / `medium` / `high` / `xhigh`; every slug except `off` must map to a
-/// real thinking budget — an unmapped slug used to silently disable thinking
-/// (only a warn), which made the advertised `minimal`/`xhigh` levels no-ops.
+/// `low` / `medium` / `high` / `xhigh`; every slug except `off` maps to a real
+/// thinking budget, so an advertised level is never a silent no-op. A slug no
+/// catalog entry declares still disables thinking, with a warn, because there is
+/// no budget to infer for it.
 pub(super) fn thinking_payload(slug: &str, max_tokens: u32) -> Option<ThinkingPayload> {
     match slug {
         "off" => None,

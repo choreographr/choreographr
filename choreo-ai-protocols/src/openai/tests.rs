@@ -15,12 +15,10 @@ fn chat_message_with_images_serializes_content_as_parts_array() {
         }],
         tool_call_id: None,
         tool_calls: None,
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: None,
     };
-    let value = serde_json::to_value(&msg).unwrap();
+    let value =
+        serde_json::to_value(chat_wire_message(&msg, ChatReasoningEcho::default())).unwrap();
     let content = value["content"].as_array().expect("content array");
     assert_eq!(content[0]["type"], "text");
     assert_eq!(content[0]["text"], "what is this?");
@@ -36,10 +34,11 @@ fn chat_message_with_images_serializes_content_as_parts_array() {
 
 #[test]
 fn chat_message_without_images_serializes_content_as_plain_string() {
-    // Regression: a text-only message keeps the exact legacy wire shape
+    // A text-only message serializes to the plain role/content shape
     // (content is a plain string; no images field).
     let msg = ChatRequestMessage::simple("user", "hi".to_string());
-    let value = serde_json::to_value(&msg).unwrap();
+    let value =
+        serde_json::to_value(chat_wire_message(&msg, ChatReasoningEcho::default())).unwrap();
     assert_eq!(value["content"], "hi");
     assert!(value.get("images").is_none());
 }
@@ -62,6 +61,48 @@ fn build_sse_event_returns_done_marker() {
     let event = build_sse_event(&mut lines).expect("event");
     assert_eq!(event, "[DONE]");
     assert_eq!(lines, [] as [String; 0]);
+}
+
+#[test]
+fn sse_reader_yields_successive_events() {
+    // The per-event byte budget is reset between events, so a long stream of
+    // ordinary events is unaffected by it.
+    let mut reader =
+        SseReader::from_reader(std::io::Cursor::new(b"data: one\n\ndata: two\n\n".to_vec()));
+    assert_eq!(reader.next_event().unwrap().as_deref(), Some("one"));
+    assert_eq!(reader.next_event().unwrap().as_deref(), Some("two"));
+    assert_eq!(reader.next_event().unwrap(), None);
+}
+
+#[test]
+fn sse_reader_rejects_an_unterminated_line_past_the_ceiling() {
+    // A peer that never emits a newline must not be able to grow the pending
+    // buffer without bound: the read fails once the ceiling is crossed.
+    struct EndlessLine;
+    impl std::io::Read for EndlessLine {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            buf.fill(b'x');
+            Ok(buf.len())
+        }
+    }
+    let mut reader = SseReader::from_reader(EndlessLine);
+    let err = reader
+        .next_event()
+        .expect_err("an endless line must fail the read");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn sse_reader_rejects_a_single_line_past_the_ceiling() {
+    // Same ceiling one level up: a line that is itself too long to be a real
+    // provider event.
+    let mut payload = vec![b'd'; 9 * 1024 * 1024];
+    payload.push(b'\n');
+    let mut reader = SseReader::from_reader(std::io::Cursor::new(payload));
+    let err = reader
+        .next_event()
+        .expect_err("an oversized line must fail the read");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }
 
 #[test]
@@ -229,10 +270,109 @@ fn parse_responses_stream_event_unknown_type_returns_none() {
 }
 
 #[test]
+fn parse_responses_stream_event_completed_reads_the_wrapped_response_object() {
+    // The documented terminal event wraps the whole `Response` object under
+    // `response` — id and usage live there, not on the event root.
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.completed","sequence_number":42,"response":{"id":"resp_9","status":"completed","usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::ResponseCompleted { id, usage } => {
+            assert_eq!(id.as_deref(), Some("resp_9"));
+            let usage = usage.expect("usage");
+            assert_eq!(usage.total_tokens, 7);
+        }
+        other => panic!("expected ResponseCompleted, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_incomplete_carries_the_provider_reason() {
+    // `incomplete` is a terminal success whose output may be partial; the
+    // provider states why under `incomplete_details.reason`.
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.incomplete","response":{"id":"resp_5","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::ResponseIncomplete { id, usage, reason } => {
+            assert_eq!(id.as_deref(), Some("resp_5"));
+            assert_eq!(reason.as_deref(), Some("max_output_tokens"));
+            assert_eq!(usage.expect("usage").total_tokens, 11);
+        }
+        other => panic!("expected ResponseIncomplete, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_incomplete_without_a_reason() {
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.incomplete","response":{"id":"resp_6","status":"incomplete"}}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::ResponseIncomplete { reason, .. } => assert!(reason.is_none()),
+        other => panic!("expected ResponseIncomplete, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_failed_reads_the_wrapped_error() {
+    // `response.failed` carries the same wrapping: the error object sits on
+    // `response.error`, not on the event root.
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.failed","response":{"id":"resp_7","status":"failed","error":{"code":"server_error","message":"upstream exploded"}}}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::ResponseFailed(error) => assert_eq!(error, "upstream exploded"),
+        other => panic!("expected ResponseFailed, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_reasoning_summary_text_delta() {
+    // The summary is the only reasoning text a Responses model streams; the
+    // event carries one text fragment per chunk.
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","delta":"step one"}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::ReasoningSummaryText(text) => assert_eq!(text, "step one"),
+        other => panic!("expected ReasoningSummaryText, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_reasoning_summary_part_boundaries_are_ignored() {
+    // Part boundaries carry no text of their own (the parts concatenate in
+    // arrival order), so they are not modelled as events.
+    for event_type in [
+        "response.reasoning_summary_part.added",
+        "response.reasoning_summary_part.done",
+    ] {
+        let data = format!(r#"{{"type":"{event_type}","item_id":"rs_1"}}"#);
+        assert!(
+            parse_responses_stream_event(&data)
+                .expect("parse")
+                .is_none(),
+            "{event_type} must not produce an event",
+        );
+    }
+}
+
+#[test]
 fn parse_responses_stream_event_response_failed_decodes_error_object() {
     // `response.failed.error` is the OpenAI error object `{code, message,
     // param, type}`; the surfaced text must be `message`, not a blank string
-    // (the old `as_str()` on the object yielded nothing).
+    // (`as_str()` on the object yields nothing).
     let event = parse_responses_stream_event(
         r#"{"type":"response.failed","error":{"code":"server_error","message":"Request failed due to internal server error.","param":null,"type":"server_error"}}"#,
     )

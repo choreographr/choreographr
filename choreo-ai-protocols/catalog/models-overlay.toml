@@ -263,7 +263,8 @@
   # handles.)
   max_output_tokens = 128000
   reasoning_supported = true
-  reasoning_content_required = true
+  reasoning_echo_field = "reasoning_content"
+  reasoning_echo_required = true
   # z.ai's chat-completions docs: GLM-5.3(-flash) accepts ONLY the wire
   # values low / high / max (the models.dev-style full OpenAI set is not
   # valid for this generation). `off` is still offered UI-side as the
@@ -271,6 +272,20 @@
   # be fully disabled — the chat adapter omits reasoning_effort for it and
   # the model thinks at its documented `max` default.
   reasoning_levels = ["off", "low", "high", "max"]
+
+# deepseek-v4.1-flash: served by the go gateway, absent from the bundled
+# snapshot (a runtime refresh is what lists it). Pinned here because the
+# `interleaved` fact is WIRE VALIDITY, not a preference: this gateway streams
+# DeepSeek reasoning under the bare `reasoning` field while rejecting any
+# history whose assistant message omits `reasoning_content`, so a refreshed
+# snapshot that ever drops the fact would 400 every continued session. Only the
+# two facts that must not depend on the snapshot are pinned; the model's
+# window/output ceiling stay "unknown" here (0) and come from the refresh when
+# it knows them.
+[provider.opencode-go.models."deepseek-v4.1-flash"]
+  reasoning_supported = true
+  reasoning_echo_field = "reasoning_content"
+  reasoning_echo_required = true
 
 # opencode -> opencode (policy from the pre-models.dev TOML)
 [provider.opencode]
@@ -648,7 +663,8 @@
   context_window = 131072
   # Aliased DeepSeek models relied on the removed name heuristic; the echo
   # requirement is now an explicit overlay flag.
-  reasoning_content_required = true
+  reasoning_echo_field = "reasoning_content"
+  reasoning_echo_required = true
 [provider.futurmix.models."claude-haiku-4-20250514"]
   context_window = 200000
 
@@ -687,16 +703,20 @@
   context_window = 131072
   # Aliased DeepSeek/Kimi ids relied on the removed name heuristic; the echo
   # requirement is now an explicit overlay flag.
-  reasoning_content_required = true
+  reasoning_echo_field = "reasoning_content"
+  reasoning_echo_required = true
 [provider.iflytek-astron.models."xopdeepseekv4flash"]
   context_window = 131072
-  reasoning_content_required = true
+  reasoning_echo_field = "reasoning_content"
+  reasoning_echo_required = true
 [provider.iflytek-astron.models."xopdeepseekv32"]
   context_window = 131072
-  reasoning_content_required = true
+  reasoning_echo_field = "reasoning_content"
+  reasoning_echo_required = true
 [provider.iflytek-astron.models."xopkimik26"]
   context_window = 262144
-  reasoning_content_required = true
+  reasoning_echo_field = "reasoning_content"
+  reasoning_echo_required = true
 [provider.iflytek-astron.models."xminimaxm25"]
   context_window = 131072
 [provider.iflytek-astron.models."xopqwen35397b"]
@@ -715,11 +735,13 @@
   reasoning_levels = ["xhigh"]
   # Aliased Kimi models relied on the removed name heuristic; the echo
   # requirement is now an explicit overlay flag.
-  reasoning_content_required = true
+  reasoning_echo_field = "reasoning_content"
+  reasoning_echo_required = true
 [provider.kimi-code.models."kimi-for-coding"]
   context_window = 262144
   reasoning_supported = true
-  reasoning_content_required = true
+  reasoning_echo_field = "reasoning_content"
+  reasoning_echo_required = true
   reasoning_levels = ["medium", "xhigh"]
 
 # Llama Swap (not covered by models.dev; defined wholesale)
@@ -786,7 +808,8 @@
   context_window = 1048576
   # Aliased DeepSeek/Kimi ids relied on the removed name heuristic; the echo
   # requirement is now an explicit overlay flag.
-  reasoning_content_required = true
+  reasoning_echo_field = "reasoning_content"
+  reasoning_echo_required = true
 [provider.routstr.models."glm-5.1"]
   context_window = 202752
 [provider.routstr.models."minimax-m2.7"]
@@ -811,13 +834,16 @@
   context_window = 164000
   # Aliased DeepSeek/Kimi ids relied on the removed name heuristic; the echo
   # requirement is now an explicit overlay flag.
-  reasoning_content_required = true
+  reasoning_echo_field = "reasoning_content"
+  reasoning_echo_required = true
 [provider.tensorix.models."deepseek/deepseek-r1-0528"]
   context_window = 164000
-  reasoning_content_required = true
+  reasoning_echo_field = "reasoning_content"
+  reasoning_echo_required = true
 [provider.tensorix.models."minimax/minimax-m2.5"]
   context_window = 197000
 [provider.tensorix.models."moonshotai/kimi-k2.5"]
   context_window = 262000
-  reasoning_content_required = true
+  reasoning_echo_field = "reasoning_content"
+  reasoning_echo_required = true
 

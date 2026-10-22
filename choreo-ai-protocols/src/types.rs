@@ -90,9 +90,9 @@ pub enum ChatTurnResult {
 
 /// A single event emitted during a streaming LLM response.
 ///
-/// Replaces the old `(CompletionChunkKind, String)` tuple with a
-/// self-describing enum so each variant carries its data inline.  The
-/// consumer receives these through the `on_event` callback of
+/// A self-describing enum: each variant carries its data inline instead of
+/// sharing one payload slot, so a consumer receives these through the
+/// `on_event` callback of
 /// [`chat_completion_turn_streaming`](crate::ProviderClient::chat_completion_turn_streaming)
 /// and can use them for real-time UI updates.
 #[derive(Debug, Clone, PartialEq, Eq)]

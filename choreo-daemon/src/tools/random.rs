@@ -177,7 +177,7 @@ pub(crate) struct Random;
 define_tool!(
     Random,
     "random",
-    "Generate random values: integers, floats, booleans, bytes (base64), or UUID v4. Supports optional seed for reproducibility.",
+    "Generate random values: integers, floats, booleans, bytes (base64), or UUID v4. Optional `seed` makes results reproducible. Reach for this whenever a value should be genuinely arbitrary or unique instead of invented: picking among interchangeable options or a random item from a list (int in 0..=len-1), generating games/simulations/dice/shuffles, sampling or gathering fuzz inputs, assigning A/B buckets (seed for stable assignment), and minting non-colliding ids or placeholder/fixture/demo data (uuid, sample emails) — models otherwise over-pick the same defaults. Do not use it for real secrets or to avoid a decision that has a correct answer.",
     RandomArgs,
     execute_random_tool,
     "core",

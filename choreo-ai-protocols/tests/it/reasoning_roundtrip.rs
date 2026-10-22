@@ -71,9 +71,6 @@ fn assistant_message_from_tool_use(tool_use: &ChatAssistantToolUse) -> ChatReque
         images: Vec::new(),
         tool_call_id: None,
         tool_calls: Some(tool_calls),
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: tool_use.reasoning_artifact.clone(),
     }
 }
@@ -86,9 +83,6 @@ fn tool_result_message(tool_use: &ChatAssistantToolUse) -> ChatRequestMessage {
         images: Vec::new(),
         tool_call_id: Some(tool_use.tool_calls[0].id.clone()),
         tool_calls: None,
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: None,
     }
 }

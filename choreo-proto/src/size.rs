@@ -405,12 +405,23 @@ impl DaemonMessage {
                 DaemonMessageType::Models {
                     models,
                     selected_model,
+                    ..
                 } => {
-                    named_field_overhead(2)
+                    // 3 named fields (models, selected_model, provisional): the
+                    // model ids and the selected id carry the payload, and the
+                    // field allowance covers the `provisional` tag.
+                    named_field_overhead(3)
                         + models.iter().map(String::len).sum::<usize>()
                         + option_str_len(selected_model.as_ref())
                 }
                 DaemonMessageType::ModelsFailed { error } => named_field_overhead(1) + error.len(),
+                DaemonMessageType::ModelsUpdated { account, models } => {
+                    // 2 named fields (account, models): the account string plus
+                    // the summed model ids cover the variable payload.
+                    named_field_overhead(2)
+                        + account.len()
+                        + models.iter().map(String::len).sum::<usize>()
+                }
                 DaemonMessageType::Unlocked
                 | DaemonMessageType::Locked
                 | DaemonMessageType::Bound

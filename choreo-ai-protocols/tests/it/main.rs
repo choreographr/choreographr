@@ -17,6 +17,8 @@
 mod images_wire;
 mod modelsdev_refresh;
 mod reasoning_roundtrip;
+mod responses_stream;
+mod simple_completion;
 mod socket_registry_wire;
 mod upload_wire;
 mod videos_wire;

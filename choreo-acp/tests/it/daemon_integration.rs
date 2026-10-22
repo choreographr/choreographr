@@ -51,6 +51,7 @@ fn daemon_io_send_and_receive() {
             let response = DaemonMessage::broadcast(DaemonMessageType::Models {
                 models: vec!["claude-4".into(), "gpt-5".into()],
                 selected_model: Some("claude-4".into()),
+                provisional: false,
             });
             write_message(&mut writer, &response).unwrap();
             writer.flush().unwrap();
@@ -122,6 +123,7 @@ fn daemon_io_send_and_receive() {
                 DaemonMessageType::Models {
                     models,
                     selected_model,
+                    ..
                 },
             ..
         }) => {

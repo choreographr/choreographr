@@ -13,12 +13,13 @@ use crate::providers::test_util::{
     make_truncating_provider_with_slug,
 };
 use crate::reasoning::{
-    build_chat_request_messages, initial_prev_resp_id, warn_on_missing_reasoning_artifacts,
+    build_chat_request_messages, initial_prev_resp_id, warn_on_uncaptured_reasoning,
 };
 use crate::tools::context::ToolContext;
 use crate::tools::{Tool, ToolError, ToolExecError, ToolRegistry};
 use choreo_ai_protocols::StreamEvent;
-use choreo_ai_protocols::openai::{AssistantToolCall, AssistantToolFunction};
+use choreo_ai_protocols::chat_reasoning_echo;
+use choreo_ai_protocols::openai::{AssistantToolCall, AssistantToolFunction, chat_wire_messages};
 use choreo_keystore::ServiceCredential;
 use choreo_proto::{ChatReasoningField, ReasoningArtifact};
 use std::sync::mpsc;
@@ -683,12 +684,28 @@ fn assistant_messages(result: &[ChatRequestMessage]) -> Vec<&ChatRequestMessage>
     result.iter().filter(|m| m.role == "assistant").collect()
 }
 
+/// Lower the built messages exactly as the chat adapter would for this route,
+/// so a wire assertion cannot drift from the real request.
+fn wire_json(
+    messages: &[ChatRequestMessage],
+    provider: &str,
+    model: &str,
+) -> Vec<serde_json::Value> {
+    chat_wire_messages(messages, chat_reasoning_echo(provider, model))
+        .messages
+        .iter()
+        .map(|m| serde_json::to_value(m).expect("serialize wire message"))
+        .collect()
+}
+
 #[test]
-fn builder_tool_loop_attaches_artifact_only_for_tool_involving_turns() {
+fn builder_tool_loop_replays_every_turn_on_a_requires_field_route() {
     let mut session = SessionState::empty();
-    // Plain text turn (no tool involvement) with an artifact: must NOT be
-    // replayed under ToolLoop (DeepSeek/Kimi only require it on tool-loop
-    // messages).
+    // Plain text turn (no tool involvement) with an artifact. deepseek-v4-pro
+    // declares `reasoning_content` as a required echo field, and DeepSeek asks
+    // for every earlier turn's reasoning back once the request carries
+    // `tools` — including turns that made no tool call — so this turn replays
+    // its payload rather than an empty marker.
     add_turn(
         &mut session,
         "hello",
@@ -712,8 +729,9 @@ fn builder_tool_loop_attaches_artifact_only_for_tool_involving_turns() {
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 2);
     assert_eq!(
-        assistants[0].reasoning_artifact, None,
-        "plain text turn must not replay reasoning under ToolLoop",
+        assistants[0].reasoning_artifact,
+        Some(artifact(b"plain")),
+        "a route requiring the echo field replays every turn's payload",
     );
     assert_eq!(
         assistants[1].reasoning_artifact,
@@ -760,11 +778,10 @@ fn builder_tool_loop_attaches_artifact_for_tool_result_turns() {
 }
 
 #[test]
-fn builder_injects_empty_reasoning_content_for_deepseek_without_artifact() {
+fn builder_lowering_emits_empty_required_field_for_deepseek_without_artifact() {
     // DeepSeek chat requires `reasoning_content` to be present on every
-    // assistant message even when the model produced no reasoning. A tool
-    // turn with no artifact must therefore carry an explicit empty string on
-    // the wire.
+    // assistant message even when the model produced no reasoning: the adapter
+    // emits an empty string on the wire for a turn with nothing to echo.
     let mut session = SessionState::empty();
     add_turn(
         &mut session,
@@ -778,18 +795,21 @@ fn builder_injects_empty_reasoning_content_for_deepseek_without_artifact() {
     let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro", None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
+    // The builder attaches no artifact (nothing to replay) — the required-field
+    // empty string is the ADAPTER's business, not a wire-shaped field the
+    // daemon populates.
+    assert_eq!(assistants[0].reasoning_artifact, None);
+    let wire = wire_json(&result, "deepseek", "deepseek-v4-pro");
     assert_eq!(
-        assistants[0].reasoning_content,
-        Some(String::new()),
+        wire[1]["reasoning_content"], "",
         "deepseek assistant message must carry an (empty) reasoning_content"
     );
 }
 
 #[test]
 fn builder_deepseek_artifact_text_outranks_empty_injection() {
-    // When a real artifact exists and is echoed, the explicit reasoning_content
-    // field must stay None so the artifact re-emits its text (not an empty
-    // placeholder crowding it out).
+    // When a real artifact exists and is echoed, the wire field carries its
+    // text, not an empty placeholder.
     let mut session = SessionState::empty();
     add_turn(
         &mut session,
@@ -803,16 +823,18 @@ fn builder_deepseek_artifact_text_outranks_empty_injection() {
     let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro", None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
-    assert_eq!(assistants[0].reasoning_content, None);
     assert_eq!(
         assistants[0].reasoning_artifact,
         Some(artifact(b"real thinking"))
     );
+    let wire = wire_json(&result, "deepseek", "deepseek-v4-pro");
+    assert_eq!(wire[1]["reasoning_content"], "real thinking");
 }
 
 #[test]
 fn builder_does_not_inject_empty_reasoning_content_for_non_deepseek() {
-    // Unrelated OpenAI-chat models are untouched: no empty reasoning_content.
+    // Unrelated OpenAI-chat models are untouched: no reasoning field at all on
+    // a turn with nothing to echo.
     let mut session = SessionState::empty();
     add_turn(
         &mut session,
@@ -829,7 +851,9 @@ fn builder_does_not_inject_empty_reasoning_content_for_non_deepseek() {
     let result = build_chat_request_messages(&session, None, "openai", "gpt-4", None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
-    assert_eq!(assistants[0].reasoning_content, None);
+    assert_eq!(assistants[0].reasoning_artifact, None);
+    let wire = wire_json(&result, "openai", "gpt-4");
+    assert!(wire[1].get("reasoning_content").is_none());
 }
 
 #[test]
@@ -859,22 +883,21 @@ fn builder_requires_rc_empty_content_turn_echoes_artifact() {
         Some(artifact(b"long reasoning text")),
         "empty-message fallback echoes the same-model artifact",
     );
-    // The injected empty string must NOT shadow the artifact: leave the
-    // explicit field None so the Serialize impl re-emits the real text.
-    assert_eq!(assistants[0].reasoning_content, None);
     assert_eq!(assistants[0].content.as_deref(), Some(""));
 
     // The wire the provider actually receives carries the non-empty echo.
-    let body = serde_json::to_value(&result[1]).unwrap();
-    assert_eq!(body["content"], "");
-    assert_eq!(body["reasoning_content"], "long reasoning text");
+    let wire = wire_json(&result, "deepseek", "deepseek-v4-pro");
+    assert_eq!(wire[1]["content"], "");
+    assert_eq!(wire[1]["reasoning_content"], "long reasoning text");
 }
 
 #[test]
-fn builder_requires_rc_empty_content_turn_keeps_content_turn_bare() {
-    // The fallback must NOT change plain-text turns: a non-empty assistant
-    // message with a same-model artifact but no tool involvement is still
-    // sent bare under ToolLoop (no echo needed — the message is valid).
+fn builder_requires_field_route_echoes_a_plain_turns_payload() {
+    // A plain-text assistant turn with a same-model artifact on a route that
+    // declares `reasoning_content` required: the payload rides, because the
+    // upstream asks for the reasoning itself back, not just the key. (The
+    // empty-message fallback is not what keeps this turn alive — its content
+    // is non-empty; the required-field fact is what selects the echo.)
     let mut session = SessionState::empty();
     add_turn(
         &mut session,
@@ -888,8 +911,9 @@ fn builder_requires_rc_empty_content_turn_keeps_content_turn_bare() {
     let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro", None);
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
-    assert_eq!(assistants[0].reasoning_artifact, None);
-    assert_eq!(assistants[0].reasoning_content, Some(String::new()));
+    assert_eq!(assistants[0].reasoning_artifact, Some(artifact(b"plain")));
+    let wire = wire_json(&result, "deepseek", "deepseek-v4-pro");
+    assert_eq!(wire[1]["reasoning_content"], "plain");
 }
 
 #[test]
@@ -913,14 +937,17 @@ fn builder_requires_rc_empty_content_turn_foreign_artifact_not_replayed() {
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
     assert_eq!(assistants[0].reasoning_artifact, None);
-    assert_eq!(assistants[0].reasoning_content, Some(String::new()));
+    // Nothing is on the wire for this turn: the foreign payload is never
+    // replayed, and a required-field empty string is not a payload, so the
+    // projection drops the empty message rather than sending it.
+    let wire = wire_json(&result, "deepseek", "deepseek-v4-pro");
+    assert_eq!(wire.len(), 1, "only the user message survives: {wire:?}");
+    assert_eq!(wire[0]["role"], "user");
 
-    // And the guard must flag it: wire-empty + requires_rc + nothing
-    // replayable.
+    // The guard reports the turn, because it has left the model's view.
     assert_eq!(
-        warn_on_missing_reasoning_artifacts(&session, 7, "deepseek", "deepseek-v4-pro"),
+        warn_on_uncaptured_reasoning(&session, 7, "deepseek", "deepseek-v4-pro"),
         1,
-        "foreign-producer artifact on a wire-empty requires_rc turn is flagged",
     );
 }
 
@@ -939,7 +966,7 @@ fn guard_requires_rc_empty_content_turn_with_replayable_artifact_is_clean() {
         vec![],
     );
     assert_eq!(
-        warn_on_missing_reasoning_artifacts(&session, 7, "deepseek", "deepseek-v4-pro"),
+        warn_on_uncaptured_reasoning(&session, 7, "deepseek", "deepseek-v4-pro"),
         0,
         "empty-message fallback already echoes the same-model artifact",
     );
@@ -961,9 +988,34 @@ fn guard_requires_rc_empty_content_turn_missing_artifact_is_flagged() {
         vec![],
     );
     assert_eq!(
-        warn_on_missing_reasoning_artifacts(&session, 7, "deepseek", "deepseek-v4-pro"),
+        warn_on_uncaptured_reasoning(&session, 7, "deepseek", "deepseek-v4-pro"),
         1,
-        "wire-empty requires_rc turn with no artifact to fill it is flagged",
+        "wire-empty turn with no artifact to fill it is flagged",
+    );
+}
+
+#[test]
+fn builder_tool_loop_still_gates_per_turn_without_a_required_field() {
+    // The mirror of `builder_tool_loop_replays_every_turn_on_a_requires_field_route`:
+    // on a ToolLoop route that demands no echoed field (groq here), a plain-text
+    // turn's payload still stays home — the upstream asks for nothing, so
+    // replaying it would only spend context.
+    let mut session = SessionState::empty();
+    add_turn(
+        &mut session,
+        "hello",
+        "hi",
+        Some(artifact(b"plain")),
+        Some(groq_producer()),
+        vec![],
+    );
+
+    let result = build_chat_request_messages(&session, None, "groq", GROQ_MODEL, None);
+    let assistants = assistant_messages(&result);
+    assert_eq!(assistants.len(), 1);
+    assert_eq!(
+        assistants[0].reasoning_artifact, None,
+        "a route with no required echo field keeps the per-turn ToolLoop gate",
     );
 }
 
@@ -993,13 +1045,11 @@ fn builder_wire_empty_turn_echoes_artifact_on_non_requires_rc_provider() {
         Some(artifact(b"reasoned but silent")),
         "empty-message fallback echoes the same-model artifact on any echo-capable chat provider",
     );
-    // No empty-string injection on non-requires_rc models: the artifact
-    // re-emits its text directly.
-    assert_eq!(assistants[0].reasoning_content, None);
-
-    let body = serde_json::to_value(&result[1]).unwrap();
-    assert_eq!(body["content"], "");
-    assert_eq!(body["reasoning_content"], "reasoned but silent");
+    // No declared field on groq: the artifact re-emits its text directly under
+    // the field it was observed in.
+    let wire = wire_json(&result, "groq", GROQ_MODEL);
+    assert_eq!(wire[1]["content"], "");
+    assert_eq!(wire[1]["reasoning_content"], "reasoned but silent");
 }
 
 #[test]
@@ -1018,7 +1068,7 @@ fn guard_wire_empty_turn_without_artifact_flagged_on_non_requires_rc() {
         vec![],
     );
     assert_eq!(
-        warn_on_missing_reasoning_artifacts(&session, 7, "groq", GROQ_MODEL),
+        warn_on_uncaptured_reasoning(&session, 7, "groq", GROQ_MODEL),
         1,
         "wire-empty turn with no artifact to fill it is flagged on any echo-capable chat provider",
     );
@@ -1026,7 +1076,12 @@ fn guard_wire_empty_turn_without_artifact_flagged_on_non_requires_rc() {
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
     assert_eq!(assistants[0].reasoning_artifact, None);
-    assert_eq!(assistants[0].reasoning_content, None);
+    // groq declares no echo field and nothing was captured, so the empty
+    // assistant message is dropped from the projection (the hazard the guard
+    // just reported never reaches the wire).
+    let wire = wire_json(&result, "groq", GROQ_MODEL);
+    assert_eq!(wire.len(), 1, "only the user message survives: {wire:?}");
+    assert_eq!(wire[0]["role"], "user");
 }
 
 #[test]
@@ -1051,11 +1106,14 @@ fn builder_wire_empty_turn_never_echoes_under_none_passback() {
     let assistants = assistant_messages(&result);
     assert_eq!(assistants.len(), 1);
     assert_eq!(assistants[0].reasoning_artifact, None);
-    assert_eq!(assistants[0].reasoning_content, None);
+    // The never-replay pin means the wire-empty message cannot be filled at
+    // all, so the projection drops it instead of sending an empty assistant
+    // message (which the gateway would reject just as hard).
+    let wire = wire_json(&result, "cerebras", "gpt-oss-120b");
+    assert_eq!(wire.len(), 1, "only the user message survives: {wire:?}");
     assert_eq!(
-        warn_on_missing_reasoning_artifacts(&session, 7, "cerebras", "gpt-oss-120b"),
-        0,
-        "None-passback requests skip the artifact guard entirely",
+        warn_on_uncaptured_reasoning(&session, 7, "cerebras", "gpt-oss-120b"),
+        1,
     );
 }
 
@@ -1310,42 +1368,33 @@ fn initial_prev_resp_id_drops_stale_id_from_other_producer() {
     assert_eq!(initial_prev_resp_id(&fresh, "openai", "gpt-5.4"), None);
 }
 
-// -- Precondition guard (phase 4c) --------------------------------------
+// -- Precondition guard (degraded-wire detection) -----------------------
 
 #[test]
-fn guard_warns_when_tool_involving_turn_lacks_artifact() {
+fn guard_flags_capture_loss_when_reasoning_displayed_without_artifact() {
+    // The model reasoned, the session shows it, but no artifact was captured:
+    // the echo degrades to an empty field. Nothing else about this turn is
+    // unusual (non-empty content, no tool calls), so capture loss is the only
+    // thing that can be flagged — and it must be.
     let mut session = SessionState::empty();
-    // Tool-involving turn WITHOUT an artifact (pre-migration session state).
     let (tid, _) = session.start_turn(Some("list".into()));
-    let records = vec![tool_call_record("call_1", "ls")];
     session.set_assistant_response(
         tid,
         AssistantResponse {
             text: Some("thinking".into()),
-            tool_calls: records.clone(),
+            reasoning: Some("displayed thoughts".into()),
             ..Default::default()
         },
     );
-    session.seed_tool_results(tid, &records, &[String::new()]);
-    // Tool-involving turn WITH an artifact: clean.
-    add_turn(
-        &mut session,
-        "again",
-        "thinking2",
-        Some(artifact(b"ok")),
-        Some(deepseek_producer()),
-        vec![tool_call_record("call_2", "sh")],
-    );
-
-    let missing = warn_on_missing_reasoning_artifacts(&session, 7, "deepseek", "deepseek-v4-pro");
     assert_eq!(
-        missing, 1,
-        "only the artifact-less tool turn should be flagged",
+        warn_on_uncaptured_reasoning(&session, 7, "deepseek", "deepseek-v4-pro"),
+        1,
+        "displayed reasoning with no artifact is a capture loss",
     );
 }
 
 #[test]
-fn guard_clean_when_all_tool_turns_have_artifacts() {
+fn guard_clean_when_every_assistant_turn_has_its_artifact() {
     let mut session = SessionState::empty();
     add_turn(
         &mut session,
@@ -1355,7 +1404,7 @@ fn guard_clean_when_all_tool_turns_have_artifacts() {
         Some(deepseek_producer()),
         vec![tool_call_record("call_1", "ls")],
     );
-    // Non-tool turns never need an artifact.
+    // A turn the model answered without thinking needs no echo at all.
     add_turn(
         &mut session,
         "plain",
@@ -1365,50 +1414,55 @@ fn guard_clean_when_all_tool_turns_have_artifacts() {
         vec![],
     );
     assert_eq!(
-        warn_on_missing_reasoning_artifacts(&session, 7, "deepseek", "deepseek-v4-pro"),
+        warn_on_uncaptured_reasoning(&session, 7, "deepseek", "deepseek-v4-pro"),
         0,
     );
 }
 
 #[test]
-fn guard_all_turns_policy_flags_non_tool_turn_missing_artifact() {
-    // AllTurns providers (Anthropic keep-all) echo reasoning on EVERY
-    // assistant message, not just tool-involving ones — so a plain
-    // assistant turn without its artifact is a violation there too (the
-    // ToolLoop scope would have skipped it).
+fn guard_flags_wire_empty_turn_without_artifact_on_any_policy() {
+    // A reasoning-only turn whose artifact never made it into the session:
+    // nothing can fill the assistant message, so it ships empty and the
+    // provider rejects it. The check is protocol/policy independent — the
+    // "must not be empty" rule is not a DeepSeek/Kimi one.
     let mut session = SessionState::empty();
-    // Tool-involving turn WITH an artifact from the same producer: clean.
     add_turn(
         &mut session,
-        "list",
-        "thinking",
-        Some(artifact(b"ok")),
-        Some(anthropic_producer()),
-        vec![tool_call_record("call_1", "ls")],
-    );
-    // Non-tool assistant turn WITH an artifact from the same producer:
-    // clean under AllTurns.
-    add_turn(
-        &mut session,
-        "plain",
-        "hi",
-        Some(artifact(b"ok")),
+        "continue",
+        "",
+        None,
         Some(anthropic_producer()),
         vec![],
     );
-    // Non-tool assistant turn WITHOUT an artifact: flagged under AllTurns.
-    let (tid, _) = session.start_turn(Some("later".into()));
-    session.set_assistant_response(
-        tid,
-        AssistantResponse {
-            text: Some("hello".into()),
-            ..Default::default()
-        },
+    for (provider, model) in [
+        ("anthropic", "claude-sonnet-5"),
+        ("deepseek", "deepseek-v4-pro"),
+        ("openai", "gpt-4"),
+    ] {
+        assert_eq!(
+            warn_on_uncaptured_reasoning(&session, 7, provider, model),
+            1,
+            "{provider}/{model}: a wire-empty assistant message is always a hazard",
+        );
+    }
+}
+
+#[test]
+fn guard_flags_a_whitespace_only_assistant_turn() {
+    // A blank answer is not a payload: the projection trims before deciding, so a
+    // whitespace-only turn is dropped and the guard must report it.
+    let mut session = SessionState::empty();
+    add_turn(
+        &mut session,
+        "continue",
+        "  \n\t ",
+        None,
+        Some(deepseek_producer()),
+        vec![],
     );
     assert_eq!(
-        warn_on_missing_reasoning_artifacts(&session, 7, "anthropic", "claude-sonnet-5"),
+        warn_on_uncaptured_reasoning(&session, 7, "deepseek", "deepseek-v4-pro"),
         1,
-        "AllTurns flags the artifact-less non-tool assistant turn",
     );
 }
 
@@ -1427,18 +1481,18 @@ fn guard_user_only_turn_is_not_flagged() {
     );
     let _ = session.start_turn(Some("pending user text".into()));
     assert_eq!(
-        warn_on_missing_reasoning_artifacts(&session, 7, "anthropic", "claude-sonnet-5"),
+        warn_on_uncaptured_reasoning(&session, 7, "anthropic", "claude-sonnet-5"),
         0,
     );
 }
 
 #[test]
-fn guard_flags_foreign_producer_artifact() {
+fn guard_does_not_flag_model_bound_artifacts() {
     // A turn whose artifact was produced by a DIFFERENT model (a mid-session
     // switch) has a payload the builder will NOT replay (same-model
-    // provenance) — the wire request omits the required echo, so the guard
-    // flags it exactly like a missing artifact. Otherwise the provider 400
-    // after a model switch would remain a mystery.
+    // provenance). That is the intended strip-on-model-change rule, not a
+    // defect: the message is still valid (content + tool calls), so the guard
+    // stays quiet.
     let mut session = SessionState::empty();
     add_turn(
         &mut session,
@@ -1449,35 +1503,35 @@ fn guard_flags_foreign_producer_artifact() {
         vec![tool_call_record("call_1", "ls")],
     );
     assert_eq!(
-        warn_on_missing_reasoning_artifacts(&session, 7, "anthropic", "claude-sonnet-5"),
-        1,
-        "foreign-producer artifact flagged under AllTurns",
+        warn_on_uncaptured_reasoning(&session, 7, "anthropic", "claude-sonnet-5"),
+        0,
+        "a model-bound artifact is dropped by design, not a capture loss",
     );
-    // The same turn under its own producer+model is clean (provenance match).
     assert_eq!(
-        warn_on_missing_reasoning_artifacts(&session, 7, "deepseek", "deepseek-v4-pro"),
+        warn_on_uncaptured_reasoning(&session, 7, "deepseek", "deepseek-v4-pro"),
         0,
     );
 }
 
 #[test]
-fn guard_skipped_for_non_echo_policies() {
+fn guard_ignores_the_route_echo_policy() {
+    // Whether the route declares a reasoning field is the adapter's business;
+    // a turn that has nothing to echo and a valid message is clean either way.
     let mut session = SessionState::empty();
-    let (tid, _) = session.start_turn(Some("list".into()));
-    let records = vec![tool_call_record("call_1", "ls")];
-    session.set_assistant_response(
-        tid,
-        AssistantResponse {
-            text: Some("thinking".into()),
-            tool_calls: records.clone(),
-            ..Default::default()
-        },
+    add_turn(
+        &mut session,
+        "list",
+        "thinking",
+        None,
+        None,
+        vec![tool_call_record("call_1", "ls")],
     );
-    session.seed_tool_results(tid, &records, &[String::new()]);
-    // ResponseId policy: artifacts flow via previous_response_id, so the
-    // guard must not flag the missing message artifact.
     assert_eq!(
-        warn_on_missing_reasoning_artifacts(&session, 7, "openai", "gpt-4"),
+        warn_on_uncaptured_reasoning(&session, 7, "openai", "gpt-4"),
+        0,
+    );
+    assert_eq!(
+        warn_on_uncaptured_reasoning(&session, 7, "deepseek", "deepseek-v4-pro"),
         0,
     );
 }
@@ -2521,23 +2575,6 @@ fn estimate_prompt_tokens_counts_content() {
 }
 
 #[test]
-fn estimate_prompt_tokens_does_not_count_reasoning_content() {
-    let base_messages = vec![
-        ChatRequestMessage::simple("user", "hello".into()),
-        ChatRequestMessage::simple("assistant", "visible".into()),
-    ];
-    let mut with_reasoning = base_messages.clone();
-    with_reasoning[1].reasoning_content = Some("thinking deep...".into());
-
-    let (_, base_est) = estimate_prompt_tokens("gpt-4", &base_messages, &[]);
-    let (_, reason_est) = estimate_prompt_tokens("gpt-4", &with_reasoning, &[]);
-    assert_eq!(
-        base_est, reason_est,
-        "legacy reasoning_content string field is never populated by the daemon and must not count"
-    );
-}
-
-#[test]
 fn estimate_prompt_tokens_counts_reasoning_artifact() {
     let base_messages = vec![
         ChatRequestMessage::simple("user", "hello".into()),
@@ -2572,9 +2609,6 @@ fn estimate_prompt_tokens_counts_tool_call_metadata() {
             },
         }]),
         tool_call_id: None,
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: None,
     }];
     let (_, estimated) = estimate_prompt_tokens("gpt-4", &messages, &[]);

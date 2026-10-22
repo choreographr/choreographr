@@ -3,8 +3,9 @@
 //! render model (height prefix-sum, markers, scroll, viewport, render cache),
 //! the streaming response auto-pin, the provider catalog, text-input machinery,
 //! page states, picker geometry, displayed-image fetch plumbing, the turn-event
-//! handlers, and the session lifecycle live in sibling modules (`history`, `pin`,
-//! `providers`, `input`, `pages`, `layout`, `images`, `turn`, `session`) and are
+//! handlers, the model selector, and the session lifecycle live in sibling
+//! modules (`history`, `pin`, `providers`, `input`, `pages`, `model_selector`,
+//! `layout`, `images`, `turn`, `session`) and are
 //! re-exported here so the rest of the crate keeps referring to
 //! `crate::state::*` unchanged.
 
@@ -27,6 +28,7 @@ mod input;
 mod keymap;
 mod layout;
 mod login;
+mod model_selector;
 mod onboarding;
 mod pages;
 mod pin;
@@ -49,6 +51,7 @@ pub(crate) use input::*;
 pub(crate) use keymap::*;
 pub(crate) use layout::*;
 pub(crate) use login::*;
+pub(crate) use model_selector::*;
 pub(crate) use onboarding::*;
 pub(crate) use pages::*;
 pub(crate) use pin::*;

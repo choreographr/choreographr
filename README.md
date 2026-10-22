@@ -606,13 +606,61 @@ and re-emits it per provider rules on the next request:
   `redacted_thinking` blocks are echoed back, complete and unmodified,
   alongside `tool_use` blocks (a missing or altered block is a 400).
 - **DeepSeek / Kimi (OpenAI-compatible chat)** — `reasoning_content` is passed
-  back on every assistant tool-call message when the request carries `tools`.
-  On any echo-capable chat provider, a turn recorded as reasoning-only (empty
-  content, no tool calls) still echoes its same-model reasoning text so the
-  history never ships a wholly empty assistant message (the "must not be
-  empty" 400 that previously broke a mid-session model switch, e.g. deepseek
-  → kimi); models pinned to "never replay" (e.g. Cerebras gpt-oss) and the
-  Responses API are left to the flag-only diagnostic instead.
+  back on every assistant message when the model's catalog fact says the route
+  *requires its presence*, which some gateways demand even for a call that
+  produced no reasoning (the field then goes out empty). Presence is its own
+  catalog fact, separate from which field a route wants: a route can declare a
+  destination field without forcing it to appear on a message that has nothing
+  to echo, and can require the key's presence without naming a destination (the
+  chat default `reasoning_content` then goes out, empty). The declared field
+  always wins over the field a response
+  happened to stream the text in, because gateways exist that answer under
+  `reasoning` while rejecting any history without `reasoning_content`. On any
+  echo-capable chat provider, a turn recorded as reasoning-only (empty content,
+  no tool calls) still echoes its same-model reasoning text so the history never
+  ships a wholly empty assistant message (the "must not be empty" 400 that
+  previously broke a mid-session model switch, e.g. deepseek → kimi); models
+  pinned to "never replay" (e.g. Cerebras gpt-oss) and the Responses API are
+  left to the flag-only diagnostic instead.
+  A turn that produced no visible output at all — blank text, no tool calls, and
+  no reasoning to replay — is dropped from the request instead of being sent
+  empty; it stays in the transcript, but the model no longer receives a message
+  every provider rejects.
+- **OpenRouter / Kimi (structured `reasoning_details`)** — routes that declare
+  the structured array (OpenRouter's resellers, Ollama Cloud, a few gateways)
+  round-trip it as JSON rather than text. Consecutive text/summary entries of one
+  stream slot (equal `index`, or an `index` absent on both) are merged at capture
+  and encrypted entries stay
+  discrete, while an unrecognised entry type is preserved verbatim and replayed
+  unchanged — the upstream requires the returned sequence to match what the model
+  produced, so nothing may be dropped; unrecognised entries contribute nothing to
+  the display text. A delta that arrives double-encoded as a JSON string (some
+  proxies do this) is decoded once and folds exactly like a real array; a value
+  that is still not an array or object is ignored and logged by kind alone. The
+  display text is derived from the text/summary entries
+  when no scalar field streamed, and an encrypted-only turn still counts as
+  output. The live display comes from one channel only — whichever channel
+  produced a fragment first owns it for the rest of the turn, so a route that
+  populates both does not show the same reasoning twice. The rule is symmetric
+  (scalar-then-structured is as legal as structured-then-scalar), a chunk
+  carrying both lets the structured entries claim first, and the losing channel
+  is still captured for the artifact and as the display fallback. On replay the OpenRouter
+  `reasoning.*` entries are sent back verbatim
+  (index, format, signature intact) while bare Kimi-shaped entries are rebuilt
+  without the stream-only `index`, and the array is the only reasoning field
+  that message carries (no scalar mirror is invented beside it).
+  A details route replays the array whenever there is one to replay
+  and omits the key entirely when there is not (no unverified empty array is
+  invented; the array is a destination, not a presence requirement), while a
+  scalar payload that was observed on a structured route is replayed as one
+  `reasoning.text` entry instead of being discarded. The payload is capped per
+  turn, small because it is replayed on every later request of the tool loop
+  (dropped and logged rather than failing the request), and the total replayed
+  across a request is bounded separately in behaviour by that same number: the history is walked newest-first, the
+  most recent turn's artifact always replays, and each older one replays only
+  while the accepted bytes stay within the request budget. A turn over budget
+  still goes out under the route's echo rules with the key present and its
+  payload dropped, so a long tool loop never builds a body the provider rejects.
 - **Gemini** — the encrypted thought-step `thoughtSignature` values are sent
   back (the summary text stays display-only).
 - **OpenAI / xAI Responses** — reasoning continuity is chained across user
@@ -1109,7 +1157,7 @@ runs the command**, and `Esc` discards the line without cancelling anything.
 - `/reasoning list` — list the available reasoning effort slugs
 - `/reasoning <slug>` — set reasoning effort (e.g. `off`, `low`, `medium`, `high`, `on`, `xhigh`, `max`; available values depend on the model)
 - `Alt+R` — cycle reasoning effort through available slugs for the attached session's model (status message states: model reports no effort levels → "model does not support reasoning"; no model selected → "no model selected — pick one with Alt+M"; model selected but capability not yet reported → "reasoning capability not yet available")
-- `Alt+M` — open the model selector: list models available on the attached session's account, type to filter, `↑`/`↓`/`PgUp`/`PgDn` or the mouse wheel to navigate, click a row or press Enter to select, Esc to dismiss
+- `Alt+M` — open the model selector: list models available on the attached session's account (alphabetical, case-insensitively by id), type to filter, `↑`/`↓`/`PgUp`/`PgDn` or the mouse wheel to navigate, click a row or press Enter to select, Esc to dismiss. The list paints instantly from the daemon's cache or the local catalog's curated ids for the account's provider, and refreshes in place when the live fetch lands, keeping the row you are on; while it is a stand-in rather than the account's live list the footer says `provisional: live models not fetched yet`.
 - `Alt+Up` / `Alt+Down` — undo / redo one undo batch (same as `/undo` and `/redo`; both require an idle session)
 - `Alt+H` — toggle the keyboard-shortcut help overlay (the two cyan lines at the bottom of the Chat page)
 - `Alt+Q` — quit the client from any page or open modal (same as `/quit`)

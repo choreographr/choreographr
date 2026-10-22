@@ -65,9 +65,6 @@ fn build_message_payloads_tool_result() {
         images: Vec::new(),
         tool_call_id: Some("call_abc".to_string()),
         tool_calls: None,
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: None,
     }];
     let (payloads, system) = build_message_payloads(&msgs).unwrap();
@@ -96,9 +93,6 @@ fn build_message_payloads_tool_call() {
                 arguments: r#"{"location":"NYC"}"#.to_string(),
             },
         }]),
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: None,
     }];
     let (payloads, system) = build_message_payloads(&msgs).unwrap();
@@ -877,9 +871,6 @@ fn build_message_payloads_attaches_thought_signature_to_last_part() {
                 arguments: r#"{"location":"NYC"}"#.to_string(),
             },
         }]),
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: Some(ReasoningArtifact::GoogleSignatures(
             br#"["encrypted-sig-1","encrypted-sig-2"]"#.to_vec(),
         )),
@@ -909,9 +900,6 @@ fn build_message_payloads_thought_signature_on_single_text_part() {
         images: Vec::new(),
         tool_call_id: None,
         tool_calls: None,
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: Some(ReasoningArtifact::GoogleSignatures(
             br#"["encrypted-sig-1"]"#.to_vec(),
         )),
@@ -945,9 +933,6 @@ fn build_message_payloads_foreign_artifact_variant_is_dropped() {
         images: Vec::new(),
         tool_call_id: None,
         tool_calls: None,
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: Some(ReasoningArtifact::ChatReasoning {
             field: choreo_proto::ChatReasoningField::ReasoningContent,
             bytes: b"not a signature".to_vec(),
@@ -974,9 +959,6 @@ fn build_message_payloads_user_image_renders_inline_data() {
         }],
         tool_call_id: None,
         tool_calls: None,
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
         reasoning_artifact: None,
     }];
     let (payloads, _) = build_message_payloads(&msgs).unwrap();
@@ -1011,4 +993,45 @@ fn request_body_carries_generation_config_output_cap() {
 
     let no_cap = build(None);
     assert!(no_cap.get("generationConfig").is_none(), "{no_cap}");
+}
+
+#[test]
+fn build_message_payloads_skips_an_assistant_message_with_no_parts() {
+    // An assistant turn that produced no visible output carries nothing, and
+    // an empty `parts` array is rejected — so it is skipped, not sent empty.
+    let msgs = vec![
+        ChatRequestMessage::simple("user", "q".to_string()),
+        ChatRequestMessage::simple("assistant", String::new()),
+    ];
+    let (payloads, _system) = build_message_payloads(&msgs).unwrap();
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads[0].role, "user");
+}
+
+#[test]
+fn build_message_payloads_drops_an_assistant_message_that_only_carries_signatures() {
+    use choreo_proto::ReasoningArtifact;
+
+    // A Gemini thought signature attaches to an existing content part (text or
+    // functionCall) — the wire has no standalone signature part — so a turn
+    // whose only payload is the signature has nothing to attach it to and is
+    // skipped rather than sent as an empty `parts` array. The continuity payload
+    // is lost either way (it was already unrepresentable); the request stays
+    // valid.
+    let msgs = vec![
+        ChatRequestMessage::simple("user", "q".to_string()),
+        ChatRequestMessage {
+            role: "assistant",
+            content: Some(String::new()),
+            images: Vec::new(),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_artifact: Some(ReasoningArtifact::GoogleSignatures(
+                br#"["sig_1"]"#.to_vec(),
+            )),
+        },
+    ];
+    let (payloads, _system) = build_message_payloads(&msgs).unwrap();
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads[0].role, "user");
 }

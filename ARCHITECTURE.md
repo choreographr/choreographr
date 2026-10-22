@@ -470,7 +470,7 @@ match enumerates it fully.
 └──────────────────┴────────────────────────────────────────┘
 ```
 
-- Protocol version: `9` (v9 = live MCP config reload: the new `ClientMessage::McpReload` request and its `DaemonMessage::McpReloaded`/`McpReloadFailed` replies, so a running daemon can pick up `mcp.json` edits (added/removed/changed servers) without a restart; v8 = per-session `pinned`/`archived` flags: the new `ClientMessage::SetSessionPinned`/`SetSessionArchived` requests, the daemon-GENERATED broadcast `SessionEvent::SessionFlagsChanged` (rides `DaemonState::broadcast()`, so a client learns of a flag change via the broadcast rather than a targeted reply), and the `SessionSummary::pinned`/`archived_at` fields they surface. v7 = the create-session reply is split from the create-session broadcast: `SessionEvent::SessionCreatedForRequester` is the direct reply to the creating connection and is the ONLY create event a frontend may auto-attach to, while `SessionEvent::SessionCreated` is notification-only (broadcast to every subscriber) and must never move a client's view — fixing a client hijacking its own view when ANOTHER client created a session. Delete/status lifecycle messages are unaffected: `SessionDeleted` was already broadcast-only with the requester already knowing the id it deleted; v6 = displayed-image bytes are no longer shipped in session-scoped snapshots (`SessionState`/`TurnAppended`/`TurnsRedone`) — they carry only `ImageMetadata` — and are instead fetched on demand via the new `ClientMessage::GetImage` ⇄ `DaemonMessage::Image` pair, keyed by `(session_id, turn_id, image_index)` and served from the durable `session_attachments` store; v5 = the two-state `Locked`/`Unlocked` status *broadcasts* were replaced by `DaemonMessage::Keystore { state: KeystoreState }` (`Unbound`/`Locked`/`Unlocked`), pushed at subscribe time and on every transition so a first-run client learns it must BIND; `Locked`/`Unlocked` remain targeted operation replies. v4 = the 29 session-scoped events were moved into `SessionEvent` and now ride the `DaemonMessage::Session { session_id: Option<u64>, event }` envelope; v3 had removed `TurnFinalized` — the final-turn snapshot rides `TurnAppended` — and added `Evicted`, a best-effort lag-eviction advisory; mixed-version peers fail fast at the version gate). The v4 shape was amended in place before the first release — the `session_id: 0` sentinel became `Option<u64>` (`None` for connection-level replies) — so the wire version stayed `4` with no bump at that point. The MCP trust-query request/reply variants (`ClientMessage::McpTrust`/`McpUntrust`/`McpTrustList`, `DaemonMessage::McpTrustUpdated`/`McpTrustList`) were added to v9 the same way, before any release carried v9; the policy is that variants may be added to the **current, unreleased** wire version without a bump, because mixed-version peers do not exist until a release ships and the version gate fails fast on a mismatch either way. A bump is required only once a version has shipped in a release. Under the same pre-release policy, the v6 `GetImage`/`Image` pair was reshaped for v9 before any release carried v9: its positional `image_index: u32` became a tagged `key: ImageKey` (`Displayed { index }` or `ToolResult { call_id }`), so one fetch protocol now serves both displayed images and tool-result vision images from the shared `session_attachments` store. Under the same pre-release policy, the v9 frame was amended in place to the uniform correlation envelope: `ClientMessage` = `{ id: u64, inner: ClientMessageType }`, `DaemonMessage` = `{ id: Option<u64>, inner: DaemonMessageType }` (a broadcast is `id: None`; a reply stamps the request's id), the payload enums were renamed `ClientMessageType`/`DaemonMessageType`, the streaming `request_id` was renamed `stream_id` and widened to `u64`, and the `MessageKind` tag plus the `Accepted`/`Failed` acknowledgement replies were added. No bump — no release has shipped v9. Under the same pre-release policy, the v9 streaming axis was made daemon-owned: the session thread assigns a run's `stream_id` (a per-session, monotonic counter) when it accepts a `RunInput`/`ContinueGeneration` and reports it on the acceptance `Started` reply/broadcast, so those requests no longer carry a client-chosen `stream_id` (the client learns it from `Started`, which also fixes the cross-client collision where two clients fanned one session could each claim the same id); the `CANCEL_ALL` sentinel (`stream_id = 0`) remains for a pre-`Started` cancel. Under the same pre-release policy, the `SessionStatus` streaming phase was split in v9: the single `Inference` state became `Sending`/`Waiting`/`Reasoning`/`Responding`, so a status bar can tell the request dispatch from the provider's time-to-first-token wait from reasoning from answer streaming. The `Waiting` boundary is anchored on client-side request-upload completion (the last byte of the request body handed to the transport), not on the provider's response headers: a buffering gateway (e.g. opencode.ai behind Cloudflare) withholds the response head until the model begins generating, so anchoring on the headers would collapse `Waiting` into `Sending` for those providers. The upload hook fires once per attempt, so a retried turn reports `Waiting` for the failed attempt too, before `Retrying`. Under the same pre-release policy, `ClientMessage::AddCredential` was reshaped in v9 to carry a typed plaintext `ServiceCredential` (`{ service, credential }`) instead of a client-encrypted `encrypted_payload` plus an `unlock_key`: no key rides the wire, the daemon encrypts the credential to its own binding public key, and the add path requires an already-unlocked keystore (no implicit unlock).
+- Protocol version: `9` (v9 = live MCP config reload: the new `ClientMessage::McpReload` request and its `DaemonMessage::McpReloaded`/`McpReloadFailed` replies, so a running daemon can pick up `mcp.json` edits (added/removed/changed servers) without a restart; v8 = per-session `pinned`/`archived` flags: the new `ClientMessage::SetSessionPinned`/`SetSessionArchived` requests, the daemon-GENERATED broadcast `SessionEvent::SessionFlagsChanged` (rides `DaemonState::broadcast()`, so a client learns of a flag change via the broadcast rather than a targeted reply), and the `SessionSummary::pinned`/`archived_at` fields they surface. v7 = the create-session reply is split from the create-session broadcast: `SessionEvent::SessionCreatedForRequester` is the direct reply to the creating connection and is the ONLY create event a frontend may auto-attach to, while `SessionEvent::SessionCreated` is notification-only (broadcast to every subscriber) and must never move a client's view — fixing a client hijacking its own view when ANOTHER client created a session. Delete/status lifecycle messages are unaffected: `SessionDeleted` was already broadcast-only with the requester already knowing the id it deleted; v6 = displayed-image bytes are no longer shipped in session-scoped snapshots (`SessionState`/`TurnAppended`/`TurnsRedone`) — they carry only `ImageMetadata` — and are instead fetched on demand via the new `ClientMessage::GetImage` ⇄ `DaemonMessage::Image` pair, keyed by `(session_id, turn_id, image_index)` and served from the durable `session_attachments` store; v5 = the two-state `Locked`/`Unlocked` status *broadcasts* were replaced by `DaemonMessage::Keystore { state: KeystoreState }` (`Unbound`/`Locked`/`Unlocked`), pushed at subscribe time and on every transition so a first-run client learns it must BIND; `Locked`/`Unlocked` remain targeted operation replies. v4 = the 29 session-scoped events were moved into `SessionEvent` and now ride the `DaemonMessage::Session { session_id: Option<u64>, event }` envelope; v3 had removed `TurnFinalized` — the final-turn snapshot rides `TurnAppended` — and added `Evicted`, a best-effort lag-eviction advisory; mixed-version peers fail fast at the version gate). The v4 shape was amended in place before the first release — the `session_id: 0` sentinel became `Option<u64>` (`None` for connection-level replies) — so the wire version stayed `4` with no bump at that point. The MCP trust-query request/reply variants (`ClientMessage::McpTrust`/`McpUntrust`/`McpTrustList`, `DaemonMessage::McpTrustUpdated`/`McpTrustList`) were added to v9 the same way, before any release carried v9; the policy is that variants may be added to the **current, unreleased** wire version without a bump, because mixed-version peers do not exist until a release ships and the version gate fails fast on a mismatch either way. A bump is required only once a version has shipped in a release. Under the same pre-release policy, the v6 `GetImage`/`Image` pair was reshaped for v9 before any release carried v9: its positional `image_index: u32` became a tagged `key: ImageKey` (`Displayed { index }` or `ToolResult { call_id }`), so one fetch protocol now serves both displayed images and tool-result vision images from the shared `session_attachments` store. Under the same pre-release policy, the v9 frame was amended in place to the uniform correlation envelope: `ClientMessage` = `{ id: u64, inner: ClientMessageType }`, `DaemonMessage` = `{ id: Option<u64>, inner: DaemonMessageType }` (a broadcast is `id: None`; a reply stamps the request's id), the payload enums were renamed `ClientMessageType`/`DaemonMessageType`, the streaming `request_id` was renamed `stream_id` and widened to `u64`, and the `MessageKind` tag plus the `Accepted`/`Failed` acknowledgement replies were added. No bump — no release has shipped v9. Under the same pre-release policy, the v9 streaming axis was made daemon-owned: the session thread assigns a run's `stream_id` (a per-session, monotonic counter) when it accepts a `RunInput`/`ContinueGeneration` and reports it on the acceptance `Started` reply/broadcast, so those requests no longer carry a client-chosen `stream_id` (the client learns it from `Started`, which also fixes the cross-client collision where two clients fanned one session could each claim the same id); the `CANCEL_ALL` sentinel (`stream_id = 0`) remains for a pre-`Started` cancel. Under the same pre-release policy, the `SessionStatus` streaming phase was split in v9: the single `Inference` state became `Sending`/`Waiting`/`Reasoning`/`Responding`, so a status bar can tell the request dispatch from the provider's time-to-first-token wait from reasoning from answer streaming. The `Waiting` boundary is anchored on client-side request-upload completion (the last byte of the request body handed to the transport), not on the provider's response headers: a buffering gateway (e.g. opencode.ai behind Cloudflare) withholds the response head until the model begins generating, so anchoring on the headers would collapse `Waiting` into `Sending` for those providers. The upload hook fires once per attempt, so a retried turn reports `Waiting` for the failed attempt too, before `Retrying`. Under the same pre-release policy, `ClientMessage::AddCredential` was reshaped in v9 to carry a typed plaintext `ServiceCredential` (`{ service, credential }`) instead of a client-encrypted `encrypted_payload` plus an `unlock_key`: no key rides the wire, the daemon encrypts the credential to its own binding public key, and the add path requires an already-unlocked keystore (no implicit unlock). Also under the same pre-release policy, v9 gained the `DaemonMessage::ModelsUpdated { account, models }` broadcast, emitted when a background model-list fetch finishes so an already-open model picker refreshes in place; a cold picker now paints instantly from a locally cached or catalog-seeded list and this broadcast supersedes that seed when the live fetch lands, instead of blocking on a slow `/v1/models` round-trip.
 - Max frame size: 64 MiB
 - Lag-eviction byte gauge: `DaemonMessage::approx_wire_size` / `Turn::approx_size` (in `choreo-proto/src/size.rs`) — a deliberate over-estimate used by the daemon's lag accounting, pinned by `types::tests::approx_wire_size_never_underestimates_encoded_payload` (see the daemon's `broadcast` module docs for the lag accounting)
 
@@ -1106,7 +1106,9 @@ runtime alias resolution**. The metrics `endpoint` label changes with the slug
 
 The merged catalog is parsed lazily into `PROVIDER_CATALOG`, a process-global
 `LazyLock<ArcSwap<Vec<ProviderEntry>>>` (`catalog/mod.rs` +
-`catalog/loader.rs`): the first access deserializes the embedded base and
+`catalog/loader.rs`, with the entry types themselves in `catalog/entry.rs`, the
+fact lookups in `catalog/lookup.rs`, and the OAuth login descriptors assembled
+from an entry's profile in `catalog/oauth.rs`): the first access deserializes the embedded base and
 merges the bundled overlay once; every later access goes straight to the
 `ArcSwap` (an atomic load, then lock-free reads / atomic `store` on swap). The
 `ArcSwap` makes the catalog runtime-swappable: readers are lock-free and
@@ -1127,21 +1129,168 @@ For Anthropic (thinking blocks + signatures), DeepSeek/Kimi
 (`reasoning_content`), Gemini (thought signatures), and OpenAI/xAI Responses
 (opaque reasoning items + `previous_response_id`), reasoning must be sent back
 on the next request or the tool-call loop fails with a 400. The round-trip
-payload is an **opaque, provider-owned artifact** handled in three layers: the
+payload is an **opaque, provider-owned artifact** handled in four layers: the
 catalog decides *how* to send (`ReasoningPassback`, per-model override else
-protocol default via `model_reasoning_passback`); each adapter captures the
-artifact verbatim at its parse boundary and re-emits it verbatim in its own wire
-format; the daemon's request builder (`choreo-daemon/src/reasoning.rs`) decides
-*whether* to send and never interprets the bytes. *Whether* is derived, never
-configured: same-model provenance (`Turn.reasoning_producer` versus the current
-provider + model, so a mid-session model switch drops every old artifact) plus
-the passback policy — with the empty-message fallback (a reasoning-only turn is
-never shipped as a wholly empty assistant message), the data-driven
-`requires_reasoning_content` fact (ingested from the snapshot, with no
-name-based heuristic), and the `previous_response_id` continuity chain. The
-artifact never leaves the daemon process — client-bound `SessionEvent`s carry it
-as `None`. The variant semantics and the resolver contracts are documented on
-`ReasoningPassback` and the resolver functions.
+protocol default via `model_reasoning_passback`, plus the chat echo policy in
+`chat_reasoning_echo`); each adapter captures the artifact verbatim at its parse
+boundary and re-emits it verbatim in its own wire format; the daemon's request
+builder (`choreo-daemon/src/reasoning.rs`) decides *whether* to send and never
+interprets the bytes; and the chat adapter's lowering (`ChatWireMessage`) decides
+*which wire key* carries it. *Whether* is derived, never configured: same-model
+provenance (`Turn.reasoning_producer` versus the current provider + model, so a
+mid-session model switch drops every old artifact) plus the passback policy —
+with the empty-message fallback (a reasoning-only turn is never shipped as a
+wholly empty assistant message), the data-driven `reasoning_echo` /
+`reasoning_echo_required` facts (ingested from the snapshot's `interleaved` field
+name, with no name-based heuristic, and overridable per model by the overlay),
+and the `previous_response_id` continuity
+chain.
+
+**Which key wins.** The catalog's declared echo field is authoritative and
+outranks the field a payload was *observed* under: `ReasoningArtifact::
+ChatReasoning` records the observation (a hint, used only when the route declares
+nothing) while `ModelEntry::reasoning_echo` states the destination — and, when
+the separate `ModelEntry::reasoning_echo_required` fact says so, that the field
+must be present. There are **two destinations**: a declared scalar field
+(`reasoning_content`, `reasoning`, or `reasoning_text`) or the declared
+structured `reasoning_details` array. Destination and presence are **two
+independent catalog facts**, each pinnable on its own — a presence requirement
+with no declared destination resolves to the chat default key
+(`field: None, require_present: true`), which the lowering emits empty — and the
+lowering (`choreo-ai-protocols`'
+`openai::chat_projection`, which owns the projection) applies both in one place so they
+cannot drift apart. Writing a scalar destination on *every* assistant message —
+the artifact's text when there is something to replay, an empty string when
+there is not — is exactly the presence case (`require_present`), not a
+consequence of declaring a field. Ingestion keeps the two aligned with what the
+upstream actually enforces: `interleaved` naming a scalar field sets BOTH facts
+(a scalar name has always meant the upstream demands the key echoed), while
+`interleaved` naming the structured array sets only the destination. This is
+why a gateway that streams
+DeepSeek thinking under `reasoning` while
+rejecting any history without `reasoning_content` cannot starve the required
+field. The artifact never leaves the daemon process — client-bound
+`SessionEvent`s carry it as `None`. The variant semantics and the resolver
+contracts are documented on `ReasoningPassback`, `ChatReasoningEcho`, and the
+resolver functions.
+
+**Structured details.** Some chat routes carry reasoning as a structured
+`reasoning_details` array instead of a scalar string (models.dev's `interleaved`
+names it for the OpenRouter resellers and a few gateways). The artifact then
+stores the array as JSON under `ChatReasoningField::ReasoningDetails` rather than
+text: display text is derived from its text/summary entries when no scalar field
+streamed, and an encrypted-only array still counts as model output (never an
+empty response). The live display comes from exactly one channel — whichever
+channel produced a fragment first claims it for the rest of the turn, and the
+other channel then contributes nothing to the display — because a route that
+populates both sends the same reasoning twice and emitting both renders it twice
+in the client. The rule is symmetric: a route may stream the scalar field first
+and the structured array later just as easily as the reverse, so neither channel
+is privileged. Processing order inside a delta stays details-first, then the
+scalar fields, so a chunk carrying both lets the structured entries claim first.
+Both channels are still captured regardless of who owns the display — the scalar
+text is accumulated all the same, since it stays the display and artifact
+fallback for a route that streams only the scalar field, and the array is
+captured even while the scalar field is on screen. All three capture paths —
+both streaming request paths and the non-streaming response conversion —
+delegate those rules to one shared state machine
+(`openai/chat_completions/reasoning_stream.rs`) rather than each reimplementing
+them, which is what keeps the plain prompt path, the tool path, and the
+non-streaming turn result interpreting reasoning identically (including the
+first-non-empty scalar precedence that stops an empty field masking a populated
+one). Capture normalizes the array under a
+documented per-turn byte cap, beyond which the *replay payload* is dropped and
+logged rather than failing the request. Three answers are kept apart here, which
+is what stops a storage bound from costing anything but the echo: the turn's
+display text is a fold over the fragments (unbounded, like the scalar channel), the
+payload is what the cap bounds, and "did the model produce output" is a fact
+reported by the fold — never inferred from whether a payload survived. An
+over-cap turn therefore still shows its reasoning, and an encrypted-only turn whose
+payload was over the cap is a `FinalText` with no visible text rather than an
+`EmptyResponse` error. That bound and the per-request replay budget below are
+**one number** (`reasoning_details::MAX_REASONING_BYTES`): an artifact larger
+than the request budget could only ever ride as its "newest always
+replays" overshoot, so a larger per-turn cap would have no replay path. Two
+bounds still work together, because the payload is persisted per
+turn and replayed on *every* later request of the tool loop: the per-turn cap
+limits what one turn may persist, and the request build that lowers the history
+applies a separate per-request budget to the total artifact bytes it replays
+across all assistant messages. The request walks the history **newest-first**:
+the most recent artifact-carrying assistant turn always replays, even when that
+single artifact alone exceeds the budget, and each older turn replays only while
+the bytes already accepted stay within the budget. A turn the budget skips is
+lowered with no artifact but under the same echo policy, so a route that
+requires the key still emits its presence marker (an empty string, or the empty
+details array) and only the payload is lost. Without that second bound a long
+tool loop would build a request body that grows roughly with `turns × cap` until
+the provider rejects it outright: losing an old turn's echo degrades a route
+that requires it, while an oversized body fails the whole turn. The scalar
+artifacts are not capped at capture at all — real thinking can exceed the
+per-turn cap and the DeepSeek/GLM echo requirement needs it replayed — so they
+are bounded by that same request budget rather than by capture. The fragments of
+one stream slot merge into one block: a slot is the entry's `index` (equal
+`index` on both entries) or, where the provider names none, the newest
+index-less entry of that kind, and each slot remembers its own accumulating
+entry — so a route that interleaves two slots across deltas still merges both
+rather than starting a fresh entry per fragment. Entries carried by one delta are
+distinct blocks and never merge on absent-index evidence, and a mixed presence
+is ambiguous and stays unmerged, because fusing on absent evidence could rewrite
+a sequence the upstream requires to match. A merge is also refused when the two
+entries state a conflicting identity — a different `id`, `format`, or
+`signature` — since that is two distinct blocks sharing a slot number. OpenRouter
+states the rule this protects: the entire sequence of reasoning blocks must match
+the output of the original request and may not be rearranged or modified
+([docs](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens#preserving-reasoning)),
+and GLM says the same of its preserved-thinking blocks
+([docs](https://docs.z.ai/guides/capabilities/thinking-mode)). Encrypted entries
+stay discrete (they are individually opaque), and an entry whose `type` is not
+modelled is kept and replayed **verbatim** — it contributes nothing to display
+text, but dropping it would again alter the sequence the model produced. The
+lowering replays OpenRouter's namespace-prefixed `reasoning.*` entries verbatim
+(index, format, and signature intact, as its documented array shape specifies —
+[spec](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens#reasoning_details-array-structure)).
+A **bare** entry (an undocumented single-word `type`) is the one exception to
+verbatim replay: it loses only the stream-only `index` and keeps everything else,
+the payload key included, because no upstream documents that shape — Kimi's own
+documentation uses solely `reasoning_content`
+([docs](https://platform.kimi.ai/docs/guide/use-thinking-models)) and models.dev's
+snapshot vocabulary is `reasoning_content` or `reasoning_details`
+([schema](https://github.com/anomalyco/models.dev/blob/dev/packages/core/src/schema.ts)) —
+so a rebuilt entry could drop an opaque block under a guessed key. The array is
+the **only** reasoning field such a message carries — a scalar mirror beside it
+would be a shape no upstream documents, and OpenRouter's guidance is one form
+*or* the other, so the companion is not emitted. The array is a **destination
+fact only**: a declared details route with nothing to echo emits *no* reasoning
+key,
+because no upstream is known to reject a history that omits the array and an
+invented `reasoning_details: []` would send an unverified array to a gateway
+that is strict about its contents. An **undeclared** route is the same shape for
+a different reason: it only reaches the array through the observation, so when
+the artifact lowers to nothing (corrupt or over the cap) no key is emitted at
+all. A route whose separate presence fact (`reasoning_echo_required`) demands
+the array still carries it empty on every assistant message — an empty array is
+a presence marker, not a payload, so it never keeps an otherwise-empty assistant
+message alive. Capture tolerates a value that is not an array or object only as
+far as one JSON decode: a proxy that double-encodes the array as a JSON string is
+decoded once and folded like a real array, and anything still not an array or
+object (a bare number, a string of non-JSON) is ignored and logged by kind alone
+— never logged by content, never invented into an entry. A scalar payload
+reaching a structured route (a catalog or overlay flip changes a model's
+declared field) is replayed as one `reasoning.text` entry rather than discarded,
+the counterpart of deriving display text from a structured payload on a scalar
+route.
+
+**Empty turns never reach the wire.** An assistant turn that produced no visible
+content (blank text counts as none), no tool calls, and no reasoning payload is
+dropped from the provider-facing projection by every adapter — a message with
+neither content nor tool calls is rejected outright by chat servers, and an
+empty `content`/`parts` array is rejected by Anthropic and Gemini. The turn stays
+in the session (the transcript, diagnostics, and `session_inspect` still see it);
+only the request projection omits it. A turn whose *only* payload is a replayed
+reasoning artifact is not empty and always survives — dropping it would starve
+the very echo this section is about — while a required-field empty string is a
+presence marker, not a payload, so it never keeps an otherwise-empty message
+alive.
 
 ### Supported providers
 
@@ -1375,13 +1524,28 @@ startup              connect→unbound?        /unlock [key]            AddCrede
   writer of `model_cache` — records the result; a per-account `model_prefetch_in_flight` guard
   deduplicates bursts of joins and is released even on fetch failure. The shared
   `MODEL_CACHE_TTL` (5 min) governs both prefetch freshness and the on-demand path in
-  `handle_list_models_inner`, which NEVER fetches on the command loop: a fresh cache answers
-  immediately; a stale/missing cache triggers the same background prefetch (no-op while one
-  is in flight, so an open picker cannot double-fetch) and serves the stale list if one
-  exists, or a retryable "warming" error otherwise. A panic inside the fetch thread is
-  caught (`catch_unwind`) and reported as a normal failure so the in-flight guard can never
-  leak, and a result arriving for an account whose provider was removed or rebuilt mid-flight
-  is discarded instead of cached.
+  `handle_list_models`, which NEVER fetches on the command loop: a fresh, non-empty cache
+  answers immediately; a stale/missing cache triggers the same background prefetch (no-op
+  while one is in flight, so an open picker cannot double-fetch) and answers with the best
+  list it already has — the stale entry, else the local catalog's curated ids for the
+  account's provider (an instant first paint, so the picker never blocks on a slow
+  `/v1/models`), and only then a retryable "warming" error. Both stand-ins are flagged
+  `provisional` on the wire, so a picker can say the list is not (yet) the account's verified
+  one, and both the prefetch gate (`should_prefetch_models`) and the on-demand path treat an
+  EMPTY cache entry as absent (`fresh_model_list`), so an empty entry never suppresses a
+  fetch. Every list the daemon
+  serves is ordered case-insensitively by id at the point it enters the daemon (a fetched
+  result and the catalog seed, `sort_model_ids`), so the cache, the `Models` reply, the
+  `/model` listing and the broadcast below cannot disagree. When a fetch lands the loop caches
+  the result unconditionally (the insert is what refreshes the TTL) and broadcasts
+  `DaemonMessage::ModelsUpdated { account, models }` on the ACTIVITY bus UNLESS the entry was
+  already a fresh, non-empty list identical to the result; a stale or absent entry is always
+  re-announced even when the ids match, so an open picker's `provisional` label clears once
+  the live fetch confirms it. The broadcast lets an already-open picker replace its list in
+  place without moving the row under the cursor. A panic inside the fetch
+  thread is caught (`catch_unwind`) and reported as a normal failure so the in-flight guard
+  can never leak, and a result arriving for an account whose provider was removed or rebuilt
+  mid-flight is discarded instead of cached.
 - There is no global "default account". Each session carries its own `account_name: Option<String>`
   field. When RunInput is issued, the daemon resolves the provider from the session's own account name.
   This avoids a global mutable fallback and lets different sessions use different accounts.
@@ -2358,6 +2522,11 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
    for OpenAI SSE, giving full control over parsing and buffering behavior. The Anthropic
    module has its own `AnthropicSseReader` that handles both `event:` and `data:` lines
    (required by the Anthropic Messages streaming format) and yields `(event_type, data)` pairs.
+   Because the peer is a provider, a gateway, or a proxy, an event is only delimited by a blank
+   line — so the reader caps one event's accumulated bytes (`MAX_SSE_EVENT_BYTES`) rather than
+   letting a peer that never terminates an event grow the buffers without bound, and it resumes
+   its newline scan from the last unscanned offset instead of rescanning the whole buffer on
+   every read (which would make one large event quadratic in its length).
    The blocking socket read is decoupled onto a dedicated reader thread (`stream.rs`) that
    forwards parsed events through a bounded crossbeam channel, so the caller can `select!`
    on the event channel, the cancellation channel, and the deadline timer simultaneously —
@@ -2395,10 +2564,25 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
     Every entry point (`completion`, `completion_stream`, `chat_completion_turn`,
     `chat_completion_turn_streaming`) matches on the resolved format and calls the appropriate
     request builder. Input/output mapping differs between the two: system messages go into the
-    `input` array as `{role: "system"}` items (rather than the `instructions` field), tool results
-    become `function_call_output` items, and the `input` is an array of typed items rather than a
+    `input` array as `{role: "system"}` items (rather than the `instructions` field), an
+    assistant turn's tool requests become `function_call` items and their answers
+    `function_call_output` items (the answer names its call by `call_id`, so a history
+    rebuilt from messages — no chained `previous_response_id`, e.g. after a model switch
+    or a restored session — has to replay the calls themselves, not only the outputs),
+    and the `input` is an array of typed items rather than a
     flat messages list. Multi-turn chaining uses `previous_response_id` to link turns together,
     while Chat Completions relies on the full message history.
+
+    The streaming terminal events wrap the whole `Response` object under `response`:
+    `response.completed` and `response.incomplete` carry the id/usage there (`sse::response_object`
+    also reads a flattened shape, which some gateways emit), and `response.failed` carries the
+    error object on `response.error`. `incomplete` is a terminal **success**, not a transport
+    failure: `incomplete_details.reason` decides — `content_filter` is the terminal
+    `ContentFiltered` error, while `max_output_tokens` (and any reason this client does not
+    classify) leaves a partial answer reported as a truncated `FinalText`, the same reading chat
+    gives `finish_reason: length`. Reasoning text is streamed as
+    `response.reasoning_summary_text.delta` fragments (the summary is the only reasoning text a
+    Responses model exposes); part boundaries carry no text and are not modelled.
 
     **Programmatic tool calling (Responses API, gpt-5.6+):** When enabled, the Responses
     request body includes a `programmatic_tool_calling` tool with `type: "programmatic_tool_calling"`.
@@ -2454,8 +2638,46 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
     its own wire format. *Whether* to send is derived, never configured: same-model provenance
     (`Turn.reasoning_producer` vs current provider+model, so a mid-session model switch drops every
     old artifact) plus the catalog's `reasoning_passback` policy (`None` / `ToolLoop` / `AllTurns` /
-    `Signature` / `ResponseId`, per-model override else protocol default). Display text stays in
+    `Signature` / `ResponseId`, per-model override else protocol default). `ToolLoop` echoes the
+    tool-involving turns, and on a route whose catalog entry requires the echoed field it echoes
+    every turn instead: DeepSeek asks for all earlier turns' `reasoning_content` once the request
+    carries `tools`, tool-less turns included
+    ([docs](https://api-docs.deepseek.com/guides/thinking_mode)), and GLM treats a missing block as
+    degraded preserved thinking ([docs](https://docs.z.ai/guides/capabilities/thinking-mode)).
+    Display text stays in
     `Turn.assistant_reasoning`; the artifact bytes are never interpreted by the daemon.
+    *Where* the payload lands on the chat wire is the adapter's decision, from two independent
+    catalog facts — the desired field (`ModelEntry::reasoning_echo`, ingested from the snapshot's
+    `interleaved`) and whether that field must be PRESENT on every assistant message even when
+    empty (`ModelEntry::reasoning_echo_required`). A declared field outranks the field the payload
+    was observed under; a scalar
+    `interleaved` name sets both facts, while the structured `reasoning_details` array is a
+    destination only — a details route with nothing to echo omits the key instead of carrying an
+    unverified empty array.
+    The field may be the structured `reasoning_details` array: its artifact payload is JSON
+    (normalized at capture under the reasoning byte budget), replayed verbatim for OpenRouter's
+    `reasoning.*` entries and rebuilt minimally for bare Kimi-shaped ones. The array is the
+    **only** reasoning field such a message carries — no scalar mirror is invented beside it,
+    because no upstream documents a message carrying both. Replay itself is bounded, per request,
+    over the artifacts of the whole history (newest always kept, older ones while the total stays
+    within the budget), and that budget is the *same number* as the per-turn cap: a larger
+    per-turn cap would have no replay path, so the two differ in behaviour (capture drops the one
+    turn's array, replay drops the oldest) rather than in size — which is why they are one
+    constant, `reasoning_details::MAX_REASONING_BYTES`. The Responses adapter's opaque reasoning
+    items ride the same persisted `ReasoningArtifact` and the same compounding replay path, so
+    they are bounded by that one constant too: capture drops an over-budget item array, and a
+    replay skips an artifact that somehow exceeds it. A corrupt persisted payload is likewise a
+    dropped artifact on both adapters, never a failed request — a hard error there would make
+    every later turn of the session unsendable.
+
+    **A reasoning-only turn is output.** The turn result carries the fact that the provider
+    produced reasoning, independent of whether any of it could be displayed or replayed: a
+    response whose only output is a reasoning item (or an entry over the replay cap) becomes a
+    `FinalText` with empty content that still carries the round-trip artifact, never an
+    `EmptyResponse` error that discards a payload the provider billed for. Both wire formats
+    reach that verdict through one shared assembler (`openai::turn::assemble_turn`), fed by
+    adapter-specific parts, so the tool-call / truncated-call / empty-response decision tree
+    exists once rather than once per path.
 
 
 
@@ -2590,7 +2812,7 @@ on the last owner. The kernel-handle rationale is in `choreo-daemon`'s
 | Daemon | Request lifecycle, session CRUD, cancellation, tool calls, model listing | `choreo-daemon/src/tests.rs`, `choreo-daemon/tests/it/session_integration.rs`, `choreo-daemon/tests/it/lifecycle_integration.rs` |
 | MCP (choreo-mcp) | Server spawn / Streamable HTTP connect, tool discovery, echo/error/structured/image calls, both protocol eras (`server/discover` + `Auto` fallback to `initialize`), schema normalization, cancellation (including the fixture asserting the SERVER observed `notifications/cancelled`), progress notifications turned into streamed chunks, the MRTR decline-and-retry loop for `input_required`, resource list/read, the `subscriptions/listen` list-change forwarding (a `modern-list-changed` fixture emits a tools list-changed that must reach the caller's sink, and a server without the capability must NOT have a stream opened), crash/no-init/garbage/oversized scenarios (the oversized case now failing on the client's own 8 MiB frame cap, plus `BoundedLineReader` unit tests); over HTTP: JSON and SSE responses, generated-header validation, `Auto` fallback, a retryable `503` connect, and rejection of the removed HTTP+SSE transport; the dispatcher protocol (including the concurrency cap: `CallGate` unit tests and a deterministic dispatcher test proving an excess call is queued until a slot frees), error mapping, retry/backoff math, and config parsing are unit-tested against a mock engine (no sleeps); the P6 bounds are covered too — the tool-count cap, the schema depth/size bounds (`json_depth`, `normalize_input_schema`/`normalize_output_schema`), the configurable restart cap (`RestartPolicy::new(0)` disables reconnect), the notification rate limiter, and the bounded SSE retry policy each have wait-free unit tests, and a `stubborn` fixture (which ignores stdin EOF) backs both a `choreo-mcp` and a daemon test proving shutdown returns within its bounded wait, while a `slow-list` fixture test proves the wedged-discovery server exits on stdin EOF rather than orphaning its child, and a crate-internal stdio test proves a dropped transport kills its child synchronously with no live runtime; the official client conformance suite runs both protocol eras against the `mcp-conformance-client` harness with a committed expected-failures baseline, and the OAuth half — target-scoped credential keying, connect-time refresh / revocation / scope handling, the `authorizationServer` override at connect, and the issuer fail-closed quarantine — against an in-repo mock authorization server with a temp-file credential backend | `choreo-mcp/tests/it/mcp_integration.rs` (stdio, against the in-tree `tests/fixtures/fixture_server.rs`), `choreo-mcp/tests/it/mcp_http_integration.rs` (a local `TcpListener` HTTP fixture), and `choreo-mcp/tests/it/mcp_oauth.rs` (a local mock authorization server); dispatcher/config/engine/retry/stdio unit tests in `src/`; the conformance harness in `tests/fixtures/conformance_client.rs` via `scripts/mcp-conformance.sh` |
 | MCP (daemon) | McpManager + ToolRegistry integration, dynamic group registration (tool wrappers plus the `resources`-capability catalogue tools), tool execution, progress streaming through the wrapper, image attachment via the sink, the `subscriptions/listen` → shared-channel forwarding and the `register_all` / `refresh_server` + `register_cached` catalogue re-registration (the latter pinned by `mcp_list_change_only_relists_the_changed_server`, which proves the unchanged server is not re-listed), the list-change handler's atomic registry swap (unit-tested with no servers), `McpManager::status` for the `/mcp` surface and `session_inspect`, `McpManager::reload` (an empty reload and a malformed-config hard failure, unit-tested) and the `/mcp reload` connection handler (success summary + refreshed list, and the config error reply), and `mcp.json` parsing (transport inference, `${VAR}` expansion, `cwd`/`~` expansion, `disabledTools`, `maxRestarts`, `shared`, and the two-tier daemon/project load with the trust-gated project expansion, plus a fuzz-style malformed-input corpus), the project-root walk, the trust store (exact-canonical matching, no ancestor inheritance, fail-closed on garbage), same-root re-resolve reuse (connection count) and the reload/reconnect/trust-reload reconciliation paths (a changed `shared = false` slot is dropped, a per-session slot reconnects, a server FLIPPED from `shared = true` to `false` drops its stale daemon shared slot, an UNTRUSTED project does not suppress a daemon per-session server, a failed project connect does not shadow the daemon group, and an unchanged trust set is a no-op), and MCP OAuth at the daemon tier — the project-root trust gate on a server's `oauth` block, that untrusting a project never deletes a stored credential row, and the interactive sign-in (RFC 9728/8414 discovery, dynamic client registration, PKCE, and the confidential-client `client_secret_basic`/`client_secret_post` selection) against a mock authorization server | `choreo-daemon/tests/it/mcp_integration.rs`; `choreo-daemon/tests/it/mcp_project_trust.rs`; `choreo-daemon/tests/it/mcp_oauth.rs`; the registry-swap unit test in `src/daemon/tests.rs`; config unit tests in `src/mcp/config.rs`, `src/mcp/trust.rs`, `src/mcp/mod.rs` |
-| Providers (`choreo-ai-protocols`) | SSE parsing, HTTP request construction, chat completions + responses serialization, content-block deserialisation, config overrides, catalog lookups | `choreo-ai-protocols/src/openai/tests.rs`, `choreo-ai-protocols/src/openai/chat_completions.rs`, `choreo-ai-protocols/src/openai/config.rs`, `choreo-ai-protocols/src/anthropic/tests.rs`, `choreo-ai-protocols/src/google/tests.rs`, `choreo-ai-protocols/src/catalog/mod.rs` |
+| Providers (`choreo-ai-protocols`) | SSE parsing, HTTP request construction, chat completions + responses serialization, content-block deserialisation, config overrides, catalog lookups, the one-shot completion paths' terminal-stop classification | `choreo-ai-protocols/src/openai/tests.rs`, `choreo-ai-protocols/src/openai/chat_completions.rs`, `choreo-ai-protocols/src/openai/config.rs`, `choreo-ai-protocols/src/anthropic/tests.rs`, `choreo-ai-protocols/src/google/tests.rs`, `choreo-ai-protocols/src/catalog/mod.rs`, `choreo-ai-protocols/tests/it/simple_completion.rs` |
 | choreo-tui | SVG rasterization, Unicode width, app state | `choreo-tui/src/app_tests.rs`, `choreo-tui/src/lib_tests.rs` |
 | choreo-gui | App state, render helpers | `choreo-gui/src/app_tests.rs` |
 | Transport (`choreo-transport`) | Noise data plane — typed message round trips, single-fragment boundary + multi-fragment reassembly, oversized/tampered length-prefix rejection, malformed-handshake rejection, tampered-ciphertext rejection, silent-peer + dribbling-peer handshake timeout | `choreo-transport/tests/it/noise_integration.rs`, `choreo-transport/src/noise.rs`, `choreo-transport/src/handshake.rs` |

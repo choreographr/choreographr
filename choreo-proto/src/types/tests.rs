@@ -733,6 +733,14 @@ fn approx_wire_size_never_underestimates_encoded_payload() {
             DaemonMessageType::Models {
                 models: vec!["gpt-4".into(), "gpt-4o".into(), "gpt-5.6".into()],
                 selected_model: Some("gpt-5.6".into()),
+                provisional: false,
+            },
+        ),
+        (
+            "ModelsUpdated",
+            DaemonMessageType::ModelsUpdated {
+                account: "default".into(),
+                models: vec!["gpt-4".into(), "gpt-4o".into(), "gpt-5.6".into()],
             },
         ),
         (
@@ -1106,6 +1114,27 @@ fn approx_wire_size_never_underestimates_encoded_payload() {
         ),
         ("ShuttingDown", DaemonMessageType::ShuttingDown),
         ("Evicted", DaemonMessageType::Evicted),
+        ("Bound", DaemonMessageType::Bound),
+        (
+            "KeystoreUnbound",
+            DaemonMessageType::KeystoreUnbound {
+                error: "keystore has no binding yet".into(),
+            },
+        ),
+        (
+            "AclAddResult",
+            DaemonMessageType::AclAddResult {
+                ok: false,
+                message: "rejected unauthorized transport".into(),
+            },
+        ),
+        ("AclUpdated", DaemonMessageType::AclUpdated { clients: 12 }),
+        (
+            "OAuthReloginRequired",
+            DaemonMessageType::OAuthReloginRequired {
+                account: "default".into(),
+            },
+        ),
     ];
 
     let mut checked = 0usize;
@@ -1326,4 +1355,25 @@ fn mcp_summary_renders_the_auth_label() {
         "docs [http → https://example.com/mcp] connected: unknown ?, 3 tool(s)"
     );
     assert_eq!(McpAuthState::NotLoggedIn.label(), "not signed in");
+}
+
+#[test]
+fn every_chat_reasoning_field_has_one_wire_name_in_the_shared_list() {
+    // The wire name is the single mapping the catalog parser, the chat
+    // lowering, and diagnostics all read, so the list a diagnostic scans and
+    // the variants that exist must agree exactly — a new variant that forgets
+    // the list (or a renamed key) fails here rather than at a provider.
+    assert_eq!(
+        ChatReasoningField::ALL.map(ChatReasoningField::wire_name),
+        CHAT_REASONING_WIRE_KEYS,
+        "CHAT_REASONING_WIRE_KEYS must mirror ChatReasoningField::ALL"
+    );
+    for field in ChatReasoningField::ALL {
+        assert_eq!(
+            ChatReasoningField::from_wire_name(field.wire_name()),
+            Some(field),
+            "a wire name must round-trip back to its field"
+        );
+    }
+    assert_eq!(ChatReasoningField::from_wire_name("vendor_reasoning"), None);
 }

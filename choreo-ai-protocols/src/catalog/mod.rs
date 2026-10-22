@@ -25,366 +25,41 @@
 //! The per-model fact **lookups** ([`lookup_context_window`],
 //! [`lookup_max_output_tokens`], [`model_request_format`], …) live in the
 //! sibling `lookup` module and are re-exported here so the public surface of
-//! the crate is unchanged.
+//! the crate is unchanged; the entry types those lookups read live in `entry`,
+//! and the OAuth login descriptors assembled from an entry's profile live in
+//! `oauth`.
 
-use std::fmt;
-use std::sync::{Arc, LazyLock};
-use tracing::debug;
-
-use arc_swap::ArcSwap;
-use serde::{Deserialize, Serialize};
-
-use crate::retry::RequestCompression;
-use crate::shared::MaxTokensField;
-
+mod entry;
 mod loader;
 mod lookup;
 mod modelsdev;
+mod oauth;
 mod overlay;
 mod persist;
 pub mod refresh;
 
+pub use entry::{
+    AuthKind, GrantEncoding, ModelCost, ModelEntry, OAuthProfile, PromptCacheTtl, ProviderEntry,
+    ProviderProtocol, ReasoningPassback,
+};
 pub use loader::{bundled_overlay_src, load_bundled_base};
 pub use lookup::{
-    image_edit_models_for_provider, image_models_for_provider, lookup_context_window,
-    lookup_max_output_tokens, model_cost, model_reasoning_capability, model_reasoning_passback,
-    model_request_format, model_supports_image_output, model_supports_temperature,
-    model_supports_vision, prompt_cache_ttl, requires_reasoning_content,
+    ChatReasoningEcho, chat_reasoning_echo, image_edit_models_for_provider,
+    image_models_for_provider, lookup_context_window, lookup_max_output_tokens, model_cost,
+    model_reasoning_capability, model_reasoning_passback, model_request_format,
+    model_supports_image_output, model_supports_temperature, model_supports_vision,
+    prompt_cache_ttl,
 };
 pub use modelsdev::normalize_modelsdev;
+pub use oauth::oauth_provider_descriptors;
 pub use overlay::merge_overlay;
 pub use persist::write_file_atomic;
 pub use refresh::{RefreshError, RefreshOutcome, fetch_modelsdev};
 
-/// How reasoning is replayed back to the provider on subsequent turns.
-/// The "unset" meaning lives in the outer `Option` on [`ModelEntry`]
-/// (`None` → derive from protocol); `None` *here* is an explicit
-/// "never replay" override. [`model_reasoning_passback`] resolves the
-/// effective format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReasoningPassback {
-    /// Never send reasoning back (display-only providers / fields).
-    None,
-    /// Echo reasoning on assistant messages that had tool calls
-    /// (DeepSeek/Kimi chat, and the minimum for Anthropic tool loops).
-    ToolLoop,
-    /// Echo reasoning across all turns of the session (Anthropic keep-all,
-    /// GPT-5.6 `all_turns`).
-    AllTurns,
-    /// Send back encrypted thought signatures (Gemini).
-    Signature,
-    /// Chain via `previous_response_id` / opaque reasoning items
-    /// (OpenAI/xAI Responses).
-    ResponseId,
-}
+use std::sync::{Arc, LazyLock};
+use tracing::debug;
 
-/// Per-model token prices as recorded by models.dev, in **USD per million
-/// tokens** ($/M).
-///
-/// `input`/`output` are always present whenever the snapshot records a cost
-/// object; `cache_read`/`cache_write` are frequently absent (many
-/// OpenAI-compatible models record only `input`/`output`/`cache_read`), so
-/// they are optional. Consumed by the cache-warming cost gate — currently
-/// **recorded but unwired**: no production caller reads it yet, alongside
-/// `model_supports_temperature`.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct ModelCost {
-    /// Prompt (input) price, USD per million tokens.
-    pub input: f64,
-    /// Completion (output) price, USD per million tokens.
-    pub output: f64,
-    /// Cache-read (cached prompt) price, USD per million tokens, when the
-    /// snapshot records one.
-    #[serde(default)]
-    pub cache_read: Option<f64>,
-    /// Cache-write price, USD per million tokens, when the snapshot records
-    /// one.
-    #[serde(default)]
-    pub cache_write: Option<f64>,
-}
-
-/// Prompt-cache TTL policy for a provider or model: the lifetimes, in seconds,
-/// of the ephemeral prompt-cache tiers a provider exposes.
-///
-/// `short_secs` is the default ephemeral tier (~5 minutes at Anthropic);
-/// `long_secs` is the extended tier (~1 hour). Both are optional so a provider
-/// or model can declare only the tiers it actually supports. This is **overlay
-/// policy** — models.dev carries no TTL fact — and the per-model value,
-/// when present, overrides the provider default (see [`prompt_cache_ttl`]).
-/// Consumed by cache-warming TTL scheduling — currently **recorded but
-/// unwired** (no production caller yet).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PromptCacheTtl {
-    /// Short (default) ephemeral tier lifetime, in seconds.
-    #[serde(default)]
-    pub short_secs: Option<u32>,
-    /// Long (extended) ephemeral tier lifetime, in seconds.
-    #[serde(default)]
-    pub long_secs: Option<u32>,
-}
-
-/// Per-model metadata in the provider catalog.
-/// A single source of truth for context window, reasoning support,
-/// explicit effort levels, and reasoning round-trip format.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelEntry {
-    /// Model id (exact wire name).
-    pub model: String,
-    /// Context window in tokens; `0` means unknown.
-    pub context_window: u32,
-    /// Whether this model supports reasoning/thinking at all.
-    /// Applicable across all protocols — `OpenAi`, `AnthropicMessages`,
-    /// and `GoogleGenerativeAi` all use this flag to enable/disable
-    /// their respective reasoning features per model.
-    /// When `false`, the model entry's `openai_reasoning_levels`
-    /// (if any) is ignored and the model is treated as non-reasoning.
-    pub reasoning_supported: bool,
-    /// Explicit reasoning effort level slugs for this model.
-    /// Only meaningful when `reasoning_supported` is true AND the
-    /// provider protocol is `OpenAi` (enforced by
-    /// `model_reasoning_capability()`). Non-OpenAi protocols always
-    /// use their own default levels — see `protocol_default_levels()`.
-    pub openai_reasoning_levels: Vec<String>,
-    /// Whether this model uses `OpenAI`'s Responses API vs Chat Completions.
-    /// Only relevant for `OpenAi` protocol providers.
-    pub openai_responses: bool,
-    /// How reasoning is replayed back to the provider on subsequent turns.
-    /// `None` means "no override — `model_reasoning_passback` derives the
-    /// format from the provider protocol" (Responses → `ResponseId`,
-    /// chat completions → `ToolLoop`, Anthropic → `AllTurns`, Google →
-    /// `Signature`); `Some(...)` is an explicit per-model override,
-    /// including `Some(ReasoningPassback::None)` for "never replay this
-    /// model's reasoning".
-    pub reasoning_passback: Option<ReasoningPassback>,
-    /// Whether this model requires `reasoning_content` to be *present* on
-    /// every assistant message sent back (e.g. DeepSeek/GLM 5.x chat: the
-    /// upstream rejects a history whose assistant tool-call message omits
-    /// `reasoning_content`, even when the model produced no reasoning on
-    /// that call). Ingested from the models.dev snapshot as a FACT — the
-    /// model's `interleaved` value names `"reasoning_content"` as the echo
-    /// field — and overridable per-model by the overlay
-    /// (`reasoning_content_required = true|false`). `None` means "no explicit
-    /// fact" and resolves to `false` in [`requires_reasoning_content`] —
-    /// there is NO name-based fallback anymore; a model not covered by the
-    /// snapshot needs an explicit overlay flag.
-    #[serde(default)]
-    pub reasoning_content_required: Option<bool>,
-    /// Maximum output tokens the model can produce (`0` = unknown), ingested
-    /// from the snapshot's `limit.output` and resolvable via
-    /// [`lookup_max_output_tokens`] (which maps 0 back to `None`).
-    #[serde(default)]
-    pub max_output_tokens: u32,
-    /// Whether the model accepts the `temperature` request parameter,
-    /// ingested from the snapshot's `temperature` flag (absent → `true`,
-    /// the permissive wire default). Resolvable via
-    /// [`model_supports_temperature`]. Currently **recorded but unwired**:
-    /// no request builder sends a `temperature` parameter today, so the
-    /// resolver has no production caller — the fact is kept so the gate
-    /// exists the moment temperature sending is added.
-    #[serde(default = "default_true")]
-    pub supports_temperature: bool,
-    /// Whether the snapshot marks the model deprecated (`status ==
-    /// "deprecated"`). Purely informational today; surfaced so UIs and
-    /// diagnostics can flag stale model picks without a second lookup.
-    #[serde(default)]
-    pub deprecated: bool,
-    /// Whether the model accepts image input (vision). Derived from the
-    /// models.dev `modalities.input` array (`"image"` present) at ingestion;
-    /// the overlay can override it where the snapshot is wrong or a model is
-    /// not covered. `false` = text-only — images must be gated out of the
-    /// request and replaced with a text placeholder (see the vision gate).
-    /// `false` is the safe default for unknown models.
-    #[serde(default)]
-    pub supports_vision: bool,
-    /// Whether the model can *produce* images (image output). Derived from
-    /// the models.dev `modalities.output` array (`"image"` present) at
-    /// ingestion; the overlay can override it the same way vision can.
-    /// `false` is the safe default for unknown models (text generation only).
-    #[serde(default)]
-    pub supports_image_output: bool,
-    /// Whether the model can *edit* an input image (image-to-image). This is
-    /// **overlay-only** policy: models.dev carries no "edit" modality, so the
-    /// flag is never ingested from the snapshot and there is NO name/prefix
-    /// heuristic — a model is edit-capable exactly when the bundled (or a
-    /// user) overlay sets `supports_image_edit = true`. `false` is the safe
-    /// default, so an un-pinned model is never offered to `edit_image` and the
-    /// tool fails closed rather than guessing.
-    #[serde(default)]
-    pub supports_image_edit: bool,
-    /// Token prices (USD per million tokens) from the snapshot's `cost` object,
-    /// or `None` when the model records no cost. Consumed by the cache-warming
-    /// cost gate — currently recorded but unwired.
-    #[serde(default)]
-    pub cost: Option<ModelCost>,
-    /// Per-model prompt-cache TTL override (overlay policy). `None` means "no
-    /// override — fall through to the provider default" in [`prompt_cache_ttl`].
-    #[serde(default)]
-    pub prompt_cache: Option<PromptCacheTtl>,
-}
-
-// Manual `impl` rather than `#[derive(Default)]` + `#[default]` because
-// `supports_temperature` must default to `true` (the permissive wire default
-// shared with its `#[serde(default = "default_true")]`); derive can only
-// express `false` for a `bool`. Every other field's natural zero-value default
-// already matches its serde behavior (`0` for unknown windows/tokens, `None`
-// for unset options), so this keeps the serde attributes untouched and the
-// wire format byte-identical while letting tests say `..Default::default()`.
-impl Default for ModelEntry {
-    fn default() -> Self {
-        Self {
-            model: String::new(),
-            context_window: 0,
-            reasoning_supported: false,
-            openai_reasoning_levels: Vec::new(),
-            openai_responses: false,
-            reasoning_passback: None,
-            reasoning_content_required: None,
-            max_output_tokens: 0,
-            supports_temperature: true,
-            deprecated: false,
-            supports_vision: false,
-            supports_image_output: false,
-            supports_image_edit: false,
-            cost: None,
-            prompt_cache: None,
-        }
-    }
-}
-
-/// Protocol variant — selects wire format and carries protocol-specific fields.
-///
-/// The serde representation is the default externally-tagged enum encoding
-/// (e.g. `{"OpenAi": {"max_tokens_field": "max_completion_tokens"}}`); it only
-/// needs to round-trip for the embedded-artifact pipeline, so the simplest
-/// correct repr is used.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum ProviderProtocol {
-    /// OpenAI-compatible: Chat Completions or Responses, with the field that
-    /// carries the output-token limit.
-    OpenAi {
-        /// The JSON field carrying the output-token limit.
-        max_tokens_field: MaxTokensField,
-    },
-    /// Anthropic Messages API.
-    AnthropicMessages,
-    /// Google Gemini `generateContent` API.
-    GoogleGenerativeAi,
-}
-
-/// Per-endpoint OAuth grant encoding: how the authorization server expects a
-/// token-request body to be serialized. The code exchange and the refresh can
-/// differ (e.g. the `ChatGPT`/Codex backend accepts a form-encoded code
-/// exchange but a JSON refresh), so a profile carries one per endpoint.
-///
-/// The type is defined once in `choreo-shared` (and re-exported by
-/// `choreo-proto` for the wire descriptor and persisted inside an OAuth
-/// credential), aliased here so the catalog data names the same type rather
-/// than a one-for-one copy.
-pub use choreo_shared::OAuthGrantEncoding as GrantEncoding;
-
-/// The OAuth profile for a provider: the authorization-server parameters the
-/// daemon and the login library need to run a sign-in and to refresh a grant.
-///
-/// This is **overlay-only policy** — models.dev carries no OAuth facts — and it
-/// is parsed all-or-nothing: a profile missing a required field is warned and
-/// skipped rather than half applied.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OAuthProfile {
-    /// Authorization-server issuer (e.g. `https://auth.openai.com`).
-    pub issuer: String,
-    /// Path of the authorization endpoint, relative to `issuer`.
-    pub authorize_path: String,
-    /// Path of the token endpoint, relative to `issuer`.
-    pub token_path: String,
-    /// Scopes requested at login.
-    pub scopes: Vec<String>,
-    /// Loopback redirect ports to try, in order (the first free one wins).
-    pub redirect_ports: Vec<u16>,
-    /// Grant encoding for the authorization-code exchange.
-    pub code_exchange_encoding: GrantEncoding,
-    /// Grant encoding for the refresh exchange.
-    pub refresh_encoding: GrantEncoding,
-    /// Whether the provider offers a device-code (headless) flow.
-    pub device_code: bool,
-    /// Path of the RFC 8628 device-authorization endpoint (the `usercode`
-    /// request), relative to `issuer`. Required only when `device_code` is
-    /// true.
-    #[serde(default)]
-    pub device_authorization_path: Option<String>,
-    /// Path of the device-code token-poll endpoint, relative to `issuer`.
-    /// Required only when `device_code` is true.
-    #[serde(default)]
-    pub device_token_path: Option<String>,
-    /// A PUBLIC client id only (PKCE). Never a secret; a confidential client
-    /// reads its secret from config/env at login.
-    pub client_id: Option<String>,
-}
-
-/// How a provider authenticates a request, derived from its catalog entry.
-///
-/// There is deliberately no separate `auth` attribute on the entry: an
-/// [`OAuthProfile`] means OAuth and its absence means API key, so the overlay
-/// `oauth` block is the single policy source while models.dev remains the fact
-/// source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthKind {
-    /// API-key authentication (the default).
-    ApiKey,
-    /// OAuth, when the entry carries an [`OAuthProfile`].
-    OAuth,
-}
-
-/// A provider and its curated model list, loaded from `<slug>.toml`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderEntry {
-    /// Catalog slug (the key callers look up by).
-    pub slug: String,
-    /// Human-readable provider name for display.
-    pub display_name: String,
-    /// Wire protocol this provider speaks.
-    pub protocol: ProviderProtocol,
-    /// API base URL (empty for models.dev-only providers with no endpoint).
-    pub base_url: String,
-    /// Model id selected when the account names none.
-    pub default_model: String,
-    /// The provider's curated model list.
-    pub models: Vec<ModelEntry>,
-    /// Provider-level prompt-cache TTL default (overlay policy). `None` means
-    /// the provider declares no TTL; a per-model override on a [`ModelEntry`]
-    /// still takes precedence when present (see [`prompt_cache_ttl`]).
-    #[serde(default)]
-    pub prompt_cache: Option<PromptCacheTtl>,
-    /// Whether this provider's endpoint accepts a compressed request body, and
-    /// with which coding (`gzip` or `zstd`) — overlay policy; models.dev carries
-    /// no such fact. Defaults to [`RequestCompression::Identity`], so a provider
-    /// the overlay does not pin is sent an uncompressed body — the safe default,
-    /// since the server must decompress. A provider that rejects a compressed
-    /// body with HTTP 415 is downgraded to identity for the process (see the
-    /// retry layer); this field is the static per-provider policy that seeds that
-    /// decision.
-    #[serde(default)]
-    pub request_compression: RequestCompression,
-    /// The provider's OAuth profile, when it can be signed into with OAuth.
-    /// Overlay-only policy (models.dev carries no OAuth facts); its presence is
-    /// what makes [`ProviderEntry::auth_kind`] report [`AuthKind::OAuth`].
-    #[serde(default)]
-    pub oauth: Option<OAuthProfile>,
-}
-
-impl ProviderEntry {
-    /// The provider's auth kind, derived from whether it carries an OAuth
-    /// profile.
-    #[must_use]
-    pub fn auth_kind(&self) -> AuthKind {
-        if self.oauth.is_some() {
-            AuthKind::OAuth
-        } else {
-            AuthKind::ApiKey
-        }
-    }
-}
+use arc_swap::ArcSwap;
 
 /// Process-wide catalog of all known providers, backed by an [`ArcSwap`] so a
 /// runtime refresh can atomically swap it while readers stay lock-free.
@@ -393,8 +68,8 @@ impl ProviderEntry {
 /// parse, so the `ArcSwap` itself is lazily initialized behind a [`LazyLock`]:
 /// the first access parses the bundled data once, and every later access goes
 /// straight to the `ArcSwap` (an atomic load, then lock-free reads / atomic
-/// `store` on swap). This preserves the old lazy-init behavior exactly while
-/// making the catalog runtime-swappable.
+/// `store` on swap). The lazy init keeps the first-access parse out of static
+/// initialization while making the catalog runtime-swappable.
 pub static PROVIDER_CATALOG: LazyLock<ArcSwap<Vec<ProviderEntry>>> =
     LazyLock::new(|| ArcSwap::from_pointee(loader::load_catalog()));
 
@@ -416,23 +91,6 @@ pub fn replace_catalog(entries: Vec<ProviderEntry>) {
 /// without holding an `ArcSwap` guard open.
 pub fn catalog_snapshot() -> Arc<Vec<ProviderEntry>> {
     PROVIDER_CATALOG.load_full()
-}
-
-impl fmt::Display for ProviderProtocol {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ProviderProtocol::OpenAi { .. } => write!(f, "Protocol: OpenAI"),
-            ProviderProtocol::AnthropicMessages => write!(f, "Protocol: Anthropic Messages"),
-            ProviderProtocol::GoogleGenerativeAi => write!(f, "Protocol: Google Generative AI"),
-        }
-    }
-}
-
-/// serde default helper: `bool` fields that mean "true when absent"
-/// (`supports_temperature`) cannot use plain `#[serde(default)]`, which
-/// would default to `false` and flip the permissive wire default.
-fn default_true() -> bool {
-    true
 }
 
 /// Look up a provider entry by slug. Returns `None` if not found.
@@ -479,96 +137,13 @@ pub fn all_display_names() -> Vec<String> {
 ///
 /// Returns `None` when the model id is not known to any provider; the caller
 /// should treat that as "provider unresolvable" rather than guessing a slug
-/// that would feed a wrong `model_reasoning_passback` / `requires_reasoning_content`.
+/// that would feed a wrong `model_reasoning_passback` / `chat_reasoning_echo`.
 pub fn provider_slug_for_model(model: &str) -> Option<String> {
     let catalog = PROVIDER_CATALOG.load();
     catalog
         .iter()
         .find(|e| e.models.iter().any(|m| m.model == model))
         .map(|e| e.slug.clone())
-}
-
-/// Assemble the OAuth login descriptors for every provider that carries an
-/// OAuth profile, applying the compiled client-identity policy.
-///
-/// This is the daemon's single source for the `ListOAuthProviders` reply: it
-/// pairs each catalog [`OAuthProfile`] with the compiled client-identity
-/// policy, so a frontend learns the issuer, scopes, redirect ports, encodings,
-/// and client-identity posture from one place instead of embedding a copy. A
-/// provider whose posture is `Borrowed` yields no `client_id` unless the
-/// per-install opt-in is enabled.
-#[must_use]
-pub fn oauth_provider_descriptors() -> Vec<choreo_proto::OAuthProviderDescriptor> {
-    let borrowed_enabled = crate::identity::borrowed_ids_enabled();
-    catalog_snapshot()
-        .iter()
-        .filter_map(|entry| assemble_oauth_descriptor(entry, borrowed_enabled))
-        .collect()
-}
-
-/// Assemble one provider's OAuth descriptor, or `None` when the provider has
-/// no [`OAuthProfile`].
-///
-/// Split from [`oauth_provider_descriptors`] so the assembly — including the
-/// borrowed-id withholding — is unit-testable without reading process-global
-/// state: the opt-in flag is passed in, and the identity policy is resolved
-/// per entry.
-#[must_use]
-fn assemble_oauth_descriptor(
-    entry: &ProviderEntry,
-    borrowed_enabled: bool,
-) -> Option<choreo_proto::OAuthProviderDescriptor> {
-    let profile = entry.oauth.as_ref()?;
-    let policy = crate::identity::oauth_client_identity(&entry.slug);
-    // A provider with an OAuth profile but no explicit policy entry registers
-    // its own client: the profile's public id is authoritative.
-    let posture = policy
-        .as_ref()
-        .map_or(crate::identity::ClientIdentity::Registered, |p| p.posture);
-    let client_id = match posture {
-        crate::identity::ClientIdentity::Registered => profile.client_id.clone(),
-        // A borrowed id is the vendor's, not ours, so it is released only when
-        // the per-install opt-in is on; otherwise the client is told nothing
-        // and must obtain its own (dynamic registration) or fall back.
-        crate::identity::ClientIdentity::Borrowed => {
-            if borrowed_enabled {
-                policy
-                    .as_ref()
-                    .and_then(|p| p.borrowed_client_id.clone())
-                    .or_else(|| profile.client_id.clone())
-            } else {
-                None
-            }
-        }
-        // A delegate flow does not run in-process, so it carries no client id.
-        crate::identity::ClientIdentity::Delegate => None,
-    };
-    Some(choreo_proto::OAuthProviderDescriptor {
-        provider: entry.slug.clone(),
-        issuer: profile.issuer.clone(),
-        authorize_path: profile.authorize_path.clone(),
-        token_path: profile.token_path.clone(),
-        client_id,
-        scopes: profile.scopes.clone(),
-        redirect_ports: profile.redirect_ports.clone(),
-        code_exchange_encoding: profile.code_exchange_encoding,
-        refresh_encoding: profile.refresh_encoding,
-        client_identity: client_identity(posture),
-        device_code: profile.device_code,
-        device_authorization_path: profile.device_authorization_path.clone(),
-        device_token_path: profile.device_token_path.clone(),
-    })
-}
-
-/// Map the compiled client-identity policy to its wire twin, one-for-one.
-fn client_identity(posture: crate::identity::ClientIdentity) -> choreo_proto::OAuthClientIdentity {
-    match posture {
-        crate::identity::ClientIdentity::Registered => {
-            choreo_proto::OAuthClientIdentity::Registered
-        }
-        crate::identity::ClientIdentity::Borrowed => choreo_proto::OAuthClientIdentity::Borrowed,
-        crate::identity::ClientIdentity::Delegate => choreo_proto::OAuthClientIdentity::Delegate,
-    }
 }
 
 #[cfg(test)]
@@ -579,9 +154,9 @@ fn client_identity(posture: crate::identity::ClientIdentity) -> choreo_proto::OA
 // `replace_catalog`/`loader`) and are shared via `pub(crate)`.
 pub(crate) mod test_util {
     use super::ProviderEntry;
-    use super::RequestCompression;
     use super::loader;
     use super::replace_catalog;
+    use crate::retry::RequestCompression;
     use crate::shared::MaxTokensField;
 
     /// Restores the bundled catalog when dropped, so a failing swap test can
@@ -942,85 +517,6 @@ mod tests {
         assert_eq!(cost.cache_write, None);
     }
 
-    /// A provider entry carrying an OAuth profile, for the assembly tests.
-    fn entry_with_oauth(slug: &str, client_id: Option<&str>) -> ProviderEntry {
-        let mut entry = test_util::tiny_catalog().remove(0);
-        entry.slug = slug.into();
-        entry.oauth = Some(OAuthProfile {
-            issuer: "https://auth.example".into(),
-            authorize_path: "/authorize".into(),
-            token_path: "/token".into(),
-            scopes: vec!["openid".into(), "offline_access".into()],
-            redirect_ports: vec![1455, 1457],
-            code_exchange_encoding: GrantEncoding::Form,
-            refresh_encoding: GrantEncoding::Json,
-            device_code: true,
-            device_authorization_path: Some("/deviceauth/usercode".into()),
-            device_token_path: Some("/deviceauth/token".into()),
-            client_id: client_id.map(str::to_string),
-        });
-        entry
-    }
-
-    #[test]
-    fn descriptor_absent_without_an_oauth_profile() {
-        let entry = test_util::tiny_catalog().remove(0);
-        assert!(entry.oauth.is_none());
-        assert!(assemble_oauth_descriptor(&entry, false).is_none());
-    }
-
-    #[test]
-    fn registered_posture_releases_the_profile_client_id() {
-        // `openai` is a Registered policy entry; the profile's public id is
-        // authoritative and released regardless of the opt-in.
-        let entry = entry_with_oauth("openai", Some("dynamic_agent_client"));
-        let descriptor = assemble_oauth_descriptor(&entry, false).expect("descriptor");
-        assert_eq!(descriptor.provider, "openai");
-        assert_eq!(
-            descriptor.client_id.as_deref(),
-            Some("dynamic_agent_client")
-        );
-        assert_eq!(
-            descriptor.client_identity,
-            choreo_proto::OAuthClientIdentity::Registered
-        );
-        assert_eq!(descriptor.redirect_ports, vec![1455, 1457]);
-        assert!(descriptor.device_code);
-    }
-
-    #[test]
-    fn borrowed_posture_withholds_the_client_id_when_opted_out() {
-        // `chatgpt` borrows the vendor CLI's public id; with the opt-in off the
-        // daemon must release no client id at all.
-        let entry = entry_with_oauth("chatgpt", None);
-        let withheld = assemble_oauth_descriptor(&entry, false).expect("descriptor");
-        assert_eq!(
-            withheld.client_identity,
-            choreo_proto::OAuthClientIdentity::Borrowed
-        );
-        assert!(withheld.client_id.is_none(), "borrowed id must be withheld");
-
-        let released = assemble_oauth_descriptor(&entry, true).expect("descriptor");
-        assert_eq!(
-            released.client_id.as_deref(),
-            Some("app_EMoamEEZ73f0CkXaXp7hrann"),
-            "opt-in releases the borrowed vendor id"
-        );
-    }
-
-    #[test]
-    fn unknown_slug_defaults_to_registered() {
-        // A provider with an OAuth profile but no policy entry registers its
-        // own client, so the profile id flows through unchanged.
-        let entry = entry_with_oauth("acme", Some("acme-public-client"));
-        let descriptor = assemble_oauth_descriptor(&entry, false).expect("descriptor");
-        assert_eq!(
-            descriptor.client_identity,
-            choreo_proto::OAuthClientIdentity::Registered
-        );
-        assert_eq!(descriptor.client_id.as_deref(), Some("acme-public-client"));
-    }
-
     #[test]
     fn chatgpt_overlay_entry_is_the_oauth_provider() {
         // The bundled overlay's `chatgpt` entry is the first real OAuth
@@ -1067,44 +563,6 @@ mod tests {
         assert!(
             !entry.models.is_empty(),
             "chatgpt's curated model list is its only model source"
-        );
-    }
-
-    #[test]
-    fn chatgpt_descriptor_withholds_the_borrowed_id_by_default() {
-        // `ListOAuthProviders` assembles the chatgpt descriptor from the
-        // overlay profile paired with the compiled `Borrowed` identity: the
-        // vendor client id is released only under the per-install opt-in.
-        let entry = lookup_provider("chatgpt").expect("chatgpt");
-        let withheld = assemble_oauth_descriptor(&entry, false).expect("descriptor");
-        assert_eq!(withheld.provider, "chatgpt");
-        assert_eq!(
-            withheld.client_identity,
-            choreo_proto::OAuthClientIdentity::Borrowed
-        );
-        assert!(withheld.client_id.is_none(), "borrowed id must be withheld");
-        assert!(withheld.device_code);
-        assert_eq!(withheld.redirect_ports, vec![1455, 1457]);
-
-        let released = assemble_oauth_descriptor(&entry, true).expect("descriptor");
-        assert_eq!(
-            released.client_id.as_deref(),
-            Some("app_EMoamEEZ73f0CkXaXp7hrann"),
-            "the opt-in releases the borrowed vendor id"
-        );
-    }
-
-    #[test]
-    fn oauth_provider_descriptors_include_chatgpt() {
-        // The daemon's single `ListOAuthProviders` source must serve the
-        // chatgpt descriptor end-to-end. The client_id is not asserted here:
-        // it depends on the process-wide opt-in flag, which per-environment
-        // may be set — the withholding is pinned by the explicit-parameter
-        // test above.
-        let descriptors = oauth_provider_descriptors();
-        assert!(
-            descriptors.iter().any(|d| d.provider == "chatgpt"),
-            "ListOAuthProviders must serve the chatgpt descriptor"
         );
     }
 }
