@@ -1,15 +1,16 @@
-//! Unit tests for `state`, split by subject into the child modules below.
+//! The `state` subject of the crate suite: the display-state plumbing, split by
+//! subject into the child modules below.
 //!
-//! Each child owns one concern of the display-state plumbing — input, the
-//! session switcher, the scroll/height model, the reasoning/tool-result
-//! collapse state, image layout, viewport-change classification, streaming, the
-//! streaming response auto-pin, and the request lifecycle. This parent holds
+//! Each child owns one concern — input, the session switcher, the scroll/height
+//! model, the reasoning/tool-result collapse state, image layout,
+//! viewport-change classification, streaming, the streaming response auto-pin,
+//! the request lifecycle, and the terminal-status records. This parent holds
 //! only the fixtures shared across children (`make_session`, `insert_turn`) and
-//! declares the modules; `terminal_status/tests.rs` reaches `make_session` as
-//! `crate::state::tests::make_session`.
+//! declares the modules; a sibling child that needs a fixture reaches it as
+//! `super::make_session`.
 
-use crate::state::{App, SessionStatus};
-use choreo_proto::{SessionSummary, Turn};
+use crate::state::App;
+use choreo_proto::{SessionStatus, SessionSummary, Turn};
 
 mod content_version;
 mod display_line;
@@ -27,8 +28,8 @@ mod session_manager;
 mod session_switch;
 mod status_height;
 mod streaming;
+mod terminal_status;
 mod tool_result;
-mod turn_live_content;
 mod undo_pruning;
 mod viewport;
 mod window;

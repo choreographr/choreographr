@@ -98,6 +98,3 @@ impl App {
             .and_then(|s| s.title.as_deref())
     }
 }
-
-#[cfg(test)]
-mod tests;
