@@ -49,6 +49,18 @@ There is **no hand-maintained `CHANGELOG.md`** — the release notes are generat
 - **Types that appear on the release page:** `feat` → **Added**, `fix` → **Fixed**, `perf`/`refactor` → **Changed**, plus two deliberate non-standard types that map 1:1 to their Keep a Changelog headings because they cannot be inferred: **`remove`** → Removed and **`security`** → Security. Housekeeping types — `chore` (except `chore(deps)`, which stays under Changed), `docs`, `ci`, `test`, `style`, `build` — are omitted from the notes. The mapping lives in `cliff.toml`; keep this list and that file in sync.
 - **Release metadata.** A major/minor release sets a new dance-style **name**, a patch keeps the current one — the machine source of truth is `choreo-shared/release-name.txt` (a single line, edited on major/minor only), compiled into the binaries and read by the CI release job for the release title. See [RELEASE.md](./RELEASE.md) Phase 1.
 
+## Wire Protocol
+
+The client↔daemon wire protocol may be changed at any time. Do **not** bump
+`PROTOCOL_VERSION` (`choreo-proto/src/frame.rs`) for an ordinary change — add or
+reshape variants and fields on the current, unreleased wire version in place.
+A protocol-version bump happens **only when cutting a new release**: until a
+release ships there are no mixed-version peers, and the version gate rejects a
+mismatch either way, so nothing is gained by bumping early. When you change
+the wire, record it in the current version's changelog block in
+`choreo-proto/src/frame.rs` and in ARCHITECTURE.md's wire-format/version history,
+and bump the version as part of the release that first carries the new shape.
+
 ## Test Discipline
 
 - **Unit tests** (in <code>src/</code> <code>#[cfg(test)]</code> modules) must never use time-based waits (`sleep`, `delay_for`, etc.). Use deterministic patterns only.
