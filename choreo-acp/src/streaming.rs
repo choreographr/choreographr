@@ -516,6 +516,7 @@ mod tests {
             DaemonMessage::broadcast(DaemonMessageType::Models {
                 models: vec![],
                 selected_model: None,
+                provisional: false,
             }),
         ];
         for msg in &msgs {

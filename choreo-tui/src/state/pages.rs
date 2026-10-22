@@ -1051,6 +1051,7 @@ mod tests {
                 "claude-3".to_string(),
             ],
             None,
+            false,
         );
         assert_eq!(sel.filtered_len(), 3, "empty filter returns every model");
         sel.filter.text = "gpt".to_string();

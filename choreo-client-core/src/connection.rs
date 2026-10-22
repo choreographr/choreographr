@@ -967,6 +967,7 @@ mod in_process_tests {
                         DaemonMessageType::Models {
                             models: vec!["m1".to_string()],
                             selected_model: None,
+                            provisional: false,
                         },
                     ),
                     ClientMessageType::Lock => {
@@ -1013,6 +1014,7 @@ mod in_process_tests {
                     DaemonMessageType::Models {
                         models: vec!["m1".to_string()],
                         selected_model: None,
+                        provisional: false,
                     },
                 ),
                 DaemonMessage::reply(2, DaemonMessageType::Locked),

@@ -374,10 +374,18 @@ pub enum DaemonMessageType {
     Pong,
     /// The available model ids plus the currently selected one.
     Models {
-        /// The available model ids.
+        /// The available model ids, ordered case-insensitively by id.
         models: Vec<String>,
         /// The currently selected model id, if any.
         selected_model: Option<String>,
+        /// `true` when the daemon could not supply a list it verified for this
+        /// account: the ids are a stale cache entry or the local catalog's
+        /// curated set for the account's provider, and a live fetch is still
+        /// running (or failed). A picker shows them as a provisional first
+        /// paint rather than claiming they are the account's live list; the
+        /// follow-up [`DaemonMessageType::ModelsUpdated`] broadcast supersedes
+        /// it with the verified list.
+        provisional: bool,
     },
     /// The model list could not be produced.
     ModelsFailed {
@@ -394,7 +402,8 @@ pub enum DaemonMessageType {
     ModelsUpdated {
         /// The account name the list belongs to.
         account: String,
-        /// The freshly fetched model ids.
+        /// The freshly fetched model ids, ordered case-insensitively by id.
+        /// A frontend that receives this supersedes any provisional list.
         models: Vec<String>,
     },
     /// Targeted reply to [`ClientMessageType::Unlock`](crate::ClientMessageType::Unlock): the presented key matched

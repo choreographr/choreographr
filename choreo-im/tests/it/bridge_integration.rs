@@ -421,6 +421,7 @@ fn bridge_models() {
         &DaemonMessage::broadcast(DaemonMessageType::Models {
             models: vec!["gpt-4".into()],
             selected_model: Some("gpt-4".into()),
+            provisional: false,
         }),
     )
     .unwrap();

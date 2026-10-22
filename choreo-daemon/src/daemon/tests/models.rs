@@ -239,6 +239,75 @@ fn handle_model_prefetch_result_success_broadcasts_models_updated() {
 }
 
 #[test]
+fn handle_model_prefetch_result_sorts_ids_case_insensitively() {
+    // A provider's `/v1/models` returns whatever order it likes, and the cache,
+    // the `Models` reply, the `ModelsUpdated` broadcast and `/model` all read
+    // this one list — so the daemon normalizes the order once, at the point the
+    // list enters it, instead of each frontend imposing its own.
+    let (mut state, _rx) = make_daemon_state();
+    seed_credentialed_account(&mut state, "acct", "openai");
+    state.model_prefetch_in_flight.insert("acct".into());
+    let (writer_tx, writer_rx) = test_sink();
+    put_client(&mut state, 1, &writer_tx, false, true, &[]);
+
+    state.handle_command(DaemonCommand::ModelPrefetchResult {
+        account: "acct".into(),
+        result: Ok(vec!["GPT-4O".into(), "claude-3".into(), "o3".into()]),
+    });
+
+    // Case-insensitive: "claude-3" < "GPT-4O" < "o3", and the cache holds the
+    // same order the broadcast carries.
+    let expected = vec![
+        "claude-3".to_string(),
+        "GPT-4O".to_string(),
+        "o3".to_string(),
+    ];
+    match &writer_rx.recv().unwrap().inner {
+        DaemonMessageType::ModelsUpdated { models, .. } => assert_eq!(models, &expected),
+        other => panic!("expected ModelsUpdated, got {other:?}"),
+    }
+    let (cached, _) = state.model_cache.get("acct").expect("cache populated");
+    assert_eq!(cached, &expected);
+}
+
+#[test]
+fn handle_model_prefetch_result_unchanged_list_refreshes_freshness_without_broadcast() {
+    // A re-fetch that returns exactly the cached ids carries no new information,
+    // so it must not re-announce the list (every open picker would re-apply it)
+    // — but it MUST still replace the cache entry, because that insert is what
+    // postpones the next fetch for `MODEL_CACHE_TTL`.
+    let (mut state, _rx) = make_daemon_state();
+    seed_credentialed_account(&mut state, "acct", "openai");
+    let stale_at = Instant::now()
+        .checked_sub(MODEL_CACHE_TTL)
+        .unwrap()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap();
+    state
+        .model_cache
+        .insert("acct".into(), (vec!["m1".into(), "m2".into()], stale_at));
+    state.model_prefetch_in_flight.insert("acct".into());
+    let (writer_tx, writer_rx) = test_sink();
+    put_client(&mut state, 1, &writer_tx, false, true, &[]);
+
+    state.handle_command(DaemonCommand::ModelPrefetchResult {
+        account: "acct".into(),
+        result: Ok(vec!["m1".into(), "m2".into()]),
+    });
+
+    assert!(
+        writer_rx.try_recv().is_err(),
+        "an unchanged list must not be broadcast"
+    );
+    let (cached, cached_at) = state.model_cache.get("acct").expect("cache refreshed");
+    assert_eq!(cached, &["m1".to_string(), "m2".to_string()]);
+    assert!(
+        cached_at.elapsed() < MODEL_CACHE_TTL,
+        "the unchanged fetch must still refresh the freshness stamp"
+    );
+}
+
+#[test]
 #[serial_test::serial(catalog)]
 fn catalog_models_for_account_resolves_known_provider_and_rejects_unknown() {
     // The instant-first-paint seed: a catalog-known provider yields its curated
@@ -437,10 +506,14 @@ fn list_models_serves_stale_cache_without_duplicate_fetch_while_prefetch_in_flig
     );
     state.model_prefetch_in_flight.insert("acct".into());
 
-    let (models, _) = state
+    let (models, _, provisional) = state
         .handle_list_models(Some(1))
         .expect("stale list served");
     assert_eq!(models, vec!["old-model".to_string()]);
+    assert!(
+        provisional,
+        "a stale cache entry is a stand-in for the live list"
+    );
 
     // No second fetch may have been spawned for the in-flight account.
     assert!(rx.try_recv().is_err(), "no duplicate prefetch spawned");
@@ -455,9 +528,13 @@ fn list_models_with_cold_cache_serves_catalog_seed_and_warms_background() {
     // provider instead of blocking on the (potentially slow) live fetch.
     let (mut state, rx) = state_with_session_account("acct");
 
-    let (models, _) = state
+    let (models, _, provisional) = state
         .handle_list_models(Some(1))
         .expect("catalog seed served");
+    assert!(
+        provisional,
+        "the catalog seed is a stand-in, so the picker can label it"
+    );
     assert!(
         !models.is_empty(),
         "the catalog seeds a known provider (openai) so the picker is never empty while warming"
@@ -498,6 +575,44 @@ fn list_models_with_no_cache_and_no_catalog_models_reports_warming() {
 }
 
 #[test]
+fn list_models_with_a_fresh_cache_is_not_provisional() {
+    // A cache entry inside `MODEL_CACHE_TTL` was fetched for THIS account, so the
+    // picker may present it as the live list (and must not be told otherwise).
+    let (mut state, _rx) = state_with_session_account("acct");
+    state
+        .model_cache
+        .insert("acct".into(), (vec!["fresh-model".into()], Instant::now()));
+
+    let (models, _, provisional) = state
+        .handle_list_models(Some(1))
+        .expect("fresh cache served");
+    assert_eq!(models, vec!["fresh-model".to_string()]);
+    assert!(!provisional, "a fresh cache entry is the verified list");
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn list_models_treats_an_empty_fresh_cache_as_absent() {
+    // An EMPTY cached list paints nothing, so it is a worse answer than the
+    // catalog seed. The fresh-cache arm and the stale arm must agree on that —
+    // otherwise a provider that reported no models would leave the picker blank
+    // while a seed was available.
+    let (mut state, _rx) = state_with_session_account("acct");
+    state
+        .model_cache
+        .insert("acct".into(), (Vec::new(), Instant::now()));
+
+    let (models, _, provisional) = state
+        .handle_list_models(Some(1))
+        .expect("catalog seed served");
+    assert!(
+        !models.is_empty(),
+        "an empty cache entry falls through to the catalog seed"
+    );
+    assert!(provisional, "the seed is still a stand-in");
+}
+
+#[test]
 fn list_models_with_stale_cache_and_no_prefetch_serves_stale_and_warms_background() {
     // Stale-but-present cache, nothing in flight: serve the stale list (it
     // beats nothing) AND kick off a background refresh.
@@ -516,7 +631,7 @@ fn list_models_with_stale_cache_and_no_prefetch_serves_stale_and_warms_backgroun
         ),
     );
 
-    let (models, _) = state
+    let (models, _, _provisional) = state
         .handle_list_models(Some(1))
         .expect("stale list served");
     assert_eq!(models, vec!["old-model".to_string()]);

@@ -9,7 +9,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 fn selector_with_models(models: &[&str]) -> ModelSelectorState {
     let mut sel = ModelSelectorState::new();
     sel.open();
-    sel.apply_models(models.iter().map(|s| (*s).to_string()).collect(), None);
+    sel.apply_models(
+        models.iter().map(|s| (*s).to_string()).collect(),
+        None,
+        false,
+    );
     sel
 }
 
@@ -48,26 +52,32 @@ fn model_selector_close_keeps_model_list() {
 fn model_selector_apply_models_preselects_current() {
     let mut sel = ModelSelectorState::new();
     sel.open();
+    // The daemon already orders ids case-insensitively by id, so the picker
+    // presents them verbatim and only has to find the active row.
     sel.apply_models(
         vec![
+            "gpt-3.5-turbo".into(),
             "gpt-4o".into(),
             "gpt-4o-mini".into(),
-            "gpt-3.5-turbo".into(),
         ],
         Some("gpt-4o-mini".into()),
+        false,
     );
 
     assert!(!sel.loading);
-    // The list is sorted case-insensitively, so "gpt-4o-mini" lands at index 2
-    // of [gpt-3.5-turbo, gpt-4o, gpt-4o-mini].
     assert_eq!(sel.focused, 2, "highlight lands on the active model");
     assert_eq!(sel.highlighted().as_deref(), Some("gpt-4o-mini"));
+    assert!(
+        !sel.provisional,
+        "a reply that says verified stays verified"
+    );
 }
 
 #[test]
-fn model_selector_apply_models_sorts_alphabetically_case_insensitive() {
-    // The daemon (and a provider's own `/v1/models`) do not guarantee any
-    // order; the picker presents models alphabetically, case-insensitively.
+fn model_selector_apply_models_keeps_the_daemon_order() {
+    // Ordering is the daemon's decision (it sorts every list it serves, so
+    // `Models`, `ModelsUpdated` and `/model` agree). The picker must not impose
+    // a second, client-side order that could disagree with them.
     let mut sel = ModelSelectorState::new();
     sel.open();
     sel.apply_models(
@@ -78,18 +88,86 @@ fn model_selector_apply_models_sorts_alphabetically_case_insensitive() {
             "o3-deep-research".into(),
         ],
         None,
+        false,
     );
     assert_eq!(
         sel.all_models,
-        vec!["claude-3", "GPT-4O", "gpt-4o-mini", "o3-deep-research"]
+        vec!["GPT-4O", "claude-3", "gpt-4o-mini", "o3-deep-research"]
     );
+}
+
+#[test]
+fn model_selector_apply_models_records_provisional() {
+    let mut sel = ModelSelectorState::new();
+    sel.open();
+    sel.apply_models(vec!["seed-a".into()], None, true);
+    assert!(
+        sel.provisional,
+        "a catalog seed is a stand-in, not a live list"
+    );
+}
+
+#[test]
+fn model_selector_refresh_keeps_the_highlighted_row_and_clears_provisional() {
+    // A background fetch landing while the picker is open must not move the
+    // cursor: the user browses rows, and the ACTIVE model (which `apply_models`
+    // preselects) is not where they are looking.
+    let mut sel = ModelSelectorState::new();
+    sel.open();
+    sel.apply_models(
+        vec!["a-model".into(), "b-model".into(), "c-model".into()],
+        Some("a-model".into()),
+        true,
+    );
+    assert_eq!(sel.highlighted().as_deref(), Some("a-model"));
+    // Navigate down to the last row, as a user reading the list would.
+    sel.focused = 2;
+    assert_eq!(sel.highlighted().as_deref(), Some("c-model"));
+
+    // The live list arrives, with one more model appended.
+    sel.refresh_models(vec![
+        "a-model".into(),
+        "b-model".into(),
+        "c-model".into(),
+        "d-model".into(),
+    ]);
+
+    assert_eq!(
+        sel.highlighted().as_deref(),
+        Some("c-model"),
+        "the refresh keeps the row the user was on, not the active model"
+    );
+    assert_eq!(
+        sel.selected.as_deref(),
+        Some("a-model"),
+        "active model is unchanged"
+    );
+    assert!(!sel.provisional, "a refreshed list is verified");
+}
+
+#[test]
+fn model_selector_refresh_clamps_when_the_highlighted_row_vanishes() {
+    let mut sel = ModelSelectorState::new();
+    sel.open();
+    sel.apply_models(
+        vec!["a-model".into(), "b-model".into(), "c-model".into()],
+        None,
+        false,
+    );
+    sel.focused = 2;
+
+    // The model the user was on is gone from the live list.
+    sel.refresh_models(vec!["a-model".into(), "b-model".into()]);
+
+    assert_eq!(sel.focused, 1, "focus clamps to the last surviving row");
+    assert_eq!(sel.highlighted().as_deref(), Some("b-model"));
 }
 
 #[test]
 fn model_selector_apply_models_falls_back_to_top_when_selected_missing() {
     let mut sel = ModelSelectorState::new();
     sel.open();
-    sel.apply_models(vec!["a".into(), "b".into()], Some("missing".into()));
+    sel.apply_models(vec!["a".into(), "b".into()], Some("missing".into()), false);
 
     assert_eq!(sel.focused, 0);
     assert_eq!(sel.highlighted().as_deref(), Some("a"));
@@ -269,7 +347,7 @@ fn a_landed_list_disarms_an_armed_warming_retry() {
 
     // A `Models` reply that raced the timer must cancel it: otherwise the UI
     // loop fires one redundant `ListModels` after the list already landed.
-    selector.apply_models(vec!["m".to_string()], None);
+    selector.apply_models(vec!["m".to_string()], None, false);
     assert!(selector.retry_timer.is_none());
     assert!(!selector.take_retry());
 }

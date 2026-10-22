@@ -88,9 +88,11 @@ mod subscriber_handlers;
 // `open` module.
 pub use open::OpenOptions;
 
-/// Reply type for the `ListModels` command.
+/// Reply type for the `ListModels` command: the model ids, the currently
+/// selected id, and whether the list is a provisional stand-in (see
+/// [`DaemonMessageType::Models`]).
 pub(super) type ListModelsReply =
-    std::sync::mpsc::Sender<Result<(Vec<String>, Option<String>), String>>;
+    std::sync::mpsc::Sender<Result<(Vec<String>, Option<String>, bool), String>>;
 
 /// Reply channel for `ResolveAccountCmd`: the resolved account's ingredients
 /// (see [`ResolvedAccount`]). Aliased because the reference-taking handler

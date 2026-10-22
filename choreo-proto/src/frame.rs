@@ -75,7 +75,11 @@ use zeroize::Zeroizing;
 /// refreshes in place. A cold picker now paints instantly from a locally
 /// cached or catalog-seeded list and this broadcast supersedes that seed when
 /// the live fetch lands, instead of the picker blocking on a slow
-/// `/v1/models` round-trip.
+/// `/v1/models` round-trip. Under the same policy, `DaemonMessage::Models`
+/// gained `provisional: bool`, set when the reply carries ids the daemon could
+/// not verify for the account (a stale cache entry or the catalog's curated set
+/// for the provider while the live fetch runs), so a picker can present them as
+/// a first paint rather than as the account's live list.
 ///
 /// Policy: variants may be added to the **current, unreleased** wire version
 /// without a bump. Mixed-version peers do not exist until a release ships, and

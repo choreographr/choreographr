@@ -271,6 +271,7 @@ fn dispatch_flat_message(msg: DaemonMessageType, handler: &mut impl TurnEventHan
         DaemonMessageType::Models {
             models,
             selected_model,
+            provisional,
         } => {
             if models.is_empty() {
                 handler.handle_status_text("[daemon] no models available".to_string());
@@ -283,6 +284,14 @@ fn dispatch_flat_message(msg: DaemonMessageType, handler: &mut impl TurnEventHan
                         "-"
                     };
                     lines.push(format!("{prefix} {model}"));
+                }
+                // A provisional list stands in for a fetch that has not landed
+                // (a stale cache entry or the catalog's curated set), so say so
+                // rather than presenting it as the account's verified list.
+                if provisional {
+                    lines.push(
+                        "(provisional: the live model list has not been fetched yet)".to_string(),
+                    );
                 }
                 handler.handle_status_text(lines.join("\n"));
             }

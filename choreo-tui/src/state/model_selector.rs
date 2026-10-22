@@ -34,8 +34,9 @@ pub(crate) struct ModelSelectorState {
     /// True between `open()` and the arrival of the `Models`/`ModelsFailed`
     /// reply; the popup shows a "loading" row instead of the list.
     pub(crate) loading: bool,
-    /// All models for the attached session's account, sorted case-insensitively
-    /// by id (see `apply_models`).
+    /// All models for the attached session's account, in the daemon's order
+    /// (case-insensitively by id — the daemon sorts at the source so `Models`,
+    /// `ModelsUpdated` and `/model` all agree).
     pub(crate) all_models: Vec<String>,
     /// The currently active model (marked with `●`), if known.
     pub(crate) selected: Option<String>,
@@ -55,6 +56,12 @@ pub(crate) struct ModelSelectorState {
     pub(crate) viewport_height: usize,
     /// Popup-scoped error text (e.g. the daemon failed to list models).
     pub(crate) error: Option<String>,
+    /// True while the painted list is a stand-in the daemon could not verify
+    /// for this account: a stale cache entry or the local catalog's curated set
+    /// for the provider, with the live fetch still running (or failed). The
+    /// renderer says so, so a seeded list is never mistaken for the live one.
+    /// A `ModelsUpdated` broadcast clears it.
+    pub(crate) provisional: bool,
     /// Fires when the list should be requested again: armed while the daemon
     /// reports the account's list as still warming (a fresh account's first
     /// fetch runs in the background). A `crossbeam_channel::after` timer, so
@@ -87,6 +94,7 @@ impl ModelSelectorState {
             scroll: 0,
             viewport_height: 0,
             error: None,
+            provisional: false,
             retry_timer: None,
             retries: 0,
         }
@@ -146,21 +154,16 @@ impl ModelSelectorState {
     /// Populate the model list from a `Models` reply and preselect the
     /// current model.  `selected` falls back to `None` when the daemon does
     /// not report one; the caller may pass the display's cached value.
-    pub(crate) fn apply_models(&mut self, mut models: Vec<String>, selected: Option<String>) {
-        // Present the list alphabetically regardless of the order the daemon
-        // (or the provider's own `/v1/models` listing) returned it in.
-        // `sort_by_cached_key` computes the lowercase key once per element
-        // rather than per comparison; it is stable, so equal keys (ids that
-        // differ only by case) keep the daemon's relative order.
-        models.sort_by_cached_key(|model| model.to_lowercase());
-        self.all_models = models;
+    /// `provisional` marks the list as an unverified stand-in (see
+    /// [`Self::provisional`]).
+    pub(crate) fn apply_models(
+        &mut self,
+        models: Vec<String>,
+        selected: Option<String>,
+        provisional: bool,
+    ) {
         self.selected = selected;
-        self.loading = false;
-        self.error = None;
-        // The list landed, so any armed warming retry is moot: disarming it
-        // here stops the UI loop from firing one more `ListModels` after a
-        // success that raced the timer.
-        self.retry_timer = None;
+        self.install_models(models, provisional);
         // Preselect the active model when it survives the current filter;
         // otherwise the highlight stays at the top of the list.
         if let Some(sel) = &self.selected
@@ -170,6 +173,43 @@ impl ModelSelectorState {
             self.scroll = idx;
         }
         self.clamp_focus();
+    }
+
+    /// Replace the painted list after a LIVE refresh (the daemon's
+    /// `ModelsUpdated` broadcast) without moving the user's cursor.
+    ///
+    /// `apply_models` derives the highlight from the ACTIVE model, which is
+    /// right for a first paint but wrong for a refresh: the active model is not
+    /// where the user is looking. So this keeps the highlighted row's model
+    /// selected across the swap (re-finding it in the new list) and leaves the
+    /// scroll window alone; a row that disappeared clamps, rather than jumping
+    /// to the active model. A refreshed list is always verified, so the
+    /// provisional flag clears.
+    pub(crate) fn refresh_models(&mut self, models: Vec<String>) {
+        let highlighted = self.highlighted();
+        self.install_models(models, false);
+        if let Some(idx) = highlighted
+            .as_deref()
+            .and_then(|id| self.filtered().iter().position(|m| *m == id))
+        {
+            self.focused = idx;
+        }
+        self.clamp_focus();
+    }
+
+    /// The shared body of `apply_models`/`refresh_models`: install a new list
+    /// and drop the per-request state that the arrival of a list makes moot
+    /// (loading row, error text, armed warming retry). Focus/scroll staying
+    /// put is what the two callers differ on, so it is not touched here.
+    fn install_models(&mut self, models: Vec<String>, provisional: bool) {
+        self.all_models = models;
+        self.provisional = provisional;
+        self.loading = false;
+        self.error = None;
+        // The list landed, so any armed warming retry is moot: disarming it
+        // here stops the UI loop from firing one more `ListModels` after a
+        // success that raced the timer.
+        self.retry_timer = None;
     }
 
     /// Record a `ModelsFailed` reply so the popup can show the error inline.

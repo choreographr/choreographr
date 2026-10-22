@@ -1106,6 +1106,7 @@ mod tests {
             DaemonMessage::broadcast(DaemonMessageType::Models {
                 models: vec!["gpt-4".into(), "claude".into()],
                 selected_model: Some("claude".into()),
+                provisional: false,
             }),
             &mut buffers,
             &mut tool_buffers,

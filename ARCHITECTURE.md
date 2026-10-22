@@ -1524,13 +1524,24 @@ startup              connect→unbound?        /unlock [key]            AddCrede
   writer of `model_cache` — records the result; a per-account `model_prefetch_in_flight` guard
   deduplicates bursts of joins and is released even on fetch failure. The shared
   `MODEL_CACHE_TTL` (5 min) governs both prefetch freshness and the on-demand path in
-  `handle_list_models`, which NEVER fetches on the command loop: a fresh cache answers
-  immediately; a stale/missing cache triggers the same background prefetch (no-op while one
-  is in flight, so an open picker cannot double-fetch) and serves the stale list if one
-  exists, or a retryable "warming" error otherwise. A panic inside the fetch thread is
-  caught (`catch_unwind`) and reported as a normal failure so the in-flight guard can never
-  leak, and a result arriving for an account whose provider was removed or rebuilt mid-flight
-  is discarded instead of cached.
+  `handle_list_models`, which NEVER fetches on the command loop: a fresh, non-empty cache
+  answers immediately; a stale/missing cache triggers the same background prefetch (no-op
+  while one is in flight, so an open picker cannot double-fetch) and answers with the best
+  list it already has — the stale entry, else the local catalog's curated ids for the
+  account's provider (an instant first paint, so the picker never blocks on a slow
+  `/v1/models`), and only then a retryable "warming" error. Both stand-ins are flagged
+  `provisional` on the wire, so a picker can say the list is not (yet) the account's verified
+  one, and an EMPTY cache entry is treated as absent on both paths. Every list the daemon
+  serves is ordered case-insensitively by id at the point it enters the daemon (a fetched
+  result and the catalog seed, `sort_model_ids`), so the cache, the `Models` reply, the
+  `/model` listing and the broadcast below cannot disagree. When a fetch lands with a list
+  that DIFFERS from the cached one, the loop broadcasts
+  `DaemonMessage::ModelsUpdated { account, models }` on the ACTIVITY bus so an already-open
+  picker replaces its list in place; the cache insert happens either way (it is what
+  refreshes the TTL), but an unchanged list is not re-announced. A panic inside the fetch
+  thread is caught (`catch_unwind`) and reported as a normal failure so the in-flight guard
+  can never leak, and a result arriving for an account whose provider was removed or rebuilt
+  mid-flight is discarded instead of cached.
 - There is no global "default account". Each session carries its own `account_name: Option<String>`
   field. When RunInput is issued, the daemon resolves the provider from the session's own account name.
   This avoids a global mutable fallback and lets different sessions use different accounts.

@@ -733,6 +733,14 @@ fn approx_wire_size_never_underestimates_encoded_payload() {
             DaemonMessageType::Models {
                 models: vec!["gpt-4".into(), "gpt-4o".into(), "gpt-5.6".into()],
                 selected_model: Some("gpt-5.6".into()),
+                provisional: false,
+            },
+        ),
+        (
+            "ModelsUpdated",
+            DaemonMessageType::ModelsUpdated {
+                account: "default".into(),
+                models: vec!["gpt-4".into(), "gpt-4o".into(), "gpt-5.6".into()],
             },
         ),
         (
@@ -1106,6 +1114,27 @@ fn approx_wire_size_never_underestimates_encoded_payload() {
         ),
         ("ShuttingDown", DaemonMessageType::ShuttingDown),
         ("Evicted", DaemonMessageType::Evicted),
+        ("Bound", DaemonMessageType::Bound),
+        (
+            "KeystoreUnbound",
+            DaemonMessageType::KeystoreUnbound {
+                error: "keystore has no binding yet".into(),
+            },
+        ),
+        (
+            "AclAddResult",
+            DaemonMessageType::AclAddResult {
+                ok: false,
+                message: "rejected unauthorized transport".into(),
+            },
+        ),
+        ("AclUpdated", DaemonMessageType::AclUpdated { clients: 12 }),
+        (
+            "OAuthReloginRequired",
+            DaemonMessageType::OAuthReloginRequired {
+                account: "default".into(),
+            },
+        ),
     ];
 
     let mut checked = 0usize;

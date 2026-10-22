@@ -2896,6 +2896,7 @@ fn handle_broadcast_activity_sends_when_no_session_id() {
     let msg = DaemonMessageType::Models {
         models: vec!["gpt-4".into()],
         selected_model: Some("gpt-4".into()),
+        provisional: false,
     };
     state.handle_command(DaemonCommand::BroadcastActivity {
         session_id: None,

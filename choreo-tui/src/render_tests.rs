@@ -135,6 +135,7 @@ fn render_model_selector_shows_title_filter_and_models() {
             "claude-3".to_string(),
         ],
         Some("gpt-4o-mini".to_string()),
+        false,
     );
 
     let backend = TestBackend::new(80, 24);

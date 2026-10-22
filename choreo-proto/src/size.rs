@@ -405,8 +405,12 @@ impl DaemonMessage {
                 DaemonMessageType::Models {
                     models,
                     selected_model,
+                    ..
                 } => {
-                    named_field_overhead(2)
+                    // 3 named fields (models, selected_model, provisional): the
+                    // model ids and the selected id carry the payload, and the
+                    // field allowance covers the `provisional` tag.
+                    named_field_overhead(3)
                         + models.iter().map(String::len).sum::<usize>()
                         + option_str_len(selected_model.as_ref())
                 }

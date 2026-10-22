@@ -695,6 +695,7 @@ fn handle_list_models_sync_ok() {
             let _ = reply.send(Ok((
                 vec!["gpt-4".into(), "gpt-3.5".into()],
                 Some("gpt-4".into()),
+                false,
             )));
         }
     });
