@@ -589,11 +589,12 @@ fn render_turn_lines_impl(
                 // ANSI coloring still works below.
                 let content = sanitize_for_terminal(&tr.content);
                 // Expand tabs to 4-column spaces (see [`expand_tabs`]):
-                // unicode-width measures `\t` as 0 columns and ratatui
-                // drops control chars at draw time, so a literal tab would
-                // vanish *and* leave every width computation (wrap, height,
-                // fill padding) mis-measured.  After expansion all four
-                // branches below (ansi/diff/markdown/plain) see exact widths.
+                // unicode-width measures `\t` as one column and ratatui draws
+                // it as none (control chars are filtered from the drawn
+                // grapheme stream), so a literal tab would vanish *and* leave
+                // every width computation (wrap, height, fill padding)
+                // mis-measured.  After expansion all four branches below
+                // (ansi/diff/markdown/plain) see exact widths.
                 let content = expand_tabs(&content);
                 // Content with ANSI escape codes gets colored rendering.
                 if content.contains("\x1b[") {

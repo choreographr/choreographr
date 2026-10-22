@@ -332,6 +332,122 @@ fn code_block_indented_wrapping() {
     }
 }
 
+// ── Code box: tab-indented code ─────────────────────────────────────
+
+/// Draw `lines` into a `TestBackend` through the same non-wrapping
+/// `Paragraph` the chat history uses, returning one `String` per rendered row.
+///
+/// Drawing is what the box's alignment actually depends on: the rows' own
+/// [`Line::width`] values agree even when the *drawn* cells do not (a control
+/// character measures as one column and draws as none), so a width-only
+/// assertion cannot catch a desync between measurement and the screen.  The
+/// samples here are ASCII, so a char index in the returned string is also its
+/// display column.
+fn draw_rows(lines: &[Line<'static>], width: u16) -> Vec<String> {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::widgets::Paragraph;
+
+    let height = u16::try_from(lines.len()).expect("row count fits a viewport");
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+    let lines = lines.to_vec();
+    terminal
+        .draw(|frame| frame.render_widget(Paragraph::new(lines), frame.area()))
+        .expect("draw the paragraph");
+    let buffer = terminal.backend().buffer();
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect()
+}
+
+#[test]
+fn code_box_tab_indented_rows_keep_the_frame_aligned() {
+    // Regression: the highlighter can hand a leading tab to a row as a span of
+    // its own — the C syntax does exactly that, while the plain-text syntax
+    // keeps it inside the token span — and ratatui measures a single-byte
+    // control character as one column yet filters it out when drawing.  The row
+    // then drew one column narrower than the box padded it for and the right
+    // `│` jogged left on every tab-indented line (a kernel-style C snippet in a
+    // ` ```c ` fence was the visible case).  Expanding tabs before the box is
+    // built keeps every row on one column *and* preserves the indentation.
+    let code = "if (perfopt(adev) == 0)\n\treturn false;\n\nreturn amdgpu_device_identity(adev);";
+    for lang in ["c", "text", "rust", "python", "sh"] {
+        let md = format!("```{lang}\n{code}\n```");
+        let (lines, _joins, _chrome) = markdown_lines_joined(&md, 80);
+        let box_width = lines[0].width();
+        let drawn = draw_rows(&lines, 80);
+        assert_eq!(drawn.len(), lines.len(), "{lang}: one drawn row per line");
+        for (i, row) in drawn.iter().enumerate() {
+            // Every row must end its own frame at the same column: strip the
+            // history fill and compare the drawn width with the box width.
+            assert_eq!(
+                row.trim_end().chars().count(),
+                box_width,
+                "{lang}: row {i} does not draw the box width ({box_width}): {row:?}"
+            );
+            assert!(
+                row.trim_end().ends_with('│') || row.contains(['╭', '╰']),
+                "{lang}: row {i} lost its right frame glyph: {row:?}"
+            );
+        }
+        // The tab expanded to one 4-column stop, so the indented line keeps its
+        // indentation instead of collapsing to the left margin.
+        let indented = drawn
+            .iter()
+            .find(|row| row.contains("return false;"))
+            .expect("indented row is rendered");
+        assert!(
+            indented.contains("│     return false;"),
+            "{lang}: tab indent must expand to spaces: {indented:?}"
+        );
+    }
+}
+
+#[test]
+fn code_box_expands_tabs_before_measuring() {
+    // No rendered span may carry a tab: measurement (unicode-width counts it as
+    // one column) and drawing (ratatui drops it) disagree about it, so a tab
+    // that reached a span would desync the row from the box built around it.
+    let (lines, _joins, _chrome) = markdown_lines_joined("```c\n\tif (x)\n\t\treturn;\n```", 80);
+    for line in &lines {
+        assert!(
+            !line.to_string().contains('\t'),
+            "no tab may survive into a rendered row: {line:#?}"
+        );
+    }
+    // The tab-indented rows are padded to the box interior, which the widest
+    // row (two stops + `return;`) sets: 2 + 8 + 7 + 2 = 19 columns.
+    assert_eq!(lines[0].width(), 19, "rows: {lines:#?}");
+}
+
+#[test]
+fn incremental_render_matches_whole_render_for_tab_indented_code() {
+    // The streaming path must expand tabs exactly like the whole-document
+    // render, or a live response's box would be drawn from unexpanded rows.
+    let code = "```c\nif (x == 0)\n\treturn false;\n\nreturn identity(adev);\n```";
+    let (whole, _, _) = markdown_lines_joined(code, 60);
+    let mut cache = IncrementalMarkdown::new();
+    // Feed growing prefixes so a commit happens mid-response, then the tail.
+    let mut rendered = Vec::new();
+    for (end, _) in code
+        .char_indices()
+        .chain(std::iter::once((code.len(), ' ')))
+    {
+        rendered = cache.render(code.get(..end).unwrap_or_default(), 60).0;
+    }
+    let as_text =
+        |lines: &[Line<'static>]| lines.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(
+        as_text(&rendered),
+        as_text(&whole),
+        "incremental render must match the whole-document render"
+    );
+}
+
 // ── Code box: copy classification edge cases ─────────────────────────
 
 #[test]

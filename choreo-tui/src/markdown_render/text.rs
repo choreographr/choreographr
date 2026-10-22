@@ -254,24 +254,28 @@ pub(crate) fn sanitize_for_terminal(text: &str) -> String {
     out
 }
 
-/// Standard terminal tab-stop interval.  `unicode-width` reports `\t` as
-/// **zero** columns, and ratatui (≥0.30) filters control characters out of
-/// `Span::styled_graphemes` entirely, so a literal tab is both mis-measured
-/// *and* silently dropped from the rendered Paragraph.  Expanding tabs to
-/// spaces at 4-column stops (a common editor convention) makes every
-/// downstream width computation (grapheme wrap, `Line::width`, height
-/// `div_ceil`, fill padding) measure exactly what ratatui draws, and keeps
-/// tab-aligned columns aligned — matching what the raw bytes would have
-/// shown on a terminal with 4-wide tab stops.
+/// Standard terminal tab-stop interval.  No width library agrees with what
+/// ratatui draws for a tab: `unicode-width` counts `\t` as **one** column
+/// inside a string, while ratatui filters control characters out of the
+/// grapheme stream when it draws, so the tab occupies **no** cell.  A literal
+/// tab therefore desyncs every width this renderer computes from the cells on
+/// screen — a row measured one column wider than it draws — and it loses its
+/// indentation as well.  Expanding tabs to spaces at 4-column stops (a common
+/// editor convention) makes every downstream width computation (grapheme wrap,
+/// `Line::width`, height `div_ceil`, fill padding, code-box padding) measure
+/// exactly what ratatui draws, and keeps tab-aligned columns aligned — matching
+/// what the raw bytes would have shown on a terminal with 4-wide tab stops.
 pub(crate) const TAB_STOP: usize = 4;
 
 /// Replace each `\t` with the spaces needed to reach the next `TAB_STOP`
-/// column, tracking the column per logical line (`\n` resets it).  Runs on
-/// already-sanitized content, so the only control chars that can reach it
-/// are `\t`, `\n`, and the bytes of a complete SGR color sequence (`ESC [`
-/// params `m`) — the latter are invisible on screen, so they are copied
-/// through *without* advancing the column (counting them would shrink the
-/// tab padding after a color code).  Every other char advances the column
+/// column, tracking the column per logical line (`\n` resets it).  Every
+/// control char other than `\t` and `\n` is copied through untouched — the
+/// caller decides whether the input has been through
+/// [`sanitize_for_terminal`] first.  Of the input that can carry a tab, only
+/// sanitized tool output can hold a complete SGR color sequence (`ESC [`
+/// params `m`) besides; those bytes are invisible on screen, so they are
+/// copied through *without* advancing the column (counting them would shrink
+/// the tab padding after a color code).  Every other char advances the column
 /// by its display width.  O(1) for content without tabs (the common case),
 /// O(n) with one output allocation otherwise.
 pub(crate) fn expand_tabs(text: &str) -> String {
