@@ -100,9 +100,18 @@ pub(super) fn render_model_selector(frame: &mut Frame<'_>, app: &mut App) {
     let focused = app.model_selector.focused;
 
     if filtered.is_empty() {
+        // Distinguish "nothing to list at all" from "the filter matches
+        // nothing". An empty verified list (e.g. a provider that reported no
+        // models) has no filter narrowing it, so "No models match the filter"
+        // would be misleading.
+        let message = if app.model_selector.all_models.is_empty() {
+            " No models available."
+        } else {
+            " No models match the filter."
+        };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                " No models match the filter.",
+                message,
                 Style::default().fg(Color::DarkGray),
             ))),
             body,
@@ -143,7 +152,7 @@ pub(super) fn render_model_selector(frame: &mut Frame<'_>, app: &mut App) {
     // selection fail at inference time. A `ModelsUpdated` broadcast replaces the
     // list and clears the flag.
     let footer = if app.model_selector.provisional {
-        " esc close · enter select · curated list, live models not fetched"
+        " esc close · enter select · provisional: live models not fetched yet"
     } else {
         " esc close · enter select"
     };

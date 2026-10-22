@@ -181,10 +181,10 @@ impl ModelSelectorState {
     /// `apply_models` derives the highlight from the ACTIVE model, which is
     /// right for a first paint but wrong for a refresh: the active model is not
     /// where the user is looking. So this keeps the highlighted row's model
-    /// selected across the swap (re-finding it in the new list) and leaves the
-    /// scroll window alone; a row that disappeared clamps, rather than jumping
-    /// to the active model. A refreshed list is always verified, so the
-    /// provisional flag clears.
+    /// selected across the swap (re-finding it in the new list) and keeps the
+    /// existing scroll hint (clamping it only to the new list length); a row
+    /// that disappeared clamps, rather than jumping to the active model. A
+    /// refreshed list is always verified, so the provisional flag clears.
     pub(crate) fn refresh_models(&mut self, models: Vec<String>) {
         let highlighted = self.highlighted();
         self.install_models(models, false);

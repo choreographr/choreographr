@@ -692,11 +692,11 @@ fn handle_list_models_sync_ok() {
     };
     std::thread::spawn(move || {
         if let Ok(DaemonCommand::ListModels { reply, .. }) = daemon_rx.recv() {
-            let _ = reply.send(Ok((
-                vec!["gpt-4".into(), "gpt-3.5".into()],
-                Some("gpt-4".into()),
-                false,
-            )));
+            let _ = reply.send(Ok(crate::daemon::ListModelsResult {
+                models: vec!["gpt-4".into(), "gpt-3.5".into()],
+                selected_model: Some("gpt-4".into()),
+                provisional: false,
+            }));
         }
     });
     let handle = ctx.reply_handle();

@@ -1531,14 +1531,18 @@ startup              connect→unbound?        /unlock [key]            AddCrede
   account's provider (an instant first paint, so the picker never blocks on a slow
   `/v1/models`), and only then a retryable "warming" error. Both stand-ins are flagged
   `provisional` on the wire, so a picker can say the list is not (yet) the account's verified
-  one, and an EMPTY cache entry is treated as absent on both paths. Every list the daemon
+  one, and both the prefetch gate (`should_prefetch_models`) and the on-demand path treat an
+  EMPTY cache entry as absent (`fresh_model_list`), so an empty entry never suppresses a
+  fetch. Every list the daemon
   serves is ordered case-insensitively by id at the point it enters the daemon (a fetched
   result and the catalog seed, `sort_model_ids`), so the cache, the `Models` reply, the
-  `/model` listing and the broadcast below cannot disagree. When a fetch lands with a list
-  that DIFFERS from the cached one, the loop broadcasts
-  `DaemonMessage::ModelsUpdated { account, models }` on the ACTIVITY bus so an already-open
-  picker replaces its list in place; the cache insert happens either way (it is what
-  refreshes the TTL), but an unchanged list is not re-announced. A panic inside the fetch
+  `/model` listing and the broadcast below cannot disagree. When a fetch lands the loop caches
+  the result unconditionally (the insert is what refreshes the TTL) and broadcasts
+  `DaemonMessage::ModelsUpdated { account, models }` on the ACTIVITY bus UNLESS the entry was
+  already a fresh, non-empty list identical to the result; a stale or absent entry is always
+  re-announced even when the ids match, so an open picker's `provisional` label clears once
+  the live fetch confirms it. The broadcast lets an already-open picker replace its list in
+  place without moving the row under the cursor. A panic inside the fetch
   thread is caught (`catch_unwind`) and reported as a normal failure so the in-flight guard
   can never leak, and a result arriving for an account whose provider was removed or rebuilt
   mid-flight is discarded instead of cached.

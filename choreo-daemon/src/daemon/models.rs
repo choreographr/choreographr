@@ -35,7 +35,7 @@
 //! rejected only when a cached list exists and does not contain it, because a
 //! list we could not fetch is no evidence that the model is invalid.
 
-use super::{DaemonCommand, DaemonMessageType, DaemonState};
+use super::{DaemonCommand, DaemonMessageType, DaemonState, ListModelsResult};
 use choreo_ai_protocols::lookup_provider;
 use std::sync::mpsc;
 use std::thread;
@@ -76,9 +76,27 @@ impl DaemonState {
         {
             return false;
         }
+        // Prefetch unless a verified (fresh, non-empty) list is already cached.
+        // An empty entry is treated as absent so this gate agrees with
+        // `handle_list_models`, which paints a catalog seed over an empty cache.
+        self.fresh_model_list(account, Instant::now()).is_none()
+    }
+
+    /// The account's cached model list WHEN it is the verified one: present,
+    /// NON-EMPTY, and within [`MODEL_CACHE_TTL`]. An empty entry is treated as
+    /// absent (it paints nothing), so the prefetch gate
+    /// ([`Self::should_prefetch_models`]) and the on-demand path
+    /// ([`Self::handle_list_models`]) agree that an empty or stale cache needs a
+    /// fresh fetch. Borrows the cached vector; a caller that must hold it across
+    /// a `&mut self` call clones first.
+    fn fresh_model_list(&self, account: &str, now: Instant) -> Option<&Vec<String>> {
         match self.model_cache.get(account) {
-            Some((_, cached_at)) => Instant::now().duration_since(*cached_at) >= MODEL_CACHE_TTL,
-            None => true,
+            Some((models, cached_at))
+                if !models.is_empty() && now.duration_since(*cached_at) < MODEL_CACHE_TTL =>
+            {
+                Some(models)
+            }
+            _ => None,
         }
     }
 
@@ -189,23 +207,26 @@ impl DaemonState {
                 // the ordering is applied once here rather than by each
                 // frontend independently.
                 sort_model_ids(&mut models);
-                // Cache unconditionally: the insert is what refreshes the
-                // freshness stamp `MODEL_CACHE_TTL` is measured against, so a
-                // prefetch that returned the same list still postpones the next
-                // one. The BROADCAST, by contrast, is only for an actual change:
-                // re-announcing an identical list would make every open picker
-                // re-apply it (resetting the row the user is browsing) for no
-                // new information.
-                let changed = self
-                    .model_cache
-                    .get(&account)
-                    .is_none_or(|(cached, _)| cached != &models);
+                let now = Instant::now();
+                // Skip the broadcast ONLY when the cached entry is already a
+                // verified (fresh, non-empty) list that matches this fetch — the
+                // clients already hold it. A stale or absent entry must be
+                // re-announced even when the ids are identical: an open picker
+                // is showing that entry as a provisional stand-in, and only the
+                // broadcast clears the label (the picker keeps the user's row
+                // across the swap, so re-announcing costs no cursor position).
+                let already_verified = self
+                    .fresh_model_list(&account, now)
+                    .is_some_and(|cached| cached == &models);
+                // Cache unconditionally: the insert refreshes the freshness
+                // stamp `MODEL_CACHE_TTL` is measured against, so a prefetch
+                // that returned the same list still postpones the next one.
                 self.model_cache
-                    .insert(account.clone(), (models.clone(), Instant::now()));
-                if !changed {
+                    .insert(account.clone(), (models.clone(), now));
+                if already_verified {
                     debug!(
                         account = %account,
-                        "background model prefetch matched the cached list; \
+                        "background model prefetch matched the verified cache; \
                          freshness refreshed, no broadcast"
                     );
                     return;
@@ -306,18 +327,18 @@ impl DaemonState {
     /// with the best model list available WITHOUT ever performing a fetch on
     /// the command loop.
     ///
-    /// A fresh cache answers immediately; otherwise the fetch is handed to a
-    /// detached background thread (dedup-guarded) and the reply is the stale
-    /// cached list, the local catalog's curated ids, or — when neither exists —
-    /// the retryable "warming" error from `choreo_proto`. The selected model
-    /// rides along so a picker can mark the active row, and the `provisional`
-    /// flag tells the picker whether to present the ids as the account's live
-    /// list or as a stand-in, so a seeded list is never mistaken for a verified
-    /// one.
+    /// A fresh, non-empty cache answers immediately; otherwise the fetch is
+    /// handed to a detached background thread (dedup-guarded) and the reply is
+    /// the stale cached list, the local catalog's curated ids, or — when neither
+    /// exists — the retryable "warming" error from `choreo_proto`. The selected
+    /// model rides along so a picker can mark the active row, and
+    /// [`ListModelsResult::provisional`] tells the picker whether to present the
+    /// ids as the account's live list or as a stand-in, so a seeded list is
+    /// never mistaken for a verified one.
     pub(super) fn handle_list_models(
         &mut self,
         session_id: Option<u64>,
-    ) -> Result<(Vec<String>, Option<String>, bool), String> {
+    ) -> Result<ListModelsResult, String> {
         let account_name = session_id
             .and_then(|sid| self.session_metadata.get(&sid))
             .and_then(|m| m.account_name.clone())
@@ -345,37 +366,36 @@ impl DaemonState {
             });
         }
 
-        // A fresh cache answers immediately. Otherwise the fetch NEVER runs here
-        // synchronously: a blocking HTTP round-trip (up to the full request
-        // timeout, retried) would stall the whole daemon command loop — the
-        // exact stall the background-prefetch design removed from unlock. The
-        // request instead TRIGGERS a background prefetch (dedup-guarded via
-        // `maybe_spawn_model_prefetch` — no-op when one is already running, so
-        // an open picker while a join-time prefetch is in flight does not
-        // double-fetch) and serves the best list it can WITHOUT blocking:
+        // A fresh, non-empty cache is the verified list and answers immediately.
+        // Otherwise the fetch NEVER runs here synchronously: a blocking HTTP
+        // round-trip (up to the full request timeout, retried) would stall the
+        // whole daemon command loop — the exact stall the background-prefetch
+        // design removed from unlock. The request instead TRIGGERS a background
+        // prefetch (dedup-guarded via `maybe_spawn_model_prefetch` — no-op when
+        // one is already running, so an open picker while a join-time prefetch
+        // is in flight does not double-fetch) and serves the best list it can
+        // WITHOUT blocking:
         //   - a fresh, non-empty cache answers immediately (and is NOT
         //     provisional: the daemon verified it for this account);
         //   - else a stale-but-present list is served (it beats nothing);
-        //   - else the local catalog's curated ids for the account's provider are
-        //     served as an instant first paint, so the picker opens without
+        //   - else the local catalog's curated ids for the account's provider
+        //     are served as an instant first paint, so the picker opens without
         //     waiting on a slow endpoint (api.openai.com's /v1/models can take
         //     ~10 s per attempt and trip a 504 retry);
         //   - only when none of those exist does it return the retryable
         //     "warming" error.
         // Both stand-ins report `provisional = true`. An EMPTY cached list is
-        // treated as absent on both paths: it paints nothing, so a catalog seed
-        // is strictly better than serving it as a verified list.
-        // When the background fetch lands it broadcasts `ModelsUpdated`, which
-        // replaces whatever was painted in an already-open picker.
+        // treated as absent (see `fresh_model_list`) so the seed stands in for
+        // it. When the background fetch lands it broadcasts `ModelsUpdated`,
+        // which replaces whatever was painted in an already-open picker — and,
+        // because a stale or absent entry is always re-announced even when the
+        // ids are identical, an open picker's provisional label clears once the
+        // live fetch confirms the list.
         let now = Instant::now();
-        let (models, provisional) = match self.model_cache.get(&account_name) {
-            Some((cached_models, cached_at))
-                if !cached_models.is_empty()
-                    && now.duration_since(*cached_at) < MODEL_CACHE_TTL =>
-            {
-                (cached_models.clone(), false)
-            }
-            _ => {
+        let (models, provisional) =
+            if let Some(models) = self.fresh_model_list(&account_name, now).cloned() {
+                (models, false)
+            } else {
                 // Clone the stale list (if any) BEFORE the mutable spawn call,
                 // so no borrow of `self` is live across it.
                 let stale = self
@@ -387,7 +407,7 @@ impl DaemonState {
                 // at all: a present (even stale) list is more account-specific
                 // than the catalog's provider-wide curated set.
                 let seed = if stale.is_none() {
-                    catalog_models_for_account(self, &account_name)
+                    self.catalog_models_for_account(&account_name)
                 } else {
                     None
                 };
@@ -396,33 +416,34 @@ impl DaemonState {
                     .or(seed)
                     .ok_or_else(|| choreo_proto::models_warming_error(&account_name))?;
                 (models, true)
-            }
-        };
+            };
 
         let selected_model = session_id
             .and_then(|sid| self.session_metadata.get(&sid))
             .and_then(|m| m.selected_model.clone());
-        Ok((models, selected_model, provisional))
+        Ok(ListModelsResult {
+            models,
+            selected_model,
+            provisional,
+        })
     }
-}
 
-/// The catalog's curated model ids for an account's provider, used to paint
-/// the model picker instantly while the live `/v1/models` fetch runs. `None`
-/// when the account or its provider is unknown to the catalog, or the catalog
-/// lists no models for that provider — in which case `handle_list_models`
-/// falls back to the retryable "warming" error rather than an empty list.
-pub(super) fn catalog_models_for_account(
-    state: &DaemonState,
-    account: &str,
-) -> Option<Vec<String>> {
-    let slug = state.account_provider_slug(account)?;
-    let entry = lookup_provider(&slug)?;
-    if entry.models.is_empty() {
-        return None;
+    /// The catalog's curated model ids for `account`'s provider, used to paint
+    /// the model picker instantly while the live `/v1/models` fetch runs. `None`
+    /// when the account or its provider is unknown to the catalog, or the
+    /// catalog lists no models for that provider — in which case
+    /// `handle_list_models` falls back to the retryable "warming" error rather
+    /// than an empty list.
+    pub(super) fn catalog_models_for_account(&self, account: &str) -> Option<Vec<String>> {
+        let slug = self.account_provider_slug(account)?;
+        let entry = lookup_provider(&slug)?;
+        if entry.models.is_empty() {
+            return None;
+        }
+        let mut models: Vec<String> = entry.models.into_iter().map(|m| m.model).collect();
+        // The seed is served as-is, so it must already carry the order every
+        // other `Models` reply has (see `sort_model_ids`).
+        sort_model_ids(&mut models);
+        Some(models)
     }
-    let mut models: Vec<String> = entry.models.into_iter().map(|m| m.model).collect();
-    // The seed is served as-is, so it must already carry the order every other
-    // `Models` reply has (see `sort_model_ids`).
-    sort_model_ids(&mut models);
-    Some(models)
 }

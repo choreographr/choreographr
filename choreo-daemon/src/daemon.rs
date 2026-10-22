@@ -88,11 +88,26 @@ mod subscriber_handlers;
 // `open` module.
 pub use open::OpenOptions;
 
-/// Reply type for the `ListModels` command: the model ids, the currently
-/// selected id, and whether the list is a provisional stand-in (see
-/// [`DaemonMessageType::Models`]).
-pub(super) type ListModelsReply =
-    std::sync::mpsc::Sender<Result<(Vec<String>, Option<String>, bool), String>>;
+/// Result of a `ListModels` request: the account's model ids, the currently
+/// selected model id, and whether the list is a provisional stand-in rather
+/// than the account's verified live list (see [`DaemonMessageType::Models`]).
+///
+/// A named struct rather than a tuple so the three fields read at every call
+/// site (the command dispatch, the connection handler, and the tests) and a
+/// reordering cannot silently swap the id list for the flag.
+#[derive(Debug, Clone)]
+pub struct ListModelsResult {
+    /// The model ids, ordered case-insensitively by id.
+    pub models: Vec<String>,
+    /// The currently selected model id, if any.
+    pub selected_model: Option<String>,
+    /// `true` when `models` is a stand-in (a stale cache entry or the catalog
+    /// seed) the daemon could not verify for this account.
+    pub provisional: bool,
+}
+
+/// Reply type for the `ListModels` command.
+pub(super) type ListModelsReply = std::sync::mpsc::Sender<Result<ListModelsResult, String>>;
 
 /// Reply channel for `ResolveAccountCmd`: the resolved account's ingredients
 /// (see [`ResolvedAccount`]). Aliased because the reference-taking handler
