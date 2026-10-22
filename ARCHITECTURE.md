@@ -1524,7 +1524,7 @@ startup              connect→unbound?        /unlock [key]            AddCrede
   writer of `model_cache` — records the result; a per-account `model_prefetch_in_flight` guard
   deduplicates bursts of joins and is released even on fetch failure. The shared
   `MODEL_CACHE_TTL` (5 min) governs both prefetch freshness and the on-demand path in
-  `handle_list_models_inner`, which NEVER fetches on the command loop: a fresh cache answers
+  `handle_list_models`, which NEVER fetches on the command loop: a fresh cache answers
   immediately; a stale/missing cache triggers the same background prefetch (no-op while one
   is in flight, so an open picker cannot double-fetch) and serves the stale list if one
   exists, or a retryable "warming" error otherwise. A panic inside the fetch thread is
