@@ -1122,7 +1122,7 @@ fn daemon_message_evicted_quits_with_message() {
     .expect("handle Evicted");
 
     assert!(app.should_quit, "eviction must terminate the TUI");
-    let msg = app.quit_message.get().expect("quit message set");
+    let msg = app.quit_message().expect("quit message set");
     assert!(
         msg.contains("evicted"),
         "quit message must explain the eviction, got: {msg}"
@@ -1142,7 +1142,7 @@ fn daemon_message_shutting_down_quits_with_message() {
     .expect("handle ShuttingDown");
 
     assert!(app.should_quit, "server shutdown must terminate the TUI");
-    let msg = app.quit_message.get().expect("quit message set");
+    let msg = app.quit_message().expect("quit message set");
     assert!(
         msg.contains("shutting down"),
         "quit message must explain the shutdown, got: {msg}"

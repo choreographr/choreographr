@@ -3,8 +3,8 @@
 //! a future non-ratatui consumer — can ever see a live escape.
 //!
 //! These tests deliberately go through the setters (`App::set_error` /
-//! `App::set_status`) rather than the private fields, because the setters *are*
-//! the choke point under test.
+//! `App::set_status` / `App::set_quit_message`) rather than the private fields,
+//! because the setters *are* the choke point under test.
 
 use crate::tests::support::test_app;
 
@@ -107,9 +107,9 @@ fn quit_message_is_stored_inert() {
     // the test on the invariant itself: whatever the print site does, it cannot
     // emit an escape that was already neutralized here.
     let mut app = test_app();
-    app.quit_message.set(HOSTILE_QUIT);
+    app.set_quit_message(HOSTILE_QUIT);
 
-    let stored = app.quit_message.get().expect("quit message stored");
+    let stored = app.quit_message().expect("quit message stored");
     assert_inert(stored);
     assert!(
         !stored.contains('\u{1b}'),
@@ -131,7 +131,7 @@ fn quit_message_is_stored_inert() {
 fn quit_message_is_absent_on_a_normal_quit() {
     // Nothing set means nothing printed: the exit path only writes when a
     // reason was stored.
-    assert!(test_app().quit_message.get().is_none());
+    assert!(test_app().quit_message().is_none());
 }
 
 #[test]
@@ -140,12 +140,12 @@ fn quit_message_set_if_absent_keeps_the_specific_reason() {
     // fallback a later layer would install, so the first writer wins — and the
     // fallback is normalized on the path that does store it.
     let mut app = test_app();
-    app.quit_message.set("the server is shutting down");
-    app.quit_message.set_if_absent(HOSTILE_QUIT);
-    assert_eq!(app.quit_message.get(), Some("the server is shutting down"));
+    app.set_quit_message("the server is shutting down");
+    app.set_quit_message_if_absent(HOSTILE_QUIT);
+    assert_eq!(app.quit_message(), Some("the server is shutting down"));
 
     let mut app = test_app();
-    app.quit_message.set_if_absent(HOSTILE_QUIT);
-    let stored = app.quit_message.get().expect("fallback stored");
+    app.set_quit_message_if_absent(HOSTILE_QUIT);
+    let stored = app.quit_message().expect("fallback stored");
     assert_inert(stored);
 }

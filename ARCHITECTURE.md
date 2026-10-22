@@ -1829,17 +1829,17 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
   anything other than a widget reads it:
 
   1. **Ingest** — daemon-authored text that is *only* displayed is normalized
-     once, where it is stored: the chat status/error line
-     (`App::set_status`/`App::set_error` writing a private `DisplayLine` field,
-     so no call site can store raw bytes and the height math measures exactly
-     the drawn text without re-scanning), the AI-providers sub-modal error
-     lines, the session-manager and model-selector error rows, the login
-     modal's status text, authorize URL and device code (both halves), and the
-     quit message `run_app` prints with `println!` once the alternate screen is
-     gone. Because the stored value is already inert, it stays inert at every
-     place it is later read — including a non-ratatui consumer with no widget
-     sink of its own to route through (a `println!` output path, a log line, a
-     clipboard copy).
+     once, where it is stored: the chat status/error line and the quit message
+     `run_app` prints with `println!` once the alternate screen is gone
+     (`App::set_status`/`App::set_error`/`App::set_quit_message` writing a
+     private `DisplayLine` field, so no call site can store raw bytes and the
+     height math measures exactly the drawn text without re-scanning), the
+     AI-providers sub-modal error lines, the session-manager and model-selector
+     error rows, and the login modal's status text, authorize URL and device
+     code (both halves). Because the stored value is already inert, it stays
+     inert at every place it is later read — including a non-ratatui consumer
+     with no widget sink of its own to route through (a `println!` output path,
+     a log line, a clipboard copy).
   2. **Sink** — identity-bearing or keyed values stay byte-exact in state and
      are normalized at the draw sink instead: a model id, a reasoning effort,
      an account slug, a session title (which also feeds the OSC 2 window title,

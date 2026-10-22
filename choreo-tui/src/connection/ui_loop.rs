@@ -537,11 +537,10 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
             // "the connection to the daemon was closed" text, and the
             // real error is strictly more specific. The version-mismatch
             // case gets actionable wording (see connection_quit_message).
-            app.quit_message.set(crate::connection_quit_message(&error));
+            app.set_quit_message(crate::connection_quit_message(&error));
         }
         Err(_) => {
-            app.quit_message
-                .set_if_absent("daemon connection thread panicked");
+            app.set_quit_message_if_absent("daemon connection thread panicked");
         }
     }
 
@@ -555,12 +554,13 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     // This `println!` is the ONE place the TUI writes user-facing text
     // outside ratatui's frame buffer: the alternate screen is gone, so there
     // is no cell buffer and nothing filters these bytes between state and the
-    // terminal.  The text is already inert because `quit_message` is a
-    // `DisplayLine`, normalized once when stored (see `normalized_display_text`)
-    // — do NOT add a second normalization pass here; the invariant this print
-    // relies on is established at ingest, and re-normalizing here would both
-    // hide a broken ingest and be easy to lose the next time this path moves.
-    if let Some(message) = app.quit_message.get() {
+    // terminal.  The text is already inert because `quit_message` is stored as
+    // a `DisplayLine` behind `App::set_quit_message`, normalized once when
+    // stored (see `normalized_display_text`) — do NOT add a second
+    // normalization pass here; the invariant this print relies on is
+    // established at ingest, and re-normalizing here would both hide a broken
+    // ingest and be easy to lose the next time this path moves.
+    if let Some(message) = app.quit_message() {
         println!("{message}");
     }
 
@@ -632,8 +632,7 @@ fn run_ui_loop(
                     // only fires if the connection thread dropped its
                     // sender without one (e.g. a panic mid-read), so it must
                     // not overwrite a reason already stored.
-                    app.quit_message
-                        .set_if_absent("the connection to the daemon was closed");
+                    app.set_quit_message_if_absent("the connection to the daemon was closed");
                 }
             }
             recv(image_result_rx) -> msg => {

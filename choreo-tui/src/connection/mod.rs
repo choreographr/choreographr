@@ -913,16 +913,15 @@ mod tests {
         let wording = crate::connection_quit_message(&error);
 
         let mut app = test_app();
-        app.quit_message.set(wording.clone());
+        app.set_quit_message(wording.clone());
 
         assert_eq!(
-            app.quit_message.get(),
+            app.quit_message(),
             Some(wording.as_str()),
             "the actionable wording must survive ingest unchanged"
         );
         assert!(
-            app.quit_message
-                .get()
+            app.quit_message()
                 .is_some_and(|m| m.contains("restart the daemon")),
             "the restart hint must stay readable"
         );
@@ -953,7 +952,7 @@ mod tests {
         );
         assert!(app.should_quit);
         assert_eq!(
-            app.quit_message.get(),
+            app.quit_message(),
             Some("the connection to the daemon was closed"),
             "a bare EOF must report the dropped connection"
         );
@@ -985,7 +984,7 @@ mod tests {
             "a connection-task status must be flagged transient"
         );
         assert!(!app.should_quit, "a status event must never quit");
-        assert!(app.quit_message.get().is_none());
+        assert!(app.quit_message().is_none());
     }
 
     #[test]
@@ -1060,7 +1059,7 @@ mod tests {
         handle_ui_event(UiEvent::ReaderClosed, &mut app, &tx).expect("handle ReaderClosed");
 
         assert_eq!(
-            app.quit_message.get(),
+            app.quit_message(),
             Some("the server is shutting down"),
             "the specific reason must survive the trailing EOF"
         );

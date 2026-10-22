@@ -270,7 +270,12 @@ pub(crate) struct App {
     /// ingest rule as `status`/`error` — so the print site needs no second
     /// normalizing pass and a future daemon-supplied reason cannot reach a
     /// normal-screen terminal as a live escape or OSC sequence.
-    pub(crate) quit_message: DisplayLine,
+    ///
+    /// Private so every writer goes through [`App::set_quit_message`] (or the
+    /// first-writer-wins [`App::set_quit_message_if_absent`]), which applies the
+    /// same ingest rule as `status`/`error`: no call site can store raw bytes in
+    /// the one field whose reader is a plain `println!`.
+    quit_message: DisplayLine,
     pub(crate) image_job_tx: Option<crossbeam_channel::Sender<ImageJob>>,
     pub(crate) attached_session_id: Option<u64>,
     /// Account slug shown in the status bar — the attached session's account
@@ -525,6 +530,29 @@ impl App {
     /// The error line to draw, already normalized (see [`Self::set_status`]).
     pub(crate) fn error(&self) -> Option<&str> {
         self.error.get()
+    }
+
+    /// Replace the quit message — the reason printed on the restored terminal
+    /// after the TUI tears down (see the field docs) — normalizing the text for
+    /// display as it is stored (see [`Self::set_status`] for the ingest rule).
+    pub(crate) fn set_quit_message(&mut self, text: impl Into<String>) {
+        self.quit_message.set(text);
+    }
+
+    /// Replace the quit message only when none is stored yet, normalizing it as
+    /// it is stored (see [`Self::set_quit_message`]).
+    ///
+    /// A reason already stored is strictly more specific than the generic
+    /// fallback a later layer would install — a shutdown notice or an eviction
+    /// cause beats "the connection was lost" — so the first writer wins.
+    pub(crate) fn set_quit_message_if_absent(&mut self, text: impl Into<String>) {
+        self.quit_message.set_if_absent(text);
+    }
+
+    /// The quit message to print, already normalized, or `None` on a normal
+    /// user-initiated quit (see [`Self::set_quit_message`]).
+    pub(crate) fn quit_message(&self) -> Option<&str> {
+        self.quit_message.get()
     }
 
     /// The key that opens the model selector — `Alt+M` on every terminal now

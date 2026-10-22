@@ -10,7 +10,9 @@
 //! such a field in this type makes ingest the choke point *structurally*: the
 //! only way to put text in is [`DisplayLine::set`], which normalizes it, so no
 //! call site can store raw control characters by accident and no reader has to
-//! re-run the normalizer.
+//! re-run the normalizer.  The owner keeps the field private and exposes setters
+//! and getters (`App::set_status`/`App::set_error`/`App::set_quit_message`), so
+//! the ingest rule cannot be bypassed by reaching into the state directly.
 //!
 //! Identity-bearing values (model id, account slug, session title, tool name,
 //! tool-call id) are deliberately NOT held in this type: they must stay byte
