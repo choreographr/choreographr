@@ -384,6 +384,19 @@ pub enum DaemonMessageType {
         /// Why the model list failed.
         error: String,
     },
+    /// Broadcast when a background model-list fetch finishes: the fresh list
+    /// for `account`. An already-open model picker replaces its list in place
+    /// instead of waiting for the user to reopen it. A cold picker paints
+    /// instantly from a locally cached or catalog-seeded list and this
+    /// broadcast supersedes that seed once the live fetch lands. Keyed by the
+    /// account name (the daemon's model-cache key) so a frontend applies it
+    /// only to the picker showing that account.
+    ModelsUpdated {
+        /// The account name the list belongs to.
+        account: String,
+        /// The freshly fetched model ids.
+        models: Vec<String>,
+    },
     /// Targeted reply to [`ClientMessageType::Unlock`](crate::ClientMessageType::Unlock): the presented key matched
     /// the binding and the daemon decrypted its credentials. This is an
     /// OPERATION OUTCOME; the current keystore *status* is pushed separately
@@ -685,6 +698,7 @@ impl DaemonMessageType {
             Self::Pong => "Pong",
             Self::Models { .. } => "Models",
             Self::ModelsFailed { .. } => "ModelsFailed",
+            Self::ModelsUpdated { .. } => "ModelsUpdated",
             Self::Unlocked => "Unlocked",
             Self::Locked => "Locked",
             Self::Keystore { .. } => "Keystore",

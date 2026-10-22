@@ -58,8 +58,31 @@ fn model_selector_apply_models_preselects_current() {
     );
 
     assert!(!sel.loading);
-    assert_eq!(sel.focused, 1, "highlight lands on the active model");
+    // The list is sorted case-insensitively, so "gpt-4o-mini" lands at index 2
+    // of [gpt-3.5-turbo, gpt-4o, gpt-4o-mini].
+    assert_eq!(sel.focused, 2, "highlight lands on the active model");
     assert_eq!(sel.highlighted().as_deref(), Some("gpt-4o-mini"));
+}
+
+#[test]
+fn model_selector_apply_models_sorts_alphabetically_case_insensitive() {
+    // The daemon (and a provider's own `/v1/models`) do not guarantee any
+    // order; the picker presents models alphabetically, case-insensitively.
+    let mut sel = ModelSelectorState::new();
+    sel.open();
+    sel.apply_models(
+        vec![
+            "GPT-4O".into(),
+            "claude-3".into(),
+            "gpt-4o-mini".into(),
+            "o3-deep-research".into(),
+        ],
+        None,
+    );
+    assert_eq!(
+        sel.all_models,
+        vec!["claude-3", "GPT-4O", "gpt-4o-mini", "o3-deep-research"]
+    );
 }
 
 #[test]

@@ -928,6 +928,25 @@ pub(crate) fn handle_daemon_message(
             // to render for this event.
             return Ok(());
         }
+        DaemonMessageType::ModelsUpdated { account, models } => {
+            // A background model-list fetch finished. If the picker is open
+            // for the attached session's account, swap its list in place:
+            // this replaces the instant catalog seed (or an empty "warming"
+            // state) with the live list, so newly-available models appear
+            // without the user reopening the picker. Ignore other accounts —
+            // the picker is scoped to the attached session only.
+            let attached = app.attached_account_slug.as_deref();
+            if app.model_selector.is_open() && attached == Some(account.as_str()) {
+                let selected = app.model_selector.selected.clone();
+                tracing::debug!(
+                    count = models.len(),
+                    "model selector: list refreshed by background fetch"
+                );
+                app.model_selector.apply_models(models.clone(), selected);
+            }
+            // Never falls through to the generic dispatch (nothing to render).
+            return Ok(());
+        }
         _ => {}
     }
 

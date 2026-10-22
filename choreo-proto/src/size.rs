@@ -411,6 +411,13 @@ impl DaemonMessage {
                         + option_str_len(selected_model.as_ref())
                 }
                 DaemonMessageType::ModelsFailed { error } => named_field_overhead(1) + error.len(),
+                DaemonMessageType::ModelsUpdated { account, models } => {
+                    // 2 named fields (account, models): the account string plus
+                    // the summed model ids cover the variable payload.
+                    named_field_overhead(2)
+                        + account.len()
+                        + models.iter().map(String::len).sum::<usize>()
+                }
                 DaemonMessageType::Unlocked
                 | DaemonMessageType::Locked
                 | DaemonMessageType::Bound

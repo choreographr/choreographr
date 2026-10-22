@@ -69,6 +69,13 @@ use zeroize::Zeroizing;
 /// copy of the server's config. No new request/reply variants are needed: sign
 /// in rides the existing `AddCredential`, and sign out rides
 /// `RemoveCredential`, both keyed by the daemon-supplied `credential_key`.
+/// Also under the same policy, 9 gained the
+/// `DaemonMessage::ModelsUpdated { account, models }` broadcast, emitted when a
+/// background model-list fetch finishes so an already-open model picker
+/// refreshes in place. A cold picker now paints instantly from a locally
+/// cached or catalog-seeded list and this broadcast supersedes that seed when
+/// the live fetch lands, instead of the picker blocking on a slow
+/// `/v1/models` round-trip.
 ///
 /// Policy: variants may be added to the **current, unreleased** wire version
 /// without a bump. Mixed-version peers do not exist until a release ships, and

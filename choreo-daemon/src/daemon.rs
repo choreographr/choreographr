@@ -45,8 +45,8 @@ use crate::sessions::{
     ActiveSessionEntry, CANCEL_ALL, RequestContext, SessionCommand, SessionMetadata, session_main,
 };
 use choreo_ai_protocols::{
-    SocketRegistry, bundled_overlay_src, catalog_snapshot, lookup_context_window, merge_overlay,
-    replace_catalog,
+    SocketRegistry, bundled_overlay_src, catalog_snapshot, lookup_context_window, lookup_provider,
+    merge_overlay, replace_catalog,
 };
 use choreo_keystore::ServiceCredential;
 use choreo_power_events::SuspendEvent;
@@ -2010,7 +2010,17 @@ impl DaemonState {
                     models = models.len(),
                     "background model prefetch complete"
                 );
+                // Announce the freshly fetched list so an already-open model
+                // picker replaces its list (a catalog seed, or an empty
+                // "warming" state) in place instead of waiting for the user to
+                // reopen it. The broadcast is keyed by account name; a frontend
+                // applies it only to the picker showing that account.
+                let updated = DaemonMessageType::ModelsUpdated {
+                    account: account.clone(),
+                    models: models.clone(),
+                };
                 self.model_cache.insert(account, (models, Instant::now()));
+                self.broadcast(&updated);
             }
             Err(e) => {
                 warn!(
@@ -3678,10 +3688,17 @@ fn handle_list_models_inner(
     // request instead TRIGGERS a background prefetch (dedup-guarded via
     // `maybe_spawn_model_prefetch` — no-op when one is already running, so
     // an open picker while a join-time prefetch is in flight does not
-    // double-fetch) and serves what it can:
-    //   - a stale-but-present list beats nothing, so it is served;
-    //   - with nothing cached at all, a retryable "warming" error is
-    //     returned and the client refetches once the prefetch lands.
+    // double-fetch) and serves the best list it can WITHOUT blocking:
+    //   - a fresh cache answers immediately;
+    //   - else a stale-but-present list is served (it beats nothing);
+    //   - else the local catalog's curated ids for the account's provider are
+    //     served as an instant first paint, so the picker opens without
+    //     waiting on a slow endpoint (api.openai.com's /v1/models can take
+    //     ~10 s per attempt and trip a 504 retry);
+    //   - only when none of those exist does it return the retryable
+    //     "warming" error.
+    // When the background fetch lands it broadcasts `ModelsUpdated`, which
+    // replaces whatever was painted in an already-open picker.
     let now = Instant::now();
     let models = match state.model_cache.get(&account_name) {
         Some((cached_models, cached_at)) if now.duration_since(*cached_at) < MODEL_CACHE_TTL => {
@@ -3689,13 +3706,25 @@ fn handle_list_models_inner(
         }
         _ => {
             // Clone the stale list (if any) BEFORE the mutable spawn call,
-            // so no borrow of `state` is live across it.
+            // so no borrow of `state` is live across it. An empty cached list
+            // is treated as absent so a catalog seed can stand in for it.
             let stale = state
                 .model_cache
                 .get(&account_name)
-                .map(|(models, _)| models.clone());
+                .map(|(models, _)| models.clone())
+                .filter(|models| !models.is_empty());
+            // Paint from the local catalog only when there is no cached list
+            // at all: a present (even stale) list is more account-specific
+            // than the catalog's provider-wide curated set.
+            let seed = if stale.is_none() {
+                catalog_models_for_account(state, &account_name)
+            } else {
+                None
+            };
             state.maybe_spawn_model_prefetch(&account_name);
-            stale.ok_or_else(|| choreo_proto::models_warming_error(&account_name))?
+            stale
+                .or(seed)
+                .ok_or_else(|| choreo_proto::models_warming_error(&account_name))?
         }
     };
 
@@ -3703,6 +3732,20 @@ fn handle_list_models_inner(
         .and_then(|sid| state.session_metadata.get(&sid))
         .and_then(|m| m.selected_model.clone());
     Ok((models, selected_model))
+}
+
+/// The catalog's curated model ids for an account's provider, used to paint
+/// the model picker instantly while the live `/v1/models` fetch runs. `None`
+/// when the account or its provider is unknown to the catalog, or the catalog
+/// lists no models for that provider — in which case `handle_list_models_inner`
+/// falls back to the retryable "warming" error rather than an empty list.
+fn catalog_models_for_account(state: &DaemonState, account: &str) -> Option<Vec<String>> {
+    let slug = state.account_provider_slug(account)?;
+    let entry = lookup_provider(&slug)?;
+    if entry.models.is_empty() {
+        return None;
+    }
+    Some(entry.models.into_iter().map(|m| m.model).collect())
 }
 
 #[cfg(test)]

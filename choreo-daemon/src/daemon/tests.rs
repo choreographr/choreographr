@@ -4064,6 +4064,52 @@ fn handle_model_prefetch_result_success_populates_cache_and_releases_guard() {
 }
 
 #[test]
+fn handle_model_prefetch_result_success_broadcasts_models_updated() {
+    // When the background fetch lands, an already-open picker must learn the
+    // fresh list without the user reopening it — so the result is broadcast as
+    // `ModelsUpdated` (keyed by account) alongside the cache insert.
+    let (mut state, _rx) = make_daemon_state();
+    seed_credentialed_account(&mut state, "acct", "openai");
+    state.model_prefetch_in_flight.insert("acct".into());
+    let (writer_tx, writer_rx) = test_sink();
+    put_client(&mut state, 1, &writer_tx, false, true, &[]);
+
+    state.handle_command(DaemonCommand::ModelPrefetchResult {
+        account: "acct".into(),
+        result: Ok(vec!["m1".into(), "m2".into()]),
+    });
+
+    let msg = writer_rx.recv().unwrap();
+    match &msg.inner {
+        DaemonMessageType::ModelsUpdated { account, models } => {
+            assert_eq!(account, "acct");
+            assert_eq!(models, &["m1".to_string(), "m2".to_string()]);
+        }
+        other => panic!("expected ModelsUpdated, got {other:?}"),
+    }
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn catalog_models_for_account_resolves_known_provider_and_rejects_unknown() {
+    // The instant-first-paint seed: a catalog-known provider yields its curated
+    // model ids; an unknown provider (or unknown account) yields None so the
+    // caller falls back to the retryable "warming" error instead of an empty
+    // list.
+    let (mut state, _rx) = make_daemon_state();
+    seed_credentialed_account(&mut state, "acct", "openai");
+    let seeded = catalog_models_for_account(&state, "acct").expect("openai is in the catalog");
+    assert!(
+        !seeded.is_empty(),
+        "the openai catalog entry carries curated model ids"
+    );
+
+    seed_credentialed_account(&mut state, "other", "not-in-catalog");
+    assert!(catalog_models_for_account(&state, "other").is_none());
+    assert!(catalog_models_for_account(&state, "ghost").is_none());
+}
+
+#[test]
 fn handle_model_prefetch_result_failure_releases_guard_without_caching() {
     let (mut state, _rx) = make_daemon_state();
     state.model_prefetch_in_flight.insert("acct".into());
@@ -4185,8 +4231,18 @@ fn create_session_with_account_spawns_background_prefetch() {
 fn state_with_session_account(
     account: &str,
 ) -> (DaemonState, crossbeam_channel::Receiver<DaemonCommand>) {
+    state_with_session_account_provider(account, "openai")
+}
+
+/// Like [`state_with_session_account`], but the account's provider slug is
+/// caller-chosen — used to exercise the "no catalog seed for this provider"
+/// branch (a slug unknown to the catalog).
+fn state_with_session_account_provider(
+    account: &str,
+    provider: &str,
+) -> (DaemonState, crossbeam_channel::Receiver<DaemonCommand>) {
     let (mut state, rx) = make_daemon_state();
-    seed_credentialed_account_with_url(&mut state, account, "openai", Some(dead_base_url()));
+    seed_credentialed_account_with_url(&mut state, account, provider, Some(dead_base_url()));
     state.session_metadata.insert(
         1,
         SessionMetadata {
@@ -4240,17 +4296,22 @@ fn list_models_serves_stale_cache_without_duplicate_fetch_while_prefetch_in_flig
 }
 
 #[test]
-fn list_models_with_cold_cache_triggers_background_prefetch_and_reports_warming() {
+#[serial_test::serial(catalog)]
+fn list_models_with_cold_cache_serves_catalog_seed_and_warms_background() {
     // Cold cache, no prefetch running: the fetch must be handed to the
-    // background thread (never the command loop) and the caller gets a
-    // retryable "warming" error.
+    // background thread (never the command loop), AND the picker must paint
+    // instantly from the local catalog's curated ids for the account's
+    // provider instead of blocking on the (potentially slow) live fetch.
     let (mut state, rx) = state_with_session_account("acct");
 
-    let err = handle_list_models_inner(&mut state, Some(1)).expect_err("cold cache → warming");
-    assert!(err.contains("warming"), "unexpected error: {err}");
+    let (models, _) = handle_list_models_inner(&mut state, Some(1)).expect("catalog seed served");
+    assert!(
+        !models.is_empty(),
+        "the catalog seeds a known provider (openai) so the picker is never empty while warming"
+    );
     assert!(
         state.model_prefetch_in_flight.contains("acct"),
-        "a background prefetch must have been spawned"
+        "a background prefetch must still be spawned to refresh the seed"
     );
 
     // The spawned fetch reports back through the command channel; feed it
@@ -4263,7 +4324,22 @@ fn list_models_with_cold_cache_triggers_background_prefetch_and_reports_warming(
     ));
     state.handle_command(msg);
     assert!(!state.model_prefetch_in_flight.contains("acct"));
+    // The (dead-endpoint) fetch failed, so nothing was cached; the catalog
+    // seed will be served again on the next request until a fetch lands.
     assert!(!state.model_cache.contains_key("acct"));
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn list_models_with_no_cache_and_no_catalog_models_reports_warming() {
+    // An account whose provider is unknown to the catalog has no seed to paint:
+    // the caller gets the retryable "warming" error so it can ask again once
+    // the live fetch lands (rather than an empty list that looks like "no
+    // models").
+    let (mut state, _rx) = state_with_session_account_provider("acct", "not-in-catalog");
+
+    let err = handle_list_models_inner(&mut state, Some(1)).expect_err("no seed → warming");
+    assert!(err.contains("warming"), "unexpected error: {err}");
 }
 
 #[test]

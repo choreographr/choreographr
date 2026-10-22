@@ -759,7 +759,8 @@ pub(crate) struct ModelSelectorState {
     /// True between `open()` and the arrival of the `Models`/`ModelsFailed`
     /// reply; the popup shows a "loading" row instead of the list.
     pub(crate) loading: bool,
-    /// All models for the attached session's account, in daemon order.
+    /// All models for the attached session's account, sorted case-insensitively
+    /// by id (see `apply_models`).
     pub(crate) all_models: Vec<String>,
     /// The currently active model (marked with `●`), if known.
     pub(crate) selected: Option<String>,
@@ -870,7 +871,13 @@ impl ModelSelectorState {
     /// Populate the model list from a `Models` reply and preselect the
     /// current model.  `selected` falls back to `None` when the daemon does
     /// not report one; the caller may pass the display's cached value.
-    pub(crate) fn apply_models(&mut self, models: Vec<String>, selected: Option<String>) {
+    pub(crate) fn apply_models(&mut self, mut models: Vec<String>, selected: Option<String>) {
+        // Present the list alphabetically regardless of the order the daemon
+        // (or the provider's own `/v1/models` listing) returned it in.
+        // `sort_by_cached_key` computes the lowercase key once per element
+        // rather than per comparison; it is stable, so equal keys (ids that
+        // differ only by case) keep the daemon's relative order.
+        models.sort_by_cached_key(|model| model.to_lowercase());
         self.all_models = models;
         self.selected = selected;
         self.loading = false;

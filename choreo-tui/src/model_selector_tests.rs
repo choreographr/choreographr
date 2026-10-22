@@ -108,8 +108,93 @@ fn model_selector_populates_from_models_reply() {
         Some("gpt-4o-mini"),
         "the active model is preselected"
     );
+    // The list is alphabetical, case-insensitively: claude-3, gpt-4o,
+    // gpt-4o-mini.
+    assert_eq!(
+        app.model_selector.all_models,
+        vec!["claude-3", "gpt-4o", "gpt-4o-mini"]
+    );
     // The reply must not leak into the chat status line.
     assert!(app.status.is_none());
+}
+
+#[test]
+fn models_updated_broadcast_refreshes_the_open_picker_for_the_attached_account() {
+    // A background fetch that lands while the picker is open replaces the
+    // instant catalog seed (or empty "warming" state) in place, without the
+    // user reopening the picker and without printing into the chat.
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut app = test_app();
+    app.attached_account_slug = Some("acct".to_string());
+    app.model_selector.open();
+    app.model_selector
+        .apply_models(vec!["seed-a".to_string()], None);
+
+    handle_daemon_message(
+        DaemonMessage::broadcast(DaemonMessageType::ModelsUpdated {
+            account: "acct".to_string(),
+            // Deliberately unsorted: the picker normalizes to alphabetical.
+            models: vec!["z-model".to_string(), "a-model".to_string()],
+        }),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ModelsUpdated");
+
+    assert_eq!(
+        app.model_selector.all_models,
+        vec!["a-model", "z-model"],
+        "the broadcast replaced the seed with the freshly sorted list"
+    );
+    assert!(app.status.is_none(), "the broadcast must not print to chat");
+}
+
+#[test]
+fn models_updated_broadcast_is_ignored_for_a_different_account() {
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut app = test_app();
+    app.attached_account_slug = Some("acct".to_string());
+    app.model_selector.open();
+    app.model_selector
+        .apply_models(vec!["seed-a".to_string()], None);
+
+    handle_daemon_message(
+        DaemonMessage::broadcast(DaemonMessageType::ModelsUpdated {
+            account: "someone-else".to_string(),
+            models: vec!["other".to_string()],
+        }),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ModelsUpdated");
+
+    assert_eq!(
+        app.model_selector.all_models,
+        vec!["seed-a"],
+        "a different account's refresh must not touch this picker"
+    );
+}
+
+#[test]
+fn models_updated_broadcast_is_ignored_when_the_picker_is_closed() {
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut app = test_app();
+    app.attached_account_slug = Some("acct".to_string());
+
+    handle_daemon_message(
+        DaemonMessage::broadcast(DaemonMessageType::ModelsUpdated {
+            account: "acct".to_string(),
+            models: vec!["a-model".to_string()],
+        }),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ModelsUpdated");
+
+    assert!(
+        app.model_selector.all_models.is_empty(),
+        "a closed picker keeps its state; reopening re-fetches"
+    );
 }
 
 #[test]
@@ -452,7 +537,8 @@ fn model_selector_click_row_selects_and_sends_set_model() {
         width: 100,
         height: 40,
     });
-    // Click the second row of the list body (scroll is 0).
+    // Click the second row of the list body (scroll is 0). Sorting places
+    // "gpt-4o" second: [claude-3, gpt-4o, gpt-4o-mini].
     send_mouse(
         &mut app,
         MouseEventKind::Down(MouseButton::Left),
@@ -469,7 +555,7 @@ fn model_selector_click_row_selects_and_sends_set_model() {
     assert_eq!(
         msg.inner,
         ClientMessageType::SetModel {
-            model: "gpt-4o-mini".to_string()
+            model: "gpt-4o".to_string()
         }
     );
 }
