@@ -1108,3 +1108,12 @@ fn login_modal_renders_untrusted_fields_inert() {
         );
     }
 }
+
+#[test]
+fn status_display_renders_a_hostile_tool_name_inert() {
+    // The status bar and the session table both show the session status, and a
+    // tool name there is MCP-supplied arbitrary text.
+    let (label, _color) = status_display(&SessionStatus::ToolCall("evil\u{7}tool".to_string()));
+    assert_eq!(label, "tool call: evil\\u{7}tool");
+    assert!(!label.chars().any(char::is_control), "{label:?}");
+}

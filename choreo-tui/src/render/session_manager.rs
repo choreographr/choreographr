@@ -239,7 +239,10 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     let status = if let Some((_id, title)) = &app.session_mgr.confirm_delete {
-        Paragraph::new(Line::from(format!(" Delete \"{title}\"? (y/N)  ")))
+        Paragraph::new(Line::from(format!(
+            " Delete \"{}\"? (y/N)  ",
+            display_text(title)
+        )))
     } else {
         let archive_hint = if archived_view {
             "unarchive"
@@ -281,15 +284,18 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(ref detail) = app.session_mgr.detail_data {
         let lines = vec![
             Line::from(format!("Session ID:    {}", detail.session_id)),
-            Line::from(format!("Title:         {}", detail.title)),
-            Line::from(format!("Model:         {}", detail.selected_model)),
+            Line::from(format!("Title:         {}", display_text(&detail.title))),
+            Line::from(format!(
+                "Model:         {}",
+                display_text(&detail.selected_model)
+            )),
             Line::from(format!(
                 "Reasoning:     {}",
                 detail
                     .reasoning_effort
                     .as_deref()
                     .filter(|e| *e != "off")
-                    .unwrap_or("off")
+                    .map_or_else(|| "off".to_string(), |e| display_text(e).into_owned())
             )),
             Line::from(format!(
                 "Parent:        {}",
@@ -297,7 +303,10 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
                     .parent_session_id
                     .map_or("none".to_string(), |id| id.to_string())
             )),
-            Line::from(format!("Working Dir:   {}", detail.working_dir)),
+            Line::from(format!(
+                "Working Dir:   {}",
+                display_text(&detail.working_dir)
+            )),
             Line::from(format!(
                 "Created:       {}",
                 format_timestamp(detail.created_at)
@@ -319,7 +328,7 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
             Line::from(format!("Turn Count:    {}", detail.turn_count)),
             Line::from(format!(
                 "Account:       {}",
-                detail.account_name.as_deref().unwrap_or("-")
+                display_text(detail.account_name.as_deref().unwrap_or("-"))
             )),
             Line::from(match &detail.accumulated_usage {
                 Some(usage) => session_detail_tokens_line(usage),

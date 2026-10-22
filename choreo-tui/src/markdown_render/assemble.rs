@@ -537,8 +537,10 @@ fn render_turn_lines_impl(
         if let Some(first) = desc_lines.first() {
             header_spans.extend(first.spans.iter().cloned());
         } else {
+            // The tool name is MCP-supplied (any string a server chooses), so
+            // it is normalized like every other displayed value.
             header_spans.push(Span::styled(
-                format!("{label}: {}", tr.name),
+                format!("{label}: {}", normalize_display_text(&tr.name)),
                 Style::default().fg(accent),
             ));
         }
@@ -571,7 +573,7 @@ fn render_turn_lines_impl(
                 body_joins.push(LineJoin::Break);
                 body_chrome.push(LineChrome::default());
                 body.push(Line::from(Span::styled(
-                    format!("{label}: {}", tr.name),
+                    format!("{label}: {}", normalize_display_text(&tr.name)),
                     Style::default().fg(accent),
                 )));
                 body_joins.push(LineJoin::Break);

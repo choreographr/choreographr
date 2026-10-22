@@ -138,8 +138,10 @@ pub(super) fn render_model_selector(frame: &mut Frame<'_>, app: &mut App) {
         } else {
             Style::default().fg(Color::White)
         };
+        // Model ids come from the catalog (and from the daemon's live list):
+        // normalize so an odd id cannot shift the row it is drawn on.
         lines.push(Line::from(Span::styled(
-            format!("{prefix}{marker} {model}"),
+            format!("{prefix}{marker} {}", display_text(model)),
             style,
         )));
     }

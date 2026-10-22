@@ -872,9 +872,14 @@ fn render_turn_image(
         .and_then(|images| images.get_mut(&slot))
     {
         if let Some(protocol) = img.protocols.get_mut(&inline_size) {
+            // The mime type comes from the protocol, so it is normalized like
+            // any other displayed value before it lands in a block title.
             let title = format!(
                 "image {} ({} {}x{})",
-                turn_id, img.metadata.mime_type, img.metadata.width, img.metadata.height,
+                turn_id,
+                display_text(&img.metadata.mime_type),
+                img.metadata.width,
+                img.metadata.height,
             );
             let block = Block::default().title(title);
             let inner = block.inner(area);
@@ -940,7 +945,10 @@ fn render_turn_image(
     // sync_turn_images), not from the session turns.
     let placeholder_title = format!(
         "image {} ({} {}x{})",
-        turn_id, meta.mime_type, meta.width, meta.height,
+        turn_id,
+        display_text(&meta.mime_type),
+        meta.width,
+        meta.height,
     );
     let block = Block::default().title(placeholder_title);
     frame.render_widget(block, area);
@@ -995,7 +1003,11 @@ pub(crate) fn status_display(status: &SessionStatus) -> (String, Color) {
         SessionStatus::Waiting => ("waiting".into(), Color::LightBlue),
         SessionStatus::Reasoning => ("reasoning".into(), Color::Yellow),
         SessionStatus::Responding => ("responding".into(), Color::LightGreen),
-        SessionStatus::ToolCall(name) => (format!("tool call: {name}"), Color::Cyan),
+        // A tool name is MCP-supplied (an arbitrary server string): normalize it
+        // here, where every session-status surface reads it.
+        SessionStatus::ToolCall(name) => {
+            (format!("tool call: {}", display_text(name)), Color::Cyan)
+        }
         SessionStatus::Retrying {
             attempt,
             max_attempts,

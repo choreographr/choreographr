@@ -103,11 +103,13 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
                 Style::default()
             };
 
-            let name_line = format!("{sel} {} ", account.name);
+            // Account names come from the keystore and the provider label from
+            // the catalog: normalize each so it occupies the columns it draws.
+            let name_line = format!("{sel} {} ", display_text(&account.name));
             let name_spans = vec![ratatui::text::Span::styled(name_line, style)];
             lines.push(Line::from(name_spans));
 
-            let provider_label = format!("   Provider: {}", account.provider);
+            let provider_label = format!("   Provider: {}", display_text(&account.provider));
             let provider_style = if is_selected {
                 Style::default().bg(Color::Blue).fg(Color::White)
             } else {
@@ -155,7 +157,10 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     let status = if let Some(ref name) = app.ai_providers.confirm_remove {
-        Paragraph::new(Line::from(format!(" Remove \"{name}\"? (y/N)  ")))
+        Paragraph::new(Line::from(format!(
+            " Remove \"{}\"? (y/N)  ",
+            display_text(name)
+        )))
     } else {
         Paragraph::new(Line::from(format!(
             " <j/k nav>  <Enter use>  <n new>  <c set key>  <r remove>  <Esc back>  —  {total_items} accounts"
@@ -195,7 +200,7 @@ fn render_credential_modal(frame: &mut Frame<'_>, app: &mut App) {
         .unwrap_or("(unknown)");
 
     let block = Block::default()
-        .title(format!(" API Key for \"{account_name}\" "))
+        .title(format!(" API Key for \"{}\" ", display_text(account_name)))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(popup);
@@ -370,7 +375,7 @@ fn render_wizard_provider(frame: &mut Frame<'_>, app: &mut App) {
             Style::default().fg(Color::White)
         };
         lines.push(Line::from(Span::styled(
-            format!("{prefix}{}", provider.display_name),
+            format!("{prefix}{}", display_text(&provider.display_name)),
             style,
         )));
     }

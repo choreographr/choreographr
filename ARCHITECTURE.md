@@ -1797,13 +1797,15 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
   carrying one measured wider than it rendered — which is what ragged a code box's
   right border on tab-indented lines. The same normalizer is applied by every
   plain widget that *displays* rather than authors its text — the status/error
-  line (and the height math that reserves rows for it), the session table's title
-  and model cells, the provider/model/credential modals, and the OAuth login
-  popup (whose status, authorize URL, and device code come from the authorization
-  server) — via `render::display_text`. The rule the renderer holds to is that
-  **every row measures exactly what ratatui draws**; any producer that hands a
-  widget text must normalize it first (clean text borrows, so the common case
-  costs one scan).
+  line (and the height math that reserves rows for it), the session-status label
+  (whose tool name is MCP-supplied), tool-result labels, the session table and
+  detail pane (title, model, working dir, account), image block titles, the
+  provider/model/credential modals and their delete confirmations, and the OAuth
+  login popup (whose status, authorize URL, and device code come from the
+  authorization server) — via `render::display_text`. The rule the renderer holds
+  to is that **every row measures exactly what ratatui draws**; any producer that
+  hands a widget text must normalize it first (clean text borrows, so the common
+  case costs one scan).
 
 **Streaming is byte-bounded end to end.** The bounded streaming channel only bounds
 *in-flight* chunks (backpressure); the *total* is capped too, so the live view can never

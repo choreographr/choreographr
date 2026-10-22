@@ -681,3 +681,55 @@ fn render_turn_lines_write_file_fenced_content_renders_as_markdown() {
         "write_file code block should be syntax-highlighted:\n{text}"
     );
 }
+
+#[test]
+fn tool_result_header_renders_a_hostile_tool_name_inert() {
+    // A tool name is supplied by an MCP server (any string it likes), and it
+    // labels both the collapsed header row and the expanded label row, so it
+    // goes through the same normalizer as every other displayed value: no
+    // control character reaches a cell, and a lone tab cannot shift the row.
+    let turn = Turn {
+        created_at: choreo_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: None,
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![choreo_proto::ToolResultRecord {
+            call_id: "call1".into(),
+            name: "evil\u{7}tool\tname".into(),
+            content: "body".into(),
+            is_error: false,
+            invocation_description: String::new(),
+            image: None,
+        }],
+        displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    };
+    // Collapsed (header only) and expanded (header + label row) both draw the
+    // name.
+    for collapsed in [[true], [false]] {
+        let lines = render_turn_lines(&turn, 80, 85, false, &collapsed).lines;
+        let text = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The join separator is a newline; every other control char is a leak.
+        let bad: Vec<char> = text
+            .chars()
+            .filter(|c| c.is_control() && *c != '\n')
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "no control char may reach a row (collapsed {collapsed:?}): {bad:?} in {text:?}"
+        );
+        assert!(
+            text.contains("tool result: evil\\u{7}tool   name"),
+            "the name renders inert, tab expanded (collapsed {collapsed:?}): {text:?}"
+        );
+    }
+}
