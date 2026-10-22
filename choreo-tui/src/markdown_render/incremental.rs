@@ -35,7 +35,7 @@
 //!   interior.
 //!
 //! The source is also normalized incrementally ([`NormalizedSource`]): the
-//! same reasoning applies to [`normalize_display_text`](super::normalize_display_text),
+//! same reasoning applies to [`normalize_display_text`](crate::text_filter::normalize_display_text),
 //! whose tab expansion makes it stateful along a line.  A line start is the only
 //! position at which that state is empty again, so each frame re-normalizes only
 //! from the last line start onward, and the cached text stays byte-identical to
@@ -46,9 +46,10 @@ use ratatui::text::{Line, Span};
 
 use super::{
     BlockKind, LineChrome, LineJoin, first_block_kind, last_block_kind, line_is_blank,
-    normalize_display_text, render_blocks_untrimmed, render_document_lines,
+    render_blocks_untrimmed, render_document_lines,
 };
 use crate::MarkdownDocument;
+use crate::text_filter::normalize_display_text;
 
 /// A committed render of a source prefix plus the incremental state needed to
 /// extend it.  See the module docs.

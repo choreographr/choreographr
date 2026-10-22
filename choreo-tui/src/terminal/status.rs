@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 use choreo_proto::SessionStatus;
 
-use super::{is_bidi_control, is_control_char, osc, write};
+use super::{is_control_char, is_unsafe_display_char, osc, write};
 
 /// Stable machine-readable program name placed on every record (children
 /// cannot inherit `app` from the unlabeled OSC 9;4 root).
@@ -61,20 +61,22 @@ fn encode(text: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(text.as_bytes())
 }
 
-/// Strip control characters and bidi-formatting controls, then truncate to
+/// Strip control characters and the unsafe display characters, then truncate to
 /// `max_bytes` on a char boundary.
 ///
 /// The spec requires a report's decoded `title` / `msg` to contain no control
 /// character and caps both by decoded byte length; a report that breaks either
 /// is discarded whole, so the emitter must sanitize and cap before framing.
-/// Bidirectional-formatting characters are also stripped: the spec's Security
-/// section calls for disarming them before free text is shown, and a title/
-/// `msg` is display text. Truncation snaps to a char boundary so a multi-byte
-/// character is never split.
+/// The non-joiner format class and the line/paragraph separators are stripped
+/// too ([`is_unsafe_display_char`]): the spec's Security section calls for
+/// disarming spoofing characters before free text is shown, a `title`/`msg` is
+/// display text, and a separator would break the record's one-line shape —
+/// exactly the characters the grid filter escapes. Truncation snaps to a char
+/// boundary so a multi-byte character is never split.
 fn sanitize_value(text: &str, max_bytes: usize) -> String {
     let mut out = String::with_capacity(text.len().min(max_bytes));
     for c in text.chars() {
-        if is_control_char(c) || is_bidi_control(c) {
+        if is_control_char(c) || is_unsafe_display_char(c) {
             continue;
         }
         if out.len() + c.len_utf8() > max_bytes {
@@ -283,6 +285,38 @@ mod tests {
         assert_eq!(
             seq,
             "\x1b]7501;state=working:app=choreo-tui:id=1:title=YWI=:msg=YWI=\x1b\\"
+        );
+    }
+
+    #[test]
+    fn record_strips_invisible_format_chars_and_separators() {
+        // The same class the grid filter escapes: ZWSP, word joiner, soft
+        // hyphen, and the line/paragraph separators are dropped from a record
+        // field too (a separator would break the one-line record). "ab" ->
+        // "YWI=".
+        for stripped in ["\u{200b}", "\u{2060}", "\u{00ad}", "\u{2028}", "\u{2029}"] {
+            let title = format!("a{stripped}b");
+            let seq = record(1, APP, "working", Some(&title), Some(&title));
+            assert_eq!(
+                seq,
+                "\x1b]7501;state=working:app=choreo-tui:id=1:title=YWI=:msg=YWI=\x1b\\",
+                "U+{:04X} must be stripped from both fields",
+                stripped.chars().next().map_or(0, u32::from)
+            );
+        }
+        // Legitimate joiners survive.
+        let seq = record(1, APP, "idle", Some("a\u{200c}b\u{200d}c"), None);
+        let encoded = seq
+            .split(":title=")
+            .nth(1)
+            .and_then(|s| s.strip_suffix("\x1b\\"))
+            .expect("title field present");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("valid base64");
+        assert_eq!(
+            std::str::from_utf8(&decoded).unwrap_or_default(),
+            "a\u{200c}b\u{200d}c"
         );
     }
 

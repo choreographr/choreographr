@@ -79,11 +79,11 @@ use ratatui::{
 /// rewriting the text on the way to the screen would both desync the cursor
 /// from the row it draws on and change what the user ends up submitting.
 ///
-/// The one implementation is the markdown renderer's
-/// [`normalize_display_text`](crate::markdown_render::normalize_display_text);
+/// The one implementation is the terminal-safety filter's
+/// [`normalize_display_text`](crate::text_filter::normalize_display_text);
 /// this is the entry point for the plain widgets that share the same sink rule.
 pub(crate) fn display_text(text: &str) -> std::borrow::Cow<'_, str> {
-    crate::markdown_render::normalize_display_text(text)
+    crate::text_filter::normalize_display_text(text)
 }
 
 /// [`display_text`] for a sink that stores the text — a [`String`] field, a

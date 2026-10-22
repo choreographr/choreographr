@@ -6,13 +6,15 @@
 //! empty) on suspend and exit so the TUI does not leave a stale name behind.
 //!
 //! Session titles are daemon/LLM-derived, so [`sanitize`] strips every control
-//! byte (C0, DEL, C1) and every bidirectional-formatting character before the
-//! title reaches the terminal — a raw `ESC`/`ST` byte would terminate or corrupt
-//! the OSC sequence, and a bidi override would let a hostile title visually
-//! reorder or spoof the window title — and caps the length so a pathologically
-//! long title cannot emit an unbounded escape.
+//! byte (C0, DEL, C1) and every character outside the grid's safe set — the
+//! spoofing format class and the line/paragraph separators, via the shared
+//! Unicode policy — before the title reaches the terminal: a raw `ESC`/`ST`
+//! byte would terminate or corrupt the OSC sequence, and a bidi override or
+//! invisible format char would let a hostile title visually reorder or spoof the
+//! window title. The length is capped too, so a pathologically long title cannot
+//! emit an unbounded escape.
 
-use super::{is_bidi_control, is_control_char, osc, write};
+use super::{is_control_char, is_unsafe_display_char, osc, write};
 
 /// The program name shown in the window title when no session is attached.
 const APP_NAME: &str = "Choreographr";
@@ -41,14 +43,17 @@ pub(crate) fn clear() {
     write(&build(""));
 }
 
-/// Strip control bytes and bidi-formatting controls, then cap the length of an
-/// OSC 2 title.
+/// Strip control bytes and the unsafe display characters, then cap the length of
+/// an OSC 2 title.
 ///
 /// Removes C0 (`U+0000..=U+001F`), DEL (`U+007F`), C1 (`U+0080..=U+009F`), and
-/// bidirectional-formatting characters, then caps at [`MAX_TITLE_CHARS`].
+/// every character [`is_unsafe_display_char`] rejects — the non-joiner format
+/// class (bidi marks/overrides/isolates, ZWSP, word joiner, soft hyphen, BOM, …)
+/// and the line/paragraph separators, i.e. exactly what the grid filter escapes
+/// — then caps at [`MAX_TITLE_CHARS`].
 pub(crate) fn sanitize(text: &str) -> String {
     text.chars()
-        .filter(|c| !is_control_char(*c) && !is_bidi_control(*c))
+        .filter(|c| !is_control_char(*c) && !is_unsafe_display_char(*c))
         .take(MAX_TITLE_CHARS)
         .collect()
 }
@@ -57,8 +62,8 @@ pub(crate) fn sanitize(text: &str) -> String {
 /// known, else `Choreographr - <session title>`.
 ///
 /// The session title is sanitized before the emptiness check, so a title whose
-/// every character is stripped (control/bidi only) falls back to the plain
-/// program name rather than a dangling `Choreographr - ` separator.
+/// every character is stripped (control/bidi/separator only) falls back to the
+/// plain program name rather than a dangling `Choreographr - ` separator.
 pub(crate) fn window_title(session_title: Option<&str>) -> String {
     match session_title.map(sanitize) {
         Some(title) if !title.is_empty() => format!("{APP_NAME} - {title}"),
@@ -92,6 +97,18 @@ mod tests {
     fn sanitize_strips_bidi_overrides() {
         // An RLO (U+202E) and an isolate (U+2066) are removed; the text survives.
         assert_eq!(sanitize("a\u{202e}b\u{2066}c"), "abc");
+    }
+
+    #[test]
+    fn sanitize_strips_invisible_format_chars_and_separators() {
+        // The alignment with the grid filter: every non-joiner format char and
+        // both line/paragraph separators are dropped from a title too.
+        assert_eq!(sanitize("a\u{200b}b"), "ab", "zero-width space");
+        assert_eq!(sanitize("a\u{2060}b"), "ab", "word joiner");
+        assert_eq!(sanitize("a\u{00ad}b"), "ab", "soft hyphen");
+        assert_eq!(sanitize("a\u{2028}b\u{2029}c"), "abc", "separators");
+        // Legitimate joiners survive (emoji ZWJ sequences, Persian ZWNJ).
+        assert_eq!(sanitize("a\u{200c}b\u{200d}c"), "a\u{200c}b\u{200d}c");
     }
 
     #[test]

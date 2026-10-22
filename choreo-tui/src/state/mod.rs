@@ -18,7 +18,8 @@ use choreo_proto::{ReasoningCapability, SessionStatus, TokenUsage, socket_path};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use std::collections::{HashMap, HashSet};
 
-use crate::markdown_render::{lines_height, normalize_display_text, plain_text_lines};
+use crate::markdown_render::{lines_height, plain_text_lines};
+use crate::text_filter::normalize_display_text;
 
 mod command_palette;
 mod display_line;

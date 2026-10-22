@@ -1776,8 +1776,11 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
   This closes the remaining
   LLM-spoofing gap for the streaming tools whose raw output is deliberately not
   source-escaped.
-- **Sink.** `choreo-tui`'s `normalize_ansi_text` filter runs over every tool-result
-  body before rendering: it keeps complete SGR color sequences (`ESC [ … m`, so ANSI
+- **Sink.** `choreo-tui`'s terminal-safety filter (`src/text_filter.rs`, the one home
+  of the policy, shared by the markdown renderer, the plain widgets, the stored
+  status text, and the OSC field strippers) exposes `normalize_ansi_text`, which
+  runs over every tool-result body before rendering: it keeps complete SGR color
+  sequences (`ESC [ … m`, so ANSI
   coloring still works) and escapes everything else — OSC/CSI/DCS sequences, C0/C1
   controls (including lone CR: a carriage return not followed by a line feed
   would let hostile content overwrite its own rendered line; a CRLF pair is folded to
@@ -1809,6 +1812,16 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
   ratatui draws**; any producer that hands a widget text it did not author must
   normalize it first (clean text borrows, so the common case costs one scan).
 
+  **The OSC fields classify the same characters.** The OSC 2 window title and the
+  OSC 7501 `title`/`msg` values are free text shown outside the grid, and their
+  strippers use the identical Unicode policy — C0/DEL/C1 plus the shared
+  `choreo_sanitize::is_unsafe_unicode` class (every non-joiner format character and
+  U+2028/U+2029). Only the action differs: the grid **escapes** (the text stays
+  readable and keeps measuring exactly what it draws), while an OSC payload
+  **drops** (a payload body cannot carry an escape sequence at all, and OSC 7501
+  forbids control bytes — a decoded one makes the terminal discard the whole
+  report).
+
   The policy is tiered, and which tier a value belongs to is decided by whether
   anything other than a widget reads it:
 
@@ -1826,8 +1839,9 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
      clipboard copy).
   2. **Sink** — identity-bearing or keyed values stay byte-exact in state and
      are normalized at the draw sink instead: a model id, a reasoning effort,
-     an account slug, a session title (which also feeds the OSC 2 window title
-     under that path's own strip policy), a tool name compared against
+     an account slug, a session title (which also feeds the OSC 2 window title,
+     where the policy is applied by *dropping* rather than escaping — see
+     above), a tool name compared against
      `MARKDOWN_TOOLS`, a tool-call id — and, in the login modal, `provider` and
      `account`, because the account name is the credential key the modal hands
      back and the provider selects the auth descriptor. Escaping those in place

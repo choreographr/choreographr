@@ -1,17 +1,15 @@
 use crate::{ListItem, MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline};
 use choreo_markdown::render_math_pretty;
 use choreo_proto::{ToolResultRecord, Turn};
-use choreo_sanitize::is_unsafe_unicode;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use smallvec::SmallVec;
 use syntect::easy::HighlightLines;
 
-use std::sync::Arc;
-
 use crate::cache::GlobalLruCache;
 use crate::diff_render::try_render_diff_content;
 use crate::syntax::{highlight_theme, syntax_set, to_ratatui_color};
+use crate::text_filter::normalize_display_text;
 use tracing::{debug, warn};
 
 mod assemble;

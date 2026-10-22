@@ -36,6 +36,7 @@ mod selection;
 mod state;
 mod syntax;
 mod terminal;
+mod text_filter;
 
 pub use choreo_client_core::{ClientError, Command, parse_input_line};
 pub use choreo_markdown::{

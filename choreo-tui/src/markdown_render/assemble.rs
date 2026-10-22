@@ -8,10 +8,10 @@
 
 use super::{
     IncrementalMarkdown, LineChrome, LineJoin, RenderedTurnLines, RowContent, ansi_lines_joined,
-    classify_row_content, markdown_lines_joined, normalize_ansi_text, normalize_display_text,
-    plain_text_lines_joined,
+    classify_row_content, markdown_lines_joined, plain_text_lines_joined,
 };
 use crate::render::{BG_SHADE, format_timestamp};
+use crate::text_filter::{normalize_ansi_text, normalize_display_text};
 use choreo_proto::Turn;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};

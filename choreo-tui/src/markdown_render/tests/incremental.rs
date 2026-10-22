@@ -3,6 +3,7 @@
 //! reused.
 
 use super::super::*;
+use crate::text_filter::normalize_display_text;
 use choreo_proto::TimestampMs;
 
 /// Documents exercised by the prefix sweep: prose, headings (including a

@@ -12,8 +12,22 @@
 //! `App`. Lifecycle orchestration that needs `App` — publishing the status
 //! records, deduping the window title, clearing everything on suspend/exit —
 //! lives in `connection`.
+//!
+//! **The strip policy is the grid's policy.** Both free-text OSC fields (the
+//! OSC 2 title and the OSC 7501 `title`/`msg`) drop exactly the characters the
+//! terminal grid filter escapes: [`is_control_char`] for the byte classes, plus
+//! `choreo_sanitize::is_unsafe_unicode` — the shared, data-table-derived
+//! predicate the grid reaches through [`crate::text_filter`] — for the spoofing
+//! class and the line/paragraph separators. Classification is therefore
+//! identical between the two consumers, and only the *action* differs: the grid
+//! **escapes** (the text stays readable and keeps measuring exactly what it
+//! draws), while an OSC payload **drops** (a payload body cannot carry an escape
+//! sequence at all, and OSC 7501 forbids control bytes — a decoded one makes a
+//! terminal discard the whole report).
 
 use std::io::Write;
+
+use choreo_sanitize::is_unsafe_unicode;
 
 pub(crate) mod clipboard;
 pub(crate) mod progress;
@@ -49,26 +63,37 @@ pub(crate) fn write(seq: &str) {
 /// `msg` text (a decoded control byte makes a terminal discard the whole
 /// report) and the bytes a raw `ESC`/`ST` in a title could use to inject or
 /// terminate a sequence, so every OSC family strips them before framing.
+///
+/// This stays a hand-written byte-class test (rather than delegating to the
+/// shared Unicode policy) because the shared crate does not provide one: the
+/// control classes are a fixed C0/DEL/C1 range check that both needs to be
+/// exact — a C1 byte is enough to break a report — and needs no data table.
+/// The rest of the strip set comes from [`is_unsafe_display_char`].
 pub(crate) fn is_control_char(c: char) -> bool {
     matches!(u32::from(c), 0x00..=0x1F | 0x7F | 0x80..=0x9F)
 }
 
-/// Whether `c` is a bidirectional-formatting control.
+/// Whether `c` must be stripped from free text shown outside the terminal grid
+/// (an OSC 2 window title, an OSC 7501 `title`/`msg` value).
 ///
-/// These Unicode `Cf` characters reorder or hide text when displayed, so a
-/// hostile session title could use them to visually spoof a window title or a
-/// status record. The OSC 7501 spec's Security section calls for disarming
-/// them before free text is shown outside the terminal grid; we strip them at
-/// the source for the same reason we strip control bytes. The zero-width
-/// space/non-joiner/joiner (`U+200B`–`U+200D`) are deliberately NOT stripped —
-/// they are legitimate inside emoji ZWJ sequences.
-pub(crate) fn is_bidi_control(c: char) -> bool {
-    matches!(u32::from(c),
-        0x061C            // ARABIC LETTER MARK
-        | 0x200E | 0x200F // LRM, RLM
-        | 0x202A..=0x202E // LRE, RLE, PDF, LRO, RLO
-        | 0x2066..=0x2069 // LRI, RLI, FSI, PDI
-    )
+/// Delegates to the shared [`is_unsafe_unicode`] policy: every Unicode *format*
+/// character other than the joiners U+200C/U+200D — bidi marks, overrides and
+/// isolates, the zero-width space and word joiner, the soft hyphen, the BOM,
+/// invisible operators, and any format char the Unicode tables gain — plus the
+/// line/paragraph separators U+2028/U+2029 (which are not control chars, yet
+/// would break the one-line status record). These reorder, hide, or fake
+/// displayed text, so a hostile session title could visually spoof a window title
+/// or a status record; the OSC 7501 spec's Security section calls for disarming
+/// them before free text is shown outside the grid.
+///
+/// Using the shared predicate — rather than a hand-kept range list — is what
+/// keeps this in step with the grid filter, which escapes the same characters:
+/// the two consumers classify identically and differ only in escaping versus
+/// dropping (see the module docs). The joiners stay because they affect ligation
+/// rather than ordering or visibility and are required by scripts such as
+/// Persian (ZWNJ) and Devanagari.
+pub(crate) fn is_unsafe_display_char(c: char) -> bool {
+    is_unsafe_unicode(c)
 }
 
 #[cfg(test)]
@@ -94,16 +119,42 @@ mod tests {
     }
 
     #[test]
-    fn is_bidi_control_covers_overrides_and_marks_but_not_zwj() {
-        assert!(is_bidi_control('\u{061c}')); // Arabic letter mark
-        assert!(is_bidi_control('\u{200e}')); // LRM
-        assert!(is_bidi_control('\u{200f}')); // RLM
-        assert!(is_bidi_control('\u{202e}')); // RLO
-        assert!(is_bidi_control('\u{2066}')); // LRI
-        assert!(is_bidi_control('\u{2069}')); // PDI
-        // Zero-width joiners are legitimate (emoji ZWJ sequences).
-        assert!(!is_bidi_control('\u{200b}'));
-        assert!(!is_bidi_control('\u{200d}'));
-        assert!(!is_bidi_control('a'));
+    fn is_unsafe_display_char_covers_the_spoofing_class_and_separators() {
+        // Bidi marks, overrides and isolates are stripped.
+        assert!(is_unsafe_display_char('\u{061c}')); // Arabic letter mark
+        assert!(is_unsafe_display_char('\u{200e}')); // LRM
+        assert!(is_unsafe_display_char('\u{200f}')); // RLM
+        assert!(is_unsafe_display_char('\u{202e}')); // RLO
+        assert!(is_unsafe_display_char('\u{2066}')); // LRI
+        assert!(is_unsafe_display_char('\u{2069}')); // PDI
+    }
+
+    #[test]
+    fn is_unsafe_display_char_strips_invisible_format_chars() {
+        // The invisible-but-harmless-looking format class: the grid escapes
+        // these, so the OSC fields must drop them too.
+        assert!(is_unsafe_display_char('\u{200b}')); // zero-width space
+        assert!(is_unsafe_display_char('\u{2060}')); // word joiner
+        assert!(is_unsafe_display_char('\u{00ad}')); // soft hyphen
+        assert!(is_unsafe_display_char('\u{feff}')); // BOM / ZWNBSP
+    }
+
+    #[test]
+    fn is_unsafe_display_char_strips_line_and_paragraph_separators() {
+        // U+2028/U+2029 are not control chars, yet a terminal renders them as
+        // line breaks — a one-line status record must not carry either.
+        assert!(is_unsafe_display_char('\u{2028}'));
+        assert!(is_unsafe_display_char('\u{2029}'));
+    }
+
+    #[test]
+    fn is_unsafe_display_char_keeps_joiners_and_ordinary_text() {
+        // Zero-width joiners are legitimate (emoji ZWJ sequences, Persian
+        // ZWNJ, Devanagari conjuncts).
+        assert!(!is_unsafe_display_char('\u{200c}'));
+        assert!(!is_unsafe_display_char('\u{200d}'));
+        assert!(!is_unsafe_display_char('a'));
+        assert!(!is_unsafe_display_char('日'));
+        assert!(!is_unsafe_display_char('\u{2014}')); // em dash
     }
 }
