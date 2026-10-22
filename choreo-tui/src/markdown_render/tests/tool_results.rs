@@ -733,3 +733,163 @@ fn tool_result_header_renders_a_hostile_tool_name_inert() {
         );
     }
 }
+
+/// A turn with exactly one tool result, for the content-routing tests below.
+fn one_result_turn(name: &str, content: &str, is_error: bool) -> Turn {
+    Turn {
+        created_at: choreo_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: None,
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![choreo_proto::ToolResultRecord {
+            call_id: "call1".into(),
+            name: name.into(),
+            content: content.into(),
+            is_error,
+            invocation_description: String::new(),
+            image: None,
+        }],
+        displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    }
+}
+
+/// Every span of a rendered body, as (foreground, text) pairs.
+fn body_spans(lines: &[Line<'static>]) -> Vec<(Option<Color>, String)> {
+    lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .map(|s| (s.style.fg, s.content.to_string()))
+        .collect()
+}
+
+/// Rendered rows joined for line-level assertions.
+fn rows_text(lines: &[Line<'static>]) -> String {
+    lines
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn markdown_tool_sgr_never_reaches_a_span_raw() {
+    // A markdown-emitting tool (`git_diff` here) whose content carries a
+    // complete SGR sequence must never leak the escape into a drawn span, and
+    // the colored text must survive intact.  The `contains("\x1b[")` gate runs
+    // before the markdown branch, so such content is rendered by the ANSI
+    // parser (which consumes the sequence into styling) and never reaches the
+    // markdown parser — a markdown tool's output can therefore not render an
+    // SGR as the literal text `[31m`, nor lose the text it colored.
+    let turn = one_result_turn("git_diff", "\x1b[31m+removed line\x1b[0m", false);
+    let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
+    let text = rows_text(&lines);
+    let spans = body_spans(&lines);
+    assert!(
+        spans.iter().all(|(_, content)| !content.contains('\x1b')),
+        "no span may carry a raw ESC: {spans:?}"
+    );
+    assert!(
+        text.contains("+removed line"),
+        "the colored text must not be swallowed: {text:?}"
+    );
+    // The escape was consumed as color, not printed as `[31m`.
+    assert!(
+        !text.contains("[31m"),
+        "the SGR must not render as literal parameter text: {text:?}"
+    );
+}
+
+#[test]
+fn shell_result_sgr_still_takes_the_ansi_path() {
+    // Colored tool output is the reason the SGR-preserving pass exists: a
+    // non-markdown tool's escape is parsed into a real style, so the color
+    // reaches the renderer as `Color::Red` rather than as inert text.
+    let turn = one_result_turn("shell", "\x1b[31m+removed line\x1b[0m", false);
+    let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
+    let spans = body_spans(&lines);
+    assert!(
+        spans
+            .iter()
+            .any(|(fg, content)| *fg == Some(Color::Red) && content.contains("+removed line")),
+        "the ANSI renderer must receive the escape: {spans:?}"
+    );
+}
+
+#[test]
+fn error_result_with_sgr_still_takes_the_ansi_path() {
+    // Branch order, pinned: the `contains("\x1b[")` gate is first, so it wins
+    // over `is_error`.  An error whose body carries a complete SGR sequence is
+    // colorized like any other ANSI result — but still with no raw ESC in a
+    // span, so the escape never becomes a live control sequence.
+    let turn = one_result_turn("shell", "\x1b[31mfailed: no such file\x1b[0m", true);
+    let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
+    let text = rows_text(&lines);
+    let spans = body_spans(&lines);
+    assert!(
+        spans
+            .iter()
+            .any(|(fg, content)| *fg == Some(Color::Red) && content.contains("failed")),
+        "an error's SGR is styled by the ANSI branch (the escape gate is first): {spans:?}"
+    );
+    assert!(
+        spans.iter().all(|(_, content)| !content.contains('\x1b')),
+        "no span may carry a raw ESC: {spans:?}"
+    );
+    assert!(text.contains("no such file"), "{text:?}");
+}
+
+#[test]
+fn error_result_with_non_sgr_escape_renders_inert_on_the_plain_path() {
+    // Without a complete SGR there is nothing for the ANSI parser, so the
+    // escape gate stays shut and the `is_error` branch renders the plain
+    // text — where a CSI clear sequence (or any other control byte) must show
+    // up as inert escaped text, never as a live sequence.
+    let turn = one_result_turn("shell", "failed\x1b[2Jafter clear", true);
+    let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
+    let text = rows_text(&lines);
+    let spans = body_spans(&lines);
+    assert!(
+        spans.iter().all(|(_, content)| !content.contains('\x1b')),
+        "no span may carry a raw ESC: {spans:?}"
+    );
+    assert!(
+        text.contains("\\u{1b}[2J"),
+        "the non-SGR sequence must render as inert escaped text: {text:?}"
+    );
+    assert!(text.contains("after clear"), "{text:?}");
+}
+
+#[test]
+fn markdown_tool_with_non_sgr_escape_is_normalized_once_by_the_markdown_renderer() {
+    // The markdown branch is handed the raw source and normalizes it itself
+    // (inert policy), so a control byte in a markdown tool's output is escaped
+    // exactly like anywhere else — and a tab in the same source is expanded by
+    // that same pass, so the branch never depends on the ANSI sink having run
+    // first.
+    let turn = one_result_turn(
+        "pdf_to_markdown",
+        "# head\x1b[2J\x1b not a csi\n\tindented",
+        false,
+    );
+    let lines = render_turn_lines(&turn, 80, 85, false, &[]).lines;
+    let text = rows_text(&lines);
+    let spans = body_spans(&lines);
+    assert!(
+        spans.iter().all(|(_, content)| !content.contains('\x1b')),
+        "no span may carry a raw ESC: {spans:?}"
+    );
+    assert!(
+        text.contains("\\u{1b}[2J\\u{1b} not a csi"),
+        "both escaped controls must survive as inert text: {text:?}"
+    );
+    assert!(!text.contains('\t'), "the tab must be expanded: {text:?}");
+    // Expanded to the 4-column stop, the indented row is a markdown indented
+    // code block — the ordinary markdown reading of four leading spaces.
+    assert!(text.contains("indented"), "{text:?}");
+}

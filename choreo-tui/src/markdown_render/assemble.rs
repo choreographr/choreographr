@@ -586,17 +586,24 @@ fn render_turn_lines_impl(
                 body.push(Line::from(Span::styled(String::new(), Style::default())));
                 body_joins.push(LineJoin::Break);
                 body_chrome.push(LineChrome::default());
-                // Terminal-safety gate: escape everything except SGR color
-                // sequences so hostile file/URL/shell bytes (OSC clipboard
-                // writes, CSI clears, bidi overrides, …) render as inert text
-                // regardless of which tool produced them. SGR survives, so
-                // ANSI coloring still works below.  The same pass expands tabs
-                // to 4-column spaces: unicode-width measures `\t` as one column
-                // and ratatui draws it as none (control chars are filtered from
-                // the drawn grapheme stream), so a literal tab would vanish *and*
-                // leave every width computation (wrap, height, fill padding)
-                // mis-measured.  After this single pass all four branches below
-                // (ansi/diff/markdown/plain) see exact widths.
+                // Terminal-safety gate: escape every control character but a
+                // complete SGR color sequence, so hostile file/URL/shell bytes
+                // (OSC clipboard writes, CSI clears, bidi overrides, …) render
+                // as inert text regardless of which tool produced them. SGR
+                // survives, so ANSI coloring still works below.  The same pass
+                // expands tabs to 4-column spaces: unicode-width measures `\t`
+                // as one column and ratatui draws it as none (control chars are
+                // filtered from the drawn grapheme stream), so a literal tab
+                // would vanish *and* leave every width computation (wrap,
+                // height, fill padding) mis-measured.
+                //
+                // `content` is the sink output for the three branches that parse
+                // no escape sequences themselves — ansi, error, plain — because
+                // escaping every non-SGR control character makes its text inert
+                // to them while keeping the widths exact.  The markdown branch is
+                // the one that normalizes on its own (see below), so it takes the
+                // raw source instead: each branch is then handed text normalized
+                // exactly once, by the policy that branch needs.
                 let content = normalize_ansi_text(&tr.content);
                 // Content with ANSI escape codes gets colored rendering.
                 if content.contains("\x1b[") {
@@ -618,8 +625,16 @@ fn render_turn_lines_impl(
                     // is verbatim data and must NOT be re-interpreted as
                     // markdown (see MARKDOWN_TOOLS); there is no content-based
                     // diff or markdown auto-detection anymore.
+                    // `markdown_lines_joined` normalizes its input before
+                    // parsing, with the inert policy — the only correct one for a
+                    // branch that parses no escapes, since a kept SGR would draw
+                    // as literal `[31m` text while still measuring as columns.
+                    // It therefore takes the raw source rather than `content`:
+                    // the SGR-preserving pass exists for the ANSI parser, and
+                    // running it here would leave the renderer's own pass to
+                    // discard its one difference from the inert one.
                     let (lines, joins, chrome) =
-                        markdown_lines_joined(&content, tool_content_width);
+                        markdown_lines_joined(&tr.content, tool_content_width);
                     body.extend(lines);
                     body_joins.extend(joins);
                     body_chrome.extend(chrome);
