@@ -27,10 +27,6 @@ zeroize.workspace = true
 # and the fingerprint renderer).
 toml.workspace = true
 base64.workspace = true
-# The known-servers store is opened `O_NOFOLLOW` and its owning euid is
-# checked via `geteuid` (src/known_servers.rs), matching the log-file
-# hardening in choreo-shared::logging.
-rustix.workspace = true
 # KnownServerEntry derives Serialize/Deserialize for the TOML store.
 serde.workspace = true
 # In-process transport (ConnectionMode::InProcess): the raw crossbeam channel
@@ -72,6 +68,13 @@ tempfile.workspace = true
 # keypair override from choreo-transport.
 x25519-dalek.workspace = true
 rand.workspace = true
+
+# The known-servers store is opened `O_NOFOLLOW` (read and write) and its
+# owning euid is checked (src/known_servers.rs), both on Unix only — the Windows
+# store inherits the parent directory's ACLs. Gated to `cfg(unix)` like the same
+# dependency in `choreo-shared`, so a Windows client build does not pull rustix.
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
 
 [features]
 # FOR TESTS ONLY — never enabled by production consumers; see src/test_support.rs.

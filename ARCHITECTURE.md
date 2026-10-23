@@ -1427,11 +1427,15 @@ authentication therefore cannot be what protects it; the operating system's
 file protections are, in three layers:
 
 1. **An owner-only directory.** The socket's parent is created mode `0700`
-   (`choreo_shared::paths::ensure_private_dir`) whenever the daemon itself
+   (`choreo_shared::perm::ensure_private_dir`) whenever the daemon itself
    creates it — a `--base-dir`'s `{base}/run`, or the temp-dir fallback's
-   per-uid directory. A pre-existing parent is never re-moded: `$XDG_RUNTIME_DIR`
-   and the platform temp dir are shared with every other process and user, and
-   narrowing them would be destructive.
+   per-uid directory. The mode is applied through an `O_NOFOLLOW` directory
+   descriptor (a planted symlink is refused, and the owner check and `fchmod`
+   act on one inode). A directory owned by another user is **refused outright**
+   — the daemon refuses to serve the trusted domain there, because that user
+   could enumerate or swap the socket path. A pre-existing parent is never
+   re-moded: `$XDG_RUNTIME_DIR` and the platform temp dir are shared with every
+   other process and user, and narrowing them would be destructive.
 2. **A `0600` socket file.** `bind(2)` creates the socket with the process umask,
    so the daemon narrows it to owner-only immediately afterwards. The short
    bind-then-chmod window is harmless because the parent directory already
@@ -1460,11 +1464,11 @@ carries secrets — and image attachments, so it is protected by the filesystem
 independently of the keystore's AES-GCM credential blobs:
 
 1. **An owner-only data directory.** `open_db_at` creates the database's
-   *immediate* parent through `choreo_shared::paths::ensure_private_dir` —
-   `0700`, and a directory owned by another user is refused. A shared ancestor
-   (the platform temp dir, the data root such as `~/.local/share`) is never
-   re-moded: narrowing it would lock out every other program and user, so a
-   `CHOREOGRAPHR_DB_PATH` that points straight at one leaves its mode alone.
+   *immediate* parent through `choreo_shared::perm::ensure_private_dir` —
+   `0700`, and a directory owned by another user is refused (fatal). A shared
+   ancestor (the platform temp dir, the data root such as `~/.local/share`) is
+   never re-moded: narrowing it would lock out every other program and user, so
+   a `CHOREOGRAPHR_DB_PATH` that points straight at one leaves its mode alone.
 2. **A `0600` database file, re-applied on every open.** `redb::Database::create`
    honours the umask, so a typical desktop create lands `0644`; the mode is
    therefore forced on every open path (fresh create, interrupted-create
@@ -1472,10 +1476,13 @@ independently of the keystore's AES-GCM credential blobs:
    default by an earlier install. Backups inherit the same treatment after their
    copy.
 
-Both steps are **best-effort**: an unusual embedder path or a filesystem without
-POSIX modes logs a `warn!` and the daemon starts anyway — losing the daemon over
-a permission quirk is worse than a visible log line, and the remaining control
-(the other layer, or the file's own mode) still bounds access.
+The file-mode tightening is **best-effort**: an unusual embedder path or a
+filesystem without POSIX modes logs a `warn!` and the daemon starts anyway —
+losing the daemon over a permission quirk is worse than a visible log line, and
+the remaining control (the other layer, or the file's own mode) still bounds
+access. A **foreign-owned** directory is the one exception: it is refused
+outright, never merely warned about, because another user in the parent could
+enumerate or swap the store's files.
 
 ### Lock/Unlock flow
 
@@ -1497,13 +1504,18 @@ legacy raw `identity.pk` file) verify existing bindings and never create new
 ones. Binding is TOFU-once — rotation is not implemented.
 
 `known_servers.toml` holds those per-daemon **private** unlock keys, so the file
-is treated as secret: it is created `0600`, and every later write re-opens it
-with `O_NOFOLLOW` (a planted symlink is refused rather than followed), verifies
-the opened file is a regular file owned by the current euid, and re-applies
-`0600` even when it pre-existed with looser permissions. The write also
-best-effort tightens its parent config directory to `0700`. The rewrite stays
-in-place under the advisory file lock (no temp+rename) so concurrent TUI pinning
-serializes on one inode.
+is treated as secret. Both the read and the write are hardened through the
+shared `choreo_shared::perm` policy: the file is opened `O_NOFOLLOW` (a planted
+symlink is refused rather than followed), verified to be a regular file owned by
+the current euid, `0600` is re-applied through the open descriptor on every
+write (so one that pre-existed with looser permissions is tightened), and the
+parent config directory is best-effort tightened to `0700`. Hardening the LOAD
+as well as the write matters because a `pubkey` pin is what steers the next
+Noise IK handshake — a file a local attacker could author would let them
+impersonate the daemon and capture credentials — so a refused or unreadable
+store loads as EMPTY (re-confirmed first contact), never as the attacker's
+contents. The rewrite stays in-place under the advisory file lock (no
+temp+rename) so concurrent TUI pinning serializes on one inode.
 
 A client sends `ClientMessage::Unlock { private_key }` (resolved verify-only as
 its stored per-daemon unlock key, else the legacy raw `identity.pk` file —

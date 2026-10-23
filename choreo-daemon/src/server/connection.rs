@@ -568,10 +568,12 @@ pub(crate) fn client_thread(
     // uid should never reach this point — but the local socket is fully trusted
     // (local-only commands such as `AclAdd`, no transport authentication), so
     // the kernel's own answer about the peer is checked before a single message
-    // is read. Only Linux exposes the peer's uid without extra ceremony
-    // (SO_PEERCRED); elsewhere the file mode remains the control.
+    // is read. `client_thread` is the Unix path (the TCP handshake path is
+    // `tcp_handshake_and_client_thread`), so this covers every local connection.
+    // Only Linux exposes the peer's uid without extra ceremony (SO_PEERCRED);
+    // elsewhere the file mode remains the control.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    if args.is_unix {
+    {
         use rustix::process::geteuid;
         match rustix::net::sockopt::socket_peercred(&stream) {
             Ok(cred) if cred.uid == geteuid() => {}

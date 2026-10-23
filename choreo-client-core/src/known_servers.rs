@@ -135,12 +135,26 @@ impl KnownServers {
     /// Load from an explicit path (the test seam — production callers use
     /// [`KnownServers::load`]).
     ///
+    /// The read is hardened like the write: the file is opened `O_NOFOLLOW` and
+    /// verified to be a regular file owned by the current user before its bytes
+    /// are trusted, so a symlink planted at the path or a foreign-owned file is
+    /// refused rather than parsed. An injected `pubkey` pin would let a user who
+    /// controls the file steer the next connection's Noise IK at their own
+    /// server (a credential-capturing MITM), so the load path cannot be laxer
+    /// than the write path. A refused or unreadable file degrades to the empty
+    /// store with a warning, per the module's tolerant-on-load policy.
+    ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Io`] if the file exists but cannot be read.
+    /// Returns [`ClientError::Io`] only if the file is present and readable but
+    /// its bytes cannot be read after the ownership check (a mid-read failure).
     pub fn load_from(path: &Path) -> Result<Self, ClientError> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => {
+        let empty = |path: &Path| KnownServers {
+            entries: Vec::new(),
+            path: path.to_path_buf(),
+        };
+        match read_store(path) {
+            Ok(Some(text)) => {
                 let entries = parse_store(&text);
                 debug!(path = %path.display(), entries = entries.len(), "loaded known servers");
                 Ok(KnownServers {
@@ -149,26 +163,21 @@ impl KnownServers {
                 })
             }
             // Missing store = first run: empty, not an error.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None) => {
                 debug!(path = %path.display(), "no known_servers.toml yet; starting empty");
-                Ok(KnownServers {
-                    entries: Vec::new(),
-                    path: path.to_path_buf(),
-                })
+                Ok(empty(path))
             }
-            // Unreadable (permissions, I/O error): empty-with-warning, per
-            // the failure policy — worst case is a re-confirmed first
-            // contact, never silent trust.
+            // Refused (a symlink or foreign-owned file) or unreadable:
+            // empty-with-warning, per the failure policy — worst case is a
+            // re-confirmed first contact, never silent trust.
             Err(e) => {
                 warn!(
                     path = %path.display(),
                     error = %e,
-                    "could not read known_servers.toml; treating as empty (trust re-confirmation will be required)"
+                    "could not read known_servers.toml safely (refused symlink/foreign-owned file, \
+                     or an I/O error); treating as empty (trust re-confirmation will be required)"
                 );
-                Ok(KnownServers {
-                    entries: Vec::new(),
-                    path: path.to_path_buf(),
-                })
+                Ok(empty(path))
             }
         }
     }
@@ -337,7 +346,7 @@ impl KnownServers {
         // and the store file's own `0600` mode remains the control, so a
         // failure here only warns rather than blocking the write.
         if let Some(parent) = self.path.parent()
-            && let Err(e) = choreo_shared::paths::ensure_private_dir(parent)
+            && let Err(e) = choreo_shared::perm::ensure_private_dir(parent)
         {
             warn!(
                 dir = %parent.display(),
@@ -384,8 +393,16 @@ impl KnownServers {
             .open(&self.path);
         let mut file = file.map_err(|e| ClientError::Io(std::io::Error::other(e)))?;
         #[cfg(unix)]
-        verify_owned_regular(&file, &self.path)
-            .map_err(|e| ClientError::Io(std::io::Error::other(e)))?;
+        {
+            // Reject a non-regular or foreign-owned file and tighten it to 0600
+            // through the open descriptor (race-free), both from the shared
+            // hardening policy so the client store, the daemon store, and the
+            // logs agree on what "owner-only" means.
+            choreo_shared::perm::verify_owned_regular(&file, &self.path)
+                .map_err(|e| ClientError::Io(std::io::Error::other(e)))?;
+            choreo_shared::perm::set_owner_only(&file)
+                .map_err(|e| ClientError::Io(std::io::Error::other(e)))?;
+        }
         file.lock()
             .map_err(|e| ClientError::Io(std::io::Error::other(e)))?;
 
@@ -410,27 +427,42 @@ impl KnownServers {
     }
 }
 
-/// Verify an opened store file is a regular file owned by this euid and
-/// tighten its mode to `0600`, refusing anything else.
+/// Read the store text, hardened against a symlink or a foreign-owned file.
 ///
-/// Applying the mode through the open fd (`fchmod`) rather than by path is
-/// what makes it race-free: the path cannot be re-pointed at a different
-/// inode between the check and the chmod. A symlink never reaches here —
-/// `O_NOFOLLOW` makes the open itself fail.
+/// Opens `O_NOFOLLOW` and verifies the opened descriptor is a regular file owned
+/// by the current user before reading a byte, so the load path refuses exactly
+/// what the write path refuses. Returns `Ok(None)` when the file is absent (the
+/// normal first-run case), `Ok(Some(text))` on success, and `Err` for a refused
+/// entry or an I/O failure (the caller degrades that to the empty store).
 #[cfg(unix)]
-fn verify_owned_regular(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    let meta = file.metadata()?;
-    if !meta.is_file() || meta.uid() != rustix::process::geteuid().as_raw() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "refusing to write {}: not a regular file owned by the current user",
-                path.display()
-            ),
-        ));
+fn read_store(path: &Path) -> std::io::Result<Option<String>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        // O_NOFOLLOW: fail rather than follow a symlink planted at the path,
+        // which could point at an attacker-written store that steers trust.
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    choreo_shared::perm::verify_owned_regular(&file, path)?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(Some(text))
+}
+
+/// Non-Unix: the store is a plain read (Windows inherits the parent's ACLs).
+#[cfg(not(unix))]
+fn read_store(path: &Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
 }
 
 /// The TOML file shape: an array of tables named `server`.
@@ -760,6 +792,43 @@ mod tests {
         assert!(
             store.pin("host:9443", &[3u8; 32]).is_err(),
             "a directory at the store path must be refused"
+        );
+    }
+
+    /// The LOAD path refuses a symlink too: a planted link to an
+    /// attacker-written store must not inject a `pubkey` pin, because a pin is
+    /// what steers the next Noise IK handshake — an injected pin would let the
+    /// attacker capture credentials by impersonating the daemon. The load
+    /// degrades to the empty store (re-confirmed first contact), never to the
+    /// symlink target's contents.
+    #[cfg(unix)]
+    #[test]
+    fn load_refuses_a_symlink_at_the_store_path() {
+        let (_temp, _guard, dir) = use_temp_config_root();
+        let store_dir = dir.join("choreographr");
+        std::fs::create_dir_all(&store_dir).expect("mkdir");
+        // An attacker-authored store pinning our daemon address to their key.
+        let evil = dir.join("evil.toml");
+        std::fs::write(
+            &evil,
+            format!(
+                "[[server]]\naddr = \"host:9443\"\npubkey = \"{}\"\n",
+                encode_key(&[0xAB; 32])
+            ),
+        )
+        .expect("write attacker store");
+        let path = store_dir.join("known_servers.toml");
+        std::os::unix::fs::symlink(&evil, &path).expect("symlink");
+
+        let store = KnownServers::load_from(&path).expect("load degrades to empty");
+        assert_eq!(
+            store.entries(),
+            [] as [KnownServerEntry; 0],
+            "a symlinked store must not be read (its pin would be attacker-controlled)"
+        );
+        assert!(
+            store.lookup("host:9443").expect("lookup").is_none(),
+            "no pin may be injected through a symlinked store"
         );
     }
 }

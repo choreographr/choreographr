@@ -248,21 +248,21 @@ fn stamp_schema_version(db: &redb::Database, version: u64) -> io::Result<()> {
 /// permission quirk is worse than a visible log line, and the containing
 /// directory's `0700` mode is the remaining control.
 fn make_owner_only(path: &std::path::Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
-            warn!(
-                path = %path.display(),
-                error = %e,
-                "could not set the database file to mode 0600; it may stay readable by other \
-                 local users"
-            );
-        }
+    // Best-effort: an unusual filesystem that cannot express POSIX modes logs a
+    // warning and the caller continues — refusing to start the daemon over a
+    // permission quirk is worse than a visible log line, and the containing
+    // directory's 0700 mode is the remaining control. The mode is applied via
+    // the shared `choreo_shared::perm` policy so the store, its backups, and the
+    // other secrets the suite keeps agree on 0600. `redb` owns the file's fd, so
+    // this is the path form.
+    if let Err(e) = choreo_shared::perm::set_owner_only_path(path) {
+        warn!(
+            path = %path.display(),
+            error = %e,
+            "could not set the database file to mode 0600; it may stay readable by other \
+             local users"
+        );
     }
-    // Non-Unix has no POSIX mode to set: the file inherits its directory's ACLs.
-    #[cfg(not(unix))]
-    let _ = path;
 }
 
 /// Directories this instance must never narrow, because other programs and
@@ -289,22 +289,29 @@ fn is_shared_root(dir: &std::path::Path) -> bool {
 /// The data directory is part of the store's access control: a `0600` file
 /// inside a world-searchable directory is still enumerable and openable by
 /// every local user, so the immediate parent gets the shared
-/// [`ensure_private_dir`](choreo_shared::paths::ensure_private_dir) treatment
+/// [`ensure_private_dir`](choreo_shared::perm::ensure_private_dir) treatment
 /// (create, refuse a foreign owner, set `0700`). A shared ancestor is created
-/// with a plain `create_dir_all` instead, and a directory that cannot be
-/// tightened at all only warns — startup proceeds and the file mode is the
-/// remaining control.
-fn ensure_db_dir(dir: &std::path::Path) {
+/// with a plain `create_dir_all` instead.
+///
+/// A **foreign-owned** immediate parent is refused outright: another user could
+/// then enumerate or swap the store's files, so that is a real problem, not a
+/// quirk to log and ignore. Any other failure to tighten only warns — startup
+/// proceeds and the file mode is the remaining control.
+fn ensure_db_dir(dir: &std::path::Path) -> io::Result<()> {
     if !is_shared_root(dir) {
-        if let Err(e) = choreo_shared::paths::ensure_private_dir(dir) {
-            warn!(
-                dir = %dir.display(),
-                error = %e,
-                "database directory is not owner-only; the database file's own 0600 mode is the \
-                 remaining control"
-            );
-        }
-        return;
+        return match choreo_shared::perm::ensure_private_dir(dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Err(e),
+            Err(e) => {
+                warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "database directory could not be made owner-only; the database file's own \
+                     0600 mode is the remaining control"
+                );
+                Ok(())
+            }
+        };
     }
     if let Err(e) = fs::create_dir_all(dir) {
         warn!(
@@ -313,6 +320,7 @@ fn ensure_db_dir(dir: &std::path::Path) {
             "could not create the database directory"
         );
     }
+    Ok(())
 }
 
 /// Compute the backup path [`backup_db_file`] and [`backup_database`] share:
@@ -706,12 +714,13 @@ pub fn open_db() -> io::Result<redb::Database> {
 ///
 /// Returns Err if the file cannot be created/opened (corruption,
 /// permissions, lock contention) or the initial schema version cannot be
-/// stamped. A parent directory that cannot be created or tightened is only
-/// warned about: the subsequent create/open reports the real failure.
+/// stamped. A foreign-owned parent directory is refused; any other failure to
+/// create or tighten the parent is only warned about (the subsequent
+/// create/open reports the real failure).
 pub fn open_db_at(path: &std::path::Path) -> io::Result<redb::Database> {
     info!(path = %path.display(), "opening database");
     if let Some(parent) = path.parent() {
-        ensure_db_dir(parent);
+        ensure_db_dir(parent)?;
     }
     // A 0-byte file is the corpse of an interrupted `Database::create`
     // (crash between file creation and the first write): it holds no

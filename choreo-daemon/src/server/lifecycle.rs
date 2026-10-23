@@ -213,6 +213,10 @@ fn handle_accept_error(e: &io::Error) {
 /// never re-moded: narrowing it would break every other process and user that
 /// legitimately lives there. For those the socket file's own 0600 mode and, on
 /// Linux, the peer-uid check in `connection::client_thread` are the control.
+///
+/// A directory we would tighten that turns out to be owned by another user is
+/// refused outright (not merely warned about): that user could enumerate or
+/// swap the socket path, which would defeat the owner-only socket entirely.
 fn ensure_socket_dir(socket_path: &str) -> io::Result<()> {
     let Some(parent) = Path::new(socket_path).parent() else {
         return Ok(());
@@ -227,16 +231,24 @@ fn ensure_socket_dir(socket_path: &str) -> io::Result<()> {
     // Only a directory this process created, or the per-uid fallback directory
     // that is dedicated to one uid by construction, is ours to tighten.
     let ours = created || parent == choreo_shared::paths::temp_socket_dir();
-    if ours && let Err(e) = choreo_shared::paths::ensure_private_dir(parent) {
-        // Not fatal: the socket is still bound 0600 and, on Linux, a foreign
-        // uid is rejected at accept time. A warning keeps the degradation
-        // visible without taking the daemon down over a filesystem quirk.
-        warn!(
-            dir = %parent.display(),
-            error = %e,
-            "socket directory is not owner-only; access control falls back to the socket \
-             file mode and the peer-uid check"
-        );
+    if ours {
+        match choreo_shared::perm::ensure_private_dir(parent) {
+            Ok(()) => {}
+            // A directory owned by another user defeats the whole point of the
+            // owner-only socket: that user could enumerate or swap the socket
+            // path, so the trusted domain is not served there at all.
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Err(e),
+            // Any other failure to tighten is not fatal: the socket is still
+            // bound 0600 and, on Linux, a foreign uid is rejected at accept
+            // time. A warning keeps the degradation visible without taking the
+            // daemon down over a filesystem quirk.
+            Err(e) => warn!(
+                dir = %parent.display(),
+                error = %e,
+                "socket directory could not be made owner-only; access control falls back to \
+                 the socket file mode and the peer-uid check"
+            ),
+        }
     }
     Ok(())
 }

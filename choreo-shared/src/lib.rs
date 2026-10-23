@@ -15,6 +15,10 @@
 //! - [`paths`] — the one filesystem-layout resolver: the XDG config/data/
 //!   runtime/state locations and the `--base-dir` override that relocates an
 //!   entire instance under a single root.
+//! - [`perm`] — the one owner-only filesystem-hardening policy: the private
+//!   directory and owner-checked `0600` file forms shared by the daemon's
+//!   socket/data dir, the client's unlock-key store, and the log opener, so the
+//!   mode, ownership check, and symlink refusal cannot drift between them.
 //! - [`credential`] — the workspace's shared serializable credential domain
 //!   type ([`ServiceCredential`]) and its borrowed views, hosted here (not in
 //!   `choreo-keystore`) so both `choreo-proto` and `choreo-keystore` can carry
@@ -65,6 +69,7 @@ pub mod oauth_claims;
 pub mod oauth_endpoint;
 pub mod oauth_token;
 pub mod paths;
+pub mod perm;
 pub mod release_name;
 pub mod url;
 

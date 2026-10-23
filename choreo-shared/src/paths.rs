@@ -185,59 +185,6 @@ pub fn data_file(name: &str) -> io::Result<PathBuf> {
     Ok(data_dir()?.join(name))
 }
 
-/// Create `dir` (and any missing parents) as an owner-only directory.
-///
-/// The Unix socket is the daemon's fully-trusted local domain — a peer that can
-/// reach it is unauthenticated-but-trusted, so it can read transcripts, retrieve
-/// plaintext credentials while the keystore is unlocked, and run tools. The
-/// directory the socket lives in is therefore part of the access control: a
-/// `0600` socket file inside a world-searchable directory is still reachable by
-/// every local user, so the parent must be owner-only too.
-///
-/// On Unix the resolved directory must belong to the current effective uid; a
-/// directory owned by somebody else is refused with `PermissionDenied` rather
-/// than narrowed, because this helper is only for directories the instance
-/// itself owns (a `--base-dir`'s `run/`, the per-uid temp fallback). After the
-/// ownership check the mode is set to `0700`; that step is best-effort — a
-/// filesystem without POSIX modes logs a warning and the caller continues,
-/// since the ownership check and the socket's own mode still bound access.
-///
-/// Non-Unix: creates the directory only (Windows inherits the parent's ACLs and
-/// its socket is a named pipe, not a filesystem path).
-///
-/// # Errors
-///
-/// Propagates a `create_dir_all` or metadata-lookup failure, and returns
-/// `PermissionDenied` when `dir` exists but is owned by another user.
-pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let owner = std::fs::metadata(dir)?.uid();
-        let euid = current_euid();
-        if owner != euid {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "refusing to use {}: it is owned by uid {owner}, not the current user \
-                     (uid {euid})",
-                    dir.display()
-                ),
-            ));
-        }
-        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
-            tracing::warn!(
-                dir = %dir.display(),
-                error = %e,
-                "could not set the socket directory to mode 0700; the socket file's own mode is \
-                 the remaining control"
-            );
-        }
-    }
-    Ok(())
-}
-
 /// The default socket path: `{base}/run/choreographr.sock` under a base, else
 /// `$XDG_RUNTIME_DIR/choreographr.sock`, else
 /// `temp_dir()/choreographr-<uid>/choreographr.sock`.
@@ -245,9 +192,9 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
 /// The temp-dir fallback (macOS/Windows, or a bare environment with
 /// `$XDG_RUNTIME_DIR` unset) is a PRIVATE per-uid subdirectory rather than the
 /// shared temp dir itself: the socket is the trusted local domain, so its
-/// parent has to be owner-only ([`ensure_private_dir`]) for the 0600 socket mode
-/// to mean anything, and the uid in the name keeps parallel users on one host
-/// from colliding.
+/// parent has to be owner-only ([`crate::perm::ensure_private_dir`]) for the 0600
+/// socket mode to mean anything, and the uid in the name keeps parallel users on
+/// one host from colliding.
 ///
 /// This is the ONE definition of the default path —
 /// `choreo_proto::default_socket_path` delegates to it — so the daemon and every
@@ -271,21 +218,7 @@ pub fn default_socket_path() -> PathBuf {
 /// shared and must never be re-moded.
 #[must_use]
 pub fn temp_socket_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("{APP_SUBDIR}-{}", current_euid()))
-}
-
-/// The current effective uid, the identity the socket directory ownership check
-/// and the per-uid fallback name are keyed on.
-#[cfg(unix)]
-fn current_euid() -> u32 {
-    rustix::process::geteuid().as_raw()
-}
-
-/// Non-Unix platforms have no uid; the platform temp dir is already per-user
-/// there, so a constant segment is enough to keep the fallback private.
-#[cfg(not(unix))]
-fn current_euid() -> u32 {
-    0
+    std::env::temp_dir().join(format!("{APP_SUBDIR}-{}", crate::perm::current_euid()))
 }
 
 /// The log directory: `{base}/log` under a base, else
@@ -480,43 +413,8 @@ mod tests {
         assert_eq!(dir.parent(), Some(std::env::temp_dir().as_path()));
         assert_eq!(
             dir.file_name().and_then(|n| n.to_str()),
-            Some(format!("{APP_SUBDIR}-{}", current_euid()).as_str())
+            Some(format!("{APP_SUBDIR}-{}", crate::perm::current_euid()).as_str())
         );
-    }
-
-    #[test]
-    fn ensure_private_dir_creates_missing_parents() {
-        let root = std::env::temp_dir().join(format!(
-            "choreo-ensure-private-dir-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let nested = root.join("a").join("b");
-        ensure_private_dir(&nested).expect("create the nested socket dir");
-        assert!(nested.is_dir());
-        // Idempotent: a second call over an existing directory succeeds.
-        ensure_private_dir(&nested).expect("re-ensure an existing socket dir");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn ensure_private_dir_sets_mode_0700() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = std::env::temp_dir().join(format!(
-            "choreo-ensure-private-mode-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        ensure_private_dir(&root).expect("create the socket dir");
-        let mode = std::fs::metadata(&root)
-            .expect("metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o700, "the socket directory must be owner-only");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -316,12 +316,15 @@ pub fn open_log_append(path: &Path) -> io::Result<std::fs::File> {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            // 0600 applies on creation; `verify_owned_regular` re-applies it.
+            // 0600 applies on creation; `perm::set_owner_only` below re-applies it.
             .mode(0o600)
             // O_NOFOLLOW: fail rather than follow a symlink at the path.
             .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
             .open(path)?;
-        verify_owned_regular(&file, path)?;
+        crate::perm::verify_owned_regular(&file, path)?;
+        // Best-effort: a log that cannot be tightened still opens, degrading to
+        // the parent directory's protection rather than failing the run.
+        let _ = crate::perm::set_owner_only(&file);
         Ok(file)
     }
     #[cfg(not(unix))]
@@ -339,7 +342,7 @@ pub fn open_log_append(path: &Path) -> io::Result<std::fs::File> {
 fn replace_if_owned(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
     let meta = std::fs::symlink_metadata(path)?;
-    if !meta.is_file() || meta.uid() != rustix::process::geteuid().as_raw() {
+    if !meta.is_file() || meta.uid() != crate::perm::current_euid() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!(
@@ -351,41 +354,22 @@ fn replace_if_owned(path: &Path) -> io::Result<()> {
     std::fs::remove_file(path)
 }
 
-/// Verify an opened log is a regular file owned by this euid and tighten it to
-/// 0600; refuse otherwise.
-#[cfg(unix)]
-fn verify_owned_regular(file: &std::fs::File, path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    let meta = file.metadata()?;
-    if !meta.is_file() || meta.uid() != rustix::process::geteuid().as_raw() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "refusing {}: not a regular file owned by the current user",
-                path.display()
-            ),
-        ));
-    }
-    let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
-    Ok(())
-}
-
 /// Create a brand-new 0600 file at `path`, refusing to follow a symlink there.
 #[cfg(unix)]
 fn create_new(path: &Path) -> io::Result<std::fs::File> {
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     let file = std::fs::OpenOptions::new()
         .write(true)
         // O_CREAT|O_EXCL: fail (`AlreadyExists`) rather than reuse an existing
         // file, so a planted file is never written into.
         .create_new(true)
-        // The create mode; `set_permissions` below re-applies it uniformly.
+        // The create mode; `set_owner_only` below re-applies it through the fd.
         .mode(0o600)
         // O_NOFOLLOW: refuse to follow a symlink planted at the path.
         .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
         .open(path)?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    crate::perm::set_owner_only(&file)?;
     Ok(file)
 }
 
