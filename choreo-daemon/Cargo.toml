@@ -30,10 +30,11 @@ hex.workspace = true
 # (`tools/shell_resolver.rs`). Never spawns `which(1)`.
 which.workspace = true
 # Type-safe syscall bindings for the process-control path (kill/pgid/pidfd),
-# the bounded pipe-drain poll loop, and the non-blocking fcntl on child pipes.
-# Shared with `choreo-shared` (the log-file opener); `event` is this crate's
-# additional feature.
-rustix = { workspace = true, features = ["event"] }
+# the bounded pipe-drain poll loop, the non-blocking fcntl on child pipes, and
+# the Unix-socket peer-uid check (SO_PEERCRED, `net`). Shared with
+# `choreo-shared` (the log-file opener); `event` and `net` are this crate's
+# additional features.
+rustix = { workspace = true, features = ["event", "net"] }
 
 # Local headless Chromium/Chrome control for the `retrieve_webpage` tool (CDP).
 # Uses default features (no `fetch`): the tool requires a Chromium/Chrome

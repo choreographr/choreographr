@@ -21,22 +21,22 @@ pub use uds_windows::UnixStream;
 
 /// The default Unix-socket path when `CHOREOGRAPHR_SOCKET_PATH` is unset.
 ///
-/// Under a base dir this is `{base}/run/choreographr.sock`; otherwise the XDG
-/// runtime directory, `$XDG_RUNTIME_DIR/choreographr.sock` (the spec's home for
-/// sockets). When no runtime dir is available — macOS/Windows, or a bare
-/// environment — it falls back to `choreographr.sock` under the PLATFORM temp
-/// dir (`std::env::temp_dir()`): `/tmp/choreographr.sock` on a desktop Linux
-/// (TMPDIR unset), so behavior there is unchanged — but on Android/Termux
-/// `TMPDIR` points at the app's writable prefix tmp dir, which is the
-/// difference between the daemon and TUI working at all and dying with a
-/// context-free "Permission denied (os error 13)" on a hardcoded `/tmp`.
+/// The whole chain is owned by `choreo_shared::paths::default_socket_path`, and
+/// this function only stringifies it: under a base dir
+/// `{base}/run/choreographr.sock`; otherwise the XDG runtime directory,
+/// `$XDG_RUNTIME_DIR/choreographr.sock` (the spec's home for sockets); and when
+/// no runtime dir is available — macOS/Windows, or a bare environment — a
+/// per-uid private directory under the PLATFORM temp dir
+/// (`temp_dir()/choreographr-<uid>/choreographr.sock`, TMPDIR-aware, so
+/// Android/Termux lands in the app's writable prefix tmp dir instead of a
+/// hardcoded `/tmp` that yields EACCES).
+///
+/// Delegating rather than re-deriving the fallback here is deliberate: the
+/// daemon and every client must resolve the SAME path, and a second copy of the
+/// chain is how the two drift apart.
 #[must_use]
 pub fn default_socket_path() -> String {
-    if let Some(path) = choreo_shared::paths::default_socket_path() {
-        return path.to_string_lossy().into_owned();
-    }
-    std::env::temp_dir()
-        .join("choreographr.sock")
+    choreo_shared::paths::default_socket_path()
         .to_string_lossy()
         .into_owned()
 }

@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 #[cfg(windows)]
 use uds_windows::UnixListener;
 
@@ -198,17 +198,45 @@ fn handle_accept_error(e: &io::Error) {
     }
 }
 
-/// Create the socket's parent directory if it does not already exist.
+/// Create the socket's parent directory if it does not already exist, and make
+/// it owner-only when this process created it.
 ///
-/// Idempotent, and a no-op when the parent already exists (the platform temp
-/// dir default) or the path has no parent. A `--base-dir` socket lives at
-/// `{base}/run/choreographr.sock`, and nothing else creates that directory —
-/// without this the bind would fail with a context-free ENOENT.
+/// Idempotent, and a no-op when the path has no parent. A `--base-dir` socket
+/// lives at `{base}/run/choreographr.sock` and nothing else creates that
+/// directory — without this the bind would fail with a context-free ENOENT —
+/// and the same is true of the per-uid temp fallback
+/// (`temp_dir()/choreographr-<uid>/choreographr.sock`).
+///
+/// Tightening is limited to a directory this process CREATED, or the per-uid
+/// fallback directory (which is dedicated to one uid by construction). A
+/// pre-existing shared parent — the platform temp dir, `$XDG_RUNTIME_DIR` — is
+/// never re-moded: narrowing it would break every other process and user that
+/// legitimately lives there. For those the socket file's own 0600 mode and, on
+/// Linux, the peer-uid check in `connection::client_thread` are the control.
 fn ensure_socket_dir(socket_path: &str) -> io::Result<()> {
-    if let Some(parent) = Path::new(socket_path).parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
+    let Some(parent) = Path::new(socket_path).parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    // Decide ownership BEFORE creating: afterwards the directory exists either
+    // way, and "did we create it" is the question that licenses re-moding it.
+    let created = !parent.exists();
+    std::fs::create_dir_all(parent)?;
+    // Only a directory this process created, or the per-uid fallback directory
+    // that is dedicated to one uid by construction, is ours to tighten.
+    let ours = created || parent == choreo_shared::paths::temp_socket_dir();
+    if ours && let Err(e) = choreo_shared::paths::ensure_private_dir(parent) {
+        // Not fatal: the socket is still bound 0600 and, on Linux, a foreign
+        // uid is rejected at accept time. A warning keeps the degradation
+        // visible without taking the daemon down over a filesystem quirk.
+        warn!(
+            dir = %parent.display(),
+            error = %e,
+            "socket directory is not owner-only; access control falls back to the socket \
+             file mode and the peer-uid check"
+        );
     }
     Ok(())
 }
@@ -365,6 +393,25 @@ pub fn run_server(
             format!("binding the Unix socket at {socket_path}: {e}"),
         )
     })?;
+    // The socket file itself is the second layer: bind() creates it with the
+    // process umask (typically world-connectable), so narrow it to the owner
+    // only immediately afterwards. The window between the two is harmless — the
+    // parent directory is owner-only, so no other user can reach the path at
+    // all while the mode is still loose, and a failed chmod is logged rather
+    // than fatal for the same reason (the directory is the primary control).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600)) {
+            Ok(()) => debug!(%socket_path, "Unix socket mode set to 0600"),
+            Err(e) => warn!(
+                %socket_path,
+                error = %e,
+                "could not set the Unix socket mode to 0600; the owner-only directory remains \
+                 the access control"
+            ),
+        }
+    }
     info!(%socket_path, "choreographr listening");
 
     // Transport-independent assembly (command channel, ACL install +
@@ -927,6 +974,38 @@ mod tests {
         assert!(sock.parent().unwrap().is_dir(), "run dir must exist");
         // Idempotent: a second call on an existing dir is a no-op.
         ensure_socket_dir(sock.to_str().unwrap()).unwrap();
+    }
+
+    /// A directory this process creates for the socket is owner-only, so the
+    /// bound socket's 0600 mode cannot be bypassed by a peer that can reach the
+    /// path.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_socket_dir_tightens_a_directory_it_creates() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("run").join("choreographr.sock");
+        ensure_socket_dir(sock.to_str().unwrap()).unwrap();
+        let run = sock.parent().unwrap();
+        let mode = std::fs::metadata(run).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "a created socket dir must be owner-only");
+    }
+
+    /// A directory that already exists is NOT re-moded: the platform temp dir
+    /// and `$XDG_RUNTIME_DIR` are shared with every other process and user, so
+    /// narrowing them would be destructive.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_socket_dir_leaves_a_pre_existing_directory_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sock = run.join("choreographr.sock");
+        ensure_socket_dir(sock.to_str().unwrap()).unwrap();
+        let mode = std::fs::metadata(&run).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "a pre-existing dir must keep its mode");
     }
 
     // The live-listener refusal case needs a real Unix socket at a real

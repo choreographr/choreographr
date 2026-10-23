@@ -559,6 +559,51 @@ pub(crate) fn client_thread(
     args: ConnThreadArgs,
     writer_write_timeout: Duration,
 ) -> io::Result<()> {
+    // Capture the id before `args` is consumed by `ClientConn::new`; the
+    // rejection path below and the connect log both need it.
+    let client_id = args.client_id;
+
+    // Defense in depth for the local trust domain. The socket is already
+    // narrowed to the owner (0600 inside an owner-only directory), so a foreign
+    // uid should never reach this point — but the local socket is fully trusted
+    // (local-only commands such as `AclAdd`, no transport authentication), so
+    // the kernel's own answer about the peer is checked before a single message
+    // is read. Only Linux exposes the peer's uid without extra ceremony
+    // (SO_PEERCRED); elsewhere the file mode remains the control.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if args.is_unix {
+        use rustix::process::geteuid;
+        match rustix::net::sockopt::socket_peercred(&stream) {
+            Ok(cred) if cred.uid == geteuid() => {}
+            Ok(cred) => {
+                warn!(
+                    peer_uid = cred.uid.as_raw(),
+                    our_uid = geteuid().as_raw(),
+                    "rejecting Unix socket connection from a foreign uid"
+                );
+                // Mirror the TCP handshake-failure path: the acceptor already
+                // registered this client's writer channel, so unregister it
+                // rather than leaving a stale entry in the daemon's map.
+                let _ = args
+                    .daemon_tx
+                    .send(DaemonCommand::ClientDisconnected { client_id });
+                return Ok(());
+            }
+            Err(e) => {
+                // No peer credentials means the socket is in a state we cannot
+                // validate; treat it as foreign rather than trusting it.
+                warn!(
+                    error = %e,
+                    "could not read the Unix socket peer credentials; rejecting connection"
+                );
+                let _ = args
+                    .daemon_tx
+                    .send(DaemonCommand::ClientDisconnected { client_id });
+                return Ok(());
+            }
+        }
+    }
+
     // Bound the writer's blocking socket writes so a wedged client (receive
     // window permanently zero) cannot stall it forever — this is what makes
     // lag eviction reap the connection without a daemon-held close handle.
@@ -570,9 +615,6 @@ pub(crate) fn client_thread(
     let reader = BufReader::new(stream.try_clone()?);
     let writer_buf = BufWriter::new(stream);
 
-    // Capture the id before `args` is consumed by `ClientConn::new`; it is
-    // only used for this connect log here.
-    let client_id = args.client_id;
     let mut conn = ClientConn::new(args, writer_buf);
 
     // The writer channel was registered with the daemon by the acceptor

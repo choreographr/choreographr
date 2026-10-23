@@ -1416,6 +1416,42 @@ compatible (deserialize to zero usage).
 
 ## Security model
 
+### Local trust domain (the Unix socket)
+
+The Unix-domain socket is the daemon's **local trust domain**: it carries no
+Noise handshake, so any peer that reaches it is trusted exactly as the daemon
+owner is — it can read session transcripts, retrieve plaintext credentials
+while the keystore is unlocked (`GetCredential`), run tools, and enroll other
+clients (`/acl add`, which is refused on the TCP/Noise listener). Transport
+authentication therefore cannot be what protects it; the operating system's
+file protections are, in three layers:
+
+1. **An owner-only directory.** The socket's parent is created mode `0700`
+   (`choreo_shared::paths::ensure_private_dir`) whenever the daemon itself
+   creates it — a `--base-dir`'s `{base}/run`, or the temp-dir fallback's
+   per-uid directory. A pre-existing parent is never re-moded: `$XDG_RUNTIME_DIR`
+   and the platform temp dir are shared with every other process and user, and
+   narrowing them would be destructive.
+2. **A `0600` socket file.** `bind(2)` creates the socket with the process umask,
+   so the daemon narrows it to owner-only immediately afterwards. The short
+   bind-then-chmod window is harmless because the parent directory already
+   blocks every other user from reaching the path; a failed chmod is logged
+   (`warn!`), never fatal, for the same reason.
+3. **A Linux peer-uid check.** Before reading a single message on a local
+   connection, `connection::client_thread` asks the kernel for the peer's
+   credentials (`SO_PEERCRED`) and rejects the connection — unregistering its
+   writer channel, exactly like a failed TCP handshake — unless the peer's uid
+   equals the daemon's effective uid. Platforms without a cheap peer-credential
+   call rely on layers 1–2 alone.
+
+The temp-dir fallback is per-uid
+(`temp_dir()/choreographr-<uid>/choreographr.sock`), not a bare
+`temp_dir()/choreographr.sock`: the shared temp dir is world-searchable, so the
+socket needs a directory of its own to be private in, and the uid in the name
+keeps two users on one host from colliding. `choreo_shared::paths::default_socket_path`
+is the single definition of the path — `choreo-proto` delegates to it — so the
+daemon and every client resolve the same one.
+
 ### Lock/Unlock flow
 
 Each daemon's credential keystore is governed by a keypair whose private half (the
@@ -2226,7 +2262,7 @@ event is a deliberate follow-up).
 
 **Database:** `~/.local/share/choreographr/state.redb` (override via `CHOREOGRAPHR_DB_PATH` env var)
 
-**Socket path:** `$XDG_RUNTIME_DIR/choreographr.sock` (falls back to `/tmp/choreographr.sock` when no runtime dir; override via `CHOREOGRAPHR_SOCKET_PATH` env var)
+**Socket path:** `$XDG_RUNTIME_DIR/choreographr.sock`, created `0600` inside an owner-only directory; when no runtime dir exists it falls back to `temp_dir()/choreographr-<uid>/choreographr.sock` (per-uid, so the parent can be private). Override via `CHOREOGRAPHR_SOCKET_PATH` env var. See **Local trust domain** under **Security model**
 
 **Tool loop limit:** `CHOREOGRAPHR_MAX_TURNS` env var overrides `config.toml` `max_turns`. Resolution
 chain: `CHOREOGRAPHR_MAX_TURNS` env var → `config.toml` → default 0 (unlimited).

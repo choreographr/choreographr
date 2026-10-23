@@ -729,8 +729,11 @@ the legacy raw `identity.pk` file is an unlock-verification fallback that is
 copied into `known_servers.toml` on first use (never deleted, never binds).
 
 The socket path defaults to `$XDG_RUNTIME_DIR/choreographr.sock` (or
-`/tmp/choreographr.sock` when no runtime dir is available; override with
-`CHOREOGRAPHR_SOCKET_PATH`). The database path defaults to
+`<temp dir>/choreographr-<uid>/choreographr.sock` when no runtime dir is
+available; override with `CHOREOGRAPHR_SOCKET_PATH`). Because the local socket
+is the fully-trusted domain, it is created `0600` inside a directory only your
+user can enter, and on Linux the daemon also rejects any peer whose uid is not
+its own. The database path defaults to
 `~/.local/share/choreographr/state.redb` (override with `CHOREOGRAPHR_DB_PATH`).
 Turn history (conversation text, tool output, reasoning) is stored
 zstd-compressed in the `session_turns` table (schema 2, pure-Rust codec); on
