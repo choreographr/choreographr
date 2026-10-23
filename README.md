@@ -734,11 +734,13 @@ available; override with `CHOREOGRAPHR_SOCKET_PATH`). Because the local socket
 is the fully-trusted domain, it is created `0600` inside a directory only your
 user can enter, and on Linux the daemon also rejects any peer whose uid is not
 its own. The database path defaults to
-`~/.local/share/choreographr/state.redb` (override with `CHOREOGRAPHR_DB_PATH`).
-Turn history (conversation text, tool output, reasoning) is stored
+`~/.local/share/choreographr/state.redb` (override with `CHOREOGRAPHR_DB_PATH`);
+the data directory is created owner-only (`0700`) and the database file is
+chmod'd `0600` on every open, so other local users cannot read your transcripts
+or tool output. Turn history (conversation text, tool output, reasoning) is stored
 zstd-compressed in the `session_turns` table (schema 2, pure-Rust codec); on
 the first startup after upgrade the daemon re-encodes existing turns and keeps
-a `state.redb.bak-v1` backup.
+a `state.redb.bak-v1` backup (also `0600`).
 
 `CHOREOGRAPHR_MAX_TURNS` overrides the `max_turns` setting from `config.toml`
 (resolution chain: `CHOREOGRAPHR_MAX_TURNS` → `config.toml` → default 0; `0` =

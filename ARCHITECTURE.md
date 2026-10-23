@@ -1452,6 +1452,31 @@ keeps two users on one host from colliding. `choreo_shared::paths::default_socke
 is the single definition of the path — `choreo-proto` delegates to it — so the
 daemon and every client resolve the same one.
 
+### On-disk state database
+
+The `redb` store (`state.redb`, plus every `state.redb.bak-v*` pre-migration
+snapshot) holds plaintext conversation history, tool output — which routinely
+carries secrets — and image attachments, so it is protected by the filesystem
+independently of the keystore's AES-GCM credential blobs:
+
+1. **An owner-only data directory.** `open_db_at` creates the database's
+   *immediate* parent through `choreo_shared::paths::ensure_private_dir` —
+   `0700`, and a directory owned by another user is refused. A shared ancestor
+   (the platform temp dir, the data root such as `~/.local/share`) is never
+   re-moded: narrowing it would lock out every other program and user, so a
+   `CHOREOGRAPHR_DB_PATH` that points straight at one leaves its mode alone.
+2. **A `0600` database file, re-applied on every open.** `redb::Database::create`
+   honours the umask, so a typical desktop create lands `0644`; the mode is
+   therefore forced on every open path (fresh create, interrupted-create
+   recreate, and ordinary open), which also tightens a file left at the old
+   default by an earlier install. Backups inherit the same treatment after their
+   copy.
+
+Both steps are **best-effort**: an unusual embedder path or a filesystem without
+POSIX modes logs a `warn!` and the daemon starts anyway — losing the daemon over
+a permission quirk is worse than a visible log line, and the remaining control
+(the other layer, or the file's own mode) still bounds access.
+
 ### Lock/Unlock flow
 
 Each daemon's credential keystore is governed by a keypair whose private half (the
@@ -2121,7 +2146,12 @@ cascade-deletion rules.
 Sessions are persisted to a `redb` (v4) embedded key-value store at
 `~/.local/share/choreographr/state.redb`, and each active session's in-memory state
 is a `SessionState` owned by its control thread with the persisted fields extracted
-into `SessionConfig`. The table schema — every table's key and value codec, the
+into `SessionConfig`. The store holds plaintext conversation history and tool
+output, so it is kept owner-only: the data directory is created `0700` (foreign
+owned directories are refused) and the database file — like every
+pre-migration `state.redb.bak-v*` snapshot — is forced to `0600` on each open, so
+even a file left at the old umask default is tightened. The table schema — every
+table's key and value codec, the
 zstd turn-value compression, the turn-attachment byte split, the deletion
 tombstone, and the runtime catalog-refresh state — and the
 `SessionState`/`SessionConfig` split, with every field's rationale, are documented
@@ -2260,7 +2290,7 @@ event is a deliberate follow-up).
 
 **Credential storage:** Credentials are encrypted per-credential in the `redb` database (`state.redb`). Each daemon's keystore is bound to one client-held unlock key (the daemon stores only the derived public binding, created once via the `BindKeystore` wire path — TOFU-once, no rotation); the legacy `identity.pk` / `public.pk` pair is removed, and the legacy raw `identity.pk` file is an unlock-verification fallback that is copied into `known_servers.toml` on first use (never deleted, never binds). `AddCredential` carries the credential as typed plaintext with no key: the DAEMON encrypts it to its own stored binding public key before persisting, so the client never holds or transmits the encryption key on the add path (which requires an already-unlocked keystore).
 
-**Database:** `~/.local/share/choreographr/state.redb` (override via `CHOREOGRAPHR_DB_PATH` env var)
+**Database:** `~/.local/share/choreographr/state.redb` (override via `CHOREOGRAPHR_DB_PATH` env var). The data directory is created owner-only (`0700`) and the database file is `0600`, re-applied on every open; pre-migration `state.redb.bak-v*` backups are `0600` too, so transcripts and tool output stay unreadable by other local users.
 
 **Socket path:** `$XDG_RUNTIME_DIR/choreographr.sock`, created `0600` inside an owner-only directory; when no runtime dir exists it falls back to `temp_dir()/choreographr-<uid>/choreographr.sock` (per-uid, so the parent can be private). Override via `CHOREOGRAPHR_SOCKET_PATH` env var. See **Local trust domain** under **Security model**
 

@@ -12,6 +12,11 @@
 //! All I/O is synchronous `redb` transactions on the calling thread; `redb`'s
 //! `Database` is safe for concurrent readers, so one shared handle is threaded
 //! to every connection thread for on-demand image reads.
+//!
+//! The store holds plaintext transcripts and tool output, so its filesystem
+//! permissions are part of the access control: [`open_db_at`] keeps the data
+//! directory owner-only and forces the database file (and every pre-migration
+//! backup) to mode `0600`.
 
 use std::collections::HashMap;
 use std::fs;
@@ -228,6 +233,88 @@ fn stamp_schema_version(db: &redb::Database, version: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// Force a database file — the store itself or one of its pre-migration
+/// backups — to owner-only `0600`.
+///
+/// The store holds plaintext conversation history, tool output (which routinely
+/// carries secrets), and attachments, so the file must not be readable by other
+/// local users. `redb::Database::create` honours the process umask, so a typical
+/// desktop create lands `0644`, and a file left from an earlier install keeps
+/// whatever mode it already had: the mode is therefore forced on every open, not
+/// merely trusted from creation.
+///
+/// Best-effort: an unusual filesystem that cannot express POSIX modes logs a
+/// warning and the caller continues — refusing to start the daemon over a
+/// permission quirk is worse than a visible log line, and the containing
+/// directory's `0700` mode is the remaining control.
+fn make_owner_only(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "could not set the database file to mode 0600; it may stay readable by other \
+                 local users"
+            );
+        }
+    }
+    // Non-Unix has no POSIX mode to set: the file inherits its directory's ACLs.
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// Directories this instance must never narrow, because other programs and
+/// users legitimately live in them and a `0700` there would lock them all out.
+///
+/// Only the DB's *immediate* parent is ours to tighten; the platform temp dir
+/// and the data *root* (`~/.local/share`, the parent of the standard
+/// `choreographr` data dir) are shared by construction. A `CHOREOGRAPHR_DB_PATH`
+/// pointing straight at one of them leaves the mode alone — the file's own
+/// `0600` is the control there.
+fn is_shared_root(dir: &std::path::Path) -> bool {
+    if dir == std::env::temp_dir() {
+        return true;
+    }
+    choreo_shared::paths::data_dir()
+        .ok()
+        .and_then(|data| data.parent().map(std::path::Path::to_path_buf))
+        .is_some_and(|root| dir == root)
+}
+
+/// Create the database's parent directory and make it owner-only when that is
+/// the right thing to do.
+///
+/// The data directory is part of the store's access control: a `0600` file
+/// inside a world-searchable directory is still enumerable and openable by
+/// every local user, so the immediate parent gets the shared
+/// [`ensure_private_dir`](choreo_shared::paths::ensure_private_dir) treatment
+/// (create, refuse a foreign owner, set `0700`). A shared ancestor is created
+/// with a plain `create_dir_all` instead, and a directory that cannot be
+/// tightened at all only warns — startup proceeds and the file mode is the
+/// remaining control.
+fn ensure_db_dir(dir: &std::path::Path) {
+    if !is_shared_root(dir) {
+        if let Err(e) = choreo_shared::paths::ensure_private_dir(dir) {
+            warn!(
+                dir = %dir.display(),
+                error = %e,
+                "database directory is not owner-only; the database file's own 0600 mode is the \
+                 remaining control"
+            );
+        }
+        return;
+    }
+    if let Err(e) = fs::create_dir_all(dir) {
+        warn!(
+            dir = %dir.display(),
+            error = %e,
+            "could not create the database directory"
+        );
+    }
+}
+
 /// Compute the backup path [`backup_db_file`] and [`backup_database`] share:
 /// `path.bak-v{from}`, named after the version being migrated FROM. Extracted
 /// so the naming cannot drift between the pre-lock copy (CLI startup) and the
@@ -270,6 +357,9 @@ fn backup_path_for(path: &std::path::Path, from: u64) -> std::path::PathBuf {
 pub fn backup_database(path: &std::path::Path, from_version: u64) -> io::Result<()> {
     let backup_path = backup_path_for(path, from_version);
     fs::copy(path, &backup_path)?;
+    // The backup is a byte-for-byte copy of the store — same transcripts, same
+    // tool output — so it gets the same owner-only mode as the store itself.
+    make_owner_only(&backup_path);
     info!(
         from = %path.display(),
         to = %backup_path.display(),
@@ -308,6 +398,9 @@ fn backup_db_file(path: &std::path::Path, from: u64) -> io::Result<()> {
         return Ok(());
     }
     fs::copy(path, &backup_path)?;
+    // A byte-for-byte copy of the store — same transcripts, same tool output —
+    // so it gets the same owner-only mode as the store itself.
+    make_owner_only(&backup_path);
     info!(
         from = %path.display(),
         to = %backup_path.display(),
@@ -611,13 +704,14 @@ pub fn open_db() -> io::Result<redb::Database> {
 ///
 /// # Errors
 ///
-/// Returns Err if the parent directory cannot be created, the file cannot
-/// be created/opened (corruption, permissions, lock contention), or the
-/// initial schema version cannot be stamped.
+/// Returns Err if the file cannot be created/opened (corruption,
+/// permissions, lock contention) or the initial schema version cannot be
+/// stamped. A parent directory that cannot be created or tightened is only
+/// warned about: the subsequent create/open reports the real failure.
 pub fn open_db_at(path: &std::path::Path) -> io::Result<redb::Database> {
     info!(path = %path.display(), "opening database");
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        ensure_db_dir(parent);
     }
     // A 0-byte file is the corpse of an interrupted `Database::create`
     // (crash between file creation and the first write): it holds no
@@ -631,11 +725,18 @@ pub fn open_db_at(path: &std::path::Path) -> io::Result<redb::Database> {
         warn!("database file exists but is empty (interrupted create?); recreating");
         let db = redb::Database::create(path)
             .map_err(|e| io::Error::other(format!("failed to create database: {e}")))?;
+        make_owner_only(path);
         initialize_schema_version(&db)?;
         return Ok(db);
     }
     match redb::Database::open(path) {
-        Ok(db) => Ok(db),
+        Ok(db) => {
+            // Force the mode even for an existing file: a store created before
+            // the file was hardened carries the umask default and would stay
+            // world-readable without this.
+            make_owner_only(path);
+            Ok(db)
+        }
         // File does not exist: fresh install. Create the database file and
         // stamp the initial schema version so `run_migrations` (called by
         // the daemon right after `open_db`) sees a versioned database and
@@ -649,6 +750,7 @@ pub fn open_db_at(path: &std::path::Path) -> io::Result<redb::Database> {
             info!("database file not found, creating new database");
             let db = redb::Database::create(path)
                 .map_err(|e| io::Error::other(format!("failed to create database: {e}")))?;
+            make_owner_only(path);
             initialize_schema_version(&db)?;
             Ok(db)
         }
@@ -2406,6 +2508,49 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn open_db_at_creates_private_dir_and_file() {
+        use std::os::unix::fs::PermissionsExt;
+        // The store holds plaintext transcripts and tool output, so both the
+        // immediate parent (0700) and the file (0600) must be owner-only from
+        // the very first open — a 0600 file inside a world-searchable
+        // directory is still reachable by every local user.
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("choreographr");
+        let db_path = data_dir.join("state.redb");
+
+        let db = open_db_at(&db_path).unwrap();
+        drop(db);
+
+        let dir_mode = fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "the data directory must be owner-only");
+        let file_mode = fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "the database file must be owner-only");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_db_at_tightens_a_world_readable_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+        // An install created before the file was hardened carries the umask
+        // default (typically 0644); reopening must tighten it rather than
+        // trusting the mode the file arrived with.
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("choreographr");
+        let db_path = data_dir.join("state.redb");
+
+        let db = open_db_at(&db_path).unwrap();
+        drop(db);
+        fs::set_permissions(&db_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let db = open_db_at(&db_path).unwrap();
+        drop(db);
+
+        let file_mode = fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "an existing 0644 file must be tightened");
+    }
+
+    #[test]
     fn backup_db_file_names_backup_after_source_version() {
         // The pre-migration snapshot must be named after the version being
         // migrated FROM (`bak-v1` for a v1 database), so restoring it rolls
@@ -2423,6 +2568,31 @@ mod tests {
         // both can coexist without colliding.
         backup_db_file(&db_path, 2).unwrap();
         assert!(db_path.with_file_name("state.redb.bak-v2").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn backup_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        // A backup is a byte-for-byte copy of the store, so it holds the same
+        // transcripts and tool output and must be no more readable than the
+        // store itself — `fs::copy` alone would carry the source's 0644 mode.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        fs::write(&db_path, b"database contents").unwrap();
+        fs::set_permissions(&db_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        backup_db_file(&db_path, 1).unwrap();
+        backup_database(&db_path, 2).unwrap();
+
+        for backup in ["state.redb.bak-v1", "state.redb.bak-v2"] {
+            let mode = fs::metadata(db_path.with_file_name(backup))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{backup} must be owner-only");
+        }
     }
 
     #[test]
