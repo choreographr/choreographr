@@ -324,28 +324,55 @@ impl KnownServers {
     /// lock (same discipline as `ensure_transport_keypair`): concurrent
     /// processes — two TUIs pinning different daemons — serialize instead
     /// of tearing each other's writes. Create the parent dir on first pin.
+    ///
+    /// The store is sensitive: it holds the per-daemon PRIVATE X25519
+    /// unlock keys, each of which decrypts every credential for its daemon.
+    /// It is therefore opened `O_NOFOLLOW`, verified to be a regular file
+    /// owned by the current user, and tightened to `0600` on every write —
+    /// not just at creation — so a pre-existing or planted file cannot
+    /// leave the keys group- or world-readable.
     fn persist(&self) -> Result<(), ClientError> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| ClientError::Io(std::io::Error::other(e)))?;
+        // Ensure the parent config dir is owner-only (`0700`). Best-effort: a
+        // filesystem without POSIX modes, or a shared ancestor, is left as-is
+        // and the store file's own `0600` mode remains the control, so a
+        // failure here only warns rather than blocking the write.
+        if let Some(parent) = self.path.parent()
+            && let Err(e) = choreo_shared::paths::ensure_private_dir(parent)
+        {
+            warn!(
+                dir = %parent.display(),
+                error = %e,
+                "could not make the known-servers config directory owner-only; the store file's \
+                 own 0600 mode is the remaining control"
+            );
         }
 
         // Open (or create) with the lock held for the whole rewrite, then
         // truncate-in-place. A reader that sees the file mid-rewrite gets
         // the load-time tolerant path (parse failure -> empty -> re-confirm
         // trust), but the lock makes that a non-event in practice.
+        //
+        // Truncating in place (rather than write-temp-then-rename) is
+        // deliberate: a rename would swap the inode out from under the
+        // cross-process advisory lock this design relies on for concurrent
+        // TUI pinning. An atomic-rename-with-a-lockfile is a possible future
+        // robustness improvement, but not while the lock lives on this fd.
         #[cfg(unix)]
         let file = {
-            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::OpenOptionsExt as _;
             std::fs::OpenOptions::new()
                 .create(true)
                 .read(true)
                 .write(true)
                 .truncate(false)
-                // 0o600: the store binds addresses to trust decisions, so
-                // it is cheap to keep private even though pubkeys are not
-                // secret.
+                // 0600 applies on creation; `verify_owned_regular` re-applies
+                // it unconditionally below, because an existing file with
+                // looser permissions would otherwise keep them.
                 .mode(0o600)
+                // O_NOFOLLOW: fail rather than follow a symlink planted at the
+                // path, which would let another local user divert the rewrite
+                // (keys included) into a file of their choosing.
+                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
                 .open(&self.path)
         };
         #[cfg(not(unix))]
@@ -356,6 +383,9 @@ impl KnownServers {
             .truncate(false)
             .open(&self.path);
         let mut file = file.map_err(|e| ClientError::Io(std::io::Error::other(e)))?;
+        #[cfg(unix)]
+        verify_owned_regular(&file, &self.path)
+            .map_err(|e| ClientError::Io(std::io::Error::other(e)))?;
         file.lock()
             .map_err(|e| ClientError::Io(std::io::Error::other(e)))?;
 
@@ -378,6 +408,29 @@ impl KnownServers {
         debug!(path = %self.path.display(), entries = self.entries.len(), "persisted known servers");
         Ok(())
     }
+}
+
+/// Verify an opened store file is a regular file owned by this euid and
+/// tighten its mode to `0600`, refusing anything else.
+///
+/// Applying the mode through the open fd (`fchmod`) rather than by path is
+/// what makes it race-free: the path cannot be re-pointed at a different
+/// inode between the check and the chmod. A symlink never reaches here —
+/// `O_NOFOLLOW` makes the open itself fail.
+#[cfg(unix)]
+fn verify_owned_regular(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.uid() != rustix::process::geteuid().as_raw() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to write {}: not a regular file owned by the current user",
+                path.display()
+            ),
+        ));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
 }
 
 /// The TOML file shape: an array of tables named `server`.
@@ -641,5 +694,72 @@ mod tests {
         .expect("write short-key store");
         let store = KnownServers::load_from(&path).expect("load");
         assert_eq!(store.entries(), [] as [KnownServerEntry; 0]);
+    }
+
+    /// A pre-existing store at looser permissions (an old create's `0644`, or a
+    /// hand-relaxed file) must be tightened to `0600` on the next write — the
+    /// creation-time mode alone never fixes one that already exists, and this
+    /// file holds the private per-daemon unlock keys.
+    #[cfg(unix)]
+    #[test]
+    fn persist_tightens_a_preexisting_file_to_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_temp, _guard, dir) = use_temp_config_root();
+        let path = dir.join("choreographr").join("known_servers.toml");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, "").expect("seed store");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let mut store = KnownServers::load_from(&path).expect("load");
+        store.pin("host:9443", &[1u8; 32]).expect("pin");
+
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the unlock-key store must end up owner-only");
+    }
+
+    /// A symlink planted at the store path is refused (`O_NOFOLLOW`) rather
+    /// than written through, so another local user cannot divert the unlock
+    /// keys into a file they control.
+    #[cfg(unix)]
+    #[test]
+    fn persist_refuses_a_symlink_at_the_store_path() {
+        let (_temp, _guard, dir) = use_temp_config_root();
+        let store_dir = dir.join("choreographr");
+        std::fs::create_dir_all(&store_dir).expect("mkdir");
+        let target = dir.join("victim");
+        std::fs::write(&target, b"do not touch").expect("write target");
+        let path = store_dir.join("known_servers.toml");
+        std::os::unix::fs::symlink(&target, &path).expect("symlink");
+
+        let mut store = KnownServers::load_from(&path).expect("load");
+        assert!(
+            store.pin("host:9443", &[2u8; 32]).is_err(),
+            "a symlink at the store path must be refused"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read target"),
+            b"do not touch",
+            "the symlink target must be untouched"
+        );
+    }
+
+    /// A non-regular entry (a directory) at the store path is refused instead
+    /// of being written into.
+    #[cfg(unix)]
+    #[test]
+    fn persist_refuses_a_non_regular_store_path() {
+        let (_temp, _guard, dir) = use_temp_config_root();
+        let path = dir.join("choreographr").join("known_servers.toml");
+        std::fs::create_dir_all(&path).expect("mkdir at the store path");
+
+        let mut store = KnownServers::load_from(&path).expect("load");
+        assert!(
+            store.pin("host:9443", &[3u8; 32]).is_err(),
+            "a directory at the store path must be refused"
+        );
     }
 }

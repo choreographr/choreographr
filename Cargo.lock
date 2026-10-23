@@ -2858,6 +2858,7 @@ dependencies = [
  "choreo-transport",
  "crossbeam-channel",
  "rand 0.10.3",
+ "rustix 1.1.5",
  "serde",
  "serde_json",
  "sha2 0.11.1",

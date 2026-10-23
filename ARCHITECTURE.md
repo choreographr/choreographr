@@ -1496,6 +1496,15 @@ is no `/bind-key` command); pre-held keys (stored known_servers key or the
 legacy raw `identity.pk` file) verify existing bindings and never create new
 ones. Binding is TOFU-once — rotation is not implemented.
 
+`known_servers.toml` holds those per-daemon **private** unlock keys, so the file
+is treated as secret: it is created `0600`, and every later write re-opens it
+with `O_NOFOLLOW` (a planted symlink is refused rather than followed), verifies
+the opened file is a regular file owned by the current euid, and re-applies
+`0600` even when it pre-existed with looser permissions. The write also
+best-effort tightens its parent config directory to `0700`. The rewrite stays
+in-place under the advisory file lock (no temp+rename) so concurrent TUI pinning
+serializes on one inode.
+
 A client sends `ClientMessage::Unlock { private_key }` (resolved verify-only as
 its stored per-daemon unlock key, else the legacy raw `identity.pk` file —
 copied into the store on first use; a caller-supplied base64 key from
