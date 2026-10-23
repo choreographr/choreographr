@@ -12,6 +12,10 @@ use super::{
 ///
 /// The repository is discovered from `repo_path` (or the session working
 /// directory), and the push is invoked as `git push`.
+///
+/// `remote` and `branch` are model-supplied, so they are placed after a
+/// literal `--` separator: everything after it is positional, and a value
+/// beginning with `-` can never be parsed as a git option.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GitPushArgs {
     /// Path to the git repository. Defaults to the session working directory.
@@ -55,6 +59,37 @@ pub fn execute_git_push_tool(
     Ok(truncate_tool_output(&output))
 }
 
+/// Build the argument vector for `git push`.
+///
+/// All option flags come first, then a literal `--` that ends option parsing,
+/// then the positional `remote` and `branch`. The separator is what makes the
+/// push safe against argument injection: without it, a model-supplied remote
+/// or branch beginning with `-` (for example `--upload-pack=...`) would be
+/// read by git as an option rather than as a positional argument. Placing the
+/// separator after the flags — never before them — keeps the flags effective.
+fn build_push_args(
+    remote: &str,
+    branch: &str,
+    dry_run: bool,
+    set_upstream: bool,
+    force_with_lease: bool,
+) -> Vec<String> {
+    let mut args = vec!["push".to_string()];
+    if dry_run {
+        args.push("--dry-run".to_string());
+    }
+    if set_upstream {
+        args.push("--set-upstream".to_string());
+    }
+    if force_with_lease {
+        args.push("--force-with-lease".to_string());
+    }
+    args.push("--".to_string());
+    args.push(remote.to_string());
+    args.push(branch.to_string());
+    args
+}
+
 fn git_push_impl(
     repo_path: Option<&str>,
     remote: &str,
@@ -71,18 +106,7 @@ fn git_push_impl(
         None => current_branch_name(&repo)?,
     };
 
-    let mut args = vec!["push".to_string()];
-    if dry_run {
-        args.push("--dry-run".to_string());
-    }
-    if set_upstream {
-        args.push("--set-upstream".to_string());
-    }
-    if force_with_lease {
-        args.push("--force-with-lease".to_string());
-    }
-    args.push(remote.to_string());
-    args.push(branch.clone());
+    let args = build_push_args(remote, &branch, dry_run, set_upstream, force_with_lease);
 
     let output = run_git_command(&repo, &args)?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -154,3 +178,51 @@ define_tool!(
     "git",
     describe_git_push_invocation
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Index of the literal `--` separator, or a panic when it is missing.
+    fn separator_index(args: &[String]) -> usize {
+        args.iter()
+            .position(|arg| arg == "--")
+            .expect("push args must contain a `--` separator")
+    }
+
+    #[test]
+    fn test_build_push_args_places_positionals_after_separator() {
+        let args = build_push_args("origin", "main", false, false, false);
+        assert_eq!(args, vec!["push", "--", "origin", "main"]);
+    }
+
+    #[test]
+    fn test_build_push_args_rejects_option_shaped_positionals() {
+        // Both values begin with `-`, so without the separator git would read
+        // them as options. They must appear only after `--`, never before it.
+        let args = build_push_args("--upload-pack=evil", "-x", false, false, false);
+        let separator = separator_index(&args);
+        assert_eq!(args, vec!["push", "--", "--upload-pack=evil", "-x"]);
+        assert_eq!(&args[separator + 1..], ["--upload-pack=evil", "-x"]);
+        // Nothing option-shaped may precede the separator.
+        assert!(args[..separator].iter().all(|arg| !arg.starts_with('-')));
+    }
+
+    #[test]
+    fn test_build_push_args_orders_flags_before_separator() {
+        let args = build_push_args("origin", "main", true, true, true);
+        let separator = separator_index(&args);
+        assert_eq!(
+            &args[..separator],
+            ["push", "--dry-run", "--set-upstream", "--force-with-lease"]
+        );
+        assert_eq!(&args[separator + 1..], ["origin", "main"]);
+    }
+
+    #[test]
+    fn test_build_push_args_separator_always_present() {
+        // The separator is structural: it appears even with every flag off.
+        let args = build_push_args("upstream", "feature", false, false, false);
+        assert_eq!(separator_index(&args), 1);
+    }
+}
