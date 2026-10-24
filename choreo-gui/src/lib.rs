@@ -32,7 +32,7 @@ mod state;
 pub mod ios_bridge;
 
 use crate::client::apply_daemon_message;
-use crate::components::{Composer, HistoryList, Toolbar};
+use crate::components::{Composer, HistoryList, SetupDialog, Toolbar};
 use crate::hooks::use_daemon_connection;
 use crate::state::{AppState, UiEvent};
 use choreo_client_core::{ConnectionMode, read_server_pk};
@@ -432,9 +432,9 @@ fn App() -> Element {
         AppState::new(&display_path)
     });
 
-    // Fetch the account list for the welcome panel once the connection is
+    // Fetch the account list for the setup popup once the connection is
     // up. `use_daemon_connection`'s hook has already run, so the handle is
-    // set; the request is quiet (its reply feeds the panel, not the history).
+    // set; the request is quiet (its reply feeds the popup, not the history).
     use_hook(move || {
         if let Some(handle) = daemon_tx.read().clone() {
             onboarding::request_accounts(&mut state.write(), &handle);
@@ -493,8 +493,10 @@ fn App() -> Element {
         document::Style { {APP_CSS} }
         div { class: "app-shell",
             Toolbar { state, tx: daemon_tx }
-            HistoryList { state, tx: daemon_tx }
+            HistoryList { state }
             Composer { state, tx: daemon_tx }
+            // Last, so it paints over the rest of the shell.
+            SetupDialog { state, tx: daemon_tx }
         }
     }
 }

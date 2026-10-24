@@ -1,12 +1,12 @@
-//! First-run setup for the GUI: the state behind the welcome panel shown in
-//! place of an empty chat, and the daemon-message handling that keeps it
+//! First-run setup for the GUI: the state behind the setup popup that opens
+//! over an empty session, and the daemon-message handling that keeps it
 //! current.
 //!
-//! The panel walks the same three steps as the TUI's welcome checklist (the
+//! The popup walks the same three steps as the TUI's welcome checklist (the
 //! rules themselves live in `choreo_client_core::onboarding`): give an
 //! account an API key, use that account in the attached session, choose a
 //! model. The GUI has no accounts page or model picker to point at, so each
-//! step is done right in the panel — a form that creates the account and
+//! step is done right in the popup — a form that creates the account and
 //! stores its key in one submit, a button per keyed account, and a filterable
 //! model list.
 //!
@@ -15,7 +15,7 @@
 //! for the session, and its `SessionAccountSet` fetches the model list, so a
 //! new user goes from pasting a key to picking a model without another click.
 //!
-//! Rendering lives in `components.rs` (`WelcomePanel`); everything here is
+//! Rendering lives in `components.rs` (`SetupDialog`); everything here is
 //! plain state plus sends through the [`DaemonHandle`], so it is unit-tested
 //! without a daemon or a renderer.
 
@@ -32,7 +32,7 @@ use std::collections::HashSet;
 use tracing::{debug, info};
 use zeroize::Zeroize;
 
-/// Most models the panel lists at once. Some providers serve hundreds; past
+/// Most models the popup lists at once. Some providers serve hundreds; past
 /// this the user narrows the list with the filter instead of scrolling.
 pub(crate) const MODEL_LIST_CAP: usize = 40;
 
@@ -69,8 +69,8 @@ pub(crate) fn checklist(progress: SetupProgress) -> [(&'static str, StepMark); 3
     ]
 }
 
-/// The welcome panel's state: what the daemon has told us about accounts and
-/// the attached session, plus the panel's own form fields.
+/// The setup popup's state: what the daemon has told us about accounts and
+/// the attached session, plus the popup's own form fields.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SetupState {
     /// Every configured account, from the latest `Accounts` reply.
@@ -80,16 +80,22 @@ pub(crate) struct SetupState {
     /// The attached session's model, when it has one.
     pub(crate) session_model: Option<String>,
     /// Models available through the session's account, from the latest
-    /// panel-requested `Models` reply.
+    /// popup-requested `Models` reply.
     pub(crate) models: Vec<String>,
     /// The armed first-run follow-through, if any (see the module docs).
     pub(crate) follow: Option<SetupFollow>,
-    /// Ids of the panel's own `ListAccounts`/`ListModels` requests. Their
-    /// replies only feed the panel; the generic dispatch would otherwise
+    /// Ids of the popup's own `ListAccounts`/`ListModels` requests. Their
+    /// replies only feed the popup; the generic dispatch would otherwise
     /// print every account and every model into the history.
     pub(crate) quiet_requests: HashSet<u64>,
     /// The step-1 form.
     pub(crate) form: SetupForm,
+    /// The user opened the setup popup from the toolbar: it stays up, even
+    /// once setup is complete, until they close it.
+    pub(crate) opened: bool,
+    /// The user closed the popup: it no longer opens on its own for the rest
+    /// of this run (the toolbar button still opens it).
+    pub(crate) dismissed: bool,
 }
 
 /// The step-1 form: one submit creates the account (when the name is new) and
@@ -117,6 +123,29 @@ impl SetupState {
             self.session_account.as_deref(),
             self.session_model.is_some(),
         )
+    }
+
+    /// Whether the setup popup is showing. It opens on its own over an empty
+    /// session whose setup is unfinished — the moment a new user needs it —
+    /// and so closes on its own once the last step lands. Opened from the
+    /// toolbar it stays up regardless; closed by the user it stops opening on
+    /// its own, so it never nags someone who chose to set up later.
+    pub(crate) fn popup_visible(&self, session_attached: bool, session_empty: bool) -> bool {
+        session_attached
+            && (self.opened || (!self.dismissed && session_empty && !self.progress().is_complete()))
+    }
+
+    /// Open the popup from the toolbar.
+    pub(crate) fn open_popup(&mut self) {
+        debug!("setup: popup opened");
+        self.opened = true;
+    }
+
+    /// Close the popup and keep it from reopening on its own.
+    pub(crate) fn close_popup(&mut self) {
+        debug!("setup: popup closed");
+        self.opened = false;
+        self.dismissed = true;
     }
 
     /// Accounts that hold a key: the ones step 2 offers.
@@ -169,19 +198,19 @@ impl SetupState {
     }
 }
 
-/// Send a request whose reply only feeds the panel (see
+/// Send a request whose reply only feeds the popup (see
 /// [`SetupState::quiet_requests`]).
 fn send_quiet(state: &mut AppState, handle: &DaemonHandle, request: ClientMessageType) {
     let id = handle.send(request);
     state.setup.quiet_requests.insert(id);
 }
 
-/// Ask for the account list on behalf of the panel.
+/// Ask for the account list on behalf of the popup.
 pub(crate) fn request_accounts(state: &mut AppState, handle: &DaemonHandle) {
     send_quiet(state, handle, ClientMessageType::ListAccounts);
 }
 
-/// Ask for the session account's model list on behalf of the panel.
+/// Ask for the session account's model list on behalf of the popup.
 pub(crate) fn request_models(state: &mut AppState, handle: &DaemonHandle) {
     send_quiet(state, handle, ClientMessageType::ListModels);
 }
@@ -272,8 +301,8 @@ pub(crate) fn select_model(daemon_tx: Option<&DaemonHandle>, model: &str) {
 /// Fold `message` into the setup state and advance the follow-through.
 ///
 /// Runs before the generic dispatch. Returns `true` when the message was a
-/// reply to one of the panel's quiet requests and must NOT be dispatched
-/// (the panel shows it instead of the history).
+/// reply to one of the popup's quiet requests and must NOT be dispatched
+/// (the popup shows it instead of the history).
 pub(crate) fn track_setup_message(
     state: &mut AppState,
     message: &DaemonMessage,
@@ -296,7 +325,7 @@ pub(crate) fn track_setup_message(
             ..
         } => {
             // Any model list answers the session's account, so keep it for
-            // the panel even when the toolbar asked for it.
+            // the popup even when the toolbar asked for it.
             state.setup.models.clone_from(models);
             if selected_model.is_some() {
                 state.setup.session_model.clone_from(selected_model);
@@ -358,7 +387,7 @@ pub(crate) fn track_setup_message(
                     .session_model
                     .clone_from(&summary.selected_model);
                 // Resuming a session stuck at step 3: fetch its models so the
-                // panel can offer them straight away.
+                // popup can offer them straight away.
                 if summary.account_name.is_some()
                     && summary.selected_model.is_none()
                     && let Some(handle) = daemon_tx
@@ -377,7 +406,7 @@ pub(crate) fn track_setup_message(
                 },
         } => {
             // The direct reply to this connection's own CreateSession: the
-            // GUI attaches to it, so its account and model are the panel's.
+            // GUI attaches to it, so its account and model are the popup's.
             debug!(?session_id, "setup: attached to a newly created session");
             state.setup.session_account.clone_from(account_name);
             state.setup.session_model.clone_from(selected_model);
@@ -509,6 +538,35 @@ mod tests {
     }
 
     #[test]
+    fn the_popup_opens_on_its_own_only_while_it_is_needed() {
+        let mut setup = SetupState::default();
+        // No session to set up yet.
+        assert!(!setup.popup_visible(false, true));
+        // An empty session with setup left to do.
+        assert!(setup.popup_visible(true, true));
+        // A session that already has turns is someone's conversation.
+        assert!(!setup.popup_visible(true, false));
+
+        // Once setup is complete it closes on its own.
+        setup.accounts = vec![account("a", true)];
+        setup.session_account = Some("a".to_string());
+        setup.session_model = Some("m".to_string());
+        assert!(!setup.popup_visible(true, true));
+    }
+
+    #[test]
+    fn closing_the_popup_stops_it_reopening_but_the_toolbar_still_can() {
+        let mut setup = SetupState::default();
+        setup.close_popup();
+        assert!(!setup.popup_visible(true, true));
+
+        setup.open_popup();
+        assert!(setup.popup_visible(true, false), "opened by hand, it stays");
+        setup.close_popup();
+        assert!(!setup.popup_visible(true, true));
+    }
+
+    #[test]
     fn picking_a_provider_suggests_a_free_name() {
         let mut setup = SetupState {
             accounts: vec![account("openai", true)],
@@ -618,7 +676,7 @@ mod tests {
             ClientMessageType::ListModels
         ));
 
-        // The reply to the panel's own request feeds the panel and is kept
+        // The reply to the popup's own request feeds the popup and is kept
         // out of the history.
         let mut reply = DaemonMessage::broadcast(DaemonMessageType::Models {
             models: vec!["m1".to_string(), "m2".to_string()],
@@ -686,7 +744,7 @@ mod tests {
         track_setup_message(&mut state, &sessions, Some(&handle));
         assert_eq!(state.setup.session_account.as_deref(), Some("work"));
         assert_eq!(state.setup.session_model, None);
-        // Stuck at step 3: the models are fetched for the panel.
+        // Stuck at step 3: the models are fetched for the popup.
         assert!(
             sent(&rx)
                 .iter()
