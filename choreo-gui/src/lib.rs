@@ -490,6 +490,9 @@ fn App() -> Element {
     });
 
     rsx! {
+        // Blitz turns the document title into the native window title, which
+        // otherwise falls back to the framework's "Dioxus App" placeholder.
+        document::Title { "Choreographr" }
         document::Style { {APP_CSS} }
         div { class: "app-shell",
             Toolbar { state, tx: daemon_tx }
