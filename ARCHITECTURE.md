@@ -872,14 +872,27 @@ separately from the per-send budget, and a `no_retry` request
 
 The compiled-in catalog is only the *fallback*: at runtime the daemon layers a
 local cache and a user overlay on top and keeps the base fresh from models.dev.
-One maintenance thread (`choreo-daemon/src/catalog.rs`) owns the whole pipeline
+One maintenance thread (`choreo-daemon/src/catalog/`) owns the whole pipeline
 but never mutates the catalog itself — every change is sent to the daemon
 command loop, the single writer of the `ArcSwap`, over a channel. The thread
 holds **no copy of the base** between events: it keeps only the small pacing
-scalars (etag, attempt anchor, overlay fingerprint), and on an overlay edit it
-re-decodes the base from `catalog.bin` (or the embedded blob) transiently for
-the one re-merge — so the process's sole resident catalog is the merged
-`ArcSwap`.
+scalars (etag, attempt anchor, overlay fingerprint), a fetch moves its fresh
+base straight into the swap command, and an overlay edit carries the overlay
+alone (`CatalogOverlayChanged`) — so the process's sole resident catalog is the
+merged `ArcSwap`, and `catalog.bin` is the base's home between events.
+
+That file's single reader is therefore its single writer: the command loop, the
+only code that writes `catalog.bin`, resolves the base when an overlay edit
+arrives (re-decoding the cache, or the embedded blob on a cache miss). Owning
+both sides is what makes the re-merge race-free — a base captured on the
+maintenance thread could already be superseded by a fetch whose swap command
+the loop had not yet applied, silently reverting that fetch (and the new etag
+would then 304 the downgrade into place for a whole revalidation period). The
+one case where the disk is behind the live catalog is a fetch whose cache write
+**failed**: the loop then retains that base in memory
+(`DaemonState::catalog_applied_base`) and re-merges from it until a persist
+succeeds, so a later overlay edit cannot revert the fetch to the stale on-disk
+base.
 
 The cross-cutting invariants: the normalized base is cached in the data dir in
 the same postcard format as the embedded blob, written atomically, with the

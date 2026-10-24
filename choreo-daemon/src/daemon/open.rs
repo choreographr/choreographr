@@ -281,6 +281,9 @@ impl DaemonState {
             // (the command loop needs the same Arc the accept paths read).
             acl: None,
             catalog_paths: opts.catalog_paths,
+            // Set only when a fetch's cache persist fails (see
+            // `persist_catalog_cache`); a fresh daemon's base is on disk.
+            catalog_applied_base: None,
             cache_warming: opts.cache_warming,
         })
     }

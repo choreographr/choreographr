@@ -416,6 +416,14 @@ pub struct DaemonState {
     /// Filesystem locations of the runtime catalog cache + user overlay
     /// (resolved from the standard XDG dirs; see `crate::catalog`).
     pub catalog_paths: CatalogPaths,
+    /// The applied catalog base when `catalog.bin` could NOT be written — the
+    /// only case in which the live base has no durable home. Normally `None`:
+    /// the cache is the base's home between events, and an overlay edit
+    /// re-reads it (`crate::catalog::load_persisted_base`). A fetch whose
+    /// cache persist fails sets this so a later overlay edit re-merges the
+    /// base the daemon is actually running instead of reverting to the stale
+    /// on-disk one; the next successful persist clears it.
+    pub catalog_applied_base: Option<std::sync::Arc<Vec<choreo_ai_protocols::ProviderEntry>>>,
     /// The daemon's loaded `[cache_warming]` config.toml table. Loaded ONCE at
     /// startup (see `OpenOptions::cache_warming` / `cli.rs`), then merged with
     /// each account's `meter`/`cache_warming`/`prompt_cache` in `spawn_session`
@@ -657,7 +665,8 @@ pub enum DaemonCommand {
         /// The (possibly refreshed) models.dev base provider entries.
         base: Vec<choreo_ai_protocols::ProviderEntry>,
         /// The HTTP etag for the fetched base, persisted for the next
-        /// conditional GET.
+        /// conditional GET. Ignored unless `persist` is set (a startup load's
+        /// etag is already in the DB, or deliberately absent).
         etag: Option<String>,
         /// The user overlay contents, or `None` for bundled-only. `Some`
         /// with a fresh value means the file was edited; `None` after `Some`
@@ -679,6 +688,18 @@ pub enum DaemonCommand {
     CatalogNotModified {
         /// The coalesced `/refresh-models` requesters to answer `UpToDate`.
         reply: Vec<RefreshRequester>,
+    },
+    /// The maintenance thread saw `models-overlay.toml` change. It carries
+    /// **only the overlay** — no base — because the command loop is the base's
+    /// single reader as well as `catalog.bin`'s single writer: it re-merges
+    /// the base it is currently running (re-reading the cache file, which no
+    /// other thread writes), so an edit that lands right after a fetch can
+    /// never hand back a base the fetch has already superseded.
+    CatalogOverlayChanged {
+        /// The new overlay contents, or `None` for bundled-only (the file was
+        /// deleted — or emptied of a `[provider]` table, which the merge
+        /// treats the same way).
+        user_overlay: Option<String>,
     },
     /// Fetch a stored credential's API key by service name.
     GetCredential {
@@ -1355,13 +1376,21 @@ impl DaemonState {
                 user_overlay,
                 persist,
                 reply,
-            } => self.handle_catalog_base_changed(
-                &base,
-                etag.as_deref(),
-                user_overlay.as_deref(),
-                persist,
-                reply,
-            ),
+            } => {
+                // A live fetch writes the cache (bin, then the etag that
+                // validates it); a startup load's base is already on disk.
+                let write = if persist {
+                    CacheWrite::Fetch {
+                        etag: etag.as_deref(),
+                    }
+                } else {
+                    CacheWrite::Skip
+                };
+                self.handle_catalog_base_changed(&base, user_overlay.as_deref(), write, reply);
+            }
+            DaemonCommand::CatalogOverlayChanged { user_overlay } => {
+                self.handle_catalog_overlay_changed(user_overlay.as_deref());
+            }
             DaemonCommand::CatalogNotModified { reply } => {
                 Self::handle_catalog_not_modified(reply);
             }
@@ -2476,32 +2505,65 @@ impl DaemonState {
     }
 
     /// Apply a new catalog base + user overlay delivered by the maintenance
-    /// thread. This is the ONLY place the daemon calls `replace_catalog` for
-    /// runtime refreshes (single-writer invariant: the daemon command loop).
+    /// thread (a startup load, or a live fetch).
     ///
-    /// Merge order, lowest → highest wins: normalized models.dev base →
-    /// bundled overlay → user overlay. The merged catalog is validated
-    /// non-empty before the swap (a hostile/typo'd overlay must never leave
-    /// the daemon with an empty catalog). On a live fetch the cache bin is
-    /// persisted atomically and the etag to the DB. Every swap broadcasts
-    /// `CatalogUpdated` so clients can refresh their provider pickers. The
-    /// work is split into small steps (merge → validate → swap → persist →
-    /// broadcast → reply) so each stage stays readable and unit-testable.
+    /// `write` says whether this swap also persists the cache: a live fetch
+    /// writes `catalog.bin` and the etag that validates it, while a startup
+    /// load's base is already on disk.
     fn handle_catalog_base_changed(
         &mut self,
         base: &[choreo_ai_protocols::ProviderEntry],
-        etag: Option<&str>,
         user_overlay: Option<&str>,
-        persist: bool,
+        write: CacheWrite<'_>,
         reply: Vec<RefreshRequester>,
     ) {
         debug!(
             base_providers = base.len(),
             user_overlay_present = user_overlay.is_some(),
-            persist,
+            persist = matches!(write, CacheWrite::Fetch { .. }),
             "CatalogBaseChanged: merging overlays",
         );
+        self.apply_catalog_swap(base, user_overlay, write, reply);
+    }
 
+    /// Apply a user-overlay edit: re-merge the overlay onto the base the daemon
+    /// is running.
+    ///
+    /// The base comes from this command loop's OWN last write — `catalog.bin`,
+    /// which only this loop writes — or, when a fetch could not persist it,
+    /// from [`DaemonState::catalog_applied_base`]. Resolving it here instead of
+    /// on the maintenance thread is what makes the re-merge race-free: the
+    /// thread sends this event right after a fetch's swap command, so a base it
+    /// captured itself could already be superseded by the time this arm ran —
+    /// silently reverting that fetch (with the new etag already adopted, the
+    /// next conditional GET would then 304 the downgrade into place).
+    fn handle_catalog_overlay_changed(&mut self, user_overlay: Option<&str>) {
+        debug!(
+            user_overlay_present = user_overlay.is_some(),
+            "CatalogOverlayChanged: re-merging the base the daemon is running",
+        );
+        let base = match &self.catalog_applied_base {
+            // A fetch's cache write failed: the disk is behind the live
+            // catalog, so this in-memory copy IS the applied base.
+            Some(base) => base.clone(),
+            None => {
+                std::sync::Arc::new(crate::catalog::load_persisted_base(&self.catalog_paths.bin))
+            }
+        };
+        self.apply_catalog_swap(&base, user_overlay, CacheWrite::Skip, Vec::new());
+    }
+
+    /// The single-writer catalog swap every change funnels through: merge the
+    /// layers, refuse an empty result, swap, persist (a live fetch only),
+    /// invalidate the sessions whose client-relevant config changed, broadcast
+    /// `CatalogUpdated`, and answer the requester(s).
+    fn apply_catalog_swap(
+        &mut self,
+        base: &[choreo_ai_protocols::ProviderEntry],
+        user_overlay: Option<&str>,
+        write: CacheWrite<'_>,
+        reply: Vec<RefreshRequester>,
+    ) {
         // Lowest → highest: base → bundled overlay → user overlay.
         let effective = merge_catalog_layers(base, user_overlay);
 
@@ -2536,7 +2598,7 @@ impl DaemonState {
 
         // Single-writer point: the atomic swap. Readers are lock-free.
         replace_catalog(effective.clone());
-        self.persist_catalog_cache(base, etag, persist);
+        self.persist_catalog_cache(base, write);
 
         // A swap only replaces the process-wide table; a session's provider
         // client was built (and cached) from the OLD entry. Rebuild the affected
@@ -2585,34 +2647,43 @@ impl DaemonState {
     }
 
     /// Persist the cache bin + etag after a live fetch. Startup loads
-    /// (`persist: false`) are already on disk — a cache-sourced base needs no
-    /// rewrite, and a cache-miss will be persisted on the first fetch — so
+    /// ([`CacheWrite::Skip`]) are already on disk — a cache-sourced base needs
+    /// no rewrite, and a cache-miss will be persisted on the first fetch — so
     /// only live fetches write. The **bin file is written first, the etag to
     /// the DB second**: a crash between the two leaves the OLD etag paired
     /// with the OLD bin (self-healing — the next conditional GET 200s and
     /// stores a fresh etag), never a NEW etag over OLD content (which would
     /// 304 forever against a stale cache). If the bin write fails, the etag
     /// is deliberately NOT updated — it must never describe content that is
-    /// not on disk. Failures are logged, never fatal: the next refresh
-    /// re-fetches and tries again.
+    /// not on disk — and the base is retained in memory instead, because the
+    /// cache is otherwise an overlay re-merge's only source for it. Failures
+    /// are logged, never fatal: the next refresh re-fetches and tries again.
     fn persist_catalog_cache(
-        &self,
+        &mut self,
         base: &[choreo_ai_protocols::ProviderEntry],
-        etag: Option<&str>,
-        persist: bool,
+        write: CacheWrite<'_>,
     ) {
-        if !persist {
+        let CacheWrite::Fetch { etag } = write else {
             return;
-        }
+        };
         // Bin first: the etag write below must only happen once the content
         // it validates is durably on disk.
         if let Err(e) = crate::catalog::write_catalog_cache(base, &self.catalog_paths.bin) {
             warn!(
                 error = %e,
-                "failed to persist the catalog cache; the next refresh will re-fetch",
+                "failed to persist the catalog cache; the next refresh will re-fetch, \
+                 and the live base is retained in memory so an overlay edit cannot \
+                 revert it to the stale on-disk one",
             );
+            // The disk cache is now behind the running catalog, so it can no
+            // longer answer "what base is applied?" — keep the answer here
+            // until a persist succeeds.
+            self.catalog_applied_base = Some(std::sync::Arc::new(base.to_vec()));
             return;
         }
+        // The cache holds exactly the applied base again, so the in-memory
+        // fallback copy is redundant.
+        self.catalog_applied_base = None;
         if let Err(e) = crate::db::set_catalog_etag(&self.db, etag) {
             warn!(
                 error = %e,
@@ -3333,10 +3404,27 @@ fn catalog_provider_pairs() -> Vec<CatalogProvider> {
         .collect()
 }
 
+/// How a catalog swap treats the durable cache.
+///
+/// The cache file is the base's home between events (see `crate::catalog`), so
+/// only a swap that *produces* a new base has anything to write.
+#[derive(Clone, Copy)]
+enum CacheWrite<'a> {
+    /// Swap only: the base is already on disk (a startup cache load) or was
+    /// re-read from it (an overlay re-merge).
+    Skip,
+    /// A live models.dev fetch: write `catalog.bin`, then the DB etag that
+    /// validates it.
+    Fetch {
+        /// The HTTP etag for this base, persisted for the next conditional GET.
+        etag: Option<&'a str>,
+    },
+}
+
 /// Merge the layered catalog: normalized models.dev base → bundled overlay →
 /// user overlay (lowest → highest wins, matching `merge_overlay` semantics).
-/// Extracted so `handle_catalog_base_changed` reads as a straight-line
-/// pipeline and the layer order is pinned in one place.
+/// Extracted so `apply_catalog_swap` reads as a straight-line pipeline and the
+/// layer order is pinned in one place.
 fn merge_catalog_layers(
     base: &[choreo_ai_protocols::ProviderEntry],
     user_overlay: Option<&str>,

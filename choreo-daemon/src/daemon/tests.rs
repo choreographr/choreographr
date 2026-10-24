@@ -128,6 +128,8 @@ pub(super) fn make_daemon_state() -> (DaemonState, crossbeam_channel::Receiver<D
         maintenance_tx: None,
         acl: None,
         catalog_paths: CatalogPaths::default(),
+        // No persist has failed, so the disk is authoritative for the base.
+        catalog_applied_base: None,
         cache_warming: crate::cache_warm::CacheWarmingConfig::default(),
     };
     (state, daemon_rx)
@@ -3477,6 +3479,111 @@ fn catalog_base_changed_empty_base_still_yields_overlay_only_providers() {
     assert_eq!(report.status, RefreshStatus::Updated);
     // The overlay-only providers are actually queryable now.
     assert!(choreo_ai_protocols::lookup_provider("ollama").is_some());
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn catalog_overlay_changed_remerges_the_on_disk_base() {
+    // The base an overlay edit re-merges is the one on disk — here a one
+    // provider cache the daemon persisted as a live fetch would — so the edit
+    // lands on the catalog the daemon is actually running.
+    let _restore = RestoreBundledCatalogOnDrop;
+    let (mut state, _rx) = make_daemon_state();
+    let dir = tempfile::tempdir().unwrap();
+    state.catalog_paths.bin = dir.path().join("catalog.bin");
+
+    // A live fetch persists the cache...
+    state.handle_command(DaemonCommand::CatalogBaseChanged {
+        base: tiny_base(),
+        etag: Some("\"v1\"".into()),
+        user_overlay: None,
+        persist: true,
+        reply: Vec::new(),
+    });
+    assert!(
+        state.catalog_paths.bin.exists(),
+        "a live fetch writes the cache"
+    );
+    assert!(state.catalog_applied_base.is_none(), "the disk is in sync");
+
+    // ...and an overlay edit re-reads it and re-merges on top.
+    state.handle_command(DaemonCommand::CatalogOverlayChanged {
+        user_overlay: Some("[provider.tiny-test]\ndisplay_name = \"Renamed\"\n".into()),
+    });
+
+    let provider = choreo_ai_protocols::lookup_provider("tiny-test").expect("tiny-test present");
+    assert_eq!(provider.display_name, "Renamed");
+    // The merge used the one-provider cache (+ the bundled overlay's wholesale
+    // providers), not the 150+ provider embedded base.
+    assert!(
+        catalog_snapshot().len() < 150,
+        "the re-merge used the embedded base instead of the cache: {} providers",
+        catalog_snapshot().len()
+    );
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn catalog_overlay_changed_keeps_the_applied_base_after_a_failed_persist() {
+    // A fetch whose cache write fails leaves the live catalog AHEAD of
+    // `catalog.bin`. An overlay edit must then re-merge the in-memory base: the
+    // disk one is stale (here absent, which would fall back to the embedded
+    // 150+ provider base and silently discard the fetch).
+    let _restore = RestoreBundledCatalogOnDrop;
+    let (mut state, _rx) = make_daemon_state();
+    let dir = tempfile::tempdir().unwrap();
+    // A FILE where the cache's parent dir should be makes the persist fail
+    // deterministically (create_dir_all hits ENOTDIR) without touching
+    // permissions.
+    let blocker = dir.path().join("blocked");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    state.catalog_paths.bin = blocker.join("catalog.bin");
+
+    state.handle_command(DaemonCommand::CatalogBaseChanged {
+        base: tiny_base(),
+        etag: Some("\"v1\"".into()),
+        user_overlay: None,
+        persist: true,
+        reply: Vec::new(),
+    });
+    // The swap still happened — only the persistence failed.
+    assert!(choreo_ai_protocols::lookup_provider("tiny-test").is_some());
+    assert!(
+        state.catalog_applied_base.is_some(),
+        "a failed persist must retain the applied base"
+    );
+
+    state.handle_command(DaemonCommand::CatalogOverlayChanged {
+        user_overlay: Some("[provider.tiny-test]\ndisplay_name = \"Renamed\"\n".into()),
+    });
+
+    let provider = choreo_ai_protocols::lookup_provider("tiny-test")
+        .expect("the overlay edit must not revert to the embedded base");
+    assert_eq!(provider.display_name, "Renamed");
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn catalog_overlay_changed_without_a_cache_falls_back_to_the_embedded_base() {
+    // A cache-miss start applies the embedded base and persists nothing, so an
+    // overlay edit must re-merge over that same embedded base — and must not
+    // create the cache file (persisting is a live fetch's job).
+    let _restore = RestoreBundledCatalogOnDrop;
+    let (mut state, _rx) = make_daemon_state();
+    let dir = tempfile::tempdir().unwrap();
+    state.catalog_paths.bin = dir.path().join("choreo").join("catalog.bin");
+
+    state.handle_command(DaemonCommand::CatalogOverlayChanged { user_overlay: None });
+
+    assert!(
+        catalog_snapshot().len() >= 150,
+        "the embedded models.dev base must be merged in, got {}",
+        catalog_snapshot().len()
+    );
+    assert!(
+        !state.catalog_paths.bin.exists(),
+        "an overlay re-merge must not write the cache"
+    );
 }
 
 #[test]
