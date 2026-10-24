@@ -1,3 +1,4 @@
+use crate::onboarding::SetupState;
 use choreo_client_core::{
     KeystoreAutoBind, SessionStateData, SessionView, ToolCallEvent, TurnEventHandler,
 };
@@ -34,6 +35,8 @@ pub(crate) struct AppState {
     /// error instead of re-minting (bind-loop guard — see
     /// [`choreo_client_core::KeystoreAutoBind`]).
     pub(crate) keystore_auto_bind: KeystoreAutoBind,
+    /// The first-run welcome panel's state (see `crate::onboarding`).
+    pub(crate) setup: SetupState,
 }
 
 impl AppState {
@@ -52,6 +55,7 @@ impl AppState {
             // daemon connection) and is not rebuilt if the reader thread
             // fails; re-connecting means relaunching with fresh state.
             keystore_auto_bind: KeystoreAutoBind::new(),
+            setup: SetupState::default(),
         }
     }
 }

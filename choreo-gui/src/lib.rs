@@ -17,6 +17,7 @@
 mod client;
 mod components;
 mod hooks;
+mod onboarding;
 mod render;
 mod settings;
 mod state;
@@ -431,6 +432,15 @@ fn App() -> Element {
         AppState::new(&display_path)
     });
 
+    // Fetch the account list for the welcome panel once the connection is
+    // up. `use_daemon_connection`'s hook has already run, so the handle is
+    // set; the request is quiet (its reply feeds the panel, not the history).
+    use_hook(move || {
+        if let Some(handle) = daemon_tx.read().clone() {
+            onboarding::request_accounts(&mut state.write(), &handle);
+        }
+    });
+
     let tx = daemon_tx.read().clone();
 
     use_future({
@@ -483,7 +493,7 @@ fn App() -> Element {
         document::Style { {APP_CSS} }
         div { class: "app-shell",
             Toolbar { state, tx: daemon_tx }
-            HistoryList { state }
+            HistoryList { state, tx: daemon_tx }
             Composer { state, tx: daemon_tx }
         }
     }
