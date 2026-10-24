@@ -72,6 +72,9 @@ pub(crate) fn Toolbar(state: Signal<AppState>, tx: Signal<Option<DaemonHandle>>)
         div { class: "toolbar",
             button { onclick: on_ping, "Ping" }
             button { onclick: on_models, "Models" }
+            // Reopens the first-run setup popup at any time (after it was
+            // closed, or to add another account).
+            button { onclick: move |_| state.write().setup.open_popup(), "Setup" }
             div { class: "cancel-row",
                 input {
                     placeholder: "Request id",
@@ -137,7 +140,7 @@ fn OnDeviceToolsToggle(state: Signal<AppState>) -> Element {
 }
 
 #[component]
-pub(crate) fn HistoryList(state: Signal<AppState>, tx: Signal<Option<DaemonHandle>>) -> Element {
+pub(crate) fn HistoryList(state: Signal<AppState>) -> Element {
     let guard = state.read();
     let turns: Vec<(u32, choreo_proto::Turn)> = guard
         .session_view
@@ -146,17 +149,10 @@ pub(crate) fn HistoryList(state: Signal<AppState>, tx: Signal<Option<DaemonHandl
         .map(|(&id, t)| (id, t.clone()))
         .collect();
     let status_texts = guard.status_texts.clone();
-    // The welcome panel stands in for an empty conversation: a session is
-    // attached and nothing is in it yet. It stays up after setup completes
-    // (as a "ready" note) until the first turn lands.
-    let show_welcome = guard.attached_session_id.is_some() && turns.is_empty();
     drop(guard);
 
     rsx! {
         div { class: "history",
-            if show_welcome {
-                WelcomePanel { state, tx }
-            }
             for text in status_texts {
                 div { class: "history-item text-item", key: "{text}", pre { "{text}" } }
             }
@@ -167,56 +163,83 @@ pub(crate) fn HistoryList(state: Signal<AppState>, tx: Signal<Option<DaemonHandl
     }
 }
 
-/// The first-run checklist shown on an empty conversation. Each step ticks
-/// itself off as the daemon confirms it, and the step to do now carries its
-/// own controls — the GUI has no separate accounts page or model picker, so
-/// setup happens entirely here. State and sends live in `crate::onboarding`.
+/// The first-run setup guide, shown as a popup over the chat (see
+/// `SetupState::popup_visible` for when). Each step ticks itself off as the
+/// daemon confirms it, and the step to do now carries its own controls — the
+/// GUI has no separate accounts page or model picker, so setup happens
+/// entirely here. State and sends live in `crate::onboarding`.
 #[component]
-fn WelcomePanel(state: Signal<AppState>, tx: Signal<Option<DaemonHandle>>) -> Element {
-    let progress = state.read().setup.progress();
-
-    if progress.is_complete() {
-        return rsx! {
-            div { class: "welcome",
-                div { class: "welcome-title", "Welcome to Choreographr" }
-                div { class: "welcome-ready",
-                    "You're all set. Type a message below and press Enter to start."
-                }
-            }
-        };
+pub(crate) fn SetupDialog(state: Signal<AppState>, tx: Signal<Option<DaemonHandle>>) -> Element {
+    let guard = state.read();
+    let visible = guard.setup.popup_visible(
+        guard.attached_session_id.is_some(),
+        guard.session_view.turns.is_empty(),
+    );
+    let progress = guard.setup.progress();
+    drop(guard);
+    if !visible {
+        return rsx! {};
     }
 
-    let rows = checklist(progress)
-        .into_iter()
-        .enumerate()
-        .map(|(index, (label, mark))| {
-            let number = index + 1;
-            let (marker, class) = match mark {
-                StepMark::Done => ("✓", "welcome-step done"),
-                StepMark::Next => ("→", "welcome-step next"),
-                StepMark::Pending => ("○", "welcome-step pending"),
-            };
-            rsx! {
-                div { class: "{class}", key: "{number}",
-                    div { class: "welcome-step-label", "{marker} {number}. {label}" }
-                    if mark == StepMark::Next {
-                        match index {
-                            0 => rsx! { AccountKeyStep { state, tx } },
-                            1 => rsx! { AccountPickStep { state, tx } },
-                            _ => rsx! { ModelPickStep { state, tx } },
+    let close = move |_| state.write().setup.close_popup();
+
+    let body = if progress.is_complete() {
+        rsx! {
+            div { class: "welcome-ready",
+                "You're all set. Type a message below and press Enter to start."
+            }
+            div { class: "welcome-actions",
+                button { onclick: close, "Start chatting" }
+            }
+        }
+    } else {
+        let rows = checklist(progress)
+            .into_iter()
+            .enumerate()
+            .map(|(index, (label, mark))| {
+                let number = index + 1;
+                let (marker, class) = match mark {
+                    StepMark::Done => ("✓", "welcome-step done"),
+                    StepMark::Next => ("→", "welcome-step next"),
+                    StepMark::Pending => ("○", "welcome-step pending"),
+                };
+                rsx! {
+                    div { class: "{class}", key: "{number}",
+                        div { class: "welcome-step-label", "{marker} {number}. {label}" }
+                        if mark == StepMark::Next {
+                            match index {
+                                0 => rsx! { AccountKeyStep { state, tx } },
+                                1 => rsx! { AccountPickStep { state, tx } },
+                                _ => rsx! { ModelPickStep { state, tx } },
+                            }
                         }
                     }
                 }
-            }
-        });
-
-    rsx! {
-        div { class: "welcome",
-            div { class: "welcome-title", "Welcome to Choreographr" }
+            });
+        rsx! {
             div { "Before your first message, finish these steps:" }
             {rows}
-            div { class: "welcome-hint",
-                "Saving a key selects the account and loads its models for you."
+            // The hint and the way out share one row, so the whole popup fits
+            // the default window without scrolling.
+            div { class: "modal-footer",
+                div { class: "welcome-hint",
+                    "Saving a key selects the account and loads its models for you."
+                }
+                // Setting up later is a real choice (accounts can also be
+                // configured by hand), so the popup always offers a way out.
+                button { class: "secondary", onclick: close, "Later" }
+            }
+        }
+    };
+
+    rsx! {
+        div { class: "modal-backdrop",
+            div { class: "modal welcome",
+                div { class: "modal-header",
+                    div { class: "welcome-title", "Welcome to Choreographr" }
+                    button { class: "modal-close", onclick: close, "×" }
+                }
+                {body}
             }
         }
     }

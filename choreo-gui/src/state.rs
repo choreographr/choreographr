@@ -35,7 +35,7 @@ pub(crate) struct AppState {
     /// error instead of re-minting (bind-loop guard — see
     /// [`choreo_client_core::KeystoreAutoBind`]).
     pub(crate) keystore_auto_bind: KeystoreAutoBind,
-    /// The first-run welcome panel's state (see `crate::onboarding`).
+    /// The first-run setup popup's state (see `crate::onboarding`).
     pub(crate) setup: SetupState,
 }
 
