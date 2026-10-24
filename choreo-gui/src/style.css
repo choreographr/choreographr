@@ -229,3 +229,82 @@ button {
 button:hover {
     background: #388bfd;
 }
+
+/* First-run welcome panel (components.rs → WelcomePanel). */
+.welcome {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-width: 720px;
+    margin: 0 auto 16px;
+    padding: 16px;
+    border: 1px solid #2f3742;
+    border-radius: 8px;
+    background: #11161d;
+}
+
+.welcome-title {
+    color: #79c0ff;
+    font-size: 18px;
+    font-weight: 600;
+}
+
+.welcome-ready {
+    color: #7ee787;
+}
+
+.welcome-step.done .welcome-step-label {
+    color: #7ee787;
+}
+
+.welcome-step.next .welcome-step-label {
+    font-weight: 600;
+}
+
+.welcome-step.pending .welcome-step-label {
+    color: #8b949e;
+}
+
+.welcome-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 8px 0 4px 24px;
+}
+
+.welcome-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.welcome-field label,
+.welcome-hint {
+    color: #8b949e;
+    font-size: 12px;
+}
+
+.welcome-error {
+    color: #f85149;
+}
+
+.welcome-actions {
+    display: flex;
+}
+
+.chip-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.chip {
+    padding: 4px 10px;
+    background: #161b22;
+    border-color: #30363d;
+}
+
+.chip.selected {
+    background: #1f6feb;
+    border-color: #1f6feb;
+}
