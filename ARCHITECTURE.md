@@ -874,7 +874,12 @@ The compiled-in catalog is only the *fallback*: at runtime the daemon layers a
 local cache and a user overlay on top and keeps the base fresh from models.dev.
 One maintenance thread (`choreo-daemon/src/catalog.rs`) owns the whole pipeline
 but never mutates the catalog itself — every change is sent to the daemon
-command loop, the single writer of the `ArcSwap`, over a channel.
+command loop, the single writer of the `ArcSwap`, over a channel. The thread
+holds **no copy of the base** between events: it keeps only the small pacing
+scalars (etag, attempt anchor, overlay fingerprint), and on an overlay edit it
+re-decodes the base from `catalog.bin` (or the embedded blob) transiently for
+the one re-merge — so the process's sole resident catalog is the merged
+`ArcSwap`.
 
 The cross-cutting invariants: the normalized base is cached in the data dir in
 the same postcard format as the embedded blob, written atomically, with the

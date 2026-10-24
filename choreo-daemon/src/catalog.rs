@@ -2,8 +2,7 @@
 //! models.dev refresh thread, and the user-overlay reload.
 //!
 //! **Threading.** One background thread owns the whole runtime pipeline. It
-//! loads the base (disk cache → embedded `catalog.bin`), applies the user
-//! overlay, does the conditional GET against models.dev, and reacts to
+//! does the conditional GET against models.dev and reacts to
 //! `models-overlay.toml` edits surfaced by the unified config-watching
 //! transport ([`crate::config_watch`]) — but it NEVER mutates the catalog
 //! itself. Every change is sent to the daemon command loop as a
@@ -13,6 +12,17 @@
 //! channel-based: the daemon hands `/refresh-models` requests to this thread
 //! over a channel (never the command loop doing HTTP), and the config
 //! transport forwards overlay events over another channel.
+//!
+//! **No retained catalog.** The thread deliberately keeps NO copy of the
+//! catalog base between events — only the small scalars it needs to pace
+//! fetches and detect overlay edits (see `MaintenanceState`). The base's
+//! durable home is `catalog.bin` (owned by the daemon) plus the embedded blob
+//! as the seed/fallback; when an overlay edit needs to re-merge, the thread
+//! decodes the base from that home transiently (see `load_current_base`). A
+//! refresh's newly fetched base likewise travels through the command as a
+//! one-shot value and is not stored on the thread. This keeps the process's
+//! sole resident copy of the catalog the merged `ArcSwap` the command loop
+//! owns — the maintenance thread adds none.
 //!
 //! **Refresh pacing (S4).** A models.dev fetch is attempted at most once per
 //! `REFRESH_ATTEMPT_INTERVAL` (25 h), regardless of whether the last attempt
@@ -294,13 +304,16 @@ pub(crate) fn spawn_catalog_maintenance(
     tx
 }
 
-/// Mutable state of the maintenance thread: the current normalized base +
-/// etag (the *facts* the daemon merges overlays onto), the wall-clock
+/// Mutable state of the maintenance thread. It deliberately holds **no
+/// catalog data**: only the small scalars needed to pace fetches and detect
+/// overlay edits — the etag for the next conditional GET, the wall-clock
 /// last-attempt anchor (loaded from the DB at startup, kept in sync by
-/// [`record_attempt`]), and the fingerprint of the last user overlay it
-/// handed to the daemon loop.
+/// [`record_attempt`]), the fingerprint of the last user overlay it handed to
+/// the daemon loop, and the next-retry deadline. The base itself lives in
+/// `catalog.bin` (owned by the daemon) and is decoded transiently only when a
+/// reload needs it (see [`load_current_base`]), so this thread never retains a
+/// second copy of the catalog.
 struct MaintenanceState {
-    base: Vec<ProviderEntry>,
     etag: Option<String>,
     /// Unix epoch millis of the last fetch attempt (DB `catalog_state`).
     /// `None` = never attempted (first run / upgrade) → fetch immediately.
@@ -379,7 +392,6 @@ fn maintenance_loop(
     };
 
     let mut state = MaintenanceState {
-        base,
         etag,
         last_attempt_ms,
         last_applied_user_overlay: user_overlay.clone(),
@@ -387,10 +399,13 @@ fn maintenance_loop(
     };
 
     // ── 3. Apply the initial catalog through the daemon command loop (the
-    // single writer of the ArcSwap). No persist: a cache-sourced base is
-    // already on disk; a cache-miss will be persisted on the first fetch.
+    // single writer of the ArcSwap). The base is moved into the command and
+    // dropped here: the maintenance thread keeps no copy of it — `catalog.bin`
+    // (or the embedded blob on a cache miss) is the durable source it re-reads
+    // when an overlay edit needs to re-merge. No persist: a cache-sourced base
+    // is already on disk; a cache-miss will be persisted on the first fetch.
     let _ = daemon_tx.send(DaemonCommand::CatalogBaseChanged {
-        base: state.base.clone(),
+        base,
         etag: state.etag.clone(),
         user_overlay,
         persist: false,
@@ -437,7 +452,7 @@ fn maintenance_loop(
                     // edit is applied even when the conditional GET below
                     // returns 304 (a 304 sends no CatalogBaseChanged, so
                     // without this the reload is lost).
-                    reload_user_overlay(daemon_tx, &mut state, &paths.overlay);
+                    reload_user_overlay(daemon_tx, &mut state, &paths.bin, &paths.overlay);
                     // Coalesce: drain any RefreshNows queued while idle so a
                     // burst of /refresh-models becomes ONE fetch. Fold the
                     // force flag (a --force anywhere in the burst forces) and
@@ -458,7 +473,7 @@ fn maintenance_loop(
                 Ok(_change) => {
                     // The transport already filtered to this basename and a
                     // create/modify/remove kind; re-read + fingerprint-gate.
-                    reload_user_overlay(daemon_tx, &mut state, &paths.overlay);
+                    reload_user_overlay(daemon_tx, &mut state, &paths.bin, &paths.overlay);
                 }
                 Err(_) => {
                     // The config transport died; continue on the maintenance
@@ -652,15 +667,17 @@ fn run_refresh_impl<F>(
                 force,
                 "models.dev refresh fetched a new catalog",
             );
-            state.base = new_base;
             state.etag = etag;
             // Even a successful fetch arms the next revalidation: without
             // this the catalog would go permanently stale after the first 200
             // (the event loop only refreshes when next_retry_at is set), and
             // the etag makes the next conditional GET cheap.
             state.next_retry_at = Some(Instant::now() + REFRESH_ATTEMPT_INTERVAL);
+            // The freshly fetched base is moved into the command and (via
+            // `persist`) written to `catalog.bin` by the command loop; the
+            // maintenance thread retains no copy of it.
             let _ = daemon_tx.send(DaemonCommand::CatalogBaseChanged {
-                base: state.base.clone(),
+                base: new_base,
                 etag: state.etag.clone(),
                 user_overlay: state.last_applied_user_overlay.clone(),
                 persist: true,
@@ -701,6 +718,15 @@ fn fold_refresh_nows(
     (any_force, replies)
 }
 
+/// Load the base catalog the daemon is currently using: the runtime cache
+/// (`catalog.bin`) when present and valid, else the embedded blob — the same
+/// load order the startup path uses. Called only where the base is needed
+/// transiently (an overlay-edit re-merge), never stored on the maintenance
+/// thread.
+fn load_current_base(bin_path: &Path) -> Vec<ProviderEntry> {
+    load_cached_base(bin_path).unwrap_or_else(load_bundled_base)
+}
+
 /// Re-read the user overlay and, if its contents changed since the
 /// last-applied value (the fingerprint gate), hand the new value to the
 /// daemon command loop so it re-merges and swaps. Shared by the notify
@@ -708,9 +734,15 @@ fn fold_refresh_nows(
 /// in exactly one place. A deleted file sends an explicit `None` so the daemon
 /// falls back to bundled-only; an unreadable-but-present file warns and keeps
 /// the last-applied value rather than churn on a transient read error.
+///
+/// The maintenance thread keeps no base copy, so a changed overlay re-decodes
+/// the base from `catalog.bin` (or the embedded blob) for this one re-merge.
+/// That decode only runs on an overlay edit — a rare, user-driven event — and
+/// keeps the process's sole resident catalog the merged `ArcSwap`.
 fn reload_user_overlay(
     daemon_tx: &crossbeam_channel::Sender<DaemonCommand>,
     state: &mut MaintenanceState,
+    bin_path: &Path,
     overlay_path: &Path,
 ) {
     match read_user_overlay(overlay_path) {
@@ -725,8 +757,11 @@ fn reload_user_overlay(
                     "user overlay changed; reloading",
                 );
                 state.last_applied_user_overlay.clone_from(&contents);
+                // Re-decode the base from its durable home for this re-merge;
+                // the thread holds no base copy of its own.
+                let base = load_current_base(bin_path);
                 let _ = daemon_tx.send(DaemonCommand::CatalogBaseChanged {
-                    base: state.base.clone(),
+                    base,
                     etag: state.etag.clone(),
                     user_overlay: contents,
                     persist: false,
@@ -898,12 +933,10 @@ mod tests {
         }
     }"#;
 
-    /// A starting maintenance state for the state-machine tests: a small
-    /// base, a cached etag, a recent (fresh) attempt timestamp, no
-    /// revalidation pending.
+    /// A starting maintenance state for the state-machine tests: a cached
+    /// etag, a recent (fresh) attempt timestamp, no revalidation pending.
     fn maintenance_state() -> MaintenanceState {
         MaintenanceState {
-            base: tiny_base(),
             etag: Some("\"v1\"".into()),
             last_attempt_ms: Some(1_700_000_000_000),
             last_applied_user_overlay: None,
@@ -933,11 +966,11 @@ mod tests {
             },
         );
 
-        // The new base + etag were adopted and the NEXT revalidation is
-        // armed — a successful fetch must not stop the cadence (that would
-        // leave the catalog permanently stale after the first 200).
+        // The new etag was adopted and the NEXT revalidation is armed — a
+        // successful fetch must not stop the cadence (that would leave the
+        // catalog permanently stale after the first 200). The base itself is
+        // NOT retained on the thread; it travels in the command below.
         assert_eq!(state.etag.as_deref(), Some("\"v2\""));
-        assert_eq!(state.base.len(), 1, "snapshot normalizes to one provider");
         assert!(
             state.next_retry_at.is_some(),
             "a successful fetch must schedule the next revalidation"
@@ -947,7 +980,13 @@ mod tests {
         // requester's own (non-forced) flag, so the daemon can individualize
         // the reply status.
         match daemon_rx.recv().unwrap() {
-            DaemonCommand::CatalogBaseChanged { persist, reply, .. } => {
+            DaemonCommand::CatalogBaseChanged {
+                base,
+                persist,
+                reply,
+                ..
+            } => {
+                assert_eq!(base.len(), 1, "snapshot normalizes to one provider");
                 assert!(persist, "a live fetch must persist the cache");
                 assert_eq!(
                     reply.len(),
@@ -1264,18 +1303,23 @@ mod tests {
     fn reload_user_overlay_fingerprint_gates_the_daemon_command() {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("models-overlay.toml");
+        // A cache file holding the (tiny) base, so the overlay-edit reload
+        // re-decodes THIS base rather than the embedded blob — exercising the
+        // "read the base from catalog.bin on reload" path.
+        let bin = dir.path().join("catalog.bin");
+        write_catalog_cache(&tiny_base(), &bin).unwrap();
         let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
         let mut state = maintenance_state();
 
         // No file yet → nothing applied, nothing sent.
-        reload_user_overlay(&daemon_tx, &mut state, &overlay);
+        reload_user_overlay(&daemon_tx, &mut state, &bin, &overlay);
         assert!(daemon_rx.try_recv().is_err(), "absent file sends nothing");
         assert!(state.last_applied_user_overlay.is_none());
 
         // Creating the file changes the fingerprint → CatalogBaseChanged with
         // the fresh contents.
         std::fs::write(&overlay, "[provider.acme]\nbase_url = \"x\"\n").unwrap();
-        reload_user_overlay(&daemon_tx, &mut state, &overlay);
+        reload_user_overlay(&daemon_tx, &mut state, &bin, &overlay);
         match daemon_rx.try_recv().unwrap() {
             DaemonCommand::CatalogBaseChanged {
                 user_overlay,
@@ -1297,7 +1341,7 @@ mod tests {
         }
 
         // An unchanged file (editor save storm) → fingerprint gate: nothing.
-        reload_user_overlay(&daemon_tx, &mut state, &overlay);
+        reload_user_overlay(&daemon_tx, &mut state, &bin, &overlay);
         assert!(
             daemon_rx.try_recv().is_err(),
             "unchanged contents must not trigger a reload"
@@ -1305,7 +1349,7 @@ mod tests {
 
         // Editing the file again → a new command with the new contents.
         std::fs::write(&overlay, "[provider.acme]\nbase_url = \"y\"\n").unwrap();
-        reload_user_overlay(&daemon_tx, &mut state, &overlay);
+        reload_user_overlay(&daemon_tx, &mut state, &bin, &overlay);
         match daemon_rx.try_recv().unwrap() {
             DaemonCommand::CatalogBaseChanged { user_overlay, .. } => {
                 assert_eq!(
@@ -1322,7 +1366,7 @@ mod tests {
         // Deleting the file → explicit None so the daemon falls back to
         // bundled-only.
         std::fs::remove_file(&overlay).unwrap();
-        reload_user_overlay(&daemon_tx, &mut state, &overlay);
+        reload_user_overlay(&daemon_tx, &mut state, &bin, &overlay);
         match daemon_rx.try_recv().unwrap() {
             DaemonCommand::CatalogBaseChanged { user_overlay, .. } => {
                 assert_eq!(
