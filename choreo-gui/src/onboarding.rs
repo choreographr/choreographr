@@ -325,8 +325,16 @@ pub(crate) fn track_setup_message(
             ..
         } => {
             // Any model list answers the session's account, so keep it for
-            // the popup even when the toolbar asked for it.
-            state.setup.models.clone_from(models);
+            // the popup even when the toolbar asked for it. Each id is kept
+            // once, first occurrence first: the popup keys a chip per model,
+            // and a list can repeat an id (the catalog-seeded stand-in merges
+            // several sources), which would give two siblings the same key.
+            let mut seen = HashSet::new();
+            state.setup.models = models
+                .iter()
+                .filter(|m| seen.insert(m.as_str()))
+                .cloned()
+                .collect();
             if selected_model.is_some() {
                 state.setup.session_model.clone_from(selected_model);
             }
@@ -761,6 +769,18 @@ mod tests {
         track_setup_message(&mut state, &accounts, None);
         assert_eq!(state.setup.form.account_name, "todo");
         assert_eq!(state.setup.form.provider, "openai");
+    }
+
+    #[test]
+    fn a_repeated_model_id_is_listed_once() {
+        let mut state = attached_state();
+        let reply = DaemonMessage::broadcast(DaemonMessageType::Models {
+            models: ["b", "a", "b", "c", "a"].map(str::to_string).to_vec(),
+            selected_model: None,
+            provisional: true,
+        });
+        track_setup_message(&mut state, &reply, None);
+        assert_eq!(state.setup.models, ["b", "a", "c"]);
     }
 
     #[test]

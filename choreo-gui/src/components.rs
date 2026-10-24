@@ -153,8 +153,14 @@ pub(crate) fn HistoryList(state: Signal<AppState>) -> Element {
 
     rsx! {
         div { class: "history",
-            for text in status_texts {
-                div { class: "history-item text-item", key: "{text}", pre { "{text}" } }
+            // Keyed by position, not text: the same status line can appear
+            // twice (two pings, two identical errors), and duplicate keys
+            // among siblings are fatal to the renderer. The feed is
+            // append-only, so a position always names the same line. The
+            // `status-` prefix keeps these keys apart from the turns below,
+            // which share this list and are keyed by their bare turn id.
+            for (index, text) in status_texts.into_iter().enumerate() {
+                div { class: "history-item text-item", key: "status-{index}", pre { "{text}" } }
             }
             for (turn_id, turn) in turns {
                 {render_turn(turn_id, &turn)}
