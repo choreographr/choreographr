@@ -22,6 +22,8 @@ body {
 }
 
 .app-shell {
+    /* The containing block for the setup popup's backdrop. */
+    position: relative;
     display: flex;
     flex-direction: column;
     gap: 12px;
@@ -228,4 +230,144 @@ button {
 
 button:hover {
     background: #388bfd;
+}
+
+/* First-run setup popup (components.rs → SetupDialog). The backdrop covers
+   the whole shell and dims the chat behind it; the dialog scrolls on its own
+   when a long model list outgrows a small (phone) window. */
+.modal-backdrop {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    box-sizing: border-box;
+    background: rgba(1, 4, 9, 0.72);
+}
+
+.modal {
+    width: 100%;
+    max-width: 640px;
+    max-height: 100%;
+    overflow-y: auto;
+    box-sizing: border-box;
+    border-radius: 12px;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+}
+
+.modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.modal-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.modal-close {
+    padding: 2px 10px;
+    background: transparent;
+    border-color: transparent;
+    color: #8b949e;
+    font-size: 18px;
+}
+
+.modal-close:hover {
+    background: #21262d;
+    color: #e6edf3;
+}
+
+button.secondary {
+    background: #21262d;
+    border-color: #30363d;
+}
+
+button.secondary:hover {
+    background: #30363d;
+}
+
+.welcome {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 16px 20px;
+    border: 1px solid #2f3742;
+    background: #11161d;
+}
+
+.welcome-title {
+    color: #79c0ff;
+    font-size: 18px;
+    font-weight: 600;
+}
+
+.welcome-ready {
+    color: #7ee787;
+}
+
+.welcome-step.done .welcome-step-label {
+    color: #7ee787;
+}
+
+.welcome-step.next .welcome-step-label {
+    font-weight: 600;
+}
+
+.welcome-step.pending .welcome-step-label {
+    color: #8b949e;
+}
+
+.welcome-body {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 6px 0 2px 24px;
+}
+
+.welcome-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.welcome-field label,
+.welcome-hint {
+    color: #8b949e;
+    font-size: 12px;
+}
+
+.welcome-error {
+    color: #f85149;
+}
+
+.welcome-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
+.chip-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.chip {
+    padding: 4px 10px;
+    background: #161b22;
+    border-color: #30363d;
+}
+
+.chip.selected {
+    background: #1f6feb;
+    border-color: #1f6feb;
 }

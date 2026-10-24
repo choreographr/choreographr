@@ -53,7 +53,7 @@ Choreographr (workspace)
 │                       baking, HEIC/HEIF with a pre-decode allocation guard)
 ├── choreo-keystore        X25519 + ECDH keypair crypto, encrypted storage primitives
 ├── choreo-transport       Noise IK encrypted TCP transport abstraction
-├── choreo-client-core     Shared client logic (parsing, images, history, credentials)
+├── choreo-client-core     Shared client logic (parsing, images, history, credentials, first-run setup)
 ├── choreo-markdown        Markdown parser and HTML renderer (pulldown-cmark + ammonia),
 │                       plus a LaTeX math → Unicode pretty-printer (`render_math_pretty`)
 ├── choreo-mcp             MCP (Model Context Protocol) client built on the official `rmcp`

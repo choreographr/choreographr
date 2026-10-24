@@ -6,10 +6,14 @@
 // false positive here.
 #![expect(clippy::useless_format)]
 use crate::client::{DaemonHandle, send_client_message, submit_input};
+use crate::onboarding::{
+    StepMark, checklist, request_models, select_account, select_model, submit_setup_form,
+};
 use crate::render::render_turn;
 #[cfg(target_os = "ios")]
 use crate::settings;
 use crate::state::AppState;
+use choreo_client_core::FEATURED_PROVIDERS;
 use choreo_proto::ClientMessageType;
 use dioxus::prelude::*;
 
@@ -68,6 +72,9 @@ pub(crate) fn Toolbar(state: Signal<AppState>, tx: Signal<Option<DaemonHandle>>)
         div { class: "toolbar",
             button { onclick: on_ping, "Ping" }
             button { onclick: on_models, "Models" }
+            // Reopens the first-run setup popup at any time (after it was
+            // closed, or to add another account).
+            button { onclick: move |_| state.write().setup.open_popup(), "Setup" }
             div { class: "cancel-row",
                 input {
                     placeholder: "Request id",
@@ -146,11 +153,240 @@ pub(crate) fn HistoryList(state: Signal<AppState>) -> Element {
 
     rsx! {
         div { class: "history",
-            for text in status_texts {
-                div { class: "history-item text-item", key: "{text}", pre { "{text}" } }
+            // Keyed by position, not text: the same status line can appear
+            // twice (two pings, two identical errors), and duplicate keys
+            // among siblings are fatal to the renderer. The feed is
+            // append-only, so a position always names the same line. The
+            // `status-` prefix keeps these keys apart from the turns below,
+            // which share this list and are keyed by their bare turn id.
+            for (index, text) in status_texts.into_iter().enumerate() {
+                div { class: "history-item text-item", key: "status-{index}", pre { "{text}" } }
             }
             for (turn_id, turn) in turns {
                 {render_turn(turn_id, &turn)}
+            }
+        }
+    }
+}
+
+/// The first-run setup guide, shown as a popup over the chat (see
+/// `SetupState::popup_visible` for when). Each step ticks itself off as the
+/// daemon confirms it, and the step to do now carries its own controls — the
+/// GUI has no separate accounts page or model picker, so setup happens
+/// entirely here. State and sends live in `crate::onboarding`.
+#[component]
+pub(crate) fn SetupDialog(state: Signal<AppState>, tx: Signal<Option<DaemonHandle>>) -> Element {
+    let guard = state.read();
+    let visible = guard.setup.popup_visible(
+        guard.attached_session_id.is_some(),
+        guard.session_view.turns.is_empty(),
+    );
+    let progress = guard.setup.progress();
+    drop(guard);
+    if !visible {
+        return rsx! {};
+    }
+
+    let close = move |_| state.write().setup.close_popup();
+
+    let body = if progress.is_complete() {
+        rsx! {
+            div { class: "welcome-ready",
+                "You're all set. Type a message below and press Enter to start."
+            }
+            div { class: "welcome-actions",
+                button { onclick: close, "Start chatting" }
+            }
+        }
+    } else {
+        let rows = checklist(progress)
+            .into_iter()
+            .enumerate()
+            .map(|(index, (label, mark))| {
+                let number = index + 1;
+                let (marker, class) = match mark {
+                    StepMark::Done => ("✓", "welcome-step done"),
+                    StepMark::Next => ("→", "welcome-step next"),
+                    StepMark::Pending => ("○", "welcome-step pending"),
+                };
+                rsx! {
+                    div { class: "{class}", key: "{number}",
+                        div { class: "welcome-step-label", "{marker} {number}. {label}" }
+                        if mark == StepMark::Next {
+                            match index {
+                                0 => rsx! { AccountKeyStep { state, tx } },
+                                1 => rsx! { AccountPickStep { state, tx } },
+                                _ => rsx! { ModelPickStep { state, tx } },
+                            }
+                        }
+                    }
+                }
+            });
+        rsx! {
+            div { "Before your first message, finish these steps:" }
+            {rows}
+            // The hint and the way out share one row, so the whole popup fits
+            // the default window without scrolling.
+            div { class: "modal-footer",
+                div { class: "welcome-hint",
+                    "Saving a key selects the account and loads its models for you."
+                }
+                // Setting up later is a real choice (accounts can also be
+                // configured by hand), so the popup always offers a way out.
+                button { class: "secondary", onclick: close, "Later" }
+            }
+        }
+    };
+
+    rsx! {
+        div { class: "modal-backdrop",
+            div { class: "modal welcome",
+                div { class: "modal-header",
+                    div { class: "welcome-title", "Welcome to Choreographr" }
+                    button { class: "modal-close", onclick: close, "×" }
+                }
+                {body}
+            }
+        }
+    }
+}
+
+/// Step 1: create an account and store its API key in one submit (or just
+/// add the key, when the name is an existing key-less account).
+#[component]
+fn AccountKeyStep(state: Signal<AppState>, tx: Signal<Option<DaemonHandle>>) -> Element {
+    let guard = state.read();
+    let form = &guard.setup.form;
+    let provider = form.provider.clone();
+    let account_name = form.account_name.clone();
+    let api_key = form.api_key.clone();
+    let error = form.error.clone();
+    drop(guard);
+
+    let on_save = move |_| {
+        let handle = tx.read().clone();
+        submit_setup_form(&mut state.write(), handle.as_ref());
+    };
+
+    rsx! {
+        div { class: "welcome-body",
+            div { class: "chip-row",
+                for slug in FEATURED_PROVIDERS.iter().copied() {
+                    button {
+                        key: "{slug}",
+                        class: if provider == slug { "chip selected" } else { "chip" },
+                        onclick: move |_| state.write().setup.pick_provider(slug),
+                        "{slug}"
+                    }
+                }
+            }
+            div { class: "welcome-field",
+                label { "Provider" }
+                input {
+                    placeholder: "provider id, e.g. anthropic",
+                    value: "{provider}",
+                    oninput: move |event| state.write().setup.form.provider = event.value(),
+                }
+            }
+            div { class: "welcome-field",
+                label { "Account name" }
+                input {
+                    placeholder: "a name for this account",
+                    value: "{account_name}",
+                    oninput: move |event| state.write().setup.form.account_name = event.value(),
+                }
+            }
+            div { class: "welcome-field",
+                label { "API key" }
+                input {
+                    r#type: "password",
+                    placeholder: "paste the provider's API key",
+                    value: "{api_key}",
+                    oninput: move |event| state.write().setup.form.api_key = event.value(),
+                }
+            }
+            if let Some(error) = error {
+                div { class: "welcome-error", "{error}" }
+            }
+            div { class: "welcome-actions",
+                button { onclick: on_save, "Save key" }
+            }
+        }
+    }
+}
+
+/// Step 2: one button per keyed account.
+#[component]
+fn AccountPickStep(state: Signal<AppState>, tx: Signal<Option<DaemonHandle>>) -> Element {
+    let accounts: Vec<(String, String)> = state
+        .read()
+        .setup
+        .keyed_accounts()
+        .map(|a| (a.name.clone(), a.provider.clone()))
+        .collect();
+
+    rsx! {
+        div { class: "welcome-body chip-row",
+            for (name, provider) in accounts {
+                button {
+                    key: "{name}",
+                    class: "chip",
+                    onclick: {
+                        let name = name.clone();
+                        move |_| select_account(tx.read().as_ref(), &name)
+                    },
+                    "{name} ({provider})"
+                }
+            }
+        }
+    }
+}
+
+/// Step 3: a filterable list of the session account's models.
+#[component]
+fn ModelPickStep(state: Signal<AppState>, tx: Signal<Option<DaemonHandle>>) -> Element {
+    let guard = state.read();
+    let setup = &guard.setup;
+    let filter = setup.form.model_filter.clone();
+    let loaded = !setup.models.is_empty();
+    let (shown, hidden) = setup.visible_models();
+    let shown: Vec<String> = shown.into_iter().map(str::to_string).collect();
+    drop(guard);
+
+    let on_load = move |_| {
+        if let Some(handle) = tx.read().clone() {
+            request_models(&mut state.write(), &handle);
+        }
+    };
+
+    rsx! {
+        div { class: "welcome-body",
+            if loaded {
+                input {
+                    placeholder: "filter models",
+                    value: "{filter}",
+                    oninput: move |event| state.write().setup.form.model_filter = event.value(),
+                }
+                div { class: "chip-row",
+                    for model in shown {
+                        button {
+                            key: "{model}",
+                            class: "chip",
+                            onclick: {
+                                let model = model.clone();
+                                move |_| select_model(tx.read().as_ref(), &model)
+                            },
+                            "{model}"
+                        }
+                    }
+                }
+                if hidden > 0 {
+                    div { class: "welcome-hint", "{hidden} more — type to narrow the list" }
+                }
+            } else {
+                div { class: "welcome-actions",
+                    button { onclick: on_load, "Load models" }
+                }
             }
         }
     }

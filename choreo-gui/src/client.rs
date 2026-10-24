@@ -374,6 +374,14 @@ pub(crate) fn apply_daemon_message(
         handle.resolve(id);
     }
 
+    // Keep the setup popup's view of accounts, the session's account and
+    // model, and the first-run follow-through current. It runs before the
+    // session handling below, which returns early for `Sessions`. A reply to
+    // one of the popup's own requests ends here: the popup shows it.
+    if crate::onboarding::track_setup_message(state, &message, daemon_tx.as_ref()) {
+        return;
+    }
+
     if handle_session_message(state, daemon_tx.as_ref(), &message) {
         return;
     }
