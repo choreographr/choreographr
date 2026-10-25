@@ -10,7 +10,7 @@ use crate::openai::{
     messages_to_responses_input,
 };
 use crate::shared::MAX_TOOL_CALLS;
-use choreo_proto::ReasoningArtifact;
+use choreo_proto::{ReasoningArtifact, TokenUsage};
 
 // ── Serialisation tests ───────────────────────────────────────────
 
@@ -282,6 +282,43 @@ fn responses_response_deserializes_with_message_and_usage() {
     assert_eq!(usage.prompt_tokens, 10);
     assert_eq!(usage.completion_tokens, 5);
     assert_eq!(usage.total_tokens, 15);
+}
+
+#[test]
+fn responses_turn_projects_input_tokens_details_into_cached_tokens() {
+    // The Responses API reports prompt-cache hits under
+    // `usage.input_tokens_details.cached_tokens`; the shared projection must
+    // carry that count onto `TokenUsage.cached_tokens` without inflating the
+    // input count (the cached tokens are already part of it).
+    let json_str = r#"{
+            "id": "resp_cached",
+            "status": "completed",
+            "output": [
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "hi"}]}
+            ],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 50,
+                "total_tokens": 1050,
+                "input_tokens_details": {"cached_tokens": 900}
+            }
+        }"#;
+    let payload: ResponsesResponse = serde_json::from_str(json_str).unwrap();
+    let ChatTurnResult::FinalText(result) = responses_response_to_turn(payload).expect("turn")
+    else {
+        panic!("expected FinalText");
+    };
+    assert_eq!(
+        result.usage,
+        Some(TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 50,
+            total_tokens: 1050,
+            cached_tokens: 900,
+            cache_write_tokens: 0,
+        })
+    );
 }
 
 #[test]

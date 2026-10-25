@@ -106,26 +106,19 @@ impl ChatCompletionsStreamAccumulator {
         payload: &ChatCompletionsStreamResponse,
         on_event: &mut impl FnMut(StreamEvent) -> io::Result<()>,
     ) -> Result<(), OpenAiError> {
-        // Capture usage from the final chunk (choices: []).
+        // Capture usage from the final chunk (choices: []). The cache-hit
+        // count comes from the shared `Usage` projection, so this path and the
+        // non-streaming conversion cannot disagree about which cache shape
+        // wins (see `openai::wire::Usage::to_token_usage`).
         if let Some(ref u) = payload.usage {
-            let cached_tokens = u
-                .prompt_tokens_details
-                .as_ref()
-                .map_or(0, |d| d.cached_tokens);
+            let usage = u.to_token_usage();
             debug!(
-                prompt_tokens = u.prompt_tokens,
-                completion_tokens = u.completion_tokens,
-                total_tokens = u.total_tokens,
-                cached_tokens,
+                prompt_tokens = usage.input_tokens,
+                completion_tokens = usage.output_tokens,
+                total_tokens = usage.total_tokens,
+                cached_tokens = usage.cached_tokens,
                 "OpenAI streaming turn usage"
             );
-            let usage = TokenUsage {
-                input_tokens: u.prompt_tokens,
-                output_tokens: u.completion_tokens,
-                total_tokens: u.total_tokens,
-                cached_tokens,
-                cache_write_tokens: 0,
-            };
             self.last_usage = Some(usage);
         }
 

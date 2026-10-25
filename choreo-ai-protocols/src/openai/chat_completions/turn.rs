@@ -67,24 +67,19 @@ pub(crate) fn chat_completions_response_to_turn(
     let reasoning = choice.message.take_reasoning();
 
     // Extract token usage from the API response for cost tracking / display.
-    // z.ai reports cached prompt tokens via `prompt_tokens_details`; providers
-    // without the details object yield 0.
+    // The cache-hit count comes from the shared `Usage` projection, so this
+    // path and the streaming accumulator cannot disagree about which cache
+    // shape wins (see `openai::wire::Usage::to_token_usage`).
     let turn_usage: Option<TokenUsage> = payload.usage.map(|u| {
-        let cached_tokens = u.prompt_tokens_details.map_or(0, |d| d.cached_tokens);
-        if cached_tokens > 0 {
+        let usage = u.to_token_usage();
+        if usage.cached_tokens > 0 {
             debug!(
-                cached_tokens,
-                prompt_tokens = u.prompt_tokens,
+                cached_tokens = usage.cached_tokens,
+                prompt_tokens = usage.input_tokens,
                 "chat-completions cached prompt tokens"
             );
         }
-        TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-            total_tokens: u.total_tokens,
-            cached_tokens,
-            cache_write_tokens: 0,
-        }
+        usage
     });
 
     let tool_calls: Vec<ChatToolCall> = choice

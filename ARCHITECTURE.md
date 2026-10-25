@@ -1392,6 +1392,17 @@ per-field-max `merge_max`: it rebuilds the lifetime total from the turn history
 (on load) and is the same fold the worker uses for its incremental
 accumulation, so the two cannot diverge on which fields they add.
 
+Every adapter resolves its provider's cache-hit field into `cached_tokens`
+through **one projection per protocol**, shared by that protocol's streaming and
+non-streaming paths, so a newly modelled cache field cannot reach one path and
+miss another: `openai::wire::Usage::to_token_usage` covers chat completions and
+the Responses API (nested `prompt_tokens_details` / `input_tokens_details`,
+falling back to `DeepSeek`'s flat `prompt_cache_hit_tokens`), and Gemini's
+`UsageMetadata::to_token_usage` covers `cachedContentTokenCount`. `cache_write_tokens`
+stays zero for every protocol that reports no write count (all but Anthropic).
+The daemon additionally feeds each turn's `cached_tokens / input_tokens` ratio
+to the `/metrics` prompt-cache-hit histogram, keyed by provider slug and model.
+
 Two cross-cutting accounting contracts:
 
 - **The billing counter vs. the context payload.** Each session tracks an

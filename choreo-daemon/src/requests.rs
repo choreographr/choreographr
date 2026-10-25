@@ -861,7 +861,14 @@ pub(crate) fn run_agent_loop(
                     "model returned final text",
                 );
                 let token_usage = final_text.usage;
-                accumulate_token_usage(session, token_usage.as_ref(), turn_iter, ctx);
+                accumulate_token_usage(
+                    session,
+                    token_usage.as_ref(),
+                    turn_iter,
+                    &provider_slug,
+                    model,
+                    ctx,
+                );
                 broadcast_token_usage(ctx, session);
                 // Cheap display hook for the finish-reason truncation flag:
                 // `length` on a final-text turn means the answer was cut off
@@ -918,7 +925,14 @@ pub(crate) fn run_agent_loop(
             }
             Ok(ChatTurnResult::ToolUse(tool_use)) => {
                 let token_usage = tool_use.usage;
-                accumulate_token_usage(session, token_usage.as_ref(), turn_iter, ctx);
+                accumulate_token_usage(
+                    session,
+                    token_usage.as_ref(),
+                    turn_iter,
+                    &provider_slug,
+                    model,
+                    ctx,
+                );
                 broadcast_token_usage(ctx, session);
                 // Build the call records once so the same ordered list seeds
                 // both the assistant message's tool_calls and the placeholder

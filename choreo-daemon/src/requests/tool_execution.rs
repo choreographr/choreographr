@@ -272,11 +272,18 @@ pub(crate) fn is_cancelled_once(rx: &crossbeam_channel::Receiver<()>) -> bool {
     rx.try_recv().is_ok()
 }
 
-/// Accumulate per-turn token usage into the session-level counter and log it.
+/// Accumulate per-turn token usage into the session-level counter, log it, and
+/// feed the prompt-cache hit ratio to `/metrics`.
+///
+/// `provider`/`model` key the metric so a cache-hit rate can be read per
+/// provider+model pair; only token COUNTS are recorded, never prompt or
+/// response content.
 pub(crate) fn accumulate_token_usage(
     session: &mut SessionState,
     token_usage: Option<&TokenUsage>,
     turn: u32,
+    provider: &str,
+    model: &str,
     ctx: &RequestContext,
 ) {
     if let Some(u) = token_usage {
@@ -284,12 +291,22 @@ pub(crate) fn accumulate_token_usage(
         // Track the latest prompt_tokens (the actual context size being sent
         // to the model) separately from the accumulated billing counter.
         session.config.last_prompt_tokens = Some(u.input_tokens);
+        // The provider-side cache-hit rate for this turn: cached tokens are a
+        // subset of the prompt, so this is `cached / input` (see
+        // `metrics::record_prompt_cache_hit_ratio`).
+        crate::metrics::record_prompt_cache_hit_ratio(
+            provider,
+            model,
+            u.input_tokens,
+            u.cached_tokens,
+        );
         debug!(
             session_id = ctx.session_id,
             turn,
             input_tokens = u.input_tokens,
             output_tokens = u.output_tokens,
             total_tokens = u.total_tokens,
+            cached_tokens = u.cached_tokens,
             accumulated_input = session.config.accumulated_usage.input_tokens,
             accumulated_output = session.config.accumulated_usage.output_tokens,
             "accumulated token usage"

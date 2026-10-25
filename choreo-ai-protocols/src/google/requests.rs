@@ -278,15 +278,10 @@ where
         let payload: GenerateContentResponse =
             serde_json::from_str(&data).map_err(|e| GoogleError::Io(io::Error::other(e)))?;
 
-        // Capture token usage from the streamed response
+        // Capture token usage from the streamed response. The projection is
+        // shared with the non-streaming path (see `UsageMetadata::to_token_usage`).
         if let Some(ref u) = payload.usage_metadata {
-            stream_usage = Some(TokenUsage {
-                input_tokens: u.prompt_token_count,
-                output_tokens: u.candidates_token_count,
-                total_tokens: u.total_token_count,
-                cached_tokens: 0,
-                cache_write_tokens: 0,
-            });
+            stream_usage = Some(u.to_token_usage());
         }
 
         // Process the first candidate's parts

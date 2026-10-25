@@ -996,6 +996,74 @@ fn request_body_carries_generation_config_output_cap() {
 }
 
 #[test]
+fn usage_metadata_deserialises_cached_content_token_count() {
+    // Gemini reports cached-prompt tokens as `cachedContentTokenCount` in
+    // `usageMetadata`; it must parse and project into `cached_tokens`.
+    let usage: UsageMetadata = serde_json::from_value(json!({
+        "promptTokenCount": 1000,
+        "candidatesTokenCount": 50,
+        "totalTokenCount": 1050,
+        "cachedContentTokenCount": 900
+    }))
+    .unwrap();
+    let projected = usage.to_token_usage();
+    assert_eq!(projected.cached_tokens, 900);
+    // `promptTokenCount` is the full effective prompt, cached content included,
+    // so the input count must stay as reported.
+    assert_eq!(projected.input_tokens, 1000);
+    assert_eq!(projected.output_tokens, 50);
+    assert_eq!(projected.cache_write_tokens, 0);
+}
+
+#[test]
+fn usage_metadata_without_cached_content_projects_zero_cached_tokens() {
+    let usage: UsageMetadata = serde_json::from_value(json!({
+        "promptTokenCount": 120,
+        "candidatesTokenCount": 8,
+        "totalTokenCount": 128
+    }))
+    .unwrap();
+    assert_eq!(usage.to_token_usage().cached_tokens, 0);
+}
+
+#[test]
+fn response_to_turn_result_carries_cached_tokens() {
+    let resp = GenerateContentResponse {
+        candidates: vec![Candidate {
+            content: Some(ContentBlock {
+                parts: vec![ResponsePart::Text {
+                    text: "Hello world!".to_string(),
+                    thought: None,
+                    thought_signature: None,
+                }],
+                role: Some("model".to_string()),
+            }),
+            finish_reason: Some("STOP".to_string()),
+            index: 0,
+        }],
+        usage_metadata: Some(UsageMetadata {
+            prompt_token_count: 1000,
+            candidates_token_count: 50,
+            total_token_count: 1050,
+            cached_content_token_count: 900,
+        }),
+    };
+    let ChatTurnResult::FinalText(result) = response_to_turn_result(resp).unwrap() else {
+        panic!("expected FinalText");
+    };
+    assert_eq!(
+        result.usage,
+        Some(TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 50,
+            total_tokens: 1050,
+            cached_tokens: 900,
+            cache_write_tokens: 0,
+        })
+    );
+}
+
+#[test]
 fn build_message_payloads_skips_an_assistant_message_with_no_parts() {
     // An assistant turn that produced no visible output carries nothing, and
     // an empty `parts` array is rejected — so it is skipped, not sent empty.

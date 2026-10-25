@@ -165,12 +165,16 @@ pub struct TokenUsage {
     /// verbatim.
     pub total_tokens: u32,
     /// Prompt tokens served from the provider's prompt cache — the cache
-    /// **read/hit** count (Anthropic's `usage.cache_read_input_tokens`, z.ai's
-    /// `usage.prompt_tokens_details.cached_tokens`). A subset of
-    /// `input_tokens`, not an addition to it: cached input is priced
-    /// differently, so cost/usage reporting tracks it separately. 0 when the
-    /// provider does not report it; `#[serde(default)]` keeps old payloads and
-    /// providers that omit the details object deserializing cleanly.
+    /// **read/hit** count. Each adapter maps its own wire field here: Anthropic's
+    /// `usage.cache_read_input_tokens`, the `OpenAI`-compatible
+    /// `usage.prompt_tokens_details.cached_tokens` (chat completions) or
+    /// `usage.input_tokens_details.cached_tokens` (Responses), `DeepSeek`'s flat
+    /// `usage.prompt_cache_hit_tokens`, and Gemini's
+    /// `usageMetadata.cachedContentTokenCount`. A subset of `input_tokens`, not
+    /// an addition to it: cached input is priced differently, so cost/usage
+    /// reporting tracks it separately. 0 when the provider does not report it;
+    /// `#[serde(default)]` keeps old payloads and providers that omit the count
+    /// deserializing cleanly.
     #[serde(default)]
     pub cached_tokens: u32,
     /// Prompt tokens written to the provider's prompt cache (e.g. Anthropic's

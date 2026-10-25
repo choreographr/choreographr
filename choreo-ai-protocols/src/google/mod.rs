@@ -440,6 +440,32 @@ pub(super) struct UsageMetadata {
     candidates_token_count: u32,
     #[serde(default, rename = "totalTokenCount")]
     total_token_count: u32,
+    /// Prompt tokens served from the provider's context cache
+    /// (`cachedContentTokenCount`). A subset of [`Self::prompt_token_count`] —
+    /// Gemini reports the full effective prompt size there even when
+    /// `cachedContent` is in play — so it is never added to the input count.
+    /// Absent on responses that used no cached content.
+    #[serde(default, rename = "cachedContentTokenCount")]
+    cached_content_token_count: u32,
+}
+
+impl UsageMetadata {
+    /// Project the provider usage onto the shared [`TokenUsage`] counter.
+    ///
+    /// The ONE projection both the non-streaming conversion and the streaming
+    /// loop use, so a newly modelled cache field cannot reach one path and
+    /// miss the other. Gemini reports no cache-write count (the context cache
+    /// is created out of band, not billed per turn), so `cache_write_tokens`
+    /// stays zero.
+    fn to_token_usage(&self) -> TokenUsage {
+        TokenUsage {
+            input_tokens: self.prompt_token_count,
+            output_tokens: self.candidates_token_count,
+            total_tokens: self.total_token_count,
+            cached_tokens: self.cached_content_token_count,
+            cache_write_tokens: 0,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -833,14 +859,7 @@ fn thinking_config_payload(slug: &str) -> Option<ThinkingConfigPayload> {
 fn response_to_turn_result(
     response: GenerateContentResponse,
 ) -> Result<ChatTurnResult, GoogleError> {
-    let usage: Option<TokenUsage> = response.usage_metadata.map(|u| TokenUsage {
-        input_tokens: u.prompt_token_count,
-        output_tokens: u.candidates_token_count,
-        total_tokens: u.total_token_count,
-        // Provider response shape exposes no cached-prompt count here.
-        cached_tokens: 0,
-        cache_write_tokens: 0,
-    });
+    let usage: Option<TokenUsage> = response.usage_metadata.map(|u| u.to_token_usage());
     let candidate = response
         .candidates
         .into_iter()

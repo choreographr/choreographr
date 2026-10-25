@@ -19,18 +19,14 @@ use choreo_proto::{ReasoningArtifact, TokenUsage};
 
 /// Project the Responses API usage onto the shared token counter.
 ///
-/// The Responses API's cached-token analogue
-/// (`input_tokens_details.cached_tokens`) is not modelled yet, so the cache
-/// fields stay zero; every caller shares this one projection so the streaming
-/// and non-streaming paths cannot disagree about it.
+/// The Responses API's cache-hit analogue lives in
+/// `input_tokens_details.cached_tokens`, which is one of the shapes
+/// [`Usage::to_token_usage`](super::super::Usage::to_token_usage) resolves — so this path and every chat-completions
+/// path share ONE projection and cannot disagree about the cache count. The
+/// Responses wire carries no cache-write count, so `cache_write_tokens` stays
+/// zero there.
 pub(super) fn responses_usage_to_token_usage(usage: &super::super::Usage) -> TokenUsage {
-    TokenUsage {
-        input_tokens: usage.prompt_tokens,
-        output_tokens: usage.completion_tokens,
-        total_tokens: usage.total_tokens,
-        cached_tokens: 0,
-        cache_write_tokens: 0,
-    }
+    usage.to_token_usage()
 }
 
 /// Classify a response that stopped early (`status: "incomplete"`).

@@ -38,6 +38,7 @@ mod backend {
         evictions_total: IntCounter,
         cache_warm_attempts_total: IntCounter,
         cache_warm_skips_total: IntCounterVec,
+        prompt_cache_hit_ratio: HistogramVec,
         request_duration_seconds: HistogramVec,
         tool_execution_duration_seconds: HistogramVec,
         api_call_duration_seconds: HistogramVec,
@@ -108,6 +109,12 @@ mod backend {
                 "choreo_cache_warm_skips_total",
                 "Total number of prompt-cache warm attempts skipped, by reason",
                 &["reason"]
+            )?,
+            prompt_cache_hit_ratio: prometheus::register_histogram_vec!(
+                "choreo_prompt_cache_hit_ratio",
+                "Per-turn share of prompt tokens served from the provider's prompt cache, by provider and model",
+                &["provider", "model"],
+                vec![0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99, 1.0]
             )?,
             request_duration_seconds: prometheus::register_histogram_vec!(
                 "choreo_request_duration_seconds",
@@ -287,6 +294,36 @@ mod backend {
         }
     }
 
+    /// Observe one turn's prompt-cache hit ratio, keyed by `provider` slug and
+    /// `model`.
+    ///
+    /// `cached_tokens` is a subset of `prompt_tokens` in every provider's
+    /// accounting, so the observed value is `cached / prompt` in `[0, 1]` — a
+    /// turn whose prompt cache was warm lands near 1, a cold one near 0. A turn
+    /// that reported no prompt tokens is skipped: the ratio is undefined there,
+    /// and recording 0 would be indistinguishable from a full cache miss. Only
+    /// counts are recorded — never prompt or response content. No-op when
+    /// metrics were never initialized (e.g. unit-test binaries).
+    pub fn record_prompt_cache_hit_ratio(
+        provider: &str,
+        model: &str,
+        prompt_tokens: u32,
+        cached_tokens: u32,
+    ) {
+        if prompt_tokens == 0 {
+            return;
+        }
+        if let Some(m) = METRICS.get() {
+            // A provider that reported more cached tokens than prompt tokens is
+            // a wire inconsistency; clamp so the value still lands in the
+            // histogram's bucket range instead of in `+Inf`.
+            let ratio = f64::from(cached_tokens) / f64::from(prompt_tokens);
+            m.prompt_cache_hit_ratio
+                .with_label_values(&[provider, model])
+                .observe(ratio.min(1.0));
+        }
+    }
+
     /// HTTP server loop that serves `/metrics` on the given address.
     /// Checks an `AtomicBool` shutdown flag every 1-second poll and exits when set.
     ///
@@ -456,6 +493,36 @@ mod backend {
 
         #[serial(metrics)]
         #[test]
+        fn test_prompt_cache_hit_ratio_observes_ratio() {
+            ensure_init();
+            let m = METRICS.get().unwrap();
+            let histogram = m
+                .prompt_cache_hit_ratio
+                .with_label_values(&["zai", "glm-5"]);
+            let before = histogram.get_sample_count();
+            record_prompt_cache_hit_ratio("zai", "glm-5", 100, 75);
+            assert_eq!(histogram.get_sample_count(), before + 1);
+            // 75/100 lands in the 0.75 upper-bound bucket.
+            assert!(histogram.get_sample_sum() >= 0.75);
+        }
+
+        #[serial(metrics)]
+        #[test]
+        fn test_prompt_cache_hit_ratio_skips_a_zero_prompt() {
+            // A turn with no prompt count has no definable ratio; recording 0
+            // would read as a full cache miss, so nothing is observed.
+            ensure_init();
+            let m = METRICS.get().unwrap();
+            let histogram = m
+                .prompt_cache_hit_ratio
+                .with_label_values(&["deepseek", "deepseek-chat"]);
+            let before = histogram.get_sample_count();
+            record_prompt_cache_hit_ratio("deepseek", "deepseek-chat", 0, 0);
+            assert_eq!(histogram.get_sample_count(), before);
+        }
+
+        #[serial(metrics)]
+        #[test]
         fn test_metrics_output_contains_help_and_type_lines() {
             ensure_init();
             // Call each metric function at least once to seed label values.
@@ -473,6 +540,7 @@ mod backend {
             record_eviction();
             record_cache_warm_attempt();
             record_cache_warm_skip("no_ttl");
+            record_prompt_cache_hit_ratio("zai", "test_model", 100, 40);
             // Gather and encode all metrics via the text encoder, verify
             // that the output contains expected HELP/TYPE lines.
             let metric_families = prometheus::gather();
@@ -491,6 +559,8 @@ mod backend {
             assert!(output.contains("# TYPE choreo_cache_warm_attempts_total counter"));
             assert!(output.contains("# HELP choreo_cache_warm_skips_total"));
             assert!(output.contains("# TYPE choreo_cache_warm_skips_total counter"));
+            assert!(output.contains("# HELP choreo_prompt_cache_hit_ratio"));
+            assert!(output.contains("# TYPE choreo_prompt_cache_hit_ratio histogram"));
             assert!(output.contains("# HELP choreo_request_duration_seconds"));
             assert!(output.contains("# TYPE choreo_request_duration_seconds histogram"));
         }
@@ -560,6 +630,15 @@ mod backend {
 
     /// No-op: metrics support is compiled out, so there is nothing to record.
     pub fn record_cache_warm_skip(_reason: &str) {}
+
+    /// No-op: metrics support is compiled out, so there is nothing to record.
+    pub fn record_prompt_cache_hit_ratio(
+        _provider: &str,
+        _model: &str,
+        _prompt_tokens: u32,
+        _cached_tokens: u32,
+    ) {
+    }
 
     /// No-op: the daemon refuses `--metrics-addr` at startup when the feature
     /// is off, so this should never run — warn loudly if something calls it.
