@@ -48,6 +48,10 @@ fn facts() -> WarmFacts {
         prefix_tokens: 40_000,
         cost: Some(cost()),
         replayable: true,
+        // The default is "no hint was withheld": every provider the catalog
+        // leaves `Off` (and every provider whose hint was accepted) reports
+        // this false and warms exactly as it always has.
+        affinity_downgraded: false,
     }
 }
 
@@ -280,6 +284,70 @@ fn arm_ineligibility_reasons() {
 }
 
 #[test]
+fn affinity_downgrade_declines_warming() {
+    // The provider rejected the affinity hint it was meant to send, so the ping
+    // is no longer known to reach the backend holding the prefix: decline, even
+    // though every economic input here would otherwise clear the gate.
+    let now = Duration::from_secs(1000);
+    let plan = policy(MeterKind::Payg).arm(
+        WarmFacts {
+            affinity_downgraded: true,
+            ..facts()
+        },
+        now,
+    );
+    assert_eq!(
+        plan.poll(now),
+        Action::Stop(SkipReason::AffinityUnavailable)
+    );
+    // The decline is clock-independent (a static fact, so the plan is inactive
+    // rather than armed-with-a-timer), and it does not depend on the meter.
+    for meter in [MeterKind::Tokens, MeterKind::Requests, MeterKind::Unknown] {
+        let plan = policy(meter).arm(
+            WarmFacts {
+                affinity_downgraded: true,
+                ..facts()
+            },
+            now,
+        );
+        assert_eq!(
+            plan.poll(now),
+            Action::Stop(SkipReason::AffinityUnavailable),
+            "{meter:?}"
+        );
+    }
+}
+
+#[test]
+fn an_accepted_affinity_leaves_the_economics_gates_unchanged() {
+    // Regression guard: with no downgrade signalled, the arm/decide path is
+    // exactly what the economics gates produced before the fact existed — the
+    // same thresholds fail and pass, and a clear win pings on schedule.
+    let start = Duration::from_secs(0);
+    let p = policy(MeterKind::Payg);
+    let plan = p.arm(facts(), start);
+    assert_eq!(plan.poll(start + Duration::from_secs(270)), Action::Ping);
+
+    let econ = economics(Some(cost()), 40_000).expect("cost present");
+    let below = WarmPolicy {
+        min_expected_savings: 0.13,
+        ..policy(MeterKind::Payg)
+    };
+    assert_eq!(
+        gate(&below, &facts(), Some(econ)),
+        Err(SkipReason::BelowThreshold)
+    );
+    let small_prefix = WarmFacts {
+        prefix_tokens: DEFAULT_MIN_PREFIX_TOKENS - 1,
+        ..facts()
+    };
+    assert_eq!(
+        gate(&policy(MeterKind::Tokens), &small_prefix, None),
+        Err(SkipReason::BelowThreshold)
+    );
+}
+
+#[test]
 fn deadline_guard_and_wait() {
     let start = Duration::from_secs(1000);
     let p = policy(MeterKind::Payg);
@@ -467,6 +535,7 @@ fn skip_reason_display_is_nonempty() {
         SkipReason::BelowThreshold,
         SkipReason::EconomicsUnavailable,
         SkipReason::DeadlineMissed,
+        SkipReason::AffinityUnavailable,
         SkipReason::ContextChanged,
     ] {
         assert!(!reason.to_string().is_empty(), "{reason:?}");
@@ -479,6 +548,10 @@ fn skip_reason_labels_are_stable_snake_case() {
     assert_eq!(SkipReason::ModeOff.label(), "mode_off");
     assert_eq!(SkipReason::DeadlineMissed.label(), "deadline_missed");
     assert_eq!(SkipReason::MeterIncompatible.label(), "meter_incompatible");
+    assert_eq!(
+        SkipReason::AffinityUnavailable.label(),
+        "affinity_unavailable"
+    );
 }
 
 // ── Warmer-driver tests ────────────────────────────────────────────
@@ -557,6 +630,25 @@ fn driver_ignores_ineligible_arm() {
     handle.arm(warm_request());
     handle.stop();
     assert_eq!(recorder.calls(), 0, "an ineligible arm must never ping");
+}
+
+#[test]
+fn driver_declines_a_downgraded_affinity_arm() {
+    // A downgraded hint is a static ineligibility, so the arm is declined
+    // without ever contacting the provider — even though this policy (a tokens
+    // gate over a large prefix) would otherwise ping.
+    let (provider, recorder) = make_recording_provider();
+    let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+    let mut handle = spawn_warmer(provider, policy(MeterKind::Tokens), cancel_rx);
+    handle.arm(WarmRequest {
+        facts: WarmFacts {
+            affinity_downgraded: true,
+            ..facts()
+        },
+        ..warm_request()
+    });
+    handle.stop();
+    assert_eq!(recorder.calls(), 0, "a downgraded affinity must never warm");
 }
 
 #[test]

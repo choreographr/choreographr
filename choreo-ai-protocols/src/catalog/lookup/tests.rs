@@ -60,6 +60,34 @@ fn lookup_context_window_known_provider() {
 
 #[test]
 #[serial_test::serial(catalog)]
+fn cache_affinity_reads_the_provider_entry() {
+    // The bundled overlay pins these dialects; every other provider is `Off`.
+    assert_eq!(cache_affinity("openai"), CacheAffinity::PromptCacheKey);
+    assert_eq!(
+        cache_affinity("openrouter"),
+        CacheAffinity::OpenRouterSession
+    );
+    assert_eq!(cache_affinity("anthropic"), CacheAffinity::Off);
+    // An unknown provider resolves to the default that sends no hint rather
+    // than to an invented dialect.
+    assert_eq!(cache_affinity("nonexistent"), CacheAffinity::Off);
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn cache_affinity_follows_a_catalog_swap() {
+    // The resolver reads the live `ArcSwap`, not the compiled-in base: a swap
+    // that flips the dialect must be visible immediately (and the guard restores
+    // the bundled catalog on drop).
+    let _restore = RestoreBundledOnDrop;
+    let mut catalog = tiny_catalog();
+    catalog[0].cache_affinity = CacheAffinity::PromptCacheKey;
+    crate::catalog::replace_catalog(catalog);
+    assert_eq!(cache_affinity("tiny-test"), CacheAffinity::PromptCacheKey);
+}
+
+#[test]
+#[serial_test::serial(catalog)]
 fn lookup_context_window_unknown_provider() {
     assert_eq!(lookup_context_window("nonexistent", "any-model"), None);
 }

@@ -18,7 +18,10 @@ use choreo_ai_protocols::{
     ChatToolCall, ChatTurnRequest, ChatTurnResult, StreamEvent, ToolResultItem,
     model_reasoning_capability,
 };
-use choreo_ai_protocols::{ProviderProtocol, lookup_provider, model_cost, prompt_cache_ttl};
+use choreo_ai_protocols::{
+    ProviderProtocol, cache_affinity, cache_affinity_downgraded, lookup_provider, model_cost,
+    prompt_cache_ttl,
+};
 use choreo_proto::{
     AssistantToolCallRecord, DaemonMessageType, OutputStream, ReasoningProducer, SessionEvent,
     SessionStatus,
@@ -1035,6 +1038,21 @@ pub(crate) fn run_agent_loop(
                         prefix_tokens: estimated_prompt_tokens,
                         cost: model_cost(&provider_slug, model),
                         replayable: is_replayable(is_anthropic, thinking_enabled),
+                        // The warming economics assume the ping reaches a
+                        // backend that still holds this prefix's cache. That is
+                        // only guaranteed while the per-session affinity hint is
+                        // actually sent: once the provider has answered the field
+                        // with a 400 (the process-wide rejection registry), the
+                        // hint is withheld and the ping could be routed anywhere,
+                        // paying a full-price write the next real turn never
+                        // reads. So a catalog-opted-in provider whose hint was
+                        // downgraded to `Off` must not warm; a provider the
+                        // catalog leaves `Off` was never relying on the hint and
+                        // warms exactly as before.
+                        affinity_downgraded: cache_affinity_downgraded(
+                            &provider_slug,
+                            cache_affinity(&provider_slug),
+                        ),
                     };
                     warmer.arm(WarmRequest {
                         model: model.to_string(),

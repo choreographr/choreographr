@@ -17,6 +17,7 @@ use tracing::trace;
 use choreo_proto::{ChatReasoningField, ReasoningCapability};
 
 use crate::openai::RequestFormat;
+use crate::session_routing::CacheAffinity;
 
 use super::{
     ModelCost, ModelEntry, PROVIDER_CATALOG, PromptCacheTtl, ProviderEntry, ProviderProtocol,
@@ -119,6 +120,26 @@ pub fn prompt_cache_ttl(provider_slug: &str, model: &str) -> Option<PromptCacheT
         model.prompt_cache.or(provider.prompt_cache)
     })
     .flatten()
+}
+
+/// The per-session cache-affinity dialect the catalog declares for
+/// `provider_slug`, or [`CacheAffinity::Off`] for an unknown provider.
+///
+/// This is the provider-level `cache_affinity` overlay scalar, i.e. the hint the
+/// catalog *intends* a request to carry. It deliberately reports the catalog
+/// value and not a request-time resolution: callers that need the hint a real
+/// body will send compare it against
+/// [`ServiceConfig::effective_cache_affinity`](crate::openai::ServiceConfig::effective_cache_affinity)
+/// (or ask [`cache_affinity_downgraded`](crate::cache_affinity_downgraded))
+/// to tell "opted in" apart from "opted in but withheld by the rejection
+/// registry".
+#[must_use]
+pub fn cache_affinity(provider_slug: &str) -> CacheAffinity {
+    PROVIDER_CATALOG
+        .load()
+        .iter()
+        .find(|e| e.slug == provider_slug)
+        .map_or_default(|e| e.cache_affinity)
 }
 
 /// Look up the context window for a model on a given provider.

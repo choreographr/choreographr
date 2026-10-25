@@ -213,6 +213,26 @@ pub(crate) fn effective_cache_affinity(slug: &str, configured: CacheAffinity) ->
     }
 }
 
+/// Whether the affinity hint `configured` for `slug` is being **withheld**
+/// because this process already learned, from a 400 naming the field, that the
+/// provider rejects it.
+///
+/// `true` requires both halves of the downgrade: the provider *intended* to
+/// send a hint (`configured` is not [`CacheAffinity::Off`]) **and** the
+/// request-time resolution comes back `Off` from the rejection registry. An
+/// `Off` provider sent nothing to reject, so it is never downgraded and always
+/// answers `false`.
+///
+/// This is the signal the cache-warming gate reads. A warm ping's economics
+/// assume the re-send lands on a backend that still holds the prefix cache;
+/// with the hint withheld the provider may route the ping anywhere, so it could
+/// pay a full-price cache write the next real turn never reads.
+#[must_use]
+pub fn cache_affinity_downgraded(slug: &str, configured: CacheAffinity) -> bool {
+    configured != CacheAffinity::Off
+        && effective_cache_affinity(slug, configured) == CacheAffinity::Off
+}
+
 /// Record that `slug` rejected the affinity field `field`, so future requests
 /// send no hint. Warns once per slug, naming only the provider and the field
 /// (never the request or response body).
@@ -385,6 +405,40 @@ mod tests {
             effective_cache_affinity("affinity-off-slug", CacheAffinity::Off),
             CacheAffinity::Off,
         );
+        // Because nothing was ever intended, no downgrade is signalled either —
+        // this is the regression guard for the cache-warming gate: an `Off`
+        // provider must keep warming exactly as it would with no registry.
+        assert!(!cache_affinity_downgraded(
+            "affinity-off-slug",
+            CacheAffinity::Off
+        ));
+    }
+
+    #[test]
+    fn downgrade_signal_needs_an_intent_and_a_rejection() {
+        // Intended, never rejected: not a downgrade.
+        assert!(!cache_affinity_downgraded(
+            "affinity-intent-clean-slug",
+            CacheAffinity::PromptCacheKey,
+        ));
+
+        // Intended and then rejected: a downgrade.
+        let slug = "affinity-intent-rejected-slug";
+        note_cache_affinity_rejected(slug, PROMPT_CACHE_KEY_FIELD);
+        assert!(cache_affinity_downgraded(
+            slug,
+            CacheAffinity::PromptCacheKey
+        ));
+        // Every dialect is downgraded alike, and an unknown provider is
+        // unaffected (`Off` from an empty catalog lookup).
+        assert!(cache_affinity_downgraded(
+            slug,
+            CacheAffinity::OpenRouterSession
+        ));
+        assert!(!cache_affinity_downgraded(
+            "affinity-never-recorded-slug",
+            CacheAffinity::Off,
+        ));
     }
 
     #[test]

@@ -909,6 +909,28 @@ the registry overrides even a forced-on override: once the provider has said no,
 it is not asked again. Consult `ServiceConfig::effective_cache_affinity` for the
 resolved value the body builders use.
 
+#### Cache warming declines a downgraded hint
+
+Because the hint is what keeps a session's requests on one backend, losing it
+invalidates the premise of **cache warming**: when the daemon re-sends the last
+request mid-tool-call to refresh the provider's prompt-cache TTL, its economics
+(`warm_cost = cache_read * prefix + output`, `miss_cost` = a write instead of a
+read) assume the ping reaches a server that **still holds the prefix**. With the
+hint withheld the ping may be routed anywhere, so it can pay a full-price cache
+write the next real turn never reads — a coin flip the warmer must not take.
+
+The gate is deliberately narrow. The arming site (`run_agent_loop`) resolves the
+catalog dialect (`catalog::cache_affinity`) and asks
+`session_routing::cache_affinity_downgraded`, which is true only when **both**
+halves hold: the provider *intended* to send a hint (catalog affinity is not
+`Off`) **and** the effective affinity came back `Off` from the rejection
+registry. The resulting `WarmFacts::affinity_downgraded` fact rides into the pure
+policy, which returns `SkipReason::AffinityUnavailable` from its static
+ineligibility check — so the plan is never armed, no timer is wasted, and the
+decline shows up in `choreo_cache_warm_skips_total{reason="affinity_unavailable"}`.
+Every provider the catalog leaves `Off` (Anthropic, Google, DeepSeek, the
+`opencode` gateways) never sets the fact and warms exactly as before.
+
 #### Transient gateway 400 (message content)
 
 The opencode.ai zen/go gateway validates message *content* on only some of its
@@ -2400,7 +2422,11 @@ which is why the meter is explicit and defaults to `unknown` (never warm).
 When `mode = "streaming"` (and the account's meter gate clears) the agent loop
 spawns a per-request warmer thread that fires while a tool call blocks; the
 ping is a single non-streaming, non-retrying 1-token request that never
-touches session or turn state. Status is observable through the
+touches session or turn state. Warming is also declined outright when the
+provider rejected the per-session cache-affinity hint the ping would rely on to
+land on the backend holding the cache — see **Cache warming declines a
+downgraded hint** under **Per-session cache affinity** — which is a static
+eligibility check, not a meter rule. Status is observable through the
 `choreo_cache_warm_attempts_total` / `choreo_cache_warm_skips_total{reason}`
 metrics and `tracing` logs only — no `SessionEvent` is emitted (a status
 event is a deliberate follow-up).

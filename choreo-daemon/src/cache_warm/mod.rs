@@ -21,6 +21,18 @@
 //! a ping actively *costs* — hence the gate is meter-kind aware and defaults to
 //! "do not warm".
 //!
+//! Eligibility checks run before the meter gate, because a ping that cannot
+//! save money is not worth scheduling at all: the request must be replayable
+//! with a capped output (an Anthropic `thinking` request is not), the model must
+//! expose a long-enough prompt-cache TTL, and — the affinity safety gate — a
+//! provider that **rejected** the per-session cache-affinity hint it was meant
+//! to send must not be warmed. That last one is not a meter rule but a
+//! correctness rule for the economics: `warm_cost`/`miss_cost` assume the ping
+//! lands on a backend that still holds the prefix cache, which is exactly what
+//! the withheld hint can no longer guarantee, so the warmer declines rather than
+//! pay a full-price write the next real turn never reads. A provider whose
+//! catalog affinity is `Off` never sets the fact and warms exactly as before.
+//!
 //! The module splits cleanly into two halves:
 //!
 //! * `policy` — the **pure, clock-injected** state machine: [`WarmPolicy`]

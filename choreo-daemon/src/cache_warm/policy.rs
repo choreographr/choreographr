@@ -263,6 +263,18 @@ pub struct WarmFacts {
     /// Whether a capped re-send of the last request would be cache-equivalent
     /// (see [`is_replayable`]).
     pub replayable: bool,
+    /// Whether the per-session cache-affinity hint this request *intended* to
+    /// send was downgraded to `Off` by the provider's rejection registry.
+    ///
+    /// A warm ping's economics assume the re-send reaches a backend that still
+    /// holds the prefix cache. When the provider has answered the affinity hint
+    /// with a 400 (so the field is withheld for the rest of the process), the
+    /// ping may instead be routed anywhere and pay a full-price cache write the
+    /// next real turn never reads — so the warmer declines rather than spend
+    /// money on a coin flip. The fact is resolved by the arming site from the
+    /// catalog dialect plus the effective affinity (the policy itself never
+    /// reads that registry, so it stays pure and deterministic).
+    pub affinity_downgraded: bool,
 }
 
 /// A resolved warm plan: an inactive plan carrying its [`SkipReason`], or an
@@ -319,6 +331,9 @@ pub enum SkipReason {
     /// The ping would land past the refresh deadline (a late ping is a
     /// money-losing cache write).
     DeadlineMissed,
+    /// The provider rejected the per-session cache-affinity hint, so the ping
+    /// cannot be trusted to land on a backend holding the prefix cache.
+    AffinityUnavailable,
     /// The request changed in a way that invalidates the plan (reserved for the
     /// warmer thread; the policy itself never produces this).
     ContextChanged,
@@ -336,6 +351,7 @@ impl fmt::Display for SkipReason {
             Self::BelowThreshold => "the request is below the savings threshold",
             Self::EconomicsUnavailable => "token prices are unavailable",
             Self::DeadlineMissed => "the refresh deadline was missed",
+            Self::AffinityUnavailable => "the provider rejected the cache-affinity hint",
             Self::ContextChanged => "the request context changed",
         };
         f.write_str(text)
@@ -360,6 +376,7 @@ impl SkipReason {
             Self::BelowThreshold => "below_threshold",
             Self::EconomicsUnavailable => "economics_unavailable",
             Self::DeadlineMissed => "deadline_missed",
+            Self::AffinityUnavailable => "affinity_unavailable",
             Self::ContextChanged => "context_changed",
         }
     }
@@ -466,6 +483,17 @@ fn ineligibility(policy: WarmPolicy, facts: WarmFacts) -> Option<SkipReason> {
     }
     if !policy.prompt_cache_enabled {
         return Some(SkipReason::CachingDisabled);
+    }
+    // The catalog opted this provider into a per-session affinity hint, but the
+    // provider rejected it, so the hint is withheld and a warm ping is no longer
+    // known to reach the backend that holds the prefix. Resolved here (rather
+    // than in the meter gate) because it is a static property of the request: a
+    // timer armed for a ping that would never be sent is pure waste, and this
+    // way the decline is reported the moment the plan is armed. Every provider
+    // whose catalog affinity is `Off` never sets the fact, so its warming is
+    // unaffected.
+    if facts.affinity_downgraded {
+        return Some(SkipReason::AffinityUnavailable);
     }
     if !facts.replayable {
         return Some(SkipReason::NotReplayable);
