@@ -806,6 +806,8 @@ surfaces a re-login notice.
 [[account]]
 name = "main"
 provider = "openai"
+prompt_cache_affinity = true   # force the per-session cache-affinity body field on/off
+                               # (omitted = follow the provider catalog's capability)
 
 [[account]]
 name = "claude"
