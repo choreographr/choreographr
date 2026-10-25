@@ -27,6 +27,7 @@ use tracing::debug;
 
 use super::{ModelCost, ModelEntry, ProviderEntry, ProviderProtocol};
 use crate::retry::RequestCompression;
+use crate::session_routing::CacheAffinity;
 use crate::shared::MaxTokensField;
 use choreo_proto::ChatReasoningField;
 
@@ -355,6 +356,10 @@ fn normalize_provider(slug: String, raw: RawProvider) -> ProviderEntry {
         // carries nothing about request encodings, so every provider starts on
         // the identity default.
         request_compression: RequestCompression::Identity,
+        // Cache-affinity routing dialect is overlay policy, never a base fact —
+        // models.dev carries nothing about session-routing hints, so every
+        // provider starts with no hint.
+        cache_affinity: CacheAffinity::Off,
         // OAuth profiles are overlay policy, never a base fact — models.dev
         // carries nothing about authorization servers.
         oauth: None,

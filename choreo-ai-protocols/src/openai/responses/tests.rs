@@ -154,6 +154,8 @@ fn responses_request_serializes_with_store_true() {
         previous_response_id: None,
         parallel_tool_calls: None,
         tool_choice: None,
+        prompt_cache_key: None,
+        session_id: None,
     };
     let value = serde_json::to_value(&req).unwrap();
     assert_eq!(value["store"], true);
@@ -186,6 +188,8 @@ fn responses_request_serializes_with_tools() {
         previous_response_id: None,
         parallel_tool_calls: None,
         tool_choice: None,
+        prompt_cache_key: None,
+        session_id: None,
     };
     let value = serde_json::to_value(&req).unwrap();
     let tools = value["tools"].as_array().unwrap();
@@ -216,6 +220,8 @@ fn responses_request_serializes_with_programmatic_tool_calling() {
         previous_response_id: None,
         parallel_tool_calls: None,
         tool_choice: None,
+        prompt_cache_key: None,
+        session_id: None,
     };
     let value = serde_json::to_value(&req).unwrap();
     let tools = value["tools"].as_array().unwrap();
@@ -239,6 +245,8 @@ fn responses_request_omits_optional_fields_when_none() {
         previous_response_id: None,
         parallel_tool_calls: None,
         tool_choice: None,
+        prompt_cache_key: None,
+        session_id: None,
     };
     let value = serde_json::to_value(&req).unwrap();
     let obj = value.as_object().unwrap();

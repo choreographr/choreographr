@@ -667,6 +667,8 @@ fn chat_completions_request_omits_reasoning_effort_when_none() {
         max_tokens: None,
         max_completion_tokens: None,
         reasoning_effort: None,
+        prompt_cache_key: None,
+        session_id: None,
     })
     .unwrap();
     assert!(body.get("reasoning_effort").is_none(), "should be omitted");
@@ -1428,6 +1430,8 @@ fn max_tokens_override_lands_in_the_models_output_field() {
             max_tokens,
             max_completion_tokens,
             reasoning_effort: None,
+            prompt_cache_key: None,
+            session_id: None,
         })
         .unwrap()
     };
@@ -1449,4 +1453,77 @@ fn max_tokens_override_lands_in_the_models_output_field() {
     let body = serialize("legacy-gpt", &config, Some(1));
     assert_eq!(body["max_tokens"], 1);
     assert!(body.get("max_completion_tokens").is_none(), "{body}");
+}
+
+// -- per-session cache affinity -------------------------------------
+
+/// Build a plain, non-streaming body through the shared builder for one
+/// affinity dialect and session id.
+fn affinity_body(affinity: crate::CacheAffinity, session_id: Option<&str>) -> serde_json::Value {
+    let config = super::super::ServiceConfig {
+        cache_affinity: affinity,
+        ..Default::default()
+    };
+    let messages = [ChatRequestMessage::simple("user", "hi".into())];
+    build_chat_completions_body(
+        &config,
+        &ChatCompletionsBodyParams {
+            model: "gpt-5.4",
+            messages: &messages,
+            tools: None,
+            stream: false,
+            stream_options: None,
+            reasoning_effort: None,
+            max_output_tokens_override: None,
+            session_id,
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn body_carries_prompt_cache_key_for_the_prompt_cache_key_dialect() {
+    let body = affinity_body(
+        crate::CacheAffinity::PromptCacheKey,
+        Some("18446744073709551615"),
+    );
+    // The value is the REAL session id, never a constant.
+    assert_eq!(body["prompt_cache_key"], "18446744073709551615");
+    // The two affinity fields are mutually exclusive.
+    assert!(body.get("session_id").is_none(), "{body}");
+}
+
+#[test]
+fn body_carries_session_id_and_not_prompt_cache_key_for_openrouter() {
+    let body = affinity_body(
+        crate::CacheAffinity::OpenRouterSession,
+        Some("sess-abc_123"),
+    );
+    assert_eq!(body["session_id"], "sess-abc_123");
+    assert!(body.get("prompt_cache_key").is_none(), "{body}");
+}
+
+#[test]
+fn body_carries_no_affinity_field_when_off() {
+    let body = affinity_body(crate::CacheAffinity::Off, Some("1844"));
+    assert!(body.get("prompt_cache_key").is_none(), "{body}");
+    assert!(body.get("session_id").is_none(), "{body}");
+}
+
+#[test]
+fn body_omits_affinity_when_the_session_id_is_invalid_for_openrouter() {
+    // A space is outside OpenRouter's `[A-Za-z0-9_-]` charset, so the id must
+    // be dropped rather than sent as a value OpenRouter would ignore.
+    let body = affinity_body(crate::CacheAffinity::OpenRouterSession, Some("bad id"));
+    assert!(body.get("session_id").is_none(), "{body}");
+    assert!(body.get("prompt_cache_key").is_none(), "{body}");
+}
+
+#[test]
+fn body_sends_no_affinity_without_a_session_id() {
+    // The session-less one-shot prompt API sends no hint even when the provider
+    // dialect is set.
+    let body = affinity_body(crate::CacheAffinity::PromptCacheKey, None);
+    assert!(body.get("prompt_cache_key").is_none(), "{body}");
+    assert!(body.get("session_id").is_none(), "{body}");
 }

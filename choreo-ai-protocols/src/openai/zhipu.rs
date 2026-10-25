@@ -215,6 +215,8 @@ mod tests {
             max_tokens: None,
             max_completion_tokens: None,
             reasoning_effort: effort,
+            prompt_cache_key: None,
+            session_id: None,
         })
         .unwrap();
         assert_eq!(body["reasoning_effort"], "high");

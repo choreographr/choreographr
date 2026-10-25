@@ -190,6 +190,17 @@ pub(super) fn build_responses_request_body(
         None
     };
 
+    // The turn's real session id (the gateway route) drives per-session cache
+    // affinity; a `None` route means no hint regardless of the dialect.
+    let session_id = params.route.map(|(session_id, _request_id)| session_id);
+    let affinity = session_id.map_or_default(|session_id| {
+        crate::session_routing::cache_affinity_fields(
+            config.cache_affinity,
+            session_id,
+            params.model,
+        )
+    });
+
     let body = serde_json::to_value(&ResponsesRequest {
         model: params.model,
         input: input_value,
@@ -204,6 +215,8 @@ pub(super) fn build_responses_request_body(
         previous_response_id: params.previous_response_id,
         parallel_tool_calls: None,
         tool_choice,
+        prompt_cache_key: affinity.prompt_cache_key,
+        session_id: affinity.session_id,
     })
     .map_err(|e| super::super::OpenAiError::Io(io::Error::other(e)))?;
 
@@ -235,6 +248,9 @@ pub(super) fn build_simple_responses_body(
         previous_response_id: None,
         parallel_tool_calls: None,
         tool_choice: None,
+        // The one-shot prompt API carries no session, so no cache-affinity hint.
+        prompt_cache_key: None,
+        session_id: None,
     })
     .map_err(|e| super::super::OpenAiError::Io(io::Error::other(e)))?;
     Ok((url, body))

@@ -21,6 +21,7 @@ fn base() -> Vec<ProviderEntry> {
             default_model: "acme-base".into(),
             prompt_cache: None,
             request_compression: RequestCompression::Identity,
+            cache_affinity: CacheAffinity::Off,
             oauth: None,
             models: vec![
                 ModelEntry {
@@ -46,6 +47,7 @@ fn base() -> Vec<ProviderEntry> {
             default_model: "zoo-1".into(),
             prompt_cache: None,
             request_compression: RequestCompression::Identity,
+            cache_affinity: CacheAffinity::Off,
             oauth: None,
             models: vec![ModelEntry {
                 model: "zoo-1".into(),

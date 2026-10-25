@@ -1,5 +1,6 @@
 use super::{MaxTokensField, OpenAiClient, RequestAuth, RequestFormat};
 use crate::retry::RequestCompression;
+use crate::session_routing::CacheAffinity;
 use choreo_proto::ContextConfig;
 use std::{collections::HashMap, io};
 
@@ -94,6 +95,12 @@ pub struct ServiceConfig {
     /// Only consulted for the chat-turn paths — the image-generation paths
     /// always send identity.
     pub request_compression: RequestCompression,
+    /// Which per-session cache-affinity body field this provider accepts, if
+    /// any (see [`CacheAffinity`]). Defaults to [`CacheAffinity::Off`]; the
+    /// daemon sets it from the provider catalog's overlay policy. Consulted for
+    /// the chat-turn paths only, and only when the turn carries a real session
+    /// id (the session-less one-shot prompt API sends no hint).
+    pub cache_affinity: CacheAffinity,
 }
 
 impl Default for ServiceConfig {
@@ -125,6 +132,7 @@ impl Default for ServiceConfig {
             programmatic_tool_calling: false,
             user_agent: None,
             request_compression: RequestCompression::Identity,
+            cache_affinity: CacheAffinity::Off,
         }
     }
 }

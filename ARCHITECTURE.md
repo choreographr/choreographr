@@ -604,7 +604,8 @@ URLs, and per-model context/reasoning/cost data), and a **bundled policy
 overlay** (`catalog/models-overlay.toml`) supplies everything models.dev cannot
 express (wire-protocol selection, endpoint and default-model policy, per-model
 passback exceptions, the prompt-cache TTL tiers, the request-body-compression
-opt-in, and the wholesale overlay-only providers models.dev does not cover). The overlay is merged **at load time**,
+opt-in, the per-session cache-affinity dialect, and the wholesale overlay-only
+providers models.dev does not cover). The overlay is merged **at load time**,
 never baked into the committed blob `catalog/catalog.bin`, so the runtime
 refresh (S4) can re-merge the same base with a user overlay. The pipeline, the
 per-model normalization, the exact overlay schema, and the merge precedence
@@ -843,6 +844,37 @@ provider — or a gateway in front of one — that answers `400` for an unsuppor
 `Content-Encoding` therefore keeps failing until its `request_compression` is
 removed by hand.
 
+### Per-session cache affinity
+
+Some OpenAI-compatible providers accept a **session identifier** in the request
+body as a routing hint: requests sharing it are more likely to reach the same
+backend, whose prompt cache is then warm for their shared prefix. The hint's
+wire shape is per provider, so it is modelled as a capability
+(`choreo-ai-protocols::CacheAffinity`) selected by the `cache_affinity` scalar on
+that provider's `[provider.<slug>]` overlay entry — `off` (the default),
+`prompt-cache-key` (the top-level `prompt_cache_key` field), or
+`openrouter-session` (`OpenRouter`'s preferred top-level `session_id`). The
+overlay pins `openai` and `venice` to `prompt-cache-key` and `openrouter` to
+`openrouter-session`; every other provider stays `off`, in particular `deepseek`
+and `google` (automatic prefix/implicit cache needs no key), `anthropic`
+(`cache_control`, already per-block), and the `opencode` slugs (they already
+route per session via the `x-opencode-session` headers — the affinity field must
+not duplicate that path).
+
+The value is always the daemon's **real per-session id**, taken from
+`ChatTurnRequest::session_id` and filled in by the single chat-completions body
+builder and the Responses body builder. A *constant* key would be wrong: on older
+OpenAI models it would pin every session to one routing bucket, and on GPT-5.6+
+models — where the key separates cache *accounting* while routing is by a hash of
+the prompt tokens — it would merely partition the accounting rather than improve
+routing. The session-less one-shot prompt API sends no hint. `OpenRouter` ignores
+an id outside `[A-Za-z0-9_-]` or longer than 256 bytes, so the resolver validates
+and omits an invalid id instead of sending a value the provider would drop. The
+dialect and its validation live in `choreo-ai-protocols/src/session_routing.rs`.
+Like the compression coding, the dialect is baked into the provider client at
+construction, so an overlay edit reaches live sessions through the catalog-swap
+client invalidation (`client_config_changed` compares it).
+
 #### Transient gateway 400 (message content)
 
 The opencode.ai zen/go gateway validates message *content* on only some of its
@@ -913,8 +945,9 @@ ModelsRefreshed` with `RefreshStatus`, or `ModelsRefreshFailed`; a burst of
 requests is coalesced into one fetch) and `CatalogUpdated`, broadcast on every
 catalog swap to all activity subscribers so the TUI's provider picker tracks the
 live catalog. A swap is not a bare table replacement: because a provider client
-bakes its catalog entry's protocol, base URL, and `request_compression` in at
-construction (and caches itself on the session), the command loop compares the
+bakes its catalog entry's protocol, base URL, `request_compression`, and
+`cache_affinity` in at construction (and caches itself on the session), the
+command loop compares the
 pre- and post-swap entries and sends `DropProvider` to every session whose
 account's provider had one of those change — or vanish — so an overlay edit
 reaches a live session's next request instead of being masked by a stale

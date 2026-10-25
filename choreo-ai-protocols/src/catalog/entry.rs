@@ -13,6 +13,7 @@ use choreo_proto::ChatReasoningField;
 use serde::{Deserialize, Serialize};
 
 use crate::retry::RequestCompression;
+use crate::session_routing::CacheAffinity;
 use crate::shared::MaxTokensField;
 
 /// How reasoning is replayed back to the provider on subsequent turns.
@@ -348,6 +349,14 @@ pub struct ProviderEntry {
     /// decision.
     #[serde(default)]
     pub request_compression: RequestCompression,
+    /// Which per-session cache-affinity body field this provider accepts, if
+    /// any — overlay policy; models.dev carries no routing-hint fact. Defaults
+    /// to [`CacheAffinity::Off`], so a provider the overlay does not pin is sent
+    /// no session hint. The value is the session identifier dialect the provider
+    /// documents (`prompt_cache_key` or `OpenRouter`'s `session_id`), not a key
+    /// itself: the real per-session id is filled in at request time.
+    #[serde(default)]
+    pub cache_affinity: CacheAffinity,
     /// The provider's OAuth profile, when it can be signed into with OAuth.
     /// Overlay-only policy (models.dev carries no OAuth facts); its presence is
     /// what makes [`ProviderEntry::auth_kind`] report [`AuthKind::OAuth`].

@@ -82,6 +82,15 @@ pub(crate) struct ResponsesRequest<'a> {
     pub(crate) parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tool_choice: Option<serde_json::Value>,
+    /// Per-session cache-affinity hint for providers that accept it (see
+    /// [`crate::CacheAffinity`]); omitted when the provider's dialect is not
+    /// `prompt-cache-key` or the turn has no session id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) prompt_cache_key: Option<&'a str>,
+    /// Per-session cache-affinity hint in `OpenRouter`'s dialect (top-level
+    /// `session_id`). At most one of the two affinity fields is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<&'a str>,
 }
 
 /// Raw Responses API response envelope.

@@ -4,7 +4,7 @@
 //! cache round-trip and a command-shape assertion cannot drift apart.
 
 use choreo_ai_protocols::{
-    MaxTokensField, ModelEntry, ProviderEntry, ProviderProtocol, RequestCompression,
+    CacheAffinity, MaxTokensField, ModelEntry, ProviderEntry, ProviderProtocol, RequestCompression,
 };
 
 /// A tiny two-provider base: small enough to assert on field-by-field, and
@@ -21,6 +21,7 @@ pub(super) fn tiny_base() -> Vec<ProviderEntry> {
             default_model: "acme-1".into(),
             prompt_cache: None,
             request_compression: RequestCompression::Identity,
+            cache_affinity: CacheAffinity::Off,
             oauth: None,
             models: vec![ModelEntry {
                 model: "acme-1".into(),
@@ -39,6 +40,7 @@ pub(super) fn tiny_base() -> Vec<ProviderEntry> {
             default_model: "zoo-1".into(),
             prompt_cache: None,
             request_compression: RequestCompression::Identity,
+            cache_affinity: CacheAffinity::Off,
             oauth: None,
             models: Vec::new(),
         },

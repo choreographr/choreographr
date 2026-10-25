@@ -9,7 +9,7 @@
 use tracing::debug;
 
 use super::retry;
-use super::{ChatRequestMessage, SseReader, endpoint_url};
+use super::{ChatRequestMessage, ChatToolDefinition, SseReader, endpoint_url};
 use crate::shared::RequestAuth;
 use crate::types::{ChatTurnResult, StreamEvent};
 use std::io;
@@ -38,6 +38,82 @@ use wire::*;
 mod turn;
 mod wire;
 
+// ── The one chat-completions body builder ───────────────────────────────
+
+/// The shape of one chat-completions request body, independent of the catalog
+/// and config policy the builder folds in.
+///
+/// Every chat-completions entry point (simple, tool-carrying, streaming and
+/// non-streaming) describes its body through this one struct and hands it to
+/// [`build_chat_completions_body`], so a request field is added in exactly one
+/// place and can never reach one path while being missed on another.
+pub(crate) struct ChatCompletionsBodyParams<'a> {
+    pub(crate) model: &'a str,
+    /// The canonical conversation; the builder lowers it to the wire messages
+    /// under the route's reasoning-echo policy.
+    pub(crate) messages: &'a [ChatRequestMessage],
+    pub(crate) tools: Option<&'a [ChatToolDefinition]>,
+    pub(crate) stream: bool,
+    pub(crate) stream_options: Option<ChatCompletionsStreamOptions>,
+    pub(crate) reasoning_effort: Option<&'a str>,
+    /// Per-call output-token cap (the cache-warming ping's `Some(1)`); `None`
+    /// leaves the provider/config default in place.
+    pub(crate) max_output_tokens_override: Option<u32>,
+    /// The real session id, or `None` on the session-less one-shot prompt API
+    /// (which sends no cache-affinity hint regardless of the configured dialect).
+    pub(crate) session_id: Option<&'a str>,
+}
+
+/// Build a serialized chat-completions request body from `config` and the
+/// per-request shape in `params`.
+///
+/// This is the single assembly point for every chat-completions path: it
+/// resolves the output-token field pair (with the optional per-call cap),
+/// lowers the messages through [`super::chat_wire_messages`], and resolves the
+/// per-session cache-affinity body fields from the configured
+/// [`crate::CacheAffinity`] dialect. A field added to the wire type is therefore
+/// populated identically on every path or not at all.
+///
+/// # Errors
+///
+/// Returns an [`super::OpenAiError::Io`] when the body cannot be serialized to
+/// JSON.
+pub(crate) fn build_chat_completions_body(
+    config: &super::ServiceConfig,
+    params: &ChatCompletionsBodyParams<'_>,
+) -> Result<serde_json::Value, super::OpenAiError> {
+    let (max_tokens, max_completion_tokens) =
+        config.max_tokens_field_pair_with_override(params.model, params.max_output_tokens_override);
+    // Lower the messages to the wire shape under this route's echo policy, so
+    // reasoning re-emission is decided once for every chat-completions path.
+    let wire = super::chat_wire_messages(
+        params.messages,
+        crate::catalog::chat_reasoning_echo(&config.provider_slug, params.model),
+    );
+    // The one-shot prompt API has no session id, so it sends no hint even when
+    // the provider's dialect is set; a real turn resolves the dialect here.
+    let affinity = params.session_id.map_or_default(|session_id| {
+        crate::session_routing::cache_affinity_fields(
+            config.cache_affinity,
+            session_id,
+            params.model,
+        )
+    });
+    serde_json::to_value(&ChatCompletionsRequest {
+        model: params.model,
+        messages: &wire.messages,
+        tools: params.tools,
+        stream: params.stream,
+        stream_options: params.stream_options,
+        max_tokens,
+        max_completion_tokens,
+        reasoning_effort: params.reasoning_effort,
+        prompt_cache_key: affinity.prompt_cache_key,
+        session_id: affinity.session_id,
+    })
+    .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))
+}
+
 // ── Simple (no-tool) chat completions request ────────────────────────────
 
 pub(crate) fn chat_completions_request(
@@ -49,27 +125,22 @@ pub(crate) fn chat_completions_request(
     cancel_rx: Option<&crossbeam_channel::Receiver<()>>,
 ) -> Result<String, super::OpenAiError> {
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
-    let (max_tokens_field, max_completion_tokens_field) = config.max_tokens_field_pair(model);
     let retry = retry::retry_config_from_config(config);
     let messages = [ChatRequestMessage::simple("user", prompt.to_string())];
-    // The route's reasoning-echo policy shapes every message on the wire; a
-    // prompt-only request carries no assistant message, so it is a no-op here,
-    // but it must still go through the same lowering as every other body.
-    let wire = super::chat_wire_messages(
-        &messages,
-        crate::catalog::chat_reasoning_echo(&config.provider_slug, model),
-    );
-    let body = serde_json::to_value(&ChatCompletionsRequest {
-        model,
-        messages: &wire.messages,
-        tools: None,
-        stream: false,
-        stream_options: None,
-        max_tokens: max_tokens_field,
-        max_completion_tokens: max_completion_tokens_field,
-        reasoning_effort: None,
-    })
-    .map_err(io::Error::other)?;
+    // The one-shot prompt API carries no session, so no cache-affinity hint.
+    let body = build_chat_completions_body(
+        config,
+        &ChatCompletionsBodyParams {
+            model,
+            messages: &messages,
+            tools: None,
+            stream: false,
+            stream_options: None,
+            reasoning_effort: None,
+            max_output_tokens_override: None,
+            session_id: None,
+        },
+    )?;
     // Hoist the no-op retry callback into a named local: a bare `&mut None`
     // temporary would be dropped before the retry call below (E0716).
     let mut no_retry = None;
@@ -142,24 +213,21 @@ pub(crate) fn chat_completions_request_with_tools(
     } = params;
     let start = std::time::Instant::now();
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
-    let (max_tokens_field, max_completion_tokens_field) =
-        config.max_tokens_field_pair_with_override(model, max_output_tokens_override);
     let retry = retry::retry_config_from_config(config).with_no_retry(no_retry);
-    let wire = super::chat_wire_messages(
-        messages,
-        crate::catalog::chat_reasoning_echo(&config.provider_slug, model),
-    );
-    let body = serde_json::to_value(&ChatCompletionsRequest {
-        model,
-        messages: &wire.messages,
-        tools: Some(tools),
-        stream: false,
-        stream_options: None,
-        max_tokens: max_tokens_field,
-        max_completion_tokens: max_completion_tokens_field,
-        reasoning_effort,
-    })
-    .map_err(io::Error::other)?;
+    let body = build_chat_completions_body(
+        config,
+        &ChatCompletionsBodyParams {
+            model,
+            messages,
+            tools: Some(tools),
+            stream: false,
+            stream_options: None,
+            reasoning_effort,
+            max_output_tokens_override,
+            // The turn's real session id drives per-session cache affinity.
+            session_id: route.map(|(session_id, _request_id)| session_id),
+        },
+    )?;
     // The upload hook fires once the payload is fully sent, so a non-streaming
     // provider reports the same `Waiting` boundary as the streaming path.
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, None);
@@ -212,26 +280,24 @@ where
         cancel_rx,
     } = params;
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
-    let (max_tokens_field, max_completion_tokens_field) = config.max_tokens_field_pair(model);
     let retry = retry::retry_config_from_config(config);
     let messages = [ChatRequestMessage::simple("user", prompt.to_string())];
-    let wire = super::chat_wire_messages(
-        &messages,
-        crate::catalog::chat_reasoning_echo(&config.provider_slug, model),
-    );
-    let body = serde_json::to_value(&ChatCompletionsRequest {
-        model,
-        messages: &wire.messages,
-        tools: None,
-        stream: true,
-        stream_options: Some(ChatCompletionsStreamOptions {
-            include_usage: true,
-        }),
-        max_tokens: max_tokens_field,
-        max_completion_tokens: max_completion_tokens_field,
-        reasoning_effort,
-    })
-    .map_err(io::Error::other)?;
+    // The one-shot prompt API carries no session, so no cache-affinity hint.
+    let body = build_chat_completions_body(
+        config,
+        &ChatCompletionsBodyParams {
+            model,
+            messages: &messages,
+            tools: None,
+            stream: true,
+            stream_options: Some(ChatCompletionsStreamOptions {
+                include_usage: true,
+            }),
+            reasoning_effort,
+            max_output_tokens_override: None,
+            session_id: None,
+        },
+    )?;
     // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
     // Hoist the no-op retry callback into a named local: a bare `&mut None`
@@ -348,33 +414,30 @@ where
         ..
     } = params;
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
-    let (max_tokens_field, max_completion_tokens_field) =
-        config.max_tokens_field_pair_with_override(model, max_output_tokens_override);
     let retry = retry::retry_config_from_config(config).with_no_retry(no_retry);
-    let wire = super::chat_wire_messages(
-        messages,
-        crate::catalog::chat_reasoning_echo(&config.provider_slug, model),
-    );
-    let body = serde_json::to_value(&ChatCompletionsRequest {
-        model,
-        messages: &wire.messages,
-        tools: Some(tools),
-        stream: true,
-        // Configurable stream_options — some OpenAI-compatible providers
-        // reject the `stream_options` field entirely, so users can disable
-        // it per-account to maintain compatibility.
-        stream_options: if config.stream_options {
-            Some(ChatCompletionsStreamOptions {
-                include_usage: true,
-            })
-        } else {
-            None
+    let body = build_chat_completions_body(
+        config,
+        &ChatCompletionsBodyParams {
+            model,
+            messages,
+            tools: Some(tools),
+            stream: true,
+            // Configurable stream_options — some OpenAI-compatible providers
+            // reject the `stream_options` field entirely, so users can disable
+            // it per-account to maintain compatibility.
+            stream_options: if config.stream_options {
+                Some(ChatCompletionsStreamOptions {
+                    include_usage: true,
+                })
+            } else {
+                None
+            },
+            reasoning_effort,
+            max_output_tokens_override,
+            // The turn's real session id drives per-session cache affinity.
+            session_id: route.map(|(session_id, _request_id)| session_id),
         },
-        max_tokens: max_tokens_field,
-        max_completion_tokens: max_completion_tokens_field,
-        reasoning_effort,
-    })
-    .map_err(io::Error::other)?;
+    )?;
     // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));

@@ -27,20 +27,22 @@ pub use auth::ProviderAuth;
 /// Whether a catalog swap changed anything [`InferenceProvider::from_account_config`]
 /// bakes into a provider *client*.
 ///
-/// The constructor reads exactly three catalog fields — the protocol (which
+/// The constructor reads exactly four catalog fields — the protocol (which
 /// selects the client type and carries the `OpenAI` `max_tokens_field`), the base
-/// URL, and the request-body compression coding. A change in any of them makes
-/// an already-built client for this slug stale, so a catalog swap must rebuild
-/// it. Everything else on the entry (the curated model list, contexts, costs,
-/// `default_model`, prompt-cache TTLs) is resolved live per request and is
-/// deliberately excluded here: those change on an ordinary models.dev refresh,
-/// and invalidating every session then would tear down warm connection pools
-/// for nothing. The slug is the map key, so it is not compared here.
+/// URL, the request-body compression coding, and the cache-affinity dialect. A
+/// change in any of them makes an already-built client for this slug stale, so a
+/// catalog swap must rebuild it. Everything else on the entry (the curated model
+/// list, contexts, costs, `default_model`, prompt-cache TTLs) is resolved live
+/// per request and is deliberately excluded here: those change on an ordinary
+/// models.dev refresh, and invalidating every session then would tear down warm
+/// connection pools for nothing. The slug is the map key, so it is not compared
+/// here.
 #[must_use]
 pub(crate) fn client_config_changed(before: &ProviderEntry, after: &ProviderEntry) -> bool {
     before.protocol != after.protocol
         || before.base_url != after.base_url
         || before.request_compression != after.request_compression
+        || before.cache_affinity != after.cache_affinity
 }
 
 /// A concrete, protocol-erased provider facade.
@@ -184,6 +186,10 @@ impl InferenceProvider {
                     // overlay marks this provider as accepting compressed
                     // request bodies (identity otherwise — the safe default).
                     request_compression: entry.request_compression,
+                    // Attach the per-session cache-affinity body field the
+                    // provider documents (none by default), filled with the
+                    // turn's real session id at request time.
+                    cache_affinity: entry.cache_affinity,
                     ..Default::default()
                 };
                 config.apply_overrides(&mut svc_config);

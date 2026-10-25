@@ -13,6 +13,9 @@
 //! display_name = "DeepSeek"            # only needed for new providers
 //! prompt_cache_short = 300             # provider-level TTL default, seconds
 //! prompt_cache_long = 3600
+//! cache_affinity = "prompt-cache-key"  # off | prompt-cache-key | openrouter-session
+//!                                      # per-session cache-affinity body field the
+//!                                      # provider accepts (default off)
 //!
 //! [provider.opencode.models."gpt-5.4"]
 //! responses = true
@@ -75,6 +78,7 @@ use super::{
     GrantEncoding, ModelEntry, OAuthProfile, ProviderEntry, ProviderProtocol, ReasoningPassback,
 };
 use crate::retry::RequestCompression;
+use crate::session_routing::CacheAffinity;
 use crate::shared::MaxTokensField;
 use choreo_proto::ChatReasoningField;
 
@@ -127,6 +131,7 @@ pub fn merge_overlay(base: &[ProviderEntry], overlay_src: &str) -> Vec<ProviderE
                 models: Vec::new(),
                 prompt_cache: None,
                 request_compression: RequestCompression::Identity,
+                cache_affinity: CacheAffinity::Off,
                 oauth: None,
             };
             apply_provider_overlay(&mut entry, table, &mut models_touched);
@@ -207,6 +212,20 @@ fn apply_provider_overlay(
                     warn!(
                         slug = %entry.slug,
                         "overlay: prompt_cache_long is not an integer; skipping",
+                    );
+                }
+            }
+            // Cache-affinity routing dialect: provider policy models.dev cannot
+            // express. The tokens are the `CacheAffinity` overlay spellings;
+            // `off` (or any unrecognized value) sends no session hint, the safe
+            // default since the field is ignored by some providers.
+            "cache_affinity" => {
+                if let Some(affinity) = value.as_str().and_then(CacheAffinity::from_overlay_str) {
+                    entry.cache_affinity = affinity;
+                } else {
+                    warn!(
+                        slug = %entry.slug,
+                        "overlay: cache_affinity must be \"off\", \"prompt-cache-key\", or \"openrouter-session\"; skipping",
                     );
                 }
             }

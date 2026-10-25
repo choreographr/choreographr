@@ -62,6 +62,7 @@ pub(crate) mod download;
 // both the image and video fal adapters.
 pub(crate) mod fal;
 mod overrides;
+mod session_routing;
 mod shared;
 mod stream;
 mod traits;
@@ -102,6 +103,7 @@ pub use openai::{AllowedCaller, OpenAiClient, RequestFormat, ServiceConfig};
 pub use choreo_sockreg::SocketRegistry;
 pub use overrides::ProviderOverrides;
 pub use retry::{RequestCompression, RequestUploadedCallback, RetryCallback};
+pub use session_routing::CacheAffinity;
 pub use shared::{MaxTokensField, ProviderError, RequestAuth};
 pub use traits::{ChatTurnRequest, ProviderClient, ToolResultItem};
 pub use types::{

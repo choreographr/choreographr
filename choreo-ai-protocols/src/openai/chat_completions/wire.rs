@@ -36,9 +36,20 @@ where
     pub(crate) max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning_effort: Option<&'a str>,
+    /// Per-session cache-affinity hint for OpenAI-compatible providers that
+    /// accept it (see [`crate::CacheAffinity`]). Omitted when
+    /// the provider's dialect is not `prompt-cache-key` or the turn has no
+    /// session id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) prompt_cache_key: Option<&'a str>,
+    /// Per-session cache-affinity hint in `OpenRouter`'s dialect, which uses a
+    /// top-level `session_id` instead of `prompt_cache_key`. At most one of the
+    /// two affinity fields is set for a given request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<&'a str>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub(crate) struct ChatCompletionsStreamOptions {
     pub(crate) include_usage: bool,
 }

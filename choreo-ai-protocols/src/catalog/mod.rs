@@ -182,6 +182,7 @@ pub(crate) mod test_util {
             default_model: "tiny-model".into(),
             prompt_cache: None,
             request_compression: RequestCompression::Identity,
+            cache_affinity: crate::session_routing::CacheAffinity::Off,
             oauth: None,
             models: vec![crate::catalog::ModelEntry {
                 model: "tiny-model".into(),

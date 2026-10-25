@@ -305,7 +305,7 @@ impl Drop for CatalogGuard {
 fn install_catalog() -> CatalogGuard {
     use choreo_ai_protocols::catalog::ModelEntry;
     use choreo_ai_protocols::openai::MaxTokensField;
-    use choreo_ai_protocols::{ProviderEntry, ProviderProtocol, RequestCompression};
+    use choreo_ai_protocols::{CacheAffinity, ProviderEntry, ProviderProtocol, RequestCompression};
 
     let saved = choreo_ai_protocols::catalog_snapshot();
     let entry = ProviderEntry {
@@ -318,6 +318,7 @@ fn install_catalog() -> CatalogGuard {
         default_model: OAUTH_MODEL.into(),
         prompt_cache: None,
         request_compression: RequestCompression::Identity,
+        cache_affinity: CacheAffinity::Off,
         oauth: None,
         models: vec![ModelEntry {
             model: OAUTH_MODEL.into(),
