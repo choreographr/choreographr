@@ -91,10 +91,12 @@ pub(crate) fn build_chat_completions_body(
         crate::catalog::chat_reasoning_echo(&config.provider_slug, params.model),
     );
     // The one-shot prompt API has no session id, so it sends no hint even when
-    // the provider's dialect is set; a real turn resolves the dialect here.
+    // the provider's dialect is set; a real turn resolves the dialect here. The
+    // dialect is filtered through the rejection registry so a provider that
+    // answered a 400 to this field stops receiving it for the process.
     let affinity = params.session_id.map_or_default(|session_id| {
         crate::session_routing::cache_affinity_fields(
-            config.cache_affinity,
+            config.effective_cache_affinity(),
             session_id,
             params.model,
         )

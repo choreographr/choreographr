@@ -191,11 +191,13 @@ pub(super) fn build_responses_request_body(
     };
 
     // The turn's real session id (the gateway route) drives per-session cache
-    // affinity; a `None` route means no hint regardless of the dialect.
+    // affinity; a `None` route means no hint regardless of the dialect. The
+    // dialect is filtered through the rejection registry so a provider that
+    // answered a 400 to this field stops receiving it for the process.
     let session_id = params.route.map(|(session_id, _request_id)| session_id);
     let affinity = session_id.map_or_default(|session_id| {
         crate::session_routing::cache_affinity_fields(
-            config.cache_affinity,
+            config.effective_cache_affinity(),
             session_id,
             params.model,
         )

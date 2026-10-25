@@ -193,6 +193,12 @@ impl InferenceProvider {
                     ..Default::default()
                 };
                 config.apply_overrides(&mut svc_config);
+                // The protocol-agnostic carrier the Anthropic and Google adapters
+                // also consume. OpenAI's other shared overrides are applied
+                // directly by `AccountConfig::apply_overrides` above; this adds
+                // the carrier fields OpenAI alone reads — the per-session
+                // cache-affinity override.
+                svc_config.apply_overrides(&config.provider_overrides());
                 // Image generation is API-key-only, so capture the key (if any)
                 // BEFORE consuming the grant: an OAuth-only account simply has
                 // no image backend. The daemon-side grant is then projected

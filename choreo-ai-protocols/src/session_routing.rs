@@ -27,10 +27,22 @@
 //! and, on the newer models, split cache accounting apart. Only the daemon's
 //! real session id gives each conversation its own affinity.
 
-use tracing::debug;
+use std::collections::HashSet;
+use std::sync::{LazyLock, RwLock};
+
+use tracing::{debug, warn};
 
 /// Maximum length of an `OpenRouter` session id, per its documented constraint.
 const OPENROUTER_SESSION_MAX_LEN: usize = 256;
+
+/// The top-level body field that carries the [`CacheAffinity::PromptCacheKey`]
+/// dialect. Named once so the rejection detector and the resolver agree on the
+/// exact spelling a 400 must mention.
+pub(crate) const PROMPT_CACHE_KEY_FIELD: &str = "prompt_cache_key";
+
+/// The top-level body field that carries the [`CacheAffinity::OpenRouterSession`]
+/// dialect.
+const SESSION_ID_FIELD: &str = "session_id";
 
 /// Which request-body field (if any) a provider accepts as a per-session
 /// cache-affinity hint.
@@ -152,6 +164,110 @@ fn is_valid_openrouter_session_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// Provider slugs whose endpoint answered the affinity body field with an HTTP
+/// 400 naming that field, i.e. reject the hint rather than ignore it.
+///
+/// [`effective_cache_affinity`] reads this before a request body is built and
+/// [`note_cache_affinity_rejected`] inserts into it once a 400 is final, so one
+/// rejected request permanently (for the process) stops that provider from
+/// receiving the field — resending a parameter the server rejects can only
+/// waste a turn. A provider that *ignores* an unknown field never appears here
+/// (it answers 2xx), so only a genuine rejection downgrades.
+///
+/// This is a process-wide behavioral cache: every request of an
+/// affinity-opted-in provider consults it (a shared read lock — the
+/// [`CacheAffinity::Off`] default skips the lookup entirely), and only a
+/// matching 400 writes it (a write lock, once per provider), so readers never
+/// contend with one another.
+/// It is single-purpose bookkeeping that carries no protocol data (a set of
+/// provider slugs); the lock recovery follows AGENTS.md's poisoned-lock rule,
+/// with a lost entry an acceptable failure mode for a downgrade hint.
+static AFFINITY_REJECTED: LazyLock<RwLock<HashSet<String>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
+
+/// The cache affinity to actually use for `slug`: `configured`, unless this
+/// process has already learned from a 400 that `slug` rejects the field.
+///
+/// The resolved precedence, lowest priority first, is the rejection registry
+/// (which can only withhold a hint), then the catalog's `cache_affinity`
+/// dialect carried in `configured`, then the per-account override already folded
+/// into `configured` at construction. Because the override is applied to
+/// `configured` before this lookup, a forced-on hint still reaches a provider
+/// that has not rejected it, while a rejection keeps it off even when forced.
+///
+/// `Off` short-circuits **before** taking the lock, so a provider that never
+/// opted in never pays for the lookup.
+#[must_use]
+pub(crate) fn effective_cache_affinity(slug: &str, configured: CacheAffinity) -> CacheAffinity {
+    if configured == CacheAffinity::Off {
+        return CacheAffinity::Off;
+    }
+    let rejected = AFFINITY_REJECTED
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(slug);
+    if rejected {
+        CacheAffinity::Off
+    } else {
+        configured
+    }
+}
+
+/// Record that `slug` rejected the affinity field `field`, so future requests
+/// send no hint. Warns once per slug, naming only the provider and the field
+/// (never the request or response body).
+pub(crate) fn note_cache_affinity_rejected(slug: &str, field: &str) {
+    let fresh = AFFINITY_REJECTED
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(slug.to_string());
+    if fresh {
+        warn!(
+            provider = %slug,
+            field = %field,
+            "provider rejected the per-session cache-affinity field (HTTP 400); \
+             omitting it for the rest of this process",
+        );
+    }
+}
+
+/// The affinity field name present in a built request body, if any.
+///
+/// Both wire spellings are mutually exclusive on a body, so the first match is
+/// the one that was actually sent — the field a 400 must name to count as a
+/// rejection of the hint rather than of something else in the request.
+pub(crate) fn sent_affinity_field(body: &serde_json::Value) -> Option<&'static str> {
+    if body.get(PROMPT_CACHE_KEY_FIELD).is_some() {
+        Some(PROMPT_CACHE_KEY_FIELD)
+    } else if body.get(SESSION_ID_FIELD).is_some() {
+        Some(SESSION_ID_FIELD)
+    } else {
+        None
+    }
+}
+
+/// The affinity field a terminal response rejects, or `None` when it is not a
+/// genuine rejection of the hint that was sent.
+///
+/// A response counts only when it is an HTTP **400** *and* its extracted detail
+/// mentions the very field carried by `body` (`prompt_cache_key`, or `session_id`
+/// for the `OpenRouter` dialect). Any other status (429, 5xx, a different 4xx)
+/// and any 400 that does not name the sent field — a malformed request, an
+/// unknown model, an unrelated schema error — returns `None`, so nothing else
+/// downgrades. `body` is inspected, never logged.
+#[must_use]
+pub(crate) fn affinity_rejection_field(
+    body: &serde_json::Value,
+    status: u16,
+    detail: &str,
+) -> Option<&'static str> {
+    if status != 400 {
+        return None;
+    }
+    let field = sent_affinity_field(body)?;
+    detail.contains(field).then_some(field)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +340,118 @@ mod tests {
         // Exactly at the limit is still valid.
         let at_limit = "a".repeat(OPENROUTER_SESSION_MAX_LEN);
         assert!(is_valid_openrouter_session_id(&at_limit));
+    }
+
+    // -- the rejection registry ---------------------------------------
+    //
+    // The static is process-wide, so every case below uses its OWN slug: cargo
+    // nextest runs each test in a fresh process, but libtest does not, and a
+    // shared slug would let one test's rejection leak into another's assertion.
+
+    #[test]
+    fn effective_affinity_stays_configured_before_any_rejection() {
+        // A never-rejected slug keeps the configured dialect.
+        assert_eq!(
+            effective_cache_affinity("affinity-clean-slug", CacheAffinity::PromptCacheKey),
+            CacheAffinity::PromptCacheKey,
+        );
+    }
+
+    #[test]
+    fn effective_affinity_is_off_after_a_rejection() {
+        // A rejection recorded for this slug downgrades it for the rest of the
+        // process, for every dialect it might have been configured with.
+        note_cache_affinity_rejected("affinity-rejected-slug", PROMPT_CACHE_KEY_FIELD);
+        assert_eq!(
+            effective_cache_affinity("affinity-rejected-slug", CacheAffinity::PromptCacheKey),
+            CacheAffinity::Off,
+        );
+        assert_eq!(
+            effective_cache_affinity("affinity-rejected-slug", CacheAffinity::OpenRouterSession),
+            CacheAffinity::Off,
+        );
+    }
+
+    #[test]
+    fn off_provider_is_never_downgraded() {
+        // `Off` short-circuits before the registry lookup, so it stays `Off`
+        // whether or not the slug has a recorded rejection.
+        assert_eq!(
+            effective_cache_affinity("affinity-off-slug", CacheAffinity::Off),
+            CacheAffinity::Off,
+        );
+        note_cache_affinity_rejected("affinity-off-slug", PROMPT_CACHE_KEY_FIELD);
+        assert_eq!(
+            effective_cache_affinity("affinity-off-slug", CacheAffinity::Off),
+            CacheAffinity::Off,
+        );
+    }
+
+    #[test]
+    fn sent_affinity_field_reads_the_body() {
+        let prompt = serde_json::json!({ "prompt_cache_key": "42" });
+        assert_eq!(sent_affinity_field(&prompt), Some(PROMPT_CACHE_KEY_FIELD));
+        let openrouter = serde_json::json!({ "session_id": "abc-123" });
+        assert_eq!(sent_affinity_field(&openrouter), Some(SESSION_ID_FIELD));
+        let neither = serde_json::json!({ "model": "gpt-5.4" });
+        assert_eq!(sent_affinity_field(&neither), None);
+    }
+
+    #[test]
+    fn a_400_naming_the_sent_field_is_a_rejection() {
+        let body = serde_json::json!({ "prompt_cache_key": "42" });
+        assert_eq!(
+            affinity_rejection_field(
+                &body,
+                400,
+                "Unrecognized request argument supplied: prompt_cache_key",
+            ),
+            Some(PROMPT_CACHE_KEY_FIELD),
+        );
+    }
+
+    #[test]
+    fn a_400_naming_the_wrong_field_is_not_a_rejection() {
+        // The server names `session_id`, but `prompt_cache_key` is what was sent
+        // — so this is not a rejection of the affinity hint.
+        let body = serde_json::json!({ "prompt_cache_key": "42" });
+        assert_eq!(
+            affinity_rejection_field(&body, 400, "unsupported: session_id"),
+            None,
+        );
+    }
+
+    #[test]
+    fn an_unrelated_400_is_not_a_rejection() {
+        let body = serde_json::json!({ "prompt_cache_key": "42" });
+        assert_eq!(
+            affinity_rejection_field(&body, 400, "invalid model: gpt-9"),
+            None,
+        );
+    }
+
+    #[test]
+    fn a_non_400_is_not_a_rejection() {
+        // Even when the body prose mentions the field, only a 400 downgrades.
+        let body = serde_json::json!({ "prompt_cache_key": "42" });
+        assert_eq!(
+            affinity_rejection_field(&body, 429, "rate limited: prompt_cache_key"),
+            None,
+        );
+        assert_eq!(
+            affinity_rejection_field(&body, 500, "server error: prompt_cache_key"),
+            None,
+        );
+    }
+
+    #[test]
+    fn a_body_without_the_field_is_never_a_rejection() {
+        // An `Off` provider's body carries no affinity field, so even a 400 that
+        // happens to mention the name cannot downgrade it.
+        let body = serde_json::json!({ "model": "gpt-5.4" });
+        assert_eq!(
+            affinity_rejection_field(&body, 400, "bad prompt_cache_key"),
+            None,
+        );
     }
 }

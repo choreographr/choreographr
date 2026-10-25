@@ -875,6 +875,40 @@ Like the compression coding, the dialect is baked into the provider client at
 construction, so an overlay edit reaches live sessions through the catalog-swap
 client invalidation (`client_config_changed` compares it).
 
+#### Downgrade on a rejected field
+
+The hint fails safe. A provider that answers the affinity field with an HTTP
+**400 naming that very field** — `prompt_cache_key`, or `session_id` for the
+`OpenRouter` dialect — is treated as rejecting the parameter, and the field is
+withheld from every later request of that provider for the rest of the process.
+The detector is narrow, so nothing unrelated downgrades: only a `400` counts (a
+`429`, a `5xx`, or any other `4xx` never does), and the detail must mention the
+field the request actually carried (`affinity_rejection_field`, which reads the
+built body — never logging it). A provider that merely *ignores* an unknown
+field answers 2xx and is never recorded, and a `400` that names some other
+problem (a malformed request, an unknown model) leaves the hint in place. An
+`Off` provider's body carries no affinity field, so it can never be downgraded.
+The rejection is recorded once the attempt is **final** — after the retry loop
+has exhausted its retries — not per attempt, so a retried request cannot record
+it more than once.
+
+The memory is the process-wide `session_routing::AFFINITY_REJECTED` set — the
+**sixteenth** sanctioned shared-state exception (see AGENTS.md), read under a
+shared lock when a body is built for an affinity-opted-in provider (the `Off`
+default skips the lookup) and written once per provider on a matching `400`, so
+it carries no protocol data and readers never contend.
+
+The field a request actually sends resolves through three layers, highest
+priority first: a **per-account override** (`prompt_cache_affinity` on
+`AccountConfig`/`ProviderOverrides`; `Some(true)` forces a hint on — keeping a
+dialect the catalog already selected, or lifting an `Off` catalog to
+`prompt_cache_key` — `Some(false)` forces it off, `None` keeps the catalog
+value), then the **catalog's `cache_affinity`** overlay dialect, then the
+**rejection registry**, which is consulted last and can only withhold a hint. So
+the registry overrides even a forced-on override: once the provider has said no,
+it is not asked again. Consult `ServiceConfig::effective_cache_affinity` for the
+resolved value the body builders use.
+
 #### Transient gateway 400 (message content)
 
 The opencode.ai zen/go gateway validates message *content* on only some of its

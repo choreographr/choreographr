@@ -119,6 +119,15 @@ pub struct AccountConfig {
     /// field set this to `false`.
     #[serde(default)]
     pub prompt_cache: Option<bool>,
+    /// Force the per-session cache-affinity body field on or off, overriding the
+    /// catalog's `cache_affinity` dialect. `None` keeps the catalog value;
+    /// `Some(false)` suppresses a hint the catalog opts into, and `Some(true)`
+    /// requests one even for a provider the catalog leaves off (using the
+    /// broadly-documented `prompt_cache_key`). The process-wide rejection
+    /// registry still withholds a hint the provider has answered a 400 to, so
+    /// the precedence is override > catalog > registry.
+    #[serde(default)]
+    pub prompt_cache_affinity: Option<bool>,
     /// Billing meter for this account's cache-warming gate. `None` means the
     /// meter is unknown, which never warms. See [`crate::cache_warm`].
     #[serde(default)]
@@ -212,6 +221,7 @@ impl AccountConfig {
             context_window: None,
             model_context_windows: None,
             prompt_cache: None,
+            prompt_cache_affinity: None,
             meter: None,
             cache_warming: None,
         }
@@ -382,6 +392,7 @@ impl From<&AccountConfig> for choreo_ai_protocols::ProviderOverrides {
             context_window: config.context_window,
             model_context_windows: config.model_context_windows.clone(),
             prompt_cache: config.prompt_cache,
+            prompt_cache_affinity: config.prompt_cache_affinity,
         }
     }
 }

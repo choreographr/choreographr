@@ -868,7 +868,8 @@ ordering; a missing cache never sends `If-None-Match`). A **user overlay** at
 `$XDG_CONFIG_HOME/choreographr/models-overlay.toml` is merged on top of the
 bundled overlay with the same schema — provider scalars (`protocol`,
 `base_url`, `max_tokens_field`, `default_model`, `display_name`,
-`prompt_cache_short`, `prompt_cache_long`, `request_compression`) and per-model
+`prompt_cache_short`, `prompt_cache_long`, `request_compression`,
+`cache_affinity`) and per-model
 entries (`[provider.<slug>.models."<model>"]` with `context_window`,
 `reasoning_supported`, `reasoning_levels`, `responses`, `reasoning_passback`,
 `prompt_cache_short`, `prompt_cache_long`),

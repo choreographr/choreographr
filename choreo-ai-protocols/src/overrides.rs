@@ -38,4 +38,12 @@ pub struct ProviderOverrides {
     /// keeps the provider default (on for the Anthropic Messages adapter).
     /// Anthropic-format gateways that reject the field set this to `false`.
     pub prompt_cache: Option<bool>,
+    /// Force the per-session cache-affinity body field on or off, overriding the
+    /// catalog's `cache_affinity` dialect. `Some(true)` sends a hint even for a
+    /// provider the catalog leaves off (lifting `Off` to the broadly-documented
+    /// `prompt_cache_key`), `Some(false)` sends none even for a provider the
+    /// catalog opts in, and `None` keeps the catalog value. The process-wide
+    /// rejection registry still withholds a hint the provider has rejected with
+    /// a 400, so the precedence is override > catalog > registry.
+    pub prompt_cache_affinity: Option<bool>,
 }

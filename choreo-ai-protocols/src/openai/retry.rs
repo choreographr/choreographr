@@ -82,7 +82,7 @@ pub(crate) fn retry_send(
     // (it stays `Fn`); each attempt shares the payload (`Arc<[u8]>`) and clones
     // the `Arc` upload hook. The Zeroizing wrapper ensures the temporary
     // `Bearer …` string is wiped when it goes out of scope.
-    retry::retry_loop_with_provider_policies(
+    let result = retry::retry_loop_with_provider_policies(
         &hooked,
         &config.provider_slug,
         || {
@@ -98,8 +98,21 @@ pub(crate) fn retry_send(
         },
         retry_cfg,
         ctx,
-    )
-    .map_err(OpenAiError::from)
+    );
+    // Record a genuine cache-affinity rejection once the attempt is final — the
+    // retry loop above has already exhausted its retries, so this runs once per
+    // request, never per attempt. A response only counts when it is a 400 whose
+    // detail names the field this request actually carried
+    // (`affinity_rejection_field`); the built `body` confirms which field that
+    // was, and it is inspected here, never logged. Recording it makes
+    // `effective_cache_affinity` withhold the field from every later request of
+    // this provider, so a rejected parameter cannot waste another turn.
+    if let Err(crate::retry::ProviderHttpError::ClientError { status, detail }) = &result
+        && let Some(field) = crate::session_routing::affinity_rejection_field(body, *status, detail)
+    {
+        crate::session_routing::note_cache_affinity_rejected(&config.provider_slug, field);
+    }
+    result.map_err(OpenAiError::from)
 }
 
 pub(crate) fn retry_send_get(

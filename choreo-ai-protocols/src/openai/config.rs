@@ -288,6 +288,49 @@ impl ServiceConfig {
         }
     }
 
+    /// The cache affinity to actually send for this provider, after applying
+    /// the process-wide rejection registry (see `session_routing::effective_cache_affinity`).
+    ///
+    /// The configured [`Self::cache_affinity`] already folds in the per-account
+    /// override and the catalog dialect; this only withholds a hint the provider
+    /// has rejected with a 400 in this process. Provides a slug/config pairing so
+    /// the body builders cannot consult the registry with the wrong slug.
+    #[must_use]
+    pub fn effective_cache_affinity(&self) -> CacheAffinity {
+        crate::session_routing::effective_cache_affinity(&self.provider_slug, self.cache_affinity)
+    }
+
+    /// Apply the per-account cache-affinity override from the protocol-agnostic
+    /// [`ProviderOverrides`](crate::ProviderOverrides) carrier.
+    ///
+    /// This is the one carrier field the `OpenAI` adapter consumes here; the
+    /// account's other overrides (base URL, streaming, retry/timeout knobs,
+    /// endpoints, model limits) are applied directly from the daemon's account
+    /// config before this runs. `Some(true)` forces a hint on, `Some(false)`
+    /// forces it off, and `None` keeps the catalog dialect in place.
+    ///
+    /// Precedence, lowest priority first: the process-wide rejection registry
+    /// (consulted later in [`Self::effective_cache_affinity`], which can only
+    /// withhold a hint), then the catalog's `cache_affinity` overlay, then this
+    /// override. Forcing on keeps a dialect the catalog already selected and
+    /// lifts an `Off` catalog to the broadly-documented
+    /// [`CacheAffinity::PromptCacheKey`], since "on" needs a concrete wire
+    /// shape and `prompt_cache_key` is the one most providers document. A forced
+    /// hint is still suppressed at request time once the provider has rejected
+    /// it.
+    pub fn apply_overrides(&mut self, overrides: &crate::ProviderOverrides) {
+        if let Some(requested) = overrides.prompt_cache_affinity {
+            self.cache_affinity = if requested {
+                match self.cache_affinity {
+                    CacheAffinity::Off => CacheAffinity::PromptCacheKey,
+                    configured => configured,
+                }
+            } else {
+                CacheAffinity::Off
+            };
+        }
+    }
+
     /// Resolve the `(max_tokens, max_completion_tokens)` pair for a model,
     /// honouring a per-call output-token cap.
     ///
@@ -554,5 +597,83 @@ mod tests {
         // would not trigger (ChatCompletions format).
         assert!(config.programmatic_tool_calling_for_model("gpt-5.6-sol"));
         assert!(config.programmatic_tool_calling_for_model("gpt-4.1"));
+    }
+
+    #[test]
+    fn cache_affinity_override_forces_off_over_the_catalog() {
+        // Catalog opts into prompt_cache_key; the operator forces it off.
+        let mut config = ServiceConfig {
+            cache_affinity: CacheAffinity::PromptCacheKey,
+            ..Default::default()
+        };
+        config.apply_overrides(&crate::ProviderOverrides {
+            prompt_cache_affinity: Some(false),
+            ..Default::default()
+        });
+        assert_eq!(config.cache_affinity, CacheAffinity::Off);
+        assert_eq!(config.effective_cache_affinity(), CacheAffinity::Off);
+    }
+
+    #[test]
+    fn cache_affinity_override_forces_on_over_the_catalog() {
+        // Catalog leaves it off; the operator forces it on, which needs a
+        // concrete dialect — the broadly-documented prompt_cache_key.
+        let mut config = ServiceConfig::default();
+        assert_eq!(config.cache_affinity, CacheAffinity::Off);
+        config.apply_overrides(&crate::ProviderOverrides {
+            prompt_cache_affinity: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(config.cache_affinity, CacheAffinity::PromptCacheKey);
+    }
+
+    #[test]
+    fn cache_affinity_override_keeps_a_selected_dialect() {
+        // Forcing on keeps the catalog's chosen dialect rather than replacing it
+        // with prompt_cache_key (OpenRouter wants its own session_id).
+        let mut config = ServiceConfig {
+            cache_affinity: CacheAffinity::OpenRouterSession,
+            ..Default::default()
+        };
+        config.apply_overrides(&crate::ProviderOverrides {
+            prompt_cache_affinity: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(config.cache_affinity, CacheAffinity::OpenRouterSession);
+    }
+
+    #[test]
+    fn cache_affinity_override_none_keeps_the_catalog_value() {
+        let mut config = ServiceConfig {
+            cache_affinity: CacheAffinity::PromptCacheKey,
+            ..Default::default()
+        };
+        config.apply_overrides(&crate::ProviderOverrides::default());
+        assert_eq!(config.cache_affinity, CacheAffinity::PromptCacheKey);
+    }
+
+    #[test]
+    fn rejection_registry_beats_a_forced_on_override() {
+        // Precedence is override > catalog > registry: the registry is the
+        // lowest priority, but it can only withhold a hint, so a provider that
+        // has already rejected the field stays off even when forced on. The
+        // slug is unique to this test because the registry is process-wide.
+        let slug = "override-rejection-test-slug";
+        crate::session_routing::note_cache_affinity_rejected(
+            slug,
+            crate::session_routing::PROMPT_CACHE_KEY_FIELD,
+        );
+        let mut config = ServiceConfig {
+            provider_slug: slug.to_string(),
+            ..Default::default()
+        };
+        config.apply_overrides(&crate::ProviderOverrides {
+            prompt_cache_affinity: Some(true),
+            ..Default::default()
+        });
+        // The configured dialect was forced on…
+        assert_eq!(config.cache_affinity, CacheAffinity::PromptCacheKey);
+        // …but the request-time resolution withholds it.
+        assert_eq!(config.effective_cache_affinity(), CacheAffinity::Off);
     }
 }
